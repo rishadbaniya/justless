@@ -4,22 +4,13 @@ Justless helps coding agents use fewer tokens when running commands and explorin
 
 ## Install
 
-Building Justless requires Rust 1.91 or newer and a C compiler.
+From your project directory, run the installer with Rust 1.91 or newer and a C compiler on your machine.
 
 ```sh
-cargo install --locked --git https://github.com/rishadbaniya/justless.git
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh
 ```
 
-## Use with Codex
-
-Run these commands from your project’s root.
-
-```sh
-justless init --hooks
-codex
-```
-
-In Codex, open `/hooks` and trust the project hooks. Justless then indexes the repo at session start and automatically shortens output from supported commands.
+It installs Justless and configures project hooks for Codex, Claude Code, and Antigravity CLI (`agy`) when it finds them on your `PATH`. Start a new agent session in the project. In Codex, review and trust the hooks with `/hooks`.
 
 ## Use from the terminal
 
@@ -31,7 +22,7 @@ justless find "/api/orders"    # Find matching lines in code, docs, and config
 ## How it works
 
 ```text
-  Codex hook or terminal                    Repository files
+  Agent hook or terminal                    Repository files
             |                                      |
             v                                      v
        justless run                       Index changed files

@@ -37,10 +37,25 @@ max_file_bytes = 2097152
 
 Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Keep the directory private if a command prints secrets. The CLI runs offline after installation, and `--raw` skips recording.
 
-## Codex integration
+## Install and configure agents
 
-`init` (also `init-codex`) installs repo instructions in `AGENTS.md` and ignores generated `.justless/` state in Git. `--hooks` also merges Justless hooks into `.codex/hooks.json`. Start Codex in the trusted project with `justless` on `PATH`, then review and trust the new hooks with `/hooks`. [Codex project instructions](https://learn.chatgpt.com/docs/agent-configuration/agents-md) · [Codex hooks](https://learn.chatgpt.com/docs/hooks)
+Run the installer from the project where you want hooks. With no arguments it detects installed clients on `PATH`. You can also choose clients explicitly or install only the CLI. From a Justless checkout you can use `sh /path/to/justless/install.sh` with the same arguments.
 
-The session hook warms the repo index in the background. The shell hook routes supported, simple Cargo, Go, npm, pytest, Git, and ripgrep commands through `justless run`. Shell pipelines, redirections, substitutions, watch modes, and known machine-output flags run unchanged. Codex evaluates rewritten commands through its normal sandbox and approval flow. The project instructions also work with the CLI directly.
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- claude agy
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- --cli-only
+```
+
+The installer builds with Cargo. The binary goes in `$CARGO_INSTALL_ROOT/bin`, defaulting to `$CARGO_HOME/bin` or `~/.cargo/bin`. Put that directory on the agent's `PATH`. Once the binary is installed, configure another project from its root with `justless init --hooks --agent codex --agent claude --agent agy`. Select only the clients you use. Running setup again preserves existing instructions, settings, and hooks.
+
+| Client | Instructions | Project hooks |
+| --- | --- | --- |
+| Codex | `AGENTS.md` | `.codex/hooks.json` |
+| Claude Code | `CLAUDE.md` | `.claude/settings.json` |
+| Antigravity CLI (`agy`) | `AGENTS.md` | `.agents/hooks.json` |
+
+Open a new session in the trusted workspace. In Codex, review and trust the project hooks with `/hooks`. The session-start hook refreshes the repo index. Before supported shell commands run, the command hook routes them through Justless. Each client handles permissions for the rewritten command. [Codex hooks](https://learn.chatgpt.com/docs/hooks) · [Claude Code hooks](https://code.claude.com/docs/en/hooks) · [Antigravity CLI hooks](https://antigravity.google/docs/hooks?tab=cli)
+
+`justless init` defaults to Codex. Omit `--hooks` to install only the selected client's project instructions and add `.justless/` to `.gitignore`. The `init-codex` alias is also supported.
 
 Run `justless run -- cargo test`, `justless run -- git diff`, or `justless run -- rg -n pattern src`. For interactive commands, live streaming, or pipelines that consume raw machine-readable output, use `justless run --raw -- …` or call the command directly. For shell expressions, pass the shell explicitly, as in `justless run -- sh -c 'cargo test && git diff'`.
