@@ -1,0 +1,346 @@
+mod capture;
+mod codex;
+mod context;
+mod index;
+mod polyglot;
+mod rust_syntax;
+mod workspace;
+
+use std::ffi::OsString;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::process::ExitCode;
+
+use anyhow::{Result, ensure};
+use clap::{Arg, ArgGroup, ArgMatches, Command};
+
+use crate::capture::Stream;
+use crate::index::Index;
+use crate::workspace::Workspace;
+
+fn number(name: &'static str, value: &'static str, help: &'static str) -> Arg<'static> {
+    Arg::new(name)
+        .long(name)
+        .value_name("N")
+        .default_value(value)
+        .help(help)
+}
+
+fn budget() -> Arg<'static> {
+    Arg::new("budget")
+        .long("budget")
+        .value_name("N")
+        .help("Context token ceiling (default 2400, conservatively budgeted by UTF-8 byte)")
+}
+
+fn id() -> Arg<'static> {
+    Arg::new("run-id").required(true).value_name("RUN_ID")
+}
+
+fn streams() -> Arg<'static> {
+    Arg::new("stream")
+        .long("stream")
+        .takes_value(true)
+        .possible_values(["both", "stdout", "stderr"])
+        .default_value("both")
+}
+
+fn cli() -> Command<'static> {
+    Command::new("justless")
+        .about("Compact command output and retrieve source-backed context")
+        .version(env!("CARGO_PKG_VERSION"))
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .arg(
+            Arg::new("root")
+                .long("root")
+                .value_name("DIR")
+                .global(true)
+                .allow_invalid_utf8(true)
+                .help("Override repository root"),
+        )
+        .subcommand(
+            Command::new("run")
+                .about("Run a noninteractive command and retain its full output")
+                .arg(
+                    Arg::new("max-bytes")
+                        .long("max-bytes")
+                        .value_name("N")
+                        .help("Maximum preview bytes per stream (default 4096)"),
+                )
+                .arg(
+                    Arg::new("raw")
+                        .long("raw")
+                        .help("Run with inherited streams and skip capture"),
+                )
+                .arg(
+                    Arg::new("command")
+                        .required(true)
+                        .multiple_values(true)
+                        .allow_invalid_utf8(true)
+                        .last(true)
+                        .value_name("COMMAND [ARGS]"),
+                ),
+        )
+        .subcommand(
+            Command::new("log")
+                .about("Replay original output or a specific line range")
+                .arg(id())
+                .arg(streams())
+                .arg(number("from", "1", "First output line, inclusive"))
+                .arg(
+                    Arg::new("to")
+                        .long("to")
+                        .value_name("N")
+                        .help("Last output line, inclusive"),
+                ),
+        )
+        .subcommand(
+            Command::new("search")
+                .about("Search a captured run")
+                .arg(id())
+                .arg(Arg::new("text").required(true).value_name("TEXT"))
+                .arg(streams())
+                .arg(number("limit", "20", "Maximum matching lines")),
+        )
+        .subcommand(Command::new("stats").about("Show captured and preview byte totals"))
+        .subcommand(Command::new("index").about("Refresh the incremental repository index"))
+        .subcommand(
+            Command::new("query")
+                .about("Find a symbol, its references, callers, or tests")
+                .arg(Arg::new("symbol").required(true))
+                .arg(
+                    Arg::new("view")
+                        .long("view")
+                        .takes_value(true)
+                        .default_value("all")
+                        .possible_values([
+                            "definition",
+                            "references",
+                            "callers",
+                            "tests",
+                            "dependencies",
+                            "all",
+                        ]),
+                )
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("find")
+                .about("Find exact text across source, docs, and configuration")
+                .arg(Arg::new("text").required(true).value_name("TEXT"))
+                .arg(
+                    Arg::new("ignore-case")
+                        .long("ignore-case")
+                        .short('i')
+                        .help("Ignore ASCII case"),
+                )
+                .arg(number("limit", "20", "Maximum matching lines"))
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("path")
+                .about("Trace a path between indexed symbols")
+                .arg(Arg::new("from").required(true).value_name("FROM"))
+                .arg(Arg::new("to").required(true).value_name("TO"))
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("context")
+                .about("Connect a run, changed lines, or a location to source")
+                .arg(Arg::new("run").long("run").value_name("RUN_ID"))
+                .arg(
+                    Arg::new("changes")
+                        .long("changes")
+                        .help("Use current Git changes"),
+                )
+                .arg(
+                    Arg::new("staged")
+                        .long("staged")
+                        .requires("changes")
+                        .help("Use staged changes"),
+                )
+                .arg(Arg::new("at").long("at").value_name("PATH:LINE[-LINE]"))
+                .arg(Arg::new("symbol").long("symbol").value_name("SYMBOL"))
+                .group(
+                    ArgGroup::new("input")
+                        .required(true)
+                        .args(&["run", "changes", "at", "symbol"]),
+                )
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("code")
+                .about("Print an exact workspace source range")
+                .arg(Arg::new("file").required(true).value_name("FILE"))
+                .arg(number("from", "1", "First source line, inclusive"))
+                .arg(
+                    Arg::new("to")
+                        .long("to")
+                        .value_name("N")
+                        .required(true)
+                        .help("Last source line, inclusive"),
+                )
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("init-codex")
+                .visible_alias("init")
+                .about("Install project instructions and optional Codex hooks")
+                .arg(
+                    Arg::new("hooks")
+                        .long("hooks")
+                        .help("Install project-local Codex hooks"),
+                ),
+        )
+        .subcommand(
+            Command::new("hook-codex").hide(true).arg(
+                Arg::new("mode")
+                    .required(true)
+                    .possible_values(["session-start", "before-command"]),
+            ),
+        )
+}
+
+fn read_num(matches: &ArgMatches, name: &str, minimum: usize) -> Result<usize> {
+    let value = matches.value_of_t::<usize>(name)?;
+    ensure!(
+        value >= minimum,
+        "--{name} expects a number of at least {minimum}"
+    );
+    Ok(value)
+}
+
+fn context_budget(workspace: &Workspace, matches: &ArgMatches) -> Result<usize> {
+    if matches.is_present("budget") {
+        read_num(matches, "budget", 128)
+    } else {
+        Ok(workspace.settings()?.context_budget)
+    }
+}
+
+fn dispatch(matches: &ArgMatches) -> Result<i32> {
+    let root = matches.value_of_os("root").map(Path::new);
+    let workspace = Workspace::discover(root)?;
+    match matches.subcommand().expect("subcommand is required") {
+        ("run", sub) => {
+            let command: Vec<OsString> = sub
+                .values_of_os("command")
+                .unwrap()
+                .map(OsString::from)
+                .collect();
+            let raw = sub.is_present("raw");
+            let max_bytes = if raw {
+                4096
+            } else if sub.is_present("max-bytes") {
+                read_num(sub, "max-bytes", 512)?
+            } else {
+                workspace.settings()?.max_output_bytes
+            };
+            return capture::execute(&workspace, &command, max_bytes, raw);
+        }
+        ("log", sub) => {
+            let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
+            let to = if sub.is_present("to") {
+                read_num(sub, "to", 1)?
+            } else {
+                usize::MAX
+            };
+            capture::log(
+                &directory,
+                Stream::select(sub.value_of("stream").unwrap()),
+                read_num(sub, "from", 1)?,
+                to,
+            )?;
+        }
+        ("search", sub) => {
+            let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
+            capture::search(
+                &directory,
+                Stream::select(sub.value_of("stream").unwrap()),
+                sub.value_of("text").unwrap(),
+                read_num(sub, "limit", 1)?,
+            )?;
+        }
+        ("stats", _) => capture::stats(&workspace)?,
+        ("index", _) => {
+            let index = Index::open(&workspace)?;
+            let refresh = &index.refresh;
+            println!(
+                "{} text files · {} symbols · {} relationships · {} parsed · {} reused · {} removed",
+                index.files.len(),
+                index.definitions.len(),
+                index.edges.len(),
+                refresh.parsed,
+                refresh.reused,
+                refresh.removed
+            );
+            for (file, error) in index.errors {
+                eprintln!("{file}: {error}");
+            }
+        }
+        ("query", sub) => {
+            let index = Index::open(&workspace)?;
+            context::query(
+                &index,
+                sub.value_of("symbol").unwrap(),
+                sub.value_of("view").unwrap(),
+                context_budget(&workspace, sub)?,
+            )?;
+        }
+        ("find", sub) => context::find(
+            &workspace,
+            &Index::open(&workspace)?,
+            sub.value_of("text").unwrap(),
+            sub.is_present("ignore-case"),
+            read_num(sub, "limit", 1)?,
+            context_budget(&workspace, sub)?,
+        )?,
+        ("path", sub) => context::path(
+            &Index::open(&workspace)?,
+            sub.value_of("from").unwrap(),
+            sub.value_of("to").unwrap(),
+            context_budget(&workspace, sub)?,
+        )?,
+        ("context", sub) => {
+            let limit = context_budget(&workspace, sub)?;
+            let index = Index::open(&workspace)?;
+            if let Some(id) = sub.value_of("run") {
+                context::from_run(&workspace, &index, id, limit)?;
+            } else if let Some(location) = sub.value_of("at") {
+                context::at(&workspace, &index, location, limit)?;
+            } else if let Some(name) = sub.value_of("symbol") {
+                context::symbol(&workspace, &index, name, limit)?;
+            } else {
+                context::changed(&workspace, &index, sub.is_present("staged"), limit)?;
+            }
+        }
+        ("code", sub) => context::code(
+            &workspace,
+            sub.value_of("file").unwrap(),
+            read_num(sub, "from", 1)?,
+            read_num(sub, "to", 1)?,
+            context_budget(&workspace, sub)?,
+        )?,
+        ("init-codex", sub) => codex::init(&workspace, sub.is_present("hooks"))?,
+        ("hook-codex", sub) => codex::run_hook(&workspace, sub.value_of("mode").unwrap())?,
+        _ => unreachable!("known subcommand"),
+    }
+    Ok(0)
+}
+
+fn main() -> ExitCode {
+    match dispatch(&cli().get_matches()) {
+        Ok(status) => ExitCode::from(u8::try_from(status).unwrap_or(1)),
+        Err(error) => {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == ErrorKind::BrokenPipe)
+            {
+                return ExitCode::SUCCESS;
+            }
+            eprintln!("justless: {error:#}");
+            ExitCode::from(2)
+        }
+    }
+}
