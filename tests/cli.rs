@@ -440,8 +440,17 @@ fn structural_parsers_cover_common_non_rust_languages() {
 }
 
 fn hook(root: &Path, mode: &str, input: serde_json::Value) -> serde_json::Value {
+    agent_hook(root, "hook-codex", mode, input)
+}
+
+fn agent_hook(
+    root: &Path,
+    handler: &str,
+    mode: &str,
+    input: serde_json::Value,
+) -> serde_json::Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["hook-codex", mode])
+        .args([handler, mode])
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -570,6 +579,126 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
             .join("stdout")
             .is_file()
     );
+}
+
+#[test]
+fn install_and_run_claude_and_agy_hooks() {
+    use serde_json::{Value, json};
+    let repo = mixed_fixture();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join(".claude")).unwrap();
+    let claude = root.join(".claude/settings.json");
+    let agy = root.join(".agents/hooks.json");
+    fs::create_dir(root.join(".agents")).unwrap();
+    fs::write(
+        &claude,
+        r#"{"permissions":{"defaultMode":"default"},"hooks":{"SessionStart":[]}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &agy,
+        r#"{"other":{"enabled":false},"justless":{"PreToolUse":"invalid"}}"#,
+    )
+    .unwrap();
+    let setup = ["init", "--hooks", "--agent", "claude", "--agent", "agy"];
+    assert!(!cli(&root, &setup).status.success());
+    assert!(!root.join("CLAUDE.md").exists());
+    fs::write(&agy, r#"{"other":{"enabled":false}}"#).unwrap();
+    fs::write(root.join("CLAUDE.md"), "# Team rules\n").unwrap();
+    success(&root, &setup);
+    let configs = || {
+        [
+            fs::read_to_string(&claude).unwrap(),
+            fs::read_to_string(&agy).unwrap(),
+        ]
+    };
+    let installed = configs();
+    success(&root, &setup);
+    assert_eq!(installed, configs());
+    assert!(!root.join(".codex").exists());
+    assert!(root.join("AGENTS.md").is_file());
+    let instructions = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+    assert!(instructions.starts_with("# Team rules\n"));
+    assert_eq!(instructions.matches("<!-- justless:begin -->").count(), 1);
+    let [claude, agy] = installed.map(|s| serde_json::from_str::<Value>(&s).unwrap());
+    assert_eq!(claude["permissions"]["defaultMode"], "default");
+    assert_eq!(
+        claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "justless hook-claude before-command"
+    );
+    assert_eq!(agy["other"]["enabled"], false);
+    assert_eq!(
+        agy["justless"]["SessionStart"][0]["command"],
+        "justless hook-agy session-start"
+    );
+    assert_eq!(agy["justless"]["PreToolUse"][0]["matcher"], "^run_command$");
+    let claude_input = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":"git diff","description":"show changes"}});
+    let output = agent_hook(&root, "hook-claude", "before-command", claude_input.clone());
+    let hook = &output["hookSpecificOutput"];
+    assert_eq!(
+        hook["updatedInput"],
+        json!({"command":"justless run -- git diff","description":"show changes"})
+    );
+    assert!(hook.get("permissionDecision").is_none());
+    let mut plan = claude_input;
+    plan["permission_mode"] = json!("plan");
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "before-command", plan),
+        json!({})
+    );
+    let elsewhere = TempDir::new().unwrap();
+    let agy_input = |command: &str, cwd: &Path| json!({"workspacePaths":[root],"toolCall":{"name":"run_command","args":{"CommandLine":command,"Cwd":cwd,"WaitMsBeforeAsync":10}}});
+    let dispatch = |command: &str, cwd: &Path| {
+        agent_hook(
+            elsewhere.path(),
+            "hook-agy",
+            "before-command",
+            agy_input(command, cwd),
+        )
+    };
+    assert_eq!(
+        dispatch("git diff", &root),
+        json!({"decision":"allow","overwrite":{"CommandLine":"justless run -- git diff"}})
+    );
+    assert_eq!(
+        dispatch("git diff", elsewhere.path()),
+        json!({"decision":"allow"})
+    );
+    assert_eq!(
+        dispatch("git diff | cat", &root),
+        json!({"decision":"allow"})
+    );
+    let mut multiple = agy_input("git diff", &root);
+    multiple["workspacePaths"] = json!([elsewhere.path(), root]);
+    let result = agent_hook(
+        elsewhere.path(),
+        "hook-agy",
+        "before-command",
+        multiple.clone(),
+    );
+    assert_eq!(
+        result["overwrite"]["CommandLine"],
+        "justless run -- git diff"
+    );
+    multiple["toolCall"]["args"]["RunPersistent"] = json!(true);
+    assert_eq!(
+        agent_hook(&root, "hook-agy", "before-command", multiple),
+        json!({"decision":"allow"})
+    );
+    let startup = agent_hook(
+        elsewhere.path(),
+        "hook-agy",
+        "session-start",
+        json!({"workspacePaths":[root]}),
+    );
+    assert!(
+        startup["injectSteps"][0]["ephemeralMessage"]
+            .as_str()
+            .unwrap()
+            .contains("Justless indexed")
+    );
+    assert!(root.join(".justless/index.json").is_file());
+    assert!(!elsewhere.path().join(".justless").exists());
 }
 
 #[test]

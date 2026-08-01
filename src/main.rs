@@ -1,5 +1,5 @@
+mod agents;
 mod capture;
-mod codex;
 mod context;
 mod index;
 mod polyglot;
@@ -184,22 +184,31 @@ fn cli() -> Command<'static> {
                 .arg(budget()),
         )
         .subcommand(
-            Command::new("init-codex")
-                .visible_alias("init")
-                .about("Install project instructions and optional Codex hooks")
+            Command::new("init")
+                .visible_alias("init-codex")
+                .about("Install project instructions and optional agent hooks")
+                .arg(
+                    Arg::new("agent")
+                        .long("agent")
+                        .takes_value(true)
+                        .multiple_occurrences(true)
+                        .possible_values(["codex", "claude", "agy"])
+                        .default_value("codex")
+                        .help("Agent to configure (repeat to select several)"),
+                )
                 .arg(
                     Arg::new("hooks")
                         .long("hooks")
-                        .help("Install project-local Codex hooks"),
+                        .help("Install project-local hooks"),
                 ),
         )
-        .subcommand(
-            Command::new("hook-codex").hide(true).arg(
+        .subcommands(["hook-codex", "hook-claude", "hook-agy"].map(|name| {
+            Command::new(name).hide(true).arg(
                 Arg::new("mode")
                     .required(true)
                     .possible_values(["session-start", "before-command"]),
-            ),
-        )
+            )
+        }))
 }
 
 fn read_num(matches: &ArgMatches, name: &str, minimum: usize) -> Result<usize> {
@@ -322,8 +331,21 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             read_num(sub, "to", 1)?,
             context_budget(&workspace, sub)?,
         )?,
-        ("init-codex", sub) => codex::init(&workspace, sub.is_present("hooks"))?,
-        ("hook-codex", sub) => codex::run_hook(&workspace, sub.value_of("mode").unwrap())?,
+        ("init", sub) => {
+            let selected = sub
+                .values_of("agent")
+                .unwrap()
+                .map(agents::Agent::parse)
+                .collect::<Result<Vec<_>>>()?;
+            agents::init(&workspace, &selected, sub.is_present("hooks"))?;
+        }
+        (name, sub) if name.starts_with("hook-") => {
+            agents::run_hook(
+                &workspace,
+                agents::Agent::parse(&name[5..])?,
+                sub.value_of("mode").unwrap(),
+            )?;
+        }
         _ => unreachable!("known subcommand"),
     }
     Ok(0)
