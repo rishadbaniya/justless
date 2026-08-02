@@ -1,9 +1,12 @@
 mod agents;
 mod capture;
 mod context;
+mod history;
 mod index;
+mod pack;
 mod polyglot;
 mod rust_syntax;
+mod summary;
 mod workspace;
 
 use std::ffi::OsString;
@@ -63,6 +66,17 @@ fn cli() -> Command<'static> {
             Command::new("run")
                 .about("Run a noninteractive command and retain its full output")
                 .arg(
+                    Arg::new("session")
+                        .long("session")
+                        .takes_value(true)
+                        .help("Scope repeat comparisons to this session"),
+                )
+                .arg(
+                    Arg::new("fresh")
+                        .long("fresh")
+                        .help("Show a fresh preview without comparing a previous run"),
+                )
+                .arg(
                     Arg::new("max-bytes")
                         .long("max-bytes")
                         .value_name("N")
@@ -103,7 +117,28 @@ fn cli() -> Command<'static> {
                 .arg(streams())
                 .arg(number("limit", "20", "Maximum matching lines")),
         )
-        .subcommand(Command::new("stats").about("Show captured and preview byte totals"))
+        .subcommand(
+            Command::new("pack")
+                .about("Gather source, relationships and run evidence for a task")
+                .arg(Arg::new("task").required(true))
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("history")
+                .about("List captured runs or search all their logs")
+                .arg(Arg::new("text"))
+                .arg(Arg::new("oldest").long("oldest"))
+                .arg(number("limit", "12", "Maximum runs or matching lines"))
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("resume")
+                .about("Show recent runs, inspected source and stale evidence")
+                .arg(budget()),
+        )
+        .subcommand(
+            Command::new("stats").about("Show output savings, full recalls and hook coverage"),
+        )
         .subcommand(Command::new("index").about("Refresh the incremental repository index"))
         .subcommand(
             Command::new("query")
@@ -246,7 +281,16 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             } else {
                 workspace.settings()?.max_output_bytes
             };
-            return capture::execute(&workspace, &command, max_bytes, raw);
+            let default_session =
+                std::env::var("JUSTLESS_SESSION").unwrap_or_else(|_| "terminal".into());
+            return capture::execute(
+                &workspace,
+                &command,
+                max_bytes,
+                raw,
+                sub.value_of("session").unwrap_or(&default_session),
+                sub.is_present("fresh"),
+            );
         }
         ("log", sub) => {
             let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
@@ -261,6 +305,14 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 read_num(sub, "from", 1)?,
                 to,
             )?;
+            history::recall(
+                &directory,
+                if to == usize::MAX && sub.value_of("from") == Some("1") {
+                    "full"
+                } else {
+                    "range"
+                },
+            );
         }
         ("search", sub) => {
             let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
@@ -270,8 +322,23 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 sub.value_of("text").unwrap(),
                 read_num(sub, "limit", 1)?,
             )?;
+            history::recall(&directory, "search");
         }
-        ("stats", _) => capture::stats(&workspace)?,
+        ("pack", sub) => pack::pack(
+            &workspace,
+            &Index::open(&workspace)?,
+            sub.value_of("task").unwrap(),
+            context_budget(&workspace, sub)?,
+        )?,
+        ("history", sub) => history::history(
+            &workspace,
+            sub.value_of("text"),
+            sub.is_present("oldest"),
+            read_num(sub, "limit", 1)?,
+            context_budget(&workspace, sub)?,
+        )?,
+        ("resume", sub) => history::resume(&workspace, context_budget(&workspace, sub)?)?,
+        ("stats", _) => history::stats(&workspace)?,
         ("index", _) => {
             let index = Index::open(&workspace)?;
             let refresh = &index.refresh;

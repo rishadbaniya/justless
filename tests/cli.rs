@@ -742,3 +742,301 @@ fn non_rust_diagnostics_and_project_budgets_work() {
     fs::write(&docs, "new marker".repeat(120)).unwrap();
     assert!(!success(root, &["find", "new marker"]).contains("docs/operations.md"));
 }
+
+#[test]
+fn diff_sections_delta_sessions_and_exact_recall() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let git = |args: &[&str]| {
+        let result = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", stderr(&result));
+        result
+    };
+    git(&["init", "-q"]);
+    for file in ["first.txt", "second.txt"] {
+        fs::write(root.join(file), "old\n").unwrap();
+        git(&["add", file]);
+        fs::write(root.join(file), "a long new line of evidence\n".repeat(90)).unwrap();
+    }
+    let args = [
+        "run",
+        "--session",
+        "one",
+        "--max-bytes",
+        "512",
+        "--",
+        "git",
+        "diff",
+    ];
+    let first = cli(root, &args);
+    let id = run_id(&first);
+    assert!(stdout(&first).contains("first.txt") && stdout(&first).contains("second.txt"));
+    let same = success(root, &args);
+    assert!(same.contains(&format!("unchanged since {id}")));
+    let another = success(
+        root,
+        &[
+            "run",
+            "--session",
+            "two",
+            "--max-bytes",
+            "512",
+            "--",
+            "git",
+            "diff",
+        ],
+    );
+    assert!(another.contains("second.txt") && !another.contains("since"));
+    fs::write(root.join("first.txt"), "different hunk\n".repeat(93)).unwrap();
+    let delta = cli(root, &args);
+    assert!(stdout(&delta).contains("+ first.txt") && !stdout(&delta).contains("second.txt"));
+    let changed = run_id(&delta);
+    let exact = cli(root, &["log", &changed, "--stream", "stdout"]);
+    assert_eq!(exact.stdout, git(&["diff"]).stdout);
+    let oldest = success(
+        root,
+        &["history", "a long new line", "--oldest", "--limit", "1"],
+    );
+    assert!(oldest.contains(&id) && oldest.contains("stdout:"));
+    let stats = success(root, &["stats"]);
+    assert!(
+        stats.contains("1/4 runs reopened in full") && stats.contains("1 unchanged runs"),
+        "{stats}"
+    );
+    assert!(
+        success(
+            root,
+            &[
+                "run",
+                "--session",
+                "one",
+                "--fresh",
+                "--max-bytes",
+                "512",
+                "--",
+                "git",
+                "diff"
+            ]
+        )
+        .contains("second.txt")
+    );
+    fs::write(root.join("first.txt"), "old\n").unwrap();
+    fs::write(root.join("second.txt"), "old\n").unwrap();
+    let removed = success(root, &args);
+    assert!(removed.contains("- first.txt") && removed.contains("- second.txt"));
+}
+
+#[test]
+fn task_packs_and_handoffs_link_live_and_historical_evidence() {
+    let mixed = mixed_fixture();
+    let two_seeds = success(
+        mixed.path(),
+        &["pack", "trace fetchOrders to purchase_orders"],
+    );
+    assert!(
+        two_seeds.contains("HTTP route") && two_seeds.contains("SQL relation"),
+        "{two_seeds}"
+    );
+    let pack = success(
+        mixed.path(),
+        &["pack", "What breaks if I rename purchase_orders?"],
+    );
+    for term in [
+        "schema.sql",
+        "list_orders",
+        "fetchOrders",
+        "possible HTTP",
+        "SELECT order_id",
+    ] {
+        assert!(pack.contains(term), "{pack}");
+    }
+    assert!(
+        success(
+            mixed.path(),
+            &["pack", "purchase_orders", "--budget", "128"]
+        )
+        .len()
+            <= 128
+    );
+    assert!(success(mixed.path(), &["pack", "canary-checkout"]).contains("docs/operations.md"));
+    let repo = fixture();
+    let root = repo.path();
+    let args = [
+        "run",
+        "--max-bytes",
+        "512",
+        "--",
+        "cargo",
+        "test",
+        "--offline",
+    ];
+    let failed = cli(root, &args);
+    assert_eq!(failed.status.code(), Some(101));
+    let id = run_id(&failed);
+    let evidence = success(root, &["pack", "diagnose the failing checkout test"]);
+    for term in [
+        &id,
+        "tests/checkout.rs:11",
+        "apply_fee",
+        "subtotal + fee + 1",
+    ] {
+        assert!(evidence.contains(term), "{evidence}");
+    }
+    let slice = ["code", "src/pricing.rs", "--from", "5", "--to", "7"];
+    success(root, &slice);
+    success(root, &slice);
+    let source = root.join("src/pricing.rs");
+    let text = fs::read_to_string(&source).unwrap();
+    fs::write(source, text.replace("subtotal + fee + 1", "subtotal + fee")).unwrap();
+    let handoff = success(root, &["resume"]);
+    assert!(
+        handoff.contains(&id) && handoff.contains("src/pricing.rs:5-7 [source changed]"),
+        "{handoff}"
+    );
+    let fixed = cli(root, &args);
+    assert_eq!(fixed.status.code(), Some(0));
+    assert!(
+        stdout(&fixed).contains("- total_includes_fee"),
+        "{}",
+        stdout(&fixed)
+    );
+    assert!(
+        !success(root, &["pack", "why did checkout fail"]).contains("Recorded cargo test failure")
+    );
+    assert!(success(root, &["history", "assertion", "--oldest", "--limit", "1"]).contains(&id));
+    assert!(success(root, &["stats"]).contains("1 repeated source-range reads"));
+}
+
+#[test]
+fn older_runs_are_searchable_and_hook_statistics_do_not_capture_arguments() {
+    let repo = mixed_fixture();
+    let root = repo.path();
+    let run = root.join(".justless/runs/run-older");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join("record.json"),r#"{"id":"run-older","status":1,"raw_bytes":8,"preview_bytes":8,"diagnostics":[],"source_digests":{}}"#).unwrap();
+    fs::write(run.join("stdout"), "old log\n").unwrap();
+    fs::write(run.join("stderr"), "").unwrap();
+    assert!(success(root, &["history", "old log"]).contains("run-older legacy stdout:1"));
+    assert!(success(root, &["resume"]).contains("run-older · legacy"));
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"odd ' input","tool_input":{"command":command}});
+    hook(
+        root,
+        "before-command",
+        call("git status --porcelain secret-value"),
+    );
+    let result = hook(root, "before-command", call("git status"));
+    let wrapped = result["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        wrapped.starts_with("justless run --session ")
+            && wrapped.ends_with(" -- git status")
+            && !wrapped.contains("odd")
+    );
+    assert!(success(root, &["stats"]).contains("Hook passed through: git × 1"));
+    assert!(
+        !fs::read_to_string(root.join(".justless/activity.json"))
+            .unwrap()
+            .contains("secret-value")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pytest_summaries_group_shared_diagnostics_and_preserve_failure_exit() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let exe = root.join("pytest");
+    fs::write(&exe, "#!/bin/sh\ncat results\nexit 1\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+    let filler = "progress\n".repeat(100);
+    fs::write(root.join("results"), format!("{filler}FAILED orders.py::one - TimeoutError\nFAILED orders.py::two - TimeoutError\nFAILED orders.py::three - ValueError\n3 failed in 0.1s\n")).unwrap();
+    let args = ["run", "--max-bytes", "512", "--", exe.to_str().unwrap()];
+    let failed = cli(root, &args);
+    let preview = stdout(&failed);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(
+        preview.contains("3 reported failing")
+            && preview.contains("2 test(s)")
+            && preview.matches("TimeoutError").count() == 1,
+        "{preview}"
+    );
+    fs::write(
+        root.join("results"),
+        format!("{filler}FAILED orders.py::two - TimeoutError\n1 failed in 0.1s\n"),
+    )
+    .unwrap();
+    let next = cli(root, &args);
+    assert!(
+        stdout(&next).contains("- orders.py::one") && !stdout(&next).contains("- orders.py::two")
+    );
+    fs::write(root.join("results"), "unrecognized fatal runner output\n").unwrap();
+    let unknown = cli(root, &args);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(stdout(&unknown), "unrecognized fatal runner output\n");
+}
+
+#[test]
+fn history_finds_an_exact_match_across_large_line_windows() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let text = format!(
+        "{}split-match{}\nnext\n",
+        "x".repeat(256 * 1024 - 3),
+        "y".repeat(500_000)
+    );
+    fs::write(root.join("big.txt"), text).unwrap();
+    let run = cli(root, &["run", "--", "cat", "big.txt"]);
+    let id = run_id(&run);
+    assert!(success(root, &["search", &id, "split-match"]).contains("stdout:1:"));
+    assert!(success(root, &["history", "split-match"]).contains("split-match"));
+    assert!(success(root, &["history", "next"]).contains("stdout:2:"));
+}
+
+#[test]
+fn concurrent_runs_publish_complete_archives_and_keep_workdirs_separate() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let a = root.join("a");
+    let b = root.join("b");
+    for folder in [&a, &b] {
+        fs::create_dir(folder).unwrap();
+        fs::write(folder.join("report"), "evidence\n".repeat(80)).unwrap();
+    }
+    let args = ["run", "--", "cat", "report"];
+    let runs = std::thread::scope(|scope| {
+        let tasks: Vec<_> = (0..4).map(|_| scope.spawn(|| cli(&a, &args))).collect();
+        tasks
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        runs.iter()
+            .filter(|r| stdout(r).contains("Output unchanged"))
+            .count(),
+        3
+    );
+    for run in &runs {
+        assert!(run.status.success());
+        assert_eq!(
+            success(root, &["log", &run_id(run), "--stream", "stdout"]),
+            "evidence\n".repeat(80)
+        );
+    }
+    assert_eq!(success(&b, &args), "evidence\n".repeat(80));
+    assert_eq!(success(root, &["history"]).lines().count(), 5);
+}

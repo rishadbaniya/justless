@@ -14,6 +14,7 @@ const END: &str = "<!-- justless:end -->";
 const INSTRUCTIONS: &str = r#"<!-- justless:begin -->
 ## Justless
 
+- Start an unfamiliar task with `justless pack "<task>"`. Use `justless resume` for a handoff and `justless history "<error>"` to search earlier runs. Expand a diff section with `justless log <id> --stream stdout --from <n> --to <n>`.
 - Use `justless query <symbol>` and `justless path <symbol> <symbol>` for repository navigation. Use `justless find <text>` for exact text in code, docs, and configuration. These commands refresh the repo index.
 - Use `justless run -- <command> <args>` for noninteractive builds, tests, Git diffs and logs, and verbose searches. The wrapped command's exit status still applies. Use the original command directly for interactive or streaming work.
 - For an error with a run ID, use `justless context --run <id>` to locate the assertion or diagnostic and its enclosing symbol. Use `justless search <id> <text>` or `justless log <id> --stream <stdout|stderr> --from <n> --to <n>` to recover relevant log lines.
@@ -224,7 +225,7 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
 fn startup(workspace: &Workspace) -> Option<String> {
     let count = Index::open(workspace).ok()?.files.len();
     Some(format!(
-        "Justless indexed {count} text files. Use justless query or justless path for symbols and justless find for narrow text searches. Queries refresh after edits."
+        "Justless indexed {count} text files. Use justless pack for a task, justless resume for earlier work, or justless query/path for symbols. Queries refresh after edits."
     ))
 }
 
@@ -261,10 +262,15 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         return None;
     }
     let cwd = cwd.canonicalize().ok()?;
-    if !roots.any(|root| cwd.starts_with(root)) {
-        return None;
-    }
-    let rewritten = wrapped_command(args["CommandLine"].as_str()?)?;
+    let root = roots
+        .filter(|root| cwd.starts_with(root))
+        .max_by_key(|root| root.components().count())?;
+    let workspace = Workspace::discover(Some(&root)).ok()?;
+    let rewritten = wrap_event(
+        &workspace,
+        args["CommandLine"].as_str()?,
+        input["conversationId"].as_str(),
+    )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
 }
 
@@ -289,7 +295,11 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
     }
     let command = args["command"].as_str()?;
     let mut updated = args.clone();
-    updated["command"] = Value::String(wrapped_command(command)?);
+    updated["command"] = Value::String(wrap_event(
+        workspace,
+        command,
+        input["session_id"].as_str(),
+    )?);
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
     if agent == Agent::Codex {
         hook["permissionDecision"] = json!("allow");
@@ -302,11 +312,30 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
     Some(json!({"hookSpecificOutput":hook}))
 }
 
-fn wrapped_command(command: &str) -> Option<String> {
-    if cfg!(windows) {
+fn wrap_event(workspace: &Workspace, command: &str, session: Option<&str>) -> Option<String> {
+    if !supported_command(command) {
+        crate::history::bypass(workspace, command);
         return None;
     }
-    let args = literal_command(command)?;
+    let session = session
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            format!(
+                " --session {}",
+                &crate::capture::source_digest(id.as_bytes())[..24]
+            )
+        })
+        .unwrap_or_default();
+    Some(format!("justless run{session} -- {}", command.trim()))
+}
+
+fn supported_command(command: &str) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let Some(args) = literal_command(command) else {
+        return false;
+    };
     let words: Vec<_> = args.iter().map(String::as_str).collect();
     let supported = matches!(
         words.as_slice(),
@@ -349,9 +378,9 @@ fn wrapped_command(command: &str) -> Option<String> {
             )
         })
     {
-        return None;
+        return false;
     }
-    Some(format!("justless run -- {}", command.trim()))
+    true
 }
 
 fn literal_command(command: &str) -> Option<Vec<String>> {

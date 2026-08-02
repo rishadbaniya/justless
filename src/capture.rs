@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::LazyLock;
@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
-use crate::workspace::{Location, Workspace, private_dir, write_json};
+use crate::history;
+use crate::summary::{Parser, Summary};
+use crate::workspace::{Location, Workspace, lock_state, private_dir, write_json};
 
 static ANSI: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("ANSI pattern"));
@@ -100,10 +102,22 @@ pub struct Diagnostic {
 
 #[derive(Serialize, Deserialize)]
 pub struct Run {
-    id: String,
-    status: i32,
-    raw_bytes: u64,
-    preview_bytes: usize,
+    pub id: String,
+    pub status: i32,
+    pub raw_bytes: u64,
+    pub preview_bytes: usize,
+    #[serde(default)]
+    pub completed_ms: u64,
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub command_key: String,
+    #[serde(default)]
+    pub digests: Vec<String>,
+    #[serde(default)]
+    pub summary: Summary,
+    #[serde(default)]
+    pub unchanged: bool,
     pub diagnostics: Vec<Diagnostic>,
     pub source_digests: BTreeMap<String, String>,
 }
@@ -117,6 +131,8 @@ pub fn execute(
     args: &[OsString],
     max_bytes: usize,
     raw: bool,
+    session: &str,
+    fresh: bool,
 ) -> Result<i32> {
     let mut command = Command::new(&args[0]);
     command.args(&args[1..]).current_dir(&workspace.cwd);
@@ -144,6 +160,12 @@ pub fn execute(
         .with_context(|| format!("run {}", args[0].to_string_lossy()))?;
 
     let mut run = Run {
+        family: crate::summary::family(args),
+        command_key: String::new(),
+        digests: Vec::new(),
+        summary: Summary::default(),
+        unchanged: false,
+        completed_ms: history::now_ms(),
         id: id.clone(),
         status: exit_code(status),
         raw_bytes: 0,
@@ -151,16 +173,74 @@ pub fn execute(
         diagnostics: Vec::new(),
         source_digests: BTreeMap::new(),
     };
+    let mut parser = Parser::new(&run.family);
     let mut previews = Vec::new();
     for stream in Stream::BOTH {
         let path = directory.join(stream.name());
         let raw_bytes = path.metadata()?.len();
         run.raw_bytes += raw_bytes;
-        let preview = scan(workspace, &path, stream, max_bytes, raw_bytes, &mut run)?;
+        let preview = scan(workspace, &path, stream, max_bytes, &mut run, &mut parser)?;
         run.preview_bytes += preview.len();
         previews.push((stream, preview));
     }
 
+    run.summary = parser.finish();
+    let mut key = Sha256::new();
+    for field in std::iter::once(workspace.cwd.as_os_str().as_encoded_bytes())
+        .chain(args.iter().map(|arg| arg.as_encoded_bytes()))
+    {
+        key.update((field.len() as u64).to_le_bytes());
+        key.update(field);
+    }
+    run.command_key = format!("{:x}", key.clone().finalize());
+    key.update(session.as_bytes());
+    key.update(max_bytes.to_le_bytes());
+    let baselines = workspace.state.join("baselines");
+    let baseline = baselines.join(format!("{:x}", key.finalize()));
+    let guard = private_dir(&baselines)
+        .and_then(|()| lock_state(&workspace.state.join("capture.lock")))
+        .map_err(|err| {
+            eprintln!("justless: could not track this baseline: {err:#}");
+            err
+        })
+        .ok();
+    let previous = if fresh || guard.is_none() {
+        None
+    } else {
+        fs::read_to_string(&baseline)
+            .ok()
+            .and_then(|id| load(workspace, id.trim()).ok())
+            .map(|(_, run)| run)
+    };
+    run.unchanged = previous
+        .as_ref()
+        .is_some_and(|p| p.digests == run.digests && p.status == run.status);
+    if let Some(prior) = &previous
+        && run.unchanged
+    {
+        if run.preview_bytes > 64 {
+            let target = usize::from(previews[0].1.is_empty());
+            for (_, bytes) in &mut previews {
+                bytes.clear();
+            }
+            previews[target].1 = format!("Output unchanged since {}.\n", prior.id).into_bytes();
+        }
+    } else if let Some(summary) = run.summary.render(
+        previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
+        run.status,
+    ) && (fs::metadata(directory.join("stdout"))?.len() > max_bytes as u64
+        || previous.is_some()
+        || summary.len() < previews[0].1.len())
+    {
+        let mut summary = summary;
+        if summary.len() > max_bytes {
+            let tail = "\n[more in full log]\n";
+            summary.truncate(summary.floor_char_boundary(max_bytes - tail.len()));
+            summary.push_str(tail);
+        }
+        previews[0].1 = summary.into_bytes();
+    }
+    run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();
     let save_result = write_json(&directory.join("record.json"), &run);
     if let Err(error) = save_result {
         eprintln!("justless: could not save run, restoring full output: {error:#}");
@@ -170,6 +250,12 @@ pub fn execute(
         return Ok(run.status);
     }
     let _directory = temporary.keep();
+    if guard.is_some()
+        && let Err(error) = crate::workspace::write_text(&baseline, &id)
+    {
+        eprintln!("justless: could not update run baseline: {error:#}");
+    }
+    drop(guard);
     for (stream, preview) in previews {
         if let Err(error) = stream.print(&preview)
             && error.kind() != io::ErrorKind::BrokenPipe
@@ -184,19 +270,35 @@ pub fn execute(
     Ok(run.status)
 }
 
+// Hash the exact bytes during the same pass that extracts the bounded preview.
+struct HashedFile {
+    file: File,
+    digest: Sha256,
+}
+impl Read for HashedFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.file.read(buffer)?;
+        self.digest.update(&buffer[..count]);
+        Ok(count)
+    }
+}
+
 fn scan(
     workspace: &Workspace,
     path: &Path,
     stream: Stream,
     max_bytes: usize,
-    raw_bytes: u64,
     run: &mut Run,
+    parser: &mut Parser,
 ) -> Result<Vec<u8>> {
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
-    let truncated = raw_bytes > max_bytes as u64;
+    let truncated = path.metadata()?.len() > max_bytes as u64;
     let payload = max_bytes - DIAGNOSTICS.len() - CLIPPED.len();
-    let mut file = BufReader::new(File::open(path)?);
+    let mut file = BufReader::new(HashedFile {
+        file: File::open(path)?,
+        digest: Sha256::new(),
+    });
     let mut raw = Vec::new();
     let mut preview = Vec::new();
     let mut head = Vec::new();
@@ -215,6 +317,9 @@ fn scan(
         line_no += 1;
         let text = String::from_utf8_lossy(&raw);
         let text = ANSI.replace_all(&text, "");
+        if matches!(stream, Stream::Stdout) {
+            parser.observe(&text, line_no);
+        }
         let structured = cargo_message(&text);
         let locations: Vec<Location> = if let Some(message) = &structured {
             json_locations(workspace, message)
@@ -283,6 +388,8 @@ fn scan(
         preview.extend_from_slice(CLIPPED);
         preview.extend(tail.into_iter().flatten());
     }
+    run.digests
+        .push(format!("{:x}", file.into_inner().digest.finalize()));
     Ok(preview)
 }
 
@@ -436,7 +543,8 @@ pub fn load(workspace: &Workspace, id: &str) -> Result<(PathBuf, Run)> {
     );
     let record = File::open(directory.join("record.json"))
         .with_context(|| format!("open recorded run {id}"))?;
-    let run = serde_json::from_reader(record).context("decode run record")?;
+    let run: Run = serde_json::from_reader(record).context("decode run record")?;
+    ensure!(run.id == id, "run record does not match its directory");
     Ok((directory, run))
 }
 
@@ -477,43 +585,59 @@ fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<()
 
 pub fn search(directory: &Path, streams: &[Stream], needle: &str, limit: usize) -> Result<()> {
     let mut remaining = limit;
-    for stream in streams {
-        let mut file = BufReader::new(File::open(directory.join(stream.name()))?);
-        let mut raw = Vec::new();
-        let mut number = 0;
-        while remaining > 0 && file.read_until(b'\n', &mut raw)? > 0 {
-            number += 1;
-            let text = String::from_utf8_lossy(&raw);
-            let text = ANSI.replace_all(&text, "");
-            if let Some(start) = text.find(needle) {
-                let start = text.ceil_char_boundary(start.saturating_sub(100));
-                let end = text.floor_char_boundary((start + 400).min(text.len()));
-                let excerpt = text[start..end].trim_end();
-                println!("{}:{number}: {excerpt}", stream.name());
-                remaining -= 1;
-            }
-            raw.clear();
-        }
-    }
-    Ok(())
+    matches(directory, streams, needle, |stream, n, line| {
+        println!("{}:{n}: {line}", stream.name());
+        remaining -= 1;
+        remaining > 0
+    })
 }
 
-pub fn stats(workspace: &Workspace) -> Result<()> {
-    let runs = workspace.state.join("runs");
-    let mut count = 0;
-    let mut raw = 0;
-    let mut preview = 0;
-    if runs.is_dir() {
-        for entry in fs::read_dir(runs)? {
-            let path = entry?.path().join("record.json");
-            if path.is_file() {
-                let run: Run = serde_json::from_reader(File::open(path)?)?;
-                count += 1;
-                raw += run.raw_bytes;
-                preview += run.preview_bytes;
+/// Keep one overlapping window so even a single enormous log line is searchable.
+pub fn matches(
+    directory: &Path,
+    streams: &[Stream],
+    needle: &str,
+    mut emit: impl FnMut(Stream, usize, &str) -> bool,
+) -> Result<()> {
+    for &stream in streams {
+        let mut file = BufReader::new(File::open(directory.join(stream.name()))?);
+        let mut window = Vec::new();
+        let mut line_number = 1;
+        let mut matched = false;
+        loop {
+            let read = file
+                .by_ref()
+                .take(SCAN_LINE_LIMIT as u64)
+                .read_until(b'\n', &mut window)?;
+            if read == 0 {
+                break;
+            }
+            let newline = window.ends_with(b"\n");
+            if !matched {
+                let text = String::from_utf8_lossy(&window);
+                let text = ANSI.replace_all(&text, "");
+                if let Some(pos) = text.find(needle) {
+                    let start = text.ceil_char_boundary(pos.saturating_sub(100));
+                    let end = text.floor_char_boundary((start + 400).min(text.len()));
+                    if !emit(stream, line_number, text[start..end].trim_end()) {
+                        return Ok(());
+                    }
+                    matched = true;
+                }
+            }
+            if newline {
+                line_number += 1;
+                matched = false;
+                window.clear();
+            } else if matched {
+                window.clear();
+            } else {
+                let drop = window
+                    .len()
+                    .saturating_sub(needle.len().saturating_add(256));
+                window.drain(..drop);
             }
         }
     }
-    println!("{count} runs · {raw} raw bytes · {preview} preview bytes");
     Ok(())
 }

@@ -15,16 +15,16 @@ static HUNK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@").expect("Git hunk pattern")
 });
 
-struct Report {
+pub(crate) struct Report {
     output: String,
     cap: usize,
-    clipped: bool,
+    pub(crate) clipped: bool,
 }
 
 impl Report {
     const CLIPPED: &str = "[context budget reached]\n";
 
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             output: String::new(),
             cap,
@@ -32,7 +32,7 @@ impl Report {
         }
     }
 
-    fn line(&mut self, line: impl AsRef<str>) {
+    pub(crate) fn line(&mut self, line: impl AsRef<str>) {
         let line = line.as_ref();
         let left = self
             .cap
@@ -52,7 +52,7 @@ impl Report {
         }
     }
 
-    fn finish(mut self) -> Result<()> {
+    pub(crate) fn finish(mut self) -> Result<()> {
         if self.clipped {
             self.output.push_str(Self::CLIPPED);
         }
@@ -136,7 +136,7 @@ pub fn query(index: &Index, name: &str, view: &str, cap: usize) -> Result<()> {
     report.finish()
 }
 
-fn relationship(kind: Kind) -> &'static str {
+pub(crate) fn relationship(kind: Kind) -> &'static str {
     match kind {
         Kind::Call | Kind::Method => "call",
         Kind::Reference => "reference",
@@ -245,11 +245,22 @@ fn snippet(
     report: &mut Report,
 ) -> Result<()> {
     let text = fs::read_to_string(workspace.source_path(file)?)?;
-    for (line, text) in text.lines().enumerate().skip(from - 1).take(to - from + 1) {
-        report.line(format!("  {} | {text}", line + 1));
+    let mut last = None;
+    for (line, content) in text.lines().enumerate().skip(from - 1).take(to - from + 1) {
         if report.clipped {
             break;
         }
+        report.line(format!("  {} | {content}", line + 1));
+        last = Some(line + 1);
+    }
+    if let Some(last) = last {
+        crate::history::saw_source(
+            workspace,
+            file,
+            from,
+            last,
+            capture::source_digest(text.as_bytes()),
+        );
     }
     Ok(())
 }
@@ -293,6 +304,7 @@ pub fn symbol(workspace: &Workspace, index: &Index, name: &str, cap: usize) -> R
 
 pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> Result<()> {
     let (directory, run) = capture::load(workspace, id)?;
+    crate::history::recall(&directory, "context");
     let mut report = Report::new(cap);
     report.line(format!(
         "Run {id} · {} source locations",
