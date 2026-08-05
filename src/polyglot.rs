@@ -95,6 +95,11 @@ impl Grammar {
         let mut tags = tags.to_owned();
         if matches!(self, Self::TypeScript | Self::Tsx) {
             tags.push_str(tree_sitter_javascript::TAGS_QUERY);
+            tags.push_str(
+                "\n(type_alias_declaration name: (_) @name) @definition.type
+                (enum_declaration name: (_) @name) @definition.enum
+                (class_declaration name: (type_identifier) @name) @definition.class\n",
+            );
         }
         if matches!(self, Self::C | Self::Cpp) {
             tags.push_str("\n(call_expression function: (identifier) @name) @reference.call\n");
@@ -105,6 +110,10 @@ impl Grammar {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Definition {
+    #[serde(skip)]
+    pub bytes: std::ops::Range<usize>,
+    #[serde(skip)]
+    pub header_end: usize,
     pub name: String,
     pub kind: String,
     pub path: String,
@@ -131,6 +140,8 @@ pub struct Import {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Facts {
+    #[serde(skip)]
+    pub import_ranges: Vec<std::ops::Range<usize>>,
     pub grammar: Grammar,
     pub lines: usize,
     pub definitions: Vec<Definition>,
@@ -216,6 +227,7 @@ impl Parsers {
         });
         definitions.dedup_by_key(|tag| tag.name_node.byte_range());
         let mut facts = Facts {
+            import_ranges: Vec::new(),
             grammar,
             lines: source.lines().count().max(1),
             definitions: Vec::new(),
@@ -244,7 +256,25 @@ impl Parsers {
                     && name
                         .strip_prefix("Test")
                         .is_some_and(|suffix| suffix.starts_with(char::is_uppercase)));
+            let extent = declaration_extent(*node, *name_node);
+            let body = node.child_by_field_name("body").or_else(|| {
+                node.child_by_field_name("value")?
+                    .child_by_field_name("body")
+            });
+            let header_end = if grammar == Grammar::Python {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .find(|child| child.kind() == ":")
+                    .map(|colon| colon.end_byte())
+            } else {
+                None
+            };
             facts.definitions.push(Definition {
+                bytes: extent.byte_range(),
+                header_end: header_end.unwrap_or_else(|| {
+                    body.or_else(|| extent.child_by_field_name("body"))
+                        .map_or(extent.end_byte(), |body| body.start_byte())
+                }),
                 name,
                 path,
                 kind: kind.to_owned(),
@@ -279,6 +309,17 @@ impl Parsers {
         }
         let mut embedded_queries = Vec::new();
         walk(tree.root_node(), |node| {
+            if matches!(
+                node.kind(),
+                "import_statement"
+                    | "import_from_statement"
+                    | "import_declaration"
+                    | "preproc_include"
+                    | "using_directive"
+                    | "namespace_use_declaration"
+            ) {
+                facts.import_ranges.push(node.byte_range());
+            }
             if let Some(import) = module_import(grammar, node, source) {
                 facts.imports.push(import);
             }
@@ -324,6 +365,51 @@ impl Parsers {
         }
         Ok(facts)
     }
+}
+
+// Some tag queries capture a declarator rather than the declaration that owns
+// its type, modifiers and body. Never widen a multi-declarator statement.
+fn declaration_extent<'a>(mut node: Node<'a>, name: Node<'a>) -> Node<'a> {
+    if node.kind() == "property_declaration" {
+        let mut cursor = node.walk();
+        let properties: Vec<_> = node
+            .named_children(&mut cursor)
+            .filter(|c| c.kind() == "property_element")
+            .collect();
+        if properties.len() > 1
+            && let Some(property) = properties
+                .into_iter()
+                .find(|p| p.start_byte() <= name.start_byte() && name.end_byte() <= p.end_byte())
+        {
+            return property;
+        }
+    }
+    while let Some(parent) = node.parent() {
+        let widen = match parent.kind() {
+            "export_statement" | "decorated_definition" => {
+                parent.named_child_count() == 1
+                    || parent.child_by_field_name("definition") == Some(node)
+                    || parent.child_by_field_name("declaration") == Some(node)
+            }
+            "function_definition" | "pointer_declarator" | "reference_declarator" => {
+                parent.child_by_field_name("declarator") == Some(node)
+            }
+            "declaration" | "field_declaration" => {
+                let mut cursor = parent.walk();
+                let mut declarators = parent.children_by_field_name("declarator", &mut cursor);
+                declarators.next() == Some(node) && declarators.next().is_none()
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                node.kind() == "variable_declarator" && parent.named_child_count() == 1
+            }
+            _ => false,
+        };
+        if !widen {
+            break;
+        }
+        node = parent;
+    }
+    node
 }
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

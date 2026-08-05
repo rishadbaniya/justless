@@ -1,0 +1,420 @@
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+use serde_json::{Value, json};
+use tempfile::tempdir;
+
+fn run(root: &Path, args: &[&str], input: &[u8]) -> Output {
+    let mut p = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .current_dir(root)
+        .args(["--root", root.to_str().unwrap()])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    p.stdin.take().unwrap().write_all(input).unwrap();
+    p.wait_with_output().unwrap()
+}
+
+fn ok(out: Output) -> Vec<u8> {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+fn json_output(root: &Path, args: &[&str], input: &Value) -> Value {
+    serde_json::from_slice(&ok(run(root, args, &serde_json::to_vec(input).unwrap()))).unwrap()
+}
+
+#[test]
+fn reads_and_edits_use_parser_extents_even_with_unicode_crlf_or_same_line_declarations() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let cases = [
+        (
+            "hello.rs",
+            "\u{feff}#!/usr/bin/env rust-script\r\n// 🍐\r\nfn one() {} fn two() { let _ = \"é\"; }",
+            "two",
+            "fn two() { let _ = \"é\"; }",
+        ),
+        (
+            "hello.cpp",
+            "// あ\r\nint one() {return 1;} int two() { return 2; }",
+            "two",
+            "int two() { return 2; }",
+        ),
+        (
+            "hello.ts",
+            "export const one = () => 1; export const two = () => 'λ';",
+            "two",
+            "export const two = () => 'λ';",
+        ),
+        (
+            "hello.py",
+            "class Foo:\r\n    @property\r\n    def two(self):\r\n        return '💿'\r\n",
+            "Foo::two",
+            "@property\r\n    def two(self):\r\n        return '💿'",
+        ),
+    ];
+    for (name, source, symbol, selected) in cases {
+        fs::write(root.join(name), source).unwrap();
+        assert_eq!(ok(run(root, &["read", name], b"")), source.as_bytes());
+        let outline = json_output(root, &["read", name, "--json"], &Value::Null);
+        let revision = outline["revision"].as_str().unwrap();
+        assert_eq!(
+            ok(run(
+                root,
+                &["expand", name, symbol, "--revision", revision],
+                b""
+            )),
+            selected.as_bytes(),
+            "{name}"
+        );
+        assert!(!run(root, &["edit", name, symbol], b"oops").status.success());
+        let edited = format!("{selected} /* updated */");
+        let preview = ok(run(
+            root,
+            &["edit", name, symbol, "--revision", revision, "--dry-run"],
+            edited.as_bytes(),
+        ));
+        assert!(
+            String::from_utf8(preview)
+                .unwrap()
+                .contains("/* updated */")
+        );
+        assert_eq!(fs::read_to_string(root.join(name)).unwrap(), source);
+        ok(run(
+            root,
+            &["edit", name, symbol, "--revision", revision],
+            edited.as_bytes(),
+        ));
+        assert_eq!(
+            fs::read_to_string(root.join(name)).unwrap(),
+            source.replace(selected, &edited)
+        );
+        assert!(
+            !run(root, &["edit", name, "L1", "--revision", revision], b"oops")
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn pagination_and_batch_edits_are_revision_bound() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let text = "use std::fmt;\nmod a { pub fn same() {} }\nmod b { pub fn same() {} }\n";
+    fs::write(root.join("lib.rs"), text).unwrap();
+    fs::write(root.join("copy.rs"), text).unwrap();
+    let page = json_output(
+        root,
+        &[
+            "read", "lib.rs", "--json", "--match", "same", "--limit", "1",
+        ],
+        &Value::Null,
+    );
+    let cursor = page["next"].as_str().unwrap();
+    assert_eq!(page["entries"][0]["name"], "a::same");
+    let next = json_output(
+        root,
+        &[
+            "read", "lib.rs", "--json", "--match", "same", "--after", cursor,
+        ],
+        &Value::Null,
+    );
+    assert_eq!(next["entries"][0]["name"], "b::same");
+    assert!(next["next"].is_null());
+    assert!(
+        !run(root, &["expand", "lib.rs", "same"], b"")
+            .status
+            .success()
+    );
+    assert!(
+        !run(root, &["edit", "copy.rs", cursor], b"oops")
+            .status
+            .success()
+    );
+    let inspected = json_output(
+        root,
+        &["expand", "lib.rs", "a::same", "--json"],
+        &Value::Null,
+    );
+    assert_eq!(inspected["content"], "pub fn same() {}");
+    assert_eq!(inspected["first"], 2);
+    assert_eq!(
+        ok(run(
+            root,
+            &["expand", "lib.rs", inspected["selector"].as_str().unwrap()],
+            b""
+        )),
+        b"pub fn same() {}"
+    );
+    let rev = page["revision"].as_str().unwrap();
+    let batch = |data: Value| {
+        run(
+            root,
+            &["edit", "lib.rs", "--batch", "--revision", rev],
+            &serde_json::to_vec(&data).unwrap(),
+        )
+    };
+    assert!(
+        !batch(json!([{"selector":"a","replacement":""},{"selector":"a::same","replacement":""}]))
+            .status
+            .success()
+    );
+    assert_eq!(fs::read_to_string(root.join("lib.rs")).unwrap(), text);
+    ok(batch(
+        json!([{"selector":"L1","replacement":"// intro\n","mode":"before"},{"selector":cursor,"replacement":"pub fn fresh() {}"},{"selector":"L3","mode":"after","replacement":"// eof"}]),
+    ));
+    assert_eq!(
+        fs::read_to_string(root.join("lib.rs")).unwrap(),
+        format!(
+            "// intro\n{}// eof",
+            text.replacen("fn same", "fn fresh", 1)
+        )
+    );
+    assert!(
+        !run(root, &["read", "lib.rs", "--after", cursor], b"")
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn text_fallback_handles_empty_files_and_verified_ranges() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    fs::write(root.join("settings.custom"), "").unwrap();
+    let page = json_output(root, &["read", "settings.custom", "--json"], &Value::Null);
+    let rev = page["revision"].as_str().unwrap();
+    let source = "é\r\n".repeat(80) + "last";
+    ok(run(
+        root,
+        &["edit", "settings.custom", "L1", "--revision", rev],
+        source.as_bytes(),
+    ));
+    assert_eq!(
+        ok(run(root, &["expand", "settings.custom", "L80-L81"], b"")),
+        "é\r\nlast".as_bytes()
+    );
+    let outline = ok(run(
+        root,
+        &["read", "settings.custom", "--budget", "128"],
+        b"",
+    ));
+    assert!(outline.len() <= 128);
+    fs::write(root.join("binary"), b"hello\0world").unwrap();
+    assert!(!run(root, &["read", "binary"], b"").status.success());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("settings.custom"), root.join("alias")).unwrap();
+        assert!(
+            !run(root, &["edit", "alias", "L1", "--revision", rev], b"wrong")
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn concurrent_verified_edits_allow_one_writer() {
+    let project = tempdir().unwrap();
+    let root = project.path();
+    fs::write(root.join("x.txt"), "before\n").unwrap();
+    let page = json_output(root, &["read", "x.txt", "--json"], &Value::Null);
+    let rev = page["revision"].as_str().unwrap();
+    std::thread::scope(|threads| {
+        let handles: Vec<_> = [b"left".as_slice(), b"right"]
+            .into_iter()
+            .map(|text| {
+                threads.spawn(move || {
+                    run(root, &["edit", "x.txt", "L1", "--revision", rev], text)
+                        .status
+                        .success()
+                })
+            })
+            .collect();
+        assert_eq!(
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap().then_some(()))
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn native_reads_preserve_explicit_windows_and_reject_mismatched_content() {
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    let subdir = root.join("folder");
+    fs::create_dir(&subdir).unwrap();
+    let path = subdir.join("sample with space.py");
+    let source = format!(
+        "def calculate():\n{}    return 42\n",
+        "    # detail\n".repeat(400)
+    );
+    fs::write(&path, &source).unwrap();
+    let mut event = json!({"tool_name":"Read","hook_event_name":"PostToolUse","tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,"content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+    let post = |event: &Value| json_output(&root, &["hook-claude", "after-read"], event);
+    let result = post(&event);
+    let compact = &result["hookSpecificOutput"]["updatedToolOutput"]["file"];
+    assert!(compact["content"].as_str().unwrap().contains("calculate"));
+    assert!(!compact["content"].as_str().unwrap().contains("# detail"));
+    assert_eq!(compact["totalLines"], 402);
+    event["tool_input"]["limit"] = json!(32);
+    assert_eq!(post(&event), json!({}));
+    event["tool_input"].as_object_mut().unwrap().remove("limit");
+    fs::write(&path, source.replace("42", "43")).unwrap();
+    assert_eq!(post(&event), json!({}));
+    let command = |cmd: &str| json!({"tool_name":"Bash","hook_event_name":"PreToolUse","tool_input":{"command":cmd,"workdir":subdir}});
+    let shell = |cmd: &str| json_output(&root, &["hook-codex", "before-command"], &command(cmd));
+    let result = shell("cat './sample with space.py'");
+    let rewrite = result["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    let words = shlex::split(rewrite).unwrap();
+    assert_eq!(words.last().unwrap(), "folder/sample with space.py");
+    assert!(words.contains(&"read".into()));
+    for cmd in ["cat a b", "cat ../outside", "cat a | head", "cat -n a"] {
+        assert_eq!(shell(cmd), json!({}));
+    }
+}
+
+#[test]
+fn outbound_requests_restore_exact_values_and_protect_current_context() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let data = "a🦀\r\n".repeat(1000);
+    let cases = [
+        (
+            json!({"system":"stay","messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"old","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"text","text":"user text"},{"type":"tool_result","tool_use_id":"old","content":[{"type":"text","text":data},{"type":"text","text":"end"}]}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"err","is_error":true,"content":data},{"type":"tool_result","tool_use_id":"recent","content":data}]}]}),
+            "/messages/1/content/1/content",
+        ),
+        (
+            json!({"messages":[{"role":"assistant","tool_calls":[{"id":"old","function":{"name":"read","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"old","content":data},{"role":"tool","tool_call_id":"recent","content":data}]}),
+            "/messages/1/content",
+        ),
+        (
+            json!({"input":[{"type":"function_call","call_id":"old","name":"read"},{"type":"function_call_output","call_id":"old","output":[{"type":"input_text","text":data}]},{"type":"function_call_output","call_id":"recent","output":data}]}),
+            "/input/1/output",
+        ),
+        (
+            json!({"messages":[{"info":{"role":"assistant"},"parts":[{"type":"tool","callID":"old","tool":"read","state":{"status":"completed","output":data}},{"type":"tool","callID":"recent","tool":"run","state":{"status":"completed","output":data}}]}]}),
+            "/messages/0/parts/0/state/output",
+        ),
+    ];
+    for (original, pointer) in cases {
+        let masked = json_output(root, &["mask", "--keep", "1"], &original);
+        let mut expected = original.clone();
+        let stub = masked.pointer(pointer).unwrap();
+        let text = stub.as_str().or_else(|| stub[0]["text"].as_str()).unwrap();
+        let id = text
+            .strip_prefix("[justless recall ")
+            .unwrap()
+            .strip_suffix(']')
+            .unwrap();
+        *expected.pointer_mut(pointer).unwrap() = stub.clone();
+        assert_eq!(masked, expected);
+        assert_eq!(
+            json_output(root, &["recall", id, "--json"], &Value::Null),
+            *original.pointer(pointer).unwrap()
+        );
+        assert_eq!(json_output(root, &["mask", "--restore"], &masked), original);
+        assert_eq!(json_output(root, &["mask", "--keep", "1"], &masked), masked);
+        for flag in [
+            ["--keep-tool", "read"],
+            ["--pin", "old"],
+            ["--trigger-bytes", "100000"],
+        ] {
+            assert_eq!(
+                json_output(root, &["mask", "--keep", "1", flag[0], flag[1]], &original),
+                original
+            );
+        }
+    }
+}
+
+#[test]
+fn multimodal_or_annotated_results_survive_and_corrupt_archives_fail_closed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let data = "y".repeat(2048);
+    let req = json!({"messages":[{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"1","content":[{"type":"text","text":data,"cache_control":{"type":"ephemeral"}}]},
+        {"type":"tool_result","tool_use_id":"2","content":[{"type":"image","source":data}]}
+    ]}]});
+    assert_eq!(json_output(root, &["mask", "--keep", "0"], &req), req);
+    let req = json!({"messages":[{"role":"tool","tool_call_id":"1","content":data}]});
+    let masked = json_output(root, &["mask", "--keep", "0"], &req);
+    let path = fs::read_dir(root.join(".justless/observations"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(path, b"\"corrupt\"").unwrap();
+    for (args, input) in [
+        (["mask", "--restore"].as_slice(), &masked),
+        (&["mask", "--keep", "0"], &req),
+    ] {
+        let out = run(root, args, &serde_json::to_vec(input).unwrap());
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
+fn markdown_sections_skip_fenced_headings_and_include_subsections() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let section = "# Install\nrun setup\n\n~~~sh\n# fake\n~~~\n## Linux\nread this\n";
+    fs::write(root.join("guide.md"), format!("{section}# Use\ncommands")).unwrap();
+    let page = json_output(root, &["read", "guide.md", "--json"], &Value::Null);
+    assert_eq!(page["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        ok(run(root, &["expand", "guide.md", "Install"], b"")),
+        section.as_bytes()
+    );
+    assert_eq!(
+        ok(run(root, &["expand", "guide.md", "Linux"], b"")),
+        b"## Linux\nread this\n"
+    );
+}
+
+#[test]
+fn agent_setup_preserves_existing_plugin_and_registers_claude_read_once() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let install = [
+        "init", "--hooks", "--agent", "opencode", "--agent", "claude",
+    ];
+    ok(run(root, &install, b""));
+    let plugin = root.join(".opencode/plugins/justless.js");
+    let script = fs::read_to_string(&plugin).unwrap();
+    assert!(script.contains("experimental.chat.messages.transform"));
+    assert!(ok(run(root, &install, b"")).is_empty());
+    let settings: Value =
+        serde_json::from_slice(&fs::read(root.join(".claude/settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "^Read$");
+    fs::write(&plugin, "// user plugin").unwrap();
+    assert!(!run(root, &install, b"").status.success());
+    assert_eq!(fs::read_to_string(&plugin).unwrap(), "// user plugin");
+}

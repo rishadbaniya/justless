@@ -3,9 +3,11 @@ mod capture;
 mod context;
 mod history;
 mod index;
+mod observations;
 mod pack;
 mod polyglot;
 mod rust_syntax;
+mod source;
 mod summary;
 mod workspace;
 
@@ -227,7 +229,7 @@ fn cli() -> Command<'static> {
                         .long("agent")
                         .takes_value(true)
                         .multiple_occurrences(true)
-                        .possible_values(["codex", "claude", "agy"])
+                        .possible_values(["codex", "claude", "agy", "opencode"])
                         .default_value("codex")
                         .help("Agent to configure (repeat to select several)"),
                 )
@@ -237,12 +239,16 @@ fn cli() -> Command<'static> {
                         .help("Install project-local hooks"),
                 ),
         )
+        .subcommands(source::commands())
+        .subcommands(observations::commands())
         .subcommands(["hook-codex", "hook-claude", "hook-agy"].map(|name| {
-            Command::new(name).hide(true).arg(
-                Arg::new("mode")
-                    .required(true)
-                    .possible_values(["session-start", "before-command"]),
-            )
+            Command::new(name)
+                .hide(true)
+                .arg(Arg::new("mode").required(true).possible_values([
+                    "session-start",
+                    "before-command",
+                    "after-read",
+                ]))
         }))
 }
 
@@ -267,6 +273,8 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
     let root = matches.value_of_os("root").map(Path::new);
     let workspace = Workspace::discover(root)?;
     match matches.subcommand().expect("subcommand is required") {
+        (name @ ("read" | "expand" | "edit"), sub) => source::run(&workspace, name, sub)?,
+        (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
         ("run", sub) => {
             let command: Vec<OsString> = sub
                 .values_of_os("command")

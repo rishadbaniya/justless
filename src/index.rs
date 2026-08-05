@@ -11,7 +11,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, lock_state, write_json};
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {

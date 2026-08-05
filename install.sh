@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    echo "Usage: sh install.sh [codex|claude|agy ... | --cli-only]"
+    echo "Usage: sh install.sh [codex|claude|agy|opencode ... | --cli-only]"
     echo "By default, configure project hooks for supported agents found on PATH."
 }
 
@@ -14,13 +14,16 @@ main() {
         for agent in codex claude agy; do
             if command -v "$agent" >/dev/null 2>&1; then set -- "$@" "$agent"; fi
         done
+        if command -v opencode >/dev/null 2>&1; then
+            case "$(opencode --version 2>/dev/null)" in 1.*) set -- "$@" opencode ;; esac
+        fi
     elif [ "$#" -eq 1 ] && [ "$1" = "--cli-only" ]; then
         shift
     fi
     agents=
     for agent do
         case "$agent" in
-            codex|claude|agy) agents="$agents $agent" ;;
+            codex|claude|agy|opencode) agents="$agents $agent" ;;
             *) usage >&2; return 2 ;;
         esac
     done

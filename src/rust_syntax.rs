@@ -9,6 +9,8 @@ use syn::{Expr, Item, Pat, Token, Type, UseTree};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Symbol {
+    #[serde(skip)]
+    pub bytes: std::ops::Range<usize>,
     pub name: String,
     pub path: Vec<String>,
     pub kind: String,
@@ -54,6 +56,8 @@ pub struct ModuleFile {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Syntax {
+    #[serde(skip)]
+    pub use_ranges: Vec<std::ops::Range<usize>>,
     pub symbols: Vec<Symbol>,
     pub references: Vec<Reference>,
     pub imports: Vec<Import>,
@@ -64,6 +68,19 @@ pub fn parse(text: &str) -> syn::Result<Syntax> {
     let file = syn::parse_file(text)?;
     let mut visitor = Extractor::default();
     visitor.visit_file(&file);
+    let offset = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8()
+        + file.shebang.as_ref().map_or(0, String::len);
+    if offset > 0 {
+        for range in visitor
+            .syntax
+            .use_ranges
+            .iter_mut()
+            .chain(visitor.syntax.symbols.iter_mut().map(|s| &mut s.bytes))
+        {
+            range.start += offset;
+            range.end += offset;
+        }
+    }
     Ok(visitor.syntax)
 }
 
@@ -108,6 +125,7 @@ impl Extractor {
         };
         let previous = self.symbol.replace(self.syntax.symbols.len());
         self.syntax.symbols.push(Symbol {
+            bytes: span.byte_range(),
             name,
             path,
             kind: kind.to_owned(),
@@ -305,7 +323,10 @@ impl<'ast> Visit<'ast> for Extractor {
                     visit::visit_item_static(this, value)
                 })
             }
-            Item::Use(value) => self.imports(&value.tree, Vec::new(), value.tree.span()),
+            Item::Use(value) => {
+                self.syntax.use_ranges.push(value.span().byte_range());
+                self.imports(&value.tree, Vec::new(), value.tree.span());
+            }
             _ => visit::visit_item(self, item),
         }
     }
