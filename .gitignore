@@ -2,3 +2,4 @@
 /.justless/
 **/target/
 **/.justless/
+__pycache__/

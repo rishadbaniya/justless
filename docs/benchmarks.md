@@ -1,5 +1,27 @@
 # Benchmarks
 
+## Three-turn repair
+
+The repair benchmark starts with a failing test, offers source retrieval, applies a single proposed arithmetic edit, and reruns the tests. An independent test checks additional inputs. Each variant uses a fresh fixture. In API mode the model selects files to read or, with Justless, can request a task pack. Tool-call counts include file listing, individual source reads or a pack, the edit, and both test runs. The separate correctness check stays outside the model conversation.
+
+```sh
+cargo build --locked
+python3 scripts/repair_benchmark.py
+# Optional: three paid turns per variant using ANTHROPIC_API_KEY
+python3 scripts/repair_benchmark.py --api
+```
+
+One live pair using Haiku 5.5 produced the following provider-reported totals across all three turns.
+
+| Tools available | Fix verified | Input tokens | Output tokens | Tool calls | Tool output bytes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Plain | Yes | 22,363 | 70 | 5 | 19,047 |
+| Justless | Yes | 2,845 | 88 | 7 | 2,365 |
+
+The Justless run used 87.3% fewer input tokens. The model chose three direct source reads in that run and one in the plain run. This pair measures the benefit of compact command output on this fixture. The scripted mode exercises the task-pack path. It uses a fixed edit and makes no model calls.
+
+## Build checks and single-task replay
+
 Run these commands from the root of the Justless checkout.
 
 ```sh
@@ -13,7 +35,7 @@ python3 scripts/benchmark.py --mode codex
 
 The CLI tests cover Rust and Python diagnostics, archive replay, multi-language source links, exact text search, source edits and deletion, Git changes, and Codex hook installation and command rewriting. The local benchmark replays the diagnosis on disposable copies of the synthetic fixture. It measures bytes and elapsed time and estimates tool output tokens as bytes divided by four, rounded up per result. The Codex benchmark runs the same task in two fresh sessions, one using Cargo and direct source reads and one using Justless. It records token usage from completed turns.
 
-On macOS arm64 with Rust 1.93.0, three local replays per variant produced these medians. Cargo compilation was warmed before the timed commands.
+The original single-task benchmark on macOS arm64 with Rust 1.93.0 produced these medians over three local replays per variant. Cargo compilation was warmed before the timed commands.
 
 | Local replay | Successful runs | Tool output | Estimated output tokens | Elapsed |
 | --- | ---: | ---: | ---: | ---: |
