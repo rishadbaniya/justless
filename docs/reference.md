@@ -15,13 +15,26 @@
 | `justless context --changes --staged` | Staged ranges for files that currently match the staged source |
 | `justless context --at src/lib.rs:8` | Enclosing symbol, relevant calls, and source around a line or range |
 | `justless code src/lib.rs --from 1 --to 8` | A numbered excerpt of original source |
-| `justless stats` | Captured and previewed bytes across runs |
+| `justless pack "What breaks if I rename purchase_orders?"` | A budgeted selection of definitions, graph links, source lines, working-tree changes, and relevant recorded failures |
+| `justless history "TimeoutError" --oldest --limit 1` | First recorded matching log line across archived commands in this project. Omit the text to list recent runs. |
+| `justless resume` | Recent command outcomes, inspected source ranges, and files in the last pack. Stale source is marked. |
+| `justless stats` | Raw and preview bytes, full-log recalls by command family, repeated reads and commands passed through by hooks |
 
 ## Indexing and languages
 
 Queries refresh the index automatically. Justless compares file identity and high-resolution timestamps where available, hashes files that need closer inspection, reuses parsed facts for unchanged content, and removes deleted files. In a Git checkout it uses tracked and unignored files. Add patterns to `.justlessignore` for repo-specific exclusions.
 
 Structured navigation supports Rust, JavaScript, TypeScript and TSX, Python, Go, Java, C, C++, C#, Ruby, PHP, Bash, and SQL. The available symbols and relationships vary by language. Calls across implicit imports, framework discovery, dynamic dispatch, and macro expansion can require source verification. Use `find` for any indexed UTF-8 text file. When source has changed since a recorded run, Justless preserves the original log location and flags the mismatch.
+
+## Task packs and run history
+
+`pack` runs locally. It matches identifiers and file paths, ranks passages by how common their terms are in the repository, and follows incoming and outgoing graph edges up to three hops. It considers up to 96 candidate text files and 25 recent runs. Working-tree changes boost relevant symbols. Inferred links carry a `possible` label. If a source digest differs from the one stored with a failure, the pack marks the old location as stale. A later successful run of the same command supersedes its failure.
+
+`run` groups recognized test failures by their reported diagnostic and summarizes Git patch hunks with file names, hunk headers, and original stdout line ranges. The command still runs every time. For a matching command, directory, session, and preview budget, byte-identical streams and an identical exit status can produce an unchanged notice. Changed test reports and patches show additions and removals against the previous run. A removed failure means it disappeared from the report. Use the exit status to check the overall result. Unrecognized output uses the ordinary preview.
+
+Use `justless run --fresh -- COMMAND` for a fresh preview. Use `--session NAME` or `JUSTLESS_SESSION` to choose a comparison session from the terminal. Project hooks scope comparisons to the client's session identifier when supplied. Captured runs remain searchable across sessions. A marker such as `stdout:8-15` expands with `justless log RUN_ID --stream stdout --from 8 --to 15`. A range marked `prior stdout` belongs to the comparison run.
+
+`history` searches stored streams locally and stops when it reaches the requested match count or byte budget. `resume` covers Justless activity, including the most recent 32 source ranges and files used in the last pack. `stats` counts full-stream reads separately from range, search, and run-context requests. Hook pass-through counts cover shell calls observed by the installed hooks. They record command families without arguments. Preview-byte totals exclude footer text and subsequent lookups. Provider token counts are measured separately by the benchmark.
 
 ## Configuration
 
@@ -33,7 +46,7 @@ max_output_bytes = 4096
 max_file_bytes = 2097152
 ```
 
-`query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
+`pack`, `history`, `resume`, `query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
 
 Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Keep the directory private if a command prints secrets. The CLI runs offline after installation, and `--raw` skips recording.
 

@@ -1,6 +1,6 @@
 # Justless
 
-Justless helps coding agents use fewer tokens when running commands and exploring a codebase. It shows a short preview of each command’s output and saves the full log locally. Its index lets an agent trace a function across files and languages, then read the source lines it needs.
+Justless helps coding agents use fewer tokens when running commands and exploring a codebase. It summarizes test failures and diffs, shows what changed on a rerun, and keeps the full output locally. Ask a question about your code to get relevant source lines, callers, and recorded failures in one response.
 
 ## Install
 
@@ -15,8 +15,9 @@ It installs Justless and configures project hooks for Codex, Claude Code, and An
 ## Use from the terminal
 
 ```sh
-justless run -- git diff       # Preview a diff and keep the full output
-justless find "/api/orders"    # Find matching lines in code, docs, and config
+justless pack "What breaks if I rename purchase_orders?"
+justless run -- git diff      # Run again after an edit to see changed hunks
+justless resume              # Pick up where the last session left off
 ```
 
 ## How it works
@@ -33,10 +34,10 @@ justless find "/api/orders"    # Find matching lines in code, docs, and config
      .justless/runs/                               |
      logs + diagnostics                            +--> find / query / path
             |                                      |
-            +-----> justless context --run ID <----+
+            +-----------> justless pack <----------+
                                 |
                                 v
-                     log excerpt + source lines
+                   source lines + linked evidence
 ```
 
 [Command reference](docs/reference.md) · [Worked examples](docs/examples.md) · [Benchmarks](docs/benchmarks.md)
