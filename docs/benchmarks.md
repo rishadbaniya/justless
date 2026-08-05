@@ -58,3 +58,17 @@ One calibrated pair with Haiku 5.5 returned these provider-reported counts.
 | Justless and targeted retrieval | Yes | 1,124 | 98 | 1,222 | 1.17 s |
 
 The Justless replay used 85.0% fewer input tokens. The direct replay identified the test function where the answer required its call target. An earlier pair with default reasoning used the full output cap without returning an answer. The API replay measures one fixture with supplied evidence. Live agent behavior and native Codex hook loading require a separate session.
+
+## Progressive reads, edits and tool history
+
+Build with `cargo build --release --locked` and run `python3 scripts/context_benchmark.py`. The local fixture has 451 Python functions. The runner browses the first outline page, filters for the function that needs fixing, expands it, submits one revision-bound replacement and checks the result with an independent Python assertion.
+
+| Source operation | Bytes |
+| --- | ---: |
+| Whole source file | 20,991 |
+| First outline page | 2,068 |
+| Filtered JSON outline | 203 |
+| Exact function | 60 |
+| Edit reference plus replacement | 88 |
+
+The same run generates an outbound request with six build results. Retiring the oldest three reduced the serialized request from 38,306 to 19,952 bytes. Restoring the references reproduced the original JSON values. These measurements count local UTF-8 bytes. Provider token counts and prompt-cache effects depend on the model and client.
