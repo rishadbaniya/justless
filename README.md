@@ -4,6 +4,9 @@ Justless is a local CLI that helps coding agents use fewer tokens when running c
 
 ## Features
 
+- **Progressive reads.** Browse signatures and line ranges, then expand one symbol or Markdown section to its exact source.
+- **Verified edits.** Send just the replacement for a symbol or line range. Preview a diff or apply a same-file batch atomically. Stale revisions are rejected.
+- **Recoverable tool history.** Keep recent results in context and retire older ones to local storage with OpenCode v1 or an API integration. Recover any archived result by ID.
 - **Task packs.** Give `justless pack` a question and a budget. It gathers relevant source lines, callers, tests, and recent failures in one response.
 - **Cross-language navigation.** Trace a TypeScript request through a Python handler to a SQL table. Each link points to a source line, and inferred links are marked as possible.
 - **Search across code, docs, and config.** Find a literal in a runbook or an unfamiliar file type. The index refreshes after edits and reuses unchanged files.
@@ -23,11 +26,12 @@ From your project directory, run the installer with Rust 1.91 or newer and a C c
 curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh
 ```
 
-It installs Justless and configures project hooks for Codex, Claude Code, and Antigravity CLI (`agy`) when it finds them on your `PATH`. Start a new agent session in the project. In Codex, review and trust the hooks with `/hooks`.
+It installs Justless and configures project hooks for Codex, Claude Code, Antigravity CLI (`agy`), and OpenCode v1 when it finds them on your `PATH`. Start a new agent session in the project. In Codex, review and trust the hooks with `/hooks`.
 
 ## Use from the terminal
 
 ```sh
+justless read src/main.rs --outline  # Expand a row with justless expand FILE 'REV#ID'
 justless pack "What breaks if I rename purchase_orders?"
 justless run -- git diff      # Run again after an edit to see changed hunks
 justless resume              # Pick up where the last session left off
@@ -51,6 +55,9 @@ justless resume              # Pick up where the last session left off
                                 |
                                 v
                    source lines + linked evidence
+
+  read --> outline + revision --> expand / verified edit
+  mask --> .justless/observations/ --> recall
 ```
 
 [Command reference](docs/reference.md) · [Worked examples](docs/examples.md) · [Benchmarks](docs/benchmarks.md)

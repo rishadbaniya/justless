@@ -15,6 +15,10 @@
 | `justless context --changes --staged` | Staged ranges for files that currently match the staged source |
 | `justless context --at src/lib.rs:8` | Enclosing symbol, relevant calls, and source around a line or range |
 | `justless code src/lib.rs --from 1 --to 8` | A numbered excerpt of original source |
+| `justless read FILE --outline` | Revision, signatures and line ranges. Small files are returned verbatim when called without outline options. |
+| `justless expand FILE SELECTOR` | Exact bytes for a symbol, entry, section or inclusive line range |
+| `justless edit FILE SELECTOR --revision REV` | Apply the replacement supplied on stdin after verifying the snapshot |
+| `justless mask` / `justless recall ID` | Retire older tool outputs from an outbound JSON request or retrieve the original result |
 | `justless pack "What breaks if I rename purchase_orders?"` | A budgeted selection of definitions, graph links, source lines, working-tree changes, and relevant recorded failures |
 | `justless history "TimeoutError" --oldest --limit 1` | First recorded matching log line across archived commands in this project. Omit the text to list recent runs. |
 | `justless resume` | Recent command outcomes, inspected source ranges, and files in the last pack. Stale source is marked. |
@@ -25,6 +29,63 @@
 Queries refresh the index automatically. Justless compares file identity and high-resolution timestamps where available, hashes files that need closer inspection, reuses parsed facts for unchanged content, and removes deleted files. In a Git checkout it uses tracked and unignored files. Add patterns to `.justlessignore` for repo-specific exclusions.
 
 Structured navigation supports Rust, JavaScript, TypeScript and TSX, Python, Go, Java, C, C++, C#, Ruby, PHP, Bash, and SQL. The available symbols and relationships vary by language. Calls across implicit imports, framework discovery, dynamic dispatch, and macro expansion can require source verification. Use `find` for any indexed UTF-8 text file. When source has changed since a recorded run, Justless preserves the original log location and flags the mismatch.
+
+## Progressive reads and verified edits
+
+Commands take workspace-relative paths. Run `justless read FILE --outline` to get a path-bound revision and numbered rows. An entry reference combines the revision and row number, such as `abc…#7`. Use `--match TEXT` to search names and signatures, `--limit N` to set a page size, and `--after CURSOR` to resume the same search. `--budget` bounds the text outline. `--json` adds structured fields and a `next` cursor. Normal reads return small UTF-8 files verbatim. Outlines use the available language parser, Markdown ATX headings, or 80-line pages.
+
+```sh
+justless read src/main.rs --match dispatch --outline
+justless expand src/main.rs dispatch --json
+justless expand src/main.rs L20-35
+```
+
+When you already know the name or range, `expand --json` returns the exact source and a ready-to-use edit selector in one call. Use the revision from the read that informed the edit. Symbol expansion uses the parser’s declaration boundaries. The returned bytes show exactly what a symbol replacement will overwrite. Line ranges include indentation and any terminating newline. Replacements and insertions use the supplied bytes verbatim, including their line endings. For duplicate names use a qualified name or a numbered entry. A revision-bound reference works directly with both `expand` and `edit`.
+
+```sh
+justless expand src/main.rs "${rev}#7"
+justless edit src/main.rs "${rev}#7" --replacement-file replacement.rs --dry-run
+justless edit src/main.rs "${rev}#7" --replacement-file replacement.rs
+```
+
+For insertions, use `--before` or `--after`. An empty replacement deletes the selected span. `--dry-run` shows a unified diff using Git. To apply several changes to one snapshot, pass a JSON array on stdin. Ranges need `--revision` or a revision in the selector.
+
+```sh
+justless edit config.ini --batch --revision "$rev" <<'JSON'
+[
+  {"selector":"L2","replacement":"workers=4\n"},
+  {"selector":"L8","mode":"after","replacement":"timeout=30\n"}
+]
+JSON
+```
+
+Justless validates the full batch before writing. Stale revisions, ambiguous selectors and overlapping spans fail the entire batch. A project lock serializes Justless writers. Justless rereads the file immediately before the atomic rename and preserves its permissions. Editors that write independently do not acquire the Justless lock.
+
+## Recoverable tool history
+
+`justless mask` reads a complete outbound request from stdin and writes JSON to stdout. It recognizes Anthropic Messages tool results, OpenAI Chat Completions tool messages, Responses API function outputs, and OpenCode v1 tool parts. By default it keeps the newest three results and considers older results of at least 1,024 serialized bytes. Controls include `--keep N`, `--min-bytes N`, `--trigger-bytes N`, repeatable `--pin CALL_ID` and `--keep-tool NAME`. The trigger applies to the combined size of eligible older results. Provider-marked errors, attachments, multimodal results and annotated text blocks stay intact.
+
+A retired result becomes `[justless recall ID]` in the same message and content format. The original value is stored locally in `.justless/observations/` and verified by SHA-256 on recall. The archive can contain sensitive tool output. `justless recall ID` returns original string bytes, while `--json` returns the typed value. `justless mask --restore` expands references across a request. `--stats` writes a JSON change count and serialized byte delta to stderr. Reapplying the filter to a masked request preserves existing references.
+
+For an API client, filter a copy of the full request immediately before sending it. The in-memory conversation can keep its original messages. This example falls back to the original request if the filter fails.
+
+```python
+import json
+import subprocess
+
+def outbound_request(request, project):
+    try:
+        result = subprocess.run(
+            ["justless", "--root", str(project), "mask"],
+            input=json.dumps(request).encode(), capture_output=True,
+            check=True, timeout=5,
+        )
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return request
+```
+
+Only outputs present in the outbound payload can be retired. A provider-managed conversation referenced solely by an ID needs a client integration that supplies its history.
 
 ## Task packs and run history
 
@@ -66,6 +127,12 @@ The installer builds with Cargo. The binary goes in `$CARGO_INSTALL_ROOT/bin`, d
 | Codex | `AGENTS.md` | `.codex/hooks.json` |
 | Claude Code | `CLAUDE.md` | `.claude/settings.json` |
 | Antigravity CLI (`agy`) | `AGENTS.md` | `.agents/hooks.json` |
+| OpenCode v1 | `AGENTS.md` | `.opencode/plugins/justless.js` |
+
+Claude Code's post-read hook can replace a successful whole text read with the smaller outline. Explicit ranges, truncated reads and non-text results pass through. The built-in Read executes before the hook, preserving the read-before-edit workflow. Codex, Claude and Antigravity shell hooks can rewrite a simple single-file `cat` for a large workspace text file. Piped commands and multi-file reads pass through. Agents can invoke `read`, `expand` and `edit` directly in any client. [Claude Code hook output](https://code.claude.com/docs/en/hooks#posttooluse-decision-control)
+
+Install automatic history retirement with `justless init --hooks --agent opencode` in an OpenCode v1 project. Its plugin transforms the outgoing message view before each model request. The session keeps its original results. For Codex, Claude Code and Antigravity, automatic history retirement requires a separate integration at the request boundary. [OpenCode v1 message transform](https://github.com/anomalyco/opencode/blob/v1.2.27/packages/opencode/src/session/prompt.ts#L621-L640)
+
 
 Open a new session in the trusted workspace. In Codex, review and trust the project hooks with `/hooks`. The session-start hook refreshes the repo index. Before supported shell commands run, the command hook routes them through Justless. Each client handles permissions for the rewritten command. [Codex hooks](https://learn.chatgpt.com/docs/hooks) · [Claude Code hooks](https://code.claude.com/docs/en/hooks) · [Antigravity CLI hooks](https://antigravity.google/docs/hooks?tab=cli)
 
