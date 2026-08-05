@@ -1,6 +1,19 @@
 # Justless
 
-Justless helps coding agents use fewer tokens when running commands and exploring a codebase. It summarizes test failures and diffs, shows what changed on a rerun, and keeps the full output locally. Ask a question about your code to get relevant source lines, callers, and recorded failures in one response.
+Justless is a local CLI that helps coding agents use fewer tokens when running commands and exploring a codebase.
+
+## Features
+
+- **Task packs.** Give `justless pack` a question and a budget. It gathers relevant source lines, callers, tests, and recent failures in one response.
+- **Cross-language navigation.** Trace a TypeScript request through a Python handler to a SQL table. Each link points to a source line, and inferred links are marked as possible.
+- **Search across code, docs, and config.** Find a literal in a runbook or an unfamiliar file type. The index refreshes after edits and reuses unchanged files.
+- **Grouped test failures.** See which tests reported the same error, then jump from the captured diagnostic to the assertion or function that produced it.
+- **Rerun comparisons.** Run the same command after an edit to see which failures or diff hunks appeared or disappeared. Identical output can collapse to a single line.
+- **Exact log replay.** Every captured run has an ID. Search its full output or replay a specific range of stdout or stderr, byte for byte.
+- **Cross-session handoffs.** Search earlier runs for an error, or use `justless resume` to see what the last session inspected and which files have changed since.
+- **Compression stats.** See how many bytes reached the preview, which commands led agents to reopen full logs, and which commands the hooks passed through.
+
+On one three-turn repair task, Claude used **87.3% fewer input tokens** with Justless. Both runs produced a fix that passed independent tests. [Benchmark and tool-call counts](docs/benchmarks.md#three-turn-repair)
 
 ## Install
 
