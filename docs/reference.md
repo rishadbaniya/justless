@@ -103,7 +103,7 @@ Compilers and linters report findings grouped by rule across stdout and stderr. 
 
 Package runners are recognized, so `npx eslint`, `pnpm exec tsc`, `uv run ruff check`, `poetry run mypy`, `python -m mypy` and `bundle exec rubocop` select the same profile as the tool itself. Hooks also route `make`, `ninja`, `cmake --build`, Gradle, Maven, `dotnet build`/`test` and `swift build`/`test` through the bounded preview.
 
-`history` searches stored streams locally and stops when it reaches the requested match count or byte budget. `resume` covers Justless activity, including the most recent 32 source ranges and files used in the last pack. `stats` counts full-stream reads separately from range, search, and run-context requests. Hook pass-through counts cover shell calls observed by the installed hooks. They record command families without arguments. Preview-byte totals exclude footer text and subsequent lookups. Provider token counts are measured separately by the benchmark.
+`history` searches stored streams locally and stops when it reaches the requested match count or byte budget. `resume` covers Justless activity, including each recent run's outcome, such as its failing test count or most frequent lint rule, the most recent 32 source ranges and files used in the last pack. `stats` counts full-stream reads separately from range, search, and run-context requests. Hook pass-through counts cover shell calls observed by the installed hooks. They record command families without arguments. Preview-byte totals exclude footer text and subsequent lookups. Provider token counts are measured separately by the benchmark.
 
 ## Configuration
 
@@ -148,6 +148,8 @@ The installer builds with Cargo. The binary goes in `$CARGO_INSTALL_ROOT/bin`, d
 | OpenCode v1 | `AGENTS.md` | `.opencode/plugins/justless.js` |
 
 Claude Code's post-read hook can replace a successful whole text read with the smaller outline. Explicit ranges, truncated reads and non-text results pass through. The built-in Read executes before the hook, preserving the read-before-edit workflow. Codex, Claude and Antigravity shell hooks can rewrite a simple single-file `cat` for a large workspace text file. Piped commands and multi-file reads pass through. Agents can invoke `read`, `expand` and `edit` directly in any client. [Claude Code hook output](https://code.claude.com/docs/en/hooks#posttooluse-decision-control)
+
+Compaction replaces earlier tool results with a summary. In Claude Code, the pre-compaction hook asks the summary to keep recent run IDs, exit statuses and inspected file ranges word for word. After compaction, Claude Code and Codex start the next turn with the same bounded handoff as `justless resume`, so the agent can recover exact logs with `justless log` instead of rerunning commands. The handoff runs synchronously, stays under 1,800 bytes, and is skipped when the project has no recorded activity. Antigravity CLI and OpenCode do not provide a post-compaction hook. Run `justless init --hooks` again to add these hooks to an existing setup.
 
 Install automatic history retirement with `justless init --hooks --agent opencode` in an OpenCode v1 project. Its plugin transforms the outgoing message view before each model request. The session keeps its original results. For Codex, Claude Code and Antigravity, automatic history retirement requires a separate integration at the request boundary. [OpenCode v1 message transform](https://github.com/anomalyco/opencode/blob/v1.2.27/packages/opencode/src/session/prompt.ts#L621-L640)
 

@@ -1526,3 +1526,104 @@ fn hooks_route_linters_build_tools_and_package_runners() {
         );
     }
 }
+
+#[test]
+fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
+    use serde_json::{Value, json};
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let raw_hook = |agent: &str, mode: &str, input: Value| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args([agent, mode])
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        stdout(&output)
+    };
+    let compact = json!({"hook_event_name":"SessionStart","source":"compact","cwd":root});
+    let pre = json!({"hook_event_name":"PreCompact","trigger":"auto","cwd":root});
+
+    // With no recorded activity both hooks stay silent.
+    success(
+        &root,
+        &[
+            "init", "--hooks", "--agent", "claude", "--agent", "codex", "--agent", "agy",
+        ],
+    );
+    assert_eq!(
+        raw_hook("hook-claude", "after-compact", compact.clone()).trim(),
+        "{}"
+    );
+    assert_eq!(raw_hook("hook-claude", "before-compact", pre.clone()), "");
+
+    let claude: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    let after = &claude["hooks"]["SessionStart"][1];
+    assert_eq!(after["matcher"], "^compact$");
+    assert_eq!(
+        after["hooks"][0]["command"],
+        "justless hook-claude after-compact"
+    );
+    assert!(after["hooks"][0].get("async").is_none());
+    assert_eq!(
+        claude["hooks"]["PreCompact"][0]["hooks"][0]["command"],
+        "justless hook-claude before-compact"
+    );
+    let codex: Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".codex/hooks.json")).unwrap()).unwrap();
+    assert_eq!(codex["hooks"]["SessionStart"][1]["matcher"], "^compact$");
+    assert!(codex["hooks"].get("PreCompact").is_none());
+    assert!(
+        !fs::read_to_string(root.join(".agents/hooks.json"))
+            .unwrap()
+            .contains("compact")
+    );
+
+    fs::write(root.join("output.txt"), lint_fixture("mypy.txt")).unwrap();
+    let mypy = fake_program(&root, "mypy", "cat output.txt\nexit 1\n");
+    let run = cli(&root, &["run", "--", mypy.to_str().unwrap(), "app.py"]);
+    let id = run_id(&run);
+
+    let restored: Value =
+        serde_json::from_str(&raw_hook("hook-claude", "after-compact", compact.clone())).unwrap();
+    let context = restored["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        restored["hookSpecificOutput"]["hookEventName"],
+        "SessionStart"
+    );
+    assert!(
+        context.contains(&format!(
+            "{id} · mypy · exit 1 · 3 finding(s) in 2 rule(s), first return-value ×2"
+        )) && context.contains("justless log RUN_ID")
+            && context.len() < 2400,
+        "{context}"
+    );
+    let codex_output: Value =
+        serde_json::from_str(&raw_hook("hook-codex", "after-compact", compact)).unwrap();
+    assert_eq!(codex_output, restored);
+    let startup = json!({"hook_event_name":"SessionStart","source":"startup","cwd":root});
+    assert_eq!(
+        raw_hook("hook-codex", "after-compact", startup).trim(),
+        "{}"
+    );
+
+    let instructions = raw_hook("hook-claude", "before-compact", pre);
+    assert!(
+        instructions.starts_with("Keep these Justless references verbatim in the summary.")
+            && instructions.contains(&id),
+        "{instructions}"
+    );
+}

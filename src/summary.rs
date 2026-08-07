@@ -22,10 +22,11 @@ pub struct Item {
 }
 
 pub fn family(args: &[OsString]) -> String {
-    let mut words: Vec<_> = args
+    let all: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+    let mut words: Vec<_> = crate::filters::unwrap_tool(&all)
         .iter()
         .take(3)
-        .map(|a| a.to_str().unwrap_or(""))
+        .copied()
         .collect();
     if let Some(command) = words.first_mut() {
         *command = std::path::Path::new(*command)
@@ -266,6 +267,36 @@ pub fn short(s: &str, len: usize) -> String {
 }
 
 impl Summary {
+    /// A one-line outcome for handoffs, such as a failing test count or top lint rule.
+    pub fn headline(&self) -> Option<String> {
+        match self.kind.as_str() {
+            "tests" if !self.items.is_empty() => Some(format!(
+                "{} failing test(s), first {}",
+                self.items.len(),
+                self.items[0].name
+            )),
+            "lint" => {
+                let total: usize = self
+                    .items
+                    .iter()
+                    .filter_map(|i| i.digest.parse::<usize>().ok())
+                    .sum();
+                let top = self.items.first()?;
+                Some(format!(
+                    "{total} finding(s) in {} rule(s), first {} ×{}",
+                    self.items.len(),
+                    top.name,
+                    top.digest
+                ))
+            }
+            "diff" if !self.items.is_empty() => {
+                Some(format!("{} diff section(s)", self.items.len()))
+            }
+            "inventory" => self.outcomes.first().cloned(),
+            _ => None,
+        }
+    }
+
     pub fn render(&self, previous: Option<(&str, &Summary)>, status: i32) -> Option<String> {
         if self.kind.is_empty()
             || (self.items.is_empty()

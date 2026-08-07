@@ -251,6 +251,8 @@ fn cli() -> Command<'static> {
                     "session-start",
                     "before-command",
                     "after-read",
+                    "after-compact",
+                    "before-compact",
                 ]))
         }))
 }

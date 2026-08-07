@@ -52,11 +52,17 @@ impl Report {
         }
     }
 
-    pub(crate) fn finish(mut self) -> Result<()> {
+    pub(crate) fn into_string(mut self) -> String {
         if self.clipped {
             self.output.push_str(Self::CLIPPED);
         }
-        io::stdout().lock().write_all(self.output.as_bytes())?;
+        self.output
+    }
+
+    pub(crate) fn finish(self) -> Result<()> {
+        io::stdout()
+            .lock()
+            .write_all(self.into_string().as_bytes())?;
         Ok(())
     }
 }

@@ -169,8 +169,18 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
             5,
         ),
         ("PostToolUse", "after-read", "^Read$", 5),
+        // Compaction drops earlier tool results. Restore the run IDs and source ranges
+        // that recover them. This handler stays synchronous so its context is applied
+        // before the next model request.
+        ("SessionStart", "after-compact", "^compact$", 10),
+        ("PreCompact", "before-compact", "^(manual|auto)$", 10),
     ] {
-        if event == "PostToolUse" && agent != Agent::Claude {
+        let supported = match mode {
+            "after-read" | "before-compact" => agent == Agent::Claude,
+            "after-compact" => matches!(agent, Agent::Claude | Agent::Codex),
+            _ => true,
+        };
+        if !supported {
             continue;
         }
         let entries = hooks
@@ -193,7 +203,7 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
             continue;
         }
         let mut handler = json!({"type":"command", "timeout":timeout, "command":command});
-        if agent != Agent::Agy && event == "SessionStart" {
+        if agent != Agent::Agy && mode == "session-start" {
             handler["async"] = json!(true);
         }
         entries.push(if flat {
@@ -225,6 +235,33 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
         })
     } else if agent == Agent::Claude && mode == "after-read" {
         claude_read(workspace, &input).unwrap_or_else(|| json!({}))
+    } else if mode == "after-compact"
+        && input["hook_event_name"] == "SessionStart"
+        && input["source"]
+            .as_str()
+            .is_none_or(|source| source == "compact")
+    {
+        compact_state(workspace)
+            .map(|state| {
+                json!({"hookSpecificOutput":{
+                    "hookEventName":"SessionStart",
+                    "additionalContext":format!(
+                        "Justless activity from before compaction. Recover exact output with `justless log RUN_ID`, `justless search RUN_ID TEXT` or `justless history TEXT`, and retired tool results with `justless recall ID`.\n{state}"
+                    )
+                }})
+            })
+            .unwrap_or_else(|| json!({}))
+    } else if agent == Agent::Claude && mode == "before-compact" {
+        // Claude Code uses PreCompact stdout as instructions for the summary, so this
+        // mode prints plain text rather than a JSON decision.
+        if input["hook_event_name"] == "PreCompact"
+            && let Some(state) = compact_state(workspace)
+        {
+            print!(
+                "Keep these Justless references verbatim in the summary. They recover exact logs and source without rerunning commands. Keep each run ID with its command family and exit status, and each file range with its stale marker.\n{state}"
+            );
+        }
+        return Ok(());
     } else if mode == "session-start" && input["hook_event_name"] == "SessionStart" {
         startup(workspace)
             .map(|message| {
@@ -294,6 +331,16 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
         "additionalContext":"Justless outline. L ranges are source line numbers. Expand a row with justless expand FILE 'REV#ID', or use Read with offset and limit for original lines."}}),
     )
+}
+
+/// A bounded handoff of recent Justless activity, or `None` when there is none.
+fn compact_state(workspace: &Workspace) -> Option<String> {
+    if !workspace.state.is_dir() {
+        return None;
+    }
+    let state = crate::history::resume_text(workspace, 1800).ok()?;
+    (!state.trim().is_empty() && !state.starts_with("No recorded project activity"))
+        .then_some(state)
 }
 
 fn startup(workspace: &Workspace) -> Option<String> {

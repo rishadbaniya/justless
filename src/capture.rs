@@ -161,11 +161,11 @@ pub fn execute(
         .with_context(|| format!("run {}", args[0].to_string_lossy()))?;
 
     let mut run = Run {
-        family: selection
-            .profile
-            .filter(|p| *p != crate::filters::Profile::Lint)
-            .map(|p| p.label().to_owned())
-            .unwrap_or_else(|| crate::summary::family(args)),
+        family: match selection.profile {
+            Some(crate::filters::Profile::Lint) => crate::filters::tool_label(args),
+            Some(profile) => profile.label().to_owned(),
+            None => crate::summary::family(args),
+        },
         command_key: String::new(),
         digests: Vec::new(),
         summary: Summary::default(),

@@ -294,6 +294,13 @@ pub fn history(
 }
 
 pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
+    print!("{}", resume_text(workspace, cap)?);
+    Ok(())
+}
+
+/// Recent runs, inspected source and the last pack, with stale source marked.
+/// Returns `None` inside the text when the project has no recorded activity.
+pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
     let mut report = Report::new(cap);
     let activity: Activity = get(&workspace.state.join("activity.json"))?;
     let mut has_runs = false;
@@ -301,7 +308,7 @@ pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
         let run = run?;
         has_runs = true;
         report.line(format!(
-            "{} · {} · exit {}{}",
+            "{} · {} · exit {}{}{}",
             run.id,
             run.family,
             run.status,
@@ -309,7 +316,11 @@ pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
                 " · unchanged output"
             } else {
                 ""
-            }
+            },
+            run.summary
+                .headline()
+                .map(|h| format!(" · {}", crate::summary::short(&h, 160)))
+                .unwrap_or_default()
         ));
         for d in run.diagnostics.iter().take(2) {
             let stale = run
@@ -354,7 +365,7 @@ pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
     if !has_runs && activity.reads.is_empty() && activity.last_pack.is_empty() {
         report.line("No recorded project activity yet.");
     }
-    report.finish()
+    Ok(report.into_string())
 }
 
 fn current(workspace: &Workspace, file: &str, old: &str) -> bool {
