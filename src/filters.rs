@@ -15,6 +15,7 @@ pub enum Profile {
     Nodes,
     JsTests,
     Logs,
+    Lint,
 }
 
 impl Profile {
@@ -27,11 +28,12 @@ impl Profile {
             Self::Nodes => "kubectl get nodes",
             Self::JsTests => "JavaScript tests",
             Self::Logs => "container logs",
+            Self::Lint => "lint",
         }
     }
 
     pub fn inventory(self) -> bool {
-        !matches!(self, Self::JsTests | Self::Logs)
+        !matches!(self, Self::JsTests | Self::Logs | Self::Lint)
     }
 }
 
@@ -60,8 +62,106 @@ fn display_options(mut args: &[&str], flags: &[&str], valued: &[&str], names: bo
     true
 }
 
+/// Skip package-runner prefixes such as `npx`, `uv run` and `bundle exec` so the
+/// tool they launch selects the profile.
+pub fn unwrap_tool<'a, 'b>(mut words: &'a [&'b str]) -> &'a [&'b str] {
+    loop {
+        let rest = match words {
+            ["npx" | "bunx" | "uvx" | "pnpx", rest @ ..] => rest,
+            ["pnpm" | "yarn" | "bun", "exec" | "dlx", rest @ ..] => rest,
+            [
+                "uv" | "poetry" | "pdm" | "hatch" | "pipenv" | "rye",
+                "run",
+                rest @ ..,
+            ] => rest,
+            ["bundle", "exec", rest @ ..] => rest,
+            ["python" | "python3", "-m", tool, ..] if *tool != "pytest" => &words[2..],
+            _ => return words,
+        };
+        let rest = match rest {
+            ["-y" | "--yes" | "--quiet" | "-q", tail @ ..] => tail,
+            _ => rest,
+        };
+        if rest.is_empty() || rest[0].starts_with('-') {
+            return words;
+        }
+        words = rest;
+    }
+}
+
+/// A short name for the tool in a lint report, such as `cargo clippy` or `ruff check`.
+pub fn tool_label(args: &[OsString]) -> String {
+    let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+    let words = unwrap_tool(&words);
+    let Some((program, rest)) = words.split_first() else {
+        return "lint".into();
+    };
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|p| p.to_str())
+        .unwrap_or(program);
+    match rest.first() {
+        Some(sub) if sub.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !sub.is_empty() => {
+            format!("{program} {sub}")
+        }
+        _ => program.to_owned(),
+    }
+}
+
+fn lint_display(args: &[&str]) -> bool {
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        let (flag, value) = arg
+            .split_once('=')
+            .map_or((*arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            // ShellCheck's gcc format is one of the recognized shapes.
+            "-f" | "--format" if value.or_else(|| args.peek().copied().copied()) == Some("gcc") => {
+                if value.is_none() {
+                    args.next();
+                }
+            }
+            "-f" | "--format" | "--output-format" | "--formatter" | "--reporter" | "--out"
+            | "--output" | "-o" | "--json" | "--watch" | "-w" | "--serve" | "--statistics"
+            | "--show-source" | "--pretty" | "--help" | "--version" => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn lint_tool(program: &str, args: &[&str]) -> bool {
+    matches!(
+        (program, args),
+        ("cargo", ["clippy" | "check" | "build", ..])
+            | ("ruff", ["check", ..])
+            | ("golangci-lint", ["run", ..])
+            | ("go", ["vet", ..])
+            | (
+                "flake8"
+                    | "pylint"
+                    | "mypy"
+                    | "pyright"
+                    | "basedpyright"
+                    | "eslint"
+                    | "tsc"
+                    | "vue-tsc"
+                    | "shellcheck"
+                    | "rubocop"
+                    | "staticcheck"
+                    | "swiftlint"
+                    | "hadolint",
+                _,
+            )
+    )
+}
+
 pub fn profile(words: &[&str]) -> Option<Profile> {
+    let words = unwrap_tool(words);
     let (&program, mut args) = words.split_first()?;
+    if lint_tool(program, args) {
+        return lint_display(args).then_some(Profile::Lint);
+    }
     if program == "kubectl" {
         // kubectl permits a namespace or context before or after the verb.
         while let Some((&arg, rest)) = args.split_first() {
@@ -198,8 +298,14 @@ fn js_display(args: &[&str]) -> bool {
 
 pub fn legacy_hook(words: &[&str]) -> bool {
     matches!(
-        words,
+        unwrap_tool(words),
         ["cargo", "build" | "check" | "clippy" | "test", ..]
+            | ["make" | "gmake" | "ninja", ..]
+            | ["cmake", "--build", ..]
+            | ["gradle" | "gradlew" | "./gradlew", ..]
+            | ["mvn" | "mvnw" | "./mvnw", ..]
+            | ["dotnet", "build" | "test" | "restore", ..]
+            | ["swift", "build" | "test", ..]
             | ["git", "diff" | "show" | "status" | "log", ..]
             | ["go", "test" | "build", ..]
             | ["python" | "python3", "-m", "pytest", ..]

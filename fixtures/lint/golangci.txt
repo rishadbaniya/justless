@@ -1,0 +1,8 @@
+main.go:12:2: Error return value of `f.Close` is not checked (errcheck)
+	f.Close()
+	^
+main.go:20:6: func `unused` is unused (unused)
+pkg/db.go:8:2: Error return value of `rows.Close` is not checked (errcheck)
+3 issues:
+* errcheck: 2
+* unused: 1

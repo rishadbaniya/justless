@@ -1,0 +1,5 @@
+app.py:7: error: Incompatible return value type (got "int", expected "str")  [return-value]
+app.py:10: error: "int" has no attribute "upper"  [attr-defined]
+app.py:14: error: Incompatible return value type (got "int", expected "str")  [return-value]
+app.py:14: note: See https://mypy.rtfd.io/en/stable/_refs.html#code-return-value for more info
+Found 3 errors in 1 file (checked 1 source file)

@@ -1,0 +1,17 @@
+F401 [*] `os` imported but unused
+ --> app.py:1:8
+  |
+1 | import os
+  |        ^^
+  |
+help: Remove unused import: `os`
+
+F401 [*] `sys` imported but unused
+ --> app.py:2:8
+  |
+2 | import sys
+  |        ^^^
+  |
+help: Remove unused import: `sys`
+
+Found 2 errors.

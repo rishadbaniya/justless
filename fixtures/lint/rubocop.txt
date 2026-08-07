@@ -1,0 +1,10 @@
+Inspecting 2 files
+CW
+
+Offenses:
+
+app.rb:1:1: C: [Correctable] Style/FrozenStringLiteralComment: Missing frozen string literal comment.
+app.rb:3:7: W: Lint/UselessAssignment: Useless assignment to variable - x.
+lib.rb:1:1: C: [Correctable] Style/FrozenStringLiteralComment: Missing frozen string literal comment.
+
+2 files inspected, 3 offenses detected, 2 offenses autocorrectable

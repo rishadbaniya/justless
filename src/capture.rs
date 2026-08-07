@@ -30,7 +30,7 @@ static TYPESCRIPT_SOURCE: LazyLock<Regex> = LazyLock::new(|| {
 });
 const SCAN_LINE_LIMIT: usize = 256 * 1024;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stream {
     Stdout,
@@ -163,6 +163,7 @@ pub fn execute(
     let mut run = Run {
         family: selection
             .profile
+            .filter(|p| *p != crate::filters::Profile::Lint)
             .map(|p| p.label().to_owned())
             .unwrap_or_else(|| crate::summary::family(args)),
         command_key: String::new(),
@@ -178,6 +179,8 @@ pub fn execute(
         source_digests: BTreeMap::new(),
     };
     let mut parser = Parser::new(&run.family, selection.profile);
+    let mut lint = (selection.profile == Some(crate::filters::Profile::Lint))
+        .then(|| crate::lint::Lint::new(&workspace.root));
     let mut previews = Vec::new();
     for stream in Stream::BOTH {
         let path = directory.join(stream.name());
@@ -189,8 +192,11 @@ pub fn execute(
             stream,
             max_bytes,
             &mut run,
-            &mut parser,
-            &selection,
+            &mut Observers {
+                parser: &mut parser,
+                selection: &selection,
+                lint: &mut lint,
+            },
         )?;
         run.preview_bytes += preview.len();
         previews.push((stream, preview));
@@ -227,6 +233,15 @@ pub fn execute(
     run.unchanged = previous
         .as_ref()
         .is_some_and(|p| p.digests == run.digests && p.status == run.status);
+    let lint = lint.and_then(|lint| {
+        lint.finish(
+            &crate::filters::tool_label(args),
+            previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
+        )
+    });
+    if let Some((_, summary)) = &lint {
+        run.summary = summary.clone();
+    }
     if let Some(prior) = &previous
         && run.unchanged
     {
@@ -236,6 +251,20 @@ pub fn execute(
                 bytes.clear();
             }
             previews[target].1 = format!("Output unchanged since {}.\n", prior.id).into_bytes();
+        }
+    } else if let Some((report, _)) = lint {
+        // Findings replace both streams: the grouped report names every rule and
+        // location, and each group links to its original lines in the full log.
+        let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
+        if report.len() < shown || previous.is_some() {
+            let mut report = report;
+            if report.len() > max_bytes {
+                let tail = "\n[more in full log]\n";
+                report.truncate(report.floor_char_boundary(max_bytes - tail.len()));
+                report.push_str(tail);
+            }
+            previews[0].1 = report.into_bytes();
+            previews[1].1.clear();
         }
     } else if let Some(summary) = run.summary.render(
         previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
@@ -295,15 +324,26 @@ impl Read for HashedFile {
     }
 }
 
+/// Line consumers that see every captured line during the single scan of a stream.
+struct Observers<'a> {
+    parser: &'a mut Parser,
+    selection: &'a crate::filters::Selection,
+    lint: &'a mut Option<crate::lint::Lint>,
+}
+
 fn scan(
     workspace: &Workspace,
     path: &Path,
     stream: Stream,
     max_bytes: usize,
     run: &mut Run,
-    parser: &mut Parser,
-    selection: &crate::filters::Selection,
+    observers: &mut Observers,
 ) -> Result<Vec<u8>> {
+    let Observers {
+        parser,
+        selection,
+        lint,
+    } = observers;
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
     let truncated = path.metadata()?.len() > max_bytes as u64;
@@ -332,6 +372,9 @@ fn scan(
         let text = String::from_utf8_lossy(&raw);
         let text = ANSI.replace_all(&text, "");
         filter.observe(&text, line_no);
+        if let Some(lint) = lint.as_mut() {
+            lint.observe(&text, line_no, stream);
+        }
         if matches!(stream, Stream::Stdout) {
             parser.observe(&text, line_no);
         }

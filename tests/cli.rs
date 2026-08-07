@@ -1327,3 +1327,202 @@ fn compound_commands_wrap_each_supported_segment_in_place() {
         assert_eq!(rewrite("hook-claude", command), None, "{command:?}");
     }
 }
+
+fn lint_fixture(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/lint")
+        .join(name);
+    fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn linter_findings_group_by_rule_with_locations() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // clippy.txt is real `cargo clippy` output. The other fixtures follow each
+    // tool's documented default format.
+    for (program, args, fixture, stream, expected) in [
+        (
+            "cargo",
+            &["clippy"][..],
+            "clippy.txt",
+            "2",
+            &[
+                "cargo clippy: 11 finding(s), 0 error(s), 11 warning(s) · 4 rule(s) · 1 file(s)",
+                "warning clippy::needless_return ×5  unneeded `return` statement",
+                "  src/lib.rs:1:49, 2:50, 3:50, 3:72 +1 more [stderr:15-27]",
+                "warning unused_variables ×2  unused variable: `unused`",
+            ][..],
+        ),
+        (
+            "mypy",
+            &["app.py"],
+            "mypy.txt",
+            "1",
+            &[
+                "error return-value ×2  Incompatible return value type (got \"int\", expected \"str\")",
+                "  app.py:7, 14 [stdout:1-1]",
+                "error attr-defined ×1",
+            ],
+        ),
+        (
+            "ruff",
+            &["check", "."],
+            "ruff.txt",
+            "1",
+            &[
+                "warning F401 ×3",
+                "  app.py:1:8, 2:8, 3:8",
+                "warning F841 ×2",
+            ],
+        ),
+        (
+            "ruff",
+            &["check", "."],
+            "ruff_full.txt",
+            "1",
+            &[
+                "warning F401 ×2  `os` imported but unused",
+                "  app.py:1:8, 2:8 [stdout:1-7]",
+            ],
+        ),
+        (
+            "tsc",
+            &["--noEmit"],
+            "tsc.txt",
+            "1",
+            &[
+                "error TS2322 ×3",
+                "  src/a.ts:1:7, 2:7, src/b.ts:3:33 [stdout:1-1]",
+            ],
+        ),
+        (
+            "shellcheck",
+            &["s.sh"],
+            "shellcheck.txt",
+            "1",
+            &["warning SC2086 ×2", "  s.sh:2, 3", "error SC2045 ×1"],
+        ),
+        (
+            "rubocop",
+            &[],
+            "rubocop.txt",
+            "1",
+            &[
+                "warning Style/FrozenStringLiteralComment ×2",
+                "  app.rb:1:1, lib.rb:1:1 [stdout:6-6]",
+            ],
+        ),
+    ] {
+        fs::write(root.join("output.txt"), lint_fixture(fixture)).unwrap();
+        let redirect = if stream == "2" { " >&2" } else { "" };
+        let exe = fake_program(
+            root,
+            program,
+            &format!("cat output.txt{redirect}\nexit 1\n"),
+        );
+        let mut command = vec!["run", "--fresh", "--", exe.to_str().unwrap()];
+        command.extend(args);
+        let output = cli(root, &command);
+        assert_eq!(output.status.code(), Some(1), "{fixture}");
+        let preview = stdout(&output);
+        for line in expected {
+            assert!(
+                preview.contains(line),
+                "{fixture}: missing {line:?}\n{preview}"
+            );
+        }
+        assert!(
+            stderr(&output).trim_start().starts_with("[justless run-"),
+            "{fixture}"
+        );
+    }
+
+    // A repeated ESLint report collapses to one line per rule and one outcome line.
+    fs::write(
+        root.join("output.txt"),
+        lint_fixture("eslint.txt").repeat(4),
+    )
+    .unwrap();
+    let eslint = fake_program(root, "eslint", "cat output.txt\nexit 1\n");
+    let report = stdout(&cli(root, &["run", "--", eslint.to_str().unwrap(), "."]));
+    assert!(
+        report.starts_with("eslint: 20 finding(s), 16 error(s), 4 warning(s) · 3 rule(s) · 2 file(s)\n")
+            && report.contains("error no-undef ×12  'foo' is not defined\n  /work/web/b.js:3:15, 4:25, /work/web/c.js:1:1 [stdout:4-4]")
+            && report.matches("✖ 5 problems").count() == 1,
+        "{report}"
+    );
+
+    // A rerun reports which rules appeared, changed or are no longer reported.
+    fs::write(
+        root.join("output.txt"),
+        "/work/web/b.js\n  3:15  error  'foo' is not defined  no-undef\n  9:1  error  'x' is assigned a value but never used  no-unused-vars\n".repeat(3),
+    )
+    .unwrap();
+    let rerun = stdout(&cli(root, &["run", "--", eslint.to_str().unwrap(), "."]));
+    assert!(
+        rerun.contains("Compared with run-")
+            && rerun.contains("~ no-undef ×12 → ×3")
+            && rerun.contains("~ no-unused-vars ×4 → ×3")
+            && rerun.contains("- eqeqeq ×4 (no longer reported)"),
+        "{rerun}"
+    );
+
+    // Output with no recognized finding keeps the ordinary preview.
+    fs::write(root.join("output.txt"), "All checks passed!\n").unwrap();
+    let ruff = fake_program(root, "ruff", "cat output.txt\n");
+    assert_eq!(
+        success(root, &["run", "--", ruff.to_str().unwrap(), "check"]),
+        "All checks passed!\n"
+    );
+}
+
+#[test]
+fn hooks_route_linters_build_tools_and_package_runners() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    for command in [
+        "cargo clippy --all-targets -- -D warnings",
+        "npx eslint src",
+        "npx -y tsc --noEmit",
+        "pnpm exec vue-tsc --noEmit",
+        "uv run ruff check .",
+        "poetry run mypy app",
+        "python -m mypy app",
+        "bundle exec rubocop",
+        "golangci-lint run ./...",
+        "shellcheck -f gcc install.sh",
+        "go vet ./...",
+        "uv run pytest -q",
+        "make",
+        "./gradlew build",
+        "mvn -q test",
+        "dotnet build",
+        "swift test",
+        "cmake --build build",
+    ] {
+        let output = agent_hook(root, "hook-claude", "before-command", call(command));
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["command"],
+            format!("justless run -- {command}"),
+            "{command}"
+        );
+    }
+    for command in [
+        "eslint --format json src",
+        "ruff check --output-format=json .",
+        "npx tsc --watch",
+        "mypy --pretty app",
+        "shellcheck -f json install.sh",
+        "npx",
+        "uv run",
+        "cmake -S . -B build",
+    ] {
+        assert_eq!(
+            agent_hook(root, "hook-claude", "before-command", call(command)),
+            serde_json::json!({}),
+            "{command}"
+        );
+    }
+}

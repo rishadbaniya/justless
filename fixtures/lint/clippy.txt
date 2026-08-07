@@ -1,0 +1,114 @@
+warning: unused variable: `unused`
+ --> src/lib.rs:1:37
+  |
+1 | pub fn a(v: &Vec<i32>) -> i32 { let unused = 1; return v.len() as i32; }
+  |                                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `unused2`
+ --> src/lib.rs:2:37
+  |
+2 | pub fn b(v: &Vec<i32>) -> i32 { let unused2 = 2; return v[0]; }
+  |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused2`
+
+warning: unneeded `return` statement
+ --> src/lib.rs:1:49
+  |
+1 | pub fn a(v: &Vec<i32>) -> i32 { let unused = 1; return v.len() as i32; }
+  |                                                 ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#needless_return
+  = note: `#[warn(clippy::needless_return)]` on by default
+help: remove `return`
+  |
+1 - pub fn a(v: &Vec<i32>) -> i32 { let unused = 1; return v.len() as i32; }
+1 + pub fn a(v: &Vec<i32>) -> i32 { let unused = 1; v.len() as i32}
+  |
+
+warning: writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+ --> src/lib.rs:1:13
+  |
+1 | pub fn a(v: &Vec<i32>) -> i32 { let unused = 1; return v.len() as i32; }
+  |             ^^^^^^^^^ help: change this to: `&[i32]`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#ptr_arg
+  = note: `#[warn(clippy::ptr_arg)]` on by default
+
+warning: unneeded `return` statement
+ --> src/lib.rs:2:50
+  |
+2 | pub fn b(v: &Vec<i32>) -> i32 { let unused2 = 2; return v[0]; }
+  |                                                  ^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#needless_return
+help: remove `return`
+  |
+2 - pub fn b(v: &Vec<i32>) -> i32 { let unused2 = 2; return v[0]; }
+2 + pub fn b(v: &Vec<i32>) -> i32 { let unused2 = 2; v[0]}
+  |
+
+warning: writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+ --> src/lib.rs:2:13
+  |
+2 | pub fn b(v: &Vec<i32>) -> i32 { let unused2 = 2; return v[0]; }
+  |             ^^^^^^^^^ help: change this to: `&[i32]`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#ptr_arg
+
+warning: unneeded `return` statement
+ --> src/lib.rs:3:50
+  |
+3 | pub fn c(x: i32) -> bool { if x == true as i32 { return true; } else { return false; } }
+  |                                                  ^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#needless_return
+help: remove `return`
+  |
+3 - pub fn c(x: i32) -> bool { if x == true as i32 { return true; } else { return false; } }
+3 + pub fn c(x: i32) -> bool { if x == true as i32 { true} else { return false; } }
+  |
+
+warning: unneeded `return` statement
+ --> src/lib.rs:3:72
+  |
+3 | pub fn c(x: i32) -> bool { if x == true as i32 { return true; } else { return false; } }
+  |                                                                        ^^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#needless_return
+help: remove `return`
+  |
+3 - pub fn c(x: i32) -> bool { if x == true as i32 { return true; } else { return false; } }
+3 + pub fn c(x: i32) -> bool { if x == true as i32 { return true; } else { false} }
+  |
+
+warning: this if-then-else expression returns a bool literal
+ --> src/lib.rs:3:28
+  |
+3 | pub fn c(x: i32) -> bool { if x == true as i32 { return true; } else { return false; } }
+  |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: you can reduce it to: `return x == true as i32`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#needless_bool
+  = note: `#[warn(clippy::needless_bool)]` on by default
+
+warning: unneeded `return` statement
+ --> src/lib.rs:4:33
+  |
+4 | pub fn d(s: &String) -> usize { return s.len(); }
+  |                                 ^^^^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#needless_return
+help: remove `return`
+  |
+4 - pub fn d(s: &String) -> usize { return s.len(); }
+4 + pub fn d(s: &String) -> usize { s.len()}
+  |
+
+warning: writing `&String` instead of `&str` involves a new object where a slice will do
+ --> src/lib.rs:4:13
+  |
+4 | pub fn d(s: &String) -> usize { return s.len(); }
+  |             ^^^^^^^ help: change this to: `&str`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#ptr_arg
+

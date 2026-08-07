@@ -5,6 +5,7 @@ mod filters;
 mod history;
 mod index;
 mod inventory;
+mod lint;
 mod observations;
 mod pack;
 mod polyglot;
