@@ -1,4 +1,17 @@
-# Justless
+<p align="center">
+  <img src="assets/logo.png" alt="Justless logo" width="140">
+</p>
+
+<h1 align="center">justless</h1>
+
+<p align="center">
+  <strong>Your agent reads less. It knows more.</strong><br>
+  Compact by default. Exact on demand.
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> · <a href="docs/reference.md">Reference</a> · <a href="docs/examples.md">Examples</a> · <a href="docs/benchmarks.md">Benchmarks</a>
+</p>
 
 Justless is a local CLI that helps coding agents use fewer tokens when running commands and exploring a codebase.
 
