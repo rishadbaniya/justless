@@ -345,6 +345,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         &cwd,
         args["CommandLine"].as_str()?,
         input["conversationId"].as_str(),
+        false,
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
 }
@@ -370,6 +371,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         &cwd,
         command,
         input["session_id"].as_str(),
+        agent != Agent::Codex,
     )?);
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
     if agent == Agent::Codex {
@@ -388,6 +390,7 @@ fn wrap_event(
     cwd: &Path,
     command: &str,
     session: Option<&str>,
+    allow_mixed: bool,
 ) -> Option<String> {
     if !cfg!(windows)
         && let Some(words) = literal_command(command)
@@ -415,10 +418,6 @@ fn wrap_event(
         }
         return None;
     }
-    if !supported_command(command) {
-        crate::history::bypass(workspace, command);
-        return None;
-    }
     let session = session
         .filter(|id| !id.is_empty())
         .map(|id| {
@@ -428,7 +427,114 @@ fn wrap_event(
             )
         })
         .unwrap_or_default();
-    Some(format!("justless run{session} -- {}", command.trim()))
+    let wrap = |segment: &str| format!("justless run{session} -- {segment}");
+    let segments = split_compound(command).filter(|s| s.len() > 1);
+    let Some(segments) = segments else {
+        if !supported_command(command) {
+            crate::history::bypass(workspace, command);
+            return None;
+        }
+        return Some(wrap(command.trim()));
+    };
+    // Rewrite each supported segment in place and keep every other byte, so the
+    // shell still sees the original operators, spacing and unsupported commands.
+    let mut rewritten = String::with_capacity(command.len() + 64);
+    let mut copied = 0;
+    let mut wrapped = 0;
+    for range in segments {
+        let segment = &command[range.clone()];
+        let words = literal_command(segment);
+        let words: Option<Vec<&str>> = words
+            .as_ref()
+            .map(|w| w.iter().map(String::as_str).collect());
+        if let Some(["cd", directory]) = words.as_deref() {
+            let directory = Path::new(directory);
+            // Stay inside the workspace so captured runs keep the same root.
+            if directory.is_absolute()
+                || directory.as_os_str().to_str()?.starts_with(['-', '~'])
+                || directory
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return None;
+            }
+            continue;
+        }
+        if !supported_command(segment) {
+            if !allow_mixed {
+                return None;
+            }
+            crate::history::bypass(workspace, segment);
+            continue;
+        }
+        rewritten.push_str(&command[copied..range.start]);
+        rewritten.push_str(&wrap(segment));
+        copied = range.end;
+        wrapped += 1;
+    }
+    if wrapped == 0 {
+        return None;
+    }
+    rewritten.push_str(&command[copied..]);
+    Some(rewritten)
+}
+
+/// Split a command list on top-level `&&`, `||` and `;`, returning the trimmed byte
+/// range of each command. Expansions, pipes, redirections, grouping, background
+/// jobs and comments return `None` so the whole command passes through unchanged.
+fn split_compound(command: &str) -> Option<Vec<std::ops::Range<usize>>> {
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut i = 0;
+    let mut push = |start: usize, end: usize| {
+        let text = &command[start..end];
+        let lead = text.len() - text.trim_start().len();
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| segments.push(start + lead..start + lead + trimmed.len()))
+    };
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_control() && c != b'\t' || matches!(c, b'$' | b'\\' | b'`') {
+            return None;
+        }
+        match quote {
+            Some(active) if c == active => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'&' | b'|' if bytes.get(i + 1) == Some(&c) => {
+                    push(start, i)?;
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+                b';' if bytes.get(i + 1) != Some(&b';') => {
+                    push(start, i)?;
+                    start = i + 1;
+                }
+                b'&' | b'|' | b';' | b'<' | b'>' | b'(' | b')' | b'{' | b'}' | b'#' | b'!' => {
+                    return None;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    // A trailing `;` is valid shell, so only a nonempty tail adds a segment.
+    if !command[start..].trim().is_empty() {
+        push(start, command.len())?;
+    } else if segments.is_empty()
+        || command.trim_end().ends_with("&&")
+        || command.trim_end().ends_with("||")
+    {
+        return None;
+    }
+    Some(segments)
 }
 
 fn supported_command(command: &str) -> bool {

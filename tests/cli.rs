@@ -1263,3 +1263,67 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
         );
     }
 }
+
+#[test]
+fn compound_commands_wrap_each_supported_segment_in_place() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join("web")).unwrap();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let rewrite = |agent: &str, command: &str| {
+        agent_hook(&root, agent, "before-command", call(command))["hookSpecificOutput"]
+            ["updatedInput"]["command"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    for (command, expected) in [
+        (
+            "git status; git diff",
+            "justless run -- git status; justless run -- git diff",
+        ),
+        ("cd web && npm test", "cd web && justless run -- npm test"),
+        (
+            "git log --oneline -5  &&  git diff --stat",
+            "justless run -- git log --oneline -5  &&  justless run -- git diff --stat",
+        ),
+    ] {
+        for agent in ["hook-claude", "hook-codex"] {
+            assert_eq!(
+                rewrite(agent, command).as_deref(),
+                Some(expected),
+                "{agent} {command}"
+            );
+        }
+    }
+    // Claude Code checks permissions for each rewritten segment. Codex auto-approves
+    // a rewrite, so it only rewrites chains made entirely of supported commands.
+    for (command, expected) in [
+        (
+            "cargo test && git push",
+            "justless run -- cargo test && git push",
+        ),
+        ("cargo test || true", "justless run -- cargo test || true"),
+        (
+            "echo \"a && b\" && git status",
+            "echo \"a && b\" && justless run -- git status",
+        ),
+    ] {
+        assert_eq!(rewrite("hook-claude", command).as_deref(), Some(expected));
+        assert_eq!(rewrite("hook-codex", command), None, "{command}");
+    }
+    for command in [
+        "cd ../elsewhere && cargo test",
+        "cd /tmp && cargo test",
+        "cargo test 2>&1 | tail -20",
+        "cargo test &",
+        "cargo test && $(touch x)",
+        "cargo test &&",
+        "; cargo test",
+        "(cd web && npm test)",
+        "cargo test # && rm",
+        "git status\ngit diff",
+        "git push && echo done",
+    ] {
+        assert_eq!(rewrite("hook-claude", command), None, "{command:?}");
+    }
+}
