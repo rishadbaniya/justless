@@ -1040,3 +1040,226 @@ fn concurrent_runs_publish_complete_archives_and_keep_workdirs_separate() {
     assert_eq!(success(&b, &args), "evidence\n".repeat(80));
     assert_eq!(success(root, &["history"]).lines().count(), 5);
 }
+
+fn fake_program(dir: &Path, name: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join(name);
+    fs::write(&exe, format!("#!/bin/sh\n{script}")).unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+    exe
+}
+
+#[test]
+fn container_and_cluster_tables_list_only_rows_that_need_attention() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(
+        root.join("ps.txt"),
+        concat!(
+            "CONTAINER ID   IMAGE         COMMAND   CREATED       STATUS                       PORTS     NAMES\n",
+            "a1b2c3d4e5f6   nginx:1.27    \"nginx\"   2 hours ago   Up 2 hours (healthy)         80/tcp    web\n",
+            "b2c3d4e5f6a1   postgres:16   \"pg\"      2 hours ago   Up 2 hours (unhealthy)                 db\n",
+            "c3d4e5f6a1b2   redis:7       \"redis\"   3 hours ago   Exited (137) 5 minutes ago             cache\n",
+            "d4e5f6a1b2c3   busybox       \"sh\"      3 hours ago   Up 3 hours                             worker\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("pods.txt"),
+        concat!(
+            "NAMESPACE   NAME          READY   STATUS             RESTARTS   AGE\n",
+            "prod        api-abcde     1/1     Running            0          3d\n",
+            "prod        api-fghij     0/1     CrashLoopBackOff   12         3d\n",
+            "jobs        migrate-xyz   0/1     Completed          0          1d\n",
+        ),
+    )
+    .unwrap();
+    let docker = fake_program(root, "docker", "cat ps.txt\n");
+    let kubectl = fake_program(root, "kubectl", "cat pods.txt\nexit ${FAIL:-0}\n");
+
+    let ps = success(root, &["run", "--", docker.to_str().unwrap(), "ps", "-a"]);
+    assert!(
+        ps.starts_with("docker ps: 4 listed, 2 need attention\n")
+            && ps.contains("db unhealthy [stdout:3-3]")
+            && ps.contains("cache Exited (137) [stdout:4-4]")
+            && ps.contains("Other examples: web, worker")
+            && !ps.contains("nginx:1.27"),
+        "{ps}"
+    );
+    let again = success(root, &["run", "--", docker.to_str().unwrap(), "ps", "-a"]);
+    assert!(again.starts_with("Output unchanged since run-"), "{again}");
+
+    let get = ["run", "--", kubectl.to_str().unwrap(), "get", "pods", "-A"];
+    let pods = success(root, &get);
+    assert!(
+        pods.contains("kubectl get pods: 3 listed, 1 need attention")
+            && pods.contains("prod/api-fghij CrashLoopBackOff ready=0/1 restarts=12")
+            && !pods.contains("prod/api-abcde Running"),
+        "{pods}"
+    );
+
+    // Formats Justless does not understand keep the ordinary preview.
+    let wide = success(
+        root,
+        &[
+            "run",
+            "--",
+            kubectl.to_str().unwrap(),
+            "get",
+            "pods",
+            "-o",
+            "wide",
+        ],
+    );
+    assert_eq!(wide, fs::read_to_string(root.join("pods.txt")).unwrap());
+    let failed = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(get)
+        .current_dir(root)
+        .env("FAIL", "1")
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        stdout(&failed),
+        fs::read_to_string(root.join("pods.txt")).unwrap()
+    );
+}
+
+#[test]
+fn js_tests_logs_and_project_filters_keep_failure_evidence() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let npm = fake_program(
+        root,
+        "npm",
+        concat!(
+            "i=0; while [ $i -lt 40 ]; do echo \"PASS src/m$i.test.js\"; i=$((i+1)); done\n",
+            "echo 'FAIL src/cart.test.js'\n",
+            "echo '  Expected: 30'\n",
+            "echo '  Received: 27'\n",
+            "echo 'Tests: 1 failed, 40 passed, 41 total'\n",
+            "exit 1\n",
+        ),
+    );
+    let tests = cli(root, &["run", "--", npm.to_str().unwrap(), "test"]);
+    let preview = stdout(&tests);
+    assert_eq!(tests.status.code(), Some(1));
+    assert!(
+        preview.starts_with("[4 retained lines, 40 filtered, 0 repeats]\n")
+            && preview.contains("FAIL src/cart.test.js\n  Expected: 30\n  Received: 27\n")
+            && !preview.contains("PASS "),
+        "{preview}"
+    );
+    let id = run_id(&tests);
+    assert_eq!(
+        success(
+            root,
+            &["log", &id, "--stream", "stdout", "--from", "1", "--to", "1"]
+        ),
+        "PASS src/m0.test.js\n"
+    );
+
+    let docker = fake_program(
+        root,
+        "docker",
+        "for i in 1 2 3 4 5; do echo 'GET /health 200'; done\necho 'ERROR db refused'\n",
+    );
+    let logs = success(
+        root,
+        &["run", "--", docker.to_str().unwrap(), "logs", "api"],
+    );
+    assert_eq!(
+        logs,
+        "[2 retained lines, 0 filtered, 4 repeats]\nGET /health 200\nERROR db refused\n"
+    );
+
+    let make = fake_program(
+        root,
+        "make",
+        concat!(
+            "for i in 1 2 3; do echo \"make[1]: Entering directory '/w/$i'\"; echo \"cc -c f$i.c\"; done\n",
+            "echo \"f3.c:10: error: expected ';'\"\n",
+            "exit 2\n",
+        ),
+    );
+    fs::write(
+        root.join(".justless.toml"),
+        "[[filters]]\ncommand = [\"make\"]\nomit = '^make\\[\\d+\\]: Entering'\n",
+    )
+    .unwrap();
+    let built = cli(root, &["run", "--", make.to_str().unwrap()]);
+    assert_eq!(built.status.code(), Some(2));
+    assert_eq!(
+        stdout(&built),
+        "[4 retained lines, 3 filtered, 0 repeats]\ncc -c f1.c\ncc -c f2.c\ncc -c f3.c\nf3.c:10: error: expected ';'\n"
+    );
+
+    for (rule, message) in [
+        ("command = []\nomit = 'x'", "nonempty argv prefix"),
+        (
+            "command = ['make']\nomit = '.*'",
+            "must not match empty text",
+        ),
+        (
+            "command = ['make']\nomit = '('",
+            "invalid filters.omit regex",
+        ),
+    ] {
+        fs::write(
+            root.join(".justless.toml"),
+            format!("[[filters]]\n{rule}\n"),
+        )
+        .unwrap();
+        let rejected = cli(root, &["run", "--", make.to_str().unwrap()]);
+        assert!(
+            !rejected.status.success() && stderr(&rejected).contains(message),
+            "{rule}: {}",
+            stderr(&rejected)
+        );
+    }
+}
+
+#[test]
+fn hooks_route_display_commands_and_leave_machine_formats_alone() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    for command in [
+        "docker ps -a",
+        "docker container ls --filter status=exited",
+        "kubectl get pods -A",
+        "kubectl -n prod get deploy",
+        "kubectl logs api-1 --tail 50",
+        "docker logs --since 10m api",
+        "npm test",
+        "pnpm run test",
+        "vitest run",
+        "node --test",
+    ] {
+        let output = agent_hook(root, "hook-claude", "before-command", call(command));
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["command"],
+            format!("justless run -- {command}"),
+            "{command}"
+        );
+    }
+    for command in [
+        "docker ps --format json",
+        "docker ps -q",
+        "kubectl get svc",
+        "kubectl get pods -o yaml",
+        "kubectl logs -f api-1",
+        "npm test -- --watch",
+        "vitest",
+        "jest --json",
+        "docker ps | grep db",
+    ] {
+        assert_eq!(
+            agent_hook(root, "hook-claude", "before-command", call(command)),
+            serde_json::json!({}),
+            "{command}"
+        );
+    }
+}

@@ -48,6 +48,7 @@ pub fn family(args: &[OsString]) -> String {
 const LIMIT: usize = 2048;
 
 pub struct Parser {
+    inventory: Option<crate::inventory::Inventory>,
     summary: Summary,
     hash: Sha256,
     file: String,
@@ -58,13 +59,17 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new(family: &str) -> Self {
+    pub fn new(family: &str, profile: Option<crate::filters::Profile>) -> Self {
         let kind = match family {
+            _ if profile.is_some() => "",
             "git diff" => "diff",
             "pytest" | "cargo test" | "go test" | "npm test" => "tests",
             _ => "",
         };
         Self {
+            inventory: profile
+                .filter(|p| p.inventory())
+                .map(crate::inventory::Inventory::new),
             summary: Summary {
                 kind: kind.into(),
                 ..Default::default()
@@ -79,7 +84,7 @@ impl Parser {
     }
 
     pub fn observe(&mut self, text: &str, number: usize) {
-        if self.summary.kind.is_empty() || self.discarded {
+        if (self.summary.kind.is_empty() && self.inventory.is_none()) || self.discarded {
             return;
         }
         if text.len() >= 256 * 1024
@@ -88,6 +93,10 @@ impl Parser {
             || self.summary.outcomes.len() >= 128
         {
             self.discarded = true;
+            return;
+        }
+        if let Some(inventory) = &mut self.inventory {
+            self.discarded = !inventory.observe(text, number);
             return;
         }
         let line = text.trim_end_matches('\n');
@@ -222,6 +231,9 @@ impl Parser {
         if self.discarded {
             return Summary::default();
         }
+        if let Some(inventory) = self.inventory {
+            return inventory.finish();
+        }
         self.flush();
         self.summary.items.extend(self.failures.into_values());
         self.summary
@@ -229,7 +241,7 @@ impl Parser {
 }
 
 impl Item {
-    fn new(name: &str, detail: &str, n: usize) -> Self {
+    pub(crate) fn new(name: &str, detail: &str, n: usize) -> Self {
         Self {
             name: short(name, 320),
             detail: short(detail, 360),
@@ -263,6 +275,13 @@ impl Summary {
             return None;
         }
         let mut report = String::new();
+        if self.kind == "inventory" {
+            if status != 0 {
+                return None;
+            }
+            report.push_str(self.outcomes.first()?);
+            report.push('\n');
+        }
         if self.kind == "tests" {
             if status != 0 && self.items.is_empty() {
                 return None;
@@ -284,7 +303,11 @@ impl Summary {
                 ));
             }
             if known == current {
-                report.push_str("Indexed items unchanged; raw output may differ.\n");
+                report.push_str(if self.kind == "inventory" {
+                    "Attention list unchanged.\n"
+                } else {
+                    "Indexed items unchanged; raw output may differ.\n"
+                });
             }
         } else if self.kind == "tests" {
             let mut groups: BTreeMap<(&str, &str), Vec<&Item>> = BTreeMap::new();
@@ -311,12 +334,18 @@ impl Summary {
                 }
             }
         } else {
-            report.push_str(&format!("{} diff section(s)\n", self.items.len()));
+            if self.kind == "diff" {
+                report.push_str(&format!("{} diff section(s)\n", self.items.len()));
+            }
             for item in &self.items {
                 report.push_str(&format!("{}\n", item.display()));
             }
         }
-        for line in &self.outcomes {
+        for line in self
+            .outcomes
+            .iter()
+            .skip(usize::from(self.kind == "inventory"))
+        {
             report.push_str(line);
             report.push('\n');
         }

@@ -439,15 +439,8 @@ fn supported_command(command: &str) -> bool {
         return false;
     };
     let words: Vec<_> = args.iter().map(String::as_str).collect();
-    let supported = matches!(
-        words.as_slice(),
-        ["cargo", "build" | "check" | "clippy" | "test", ..]
-            | ["git", "diff" | "show" | "status" | "log", ..]
-            | ["go", "test" | "build", ..]
-            | ["npm", "test", ..]
-            | ["python" | "python3", "-m", "pytest", ..]
-            | ["pytest" | "rg", ..]
-    );
+    let supported =
+        crate::filters::legacy_hook(&words) || crate::filters::profile(&words).is_some();
     if !supported
         || words.iter().any(|word| {
             let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);

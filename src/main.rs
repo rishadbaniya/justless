@@ -1,8 +1,10 @@
 mod agents;
 mod capture;
 mod context;
+mod filters;
 mod history;
 mod index;
+mod inventory;
 mod observations;
 mod pack;
 mod polyglot;

@@ -95,6 +95,10 @@ Only outputs present in the outbound payload can be retired. A provider-managed 
 
 Use `justless run --fresh -- COMMAND` for a fresh preview. Use `--session NAME` or `JUSTLESS_SESSION` to choose a comparison session from the terminal. Project hooks scope comparisons to the client's session identifier when supplied. Captured runs remain searchable across sessions. A marker such as `stdout:8-15` expands with `justless log RUN_ID --stream stdout --from 8 --to 15`. A range marked `prior stdout` belongs to the comparison run.
 
+Container and cluster listings use the default table output. `docker ps` and `kubectl get pods`, `deployments`, `statefulsets` and `nodes` report how many rows were listed and name only the rows that need attention, such as unhealthy or exited containers, pods that are not ready or have restarted, and rollouts that are behind. A few healthy names are shown as examples. Each flagged row links to its original line. A failing command, an unrecognized header or a custom output format such as `-o wide` or `--format` keeps the ordinary preview.
+
+JavaScript test runners (`npm`, `pnpm`, `yarn` and `bun test`, `jest`, `vitest run`, `node --test`) drop passing-file lines and keep failures with the lines that follow them. `docker logs` and `kubectl logs` collapse consecutive identical lines. Both report retained, filtered and repeated line counts. Watch, interactive, coverage and machine-readable reporter flags run the command with the ordinary preview.
+
 `history` searches stored streams locally and stops when it reaches the requested match count or byte budget. `resume` covers Justless activity, including the most recent 32 source ranges and files used in the last pack. `stats` counts full-stream reads separately from range, search, and run-context requests. Hook pass-through counts cover shell calls observed by the installed hooks. They record command families without arguments. Preview-byte totals exclude footer text and subsequent lookups. Provider token counts are measured separately by the benchmark.
 
 ## Configuration
@@ -106,6 +110,16 @@ context_budget = 2400
 max_output_bytes = 4096
 max_file_bytes = 2097152
 ```
+
+Add `[[filters]]` entries to omit known noise from a command's preview. `command` is an argument prefix matched against the program name and its leading arguments. The longest matching prefix applies. `omit` is a regular expression tested against each trimmed line. Lines that look like failures, errors, warnings or assertions, and the four lines after them, are always kept. The full stream stays in the log.
+
+```toml
+[[filters]]
+command = ["make"]
+omit = '^make\[\d+\]: (Entering|Leaving) directory'
+```
+
+An empty prefix, an invalid expression or one that matches empty text stops the run with an error.
 
 `pack`, `history`, `resume`, `query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
 

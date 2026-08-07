@@ -140,6 +140,7 @@ pub fn execute(
         return Ok(exit_code(command.status().context("run command")?));
     }
 
+    let selection = crate::filters::Selection::for_run(args, &workspace.settings()?.filters)?;
     workspace.prepare_state()?;
     let runs = workspace.state.join("runs");
     private_dir(&runs)?;
@@ -160,7 +161,10 @@ pub fn execute(
         .with_context(|| format!("run {}", args[0].to_string_lossy()))?;
 
     let mut run = Run {
-        family: crate::summary::family(args),
+        family: selection
+            .profile
+            .map(|p| p.label().to_owned())
+            .unwrap_or_else(|| crate::summary::family(args)),
         command_key: String::new(),
         digests: Vec::new(),
         summary: Summary::default(),
@@ -173,13 +177,21 @@ pub fn execute(
         diagnostics: Vec::new(),
         source_digests: BTreeMap::new(),
     };
-    let mut parser = Parser::new(&run.family);
+    let mut parser = Parser::new(&run.family, selection.profile);
     let mut previews = Vec::new();
     for stream in Stream::BOTH {
         let path = directory.join(stream.name());
         let raw_bytes = path.metadata()?.len();
         run.raw_bytes += raw_bytes;
-        let preview = scan(workspace, &path, stream, max_bytes, &mut run, &mut parser)?;
+        let preview = scan(
+            workspace,
+            &path,
+            stream,
+            max_bytes,
+            &mut run,
+            &mut parser,
+            &selection,
+        )?;
         run.preview_bytes += preview.len();
         previews.push((stream, preview));
     }
@@ -290,6 +302,7 @@ fn scan(
     max_bytes: usize,
     run: &mut Run,
     parser: &mut Parser,
+    selection: &crate::filters::Selection,
 ) -> Result<Vec<u8>> {
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
@@ -307,6 +320,7 @@ fn scan(
     let mut tail = VecDeque::new();
     let mut tail_bytes = 0;
     let mut line_no = 0;
+    let mut filter = crate::filters::LineFilter::new(selection, max_bytes);
 
     let line_limit = if truncated {
         SCAN_LINE_LIMIT
@@ -317,6 +331,7 @@ fn scan(
         line_no += 1;
         let text = String::from_utf8_lossy(&raw);
         let text = ANSI.replace_all(&text, "");
+        filter.observe(&text, line_no);
         if matches!(stream, Stream::Stdout) {
             parser.observe(&text, line_no);
         }
@@ -390,6 +405,11 @@ fn scan(
     }
     run.digests
         .push(format!("{:x}", file.into_inner().digest.finalize()));
+    if let Some(filtered) = filter.finish()
+        && (filtered.len() < preview.len() || truncated && filtered.len() <= max_bytes)
+    {
+        return Ok(filtered);
+    }
     Ok(preview)
 }
 
