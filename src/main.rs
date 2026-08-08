@@ -1,6 +1,7 @@
 mod agents;
 mod capture;
 mod context;
+mod discover;
 mod filters;
 mod history;
 mod index;
@@ -142,7 +143,16 @@ fn cli() -> Command<'static> {
                 .arg(budget()),
         )
         .subcommand(
-            Command::new("stats").about("Show output savings, full recalls and hook coverage"),
+            Command::new("stats")
+                .about("Show output savings by day and command, recoveries and hook coverage")
+                .arg(number("days", "7", "Days in the timeline"))
+                .arg(Arg::new("json").long("json").help("Print a JSON report")),
+        )
+        .subcommand(
+            Command::new("discover")
+                .about("Find shell commands agents ran here without Justless, from Claude Code transcripts")
+                .arg(number("days", "30", "Days of transcripts to scan"))
+                .arg(Arg::new("json").long("json").help("Print a JSON report")),
         )
         .subcommand(Command::new("index").about("Refresh the incremental repository index"))
         .subcommand(
@@ -351,7 +361,16 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             context_budget(&workspace, sub)?,
         )?,
         ("resume", sub) => history::resume(&workspace, context_budget(&workspace, sub)?)?,
-        ("stats", _) => history::stats(&workspace)?,
+        ("discover", sub) => discover::discover(
+            &workspace,
+            read_num(sub, "days", 1)? as u64,
+            sub.is_present("json"),
+        )?,
+        ("stats", sub) => history::stats(
+            &workspace,
+            read_num(sub, "days", 1)? as u64,
+            sub.is_present("json"),
+        )?,
         ("index", _) => {
             let index = Index::open(&workspace)?;
             let refresh = &index.refresh;

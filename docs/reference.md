@@ -22,7 +22,8 @@
 | `justless pack "What breaks if I rename purchase_orders?"` | A budgeted selection of definitions, graph links, source lines, working-tree changes, and relevant recorded failures |
 | `justless history "TimeoutError" --oldest --limit 1` | First recorded matching log line across archived commands in this project. Omit the text to list recent runs. |
 | `justless resume` | Recent command outcomes, inspected source ranges, and files in the last pack. Stale source is marked. |
-| `justless stats` | Raw and preview bytes, full-log recalls by command family, repeated reads and commands passed through by hooks |
+| `justless stats --days 7 --json` | Bytes kept out of context with an estimated token count, a daily timeline, savings by command, full-log reopenings, repeated reads and commands passed through by hooks |
+| `justless discover --days 30 --json` | Shell commands Claude Code ran in this workspace, split into those routed through Justless, supported commands that were not routed, and unsupported commands, with output sizes |
 
 ## Indexing and languages
 
@@ -103,7 +104,9 @@ Compilers and linters report findings grouped by rule across stdout and stderr. 
 
 Package runners are recognized, so `npx eslint`, `pnpm exec tsc`, `uv run ruff check`, `poetry run mypy`, `python -m mypy` and `bundle exec rubocop` select the same profile as the tool itself. Hooks also route `make`, `ninja`, `cmake --build`, Gradle, Maven, `dotnet build`/`test` and `swift build`/`test` through the bounded preview.
 
-`history` searches stored streams locally and stops when it reaches the requested match count or byte budget. `resume` covers Justless activity, including each recent run's outcome, such as its failing test count or most frequent lint rule, the most recent 32 source ranges and files used in the last pack. `stats` counts full-stream reads separately from range, search, and run-context requests. Hook pass-through counts cover shell calls observed by the installed hooks. They record command families without arguments. Preview-byte totals exclude footer text and subsequent lookups. Provider token counts are measured separately by the benchmark.
+`history` searches stored streams locally and stops when it reaches the requested match count or byte budget. `resume` covers Justless activity, including each recent run's outcome, such as its failing test count or most frequent lint rule, the most recent 32 source ranges and files used in the last pack. `stats` counts full-stream reads separately from range, search, and run-context requests. Hook pass-through counts cover shell calls observed by the installed hooks. They record command families without arguments. Preview-byte totals exclude footer text and subsequent lookups. Token figures are estimates of UTF-8 bytes divided by four, the same convention the benchmark scripts use, and are always shown next to the measured bytes. Provider token counts are measured separately by the benchmark. A high reopen rate for a command family suggests its preview drops evidence agents need.
+
+`discover` reads Claude Code's session transcripts for this workspace from `~/.claude/projects/` or `$CLAUDE_CONFIG_DIR/projects/`. A command counts as routed when its output carries a Justless run footer. Supported commands that reached the agent unfiltered usually mean the hooks are missing or the session started before they were installed. The report prints command labels such as `cargo test` and byte counts, never full command lines or output.
 
 ## Configuration
 

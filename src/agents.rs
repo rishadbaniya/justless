@@ -584,6 +584,49 @@ fn split_compound(command: &str) -> Option<Vec<std::ops::Range<usize>>> {
     Some(segments)
 }
 
+/// Whether the command hook would route all or part of this command through Justless.
+pub fn would_route(command: &str) -> bool {
+    supported_command(command)
+        || split_compound(command).is_some_and(|segments| {
+            segments.len() > 1
+                && segments
+                    .iter()
+                    .any(|range| supported_command(&command[range.clone()]))
+        })
+}
+
+/// The program and subcommand that start a shell command, such as `cargo test`.
+pub fn command_label(command: &str) -> String {
+    // Label a chain by its first supported command, or else its first command
+    // that is not a `cd`, so `cd web && npm test` counts as `npm test`.
+    // A label never runs, so a loose split also works for pipes and expansions.
+    let segments: Vec<&str> = split_compound(command)
+        .map(|ranges| ranges.into_iter().map(|r| &command[r]).collect())
+        .unwrap_or_else(|| {
+            command
+                .split(['&', '|', ';', '\n'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+    let is_cd = |s: &&str| s.split_whitespace().next() == Some("cd");
+    let first = segments
+        .iter()
+        .find(|s| !is_cd(s) && supported_command(s))
+        .or_else(|| segments.iter().find(|s| !is_cd(s)))
+        .or(segments.first())
+        .copied()
+        .unwrap_or(command);
+    let words = literal_command(first)
+        .unwrap_or_else(|| first.split_whitespace().map(str::to_owned).collect());
+    let words: Vec<_> = words
+        .iter()
+        .map(String::as_str)
+        .skip_while(|w| w.contains('=') && !w.starts_with('-'))
+        .collect();
+    crate::filters::tool_label_words(&words)
+}
+
 fn supported_command(command: &str) -> bool {
     if cfg!(windows) {
         return false;

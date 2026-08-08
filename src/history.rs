@@ -180,61 +180,209 @@ pub fn bypass(workspace: &Workspace, command: &str) {
     );
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 struct FamilyStats {
+    family: String,
     runs: u64,
-    reopened: u64,
-    full: u64,
-    targeted: u64,
-    unchanged: u64,
-    preview_bytes: usize,
+    raw_bytes: u64,
+    preview_bytes: u64,
+    reopened_runs: u64,
+    full_reads: u64,
+    targeted_lookups: u64,
+    unchanged_runs: u64,
 }
 
-pub fn stats(workspace: &Workspace) -> Result<()> {
-    let (mut count, mut raw, mut preview) = (0u64, 0u64, 0usize);
+#[derive(Default, Serialize)]
+struct DayStats {
+    date: String,
+    runs: u64,
+    raw_bytes: u64,
+    preview_bytes: u64,
+}
+
+/// Agents and providers tokenize differently. Like the benchmarks, the report
+/// estimates tokens as UTF-8 bytes divided by four and labels the figure as such.
+pub fn estimated_tokens(bytes: u64) -> u64 {
+    bytes.div_ceil(4)
+}
+
+pub fn human_bytes(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
+}
+
+fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / whole as f64
+    }
+}
+
+/// The UTC calendar date for a Unix timestamp in milliseconds.
+pub fn utc_date(ms: u64) -> String {
+    // Civil-from-days conversion for the proleptic Gregorian calendar.
+    let z = (ms / 86_400_000) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
+    let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
+    let (mut count, mut raw, mut preview) = (0u64, 0u64, 0u64);
     let mut families: BTreeMap<String, FamilyStats> = BTreeMap::new();
+    let mut timeline: BTreeMap<String, DayStats> = BTreeMap::new();
     for run in records(workspace, false)? {
         let run = run?;
+        let shown = run.preview_bytes as u64;
         count += 1;
         raw += run.raw_bytes;
-        preview += run.preview_bytes;
+        preview += shown;
         let c: Recalls = get(&workspace
             .state
             .join("runs")
             .join(&run.id)
             .join("recalls.json"))?;
-        let f = families.entry(run.family).or_default();
+        let f = families.entry(run.family.clone()).or_default();
+        f.family = run.family;
         f.runs += 1;
-        f.reopened += u64::from(c.full > 0);
-        f.full += c.full;
-        f.targeted += c.range + c.search + c.context;
-        f.unchanged += u64::from(run.unchanged);
-        f.preview_bytes += run.preview_bytes;
-    }
-    println!("{count} runs · {raw} raw bytes · {preview} preview bytes");
-    for (
-        family,
-        FamilyStats {
-            runs,
-            reopened,
-            full,
-            targeted,
-            unchanged,
-            preview_bytes,
-        },
-    ) in families
-    {
-        println!(
-            "{family}: {reopened}/{runs} runs reopened in full · {full} full reads · {targeted} targeted lookups · {unchanged} unchanged runs · {preview_bytes} preview bytes"
-        );
+        f.raw_bytes += run.raw_bytes;
+        f.preview_bytes += shown;
+        f.reopened_runs += u64::from(c.full > 0);
+        f.full_reads += c.full;
+        f.targeted_lookups += c.range + c.search + c.context;
+        f.unchanged_runs += u64::from(run.unchanged);
+        if run.completed_ms >= since && run.completed_ms > 0 {
+            let date = utc_date(run.completed_ms);
+            let d = timeline.entry(date.clone()).or_default();
+            d.date = date;
+            d.runs += 1;
+            d.raw_bytes += run.raw_bytes;
+            d.preview_bytes += shown;
+        }
     }
     let activity: Activity = get(&workspace.state.join("activity.json"))?;
-    println!(
-        "{} repeated source-range reads (recent 32 ranges)",
-        activity.repeat_reads
-    );
-    for (family, n) in activity.bypasses {
-        println!("Hook passed through: {family} × {n}");
+    let saved = raw.saturating_sub(preview);
+    let mut commands: Vec<_> = families.into_values().collect();
+    commands.sort_by(|a, b| {
+        let saved = |f: &FamilyStats| f.raw_bytes.saturating_sub(f.preview_bytes);
+        saved(b).cmp(&saved(a)).then(a.family.cmp(&b.family))
+    });
+    if as_json {
+        let report = serde_json::json!({
+            "runs": count,
+            "raw_bytes": raw,
+            "preview_bytes": preview,
+            "saved_bytes": saved,
+            "saved_percent": (percent(saved, raw) * 10.0).round() / 10.0,
+            "estimated_tokens_saved": estimated_tokens(saved),
+            "token_estimate": "UTF-8 bytes / 4",
+            "days": timeline.into_values().collect::<Vec<_>>(),
+            "commands": commands,
+            "repeated_source_reads": activity.repeat_reads,
+            "hook_pass_through": activity.bypasses,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if count == 0 {
+        println!(
+            "No captured runs yet. Run a command with `justless run -- COMMAND` or install hooks with `justless init --hooks`."
+        );
+    } else {
+        println!(
+            "Kept {} of {} command output out of context ({:.1}%) across {count} run(s)",
+            human_bytes(saved),
+            human_bytes(raw),
+            percent(saved, raw)
+        );
+        println!(
+            "≈{} tokens saved (estimated as bytes ÷ 4)",
+            estimated_tokens(saved)
+        );
+        if !timeline.is_empty() {
+            println!("\nLast {days} day(s), UTC");
+            let peak = timeline
+                .values()
+                .map(|d| d.raw_bytes.saturating_sub(d.preview_bytes))
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            for d in timeline.values() {
+                let day_saved = d.raw_bytes.saturating_sub(d.preview_bytes);
+                let width = (day_saved * 20).div_ceil(peak) as usize;
+                println!(
+                    "  {}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%  {}",
+                    d.date,
+                    d.runs,
+                    human_bytes(d.raw_bytes),
+                    human_bytes(d.preview_bytes),
+                    percent(day_saved, d.raw_bytes),
+                    "█".repeat(width)
+                );
+            }
+        }
+        println!("\nBy command, most saved first");
+        let wide = commands
+            .iter()
+            .map(|f| f.family.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(28);
+        for f in &commands {
+            let mut notes = Vec::new();
+            if f.reopened_runs > 0 {
+                notes.push(format!("{}/{} reopened in full", f.reopened_runs, f.runs));
+            }
+            if f.targeted_lookups > 0 {
+                notes.push(format!("{} targeted lookup(s)", f.targeted_lookups));
+            }
+            if f.unchanged_runs > 0 {
+                notes.push(format!("{} unchanged", f.unchanged_runs));
+            }
+            let family = crate::summary::short(&f.family, 28);
+            println!(
+                "  {family:<wide$}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%{}",
+                f.runs,
+                human_bytes(f.raw_bytes),
+                human_bytes(f.preview_bytes),
+                percent(f.raw_bytes.saturating_sub(f.preview_bytes), f.raw_bytes),
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("  · {}", notes.join(" · "))
+                }
+            );
+        }
+    }
+    let reopened: u64 = commands.iter().map(|f| f.reopened_runs).sum();
+    let targeted: u64 = commands.iter().map(|f| f.targeted_lookups).sum();
+    if count > 0 || activity.repeat_reads > 0 {
+        println!(
+            "\nRecovery: {reopened} run(s) reopened in full · {targeted} targeted lookup(s) · {} repeated source-range read(s)",
+            activity.repeat_reads
+        );
+    }
+    if !activity.bypasses.is_empty() {
+        let passed: Vec<_> = activity
+            .bypasses
+            .iter()
+            .map(|(family, n)| format!("{family} ×{n}"))
+            .collect();
+        println!(
+            "Hooks passed through: {}. Run `justless discover` to see what agents ran without Justless.",
+            passed.join(", ")
+        );
     }
     Ok(())
 }

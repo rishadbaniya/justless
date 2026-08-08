@@ -92,16 +92,23 @@ pub fn unwrap_tool<'a, 'b>(mut words: &'a [&'b str]) -> &'a [&'b str] {
 /// A short name for the tool in a lint report, such as `cargo clippy` or `ruff check`.
 pub fn tool_label(args: &[OsString]) -> String {
     let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
-    let words = unwrap_tool(&words);
+    tool_label_words(&words)
+}
+
+pub fn tool_label_words(words: &[&str]) -> String {
+    let words = unwrap_tool(words);
     let Some((program, rest)) = words.split_first() else {
-        return "lint".into();
+        return "other".into();
     };
     let program = Path::new(program)
         .file_name()
         .and_then(|p| p.to_str())
         .unwrap_or(program);
     match rest.first() {
-        Some(sub) if sub.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !sub.is_empty() => {
+        Some(sub)
+            if sub.starts_with(|c: char| c.is_ascii_lowercase())
+                && sub.chars().all(|c| c.is_ascii_lowercase() || c == '-') =>
+        {
             format!("{program} {sub}")
         }
         _ => program.to_owned(),

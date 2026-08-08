@@ -804,7 +804,7 @@ fn diff_sections_delta_sessions_and_exact_recall() {
     assert!(oldest.contains(&id) && oldest.contains("stdout:"));
     let stats = success(root, &["stats"]);
     assert!(
-        stats.contains("1/4 runs reopened in full") && stats.contains("1 unchanged runs"),
+        stats.contains("1/4 reopened in full") && stats.contains("1 unchanged"),
         "{stats}"
     );
     assert!(
@@ -908,7 +908,7 @@ fn task_packs_and_handoffs_link_live_and_historical_evidence() {
         !success(root, &["pack", "why did checkout fail"]).contains("Recorded cargo test failure")
     );
     assert!(success(root, &["history", "assertion", "--oldest", "--limit", "1"]).contains(&id));
-    assert!(success(root, &["stats"]).contains("1 repeated source-range reads"));
+    assert!(success(root, &["stats"]).contains("1 repeated source-range read(s)"));
 }
 
 #[test]
@@ -937,7 +937,7 @@ fn older_runs_are_searchable_and_hook_statistics_do_not_capture_arguments() {
             && wrapped.ends_with(" -- git status")
             && !wrapped.contains("odd")
     );
-    assert!(success(root, &["stats"]).contains("Hook passed through: git × 1"));
+    assert!(success(root, &["stats"]).contains("Hooks passed through: git ×1."));
     assert!(
         !fs::read_to_string(root.join(".justless/activity.json"))
             .unwrap()
@@ -1625,5 +1625,103 @@ fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
         instructions.starts_with("Keep these Justless references verbatim in the summary.")
             && instructions.contains(&id),
         "{instructions}"
+    );
+}
+
+#[test]
+fn stats_report_savings_by_command_with_token_estimates() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    assert!(success(root, &["stats"]).starts_with("No captured runs yet."));
+    fs::write(root.join("output.txt"), lint_fixture("mypy.txt").repeat(20)).unwrap();
+    let mypy = fake_program(root, "mypy", "cat output.txt\nexit 1\n");
+    cli(root, &["run", "--", mypy.to_str().unwrap(), "app.py"]);
+    cli(root, &["run", "--", "sh", "-c", "echo small"]);
+    let report: serde_json::Value =
+        serde_json::from_str(&success(root, &["stats", "--json"])).unwrap();
+    let raw = report["raw_bytes"].as_u64().unwrap();
+    let preview = report["preview_bytes"].as_u64().unwrap();
+    let saved = report["saved_bytes"].as_u64().unwrap();
+    assert_eq!(report["runs"], 2);
+    assert_eq!(saved, raw - preview);
+    assert_eq!(report["estimated_tokens_saved"], saved.div_ceil(4));
+    assert_eq!(report["token_estimate"], "UTF-8 bytes / 4");
+    assert_eq!(report["commands"][0]["family"], "mypy");
+    assert_eq!(report["days"].as_array().unwrap().len(), 1);
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains("tokens saved (estimated as bytes ÷ 4)")
+            && text.contains("By command, most saved first\n  mypy"),
+        "{text}"
+    );
+}
+
+#[test]
+fn discover_classifies_claude_code_shell_commands() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let config = repo.path().join("claude");
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = config.join("projects").join(slug);
+    fs::create_dir_all(&transcripts).unwrap();
+    let mut lines = Vec::new();
+    for (id, command, output, cwd) in [
+        ("t1", "cargo test", "x".repeat(4000), root.clone()),
+        (
+            "t2",
+            "cd web && npm test",
+            "ok\n[justless run-abc] exit 0".into(),
+            root.join("web"),
+        ),
+        ("t3", "ls -la", "y".repeat(100), root.clone()),
+        (
+            "t4",
+            "cargo test",
+            "z".repeat(900),
+            PathBuf::from("/elsewhere"),
+        ),
+    ] {
+        lines.push(serde_json::json!({"type":"assistant","cwd":cwd,"timestamp":"2999-01-01T00:00:00Z",
+            "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}}));
+        lines.push(
+            serde_json::json!({"type":"user","cwd":cwd,"timestamp":"2999-01-01T00:00:01Z",
+            "message":{"content":[{"type":"tool_result","tool_use_id":id,"content":output}]}}),
+        );
+    }
+    let body: Vec<_> = lines.iter().map(|l| l.to_string()).collect();
+    fs::write(transcripts.join("session.jsonl"), body.join("\n")).unwrap();
+    let discover = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .arg("discover")
+            .args(args)
+            .current_dir(&root)
+            .env("CLAUDE_CONFIG_DIR", &config)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    };
+    let report: serde_json::Value = serde_json::from_str(&discover(&["--json"])).unwrap();
+    assert_eq!(report["commands"], 3);
+    assert_eq!(report["sessions"], 1);
+    let groups = report["groups"].as_array().unwrap();
+    let route = |name: &str| groups.iter().find(|g| g["route"] == name).unwrap();
+    assert_eq!(route("through_justless")["labels"][0]["label"], "npm test");
+    assert_eq!(route("supported_not_routed")["output_bytes"], 4000);
+    assert_eq!(route("supported_not_routed")["estimated_tokens"], 1000);
+    assert_eq!(route("not_supported")["labels"][0]["label"], "ls");
+    let text = discover(&[]);
+    assert!(
+        text.starts_with("Claude Code ran 3 shell command(s) here in the last 30 day(s), across 1 session(s)")
+            && text.contains("Supported, not routed: 1 command(s) · 3.9 KB output · ≈1000 tokens\n  cargo test ×1 (3.9 KB)")
+            && text.contains("justless init --hooks --agent claude")
+            && !text.contains("x".repeat(20).as_str()),
+        "{text}"
     );
 }
