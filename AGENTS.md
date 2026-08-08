@@ -29,6 +29,7 @@ On a returning checkout, `./target/debug/justless resume` shows recent runs and 
 | Tool history retirement | `src/observations.rs`, `integrations/opencode.js` | Archive a result before replacing it. Recall must reproduce its original value. OpenCode v1 automates this on outbound requests. Other API clients can call `mask` at the request boundary. |
 | MCP server and client config | `src/mcp.rs` | Stdout carries only JSON-RPC messages, so tools run the CLI in a child process. Expose only read-only commands. Client setup merges into existing config without touching other keys. |
 | Agent setup and hooks | `install.sh`, `src/agents.rs` | Preserve existing project instructions and settings across repeated installs. Codex, Claude Code and Antigravity have separate shell hook contracts. Claude Code also supports native read outlines. A client that auto-approves rewritten commands only gets command lists made entirely of supported commands. Re-running `init --hooks` adds new hook entries, such as the compaction hooks, to existing installs. |
+| Prebuilt binaries and releases | `install.sh`, `.github/workflows/`, `packaging/homebrew/` | Install an archive only when its SHA-256 matches `SHA256SUMS`, and abort on a mismatch. Fall back to Cargo when no prebuilt binary fits. Keep the crate compiling on Windows by gating Unix-only APIs with `cfg(unix)`. |
 
 The instruction template in `src/agents.rs` is installed into **consumer repositories**. Edit that template to change what their agents see. Edit this file for guidance about developing Justless itself.
 
@@ -40,8 +41,17 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
+For an installer change, also run `sh scripts/test_install.sh` (and `sh scripts/test_install.sh dash` where available). It installs from local fake releases with a stub Cargo.
+
 `tests/cli.rs` exercises the binary, including command capture, navigation and hooks. `tests/progressive.rs` covers exact spans, stale and concurrent edits, and observation recovery. `fixtures/failing` is deliberately broken so the tests can diagnose and repair disposable copies. `fixtures/mixed` exercises links across TypeScript, Python and SQL.
 
 For a context-size change, run `python3 scripts/context_benchmark.py --binary ./target/debug/justless` after building. It applies a verified repair and round-trips a masked request locally. Report byte measurements as bytes. Provider token counts come from the separate API benchmarks. [Benchmark methods and results](docs/benchmarks.md)
 
 Use Conventional Commits such as `feat(source): support section edits`. Keep the README focused on the goal, architecture and quick start. Put detailed flags and examples in `docs/`, and describe features in Justless’s own terms.
+
+## Cut a release
+
+1. On an up-to-date `main` with green CI, set `version` in `Cargo.toml` to `X.Y.Z`, run `cargo build` (without `--locked`) to refresh `Cargo.lock`, and commit `chore(release): X.Y.Z`.
+2. Tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+3. `.github/workflows/release.yml` checks that the tag matches `Cargo.toml`, builds the five targets, and publishes a GitHub release with the archives and `SHA256SUMS`. A version with a hyphen, such as `0.3.0-rc.1`, becomes a prerelease, which the installer's latest download skips.
+4. For Homebrew, update `url` and `sha256` in `packaging/homebrew/justless.rb` as its header describes and push it to the tap.
