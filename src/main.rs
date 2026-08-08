@@ -7,6 +7,7 @@ mod history;
 mod index;
 mod inventory;
 mod lint;
+mod mcp;
 mod observations;
 mod pack;
 mod polyglot;
@@ -252,6 +253,7 @@ fn cli() -> Command<'static> {
                         .help("Install project-local hooks"),
                 ),
         )
+        .subcommand(mcp::command())
         .subcommands(source::commands())
         .subcommands(observations::commands())
         .subcommands(["hook-codex", "hook-claude", "hook-agy"].map(|name| {
@@ -285,11 +287,21 @@ fn context_budget(workspace: &Workspace, matches: &ArgMatches) -> Result<usize> 
 }
 
 fn dispatch(matches: &ArgMatches) -> Result<i32> {
-    let root = matches.value_of_os("root").map(Path::new);
+    // Claude Code starts MCP servers with CLAUDE_PROJECT_DIR set to the project, so
+    // the server follows it when no explicit root is given.
+    let project = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .filter(|_| matches!(matches.subcommand_name(), Some("mcp")))
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    let root = matches
+        .value_of_os("root")
+        .map(Path::new)
+        .or(project.as_deref());
     let workspace = Workspace::discover(root)?;
     match matches.subcommand().expect("subcommand is required") {
         (name @ ("read" | "expand" | "edit"), sub) => source::run(&workspace, name, sub)?,
         (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
+        ("mcp", sub) => mcp::run(&workspace, sub)?,
         ("run", sub) => {
             let command: Vec<OsString> = sub
                 .values_of_os("command")
