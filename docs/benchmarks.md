@@ -18,7 +18,7 @@ One live pair using Haiku 5.5 produced the following provider-reported totals ac
 | Plain | Yes | 22,363 | 70 | 5 | 19,047 |
 | Justless | Yes | 2,845 | 88 | 7 | 2,365 |
 
-The Justless run used 87.3% fewer input tokens. The model chose three direct source reads in that run and one in the plain run. This pair measures the benefit of compact command output on this fixture. The scripted mode exercises the task-pack path. It uses a fixed edit and makes no model calls.
+The Justless run used 87.3% fewer input tokens. A rerun on 2026-11-18 with the same model reproduced it: 22,364 input tokens for the plain run and 2,851 with Justless, 87.3% fewer, and both fixes passed the independent check. The model chose three direct source reads in that run and one in the plain run. This pair measures the benefit of compact command output on this fixture. The scripted mode exercises the task-pack path. It uses a fixed edit and makes no model calls.
 
 ## Build checks and single-task replay
 
