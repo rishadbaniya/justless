@@ -164,6 +164,7 @@ impl Workspace {
 }
 
 pub fn private_dir(path: &Path) -> Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {

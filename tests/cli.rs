@@ -1041,6 +1041,7 @@ fn concurrent_runs_publish_complete_archives_and_keep_workdirs_separate() {
     assert_eq!(success(root, &["history"]).lines().count(), 5);
 }
 
+#[cfg(unix)]
 fn fake_program(dir: &Path, name: &str, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
@@ -1051,6 +1052,7 @@ fn fake_program(dir: &Path, name: &str, script: &str) -> PathBuf {
     exe
 }
 
+#[cfg(unix)]
 #[test]
 fn container_and_cluster_tables_list_only_rows_that_need_attention() {
     let repo = TempDir::new().unwrap();
@@ -1127,6 +1129,7 @@ fn container_and_cluster_tables_list_only_rows_that_need_attention() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn js_tests_logs_and_project_filters_keep_failure_evidence() {
     let repo = TempDir::new().unwrap();
@@ -1328,6 +1331,7 @@ fn compound_commands_wrap_each_supported_segment_in_place() {
     }
 }
 
+#[cfg(unix)]
 fn lint_fixture(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures/lint")
@@ -1335,6 +1339,7 @@ fn lint_fixture(name: &str) -> String {
     fs::read_to_string(path).unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn linter_findings_group_by_rule_with_locations() {
     let repo = TempDir::new().unwrap();
@@ -1527,6 +1532,7 @@ fn hooks_route_linters_build_tools_and_package_runners() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
     use serde_json::{Value, json};
@@ -1628,6 +1634,7 @@ fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn stats_report_savings_by_command_with_token_estimates() {
     let repo = TempDir::new().unwrap();
