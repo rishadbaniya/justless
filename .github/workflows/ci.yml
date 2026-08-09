@@ -61,4 +61,5 @@ jobs:
       # so the test run is reported but does not gate the build yet.
       - name: Test (advisory)
         continue-on-error: true
+        timeout-minutes: 15
         run: cargo test --locked
