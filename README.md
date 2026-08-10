@@ -44,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.
 
 On Linux and macOS (x86_64 or arm64) it downloads the prebuilt binary from the latest [release](https://github.com/rishadbaniya/justless/releases) and verifies its SHA-256 checksum. On other systems, or with `sh -s -- --from-source`, it builds with Cargo, which needs Rust 1.91 or newer and a C compiler. Windows users can download the zip from the release page.
 
-The installer also configures project hooks for Codex, Claude Code, Antigravity CLI (`agy`), and OpenCode v1 when it finds them on your `PATH`. Start a new agent session in the project. In Codex, review and trust the hooks with `/hooks`. [Install options](docs/reference.md#install-and-configure-agents)
+The installer also configures project hooks for Codex, Claude Code, Antigravity CLI (`agy`), OpenCode v1, Cursor, Gemini CLI and GitHub Copilot CLI when it finds them on your `PATH`. Start a new agent session in the project. In Codex, review and trust the hooks with `/hooks`. [Install options](docs/reference.md#install-and-configure-agents)
 
 ## Use from the terminal
 

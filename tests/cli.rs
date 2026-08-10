@@ -1732,3 +1732,240 @@ fn discover_classifies_claude_code_shell_commands() {
         "{text}"
     );
 }
+
+#[test]
+fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
+    use serde_json::{Value, json};
+    let repo = mixed_fixture();
+    let root = repo.path().canonicalize().unwrap();
+    let cursor = root.join(".cursor/hooks.json");
+    let gemini = root.join(".gemini/settings.json");
+    let copilot = root.join(".github/hooks/justless.json");
+    fs::create_dir(root.join(".cursor")).unwrap();
+    fs::create_dir(root.join(".gemini")).unwrap();
+    fs::write(&cursor, r#"{"hooks":[]}"#).unwrap();
+    fs::write(
+        &gemini,
+        r#"{"mcpServers":{"other":{"command":"other"}},"hooks":{"BeforeTool":[{"matcher":"write_file","hooks":[{"type":"command","command":"scan"}]}]}}"#,
+    )
+    .unwrap();
+    let setup = [
+        "init", "--hooks", "--agent", "copilot", "--agent", "gemini", "--agent", "cursor",
+    ];
+    // An invalid file stops setup before anything is written.
+    assert!(!cli(&root, &setup).status.success());
+    assert!(!root.join("GEMINI.md").exists() && !root.join(".github").exists());
+    fs::write(
+        &cursor,
+        r#"{"version":1,"hooks":{"afterFileEdit":[{"command":"fmt"}],"preToolUse":[{"command":"audit","matcher":"Read"}]}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("GEMINI.md"), "# Team rules\n").unwrap();
+    success(&root, &setup);
+    let configs = || [&cursor, &gemini, &copilot].map(|path| fs::read_to_string(path).unwrap());
+    let installed = configs();
+    success(&root, &setup);
+    assert_eq!(installed, configs());
+    assert!(root.join("AGENTS.md").is_file());
+    let instructions = fs::read_to_string(root.join("GEMINI.md")).unwrap();
+    assert!(instructions.starts_with("# Team rules\n"));
+    assert_eq!(instructions.matches("<!-- justless:begin -->").count(), 1);
+    let [cursor, gemini, copilot] = installed.map(|s| serde_json::from_str::<Value>(&s).unwrap());
+
+    assert_eq!(cursor["version"], 1);
+    assert_eq!(cursor["hooks"]["afterFileEdit"][0]["command"], "fmt");
+    assert_eq!(
+        cursor["hooks"]["preToolUse"],
+        json!([
+            {"command":"audit","matcher":"Read"},
+            {"command":"justless hook-cursor before-command","matcher":"^Shell$","timeout":5}
+        ])
+    );
+    assert_eq!(
+        cursor["hooks"]["sessionStart"],
+        json!([{"command":"justless hook-cursor session-start","timeout":60}])
+    );
+    assert_eq!(gemini["mcpServers"]["other"]["command"], "other");
+    assert!(gemini.get("version").is_none());
+    assert_eq!(gemini["hooks"]["BeforeTool"][0]["matcher"], "write_file");
+    assert_eq!(
+        gemini["hooks"]["BeforeTool"][1],
+        json!({"matcher":"^run_shell_command$","hooks":[{"type":"command",
+            "name":"justless-before-command","command":"justless hook-gemini before-command",
+            "timeout":5000}]})
+    );
+    assert_eq!(
+        gemini["hooks"]["SessionStart"],
+        json!([{"hooks":[{"type":"command","name":"justless-session-start",
+            "command":"justless hook-gemini session-start","timeout":60000}]}])
+    );
+    assert_eq!(
+        copilot,
+        json!({"version":1,"hooks":{
+            "sessionStart":[{"type":"command",
+                "bash":"justless hook-copilot session-start || true","timeoutSec":60}],
+            "preToolUse":[{"type":"command",
+                "bash":"justless hook-copilot before-command || true","matcher":"bash",
+                "timeoutSec":5}]
+        }})
+    );
+
+    let run = |args: &[&str], stdin: Option<&str>| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(args)
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        if let Some(text) = stdin {
+            input.write_all(text.as_bytes()).unwrap();
+        }
+        drop(input);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        stdout(&output)
+    };
+    let hook = |handler: &str, mode: &str, input: Value| {
+        let output = run(&[handler, mode], Some(&input.to_string()));
+        serde_json::from_str::<Value>(&output).unwrap()
+    };
+
+    // Session context in each client's documented field.
+    let context = |output: &Value, pointer: &str| {
+        output
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with("Justless indexed"))
+    };
+    let start = hook(
+        "hook-cursor",
+        "session-start",
+        json!({"hook_event_name":"sessionStart","session_id":"s","workspace_roots":[root]}),
+    );
+    assert!(context(&start, "/additional_context"), "{start}");
+    assert_eq!(start.as_object().unwrap().len(), 1);
+    let start = hook(
+        "hook-gemini",
+        "session-start",
+        json!({"hook_event_name":"SessionStart","source":"startup","cwd":root}),
+    );
+    assert_eq!(start["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    assert!(
+        context(&start, "/hookSpecificOutput/additionalContext"),
+        "{start}"
+    );
+    let start = hook(
+        "hook-copilot",
+        "session-start",
+        json!({"sessionId":"s","timestamp":1,"cwd":root,"source":"startup"}),
+    );
+    assert!(context(&start, "/additionalContext"), "{start}");
+    assert!(root.join(".justless/index.json").is_file());
+    assert_eq!(
+        hook(
+            "hook-gemini",
+            "session-start",
+            json!({"hook_event_name":"BeforeTool"})
+        ),
+        json!({})
+    );
+
+    // Cursor returns `permission: "allow"` with a rewrite, so a list that contains
+    // an unsupported command passes through, as for Codex.
+    let cursor = |command: &str| {
+        hook(
+            "hook-cursor",
+            "before-command",
+            json!({"hook_event_name":"preToolUse","tool_name":"Shell","cwd":root,
+                "tool_input":{"command":command,"working_directory":root}}),
+        )
+    };
+    assert_eq!(
+        cursor("git diff"),
+        json!({"permission":"allow","updated_input":{
+            "command":"justless run -- git diff","working_directory":root}})
+    );
+    assert_eq!(
+        cursor("git status && git diff")["updated_input"]["command"],
+        "justless run -- git status && justless run -- git diff"
+    );
+    for command in ["git push", "cargo test && git push", "git diff | cat"] {
+        assert_eq!(cursor(command), json!({}), "{command}");
+    }
+    let mut other = json!({"hook_event_name":"preToolUse","tool_name":"Read",
+        "cwd":root,"tool_input":{"command":"git diff"}});
+    assert_eq!(
+        hook("hook-cursor", "before-command", other.clone()),
+        json!({})
+    );
+    other["tool_name"] = json!("Shell");
+    other["conversation_id"] = json!("conversation");
+    let rewritten = hook("hook-cursor", "before-command", other);
+    let command = rewritten["updated_input"]["command"].as_str().unwrap();
+    assert!(
+        command.starts_with("justless run --session ") && command.ends_with(" -- git diff"),
+        "{command}"
+    );
+
+    // Gemini CLI checks its policy against the rewritten command, so a mixed list is
+    // wrapped in place, as in Claude Code.
+    let gemini = |args: Value| {
+        hook(
+            "hook-gemini",
+            "before-command",
+            json!({"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
+                "cwd":root,"tool_input":args}),
+        )
+    };
+    assert_eq!(
+        gemini(
+            json!({"command":"cargo test && git push","description":"test","dir_path":"frontend"})
+        ),
+        json!({"hookSpecificOutput":{"hookEventName":"BeforeTool","tool_input":{
+            "command":"justless run -- cargo test && git push","description":"test",
+            "dir_path":"frontend"}}})
+    );
+    for args in [
+        json!({"command":"git push"}),
+        json!({"command":"git diff","is_background":true}),
+        json!({"command":"git diff","dir_path":"/"}),
+    ] {
+        assert_eq!(gemini(args.clone()), json!({}), "{args}");
+    }
+
+    // Copilot sends camelCase input with `toolArgs` as a JSON string or an object,
+    // and gets `modifiedArgs` without a permission decision.
+    let copilot = |args: Value| {
+        hook(
+            "hook-copilot",
+            "before-command",
+            json!({"sessionId":"","timestamp":1,"cwd":root,"toolName":"bash","toolArgs":args}),
+        )
+    };
+    let expected = json!({"modifiedArgs":{"command":"justless run -- git diff",
+        "description":"show changes"}});
+    let args = json!({"command":"git diff","description":"show changes"});
+    assert_eq!(copilot(json!(args.to_string())), expected);
+    assert_eq!(copilot(args), expected);
+    for command in ["git push", "cargo test && git push"] {
+        assert_eq!(copilot(json!({"command":command})), json!({}), "{command}");
+    }
+
+    // Every failure answers with the no-op and a zero exit status.
+    for handler in ["hook-cursor", "hook-gemini", "hook-copilot"] {
+        for (args, stdin) in [
+            (vec![handler, "before-command"], Some("not json")),
+            (
+                vec!["--root", "/nonexistent/justless", handler, "before-command"],
+                Some("{}"),
+            ),
+            (vec![handler, "unknown-mode"], Some("{}")),
+            (vec![handler], None),
+        ] {
+            assert_eq!(run(&args, stdin), "{}\n", "{args:?}");
+        }
+    }
+}

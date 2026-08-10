@@ -30,6 +30,9 @@ pub enum Agent {
     Claude,
     Agy,
     OpenCode,
+    Cursor,
+    Gemini,
+    Copilot,
 }
 
 impl Agent {
@@ -39,6 +42,9 @@ impl Agent {
             "claude" => Ok(Self::Claude),
             "agy" => Ok(Self::Agy),
             "opencode" => Ok(Self::OpenCode),
+            "cursor" => Ok(Self::Cursor),
+            "gemini" => Ok(Self::Gemini),
+            "copilot" => Ok(Self::Copilot),
             _ => anyhow::bail!("unknown agent {name}"),
         }
     }
@@ -49,6 +55,9 @@ impl Agent {
             Self::Claude => (".claude", "settings.json"),
             Self::Agy => (".agents", "hooks.json"),
             Self::OpenCode => (".opencode", "plugins/justless.js"),
+            Self::Cursor => (".cursor", "hooks.json"),
+            Self::Gemini => (".gemini", "settings.json"),
+            Self::Copilot => (".github", "hooks/justless.json"),
         }
     }
 
@@ -58,8 +67,25 @@ impl Agent {
             Self::Claude => "claude",
             Self::Agy => "agy",
             Self::OpenCode => "opencode",
+            Self::Cursor => "cursor",
+            Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
         };
         format!("justless hook-{agent} {mode}")
+    }
+
+    /// The project instructions file the client loads by default.
+    /// Cursor reads `AGENTS.md`: <https://cursor.com/docs/rules#agentsmd>.
+    /// Gemini CLI reads `GEMINI.md` unless `context.fileName` names others:
+    /// <https://geminicli.com/docs/cli/gemini-md/>.
+    /// Copilot CLI reads `AGENTS.md`, among others:
+    /// <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions>.
+    fn instructions(self) -> &'static str {
+        match self {
+            Self::Claude => "CLAUDE.md",
+            Self::Gemini => "GEMINI.md",
+            _ => "AGENTS.md",
+        }
     }
 }
 
@@ -68,11 +94,7 @@ pub fn init(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<()> 
     let _guard = lock_state(&workspace.state.join("setup.lock"))?;
     let mut changes = BTreeMap::new();
     for &agent in agents {
-        let filename = if agent == Agent::Claude {
-            "CLAUDE.md"
-        } else {
-            "AGENTS.md"
-        };
+        let filename = agent.instructions();
         let path = workspace.root.join(filename);
         let original = read_regular(&path)?;
         let updated = match (original.split_once(START), original.split_once(END)) {
@@ -105,7 +127,12 @@ pub fn init(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<()> 
         changes.insert(gitignore, appended(&original, "/.justless/"));
     }
     for (path, contents) in changes {
-        private_dir(path.parent().unwrap())?;
+        // Copilot's hook file is two levels deep, in `.github/hooks/`.
+        let parent = path.parent().unwrap();
+        if let Some(outer) = parent.parent().filter(|outer| !outer.exists()) {
+            private_dir(outer)?;
+        }
+        private_dir(parent)?;
         write_text(&path, &contents)?;
         println!("Updated {}", path.display());
     }
@@ -124,6 +151,9 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         Err(error) => return Err(error.into()),
     }
     let path = dir.join(file);
+    if matches!(agent, Agent::Cursor | Agent::Gemini | Agent::Copilot) {
+        return prepare_client_hooks(&dir, &path, agent);
+    }
     if agent == Agent::OpenCode {
         private_dir(&dir)?;
         private_dir(path.parent().unwrap())?;
@@ -220,6 +250,273 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         path,
         format!("{}\n", serde_json::to_string_pretty(&config)?),
     )))
+}
+
+/// Project hooks for Cursor, Gemini CLI and GitHub Copilot. Each client has its own
+/// schema, merged with the same discipline as `prepare_hooks`: other keys and hooks
+/// stay, and an entry that already runs the Justless handler is left unchanged.
+///
+/// - Cursor `.cursor/hooks.json`: `"version": 1` and flat `{"command", "matcher",
+///   "timeout"}` entries under `hooks.sessionStart` and `hooks.preToolUse`, with
+///   the timeout in seconds. <https://cursor.com/docs/hooks#configuration>
+/// - Gemini CLI `.gemini/settings.json`: `{"matcher", "hooks": [{"type",
+///   "name", "command", "timeout"}]}` groups under `hooks.SessionStart` and
+///   `hooks.BeforeTool`, with the timeout in milliseconds. Lifecycle matchers are
+///   exact strings, so the session group has none and runs for every source.
+///   <https://geminicli.com/docs/hooks/reference/#configuration-schema>
+/// - Copilot `.github/hooks/*.json`: `"version": 1` and `{"type", "bash",
+///   "matcher", "timeoutSec"}` entries under camelCase `sessionStart` and
+///   `preToolUse`. A failing command `preToolUse` hook denies the tool call, and
+///   the cloud agent loads these files without Justless installed, so the command
+///   ends in `|| true`. Empty output keeps the default behavior.
+///   <https://docs.github.com/en/copilot/reference/hooks-reference#hook-configuration-format>
+fn prepare_client_hooks(
+    dir: &Path,
+    path: &Path,
+    agent: Agent,
+) -> Result<Option<(PathBuf, String)>> {
+    let parent = path.parent().unwrap();
+    if parent != dir {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir(),
+                "{} must be a directory",
+                parent.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let original = read_regular(path)?;
+    let mut config: Value = if original.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&original).with_context(|| format!("decode {}", path.display()))?
+    };
+    let root = config
+        .as_object_mut()
+        .with_context(|| format!("{} must contain an object", path.display()))?;
+    let mut changed = false;
+    if agent != Agent::Gemini && !root.contains_key("version") {
+        root.insert("version".into(), json!(1));
+        changed = true;
+    }
+    let hooks = root
+        .entry("hooks")
+        .or_insert(json!({}))
+        .as_object_mut()
+        .context("hooks must contain an object")?;
+    let events = match agent {
+        Agent::Gemini => [
+            ("SessionStart", "session-start"),
+            ("BeforeTool", "before-command"),
+        ],
+        _ => [
+            ("sessionStart", "session-start"),
+            ("preToolUse", "before-command"),
+        ],
+    };
+    for (event, mode) in events {
+        let entries = hooks
+            .entry(event)
+            .or_insert(json!([]))
+            .as_array_mut()
+            .with_context(|| format!("{event} must contain an array"))?;
+        let command = agent.command(mode);
+        let runs = |value: &Value| {
+            value
+                .as_str()
+                .and_then(|text| text.split("||").next())
+                .is_some_and(|text| text.trim() == command)
+        };
+        let present = entries.iter().any(|entry| {
+            runs(&entry["command"])
+                || runs(&entry["bash"])
+                || entry["hooks"]
+                    .as_array()
+                    .is_some_and(|handlers| handlers.iter().any(|h| runs(&h["command"])))
+        });
+        if present {
+            continue;
+        }
+        let before = mode == "before-command";
+        entries.push(match agent {
+            Agent::Cursor if before => {
+                json!({"command":command, "matcher":"^Shell$", "timeout":5})
+            }
+            Agent::Cursor => json!({"command":command, "timeout":60}),
+            Agent::Gemini => {
+                let handler = json!({"type":"command", "name":format!("justless-{mode}"),
+                    "command":command, "timeout":if before { 5000 } else { 60000 }});
+                if before {
+                    json!({"matcher":"^run_shell_command$", "hooks":[handler]})
+                } else {
+                    json!({"hooks":[handler]})
+                }
+            }
+            _ if before => json!({"type":"command", "bash":format!("{command} || true"),
+                "matcher":"bash", "timeoutSec":5}),
+            _ => json!({"type":"command", "bash":format!("{command} || true"), "timeoutSec":60}),
+        });
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some((
+        path.to_path_buf(),
+        format!("{}\n", serde_json::to_string_pretty(&config)?),
+    )))
+}
+
+/// The client handled by `run_client_hook` for a hidden `hook-NAME` subcommand.
+pub fn client(subcommand: &str) -> Option<Agent> {
+    match subcommand {
+        "hook-cursor" => Some(Agent::Cursor),
+        "hook-gemini" => Some(Agent::Gemini),
+        "hook-copilot" => Some(Agent::Copilot),
+        _ => None,
+    }
+}
+
+/// Run a Cursor, Gemini CLI or Copilot hook. These clients block a tool call when
+/// its hook exits with status 2, and Copilot denies on any failed `preToolUse`
+/// command, so a missing workspace, an unknown mode, unexpected input or a panic
+/// all print `{}`, which each client documents as making no decision, and exit 0.
+pub fn run_client_hook(root: Option<&Path>, agent: Agent, mode: &str) {
+    let input: Value =
+        serde_json::from_reader(io::stdin().take(8 * 1024 * 1024)).unwrap_or(Value::Null);
+    let output = std::panic::catch_unwind(|| {
+        let workspace = Workspace::discover(root).ok()?;
+        match mode {
+            "session-start" => client_start(&workspace, agent, &input),
+            "before-command" => client_command(&workspace, agent, &input),
+            _ => None,
+        }
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| json!({}));
+    let _ = io::Write::write_all(&mut io::stdout().lock(), format!("{output}\n").as_bytes());
+}
+
+/// Session context for a new client session.
+///
+/// - Cursor `sessionStart` returns `additional_context`.
+///   <https://cursor.com/docs/hooks#sessionstart>
+/// - Gemini CLI `SessionStart` returns `hookSpecificOutput.additionalContext`.
+///   <https://geminicli.com/docs/hooks/reference/#sessionstart>
+/// - Copilot `sessionStart` (camelCase input without an event name) returns
+///   `additionalContext`.
+///   <https://docs.github.com/en/copilot/reference/hooks-reference#sessionstart--sessionstart>
+fn client_start(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value> {
+    let event = &input["hook_event_name"];
+    let expected = match agent {
+        Agent::Cursor => event == "sessionStart",
+        Agent::Gemini => event == "SessionStart",
+        _ => input.is_object(),
+    };
+    if !expected {
+        return None;
+    }
+    let message = startup(workspace)?;
+    Some(match agent {
+        Agent::Cursor => json!({"additional_context":message}),
+        Agent::Gemini => json!({"hookSpecificOutput":{
+            "hookEventName":"SessionStart", "additionalContext":message
+        }}),
+        _ => json!({"additionalContext":message}),
+    })
+}
+
+/// Route a client's shell tool call through `justless run`, returning the full tool
+/// input with only `command` replaced.
+///
+/// - Cursor `preToolUse` sends `tool_name: "Shell"` with `tool_input.command` and
+///   `tool_input.working_directory`, and accepts `updated_input`. The docs do not
+///   say whether `permission: "allow"` skips Cursor's own approval, so a list is
+///   rewritten only when every command in it is supported, as for Codex.
+///   <https://cursor.com/docs/hooks#pretooluse>
+/// - Gemini CLI `BeforeTool` sends `tool_name: "run_shell_command"` with
+///   `tool_input.command`, `dir_path` and `is_background`, and accepts
+///   `hookSpecificOutput.tool_input`. The scheduler runs the hook before its
+///   policy check and confirmation, so the rewritten command is what the user
+///   approves, as in Claude Code.
+///   <https://geminicli.com/docs/hooks/reference/#beforetool>
+///   <https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/scheduler/scheduler.ts>
+/// - Copilot `preToolUse` sends `toolName: "bash"` and `toolArgs`, a JSON string in
+///   the documented example, and accepts `modifiedArgs`. The handler sets no
+///   `permissionDecision`, and because the docs do not say which arguments the
+///   permission flow checks, a list is rewritten only when every command in it is
+///   supported.
+///   <https://docs.github.com/en/copilot/reference/hooks-reference#pretooluse-decision-control>
+fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value> {
+    let (mut args, cwd, session) = match agent {
+        Agent::Cursor => {
+            if input["hook_event_name"] != "preToolUse" || input["tool_name"] != "Shell" {
+                return None;
+            }
+            let args = input["tool_input"].clone();
+            let cwd = args["working_directory"]
+                .as_str()
+                .or_else(|| input["cwd"].as_str())
+                .map(PathBuf::from);
+            let session = input["conversation_id"]
+                .as_str()
+                .or_else(|| input["session_id"].as_str());
+            (args, cwd, session)
+        }
+        Agent::Gemini => {
+            let args = &input["tool_input"];
+            if input["hook_event_name"] != "BeforeTool"
+                || input["tool_name"] != "run_shell_command"
+                || args["is_background"] == true
+            {
+                return None;
+            }
+            // `dir_path` is absolute or relative to the workspace root.
+            let base = Path::new(input["cwd"].as_str().unwrap_or("."));
+            let cwd = args["dir_path"]
+                .as_str()
+                .map_or_else(|| base.to_path_buf(), |dir| base.join(dir));
+            (args.clone(), Some(cwd), input["session_id"].as_str())
+        }
+        Agent::Copilot => {
+            if input["toolName"] != "bash" {
+                return None;
+            }
+            let args = match &input["toolArgs"] {
+                Value::String(text) => serde_json::from_str(text).ok()?,
+                other => other.clone(),
+            };
+            // Not in the hook reference: leave a detached or asynchronous shell,
+            // which the agent may keep interacting with, unchanged.
+            if args["mode"] == "async" || args["detach"] == true {
+                return None;
+            }
+            let cwd = input["cwd"].as_str().map(PathBuf::from);
+            (args, cwd, input["sessionId"].as_str())
+        }
+        _ => return None,
+    };
+    let cwd = workspace
+        .cwd
+        .join(cwd.unwrap_or_else(|| PathBuf::from(".")))
+        .canonicalize()
+        .ok()?;
+    if !cwd.starts_with(&workspace.root) {
+        return None;
+    }
+    let command = args.get("command")?.as_str()?.to_owned();
+    let rewritten = wrap_event(workspace, &cwd, &command, session, agent == Agent::Gemini)?;
+    args["command"] = Value::String(rewritten);
+    Some(match agent {
+        Agent::Cursor => json!({"permission":"allow", "updated_input":args}),
+        Agent::Gemini => json!({"hookSpecificOutput":{
+            "hookEventName":"BeforeTool", "tool_input":args
+        }}),
+        _ => json!({"modifiedArgs":args}),
+    })
 }
 
 pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {

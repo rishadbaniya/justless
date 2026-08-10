@@ -243,7 +243,9 @@ fn cli() -> Command<'static> {
                         .long("agent")
                         .takes_value(true)
                         .multiple_occurrences(true)
-                        .possible_values(["codex", "claude", "agy", "opencode"])
+                        .possible_values([
+                            "codex", "claude", "agy", "opencode", "cursor", "gemini", "copilot",
+                        ])
                         .default_value("codex")
                         .help("Agent to configure (repeat to select several)"),
                 )
@@ -266,6 +268,10 @@ fn cli() -> Command<'static> {
                     "after-compact",
                     "before-compact",
                 ]))
+        }))
+        // No value list here: an unknown mode must still reach the no-op handler.
+        .subcommands(["hook-cursor", "hook-gemini", "hook-copilot"].map(|name| {
+            Command::new(name).hide(true).arg(Arg::new("mode"))
         }))
 }
 
@@ -297,6 +303,14 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         .value_of_os("root")
         .map(Path::new)
         .or(project.as_deref());
+    // Cursor, Gemini CLI and Copilot block a tool call when its hook fails, so these
+    // handlers answer every error, including a missing workspace, with a no-op.
+    if let Some((name, sub)) = matches.subcommand()
+        && let Some(agent) = agents::client(name)
+    {
+        agents::run_client_hook(root, agent, sub.value_of("mode").unwrap_or_default());
+        return Ok(0);
+    }
     let workspace = Workspace::discover(root)?;
     match matches.subcommand().expect("subcommand is required") {
         (name @ ("read" | "expand" | "edit"), sub) => source::run(&workspace, name, sub)?,

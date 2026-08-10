@@ -5,7 +5,7 @@ repo=rishadbaniya/justless
 tmp=
 
 usage() {
-    echo "Usage: sh install.sh [--from-source] [codex|claude|agy|opencode ... | --cli-only]"
+    echo "Usage: sh install.sh [--from-source] [codex|claude|agy|opencode|cursor|gemini|copilot ... | --cli-only]"
     echo "By default, configure project hooks for supported agents found on PATH."
     echo "Installs the prebuilt release binary when one matches this system, otherwise builds with Cargo."
     echo "--from-source always builds with Cargo. JUSTLESS_VERSION=X.Y.Z selects a release instead of the latest."
@@ -179,9 +179,14 @@ main() {
         -h|--help) usage; return ;;
     esac
     if [ "$#" -eq 0 ]; then
-        for agent in codex claude agy; do
+        for agent in codex claude agy gemini copilot; do
             if command -v "$agent" >/dev/null 2>&1; then set -- "$@" "$agent"; fi
         done
+        # The Cursor CLI installs as the generic name `agent`, so detect the editor's
+        # `cursor` command or the CLI's older `cursor-agent` name instead.
+        if command -v cursor >/dev/null 2>&1 || command -v cursor-agent >/dev/null 2>&1; then
+            set -- "$@" cursor
+        fi
         if command -v opencode >/dev/null 2>&1; then
             case "$(opencode --version 2>/dev/null)" in 1.*) set -- "$@" opencode ;; esac
         fi
@@ -191,7 +196,7 @@ main() {
     agents=
     for agent do
         case "$agent" in
-            codex|claude|agy|opencode) agents="$agents $agent" ;;
+            codex|claude|agy|opencode|cursor|gemini|copilot) agents="$agents $agent" ;;
             *) usage >&2; return 2 ;;
         esac
     done
