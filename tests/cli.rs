@@ -1778,7 +1778,7 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
         cursor["hooks"]["preToolUse"],
         json!([
             {"command":"audit","matcher":"Read"},
-            {"command":"justless hook-cursor before-command","matcher":"^Shell$","timeout":5}
+            {"command":"justless hook-cursor before-command","matcher":"Shell","timeout":5}
         ])
     );
     assert_eq!(

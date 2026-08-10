@@ -342,7 +342,7 @@ fn prepare_client_hooks(
         let before = mode == "before-command";
         entries.push(match agent {
             Agent::Cursor if before => {
-                json!({"command":command, "matcher":"^Shell$", "timeout":5})
+                json!({"command":command, "matcher":"Shell", "timeout":5})
             }
             Agent::Cursor => json!({"command":command, "timeout":60}),
             Agent::Gemini => {
@@ -409,11 +409,12 @@ pub fn run_client_hook(root: Option<&Path>, agent: Agent, mode: &str) {
 /// - Copilot `sessionStart` (camelCase input without an event name) returns
 ///   `additionalContext`.
 ///   <https://docs.github.com/en/copilot/reference/hooks-reference#sessionstart--sessionstart>
+///
+/// Cursor's docs do not list its `hook_event_name` values, so only Gemini's input
+/// is checked for the event name. The configured mode already selects the event.
 fn client_start(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value> {
-    let event = &input["hook_event_name"];
     let expected = match agent {
-        Agent::Cursor => event == "sessionStart",
-        Agent::Gemini => event == "SessionStart",
+        Agent::Gemini => input["hook_event_name"] == "SessionStart",
         _ => input.is_object(),
     };
     if !expected {
@@ -453,7 +454,7 @@ fn client_start(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Va
 fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value> {
     let (mut args, cwd, session) = match agent {
         Agent::Cursor => {
-            if input["hook_event_name"] != "preToolUse" || input["tool_name"] != "Shell" {
+            if input["tool_name"] != "Shell" {
                 return None;
             }
             let args = input["tool_input"].clone();
@@ -489,8 +490,8 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
                 Value::String(text) => serde_json::from_str(text).ok()?,
                 other => other.clone(),
             };
-            // Not in the hook reference: leave a detached or asynchronous shell,
-            // which the agent may keep interacting with, unchanged.
+            // Unverified field names, absent from the hook reference: leave a
+            // detached or asynchronous shell, which the agent may keep using, unchanged.
             if args["mode"] == "async" || args["detach"] == true {
                 return None;
             }
