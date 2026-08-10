@@ -439,6 +439,311 @@ fn structural_parsers_cover_common_non_rust_languages() {
     }
 }
 
+fn language_fixture(language: &str) -> TempDir {
+    let target = TempDir::new().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/languages")
+        .join(language);
+    for entry in fs::read_dir(source).unwrap() {
+        let path = entry.unwrap().path();
+        fs::copy(&path, target.path().join(path.file_name().unwrap())).unwrap();
+    }
+    target
+}
+
+struct LanguageCase<'a> {
+    language: &'a str,
+    file: &'a str,
+    rows: &'a [&'a str],
+    expand: (&'a str, &'a str),
+    caller: (&'a str, &'a str),
+    test: (&'a str, &'a str),
+}
+
+fn check_language(case: LanguageCase<'_>) -> TempDir {
+    let repo = language_fixture(case.language);
+    let root = repo.path();
+    let outline = success(root, &["read", case.file, "--outline"]);
+    for row in case.rows {
+        assert!(outline.contains(&format!("{row}\n")), "{row}\n{outline}");
+    }
+    let (symbol, content) = case.expand;
+    assert_eq!(success(root, &["expand", case.file, symbol]), content);
+    let (symbol, caller) = case.caller;
+    let callers = success(root, &["query", symbol, "--view", "callers"]);
+    assert!(callers.contains(caller), "{callers}");
+    let found = success(root, &["find", symbol]);
+    assert!(found.contains(&format!("{}:", case.file)), "{found}");
+    let (symbol, test) = case.test;
+    let tests = success(root, &["query", symbol, "--view", "tests"]);
+    assert!(tests.contains(test), "{tests}");
+    repo
+}
+
+#[test]
+fn kotlin_outlines_calls_and_junit_tests_share_the_jvm_index() {
+    let repo = check_language(LanguageCase {
+        language: "kotlin",
+        file: "Billing.kt",
+        rows: &[
+            "#3 L7-9 interface Ledger  interface Ledger",
+            "#5 L11-23 class InvoiceService  class InvoiceService(private val ledger: Ledger) : Ledger by ledger",
+            "#6 L12-12 property InvoiceService::currency  val currency = \"EUR\"",
+            "#7 L14-18 method InvoiceService::total  fun total(items: List<Cents>): Cents",
+            "#8 L21-21 method InvoiceService::create  fun create(ledger: Ledger): InvoiceService",
+            "#9 L25-25 function applyTax  fun applyTax(amount: Cents): Cents",
+        ],
+        expand: (
+            "applyTax",
+            "fun applyTax(amount: Cents): Cents = amount * 2",
+        ),
+        caller: (
+            "applyTax",
+            "call from Billing.kt::InvoiceService::total at Billing.kt:17",
+        ),
+        test: (
+            "total",
+            "related test (1 call hops): BillingTest.kt::BillingTest::totalsItems [test]",
+        ),
+    });
+    let root = repo.path();
+    // Kotlin and Java resolve calls to each other, and JUnit marks Java tests too.
+    fs::write(
+        root.join("TaxTest.java"),
+        "class TaxTest {\n  @org.junit.Test\n  void doubles() { BillingKt.applyTax(2); }\n}\n",
+    )
+    .unwrap();
+    let tests = success(root, &["query", "applyTax", "--view", "tests"]);
+    assert!(
+        tests.contains("related test (1 call hops): TaxTest.java::TaxTest::doubles [test]"),
+        "{tests}"
+    );
+}
+
+#[test]
+fn swift_extensions_extend_their_type_and_xctest_methods_are_tests() {
+    let repo = check_language(LanguageCase {
+        language: "swift",
+        file: "Billing.swift",
+        rows: &[
+            "#3 L5-7 protocol Ledger  protocol Ledger",
+            "#5 L9-12 struct Invoice  struct Invoice",
+            "#8 L14-26 class InvoiceService  final class InvoiceService",
+            "#10 L17-19 constructor InvoiceService::init  init(ledger: Ledger)",
+            "#11 L21-25 method InvoiceService::total  func total(_ items: [Cents]) -> Cents",
+            "#12 L29-29 method InvoiceService::reset  func reset()",
+            "#13 L32-34 function applyTax  func applyTax(_ amount: Cents) -> Cents",
+        ],
+        expand: ("InvoiceService::reset", "func reset() {}"),
+        caller: (
+            "applyTax",
+            "call from Billing.swift::InvoiceService::total at Billing.swift:24",
+        ),
+        test: (
+            "total",
+            "related test (1 call hops): BillingTests.swift::BillingTests::testTotalsItems [test]",
+        ),
+    });
+    let definition = success(
+        repo.path(),
+        &["query", "InvoiceService", "--view", "definition"],
+    );
+    assert_eq!(
+        definition,
+        "Billing.swift::InvoiceService [class] at Billing.swift:14-26\n"
+    );
+}
+
+#[test]
+fn scala_companions_and_test_dsl_calls_are_indexed() {
+    let repo = check_language(LanguageCase {
+        language: "scala",
+        file: "Billing.scala",
+        rows: &[
+            "#3 L7-9 trait Ledger  trait Ledger",
+            "#5 L11-11 class Invoice  case class Invoice(id: String, total: Cents)",
+            "#6 L13-21 class InvoiceService  class InvoiceService(ledger: Ledger)",
+            "#8 L16-20 method InvoiceService::total  def total(items: List[Cents]): Cents =",
+            "#9 L24-24 method InvoiceService::create  def create(ledger: Ledger): InvoiceService =",
+            "#10 L27-27 function applyTax  def applyTax(amount: Cents): Cents =",
+        ],
+        expand: (
+            "InvoiceService::create",
+            "def create(ledger: Ledger): InvoiceService = new InvoiceService(ledger)",
+        ),
+        caller: (
+            "applyTax",
+            "call from Billing.scala::InvoiceService::total at Billing.scala:19",
+        ),
+        test: (
+            "create",
+            "related test (1 call hops): BillingSuite.scala::BillingSuite::\"totals items\" [test]",
+        ),
+    });
+    let suite = success(repo.path(), &["read", "BillingSuite.scala", "--outline"]);
+    assert!(
+        suite.contains("#3 L6-9 test BillingSuite::\"totals items\"  test(\"totals items\") {\n"),
+        "{suite}"
+    );
+}
+
+#[test]
+fn dart_constructors_and_test_calls_are_indexed() {
+    let repo = check_language(LanguageCase {
+        language: "dart",
+        file: "billing.dart",
+        rows: &[
+            "#3 L5-7 class Ledger  abstract class Ledger",
+            "#4 L6-6 method Ledger::record  void record(Cents amount);",
+            "#6 L10-10 field InvoiceService::ledger  final Ledger ledger;",
+            "#7 L12-12 constructor InvoiceService::new  InvoiceService(this.ledger);",
+            "#9 L16-20 method InvoiceService::total  Cents total(List<Cents> items)",
+            "#10 L23-25 function applyTax  Cents applyTax(Cents amount)",
+        ],
+        expand: (
+            "InvoiceService::standard",
+            "InvoiceService.standard() : ledger = MemoryLedger();",
+        ),
+        caller: (
+            "applyTax",
+            "call from billing.dart::InvoiceService::total at billing.dart:19",
+        ),
+        test: (
+            "total",
+            "related test (1 call hops): billing_test.dart::main::\"totals items\" [test]",
+        ),
+    });
+    let definition = success(
+        repo.path(),
+        &["query", "InvoiceService", "--view", "definition"],
+    );
+    assert_eq!(
+        definition,
+        "billing.dart::InvoiceService [class] at billing.dart:9-21\n"
+    );
+    // A test described by a function name stays distinct from that function.
+    let tests = success(repo.path(), &["query", "applyTax", "--view", "tests"]);
+    assert!(
+        tests.starts_with("billing.dart::applyTax [function]")
+            && tests.contains(
+                "related test (1 call hops): billing_test.dart::main::\"applyTax\" [test]"
+            ),
+        "{tests}"
+    );
+}
+
+#[test]
+fn lua_and_zig_outlines_link_calls_and_tests() {
+    check_language(LanguageCase {
+        language: "lua",
+        file: "billing.lua",
+        rows: &[
+            "#1 L3-5 function apply_tax  local function apply_tax(amount)",
+            "#2 L7-13 function total  function M.total(items)",
+            "#3 L15-17 function format_total  local format_total = function(amount)",
+            "#4 L19-21 method describe  function M:describe()",
+        ],
+        expand: (
+            "format_total",
+            "local format_total = function(amount)\n  return string.format(\"%d\", amount)\nend",
+        ),
+        caller: (
+            "apply_tax",
+            "call from billing.lua::total at billing.lua:12",
+        ),
+        test: (
+            "total",
+            "related test (1 call hops): billing_spec.lua::\"totals items\" [test]",
+        ),
+    });
+    let repo = check_language(LanguageCase {
+        language: "zig",
+        file: "billing.zig",
+        rows: &[
+            "#2 L3-9 struct Invoice  pub const Invoice = struct",
+            "#3 L6-8 function Invoice::add  pub fn add(self: *Invoice, amount: u64) void",
+            "#4 L11-13 function applyTax  fn applyTax(amount: u64) u64",
+            "#5 L15-19 test \"adds tax\"  test \"adds tax\"",
+            "#6 L21-23 test \"applyTax\"  test applyTax",
+        ],
+        expand: (
+            "Invoice::add",
+            "pub fn add(self: *Invoice, amount: u64) void {\n        self.total += applyTax(amount);\n    }",
+        ),
+        caller: (
+            "applyTax",
+            "call from billing.zig::Invoice::add at billing.zig:7",
+        ),
+        test: (
+            "add",
+            "related test (1 call hops): billing.zig::\"adds tax\" [test]",
+        ),
+    });
+    // `test applyTax` documents the function without shadowing it.
+    let callers = success(repo.path(), &["query", "applyTax", "--view", "callers"]);
+    assert!(
+        callers.contains("call from billing.zig::\"applyTax\" at billing.zig:22"),
+        "{callers}"
+    );
+}
+
+#[test]
+fn terraform_blocks_use_addresses_and_link_references() {
+    let repo = language_fixture("terraform");
+    let root = repo.path();
+    let outline = success(root, &["read", "main.tf", "--outline"]);
+    for row in [
+        "#1 L1-3 terraform terraform  terraform\n",
+        "#2 L5-7 provider provider.aws  provider \"aws\"\n",
+        "#3 L10-10 local local.bucket_name  bucket_name = \"${var.prefix}-logs\"\n",
+        "#4 L13-15 resource aws_s3_bucket.logs  resource \"aws_s3_bucket\" \"logs\"\n",
+        "#5 L17-21 data data.aws_iam_policy_document.read  data \"aws_iam_policy_document\" \"read\"\n",
+        "#6 L23-26 module module.vpc  module \"vpc\"\n",
+    ] {
+        assert!(outline.contains(row), "{row}{outline}");
+    }
+    let variables = success(root, &["read", "variables.tf", "--outline"]);
+    assert!(
+        variables.contains("#1 L1-4 variable var.region  variable \"region\"\n"),
+        "{variables}"
+    );
+    assert_eq!(
+        success(root, &["expand", "main.tf", "aws_s3_bucket.logs"]),
+        "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = local.bucket_name\n}"
+    );
+    for (symbol, expected) in [
+        (
+            "aws_s3_bucket.logs",
+            "  reference from main.tf::data.aws_iam_policy_document.read at main.tf:19\n",
+        ),
+        (
+            "aws_s3_bucket.logs",
+            "  possible reference from outputs.tf::output.bucket_arn at outputs.tf:2\n",
+        ),
+        (
+            "local.bucket_name",
+            "  reference from main.tf::aws_s3_bucket.logs at main.tf:14\n",
+        ),
+        (
+            "var.region",
+            "  possible reference from main.tf::provider.aws at main.tf:6\n",
+        ),
+        (
+            "data.aws_iam_policy_document.read",
+            "  possible reference from outputs.tf::output.read_policy at outputs.tf:6\n",
+        ),
+        (
+            "module.vpc",
+            "  possible reference from outputs.tf::output.read_policy at outputs.tf:7\n",
+        ),
+    ] {
+        let references = success(root, &["query", symbol, "--view", "references"]);
+        assert!(references.contains(expected), "{symbol}: {references}");
+    }
+    let found = success(root, &["find", "aws_s3_bucket.logs"]);
+    assert!(found.contains("outputs.tf:2:"), "{found}");
+}
+
 fn hook(root: &Path, mode: &str, input: serde_json::Value) -> serde_json::Value {
     agent_hook(root, "hook-codex", mode, input)
 }
