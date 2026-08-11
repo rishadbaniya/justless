@@ -63,7 +63,7 @@ justless resume              # Pick up where the last session left off
   <img src="assets/how-it-works-light.svg" alt="Your agent reaches Justless through hooks, MCP or the CLI. Justless turns commands, code lookups and old tool results into compact answers for the context window, archives the full output in .justless, and returns exact bytes on demand with log, expand and recall." width="100%">
 </picture>
 
-- **Commands.** Hooks route builds, tests, linters, diffs and cluster listings through `justless run`. The agent sees grouped failures, rules and hunks with a run ID instead of the raw stream.
+- **Commands.** Hooks route builds, tests, linters, diffs, searches, file listings and cluster listings through `justless run`. The agent sees grouped failures, rules, hunks, matches by file and paths by directory with a run ID instead of the raw stream. Claude Code's Grep and Glob results are grouped the same way.
 - **Code.** A local index of 21 languages answers definition, caller, path and task-pack questions, so the agent reads the lines it needs rather than whole files.
 - **History.** Older tool results are retired to an ID, and recent activity is carried across compaction and sessions.
 - **Exact on demand.** Everything is archived in `.justless/`. `log`, `expand` and `recall` return the original bytes whenever the summary is not enough.

@@ -16,6 +16,8 @@ pub enum Profile {
     JsTests,
     Logs,
     Lint,
+    Search,
+    Listing,
 }
 
 impl Profile {
@@ -29,11 +31,16 @@ impl Profile {
             Self::JsTests => "JavaScript tests",
             Self::Logs => "container logs",
             Self::Lint => "lint",
+            Self::Search => "search",
+            Self::Listing => "listing",
         }
     }
 
     pub fn inventory(self) -> bool {
-        !matches!(self, Self::JsTests | Self::Logs | Self::Lint)
+        !matches!(
+            self,
+            Self::JsTests | Self::Logs | Self::Lint | Self::Search | Self::Listing
+        )
     }
 }
 
@@ -104,6 +111,23 @@ pub fn tool_label_words(words: &[&str]) -> String {
         .file_name()
         .and_then(|p| p.to_str())
         .unwrap_or(program);
+    // A search or listing argument is a pattern or path, never a subcommand.
+    if matches!(
+        program,
+        "rg" | "grep"
+            | "egrep"
+            | "fgrep"
+            | "ag"
+            | "ack"
+            | "ack-grep"
+            | "find"
+            | "ls"
+            | "tree"
+            | "fd"
+            | "fdfind"
+    ) {
+        return program.to_owned();
+    }
     match rest.first() {
         Some(sub)
             if sub.starts_with(|c: char| c.is_ascii_lowercase())
@@ -165,6 +189,9 @@ fn lint_tool(program: &str, args: &[&str]) -> bool {
 
 pub fn profile(words: &[&str]) -> Option<Profile> {
     let words = unwrap_tool(words);
+    if let Some(profile) = crate::search::select(words) {
+        return Some(profile);
+    }
     let (&program, mut args) = words.split_first()?;
     if lint_tool(program, args) {
         return lint_display(args).then_some(Profile::Lint);

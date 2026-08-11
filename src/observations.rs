@@ -41,7 +41,7 @@ fn recover(ws: &Workspace, id: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn archive(ws: &Workspace, value: &Value) -> Result<String> {
+pub(crate) fn archive(ws: &Workspace, value: &Value) -> Result<String> {
     let id = source_digest(&serde_json::to_vec(value)?);
     ws.prepare_state()?;
     let directory = ws.state.join("observations");

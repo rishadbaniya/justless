@@ -1991,7 +1991,7 @@ fn discover_classifies_claude_code_shell_commands() {
             "ok\n[justless run-abc] exit 0".into(),
             root.join("web"),
         ),
-        ("t3", "ls -la", "y".repeat(100), root.clone()),
+        ("t3", "ls", "y".repeat(100), root.clone()),
         (
             "t4",
             "cargo test",
@@ -2504,4 +2504,366 @@ fn affected_changes_start_from_the_changed_symbols() {
     ] {
         has_line(&impact, expected);
     }
+}
+
+/// A repository with one file full of matches, many lightly matching files and the
+/// dependency and build trees agents usually do not want listed.
+fn search_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = repo.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    let big: String = (0..150)
+        .map(|i| format!("let needle_{i} = load(needle, {i});\n"))
+        .collect();
+    write("src/big.rs", &big);
+    for dir in ["api", "core", "db"] {
+        for f in 0..10 {
+            let text: String = (0..40)
+                .map(|i| {
+                    if (i + f) % 9 == 0 {
+                        format!("    call(needle, {i}); // {dir} {f}\n")
+                    } else {
+                        format!("    other({i});\n")
+                    }
+                })
+                .collect();
+            write(&format!("src/{dir}/f{f}.rs"), &text);
+        }
+    }
+    for p in 0..60 {
+        write(
+            &format!("node_modules/pkg{p}/index.js"),
+            "module.exports = needle;\n",
+        );
+    }
+    for t in 0..80 {
+        write(&format!("target/debug/deps/lib{t}.rlib"), "bin");
+    }
+    write("docs/rare.md", "rare_token appears once\n");
+    repo
+}
+
+fn log_range(line: &str) -> (String, String) {
+    let range = line
+        .rsplit_once("[stdout:")
+        .unwrap()
+        .1
+        .trim_end_matches(']');
+    let (from, to) = range.split_once('-').unwrap_or((range, range));
+    (from.to_owned(), to.to_owned())
+}
+
+#[cfg(unix)]
+#[test]
+fn search_output_groups_matches_by_file_with_exact_lines() {
+    let repo = search_repo();
+    let root = repo.path();
+    let direct = |args: &[&str]| {
+        let output = Command::new("grep")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        stdout(&output)
+    };
+    let raw = direct(&["-rn", "needle", "."]);
+    let total = raw.lines().count();
+    let files = raw
+        .lines()
+        .map(|l| l.split(':').next().unwrap())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    assert!(raw.len() > 4096);
+
+    let output = cli(root, &["run", "--", "grep", "-rn", "needle", "."]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.len() <= 4096 && report.len() * 3 < raw.len(),
+        "{report}"
+    );
+    assert!(
+        report.starts_with(&format!("grep: {total} matches in {files} files\n")),
+        "{report}"
+    );
+    // The busiest file comes first and links to exactly its original lines.
+    let group = report.lines().nth(1).unwrap();
+    assert!(group.starts_with("./src/big.rs ×150 [stdout:"), "{report}");
+    let (from, to) = log_range(group);
+    let id = run_id(&output);
+    let slice = success(
+        root,
+        &[
+            "log", &id, "--stream", "stdout", "--from", &from, "--to", &to,
+        ],
+    );
+    assert_eq!(slice.lines().count(), 150);
+    assert!(slice.lines().all(|l| l.starts_with("./src/big.rs:")));
+    let first = raw
+        .lines()
+        .find(|l| l.starts_with("./src/big.rs:"))
+        .unwrap();
+    assert_eq!(
+        report.lines().nth(2).unwrap(),
+        format!("  {}", &first["./src/big.rs:".len()..])
+    );
+    assert!(report.contains(" more in file\n"), "{report}");
+
+    // Archived logs, including the stdout of the run itself, are never searched.
+    let again = cli(
+        root,
+        &["run", "--fresh", "--", "grep", "-rn", "needle", "."],
+    );
+    assert!(stdout(&again).starts_with(&format!("grep: {total} matches")));
+    let source = fs::read_to_string(root.join("src/big.rs")).unwrap();
+    fs::write(root.join("src/big.rs"), format!("{source}needle again\n")).unwrap();
+    let rerun = stdout(&cli(root, &["run", "--", "grep", "-rn", "needle", "."]));
+    assert!(
+        rerun.contains(&format!("Compared with {}:\n", run_id(&again)))
+            && rerun.contains("~ ./src/big.rs ×150 → ×151"),
+        "{rerun}"
+    );
+
+    // No match keeps grep's exit status 1 and prints nothing.
+    let missing = cli(root, &["run", "--", "grep", "-rn", "absent_token", "."]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stdout(&missing).is_empty());
+    // Small output stays verbatim.
+    let small = cli(root, &["run", "--", "grep", "-rn", "rare_token", "."]);
+    let expected = direct(&["-rn", "--exclude-dir=.justless", "rare_token", "."]);
+    assert_eq!(stdout(&small), expected);
+    // Context lines extend each file's range but are not counted as matches.
+    let context = stdout(&cli(
+        root,
+        &["run", "--", "grep", "-rn", "-A", "1", "needle", "src"],
+    ));
+    let matches = direct(&["-rn", "needle", "src"]).lines().count();
+    assert!(
+        context.starts_with(&format!("grep: {matches} matches in "))
+            && context.lines().next().unwrap().ends_with(" context lines"),
+        "{context}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn listings_group_by_directory_and_collapse_dependency_trees() {
+    let repo = search_repo();
+    let root = repo.path();
+    let output = cli(root, &["run", "--", "find", "."]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = stdout(&output);
+    let raw = success(root, &["log", &run_id(&output), "--stream", "stdout"]);
+    assert!(raw.len() > 4096 && report.len() * 3 < raw.len(), "{report}");
+    let total = raw.lines().count();
+    assert!(
+        report.starts_with(&format!("find: {total} entries in ")),
+        "{report}"
+    );
+    let modules = raw
+        .lines()
+        .filter(|l| l.starts_with("./node_modules/"))
+        .count();
+    let line = report
+        .lines()
+        .find(|l| l.starts_with("node_modules/ "))
+        .unwrap();
+    assert!(
+        line.starts_with(&format!(
+            "node_modules/ {modules} entries collapsed [stdout:"
+        )),
+        "{report}"
+    );
+    assert!(report.contains("\nsrc/api/ 10: f"), "{report}");
+    assert!(
+        report.contains("\nsrc/ 4: ") && !report.contains("pkg1"),
+        "{report}"
+    );
+
+    let report = stdout(&cli(root, &["run", "--", "ls", "-laR"]));
+    assert!(
+        report.starts_with("ls: ") && report.contains("\ntarget/ ") && report.len() < 4096,
+        "{report}"
+    );
+    assert!(report.contains("\nsrc/db/ 10: f0.rs, f1.rs"), "{report}");
+
+    // tree output, with its non-breaking-space indentation and count line.
+    let mut tree = String::from(".\n");
+    for p in 0..60 {
+        tree.push_str(&format!(
+            "├── pkg{p}\n│\u{a0}\u{a0} ├── index.js\n│\u{a0}\u{a0} └── package.json\n"
+        ));
+    }
+    tree.push_str("└── src\n    └── main.rs\n\n61 directories, 121 files\n");
+    fs::write(root.join("tree.txt"), &tree).unwrap();
+    let script = format!("cat '{}'\n", root.join("tree.txt").display());
+    let program = fake_program(root, "tree", &script);
+    let report = stdout(&cli(
+        root,
+        &["run", "--", program.to_str().unwrap(), "-L", "2"],
+    ));
+    assert!(
+        report.starts_with("tree: 182 entries in 62 directories · 61 directories, 121 files\n")
+            && report.contains("\nsrc/ 1: main.rs [stdout:"),
+        "{report}"
+    );
+}
+
+#[test]
+fn hooks_route_searches_and_listings_but_not_machine_output() {
+    let repo = mixed_fixture();
+    let root = repo.path();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    for command in [
+        "grep -rn fetch .",
+        "grep -n fetch frontend/orders.ts frontend/format.ts",
+        "grep -rl fetch frontend",
+        "git grep -n fetch",
+        "rg -l fetch",
+        "rg --files",
+        "rg -n -C 2 fetch frontend",
+        "rg -c fetch",
+        "ag fetch",
+        "find . -name '*.ts' -type f",
+        "find frontend -maxdepth 2",
+        "ls -la",
+        "ls -R frontend",
+        "tree -L 2",
+        "fd orders",
+        "git ls-files",
+    ] {
+        for agent in ["hook-claude", "hook-codex"] {
+            let output = agent_hook(root, agent, "before-command", call(command));
+            assert_eq!(
+                output["hookSpecificOutput"]["updatedInput"]["command"],
+                format!("justless run -- {command}"),
+                "{agent} {command}"
+            );
+        }
+    }
+    for command in [
+        "grep fetch frontend/orders.ts",
+        "grep -rn fetch . | head",
+        "grep -rc fetch .",
+        "grep -rh fetch .",
+        "grep -rZ fetch .",
+        "git grep --no-index fetch",
+        "rg --json fetch",
+        "find . -print0",
+        "find . -name '*.tmp' -delete",
+        "find . -ls",
+        "ls",
+        "ls -la > listing.txt",
+        "tree -J",
+        "fd -0 orders",
+        "git ls-files -z",
+    ] {
+        assert_eq!(
+            agent_hook(root, "hook-claude", "before-command", call(command)),
+            serde_json::json!({}),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn claude_grep_and_glob_results_are_grouped_and_recoverable() {
+    use serde_json::{Value, json};
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let raw = Command::new("grep")
+        .args(["-rn", "needle", "src"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let content = stdout(&raw).trim_end().to_owned();
+    let lines = content.lines().count();
+    let grep = |content: &str, mode: Value| {
+        json!({"hook_event_name":"PostToolUse","tool_name":"Grep","cwd":root,
+            "tool_input":{"pattern":"needle","output_mode":"content","-n":true},
+            "tool_response":{"mode":mode,"numFiles":0,"filenames":[],"content":content,
+                "numLines":content.lines().count(),"appliedLimit":250}})
+    };
+    let event = grep(&content, json!("content"));
+    let output = agent_hook(&root, "hook-claude", "after-search", event);
+    let hook = &output["hookSpecificOutput"];
+    let updated = &hook["updatedToolOutput"];
+    let text = updated["content"].as_str().unwrap();
+    assert!(text.len() * 3 < content.len(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "\nGrep: {lines} matches in 31 files\nsrc/big.rs ×150\n  1:let needle_0"
+        )),
+        "{text}"
+    );
+    assert_eq!(updated["numLines"], text.lines().count());
+    assert_eq!(updated["appliedLimit"], 250);
+    assert_eq!(updated["mode"], "content");
+    let id = text
+        .strip_prefix("[justless recall ")
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    assert!(hook["additionalContext"].as_str().unwrap().contains(id));
+    assert_eq!(success(&root, &["recall", id]), content);
+
+    // Results without paths, counts and small results reach Claude unchanged.
+    let single: String = (1..300)
+        .map(|i| format!("{i}:let needle_{i} = load(needle);\n"))
+        .collect();
+    for event in [
+        grep(&single, json!("content")),
+        grep(&content, json!("count")),
+        grep("src/big.rs:1:needle", json!("content")),
+    ] {
+        let output = agent_hook(&root, "hook-claude", "after-search", event);
+        assert_eq!(output, json!({}));
+    }
+
+    let mut files: Vec<String> = Vec::new();
+    for dir in ["api", "core", "db"] {
+        for f in 0..10 {
+            let path = root.join(format!("src/{dir}/f{f}.rs"));
+            files.push(path.display().to_string());
+        }
+    }
+    for p in 0..60 {
+        let path = root.join(format!("node_modules/pkg{p}/index.js"));
+        files.push(path.display().to_string());
+    }
+    let glob = json!({"hook_event_name":"PostToolUse","tool_name":"Glob","cwd":root,
+        "tool_input":{"pattern":"**/*.*"},
+        "tool_response":{"durationMs":4,"numFiles":files.len(),"filenames":files,"truncated":true,
+            "totalMatches":250,"countIsComplete":true}});
+    let output = agent_hook(&root, "hook-claude", "after-search", glob);
+    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+    let names: Vec<_> = updated["filenames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert_eq!(updated["numFiles"], 90);
+    assert_eq!(updated["truncated"], false);
+    assert!(
+        names[1].starts_with(&format!("Glob in {}: 90 entries", root.display()))
+            && names.contains(&"node_modules/ 60 entries collapsed")
+            && names.contains(&"src/api/ 10: f0.rs, f1.rs, f2.rs, f3.rs, f4.rs, f5.rs +4 more")
+            && names
+                .last()
+                .unwrap()
+                .starts_with("(Showing 90 of 250 matching files; 160 more"),
+        "{names:?}"
+    );
+    let id = names[0]
+        .strip_prefix("[justless recall ")
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    assert_eq!(success(&root, &["recall", id]), files.join("\n"));
 }

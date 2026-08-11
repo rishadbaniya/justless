@@ -135,12 +135,20 @@ pub fn execute(
     fresh: bool,
 ) -> Result<i32> {
     let mut command = Command::new(&args[0]);
-    command.args(&args[1..]).current_dir(&workspace.cwd);
+    command.current_dir(&workspace.cwd);
     if raw {
+        command.args(&args[1..]);
         return Ok(exit_code(command.status().context("run command")?));
     }
 
     let selection = crate::filters::Selection::for_run(args, &workspace.settings()?.filters)?;
+    let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+    // A recursive grep would otherwise read the archived logs, including the stdout
+    // file it is writing.
+    if let Some(exclude) = crate::search::exclude_state(&words) {
+        command.arg(exclude);
+    }
+    command.args(&args[1..]);
     workspace.prepare_state()?;
     let runs = workspace.state.join("runs");
     private_dir(&runs)?;
@@ -162,7 +170,11 @@ pub fn execute(
 
     let mut run = Run {
         family: match selection.profile {
-            Some(crate::filters::Profile::Lint) => crate::filters::tool_label(args),
+            Some(
+                crate::filters::Profile::Lint
+                | crate::filters::Profile::Search
+                | crate::filters::Profile::Listing,
+            ) => crate::filters::tool_label(args),
             Some(profile) => profile.label().to_owned(),
             None => crate::summary::family(args),
         },
@@ -181,6 +193,15 @@ pub fn execute(
     let mut parser = Parser::new(&run.family, selection.profile);
     let mut lint = (selection.profile == Some(crate::filters::Profile::Lint))
         .then(|| crate::lint::Lint::new(&workspace.root));
+    let mut grouping = match selection.profile {
+        Some(crate::filters::Profile::Search) => {
+            Some(Grouping::Search(crate::search::Search::new(&workspace.cwd)))
+        }
+        Some(crate::filters::Profile::Listing) => {
+            Some(Grouping::Listing(crate::listing::Listing::new(&words)))
+        }
+        _ => None,
+    };
     let mut previews = Vec::new();
     for stream in Stream::BOTH {
         let path = directory.join(stream.name());
@@ -196,6 +217,7 @@ pub fn execute(
                 parser: &mut parser,
                 selection: &selection,
                 lint: &mut lint,
+                grouping: &mut grouping,
             },
         )?;
         run.preview_bytes += preview.len();
@@ -242,6 +264,16 @@ pub fn execute(
     if let Some((_, summary)) = &lint {
         run.summary = summary.clone();
     }
+    let grouped = grouping.and_then(|grouping| {
+        let previous = previous.as_ref().map(|r| (r.id.as_str(), &r.summary));
+        match grouping {
+            Grouping::Search(search) => search.finish(&run.family, max_bytes, previous, true),
+            Grouping::Listing(listing) => listing.finish(&run.family, max_bytes, previous, true),
+        }
+    });
+    if let Some((_, summary)) = &grouped {
+        run.summary = summary.clone();
+    }
     if let Some(prior) = &previous
         && run.unchanged
     {
@@ -265,6 +297,18 @@ pub fn execute(
             }
             previews[0].1 = report.into_bytes();
             previews[1].1.clear();
+        }
+    } else if let Some((report, _)) = grouped {
+        // Search and listing groups replace a large stdout only. Smaller output stays
+        // verbatim, and stderr keeps messages such as unreadable directories.
+        if fs::metadata(directory.join("stdout"))?.len() > max_bytes as u64 && !report.is_empty() {
+            let mut report = report;
+            if report.len() > max_bytes {
+                let tail = "\n[more in full log]\n";
+                report.truncate(report.floor_char_boundary(max_bytes - tail.len()));
+                report.push_str(tail);
+            }
+            previews[0].1 = report.into_bytes();
         }
     } else if let Some(summary) = run.summary.render(
         previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
@@ -329,6 +373,13 @@ struct Observers<'a> {
     parser: &'a mut Parser,
     selection: &'a crate::filters::Selection,
     lint: &'a mut Option<crate::lint::Lint>,
+    grouping: &'a mut Option<Grouping>,
+}
+
+/// Groups stdout of a search by file, or of a file listing by directory.
+enum Grouping {
+    Search(crate::search::Search),
+    Listing(crate::listing::Listing),
 }
 
 fn scan(
@@ -343,6 +394,7 @@ fn scan(
         parser,
         selection,
         lint,
+        grouping,
     } = observers;
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
@@ -377,6 +429,11 @@ fn scan(
         }
         if matches!(stream, Stream::Stdout) {
             parser.observe(&text, line_no);
+            match grouping.as_mut() {
+                Some(Grouping::Search(search)) => search.observe(&text, line_no),
+                Some(Grouping::Listing(listing)) => listing.observe(&text, line_no),
+                None => {}
+            }
         }
         let structured = cargo_message(&text);
         let locations: Vec<Location> = if let Some(message) = &structured {

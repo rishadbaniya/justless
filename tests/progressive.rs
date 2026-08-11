@@ -411,9 +411,13 @@ fn agent_setup_preserves_existing_plugin_and_registers_claude_read_once() {
         serde_json::from_slice(&fs::read(root.join(".claude/settings.json")).unwrap()).unwrap();
     assert_eq!(
         settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
-        1
+        2
     );
     assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "^Read$");
+    assert_eq!(
+        settings["hooks"]["PostToolUse"][1]["matcher"],
+        "^(Grep|Glob)$"
+    );
     fs::write(&plugin, "// user plugin").unwrap();
     assert!(!run(root, &install, b"").status.success());
     assert_eq!(fs::read_to_string(&plugin).unwrap(), "// user plugin");

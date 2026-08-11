@@ -250,8 +250,10 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
     let mut sources = BTreeMap::new();
     for run in history::records(workspace, false)?.take(25) {
         let run = run?;
+        // A search that found nothing exits 1, and its matches are not diagnostics.
         if (!run.command_key.is_empty() && !latest.insert(run.command_key.clone()))
             || run.status == 0
+            || matches!(run.summary.kind.as_str(), "search" | "listing")
         {
             continue;
         }

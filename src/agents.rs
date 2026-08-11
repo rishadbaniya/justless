@@ -200,6 +200,7 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
             5,
         ),
         ("PostToolUse", "after-read", "^Read$", 5),
+        ("PostToolUse", "after-search", "^(Grep|Glob)$", 5),
         // Compaction drops earlier tool results. Restore the run IDs and source ranges
         // that recover them. This handler stays synchronous so its context is applied
         // before the next model request.
@@ -207,7 +208,7 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         ("PreCompact", "before-compact", "^(manual|auto)$", 10),
     ] {
         let supported = match mode {
-            "after-read" | "before-compact" => agent == Agent::Claude,
+            "after-read" | "after-search" | "before-compact" => agent == Agent::Claude,
             "after-compact" => matches!(agent, Agent::Claude | Agent::Codex),
             _ => true,
         };
@@ -534,6 +535,8 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
         })
     } else if agent == Agent::Claude && mode == "after-read" {
         claude_read(workspace, &input).unwrap_or_else(|| json!({}))
+    } else if agent == Agent::Claude && mode == "after-search" {
+        crate::search::claude_tool_output(workspace, &input).unwrap_or_else(|| json!({}))
     } else if mode == "after-compact"
         && input["hook_event_name"] == "SessionStart"
         && input["source"]
@@ -934,6 +937,10 @@ fn supported_command(command: &str) -> bool {
         return false;
     };
     let words: Vec<_> = args.iter().map(String::as_str).collect();
+    // Searches and listings accept only display options, so they skip the list below.
+    if let Some(route) = crate::search::route(&words) {
+        return route;
+    }
     let supported =
         crate::filters::legacy_hook(&words) || crate::filters::profile(&words).is_some();
     if !supported

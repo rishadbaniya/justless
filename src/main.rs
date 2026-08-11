@@ -8,12 +8,14 @@ mod impact;
 mod index;
 mod inventory;
 mod lint;
+mod listing;
 mod map;
 mod mcp;
 mod observations;
 mod pack;
 mod polyglot;
 mod rust_syntax;
+mod search;
 mod source;
 mod summary;
 mod workspace;
@@ -269,6 +271,7 @@ fn cli() -> Command<'static> {
                     "session-start",
                     "before-command",
                     "after-read",
+                    "after-search",
                     "after-compact",
                     "before-compact",
                 ]))

@@ -292,7 +292,7 @@ impl Summary {
             "diff" if !self.items.is_empty() => {
                 Some(format!("{} diff section(s)", self.items.len()))
             }
-            "inventory" => self.outcomes.first().cloned(),
+            "inventory" | "search" | "listing" => self.outcomes.first().cloned(),
             _ => None,
         }
     }
