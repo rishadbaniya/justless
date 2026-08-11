@@ -165,6 +165,17 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
             "find",
             json!({"text": "purchase_orders", "limit": 5}),
         ),
+        call("map", "map", json!({"budget": 1200})),
+        call(
+            "affected",
+            "affected",
+            json!({"target": "purchase_orders", "depth": 2}),
+        ),
+        call(
+            "affected-both",
+            "affected",
+            json!({"target": "purchase_orders", "changes": true}),
+        ),
         // Values that look like options stay positional.
         call("flag", "find", json!({"text": "--budget=1"})),
         call("stats", "stats", json!({})),
@@ -228,8 +239,8 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
     assert_eq!(
         names,
         BTreeSet::from([
-            "code", "context", "expand", "find", "history", "log", "pack", "path", "query", "read",
-            "recall", "resume", "search", "stats",
+            "affected", "code", "context", "expand", "find", "history", "log", "map", "pack",
+            "path", "query", "read", "recall", "resume", "search", "stats",
         ])
     );
     // The tool list rides along with every model request, so keep it compact.
@@ -265,6 +276,18 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
     assert!(succeeded(by_id(&responses, "context")).contains("backend/orders.py"));
     assert!(succeeded(by_id(&responses, "pack")).contains("purchase_orders"));
     assert!(succeeded(by_id(&responses, "find")).contains("db/schema.sql:1"));
+    let map = succeeded(by_id(&responses, "map"));
+    assert!(
+        map.contains("  backend/ → db/ · Python → SQL · possible SQL relation 1 · list_orders backend/orders.py:8 → purchase_orders db/schema.sql:1-3"),
+        "{map}"
+    );
+    assert!(map.len() <= 1200, "{map}");
+    let affected = succeeded(by_id(&responses, "affected"));
+    assert!(
+        affected.contains("  fetchOrders [function] frontend/orders.ts:3-7 · possible HTTP route at frontend/orders.ts:4 → list_orders"),
+        "{affected}"
+    );
+    assert!(failed(by_id(&responses, "affected-both")).contains("exactly one of `target`"));
     assert!(succeeded(by_id(&responses, "flag")).contains("No matching indexed text"));
     succeeded(by_id(&responses, "stats"));
 
@@ -340,7 +363,7 @@ fn stateless_requests_declare_their_version() {
 
     let list = &by_id(&responses, "list")["result"];
     assert_eq!(list["resultType"], "complete");
-    assert_eq!(list["tools"].as_array().unwrap().len(), 14);
+    assert_eq!(list["tools"].as_array().unwrap().len(), 16);
     assert!(list["ttlMs"].is_u64());
 
     let call = by_id(&responses, "call");

@@ -4,9 +4,11 @@ mod context;
 mod discover;
 mod filters;
 mod history;
+mod impact;
 mod index;
 mod inventory;
 mod lint;
+mod map;
 mod mcp;
 mod observations;
 mod pack;
@@ -255,6 +257,8 @@ fn cli() -> Command<'static> {
                         .help("Install project-local hooks"),
                 ),
         )
+        .subcommand(map::command())
+        .subcommand(impact::command())
         .subcommand(mcp::command())
         .subcommands(source::commands())
         .subcommands(observations::commands())
@@ -316,6 +320,8 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         (name @ ("read" | "expand" | "edit"), sub) => source::run(&workspace, name, sub)?,
         (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
         ("mcp", sub) => mcp::run(&workspace, sub)?,
+        ("map", sub) => map::run(&workspace, sub)?,
+        ("affected", sub) => impact::run(&workspace, sub)?,
         ("run", sub) => {
             let command: Vec<OsString> = sub
                 .values_of_os("command")

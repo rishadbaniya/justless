@@ -568,6 +568,15 @@ impl Index {
         ids
     }
 
+    /// HTTP routes and their handlers. Route names start with `/`, so they never
+    /// collide with symbol or file names.
+    pub fn routes(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.by_name
+            .iter()
+            .filter(|(name, _)| name.starts_with('/'))
+            .flat_map(|(name, ids)| ids.iter().map(move |&id| (name.as_str(), id)))
+    }
+
     pub fn incoming(&self, id: usize) -> impl Iterator<Item = &Edge> {
         self.incoming[id].iter().map(|&edge| &self.edges[edge])
     }

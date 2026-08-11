@@ -10,6 +10,8 @@
 | `justless query SYMBOL --view VIEW` | Definition, references, callers, or related tests. Use `all` for the combined view. |
 | `justless query SYMBOL --view dependencies` | Outgoing calls, imports, and other indexed relationships |
 | `justless path FROM TO` | A short relationship chain with the location and direction of each edge |
+| `justless map` | Areas, most connected symbols, communities, cross-area links, entry points and test locations, each with a file and line |
+| `justless affected SYMBOL --depth 3` | Dependents grouped by distance, then the tests that reach the target and a command to run them. Also takes a file path or `--changes`. |
 | `justless find TEXT` | Literal search across indexed text, with exact file and line matches |
 | `justless context --changes` | Current changes against `HEAD`, with nearby symbols and tests where available. Includes untracked files. |
 | `justless context --changes --staged` | Staged ranges for files that currently match the staged source |
@@ -35,6 +37,40 @@ Structured navigation supports Rust, JavaScript, TypeScript and TSX, Python, Go,
 Related tests come from each ecosystem's conventions: `#[test]` functions in Rust, `test_` functions in Python, `Test` functions in Go, `@Test` annotations in Java, Kotlin and Scala, XCTest `test…` methods and `@Test` functions in Swift, and Zig `test` blocks. Test calls such as `test("…")` in Scala, Dart and Lua become test entries named by their quoted description, such as `main::"totals items"`. Zig test blocks are named the same way. Calls between Kotlin, Scala and Java resolve as possible links. Members of a Swift extension or a Scala companion object belong to the extended type, as in `InvoiceService::reset`, and a Dart unnamed constructor is `Type::new`.
 
 HCL files index top-level blocks by their Terraform address, such as `aws_s3_bucket.logs`, `data.aws_iam_policy_document.read`, `var.region`, `module.vpc` and `output.bucket_arn`. Each `locals` entry is indexed as `local.NAME`. Expressions that use an address become references, so `justless query var.region --view references` lists its uses. References to a block in another file are possible links. An address defined in more than one indexed module is ambiguous, so its references stay unlinked.
+
+## Repository map and change impact
+
+`justless map` orients an agent in a repository from the index alone, without reading source files.
+
+- **Areas** are top-level directories with their file and symbol counts and main languages. A directory that holds more than half of the symbols is split into its subdirectories and files. Each area names its most connected symbol.
+- **Hubs** are the symbols with the most distinct dependents (`in`) and dependencies (`out`). Certain links rank first, and a count that includes possible links says how many.
+- **Communities** are groups of symbols that link to each other. Label propagation runs over resolved links and each symbol's enclosing definition or file, in a fixed order, so the same index always gives the same groups. Inferred calls are left out, while inferred HTTP routes and SQL relations count. Each group is named after the file that holds most of its symbols and lists its two most connected symbols.
+- **Cross-area links** group the links between areas or languages by direction, with a count per relationship and one example. Links between languages come first.
+- **Entry points** are `main` functions, HTTP route handlers, and functions with no indexed callers and at least three dependencies, which are often framework or command handlers.
+- **Tests** lists the directories with test definitions or test-convention files.
+
+Every row carries a file and line for `code`, `expand` or `query`. Sections take turns within the budget, so a small budget still shows the first rows of each. A section that does not fit is listed by name with its row count.
+
+`justless affected TARGET` walks back from a symbol or a workspace-relative file through calls, references, imports, HTTP routes and SQL relations to the code that depends on it. `--changes` starts from the current Git changes: the innermost definition around each changed range, and any definition whose declaration line changed. Add `--staged` for staged changes. Each dependent appears once, at its shortest distance and through its most certain link, so cycles end. `--depth` sets the number of hops, 3 by default, and the report counts the dependents just past it. A dependent reached through an inferred link is marked possible, as is everything reached through it. A Rust `use` outside any item appears as a file scope.
+
+Tests that reach the target come from the walk and from call chains of up to eight hops, whatever the depth. Test-convention files reached without a detected test definition, such as JavaScript suites, are listed by file. When the layout identifies the runner, the report ends with a command for those tests.
+
+| Language | When | Command |
+| --- | --- | --- |
+| Rust | A `Cargo.toml` above the test file | `cargo test` filtered by the test's path in its crate. A test in `tests/NAME.rs` adds `--test NAME`, and a nested package adds `--manifest-path`. |
+| Python | A function, or a method of a `Test` class, in `test_*.py` or `*_test.py` | `pytest` with the node ID |
+| Go | A `Test` function in `*_test.go`, with `go.mod` at the root | `go test ./DIR -run '^(TestA\|TestB)$'` |
+
+A command names at most eight tests. The walk follows at most 256 links into one symbol and stops after 5,000 dependents. The report says when either cap applies. Within the budget, tests and commands are placed first, then nearer distances.
+
+```sh
+justless map --budget 4000
+justless affected purchase_orders --depth 2
+justless affected src/pricing.rs --json
+justless affected --changes
+```
+
+With `--json`, both commands return the rows selected for the budget as structured fields, with an `omitted` count per section and a `capped` flag.
 
 ## Progressive reads and verified edits
 
@@ -133,7 +169,7 @@ omit = '^make\[\d+\]: (Entering|Leaving) directory'
 
 An empty prefix, an invalid expression or one that matches empty text stops the run with an error.
 
-`pack`, `history`, `resume`, `query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
+`pack`, `map`, `affected`, `history`, `resume`, `query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
 
 Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Keep the directory private if a command prints secrets. The CLI runs offline after installation, and `--raw` skips recording.
 
@@ -141,7 +177,7 @@ Full output is retained locally under `.justless/runs/`, including output short 
 
 `justless mcp` serves the read-only commands as MCP tools over stdio. Use it with clients that have no Justless hooks, or when an agent should call navigation tools instead of shell commands. Each tool runs the matching command against the project root and returns its output as text. A failed command or an invalid argument comes back as a tool error that the agent can correct. `run`, `edit`, `mask` and `init` are not exposed, so every change still goes through the client's own permission prompts.
 
-The server uses `--root` when given. Otherwise it uses `CLAUDE_PROJECT_DIR`, which Claude Code sets for project servers, and then the directory the client starts it in. The tool list is kept to about 7.6 KB because clients send it with every model request. Arguments are fully validated when a tool is called.
+The server uses `--root` when given. Otherwise it uses `CLAUDE_PROJECT_DIR`, which Claude Code sets for project servers, and then the directory the client starts it in. The tool list is kept under 8 KB because clients send it with every model request. Arguments are fully validated when a tool is called.
 
 | Tool | Command | Arguments |
 | --- | --- | --- |
@@ -153,6 +189,8 @@ The server uses `--root` when given. Otherwise it uses `CLAUDE_PROJECT_DIR`, whi
 | `read` | `read FILE` | `file`, `outline`, `match`, `limit`, `after`, `budget` |
 | `expand` | `expand FILE SELECTOR` | `file`, `selector`, `revision` |
 | `pack` | `pack TASK` | `question`, `budget` |
+| `map` | `map` | `budget` |
+| `affected` | `affected TARGET` or `--changes` | `target` or `changes`, `depth`, `budget` |
 | `log` | `log RUN_ID` | `run_id`, `stream`, `from`, `to` |
 | `search` | `search RUN_ID TEXT` | `run_id`, `text`, `stream`, `limit` |
 | `history` | `history [TEXT]` | `text`, `oldest`, `limit`, `budget` |

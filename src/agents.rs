@@ -16,6 +16,7 @@ const INSTRUCTIONS: &str = r#"<!-- justless:begin -->
 
 - Start an unfamiliar task with `justless pack "<task>"`. Use `justless resume` for a handoff and `justless history "<error>"` to search earlier runs. Expand a diff section with `justless log <id> --stream stdout --from <n> --to <n>`.
 - Use `justless query <symbol>` and `justless path <symbol> <symbol>` for repository navigation. Use `justless find <text>` for exact text in code, docs, and configuration. These commands refresh the repo index.
+- Run `justless map` to orient in an unfamiliar repository. Before changing a symbol or file, `justless affected <symbol|file>` (or `--changes`) lists its dependents and the tests to run.
 - Use `justless run -- <command> <args>` for noninteractive builds, tests, Git diffs and logs, and verbose searches. The wrapped command's exit status still applies. Use the original command directly for interactive or streaming work.
 - For an error with a run ID, use `justless context --run <id>` to locate the assertion or diagnostic and its enclosing symbol. Use `justless search <id> <text>` or `justless log <id> --stream <stdout|stderr> --from <n> --to <n>` to recover relevant log lines.
 - Use `justless context --changes` for current Git changes. Use `justless context --symbol <qualified-symbol>` or `justless code <file> --from <n> --to <n>` for original source.

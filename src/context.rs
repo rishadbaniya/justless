@@ -453,8 +453,58 @@ fn at_location(
     Ok(())
 }
 
+pub(crate) enum Change {
+    Unindexed,
+    StagedDiffers,
+    Empty,
+    Ranges(Vec<(usize, usize)>),
+}
+
 pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -> Result<()> {
     let mut report = Report::new(cap);
+    let changes = changes(workspace, index, staged)?;
+    for (file, change) in &changes {
+        match change {
+            Change::Unindexed => report.line(format!("{file} · no current indexed source")),
+            Change::StagedDiffers => report.line(format!("{file} · working tree differs from staged source. Use justless context --changes to inspect the current file.")),
+            Change::Empty => report.line(format!("{file} · empty after changes")),
+            Change::Ranges(locations) => {
+                report.line(format!("{file} · {} changed ranges", locations.len()));
+                for &(start, end) in locations {
+                    report.line(format!("Changed {file}:{start}-{end}"));
+                    at_location(
+                        workspace,
+                        index,
+                        &Location {
+                            file: file.clone(),
+                            start,
+                            end,
+                        },
+                        &mut report,
+                    )?;
+                    if report.clipped {
+                        break;
+                    }
+                }
+            }
+        }
+        if report.clipped {
+            break;
+        }
+    }
+    if changes.is_empty() {
+        report.line("No changed files.");
+    }
+    report.finish()
+}
+
+/// Changed line ranges per file against `HEAD`, or the index with `staged`.
+/// Untracked files count as changed throughout.
+pub(crate) fn changes(
+    workspace: &Workspace,
+    index: &Index,
+    staged: bool,
+) -> Result<Vec<(String, Change)>> {
     let mut args = vec![
         "diff",
         "--relative",
@@ -500,28 +550,27 @@ pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -
         }
         tracked.retain(|file| !new_files.contains(file));
     }
-    let mut files = 0;
+    let mut changes = Vec::new();
     for (file, untracked) in tracked
         .iter()
         .map(|file| (file, false))
         .chain(new_files.iter().map(|file| (file, true)))
     {
-        files += 1;
         if !index.files.contains_key(file) {
-            report.line(format!("{file} · no current indexed source"));
+            changes.push((file.clone(), Change::Unindexed));
             continue;
         }
         if staged {
             let difference = workspace.git(&["diff", "--quiet", "--", file])?;
             if !difference.status.success() {
-                report.line(format!("{file} · working tree differs from staged source. Use justless context --changes to inspect the current file."));
+                changes.push((file.clone(), Change::StagedDiffers));
                 continue;
             }
         }
         let text = fs::read_to_string(workspace.source_path(file)?)?;
         let file_lines = text.lines().count();
         if file_lines == 0 {
-            report.line(format!("{file} · empty after changes"));
+            changes.push((file.clone(), Change::Empty));
             continue;
         }
         let locations = if untracked {
@@ -550,29 +599,7 @@ pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -
                 })
                 .collect()
         };
-        report.line(format!("{file} · {} changed ranges", locations.len()));
-        for (start, end) in locations {
-            report.line(format!("Changed {file}:{start}-{end}"));
-            at_location(
-                workspace,
-                index,
-                &Location {
-                    file: file.clone(),
-                    start,
-                    end,
-                },
-                &mut report,
-            )?;
-            if report.clipped {
-                break;
-            }
-        }
-        if report.clipped {
-            break;
-        }
+        changes.push((file.clone(), Change::Ranges(locations)));
     }
-    if files == 0 {
-        report.line("No changed files.");
-    }
-    report.finish()
+    Ok(changes)
 }

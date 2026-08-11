@@ -2272,5 +2272,199 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
         ] {
             assert_eq!(run(&args, stdin), "{}\n", "{args:?}");
         }
+
+fn has_line(output: &str, expected: &str) {
+    assert!(
+        output.lines().any(|line| line == expected),
+        "missing {expected:?} in\n{output}"
+    );
+}
+
+#[test]
+fn map_orients_with_located_areas_hubs_links_and_entry_points() {
+    let repo = mixed_fixture();
+    let root = repo.path();
+    let map = success(root, &["map"]);
+    assert_eq!(map, success(root, &["map"]), "map must be deterministic");
+    for expected in [
+        "Map · 6 files · 5 symbols · 4 links (2 possible) · TypeScript 2 · Python 1 · SQL 1",
+        "  frontend/ · 2 files · 2 symbols · TypeScript · hub formatOrder frontend/format.ts:1-3",
+        "  docs/ · 1 file · 0 symbols · text · docs/operations.md:1",
+        "  list_orders [function] backend/orders.py:7-8 · in 1 (1 possible) · out 1 (1 possible)",
+        "  frontend/format.ts +1 file · 2 symbols · formatOrder frontend/format.ts:1-3, fetchOrders frontend/orders.ts:3-7",
+        "  frontend/ → backend/ · TypeScript → Python · possible HTTP route 1 · fetchOrders frontend/orders.ts:4 → list_orders backend/orders.py:7-8",
+        "  backend/ → db/ · Python → SQL · possible SQL relation 1 · list_orders backend/orders.py:8 → purchase_orders db/schema.sql:1-3",
+        "  list_orders [function] backend/orders.py:7-8 · HTTP route /api/orders",
+        "Tests · none detected",
+    ] {
+        has_line(&map, expected);
+    }
+    let small = success(root, &["map", "--budget", "300"]);
+    assert!(small.len() <= 300, "{} bytes\n{small}", small.len());
+    assert!(small.contains("Not shown: "), "{small}");
+    let json: serde_json::Value = serde_json::from_str(&success(root, &["map", "--json"])).unwrap();
+    assert_eq!(json["symbols"], 5);
+    assert_eq!(json["possible_links"], 2);
+    assert_eq!(
+        json["cross_area_links"][0]["example"]["at"],
+        "backend/orders.py:8"
+    );
+    assert_eq!(json["cross_area_links"][0]["example"]["possible"], true);
+    assert_eq!(json["entry_points"][0]["reason"], "HTTP route /api/orders");
+    assert_eq!(json["capped"], false);
+
+    let repo = fixture();
+    let path = repo.path();
+    fs::create_dir_all(path.join("src/bin")).unwrap();
+    fs::write(
+        path.join("src/bin/quote.rs"),
+        "fn main() {\n    println!(\"{}\", checkout_fixture::checkout_total(1, 2));\n}\n",
+    )
+    .unwrap();
+    let map = success(path, &["map"]);
+    for expected in [
+        "  pricing::checkout_total [function] src/pricing.rs:1-3 · in 4 · out 1",
+        "  src/bin/ → src/pricing.rs · call 1 · main src/bin/quote.rs:2 → pricing::checkout_total src/pricing.rs:1-3",
+        "  main [function] src/bin/quote.rs:1-3 · main",
+        "  tests/ · 1 file · 1 test · e.g. total_includes_fee [test] tests/checkout.rs:3-12",
+    ] {
+        has_line(&map, expected);
+    }
+}
+
+#[test]
+fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
+    let repo = fixture();
+    let path = repo.path();
+    let impact = success(path, &["affected", "apply_fee"]);
+    assert_eq!(impact, success(path, &["affected", "apply_fee"]));
+    for expected in [
+        "Affected by pricing::apply_fee [function] src/pricing.rs:5-7 · 4 dependents within 3 hops",
+        "Distance 1 · 1",
+        "  pricing::checkout_total [function] src/pricing.rs:1-3 · call at src/pricing.rs:2",
+        "Distance 2 · 3",
+        "  total_includes_fee [test] tests/checkout.rs:3-12 · call at tests/checkout.rs:11 → pricing::checkout_total",
+        "  file scope · import at src/lib.rs:4 → pricing::checkout_total",
+        "  file scope · import at tests/checkout.rs:1 → pricing::checkout_total",
+        "  total_includes_fee [test] tests/checkout.rs:3-12 · 2 hops",
+        "  cargo test --test checkout total_includes_fee",
+    ] {
+        has_line(&impact, expected);
+    }
+    // Tests are found past the walk's depth, and the report says it stopped early.
+    let shallow = success(path, &["affected", "apply_fee", "--depth", "1"]);
+    assert!(!shallow.contains("Distance 2"), "{shallow}");
+    has_line(&shallow, "  cargo test --test checkout total_includes_fee");
+    has_line(
+        &shallow,
+        "Depth limit: 3 more dependents past 1 hop. Raise --depth to follow them.",
+    );
+    let file = success(path, &["affected", "src/pricing.rs"]);
+    has_line(
+        &file,
+        "Affected by src/pricing.rs (2 symbols) · 3 dependents within 3 hops",
+    );
+    let small = success(path, &["affected", "apply_fee", "--budget", "300"]);
+    assert!(small.len() <= 300, "{} bytes\n{small}", small.len());
+    has_line(&small, "  cargo test --test checkout total_includes_fee");
+    let json: serde_json::Value =
+        serde_json::from_str(&success(path, &["affected", "apply_fee", "--json"])).unwrap();
+    assert_eq!(json["reached"], 4);
+    assert_eq!(json["dependents"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        json["dependents"][0]["dependent"]["name"],
+        "pricing::checkout_total"
+    );
+    assert_eq!(json["tests"][0]["hops"], 2);
+    assert_eq!(
+        json["commands"],
+        serde_json::json!(["cargo test --test checkout total_includes_fee"])
+    );
+    assert!(
+        stderr(&cli(path, &["affected", "src/missing.rs"]))
+            .contains("src/missing.rs is not an indexed file or symbol")
+    );
+    // Without a repository there are no changes to start from.
+    assert!(stderr(&cli(path, &["affected", "--changes"])).contains("git diff failed"));
+
+    // A cycle ends once every symbol on it has been reached.
+    fs::write(
+        path.join("src/cycle.rs"),
+        "pub fn ping(n: u32) -> u32 {\n    if n == 0 { 0 } else { pong(n - 1) }\n}\n\npub fn pong(n: u32) -> u32 {\n    ping(n)\n}\n",
+    )
+    .unwrap();
+    let mut lib = fs::OpenOptions::new()
+        .append(true)
+        .open(path.join("src/lib.rs"))
+        .unwrap();
+    writeln!(lib, "pub mod cycle;").unwrap();
+    let cycle = success(path, &["affected", "ping", "--depth", "6"]);
+    has_line(
+        &cycle,
+        "Affected by cycle::ping [function] src/cycle.rs:1-3 · 1 dependent within 6 hops",
+    );
+    has_line(
+        &cycle,
+        "  cycle::pong [function] src/cycle.rs:5-7 · call at src/cycle.rs:6",
+    );
+
+    // TypeScript → Python → SQL, with pytest node IDs for the tests that reach it.
+    let repo = mixed_fixture();
+    let root = repo.path();
+    fs::create_dir(root.join("tests")).unwrap();
+    fs::write(
+        root.join("tests/test_orders.py"),
+        "from backend.orders import list_orders\n\n\ndef test_list_orders():\n    assert list_orders() is not None\n\n\nclass TestOrders:\n    def test_again(self):\n        list_orders()\n",
+    )
+    .unwrap();
+    let impact = success(root, &["affected", "purchase_orders"]);
+    for expected in [
+        "  list_orders [function] backend/orders.py:7-8 · possible SQL relation at backend/orders.py:8",
+        "  fetchOrders [function] frontend/orders.ts:3-7 · possible HTTP route at frontend/orders.ts:4 → list_orders",
+        "  test_list_orders [test] tests/test_orders.py:4-5 · possible · 2 hops",
+        "  pytest tests/test_orders.py::test_list_orders tests/test_orders.py::TestOrders::test_again",
+    ] {
+        has_line(&impact, expected);
+    }
+}
+
+#[test]
+fn affected_changes_start_from_the_changed_symbols() {
+    let repo = fixture();
+    let path = repo.path();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?} {}", stderr(&output));
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Justless Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "fixture",
+    ]);
+    assert_eq!(
+        success(path, &["affected", "--changes"]),
+        "No changed files.\n"
+    );
+    let pricing = path.join("src/pricing.rs");
+    let source = fs::read_to_string(&pricing).unwrap();
+    fs::write(&pricing, source.replace("fee + 1", "fee + 2")).unwrap();
+    let impact = success(path, &["affected", "--changes"]);
+    for expected in [
+        "Affected by changes (1 changed symbol) · 4 dependents within 3 hops",
+        "  pricing::apply_fee [function] src/pricing.rs:5-7 · changed src/pricing.rs:6-6",
+        "  pricing::checkout_total [function] src/pricing.rs:1-3 · call at src/pricing.rs:2",
+        "  cargo test --test checkout total_includes_fee",
+    ] {
+        has_line(&impact, expected);
     }
 }
