@@ -60,6 +60,8 @@ pub(crate) struct Section {
     pub values: Vec<Value>,
     /// Lines placed in turn with the other sections before any section grows past it.
     pub floor: usize,
+    /// Ranked items left out before rendering, counted in the omissions.
+    pub unlisted: usize,
 }
 
 impl Section {
@@ -70,12 +72,18 @@ impl Section {
             lines: Vec::new(),
             values: Vec::new(),
             floor,
+            unlisted: 0,
         }
     }
 
     pub fn push(&mut self, line: String, value: Value) {
         self.lines.push(line);
         self.values.push(value);
+    }
+
+    /// Every item, including those never turned into lines.
+    fn total(&self) -> usize {
+        self.lines.len() + self.unlisted
     }
 }
 
@@ -108,17 +116,17 @@ fn render(
     }
     let mut hidden = Vec::new();
     for (section, &count) in sections.iter().zip(shown) {
-        if count == 0 && !section.lines.is_empty() {
+        if count == 0 && section.total() > 0 {
             let heading = section.title.split(" · ").next().unwrap_or_default();
-            hidden.push(format!("{heading} ({})", section.lines.len()));
+            hidden.push(format!("{heading} ({})", section.total()));
             continue;
         }
         sink(&section.title);
         for line in &section.lines[..count] {
             sink(line);
         }
-        if count < section.lines.len() {
-            sink(&more(section.lines.len() - count));
+        if count < section.total() {
+            sink(&more(section.total() - count));
         }
     }
     if !hidden.is_empty() {
@@ -202,7 +210,7 @@ pub(crate) fn emit(
             if let Value::Array(values) = values {
                 values.extend_from_slice(&section.values[..count]);
             }
-            let missing = section.values.len() - count;
+            let missing = section.total() - count;
             if missing > 0 {
                 let total = omitted.entry(section.key).or_insert(json!(0));
                 *total = json!(total.as_u64().unwrap_or(0) + missing as u64);
@@ -753,6 +761,7 @@ fn area_section(graph: &Graph) -> Section {
         )
     });
     let mut section = Section::new("areas", format!("Areas · {}", ordered.len()), 5);
+    section.unlisted = ordered.len().saturating_sub(RANKED);
     for (name, area) in ordered.iter().take(RANKED) {
         let mut languages: Vec<_> = area.languages.iter().collect();
         languages.sort_by_key(|(language, files)| (Reverse(**files), **language));
@@ -802,6 +811,7 @@ fn hub_section(graph: &Graph) -> Section {
         "Hubs · in = dependents, out = dependencies".into(),
         5,
     );
+    section.unlisted = hubs.len().saturating_sub(RANKED);
     for &id in hubs.iter().take(RANKED) {
         let mut value = node(graph.definition(id));
         value["in"] = json!(degrees.dependents[id]);
@@ -830,6 +840,7 @@ fn community_section(graph: &Graph) -> Section {
         format!("Communities · {} groups of linked symbols", groups.len()),
         3,
     );
+    section.unlisted = groups.len().saturating_sub(RANKED);
     for members in groups.iter().take(RANKED) {
         let mut files = BTreeMap::<&str, usize>::new();
         for &id in members {
@@ -925,6 +936,7 @@ fn link_section(graph: &Graph) -> Section {
         format!("Cross-area links · {}", crossings.len()),
         4,
     );
+    section.unlisted = crossings.len().saturating_sub(RANKED);
     for ((from, to, source, target), crossing) in crossings.iter().take(RANKED) {
         let mut kinds: Vec<_> = crossing.kinds.iter().collect();
         kinds.sort_by_key(|((inferred, kind), count)| (Reverse(**count), *inferred, *kind));
@@ -1006,7 +1018,7 @@ fn entry_section(graph: &Graph) -> Section {
         })
         .collect();
     roots.sort_by_key(|&id| graph.rank(id));
-    for id in roots.into_iter().take(RANKED) {
+    for id in roots {
         entries.push((
             2,
             id,
@@ -1021,6 +1033,7 @@ fn entry_section(graph: &Graph) -> Section {
         format!("Entry points · {}", entries.len()),
         3,
     );
+    section.unlisted = entries.len().saturating_sub(RANKED);
     for (_, id, reason) in entries.iter().take(RANKED) {
         let mut value = node(&definitions[*id]);
         value["reason"] = json!(reason);
@@ -1071,6 +1084,7 @@ fn test_section(graph: &Graph) -> Section {
         format!("Tests · {}", plural(places.len(), "location")),
         3,
     );
+    section.unlisted = places.len().saturating_sub(RANKED);
     for (directory, place) in places.iter().take(RANKED) {
         let first = place.files.first().copied().unwrap_or_default();
         let (example, example_json) = match place.example {

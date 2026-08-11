@@ -2429,6 +2429,37 @@ fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
 }
 
 #[test]
+fn affected_caps_fan_out_deterministically() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let mut source = String::from("def hot():\n    return 1\n");
+    for number in 0..300 {
+        source.push_str(&format!(
+            "\n\ndef caller_{number:03}():\n    return hot()\n"
+        ));
+    }
+    fs::write(root.join("hot.py"), source).unwrap();
+    let args = ["affected", "hot", "--budget", "100000"];
+    let impact = success(root, &args);
+    assert_eq!(impact, success(root, &args));
+    has_line(
+        &impact,
+        "Fan-out cap: followed 256 of 300 dependents of hot [function] hot.py:1-2.",
+    );
+    has_line(&impact, "Distance 1 · 256");
+    assert!(impact.contains("  caller_255 [function]"), "{impact}");
+    assert!(!impact.contains("caller_256"), "{impact}");
+    let json: serde_json::Value = serde_json::from_str(&success(
+        root,
+        &["affected", "hot", "--budget", "100000", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(json["capped"], true);
+    assert_eq!(json["dependents"].as_array().unwrap().len(), 256);
+    assert_eq!(json["commands"], serde_json::json!([]));
+}
+
+#[test]
 fn affected_changes_start_from_the_changed_symbols() {
     let repo = fixture();
     let path = repo.path();
@@ -2455,6 +2486,10 @@ fn affected_changes_start_from_the_changed_symbols() {
         success(path, &["affected", "--changes"]),
         "No changed files.\n"
     );
+    let clean: serde_json::Value =
+        serde_json::from_str(&success(path, &["affected", "--changes", "--json"])).unwrap();
+    assert_eq!(clean["changed"], serde_json::json!([]));
+    assert_eq!(clean["reached"], 0);
     let pricing = path.join("src/pricing.rs");
     let source = fs::read_to_string(&pricing).unwrap();
     fs::write(&pricing, source.replace("fee + 1", "fee + 2")).unwrap();

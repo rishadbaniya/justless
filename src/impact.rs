@@ -13,7 +13,7 @@ use crate::index::{Edge, Index};
 use crate::map::{Fill, Section, emit, is_test_file, label, name, node, plural};
 use crate::workspace::{Location, Workspace};
 
-/// Links followed into any one symbol. Certain links sort first.
+/// New dependents followed from any one symbol. Certain links sort first.
 const FAN_OUT: usize = 256;
 /// Dependents gathered across the whole walk.
 const MAX_REACHED: usize = 5000;
@@ -59,6 +59,9 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let index = Index::open(workspace)?;
     let definitions = &index.definitions;
     let mut summary = Map::new();
+    for key in ["dependents", "tests", "commands"] {
+        summary.insert(key.into(), json!([]));
+    }
     let mut sections = Vec::new();
     let (subject, seeds) = match matches.value_of("target") {
         Some(target) => {
@@ -78,7 +81,13 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         None => {
             let (seeds, section) = changed(workspace, &index, matches.is_present("staged"))?;
             if section.lines.is_empty() {
-                println!("No changed files.");
+                if matches.is_present("json") {
+                    summary.insert("changed".into(), json!([]));
+                    summary.insert("reached".into(), json!(0));
+                    println!("{}", serde_json::to_string(&summary)?);
+                } else {
+                    println!("No changed files.");
+                }
                 return Ok(());
             }
             sections.push(section);
@@ -234,9 +243,9 @@ fn notes(index: &Index, walk: &Walk, depth: usize) -> Vec<String> {
             plural(depth, "hop")
         ));
     }
-    for &(id, links) in walk.fanned.iter().take(2) {
+    for &(id, dependents) in walk.fanned.iter().take(2) {
         notes.push(format!(
-            "Fan-out cap: followed {FAN_OUT} of {links} links into {}.",
+            "Fan-out cap: followed {FAN_OUT} of {dependents} dependents of {}.",
             label(&index.definitions[id])
         ));
     }
@@ -372,7 +381,7 @@ struct Walk<'a> {
     levels: Vec<Vec<Reach<'a>>>,
     /// Distinct dependents one hop past the depth limit.
     beyond: usize,
-    /// Symbols whose incoming links exceeded the fan-out cap, with their link count.
+    /// Symbols with more new dependents than the fan-out cap, and how many they had.
     fanned: Vec<(usize, usize)>,
     /// Whether the walk stopped at `MAX_REACHED`.
     full: bool,
@@ -404,17 +413,25 @@ fn walk<'a>(index: &'a Index, seeds: &[usize], depth: usize) -> Walk<'a> {
     for _ in 0..depth {
         let mut next = BTreeMap::<Dependent, Reach>::new();
         for &(id, possible) in &frontier {
-            let mut edges: Vec<&Edge> = links_into(index, id).collect();
-            edges.sort_by_key(|edge| (edge.inferred, &edge.location, edge.from));
-            if edges.len() > FAN_OUT {
-                fanned.push((id, edges.len()));
-                edges.truncate(FAN_OUT);
-            }
-            for edge in edges {
+            // One link per new dependent, the most certain and then the first.
+            let mut links = BTreeMap::<Dependent, &Edge>::new();
+            for edge in links_into(index, id) {
                 let key = dependent(edge);
                 if seen.contains(&key) {
                     continue;
                 }
+                let link = links.entry(key).or_insert(edge);
+                if (edge.inferred, &edge.location) < (link.inferred, &link.location) {
+                    *link = edge;
+                }
+            }
+            let mut links: Vec<_> = links.into_iter().collect();
+            links.sort_by_key(|(key, edge)| (edge.inferred, &edge.location, *key));
+            if links.len() > FAN_OUT {
+                fanned.push((id, links.len()));
+                links.truncate(FAN_OUT);
+            }
+            for (key, edge) in links {
                 let reach = Reach {
                     dependent: key,
                     edge,

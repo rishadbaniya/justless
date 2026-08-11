@@ -51,7 +51,7 @@ HCL files index top-level blocks by their Terraform address, such as `aws_s3_buc
 
 Every row carries a file and line for `code`, `expand` or `query`. Sections take turns within the budget, so a small budget still shows the first rows of each. A section that does not fit is listed by name with its row count.
 
-`justless affected TARGET` walks back from a symbol or a workspace-relative file through calls, references, imports, HTTP routes and SQL relations to the code that depends on it. `--changes` starts from the current Git changes: the innermost definition around each changed range, and any definition whose declaration line changed. Add `--staged` for staged changes. Each dependent appears once, at its shortest distance and through its most certain link, so cycles end. `--depth` sets the number of hops, 3 by default, and the report counts the dependents just past it. A dependent reached through an inferred link is marked possible, as is everything reached through it. A Rust `use` outside any item appears as a file scope.
+`justless affected TARGET` walks back from a symbol or a workspace-relative file through calls, references, imports, HTTP routes and SQL relations to the code that depends on it. `--changes` starts from the current Git changes: the innermost definition around each changed range, and any definition whose declaration line changed. Add `--staged` for staged changes. Each dependent appears once, at its shortest distance and through its most certain link, so cycles end. `--depth` sets the number of hops, 3 by default, and the report counts the dependents just past it. A dependent reached through an inferred link is marked possible, as is everything reached through it. A Rust `use` outside any item appears as a file scope, except in the file that defines the symbol.
 
 Tests that reach the target come from the walk and from call chains of up to eight hops, whatever the depth. Test-convention files reached without a detected test definition, such as JavaScript suites, are listed by file. When the layout identifies the runner, the report ends with a command for those tests.
 
@@ -61,7 +61,7 @@ Tests that reach the target come from the walk and from call chains of up to eig
 | Python | A function, or a method of a `Test` class, in `test_*.py` or `*_test.py` | `pytest` with the node ID |
 | Go | A `Test` function in `*_test.go`, with `go.mod` at the root | `go test ./DIR -run '^(TestA\|TestB)$'` |
 
-A command names at most eight tests. The walk follows at most 256 links into one symbol and stops after 5,000 dependents. The report says when either cap applies. Within the budget, tests and commands are placed first, then nearer distances.
+A command names at most eight tests. The walk follows the first 256 new dependents of any one symbol, certain links first, and stops after 5,000 dependents. The report says when either cap applies. Within the budget, tests and commands are placed first, then nearer distances.
 
 ```sh
 justless map --budget 4000
