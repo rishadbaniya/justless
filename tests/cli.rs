@@ -2272,6 +2272,8 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
         ] {
             assert_eq!(run(&args, stdin), "{}\n", "{args:?}");
         }
+    }
+}
 
 fn has_line(output: &str, expected: &str) {
     assert!(

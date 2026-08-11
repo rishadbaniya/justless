@@ -253,6 +253,13 @@ pub(crate) fn language(file: &str) -> Option<&'static str> {
         Grammar::Php => "PHP",
         Grammar::Bash => "Bash",
         Grammar::Sql => "SQL",
+        Grammar::Kotlin => "Kotlin",
+        Grammar::Swift => "Swift",
+        Grammar::Scala => "Scala",
+        Grammar::Dart => "Dart",
+        Grammar::Hcl => "HCL",
+        Grammar::Lua => "Lua",
+        Grammar::Zig => "Zig",
     })
 }
 
