@@ -2747,7 +2747,13 @@ fn hooks_route_searches_and_listings_but_not_machine_output() {
         "fd orders",
         "git ls-files",
     ] {
-        for agent in ["hook-claude", "hook-codex"] {
+        // Claude Code keeps its own grep (see claude_code_keeps_its_own_grep_...).
+        let agents: &[&str] = if command.starts_with("grep ") {
+            &["hook-codex"]
+        } else {
+            &["hook-claude", "hook-codex"]
+        };
+        for agent in agents {
             let output = agent_hook(root, agent, "before-command", call(command));
             assert_eq!(
                 output["hookSpecificOutput"]["updatedInput"]["command"],
@@ -2878,4 +2884,45 @@ fn claude_grep_and_glob_results_are_grouped_and_recoverable() {
         .next()
         .unwrap();
     assert_eq!(success(&root, &["recall", id]), files.join("\n"));
+}
+
+#[test]
+fn claude_code_keeps_its_own_grep_and_destructive_finds_pass_through() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let rewrite = |agent: &str, command: &str| {
+        agent_hook(&root, agent, "before-command", call(command))["hookSpecificOutput"]
+            ["updatedInput"]["command"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    // Claude Code's shell replaces grep with a bundled ugrep that honors .gitignore,
+    // so its hook leaves grep alone. Other clients run the system grep either way.
+    for command in ["grep -rn Workspace src", "cd src && grep -rn foo ."] {
+        assert_eq!(rewrite("hook-claude", command), None, "{command}");
+        assert!(rewrite("hook-codex", command).is_some(), "{command}");
+    }
+    for command in [
+        "find . -name '*.rs'",
+        "rg Workspace",
+        "git grep -n Workspace",
+        "ls -la src",
+    ] {
+        assert_eq!(
+            rewrite("hook-claude", command),
+            Some(format!("justless run -- {command}")),
+            "{command}"
+        );
+    }
+    for command in [
+        "find . -name '*.tmp' -delete",
+        "find . -exec rm {} +",
+        "find . -name x -execdir cat {} +",
+        "find . -ok rm {} +",
+    ] {
+        for agent in ["hook-claude", "hook-codex"] {
+            assert_eq!(rewrite(agent, command), None, "{agent} {command}");
+        }
+    }
 }

@@ -511,7 +511,14 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         return None;
     }
     let command = args.get("command")?.as_str()?.to_owned();
-    let rewritten = wrap_event(workspace, &cwd, &command, session, agent == Agent::Gemini)?;
+    let rewritten = wrap_event(
+        workspace,
+        &cwd,
+        &command,
+        session,
+        agent == Agent::Gemini,
+        false,
+    )?;
     args["command"] = Value::String(rewritten);
     Some(match agent {
         Agent::Cursor => json!({"permission":"allow", "updated_input":args}),
@@ -695,6 +702,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         args["CommandLine"].as_str()?,
         input["conversationId"].as_str(),
         false,
+        false,
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
 }
@@ -721,6 +729,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         command,
         input["session_id"].as_str(),
         agent != Agent::Codex,
+        agent == Agent::Claude,
     )?);
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
     if agent == Agent::Codex {
@@ -740,7 +749,13 @@ fn wrap_event(
     command: &str,
     session: Option<&str>,
     allow_mixed: bool,
+    client_grep: bool,
 ) -> Option<String> {
+    // Claude Code's shell replaces `grep` with a bundled ugrep that honors .gitignore
+    // and skips binary files. Running the system grep instead would search ignored
+    // build and dependency trees, so leave grep to that client's shell.
+    let supported =
+        |segment: &str| supported_command(segment) && !(client_grep && runs_grep(segment));
     if !cfg!(windows)
         && let Some(words) = literal_command(command)
         && let [program, file] = words.as_slice()
@@ -779,7 +794,7 @@ fn wrap_event(
     let wrap = |segment: &str| format!("justless run{session} -- {segment}");
     let segments = split_compound(command).filter(|s| s.len() > 1);
     let Some(segments) = segments else {
-        if !supported_command(command) {
+        if !supported(command) {
             crate::history::bypass(workspace, command);
             return None;
         }
@@ -809,7 +824,7 @@ fn wrap_event(
             }
             continue;
         }
-        if !supported_command(segment) {
+        if !supported(segment) {
             if !allow_mixed {
                 return None;
             }
@@ -927,6 +942,20 @@ pub fn command_label(command: &str) -> String {
         .skip_while(|w| w.contains('=') && !w.starts_with('-'))
         .collect();
     crate::filters::tool_label_words(&words)
+}
+
+/// Whether a command runs plain `grep`, possibly behind a package runner.
+fn runs_grep(command: &str) -> bool {
+    let Some(words) = literal_command(command) else {
+        return false;
+    };
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    crate::filters::unwrap_tool(&words)
+        .first()
+        .is_some_and(|program| {
+            let name = Path::new(program).file_name().and_then(|n| n.to_str());
+            matches!(name, Some("grep" | "egrep" | "fgrep"))
+        })
 }
 
 fn supported_command(command: &str) -> bool {
