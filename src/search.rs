@@ -321,7 +321,27 @@ pub fn route(words: &[&str]) -> Option<bool> {
 /// ag skip hidden directories unless asked to search them.
 pub fn exclude_state(words: &[&str]) -> Option<&'static str> {
     let (&program, args) = words.split_first()?;
-    if words.iter().any(|w| w.contains(".justless")) || select(words).is_none() {
+    let spec = match basename(program) {
+        "grep" | "egrep" | "fgrep" => &GREP,
+        "ack" | "ack-grep" => &ACK,
+        "ag" => &AG,
+        "rg" => &RG,
+        _ => return None,
+    };
+    // Searching inside the state directory on purpose keeps it. A pattern or option
+    // value that mentions it does not. Unknown options count every word as a path.
+    let operands = match parse(args, spec) {
+        Some(parsed) => {
+            let explicit = parsed.has(&["-e", "--regexp", "-f", "--file"]);
+            let pattern = usize::from(!explicit).min(parsed.positional.len());
+            parsed.positional[pattern..].to_vec()
+        }
+        None => args.to_vec(),
+    };
+    if operands
+        .iter()
+        .any(|path| path.split('/').any(|part| part == ".justless"))
+    {
         return None;
     }
     let hidden = || {
@@ -350,6 +370,7 @@ struct Group {
 /// Groups search output by file while the stream is scanned.
 pub struct Search {
     base: PathBuf,
+    keep: Vec<String>,
     groups: Vec<Group>,
     index: HashMap<String, usize>,
     current: Option<usize>,
@@ -366,9 +387,11 @@ pub struct Search {
 
 impl Search {
     /// `base` is the directory relative paths in the output resolve against.
-    pub fn new(base: &Path) -> Self {
+    /// Dependency and build directories named in `words` are not collapsed.
+    pub fn new(base: &Path, words: &[&str]) -> Self {
         Self {
             base: base.to_path_buf(),
+            keep: crate::listing::named_noise(words),
             groups: Vec::new(),
             index: HashMap::new(),
             current: None,
@@ -397,6 +420,16 @@ impl Search {
             return;
         }
         self.records += 1;
+        // BSD and older GNU grep report a matching binary file on stdout.
+        if let Some(path) = line
+            .strip_prefix("Binary file ")
+            .and_then(|rest| rest.strip_suffix(" matches"))
+        {
+            if let Some(c) = self.group(path, n) {
+                self.hit(c, "(binary file matches)", n);
+            }
+            return;
+        }
         if let Some(c) = self.current
             && let Some(rest) = line.strip_prefix(self.groups[c].path.as_str())
         {
@@ -411,23 +444,8 @@ impl Search {
         }
         if let Some(end) = self.split(line) {
             let path = &line[..end];
-            let c = match self.index.get(path) {
-                Some(&c) => c,
-                None => {
-                    if self.groups.len() >= MAX_FILES {
-                        self.overflow = true;
-                        return;
-                    }
-                    self.index.insert(path.to_owned(), self.groups.len());
-                    self.groups.push(Group {
-                        path: path.to_owned(),
-                        matches: 0,
-                        first: n,
-                        last: n,
-                        shown: Vec::new(),
-                    });
-                    self.groups.len() - 1
-                }
+            let Some(c) = self.group(path, n) else {
+                return;
             };
             // Lines printed just before a file's first match are its leading context.
             let prefix = format!("{path}-");
@@ -445,6 +463,25 @@ impl Search {
             self.drop_pending();
         }
         self.pending.push((n, line.to_owned()));
+    }
+
+    fn group(&mut self, path: &str, n: usize) -> Option<usize> {
+        if let Some(&c) = self.index.get(path) {
+            return Some(c);
+        }
+        if self.groups.len() >= MAX_FILES {
+            self.overflow = true;
+            return None;
+        }
+        self.index.insert(path.to_owned(), self.groups.len());
+        self.groups.push(Group {
+            path: path.to_owned(),
+            matches: 0,
+            first: n,
+            last: n,
+            shown: Vec::new(),
+        });
+        Some(self.groups.len() - 1)
     }
 
     fn hit(&mut self, c: usize, text: &str, n: usize) {
@@ -564,6 +601,40 @@ impl Search {
                 }
             )
         });
+        // Matches inside dependency and build directories collapse into one line each.
+        let mut collapsed: Vec<(&str, usize, usize, usize, usize)> = Vec::new();
+        order.retain(|g| {
+            let Some(prefix) = crate::listing::noise_prefix(&g.path, &self.keep) else {
+                return true;
+            };
+            match collapsed.iter_mut().find(|c| c.0 == prefix) {
+                Some(c) => {
+                    c.1 += 1;
+                    c.2 += g.matches;
+                    c.3 = c.3.min(g.first);
+                    c.4 = c.4.max(g.last);
+                }
+                None => collapsed.push((prefix, 1, g.matches, g.first, g.last)),
+            }
+            false
+        });
+        collapsed.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+        let other: String = collapsed
+            .iter()
+            .map(|(prefix, files, matches, first, last)| {
+                format!(
+                    "{prefix}/ {} in {} collapsed{}\n",
+                    plural(*matches, "match", "matches"),
+                    plural(*files, "file", "files"),
+                    if pointers {
+                        format!(" [stdout:{first}-{last}]")
+                    } else {
+                        String::new()
+                    }
+                )
+            })
+            .chain(std::iter::once(other))
+            .collect();
         let room = budget.saturating_sub(header.len() + other.len() + 96);
         let block = |g: &Group, k: usize| {
             let mut text = format!("{} ×{}{}\n", g.path, g.matches, pointer(pointers, g));
@@ -743,16 +814,24 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
     };
     response["numFiles"].as_u64()?;
     let budget = ws.settings().ok()?.context_budget;
+    // Grep prints paths relative to the session directory, and Glob absolute paths.
     let base = input["cwd"]
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| ws.cwd.clone());
+    // A dependency directory the agent searched on purpose is not collapsed.
+    let args = &input["tool_input"];
+    let named: Vec<&str> = ["path", "glob", "pattern"]
+        .iter()
+        .map(|key| args[*key].as_str().unwrap_or(""))
+        .collect();
+    let words = [&[tool][..], &named].concat();
     let (original, lines) = if content {
         let original = response["content"].as_str()?.to_owned();
         if original.len() <= budget || !response["numLines"].is_u64() {
             return None;
         }
-        let mut search = Search::new(&base);
+        let mut search = Search::new(&base, &words);
         for (i, line) in original.lines().enumerate() {
             search.observe(line, i + 1);
         }
@@ -768,7 +847,7 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
         if original.len() <= budget {
             return None;
         }
-        let report = crate::listing::paths(tool, &names, &base, budget)?;
+        let report = crate::listing::paths(tool, &names, &base, &words, budget)?;
         (original, report)
     };
     let id = crate::observations::archive(ws, &Value::String(original.clone())).ok()?;

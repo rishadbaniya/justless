@@ -194,9 +194,9 @@ pub fn execute(
     let mut lint = (selection.profile == Some(crate::filters::Profile::Lint))
         .then(|| crate::lint::Lint::new(&workspace.root));
     let mut grouping = match selection.profile {
-        Some(crate::filters::Profile::Search) => {
-            Some(Grouping::Search(crate::search::Search::new(&workspace.cwd)))
-        }
+        Some(crate::filters::Profile::Search) => Some(Grouping::Search(
+            crate::search::Search::new(&workspace.cwd, &words),
+        )),
         Some(crate::filters::Profile::Listing) => {
             Some(Grouping::Listing(crate::listing::Listing::new(&words)))
         }

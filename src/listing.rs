@@ -93,15 +93,7 @@ impl Listing {
             _ => Format::Paths,
         };
         let mut listing = Self::with_format(format);
-        // A directory the command names is the subject, not noise.
-        listing.keep = words
-            .iter()
-            .skip(1)
-            .filter(|w| !w.starts_with('-'))
-            .flat_map(|w| w.split('/'))
-            .filter(|c| NOISE.contains(c))
-            .map(str::to_owned)
-            .collect();
+        listing.keep = named_noise(words);
         // `find` prints each starting point itself before its contents.
         if program == "find" {
             listing.roots = words[1..]
@@ -248,21 +240,12 @@ impl Listing {
         if path.is_empty() || path == "/" || self.roots.iter().any(|r| r == path) {
             return;
         }
-        let segments: Vec<&str> = path.split('/').collect();
-        let mut end = 0;
-        for (i, segment) in segments.iter().enumerate() {
-            end += segment.len();
-            if i + 1 < segments.len()
-                && NOISE.contains(segment)
-                && !self.keep.iter().any(|k| k == segment)
-            {
-                if let Some(group) = self.dir(&path[..end], n) {
-                    group.noise = true;
-                    group.entries += 1;
-                }
-                return;
+        if let Some(prefix) = noise_prefix(path, &self.keep) {
+            if let Some(group) = self.dir(prefix, n) {
+                group.noise = true;
+                group.entries += 1;
             }
-            end += 1;
+            return;
         }
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
         let parent = if parent.is_empty() && path.starts_with('/') {
@@ -543,6 +526,33 @@ impl Listing {
     }
 }
 
+/// Dependency and build directory names that a command names as its subject, so
+/// they are not collapsed.
+pub(crate) fn named_noise(words: &[&str]) -> Vec<String> {
+    words
+        .iter()
+        .skip(1)
+        .filter(|w| !w.starts_with('-'))
+        .flat_map(|w| w.split('/'))
+        .filter(|c| NOISE.contains(c))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The path up to the first dependency or build directory that contains it.
+pub(crate) fn noise_prefix<'a>(path: &'a str, keep: &[String]) -> Option<&'a str> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut end = 0;
+    for (i, segment) in segments.iter().enumerate() {
+        end += segment.len();
+        if i + 1 < segments.len() && NOISE.contains(segment) && !keep.iter().any(|k| k == segment) {
+            return Some(&path[..end]);
+        }
+        end += 1;
+    }
+    None
+}
+
 struct View<'a> {
     key: &'a str,
     dir: Option<&'a Dir>,
@@ -555,11 +565,18 @@ struct View<'a> {
 
 /// Compact a file list from an agent tool, such as Claude Code's Glob, relative to
 /// `base` when every path sits under it.
-pub fn paths(tool: &str, names: &[&str], base: &Path, budget: usize) -> Option<String> {
+pub fn paths(
+    tool: &str,
+    names: &[&str],
+    base: &Path,
+    words: &[&str],
+    budget: usize,
+) -> Option<String> {
     let base = base.to_str()?.trim_end_matches('/');
     let prefix = format!("{base}/");
     let relative = !base.is_empty() && names.iter().all(|n| n.starts_with(&prefix));
     let mut listing = Listing::with_format(Format::Paths);
+    listing.keep = named_noise(words);
     for (i, name) in names.iter().enumerate() {
         listing.observe(
             if relative {

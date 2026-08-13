@@ -2611,8 +2611,20 @@ fn search_output_groups_matches_by_file_with_exact_lines() {
         format!("  {}", &first["./src/big.rs:".len()..])
     );
     assert!(report.contains(" more in file\n"), "{report}");
+    // Dependency trees collapse into one line that still links to their matches.
+    assert!(
+        report.contains("\n./node_modules/ 60 matches in 60 files collapsed [stdout:"),
+        "{report}"
+    );
 
-    // Archived logs, including the stdout of the run itself, are never searched.
+    // Archived logs, including the stdout of the run itself, are never searched,
+    // even when the pattern names the state directory.
+    fs::write(root.join("docs/state.md"), "keep .justless/ out of Git\n").unwrap();
+    let state = cli(root, &["run", "--", "grep", "-rn", ".justless", "."]);
+    assert_eq!(
+        stdout(&state),
+        "./docs/state.md:1:keep .justless/ out of Git\n"
+    );
     let again = cli(
         root,
         &["run", "--fresh", "--", "grep", "-rn", "needle", "."],
