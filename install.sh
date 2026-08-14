@@ -224,6 +224,13 @@ main() {
     if [ "$(command -v justless || true)" != "$binary" ]; then
         printf 'For future agent sessions, put %s first on your PATH.\n' "$prefix/bin"
     fi
+    # Hooks belong to a project. In the home directory they would land in the user's
+    # global agent settings, so ask for a project folder instead.
+    if [ -n "$agents" ] && { [ "$PWD" = "$HOME" ] || [ "$PWD" = "/" ]; }; then
+        echo "Justless CLI installed. Run this again inside a project folder to turn it on there,"
+        echo "or run justless init --hooks --agent NAME from the project."
+        return 0
+    fi
     if [ -n "$agents" ]; then
         set -- init --hooks
         for agent in $agents; do set -- "$@" --agent "$agent"; done

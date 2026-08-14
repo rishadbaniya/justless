@@ -15,6 +15,16 @@
 
 Justless is a local CLI that helps coding agents use fewer tokens when running commands and exploring a codebase.
 
+## Quick start
+
+Paste this in your project folder:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh
+```
+
+That installs Justless and turns it on for every coding agent it finds: Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, OpenCode and Antigravity CLI. Then start a new agent session. In Codex, run `/hooks` once and trust them. Until a release is published, the installer builds Justless from source, which needs [Rust](https://rustup.rs). Details are under [Install](#install).
+
 ## Features
 
 - **Progressive reads.** Browse signatures and line ranges, then expand one symbol or Markdown section to its exact source.
