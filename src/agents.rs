@@ -791,7 +791,7 @@ fn wrap_event(
             )
         })
         .unwrap_or_default();
-    let wrap = |segment: &str| format!("justless run{session} -- {segment}");
+    let wrap = |segment: &str| format!("justless run --hook{session} -- {segment}");
     let segments = split_compound(command).filter(|s| s.len() > 1);
     let Some(segments) = segments else {
         if !supported(command) {

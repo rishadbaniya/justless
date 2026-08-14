@@ -118,6 +118,13 @@ pub struct Run {
     pub summary: Summary,
     #[serde(default)]
     pub unchanged: bool,
+    /// Bytes of the footer printed after the preview, so savings count everything
+    /// the agent received.
+    #[serde(default)]
+    pub footer_bytes: usize,
+    /// The run was routed by an agent hook rather than typed by a person.
+    #[serde(default)]
+    pub hook: bool,
     pub diagnostics: Vec<Diagnostic>,
     pub source_digests: BTreeMap<String, String>,
 }
@@ -133,6 +140,7 @@ pub fn execute(
     raw: bool,
     session: &str,
     fresh: bool,
+    hook: bool,
 ) -> Result<i32> {
     let mut command = Command::new(&args[0]);
     command.current_dir(&workspace.cwd);
@@ -182,6 +190,8 @@ pub fn execute(
         digests: Vec::new(),
         summary: Summary::default(),
         unchanged: false,
+        footer_bytes: 0,
+        hook,
         completed_ms: history::now_ms(),
         id: id.clone(),
         status: exit_code(status),
@@ -326,6 +336,8 @@ pub fn execute(
         previews[0].1 = summary.into_bytes();
     }
     run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();
+    let footer = footer(&id, &run, &previews, directory, hook, &selection)?;
+    run.footer_bytes = footer.len();
     let save_result = write_json(&directory.join("record.json"), &run);
     if let Err(error) = save_result {
         eprintln!("justless: could not save run, restoring full output: {error:#}");
@@ -348,11 +360,69 @@ pub fn execute(
             eprintln!("justless: could not display {}: {error}", stream.name());
         }
     }
-    eprintln!(
-        "\n[justless {id}] exit {} · {} of {} output bytes · justless log {id}",
-        run.status, run.preview_bytes, run.raw_bytes
-    );
+    if !footer.is_empty() {
+        eprint!("{footer}");
+    }
     Ok(run.status)
+}
+
+/// The line printed after the preview. A command typed by a person keeps the full
+/// footer. A hook-routed command that reached the agent verbatim prints nothing, since
+/// the agent already has every byte; otherwise one short marker names the run so the
+/// agent can recover what was left out.
+fn footer(
+    id: &str,
+    run: &Run,
+    previews: &[(Stream, Vec<u8>)],
+    directory: &Path,
+    hook: bool,
+    selection: &crate::filters::Selection,
+) -> Result<String> {
+    if !hook {
+        return Ok(format!(
+            "\n[justless {id}] exit {} · {} of {} output bytes · justless log {id}\n",
+            run.status, run.preview_bytes, run.raw_bytes
+        ));
+    }
+    // Compare the printed bytes with the archive itself: equal sizes alone can hide
+    // a replaced or regrouped stream.
+    let mut verbatim = run.preview_bytes as u64 == run.raw_bytes;
+    for (stream, preview) in previews {
+        if !verbatim {
+            break;
+        }
+        let path = directory.join(stream.name());
+        verbatim =
+            fs::metadata(&path)?.len() == preview.len() as u64 && fs::read(&path)? == *preview;
+    }
+    // A search that matched nothing exits 1 with no output; that is an answer, not a failure.
+    let empty_search = run.status == 1
+        && run.raw_bytes == 0
+        && selection.profile == Some(crate::filters::Profile::Search);
+    let separator = match previews.iter().rev().find(|(_, bytes)| !bytes.is_empty()) {
+        Some((_, bytes)) if !bytes.ends_with(b"\n") => "\n",
+        _ => "",
+    };
+    Ok(if verbatim && (run.status == 0 || empty_search) {
+        String::new()
+    } else if verbatim || run.unchanged {
+        if run.status == 0 {
+            String::new()
+        } else {
+            format!("{separator}[justless {id} · exit {}]\n", run.status)
+        }
+    } else {
+        let exit = if run.status == 0 {
+            String::new()
+        } else {
+            format!(" · exit {}", run.status)
+        };
+        format!(
+            "{separator}[justless {id} · {} of {} shown{exit}]\n",
+            history::human_bytes(run.preview_bytes as u64),
+            history::human_bytes(run.raw_bytes)
+        )
+    })
 }
 
 // Hash the exact bytes during the same pass that extracts the bounded preview.

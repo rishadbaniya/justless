@@ -190,6 +190,8 @@ struct FamilyStats {
     full_reads: u64,
     targeted_lookups: u64,
     unchanged_runs: u64,
+    /// Runs whose printed preview and footer were larger than the raw output.
+    grown_runs: u64,
 }
 
 #[derive(Default, Serialize)]
@@ -244,7 +246,8 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     let mut timeline: BTreeMap<String, DayStats> = BTreeMap::new();
     for run in records(workspace, false)? {
         let run = run?;
-        let shown = run.preview_bytes as u64;
+        // Count everything the agent received, including the footer.
+        let shown = (run.preview_bytes + run.footer_bytes) as u64;
         count += 1;
         raw += run.raw_bytes;
         preview += shown;
@@ -262,6 +265,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         f.full_reads += c.full;
         f.targeted_lookups += c.range + c.search + c.context;
         f.unchanged_runs += u64::from(run.unchanged);
+        f.grown_runs += u64::from(shown > run.raw_bytes);
         if run.completed_ms >= since && run.completed_ms > 0 {
             let date = utc_date(run.completed_ms);
             let d = timeline.entry(date.clone()).or_default();
@@ -349,6 +353,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             }
             if f.unchanged_runs > 0 {
                 notes.push(format!("{} unchanged", f.unchanged_runs));
+            }
+            if f.grown_runs > 0 {
+                notes.push(format!("{} grew", f.grown_runs));
             }
             let family = crate::summary::short(&f.family, 28);
             println!(

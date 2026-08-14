@@ -824,7 +824,7 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
     );
     assert_eq!(
         rewritten["hookSpecificOutput"]["updatedInput"]["command"],
-        "justless run -- rg 'fetch|list_orders' frontend"
+        "justless run --hook -- rg 'fetch|list_orders' frontend"
     );
     assert_eq!(
         rewritten["hookSpecificOutput"]["updatedInput"]["workdir"],
@@ -844,7 +844,7 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
         "git status --porcelain=v1",
         "rg fetch > matches.txt",
         "npm test -- --watch",
-        "justless run -- rg fetch",
+        "justless run --hook -- rg fetch",
         "rg fetch frontend/*.ts",
     ] {
         assert_eq!(
@@ -878,9 +878,18 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("frontend/"), "{}", stdout(&output));
+    // A hook-routed run that reached the agent verbatim prints no footer, but it is
+    // still archived and listed.
+    assert!(
+        !stderr(&output).contains("[justless"),
+        "{}",
+        stderr(&output)
+    );
+    let latest = success(root, &["history"]);
+    let id = latest.split_whitespace().next().unwrap();
     assert!(
         root.join(".justless/runs")
-            .join(run_id(&output))
+            .join(id)
             .join("stdout")
             .is_file()
     );
@@ -942,7 +951,7 @@ fn install_and_run_claude_and_agy_hooks() {
     let hook = &output["hookSpecificOutput"];
     assert_eq!(
         hook["updatedInput"],
-        json!({"command":"justless run -- git diff","description":"show changes"})
+        json!({"command":"justless run --hook -- git diff","description":"show changes"})
     );
     assert!(hook.get("permissionDecision").is_none());
     let mut plan = claude_input;
@@ -963,7 +972,7 @@ fn install_and_run_claude_and_agy_hooks() {
     };
     assert_eq!(
         dispatch("git diff", &root),
-        json!({"decision":"allow","overwrite":{"CommandLine":"justless run -- git diff"}})
+        json!({"decision":"allow","overwrite":{"CommandLine":"justless run --hook -- git diff"}})
     );
     assert_eq!(
         dispatch("git diff", elsewhere.path()),
@@ -983,7 +992,7 @@ fn install_and_run_claude_and_agy_hooks() {
     );
     assert_eq!(
         result["overwrite"]["CommandLine"],
-        "justless run -- git diff"
+        "justless run --hook -- git diff"
     );
     multiple["toolCall"]["args"]["RunPersistent"] = json!(true);
     assert_eq!(
@@ -1238,7 +1247,7 @@ fn older_runs_are_searchable_and_hook_statistics_do_not_capture_arguments() {
         .as_str()
         .unwrap();
     assert!(
-        wrapped.starts_with("justless run --session ")
+        wrapped.starts_with("justless run --hook --session ")
             && wrapped.ends_with(" -- git status")
             && !wrapped.contains("odd")
     );
@@ -1549,7 +1558,7 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
         let output = agent_hook(root, "hook-claude", "before-command", call(command));
         assert_eq!(
             output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!("justless run -- {command}"),
+            format!("justless run --hook -- {command}"),
             "{command}"
         );
     }
@@ -1587,12 +1596,15 @@ fn compound_commands_wrap_each_supported_segment_in_place() {
     for (command, expected) in [
         (
             "git status; git diff",
-            "justless run -- git status; justless run -- git diff",
+            "justless run --hook -- git status; justless run --hook -- git diff",
         ),
-        ("cd web && npm test", "cd web && justless run -- npm test"),
+        (
+            "cd web && npm test",
+            "cd web && justless run --hook -- npm test",
+        ),
         (
             "git log --oneline -5  &&  git diff --stat",
-            "justless run -- git log --oneline -5  &&  justless run -- git diff --stat",
+            "justless run --hook -- git log --oneline -5  &&  justless run --hook -- git diff --stat",
         ),
     ] {
         for agent in ["hook-claude", "hook-codex"] {
@@ -1608,12 +1620,15 @@ fn compound_commands_wrap_each_supported_segment_in_place() {
     for (command, expected) in [
         (
             "cargo test && git push",
-            "justless run -- cargo test && git push",
+            "justless run --hook -- cargo test && git push",
         ),
-        ("cargo test || true", "justless run -- cargo test || true"),
+        (
+            "cargo test || true",
+            "justless run --hook -- cargo test || true",
+        ),
         (
             "echo \"a && b\" && git status",
-            "echo \"a && b\" && justless run -- git status",
+            "echo \"a && b\" && justless run --hook -- git status",
         ),
     ] {
         assert_eq!(rewrite("hook-claude", command).as_deref(), Some(expected));
@@ -1815,7 +1830,7 @@ fn hooks_route_linters_build_tools_and_package_runners() {
         let output = agent_hook(root, "hook-claude", "before-command", call(command));
         assert_eq!(
             output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!("justless run -- {command}"),
+            format!("justless run --hook -- {command}"),
             "{command}"
         );
     }
@@ -2191,11 +2206,11 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
     assert_eq!(
         cursor("git diff"),
         json!({"permission":"allow","updated_input":{
-            "command":"justless run -- git diff","working_directory":root}})
+            "command":"justless run --hook -- git diff","working_directory":root}})
     );
     assert_eq!(
         cursor("git status && git diff")["updated_input"]["command"],
-        "justless run -- git status && justless run -- git diff"
+        "justless run --hook -- git status && justless run --hook -- git diff"
     );
     for command in ["git push", "cargo test && git push", "git diff | cat"] {
         assert_eq!(cursor(command), json!({}), "{command}");
@@ -2211,7 +2226,7 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
     let rewritten = hook("hook-cursor", "before-command", other);
     let command = rewritten["updated_input"]["command"].as_str().unwrap();
     assert!(
-        command.starts_with("justless run --session ") && command.ends_with(" -- git diff"),
+        command.starts_with("justless run --hook --session ") && command.ends_with(" -- git diff"),
         "{command}"
     );
 
@@ -2230,7 +2245,7 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
             json!({"command":"cargo test && git push","description":"test","dir_path":"frontend"})
         ),
         json!({"hookSpecificOutput":{"hookEventName":"BeforeTool","tool_input":{
-            "command":"justless run -- cargo test && git push","description":"test",
+            "command":"justless run --hook -- cargo test && git push","description":"test",
             "dir_path":"frontend"}}})
     );
     for args in [
@@ -2250,7 +2265,7 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
             json!({"sessionId":"","timestamp":1,"cwd":root,"toolName":"bash","toolArgs":args}),
         )
     };
-    let expected = json!({"modifiedArgs":{"command":"justless run -- git diff",
+    let expected = json!({"modifiedArgs":{"command":"justless run --hook -- git diff",
         "description":"show changes"}});
     let args = json!({"command":"git diff","description":"show changes"});
     assert_eq!(copilot(json!(args.to_string())), expected);
@@ -2757,7 +2772,7 @@ fn hooks_route_searches_and_listings_but_not_machine_output() {
             let output = agent_hook(root, agent, "before-command", call(command));
             assert_eq!(
                 output["hookSpecificOutput"]["updatedInput"]["command"],
-                format!("justless run -- {command}"),
+                format!("justless run --hook -- {command}"),
                 "{agent} {command}"
             );
         }
@@ -2911,7 +2926,7 @@ fn claude_code_keeps_its_own_grep_and_destructive_finds_pass_through() {
     ] {
         assert_eq!(
             rewrite("hook-claude", command),
-            Some(format!("justless run -- {command}")),
+            Some(format!("justless run --hook -- {command}")),
             "{command}"
         );
     }
@@ -2925,4 +2940,96 @@ fn claude_code_keeps_its_own_grep_and_destructive_finds_pass_through() {
             assert_eq!(rewrite(agent, command), None, "{agent} {command}");
         }
     }
+}
+
+#[test]
+fn hook_routed_runs_print_a_footer_only_when_it_adds_information() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+    let hooked = |args: &[&str]| {
+        let mut all = vec!["run", "--hook", "--"];
+        all.extend(args);
+        cli(root, &all)
+    };
+
+    // Verbatim success: the agent already has every byte, so nothing is added.
+    let ok = hooked(&["sh", "-c", "echo done"]);
+    assert_eq!(
+        (ok.status.code(), stdout(&ok), stderr(&ok)),
+        (Some(0), "done\n".into(), String::new())
+    );
+
+    // A search that matches nothing keeps its exit status 1 and prints nothing.
+    let miss = hooked(&["grep", "-rn", "zzz-no-match", "."]);
+    assert_eq!(
+        (miss.status.code(), stdout(&miss), stderr(&miss)),
+        (Some(1), String::new(), String::new())
+    );
+
+    // A real failure keeps its message and gains one short marker with the exit status.
+    let error = hooked(&["grep", "-rn", "zzz", "/nonexistent/justless-path"]);
+    assert_eq!(error.status.code(), Some(2));
+    let marker = stderr(&error);
+    assert!(
+        marker.lines().last().unwrap().starts_with("[justless run-")
+            && marker.trim_end().ends_with(" · exit 2]"),
+        "{marker}"
+    );
+    assert!(marker.contains("nonexistent"), "{marker}");
+
+    // Clipped output says how much was shown, and the full stream replays exactly.
+    let long = hooked(&["sh", "-c", "seq 1 20000"]);
+    assert_eq!(long.status.code(), Some(0));
+    let marker = stderr(&long);
+    assert!(
+        marker.contains(" of ") && marker.trim_end().ends_with(" shown]"),
+        "{marker}"
+    );
+    let id = marker
+        .trim()
+        .trim_start_matches('[')
+        .split(' ')
+        .nth(1)
+        .unwrap();
+    let replay = success(root, &["log", id, "--stream", "stdout"]);
+    let expected: String = (1..=20000).map(|n| format!("{n}\n")).collect();
+    assert_eq!(replay, expected);
+
+    // A repeated run collapses and needs no marker of its own.
+    let again = hooked(&["sh", "-c", "seq 1 20000"]);
+    assert!(
+        stdout(&again).starts_with("Output unchanged since run-"),
+        "{}",
+        stdout(&again)
+    );
+    assert_eq!(stderr(&again), "");
+
+    // Output without a final newline still puts the marker on its own line.
+    let partial = hooked(&["sh", "-c", "printf partial; exit 4"]);
+    assert_eq!(
+        (partial.status.code(), stdout(&partial)),
+        (Some(4), "partial".into())
+    );
+    assert!(
+        stderr(&partial).starts_with("\n[justless run-"),
+        "{:?}",
+        stderr(&partial)
+    );
+
+    // A command typed by a person keeps the full footer that scripts parse.
+    let typed = cli(root, &["run", "--", "sh", "-c", "echo typed"]);
+    assert!(stderr(&typed).contains("] exit 0 · 6 of 6 output bytes · justless log run-"));
+
+    // Stats count the footers the agent received and flag runs that grew.
+    let report: serde_json::Value =
+        serde_json::from_str(&success(root, &["stats", "--json"])).unwrap();
+    let grown: u64 = report["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["grown_runs"].as_u64().unwrap())
+        .sum();
+    assert!(grown >= 2, "{report:#}");
+    assert!(success(root, &["stats"]).contains("grew"));
 }

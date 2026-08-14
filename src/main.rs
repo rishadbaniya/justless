@@ -99,6 +99,12 @@ fn cli() -> Command<'static> {
                         .help("Run with inherited streams and skip capture"),
                 )
                 .arg(
+                    Arg::new("hook")
+                        .long("hook")
+                        .hide(true)
+                        .help("Routed by an agent hook: print a footer only when it adds information"),
+                )
+                .arg(
                     Arg::new("command")
                         .required(true)
                         .multiple_values(true)
@@ -348,6 +354,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 raw,
                 sub.value_of("session").unwrap_or(&default_session),
                 sub.is_present("fresh"),
+                sub.is_present("hook"),
             );
         }
         ("log", sub) => {
