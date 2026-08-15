@@ -13,7 +13,40 @@
   <a href="#install">Install</a> · <a href="docs/reference.md">Reference</a> · <a href="docs/examples.md">Examples</a> · <a href="docs/benchmarks.md">Benchmarks</a>
 </p>
 
-Justless is a local CLI that helps coding agents use fewer tokens when running commands and exploring a codebase.
+Justless is a local CLI that cuts the tokens coding agents spend on command output, source reads and old tool results. It sits between the agent and your shell through hooks, so agents keep running their usual commands.
+
+## How it cuts tokens
+
+**⚡ Compact Output.** Builds, tests, linters, diffs and searches come back as the part that decides the next step. Test failures are grouped by cause, lint findings by rule, search matches by file and paths by directory. Errors, exit codes and the first failing line are always kept.
+
+**🎯 Exact Recall.** Nothing is thrown away. Every run is archived byte for byte with a run ID, and `justless log` replays any line range. Agents read the one line they need instead of rerunning a test suite.
+
+**🔬 Surgical Reads.** A file arrives as an outline of its symbols with line ranges, then the agent expands only the symbol it needs. Edits send just the replacement, checked against the revision the agent read.
+
+**🗺️ Code Map and Impact.** `map`, `pack`, `query` and `affected` answer "where is this", "what calls it" and "what breaks if I change it" from a local index of 21 languages, along with the exact test command to run.
+
+**🧹 Context Hygiene.** Identical reruns collapse to one line, changed reruns show only what changed, and recent activity is handed across compaction.
+
+### Measured
+
+| What the agent ran | Raw output | With Justless |
+| --- | ---: | ---: |
+| 77 real commands across four Rust and Python repositories | 1,171 KB | **115 KB** (90% smaller) |
+| `git diff` against older revisions | 274 KB | 13.5 KB |
+| `find .` | 267 KB | 9.4 KB |
+| `grep -rn` | 200 KB | 16.4 KB |
+| `cargo check` with compile errors | 26.5 KB | 0.5 KB |
+| One 21 KB source file: outline, then one symbol | 21 KB | 2.1 KB, then 60 B |
+| Three-turn repair task, provider-reported input tokens (Claude Haiku 5.5) | 22,364 | **2,851** (87% fewer) |
+
+Every row keeps the original output recoverable, and exit codes matched in every run. The repair task is one task, run twice with the same result; a broader multi-task benchmark is in progress. [Methods](docs/benchmarks.md)
+
+### What it does not do
+
+- **It doesn't change your commands.** The same command runs with the same exit code. Pipes, machine-readable formats and interactive commands pass through untouched.
+- **It doesn't summarize with an LLM or send anything anywhere.** Output is parsed locally and deterministically, and everything stays in `.justless/` on your machine.
+- **It doesn't touch your prompt or the model's replies.** It shrinks what tools return to the agent.
+- **It doesn't hide failures.** Anything left out of a preview is marked, and the full output is one command away.
 
 ## Quick start
 
