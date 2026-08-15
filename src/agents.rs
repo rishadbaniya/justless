@@ -1011,6 +1011,7 @@ fn supported_command(command: &str) -> bool {
 
 fn literal_command(command: &str) -> Option<Vec<String>> {
     let mut quote = None;
+    let mut previous = None;
     for character in command.chars() {
         if character.is_control() && character != '\t' || matches!(character, '$' | '\\' | '\u{60}')
         {
@@ -1020,9 +1021,17 @@ fn literal_command(command: &str) -> Option<Vec<String>> {
             Some(active) if character == active => quote = None,
             Some(_) => {}
             None if matches!(character, '\'' | '"') => quote = Some(character),
-            None if "|;&<>*?[]{}~#!()".contains(character) => return None,
+            // The shell expands `~` only at the start of a word or after `=` or `:`,
+            // so revisions such as HEAD~3 and main~5..HEAD stay literal.
+            None if character == '~' => {
+                if previous.is_none_or(|p: char| p.is_whitespace() || p == '=' || p == ':') {
+                    return None;
+                }
+            }
+            None if "|;&<>*?[]{}#!()".contains(character) => return None,
             None => {}
         }
+        previous = Some(character);
     }
     if quote.is_some() {
         return None;

@@ -3199,3 +3199,36 @@ pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
     );
     assert!(!impact.contains("checks_kept"), "{impact}");
 }
+
+#[test]
+fn revisions_with_a_tilde_are_routed_but_home_paths_are_not() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    // `~` inside a word is literal to the shell, so these are ordinary Git revisions.
+    for command in [
+        "git diff HEAD~3",
+        "git log main~5..HEAD",
+        "git show HEAD~1 --stat",
+    ] {
+        let output = agent_hook(root, "hook-claude", "before-command", call(command));
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["command"],
+            format!("justless run --hook -- {command}"),
+            "{command}"
+        );
+    }
+    // At the start of a word, or after `=` or `:`, the shell expands it: pass through.
+    for command in [
+        "ls ~/x",
+        "cat ~/.ssh/config",
+        "git diff --output=~/x",
+        "git log a:~b",
+    ] {
+        assert_eq!(
+            agent_hook(root, "hook-claude", "before-command", call(command)),
+            serde_json::json!({}),
+            "{command}"
+        );
+    }
+}
