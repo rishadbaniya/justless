@@ -295,6 +295,138 @@ fn resolve(index: &Index, target: &str) -> Result<(Option<String>, Vec<usize>)> 
     }
 }
 
+/// Seed the walk for lines removed without a replacement. A removed symbol no
+/// longer exists, so its impact starts at the code that still names it. Lines
+/// removed inside a surviving symbol change that symbol. Anything else is reported
+/// as unknown rather than pinned on a neighbor.
+fn deleted(
+    workspace: &Workspace,
+    index: &Index,
+    file: &str,
+    deletion: &crate::context::Deletion,
+    seeds: &mut BTreeSet<usize>,
+    section: &mut Section,
+) {
+    let definitions = &index.definitions;
+    let (first, last) = deletion.old;
+    if deletion.symbols.is_empty() {
+        // The lines on both sides of the removal belong to one symbol: it changed.
+        let around = index
+            .at(&Location {
+                file: file.to_owned(),
+                start: deletion.after.max(1),
+                end: deletion.after + 1,
+            })
+            .into_iter()
+            .filter(|&id| {
+                let span = &definitions[id].location;
+                span.start <= deletion.after && deletion.after < span.end
+            })
+            .min_by_key(|&id| {
+                let span = &definitions[id].location;
+                span.end - span.start
+            });
+        match around {
+            Some(id) => {
+                if seeds.insert(id) {
+                    let mut value = node(&definitions[id]);
+                    value["changed"] =
+                        json!(format!("{file}: lines removed after {}", deletion.after));
+                    section.push(
+                        format!(
+                            "  {} · lines removed after {file}:{}",
+                            label(&definitions[id]),
+                            deletion.after
+                        ),
+                        value,
+                    );
+                }
+            }
+            None => section.push(
+                format!("  {file} · lines {first}-{last} removed between symbols · impact unknown"),
+                json!({"file": file, "removed": [first, last], "note": "impact unknown"}),
+            ),
+        }
+        return;
+    }
+    for (name, kind) in &deletion.symbols {
+        section.push(
+            format!("  {name} [{kind}] · deleted from {file} (committed lines {first}-{last})"),
+            json!({"file": file, "deleted": name, "kind": kind, "removed": [first, last]}),
+        );
+        let short = name.rsplit("::").next().unwrap_or(name);
+        let mut referenced = false;
+        for (path, line) in mentions(workspace, index, short) {
+            let enclosing = index
+                .at(&Location {
+                    file: path.clone(),
+                    start: line,
+                    end: line,
+                })
+                .into_iter()
+                .min_by_key(|&id| {
+                    let span = &definitions[id].location;
+                    span.end - span.start
+                });
+            let Some(id) = enclosing else { continue };
+            referenced = true;
+            if seeds.insert(id) {
+                let mut value = node(&definitions[id]);
+                value["references_deleted"] = json!(name);
+                value["changed"] = json!(format!("{path}:{line}"));
+                section.push(
+                    format!(
+                        "  {} · still references deleted {short} at {path}:{line}",
+                        label(&definitions[id])
+                    ),
+                    value,
+                );
+            }
+        }
+        if !referenced {
+            section.push(
+                format!("  no remaining references to {short} found in indexed text"),
+                json!({"deleted": name, "note": "no remaining references"}),
+            );
+        }
+    }
+}
+
+/// Lines in indexed files that mention `name` as a whole identifier.
+fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Vec<(String, usize)> {
+    const LIMIT: usize = 256;
+    let identifier = |c: char| c.is_alphanumeric() || c == '_';
+    let fingerprint = crate::index::Fingerprint::new(name);
+    let mut found = Vec::new();
+    for (file, candidate) in &index.fingerprints {
+        if !candidate.includes(fingerprint) {
+            continue;
+        }
+        let Ok(path) = workspace.source_path(file) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for (offset, line) in text.lines().enumerate() {
+            let whole = line.match_indices(name).any(|(at, _)| {
+                !line[..at].chars().next_back().is_some_and(identifier)
+                    && !line[at + name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(identifier)
+            });
+            if whole {
+                found.push((file.clone(), offset + 1));
+                if found.len() == LIMIT {
+                    return found;
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Symbols touched by the current changes: the innermost definition around each
 /// changed range, and any definition whose declaration line changed.
 fn changed(workspace: &Workspace, index: &Index, staged: bool) -> Result<(Vec<usize>, Section)> {
@@ -304,6 +436,12 @@ fn changed(workspace: &Workspace, index: &Index, staged: bool) -> Result<(Vec<us
     for (file, change) in changes(workspace, index, staged)? {
         let ranges = match change {
             Change::Ranges(ranges) => ranges,
+            Change::Deleted(deletions) => {
+                for deletion in deletions {
+                    deleted(workspace, index, &file, &deletion, &mut seeds, &mut section);
+                }
+                continue;
+            }
             other => {
                 let reason = match other {
                     Change::Unindexed => "not indexed",

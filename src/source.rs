@@ -135,6 +135,40 @@ impl Snapshot {
         })
     }
 
+    /// An outline of `text` as if it were `file`, for source that is not on disk,
+    /// such as the committed version of a changed file.
+    pub fn from_text(file: &str, text: String) -> Self {
+        let mut lines = vec![0];
+        lines.extend(
+            text.match_indices('\n')
+                .map(|(i, _)| i + 1)
+                .filter(|i| *i < text.len()),
+        );
+        let revision = revision_for(file, text.as_bytes());
+        Self {
+            text,
+            revision,
+            lines,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Indexed symbols as (name, kind, first line, last line), lines 1-based.
+    pub fn symbols(&self) -> Vec<(String, String, usize, usize)> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                let last = entry.bytes.end.saturating_sub(1).max(entry.bytes.start);
+                (
+                    entry.name.clone(),
+                    entry.kind.clone(),
+                    self.line(entry.bytes.start),
+                    self.line(last),
+                )
+            })
+            .collect()
+    }
+
     fn line(&self, offset: usize) -> usize {
         self.lines.partition_point(|&start| start <= offset)
     }

@@ -12,7 +12,7 @@ use crate::rust_syntax::Kind;
 use crate::workspace::{Location, Workspace};
 
 static HUNK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@").expect("Git hunk pattern")
+    Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("Git hunk pattern")
 });
 
 pub(crate) struct Report {
@@ -491,6 +491,50 @@ pub(crate) enum Change {
     StagedDiffers,
     Empty,
     Ranges(Vec<(usize, usize)>),
+    /// Lines removed without a replacement.
+    Deleted(Vec<Deletion>),
+}
+
+/// Lines a change removed from a file without adding any in their place.
+pub(crate) struct Deletion {
+    /// The current line the removed lines followed (0 for the top of the file).
+    pub after: usize,
+    /// The removed lines in the committed version, inclusive.
+    pub old: (usize, usize),
+    /// Symbols that lay entirely inside the removed lines, as (name, kind).
+    pub symbols: Vec<(String, String)>,
+}
+
+/// Name the symbols each deletion removed, from the committed version of `file`.
+/// Leaves the list empty when that version cannot be read or parsed.
+fn deleted_symbols(workspace: &Workspace, file: &str, deletions: &mut [Deletion]) {
+    let Ok(output) = workspace.git(&["show", &format!("HEAD:./{file}")]) else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let Ok(text) = String::from_utf8(output.stdout) else {
+        return;
+    };
+    let mut snapshot = crate::source::Snapshot::from_text(file, text);
+    if snapshot.index(file).is_err() {
+        return;
+    }
+    let symbols = snapshot.symbols();
+    for deletion in deletions {
+        let (first, last) = deletion.old;
+        let inside = |start: usize, end: usize| first <= start && end <= last;
+        for (name, kind, start, end) in &symbols {
+            // Keep the outermost removed symbol; its members went with it.
+            let nested = symbols.iter().any(|(_, _, s, e)| {
+                (s, e) != (start, end) && inside(*s, *e) && s <= start && end <= e
+            });
+            if inside(*start, *end) && !nested {
+                deletion.symbols.push((name.clone(), kind.clone()));
+            }
+        }
+    }
 }
 
 pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -> Result<()> {
@@ -501,6 +545,24 @@ pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -
             Change::Unindexed => report.line(format!("{file} · no current indexed source")),
             Change::StagedDiffers => report.line(format!("{file} · working tree differs from staged source. Use justless context --changes to inspect the current file.")),
             Change::Empty => report.line(format!("{file} · empty after changes")),
+            Change::Deleted(deletions) => {
+                for deletion in deletions {
+                    let removed = if deletion.symbols.is_empty() {
+                        "no whole symbol".to_owned()
+                    } else {
+                        deletion
+                            .symbols
+                            .iter()
+                            .map(|(name, kind)| format!("{name} [{kind}]"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    report.line(format!(
+                        "{file} · deleted after line {} (committed lines {}-{}) · {removed}",
+                        deletion.after, deletion.old.0, deletion.old.1
+                    ));
+                }
+            }
             Change::Ranges(locations) => {
                 report.line(format!("{file} · {} changed ranges", locations.len()));
                 for &(start, end) in locations {
@@ -606,6 +668,7 @@ pub(crate) fn changes(
             changes.push((file.clone(), Change::Empty));
             continue;
         }
+        let mut deletions = Vec::new();
         let locations = if untracked {
             vec![(1, file_lines)]
         } else {
@@ -613,26 +676,50 @@ pub(crate) fn changes(
             hunk.extend(["--unified=0", "--", file]);
             let output = workspace.git(&hunk)?;
             ensure!(output.status.success(), "could not read diff for {file}");
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| {
-                    let matches = HUNK.captures(line)?;
-                    let start: usize = matches[1].parse().ok()?;
-                    let count = matches
-                        .get(2)
+            let mut ranges = Vec::new();
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let Some(matches) = HUNK.captures(line) else {
+                    continue;
+                };
+                let number = |i: usize, default: usize| {
+                    matches
+                        .get(i)
                         .and_then(|value| value.as_str().parse::<usize>().ok())
-                        .unwrap_or(1);
-                    let start = start.max(1).min(file_lines);
-                    Some((
-                        start,
-                        start
-                            .saturating_add(count.saturating_sub(1))
-                            .min(file_lines),
-                    ))
-                })
-                .collect()
+                        .unwrap_or(default)
+                };
+                let (old_start, old_count) = (number(1, 0), number(2, 1));
+                let (start, count) = (number(3, 0), number(4, 1));
+                if count == 0 {
+                    // A hunk with no new lines removed lines after line `start` of the
+                    // current file. It changes no surviving line, so it must not be
+                    // pinned on the line before it.
+                    deletions.push(Deletion {
+                        after: start,
+                        old: (old_start, old_start + old_count.saturating_sub(1)),
+                        symbols: Vec::new(),
+                    });
+                    continue;
+                }
+                let start = start.max(1).min(file_lines);
+                ranges.push((
+                    start,
+                    start
+                        .saturating_add(count.saturating_sub(1))
+                        .min(file_lines),
+                ));
+            }
+            ranges
         };
-        changes.push((file.clone(), Change::Ranges(locations)));
+        if !deletions.is_empty() {
+            deleted_symbols(workspace, file, &mut deletions);
+            changes.push((
+                file.clone(),
+                Change::Deleted(std::mem::take(&mut deletions)),
+            ));
+        }
+        if !locations.is_empty() || untracked {
+            changes.push((file.clone(), Change::Ranges(locations)));
+        }
     }
     Ok(changes)
 }

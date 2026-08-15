@@ -3120,3 +3120,82 @@ fn failed_run_context_keeps_every_diagnostic_at_a_shared_location() {
         "{context}"
     );
 }
+
+#[test]
+fn deleting_a_function_points_affected_at_its_callers_not_its_neighbor() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=f@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+    };
+    git(&["init", "-q"]);
+    fs::write(root.join(".gitignore"), ".justless/\n").unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    let original = "pub fn kept() -> u8 { 1 }\npub fn removed() -> u8 { 2 }\npub fn consumer() -> u8 { removed() }\n\
+#[test]\nfn checks_removed() { assert_eq!(consumer(), 2); }\n#[test]\nfn checks_kept() { assert_eq!(kept(), 1); }\n\
+pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
+    let source = root.join("src/lib.rs");
+    fs::write(&source, original).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "fixture"]);
+
+    fs::write(
+        &source,
+        original.replace("pub fn removed() -> u8 { 2 }\n", ""),
+    )
+    .unwrap();
+    for staged in [false, true] {
+        if staged {
+            git(&["add", "src/lib.rs"]);
+        }
+        let mut args = vec!["affected", "--changes"];
+        if staged {
+            args.push("--staged");
+        }
+        let impact = success(root, &args);
+        assert!(
+            impact.contains("removed [function] · deleted from src/lib.rs (committed lines 2-2)")
+                && impact.contains(
+                    "consumer [function] src/lib.rs:2 · still references deleted removed"
+                )
+                && impact.contains("cargo test checks_removed")
+                && !impact.contains("kept [function]")
+                && !impact.contains("checks_kept"),
+            "staged={staged}\n{impact}"
+        );
+    }
+    assert!(
+        success(root, &["context", "--changes"]).contains(
+            "src/lib.rs · deleted after line 1 (committed lines 2-2) · removed [function]"
+        )
+    );
+
+    // Lines removed inside a surviving function change that function.
+    git(&["commit", "-qm", "remove"]);
+    let current = fs::read_to_string(&source).unwrap();
+    fs::write(&source, current.replace("    let b = 2;\n", "")).unwrap();
+    let impact = success(root, &["affected", "--changes"]);
+    assert!(
+        impact.contains("long [function]") && impact.contains("lines removed after src/lib.rs:"),
+        "{impact}"
+    );
+    assert!(!impact.contains("checks_kept"), "{impact}");
+}
