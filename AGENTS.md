@@ -51,7 +51,7 @@ Use Conventional Commits such as `feat(source): support section edits`. Keep the
 
 ## Cut a release
 
-1. On an up-to-date `main` with green CI, set `version` in `Cargo.toml` to `X.Y.Z`, run `cargo build` (without `--locked`) to refresh `Cargo.lock`, and commit `chore(release): X.Y.Z`.
+1. On an up-to-date `main` where `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` pass locally, set `version` in `Cargo.toml` to `X.Y.Z`, run `cargo build` (without `--locked`) to refresh `Cargo.lock`, and commit `chore(release): X.Y.Z`.
 2. Tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 3. `.github/workflows/release.yml` checks that the tag matches `Cargo.toml`, builds the five targets, and publishes a GitHub release with the archives and `SHA256SUMS`. A version with a hyphen, such as `0.3.0-rc.1`, becomes a prerelease, which the installer's latest download skips.
 4. For Homebrew, update `url` and `sha256` in `packaging/homebrew/justless.rb` as its header describes and push it to the tap.
