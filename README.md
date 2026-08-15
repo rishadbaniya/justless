@@ -13,7 +13,7 @@
   <a href="#install">Install</a> · <a href="docs/reference.md">Reference</a> · <a href="docs/examples.md">Examples</a> · <a href="docs/benchmarks.md">Benchmarks</a>
 </p>
 
-Justless is a local CLI that cuts the tokens coding agents spend on command output, source reads and old tool results. It sits between the agent and your shell through hooks, so agents keep running their usual commands.
+Justless is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
 
 ## How it cuts tokens
 
