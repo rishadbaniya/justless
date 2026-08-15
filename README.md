@@ -43,15 +43,96 @@ Originals stay recoverable and exit codes matched in every run. The repair task 
 - **No LLM, no network.** Deterministic local parsing; everything stays in `.justless/`.
 - **No hidden failures.** Anything cut is marked and one command away.
 
-## Quick start
+## Install
 
-Paste this in your project folder:
+Run the line for your agent **inside your project folder**. It installs Justless and turns it on for that project. It downloads a prebuilt binary when a release exists for your platform and otherwise builds from source, which needs [Rust](https://rustup.rs).
+
+### Claude Code
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- claude
 ```
 
-That installs Justless and turns it on for every coding agent it finds: Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, OpenCode and Antigravity CLI. Then start a new agent session. In Codex, run `/hooks` once and trust them. Until a release is published, the installer builds Justless from source, which needs [Rust](https://rustup.rs). Details are under [Install](#install).
+Then start a new `claude` session.
+
+### Codex
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- codex
+```
+
+Then run `/hooks` in Codex once and trust the hooks.
+
+### Cursor
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- cursor
+```
+
+Then start a new agent chat.
+
+### Gemini CLI
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- gemini
+```
+
+Then start a new session.
+
+### GitHub Copilot CLI
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- copilot
+```
+
+Then start a new session.
+
+### OpenCode
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- opencode
+```
+
+Then restart OpenCode.
+
+### Antigravity CLI
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- agy
+```
+
+Then start a new session.
+
+### Several agents, or every agent on your machine
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- claude codex   # name the agents you use
+curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh                      # set up every agent found on your PATH
+```
+
+### Other MCP clients, such as VS Code
+
+```sh
+justless mcp --install vscode   # also: claude, cursor, gemini, codex
+```
+
+This gives the client Justless's read-only navigation tools without hooks.
+
+### Check that it works
+
+```sh
+justless run -- git status   # ends with a line like: [justless run-…] exit 0 · …
+```
+
+In an agent session, run your tests. Compact or failing output ends with a `[justless run-…]` marker. `justless stats` shows what was saved, and `justless discover` lists commands that still bypassed Justless.
+
+### Add another project later
+
+The binary only needs installing once. In any other project, run `justless init --hooks --agent claude` (or `codex`, `cursor`, `gemini`, `copilot`, `opencode`, `agy`). Setup keeps your existing instructions and settings, and running it again is safe.
+
+### Update or remove
+
+To update, run your install line again, then rerun `justless init --hooks --agent …` in your projects to pick up new hooks. To remove Justless from a project, delete the section between `<!-- justless:begin -->` and `<!-- justless:end -->` in `CLAUDE.md`, `AGENTS.md` or `GEMINI.md`, the `justless` hook entries in the agent's config file, and the `.justless/` directory. [All install options](docs/reference.md#install-and-configure-agents)
 
 ## Features
 
@@ -72,66 +153,6 @@ That installs Justless and turns it on for every coding agent it finds: Claude C
 - **Savings you can see.** `justless stats` shows bytes and estimated tokens saved by day and by command, and how often agents reopened full logs. `justless discover` finds commands agents ran without Justless in Claude Code transcripts.
 
 On one three-turn repair task, Claude used **87.3% fewer input tokens** with Justless. Both runs produced a fix that passed independent tests. [Benchmark and tool-call counts](docs/benchmarks.md#three-turn-repair)
-
-## Install
-
-### 1. Install the binary (once per machine)
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- --cli-only
-```
-
-It downloads a verified prebuilt binary when a release exists for your platform, and otherwise builds with Cargo (Rust 1.91+ and a C compiler). The binary goes to `~/.cargo/bin`, which must be on your `PATH` so agent hooks can find `justless`. From a checkout you can run `cargo install --locked --path .` instead.
-
-### 2. Turn it on in a project
-
-Run this inside each project, naming the agents you use:
-
-```sh
-cd your-project
-justless init --hooks --agent claude --agent codex
-```
-
-| Agent | Flag | What it writes | Then |
-| --- | --- | --- | --- |
-| Claude Code | `--agent claude` | `.claude/settings.json`, `CLAUDE.md` | Start a new `claude` session |
-| Codex | `--agent codex` | `.codex/hooks.json`, `AGENTS.md` | Run `/hooks` in Codex and trust them |
-| Cursor | `--agent cursor` | `.cursor/hooks.json`, `AGENTS.md` | Start a new agent chat |
-| Gemini CLI | `--agent gemini` | `.gemini/settings.json`, `GEMINI.md` | Start a new session |
-| GitHub Copilot CLI | `--agent copilot` | `.github/hooks/justless.json`, `AGENTS.md` | Start a new session |
-| Antigravity CLI | `--agent agy` | `.agents/hooks.json`, `AGENTS.md` | Start a new session |
-| OpenCode | `--agent opencode` | `.opencode/plugins/justless.js`, `AGENTS.md` | Restart OpenCode |
-
-Setup keeps your existing instructions and settings, and running it again is safe. It also adds `.justless/` to `.gitignore`.
-
-Shortcut: running the installer from inside a project does both steps and sets up every agent it finds on your `PATH`.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh                  # detect agents
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- claude codex   # pick agents
-```
-
-### 3. Check that it works
-
-```sh
-justless run -- git status   # ends with a line like: [justless run-…] exit 0 · …
-```
-
-In an agent session, ask it to run your tests. The tool output should end with a `[justless run-…]` line. Later, `justless stats` shows how much output was kept out of context, and `justless discover` lists commands that still bypassed Justless.
-
-### Optional: MCP tools
-
-Clients without Justless hooks, such as VS Code, can use the read-only navigation tools over MCP:
-
-```sh
-justless mcp --install vscode   # also: claude, cursor, gemini, codex
-```
-
-### Update or remove
-
-To update, run the install command again, then rerun `justless init --hooks --agent …` in your projects to pick up new hooks. To remove Justless from a project, delete the section between `<!-- justless:begin -->` and `<!-- justless:end -->` in the instruction files, the `justless` hook entries in the agent config files listed above, and the `.justless/` directory.
-
-[All install options](docs/reference.md#install-and-configure-agents)
 
 ## Use from the terminal
 
