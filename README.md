@@ -17,15 +17,11 @@ Justless is a local CLI that cuts the tokens coding agents spend on command outp
 
 ## How it cuts tokens
 
-**⚡ Compact Output.** Builds, tests, linters, diffs and searches come back as the part that decides the next step. Test failures are grouped by cause, lint findings by rule, search matches by file and paths by directory. Errors, exit codes and the first failing line are always kept.
-
-**🎯 Exact Recall.** Nothing is thrown away. Every run is archived byte for byte with a run ID, and `justless log` replays any line range. Agents read the one line they need instead of rerunning a test suite.
-
-**🔬 Surgical Reads.** A file arrives as an outline of its symbols with line ranges, then the agent expands only the symbol it needs. Edits send just the replacement, checked against the revision the agent read.
-
-**🗺️ Code Map and Impact.** `map`, `pack`, `query` and `affected` answer "where is this", "what calls it" and "what breaks if I change it" from a local index of 21 languages, along with the exact test command to run.
-
-**🧹 Context Hygiene.** Identical reruns collapse to one line, changed reruns show only what changed, and recent activity is handed across compaction.
+- **⚡ Compact Output.** Test failures grouped by cause, lint by rule, matches by file. Errors always kept.
+- **🎯 Exact Recall.** Every run archived. Replay any line instead of rerunning.
+- **🔬 Surgical Reads.** Outline first, then only the symbol you need.
+- **🗺️ Code Map and Impact.** Find code, callers and the tests to run without reading files.
+- **🧹 Context Hygiene.** Identical reruns collapse to one line; your place survives compaction.
 
 ### Measured
 
@@ -39,14 +35,13 @@ Justless is a local CLI that cuts the tokens coding agents spend on command outp
 | One 21 KB source file: outline, then one symbol | 21 KB | 2.1 KB, then 60 B |
 | Three-turn repair task, provider-reported input tokens (Claude Haiku 5.5) | 22,364 | **2,851** (87% fewer) |
 
-Every row keeps the original output recoverable, and exit codes matched in every run. The repair task is one task, run twice with the same result; a broader multi-task benchmark is in progress. [Methods](docs/benchmarks.md)
+Originals stay recoverable and exit codes matched in every run. The repair task is one task run twice; a broader benchmark is in progress. [Methods](docs/benchmarks.md)
 
 ### What it does not do
 
-- **It doesn't change your commands.** The same command runs with the same exit code. Pipes, machine-readable formats and interactive commands pass through untouched.
-- **It doesn't summarize with an LLM or send anything anywhere.** Output is parsed locally and deterministically, and everything stays in `.justless/` on your machine.
-- **It doesn't touch your prompt or the model's replies.** It shrinks what tools return to the agent.
-- **It doesn't hide failures.** Anything left out of a preview is marked, and the full output is one command away.
+- **No changed commands.** Same command, same exit code. Pipes and machine formats pass through.
+- **No LLM, no network.** Deterministic local parsing; everything stays in `.justless/`.
+- **No hidden failures.** Anything cut is marked and one command away.
 
 ## Quick start
 
