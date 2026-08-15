@@ -437,9 +437,17 @@ impl Search {
                 self.hit(c, text, n);
                 return;
             }
+            // `path-` starts a context line, unless the line is a match from another
+            // file whose name extends this one, such as `settings-prod:3:…` after
+            // `settings`. Prefer the longer path when it names a real file.
             if rest.starts_with('-') {
-                self.context_line(c, n);
-                return;
+                let longer = self
+                    .split(line)
+                    .filter(|&end| end > self.groups[c].path.len());
+                if longer.is_none() {
+                    self.context_line(c, n);
+                    return;
+                }
             }
         }
         if let Some(end) = self.split(line) {

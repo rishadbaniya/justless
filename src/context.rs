@@ -308,6 +308,9 @@ pub fn symbol(workspace: &Workspace, index: &Index, name: &str, cap: usize) -> R
     )
 }
 
+/// Distinct log lines listed for one source location in `context --run`.
+const MAX_DIAGNOSTICS_PER_LOCATION: usize = 4;
+
 pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> Result<()> {
     let (directory, run) = capture::load(workspace, id)?;
     crate::history::recall(&directory, "context");
@@ -319,26 +322,56 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
     if run.diagnostics.is_empty() {
         report.line(format!("No indexed source location found. Inspect justless search {id} <text> or justless log {id}."));
     }
-    let mut seen = BTreeSet::new();
+    // Group by source location but keep every distinct log line: progress output and
+    // the real error often name the same line, and the error must survive.
+    let mut groups: Vec<(&Location, Vec<&capture::Diagnostic>)> = Vec::new();
     for diagnostic in &run.diagnostics {
         let location = &diagnostic.location;
-        if !seen.insert(location) {
-            continue;
+        match groups.iter_mut().find(|(seen, _)| *seen == location) {
+            Some((_, list)) => {
+                if !list.iter().any(|d| {
+                    d.stream.name() == diagnostic.stream.name() && d.log_line == diagnostic.log_line
+                }) {
+                    list.push(diagnostic);
+                }
+            }
+            None => groups.push((location, vec![diagnostic])),
         }
-        report.line(format!(
-            "{} · log {}:{}",
-            location,
-            diagnostic.stream.name(),
-            diagnostic.log_line
-        ));
-        report.line(format!(
-            "  Replay: justless log {id} --stream {} --from {} --to {}",
-            diagnostic.stream.name(),
-            diagnostic.log_line.saturating_sub(2).max(1),
-            diagnostic.log_line.saturating_add(2)
-        ));
-        for line in capture::diagnostic_excerpt(&directory, diagnostic)? {
-            report.line(line);
+    }
+    // A failed command usually reports its error on stderr; list those first, both
+    // within a location and across locations, so a tight budget keeps them.
+    let on_stderr = |d: &&capture::Diagnostic| d.stream.name() == "stderr";
+    if run.status != 0 {
+        for (_, list) in &mut groups {
+            list.sort_by_key(|d| !on_stderr(d));
+        }
+        groups.sort_by_key(|(_, list)| !list.iter().any(on_stderr));
+    }
+    for (location, diagnostics) in groups {
+        let shown = diagnostics.len().min(MAX_DIAGNOSTICS_PER_LOCATION);
+        for diagnostic in &diagnostics[..shown] {
+            report.line(format!(
+                "{} · log {}:{}",
+                location,
+                diagnostic.stream.name(),
+                diagnostic.log_line
+            ));
+            report.line(format!(
+                "  Replay: justless log {id} --stream {} --from {} --to {}",
+                diagnostic.stream.name(),
+                diagnostic.log_line.saturating_sub(2).max(1),
+                diagnostic.log_line.saturating_add(2)
+            ));
+            for line in capture::diagnostic_excerpt(&directory, diagnostic)? {
+                report.line(line);
+            }
+        }
+        if diagnostics.len() > shown {
+            report.line(format!(
+                "  +{} more log line(s) at this location. justless search {id} {}",
+                diagnostics.len() - shown,
+                location.file
+            ));
         }
         if let Some(digest) = run.source_digests.get(&location.file)
             && index.files.get(&location.file) != Some(digest)

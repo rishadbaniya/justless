@@ -3033,3 +3033,90 @@ fn hook_routed_runs_print_a_footer_only_when_it_adds_information() {
     assert!(grown >= 2, "{report:#}");
     assert!(success(root, &["stats"]).contains("grew"));
 }
+
+#[test]
+fn search_groups_files_whose_names_share_a_prefix() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    for name in ["settings", "settings-prod"] {
+        fs::write(
+            root.join(name),
+            "needle in this configuration value\n".repeat(100),
+        )
+        .unwrap();
+    }
+    // `settings-prod:1:…` must not be read as a context line of `settings`.
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--",
+            "grep",
+            "-n",
+            "needle",
+            "settings",
+            "settings-prod",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let preview = stdout(&output);
+    assert!(
+        preview.starts_with("grep: 200 matches in 2 files\n") && !preview.contains("context lines"),
+        "{preview}"
+    );
+    // Real context lines (`settings-2-…`) are still recognized as context.
+    fs::write(
+        root.join("settings"),
+        "needle one\nplain line\n".repeat(300),
+    )
+    .unwrap();
+    let context = cli(
+        root,
+        &[
+            "run",
+            "--",
+            "grep",
+            "-n",
+            "-A",
+            "1",
+            "needle",
+            "settings",
+            "settings-prod",
+        ],
+    );
+    let preview = stdout(&context);
+    assert!(
+        preview.starts_with("grep: 400 matches in 2 files, 300 context lines"),
+        "{preview}"
+    );
+}
+
+#[test]
+fn failed_run_context_keeps_every_diagnostic_at_a_shared_location() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join("price.py"), "def price():\n    return 1\n").unwrap();
+    // Progress on stdout and the real error on stderr both name price.py:2.
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo 'price.py:2: progress'; echo 'price.py:2: error: EXPECTED_FAILURE' >&2; exit 1",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let id = run_id(&output);
+    let context = success(root, &["context", "--run", &id, "--budget", "12000"]);
+    let error = context.find("EXPECTED_FAILURE").expect(&context);
+    let progress = context.find("progress").expect(&context);
+    // Both survive, and the failure's own line comes first.
+    assert!(error < progress, "{context}");
+    assert!(
+        context.contains("price.py:2 · log stderr:1")
+            && context.contains("price.py:2 · log stdout:1"),
+        "{context}"
+    );
+}
