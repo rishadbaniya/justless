@@ -422,3 +422,22 @@ fn agent_setup_preserves_existing_plugin_and_registers_claude_read_once() {
     assert!(!run(root, &install, b"").status.success());
     assert_eq!(fs::read_to_string(&plugin).unwrap(), "// user plugin");
 }
+
+#[test]
+fn oversized_files_report_the_size_cap_even_when_it_splits_a_character() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    fs::write(root.join(".justless.toml"), "max_file_bytes = 8\n").unwrap();
+    // The cap's extra byte falls inside the two-byte é.
+    fs::write(root.join("big.txt"), "aaaaaaaaé\n").unwrap();
+    fs::write(root.join("bad.txt"), b"abc\xff\n").unwrap();
+    let out = run(root, &["read", "big.txt", "--outline"], b"");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("file exceeds max_file_bytes"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(root, &["read", "bad.txt"], b"");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expected UTF-8 source"));
+}

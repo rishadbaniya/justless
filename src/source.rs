@@ -113,12 +113,13 @@ impl Snapshot {
     pub fn open(ws: &Workspace, file: &str) -> Result<Self> {
         let path = ws.source_path(file)?;
         let cap = ws.settings()?.max_file_bytes;
-        let mut text = String::new();
+        // Check the size before decoding: the cap can split a multibyte character.
+        let mut bytes = Vec::new();
         File::open(path)?
             .take(cap.saturating_add(1))
-            .read_to_string(&mut text)
-            .context("expected UTF-8 source")?;
-        ensure!(text.len() as u64 <= cap, "file exceeds max_file_bytes");
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() as u64 <= cap, "file exceeds max_file_bytes");
+        let text = String::from_utf8(bytes).context("expected UTF-8 source")?;
         ensure!(!text.contains('\0'), "expected a text file");
         let mut lines = vec![0];
         lines.extend(
