@@ -35,7 +35,7 @@ Justless is a local CLI that cuts the tokens coding agents spend on command outp
 | `git diff` against older revisions | 274 KB | 13.5 KB |
 | `find .` | 267 KB | 9.4 KB |
 | `grep -rn` | 200 KB | 16.4 KB |
-| `cargo check` with compile errors | 26.5 KB | 0.5 KB |
+| `cargo check`, successful builds in three repositories | 26.5 KB | 0.5 KB |
 | One 21 KB source file: outline, then one symbol | 21 KB | 2.1 KB, then 60 B |
 | Three-turn repair task, provider-reported input tokens (Claude Haiku 5.5) | 22,364 | **2,851** (87% fewer) |
 
