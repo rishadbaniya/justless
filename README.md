@@ -13,7 +13,7 @@
   <a href="#install">Install</a> · <a href="docs/reference.md">Reference</a> · <a href="docs/examples.md">Examples</a> · <a href="docs/benchmarks.md">Benchmarks</a>
 </p>
 
-Justless is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
+**justless** is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
 
 ## How it cuts tokens
 
@@ -25,7 +25,7 @@ Justless is a local Rust CLI that sits between your coding agent and its tools. 
 
 ### Measured
 
-| What the agent ran | Raw output | With Justless |
+| What the agent ran | Raw output | With justless |
 | --- | ---: | ---: |
 | 77 real commands across four Rust and Python repositories | 1,171 KB | **115 KB** (90% smaller) |
 | `git diff` against older revisions | 274 KB | 13.5 KB |
@@ -45,7 +45,7 @@ Originals stay recoverable and exit codes matched in every run. The repair task 
 
 ## Install
 
-Run the line for your agent **inside your project folder**. It installs Justless and turns it on for that project. It downloads a prebuilt binary when a release exists for your platform and otherwise builds from source, which needs [Rust](https://rustup.rs).
+Run the line for your agent **inside your project folder**. It installs justless and turns it on for that project. It downloads a prebuilt binary when a release exists for your platform and otherwise builds from source, which needs [Rust](https://rustup.rs).
 
 ### Claude Code
 
@@ -116,7 +116,7 @@ curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.
 justless mcp --install vscode   # also: claude, cursor, gemini, codex
 ```
 
-This gives the client Justless's read-only navigation tools without hooks.
+This gives the client justless's read-only navigation tools without hooks.
 
 ### Check that it works
 
@@ -124,7 +124,7 @@ This gives the client Justless's read-only navigation tools without hooks.
 justless run -- git status   # ends with a line like: [justless run-…] exit 0 · …
 ```
 
-In an agent session, run your tests. Compact or failing output ends with a `[justless run-…]` marker. `justless stats` shows what was saved, and `justless discover` lists commands that still bypassed Justless.
+In an agent session, run your tests. Compact or failing output ends with a `[justless run-…]` marker. `justless stats` shows what was saved, and `justless discover` lists commands that still bypassed justless.
 
 ### Add another project later
 
@@ -132,7 +132,7 @@ The binary only needs installing once. In any other project, run `justless init 
 
 ### Update or remove
 
-To update, run your install line again, then rerun `justless init --hooks --agent …` in your projects to pick up new hooks. To remove Justless from a project, delete the section between `<!-- justless:begin -->` and `<!-- justless:end -->` in `CLAUDE.md`, `AGENTS.md` or `GEMINI.md`, the `justless` hook entries in the agent's config file, and the `.justless/` directory. [All install options](docs/reference.md#install-and-configure-agents)
+To update, run your install line again, then rerun `justless init --hooks --agent …` in your projects to pick up new hooks. To remove justless from a project, delete the section between `<!-- justless:begin -->` and `<!-- justless:end -->` in `CLAUDE.md`, `AGENTS.md` or `GEMINI.md`, the `justless` hook entries in the agent's config file, and the `.justless/` directory. [All install options](docs/reference.md#install-and-configure-agents)
 
 ## Features
 
@@ -150,9 +150,9 @@ To update, run your install line again, then rerun `justless init --hooks --agen
 - **Context that survives compaction.** Claude Code and Codex hooks carry recent run IDs, outcomes and inspected files across compaction, so agents recover logs instead of rerunning commands.
 - **Cross-session handoffs.** Search earlier runs for an error, or use `justless resume` to see what the last session inspected and which files have changed since.
 - **MCP server.** Cursor, Gemini CLI, VS Code and other MCP clients can call the read-only navigation commands as tools with `justless mcp`. `justless mcp --install cursor` adds it to the project's client config.
-- **Savings you can see.** `justless stats` shows bytes and estimated tokens saved by day and by command, and how often agents reopened full logs. `justless discover` finds commands agents ran without Justless in Claude Code transcripts.
+- **Savings you can see.** `justless stats` shows bytes and estimated tokens saved by day and by command, and how often agents reopened full logs. `justless discover` finds commands agents ran without justless in Claude Code transcripts.
 
-On one three-turn repair task, Claude used **87.3% fewer input tokens** with Justless. Both runs produced a fix that passed independent tests. [Benchmark and tool-call counts](docs/benchmarks.md#three-turn-repair)
+On one three-turn repair task, Claude used **87.3% fewer input tokens** with justless. Both runs produced a fix that passed independent tests. [Benchmark and tool-call counts](docs/benchmarks.md#three-turn-repair)
 
 ## Use from the terminal
 
