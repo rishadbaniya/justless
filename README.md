@@ -17,11 +17,11 @@ Justless is a local CLI that cuts the tokens coding agents spend on command outp
 
 ## How it cuts tokens
 
-- **⚡ Compact Output.** Test failures grouped by cause, lint by rule, matches by file. Errors always kept.
-- **🎯 Exact Recall.** Every run archived. Replay any line instead of rerunning.
-- **🔬 Surgical Reads.** Outline first, then only the symbol you need.
-- **🗺️ Code Map and Impact.** Find code, callers and the tests to run without reading files.
-- **🧹 Context Hygiene.** Identical reruns collapse to one line; your place survives compaction.
+- **⚡ Compact Output.** `justless run` parses each tool's output: test failures grouped by panic or assertion message (cargo, pytest, Go, Jest/Vitest), lint and compiler findings grouped by rule ID with `file:line` (rustc, Clippy, Ruff, mypy, ESLint, tsc and more), search matches grouped by file and paths by directory. Anything else is clipped to a 4 KB preview that keeps the head, the tail and every diagnostic line.
+- **🎯 Exact Recall.** Every stream is archived byte for byte under `.justless/runs/<id>` with a SHA-256 digest. `justless log ID --from N --to M` replays exact line ranges, and a rerun with identical digests and exit status collapses to `Output unchanged since run-…`.
+- **🔬 Surgical Reads.** Outlines come from syn for Rust and Tree-sitter for 20 more languages, with revision-bound row IDs. `expand` returns the exact byte span of one symbol, and `edit` writes only the replacement after verifying the file revision.
+- **🗺️ Code Map and Impact.** An incremental index of symbols, calls, imports, HTTP routes and SQL relations, refreshed by file timestamp and content hash. `pack` ranks passages by term rarity and follows links up to three hops; `affected` walks reverse edges to the tests that reach a change and prints the command to run them.
+- **🧹 Context Hygiene.** Hook-routed runs add a footer only when output was clipped or failed. Compaction hooks carry run IDs, outcomes and inspected ranges into the next turn.
 
 ### Measured
 
