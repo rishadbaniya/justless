@@ -15,6 +15,8 @@
 
 **justless** is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
 
+> **🔒 100% local. Zero network calls.** justless runs entirely on your machine, between your agent and your shell. It makes no network requests of any kind: no telemetry, no analytics, no cloud service, no LLM, no account. Your code and command output never leave your computer.
+
 ## How it cuts tokens
 
 - **⚡ Compact Output.** `justless run` parses each tool's output: test failures grouped by their reported diagnostic (cargo, pytest, Go, Jest/Vitest), lint and compiler findings grouped by rule ID with `file:line` (rustc, Clippy, Ruff, mypy, ESLint, tsc and more), search matches grouped by file and paths by directory. Anything else is clipped to a 4 KB preview built from the head, the tail and a section of error and warning lines.
@@ -40,7 +42,7 @@ Originals stay recoverable and exit codes matched in every run. The repair task 
 ### What it does not do
 
 - **No changed commands.** Same command, same exit code. Pipes and machine formats pass through.
-- **No LLM, no network.** Deterministic local parsing; everything stays in `.justless/`.
+- **No network, no LLM, no telemetry.** justless never opens a network connection. Parsing is deterministic and local, and everything it stores stays in `.justless/` in your project.
 - **No hidden failures.** Anything cut is marked and one command away.
 
 ## Install
