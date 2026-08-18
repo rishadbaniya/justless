@@ -90,6 +90,8 @@ struct Entry {
     name: String,
     kind: String,
     bytes: Range<usize>,
+    /// Where the outline signature starts, after Rust attributes and docs.
+    signature_start: usize,
     header_end: usize,
 }
 
@@ -183,25 +185,11 @@ impl Snapshot {
                     let Some(fragment) = self.text.get(symbol.bytes.clone()) else {
                         continue;
                     };
-                    // Token groups distinguish a declaration's body from braces inside
-                    // attributes, types, patterns, strings and comments.
-                    let end = fragment
-                        .parse::<proc_macro2::TokenStream>()
-                        .ok()
-                        .and_then(|tokens| {
-                            tokens.into_iter().find_map(|token| match token {
-                                proc_macro2::TokenTree::Group(group)
-                                    if group.delimiter() == proc_macro2::Delimiter::Brace =>
-                                {
-                                    Some(group.span_open().byte_range().start)
-                                }
-                                _ => None,
-                            })
-                        })
-                        .unwrap_or(fragment.len());
+                    let (start, end) = rust_header(fragment);
                     self.entries.push(Entry {
                         name: symbol.path.join("::"),
                         kind: symbol.kind,
+                        signature_start: symbol.bytes.start + start,
                         header_end: symbol.bytes.start + end,
                         bytes: symbol.bytes,
                     });
@@ -214,6 +202,7 @@ impl Snapshot {
                 self.entries.push(Entry {
                     name: def.path,
                     kind: def.kind,
+                    signature_start: def.bytes.start,
                     bytes: def.bytes,
                     header_end: def.header_end,
                 });
@@ -227,6 +216,7 @@ impl Snapshot {
             self.entries.push(Entry {
                 name: "import".into(),
                 kind: "import".into(),
+                signature_start: bytes.start,
                 header_end: bytes.end,
                 bytes,
             });
@@ -242,6 +232,7 @@ impl Snapshot {
                 self.entries.push(Entry {
                     name: format!("lines-{}", page * 80 + 1),
                     kind: "text".into(),
+                    signature_start: begin,
                     bytes: begin..end,
                     header_end: self.lines.get(page * 80 + 1).copied().unwrap_or(end),
                 });
@@ -309,6 +300,7 @@ impl Snapshot {
             self.entries.push(Entry {
                 name: title.into(),
                 kind: "heading".into(),
+                signature_start: start,
                 bytes: start..self.text.len(),
                 header_end: end,
             });
@@ -410,12 +402,15 @@ impl Snapshot {
         let mut size = page.display().len() + 42;
         let mut last = None;
         let filter = filter.to_lowercase();
+        let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
         for (index, e) in self.entries.iter().enumerate().skip(start) {
-            let raw = &self.text[e.bytes.start..e.header_end];
-            let signature = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            let signature = words(&self.text[e.signature_start..e.header_end]);
+            // Matching also covers the docs and attributes the row leaves out.
             if !filter.is_empty()
                 && !e.name.to_lowercase().contains(&filter)
-                && !signature.to_lowercase().contains(&filter)
+                && !words(&self.text[e.bytes.start..e.header_end])
+                    .to_lowercase()
+                    .contains(&filter)
             {
                 continue;
             }
@@ -445,6 +440,40 @@ impl Snapshot {
         }
         Ok(page)
     }
+}
+
+/// Offsets within a Rust declaration where its signature starts, after outer
+/// attributes and doc comments, and where its body begins. Token groups
+/// distinguish a declaration's body from braces inside attributes, types,
+/// patterns, strings and comments.
+fn rust_header(fragment: &str) -> (usize, usize) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let Ok(tokens) = fragment.parse::<proc_macro2::TokenStream>() else {
+        return (0, fragment.len());
+    };
+    let tokens: Vec<_> = tokens.into_iter().collect();
+    let mut first = 0;
+    // `#[…]`, and `///` comments, which lex as `#[doc = "…"]`.
+    while let Some(TokenTree::Punct(hash)) = tokens.get(first)
+        && hash.as_char() == '#'
+        && let Some(TokenTree::Group(group)) = tokens.get(first + 1)
+        && group.delimiter() == Delimiter::Bracket
+    {
+        first += 2;
+    }
+    let start = tokens
+        .get(first)
+        .map_or(0, |token| token.span().byte_range().start);
+    let end = tokens[first..]
+        .iter()
+        .find_map(|token| match token {
+            TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
+                Some(group.span_open().byte_range().start)
+            }
+            _ => None,
+        })
+        .unwrap_or(fragment.len());
+    (start, end.max(start))
 }
 
 fn clipped(text: &str, max: usize) -> String {

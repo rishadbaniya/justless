@@ -464,3 +464,40 @@ fn markdown_heading_names_drop_closing_hashes() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous symbol"));
 }
+
+#[test]
+fn rust_outline_signatures_skip_docs_and_attributes() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let function = "/// Computes the settlement-adjusted fair value, taking the smile-adjusted vol\n/// and the time to expiry into account; see the design notes for the details.\n#[inline]\n#[must_use]\npub fn fair_value(spot: f64, vol: f64) -> f64 {\n    spot * vol\n}";
+    let text = format!(
+        "{function}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]\n#[repr(i8)]\npub enum Side {{ Buy = 1 }}\n"
+    );
+    fs::write(root.join("lib.rs"), &text).unwrap();
+    let page = json_output(root, &["read", "lib.rs", "--json"], &Value::Null);
+    let signatures: Vec<_> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["signature"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        signatures,
+        [
+            "pub fn fair_value(spot: f64, vol: f64) -> f64",
+            "pub enum Side"
+        ]
+    );
+    assert_eq!(page["entries"][0]["first"], 1);
+    // Doc text stays searchable and inside the editable span.
+    let found = json_output(
+        root,
+        &["read", "lib.rs", "--json", "--match", "smile-adjusted"],
+        &Value::Null,
+    );
+    assert_eq!(found["entries"][0]["name"], "fair_value");
+    assert_eq!(
+        ok(run(root, &["expand", "lib.rs", "fair_value"], b"")),
+        function.as_bytes()
+    );
+}

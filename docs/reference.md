@@ -74,7 +74,7 @@ With `--json`, both commands return the rows selected for the budget as structur
 
 ## Progressive reads and verified edits
 
-Commands take workspace-relative paths. Run `justless read FILE --outline` to get a path-bound revision and numbered rows. An entry reference combines the revision and row number, such as `abc…#7`. Use `--match TEXT` to search names and signatures, `--limit N` to set a page size, and `--after CURSOR` to resume the same search. `--budget` bounds the text outline. `--json` adds structured fields and a `next` cursor. Normal reads return small UTF-8 files verbatim. Outlines use the available language parser, Markdown ATX headings, or 80-line pages. A heading's name leaves out an optional closing run of `#`, so `## Setup ##` is named `Setup`.
+Commands take workspace-relative paths. Run `justless read FILE --outline` to get a path-bound revision and numbered rows. An entry reference combines the revision and row number, such as `abc…#7`. A Rust row's signature starts at the declaration itself, while its line range, `expand` and `edit` still cover the doc comments and attributes above it. Use `--match TEXT` to search names and signatures, including Rust doc comments and attributes, `--limit N` to set a page size, and `--after CURSOR` to resume the same search. `--budget` bounds the text outline. `--json` adds structured fields and a `next` cursor. Normal reads return small UTF-8 files verbatim. Outlines use the available language parser, Markdown ATX headings, or 80-line pages. A heading's name leaves out an optional closing run of `#`, so `## Setup ##` is named `Setup`.
 
 ```sh
 justless read src/main.rs --match dispatch --outline
