@@ -501,3 +501,42 @@ fn rust_outline_signatures_skip_docs_and_attributes() {
         function.as_bytes()
     );
 }
+
+#[test]
+fn rust_syntax_errors_are_reported_instead_of_hiding_symbols() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let mut text: String = (1..=100)
+        .map(|i| format!("pub fn f{i}() -> u8 {{ {i} }}\n"))
+        .collect();
+    fs::write(root.join("ok.rs"), &text).unwrap();
+    let healthy = json_output(root, &["read", "ok.rs", "--json"], &Value::Null);
+    assert!(healthy.get("parse_error").is_none());
+    text.push_str("pub fn wip( {\n");
+    fs::write(root.join("lib.rs"), &text).unwrap();
+    let outline = String::from_utf8(ok(run(root, &["read", "lib.rs", "--outline"], b""))).unwrap();
+    assert_eq!(
+        outline.lines().nth(1),
+        Some("Rust parse failed at line 101: cannot parse string into token stream")
+    );
+    let page = json_output(root, &["read", "lib.rs", "--json"], &Value::Null);
+    assert!(
+        page["parse_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Rust parse failed at line 101")
+    );
+    let small = ok(run(root, &["read", "lib.rs", "--budget", "128"], b""));
+    assert!(small.len() <= 128, "{}", String::from_utf8_lossy(&small));
+    let out = run(root, &["expand", "lib.rs", "f3"], b"");
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains("line 101") && error.contains("line range"),
+        "{error}"
+    );
+    assert_eq!(
+        ok(run(root, &["expand", "lib.rs", "L3"], b"")),
+        b"pub fn f3() -> u8 { 3 }\n"
+    );
+}

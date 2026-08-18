@@ -100,6 +100,8 @@ pub struct Snapshot {
     revision: String,
     lines: Vec<usize>,
     entries: Vec<Entry>,
+    /// Why the language parser produced no entries, such as a Rust syntax error.
+    parse_error: Option<String>,
 }
 
 fn revision_for(file: &str, bytes: &[u8]) -> String {
@@ -135,6 +137,7 @@ impl Snapshot {
             revision,
             lines,
             entries: Vec::new(),
+            parse_error: None,
         })
     }
 
@@ -179,20 +182,29 @@ impl Snapshot {
     pub fn index(&mut self, file: &str) -> Result<()> {
         let mut imports = Vec::new();
         if file.ends_with(".rs") {
-            if let Ok(facts) = crate::rust_syntax::parse(&self.text) {
-                imports = facts.use_ranges;
-                for symbol in facts.symbols {
-                    let Some(fragment) = self.text.get(symbol.bytes.clone()) else {
-                        continue;
-                    };
-                    let (start, end) = rust_header(fragment);
-                    self.entries.push(Entry {
-                        name: symbol.path.join("::"),
-                        kind: symbol.kind,
-                        signature_start: symbol.bytes.start + start,
-                        header_end: symbol.bytes.start + end,
-                        bytes: symbol.bytes,
-                    });
+            // syn parses whole files, so one syntax error leaves no symbols.
+            match crate::rust_syntax::parse(&self.text) {
+                Err(error) => {
+                    self.parse_error = Some(format!(
+                        "Rust parse failed at line {}: {error}",
+                        error.span().start().line
+                    ));
+                }
+                Ok(facts) => {
+                    imports = facts.use_ranges;
+                    for symbol in facts.symbols {
+                        let Some(fragment) = self.text.get(symbol.bytes.clone()) else {
+                            continue;
+                        };
+                        let (start, end) = rust_header(fragment);
+                        self.entries.push(Entry {
+                            name: symbol.path.join("::"),
+                            kind: symbol.kind,
+                            signature_start: symbol.bytes.start + start,
+                            header_end: symbol.bytes.start + end,
+                            bytes: symbol.bytes,
+                        });
+                    }
                 }
             }
         } else if let Some(grammar) = Grammar::for_file(file) {
@@ -363,7 +375,12 @@ impl Snapshot {
         let mut matching = self.entries.iter().enumerate().filter(|(_, entry)| {
             entry.name == target || entry.name.rsplit("::").next() == Some(target)
         });
-        let (id, entry) = matching.next().context("unknown symbol or selector")?;
+        let Some((id, entry)) = matching.next() else {
+            match &self.parse_error {
+                Some(error) => bail!("unknown symbol; {error}, so select a line range instead"),
+                None => bail!("unknown symbol or selector"),
+            }
+        };
         if let Some((other, _)) = matching.next() {
             bail!(
                 "ambiguous symbol; select an outline reference such as {} or {}",
@@ -396,9 +413,15 @@ impl Snapshot {
         let mut page = Page {
             revision: self.revision.clone(),
             lines: self.lines.len(),
+            parse_error: None,
             entries: Vec::new(),
             next: None,
         };
+        if let Some(error) = &self.parse_error {
+            // Leave room for the cursor line and one short row.
+            let room = budget.saturating_sub(page.display().len() + 42 + 32 + 1);
+            page.parse_error = (room >= 32).then(|| clipped(error, room.min(240)));
+        }
         let mut size = page.display().len() + 42;
         let mut last = None;
         let filter = filter.to_lowercase();
@@ -494,6 +517,8 @@ fn clipped(text: &str, max: usize) -> String {
 pub struct Page {
     revision: String,
     lines: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_error: Option<String>,
     entries: Vec<Row>,
     next: Option<String>,
 }
@@ -517,6 +542,10 @@ impl Row {
 impl Page {
     pub fn display(&self) -> String {
         let mut out = format!("revision {} · {} lines\n", self.revision, self.lines);
+        if let Some(error) = &self.parse_error {
+            out.push_str(error);
+            out.push('\n');
+        }
         for row in &self.entries {
             out.push_str(&row.display());
         }
