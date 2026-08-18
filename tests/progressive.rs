@@ -540,3 +540,43 @@ fn rust_syntax_errors_are_reported_instead_of_hiding_symbols() {
         b"pub fn f3() -> u8 { 3 }\n"
     );
 }
+
+#[test]
+fn deeply_nested_rust_reports_an_error_instead_of_overflowing_the_stack() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    fs::write(root.join(".justless.toml"), "").unwrap();
+    fs::write(root.join("ok.rs"), "pub fn hello() -> u8 { 1 }\n").unwrap();
+    let deep = format!(
+        "fn f() -> u8 {{ {}1{} }}\n",
+        "(".repeat(3000),
+        ")".repeat(3000)
+    );
+    let unary = format!("const B: bool = {}true;\n", "!".repeat(3000));
+    let chain = format!("const X: u64 = {}1;\n", "1 + ".repeat(20000));
+    fs::write(root.join("deep.rs"), &deep).unwrap();
+    fs::write(root.join("unary.rs"), &unary).unwrap();
+    fs::write(root.join("chain.rs"), &chain).unwrap();
+    fs::write(root.join("late.rs"), "fn a() {}\n\nfn b( -> {}\n").unwrap();
+    for (name, text) in [("deep.rs", &deep), ("unary.rs", &unary)] {
+        let page = json_output(root, &["read", name, "--json"], &Value::Null);
+        assert_eq!(
+            page["parse_error"],
+            "Rust parse failed at line 1: nesting deeper than 1024 levels"
+        );
+        // Line ranges never need the parser.
+        assert_eq!(ok(run(root, &["expand", name, "L1"], b"")), text.as_bytes());
+    }
+    let page = json_output(root, &["read", "chain.rs", "--json"], &Value::Null);
+    assert_eq!(page["entries"][0]["name"], "X");
+    let page = json_output(root, &["read", "late.rs", "--json"], &Value::Null);
+    assert!(
+        page["parse_error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Rust parse failed at line 3: "),
+        "{page}"
+    );
+    let found = String::from_utf8(ok(run(root, &["query", "hello"], b""))).unwrap();
+    assert!(found.contains("hello [function] at ok.rs:1"), "{found}");
+}

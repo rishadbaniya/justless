@@ -64,8 +64,102 @@ pub struct Syntax {
     pub modules: Vec<ModuleFile>,
 }
 
+/// Delimiter nesting or a run of operators longer than this is reported as a
+/// parse error instead of recursing through syn. rustc itself stops compiling
+/// before 3,000 nested parentheses.
+const MAX_NESTING: usize = 1024;
+
+/// `syn::parse_file`, with a nesting check on the tokens before syn recurses
+/// through them.
+fn parse_file(text: &str) -> syn::Result<syn::File> {
+    use proc_macro2::TokenTree;
+    let mut content = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut shebang = None;
+    if content.starts_with("#!") && !skip_trivia(&content[2..]).starts_with('[') {
+        let end = content.find('\n').unwrap_or(content.len());
+        shebang = Some(content[..end].to_owned());
+        content = &content[end..];
+    }
+    let tokens: proc_macro2::TokenStream = content.parse()?;
+    let mut levels = vec![tokens.clone().into_iter()];
+    // Prefix operators such as `!!!x` nest without delimiters.
+    let mut operators = 0;
+    while let Some(level) = levels.last_mut() {
+        let token = level.next();
+        operators = match &token {
+            Some(TokenTree::Punct(_)) => operators + 1,
+            _ => 0,
+        };
+        let too_deep = match token {
+            Some(TokenTree::Group(group)) if levels.len() > MAX_NESTING => Some(group.span_open()),
+            Some(TokenTree::Group(group)) => {
+                levels.push(group.stream().into_iter());
+                None
+            }
+            Some(punct) if operators > MAX_NESTING => Some(punct.span()),
+            Some(_) => None,
+            None => {
+                levels.pop();
+                None
+            }
+        };
+        if let Some(span) = too_deep {
+            return Err(syn::Error::new(
+                span,
+                format!("nesting deeper than {MAX_NESTING} levels"),
+            ));
+        }
+    }
+    let mut file: syn::File = syn::parse2(tokens)?;
+    file.shebang = shebang;
+    Ok(file)
+}
+
+/// Whitespace and non-doc comments, as `syn::parse_file` skips them to tell a
+/// shebang from an inner attribute.
+fn skip_trivia(mut s: &str) -> &str {
+    loop {
+        let trimmed =
+            s.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{200e}' || c == '\u{200f}');
+        if trimmed.starts_with("//")
+            && (!trimmed.starts_with("///") || trimmed.starts_with("////"))
+            && !trimmed.starts_with("//!")
+        {
+            s = trimmed.find('\n').map_or("", |end| &trimmed[end + 1..]);
+        } else if let Some(rest) = trimmed.strip_prefix("/**/") {
+            s = rest;
+        } else if trimmed.starts_with("/*")
+            && (!trimmed.starts_with("/**") || trimmed.starts_with("/***"))
+            && !trimmed.starts_with("/*!")
+        {
+            let bytes = trimmed.as_bytes();
+            let (mut depth, mut i) = (0, 0);
+            loop {
+                match bytes.get(i..i + 2) {
+                    Some(b"/*") => depth += 1,
+                    Some(b"*/") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Some(_) => {
+                        i += 1;
+                        continue;
+                    }
+                    None => return trimmed,
+                }
+                i += 2;
+            }
+            s = &trimmed[i + 2..];
+        } else {
+            return trimmed;
+        }
+    }
+}
+
 pub fn parse(text: &str) -> syn::Result<Syntax> {
-    let file = syn::parse_file(text)?;
+    let file = parse_file(text)?;
     let mut visitor = Extractor::default();
     visitor.visit_file(&file);
     let offset = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8()

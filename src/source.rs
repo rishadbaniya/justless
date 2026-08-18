@@ -329,13 +329,7 @@ impl Snapshot {
         revision: Option<&str>,
         guarded: bool,
     ) -> Result<Range<usize>> {
-        let (embedded, target) = selector
-            .split_once('#')
-            .filter(|(r, t)| {
-                (r.is_empty() && t.parse::<usize>().is_ok())
-                    || (r.len() == 24 && r.bytes().all(|b| b.is_ascii_hexdigit()))
-            })
-            .map_or((None, selector), |(r, t)| ((!r.is_empty()).then_some(r), t));
+        let (embedded, target) = split_selector(selector);
         for supplied in [embedded, revision].into_iter().flatten() {
             ensure!(
                 supplied == self.revision,
@@ -355,12 +349,7 @@ impl Snapshot {
                 .map(|entry| entry.bytes.clone())
                 .context("unknown outline entry");
         }
-        if let Some(range) = target.strip_prefix('L')
-            && range.starts_with(|c: char| c.is_ascii_digit())
-            && range
-                .bytes()
-                .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'L'))
-        {
+        if let Some(range) = line_range(target) {
             let (first, last) = range.split_once('-').unwrap_or((range, range));
             let start = first.parse::<usize>()?;
             let end = last.trim_start_matches('L').parse::<usize>()?;
@@ -499,6 +488,32 @@ fn rust_header(fragment: &str) -> (usize, usize) {
     (start, end.max(start))
 }
 
+/// A selector's embedded revision, if any, and its target.
+fn split_selector(selector: &str) -> (Option<&str>, &str) {
+    selector
+        .split_once('#')
+        .filter(|(r, t)| {
+            (r.is_empty() && t.parse::<usize>().is_ok())
+                || (r.len() == 24 && r.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .map_or((None, selector), |(r, t)| ((!r.is_empty()).then_some(r), t))
+}
+
+/// The `A-B` of an `LA-B` or `LA-LB` target.
+fn line_range(target: &str) -> Option<&str> {
+    target.strip_prefix('L').filter(|range| {
+        range.starts_with(|c: char| c.is_ascii_digit())
+            && range
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'L'))
+    })
+}
+
+/// Line ranges resolve without the outline, so they skip the parser.
+fn needs_outline(selector: &str) -> bool {
+    line_range(split_selector(selector).1).is_none()
+}
+
 fn clipped(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
@@ -580,11 +595,13 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
             print!("{}", page.display());
         }
     } else {
-        source.index(file)?;
         if name == "edit" {
-            return edit(ws, file, &source, args);
+            return edit(ws, file, source, args);
         }
         let selector = args.value_of("selector").unwrap();
+        if needs_outline(selector) {
+            source.index(file)?;
+        }
         let span = source.resolve(selector, args.value_of("revision"), false)?;
         let first = source.line(span.start);
         let last = source.line(span.end.saturating_sub(1));
@@ -633,7 +650,7 @@ struct Edit {
     mode: Mode,
 }
 
-fn edit(ws: &Workspace, file: &str, source: &Snapshot, args: &ArgMatches) -> Result<()> {
+fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> Result<()> {
     let mut input = String::new();
     match args.value_of("replacement-file") {
         Some(path) => input = fs::read_to_string(path)?,
@@ -657,6 +674,9 @@ fn edit(ws: &Workspace, file: &str, source: &Snapshot, args: &ArgMatches) -> Res
         }]
     };
     ensure!(!edits.is_empty(), "empty batch");
+    if edits.iter().any(|edit| needs_outline(&edit.selector)) {
+        source.index(file)?;
+    }
     let mut resolved = Vec::new();
     for edit in edits {
         let span = source.resolve(&edit.selector, args.value_of("revision"), true)?;

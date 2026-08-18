@@ -492,7 +492,24 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
     Ok(0)
 }
 
+/// Parsers recurse once per level of source nesting, so a deep but valid file
+/// needs more stack than the default main thread has.
+const STACK_BYTES: usize = 512 << 20;
+
 fn main() -> ExitCode {
+    let worker = std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(STACK_BYTES)
+        .spawn(run);
+    match worker {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        Err(_) => run(),
+    }
+}
+
+fn run() -> ExitCode {
     match dispatch(&cli().get_matches()) {
         Ok(status) => ExitCode::from(u8::try_from(status).unwrap_or(1)),
         Err(error) => {
