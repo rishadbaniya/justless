@@ -441,3 +441,26 @@ fn oversized_files_report_the_size_cap_even_when_it_splits_a_character() {
     let out = run(root, &["read", "bad.txt"], b"");
     assert!(String::from_utf8_lossy(&out.stderr).contains("expected UTF-8 source"));
 }
+
+#[test]
+fn markdown_heading_names_drop_closing_hashes() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let text = "# Guide #\n\n## Setup ##\nInstall steps.\n\n## C#\nRun it.\n\n### Setup\nPer-command setup.\n";
+    fs::write(root.join("doc.md"), text).unwrap();
+    let page = json_output(root, &["read", "doc.md", "--json"], &Value::Null);
+    let names: Vec<_> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Guide", "Setup", "C#", "Setup"]);
+    assert_eq!(
+        ok(run(root, &["expand", "doc.md", "Guide"], b"")),
+        text.as_bytes()
+    );
+    let out = run(root, &["expand", "doc.md", "Setup"], b"");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous symbol"));
+}

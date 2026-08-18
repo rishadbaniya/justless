@@ -295,7 +295,12 @@ impl Snapshot {
             if !(1..=6).contains(&level) || !content[level..].starts_with([' ', '\t']) {
                 continue;
             }
-            let title = content[level..].trim();
+            let mut title = content[level..].trim();
+            // A closing run of #s after a space is not part of the heading text.
+            let unclosed = title.trim_end_matches('#');
+            if unclosed.is_empty() || unclosed.ends_with([' ', '\t']) {
+                title = unclosed.trim_end();
+            }
             while open.last().is_some_and(|(depth, _)| *depth >= level) {
                 let (_, id) = open.pop().unwrap();
                 self.entries[id].bytes.end = start;
