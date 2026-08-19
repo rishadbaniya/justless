@@ -545,7 +545,7 @@ impl Parsers {
                 None
             };
             facts.definitions.push(Definition {
-                bytes: extent.byte_range(),
+                bytes: decorated_start(extent)..extent.end_byte(),
                 header_end: header_end.unwrap_or_else(|| {
                     body.or_else(|| extent.child_by_field_name("body"))
                         .or_else(|| header_boundary(grammar, extent))
@@ -704,6 +704,22 @@ fn declaration_extent<'a>(mut node: Node<'a>, name: Node<'a>) -> Node<'a> {
         node = parent;
     }
     node
+}
+
+// TypeScript keeps a class member's decorators as preceding siblings in the
+// class body rather than inside the member, so the span reaches back to them.
+fn decorated_start(node: Node<'_>) -> usize {
+    let mut start = node.start_byte();
+    let mut sibling = node.prev_named_sibling();
+    while let Some(previous) = sibling {
+        match previous.kind() {
+            "decorator" => start = previous.start_byte(),
+            "comment" => {}
+            _ => break,
+        }
+        sibling = previous.prev_named_sibling();
+    }
+    start
 }
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

@@ -580,3 +580,35 @@ fn deeply_nested_rust_reports_an_error_instead_of_overflowing_the_stack() {
     let found = String::from_utf8(ok(run(root, &["query", "hello"], b""))).unwrap();
     assert!(found.contains("hello [function] at ok.rs:1"), "{found}");
 }
+
+#[test]
+fn typescript_method_spans_include_their_decorators() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let method =
+        "@Get(\"/admin\")\n  // admins only\n  @UseGuards(AdminGuard)\n  admin() { return 1; }";
+    let text = format!(
+        "class Ctl {{\n  /** Lists users. */\n  {method}\n\n  open() {{ return 2; }}\n}}\n"
+    );
+    for name in ["ctl.ts", "ctl.tsx"] {
+        fs::write(root.join(name), &text).unwrap();
+        let found = json_output(
+            root,
+            &["expand", name, "Ctl::admin", "--json"],
+            &Value::Null,
+        );
+        assert_eq!(found["content"], method, "{name}");
+        assert_eq!(found["first"], 3);
+        let revision = found["revision"].as_str().unwrap();
+        ok(run(
+            root,
+            &["edit", name, "Ctl::admin", "--revision", revision],
+            b"",
+        ));
+        // The decorators leave with the method instead of moving to open().
+        assert_eq!(
+            fs::read_to_string(root.join(name)).unwrap(),
+            "class Ctl {\n  /** Lists users. */\n  \n\n  open() { return 2; }\n}\n"
+        );
+    }
+}

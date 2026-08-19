@@ -82,7 +82,7 @@ justless expand src/main.rs dispatch --json
 justless expand src/main.rs L20-35
 ```
 
-When you already know the name or range, `expand --json` returns the exact source and a ready-to-use edit selector in one call. Use the revision from the read that informed the edit. Symbol expansion uses the parser’s declaration boundaries. The returned bytes show exactly what a symbol replacement will overwrite. Line ranges include indentation and any terminating newline. Replacements and insertions use the supplied bytes verbatim, including their line endings. For duplicate names use a qualified name or a numbered entry. A revision-bound reference works directly with both `expand` and `edit`.
+When you already know the name or range, `expand --json` returns the exact source and a ready-to-use edit selector in one call. Use the revision from the read that informed the edit. Symbol expansion uses the parser’s declaration boundaries, which include the declaration's attributes and decorators, such as a TypeScript method's `@Get()`. The returned bytes show exactly what a symbol replacement will overwrite. Line ranges include indentation and any terminating newline. Replacements and insertions use the supplied bytes verbatim, including their line endings. For duplicate names use a qualified name or a numbered entry. A revision-bound reference works directly with both `expand` and `edit`.
 
 ```sh
 justless expand src/main.rs "${rev}#7"
