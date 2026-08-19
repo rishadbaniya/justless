@@ -90,7 +90,7 @@ justless edit src/main.rs "${rev}#7" --replacement-file replacement.rs --dry-run
 justless edit src/main.rs "${rev}#7" --replacement-file replacement.rs
 ```
 
-For insertions, use `--before` or `--after`. An empty replacement deletes the selected span. `--dry-run` shows a unified diff using Git. To apply several changes to one snapshot, pass a JSON array on stdin. Ranges need `--revision` or a revision in the selector.
+For insertions, use `--before` or `--after`. Insertions at a symbol or entry are line-aligned when nothing else shares the symbol's lines. `--before` inserts at the start of its first line, ahead of the indentation, and `--after` inserts after the line ending of its last line, or at the end of a file that has no final line ending. A symbol that shares a line with other code keeps its exact boundary. Supply complete lines with their own indentation. An empty replacement deletes the selected span. `--dry-run` shows a unified diff using Git. To apply several changes to one snapshot, pass a JSON array on stdin. Ranges need `--revision` or a revision in the selector.
 
 ```sh
 justless edit config.ini --batch --revision "$rev" <<'JSON'

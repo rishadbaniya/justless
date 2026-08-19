@@ -612,3 +612,66 @@ fn typescript_method_spans_include_their_decorators() {
         );
     }
 }
+
+#[test]
+fn symbol_insertions_land_on_line_boundaries() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let insert = |name: &str, text: &str, args: &[&str], replacement: &str| {
+        fs::write(root.join(name), text).unwrap();
+        let page = json_output(root, &["read", name, "--json"], &Value::Null);
+        let revision = page["revision"].as_str().unwrap();
+        let mut command = vec!["edit", name];
+        command.extend_from_slice(args);
+        command.extend_from_slice(&["--revision", revision]);
+        ok(run(root, &command, replacement.as_bytes()));
+        fs::read_to_string(root.join(name)).unwrap()
+    };
+    assert_eq!(
+        insert(
+            "a.py",
+            "class A:\n    def old(self):\n        return 1\n\n    def last(self):\n        return 2\n",
+            &["A::old", "--after"],
+            "    def new(self):\n        return 0\n",
+        ),
+        "class A:\n    def old(self):\n        return 1\n    def new(self):\n        return 0\n\n    def last(self):\n        return 2\n"
+    );
+    assert_eq!(
+        insert(
+            "x.rs",
+            "fn a() {}\r\nfn b() {}\r\n",
+            &["a", "--after"],
+            "fn n() {}\r\n"
+        ),
+        "fn a() {}\r\nfn n() {}\r\nfn b() {}\r\n"
+    );
+    assert_eq!(
+        insert(
+            "ctl.ts",
+            "class Ctl {\n  @Get(\"/a\")\n  admin() {}\n}\n",
+            &["Ctl::admin", "--before"],
+            "  fresh() {}\n",
+        ),
+        "class Ctl {\n  fresh() {}\n  @Get(\"/a\")\n  admin() {}\n}\n"
+    );
+    // A symbol that shares its line keeps its exact boundary.
+    assert_eq!(
+        insert(
+            "same.rs",
+            "fn one() {} fn two() {}\n",
+            &["two", "--before"],
+            "fn mid() {} "
+        ),
+        "fn one() {} fn mid() {} fn two() {}\n"
+    );
+    // The last line has no line ending, so the insertion goes at the end.
+    assert_eq!(
+        insert("end.rs", "fn a() {}", &["a", "--after"], "\nfn z() {}"),
+        "fn a() {}\nfn z() {}"
+    );
+    // Line ranges already end at a line boundary and keep a blank next line.
+    assert_eq!(
+        insert("t.txt", "one\n\nthree\n", &["L1", "--after"], "two\n"),
+        "one\ntwo\n\nthree\n"
+    );
+}

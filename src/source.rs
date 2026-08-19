@@ -179,6 +179,32 @@ impl Snapshot {
         self.lines.partition_point(|&start| start <= offset)
     }
 
+    /// The start of `offset`'s line when only indentation precedes it, so a
+    /// symbol insertion goes before the whole line.
+    fn line_aligned_start(&self, offset: usize) -> usize {
+        let start = self.text[..offset].rfind('\n').map_or(0, |i| i + 1);
+        if self.text[start..offset].trim().is_empty() {
+            start
+        } else {
+            offset
+        }
+    }
+
+    /// Just past the line ending after `offset` when only whitespace follows
+    /// it on that line, so a symbol insertion goes after the whole line.
+    fn line_aligned_end(&self, offset: usize) -> usize {
+        if offset == 0 || self.text.as_bytes()[offset - 1] == b'\n' {
+            return offset;
+        }
+        let rest = &self.text[offset..];
+        let end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        if rest[..end].trim().is_empty() {
+            offset + end
+        } else {
+            offset
+        }
+    }
+
     pub fn index(&mut self, file: &str) -> Result<()> {
         let mut imports = Vec::new();
         if file.ends_with(".rs") {
@@ -682,8 +708,14 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
         let span = source.resolve(&edit.selector, args.value_of("revision"), true)?;
         let span = match edit.mode {
             Mode::Replace => span,
-            Mode::Before => span.start..span.start,
-            Mode::After => span.end..span.end,
+            Mode::Before => {
+                let at = source.line_aligned_start(span.start);
+                at..at
+            }
+            Mode::After => {
+                let at = source.line_aligned_end(span.end);
+                at..at
+            }
         };
         ensure!(!edit.replacement.contains('\0'), "replacement must be text");
         resolved.push((span, edit.replacement));
