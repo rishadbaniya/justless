@@ -803,16 +803,39 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
         );
         return preview(file, &path, &source.text, &edited);
     }
-    let mut temp = NamedTempFile::new_in(path.parent().context("expected source directory")?)?;
-    temp.write_all(edited.as_bytes())?;
-    temp.as_file()
-        .set_permissions(fs::metadata(&path)?.permissions())?;
-    ensure!(
-        fs::read(ws.source_path(file)?)? == source.text.as_bytes(),
-        "stale revision; file changed during edit"
-    );
-    if edited != source.text {
-        temp.persist(path)?;
+    // Opening for writing applies the same permission check as a shell write.
+    let mut target = File::options()
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("{file} is not writable"))?;
+    let replacement = path
+        .parent()
+        .and_then(|dir| NamedTempFile::new_in(dir).ok())
+        .filter(|temp| replaceable(&path, temp));
+    let unchanged = || -> Result<()> {
+        ensure!(
+            fs::read(ws.source_path(file)?)? == source.text.as_bytes(),
+            "stale revision; file changed during edit"
+        );
+        Ok(())
+    };
+    match replacement {
+        Some(mut temp) if edited != source.text => {
+            temp.write_all(edited.as_bytes())?;
+            temp.as_file()
+                .set_permissions(fs::metadata(&path)?.permissions())?;
+            unchanged()?;
+            // A bind-mounted file, for one, cannot be renamed over.
+            if temp.persist(&path).is_err() {
+                write_in_place(&mut target, edited.as_bytes())?;
+            }
+        }
+        _ => {
+            unchanged()?;
+            if edited != source.text {
+                write_in_place(&mut target, edited.as_bytes())?;
+            }
+        }
     }
     println!(
         "{} edits · revision {}",
@@ -820,6 +843,64 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
         revision_for(file, edited.as_bytes())
     );
     Ok(())
+}
+
+/// Whether renaming `temp` over `path` keeps the file's hard links, owner,
+/// group and extended attributes. Otherwise the edit is written in place.
+#[cfg(unix)]
+fn replaceable(path: &Path, temp: &NamedTempFile) -> bool {
+    use std::os::unix::fs::{MetadataExt, fchown};
+    let Ok(old) = fs::metadata(path) else {
+        return false;
+    };
+    // Only root can keep another owner, but a member can keep the group.
+    if fchown(temp.as_file(), Some(old.uid()), Some(old.gid())).is_err() {
+        let _ = fchown(temp.as_file(), None, Some(old.gid()));
+    }
+    let Ok(new) = temp.as_file().metadata() else {
+        return false;
+    };
+    old.nlink() == 1
+        && (old.uid(), old.gid()) == (new.uid(), new.gid())
+        && keeps_attributes(path, temp.path())
+}
+
+#[cfg(not(unix))]
+fn replaceable(_: &Path, _: &NamedTempFile) -> bool {
+    true
+}
+
+/// Whether the new file already has every extended attribute name the old
+/// one has, such as those the system adds to every new file.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn keeps_attributes(old: &Path, new: &Path) -> bool {
+    let names = |path: &Path| {
+        let mut list = vec![0; rustix::fs::listxattr_query(path).unwrap_or(0)];
+        let len = rustix::fs::listxattr(path, &mut list[..]).unwrap_or(0);
+        list.truncate(len);
+        list.split(|&byte| byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>()
+    };
+    let kept = names(new);
+    names(old).iter().all(|name| kept.contains(name))
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn keeps_attributes(_: &Path, _: &Path) -> bool {
+    true
+}
+
+/// Overwrites the file's bytes, keeping its inode and metadata, at the cost
+/// of the atomic rename.
+fn write_in_place(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    file.sync_all()
 }
 
 /// Prints the edit as a Git patch whose headers name the workspace-relative

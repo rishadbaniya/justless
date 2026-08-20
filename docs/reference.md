@@ -101,7 +101,7 @@ justless edit config.ini --batch --revision "$rev" <<'JSON'
 JSON
 ```
 
-Justless validates the full batch before writing. Stale revisions, ambiguous selectors and overlapping spans fail the entire batch. A project lock serializes Justless writers. Justless rereads the file immediately before the atomic rename and preserves its permissions. Editors that write independently do not acquire the Justless lock.
+Justless validates the full batch before writing. Stale revisions, ambiguous selectors and overlapping spans fail the entire batch. A project lock serializes Justless writers. Justless refuses a file the user cannot write, as a shell write would, and rereads the file immediately before writing it. It normally writes a new copy with the same permissions and renames it into place atomically. When a rename would split hard links, change the owner or group, or drop extended attributes, or the directory cannot take a new file, Justless overwrites the file in place instead. Editors that write independently do not acquire the Justless lock.
 
 ## Recoverable tool history
 

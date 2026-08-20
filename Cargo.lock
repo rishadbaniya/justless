@@ -276,6 +276,7 @@ dependencies = [
  "ignore",
  "proc-macro2",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

@@ -800,3 +800,58 @@ fn dry_run_patches_name_the_workspace_file_and_apply_cleanly() {
         fs::read(root.join(name)).unwrap()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn edits_refuse_read_only_files_and_keep_links_and_attributes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let edit = |name: &str| {
+        let page = json_output(root, &["read", name, "--json"], &Value::Null);
+        let revision = page["revision"].as_str().unwrap().to_owned();
+        run(
+            root,
+            &["edit", name, "L2", "--revision", &revision],
+            b"TWO\n",
+        )
+    };
+    fs::write(root.join("ro.txt"), "one\ntwo\n").unwrap();
+    fs::set_permissions(root.join("ro.txt"), fs::Permissions::from_mode(0o444)).unwrap();
+    // Root may write anyway, as a shell would let it.
+    if fs::File::options()
+        .write(true)
+        .open(root.join("ro.txt"))
+        .is_err()
+    {
+        let out = edit("ro.txt");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("ro.txt is not writable"));
+        assert_eq!(
+            fs::read_to_string(root.join("ro.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+    fs::write(root.join("linked.txt"), "one\ntwo\n").unwrap();
+    fs::hard_link(root.join("linked.txt"), root.join("link.txt")).unwrap();
+    let inode = fs::metadata(root.join("linked.txt")).unwrap().ino();
+    ok(edit("linked.txt"));
+    assert_eq!(fs::metadata(root.join("linked.txt")).unwrap().ino(), inode);
+    assert_eq!(
+        fs::read_to_string(root.join("link.txt")).unwrap(),
+        "one\nTWO\n"
+    );
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        let tagged = root.join("tagged.txt");
+        fs::write(&tagged, "one\ntwo\n").unwrap();
+        // Some filesystems, such as older tmpfs, have no user attributes.
+        let flags = rustix::fs::XattrFlags::empty();
+        if rustix::fs::setxattr(&tagged, "user.justless.test", b"kept", flags).is_ok() {
+            ok(edit("tagged.txt"));
+            let mut value = [0; 8];
+            let len = rustix::fs::getxattr(&tagged, "user.justless.test", &mut value[..]).unwrap();
+            assert_eq!(&value[..len], b"kept");
+            assert_eq!(fs::read_to_string(&tagged).unwrap(), "one\nTWO\n");
+        }
+    }
+}
