@@ -682,13 +682,14 @@ fn source_paths_resolve_from_the_current_directory_within_the_workspace() {
     let root = d.path().canonicalize().unwrap();
     let crate_dir = root.join("crate");
     fs::create_dir(&crate_dir).unwrap();
+    // The marker makes the parent the discovered root, as a Git checkout would.
+    fs::write(root.join(".justless.toml"), "").unwrap();
     fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
     fs::write(crate_dir.join("Cargo.toml"), "[package]\n").unwrap();
     fs::write(crate_dir.join("only.txt"), "only here\n").unwrap();
     let from_crate = |args: &[&str], input: &[u8]| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
             .current_dir(&crate_dir)
-            .args(["--root", root.to_str().unwrap()])
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -698,37 +699,40 @@ fn source_paths_resolve_from_the_current_directory_within_the_workspace() {
         child.stdin.take().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     };
-    assert_eq!(
-        ok(from_crate(&["read", "./Cargo.toml"], b"")),
-        b"[package]\n"
-    );
-    assert_eq!(
-        ok(from_crate(&["read", "../Cargo.toml"], b"")),
-        b"[workspace]\n"
-    );
-    assert_eq!(ok(from_crate(&["read", "only.txt"], b"")), b"only here\n");
-    assert_eq!(
-        ok(from_crate(&["read", "crate/only.txt"], b"")),
-        b"only here\n"
-    );
-    let absolute = crate_dir.join("Cargo.toml");
-    assert_eq!(
-        ok(from_crate(&["read", absolute.to_str().unwrap()], b"")),
-        b"[package]\n"
-    );
-    // A bare name stays workspace-relative, as hooks pass it, and says so.
+    let read = |file: &str| ok(from_crate(&["read", file], b""));
+    // Without --root, a bare path resolves like a shell path and says so when
+    // the root has a different file of that name.
     let shadowed = from_crate(&["read", "Cargo.toml"], b"");
     assert!(
-        String::from_utf8_lossy(&shadowed.stderr).contains("use ./Cargo.toml for crate/Cargo.toml")
+        String::from_utf8_lossy(&shadowed.stderr)
+            .contains("use ../Cargo.toml for the workspace root's file")
     );
-    assert_eq!(ok(shadowed), b"[workspace]\n");
+    assert_eq!(ok(shadowed), b"[package]\n");
+    assert_eq!(read("./Cargo.toml"), b"[package]\n");
+    assert_eq!(read("../Cargo.toml"), b"[workspace]\n");
+    assert_eq!(read("only.txt"), b"only here\n");
+    // A workspace-relative path still works when the current directory lacks it.
+    assert_eq!(read("crate/only.txt"), b"only here\n");
+    assert_eq!(
+        read(crate_dir.join("Cargo.toml").to_str().unwrap()),
+        b"[package]\n"
+    );
     assert!(
         !from_crate(&["read", "../../outside.txt"], b"")
             .status
             .success()
     );
+    // With --root, as hooks pass it, a bare path is root-relative first.
+    let hooked = from_crate(
+        &["--root", root.to_str().unwrap(), "read", "Cargo.toml"],
+        b"",
+    );
+    assert!(
+        String::from_utf8_lossy(&hooked.stderr).contains("use ./Cargo.toml for crate/Cargo.toml")
+    );
+    assert_eq!(ok(hooked), b"[workspace]\n");
     // Every spelling of one file shares its name and revision.
-    let local = from_crate(&["expand", "./Cargo.toml", "L1", "--json"], b"");
+    let local = from_crate(&["expand", "Cargo.toml", "L1", "--json"], b"");
     let local: Value = serde_json::from_slice(&ok(local)).unwrap();
     let rooted = json_output(
         &root,
@@ -741,7 +745,7 @@ fn source_paths_resolve_from_the_current_directory_within_the_workspace() {
     ok(from_crate(
         &[
             "edit",
-            "./Cargo.toml",
+            "Cargo.toml",
             "L1",
             "--before",
             "--revision",

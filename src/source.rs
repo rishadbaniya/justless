@@ -598,11 +598,12 @@ impl Page {
     }
 }
 
-/// FILE as a workspace-relative name. Paths that start with `./` or `../`,
-/// absolute paths, and bare paths that exist only under the current directory
-/// are taken from there. Other bare paths are workspace-relative, as hooks and
-/// MCP clients pass them.
-fn workspace_file(ws: &Workspace, file: &str) -> Result<String> {
+/// FILE as a workspace-relative name. A bare path comes from the current
+/// directory like a shell path and falls back to the workspace root. With
+/// `--root`, as hooks pass it, a bare path is root-relative first. Paths that
+/// start with `./` or `../`, and absolute paths, always resolve from the
+/// current directory.
+fn workspace_file(ws: &Workspace, file: &str, root_given: bool) -> Result<String> {
     let path = Path::new(file);
     let bare = path
         .components()
@@ -638,21 +639,38 @@ fn workspace_file(ws: &Workspace, file: &str) -> Result<String> {
     let Some(relative) = relative else {
         return Ok(file.to_owned());
     };
-    match (
-        ws.source_path(&relative).is_ok(),
-        ws.source_path(file).is_ok(),
-    ) {
-        (true, false) => return Ok(relative),
-        (true, true) => {
-            eprintln!("justless: {file} is the workspace root's file; use ./{file} for {relative}")
-        }
-        _ => {}
-    }
-    Ok(file.to_owned())
+    let up = "../".repeat(
+        ws.cwd
+            .strip_prefix(&ws.root)
+            .map_or(0, |dir| dir.iter().count()),
+    );
+    Ok(
+        match (
+            ws.source_path(&relative).is_ok(),
+            ws.source_path(file).is_ok(),
+            root_given,
+        ) {
+            (true, false, _) | (false, false, false) => relative,
+            (false, true, _) => file.to_owned(),
+            (true, true, false) => {
+                eprintln!(
+                    "justless: {file} is {relative}; use {up}{file} for the workspace root's file"
+                );
+                relative
+            }
+            (true, true, true) => {
+                eprintln!(
+                    "justless: {file} is the workspace root's file; use ./{file} for {relative}"
+                );
+                file.to_owned()
+            }
+            (false, false, true) => file.to_owned(),
+        },
+    )
 }
 
-pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
-    let file = &workspace_file(ws, args.value_of("file").unwrap())?;
+pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> Result<()> {
+    let file = &workspace_file(ws, args.value_of("file").unwrap(), root_given)?;
     let mut source = Snapshot::open(ws, file)?;
     if name == "read" {
         let budget = crate::context_budget(ws, args)?;

@@ -326,7 +326,9 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
     }
     let workspace = Workspace::discover(root)?;
     match matches.subcommand().expect("subcommand is required") {
-        (name @ ("read" | "expand" | "edit"), sub) => source::run(&workspace, name, sub)?,
+        (name @ ("read" | "expand" | "edit"), sub) => {
+            source::run(&workspace, name, sub, matches.is_present("root"))?
+        }
         (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
         ("mcp", sub) => mcp::run(&workspace, sub)?,
         ("map", sub) => map::run(&workspace, sub)?,
