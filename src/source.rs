@@ -158,6 +158,7 @@ impl Snapshot {
             revision,
             lines,
             entries: Vec::new(),
+            parse_error: None,
         }
     }
 
