@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::ops::Range;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -597,8 +598,61 @@ impl Page {
     }
 }
 
+/// FILE as a workspace-relative name. Paths that start with `./` or `../`,
+/// absolute paths, and bare paths that exist only under the current directory
+/// are taken from there. Other bare paths are workspace-relative, as hooks and
+/// MCP clients pass them.
+fn workspace_file(ws: &Workspace, file: &str) -> Result<String> {
+    let path = Path::new(file);
+    let bare = path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)));
+    if bare && ws.cwd == ws.root {
+        return Ok(file.to_owned());
+    }
+    let mut local = PathBuf::new();
+    for part in ws.cwd.join(path).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                local.pop();
+            }
+            part => local.push(part),
+        }
+    }
+    // Resolve the directory, such as macOS's /tmp, but not a linked file.
+    if let (Some(parent), Some(name)) = (local.parent(), local.file_name())
+        && let Ok(parent) = parent.canonicalize()
+    {
+        local = parent.join(name);
+    }
+    let relative = local
+        .strip_prefix(&ws.root)
+        .ok()
+        .and_then(Path::to_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    if !bare {
+        return relative.with_context(|| format!("{file} is outside the workspace"));
+    }
+    let Some(relative) = relative else {
+        return Ok(file.to_owned());
+    };
+    match (
+        ws.source_path(&relative).is_ok(),
+        ws.source_path(file).is_ok(),
+    ) {
+        (true, false) => return Ok(relative),
+        (true, true) => {
+            eprintln!("justless: {file} is the workspace root's file; use ./{file} for {relative}")
+        }
+        _ => {}
+    }
+    Ok(file.to_owned())
+}
+
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
-    let file = args.value_of("file").unwrap();
+    let file = &workspace_file(ws, args.value_of("file").unwrap())?;
     let mut source = Snapshot::open(ws, file)?;
     if name == "read" {
         let budget = crate::context_budget(ws, args)?;

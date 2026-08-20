@@ -675,3 +675,86 @@ fn symbol_insertions_land_on_line_boundaries() {
         "one\ntwo\n\nthree\n"
     );
 }
+
+#[test]
+fn source_paths_resolve_from_the_current_directory_within_the_workspace() {
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    let crate_dir = root.join("crate");
+    fs::create_dir(&crate_dir).unwrap();
+    fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(crate_dir.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(crate_dir.join("only.txt"), "only here\n").unwrap();
+    let from_crate = |args: &[&str], input: &[u8]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .current_dir(&crate_dir)
+            .args(["--root", root.to_str().unwrap()])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    assert_eq!(
+        ok(from_crate(&["read", "./Cargo.toml"], b"")),
+        b"[package]\n"
+    );
+    assert_eq!(
+        ok(from_crate(&["read", "../Cargo.toml"], b"")),
+        b"[workspace]\n"
+    );
+    assert_eq!(ok(from_crate(&["read", "only.txt"], b"")), b"only here\n");
+    assert_eq!(
+        ok(from_crate(&["read", "crate/only.txt"], b"")),
+        b"only here\n"
+    );
+    let absolute = crate_dir.join("Cargo.toml");
+    assert_eq!(
+        ok(from_crate(&["read", absolute.to_str().unwrap()], b"")),
+        b"[package]\n"
+    );
+    // A bare name stays workspace-relative, as hooks pass it, and says so.
+    let shadowed = from_crate(&["read", "Cargo.toml"], b"");
+    assert!(
+        String::from_utf8_lossy(&shadowed.stderr).contains("use ./Cargo.toml for crate/Cargo.toml")
+    );
+    assert_eq!(ok(shadowed), b"[workspace]\n");
+    assert!(
+        !from_crate(&["read", "../../outside.txt"], b"")
+            .status
+            .success()
+    );
+    // Every spelling of one file shares its name and revision.
+    let local = from_crate(&["expand", "./Cargo.toml", "L1", "--json"], b"");
+    let local: Value = serde_json::from_slice(&ok(local)).unwrap();
+    let rooted = json_output(
+        &root,
+        &["expand", "crate/Cargo.toml", "L1", "--json"],
+        &Value::Null,
+    );
+    assert_eq!(local["file"], "crate/Cargo.toml");
+    assert_eq!(local["revision"], rooted["revision"]);
+    let revision = local["revision"].as_str().unwrap();
+    ok(from_crate(
+        &[
+            "edit",
+            "./Cargo.toml",
+            "L1",
+            "--before",
+            "--revision",
+            revision,
+        ],
+        b"# added\n",
+    ));
+    assert_eq!(
+        fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap(),
+        "# added\n[package]\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        "[workspace]\n"
+    );
+}
