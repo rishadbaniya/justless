@@ -796,6 +796,13 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
     ws.prepare_state()?;
     let _lock = lock_state(&ws.state.join("edit.lock"))?;
     let path = ws.source_path(file)?;
+    if args.is_present("dry-run") {
+        ensure!(
+            fs::read(&path)? == source.text.as_bytes(),
+            "stale revision; file changed during edit"
+        );
+        return preview(file, &path, &source.text, &edited);
+    }
     let mut temp = NamedTempFile::new_in(path.parent().context("expected source directory")?)?;
     temp.write_all(edited.as_bytes())?;
     temp.as_file()
@@ -804,27 +811,47 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
         fs::read(ws.source_path(file)?)? == source.text.as_bytes(),
         "stale revision; file changed during edit"
     );
-    if args.is_present("dry-run") {
-        let result = Command::new("git")
-            .args(["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--"])
-            .arg(&path)
-            .arg(temp.path())
-            .output()?;
-        ensure!(
-            matches!(result.status.code(), Some(0 | 1)),
-            "git diff failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        io::stdout().lock().write_all(&result.stdout)?;
-    } else {
-        if edited != source.text {
-            temp.persist(path)?;
-        }
-        println!(
-            "{} edits · revision {}",
-            resolved.len(),
-            revision_for(file, edited.as_bytes())
-        );
+    if edited != source.text {
+        temp.persist(path)?;
     }
+    println!(
+        "{} edits · revision {}",
+        resolved.len(),
+        revision_for(file, edited.as_bytes())
+    );
     Ok(())
+}
+
+/// Prints the edit as a Git patch whose headers name the workspace-relative
+/// file, so `git apply` can apply it from the workspace root.
+fn preview(file: &str, path: &Path, before: &str, after: &str) -> Result<()> {
+    let sides = tempfile::tempdir()?;
+    let permissions = fs::metadata(path)?.permissions();
+    for (side, text) in [("a", before), ("b", after)] {
+        let copy = sides.path().join(side).join(file);
+        fs::create_dir_all(copy.parent().context("expected source directory")?)?;
+        fs::write(&copy, text)?;
+        fs::set_permissions(&copy, permissions.clone())?;
+    }
+    let result = Command::new("git")
+        .current_dir(sides.path())
+        .args([
+            "diff",
+            "--no-index",
+            "--no-prefix",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ])
+        .arg(Path::new("a").join(file))
+        .arg(Path::new("b").join(file))
+        .output()
+        .context("run git diff")?;
+    ensure!(
+        matches!(result.status.code(), Some(0 | 1)),
+        "git diff failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(io::stdout().lock().write_all(&result.stdout)?)
 }

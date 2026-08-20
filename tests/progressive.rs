@@ -758,3 +758,45 @@ fn source_paths_resolve_from_the_current_directory_within_the_workspace() {
         "[workspace]\n"
     );
 }
+
+#[test]
+fn dry_run_patches_name_the_workspace_file_and_apply_cleanly() {
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    let copy = tempdir().unwrap();
+    let name = "src/a b/é.rs";
+    let text = "fn a() {}\nfn b() {}\nfn c() {}\n";
+    for base in [root.as_path(), copy.path()] {
+        fs::create_dir_all(base.join("src/a b")).unwrap();
+        fs::write(base.join(name), text).unwrap();
+    }
+    let page = json_output(&root, &["read", name, "--json"], &Value::Null);
+    let revision = page["revision"].as_str().unwrap();
+    let edit = ["edit", name, "b", "--revision", revision];
+    let patch = ok(run(
+        &root,
+        &[&edit[..], &["--dry-run"]].concat(),
+        b"fn b2() {}",
+    ));
+    let header = String::from_utf8_lossy(&patch);
+    // Git may quote the non-ASCII name, depending on core.quotePath.
+    let lines: Vec<_> = header.lines().collect();
+    assert!(lines[0].starts_with("diff --git ") && lines[0].contains("b/src/a b/"));
+    assert!(lines[2].starts_with("--- ") && lines[2].contains("a/src/a b/"));
+    assert!(lines[3].starts_with("+++ ") && lines[3].contains("b/src/a b/"));
+    assert!(!header.contains(root.to_str().unwrap()) && !header.contains(".tmp"));
+    assert_eq!(fs::read_to_string(root.join(name)).unwrap(), text);
+    let mut apply = Command::new("git")
+        .args(["apply", "-"])
+        .current_dir(copy.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    apply.stdin.take().unwrap().write_all(&patch).unwrap();
+    assert!(apply.wait().unwrap().success());
+    ok(run(&root, &edit, b"fn b2() {}"));
+    assert_eq!(
+        fs::read(copy.path().join(name)).unwrap(),
+        fs::read(root.join(name)).unwrap()
+    );
+}
