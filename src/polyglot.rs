@@ -341,6 +341,10 @@ impl Grammar {
 pub struct Definition {
     #[serde(skip)]
     pub bytes: std::ops::Range<usize>,
+    /// Where the declaration itself starts, after decorators that `bytes`
+    /// reaches back to.
+    #[serde(skip)]
+    pub signature_start: usize,
     #[serde(skip)]
     pub header_end: usize,
     pub name: String,
@@ -546,6 +550,7 @@ impl Parsers {
             };
             facts.definitions.push(Definition {
                 bytes: decorated_start(extent)..extent.end_byte(),
+                signature_start: extent.start_byte(),
                 header_end: header_end.unwrap_or_else(|| {
                     body.or_else(|| extent.child_by_field_name("body"))
                         .or_else(|| header_boundary(grammar, extent))

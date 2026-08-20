@@ -614,6 +614,47 @@ fn typescript_method_spans_include_their_decorators() {
 }
 
 #[test]
+fn typescript_outline_signatures_skip_member_decorators() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    // More than the 160 bytes a row shows before its signature is clipped.
+    let decorators = "@ApiResponse({ status: 200, description: \"The list of users visible to the caller\" })\n  @ApiResponse({ status: 403, description: \"The caller lacks the users:read permission\" })\n  @Get(\"/users\")\n  ";
+    assert!(decorators.len() > 160);
+    let method = format!(
+        "{decorators}listUsers(page: number, size: number): Promise<User[]> {{ return []; }}"
+    );
+    let text = format!("class UsersController {{\n  {method}\n}}\n");
+    for name in ["u.ts", "u.tsx"] {
+        fs::write(root.join(name), &text).unwrap();
+        let page = json_output(root, &["read", name, "--json"], &Value::Null);
+        let row = &page["entries"][1];
+        assert_eq!(row["name"], "UsersController::listUsers", "{name}");
+        assert_eq!(
+            row["signature"], "listUsers(page: number, size: number): Promise<User[]>",
+            "{name}"
+        );
+        // The line range and the editable span still cover the decorators.
+        assert_eq!(row["first"], 2, "{name}");
+        let found = json_output(
+            root,
+            &["expand", name, "UsersController::listUsers", "--json"],
+            &Value::Null,
+        );
+        assert_eq!(found["content"], method.as_str(), "{name}");
+        // Decorator text stays searchable.
+        let matched = json_output(
+            root,
+            &["read", name, "--json", "--match", "users:read"],
+            &Value::Null,
+        );
+        assert_eq!(
+            matched["entries"][0]["name"], "UsersController::listUsers",
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn symbol_insertions_land_on_line_boundaries() {
     let d = tempdir().unwrap();
     let root = d.path();

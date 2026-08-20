@@ -91,7 +91,8 @@ struct Entry {
     name: String,
     kind: String,
     bytes: Range<usize>,
-    /// Where the outline signature starts, after Rust attributes and docs.
+    /// Where the outline signature starts, after Rust attributes and docs and
+    /// after TypeScript member decorators.
     signature_start: usize,
     header_end: usize,
 }
@@ -241,7 +242,7 @@ impl Snapshot {
                 self.entries.push(Entry {
                     name: def.path,
                     kind: def.kind,
-                    signature_start: def.bytes.start,
+                    signature_start: def.signature_start,
                     bytes: def.bytes,
                     header_end: def.header_end,
                 });
