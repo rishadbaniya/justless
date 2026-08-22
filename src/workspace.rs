@@ -64,28 +64,44 @@ impl Default for Settings {
 
 impl Workspace {
     pub fn discover(root: Option<&Path>) -> Result<Self> {
+        Self::locate(root, None)
+    }
+
+    /// Searches upward from `start` instead of the working directory, the way
+    /// a command run from `start` would find its project.
+    pub fn discover_from(start: &Path) -> Result<Self> {
+        Self::locate(None, Some(start))
+    }
+
+    fn locate(root: Option<&Path>, start: Option<&Path>) -> Result<Self> {
         let cwd = std::env::current_dir()?.canonicalize()?;
+        let start = match start {
+            Some(start) => start
+                .canonicalize()
+                .with_context(|| format!("open {}", start.display()))?,
+            None => cwd.clone(),
+        };
         let root = match root {
             Some(root) => root
                 .canonicalize()
                 .with_context(|| format!("open {}", root.display()))?,
-            None => cwd
+            None => start
                 .ancestors()
                 .find(|ancestor| ancestor.join(".git").exists())
                 .or_else(|| {
-                    cwd.ancestors().find(|ancestor| {
+                    start.ancestors().find(|ancestor| {
                         ancestor.join(".justless").is_dir()
                             || ancestor.join(".justless.toml").is_file()
                     })
                 })
                 .or_else(|| {
-                    cwd.ancestors().find(|ancestor| {
+                    start.ancestors().find(|ancestor| {
                         PROJECT_MARKERS
                             .iter()
                             .any(|name| ancestor.join(name).is_file())
                     })
                 })
-                .unwrap_or(&cwd)
+                .unwrap_or(&start)
                 .to_path_buf(),
         };
         ensure!(root.is_dir(), "{} is not a directory", root.display());

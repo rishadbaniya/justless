@@ -181,7 +181,7 @@ Full output is retained locally under `.justless/runs/`, including output short 
 
 `justless mcp` serves the read-only commands as MCP tools over stdio. Use it with clients that have no Justless hooks, or when an agent should call navigation tools instead of shell commands. Each tool runs the matching command against the project root and returns its output as text. A failed command or an invalid argument comes back as a tool error that the agent can correct. `run`, `edit`, `mask` and `init` are not exposed, so every change still goes through the client's own permission prompts.
 
-The server uses `--root` when given. Otherwise it uses `CLAUDE_PROJECT_DIR`, which Claude Code sets for project servers, and then the directory the client starts it in. The tool list is kept under 8 KB because clients send it with every model request. Arguments are fully validated when a tool is called.
+The server uses `--root` when given. Otherwise it finds the project the way other commands do, searching upward for `.git`, `.justless` or a project marker. The search starts from `CLAUDE_PROJECT_DIR`, which Claude Code sets to its launch directory, or else from the directory the client starts the server in. A server started in a subdirectory therefore shares the project's state with hooks and commands. The tool list is kept under 8 KB because clients send it with every model request. Arguments are fully validated when a tool is called.
 
 | Tool | Command | Arguments |
 | --- | --- | --- |
@@ -202,9 +202,9 @@ The server uses `--root` when given. Otherwise it uses `CLAUDE_PROJECT_DIR`, whi
 | `resume` | `resume` | `budget` |
 | `stats` | `stats` | none |
 
-File arguments must be workspace-relative, and unknown arguments are rejected. The server resolves the project root once at startup, from `--root` or its working directory, the same way other commands do. Queries refresh the index under `.justless/`, and log replays are counted in `stats`. Source files are never modified. Run `justless init` or add `/.justless/` to `.gitignore` to keep that local state out of Git.
+File arguments must be workspace-relative, and unknown arguments are rejected. The server resolves the project root once at startup. Queries refresh the index under `.justless/`, and log replays are counted in `stats`. Source files are never modified. Run `justless init` or add `/.justless/` to `.gitignore` to keep that local state out of Git.
 
-Add the server to a project's client config from the project root. Select one or more clients.
+Add the server to a project's client config from the project root. Select one or more clients. `--install` writes to the project found from the current directory, even when `CLAUDE_PROJECT_DIR` is set, and prints the absolute path of each file.
 
 ```sh
 justless mcp --install claude --install cursor
@@ -219,7 +219,7 @@ justless mcp --install gemini vscode codex
 | VS Code with Copilot | `.vscode/mcp.json` under `servers` | `justless mcp --root ${workspaceFolder}` |
 | Codex | `.codex/config.toml` as `[mcp_servers.justless]` | `justless mcp` |
 
-Setup keeps every other key and server in these files and leaves an existing `justless` entry unchanged. It checks every selected file before writing any of them, so one unreadable file leaves the others untouched. JSON files containing comments must be edited by hand. Claude Code, Gemini CLI and Codex do not document the directory they start a server in, so their entry relies on it being inside the project. If a client starts it elsewhere, add `--root` with the project path. Codex loads project config only in trusted projects. VS Code plans to remove the Local harness that reads `.vscode/mcp.json` in February 2027. Its Copilot harness reads the root `.mcp.json`, which `--install claude` writes. For other clients, such as Zed or Windsurf, add a stdio server with the command `justless` and the arguments `mcp --root /path/to/project`. [Claude Code](https://code.claude.com/docs/en/mcp) · [Cursor](https://cursor.com/docs/context/mcp) · [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) · [VS Code](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) · [Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+Setup keeps every other key and server in these files and leaves an existing `justless` entry unchanged. It checks every selected file before writing any of them, so one unreadable file leaves the others untouched, and the error names that file. JSON files containing comments must be edited by hand. Claude Code, Gemini CLI and Codex do not document the directory they start a server in, so their entry relies on it being inside the project. If a client starts it elsewhere, add `--root` with the project path. Codex loads project config only in trusted projects. VS Code plans to remove the Local harness that reads `.vscode/mcp.json` in February 2027. Its Copilot harness reads the root `.mcp.json`, which `--install claude` writes. For other clients, such as Zed or Windsurf, add a stdio server with the command `justless` and the arguments `mcp --root /path/to/project`. [Claude Code](https://code.claude.com/docs/en/mcp) · [Cursor](https://cursor.com/docs/context/mcp) · [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) · [VS Code](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) · [Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 
 The server implements MCP revision 2026-07-28, where each request declares its protocol version. It also answers the `initialize` handshake from revisions 2024-11-05 through 2025-11-25 for clients that predate it. [MCP specification](https://modelcontextprotocol.io/specification/2026-07-28)
 

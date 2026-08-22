@@ -306,16 +306,7 @@ fn context_budget(workspace: &Workspace, matches: &ArgMatches) -> Result<usize> 
 }
 
 fn dispatch(matches: &ArgMatches) -> Result<i32> {
-    // Claude Code starts MCP servers with CLAUDE_PROJECT_DIR set to the project, so
-    // the server follows it when no explicit root is given.
-    let project = std::env::var_os("CLAUDE_PROJECT_DIR")
-        .filter(|_| matches!(matches.subcommand_name(), Some("mcp")))
-        .map(std::path::PathBuf::from)
-        .filter(|dir| dir.is_dir());
-    let root = matches
-        .value_of_os("root")
-        .map(Path::new)
-        .or(project.as_deref());
+    let root = matches.value_of_os("root").map(Path::new);
     // Cursor, Gemini CLI and Copilot block a tool call when its hook fails, so these
     // handlers answer every error, including a missing workspace, with a no-op.
     if let Some((name, sub)) = matches.subcommand()
@@ -324,7 +315,19 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         agents::run_client_hook(root, agent, sub.value_of("mode").unwrap_or_default());
         return Ok(0);
     }
-    let workspace = Workspace::discover(root)?;
+    // Claude Code starts MCP servers with CLAUDE_PROJECT_DIR set to its launch
+    // directory. Without an explicit root the server searches upward from there, as
+    // hooks and commands do from theirs. `--install` writes to the current project.
+    let project = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .filter(
+            |_| matches!(matches.subcommand(), Some(("mcp", sub)) if !sub.is_present("install")),
+        )
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    let workspace = match (root, project) {
+        (None, Some(start)) => Workspace::discover_from(&start)?,
+        _ => Workspace::discover(root)?,
+    };
     match matches.subcommand().expect("subcommand is required") {
         (name @ ("read" | "expand" | "edit"), sub) => {
             source::run(&workspace, name, sub, matches.is_present("root"))?

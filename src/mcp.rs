@@ -1069,7 +1069,10 @@ pub fn config_entries(
                         directory.display()
                     ),
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("inspect {}", directory.display()));
+                    }
                 }
             }
             let original = read_regular(&path)?;
@@ -1158,10 +1161,10 @@ fn read_regular(path: &Path) -> Result<String> {
                 "{} must be a regular file",
                 path.display()
             );
-            Ok(fs::read_to_string(path)?)
+            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
         }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
     }
 }
 
@@ -1170,15 +1173,16 @@ fn install(workspace: &Workspace, clients: &BTreeSet<Client>) -> Result<()> {
     let _guard = lock_state(&workspace.state.join("setup.lock"))?;
     // Validate every selected file before writing any of them.
     let files = config_entries(workspace, clients)?;
+    // Absolute paths show which project was changed.
     for file in files {
-        let relative = file.client.file();
+        let path = file.path.display();
         match file.contents {
             Some(contents) => {
                 private_dir(file.path.parent().context("config directory")?)?;
                 write_text(&file.path, &contents)?;
-                println!("{}: added justless to {relative}", file.client.label());
+                println!("{}: added justless to {path}", file.client.label());
             }
-            None => println!("{}: {relative} already lists justless", file.client.label()),
+            None => println!("{}: {path} already lists justless", file.client.label()),
         }
     }
     Ok(())

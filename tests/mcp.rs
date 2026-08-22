@@ -556,3 +556,127 @@ fn server_follows_claude_project_dir_without_an_explicit_root() {
     assert!(succeeded(by_id(&responses, 2)).contains("db/schema.sql::purchase_orders [table]"));
     assert!(!elsewhere.path().join(".justless").exists());
 }
+
+/// Runs `justless mcp` without `--root`, with the given working directory and
+/// environment, and returns the server's stderr and parsed response lines.
+fn serve_from(cwd: &Path, env: &[(&str, &Path)], lines: &[String]) -> (String, Vec<Value>) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+    command
+        .arg("mcp")
+        .current_dir(cwd)
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for line in lines {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let responses = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    (text(&output.stderr), responses)
+}
+
+fn legacy_initialize() -> String {
+    request(
+        0,
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}),
+    )
+}
+
+#[test]
+fn claude_project_dir_in_a_subdirectory_finds_the_enclosing_project() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+    let src = root.join("src");
+    let run = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["run", "--", "echo", "captured-by-hook"])
+        .current_dir(&src)
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", text(&run.stderr));
+
+    let (stderr, responses) = serve_from(
+        &src,
+        &[("CLAUDE_PROJECT_DIR", &src)],
+        &[
+            legacy_initialize(),
+            call(1, "history", json!({})),
+            call(2, "read", json!({"file": "src/lib.rs"})),
+        ],
+    );
+    assert!(
+        stderr.contains(&format!("serving {} over stdio", root.display())),
+        "{stderr}"
+    );
+    assert!(succeeded(by_id(&responses, 1)).contains("run-"));
+    assert!(succeeded(by_id(&responses, 2)).contains("pub fn hello"));
+    assert!(!src.join(".justless").exists());
+}
+
+#[test]
+fn install_writes_to_the_current_project_and_names_the_file() {
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let (a, b) = (
+        a.path().canonicalize().unwrap(),
+        b.path().canonicalize().unwrap(),
+    );
+    for root in [&a, &b] {
+        fs::create_dir(root.join(".git")).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["mcp", "--install", "cursor"])
+        .current_dir(&b)
+        .env("CLAUDE_PROJECT_DIR", &a)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let file = b.join(".cursor/mcp.json");
+    assert!(file.is_file());
+    assert!(!a.join(".cursor").exists() && !a.join(".justless").exists());
+    assert_eq!(
+        text(&output.stdout),
+        format!("Cursor: added justless to {}\n", file.display())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn install_names_an_unreadable_config_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempDir::new().unwrap();
+    let root = &project.path().canonicalize().unwrap();
+    fs::create_dir(root.join(".codex")).unwrap();
+    let config = root.join(".codex/config.toml");
+    fs::write(&config, "").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&config).is_ok() {
+        // Running as root: permissions do not apply.
+        return;
+    }
+    let output = install(root, &["claude", "codex"]);
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!output.status.success());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains(&format!("read {}", config.display())),
+        "{stderr}"
+    );
+    assert!(!root.join(".mcp.json").exists());
+}
