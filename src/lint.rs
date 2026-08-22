@@ -334,6 +334,7 @@ impl Lint {
             && !ESLINT_ROW.is_match(line)
             && !PYRIGHT.is_match(line)
             && !SHELLCHECK_ROW.is_match(line)
+            && !CARGO_STATUS.is_match(line)
         {
             let finding = &mut self.findings[index];
             finding.last = n;

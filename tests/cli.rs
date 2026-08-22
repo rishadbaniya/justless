@@ -3393,6 +3393,16 @@ fn lint_reports_name_rustc_lints_and_short_format_errors() {
             && report.contains("warning unused_variables ×3  unused variable: `x`\n"),
         "{report}"
     );
+    // A parallel build's progress line is not detail of the error before it.
+    let interleaved = lint_fixture("cargo_short.txt").replace(
+        "found `&str`\n",
+        "found `&str`\n    Checking c2 v0.1.0 (/work/c2)\n",
+    );
+    let report = lint_preview(root, "cargo", &["--fresh", "check"], "", &interleaved);
+    assert!(
+        report.contains("  src/lib.rs:4:21 [stderr:2-2]\n") && !report.contains("Checking c2"),
+        "{report}"
+    );
     // rustc names dead_code and unused_imports once, with wording that varies by item.
     let report = lint_preview(
         root,
@@ -3572,6 +3582,37 @@ fn lint_reruns_compare_severity_and_findings_within_the_budget() {
             && small.contains("error: could not compile `r08`"),
         "{small}"
     );
+
+    // A baseline recorded without severities compares by rule alone.
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let forget_severities = || {
+        for entry in fs::read_dir(root.join(".justless/runs")).unwrap() {
+            let path = entry.unwrap().path().join("record.json");
+            let mut record: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            record["summary"]["outcomes"] = serde_json::json!([]);
+            fs::write(&path, record.to_string()).unwrap();
+        }
+    };
+    let eslint = lint_fixture("eslint.txt");
+    lint_preview(root, "eslint", &["."], &eslint, "");
+    forget_severities();
+    let without_eqeqeq: String = eslint
+        .lines()
+        .filter(|line| !line.contains("eqeqeq"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let rerun = lint_preview(root, "eslint", &["."], &without_eqeqeq, "");
+    assert!(
+        rerun.contains("Compared with run-")
+            && rerun.contains("- eqeqeq ×1 (no longer reported)\n")
+            && !rerun.contains("+ "),
+        "{rerun}"
+    );
+    forget_severities();
+    let rerun = lint_preview(root, "eslint", &["."], &format!("{without_eqeqeq}\n"), "");
+    assert!(rerun.contains("Same rule counts as run-"), "{rerun}");
 }
 
 #[cfg(unix)]
