@@ -3437,6 +3437,25 @@ fn lint_reports_name_rustc_lints_and_short_format_errors() {
         &lint_fixture("cargo_deny_group.txt"),
     );
     assert!(report.contains("error unused_imports ×2"), "{report}");
+    // Real `cargo clippy --message-format=short` names no lint. Common rustc lints are
+    // recognized by their wording, a repeated label is dropped, and Clippy's own
+    // findings stay grouped by message.
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "clippy", "--message-format=short"],
+        "",
+        &lint_fixture("clippy_short_lints.txt"),
+    );
+    assert!(
+        report.starts_with("cargo clippy: 7 finding(s), 0 error(s), 7 warning(s) · 3 rule(s)")
+            && report.contains(
+                "warning non_snake_case ×3  function `Foo` should have a snake case name\n"
+            )
+            && report.contains("warning unreachable_code ×2  unreachable statement\n")
+            && report.contains("warning unneeded … statement ×2  unneeded `return` statement\n"),
+        "{report}"
+    );
 }
 
 #[cfg(unix)]
@@ -3477,7 +3496,8 @@ fn lint_reports_keep_failures_outside_the_findings_visible() {
         "{report}"
     );
 
-    // Repeated `could not compile` lines collapse, and further outcomes are counted.
+    // `could not compile` lines collapse into one that names each package and target,
+    // and further outcomes are counted.
     let report = lint_preview(
         root,
         "cargo",
@@ -3487,7 +3507,60 @@ fn lint_reports_keep_failures_outside_the_findings_visible() {
     );
     assert!(
         report.contains(
-            "error: could not compile 6 packages: `c1`, `c6`, `c4`, `c5`, `c3`, `c2` [stderr:11]\n"
+            "error: could not compile 6 packages: `c1` (lib), `c6` (lib), `c4` (lib), `c5` (lib), `c3` (lib), `c2` (lib) [stderr:11]\n"
+        ),
+        "{report}"
+    );
+    // `--all-targets` fails the library and its test build separately.
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "clippy", "--all-targets", "--keep-going"],
+        "",
+        &lint_fixture("cargo_targets.txt"),
+    );
+    assert!(
+        report.contains("error: could not compile `rt` (lib, lib test) [stderr:11]\n"),
+        "{report}"
+    );
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "clippy", "--all-targets", "--keep-going"],
+        "",
+        &lint_fixture("cargo_workspace_targets.txt"),
+    );
+    assert!(
+        report.contains(
+            "error: could not compile 2 packages: `a` (lib test, lib), `b` (lib, lib test) [stderr:11]\n"
+        ),
+        "{report}"
+    );
+    // Many targets of one package are counted, and a line without a target, as older
+    // Cargo prints, names the package alone.
+    let mut err = String::from("error: could not compile `old` due to previous error\n");
+    for target in [
+        "lib",
+        "lib test",
+        "test \"a\"",
+        "test \"b\"",
+        "test \"c\"",
+        "bin \"d\"",
+    ] {
+        err.push_str(&format!(
+            "error: could not compile `rt` ({target}) due to 1 previous error\n"
+        ));
+    }
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "check"],
+        "",
+        &(lint_fixture("cargo_short.txt") + &err),
+    );
+    assert!(
+        report.contains(
+            "error: could not compile 3 packages: `r04` (lib), `old`, `rt` (lib, lib test, test \"a\", test \"b\" +2 more) [stderr:7]\n"
         ),
         "{report}"
     );

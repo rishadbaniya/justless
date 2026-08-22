@@ -1,0 +1,10 @@
+    Checking sl v0.1.0 (/work/sl)
+src/lib.rs:4:31: warning: unreachable statement: unreachable statement
+src/lib.rs:5:31: warning: unreachable statement: unreachable statement
+src/lib.rs:6:27: warning: unneeded `return` statement
+src/lib.rs:7:27: warning: unneeded `return` statement
+src/lib.rs:1:8: warning: function `Foo` should have a snake case name: help: convert the identifier to snake case (notice the capitalization): `foo`
+src/lib.rs:2:8: warning: function `Bar` should have a snake case name: help: convert the identifier to snake case: `bar`
+src/lib.rs:3:8: warning: function `Baz` should have a snake case name: help: convert the identifier to snake case: `baz`
+warning: `sl` (lib) generated 7 warnings (run `cargo clippy --fix --lib -p sl` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s

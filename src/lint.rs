@@ -33,6 +33,7 @@ const SHOWN_LOCATIONS: usize = 4;
 const SHOWN_OUTCOMES: usize = 4;
 const SHOWN_CHANGES: usize = 24;
 const SHOWN_PACKAGES: usize = 6;
+const SHOWN_TARGETS: usize = 4;
 
 static RUST_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_]+)\])?: (.+)$").unwrap());
@@ -100,8 +101,9 @@ static TOTAL: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+// The package and, in recent Cargo, the target, such as `(lib test)` or `(bin "x")`.
 static UNCOMPILED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^error: could not compile `([^`]+)`").unwrap());
+    LazyLock::new(|| Regex::new(r"^error: could not compile `([^`]+)`(?: \(([^)]+)\))?").unwrap());
 static CARGO_STATUS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^ +(?:Compiling|Checking|Finished|Building|Blocking|Fresh|Documenting|Downloaded|Downloading|Updating|Locking|Adding|Running|Packaging|Verifying) \S",
@@ -109,7 +111,7 @@ static CARGO_STATUS: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 // rustc names a lint only on its first diagnostic, and the wording of later ones
-// varies with the item kind and plural forms.
+// varies with the item kind and plural forms. `--message-format=short` names none.
 static RUSTC_LINTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     [
         (
@@ -127,6 +129,21 @@ static RUSTC_LINTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             r"\b(?:is|are) never (?:used|constructed|read)\b",
             "dead_code",
         ),
+        (r"\bshould have a snake case name\b", "non_snake_case"),
+        (
+            r"\bshould have an upper camel case name\b",
+            "non_camel_case_types",
+        ),
+        (
+            r"\bshould have an upper case name\b",
+            "non_upper_case_globals",
+        ),
+        (
+            r"^unreachable (?:statement|expression|block|call|arm)\b",
+            "unreachable_code",
+        ),
+        (r"^unreachable patterns?\b", "unreachable_patterns"),
+        (r"^unnecessary parentheses around ", "unused_parens"),
     ]
     .into_iter()
     .map(|(pattern, lint)| (Regex::new(pattern).unwrap(), lint))
@@ -250,7 +267,9 @@ pub struct Lint {
     shellcheck_line: Option<(String, String)>,
     outcomes: Vec<(String, Vec<String>)>,
     hidden_outcomes: usize,
-    uncompiled: Vec<String>,
+    /// Packages that failed to compile, each with its failed targets in order. An
+    /// empty target stands for a line that named none.
+    uncompiled: Vec<(String, Vec<String>)>,
     uncompiled_line: String,
     uncompiled_at: String,
     unlocated_errors: usize,
@@ -452,7 +471,8 @@ impl Lint {
     }
 
     /// Keep a general outcome line, such as an error without a source location or a
-    /// tool's total. Repeated `could not compile` lines collapse into one.
+    /// tool's total. `could not compile` lines collapse into one that names each
+    /// failed package and target.
     fn outcome(&mut self, text: &str, detail: &[String], stream: Stream, n: usize) {
         let head = short(text, 240);
         let at = format!(" [{}:{n}]", stream.name());
@@ -461,8 +481,15 @@ impl Lint {
                 self.uncompiled_line = format!("{head}{at}");
                 self.uncompiled_at = at;
             }
-            if !self.uncompiled.iter().any(|p| p == &c[1]) {
-                self.uncompiled.push(c[1].to_owned());
+            let target = c.get(2).map_or("", |m| m.as_str());
+            match self.uncompiled.iter_mut().find(|(p, _)| p == &c[1]) {
+                Some((_, targets)) if !targets.iter().any(|t| t == target) => {
+                    targets.push(target.to_owned());
+                }
+                Some(_) => {}
+                None => self
+                    .uncompiled
+                    .push((c[1].to_owned(), vec![target.to_owned()])),
             }
             return;
         }
@@ -534,7 +561,7 @@ impl Lint {
                 .rule
                 .clone()
                 .or_else(|| learned.get(&normalized).cloned())
-                .or_else(|| rustc_lint(&finding.message).map(str::to_owned))
+                .or_else(|| rustc_lint(&finding).map(str::to_owned))
                 .unwrap_or(normalized);
             groups
                 .entry((finding.severity, key))
@@ -631,25 +658,46 @@ impl Lint {
                 tail.push_str(&format!("    {line}\n"));
             }
         }
-        match self.uncompiled.len() {
-            0 => {}
-            1 => {
+        // One failed target keeps its original line. Several name each package with
+        // its failed targets, such as `rt` (lib, lib test).
+        match self.uncompiled.as_slice() {
+            [] => {}
+            [(_, targets)] if targets.len() == 1 => {
                 tail.push_str(&self.uncompiled_line);
                 tail.push('\n');
             }
-            count => {
-                let names: Vec<_> = self
-                    .uncompiled
+            packages => {
+                let names: Vec<_> = packages
                     .iter()
                     .take(SHOWN_PACKAGES)
-                    .map(|p| format!("`{p}`"))
+                    .map(|(package, targets)| {
+                        let named: Vec<_> = targets.iter().filter(|t| !t.is_empty()).collect();
+                        let mut list = named
+                            .iter()
+                            .take(SHOWN_TARGETS)
+                            .map(|t| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if named.len() > SHOWN_TARGETS {
+                            list.push_str(&format!(" +{} more", named.len() - SHOWN_TARGETS));
+                        }
+                        if list.is_empty() {
+                            format!("`{package}`")
+                        } else {
+                            format!("`{package}` ({list})")
+                        }
+                    })
                     .collect();
-                let more = match count.saturating_sub(SHOWN_PACKAGES) {
+                let more = match packages.len().saturating_sub(SHOWN_PACKAGES) {
                     0 => String::new(),
                     more => format!(" +{more} more"),
                 };
+                let count = match packages.len() {
+                    1 => String::new(),
+                    count => format!("{count} packages: "),
+                };
                 tail.push_str(&format!(
-                    "error: could not compile {count} packages: {}{more}{}\n",
+                    "error: could not compile {count}{}{more}{}\n",
                     names.join(", "),
                     self.uncompiled_at
                 ));
@@ -864,6 +912,14 @@ fn located(message: &str, stream: Stream) -> Option<Finding> {
     {
         text = &text[..end];
     }
+    // It also appends the primary label, which can repeat the message:
+    // `unreachable statement: unreachable statement`.
+    if let Some(head) = text.get(..text.len().saturating_sub(2) / 2)
+        && !head.is_empty()
+        && text[head.len()..].strip_prefix(": ") == Some(head)
+    {
+        text = head;
+    }
     if rule.is_none() {
         if let Some(c) = TRAILING_BRACKET.captures(text) {
             rule = Some(c[2].to_owned());
@@ -881,10 +937,15 @@ fn located(message: &str, stream: Stream) -> Option<Finding> {
     Some(Finding::new(severity, rule, text, stream))
 }
 
-fn rustc_lint(message: &str) -> Option<&'static str> {
+/// The rustc lint a Rust finding's wording implies. Other languages' compilers, such
+/// as javac's `unreachable statement`, keep their message.
+fn rustc_lint(finding: &Finding) -> Option<&'static str> {
+    if !finding.file.ends_with(".rs") {
+        return None;
+    }
     RUSTC_LINTS
         .iter()
-        .find(|(shape, _)| shape.is_match(message))
+        .find(|(shape, _)| shape.is_match(&finding.message))
         .map(|(_, lint)| *lint)
 }
 
