@@ -680,3 +680,75 @@ fn install_names_an_unreadable_config_file() {
     );
     assert!(!root.join(".mcp.json").exists());
 }
+
+/// Sends raw lines to `justless mcp --root ROOT` and returns each stdout line
+/// parsed, whether it holds one message or a batch array.
+fn raw_exchange(root: &Path, lines: &[String]) -> Vec<Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["mcp", "--root"])
+        .arg(root)
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for line in lines {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn batches_are_answered_only_after_negotiating_2025_03_26() {
+    let fixture = mixed_fixture();
+    let root = fixture.path();
+    let initialize = |version: &str| {
+        request(
+            1,
+            "initialize",
+            json!({"protocolVersion": version, "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}),
+        )
+    };
+    let batch = json!([
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+        1,
+    ])
+    .to_string();
+    let notifications =
+        json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}]).to_string();
+    let lines = raw_exchange(
+        root,
+        &[
+            initialize("2025-03-26"),
+            batch.clone(),
+            notifications,
+            "[]".into(),
+        ],
+    );
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    assert_eq!(lines[0]["result"]["protocolVersion"], "2025-03-26");
+    let replies = lines[1].as_array().unwrap();
+    assert_eq!(replies.len(), 3, "{replies:#?}");
+    assert_eq!(replies[0], json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
+    assert_eq!(replies[1]["id"], 3);
+    assert!(replies[1]["result"]["tools"].as_array().unwrap().len() > 10);
+    assert_eq!(replies[2]["error"]["code"], -32600);
+    assert_eq!(lines[2]["error"]["code"], -32600);
+    assert_eq!(lines[2]["id"], Value::Null);
+
+    // Later revisions removed batching, so an array is still one invalid message.
+    let lines = raw_exchange(root, &[initialize("2025-06-18"), batch]);
+    assert_eq!(lines[1]["error"]["code"], -32600, "{lines:#?}");
+    assert_eq!(lines[1]["id"], Value::Null);
+}

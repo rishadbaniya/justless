@@ -10,7 +10,8 @@
 //! <https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning#backward-compatibility-with-initialization-based-versions>.
 //!
 //! Messages are newline-delimited JSON-RPC 2.0 on stdin and stdout, and stdout
-//! carries nothing else. Each tool call runs the equivalent CLI command in a
+//! carries nothing else. A client that negotiates 2025-03-26 may also send a
+//! batch array on one line, which is answered with one array. Each tool call runs the equivalent CLI command in a
 //! child process, so command output can never interleave with protocol
 //! messages. Mutating commands (`run`, `edit`, `mask`, `init`) are not exposed,
 //! so the client's own permission flow still governs every change.
@@ -32,6 +33,8 @@ use crate::workspace::{Workspace, lock_state, private_dir, write_text};
 const MODERN_VERSIONS: &[&str] = &["2026-07-28"];
 /// Revisions negotiated through `initialize`, newest first.
 const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// The only revision whose clients may send JSON-RPC batches.
+const BATCH_VERSION: &str = "2025-03-26";
 
 const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 const CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
@@ -86,6 +89,8 @@ struct Server {
     root: PathBuf,
     exe: PathBuf,
     initialized: bool,
+    /// The revision negotiated through `initialize`.
+    version: Option<&'static str>,
 }
 
 struct RpcError {
@@ -113,6 +118,7 @@ fn serve(workspace: &Workspace) -> Result<()> {
         root: workspace.root.clone(),
         exe: std::env::current_exe().context("locate the justless executable")?,
         initialized: false,
+        version: None,
     };
     eprintln!("justless mcp: serving {} over stdio", server.root.display());
     let mut input = io::stdin().lock();
@@ -176,6 +182,27 @@ impl Server {
                 ));
             }
         };
+        // Revision 2025-03-26 requires servers to accept JSON-RPC batches. The
+        // other revisions send one message per line.
+        match message {
+            Value::Array(batch) if self.version == Some(BATCH_VERSION) => {
+                if batch.is_empty() {
+                    return Some(reply(
+                        Value::Null,
+                        Err(RpcError::new(INVALID_REQUEST, "empty batch")),
+                    ));
+                }
+                let replies = batch
+                    .into_iter()
+                    .filter_map(|message| self.message(message))
+                    .collect::<Vec<_>>();
+                (!replies.is_empty()).then_some(Value::Array(replies))
+            }
+            message => self.message(message),
+        }
+    }
+
+    fn message(&mut self, message: Value) -> Option<Value> {
         let Value::Object(message) = message else {
             return Some(reply(
                 Value::Null,
@@ -297,6 +324,7 @@ impl Server {
             .find(|version| **version == requested)
             .unwrap_or(&LEGACY_VERSIONS[0]);
         self.initialized = true;
+        self.version = Some(version);
         Ok(json!({
             "protocolVersion": version,
             "capabilities": capabilities(),
