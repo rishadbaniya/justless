@@ -752,3 +752,94 @@ fn batches_are_answered_only_after_negotiating_2025_03_26() {
     assert_eq!(lines[1]["error"]["code"], -32600, "{lines:#?}");
     assert_eq!(lines[1]["id"], Value::Null);
 }
+
+/// Captures a shell script with `justless run` and returns its run ID.
+fn captured(root: &Path, script: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["--root"])
+        .arg(root)
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let stderr = text(&output.stderr);
+    let start = stderr.rfind("[justless run-").unwrap() + 10;
+    let end = start + stderr[start..].find(']').unwrap();
+    stderr[start..end].to_owned()
+}
+
+#[test]
+fn log_replays_are_paged_on_line_boundaries() {
+    let fixture = mixed_fixture();
+    let root = fixture.path();
+    let rows = captured(
+        root,
+        "awk 'BEGIN{for(i=1;i<=20000;i++) printf \"row %05d\\n\", i}'; echo warning >&2",
+    );
+    let long = captured(
+        root,
+        "awk 'BEGIN{s=\"\"; for(i=0;i<40000;i++) s=s \"x\"; print s; print \"after\"}'",
+    );
+    let lines = raw_exchange(
+        root,
+        &[
+            legacy_initialize(),
+            call(1, "log", json!({"run_id": rows})),
+            call(
+                2,
+                "log",
+                json!({"run_id": rows, "stream": "stdout", "from": 3277}),
+            ),
+            call(
+                3,
+                "log",
+                json!({"run_id": rows, "from": 1, "to": 100_000_000}),
+            ),
+            call(4, "log", json!({"run_id": rows, "stream": "stderr"})),
+            call(5, "log", json!({"run_id": long})),
+            call(6, "log", json!({"run_id": rows, "from": 19_999})),
+        ],
+    );
+    let page = |id: i64| {
+        let response = by_id(&lines, id);
+        assert_eq!(response["result"]["isError"], false, "{response:#}");
+        response["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["text"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // 3,276 ten-byte rows fit in 32 KiB.
+    let first = page(1);
+    assert_eq!(first.len(), 2);
+    assert!(first[0].starts_with("row 00001\n"));
+    assert!(
+        first[0].ends_with(
+            "row 03276\n[justless: stdout page ends at line 3276 after 32768 bytes. Call log with stream=\"stdout\", from=3277 for more.]"
+        ),
+        "{}",
+        &first[0][first[0].len() - 200..]
+    );
+    assert_eq!(
+        first[1],
+        "[justless: stderr not shown, the page is full. Call log with stream=\"stderr\", from=1.]"
+    );
+    let second = page(2);
+    assert!(second[0].starts_with("row 03277\n") && second[0].contains("from=6553 for more"));
+    let ranged = page(3);
+    assert!(ranged[0].contains("from=3277, to=100000000 for more"));
+    assert_eq!(page(4), vec!["warning\n".to_owned()]);
+    let cut = page(5);
+    assert_eq!(cut.len(), 1);
+    assert!(cut[0].starts_with(&"x".repeat(32_768)));
+    assert!(
+        cut[0].contains(&format!(
+            "line 1 is longer than 32768 bytes and was cut. Run `justless log {long} --stream stdout --from 1 --to 1` in a shell"
+        )) && cut[0].contains("from=2 to continue"),
+        "{}",
+        &cut[0][32_768..]
+    );
+    // A replay that fits is returned exactly. stderr has no line 19,999.
+    assert_eq!(page(6), vec!["row 19999\nrow 20000\n".to_owned()]);
+}

@@ -202,7 +202,7 @@ The server uses `--root` when given. Otherwise it finds the project the way othe
 | `resume` | `resume` | `budget` |
 | `stats` | `stats` | none |
 
-File arguments must be workspace-relative, and unknown arguments are rejected. The server resolves the project root once at startup. Queries refresh the index under `.justless/`, and log replays are counted in `stats`. Source files are never modified. Run `justless init` or add `/.justless/` to `.gitignore` to keep that local state out of Git.
+File arguments must be workspace-relative, and unknown arguments are rejected. The server resolves the project root once at startup. Clients limit the size of a tool result, so the `log` tool returns at most 32 KiB of replayed output per call, with or without a line range. A longer replay ends on a line boundary with a note naming the stream and the `from` line of the next page. A single line longer than a page is cut, and the note gives the shell command that replays it whole. Queries refresh the index under `.justless/`, and log replays are counted in `stats`. Source files are never modified. Run `justless init` or add `/.justless/` to `.gitignore` to keep that local state out of Git.
 
 Add the server to a project's client config from the project root. Select one or more clients. `--install` writes to the project found from the current directory, even when `CLAUDE_PROJECT_DIR` is set, and prints the absolute path of each file.
 

@@ -349,14 +349,15 @@ impl Server {
             Some(_) => return Err(RpcError::params("arguments must be an object")),
         };
         Ok(match tool.argv(arguments) {
-            Ok(argv) => self.execute(&argv),
+            Ok(argv) => self.execute(&argv, (tool.name == "log").then_some(arguments)),
             // Invalid arguments are tool execution errors, so the model can
             // correct them and retry.
             Err(message) => tool_result(vec![message], true),
         })
     }
 
-    fn execute(&self, argv: &[String]) -> Value {
+    /// Runs one command. `log` passes its arguments so a long replay is paged.
+    fn execute(&self, argv: &[String], log: Option<&Map<String, Value>>) -> Value {
         let output = Process::new(&self.exe)
             .arg("--root")
             .arg(&self.root)
@@ -372,9 +373,13 @@ impl Server {
         };
         let failed = !output.status.success();
         let mut texts = Vec::new();
-        for stream in [&output.stdout, &output.stderr] {
-            if !stream.is_empty() {
-                texts.push(String::from_utf8_lossy(stream).into_owned());
+        if let Some(arguments) = log.filter(|_| !failed) {
+            texts = log_pages(&output, arguments);
+        } else {
+            for stream in [&output.stdout, &output.stderr] {
+                if !stream.is_empty() {
+                    texts.push(String::from_utf8_lossy(stream).into_owned());
+                }
             }
         }
         if texts.is_empty() {
@@ -386,6 +391,69 @@ impl Server {
         }
         tool_result(texts, failed)
     }
+}
+
+/// Bytes of replayed output in one `log` result. Clients limit tool results
+/// (Claude Code to 25,000 tokens by default), so longer output is paged by line.
+const LOG_PAGE: usize = 32 * 1024;
+
+/// A successful `log` replay as one text per stream. A replay that exceeds
+/// `LOG_PAGE` ends on a line boundary with the arguments for the next page.
+fn log_pages(output: &std::process::Output, arguments: &Map<String, Value>) -> Vec<String> {
+    let run = arguments["run_id"].as_str().unwrap_or_default();
+    let from = arguments
+        .get("from")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
+    let to = arguments.get("to").and_then(Value::as_u64);
+    let to_hint = to.map(|to| format!(", to={to}")).unwrap_or_default();
+    let mut left = LOG_PAGE;
+    let mut texts = Vec::new();
+    // The child replays stdout to stdout and stderr to stderr.
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        if bytes.is_empty() {
+            continue;
+        }
+        if bytes.len() <= left {
+            left -= bytes.len();
+            texts.push(String::from_utf8_lossy(bytes).into_owned());
+            continue;
+        }
+        let shown = match bytes[..left].iter().rposition(|&b| b == b'\n') {
+            Some(newline) => newline + 1,
+            // Cut inside a line only when that line alone exceeds a page.
+            None if left == LOG_PAGE => left,
+            None => 0,
+        };
+        let lines = bytes[..shown].iter().filter(|&&b| b == b'\n').count() as u64;
+        let mut text = String::from_utf8_lossy(&bytes[..shown]).into_owned();
+        let hint = if shown == 0 {
+            format!(
+                "[justless: {stream} not shown, the page is full. Call log with stream=\"{stream}\", from={from}{to_hint}.]"
+            )
+        } else if lines == 0 {
+            // One line is longer than a page.
+            format!(
+                "\n[justless: {stream} line {from} is longer than {LOG_PAGE} bytes and was cut. \
+                 Run `justless log {run} --stream {stream} --from {from} --to {from}` in a shell \
+                 for the whole line, or call log with stream=\"{stream}\", from={}{to_hint} to continue.]",
+                from + 1
+            )
+        } else {
+            let last = from + lines - 1;
+            format!(
+                "[justless: {stream} page ends at line {last} after {LOG_PAGE} bytes. \
+                 Call log with stream=\"{stream}\", from={}{to_hint} for more.]",
+                last + 1
+            )
+        };
+        text.push_str(&hint);
+        texts.push(text);
+        // A later stream starts its own page.
+        left = 0;
+    }
+    texts
 }
 
 fn check_request_meta(meta: &Value, version: &Value) -> Result<(), RpcError> {
