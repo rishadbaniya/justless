@@ -1787,9 +1787,9 @@ fn linter_findings_group_by_rule_with_locations() {
     let rerun = stdout(&cli(root, &["run", "--", eslint.to_str().unwrap(), "."]));
     assert!(
         rerun.contains("Compared with run-")
-            && rerun.contains("~ no-undef ×12 → ×3")
-            && rerun.contains("~ no-unused-vars ×4 → ×3")
-            && rerun.contains("- eqeqeq ×4 (no longer reported)"),
+            && rerun.contains("~ error no-undef ×12 → ×3")
+            && rerun.contains("~ error no-unused-vars ×4 → ×3")
+            && rerun.contains("- warning eqeqeq ×4 (no longer reported)"),
         "{rerun}"
     );
 
@@ -3231,4 +3231,416 @@ fn revisions_with_a_tilde_are_routed_but_home_paths_are_not() {
             "{command}"
         );
     }
+}
+
+/// Run a fake linter that prints `out` on stdout and `err` on stderr, and return the
+/// preview. A `--fresh` first argument goes to Justless rather than the linter.
+#[cfg(unix)]
+fn lint_preview(root: &Path, program: &str, args: &[&str], out: &str, err: &str) -> String {
+    fs::write(root.join("out.txt"), out).unwrap();
+    fs::write(root.join("err.txt"), err).unwrap();
+    let exe = fake_program(root, program, "cat out.txt\ncat err.txt >&2\nexit 1\n");
+    let (fresh, args) = match args.split_first() {
+        Some((&"--fresh", rest)) => (true, rest),
+        _ => (false, args),
+    };
+    let mut command = vec!["run"];
+    if fresh {
+        command.push("--fresh");
+    }
+    command.extend(["--", exe.to_str().unwrap()]);
+    command.extend(args);
+    let output = cli(root, &command);
+    assert_eq!(output.status.code(), Some(1), "{program}");
+    stdout(&output)
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_reports_keep_findings_under_unusual_paths() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let fresh = |program: &str, args: &[&str], out: &str| {
+        let mut args = args.to_vec();
+        args.insert(0, "--fresh");
+        lint_preview(root, program, &args, out, "")
+    };
+
+    // ESLint file names may contain spaces, and rows never inherit an earlier file.
+    let mut out = String::from("\n/work/web/src/a.js\n");
+    for i in 1..=30 {
+        out.push_str(&format!("  {i}:5  error  'foo' is not defined  no-undef\n"));
+    }
+    out.push_str("\n/work/web/src/My Components/Button.jsx\n  10:1   error  'React' is not defined  no-undef\n  12:7   error  'unusedProp' is assigned a value but never used  no-unused-vars\n\n✖ 32 problems (32 errors, 0 warnings)\n");
+    let report = fresh("eslint", &["."], &out);
+    assert!(
+        report.starts_with(
+            "eslint: 32 finding(s), 32 error(s), 0 warning(s) · 2 rule(s) · 2 file(s)\n"
+        ) && report.contains("  /work/web/src/My Components/Button.jsx:12:7 [stdout:")
+            && report
+                .contains("/work/web/src/My Components/Button.jsx:10:1, /work/web/src/a.js:1:5"),
+        "{report}"
+    );
+    let out = out.replace("/work/web/src/a.js", "/work/My App/src/a.js");
+    let report = fresh("eslint", &["."], &out);
+    assert!(
+        report.contains("error no-undef ×31") && report.contains("/work/My App/src/a.js:1:5"),
+        "{report}"
+    );
+
+    // Windows paths keep their drive letter, count as separate files and sort per file.
+    let mut out = String::new();
+    for (file, line) in [(r"C:\proj\src\b.ts", 3), (r"C:\proj\src\a.ts", 5)] {
+        out.push_str(&format!(
+            "{file}({line},1): error TS2304: Cannot find name 'x'.\n"
+        ));
+    }
+    for i in 1..=10 {
+        out.push_str(&format!(
+            "C:\\proj\\src\\c.ts({i},1): error TS2304: Cannot find name 'q'.\n"
+        ));
+    }
+    let report = fresh("tsc", &[], &out);
+    assert!(
+        report.contains("· 3 file(s)")
+            && report.contains(
+                r"  C:\proj\src\a.ts:5:1, C:\proj\src\b.ts:3:1, C:\proj\src\c.ts:1:1, 2:1 +8 more"
+            ),
+        "{report}"
+    );
+    let mut out = String::from("\nC:\\proj\\src\\b.js\n");
+    for i in 1..=10 {
+        out.push_str(&format!("  {i}:5  error  'foo' is not defined  no-undef\n"));
+    }
+    out.push_str("\nC:\\proj\\src\\a.js\n  3:1  error  'bar' is not defined  no-undef\n\nD:\\other\\c.js\n  1:1  error  'baz' is not defined  no-undef\n");
+    let report = fresh("eslint", &["."], &out);
+    assert!(
+        report.contains("· 3 file(s)")
+            && report.contains(r"  C:\proj\src\a.js:3:1, C:\proj\src\b.js:1:5, 2:5, 3:5 +8 more"),
+        "{report}"
+    );
+
+    // TypeScript paths may contain parentheses, and elaboration lines stay with their error.
+    let mut out = "app/(auth)/login/page.tsx(12,7): error TS2322: Type 'string' is not assignable to type 'number'.\n\
+app/(auth)/login/page.tsx(20,3): error TS2304: Cannot find name 'useSession'.\n\
+src/lib/api.ts(4,10): error TS2322: Type '{ id: string; extra: number; }' is not assignable to type 'User'.\n  \
+Object literal may only specify known properties, and 'extra' does not exist in type 'User'.\n\
+src/lib/api.ts(9,1): error TS2554: Expected 1 arguments, but got 2.\n"
+        .to_owned();
+    for i in 21..=26 {
+        out.push_str(&format!(
+            "src/lib/api.ts({i},1): error TS2554: Expected 1 arguments, but got 2.\n"
+        ));
+    }
+    let report = fresh("tsc", &["--noEmit"], &out);
+    assert!(
+        report
+            .starts_with("tsc: 10 finding(s), 10 error(s), 0 warning(s) · 3 rule(s) · 2 file(s)\n")
+            && report
+                .contains("  app/(auth)/login/page.tsx:12:7, src/lib/api.ts:4:10 [stdout:1-1]")
+            && report.contains("  app/(auth)/login/page.tsx:20:3 [stdout:2-2]")
+            && report.contains("      Object literal may only specify known properties"),
+        "{report}"
+    );
+
+    // One-line findings accept spaces and a colon in the path. The tool's own total stays.
+    let mut out = String::new();
+    for i in 1..=8 {
+        out.push_str(&format!(
+            "src/app.py:{i}:1: F401 [*] `os{i}` imported but unused\n"
+        ));
+    }
+    out.push_str("src/my mod.py:2:1: F821 Undefined name `x`\nsrc/my mod.py:3:1: F821 Undefined name `y`\nFound 10 errors.\n");
+    let report = fresh("ruff", &["check", "."], &out);
+    assert!(
+        report.starts_with("ruff check: 10 finding(s)")
+            && report.contains("warning F821 ×2  Undefined name `x`\n  src/my mod.py:2:1, 3:1")
+            && report.contains("Found 10 errors. [stdout:11]"),
+        "{report}"
+    );
+    let mut out = String::new();
+    for i in 1..=7 {
+        out.push_str(&format!(
+            "pkg/a.py:{i}: error: Name \"v{i}\" is not defined  [name-defined]\n"
+        ));
+    }
+    out.push_str("pkg/a:b.py:9: error: Name \"q\" is not defined  [name-defined]\nFound 8 errors in 2 files (checked 2 source files)\n");
+    let report = fresh("mypy", &["pkg"], &out);
+    assert!(
+        report.contains("error name-defined ×8")
+            && report.contains("· 2 file(s)")
+            && report.contains("Found 8 errors in 2 files"),
+        "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_reports_name_rustc_lints_and_short_format_errors() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // Real `cargo check --message-format=short`: the error code is part of the level.
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "check"],
+        "",
+        &lint_fixture("cargo_short.txt"),
+    );
+    assert!(
+        report.starts_with("cargo check: 4 finding(s), 1 error(s), 3 warning(s) · 2 rule(s)")
+            && report.contains("error E0308 ×1  mismatched types: expected `u32`, found `&str`\n")
+            && report.contains("warning unused_variables ×3  unused variable: `x`\n"),
+        "{report}"
+    );
+    // rustc names dead_code and unused_imports once, with wording that varies by item.
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "check"],
+        "",
+        &lint_fixture("cargo_dead_code.txt"),
+    );
+    assert!(
+        report.starts_with("cargo check: 8 finding(s), 0 error(s), 8 warning(s) · 2 rule(s)")
+            && report.contains("warning dead_code ×6")
+            && report.contains("warning unused_imports ×2"),
+        "{report}"
+    );
+    // `-D warnings` and a lint group on an item still name each lint.
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "clippy"],
+        "",
+        &lint_fixture("clippy_deny_warnings.txt"),
+    );
+    assert!(
+        report.contains("error dead_code ×2") && report.contains("error unused_variables ×2"),
+        "{report}"
+    );
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "check"],
+        "",
+        &lint_fixture("cargo_deny_group.txt"),
+    );
+    assert!(report.contains("error unused_imports ×2"), "{report}");
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_reports_keep_failures_outside_the_findings_visible() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // A failed build script has no source location. Its cause stays in the preview.
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "check"],
+        "",
+        &lint_fixture("cargo_build_script.txt"),
+    );
+    assert!(
+        report.contains("· 1 error(s) without a location\n")
+            && report.contains("error: failed to run custom build command for `r05 v0.1.0 (/work/r05)` [stderr:11]\n    Caused by:")
+            && report.contains("      QA_BUILD_FAILURE: libfoo not found; set FOO_DIR to the install prefix\n"),
+        "{report}"
+    );
+
+    // A stream with no finding, such as a crash on stderr, is summarized by its range.
+    let mut out = String::from("************* Module app\n");
+    for i in 1..=8 {
+        out.push_str(&format!(
+            "app.py:{}:0: C0116: Missing function or method docstring (missing-function-docstring)\n",
+            i * 10
+        ));
+    }
+    let err = "Exception on node <Call l.42> in file '/work/app/models.py'\nTraceback (most recent call last):\n  File \"typecheck.py\", line 1394, in visit_call\n    called = safe_infer(node.func)\nRecursionError: maximum recursion depth exceeded while calling a Python object\n";
+    let report = lint_preview(root, "pylint", &["--fresh", "app.py"], &out, err);
+    assert!(
+        report.contains("warning C0116 ×8")
+            && report
+                .contains("stderr: 5 other line(s) [stderr:1-5]\n  Exception on node <Call l.42>")
+            && report.contains("  RecursionError: maximum recursion depth exceeded"),
+        "{report}"
+    );
+
+    // Repeated `could not compile` lines collapse, and further outcomes are counted.
+    let report = lint_preview(
+        root,
+        "cargo",
+        &["--fresh", "check"],
+        "",
+        &lint_fixture("cargo_workspace.txt"),
+    );
+    assert!(
+        report.contains(
+            "error: could not compile 6 packages: `c1`, `c6`, `c4`, `c5`, `c3`, `c2` [stderr:11]\n"
+        ),
+        "{report}"
+    );
+    let err: String = (1..=6)
+        .map(|i| format!("Error: worker {i} failed\n"))
+        .collect();
+    let report = lint_preview(
+        root,
+        "eslint",
+        &["--fresh", "."],
+        &lint_fixture("eslint.txt").repeat(2),
+        &err,
+    );
+    assert!(
+        report.contains("✖ 5 problems (4 errors, 1 warning) [stdout:11]\n")
+            && report.contains("Error: worker 3 failed [stderr:3]\n")
+            && !report.contains("worker 4")
+            && report.contains("+3 more outcome line(s) in full log\n"),
+        "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_reruns_compare_severity_and_findings_within_the_budget() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let cargo = |fixture: &str| lint_preview(root, "cargo", &["check"], "", &lint_fixture(fixture));
+
+    // Errors and warnings of one rule are compared separately.
+    cargo("cargo_severity_before.txt");
+    let rerun = cargo("cargo_severity_after.txt");
+    assert!(
+        rerun.contains("Compared with run-")
+            && rerun.contains("- error unused_variables ×2 (no longer reported)\n")
+            && !rerun.contains("Same findings"),
+        "{rerun}"
+    );
+
+    // A fixed finding replaced by a new one at the same count is not the same result.
+    cargo("cargo_moved_before.txt");
+    let rerun = cargo("cargo_moved_after.txt");
+    assert!(
+        rerun.contains("~ warning unused_variables ×2 with different findings\n"),
+        "{rerun}"
+    );
+    // The same findings on shifted lines say so.
+    let moved = lint_fixture("cargo_moved_after.txt")
+        .replace("src/lib.rs:2:19", "src/lib.rs:4:19")
+        .replace("src/lib.rs:3:23", "src/lib.rs:5:23");
+    let rerun = lint_preview(root, "cargo", &["check"], "", &moved);
+    assert!(
+        rerun.contains("Same findings as run-") && rerun.contains(", some on other lines.\n"),
+        "{rerun}"
+    );
+
+    // An over-budget rerun keeps every rule, the comparison and the outcome, and drops
+    // error excerpts first.
+    let first = cargo("cargo_many_before.txt");
+    assert!(first.len() <= 4096, "{}", first.len());
+    let rerun = cargo("cargo_many_after.txt");
+    assert!(
+        rerun.len() <= 4096
+            && rerun
+                .starts_with("cargo check: 17 finding(s), 16 error(s), 1 warning(s) · 17 rule(s)")
+            && ["E0599", "E0603", "E0608", "E0614", "E0616", "E0618"]
+                .iter()
+                .all(|code| rerun.contains(&format!("error {code} ×1")))
+            && rerun.contains("warning unused_assignments ×1")
+            && rerun.contains("Compared with run-")
+            && rerun.contains("- error E0308 ×1 (no longer reported)\n")
+            && rerun.contains("error: could not compile `r08` (lib) due to 16 previous errors"),
+        "{rerun}"
+    );
+    // A smaller budget drops whole groups with a count rather than cutting a line.
+    let exe = root.join("bin/cargo");
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--max-bytes",
+            "1024",
+            "--",
+            exe.to_str().unwrap(),
+            "check",
+        ],
+    );
+    let small = stdout(&output);
+    assert!(
+        small.len() <= 1024
+            && small.contains("more rule(s) with ")
+            && small.contains("error: could not compile `r08`"),
+        "{small}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_reports_read_pylint_categories_pyright_hadolint_and_staticcheck() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // pylint's E (error) and F (fatal) categories are errors, listed before conventions.
+    let mut out = String::from(
+        "************* Module app\n\
+app.py:1:0: C0114: Missing module docstring (missing-module-docstring)\n\
+app.py:3:4: E0602: Undefined variable 'foo' (undefined-variable)\n\
+app.py:9:0: F0001: No module named nope (fatal)\n",
+    );
+    for i in 10..=30 {
+        out.push_str(&format!(
+            "app.py:{i}:0: C0116: Missing function or method docstring (missing-function-docstring)\n"
+        ));
+    }
+    let report = lint_preview(root, "pylint", &["--fresh", "app.py"], &out, "");
+    assert!(
+        report.starts_with("pylint: 24 finding(s), 2 error(s), 22 warning(s)")
+            && report.contains("\nerror E0602 ×1")
+            && report.contains("\nerror F0001 ×1"),
+        "{report}"
+    );
+
+    // These samples follow each tool's documented default output.
+    let report = lint_preview(
+        root,
+        "pyright",
+        &["--fresh"],
+        &lint_fixture("pyright.txt"),
+        "",
+    );
+    assert!(
+        report.starts_with("pyright: 5 finding(s), 4 error(s), 1 warning(s) · 3 rule(s) · 2 file(s)\n")
+            && report.contains("error reportMissingImports ×3  Import \"requestz\" could not be resolved\n  /work/app/main.py:1:8, 2:8, /work/app/util.py:3:8")
+            && report.contains("        \"Literal['x']\" is not assignable to \"int\" (reportArgumentType)\n  /work/app/main.py:9:12 [stdout:4-5]")
+            && report.contains("4 errors, 1 warning, 0 informations [stdout:9]"),
+        "{report}"
+    );
+    let report = lint_preview(
+        root,
+        "hadolint",
+        &["--fresh", "Dockerfile"],
+        &lint_fixture("hadolint.txt").repeat(3),
+        "",
+    );
+    assert!(
+        report.starts_with(
+            "hadolint: 21 finding(s), 3 error(s), 18 warning(s) · 6 rule(s) · 2 file(s)\n"
+        ) && report.contains("error DL3020 ×3  Use COPY instead of ADD for files and folders\n")
+            && report.contains("warning DL3008 ×6")
+            && report.contains("  Dockerfile:3, 5 [stdout:1-1]"),
+        "{report}"
+    );
+    let report = lint_preview(
+        root,
+        "staticcheck",
+        &["--fresh", "./..."],
+        &lint_fixture("staticcheck.txt").repeat(3),
+        "",
+    );
+    assert!(
+        report.contains(
+            "warning S1028 ×6  should use fmt.Errorf(...) instead of errors.New(fmt.Sprintf(...))\n"
+        ) && report.contains("warning SA1019 ×3")
+            && report.contains("warning U1000 ×3"),
+        "{report}"
+    );
 }

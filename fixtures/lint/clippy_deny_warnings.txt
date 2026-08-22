@@ -1,0 +1,32 @@
+    Checking r10 v0.1.0 (/work/r10)
+error: unused variable: `x`
+ --> src/lib.rs:1:18
+  |
+1 | pub fn a() { let x = 1; }
+  |                  ^ help: if this is intentional, prefix it with an underscore: `_x`
+  |
+  = note: `-D unused-variables` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(unused_variables)]`
+
+error: unused variable: `y`
+ --> src/lib.rs:2:18
+  |
+2 | pub fn b() { let y = 1; }
+  |                  ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+error: function `dead1` is never used
+ --> src/lib.rs:3:4
+  |
+3 | fn dead1() {}
+  |    ^^^^^
+  |
+  = note: `-D dead-code` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(dead_code)]`
+
+error: function `dead2` is never used
+ --> src/lib.rs:4:4
+  |
+4 | fn dead2() {}
+  |    ^^^^^
+
+error: could not compile `r10` (lib) due to 4 previous errors

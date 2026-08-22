@@ -268,6 +268,7 @@ pub fn execute(
     let lint = lint.and_then(|lint| {
         lint.finish(
             &crate::filters::tool_label(args),
+            max_bytes,
             previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
         )
     });

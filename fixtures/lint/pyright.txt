@@ -1,0 +1,9 @@
+/work/app/main.py
+  /work/app/main.py:1:8 - error: Import "requestz" could not be resolved (reportMissingImports)
+  /work/app/main.py:2:8 - error: Import "yamll" could not be resolved (reportMissingImports)
+  /work/app/main.py:9:12 - error: Argument of type "Literal['x']" cannot be assigned to parameter "n" of type "int" in function "f"
+    "Literal['x']" is not assignable to "int" (reportArgumentType)
+  /work/app/main.py:14:5 - warning: Variable "unused" is not accessed (reportUnusedVariable)
+/work/app/util.py
+  /work/app/util.py:3:8 - error: Import "nope" could not be resolved (reportMissingImports)
+4 errors, 1 warning, 0 informations

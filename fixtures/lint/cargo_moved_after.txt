@@ -1,0 +1,17 @@
+    Checking r12 v0.1.0 (/work/r12)
+warning: unused variable: `b`
+ --> src/lib.rs:2:19
+  |
+2 | pub fn w2() { let b = 1; }
+  |                   ^ help: if this is intentional, prefix it with an underscore: `_b`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `brand_new`
+ --> src/lib.rs:3:23
+  |
+3 | pub fn w3_new() { let brand_new = 1; }
+  |                       ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_brand_new`
+
+warning: `r12` (lib) generated 2 warnings (run `cargo fix --lib -p r12` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s

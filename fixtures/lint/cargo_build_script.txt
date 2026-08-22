@@ -1,0 +1,19 @@
+   Compiling r05 v0.1.0 (/work/r05)
+warning: unused variable: `unused`
+ --> build.rs:2:9
+  |
+2 |     let unused = 1;
+  |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `r05` (build script) generated 1 warning
+error: failed to run custom build command for `r05 v0.1.0 (/work/r05)`
+
+Caused by:
+  process didn't exit successfully: `/work/r05/target/debug/build/r05-2abfd76282a6210d/build-script-build` (exit status: 101)
+  --- stderr
+
+  thread 'main' (1492799) panicked at build.rs:3:5:
+  QA_BUILD_FAILURE: libfoo not found; set FOO_DIR to the install prefix
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,189 @@
+    Checking r08 v0.1.0 (/work/r08)
+error[E0603]: function `hidden` is private
+  --> src/lib.rs:14:19
+   |
+14 | pub fn e14() { m::hidden(); }
+   |                   ^^^^^^ private function
+   |
+note: the function `hidden` is defined here
+  --> src/lib.rs:1:32
+   |
+ 1 | mod m { pub struct Q { f: u8 } fn hidden() {} pub fn mk() -> Q { Q { f: 0 } } }
+   |                                ^^^^^^^^^^^
+
+error[E0308]: mismatched types
+ --> src/lib.rs:2:22
+  |
+2 | pub fn e1() -> u32 { "x" }
+  |                ---   ^^^ expected `u32`, found `&str`
+  |                |
+  |                expected `u32` because of return type
+
+error[E0425]: cannot find function `missing_fn` in this scope
+ --> src/lib.rs:3:22
+  |
+3 | pub fn e2() -> u32 { missing_fn() }
+  |                      ^^^^^^^^^^ not found in this scope
+
+error[E0599]: no method named `no_such_method` found for struct `Vec<u8>` in the current scope
+ --> src/lib.rs:4:46
+  |
+4 | pub fn e3() { let v: Vec<u8> = Vec::new(); v.no_such_method(); }
+  |                                              ^^^^^^^^^^^^^^ method not found in `Vec<u8>`
+
+error[E0277]: cannot add `&str` to `u8`
+   --> src/lib.rs:5:28
+    |
+  5 | pub fn e5(a: u8) -> u8 { a + "s" }
+    |                            ^ no implementation for `u8 + &str`
+    |
+    = help: the trait `Add<&str>` is not implemented for `u8`
+help: the following other types implement trait `Add<Rhs>`
+   --> /home/dev/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/arith.rs:114:1
+    |
+114 | add_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    | |
+    | `&u8` implements `Add<u8>`
+    | `&u8` implements `Add`
+    | `u8` implements `Add<&u8>`
+    | `u8` implements `Add`
+    = note: this error originates in the macro `forward_ref_binop` which comes from the expansion of the macro `add_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0560]: struct `P` has no field named `b`
+ --> src/lib.rs:9:47
+  |
+9 | pub fn e9() { struct P { a: u8 } let _p = P { b: 1 }; }
+  |                                               ^ unknown field
+  |
+help: a field with a similar name exists
+  |
+9 - pub fn e9() { struct P { a: u8 } let _p = P { b: 1 }; }
+9 + pub fn e9() { struct P { a: u8 } let _p = P { a: 1 }; }
+  |
+
+error[E0061]: this function takes 0 arguments but 1 argument was supplied
+  --> src/lib.rs:10:16
+   |
+10 | pub fn e10() { e1(5); }
+   |                ^^ - unexpected argument of type `{integer}`
+   |
+note: function defined here
+  --> src/lib.rs:2:8
+   |
+ 2 | pub fn e1() -> u32 { "x" }
+   |        ^^
+help: remove the extra argument
+   |
+10 - pub fn e10() { e1(5); }
+10 + pub fn e10() { e1(); }
+   |
+
+error[E0614]: type `u8` cannot be dereferenced
+  --> src/lib.rs:11:37
+   |
+11 | pub fn e11() { let a = 5u8; let _ = *a; }
+   |                                     ^^ can't be dereferenced
+
+error[E0608]: cannot index into a value of type `u8`
+  --> src/lib.rs:12:38
+   |
+12 | pub fn e12() { let a = 5u8; let _ = a[0]; }
+   |                                      ^^^
+
+error[E0618]: expected function, found `u8`
+  --> src/lib.rs:13:29
+   |
+13 | pub fn e13() { let a = 5u8; a(); }
+   |                    -        ^--
+   |                    |        |
+   |                    |        call expression requires function
+   |                    `a` has type `u8`
+
+error[E0616]: field `f` of struct `Q` is private
+  --> src/lib.rs:15:43
+   |
+15 | pub fn e15() { let q = m::mk(); let _ = q.f; }
+   |                                           ^ private field
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `nosuchmod`
+  --> src/lib.rs:18:24
+   |
+18 | pub fn e18() { let _ = nosuchmod::x(); }
+   |                        ^^^^^^^^^ use of unresolved module or unlinked crate `nosuchmod`
+   |
+   = help: if you wanted to use a crate named `nosuchmod`, use `cargo add nosuchmod` to add it to your `Cargo.toml`
+
+error[E0382]: use of moved value: `s`
+ --> src/lib.rs:6:59
+  |
+6 | pub fn e6() { let s = String::new(); let _t = s; let _u = s; }
+  |                   -                           -           ^ value used here after move
+  |                   |                           |
+  |                   |                           value moved here
+  |                   move occurs because `s` has type `String`, which does not implement the `Copy` trait
+  |
+help: consider cloning the value if the performance cost is acceptable
+  |
+6 | pub fn e6() { let s = String::new(); let _t = s.clone(); let _u = s; }
+  |                                                ++++++++
+
+error[E0384]: cannot assign twice to immutable variable `x`
+ --> src/lib.rs:7:26
+  |
+7 | pub fn e7() { let x = 1; x = 2; let _ = x; }
+  |                   -      ^^^^^ cannot assign twice to immutable variable
+  |                   |
+  |                   first assignment to `x`
+  |
+help: consider making this binding mutable
+  |
+7 | pub fn e7() { let mut x = 1; x = 2; let _ = x; }
+  |                   +++
+
+warning: value assigned to `x` is never read
+ --> src/lib.rs:7:23
+  |
+7 | pub fn e7() { let x = 1; x = 2; let _ = x; }
+  |                       ^
+  |
+  = help: maybe it is overwritten before being read?
+  = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+error[E0381]: used binding `x` isn't initialized
+ --> src/lib.rs:8:34
+  |
+8 | pub fn e8() -> i32 { let x: i32; x }
+  |                          -       ^ `x` used here but it isn't initialized
+  |                          |
+  |                          binding declared here but left uninitialized
+  |
+help: consider assigning a value
+  |
+8 | pub fn e8() -> i32 { let x: i32 = 42; x }
+  |                                 ++++
+
+error[E0502]: cannot borrow `v` as mutable because it is also borrowed as immutable
+  --> src/lib.rs:16:49
+   |
+16 | pub fn e16() { let mut v = vec![1]; let r = &v; v.push(2); let _ = r; }
+   |                                             --  ^^^^^^^^^          - immutable borrow later used here
+   |                                             |   |
+   |                                             |   mutable borrow occurs here
+   |                                             immutable borrow occurs here
+
+error[E0596]: cannot borrow `v` as mutable, as it is not declared as mutable
+  --> src/lib.rs:17:33
+   |
+17 | pub fn e17() { let v = vec![1]; v.push(2); }
+   |                                 ^ cannot borrow as mutable
+   |
+help: consider changing this to be mutable
+   |
+17 | pub fn e17() { let mut v = vec![1]; v.push(2); }
+   |                    +++
+
+Some errors have detailed explanations: E0061, E0277, E0308, E0381, E0382, E0384, E0425, E0433, E0502...
+For more information about an error, try `rustc --explain E0061`.
+warning: `r08` (lib) generated 1 warning
+error: could not compile `r08` (lib) due to 17 previous errors; 1 warning emitted

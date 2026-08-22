@@ -1,0 +1,59 @@
+    Checking r09 v0.1.0 (/work/r09)
+warning: unused import: `std::collections::HashMap`
+ --> src/lib.rs:1:5
+  |
+1 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Debug` and `Display`
+ --> src/lib.rs:2:16
+  |
+2 | use std::fmt::{Debug, Display};
+  |                ^^^^^  ^^^^^^^
+
+warning: function `helper` is never used
+ --> src/lib.rs:3:4
+  |
+3 | fn helper() {}
+  |    ^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `helper2` is never used
+ --> src/lib.rs:4:4
+  |
+4 | fn helper2() {}
+  |    ^^^^^^^
+
+warning: struct `Unbuilt` is never constructed
+ --> src/lib.rs:5:8
+  |
+5 | struct Unbuilt;
+  |        ^^^^^^^
+
+warning: constant `C` is never used
+ --> src/lib.rs:6:7
+  |
+6 | const C: u8 = 1;
+  |       ^
+
+warning: fields `a`, `b`, and `c` are never read
+ --> src/lib.rs:7:16
+  |
+7 | pub struct S { a: u8, b: u8, c: u8, pub d: u8 }
+  |            -   ^      ^      ^
+  |            |
+  |            fields in this struct
+
+warning: field `e` is never read
+ --> src/lib.rs:8:16
+  |
+8 | pub struct T { e: u8, pub f: u8 }
+  |            -   ^
+  |            |
+  |            field in this struct
+
+warning: `r09` (lib) generated 8 warnings (run `cargo fix --lib -p r09` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
