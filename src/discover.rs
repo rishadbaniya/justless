@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
+use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -22,6 +24,8 @@ use crate::workspace::Workspace;
 enum Route {
     ThroughJustless,
     SupportedNotRouted,
+    /// A supported tool in a form the hooks pass through whole, such as a pipe.
+    PassedThrough,
     NotSupported,
 }
 
@@ -30,10 +34,18 @@ impl Route {
         match self {
             Self::ThroughJustless => "Through Justless",
             Self::SupportedNotRouted => "Supported, not routed",
+            Self::PassedThrough => "Supported tool, passed through",
             Self::NotSupported => "Not supported yet",
         }
     }
 }
+
+/// The footer `justless run` prints on its own line after a captured command.
+static FOOTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\[justless run-[A-Za-z0-9]+\] exit -?[0-9]+").unwrap());
+/// The first line of `justless read` output, which the hooks substitute for `cat FILE`.
+static OUTLINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\Arevision [0-9a-f]+ · [0-9]+ lines\n").unwrap());
 
 #[derive(Default, Serialize)]
 struct Group {
@@ -90,14 +102,37 @@ fn text_bytes(content: &Value) -> u64 {
     }
 }
 
-fn text_contains(content: &Value, needle: &str) -> bool {
+fn text_matches(content: &Value, pattern: &Regex) -> bool {
     match content {
-        Value::String(text) => text.contains(needle),
+        Value::String(text) => pattern.is_match(text),
         Value::Array(parts) => parts
             .iter()
-            .any(|p| p["text"].as_str().is_some_and(|t| t.contains(needle))),
+            .any(|p| p["text"].as_str().is_some_and(|t| pattern.is_match(t))),
         _ => false,
     }
+}
+
+/// Whether a command ran through Justless: its output has a run footer, one of
+/// its commands invokes a `justless` binary, or it is a bare `cat FILE` whose
+/// result is the outline the hooks substitute.
+fn routed(command: &str, content: &Value) -> bool {
+    if text_matches(content, &FOOTER) {
+        return true;
+    }
+    let invokes_justless = command.split(['&', '|', ';', '\n']).any(|segment| {
+        segment
+            .split_whitespace()
+            .next()
+            .is_some_and(|program| Path::new(program).file_name() == Some("justless".as_ref()))
+    });
+    let words: Vec<_> = command.split_whitespace().collect();
+    let bare_cat = matches!(words.as_slice(), ["cat", file]
+        if !file.starts_with('-') && !file.contains(|c: char| "|;&<>$`*?(){}[]!#~\\\"'".contains(c)));
+    let first = match content {
+        Value::Array(parts) => parts.first().and_then(|p| p["text"].as_str()),
+        other => other.as_str(),
+    };
+    invokes_justless || bare_cat && first.is_some_and(|text| OUTLINE.is_match(text))
 }
 
 pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
@@ -109,14 +144,26 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     let Some(dir) = transcript_dir(&workspace.root) else {
         anyhow::bail!("cannot locate the Claude Code configuration directory");
     };
+    // Sessions keep subagent transcripts under <session>/subagents/, and workflow
+    // subagents one level deeper under subagents/workflows/<run>/.
     let mut files = Vec::new();
-    transcripts(&dir, since, 3, &mut files);
+    transcripts(&dir, since, 6, &mut files);
     files.sort();
 
     let root = workspace.root.to_string_lossy().into_owned();
     let mut groups: BTreeMap<Route, Group> = BTreeMap::new();
     let mut sessions = BTreeSet::new();
     for file in &files {
+        // <session>.jsonl and everything under <session>/ belong to one session.
+        let session = file
+            .strip_prefix(&dir)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .map(|first| {
+                let name = first.as_os_str().to_string_lossy();
+                name.strip_suffix(".jsonl").unwrap_or(&name).to_owned()
+            })
+            .unwrap_or_default();
         let mut calls: HashMap<String, Call> = HashMap::new();
         let Ok(handle) = File::open(file) else {
             continue;
@@ -171,12 +218,15 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
                             continue;
                         }
                         let content = &part["content"];
-                        let route = if text_contains(content, "[justless run-")
-                            || call.command.trim_start().starts_with("justless ")
-                        {
+                        // Keep only the program and a known subcommand.
+                        let words = crate::agents::command_label(&call.command);
+                        let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
+                        let route = if routed(&call.command, content) {
                             Route::ThroughJustless
                         } else if crate::agents::would_route(&call.command) {
                             Route::SupportedNotRouted
+                        } else if crate::agents::would_route(&label) {
+                            Route::PassedThrough
                         } else {
                             Route::NotSupported
                         };
@@ -184,13 +234,10 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
                         let group = groups.entry(route).or_default();
                         group.commands += 1;
                         group.output_bytes += bytes;
-                        let label = group
-                            .labels
-                            .entry(crate::agents::command_label(&call.command))
-                            .or_default();
+                        let label = group.labels.entry(label).or_default();
                         label.0 += 1;
                         label.1 += bytes;
-                        sessions.insert(file.clone());
+                        sessions.insert(session.clone());
                     }
                     _ => {}
                 }

@@ -3758,3 +3758,112 @@ app.py:9:0: F0001: No module named nope (fatal)\n",
         "{report}"
     );
 }
+
+/// Writes Claude Code transcripts for `root` under `config`. Each file holds
+/// Bash calls as (command, output) pairs.
+fn write_transcripts(root: &Path, config: &Path, files: &[(&str, &[(&str, &str)])]) {
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let base = config.join("projects").join(slug);
+    for (file, calls) in files {
+        let mut lines = Vec::new();
+        for (i, (command, output)) in calls.iter().enumerate() {
+            let id = format!("{file}-{i}");
+            lines.push(serde_json::json!({"cwd":root,"timestamp":"2999-01-01T00:00:00Z",
+                "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}}).to_string());
+            lines.push(
+                serde_json::json!({"cwd":root,"timestamp":"2999-01-01T00:00:01Z",
+                "message":{"content":[{"type":"tool_result","tool_use_id":id,"content":output}]}})
+                .to_string(),
+            );
+        }
+        let path = base.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, lines.join("\n")).unwrap();
+    }
+}
+
+#[test]
+fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let config = repo.path().join("claude");
+    let footer = "ok\n[justless run-0lF7HYV5JgQV] exit 0 · 3 of 3 output bytes · justless log run-0lF7HYV5JgQV";
+    let outline = "revision 3aa7da2e4ea6fb73b0c21cd8 · 200 lines\n#1 L1-1 function f";
+    write_transcripts(
+        &root,
+        &config,
+        &[
+            ("S.jsonl", &[("cargo test", "test result: ok")]),
+            (
+                "S/subagents/agent-a.jsonl",
+                &[("cd web && npm test", footer)],
+            ),
+            (
+                "S/subagents/workflows/wf_1/agent-b.jsonl",
+                &[
+                    ("./target/debug/justless query f", "src/lib.rs:1"),
+                    ("cat src/lib.rs", outline),
+                ],
+            ),
+            (
+                "T.jsonl",
+                &[
+                    ("cargo test 2>&1 | tail -20", "test result: FAILED"),
+                    ("n=$(grep -n foo src/lib.rs); echo $n", ""),
+                    ("mysql secretdb", "x"),
+                    ("ssh prod-host uptime", "x"),
+                    // Justless's own source mentions the footer text mid-line.
+                    (
+                        "sed -n 160,200p src/discover.rs",
+                        "let route = if text_contains(content, \"[justless run-\")",
+                    ),
+                    ("cat notes.txt", "revision is not an outline"),
+                ],
+            ),
+        ],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["discover", "--json"])
+        .current_dir(&root)
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["sessions"], 2);
+    assert_eq!(report["commands"], 10);
+    let labels = |route: &str| -> Vec<String> {
+        report["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["route"] == route)
+            .map(|g| {
+                g["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| format!("{} ×{}", l["label"].as_str().unwrap(), l["commands"]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        labels("through_justless"),
+        ["cat ×1", "justless query ×1", "npm test ×1"]
+    );
+    assert_eq!(labels("supported_not_routed"), ["cargo test ×1"]);
+    assert_eq!(labels("passed_through"), ["cargo test ×1"]);
+    assert_eq!(
+        labels("not_supported"),
+        ["cat ×1", "mysql ×1", "other ×1", "sed ×1", "ssh ×1"]
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("secretdb") && !text.contains("prod-host"));
+}

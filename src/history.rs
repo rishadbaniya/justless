@@ -15,6 +15,89 @@ pub fn now_ms() -> u64 {
     millis(SystemTime::now())
 }
 
+/// Programs whose second word names a subcommand rather than an argument.
+const SUBCOMMANDS: &[&str] = &[
+    "bazel",
+    "brew",
+    "bun",
+    "bundle",
+    "cabal",
+    "cargo",
+    "composer",
+    "conda",
+    "dart",
+    "deno",
+    "docker",
+    "dotnet",
+    "flutter",
+    "gh",
+    "git",
+    "go",
+    "golangci-lint",
+    "gradle",
+    "gradlew",
+    "hatch",
+    "helm",
+    "justless",
+    "kubectl",
+    "make",
+    "mix",
+    "mvn",
+    "mvnw",
+    "nix",
+    "npm",
+    "pdm",
+    "pip",
+    "pip3",
+    "pixi",
+    "pnpm",
+    "podman",
+    "poetry",
+    "rustup",
+    "rye",
+    "ruff",
+    "stack",
+    "swift",
+    "terraform",
+    "tofu",
+    "uv",
+    "vitest",
+    "yarn",
+    "zig",
+];
+
+/// A command label without arguments, such as `cargo test`, `make` or `mysql`.
+/// Only programs known to take subcommands keep their second word, so host,
+/// database and file names never appear in a label.
+pub fn label(words: &[&str]) -> String {
+    let words = crate::filters::unwrap_tool(words);
+    let Some((program, rest)) = words.split_first() else {
+        return "other".into();
+    };
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if program.is_empty()
+        || program.starts_with(['-', '.'])
+        || !program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+    {
+        return "other".into();
+    }
+    match rest.first() {
+        Some(sub)
+            if SUBCOMMANDS.contains(&program)
+                && sub.starts_with(|c: char| c.is_ascii_lowercase())
+                && sub.chars().all(|c| c.is_ascii_lowercase() || c == '-') =>
+        {
+            format!("{program} {sub}")
+        }
+        _ => program.to_owned(),
+    }
+}
+
 fn millis(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
