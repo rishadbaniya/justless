@@ -110,6 +110,9 @@ pub struct Run {
     pub completed_ms: u64,
     #[serde(default)]
     pub family: String,
+    /// The program and any known subcommand, such as `git log`, without arguments.
+    #[serde(default)]
+    pub label: String,
     #[serde(default)]
     pub command_key: String,
     #[serde(default)]
@@ -186,6 +189,7 @@ pub fn execute(
             Some(profile) => profile.label().to_owned(),
             None => crate::summary::family(args),
         },
+        label: history::label(&words),
         command_key: String::new(),
         digests: Vec::new(),
         summary: Summary::default(),

@@ -3946,3 +3946,47 @@ fn history_orders_by_completion_and_skips_unreadable_records() {
             .contains(&ids[5])
     );
 }
+
+#[test]
+fn runs_are_listed_by_command_label_and_resume_shows_32_source_ranges() {
+    let repo = mixed_fixture();
+    let root = repo.path();
+    let mut ids = Vec::new();
+    for command in [
+        &["git", "status"][..],
+        &["git", "log", "-1"],
+        &["ls", "backend"],
+        &["sh", "-c", "echo secret-argument"],
+    ] {
+        let args = [&["run", "--"][..], command].concat();
+        ids.push(run_id(&cli(root, &args)));
+    }
+    let history = success(root, &["history"]);
+    let resume = success(root, &["resume"]);
+    for (id, label) in ids.iter().zip(["git status", "git log", "ls", "sh"]) {
+        for text in [&history, &resume] {
+            assert!(text.contains(&format!("{id} · {label} · exit ")), "{text}");
+        }
+        let record =
+            fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap();
+        assert!(
+            record.contains(&format!("\"label\":\"{label}\"")),
+            "{record}"
+        );
+    }
+    // Arguments stay out of labels. Resume headlines describe output instead.
+    assert!(!history.contains("secret-argument") && !history.contains("backend"));
+    assert!(!resume.contains("secret-argument"));
+
+    for n in 1..=40 {
+        let file = format!("notes/n{n:02}.txt");
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join(&file), "a\nb\nc\n").unwrap();
+        success(root, &["code", &file, "--from", "1", "--to", "2"]);
+    }
+    let resume = success(root, &["resume", "--budget", "100000"]);
+    let reads: Vec<_> = resume.lines().filter(|l| l.starts_with("Read ")).collect();
+    assert_eq!(reads.len(), 32, "{resume}");
+    assert_eq!(reads[0], "Read notes/n40.txt:1-2");
+    assert_eq!(reads[31], "Read notes/n09.txt:1-2");
+}

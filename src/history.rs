@@ -558,7 +558,7 @@ pub fn history(
             report.line(format!(
                 "{} · {} · exit {} · {} (epoch ms {})",
                 run.id,
-                run.family,
+                command(&run),
                 run.status,
                 age(run.completed_ms),
                 run.completed_ms
@@ -573,6 +573,19 @@ pub fn history(
         report.line("No matching captured runs.");
     }
     report.finish()
+}
+
+/// How lists name a run: its command label, or the output family when that is
+/// more specific, as for `kubectl get pods`, or adds detail, as for `pytest`.
+fn command(run: &Run) -> String {
+    let (label, family) = (run.label.as_str(), run.family.as_str());
+    if label.is_empty() || family.starts_with(label) {
+        family.to_owned()
+    } else if matches!(family, "other" | "legacy") || label.starts_with(family) {
+        label.to_owned()
+    } else {
+        format!("{label} ({family})")
+    }
 }
 
 pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
@@ -592,7 +605,7 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
         report.line(format!(
             "{} · {} · exit {}{}{}",
             run.id,
-            run.family,
+            command(&run),
             run.status,
             if run.unchanged {
                 " · unchanged output"
@@ -618,7 +631,11 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
             ));
         }
     }
-    for read in activity.reads.iter().take(10) {
+    // Activity keeps the 32 most recent ranges.
+    for read in activity.reads.iter().take(32) {
+        if report.clipped {
+            break;
+        }
         report.line(format!(
             "Read {}:{}-{}{}",
             read.file,
