@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{self, Run, Stream};
@@ -114,10 +114,23 @@ fn age(ms: u64) -> String {
     }
 }
 
+fn skipped(id: &str, error: &anyhow::Error) {
+    eprintln!("justless: skipped run {id}: {error:#}");
+}
+
+/// Recorded runs ordered by completion time, newest first unless `oldest`.
+/// A record that cannot be read is skipped with a warning naming its run, so
+/// the others stay readable. The iterator never yields an error.
 pub fn records(
     workspace: &Workspace,
     oldest: bool,
 ) -> Result<impl Iterator<Item = Result<Run>> + '_> {
+    /// The ordering field, read without decoding the whole record.
+    #[derive(Deserialize)]
+    struct Stamp {
+        #[serde(default)]
+        completed_ms: u64,
+    }
     let path = workspace.state.join("runs");
     let mut entries = Vec::new();
     if path.exists() {
@@ -126,27 +139,48 @@ pub fn records(
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            match fs::metadata(entry.path().join("record.json")) {
-                Ok(meta) => entries.push((meta.modified()?, entry.file_name())),
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let record = entry.path().join("record.json");
+            let stamp = match fs::read(&record) {
+                Ok(bytes) => serde_json::from_slice::<Stamp>(&bytes).context("decode run record"),
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            }
+                Err(e) => Err(e).context("read run record"),
+            };
+            // Records from before completion times were stored sort by mtime.
+            let completed = match stamp {
+                Ok(stamp) if stamp.completed_ms > 0 => stamp.completed_ms,
+                Ok(_) => fs::metadata(&record)
+                    .and_then(|meta| meta.modified())
+                    .map_or(0, millis),
+                Err(error) => {
+                    skipped(&id, &error);
+                    continue;
+                }
+            };
+            entries.push((completed, id));
         }
     }
     entries.sort_unstable();
     if !oldest {
         entries.reverse();
     }
-    Ok(entries.into_iter().map(|(date, id)| {
-        let (_, mut run) = capture::load(workspace, &id.to_string_lossy())?;
-        if run.completed_ms == 0 {
-            run.completed_ms = millis(date);
-        }
-        if run.family.is_empty() {
-            run.family = "legacy".into();
-        }
-        Ok(run)
-    }))
+    Ok(entries
+        .into_iter()
+        .filter_map(|(completed, id)| match capture::load(workspace, &id) {
+            Ok((_, mut run)) => {
+                if run.completed_ms == 0 {
+                    run.completed_ms = completed;
+                }
+                if run.family.is_empty() {
+                    run.family = "legacy".into();
+                }
+                Some(Ok(run))
+            }
+            Err(error) => {
+                skipped(&id, &error);
+                None
+            }
+        }))
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -180,6 +214,14 @@ fn get<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Reads state for a report, warning about a damaged file instead of failing.
+fn get_or_warn<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    get(path).unwrap_or_else(|error| {
+        eprintln!("justless: ignored unreadable {}: {error:#}", path.display());
+        T::default()
+    })
 }
 
 fn update<T: serde::de::DeserializeOwned + Serialize + Default>(
@@ -334,11 +376,13 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         count += 1;
         raw += run.raw_bytes;
         preview += shown;
-        let c: Recalls = get(&workspace
-            .state
-            .join("runs")
-            .join(&run.id)
-            .join("recalls.json"))?;
+        let c: Recalls = get_or_warn(
+            &workspace
+                .state
+                .join("runs")
+                .join(&run.id)
+                .join("recalls.json"),
+        );
         let f = families.entry(run.family.clone()).or_default();
         f.family = run.family;
         f.runs += 1;
@@ -358,7 +402,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             d.preview_bytes += shown;
         }
     }
-    let activity: Activity = get(&workspace.state.join("activity.json"))?;
+    let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
     let saved = raw.saturating_sub(preview);
     let mut commands: Vec<_> = families.into_values().collect();
     commands.sort_by(|a, b| {
@@ -540,7 +584,7 @@ pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
 /// Returns `None` inside the text when the project has no recorded activity.
 pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
     let mut report = Report::new(cap);
-    let activity: Activity = get(&workspace.state.join("activity.json"))?;
+    let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
     let mut has_runs = false;
     for run in records(workspace, false)?.take(5) {
         let run = run?;

@@ -3867,3 +3867,82 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(!text.contains("secretdb") && !text.contains("prod-host"));
 }
+
+#[test]
+fn history_orders_by_completion_and_skips_unreadable_records() {
+    let repo = mixed_fixture();
+    let root = repo.path();
+    let mut ids = Vec::new();
+    for n in 1..=6 {
+        let script = format!("echo cmd {n}: TimeoutError");
+        ids.push(run_id(&cli(root, &["run", "--", "sh", "-c", &script])));
+    }
+    // A copy can reorder modification times, so the newest run gets the oldest.
+    for (k, id) in ids.iter().enumerate() {
+        let record = fs::File::options()
+            .write(true)
+            .open(root.join(".justless/runs").join(id).join("record.json"))
+            .unwrap();
+        let age = std::time::Duration::from_secs(1000 + k as u64 * 100);
+        record
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+    let oldest = success(
+        root,
+        &["history", "TimeoutError", "--oldest", "--limit", "1"],
+    );
+    assert!(
+        oldest.contains(&ids[0]) && oldest.contains("cmd 1: TimeoutError"),
+        "{oldest}"
+    );
+    let listed: Vec<String> = success(root, &["history"])
+        .lines()
+        .map(|line| line.split(' ').next().unwrap().to_owned())
+        .collect();
+    assert_eq!(listed, ids.iter().rev().cloned().collect::<Vec<_>>());
+
+    // An empty record and one missing required fields, sorted newest.
+    for (id, record) in [
+        ("run-empty", String::new()),
+        (
+            "run-partial",
+            r#"{"id":"run-partial","status":0,"completed_ms":99999999999999}"#.to_owned(),
+        ),
+    ] {
+        let directory = root.join(".justless/runs").join(id);
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("record.json"), record).unwrap();
+    }
+    for args in [
+        &["history"][..],
+        &["history", "TimeoutError"],
+        &["stats"],
+        &["resume"],
+        &["pack", "where is TimeoutError raised"],
+    ] {
+        let output = cli(root, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        let warnings = stderr(&output);
+        assert!(
+            warnings.contains("justless: skipped run run-empty: decode run record")
+                && warnings.contains("justless: skipped run run-partial: decode run record"),
+            "{args:?}: {warnings}"
+        );
+    }
+    let resume = success(root, &["resume"]);
+    let runs: Vec<_> = resume.lines().filter(|l| l.starts_with("run-")).collect();
+    assert_eq!(runs.len(), 5, "{resume}");
+    assert!(runs[0].starts_with(&ids[5]), "{resume}");
+    let handoff = hook(
+        root,
+        "after-compact",
+        serde_json::json!({"hook_event_name":"SessionStart","source":"compact"}),
+    );
+    assert!(
+        handoff["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(&ids[5])
+    );
+}
