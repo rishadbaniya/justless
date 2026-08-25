@@ -550,13 +550,11 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
             .as_str()
             .is_none_or(|source| source == "compact")
     {
-        compact_state(workspace)
-            .map(|state| {
+        compact_state(workspace, AFTER_COMPACT)
+            .map(|context| {
                 json!({"hookSpecificOutput":{
                     "hookEventName":"SessionStart",
-                    "additionalContext":format!(
-                        "Justless activity from before compaction. Recover exact output with `justless log RUN_ID`, `justless search RUN_ID TEXT` or `justless history TEXT`, and retired tool results with `justless recall ID`.\n{state}"
-                    )
+                    "additionalContext":context
                 }})
             })
             .unwrap_or_else(|| json!({}))
@@ -564,11 +562,9 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
         // Claude Code uses PreCompact stdout as instructions for the summary, so this
         // mode prints plain text rather than a JSON decision.
         if input["hook_event_name"] == "PreCompact"
-            && let Some(state) = compact_state(workspace)
+            && let Some(context) = compact_state(workspace, BEFORE_COMPACT)
         {
-            print!(
-                "Keep these Justless references verbatim in the summary. They recover exact logs and source without rerunning commands. Keep each run ID with its command family and exit status, and each file range with its stale marker.\n{state}"
-            );
+            print!("{context}");
         }
         return Ok(());
     } else if mode == "session-start" && input["hook_event_name"] == "SessionStart" {
@@ -642,14 +638,20 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     )
 }
 
-/// A bounded handoff of recent Justless activity, or `None` when there is none.
-fn compact_state(workspace: &Workspace) -> Option<String> {
+/// The documented bound on a compaction handoff, including its introduction.
+const HANDOFF_BYTES: usize = 1800;
+const AFTER_COMPACT: &str = "Justless activity from before compaction. Recover exact output with `justless log RUN_ID`, `justless search RUN_ID TEXT` or `justless history TEXT`, and retired tool results with `justless recall ID`.\n";
+const BEFORE_COMPACT: &str = "Keep these Justless references verbatim in the summary. They recover exact logs and source without rerunning commands. Keep each run ID with its command and exit status, and each file range with its stale marker.\n";
+
+/// `intro` followed by recent Justless activity, within `HANDOFF_BYTES`, or
+/// `None` when there is no activity.
+fn compact_state(workspace: &Workspace, intro: &str) -> Option<String> {
     if !workspace.state.is_dir() {
         return None;
     }
-    let state = crate::history::resume_text(workspace, 1800).ok()?;
+    let state = crate::history::resume_text(workspace, HANDOFF_BYTES - intro.len()).ok()?;
     (!state.trim().is_empty() && !state.starts_with("No recorded project activity"))
-        .then_some(state)
+        .then(|| format!("{intro}{state}"))
 }
 
 fn startup(workspace: &Workspace) -> Option<String> {

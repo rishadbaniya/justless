@@ -3990,3 +3990,61 @@ fn runs_are_listed_by_command_label_and_resume_shows_32_source_ranges() {
     assert_eq!(reads[0], "Read notes/n40.txt:1-2");
     assert_eq!(reads[31], "Read notes/n09.txt:1-2");
 }
+
+#[test]
+fn compaction_handoffs_stay_within_1800_bytes_with_their_introduction() {
+    use serde_json::json;
+    let repo = mixed_fixture();
+    let root = repo.path();
+    for n in 0..8 {
+        let script = format!("echo line {n} {}; exit 1", "x".repeat(200));
+        cli(root, &["run", "--", "sh", "-c", &script]);
+    }
+    let deep = ["a_rather_long_directory_name"; 8].join("/");
+    for n in 0..32 {
+        let file = format!("{deep}/f{n:02}.rs");
+        fs::create_dir_all(root.join(&deep)).unwrap();
+        fs::write(root.join(&file), "fn f() {}\n".repeat(10)).unwrap();
+        success(root, &["code", &file, "--from", "1", "--to", "5"]);
+    }
+    let compact = json!({"hook_event_name":"SessionStart","source":"compact"});
+    for handler in ["hook-claude", "hook-codex"] {
+        let output = agent_hook(root, handler, "after-compact", compact.clone());
+        let context = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            context.starts_with("Justless activity from before compaction.")
+                && context.ends_with("[context budget reached]\n")
+                && context.len() <= 1800,
+            "{handler}: {} bytes",
+            context.len()
+        );
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["hook-claude", "before-compact"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"hook_event_name":"PreCompact"})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let instructions = stdout(&output);
+    assert!(
+        instructions.starts_with("Keep these Justless references verbatim")
+            && instructions.ends_with("[context budget reached]\n")
+            && instructions.len() <= 1800,
+        "{} bytes",
+        instructions.len()
+    );
+}
