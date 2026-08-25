@@ -499,6 +499,34 @@ fn rust_outline_signatures_skip_docs_and_attributes() {
     assert_eq!(
         ok(run(root, &["expand", "lib.rs", "fair_value"], b"")),
         function.as_bytes()
+}
+
+fn recall_id(stub: &Value) -> String {
+    let text = stub.as_str().or_else(|| stub[0]["text"].as_str()).unwrap();
+    text.strip_prefix("[justless recall ")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn plain_recall_prints_the_text_of_retired_text_parts() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let lines: String = (1..=80)
+        .map(|n| format!("line {n} of the file\n"))
+        .collect();
+    let request = json!({"messages":[
+        {"role":"assistant","tool_calls":[{"id":"old","type":"function","function":{"name":"read","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"old","content":[{"type":"text","text":lines},{"type":"text","text":"end"}]},
+        {"role":"tool","tool_call_id":"recent","content":"x"}]});
+    let masked = json_output(root, &["mask", "--keep", "1"], &request);
+    let id = recall_id(&masked["messages"][1]["content"]);
+    let plain = ok(run(root, &["recall", &id], b""));
+    assert_eq!(String::from_utf8(plain).unwrap(), format!("{lines}end"));
+    assert_eq!(
+        json_output(root, &["recall", &id, "--json"], &Value::Null),
+        request["messages"][1]["content"]
     );
 }
 
@@ -899,4 +927,43 @@ fn edits_refuse_read_only_files_and_keep_links_and_attributes() {
             assert_eq!(fs::read_to_string(&tagged).unwrap(), "one\nTWO\n");
         }
     }
+}
+}
+
+fn mask_keeps_lone_surrogate_escapes_and_retires_other_results() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    let data = "line of output\n".repeat(200);
+    // JSON.stringify("x\uD83D") and Python's json.dumps emit unpaired escapes.
+    // The escaped backslash before `ud83d` in the second message is not one.
+    let request = format!(
+        concat!(
+            r#"{{"messages":[{{"role":"user","content":"file caf\udc80 and \\ud83d"}},"#,
+            r#"{{"role":"assistant","tool_calls":[{{"id":"a","type":"function","function":{{"name":"read","arguments":"{{}}"}}}}]}},"#,
+            r#"{{"role":"tool","tool_call_id":"a","content":{}}},"#,
+            r#"{{"role":"tool","tool_call_id":"b","content":"{}cut \uD83D"}},"#,
+            r#"{{"role":"tool","tool_call_id":"c","content":"pair \ud83e\udd80"}},"#,
+            r#"{{"role":"tool","tool_call_id":"d","content":"x"}}]}}"#
+        ),
+        serde_json::to_string(&data).unwrap(),
+        "y".repeat(2000),
+    );
+    // Without retirement the request comes back byte for byte, except that
+    // the paired escape is decoded like any other character.
+    let normalized = request.replace(r"\ud83e\udd80", "🦀");
+    let same = ok(run(root, &["mask", "--keep", "10"], request.as_bytes()));
+    assert_eq!(String::from_utf8(same).unwrap(), normalized);
+
+    let masked = ok(run(root, &["mask", "--keep", "1"], request.as_bytes()));
+    let masked_text = String::from_utf8(masked.clone()).unwrap();
+    assert!(
+        masked_text.contains(r#""file caf\udc80 and \\ud83d""#)
+            && masked_text.contains(r#"cut \uD83D""#),
+        "{masked_text}"
+    );
+    let start = masked_text.find("[justless recall ").unwrap();
+    let id = &masked_text[start + 17..start + 81];
+    assert_eq!(ok(run(root, &["recall", id], b"")), data.as_bytes());
+    let restored = ok(run(root, &["mask", "--restore"], &masked));
+    assert_eq!(String::from_utf8(restored).unwrap(), normalized);
 }

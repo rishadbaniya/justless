@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Arg, ArgMatches, Command};
@@ -208,15 +208,25 @@ fn marker(value: &Value) -> Option<&str> {
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     if name == "recall" {
         let value = recover(ws, args.value_of("id").unwrap())?;
-        if !args.is_present("json")
-            && let Some(text) = value.as_str()
-        {
-            return Ok(io::stdout().lock().write_all(text.as_bytes())?);
+        // Plain recall prints text: a string, or the parts of an all-text array
+        // joined without a separator. `--json` prints the typed value.
+        if !args.is_present("json") && text_kind(&value).is_some() {
+            let mut out = io::stdout().lock();
+            match value.as_array() {
+                Some(parts) => {
+                    for part in parts {
+                        out.write_all(part["text"].as_str().unwrap_or_default().as_bytes())?;
+                    }
+                }
+                None => out.write_all(value.as_str().unwrap_or_default().as_bytes())?,
+            }
+            return Ok(());
         }
         return Ok(serde_json::to_writer(io::stdout().lock(), &value)?);
     }
-    let mut request: Value =
-        serde_json::from_reader(io::stdin().lock()).context("decode request")?;
+    let mut input = Vec::new();
+    io::stdin().lock().read_to_end(&mut input)?;
+    let (mut request, surrogates) = decode_request(&input)?;
     let candidates = outputs(&request)?;
     let keep = crate::read_num(args, "keep", 0)?;
     let minimum = crate::read_num(args, "min-bytes", 0)?;
@@ -252,6 +262,12 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
             continue;
         }
         if !eligible(index, c) || marker(value).is_some() {
+            continue;
+        }
+        // The archive holds valid JSON, so a result with a lone surrogate stays.
+        if let Some(surrogates) = &surrogates
+            && serde_json::to_string(value)?.contains(surrogates.marker)
+        {
             continue;
         }
         let Some(kind) = text_kind(value) else {
@@ -296,6 +312,117 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     if args.is_present("stats") {
         eprintln!("{}", json!({"changed":count,"bytes_saved":saved_bytes}));
     }
-    serde_json::to_writer(io::stdout().lock(), &request)?;
+    let output = encode_request(&request, surrogates.as_ref())?;
+    io::stdout().lock().write_all(&output)?;
     Ok(())
+}
+
+/// Unpaired UTF-16 surrogate escapes, such as `\ud83d` from a JavaScript or
+/// Python string cut inside a character, replaced while the request is parsed.
+struct Surrogates {
+    /// A private-use character absent from the request. Each escape becomes
+    /// this character followed by the escape's four hex digits.
+    marker: char,
+    count: usize,
+}
+
+/// Parses a request. serde_json rejects unpaired surrogate escapes, so each is
+/// replaced with a marker that `encode_request` turns back into the escape.
+fn decode_request(input: &[u8]) -> Result<(Value, Option<Surrogates>)> {
+    let hex = |at: usize| {
+        input
+            .get(at..at + 4)
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+    };
+    let escape = |at: usize| {
+        (input.get(at..at + 2) == Some(b"\\u"))
+            .then(|| hex(at + 2))
+            .flatten()
+    };
+    let mut lone = Vec::new();
+    let mut i = 0;
+    // A backslash appears only inside strings and always starts an escape.
+    while i < input.len() {
+        if input[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        match escape(i) {
+            Some(0xD800..=0xDBFF) if matches!(escape(i + 6), Some(0xDC00..=0xDFFF)) => i += 12,
+            Some(0xD800..=0xDFFF) => {
+                lone.push(i);
+                i += 6;
+            }
+            Some(_) => i += 6,
+            None => i += 2,
+        }
+    }
+    if lone.is_empty() {
+        return Ok((
+            serde_json::from_slice(input).context("decode request")?,
+            None,
+        ));
+    }
+    let lower = input.to_ascii_lowercase();
+    let marker = ('\u{E000}'..='\u{F8FF}')
+        .rev()
+        .find(|c| {
+            let escaped = format!("\\u{:04x}", *c as u32);
+            !contains(input, c.encode_utf8(&mut [0; 4]).as_bytes())
+                && !contains(&lower, escaped.as_bytes())
+        })
+        .context("decode request: no private-use character is free to mark surrogates")?;
+    let mut text = Vec::with_capacity(input.len() + lone.len() * 6);
+    let mut start = 0;
+    for &at in &lone {
+        text.extend_from_slice(&input[start..at]);
+        text.extend_from_slice(format!("\\u{:04x}", marker as u32).as_bytes());
+        text.extend_from_slice(&input[at + 2..at + 6]);
+        start = at + 6;
+    }
+    text.extend_from_slice(&input[start..]);
+    let request = serde_json::from_slice(&text).context("decode request")?;
+    let count = lone.len();
+    Ok((request, Some(Surrogates { marker, count })))
+}
+
+/// Serializes a request, restoring each surrogate escape `decode_request` marked.
+fn encode_request(request: &Value, surrogates: Option<&Surrogates>) -> Result<Vec<u8>> {
+    let output = serde_json::to_vec(request)?;
+    let Some(surrogates) = surrogates else {
+        return Ok(output);
+    };
+    let mut buffer = [0; 4];
+    let marker = surrogates.marker.encode_utf8(&mut buffer).as_bytes();
+    let mut restored = Vec::with_capacity(output.len());
+    let mut count = 0;
+    let mut i = 0;
+    while i < output.len() {
+        let digits = output[i..]
+            .strip_prefix(marker)
+            .and_then(|rest| rest.get(..4))
+            .filter(|digits| digits.iter().all(u8::is_ascii_hexdigit));
+        if let Some(digits) = digits {
+            restored.extend_from_slice(b"\\u");
+            restored.extend_from_slice(digits);
+            count += 1;
+            i += marker.len() + 4;
+        } else {
+            restored.push(output[i]);
+            i += 1;
+        }
+    }
+    ensure!(
+        count == surrogates.count,
+        "restored results contain U+{:04X}, which marks surrogate escapes in this request",
+        surrogates.marker as u32
+    );
+    Ok(restored)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
