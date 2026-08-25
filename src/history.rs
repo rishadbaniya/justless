@@ -146,7 +146,7 @@ pub fn records(
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) => Err(e).context("read run record"),
             };
-            // Records from before completion times were stored sort by mtime.
+            // Records stored before completion times existed sort by modification time.
             let completed = match stamp {
                 Ok(stamp) if stamp.completed_ms > 0 => stamp.completed_ms,
                 Ok(_) => fs::metadata(&record)
