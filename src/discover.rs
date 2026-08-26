@@ -112,19 +112,14 @@ fn text_matches(content: &Value, pattern: &Regex) -> bool {
     }
 }
 
-/// Whether a command ran through Justless: its output has a run footer, one of
-/// its commands invokes a `justless` binary, or it is a bare `cat FILE` whose
-/// result is the outline the hooks substitute.
-fn routed(command: &str, content: &Value) -> bool {
+/// Whether a command ran through Justless: its output has a run footer, its
+/// labelled command is a `justless` binary at any path, or it is a bare
+/// `cat FILE` whose result is the outline the hooks substitute.
+fn routed(command: &str, label: &str, content: &Value) -> bool {
     if text_matches(content, &FOOTER) {
         return true;
     }
-    let invokes_justless = command.split(['&', '|', ';', '\n']).any(|segment| {
-        segment
-            .split_whitespace()
-            .next()
-            .is_some_and(|program| Path::new(program).file_name() == Some("justless".as_ref()))
-    });
+    let invokes_justless = label == "justless" || label.starts_with("justless ");
     let words: Vec<_> = command.split_whitespace().collect();
     let bare_cat = matches!(words.as_slice(), ["cat", file]
         if !file.starts_with('-') && !file.contains(|c: char| "|;&<>$`*?(){}[]!#~\\\"'".contains(c)));
@@ -221,7 +216,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
                         // Keep only the program and a known subcommand.
                         let words = crate::agents::command_label(&call.command);
                         let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
-                        let route = if routed(&call.command, content) {
+                        let route = if routed(&call.command, &label, content) {
                             Route::ThroughJustless
                         } else if crate::agents::would_route(&call.command) {
                             Route::SupportedNotRouted

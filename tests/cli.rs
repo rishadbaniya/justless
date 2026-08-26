@@ -3824,6 +3824,11 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
                         "let route = if text_contains(content, \"[justless run-\")",
                     ),
                     ("cat notes.txt", "revision is not an outline"),
+                    // A message line that starts with `justless` runs nothing.
+                    (
+                        "git commit -m \"fix(discover): labels\n\njustless now names runs\"",
+                        "[main 1a2b3c4] fix(discover): labels",
+                    ),
                 ],
             ),
         ],
@@ -3837,7 +3842,7 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
     assert!(output.status.success(), "{}", stderr(&output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["sessions"], 2);
-    assert_eq!(report["commands"], 10);
+    assert_eq!(report["commands"], 11);
     let labels = |route: &str| -> Vec<String> {
         report["groups"]
             .as_array()
@@ -3862,7 +3867,14 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
     assert_eq!(labels("passed_through"), ["cargo test ×1"]);
     assert_eq!(
         labels("not_supported"),
-        ["cat ×1", "mysql ×1", "other ×1", "sed ×1", "ssh ×1"]
+        [
+            "cat ×1",
+            "git commit ×1",
+            "mysql ×1",
+            "other ×1",
+            "sed ×1",
+            "ssh ×1"
+        ]
     );
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(!text.contains("secretdb") && !text.contains("prod-host"));
