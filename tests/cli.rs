@@ -3881,6 +3881,77 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
 }
 
 #[test]
+fn discover_counts_hook_routed_runs_by_their_short_footers() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let config = repo.path().join("claude");
+    // The footers that real hook-routed runs print for a failure and for clipped output.
+    let footer = |script: &str| {
+        let output = cli(&root, &["run", "--hook", "--", "sh", "-c", script]);
+        let text = stderr(&output);
+        let last = text.lines().last().unwrap_or_default().to_owned();
+        assert!(last.starts_with("[justless run-"), "{text}");
+        last
+    };
+    let failed = format!(
+        "test result: FAILED\n\n{}",
+        footer("echo 'test result: FAILED'; exit 101")
+    );
+    assert!(failed.ends_with(" · exit 101]"), "{failed}");
+    let clipped = format!("commit 1\n\n{}", footer("seq 1 20000"));
+    assert!(clipped.ends_with(" shown]"), "{clipped}");
+    write_transcripts(
+        &root,
+        &config,
+        &[(
+            "S.jsonl",
+            &[
+                ("cargo test", &failed),
+                ("git log", &clipped),
+                (
+                    "cargo build",
+                    "error[E0425]\n[justless run-Ab1 · 512 B of 9.0 KB shown · exit 2]",
+                ),
+                // Footer text inside a line or an unrelated bracket is not a footer.
+                ("git diff", "see [justless run-abc · exit 1] here"),
+                ("git status", "[justless run-abc · see the notes]"),
+            ],
+        )],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["discover", "--json"])
+        .current_dir(&root)
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let labels = |route: &str| -> Vec<String> {
+        report["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["route"] == route)
+            .map(|g| {
+                g["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| l["label"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        labels("through_justless"),
+        ["cargo build", "cargo test", "git log"]
+    );
+    assert_eq!(labels("supported_not_routed"), ["git diff", "git status"]);
+}
+
+#[test]
 fn history_orders_by_completion_and_skips_unreadable_records() {
     let repo = mixed_fixture();
     let root = repo.path();
