@@ -4131,3 +4131,82 @@ fn compaction_handoffs_stay_within_1800_bytes_with_their_introduction() {
         instructions.len()
     );
 }
+
+#[test]
+fn resume_keeps_room_for_the_last_pack_after_many_source_ranges() {
+    let repo = mixed_fixture();
+    let root = repo.path();
+    for n in 0..8 {
+        let script = format!("echo step {n} failed >&2; exit 1");
+        cli(root, &["run", "--", "sh", "-c", &script]);
+    }
+    let deep = "src/a_fairly_long_directory_name/another_nested_module_directory";
+    fs::create_dir_all(root.join(deep)).unwrap();
+    for n in 1..=40 {
+        let file = format!("{deep}/source_file_number_{n}.rs");
+        fs::write(
+            root.join(&file),
+            format!("pub fn f{n}() -> u32 {{\n    {n}\n}}\n"),
+        )
+        .unwrap();
+        success(root, &["code", &file, "--from", "1", "--to", "2"]);
+    }
+    success(root, &["pack", "Where is purchase_orders defined?"]);
+    let activity: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".justless/activity.json")).unwrap())
+            .unwrap();
+    let pack: Vec<_> = activity["last_pack"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|file| format!("Last pack: {file}"))
+        .collect();
+    assert!(!pack.is_empty(), "{activity}");
+
+    let handoff = agent_hook(
+        root,
+        "hook-claude",
+        "after-compact",
+        serde_json::json!({"hook_event_name":"SessionStart","source":"compact"}),
+    );
+    let handoff = handoff["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(handoff.len() <= 1800, "{} bytes", handoff.len());
+    for text in [success(root, &["resume"]), handoff] {
+        let lines: Vec<_> = text.lines().collect();
+        let reads: Vec<_> = lines.iter().filter(|l| l.starts_with("Read ")).collect();
+        // The newest ranges are kept, every last-pack file is listed after
+        // them, and the budget marker says older ranges were left out.
+        assert!(
+            reads.len() >= 3
+                && reads[0].ends_with("source_file_number_40.rs:1-2")
+                && pack.iter().all(|line| lines.contains(&line.as_str()))
+                && lines.last() == Some(&"[context budget reached]"),
+            "{text}"
+        );
+        let first_pack = lines.iter().position(|l| l.starts_with("Last pack: "));
+        let last_read = lines.iter().rposition(|l| l.starts_with("Read "));
+        assert!(first_pack > last_read, "{text}");
+    }
+
+    // A pack too long for half the space still leaves the other half to ranges.
+    let mut activity = activity;
+    activity["last_pack"] = (1..=40)
+        .map(|n| {
+            (
+                format!("{deep}/source_file_number_{n}.rs"),
+                "0".repeat(16).into(),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    fs::write(root.join(".justless/activity.json"), activity.to_string()).unwrap();
+    let resume = success(root, &["resume"]);
+    let count = |prefix: &str| resume.lines().filter(|l| l.starts_with(prefix)).count();
+    assert!(
+        count("Read ") >= 5 && count("Last pack: ") >= 5 && count("Last pack: ") < 40,
+        "{resume}"
+    );
+}

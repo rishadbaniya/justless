@@ -52,6 +52,13 @@ impl Report {
         }
     }
 
+    /// Bytes still available before the budget is reached. A line is kept
+    /// whole while it is shorter than this.
+    pub(crate) fn left(&self) -> usize {
+        self.cap
+            .saturating_sub(self.output.len() + Self::CLIPPED.len())
+    }
+
     pub(crate) fn into_string(mut self) -> String {
         if self.clipped {
             self.output.push_str(Self::CLIPPED);

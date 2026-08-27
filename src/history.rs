@@ -631,12 +631,36 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
             ));
         }
     }
-    // Activity keeps the 32 most recent ranges.
+    // Source ranges and the last pack share the space the runs leave. The pack
+    // keeps up to half of it, so neither list crowds out the other. A line that
+    // does not fit whole is left out, and files are hashed only while their
+    // lines can still fit.
+    let room = report.left();
+    let mut pack = Vec::new();
+    let mut pack_bytes = 0;
+    for (file, digest) in &activity.last_pack {
+        if pack_bytes >= room {
+            break;
+        }
+        let line = format!(
+            "Last pack: {file}{}",
+            if current(workspace, file, digest) {
+                ""
+            } else {
+                " [source changed]"
+            }
+        );
+        pack_bytes += line.len() + 1;
+        pack.push(line);
+    }
+    let reserve = pack_bytes.min(room / 2);
+    let mut dropped = pack.len() < activity.last_pack.len();
+    // Activity keeps the 32 most recent ranges, newest first.
     for read in activity.reads.iter().take(32) {
         if report.clipped {
             break;
         }
-        report.line(format!(
+        let line = format!(
             "Read {}:{}-{}{}",
             read.file,
             read.from,
@@ -646,21 +670,21 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
             } else {
                 " [source changed]"
             }
-        ));
-    }
-    for (file, digest) in &activity.last_pack {
-        report.line(format!(
-            "Last pack: {file}{}",
-            if current(workspace, file, digest) {
-                ""
-            } else {
-                " [source changed]"
-            }
-        ));
-        if report.clipped {
+        );
+        if line.len() + 1 + reserve > report.left() {
+            dropped = true;
             break;
         }
+        report.line(line);
     }
+    for line in pack {
+        if line.len() + 1 > report.left() {
+            dropped = true;
+            break;
+        }
+        report.line(line);
+    }
+    report.clipped |= dropped;
     if !has_runs && activity.reads.is_empty() && activity.last_pack.is_empty() {
         report.line("No recorded project activity yet.");
     }
