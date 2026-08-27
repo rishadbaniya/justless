@@ -499,6 +499,7 @@ fn rust_outline_signatures_skip_docs_and_attributes() {
     assert_eq!(
         ok(run(root, &["expand", "lib.rs", "fair_value"], b"")),
         function.as_bytes()
+    );
 }
 
 fn recall_id(stub: &Value) -> String {
@@ -927,7 +928,6 @@ fn edits_refuse_read_only_files_and_keep_links_and_attributes() {
             assert_eq!(fs::read_to_string(&tagged).unwrap(), "one\nTWO\n");
         }
     }
-}
 }
 
 fn mask_keeps_lone_surrogate_escapes_and_retires_other_results() {
