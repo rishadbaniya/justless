@@ -11,7 +11,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, lock_state, write_json};
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -354,23 +354,25 @@ impl Index {
             by_name: &index.by_name,
         };
         let mut seen = BTreeSet::new();
+        let mut resolved = Vec::new();
         for (unit, origin) in units.iter().zip(&origins) {
             for reference in &cache.files[&unit.file].syntax.references {
                 let from = reference.from.map(|id| origin + id);
-                if let Some((to, inferred)) = resolver.resolve(unit, from, reference)
-                    && seen.insert((from, to, unit.file.clone(), reference.line, reference.kind))
-                {
-                    index.edges.push(Edge {
-                        from,
-                        to,
-                        kind: reference.kind,
-                        inferred,
-                        location: Location {
-                            file: unit.file.clone(),
-                            start: reference.line,
-                            end: reference.line,
-                        },
-                    });
+                resolver.resolve(unit, from, reference, &mut resolved);
+                for &(to, kind, inferred) in &resolved {
+                    if seen.insert((from, to, unit.file.as_str(), reference.line, kind)) {
+                        index.edges.push(Edge {
+                            from,
+                            to,
+                            kind,
+                            inferred,
+                            location: Location {
+                                file: unit.file.clone(),
+                                start: reference.line,
+                                end: reference.line,
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -525,8 +527,62 @@ impl Index {
         id
     }
 
+    /// Selects one definition by name, qualified name, or `NAME@FILE:LINE` for
+    /// definitions that share a qualified name, such as cfg-gated twins.
     pub fn select(&self, name: &str) -> Result<usize> {
         let name = name.trim_start_matches("::");
+        if let Some((symbol, place)) = name.rsplit_once('@')
+            && let Some((file, line)) = place.rsplit_once(':')
+            && let Ok(line) = line.parse::<usize>()
+            && self.by_file.contains_key(file)
+        {
+            let here = Location {
+                file: file.to_owned(),
+                start: line,
+                end: line,
+            };
+            let selected = self.select_all(symbol);
+            return self
+                .at(&here)
+                .into_iter()
+                .find(|id| selected.contains(id))
+                .with_context(|| format!("symbol not found: {symbol} at {file}:{line}"));
+        }
+        let matches = self.select_all(name);
+        match matches.as_slice() {
+            [symbol] => Ok(*symbol),
+            [] => Err(anyhow!("symbol not found: {name}")),
+            many => {
+                let mut names = BTreeMap::<&str, usize>::new();
+                for &id in many {
+                    *names.entry(&self.definitions[id].qualified).or_default() += 1;
+                }
+                let mut locations = many
+                    .iter()
+                    .take(12)
+                    .map(|&id| {
+                        let definition = &self.definitions[id];
+                        let location = &definition.location;
+                        let selector = if names[definition.qualified.as_str()] > 1 {
+                            format!(
+                                " (select {}@{}:{})",
+                                definition.qualified, location.file, location.start
+                            )
+                        } else {
+                            String::new()
+                        };
+                        format!("  {} at {location}{selector}", definition.qualified)
+                    })
+                    .collect::<Vec<_>>();
+                if many.len() > 12 {
+                    locations.push(format!("  … and {} more", many.len() - 12));
+                }
+                Err(anyhow!("ambiguous symbol {name}\n{}", locations.join("\n")))
+            }
+        }
+    }
+
+    fn select_all(&self, name: &str) -> Vec<usize> {
         let suffix = format!("::{name}");
         let mut matches: Vec<_> = if name.contains("::") {
             self.definitions
@@ -542,22 +598,7 @@ impl Index {
         };
         let mut locations = BTreeSet::new();
         matches.retain(|&id| locations.insert(&self.definitions[id].location));
-        match matches.as_slice() {
-            [symbol] => Ok(*symbol),
-            [] => Err(anyhow!("symbol not found: {name}")),
-            many => {
-                let locations = many
-                    .iter()
-                    .take(12)
-                    .map(|&id| {
-                        let definition = &self.definitions[id];
-                        format!("  {} at {}", definition.qualified, definition.location)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                Err(anyhow!("ambiguous symbol {name}\n{locations}"))
-            }
-        }
+        matches
     }
 
     pub fn at(&self, location: &Location) -> Vec<usize> {
@@ -1068,14 +1109,70 @@ struct Resolver<'a> {
     by_name: &'a BTreeMap<String, Vec<usize>>,
 }
 
+/// Import hops one reference may follow. A glob such as `use super::*` spends a
+/// hop and can reach the imports of the module it names. A named import ends the chain.
+const IMPORT_HOPS: u8 = 3;
+
 impl Resolver<'_> {
+    /// Targets of one reference: its own target, or every definition that shares
+    /// that path (marked possible), plus the type that owns an enum variant or
+    /// associated item, such as `Status` in `Status::Open` or `Widget` in `Widget::new()`.
     fn resolve(
         &self,
         unit: &Unit,
         from: Option<usize>,
         reference: &Reference,
-    ) -> Option<(usize, bool)> {
+        resolved: &mut Vec<(usize, Kind, bool)>,
+    ) {
+        resolved.clear();
         let path = &reference.path;
+        if reference.inferred_receiver {
+            let Some(name) = path.first() else { return };
+            let candidates = self
+                .by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&id| self.definitions[id].kind == "method");
+            if let Some(id) = unique(candidates) {
+                resolved.push((id, reference.kind, true));
+            }
+            return;
+        }
+        if let Some(ids) = self.lookup(unit, from, reference, path) {
+            let inferred = ids.len() > 1;
+            resolved.extend(ids.iter().map(|&id| (id, reference.kind, inferred)));
+        }
+        if path.len() > 1
+            && let Some(ids) = self.lookup(unit, from, reference, &path[..path.len() - 1])
+        {
+            let kind = if reference.kind == Kind::Import {
+                Kind::Import
+            } else {
+                Kind::Reference
+            };
+            let inferred = ids.len() > 1;
+            resolved.extend(
+                ids.iter()
+                    .filter(|&&id| {
+                        matches!(
+                            self.definitions[id].kind.as_str(),
+                            "struct" | "enum" | "trait" | "type"
+                        )
+                    })
+                    .map(|&id| (id, kind, inferred)),
+            );
+        }
+    }
+
+    fn lookup(
+        &self,
+        unit: &Unit,
+        from: Option<usize>,
+        reference: &Reference,
+        path: &[String],
+    ) -> Option<&[usize]> {
         // Every resolution keeps the last segment, unless a single-segment path
         // is an import alias. Most unresolvable names (std items, locals) stop here.
         let last = path.last()?;
@@ -1086,16 +1183,6 @@ impl Resolver<'_> {
         }
         let namespace = unit.namespace();
         let module = joined(&unit.module, &reference.module);
-        if reference.inferred_receiver {
-            let name = path.first()?;
-            let candidates = self
-                .by_name
-                .get(name)?
-                .iter()
-                .copied()
-                .filter(|&id| self.definitions[id].kind == "method");
-            return unique(candidates).map(|id| (id, true));
-        }
         if let Some(from) = from
             && reference.kind != Kind::Import
             && path.len() == 1
@@ -1108,33 +1195,27 @@ impl Resolver<'_> {
                 .map(str::to_owned)
                 .collect();
             if definition.kind == "function"
-                && let Some(id) = self.exact(namespace, joined(&scope, path))
+                && let Some(ids) = self.exact(namespace, joined(&scope, path))
             {
-                return Some((id, false));
+                return Some(ids);
             }
             if scope.pop().is_some()
                 && scope.len() > module.len()
-                && let Some(id) = self.exact(namespace, joined(&scope, path))
+                && let Some(ids) = self.exact(namespace, joined(&scope, path))
             {
-                return Some((id, false));
+                return Some(ids);
             }
         }
-        if let Some(id) = self.resolve_path(
-            namespace,
-            &module,
-            from,
-            path,
-            reference.kind == Kind::Import,
-            0,
-        ) {
-            return Some((id, false));
-        }
-        None
+        let hops = if reference.kind == Kind::Import {
+            0
+        } else {
+            IMPORT_HOPS
+        };
+        self.resolve_path(namespace, &module, from, path, hops, 0)
     }
 
-    fn exact(&self, namespace: usize, path: Vec<String>) -> Option<usize> {
-        let matches = self.precise.get(&(namespace, path))?;
-        unique(matches.iter().copied())
+    fn exact(&self, namespace: usize, path: Vec<String>) -> Option<&[usize]> {
+        self.precise.get(&(namespace, path)).map(Vec::as_slice)
     }
 
     fn resolve_path(
@@ -1143,17 +1224,17 @@ impl Resolver<'_> {
         module: &[String],
         from: Option<usize>,
         path: &[String],
-        importing: bool,
+        hops: u8,
         depth: usize,
-    ) -> Option<usize> {
+    ) -> Option<&[usize]> {
         let (first, rest) = path.split_first()?;
         if depth >= 12 {
             return None;
         }
         match first.as_str() {
-            "crate" => return self.resolve_path(namespace, &[], None, rest, importing, depth + 1),
+            "crate" => return self.resolve_path(namespace, &[], None, rest, hops, depth + 1),
             "self" => {
-                return self.resolve_path(namespace, module, None, rest, importing, depth + 1);
+                return self.resolve_path(namespace, module, None, rest, hops, depth + 1);
             }
             "super" => {
                 return self.resolve_path(
@@ -1161,34 +1242,40 @@ impl Resolver<'_> {
                     module.split_last()?.1,
                     None,
                     rest,
-                    importing,
+                    hops,
                     depth + 1,
                 );
             }
             _ => {}
         }
-        if let Some(id) = self.exact(namespace, joined(module, path)) {
-            return Some(id);
+        if let Some(ids) = self.exact(namespace, joined(module, path)) {
+            return Some(ids);
         }
-        if !importing && let Some(bindings) = self.imports.get(&(namespace, module.to_vec())) {
-            let mut candidates = BTreeSet::new();
+        if hops > 0
+            && let Some(bindings) = self.imports.get(&(namespace, module.to_vec()))
+        {
+            let mut found: Option<&[usize]> = None;
+            let mut ambiguous = false;
             for binding in bindings
                 .iter()
                 .filter(|binding| binding.from.is_none() || binding.from == from)
             {
-                let expanded = match &binding.import.alias {
-                    Some(alias) if alias == first => joined(&binding.import.path, rest),
-                    None => joined(&binding.import.path, path),
+                let (expanded, hops) = match &binding.import.alias {
+                    Some(alias) if alias == first => (joined(&binding.import.path, rest), 0),
+                    None => (joined(&binding.import.path, path), hops - 1),
                     _ => continue,
                 };
-                if let Some(id) =
-                    self.resolve_path(namespace, module, from, &expanded, true, depth + 1)
+                if let Some(ids) =
+                    self.resolve_path(namespace, module, from, &expanded, hops, depth + 1)
                 {
-                    candidates.insert(id);
+                    match found {
+                        Some(previous) if previous != ids => ambiguous = true,
+                        _ => found = Some(ids),
+                    }
                 }
             }
-            if let Some(id) = unique(candidates.into_iter()) {
-                return Some(id);
+            if !ambiguous && let Some(ids) = found {
+                return Some(ids);
             }
         }
         let target = self.targets.get(namespace)?;
@@ -1199,7 +1286,7 @@ impl Resolver<'_> {
                     || self.targets[id].package == target.package
             }))
         })?;
-        self.resolve_path(library, &[], None, rest, false, depth + 1)
+        self.resolve_path(library, &[], None, rest, IMPORT_HOPS, depth + 1)
     }
 }
 

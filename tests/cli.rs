@@ -4295,3 +4295,134 @@ fn state_locks_time_out_with_a_message_and_reads_do_not_wait() {
     );
     drop(capture_lock);
 }
+
+fn write_files(root: &Path, files: &[(&str, &str)]) {
+    for (file, text) in files {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+}
+
+#[test]
+fn rust_references_follow_globs_variants_trait_uses_and_twins() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod a;\npub mod b;\npub mod twins;\n"),
+            (
+                "src/a.rs",
+                "pub struct Widget;\n\nimpl Widget {\n    pub fn new() -> Self {\n        Widget\n    }\n}\n\npub enum Status {\n    Open,\n    Closed(u32),\n}\n\npub trait Describe {\n    fn describe(&self) -> String;\n}\n",
+            ),
+            (
+                "src/b.rs",
+                "use crate::a::{Describe, Status, Widget};\n\npub fn build() -> Widget {\n    Widget::new()\n}\n\npub fn is_open(status: &Status) -> bool {\n    match status {\n        Status::Open => true,\n        Status::Closed(_) => false,\n    }\n}\n\npub fn closed() -> bool {\n    is_open(&Status::Closed(1))\n}\n\nimpl Describe for Widget {\n    fn describe(&self) -> String {\n        String::new()\n    }\n}\n\npub fn show<T: Describe>(item: &T) -> String {\n    item.describe()\n}\n\npub fn show_dyn(item: &dyn Describe) -> String {\n    item.describe()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn makes_widget() {\n        let _ = Widget::new();\n    }\n}\n",
+            ),
+            (
+                "src/twins.rs",
+                "#[cfg(unix)]\nfn tune(x: u32) -> u32 {\n    x + 1\n}\n\n#[cfg(not(unix))]\nfn tune(x: u32) -> u32 {\n    x\n}\n\npub fn run() -> u32 {\n    tune(1)\n}\n",
+            ),
+        ],
+    );
+    // `use super::*` reaches the item the parent module imported.
+    let callers = success(root, &["query", "Widget::new", "--view", "callers"]);
+    assert!(
+        callers.contains("call from demo::b::tests::makes_widget at src/b.rs:38"),
+        "{callers}"
+    );
+    let tests = success(root, &["query", "Widget::new", "--view", "tests"]);
+    assert!(tests.contains("demo::b::tests::makes_widget"), "{tests}");
+    // Variant uses and patterns count as references to their enum.
+    let status = success(root, &["query", "Status", "--view", "references"]);
+    for line in ["src/b.rs:9", "src/b.rs:10", "src/b.rs:15"] {
+        assert!(status.contains(line), "{line}: {status}");
+    }
+    assert!(
+        status.contains("demo::b::closed at src/b.rs:15"),
+        "{status}"
+    );
+    // An associated call credits its type as well as the method.
+    let widget = success(root, &["query", "Widget", "--view", "references"]);
+    assert!(widget.contains("demo::b::build at src/b.rs:4"), "{widget}");
+    // Trait impls, bounds and trait objects reference the trait.
+    let describe = success(root, &["query", "Describe", "--view", "references"]);
+    for line in [
+        "file scope at src/b.rs:18",
+        "demo::b::show at src/b.rs:24",
+        "demo::b::show_dyn at src/b.rs:28",
+    ] {
+        assert!(describe.contains(line), "{line}: {describe}");
+    }
+    // Twins that share a qualified name get copyable selectors, and calls to
+    // them stay visible as possible links.
+    let ambiguous = cli(root, &["query", "demo::twins::tune"]);
+    assert_eq!(ambiguous.status.code(), Some(2));
+    let message = stderr(&ambiguous);
+    assert!(
+        message.contains("(select demo::twins::tune@src/twins.rs:1)")
+            && message.contains("(select demo::twins::tune@src/twins.rs:6)"),
+        "{message}"
+    );
+    let second = success(
+        root,
+        &[
+            "query",
+            "demo::twins::tune@src/twins.rs:6",
+            "--view",
+            "callers",
+        ],
+    );
+    assert!(
+        second.starts_with("demo::twins::tune [function] at src/twins.rs:6-9\n")
+            && second.contains("possible call from demo::twins::run at src/twins.rs:12"),
+        "{second}"
+    );
+    let run = success(root, &["query", "run", "--view", "dependencies"]);
+    assert!(
+        run.contains("possible call → demo::twins::tune [function] at src/twins.rs:1-4")
+            && run.contains("possible call → demo::twins::tune [function] at src/twins.rs:6-9"),
+        "{run}"
+    );
+    let missing = cli(root, &["query", "demo::twins::tune@src/twins.rs:11"]);
+    assert!(
+        stderr(&missing).contains("symbol not found: demo::twins::tune at src/twins.rs:11"),
+        "{}",
+        stderr(&missing)
+    );
+}
+
+#[test]
+fn ambiguity_lists_say_how_many_candidates_they_leave_out() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let mut files = vec![(
+        "Cargo.toml".to_owned(),
+        "[package]\nname = \"many\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_owned(),
+    )];
+    let mut lib = String::new();
+    for module in 0..15 {
+        lib.push_str(&format!("pub mod m{module};\n"));
+        files.push((format!("src/m{module}.rs"), "pub struct Args;\n".to_owned()));
+    }
+    files.push(("src/lib.rs".to_owned(), lib));
+    let files: Vec<_> = files
+        .iter()
+        .map(|(file, text)| (file.as_str(), text.as_str()))
+        .collect();
+    write_files(root, &files);
+    let message = stderr(&cli(root, &["query", "Args"]));
+    assert_eq!(
+        message
+            .lines()
+            .filter(|line| line.contains(" at src/"))
+            .count(),
+        12
+    );
+    assert!(message.ends_with("  … and 3 more\n"), "{message}");
+}

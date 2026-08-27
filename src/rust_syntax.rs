@@ -380,6 +380,9 @@ impl<'ast> Visit<'ast> for Extractor {
                 })
             }
             Item::Impl(implementation) => {
+                if let Some((_, path, _)) = &implementation.trait_ {
+                    self.reference(path_parts(path), Kind::Reference, path.span(), false);
+                }
                 let previous =
                     std::mem::replace(&mut self.owner, type_path(&implementation.self_ty));
                 visit::visit_item_impl(self, implementation);
@@ -505,6 +508,43 @@ impl<'ast> Visit<'ast> for Extractor {
             self.reference(path_parts(&path.path), Kind::Reference, path.span(), false);
         }
         visit::visit_type_path(self, path);
+    }
+
+    // Bounds in generics and where clauses, supertraits, `dyn Trait` and `impl Trait`.
+    fn visit_trait_bound(&mut self, bound: &'ast syn::TraitBound) {
+        self.reference(
+            path_parts(&bound.path),
+            Kind::Reference,
+            bound.path.span(),
+            false,
+        );
+        visit::visit_trait_bound(self, bound);
+    }
+
+    // Variant and struct patterns, such as `Status::Open(code)` or `Point { x, .. }`.
+    // Plain path patterns already arrive through visit_expr_path.
+    fn visit_pat_tuple_struct(&mut self, pattern: &'ast syn::PatTupleStruct) {
+        if pattern.qself.is_none() {
+            self.reference(
+                path_parts(&pattern.path),
+                Kind::Reference,
+                pattern.path.span(),
+                false,
+            );
+        }
+        visit::visit_pat_tuple_struct(self, pattern);
+    }
+
+    fn visit_pat_struct(&mut self, pattern: &'ast syn::PatStruct) {
+        if pattern.qself.is_none() {
+            self.reference(
+                path_parts(&pattern.path),
+                Kind::Reference,
+                pattern.path.span(),
+                false,
+            );
+        }
+        visit::visit_pat_struct(self, pattern);
     }
 
     fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
