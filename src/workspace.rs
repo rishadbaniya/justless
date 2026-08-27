@@ -16,11 +16,22 @@ pub struct Location {
 
 impl std::fmt::Display for Location {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = display_path(&self.file);
         if self.start == self.end {
-            write!(formatter, "{}:{}", self.file, self.start)
+            write!(formatter, "{file}:{}", self.start)
         } else {
-            write!(formatter, "{}:{}-{}", self.file, self.start, self.end)
+            write!(formatter, "{file}:{}-{}", self.start, self.end)
         }
+    }
+}
+
+/// Quotes a name that contains control characters, such as a newline, so one
+/// result stays on one line. Other names are returned unchanged.
+pub fn display_path(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.chars().any(char::is_control) {
+        format!("{name:?}").into()
+    } else {
+        name.into()
     }
 }
 
@@ -136,10 +147,41 @@ impl Workspace {
             .canonicalize()
             .with_context(|| format!("open {file}"))?;
         ensure!(
-            canonical == path && canonical.is_file(),
+            (canonical == path || self.respelled(&path, &canonical)) && canonical.is_file(),
             "expected a workspace file: {file}"
         );
         Ok(canonical)
+    }
+
+    /// macOS file systems return the stored Unicode normalization of a name, so
+    /// the precomposed name Git prints can canonicalize to decomposed bytes.
+    /// Accept that difference when no component is a symlink and only accented
+    /// or other non-ASCII characters differ, so ASCII case still has to match.
+    fn respelled(&self, path: &Path, canonical: &Path) -> bool {
+        // Drop non-ASCII characters and any base letter a combining mark follows.
+        let ascii = |path: &Path| {
+            let text: Vec<char> = path.to_str()?.chars().collect();
+            Some(
+                text.iter()
+                    .enumerate()
+                    .filter(|&(at, c)| {
+                        c.is_ascii() && !text.get(at + 1).is_some_and(|&next| combining(next))
+                    })
+                    .map(|(_, c)| *c)
+                    .collect::<String>(),
+            )
+        };
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let mut current = self.root.clone();
+        canonical.starts_with(&self.root)
+            && ascii(path).is_some()
+            && ascii(path) == ascii(canonical)
+            && relative.components().all(|part| {
+                current.push(part);
+                fs::symlink_metadata(&current).is_ok_and(|meta| !meta.file_type().is_symlink())
+            })
     }
 
     pub fn relative_file(&self, path: &Path) -> Option<String> {
@@ -177,6 +219,13 @@ impl Workspace {
         );
         Ok(settings)
     }
+}
+
+fn combining(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x300..=0x36F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
+    )
 }
 
 pub fn private_dir(path: &Path) -> Result<()> {

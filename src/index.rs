@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::capture::source_digest;
 use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
-use crate::workspace::{Location, Workspace, lock_state, write_json};
+use crate::workspace::{Location, Workspace, display_path, lock_state, write_json};
 
 const VERSION: u32 = 6;
 
@@ -86,6 +86,8 @@ pub struct Refresh {
     pub parsed: usize,
     pub reused: usize,
     pub removed: usize,
+    /// Files left out of the index, with the reason, such as their size.
+    pub skipped: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,10 +141,10 @@ impl Index {
                 files: BTreeMap::new(),
             };
         }
-        let candidates = inputs(workspace)?;
+        let mut refresh = Refresh::default();
+        let candidates = inputs(workspace, &mut refresh.skipped)?;
         let mut manifests = BTreeMap::new();
         let mut found = BTreeSet::new();
-        let mut refresh = Refresh::default();
         let mut changed = rebuild;
         let mut parsers = Parsers::default();
         let max_bytes = workspace.settings()?.max_file_bytes;
@@ -150,12 +152,23 @@ impl Index {
             let Ok(path) = workspace.source_path(&file) else {
                 continue;
             };
+            // One unreadable file must not stop navigation for the whole project.
             let metadata = match path.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) => return Err(error).with_context(|| format!("stat {file}")),
+                Err(error) => {
+                    refresh.skipped.insert(file, format!("unreadable: {error}"));
+                    continue;
+                }
             };
             if metadata.len() > max_bytes {
+                refresh.skipped.insert(
+                    file,
+                    format!(
+                        "{} bytes, over max_file_bytes ({max_bytes})",
+                        metadata.len()
+                    ),
+                );
                 continue;
             }
             let stamp = file_stamp(&metadata);
@@ -178,7 +191,10 @@ impl Index {
             let bytes = match fs::read(path) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) => return Err(error).with_context(|| format!("read {file}")),
+                Err(error) => {
+                    refresh.skipped.insert(file, format!("unreadable: {error}"));
+                    continue;
+                }
             };
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 continue;
@@ -301,7 +317,7 @@ impl Index {
                     .map(|target| targets[target].name.as_str())
                     .unwrap_or("crate");
                 index.definitions.push(Definition {
-                    qualified: format!("{prefix}::{}", path.join("::")),
+                    qualified: display_path(&format!("{prefix}::{}", path.join("::"))).into_owned(),
                     kind: symbol.kind.clone(),
                     location: Location {
                         file: unit.file.clone(),
@@ -401,7 +417,7 @@ impl Index {
             let module = self.add_definition(
                 file,
                 Definition {
-                    qualified: file.clone(),
+                    qualified: display_path(file).into_owned(),
                     kind: "file".into(),
                     location: Location {
                         file: file.clone(),
@@ -420,7 +436,7 @@ impl Index {
                 let id = self.add_definition(
                     &tag.name,
                     Definition {
-                        qualified: format!("{file}::{}", tag.path),
+                        qualified: display_path(&format!("{file}::{}", tag.path)).into_owned(),
                         kind: tag.kind.clone(),
                         location: Location {
                             file: file.clone(),
@@ -553,7 +569,11 @@ impl Index {
         let matches = self.select_all(name);
         match matches.as_slice() {
             [symbol] => Ok(*symbol),
-            [] => Err(anyhow!("symbol not found: {name}")),
+            [] => Err(anyhow!(
+                "symbol not found: {name}{}",
+                self.skipped_note()
+                    .map_or_else(String::new, |note| format!("\n{note}"))
+            )),
             many => {
                 let mut names = BTreeMap::<&str, usize>::new();
                 for &id in many {
@@ -582,6 +602,19 @@ impl Index {
                 Err(anyhow!("ambiguous symbol {name}\n{}", locations.join("\n")))
             }
         }
+    }
+
+    /// Names files that were left out of the index, for a search that found nothing.
+    pub fn skipped_note(&self) -> Option<String> {
+        let skipped = &self.refresh.skipped;
+        let (file, reason) = skipped.iter().next()?;
+        let more = match skipped.len() {
+            1 => String::new(),
+            count => format!(" and {} more", count - 1),
+        };
+        Some(format!(
+            "Not indexed: {file} ({reason}){more}. Run justless index to list them."
+        ))
     }
 
     fn select_all(&self, name: &str) -> Vec<usize> {
@@ -761,7 +794,10 @@ fn import_target<'a>(
     }
 }
 
-fn inputs(workspace: &Workspace) -> Result<BTreeSet<String>> {
+fn inputs(
+    workspace: &Workspace,
+    skipped: &mut BTreeMap<String, String>,
+) -> Result<BTreeSet<String>> {
     let mut patterns = ignore::gitignore::GitignoreBuilder::new(&workspace.root);
     let project_ignores = workspace.root.join(".justlessignore");
     if project_ignores.is_file()
@@ -775,9 +811,12 @@ fn inputs(workspace: &Workspace) -> Result<BTreeSet<String>> {
         .ancestors()
         .any(|path| path.join(".git").exists())
     {
+        // `-t` tags untracked files with `?`, so a tracked `src/target/` module
+        // is indexed while an unignored build directory is not.
         let output = workspace.git(&[
             "ls-files",
             "-z",
+            "-t",
             "--cached",
             "--others",
             "--exclude-standard",
@@ -790,11 +829,14 @@ fn inputs(workspace: &Workspace) -> Result<BTreeSet<String>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
         return Ok(nul_paths(&output.stdout)
+            .filter_map(|record| {
+                let (tag, file) = record.split_at_checked(2)?;
+                is_input(file, tag != "? ").then_some(file)
+            })
             .filter(|file| {
-                is_input(file)
-                    && !project_ignores
-                        .matched_path_or_any_parents(file, false)
-                        .is_ignore()
+                !project_ignores
+                    .matched_path_or_any_parents(file, false)
+                    .is_ignore()
             })
             .map(str::to_owned)
             .collect());
@@ -811,15 +853,48 @@ fn inputs(workspace: &Workspace) -> Result<BTreeSet<String>> {
         })
         .build()
     {
-        let entry = entry?;
+        // An unreadable directory leaves out its own files, not the project.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = walk_error_path(&error)
+                    .and_then(|path| path.strip_prefix(&workspace.root).ok())
+                    .and_then(Path::to_str)
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or(".");
+                // The walker wraps the OS error in messages that repeat the path.
+                let code = std::iter::successors(
+                    error.io_error().map(|io| io as &dyn std::error::Error),
+                    |inner| inner.source(),
+                )
+                .find_map(|inner| inner.downcast_ref::<std::io::Error>()?.raw_os_error());
+                let reason = code.map_or_else(
+                    || error.to_string(),
+                    |code| std::io::Error::from_raw_os_error(code).to_string(),
+                );
+                skipped.insert(path.to_owned(), format!("unreadable: {reason}"));
+                continue;
+            }
+        };
         if entry.file_type().is_some_and(|kind| kind.is_file())
             && let Some(file) = entry.path().strip_prefix(&workspace.root)?.to_str()
-            && is_input(file)
+            && is_input(file, false)
         {
             files.insert(file.to_owned());
         }
     }
     Ok(files)
+}
+
+fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        _ => None,
+    }
 }
 
 fn excluded(name: &str) -> bool {
@@ -829,13 +904,16 @@ fn excluded(name: &str) -> bool {
     )
 }
 
-fn is_input(file: &str) -> bool {
+/// Tracked files may live under a directory named `target`, such as a Rust
+/// `mod target;`. Build output under that name is untracked.
+fn is_input(file: &str, tracked: bool) -> bool {
     let path = Path::new(file);
     !path
         .parent()
         .into_iter()
         .flat_map(Path::components)
-        .any(|part| excluded(&part.as_os_str().to_string_lossy()))
+        .map(|part| part.as_os_str().to_string_lossy())
+        .any(|part| excluded(&part) && !(tracked && part == "target"))
 }
 
 fn is_rust(file: &str) -> bool {

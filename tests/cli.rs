@@ -1054,7 +1054,12 @@ fn non_rust_diagnostics_and_project_budgets_work() {
     assert!(success(root, &["find", "new marker"]).contains("docs/operations.md"));
     assert!(!success(root, &["find", "old marker"]).contains("docs/operations.md"));
     fs::write(&docs, "new marker".repeat(120)).unwrap();
-    assert!(!success(root, &["find", "new marker"]).contains("docs/operations.md"));
+    let oversized = success(root, &["find", "new marker"]);
+    assert!(
+        !oversized.contains("docs/operations.md:1:")
+            && oversized.contains("Not indexed: docs/operations.md (1200 bytes"),
+        "{oversized}"
+    );
 }
 
 #[test]
@@ -4472,5 +4477,185 @@ fn sql_writes_and_schema_qualified_tables_link_by_short_name() {
             && ambiguous.contains("billing.sql::billing.event_log at billing.sql:1")
             && ambiguous.contains("schema.sql::audit.event_log at schema.sql:2"),
         "{ambiguous}"
+    );
+}
+
+fn git_repository(root: &Path) {
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"],
+        &[
+            "-c",
+            "user.name=Justless Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?} {}", stderr(&output));
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_files_and_directories_are_skipped_and_reported() {
+    for git in [true, false] {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        write_files(
+            root,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"visible\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", "pub fn visible_fn() {} // VISIBLE_NEEDLE\n"),
+                ("secret/a.rs", "pub fn hidden() {}\n"),
+            ],
+        );
+        if git {
+            git_repository(root);
+        }
+        fs::write(root.join("locked.rs"), "pub fn locked() {}\n").unwrap();
+        set_mode(&root.join("locked.rs"), 0o000);
+        set_mode(&root.join("secret"), 0o000);
+        // Permissions do not apply to root, so the test has nothing to show there.
+        let enforced = fs::read(root.join("locked.rs")).is_err();
+        let found = cli(root, &["find", "VISIBLE_NEEDLE"]);
+        let query = cli(root, &["query", "visible_fn"]);
+        let index = cli(root, &["index"]);
+        let missing = cli(root, &["query", "locked"]);
+        set_mode(&root.join("secret"), 0o755);
+        set_mode(&root.join("locked.rs"), 0o644);
+        if !enforced {
+            continue;
+        }
+        assert!(found.status.success(), "{git}: {}", stderr(&found));
+        assert!(stdout(&found).contains("src/lib.rs:1: pub fn visible_fn()"));
+        assert!(query.status.success(), "{git}: {}", stderr(&query));
+        assert!(index.status.success(), "{git}: {}", stderr(&index));
+        let skipped = stderr(&index);
+        assert!(
+            skipped.contains("locked.rs: not indexed, unreadable: Permission denied"),
+            "{git}: {skipped}"
+        );
+        if !git {
+            assert!(
+                skipped.contains("secret: not indexed, unreadable: Permission denied"),
+                "{skipped}"
+            );
+        }
+        assert!(
+            stderr(&missing).contains("symbol not found: locked\nNot indexed: "),
+            "{git}: {}",
+            stderr(&missing)
+        );
+    }
+}
+
+#[test]
+fn tracked_target_modules_are_indexed_and_oversized_files_are_reported() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let filler: String = (0..40_000)
+        .map(|line| format!("// filler {line:06} {}\n", "x".repeat(50)))
+        .collect();
+    let big = format!("pub fn huge_fn() {{}}\n{filler}");
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"skip\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod target;\npub mod big;\npub fn top() { target::aim(); }\n",
+            ),
+            ("src/target/mod.rs", "pub fn aim() {}\n"),
+            ("src/big.rs", &big),
+        ],
+    );
+    git_repository(root);
+    // Untracked build output under target/ stays out of the index.
+    write_files(
+        root,
+        &[("target/debug/build.rs", "pub fn generated() {}\n")],
+    );
+    let aim = success(root, &["query", "aim", "--view", "callers"]);
+    assert!(
+        aim.starts_with("skip::target::aim [function] at src/target/mod.rs:1\n")
+            && aim.contains("call from skip::top at src/lib.rs:3"),
+        "{aim}"
+    );
+    assert!(success(root, &["find", "pub fn aim"]).contains("src/target/mod.rs:1: pub fn aim"));
+    assert!(stderr(&cli(root, &["query", "generated"])).contains("symbol not found"));
+    let index = cli(root, &["index"]);
+    assert!(
+        stderr(&index)
+            .contains("src/big.rs: not indexed, 2720020 bytes, over max_file_bytes (2097152)"),
+        "{}",
+        stderr(&index)
+    );
+    let missing = stderr(&cli(root, &["query", "huge_fn"]));
+    assert!(
+        missing.contains("symbol not found: huge_fn\nNot indexed: src/big.rs (2720020 bytes"),
+        "{missing}"
+    );
+    let text = success(root, &["find", "pub fn huge_fn"]);
+    assert!(
+        text.starts_with("No matching indexed text.\nNot indexed: src/big.rs"),
+        "{text}"
+    );
+}
+
+#[test]
+fn unusual_file_names_stay_searchable_and_on_one_line() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let decomposed = "src/re\u{301}sume\u{301}.rs";
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"n\"\nversion = \"0.1.0\"\n",
+            ),
+            (decomposed, "pub fn token_nfd() {} // NEEDLE_NFD\n"),
+        ],
+    );
+    git_repository(root);
+    // Git may print the precomposed name while the file system stores the
+    // decomposed one. Either way the file is indexed and readable by that name.
+    let found = success(root, &["find", "NEEDLE_NFD"]);
+    let listed = found.split(':').next().unwrap().to_owned();
+    assert!(found.contains(":1: pub fn token_nfd()"), "{found}");
+    assert!(success(root, &["query", "token_nfd"]).contains(&listed));
+    assert!(success(root, &["read", &listed]).contains("NEEDLE_NFD"));
+    fs::write(
+        root.join("src/a\nb.rs"),
+        "pub fn nl_fn() {}\n// NEEDLE_NL\n",
+    )
+    .unwrap();
+    assert_eq!(
+        success(root, &["find", "NEEDLE_NL"]),
+        "\"src/a\\nb.rs\":2: // NEEDLE_NL\n"
+    );
+    assert!(
+        success(root, &["query", "nl_fn"])
+            .starts_with("\"crate::src::a\\nb::nl_fn\" [function] at \"src/a\\nb.rs\":1\n")
     );
 }

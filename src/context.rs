@@ -9,7 +9,7 @@ use regex::Regex;
 use crate::capture;
 use crate::index::{Definition, Fingerprint, Index, is_call, nul_paths};
 use crate::rust_syntax::Kind;
-use crate::workspace::{Location, Workspace};
+use crate::workspace::{Location, Workspace, display_path};
 
 static HUNK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("Git hunk pattern")
@@ -225,7 +225,12 @@ pub fn find(
                 let end = line.floor_char_boundary(
                     (position + term.len()).saturating_add(180).min(line.len()),
                 );
-                report.line(format!("{file}:{}: {}", offset + 1, &line[start..end]));
+                report.line(format!(
+                    "{}:{}: {}",
+                    display_path(file),
+                    offset + 1,
+                    &line[start..end]
+                ));
                 matches += 1;
                 if matches == limit || report.clipped {
                     break 'files;
@@ -235,6 +240,9 @@ pub fn find(
     }
     if matches == 0 {
         report.line("No matching indexed text.");
+        if let Some(note) = index.skipped_note() {
+            report.line(note);
+        }
     }
     report.finish()
 }
@@ -245,7 +253,7 @@ pub fn code(workspace: &Workspace, file: &str, from: usize, to: usize, cap: usiz
         "expected a positive, ordered line range"
     );
     let mut report = Report::new(cap);
-    report.line(format!("{file}:{from}-{to}"));
+    report.line(format!("{}:{from}-{to}", display_path(file)));
     snippet(workspace, file, from, to, &mut report)?;
     report.finish()
 }
@@ -487,7 +495,8 @@ fn at_location(
     if definition.declaration < from && !report.clipped {
         report.line(format!(
             "  Declaration starts at {}:{}",
-            location.file, definition.declaration
+            display_path(&location.file),
+            definition.declaration
         ));
     }
     Ok(())

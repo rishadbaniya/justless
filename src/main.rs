@@ -433,6 +433,9 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             for (file, error) in index.errors {
                 eprintln!("{file}: {error}");
             }
+            for (file, reason) in &index.refresh.skipped {
+                eprintln!("{file}: not indexed, {reason}");
+            }
         }
         ("query", sub) => {
             let index = Index::open(&workspace)?;

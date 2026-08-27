@@ -30,7 +30,7 @@
 
 ## Indexing and languages
 
-Queries refresh the index automatically. Justless compares file identity and high-resolution timestamps where available, hashes files that need closer inspection, reuses parsed facts for unchanged content, and removes deleted files. In a Git checkout it uses tracked and unignored files. Add patterns to `.justlessignore` for repo-specific exclusions.
+Queries refresh the index automatically. Justless compares file identity and high-resolution timestamps where available, hashes files that need closer inspection, reuses parsed facts for unchanged content, and removes deleted files. In a Git checkout it uses tracked and unignored files. Files under version-control and dependency directories such as `node_modules`, `.venv` and `__pycache__` are left out, as are untracked files under `target`. Add patterns to `.justlessignore` for repo-specific exclusions. Files larger than `max_file_bytes` and files or directories Justless cannot read are skipped without stopping the index. `justless index` lists them on stderr, and a `query` or `find` that finds nothing names them. A file name that contains a control character, such as a newline, is printed as a quoted string with escapes.
 
 Structured navigation supports Rust, JavaScript, TypeScript and TSX, Python, Go, Java, Kotlin, Scala, C, C++, C#, Swift, Dart, Ruby, PHP, Lua, Zig, Bash, SQL, and HCL, including Terraform. The available symbols and relationships vary by language. Calls across implicit imports, framework discovery, dynamic dispatch, and macro expansion can require source verification. Use `find` for any indexed UTF-8 text file. When source has changed since a recorded run, Justless preserves the original log location and flags the mismatch.
 
