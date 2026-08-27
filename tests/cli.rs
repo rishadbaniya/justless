@@ -4790,3 +4790,47 @@ fn context_and_find_state_their_limits() {
         "{message}"
     );
 }
+
+#[test]
+fn packs_rank_names_that_cover_the_question_above_single_word_matches() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"market\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod book;\npub mod signing;\n"),
+            (
+                "src/book.rs",
+                "pub struct OrderBook {\n    pub bids: Vec<(u64, f64)>,\n}\n\n/// Applies one level delta to the order book.\npub fn update_order_book(book: &mut OrderBook, price: u64, size: f64) {\n    book.bids.retain(|(p, _)| *p != price);\n    if size > 0.0 {\n        book.bids.push((price, size));\n    }\n}\n",
+            ),
+            (
+                "src/signing.rs",
+                "pub struct Order {\n    pub id: u64,\n}\n\npub fn sign(order: &Order) -> u64 {\n    order.id * 31\n}\n\npub struct Event;\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn order() -> Order {\n        Order { id: 1 }\n    }\n\n    #[test]\n    fn signs() {\n        assert_eq!(sign(&order()), 31);\n    }\n}\n",
+            ),
+            ("schema.sql", "CREATE TABLE internal_event (id INT);\n"),
+        ],
+    );
+    let pack = success(root, &["pack", "where is the order book updated?"]);
+    let leads: Vec<_> = pack.lines().filter(|line| !line.starts_with(' ')).collect();
+    assert!(
+        leads[0].starts_with("market::book::update_order_book [function]")
+            && leads[1].starts_with("market::book::OrderBook [struct]"),
+        "{pack}"
+    );
+    assert!(
+        !pack.contains("market::signing::tests::order [function]"),
+        "{pack}"
+    );
+    // A name typed as code outranks names that share one of its parts.
+    let rename = success(root, &["pack", "What breaks if I rename internal_event?"]);
+    assert!(
+        rename.starts_with("schema.sql::internal_event [table]")
+            && !rename.contains("Event [struct]"),
+        "{rename}"
+    );
+    assert!(success(root, &["pack", "OrderBook"]).starts_with("market::book::OrderBook [struct]"));
+}

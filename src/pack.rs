@@ -53,6 +53,32 @@ fn terms(text: &str) -> BTreeSet<String> {
                     | "failing"
                     | "failed"
                     | "failure"
+                    | "is"
+                    | "it"
+                    | "in"
+                    | "on"
+                    | "of"
+                    | "to"
+                    | "by"
+                    | "be"
+                    | "do"
+                    | "an"
+                    | "as"
+                    | "at"
+                    | "or"
+                    | "if"
+                    | "we"
+                    | "my"
+                    | "me"
+                    | "has"
+                    | "have"
+                    | "been"
+                    | "there"
+                    | "they"
+                    | "its"
+                    | "who"
+                    | "should"
+                    | "could"
             )
         {
             continue;
@@ -77,6 +103,51 @@ fn terms(text: &str) -> BTreeSet<String> {
         }
     }
     result
+}
+
+/// A light stem so that `updated`, `updates` and `update` meet, as do
+/// `applied` and `apply`.
+fn stem(word: &str) -> String {
+    let long = |base: &&str| base.len() >= 3;
+    let base = word
+        .strip_suffix("ing")
+        .filter(long)
+        .or_else(|| word.strip_suffix("ed").filter(long))
+        .or_else(|| {
+            word.strip_suffix("es")
+                .filter(|base| long(base) && base.ends_with(['s', 'x', 'h']))
+        })
+        .or_else(|| {
+            word.strip_suffix('s')
+                .filter(|base| long(base) && !base.ends_with('s'))
+        })
+        .unwrap_or(word);
+    let base = base.strip_suffix('e').filter(long).unwrap_or(base);
+    match base.strip_suffix('y') {
+        Some(root) if root.len() >= 3 => format!("{root}i"),
+        _ => base.to_owned(),
+    }
+}
+
+/// Words the task spells like code: snake_case, camelCase, a capitalized word
+/// after the first, or a task that is a single name.
+fn identifiers(task: &str) -> BTreeSet<String> {
+    let tokens: Vec<&str> = task
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|token| !token.is_empty())
+        .collect();
+    let single = tokens.len() == 1;
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|&(at, token)| {
+            single
+                || token.contains('_')
+                || token.chars().skip(1).any(char::is_uppercase)
+                || (at > 0 && token.starts_with(char::is_uppercase))
+        })
+        .map(|(_, token)| token.to_lowercase())
+        .collect()
 }
 
 fn changed_files(workspace: &Workspace) -> BTreeSet<String> {
@@ -225,14 +296,50 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
     let failure_task = ["fail", "error", "panic", "diagnos", "regress"]
         .iter()
         .any(|term| question.contains(term));
+    // A definition ranks by the task words its name covers, weighted by how few
+    // names share each word, so `update_order_book` outranks `Order` for "where
+    // is the order book updated?". A name the task spells as code ranks first.
+    let stems: BTreeSet<String> = words.iter().map(|word| stem(word)).collect();
+    let code_names = identifiers(task);
+    let names: Vec<(&str, BTreeSet<String>)> = index
+        .definitions
+        .iter()
+        .map(|def| {
+            let name = def.qualified.rsplit("::").next().unwrap_or(&def.qualified);
+            let parts = terms(name)
+                .iter()
+                .map(|part| stem(part))
+                .filter(|part| stems.contains(part))
+                .collect();
+            (name, parts)
+        })
+        .collect();
+    let mut frequency = BTreeMap::<&str, usize>::new();
+    for (_, parts) in &names {
+        for part in parts {
+            *frequency.entry(part.as_str()).or_default() += 1;
+        }
+    }
+    let total = index.definitions.len().max(1);
+    let weight = |part: &str| {
+        let shared = frequency.get(part).copied().unwrap_or(0) + 1;
+        1 + ((total / shared).max(1).ilog2() as usize).min(5)
+    };
     let mut ranks = BTreeMap::new();
-    for (id, def) in index.definitions.iter().enumerate() {
-        let name = def.qualified.rsplit("::").next().unwrap_or(&def.qualified);
-        let exact = words.contains(&name.to_lowercase());
-        let parts = terms(name);
-        let hits = parts.intersection(&words).count();
+    for (id, (def, (name, parts))) in index.definitions.iter().zip(&names).enumerate() {
+        let lower = name.to_lowercase();
+        let container = matches!(def.kind.as_str(), "module" | "file");
+        let exact = if code_names.contains(&lower) {
+            400
+        } else if words.contains(&lower) {
+            16 * weight(&stem(&lower))
+        } else {
+            0
+        } / if container { 2 } else { 1 };
+        let covered: usize = parts.iter().map(|part| 16 * weight(part)).sum();
+        let breadth = 40 * parts.len().saturating_sub(1);
         let file_hits = terms(&def.location.file).intersection(&words).count();
-        let mut score = usize::from(exact) * 200 + hits * 16 + file_hits * 3;
+        let mut score = exact + covered + breadth + file_hits * 3;
         if score > 0 || (changes.contains(&def.location.file) && question.contains("chang")) {
             score += usize::from(changes.contains(&def.location.file)) * 4;
             ranks.insert(id, score);
