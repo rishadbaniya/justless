@@ -4426,3 +4426,51 @@ fn ambiguity_lists_say_how_many_candidates_they_leave_out() {
     );
     assert!(message.ends_with("  … and 3 more\n"), "{message}");
 }
+
+#[test]
+fn sql_writes_and_schema_qualified_tables_link_by_short_name() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            (
+                "schema.sql",
+                "CREATE TABLE events (id INT);\nCREATE TABLE audit.event_log (id INT);\n",
+            ),
+            (
+                "writes.sql",
+                "INSERT INTO events (id) VALUES (1);\nDELETE FROM events WHERE id = 1;\nUPDATE events SET id = 2;\nSELECT id FROM events;\nALTER TABLE events ADD COLUMN name TEXT;\nDROP TABLE events;\n",
+            ),
+            (
+                "app.py",
+                "def save(db):\n    db.execute(\"INSERT INTO events (id) VALUES (1)\")\n    return db.execute(\"SELECT id FROM event_log\")\n",
+            ),
+        ],
+    );
+    let events = success(root, &["query", "events", "--view", "references"]);
+    for line in 1..=6 {
+        assert!(
+            events.contains(&format!("from writes.sql at writes.sql:{line}\n")),
+            "{line}: {events}"
+        );
+    }
+    assert!(events.contains("from app.py::save at app.py:2"), "{events}");
+    let log = success(root, &["query", "event_log", "--view", "references"]);
+    assert!(
+        log.starts_with("schema.sql::audit.event_log [table] at schema.sql:2\n")
+            && log.contains("possible SQL relation from app.py::save at app.py:3"),
+        "{log}"
+    );
+    write_files(
+        root,
+        &[("billing.sql", "CREATE TABLE billing.event_log (id INT);\n")],
+    );
+    let ambiguous = stderr(&cli(root, &["query", "event_log"]));
+    assert!(
+        ambiguous.contains("ambiguous symbol event_log")
+            && ambiguous.contains("billing.sql::billing.event_log at billing.sql:1")
+            && ambiguous.contains("schema.sql::audit.event_log at schema.sql:2"),
+        "{ambiguous}"
+    );
+}

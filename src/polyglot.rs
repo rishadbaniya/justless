@@ -34,6 +34,11 @@ const SQL_TAGS: &str = "
 (create_table (object_reference) @name) @definition.table
 (create_view (object_reference) @name) @definition.view
 (relation (object_reference) @name) @reference.table
+(insert (object_reference) @name) @reference.table
+(from (object_reference) @name) @reference.table
+(alter_table (object_reference) @name) @reference.table
+(drop_table (object_reference) @name) @reference.table
+(create_index (object_reference) @name) @reference.table
 ";
 
 // Member patterns are anchored to a type body or the file so that locals

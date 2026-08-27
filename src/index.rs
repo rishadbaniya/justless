@@ -436,6 +436,8 @@ impl Index {
                     tables.entry(&tag.name).or_default().push(id);
                     if let Some((_, short)) = tag.name.rsplit_once('.') {
                         tables.entry(short).or_default().push(id);
+                        // Queries may name a schema-qualified table by its short name.
+                        self.by_name.entry(short.to_owned()).or_default().push(id);
                     }
                 }
             }

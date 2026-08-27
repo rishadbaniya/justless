@@ -38,6 +38,8 @@ Related tests come from each ecosystem's conventions: `#[test]` functions in Rus
 
 Rust references to a type include enum variant uses and patterns such as `Status::Open`, associated items such as `Widget::new()`, trait impls, generic bounds, where clauses, `dyn` and `impl` trait uses. Glob imports such as `use super::*` resolve through the items the parent module imports. Definitions that share a qualified name, such as cfg-gated twins or an inherent method and a trait method of the same name, each receive the calls as possible relationships. `query`, `path` and `context --symbol` accept `NAME@FILE:LINE` to select one of them, and the ambiguity error prints that selector for each twin. An ambiguity error lists 12 candidates and counts the rest.
 
+SQL tables and views are linked from the statements that read or write them: `SELECT` and `JOIN` sources, `UPDATE`, `INSERT INTO`, `DELETE FROM`, `ALTER TABLE`, `DROP TABLE` and `CREATE INDEX … ON`. Queries in string literals of the other parsed languages are linked the same way. These links are possible relationships. A schema-qualified table such as `audit.event_log` can also be queried by its short name, `event_log`.
+
 HCL files index top-level blocks by their Terraform address, such as `aws_s3_bucket.logs`, `data.aws_iam_policy_document.read`, `var.region`, `module.vpc` and `output.bucket_arn`. Each `locals` entry is indexed as `local.NAME`. Expressions that use an address become references, so `justless query var.region --view references` lists its uses. References to a block in another file are possible links. An address defined in more than one indexed module is ambiguous, so its references stay unlinked.
 
 ## Repository map and change impact
