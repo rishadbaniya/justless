@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
@@ -123,9 +123,12 @@ impl Index {
     pub fn open(workspace: &Workspace) -> Result<Self> {
         workspace.prepare_state()?;
         let path = workspace.state.join("index.json");
-        let _guard = lock_state(&workspace.state.join("index.lock"))?;
-        let mut cache: Cache = match File::open(&path) {
-            Ok(file) => serde_json::from_reader(file).unwrap_or_default(),
+        // Writers replace the cache with an atomic rename, and every entry is
+        // checked against its file before reuse, so reading needs no lock.
+        // Read the whole cache at once: serde_json pulls an unbuffered reader one
+        // byte per read(2), which made a 20 MB cache cost seconds of system time.
+        let mut cache: Cache = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(error) if error.kind() == ErrorKind::NotFound => Cache::default(),
             Err(error) => return Err(error).context("open source index"),
         };
@@ -238,9 +241,12 @@ impl Index {
             false
         });
         if changed {
-            write_json(&path, &cache)?;
+            // A writer that cannot get the lock still answers from what it parsed.
+            match lock_state(&workspace.state.join("index.lock")) {
+                Ok(_guard) => write_json(&path, &cache)?,
+                Err(error) => eprintln!("justless: index cache not saved: {error:#}"),
+            }
         }
-        drop(_guard);
         Ok(Self::assemble(cache, &manifests, refresh))
     }
 
@@ -281,7 +287,7 @@ impl Index {
             incoming: Vec::new(),
             outgoing: Vec::new(),
         };
-        let mut precise = BTreeMap::<(usize, Vec<String>), Vec<usize>>::new();
+        let mut precise = HashMap::<(usize, Vec<String>), Vec<usize>>::new();
         let mut origins = Vec::new();
         for unit in &units {
             let parsed = &cache.files[&unit.file];
@@ -318,7 +324,7 @@ impl Index {
             }
         }
 
-        let mut imports = BTreeMap::<(usize, Vec<String>), Vec<Binding>>::new();
+        let mut imports = HashMap::<(usize, Vec<String>), Vec<Binding>>::new();
         for (unit, origin) in units.iter().zip(&origins) {
             for import in &cache.files[&unit.file].syntax.imports {
                 let module = joined(&unit.module, &import.module);
@@ -335,6 +341,11 @@ impl Index {
             }
         }
         let resolver = Resolver {
+            aliases: imports
+                .values()
+                .flatten()
+                .filter_map(|binding| binding.import.alias.as_deref())
+                .collect(),
             precise,
             imports,
             package_libraries,
@@ -1048,8 +1059,9 @@ struct Binding<'a> {
 }
 
 struct Resolver<'a> {
-    precise: BTreeMap<(usize, Vec<String>), Vec<usize>>,
-    imports: BTreeMap<(usize, Vec<String>), Vec<Binding<'a>>>,
+    aliases: BTreeSet<&'a str>,
+    precise: HashMap<(usize, Vec<String>), Vec<usize>>,
+    imports: HashMap<(usize, Vec<String>), Vec<Binding<'a>>>,
     package_libraries: BTreeMap<String, Vec<usize>>,
     targets: &'a [Target],
     definitions: &'a [Definition],
@@ -1063,8 +1075,16 @@ impl Resolver<'_> {
         from: Option<usize>,
         reference: &Reference,
     ) -> Option<(usize, bool)> {
-        let namespace = unit.namespace();
         let path = &reference.path;
+        // Every resolution keeps the last segment, unless a single-segment path
+        // is an import alias. Most unresolvable names (std items, locals) stop here.
+        let last = path.last()?;
+        if !self.by_name.contains_key(last)
+            && (path.len() > 1 || !self.aliases.contains(last.as_str()))
+        {
+            return None;
+        }
+        let namespace = unit.namespace();
         let module = joined(&unit.module, &reference.module);
         if reference.inferred_receiver {
             let name = path.first()?;

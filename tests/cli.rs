@@ -4210,3 +4210,88 @@ fn resume_keeps_room_for_the_last_pack_after_many_source_ranges() {
         "{resume}"
     );
 }
+
+fn warm_index_reads_its_cache_in_bulk() {
+    let root = fixture();
+    let path = root.path();
+    assert!(success(path, &["index"]).contains("4 parsed"));
+    // Trailing whitespace leaves the cache valid. Reading it one byte per
+    // system call took several seconds at this size; a bulk read takes well under one.
+    let cache = path.join(".justless/index.json");
+    let mut file = fs::OpenOptions::new().append(true).open(&cache).unwrap();
+    file.write_all(&vec![b' '; 32 << 20]).unwrap();
+    drop(file);
+    let started = std::time::Instant::now();
+    let warm = success(path, &["index"]);
+    let elapsed = started.elapsed();
+    assert!(warm.contains("0 parsed · 4 reused"), "{warm}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "warm index took {elapsed:?}"
+    );
+}
+
+#[test]
+fn state_locks_time_out_with_a_message_and_reads_do_not_wait() {
+    let root = fixture();
+    let path = root.path();
+    fs::create_dir_all(path.join(".justless")).unwrap();
+    let hold = |name: &str| {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.join(".justless").join(name))
+            .unwrap();
+        file.lock().unwrap();
+        file
+    };
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(args)
+            .current_dir(path)
+            .env("JUSTLESS_LOCK_TIMEOUT", "1.5")
+            .output()
+            .unwrap()
+    };
+    let index_lock = hold("index.lock");
+    // A writer that cannot take the lock still answers from what it parsed.
+    let started = std::time::Instant::now();
+    let cold = run(&["query", "apply_fee", "--view", "definition"]);
+    assert!(cold.status.success(), "{}", stderr(&cold));
+    assert!(
+        stdout(&cold).contains("src/pricing.rs:5-7"),
+        "{}",
+        stdout(&cold)
+    );
+    let message = stderr(&cold);
+    assert!(
+        message.contains("waiting for")
+            && message.contains("index.lock")
+            && message.contains("index cache not saved: timed out after"),
+        "{message}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    drop(index_lock);
+    assert!(success(path, &["index"]).contains("4 parsed"));
+    // Unchanged sources need no lock at all.
+    let index_lock = hold("index.lock");
+    let started = std::time::Instant::now();
+    let warm = run(&["query", "apply_fee", "--view", "definition"]);
+    assert!(warm.status.success(), "{}", stderr(&warm));
+    assert_eq!(stderr(&warm), "");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    drop(index_lock);
+    // A held capture lock degrades to a run without a baseline instead of hanging.
+    let capture_lock = hold("capture.lock");
+    let captured = run(&["run", "--", "echo", "hello"]);
+    assert!(captured.status.success(), "{}", stderr(&captured));
+    assert!(stdout(&captured).contains("hello"));
+    assert!(
+        stderr(&captured).contains("timed out after"),
+        "{}",
+        stderr(&captured)
+    );
+    drop(capture_lock);
+}

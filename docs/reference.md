@@ -177,6 +177,8 @@ An empty prefix, an invalid expression or one that matches empty text stops the 
 
 Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Keep the directory private if a command prints secrets. The CLI runs offline after installation, and `--raw` skips recording.
 
+Reading the index takes no lock, so concurrent queries over unchanged sources run in parallel. Saving a refreshed index, recording a run baseline and applying edits take a project lock under `.justless/`. When another Justless process holds it, Justless says so on stderr after a second and gives up after 30 seconds, or after the number of seconds in `JUSTLESS_LOCK_TIMEOUT`. A query that gives up still answers from the files it read and leaves the saved index unchanged, and a run that gives up records no baseline.
+
 ## MCP server
 
 `justless mcp` serves the read-only commands as MCP tools over stdio. Use it with clients that have no Justless hooks, or when an agent should call navigation tools instead of shell commands. Each tool runs the matching command against the project root and returns its output as text. A failed command or an invalid argument comes back as a tool error that the agent can correct. `run`, `edit`, `mask` and `init` are not exposed, so every change still goes through the client's own permission prompts.

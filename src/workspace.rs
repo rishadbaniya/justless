@@ -228,6 +228,37 @@ pub fn lock_state(path: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(path)?;
-    file.lock()?;
-    Ok(file)
+    let started = std::time::Instant::now();
+    let timeout = std::env::var("JUSTLESS_LOCK_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map_or(std::time::Duration::from_secs(30), |seconds| {
+            std::time::Duration::from_secs_f64(seconds)
+        });
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock {}", path.display()));
+            }
+            Err(fs::TryLockError::WouldBlock) => {}
+        }
+        let waited = started.elapsed();
+        ensure!(
+            waited < timeout,
+            "timed out after {:.0?} waiting for {} (held by another justless process)",
+            waited,
+            path.display()
+        );
+        if !announced && waited >= std::time::Duration::from_secs(1) {
+            eprintln!(
+                "justless: waiting for {} (held by another justless process)",
+                path.display()
+            );
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
