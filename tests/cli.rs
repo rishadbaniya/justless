@@ -4834,3 +4834,26 @@ fn packs_rank_names_that_cover_the_question_above_single_word_matches() {
     );
     assert!(success(root, &["pack", "OrderBook"]).starts_with("market::book::OrderBook [struct]"));
 }
+
+#[test]
+fn a_wide_range_names_its_symbols_within_the_budget() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let source: String = (0..30)
+        .map(|id| format!("def f{id}():\n    return {id}\n\n"))
+        .collect();
+    write_files(root, &[("many.py", &source)]);
+    let wide = success(root, &["context", "--at", "many.py:1-89"]);
+    let names: Vec<_> = (0..24).map(|id| format!("f{id}")).collect();
+    assert!(
+        wide.starts_with(&format!(
+            "many.py:1-89 · 30 symbols: {}, +6 more\nmany.py::f0 [function] at many.py:1-2\n",
+            names.join(", ")
+        )),
+        "{wide}"
+    );
+    assert!(
+        wide.len() <= 2400 && wide.ends_with("[context budget reached]\n"),
+        "{wide}"
+    );
+}

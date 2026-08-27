@@ -469,16 +469,22 @@ fn at_location(
             })
             .collect();
         outermost.sort_by_key(|&id| (index.definitions[id].location.start, id));
-        let names: Vec<_> = outermost
+        let mut names: Vec<_> = outermost
             .iter()
+            .take(24)
             .map(|&id| {
                 let qualified = &index.definitions[id].qualified;
                 qualified.rsplit("::").next().unwrap_or(qualified)
             })
             .collect();
+        let more = outermost.len().saturating_sub(names.len());
+        let rest = format!("+{more} more");
+        if more > 0 {
+            names.push(&rest);
+        }
         report.line(format!(
             "{location} · {} symbols: {}",
-            names.len(),
+            outermost.len(),
             names.join(", ")
         ));
         for id in outermost {
