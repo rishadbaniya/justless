@@ -12,11 +12,11 @@
 | `justless path FROM TO` | A short relationship chain with the location and direction of each edge |
 | `justless map` | Areas, most connected symbols, communities, cross-area links, entry points and test locations, each with a file and line |
 | `justless affected SYMBOL --depth 3` | Dependents grouped by distance, then the tests that reach the target and a command to run them. Also takes a file path or `--changes`. |
-| `justless find TEXT` | Literal search across indexed text, with exact file and line matches |
-| `justless context --changes` | Current changes against `HEAD`, with nearby symbols and tests where available. Includes untracked files. |
+| `justless find TEXT` | Literal search across indexed text, with exact file and line matches. Stops at `--limit` matches, 20 by default, and says when more exist. |
+| `justless context --changes` | Current changes against `HEAD`, with nearby symbols and tests where available. Includes untracked files. A new file or a range across several symbols names each symbol, then shows each in source order. A pure deletion shows where the lines were, their text, any symbol removed whole and the surviving symbol that lost them, without pinning them on the line before. A deleted file is marked deleted. Needs a Git repository. |
 | `justless context --changes --staged` | Staged ranges for files that currently match the staged source |
-| `justless context --at src/lib.rs:8` | Enclosing symbol, relevant calls, and source around a line or range |
-| `justless code src/lib.rs --from 1 --to 8` | A numbered excerpt of original source |
+| `justless context --at src/lib.rs:8` | Enclosing symbol, relevant calls, and source around a line or range. A range across several symbols shows each of them. A line past the end of the file is an error. |
+| `justless code src/lib.rs --from 1 --to 8` | A numbered excerpt of original source. A range that starts past the end of the file is an error, and one that runs past it ends at the last line with a note. |
 | `justless read FILE --outline` | Revision, signatures and line ranges. Small files are returned verbatim when called without outline options. |
 | `justless expand FILE SELECTOR` | Exact bytes for a symbol, entry, section or inclusive line range |
 | `justless edit FILE SELECTOR --revision REV` | Apply the replacement supplied on stdin after verifying the snapshot |
@@ -35,6 +35,8 @@ Queries refresh the index automatically. Justless compares file identity and hig
 Structured navigation supports Rust, JavaScript, TypeScript and TSX, Python, Go, Java, Kotlin, Scala, C, C++, C#, Swift, Dart, Ruby, PHP, Lua, Zig, Bash, SQL, and HCL, including Terraform. The available symbols and relationships vary by language. Calls across implicit imports, framework discovery, dynamic dispatch, and macro expansion can require source verification. Use `find` for any indexed UTF-8 text file. When source has changed since a recorded run, Justless preserves the original log location and flags the mismatch.
 
 Related tests come from each ecosystem's conventions: `#[test]` functions in Rust, `test_` functions in Python, `Test` functions in Go, `@Test` annotations in Java, Kotlin and Scala, XCTest `test…` methods and `@Test` functions in Swift, and Zig `test` blocks. Test calls such as `test("…")` in Scala, Dart and Lua become test entries named by their quoted description, such as `main::"totals items"`. Zig test blocks are named the same way. Calls between Kotlin, Scala and Java resolve as possible links. Members of a Swift extension or a Scala companion object belong to the extended type, as in `InvoiceService::reset`, and a Dart unnamed constructor is `Type::new`.
+
+A definition's line range includes its decorators, attributes and export keyword, as in `read --outline`.
 
 Rust references to a type include enum variant uses and patterns such as `Status::Open`, associated items such as `Widget::new()`, trait impls, generic bounds, where clauses, `dyn` and `impl` trait uses. Glob imports such as `use super::*` resolve through the items the parent module imports. Definitions that share a qualified name, such as cfg-gated twins or an inherent method and a trait method of the same name, each receive the calls as possible relationships. `query`, `path` and `context --symbol` accept `NAME@FILE:LINE` to select one of them, and the ambiguity error prints that selector for each twin. An ambiguity error lists 12 candidates and counts the rest.
 

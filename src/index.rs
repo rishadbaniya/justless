@@ -11,7 +11,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, display_path, lock_state, write_json};
 
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -648,9 +648,17 @@ impl Index {
                 span.start <= location.end && span.end >= location.start
             })
             .collect();
+        // Innermost first. A function that spans its whole file wins the tie
+        // with the file or module that holds it.
         ids.sort_by_key(|&id| {
-            let span = &self.definitions[id].location;
-            (span.end - span.start, span.start, id)
+            let definition = &self.definitions[id];
+            let span = &definition.location;
+            (
+                span.end - span.start,
+                matches!(definition.kind.as_str(), "file" | "module"),
+                span.start,
+                id,
+            )
         });
         ids
     }

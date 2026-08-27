@@ -204,6 +204,7 @@ pub fn find(
     let fingerprint = Fingerprint::new(&term);
     let mut report = Report::new(cap);
     let mut matches = 0;
+    let mut more = false;
     'files: for (file, candidate) in &index.fingerprints {
         if !candidate.includes(fingerprint) {
             continue;
@@ -221,6 +222,10 @@ pub fn find(
                 line.find(&term)
             };
             if let Some(position) = position {
+                if matches == limit {
+                    more = true;
+                    break 'files;
+                }
                 let start = line.ceil_char_boundary(position.saturating_sub(80));
                 let end = line.floor_char_boundary(
                     (position + term.len()).saturating_add(180).min(line.len()),
@@ -232,11 +237,16 @@ pub fn find(
                     &line[start..end]
                 ));
                 matches += 1;
-                if matches == limit || report.clipped {
+                if report.clipped {
                     break 'files;
                 }
             }
         }
+    }
+    if more {
+        report.line(format!(
+            "[limit of {limit} matches reached; more exist. Raise --limit to see them.]"
+        ));
     }
     if matches == 0 {
         report.line("No matching indexed text.");
@@ -252,10 +262,32 @@ pub fn code(workspace: &Workspace, file: &str, from: usize, to: usize, cap: usiz
         from > 0 && from <= to,
         "expected a positive, ordered line range"
     );
+    let lines = ensure_line(workspace, file, from)?;
+    let shown = to.min(lines);
     let mut report = Report::new(cap);
-    report.line(format!("{}:{from}-{to}", display_path(file)));
-    snippet(workspace, file, from, to, &mut report)?;
+    report.line(format!("{}:{from}-{shown}", display_path(file)));
+    snippet(workspace, file, from, shown, &mut report)?;
+    if shown < to && !report.clipped {
+        report.line(format!("  (file ends at line {lines})"));
+    }
     report.finish()
+}
+
+/// Lines in a workspace file. A range that starts past the end is an error,
+/// so a stale line number never looks like an empty location.
+fn line_count(workspace: &Workspace, file: &str) -> Result<usize> {
+    let text = fs::read_to_string(workspace.source_path(file)?)?;
+    Ok(text.lines().count())
+}
+
+fn ensure_line(workspace: &Workspace, file: &str, line: usize) -> Result<usize> {
+    let lines = line_count(workspace, file)?;
+    ensure!(
+        line <= lines,
+        "{} has {lines} lines; line {line} is past the end",
+        display_path(file)
+    );
+    Ok(lines)
 }
 
 fn snippet(
@@ -297,7 +329,7 @@ pub fn at(workspace: &Workspace, index: &Index, input: &str, cap: usize) -> Resu
         start > 0 && start <= end,
         "expected a positive, ordered line range"
     );
-    workspace.source_path(file)?;
+    let lines = ensure_line(workspace, file, start)?;
     let mut report = Report::new(cap);
     at_location(
         workspace,
@@ -305,7 +337,7 @@ pub fn at(workspace: &Workspace, index: &Index, input: &str, cap: usize) -> Resu
         &Location {
             file: file.to_owned(),
             start,
-            end,
+            end: end.min(lines),
         },
         &mut report,
     )?;
@@ -409,6 +441,60 @@ fn at_location(
     report: &mut Report,
 ) -> Result<()> {
     let definitions = index.at(location);
+    // A file or module contains everything in it, so it only stands for a range
+    // when no symbol inside it overlaps. A range across several symbols, such as
+    // a new file, shows each of them in source order.
+    let members: Vec<usize> = definitions
+        .iter()
+        .copied()
+        .filter(|&id| !matches!(index.definitions[id].kind.as_str(), "file" | "module"))
+        .collect();
+    let containing = members.iter().copied().find(|&id| {
+        let span = &index.definitions[id].location;
+        span.start <= location.start && location.end <= span.end
+    });
+    if let Some(best) = containing {
+        return detail(workspace, index, best, location, &members, report);
+    }
+    if !members.is_empty() {
+        let mut outermost: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let span = &index.definitions[id].location;
+                !members.iter().any(|&other| {
+                    let outer = &index.definitions[other].location;
+                    outer != span && outer.start <= span.start && span.end <= outer.end
+                })
+            })
+            .collect();
+        outermost.sort_by_key(|&id| (index.definitions[id].location.start, id));
+        let names: Vec<_> = outermost
+            .iter()
+            .map(|&id| {
+                let qualified = &index.definitions[id].qualified;
+                qualified.rsplit("::").next().unwrap_or(qualified)
+            })
+            .collect();
+        report.line(format!(
+            "{location} · {} symbols: {}",
+            names.len(),
+            names.join(", ")
+        ));
+        for id in outermost {
+            if report.clipped {
+                break;
+            }
+            let span = &index.definitions[id].location;
+            let part = Location {
+                file: location.file.clone(),
+                start: span.start.max(location.start),
+                end: span.end.min(location.end),
+            };
+            detail(workspace, index, id, &part, &[], report)?;
+        }
+        return Ok(());
+    }
     let Some(best) = definitions.first().copied() else {
         report.line(format!("{} · no enclosing indexed symbol", location));
         if let Some(error) = index.errors.get(&location.file) {
@@ -422,6 +508,19 @@ fn at_location(
             report,
         );
     };
+    detail(workspace, index, best, location, &definitions, report)
+}
+
+/// One symbol around a location: its calls, related tests, the other symbols
+/// the range overlaps, and source from the location.
+fn detail(
+    workspace: &Workspace,
+    index: &Index,
+    best: usize,
+    location: &Location,
+    overlapping: &[usize],
+    report: &mut Report,
+) -> Result<()> {
     let definition = &index.definitions[best];
     report.line(describe(definition));
     let mut referenced = BTreeSet::new();
@@ -476,10 +575,18 @@ fn at_location(
         }
     }
     if location.end > location.start {
-        for &id in definitions.iter().skip(1).take(4) {
-            if index.definitions[id].location != definition.location {
-                report.line(format!("  overlaps {}", describe(&index.definitions[id])));
-            }
+        let others: Vec<_> = overlapping
+            .iter()
+            .filter(|&&id| id != best && index.definitions[id].location != definition.location)
+            .collect();
+        for &&id in others.iter().take(4) {
+            report.line(format!("  overlaps {}", describe(&index.definitions[id])));
+        }
+        if others.len() > 4 {
+            report.line(format!(
+                "  … and {} more overlapping symbols",
+                others.len() - 4
+            ));
         }
     }
     let from = location
@@ -519,6 +626,8 @@ pub(crate) struct Deletion {
     pub old: (usize, usize),
     /// Symbols that lay entirely inside the removed lines, as (name, kind).
     pub symbols: Vec<(String, String)>,
+    /// The text of the removed lines, as the diff showed them.
+    pub lines: Vec<String>,
 }
 
 /// Name the symbols each deletion removed, from the committed version of `file`.
@@ -557,32 +666,26 @@ pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -
     let mut report = Report::new(cap);
     let changes = changes(workspace, index, staged)?;
     for (file, change) in &changes {
+        let name = display_path(file);
         match change {
-            Change::Unindexed => report.line(format!("{file} · no current indexed source")),
-            Change::StagedDiffers => report.line(format!("{file} · working tree differs from staged source. Use justless context --changes to inspect the current file.")),
-            Change::Empty => report.line(format!("{file} · empty after changes")),
+            Change::Unindexed if fs::symlink_metadata(workspace.root.join(file)).is_err() => {
+                report.line(format!("{name} · deleted"))
+            }
+            Change::Unindexed => report.line(format!("{name} · no current indexed source")),
+            Change::StagedDiffers => report.line(format!("{name} · working tree differs from staged source. Use justless context --changes to inspect the current file.")),
+            Change::Empty => report.line(format!("{name} · empty after changes")),
             Change::Deleted(deletions) => {
                 for deletion in deletions {
-                    let removed = if deletion.symbols.is_empty() {
-                        "no whole symbol".to_owned()
-                    } else {
-                        deletion
-                            .symbols
-                            .iter()
-                            .map(|(name, kind)| format!("{name} [{kind}]"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    report.line(format!(
-                        "{file} · deleted after line {} (committed lines {}-{}) · {removed}",
-                        deletion.after, deletion.old.0, deletion.old.1
-                    ));
+                    deleted(workspace, index, file, deletion, &mut report)?;
+                    if report.clipped {
+                        break;
+                    }
                 }
             }
             Change::Ranges(locations) => {
-                report.line(format!("{file} · {} changed ranges", locations.len()));
+                report.line(format!("{name} · {} changed ranges", locations.len()));
                 for &(start, end) in locations {
-                    report.line(format!("Changed {file}:{start}-{end}"));
+                    report.line(format!("Changed {name}:{start}-{end}"));
                     at_location(
                         workspace,
                         index,
@@ -609,13 +712,104 @@ pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -
     report.finish()
 }
 
+/// One deletion for `context --changes`: where the lines were, what they said,
+/// the symbols removed whole, and the surviving symbol that lost lines, if any.
+/// A deletion between symbols is not pinned on the line before it.
+fn deleted(
+    workspace: &Workspace,
+    index: &Index,
+    file: &str,
+    deletion: &Deletion,
+    report: &mut Report,
+) -> Result<()> {
+    const SHOWN: usize = 8;
+    let name = display_path(file);
+    let (first, last) = deletion.old;
+    let (lines, previously) = if first == last {
+        ("1 line".to_owned(), format!("previously line {first}"))
+    } else {
+        (
+            format!("{} lines", last + 1 - first),
+            format!("previously lines {first}-{last}"),
+        )
+    };
+    let place = if deletion.after == 0 {
+        format!("at the start of {name}")
+    } else {
+        format!("after {name}:{}", deletion.after)
+    };
+    let removed = if deletion.symbols.is_empty() {
+        String::new()
+    } else {
+        let symbols: Vec<_> = deletion
+            .symbols
+            .iter()
+            .map(|(name, kind)| format!("{name} [{kind}]"))
+            .collect();
+        format!(" · removed {}", symbols.join(", "))
+    };
+    report.line(format!("Deleted {lines} {place} ({previously}){removed}"));
+    for (offset, line) in deletion.lines.iter().take(SHOWN).enumerate() {
+        report.line(format!("  -{} | {line}", first + offset));
+    }
+    if deletion.lines.len() > SHOWN {
+        report.line(format!(
+            "  … and {} more deleted lines",
+            deletion.lines.len() - SHOWN
+        ));
+    }
+    if deletion.after == 0 {
+        return Ok(());
+    }
+    // The lines on both sides of the removal belong to one symbol: it changed.
+    let location = Location {
+        file: file.to_owned(),
+        start: deletion.after,
+        end: deletion.after + 1,
+    };
+    let around = index
+        .at(&location)
+        .into_iter()
+        .filter(|&id| {
+            let definition = &index.definitions[id];
+            let span = &definition.location;
+            !matches!(definition.kind.as_str(), "file" | "module")
+                && span.start <= deletion.after
+                && deletion.after < span.end
+        })
+        .min_by_key(|&id| {
+            let span = &index.definitions[id].location;
+            span.end - span.start
+        });
+    if let Some(id) = around {
+        detail(workspace, index, id, &location, &[], report)?;
+    }
+    Ok(())
+}
+
+fn first_line(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
 /// Changed line ranges per file against `HEAD`, or the index with `staged`.
-/// Untracked files count as changed throughout.
+/// Untracked files count as changed throughout. Lines removed without a
+/// replacement are reported apart, as deletions.
 pub(crate) fn changes(
     workspace: &Workspace,
     index: &Index,
     staged: bool,
 ) -> Result<Vec<(String, Change)>> {
+    let inside = workspace.git(&["rev-parse", "--is-inside-work-tree"])?;
+    ensure!(
+        inside.status.success() && inside.stdout.starts_with(b"true"),
+        "--changes needs a Git repository: {}",
+        first_line(&inside.stderr)
+    );
     let mut args = vec![
         "diff",
         "--relative",
@@ -635,7 +829,7 @@ pub(crate) fn changes(
     ensure!(
         output.status.success(),
         "git diff failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        first_line(&output.stderr)
     );
     let mut tracked: BTreeSet<_> = nul_paths(&output.stdout).map(str::to_owned).collect();
     let mut new_files = BTreeSet::new();
@@ -651,7 +845,7 @@ pub(crate) fn changes(
         ensure!(
             output.status.success(),
             "git ls-files failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            first_line(&output.stderr)
         );
         new_files.extend(nul_paths(&output.stdout).map(str::to_owned));
         if !head.status.success() {
@@ -693,8 +887,15 @@ pub(crate) fn changes(
             let output = workspace.git(&hunk)?;
             ensure!(output.status.success(), "could not read diff for {file}");
             let mut ranges = Vec::new();
+            // Whether the removed lines that follow belong to the last deletion.
+            let mut removing = false;
             for line in String::from_utf8_lossy(&output.stdout).lines() {
                 let Some(matches) = HUNK.captures(line) else {
+                    if removing && let Some(text) = line.strip_prefix('-') {
+                        let deletion: &mut Deletion =
+                            deletions.last_mut().expect("deletion in progress");
+                        deletion.lines.push(text.to_owned());
+                    }
                     continue;
                 };
                 let number = |i: usize, default: usize| {
@@ -705,6 +906,7 @@ pub(crate) fn changes(
                 };
                 let (old_start, old_count) = (number(1, 0), number(2, 1));
                 let (start, count) = (number(3, 0), number(4, 1));
+                removing = count == 0;
                 if count == 0 {
                     // A hunk with no new lines removed lines after line `start` of the
                     // current file. It changes no surviving line, so it must not be
@@ -713,6 +915,7 @@ pub(crate) fn changes(
                         after: start,
                         old: (old_start, old_start + old_count.saturating_sub(1)),
                         symbols: Vec::new(),
+                        lines: Vec::new(),
                     });
                     continue;
                 }

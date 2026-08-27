@@ -342,7 +342,7 @@ fn mixed_repo_paths_and_exact_text_refresh_after_edits() {
         "{route}"
     );
     assert!(
-        route.contains("list_orders [function] at backend/orders.py:7-8"),
+        route.contains("list_orders [function] at backend/orders.py:6-8"),
         "{route}"
     );
     assert!(
@@ -2312,11 +2312,11 @@ fn map_orients_with_located_areas_hubs_links_and_entry_points() {
         "Map · 6 files · 5 symbols · 4 links (2 possible) · TypeScript 2 · Python 1 · SQL 1",
         "  frontend/ · 2 files · 2 symbols · TypeScript · hub formatOrder frontend/format.ts:1-3",
         "  docs/ · 1 file · 0 symbols · text · docs/operations.md:1",
-        "  list_orders [function] backend/orders.py:7-8 · in 1 (1 possible) · out 1 (1 possible)",
+        "  list_orders [function] backend/orders.py:6-8 · in 1 (1 possible) · out 1 (1 possible)",
         "  frontend/format.ts +1 file · 2 symbols · formatOrder frontend/format.ts:1-3, fetchOrders frontend/orders.ts:3-7",
-        "  frontend/ → backend/ · TypeScript → Python · possible HTTP route 1 · fetchOrders frontend/orders.ts:4 → list_orders backend/orders.py:7-8",
+        "  frontend/ → backend/ · TypeScript → Python · possible HTTP route 1 · fetchOrders frontend/orders.ts:4 → list_orders backend/orders.py:6-8",
         "  backend/ → db/ · Python → SQL · possible SQL relation 1 · list_orders backend/orders.py:8 → purchase_orders db/schema.sql:1-3",
-        "  list_orders [function] backend/orders.py:7-8 · HTTP route /api/orders",
+        "  list_orders [function] backend/orders.py:6-8 · HTTP route /api/orders",
         "Tests · none detected",
     ] {
         has_line(&map, expected);
@@ -2407,7 +2407,9 @@ fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
             .contains("src/missing.rs is not an indexed file or symbol")
     );
     // Without a repository there are no changes to start from.
-    assert!(stderr(&cli(path, &["affected", "--changes"])).contains("git diff failed"));
+    assert!(
+        stderr(&cli(path, &["affected", "--changes"])).contains("--changes needs a Git repository")
+    );
 
     // A cycle ends once every symbol on it has been reached.
     fs::write(
@@ -2441,7 +2443,7 @@ fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
     .unwrap();
     let impact = success(root, &["affected", "purchase_orders"]);
     for expected in [
-        "  list_orders [function] backend/orders.py:7-8 · possible SQL relation at backend/orders.py:8",
+        "  list_orders [function] backend/orders.py:6-8 · possible SQL relation at backend/orders.py:8",
         "  fetchOrders [function] frontend/orders.ts:3-7 · possible HTTP route at frontend/orders.ts:4 → list_orders",
         "  test_list_orders [test] tests/test_orders.py:4-5 · possible · 2 hops",
         "  pytest tests/test_orders.py::test_list_orders tests/test_orders.py::TestOrders::test_again",
@@ -3187,10 +3189,14 @@ pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
             "staged={staged}\n{impact}"
         );
     }
+    // context --changes names the removed function and shows its text, but does
+    // not present the untouched function before it as changed.
+    let context = success(root, &["context", "--changes"]);
     assert!(
-        success(root, &["context", "--changes"]).contains(
-            "src/lib.rs · deleted after line 1 (committed lines 2-2) · removed [function]"
-        )
+        context.starts_with(
+            "Deleted 1 line after src/lib.rs:1 (previously line 2) · removed removed [function]\n  -2 | pub fn removed() -> u8 { 2 }\n"
+        ) && !context.contains("kept [function]"),
+        "{context}"
     );
 
     // Lines removed inside a surviving function change that function.
@@ -3203,6 +3209,12 @@ pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
         "{impact}"
     );
     assert!(!impact.contains("checks_kept"), "{impact}");
+    let context = success(root, &["context", "--changes"]);
+    assert!(
+        context.starts_with("Deleted 1 line after src/lib.rs:8 (previously line 9)\n  -9 |     let b = 2;\nprobe::long [function] at src/lib.rs:7-10\n")
+            && !context.contains("· removed"),
+        "{context}"
+    );
 }
 
 #[test]
@@ -4657,5 +4669,124 @@ fn unusual_file_names_stay_searchable_and_on_one_line() {
     assert!(
         success(root, &["query", "nl_fn"])
             .starts_with("\"crate::src::a\\nb::nl_fn\" [function] at \"src/a\\nb.rs\":1\n")
+    );
+}
+
+#[test]
+fn changes_show_every_symbol_of_a_new_file_and_name_deletions() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"multi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod engine;\n"),
+            (".gitignore", "/.justless/\n"),
+            (
+                "main.py",
+                "def run():\n    x = 1\n    y = 2\n    return helper()\n",
+            ),
+            ("old.py", "def gone():\n    return 0\n"),
+        ],
+    );
+    git_repository(root);
+    write_files(
+        root,
+        &[(
+            "src/engine.rs",
+            "pub const LIMIT: u32 = 10;\n\npub struct Engine {\n    pub level: u32,\n}\n\nimpl Engine {\n    pub fn new() -> Self {\n        Engine { level: 0 }\n    }\n\n    pub fn step(&mut self) {\n        self.level += 1;\n        if self.level > LIMIT {\n            self.level = LIMIT;\n        }\n    }\n\n    pub fn reset(&mut self) {\n        self.level = 0;\n    }\n}\n\npub fn drive(engine: &mut Engine, n: u32) {\n    for _ in 0..n {\n        engine.step();\n    }\n    engine.reset();\n}\n",
+        )],
+    );
+    fs::write(root.join("main.py"), "def run():\n    return helper()\n").unwrap();
+    fs::remove_file(root.join("old.py")).unwrap();
+    let changes = success(root, &["context", "--changes", "--budget", "6000"]);
+    for expected in [
+        "Deleted 2 lines after main.py:1 (previously lines 2-3)\n  -2 |     x = 1\n  -3 |     y = 2\n",
+        "old.py · deleted\n",
+        "Changed src/engine.rs:1-29\nsrc/engine.rs:1-29 · 6 symbols: LIMIT, Engine, new, step, reset, drive\n",
+        "multi::engine::drive [function] at src/engine.rs:24-29\n  calls multi::engine::Engine::step [method]",
+        "  26 |         engine.step();\n",
+    ] {
+        assert!(changes.contains(expected), "{expected}\n---\n{changes}");
+    }
+    // A range inside one function picks that function, not a smaller neighbor.
+    let inside = success(root, &["context", "--at", "src/engine.rs:12-16"]);
+    assert!(
+        inside.starts_with("multi::engine::Engine::step [method] at src/engine.rs:12-17\n"),
+        "{inside}"
+    );
+}
+
+#[test]
+fn context_and_find_state_their_limits() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let notes: String = (1..=30).map(|line| format!("marker {line}\n")).collect();
+    write_files(
+        root,
+        &[
+            ("util.py", "def helper():\n    return 1\n"),
+            ("main.py", "def run():\n    return helper()\n"),
+            (
+                "test_main.py",
+                "from main import run\n\n\ndef test_run():\n    assert run() == 1\n",
+            ),
+            (
+                "pricing.py",
+                "import functools\n\n\n@functools.lru_cache(maxsize=8)\ndef fee(x):\n    return x / 100\n",
+            ),
+            ("notes.txt", &notes),
+        ],
+    );
+    // A function that spans its whole file wins over the file itself.
+    let at = success(root, &["context", "--at", "main.py:2"]);
+    assert!(
+        at.starts_with("main.py::run [function] at main.py:1-2\n")
+            && at.contains("calls util.py::helper")
+            && at.contains("related test: test_main.py::test_run"),
+        "{at}"
+    );
+    // Decorators belong to the definition, as in read --outline.
+    assert_eq!(
+        success(root, &["query", "pricing.py::fee", "--view", "definition"]),
+        "pricing.py::fee [function] at pricing.py:4-6\n"
+    );
+    assert!(
+        success(root, &["context", "--symbol", "pricing.py::fee"])
+            .contains("  4 | @functools.lru_cache(maxsize=8)\n")
+    );
+    let limited = success(root, &["find", "marker", "--limit", "3"]);
+    assert_eq!(limited.lines().count(), 4, "{limited}");
+    assert!(
+        limited.ends_with("[limit of 3 matches reached; more exist. Raise --limit to see them.]\n")
+    );
+    assert!(!success(root, &["find", "marker", "--limit", "30"]).contains("limit of"));
+    for args in [
+        &["code", "main.py", "--from", "400", "--to", "410"][..],
+        &["context", "--at", "main.py:5000"],
+    ] {
+        let output = cli(root, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr(&output).contains("main.py has 2 lines; line"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(
+        success(root, &["code", "main.py", "--from", "1", "--to", "40"]),
+        "main.py:1-2\n  1 | def run():\n  2 |     return helper()\n  (file ends at line 2)\n"
+    );
+    // Outside a repository, --changes says so in one line.
+    let outside = cli(root, &["context", "--changes", "--budget", "200"]);
+    assert_eq!(outside.status.code(), Some(2));
+    let message = stderr(&outside);
+    assert!(
+        message.starts_with("justless: --changes needs a Git repository")
+            && message.lines().count() == 1,
+        "{message}"
     );
 }

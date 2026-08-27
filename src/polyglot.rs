@@ -564,8 +564,8 @@ impl Parsers {
                 name,
                 path,
                 kind: kind.to_owned(),
-                start: node.start_position().row + 1,
-                end: last_line(*node),
+                start: extent.start_position().row + 1,
+                end: last_line(extent),
                 declaration: name_node.start_position().row + 1,
                 test,
             });
