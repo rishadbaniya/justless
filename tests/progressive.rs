@@ -930,6 +930,7 @@ fn edits_refuse_read_only_files_and_keep_links_and_attributes() {
     }
 }
 
+#[test]
 fn mask_keeps_lone_surrogate_escapes_and_retires_other_results() {
     let d = tempdir().unwrap();
     let root = d.path();
