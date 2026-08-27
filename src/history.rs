@@ -210,7 +210,7 @@ struct Read {
 
 fn get<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match File::open(path) {
-        Ok(file) => Ok(serde_json::from_reader(file)?),
+        Ok(file) => Ok(serde_json::from_reader(std::io::BufReader::new(file))?),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e.into()),
     }

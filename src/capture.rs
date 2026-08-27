@@ -738,7 +738,7 @@ pub fn load(workspace: &Workspace, id: &str) -> Result<(PathBuf, Run)> {
     );
     let record = File::open(directory.join("record.json"))
         .with_context(|| format!("open recorded run {id}"))?;
-    let run: Run = serde_json::from_reader(record).context("decode run record")?;
+    let run: Run = serde_json::from_reader(BufReader::new(record)).context("decode run record")?;
     ensure!(run.id == id, "run record does not match its directory");
     Ok((directory, run))
 }
