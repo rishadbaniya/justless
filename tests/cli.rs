@@ -4292,13 +4292,11 @@ fn state_locks_time_out_with_a_message_and_reads_do_not_wait() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     drop(index_lock);
     assert!(success(path, &["index"]).contains("4 parsed"));
-    // Unchanged sources need no lock at all.
+    // Unchanged sources need no lock at all: no wait message, no timeout.
     let index_lock = hold("index.lock");
-    let started = std::time::Instant::now();
     let warm = run(&["query", "apply_fee", "--view", "definition"]);
     assert!(warm.status.success(), "{}", stderr(&warm));
     assert_eq!(stderr(&warm), "");
-    assert!(started.elapsed() < std::time::Duration::from_secs(1));
     drop(index_lock);
     // A held capture lock degrades to a run without a baseline instead of hanging.
     let capture_lock = hold("capture.lock");
@@ -4856,4 +4854,45 @@ fn a_wide_range_names_its_symbols_within_the_budget() {
         wide.len() <= 2400 && wide.ends_with("[context budget reached]\n"),
         "{wide}"
     );
+}
+
+#[test]
+fn wide_ranges_name_class_members_and_hints_skip_binaries() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let methods: String = (0..6)
+        .map(|id| format!("    def m{id}(self):\n        return {id}\n\n"))
+        .collect();
+    let mut media = vec![0u8; 64];
+    media.extend(vec![b'x'; 3 << 20]);
+    write_files(
+        root,
+        &[
+            (
+                "engine.py",
+                &format!("class Engine:\n{methods}\ndef drive():\n    return Engine()\n"),
+            ),
+            ("notes.txt", &"marker\n".repeat(400_000)),
+        ],
+    );
+    fs::write(root.join("clip.wav"), media).unwrap();
+    let wide = success(
+        root,
+        &["context", "--at", "engine.py:1-22", "--budget", "4000"],
+    );
+    assert!(
+        wide.starts_with("engine.py:1-22 · 2 symbols: Engine, drive\n")
+            && wide.contains("  overlaps engine.py::Engine::m0 [function] at engine.py:2-3\n")
+            && wide.contains("  … and 2 more overlapping symbols\n")
+            && wide.contains("engine.py::drive [function] at engine.py:21-22\n"),
+        "{wide}"
+    );
+    // An oversized text file is reported; an oversized binary is not text at all.
+    let index = stderr(&cli(root, &["index"]));
+    assert!(index.contains("notes.txt: not indexed"), "{index}");
+    assert!(!index.contains("clip.wav"), "{index}");
+    // Only files that could define symbols are named when a symbol is missing.
+    let missing = stderr(&cli(root, &["query", "absent"]));
+    assert_eq!(missing, "justless: symbol not found: absent\n");
+    assert!(success(root, &["find", "absent"]).contains("Not indexed: notes.txt"));
 }

@@ -250,7 +250,7 @@ pub fn find(
     }
     if matches == 0 {
         report.line("No matching indexed text.");
-        if let Some(note) = index.skipped_note() {
+        if let Some(note) = index.skipped_note(false) {
             report.line(note);
         }
     }
@@ -497,7 +497,17 @@ fn at_location(
                 start: span.start.max(location.start),
                 end: span.end.min(location.end),
             };
-            detail(workspace, index, id, &part, &[], report)?;
+            // Members such as a class's methods are named under their owner.
+            let mut inner: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&other| {
+                    let member = &index.definitions[other].location;
+                    other != id && span.start <= member.start && member.end <= span.end
+                })
+                .collect();
+            inner.sort_by_key(|&other| (index.definitions[other].location.start, other));
+            detail(workspace, index, id, &part, &inner, report)?;
         }
         return Ok(());
     }

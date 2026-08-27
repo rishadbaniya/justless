@@ -162,13 +162,16 @@ impl Index {
                 }
             };
             if metadata.len() > max_bytes {
-                refresh.skipped.insert(
-                    file,
-                    format!(
-                        "{} bytes, over max_file_bytes ({max_bytes})",
-                        metadata.len()
-                    ),
-                );
+                // Large binaries such as media are not text, whatever the limit.
+                if !looks_binary(&path) {
+                    refresh.skipped.insert(
+                        file,
+                        format!(
+                            "{} bytes, over max_file_bytes ({max_bytes})",
+                            metadata.len()
+                        ),
+                    );
+                }
                 continue;
             }
             let stamp = file_stamp(&metadata);
@@ -571,7 +574,7 @@ impl Index {
             [symbol] => Ok(*symbol),
             [] => Err(anyhow!(
                 "symbol not found: {name}{}",
-                self.skipped_note()
+                self.skipped_note(true)
                     .map_or_else(String::new, |note| format!("\n{note}"))
             )),
             many => {
@@ -604,10 +607,21 @@ impl Index {
         }
     }
 
-    /// Names files that were left out of the index, for a search that found nothing.
-    pub fn skipped_note(&self) -> Option<String> {
-        let skipped = &self.refresh.skipped;
-        let (file, reason) = skipped.iter().next()?;
+    /// Names files that were left out of the index, for a search that found
+    /// nothing. A symbol search only mentions files that could define symbols.
+    pub fn skipped_note(&self, symbols: bool) -> Option<String> {
+        let skipped: Vec<_> = self
+            .refresh
+            .skipped
+            .iter()
+            .filter(|(file, reason)| {
+                !symbols
+                    || reason.starts_with("unreadable")
+                    || is_rust(file)
+                    || Grammar::for_file(file).is_some()
+            })
+            .collect();
+        let (file, reason) = skipped.first()?;
         let more = match skipped.len() {
             1 => String::new(),
             count => format!(" and {} more", count - 1),
@@ -922,6 +936,14 @@ fn is_input(file: &str, tracked: bool) -> bool {
         .flat_map(Path::components)
         .map(|part| part.as_os_str().to_string_lossy())
         .any(|part| excluded(&part) && !(tracked && part == "target"))
+}
+
+fn looks_binary(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0; 8192];
+    fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .map_or(true, |read| head[..read].contains(&0))
 }
 
 fn is_rust(file: &str) -> bool {
