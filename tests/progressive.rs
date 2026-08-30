@@ -968,3 +968,69 @@ fn mask_keeps_lone_surrogate_escapes_and_retires_other_results() {
     let restored = ok(run(root, &["mask", "--restore"], &masked));
     assert_eq!(String::from_utf8(restored).unwrap(), normalized);
 }
+
+#[test]
+fn native_reads_of_scripts_keep_top_level_code_the_outline_leaves_out() {
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    let detail = |marker: &str| format!("{marker} detail\n").repeat(400);
+    let files = [
+        // Commands between and after a shell script's functions.
+        (
+            "deploy.sh",
+            format!(
+                "#!/bin/sh\n# Deploy the service.\nset -eu\n\nrequire() {{\n{}  command -v \"$1\" >/dev/null\n}}\n\nrequire cargo\ncargo build --release\n",
+                detail("  #")
+            ),
+            false,
+        ),
+        // A Python entry point.
+        (
+            "tool.py",
+            format!(
+                "import sys\n\n\ndef main():\n{}    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
+                detail("    #")
+            ),
+            false,
+        ),
+        // Docstrings, comments and imports are not code the outline hides.
+        (
+            "module.py",
+            format!(
+                "\"\"\"Pricing rules.\n\nLong description.\n\"\"\"\n# Helpers follow.\nimport math\n\n\ndef price():\n{}    return math.pi\n",
+                detail("    #")
+            ),
+            true,
+        ),
+        // PHP tags, `declare` and a lone directive string are not code either.
+        (
+            "Service.php",
+            format!(
+                "<?php\n'use strict';\ndeclare(strict_types=1);\n\nnamespace App;\n\nclass Service\n{{\n    public function total(): int\n    {{\n{}        return 1;\n    }}\n}}\n",
+                detail("        //")
+            ),
+            true,
+        ),
+        // Rust holds only items at the top level, so an `impl` wrapper and its
+        // associated constant do not stop the outline.
+        (
+            "lib.rs",
+            format!(
+                "pub struct Price(u32);\n\nimpl Price {{\n    const LIMIT: u32 = 10;\n\n    pub fn checked(&self) -> bool {{\n{}        self.0 < Self::LIMIT\n    }}\n}}\n",
+                detail("        //")
+            ),
+            true,
+        ),
+    ];
+    for (name, source, outlined) in files {
+        let path = root.join(name);
+        fs::write(&path, &source).unwrap();
+        let lines = source.lines().count();
+        let event = json!({"tool_name":"Read","hook_event_name":"PostToolUse","tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,"content":source.trim_end_matches('\n'),"startLine":1,"numLines":lines,"totalLines":lines}}});
+        let read = json_output(&root, &["hook-claude", "after-read"], &event);
+        assert_eq!(read != json!({}), outlined, "{name}: {read}");
+        let cat = json!({"tool_name":"Bash","hook_event_name":"PreToolUse","tool_input":{"command":format!("cat {name}"),"workdir":root}});
+        let rewritten = json_output(&root, &["hook-codex", "before-command"], &cat);
+        assert_eq!(rewritten != json!({}), outlined, "{name}: {rewritten}");
+    }
+}

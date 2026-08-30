@@ -686,6 +686,9 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
         return None;
     }
     source.index(&file).ok()?;
+    if hides_code(&file, &source)? {
+        return None;
+    }
     let outline = source.page("", None, 40, budget).ok()?.display();
     if outline.len() + 160 >= native.len() {
         return None;
@@ -830,25 +833,7 @@ fn wrap_event(
         && program == "cat"
         && !file.starts_with('-')
     {
-        let path = cwd.join(file);
-        let path = path.strip_prefix(&workspace.root).ok()?;
-        if path
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-        {
-            return None;
-        }
-        let file: PathBuf = path.components().collect();
-        let file = file.to_str()?;
-        let snapshot = crate::source::Snapshot::open(workspace, file).ok()?;
-        if snapshot.text.len() > workspace.settings().ok()?.context_budget {
-            return Some(format!(
-                "justless --root {} read -- {}",
-                shlex::try_quote(workspace.root.to_str()?).ok()?,
-                shlex::try_quote(file).ok()?
-            ));
-        }
-        return None;
+        return read_instead(workspace, cwd, file);
     }
     let session = session
         .filter(|id| !id.is_empty())
@@ -909,6 +894,146 @@ fn wrap_event(
     }
     rewritten.push_str(&command[copied..]);
     Some(rewritten)
+}
+
+/// A `justless read` command for a single-file `cat` of a large workspace text file
+/// whose outline covers its code.
+fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String> {
+    let path = cwd.join(file);
+    let path = path.strip_prefix(&workspace.root).ok()?;
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let file: PathBuf = path.components().collect();
+    let file = file.to_str()?;
+    let mut snapshot = crate::source::Snapshot::open(workspace, file).ok()?;
+    if snapshot.text.len() <= workspace.settings().ok()?.context_budget {
+        return None;
+    }
+    snapshot.index(file).ok()?;
+    if hides_code(file, &snapshot)? {
+        return None;
+    }
+    Some(format!(
+        "justless --root {} read -- {}",
+        shlex::try_quote(workspace.root.to_str()?).ok()?,
+        shlex::try_quote(file).ok()?
+    ))
+}
+
+/// Whether an outline leaves out top-level code that no row covers, such as the
+/// commands of a shell script between its functions or a Python `__main__` block.
+/// Only languages that run statements at the top level are checked. Rust, Go, Java
+/// and other compiled languages hold only declarations there. Blank lines,
+/// comments, docstrings and other lone string literals such as `'use strict'`,
+/// PHP tags and `declare`, Ruby's `require`, closing brackets and a wrapper whose
+/// members are outlined, such as `class Name {`, do not count.
+fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
+    let extension = Path::new(file)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(
+        extension.as_deref(),
+        Some(
+            "sh" | "bash"
+                | "py"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "ts"
+                | "mts"
+                | "cts"
+                | "tsx"
+                | "rb"
+                | "rake"
+                | "php"
+                | "phtml"
+                | "lua"
+                | "sql"
+                | "kts"
+                | "sc"
+                | "sbt"
+        )
+    ) {
+        return Some(false);
+    }
+    let page = source.page("", None, usize::MAX, usize::MAX).ok()?;
+    let page = serde_json::to_value(page).ok()?;
+    let lines: Vec<&str> = source.text.lines().collect();
+    let mut covered = vec![false; lines.len()];
+    for entry in page["entries"].as_array()? {
+        let first = usize::try_from(entry["first"].as_u64()?).ok()?;
+        let last = usize::try_from(entry["last"].as_u64()?).ok()?;
+        for line in covered.iter_mut().take(last).skip(first.saturating_sub(1)) {
+            *line = true;
+        }
+    }
+    let mut docstring = None;
+    for (index, line) in lines.iter().enumerate() {
+        if covered[index] {
+            continue;
+        }
+        let text = line.trim();
+        if let Some(quote) = docstring {
+            if text.contains(quote) {
+                docstring = None;
+            }
+            continue;
+        }
+        let literal = text.trim_end_matches(';');
+        if text.is_empty()
+            || text.starts_with(['#', '*'])
+            || [
+                "//",
+                "/*",
+                "--",
+                "<!--",
+                "<?",
+                "?>",
+                "declare(",
+                "require ",
+                "require(",
+                "require_relative ",
+            ]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            || text
+                .chars()
+                .all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
+            || ['\'', '"'].into_iter().any(|quote| {
+                literal.len() > 1
+                    && literal.starts_with(quote)
+                    && literal.ends_with(quote)
+                    && !literal[1..literal.len() - 1].contains(quote)
+            })
+        {
+            continue;
+        }
+        if let Some(quote) = ["\"\"\"", "'''"]
+            .into_iter()
+            .find(|quote| text.starts_with(quote))
+        {
+            if !text[3..].contains(quote) {
+                docstring = Some(quote);
+            }
+            continue;
+        }
+        let wrapper = text.ends_with('{')
+            && lines[index + 1..]
+                .iter()
+                .zip(&covered[index + 1..])
+                .find(|(line, _)| !line.trim().is_empty())
+                .is_some_and(|(_, covered)| *covered);
+        if !wrapper {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Split a command list on top-level `&&`, `||` and `;`, returning the trimmed byte
