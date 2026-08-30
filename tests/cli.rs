@@ -4897,3 +4897,49 @@ fn wide_ranges_name_class_members_and_hints_skip_binaries() {
     assert_eq!(missing, "justless: symbol not found: absent\n");
     assert!(success(root, &["find", "absent"]).contains("Not indexed: notes.txt"));
 }
+
+#[cfg(unix)]
+#[test]
+fn init_edits_a_linked_instructions_file_once_and_keeps_the_link() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("project");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    // A link to AGENTS.md before the file exists, then shared by two clients.
+    std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+    let setup = ["init", "--hooks", "--agent", "claude", "--agent", "codex"];
+    success(&root, &setup);
+    success(&root, &setup);
+    let link = fs::symlink_metadata(root.join("CLAUDE.md")).unwrap();
+    assert!(link.file_type().is_symlink());
+    let instructions = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+    assert_eq!(instructions.matches("<!-- justless:begin -->").count(), 1);
+    assert!(root.join(".claude/settings.json").is_file());
+    assert!(root.join(".codex/hooks.json").is_file());
+
+    // A link that leaves the project is skipped, and hooks are still installed.
+    let other = repo.path().join("other");
+    fs::create_dir(&other).unwrap();
+    fs::write(repo.path().join("shared.md"), "# Shared\n").unwrap();
+    std::os::unix::fs::symlink("../shared.md", other.join("CLAUDE.md")).unwrap();
+    let output = cli(&other, &["init", "--hooks", "--agent", "claude"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("Skipped CLAUDE.md"));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("shared.md")).unwrap(),
+        "# Shared\n"
+    );
+    assert!(other.join(".claude/settings.json").is_file());
+
+    // A setup that fails leaves no state directory behind.
+    let broken = repo.path().join("broken");
+    fs::create_dir_all(broken.join(".claude")).unwrap();
+    fs::write(broken.join(".claude/settings.json"), "[]").unwrap();
+    assert!(
+        !cli(&broken, &["init", "--hooks", "--agent", "claude"])
+            .status
+            .success()
+    );
+    assert!(!broken.join(".justless").exists());
+    assert!(!broken.join("CLAUDE.md").exists());
+}

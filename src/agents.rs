@@ -91,13 +91,55 @@ impl Agent {
 }
 
 pub fn init(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<()> {
+    // Check every file before creating the state directory, so a setup that fails
+    // leaves the project as it was. The changes are planned again under the lock.
+    planned_changes(workspace, agents, hooks)?;
     workspace.prepare_state()?;
     let _guard = lock_state(&workspace.state.join("setup.lock"))?;
+    let (changes, skipped) = planned_changes(workspace, agents, hooks)?;
+    for filename in skipped {
+        eprintln!(
+            "Skipped {filename}, a link to a file outside the project. Replace the link with a file, or add the Justless section to its target yourself."
+        );
+    }
+    for (path, contents) in changes {
+        // Copilot's hook file is two levels deep, in `.github/hooks/`.
+        let parent = path.parent().unwrap();
+        if let Some(outer) = parent.parent().filter(|outer| !outer.exists()) {
+            private_dir(outer)?;
+        }
+        private_dir(parent)?;
+        write_text(&path, &contents)?;
+        println!("Updated {}", path.display());
+    }
+    if hooks && agents.contains(&Agent::Codex) {
+        println!("Review and trust the project hooks with /hooks in Codex.");
+    }
+    Ok(())
+}
+
+/// The file contents setup writes, keyed by path, and the instruction files it skips.
+type Changes = (BTreeMap<PathBuf, String>, Vec<&'static str>);
+
+fn planned_changes(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<Changes> {
     let mut changes = BTreeMap::new();
+    let mut skipped = Vec::new();
     for &agent in agents {
         let filename = agent.instructions();
-        let path = workspace.root.join(filename);
-        let original = read_regular(&path)?;
+        let Some(path) = instructions_file(&workspace.root, &workspace.root.join(filename))? else {
+            if !skipped.contains(&filename) {
+                skipped.push(filename);
+            }
+            if hooks && let Some((path, contents)) = prepare_hooks(workspace, agent)? {
+                changes.insert(path, contents);
+            }
+            continue;
+        };
+        // Two clients can share one file, such as `CLAUDE.md -> AGENTS.md`.
+        let original = match changes.get(&path) {
+            Some(planned) => String::clone(planned),
+            None => read_regular(&path)?,
+        };
         let updated = match (original.split_once(START), original.split_once(END)) {
             (None, None) => appended(&original, INSTRUCTIONS),
             (Some((prefix, rest)), Some(_)) => {
@@ -127,20 +169,40 @@ pub fn init(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<()> 
     {
         changes.insert(gitignore, appended(&original, "/.justless/"));
     }
-    for (path, contents) in changes {
-        // Copilot's hook file is two levels deep, in `.github/hooks/`.
-        let parent = path.parent().unwrap();
-        if let Some(outer) = parent.parent().filter(|outer| !outer.exists()) {
-            private_dir(outer)?;
+    Ok((changes, skipped))
+}
+
+/// The file that holds a client's project instructions. A symlink, such as
+/// `CLAUDE.md -> AGENTS.md`, resolves to its target when that stays inside the
+/// project, so the shared file is edited once and the link is kept. Returns `None`
+/// for a link that leaves the project.
+fn instructions_file(root: &Path, path: &Path) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() != ErrorKind::NotFound => return Err(error.into()),
+        _ => return Ok(Some(path.to_path_buf())),
+    }
+    let target = match path.canonicalize() {
+        Ok(target) => target,
+        // A link to a file that setup creates, such as AGENTS.md in a new project.
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let link = path.parent().unwrap().join(fs::read_link(path)?);
+            let (Some(directory), Some(name)) = (link.parent(), link.file_name()) else {
+                return Ok(None);
+            };
+            let Ok(directory) = directory.canonicalize() else {
+                return Ok(None);
+            };
+            let target = directory.join(name);
+            // Another dangling link is not followed further.
+            if fs::symlink_metadata(&target).is_ok() {
+                return Ok(None);
+            }
+            target
         }
-        private_dir(parent)?;
-        write_text(&path, &contents)?;
-        println!("Updated {}", path.display());
-    }
-    if hooks && agents.contains(&Agent::Codex) {
-        println!("Review and trust the project hooks with /hooks in Codex.");
-    }
-    Ok(())
+        Err(error) => return Err(error.into()),
+    };
+    Ok(target.starts_with(root).then_some(target))
 }
 
 fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf, String)>> {
@@ -156,8 +218,6 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         return prepare_client_hooks(&dir, &path, agent);
     }
     if agent == Agent::OpenCode {
-        private_dir(&dir)?;
-        private_dir(path.parent().unwrap())?;
         let plugin = include_str!("../integrations/opencode.js");
         let old = read_regular(&path)?;
         ensure!(
