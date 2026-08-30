@@ -784,6 +784,12 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         return None;
     }
     let command = args["command"].as_str()?;
+    // Claude Code returns at once from a background command and reads its output
+    // later, so a server or watcher keeps streaming to the agent.
+    if args["run_in_background"] == true {
+        crate::history::bypass(workspace, command);
+        return None;
+    }
     let mut updated = args.clone();
     updated["command"] = Value::String(wrap_event(
         workspace,

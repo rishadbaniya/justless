@@ -4898,6 +4898,34 @@ fn wide_ranges_name_class_members_and_hints_skip_binaries() {
     assert!(success(root, &["find", "absent"]).contains("Not indexed: notes.txt"));
 }
 
+#[test]
+fn claude_background_commands_pass_through() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join(".justless")).unwrap();
+    let call = |input: serde_json::Value| {
+        agent_hook(
+            &root,
+            "hook-claude",
+            "before-command",
+            serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":input}),
+        )
+    };
+    // A background command returns at once and streams later. Wrapped, it would
+    // show nothing until it exits.
+    assert_eq!(
+        call(serde_json::json!({"command":"make serve","run_in_background":true})),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        call(serde_json::json!({"command":"make serve"}))["hookSpecificOutput"]["updatedInput"]["command"],
+        "justless run -- make serve"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&success(&root, &["stats", "--json"])).unwrap();
+    assert_eq!(stats["hook_pass_through"]["make"], 1, "{stats}");
+}
+
 #[cfg(unix)]
 #[test]
 fn init_edits_a_linked_instructions_file_once_and_keeps_the_link() {
