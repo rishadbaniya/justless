@@ -4228,6 +4228,7 @@ fn resume_keeps_room_for_the_last_pack_after_many_source_ranges() {
     );
 }
 
+#[test]
 fn warm_index_reads_its_cache_in_bulk() {
     let root = fixture();
     let path = root.path();
