@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, ErrorKind, Read};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -571,14 +572,11 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         return None;
     }
     let command = args.get("command")?.as_str()?.to_owned();
-    let rewritten = wrap_event(
-        workspace,
-        &cwd,
-        &command,
-        session,
-        agent == Agent::Gemini,
-        false,
-    )?;
+    let rules = Rules {
+        mixed: agent == Agent::Gemini,
+        client_grep: false,
+    };
+    let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
     args["command"] = Value::String(rewritten);
     Some(match agent {
         Agent::Cursor => json!({"permission":"allow", "updated_input":args}),
@@ -766,8 +764,10 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         &cwd,
         args["CommandLine"].as_str()?,
         input["conversationId"].as_str(),
-        false,
-        false,
+        Rules {
+            mixed: false,
+            client_grep: false,
+        },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
 }
@@ -799,8 +799,10 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         &cwd,
         command,
         input["session_id"].as_str(),
-        agent != Agent::Codex,
-        agent == Agent::Claude,
+        Rules {
+            mixed: agent != Agent::Codex,
+            client_grep: agent == Agent::Claude,
+        },
     )?);
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
     if agent == Agent::Codex {
@@ -814,26 +816,36 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
     Some(json!({"hookSpecificOutput":hook}))
 }
 
+/// What a client's command hook may rewrite.
+#[derive(Clone, Copy)]
+struct Rules {
+    /// The client checks the rewritten command, so a list may mix supported
+    /// commands with others that stay as they are.
+    mixed: bool,
+    /// Claude Code's shell replaces `grep` with a bundled ugrep that honors
+    /// .gitignore and skips binary files. Running the system grep instead would
+    /// search ignored build and dependency trees, so leave grep to that shell.
+    client_grep: bool,
+}
+
 fn wrap_event(
     workspace: &Workspace,
     cwd: &Path,
     command: &str,
     session: Option<&str>,
-    allow_mixed: bool,
-    client_grep: bool,
+    rules: Rules,
 ) -> Option<String> {
-    // Claude Code's shell replaces `grep` with a bundled ugrep that honors .gitignore
-    // and skips binary files. Running the system grep instead would search ignored
-    // build and dependency trees, so leave grep to that client's shell.
-    let supported =
-        |segment: &str| supported_command(segment) && !(client_grep && runs_grep(segment));
     if !cfg!(windows)
         && let Some(words) = literal_command(command)
         && let [program, file] = words.as_slice()
         && program == "cat"
         && !file.starts_with('-')
     {
-        return read_instead(workspace, cwd, file);
+        let rewritten = read_instead(workspace, cwd, file);
+        if rewritten.is_none() {
+            crate::history::bypass(workspace, command);
+        }
+        return rewritten;
     }
     let session = session
         .filter(|id| !id.is_empty())
@@ -844,53 +856,34 @@ fn wrap_event(
             )
         })
         .unwrap_or_default();
-    let wrap = |segment: &str| format!("justless run --hook{session} -- {segment}");
-    let segments = split_compound(command).filter(|s| s.len() > 1);
-    let Some(segments) = segments else {
-        if !supported(command) {
-            crate::history::bypass(workspace, command);
-            return None;
+    // Follow each `cd` so a later one is checked from the directory it starts in.
+    let mut directory = cwd.to_path_buf();
+    let plan = plan(command, rules, |entered| {
+        match directory.join(entered).canonicalize() {
+            Ok(next) if next.is_dir() && next.starts_with(&workspace.root) => {
+                directory = next;
+                true
+            }
+            _ => false,
         }
-        return Some(wrap(command.trim()));
-    };
-    // Rewrite each supported segment in place and keep every other byte, so the
+    });
+    for range in plan.other {
+        crate::history::bypass(workspace, &command[range]);
+    }
+    if plan.wrap.is_empty() {
+        return None;
+    }
+    // Rewrite each supported command in place and keep every other byte, so the
     // shell still sees the original operators, spacing and unsupported commands.
     let mut rewritten = String::with_capacity(command.len() + 64);
     let mut copied = 0;
-    let mut wrapped = 0;
-    for range in segments {
-        let segment = &command[range.clone()];
-        let words = literal_command(segment);
-        let words: Option<Vec<&str>> = words
-            .as_ref()
-            .map(|w| w.iter().map(String::as_str).collect());
-        if let Some(["cd", directory]) = words.as_deref() {
-            let directory = Path::new(directory);
-            // Stay inside the workspace so captured runs keep the same root.
-            if directory.is_absolute()
-                || directory.as_os_str().to_str()?.starts_with(['-', '~'])
-                || directory
-                    .components()
-                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
-            {
-                return None;
-            }
-            continue;
-        }
-        if !supported(segment) {
-            if !allow_mixed {
-                return None;
-            }
-            crate::history::bypass(workspace, segment);
-            continue;
-        }
+    for range in plan.wrap {
         rewritten.push_str(&command[copied..range.start]);
-        rewritten.push_str(&wrap(segment));
+        rewritten.push_str(&format!(
+            "justless run --hook{session} -- {}",
+            &command[range.clone()]
+        ));
         copied = range.end;
-        wrapped += 1;
-    }
-    if wrapped == 0 {
-        return None;
     }
     rewritten.push_str(&command[copied..]);
     Some(rewritten)
@@ -1036,10 +1029,115 @@ fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
     Some(false)
 }
 
+/// The commands of a shell command line that a hook runs through Justless, and the
+/// others that it counts as passed through.
+#[derive(Default)]
+struct Plan {
+    wrap: Vec<Range<usize>>,
+    other: Vec<Range<usize>>,
+}
+
+/// Decide which commands of a list to rewrite. A list that changes directory in any
+/// way other than a plain `cd DIR` into the workspace, accepted by `enter`, passes
+/// through whole, so a wrapped command never runs from outside the workspace.
+fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Plan {
+    let supported =
+        |segment: &str| supported_command(segment) && !(rules.client_grep && runs_grep(segment));
+    let mut plan = Plan::default();
+    let Some(segments) = split_compound(command).filter(|s| s.len() > 1) else {
+        let start = command.len() - command.trim_start().len();
+        let range = start..command.trim_end().len().max(start);
+        if supported(command) {
+            plan.wrap.push(range);
+        } else {
+            plan.other.push(range);
+        }
+        return plan;
+    };
+    for range in &segments {
+        let segment = &command[range.clone()];
+        match directory_change(segment) {
+            None if supported(segment) => plan.wrap.push(range.clone()),
+            None => plan.other.push(range.clone()),
+            Some(Some(directory)) if descends(&directory) && enter(&directory) => {}
+            Some(_) => {
+                return Plan {
+                    wrap: Vec::new(),
+                    other: segments
+                        .iter()
+                        .filter(|range| directory_change(&command[(*range).clone()]).is_none())
+                        .cloned()
+                        .collect(),
+                };
+            }
+        }
+    }
+    if !rules.mixed && !plan.other.is_empty() {
+        plan.other.append(&mut plan.wrap);
+    }
+    plan
+}
+
+/// A command that can change the shell's directory: `Some(Some(DIR))` for a plain
+/// `cd DIR`, and `Some(None)` for any other form, such as a bare `cd`, `cd -P DIR`,
+/// `builtin cd`, `pushd`, `popd`, `source` or `eval`.
+fn directory_change(segment: &str) -> Option<Option<String>> {
+    let Some(words) = shlex::split(segment) else {
+        return Some(None);
+    };
+    // Look past assignments and the words that run the next one in this shell, such
+    // as `builtin cd`, `time cd` or the `then cd` of an `if` split at its `;`.
+    let program = words.iter().map(String::as_str).find(|word| {
+        !word.contains('=')
+            && !word.starts_with('-')
+            && !matches!(
+                *word,
+                "builtin"
+                    | "command"
+                    | "time"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "elif"
+                    | "while"
+                    | "until"
+                    | "do"
+            )
+    })?;
+    match words.as_slice() {
+        [cd, directory] if cd == "cd" && !directory.is_empty() && !directory.starts_with('-') => {
+            Some(Some(directory.clone()))
+        }
+        _ if matches!(
+            program,
+            "cd" | "pushd" | "popd" | "chdir" | "source" | "." | "eval"
+        ) =>
+        {
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a `cd` operand names a directory below the current one, without `..`,
+/// `~` or a root.
+fn descends(directory: &str) -> bool {
+    let path = Path::new(directory);
+    !directory.starts_with('~')
+        && !directory.contains(['*', '?', '['])
+        && !path.has_root()
+        && path.components().all(|part| {
+            matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
+
 /// Split a command list on top-level `&&`, `||` and `;`, returning the trimmed byte
 /// range of each command. Expansions, pipes, redirections, grouping, background
 /// jobs and comments return `None` so the whole command passes through unchanged.
-fn split_compound(command: &str) -> Option<Vec<std::ops::Range<usize>>> {
+fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
@@ -1094,15 +1192,15 @@ fn split_compound(command: &str) -> Option<Vec<std::ops::Range<usize>>> {
     Some(segments)
 }
 
-/// Whether the command hook would route all or part of this command through Justless.
+/// Whether the Claude Code command hook would route all or part of this command
+/// through Justless. Each `cd` is checked by its words alone, so a link that leaves
+/// the workspace is not detected here.
 pub fn would_route(command: &str) -> bool {
-    supported_command(command)
-        || split_compound(command).is_some_and(|segments| {
-            segments.len() > 1
-                && segments
-                    .iter()
-                    .any(|range| supported_command(&command[range.clone()]))
-        })
+    let rules = Rules {
+        mixed: true,
+        client_grep: true,
+    };
+    !plan(command, rules, |_| true).wrap.is_empty()
 }
 
 /// The program and subcommand that start a shell command, such as `cargo test`.

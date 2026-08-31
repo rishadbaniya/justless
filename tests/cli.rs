@@ -2912,6 +2912,7 @@ fn claude_grep_and_glob_results_are_grouped_and_recoverable() {
 fn claude_code_keeps_its_own_grep_and_destructive_finds_pass_through() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join("src")).unwrap();
     let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
     let rewrite = |agent: &str, command: &str| {
         agent_hook(&root, agent, "before-command", call(command))["hookSpecificOutput"]
@@ -4919,11 +4920,165 @@ fn claude_background_commands_pass_through() {
     );
     assert_eq!(
         call(serde_json::json!({"command":"make serve"}))["hookSpecificOutput"]["updatedInput"]["command"],
-        "justless run -- make serve"
+        "justless run --hook -- make serve"
     );
     let stats: serde_json::Value =
         serde_json::from_str(&success(&root, &["stats", "--json"])).unwrap();
     assert_eq!(stats["hook_pass_through"]["make"], 1, "{stats}");
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_changes_that_can_leave_the_workspace_pass_through() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("repo");
+    fs::create_dir_all(root.join("sub/deeper")).unwrap();
+    fs::create_dir(repo.path().join("sibling")).unwrap();
+    let root = root.canonicalize().unwrap();
+    std::os::unix::fs::symlink("../sibling", root.join("ext")).unwrap();
+    std::os::unix::fs::symlink("sub", root.join("inner")).unwrap();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let rewrite = |agent: &str, command: &str| {
+        agent_hook(&root, agent, "before-command", call(command))["hookSpecificOutput"]
+            ["updatedInput"]["command"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    for command in [
+        "cd && git status --short",
+        "cd ~ && git status",
+        "cd -- ../sibling && git status",
+        "cd -P / && git status",
+        "cd - && git status",
+        "cd ../sibling && git status",
+        "cd /tmp && git status",
+        "cd ext && make",
+        "cd sub && cd ../.. && git status",
+        "cd missing && git status",
+        "cd 'sub' deeper && git status",
+        "pushd ../sibling && git status",
+        "pushd sub && git status",
+        "popd && git status",
+        "builtin cd /tmp && git status",
+        "command cd /tmp && git status",
+        "HOME=/tmp cd && git status",
+        "source env.sh && git status",
+        ". ./env.sh && git status",
+        "eval 'cd /tmp' && git status",
+        "time cd /tmp && git status",
+        "if cd /tmp; then git status; fi",
+    ] {
+        for agent in ["hook-claude", "hook-codex"] {
+            assert_eq!(rewrite(agent, command), None, "{agent} {command}");
+        }
+    }
+    for (command, expected) in [
+        (
+            "cd sub && git status",
+            "cd sub && justless run --hook -- git status",
+        ),
+        (
+            "cd ./sub/ && cd deeper && git status",
+            "cd ./sub/ && cd deeper && justless run --hook -- git status",
+        ),
+        (
+            "cd inner && git status",
+            "cd inner && justless run --hook -- git status",
+        ),
+    ] {
+        for agent in ["hook-claude", "hook-codex"] {
+            assert_eq!(
+                rewrite(agent, command).as_deref(),
+                Some(expected),
+                "{agent} {command}"
+            );
+        }
+    }
+}
+
+#[test]
+fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("work");
+    fs::create_dir_all(root.join(".justless")).unwrap();
+    let root = root.canonicalize().unwrap();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let absolute = format!("cd {} && cargo test", root.display());
+    for command in [absolute.as_str(), "ls && cd /tmp && git status"] {
+        assert_eq!(
+            agent_hook(&root, "hook-claude", "before-command", call(command)),
+            serde_json::json!({}),
+            "{command}"
+        );
+    }
+    // Codex declines a list with an unsupported command and counts each command once.
+    assert_eq!(
+        hook(&root, "before-command", call("cargo test && git push")),
+        serde_json::json!({})
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&success(&root, &["stats", "--json"])).unwrap();
+    assert_eq!(
+        stats["hook_pass_through"],
+        serde_json::json!({"cargo":2,"git":2,"ls":1}),
+        "{stats}"
+    );
+
+    // `discover` applies the hook's own rules, so a list the hook passes through
+    // is not reported as a missing hook.
+    let config = repo.path().join("claude");
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = config.join("projects").join(slug);
+    fs::create_dir_all(&transcripts).unwrap();
+    let mut lines = Vec::new();
+    for (id, command) in [("t1", absolute.as_str()), ("t2", "grep -rn x src")] {
+        lines.push(serde_json::json!({"type":"assistant","cwd":root,"timestamp":"2999-01-01T00:00:00Z",
+            "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}}).to_string());
+        lines.push(serde_json::json!({"type":"user","cwd":root,"timestamp":"2999-01-01T00:00:01Z",
+            "message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"x".repeat(900)}]}}).to_string());
+    }
+    fs::write(transcripts.join("session.jsonl"), lines.join("\n")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["discover", "--json"])
+        .current_dir(&root)
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let groups = report["groups"].as_array().unwrap();
+    assert_eq!(report["commands"], 2, "{report}");
+    // A list the hook declines on purpose must never read as a missing hook.
+    assert!(
+        groups.iter().all(|g| g["route"] != "supported_not_routed"),
+        "{report}"
+    );
+    let route = |label: &str| {
+        groups
+            .iter()
+            .find(|g| {
+                g["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l["label"] == label)
+            })
+            .map(|g| g["route"].clone())
+    };
+    assert_eq!(
+        route("cargo test"),
+        Some(serde_json::json!("passed_through")),
+        "{report}"
+    );
+    assert_eq!(
+        route("grep"),
+        Some(serde_json::json!("not_supported")),
+        "{report}"
+    );
 }
 
 #[cfg(unix)]
