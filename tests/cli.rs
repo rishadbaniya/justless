@@ -5082,6 +5082,94 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
 }
 
 #[test]
+fn codex_and_cursor_approve_only_local_build_and_test_commands() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let cursor = |command: &str| {
+        agent_hook(
+            &root,
+            "hook-cursor",
+            "before-command",
+            serde_json::json!({"tool_name":"Shell","cwd":root,"tool_input":{"command":command}}),
+        )
+    };
+    for command in [
+        "make install",
+        "make deploy",
+        "make -j deploy",
+        "make CC=./cc",
+        "make -C /usr/local/src/other clean",
+        "make -f /tmp/evil.mk",
+        "ninja -C build",
+        "cmake --build build --target install",
+        "mvn deploy",
+        "mvn -s /tmp/settings.xml deploy",
+        "mvn spring-boot:run",
+        "gradle publish",
+        "gradle -I /tmp/init.gradle publish",
+        "./gradlew bootRun",
+        "pytest --basetemp=/Users/me/Documents",
+        "pytest ../elsewhere",
+        "go build -o /usr/local/bin/tool",
+        "go test -exec ./wrapper ./...",
+        "cargo test --config build.rustc-wrapper=/tmp/x",
+        "cargo test --target-dir=/tmp/target",
+        "npx -y make",
+        "npx -y pytest",
+        "npx --yes rg x",
+        "uvx rg foo",
+        "uv run pytest",
+        "pnpm dlx make",
+        "bunx git status",
+    ] {
+        assert_eq!(
+            hook(&root, "before-command", call(command)),
+            serde_json::json!({}),
+            "{command}"
+        );
+        assert_eq!(cursor(command), serde_json::json!({}), "{command}");
+    }
+    // Claude Code checks the rewritten command itself, so its hook still routes them.
+    let claude = agent_hook(&root, "hook-claude", "before-command", call("make deploy"));
+    assert_eq!(
+        claude["hookSpecificOutput"]["updatedInput"]["command"],
+        "justless run -- make deploy"
+    );
+    for command in [
+        "make",
+        "make -j8 test",
+        "make -j 4 all",
+        "ninja",
+        "cmake --build build --target test -j 8",
+        "mvn -q test",
+        "mvn clean verify -Dtest=FooTest",
+        "./gradlew build",
+        "./gradlew :app:test --tests 'com.example.Foo*'",
+        "cargo test",
+        "cargo clippy --all-targets -- -D warnings",
+        "go test ./...",
+        "python -m pytest -q tests/unit",
+        "python -m mypy app",
+        "pytest tests/test_orders.py",
+        "git status --short",
+        "rg fetch src",
+        "npm test",
+    ] {
+        let output = hook(&root, "before-command", call(command));
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"], "allow",
+            "{command}"
+        );
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["command"],
+            format!("justless run -- {command}")
+        );
+        assert_eq!(cursor(command)["permission"], "allow", "{command}");
+    }
+}
+
+#[test]
 fn rewritten_commands_keep_unicode_spaces_that_belong_to_a_word() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();

@@ -572,9 +572,11 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         return None;
     }
     let command = args.get("command")?.as_str()?.to_owned();
+    // Cursor answers a rewrite with `permission: "allow"`, like Codex.
     let rules = Rules {
         mixed: agent == Agent::Gemini,
         client_grep: false,
+        approves: agent == Agent::Cursor,
     };
     let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
     args["command"] = Value::String(rewritten);
@@ -767,6 +769,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         Rules {
             mixed: false,
             client_grep: false,
+            approves: false,
         },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
@@ -802,6 +805,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         Rules {
             mixed: agent != Agent::Codex,
             client_grep: agent == Agent::Claude,
+            approves: agent == Agent::Codex,
         },
     )?);
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
@@ -826,6 +830,9 @@ struct Rules {
     /// .gitignore and skips binary files. Running the system grep instead would
     /// search ignored build and dependency trees, so leave grep to that shell.
     client_grep: bool,
+    /// The client runs a rewritten command without asking, so each command must
+    /// also pass `filters::approvable`.
+    approves: bool,
 }
 
 fn wrap_event(
@@ -1041,8 +1048,15 @@ struct Plan {
 /// way other than a plain `cd DIR` into the workspace, accepted by `enter`, passes
 /// through whole, so a wrapped command never runs from outside the workspace.
 fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Plan {
-    let supported =
-        |segment: &str| supported_command(segment) && !(rules.client_grep && runs_grep(segment));
+    let supported = |segment: &str| {
+        supported_command(segment)
+            && !(rules.client_grep && runs_grep(segment))
+            && (!rules.approves
+                || literal_command(segment).is_some_and(|words| {
+                    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                    crate::filters::approvable(&words)
+                }))
+    };
     let mut plan = Plan::default();
     let Some(segments) = split_compound(command).filter(|s| s.len() > 1) else {
         let start = command.len() - command.trim_start_matches(SHELL_BLANKS).len();
@@ -1200,6 +1214,7 @@ pub fn would_route(command: &str) -> bool {
     let rules = Rules {
         mixed: true,
         client_grep: true,
+        approves: false,
     };
     !plan(command, rules, |_| true).wrap.is_empty()
 }

@@ -347,6 +347,260 @@ pub fn legacy_hook(words: &[&str]) -> bool {
     )
 }
 
+/// Whether a routed command may also run without the client asking, for a client
+/// that approves every rewritten command, such as Codex. The tool must run directly,
+/// not through a package runner that may download it. Build tools are limited to
+/// conventional build and test targets and a few display options. No argument may
+/// name a path outside the working tree, so options such as `make -C /elsewhere` or
+/// `pytest --basetemp=/tmp/x` fail, and `-f`, `-I` and `--config` fail for the tools
+/// that load code from them.
+pub fn approvable(words: &[&str]) -> bool {
+    let tool = unwrap_tool(words);
+    if tool.len() != words.len() && !matches!(words, ["python" | "python3", "-m", ..]) {
+        return false;
+    }
+    let Some((&program, args)) = tool.split_first() else {
+        return false;
+    };
+    // Searches and Git display commands only read, and their options are checked
+    // when they are routed.
+    if crate::search::select(tool).is_some() || program == "git" {
+        return true;
+    }
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    const TARGETS: &[&str] = &["all", "build", "test", "check"];
+    let target = |name: &str| TARGETS.contains(&name);
+    match program {
+        "make" | "gmake" => build_args(
+            args,
+            &[
+                "-k",
+                "--keep-going",
+                "-s",
+                "--silent",
+                "--quiet",
+                "--no-print-directory",
+                "-n",
+                "--dry-run",
+                "--just-print",
+            ],
+            &["-j", "--jobs", "-l", "--load-average"],
+            &[],
+            target,
+        ),
+        "ninja" => build_args(
+            args,
+            &["-v", "--verbose", "-n"],
+            &["-j", "-k", "-l"],
+            &[],
+            target,
+        ),
+        "cmake" => match args {
+            ["--build", directory, rest @ ..] if !directory.starts_with('-') => {
+                build_args(
+                    rest,
+                    &["-v", "--verbose", "--clean-first"],
+                    &["-j", "--parallel"],
+                    &["--config", "--target", "-t"],
+                    |_| false,
+                ) && rest
+                    .iter()
+                    .enumerate()
+                    .all(|(i, arg)| match arg.split_once('=') {
+                        Some(("--target", name)) => target(name),
+                        _ if matches!(*arg, "--target" | "-t") => {
+                            rest.get(i + 1).is_some_and(|name| target(name))
+                        }
+                        _ => true,
+                    })
+            }
+            _ => false,
+        },
+        "gradle" | "gradlew" | "./gradlew" => build_args(
+            args,
+            &[
+                "-q",
+                "--quiet",
+                "-i",
+                "--info",
+                "-s",
+                "--stacktrace",
+                "-S",
+                "--full-stacktrace",
+                "--offline",
+                "--continue",
+                "--parallel",
+                "--no-parallel",
+                "--daemon",
+                "--no-daemon",
+                "--build-cache",
+                "--no-build-cache",
+                "--rerun-tasks",
+                "-m",
+                "--dry-run",
+            ],
+            &[],
+            &[
+                "--console",
+                "--warning-mode",
+                "-x",
+                "--exclude-task",
+                "--tests",
+                "--max-workers",
+            ],
+            // A task may be qualified by its project, such as `:app:test`.
+            |task| {
+                !task.starts_with('-')
+                    && matches!(
+                        task.rsplit(':').next(),
+                        Some("build" | "test" | "check" | "assemble" | "clean")
+                    )
+            },
+        ),
+        "mvn" | "mvnw" | "./mvnw" => build_args(
+            args,
+            &[
+                "-q",
+                "--quiet",
+                "-o",
+                "--offline",
+                "-B",
+                "--batch-mode",
+                "-e",
+                "--errors",
+                "-X",
+                "--debug",
+                "-ntp",
+                "--no-transfer-progress",
+                "-am",
+                "--also-make",
+                "-amd",
+                "--also-make-dependents",
+                "-ff",
+                "--fail-fast",
+                "-fae",
+                "--fail-at-end",
+                "-N",
+                "--non-recursive",
+            ],
+            &[],
+            &[
+                "-T",
+                "--threads",
+                "-pl",
+                "--projects",
+                "-rf",
+                "--resume-from",
+            ],
+            |phase| {
+                let property = phase
+                    .strip_prefix("-D")
+                    .map(|property| property.split_once('=').map_or(property, |(key, _)| key));
+                matches!(
+                    phase,
+                    "clean"
+                        | "validate"
+                        | "compile"
+                        | "test-compile"
+                        | "test"
+                        | "package"
+                        | "verify"
+                ) || matches!(
+                    property,
+                    Some("test" | "it.test" | "skipTests" | "skipITs" | "maven.test.skip")
+                )
+            },
+        ),
+        "cargo" => !args.iter().any(|arg| {
+            arg.starts_with("-Z")
+                || arg.split_once('=').map_or(*arg, |(flag, _)| flag) == "--config"
+        }),
+        "go" => !args.iter().any(|arg| {
+            let flag = arg.split_once('=').map_or(*arg, |(flag, _)| flag);
+            matches!(
+                flag.trim_start_matches('-'),
+                "exec" | "toolexec" | "overlay"
+            )
+        }),
+        _ => true,
+    }
+}
+
+/// Whether build tool arguments are only the given flags, job counts, options with a
+/// value and targets that `target` accepts. A count is taken only when it is a
+/// number, so `make -j deploy` still checks `deploy`. A value that looks like an
+/// option fails, so `-x --dry-run` cannot hide a flag.
+fn build_args(
+    mut args: &[&str],
+    flags: &[&str],
+    counts: &[&str],
+    valued: &[&str],
+    target: impl Fn(&str) -> bool,
+) -> bool {
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    while let Some((&arg, rest)) = args.split_first() {
+        args = rest;
+        let (key, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(key, value)| (key, Some(value)));
+        if flags.contains(&arg) {
+            continue;
+        }
+        if counts.contains(&key) {
+            match inline {
+                Some(value) if !number(value) => return false,
+                Some(_) => {}
+                None if args.first().is_some_and(|value| number(value)) => args = &args[1..],
+                None => {}
+            }
+            continue;
+        }
+        if counts
+            .iter()
+            .any(|count| !count.starts_with("--") && arg.strip_prefix(count).is_some_and(number))
+        {
+            continue;
+        }
+        if valued.contains(&key) {
+            if inline.is_none() {
+                match args.split_first() {
+                    Some((value, rest)) if !value.starts_with('-') => args = rest,
+                    _ => return false,
+                }
+            }
+            continue;
+        }
+        if arg.starts_with('-') && !arg.starts_with("-D") || !target(arg) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether an argument, or the value after its `=`, stays inside the working tree:
+/// not absolute, not under `~`, and with no `..` component.
+fn local_argument(arg: &str) -> bool {
+    let mut values = vec![arg];
+    if let Some((_, value)) = arg.split_once('=') {
+        values.push(value);
+    }
+    // An attached short option value, such as `-o/tmp/out` or `-I/opt/include`.
+    let mut chars = arg.chars();
+    if chars.next() == Some('-') && chars.next().is_some_and(|c| c != '-') {
+        values.push(chars.as_str());
+    }
+    values.into_iter().all(|value| {
+        let path = Path::new(value);
+        !value.starts_with('~')
+            && !path.has_root()
+            && !path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
