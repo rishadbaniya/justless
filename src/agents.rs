@@ -927,15 +927,17 @@ fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String>
 /// Whether an outline leaves out top-level code that no row covers, such as the
 /// commands of a shell script between its functions or a Python `__main__` block.
 /// Only languages that run statements at the top level are checked. Rust, Go, Java
-/// and other compiled languages hold only declarations there. Blank lines,
-/// comments, docstrings and other lone string literals such as `'use strict'`,
-/// PHP tags and `declare`, Ruby's `require`, closing brackets and a wrapper whose
-/// members are outlined, such as `class Name {`, do not count.
+/// and other compiled languages hold only declarations there. Blank lines, the
+/// language's comments, Python docstrings, a lone string literal such as
+/// `'use strict'` outside shell, PHP tags and `declare`, Ruby's `require`, closing
+/// brackets and a wrapper whose members are outlined, such as `class Name {`, do
+/// not count.
 fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
     let extension = Path::new(file)
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
+    let language = extension.as_deref().unwrap_or_default();
     if !matches!(
         extension.as_deref(),
         Some(
@@ -986,37 +988,34 @@ fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
             continue;
         }
         let literal = text.trim_end_matches(';');
+        let prefixes: &[&str] = match language {
+            "php" | "phtml" => &["//", "/*", "*", "<?", "?>", "<!--", "declare("],
+            "rb" | "rake" => &["require ", "require(", "require_relative "],
+            "lua" | "sql" => &["--"],
+            "sh" | "bash" | "py" => &[],
+            _ => &["//", "/*", "*"],
+        };
         if text.is_empty()
-            || text.starts_with(['#', '*'])
-            || [
-                "//",
-                "/*",
-                "--",
-                "<!--",
-                "<?",
-                "?>",
-                "declare(",
-                "require ",
-                "require(",
-                "require_relative ",
-            ]
-            .iter()
-            .any(|prefix| text.starts_with(prefix))
+            || text.starts_with('#')
+            || prefixes.iter().any(|prefix| text.starts_with(prefix))
             || text
                 .chars()
                 .all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
-            || ['\'', '"'].into_iter().any(|quote| {
-                literal.len() > 1
-                    && literal.starts_with(quote)
-                    && literal.ends_with(quote)
-                    && !literal[1..literal.len() - 1].contains(quote)
-            })
+            // A lone string literal, such as `'use strict'`, has no effect. In a
+            // shell script it is a command, such as the dispatcher `"$@"`.
+            || !matches!(language, "sh" | "bash")
+                && ['\'', '"'].into_iter().any(|quote| {
+                    literal.len() > 1
+                        && literal.starts_with(quote)
+                        && literal.ends_with(quote)
+                        && !literal[1..literal.len() - 1].contains(quote)
+                })
         {
             continue;
         }
         if let Some(quote) = ["\"\"\"", "'''"]
             .into_iter()
-            .find(|quote| text.starts_with(quote))
+            .find(|quote| language == "py" && text.starts_with(quote))
         {
             if !text[3..].contains(quote) {
                 docstring = Some(quote);

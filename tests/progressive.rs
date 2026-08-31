@@ -984,6 +984,23 @@ fn native_reads_of_scripts_keep_top_level_code_the_outline_leaves_out() {
             ),
             false,
         ),
+        // In shell, a lone quoted word and `require NAME` are commands too.
+        (
+            "dispatch.sh",
+            format!(
+                "#!/bin/sh\nbuild() {{\n{}  :\n}}\n\n\"$@\"\n",
+                detail("  #")
+            ),
+            false,
+        ),
+        (
+            "setup.sh",
+            format!(
+                "#!/bin/sh\nrequire() {{\n{}  command -v \"$1\"\n}}\n\nrequire cargo\n",
+                detail("  #")
+            ),
+            false,
+        ),
         // A Python entry point.
         (
             "tool.py",
