@@ -3,8 +3,10 @@ use std::fs;
 use std::io::{self, ErrorKind, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
+use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::index::Index;
@@ -686,10 +688,27 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
         return None;
     }
     source.index(&file).ok()?;
-    if hides_code(&file, &source)? {
+    // A few lines of code outside every row, such as a `__main__` guard, follow the
+    // rows verbatim. More keep the native read.
+    let uncovered = uncovered_code(&file, &source)?;
+    if uncovered.len() > 20 {
         return None;
     }
-    let outline = source.page("", None, 40, budget).ok()?.display();
+    let mut outline = source.page("", None, 40, budget).ok()?.display();
+    let mut context = "Justless outline. L ranges are source line numbers.";
+    if !uncovered.is_empty() {
+        let lines: Vec<&str> = source.text.lines().collect();
+        let mut code = String::from("Code outside these rows:\n");
+        for index in uncovered {
+            let line = lines[index].trim_end_matches('\r');
+            code.push_str(&format!("L{}: {line}\n", index + 1));
+        }
+        if code.len() > budget {
+            return None;
+        }
+        outline.push_str(&code);
+        context = "Justless outline. L ranges are source line numbers, and code that no row covers follows the rows verbatim.";
+    }
     if outline.len() + 160 >= native.len() {
         return None;
     }
@@ -697,7 +716,7 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     result["content"] = json!(outline.trim_end_matches('\n'));
     Some(
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
-        "additionalContext":"Justless outline. L ranges are source line numbers. Expand a row with justless expand FILE 'REV#ID', or use Read with offset and limit for original lines."}}),
+        "additionalContext":format!("{context} Expand a row with justless expand FILE 'REV#ID', or use Read with offset and limit for original lines.")}}),
     )
 }
 
@@ -914,7 +933,8 @@ fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String>
         return None;
     }
     snapshot.index(file).ok()?;
-    if hides_code(file, &snapshot)? {
+    // `justless read` prints only the rows, so every line of code must be in one.
+    if !uncovered_code(file, &snapshot)?.is_empty() {
         return None;
     }
     Some(format!(
@@ -924,15 +944,17 @@ fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String>
     ))
 }
 
-/// Whether an outline leaves out top-level code that no row covers, such as the
+/// The zero-based lines of top-level code that no outline row covers, such as the
 /// commands of a shell script between its functions or a Python `__main__` block.
 /// Only languages that run statements at the top level are checked. Rust, Go, Java
 /// and other compiled languages hold only declarations there. Blank lines, the
 /// language's comments, Python docstrings, a lone string literal such as
 /// `'use strict'` outside shell, PHP tags and `declare`, Ruby's `require`, closing
 /// brackets and a wrapper whose members are outlined, such as `class Name {`, do
-/// not count.
-fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
+/// not count. Neither do statements that only bind modules or names: JavaScript and
+/// TypeScript `require` bindings, export lists, re-exports and `module.exports`
+/// set to names, and Python's `from __future__` imports and `if TYPE_CHECKING:`.
+fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Option<Vec<usize>> {
     let extension = Path::new(file)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -962,7 +984,7 @@ fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
                 | "sbt"
         )
     ) {
-        return Some(false);
+        return Some(Vec::new());
     }
     let page = source.page("", None, usize::MAX, usize::MAX).ok()?;
     let page = serde_json::to_value(page).ok()?;
@@ -975,12 +997,16 @@ fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
             *line = true;
         }
     }
+    let mut uncovered = Vec::new();
     let mut docstring = None;
-    for (index, line) in lines.iter().enumerate() {
+    let mut next = 0;
+    while next < lines.len() {
+        let index = next;
+        next += 1;
         if covered[index] {
             continue;
         }
-        let text = line.trim();
+        let text = lines[index].trim();
         if let Some(quote) = docstring {
             if text.contains(quote) {
                 docstring = None;
@@ -1022,6 +1048,10 @@ fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
             }
             continue;
         }
+        if let Some(end) = module_binding(language, &lines, index) {
+            next = end;
+            continue;
+        }
         let wrapper = text.ends_with('{')
             && lines[index + 1..]
                 .iter()
@@ -1029,10 +1059,95 @@ fn hides_code(file: &str, source: &crate::source::Snapshot) -> Option<bool> {
                 .find(|(line, _)| !line.trim().is_empty())
                 .is_some_and(|(_, covered)| *covered);
         if !wrapper {
-            return Some(true);
+            uncovered.push(index);
         }
     }
-    Some(false)
+    Some(uncovered)
+}
+
+/// A JavaScript or TypeScript statement that only binds modules or names.
+static JS_BINDING: LazyLock<Regex> = LazyLock::new(|| {
+    let module = r#"(?:'[^']*'|"[^"]*")"#;
+    let names = r"\{[^{}()\[\]]*\}";
+    let require = format!(r"require\(\s*{module}\s*\)");
+    Regex::new(&format!(
+        r"^(?:(?:const|let|var)\s+(?:[\w$]+|{names}|\[[\w$,\s]*\])\s*=\s*{require}(?:\.[\w$]+)*|import\s+[^()]*{module}|import\s+[\w$]+\s*=\s*{require}|export\s+(?:type\s+)?\*(?:\s+as\s+[\w$]+)?\s+from\s+{module}|export\s+(?:type\s+)?{names}(?:\s*from\s+{module})?|export\s+default\s+[\w$.]+|(?:module\.)?exports(?:\.[\w$]+)?\s*=\s*(?:[\w$.]+|{names}))\s*;?$"
+    ))
+    .expect("module binding pattern")
+});
+
+/// The line after a statement that starts at `start` and only binds modules or
+/// names, such as `const fs = require('fs')` or `export { a, b } from './x'`, even
+/// when it spans several lines. A call, function or nested object is code.
+fn module_binding(language: &str, lines: &[&str], start: usize) -> Option<usize> {
+    let first = lines[start].trim();
+    if language == "py" {
+        let typing = first.strip_prefix("if ").is_some_and(|condition| {
+            matches!(
+                condition.strip_suffix(':').map(str::trim),
+                Some("TYPE_CHECKING" | "typing.TYPE_CHECKING")
+            )
+        });
+        if typing {
+            return Some(start + 1);
+        }
+        if !first.starts_with("from __future__ import ") {
+            return None;
+        }
+        // A parenthesized list of feature names ends at its closing parenthesis.
+        if !first.contains('(') || first.contains(')') {
+            return Some(start + 1);
+        }
+        return lines[start + 1..]
+            .iter()
+            .take(64)
+            .position(|line| line.contains(')'))
+            .map(|offset| start + offset + 2);
+    } else if !matches!(
+        language,
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "mts" | "cts" | "tsx"
+    ) || ![
+        "const ",
+        "let ",
+        "var ",
+        "import ",
+        "export ",
+        "module.exports",
+        "exports.",
+        "exports ",
+    ]
+    .iter()
+    .any(|prefix| first.starts_with(prefix))
+    {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote = None;
+    for (offset, line) in lines[start..].iter().take(64).enumerate() {
+        for c in line.chars() {
+            match quote {
+                Some(open) if c == open => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '\'' | '"' | '`' => quote = Some(c),
+                    '{' | '[' | '(' => depth += 1,
+                    '}' | ']' | ')' => depth -= 1,
+                    _ => {}
+                },
+            }
+        }
+        if depth > 0 || quote.is_some() {
+            continue;
+        }
+        let end = start + offset + 1;
+        let statement = lines[start..end]
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return JS_BINDING.is_match(&statement).then_some(end);
+    }
+    None
 }
 
 /// The commands of a shell command line that a hook runs through Justless, and the
