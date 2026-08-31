@@ -524,6 +524,29 @@ pub fn approvable(words: &[&str]) -> bool {
                 "exec" | "toolexec" | "overlay"
             )
         }),
+        // MSBuild targets and properties, such as `-t:Publish` with a publish
+        // profile, and package sources can deploy or fetch from elsewhere.
+        "dotnet" => args.split_first().is_some_and(|(_, rest)| {
+            build_args(
+                rest,
+                &["--no-restore", "--no-build", "--nologo", "--no-incremental"],
+                &[],
+                &[
+                    "-c",
+                    "--configuration",
+                    "-f",
+                    "--framework",
+                    "-v",
+                    "--verbosity",
+                    "--filter",
+                ],
+                |project| !project.starts_with('-'),
+            )
+        }),
+        // `--install-types` installs packages without asking.
+        "mypy" | "dmypy" => !args
+            .iter()
+            .any(|arg| arg.split('=').next() == Some("--install-types")),
         _ => true,
     }
 }

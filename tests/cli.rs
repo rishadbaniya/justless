@@ -5122,6 +5122,9 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "uv run pytest",
         "pnpm dlx make",
         "bunx git status",
+        "dotnet build -t:Publish",
+        "dotnet restore --source https://example.invalid/v3/index.json",
+        "mypy --install-types --non-interactive .",
     ] {
         assert_eq!(
             hook(&root, "before-command", call(command)),
@@ -5155,6 +5158,9 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "git status --short",
         "rg fetch src",
         "npm test",
+        "dotnet test --filter Unit",
+        "dotnet build -c Release",
+        "mypy app",
     ] {
         let output = hook(&root, "before-command", call(command));
         assert_eq!(
