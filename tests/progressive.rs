@@ -1155,7 +1155,7 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
     let detail = |marker: &str| format!("{marker} detail\n").repeat(400);
     // `None` keeps the native read. Otherwise the outline lists these lines of code
     // that no row covers, and only a file with none has its `cat` rewritten.
-    let files: [(&str, String, Option<&[&str]>); 15] = [
+    let files: [(&str, String, Option<&[&str]>); 17] = [
         // Commands between and after a shell script's functions.
         (
             "deploy.sh",
@@ -1250,6 +1250,28 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
                 detail("    //")
             ),
             Some(&["module.exports = {", "  name: 'thing',"]),
+        ),
+        // After the first statement, a lone string can be part of one, so it is
+        // shown with the rest of the statement.
+        (
+            "message.js",
+            format!(
+                "'use strict'\nconst MESSAGE = 'Refusing to delete. ' +\n  'It blocks republishing. ' +\n  'Run with --force.'\nfunction check() {{\n{}  return MESSAGE\n}}\n",
+                detail("  //")
+            ),
+            Some(&[
+                "const MESSAGE = 'Refusing to delete. ' +",
+                "  'It blocks republishing. ' +",
+                "  'Run with --force.'",
+            ]),
+        ),
+        (
+            "usage.py",
+            format!(
+                "import sys\n\n\ndef main():\n{}    return 0\n\n\nprint(\"\"\"\nusage: tool\n\"\"\")\nsys.exit(main())\n",
+                detail("    #")
+            ),
+            Some(&["print(\"\"\"", "usage: tool", "\"\"\")", "sys.exit(main())"]),
         ),
         // A function exported whole is a row of its own.
         (

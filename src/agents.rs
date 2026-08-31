@@ -948,8 +948,9 @@ fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String>
 /// commands of a shell script between its functions or a Python `__main__` block.
 /// Only languages that run statements at the top level are checked. Rust, Go, Java
 /// and other compiled languages hold only declarations there. Blank lines, the
-/// language's comments, Python docstrings, a lone string literal such as
-/// `'use strict'` outside shell, PHP tags and `declare`, Ruby's `require`, closing
+/// language's comments, a Python module docstring or a lone string literal such as
+/// `'use strict'` before the first statement outside shell, docstrings inside rows,
+/// PHP tags and `declare`, Ruby's `require`, closing
 /// brackets and a wrapper whose members are outlined, such as `class Name {`, do
 /// not count. Neither do statements that only bind modules or names: JavaScript and
 /// TypeScript `require` bindings, export lists, re-exports and `module.exports`
@@ -999,11 +1000,15 @@ fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Option<Vec<us
     }
     let mut uncovered = Vec::new();
     let mut docstring = None;
+    // Directives and module docstrings come before the first statement. A string
+    // after it can be part of a statement, such as the last operand of a `+`.
+    let mut prologue = true;
     let mut next = 0;
     while next < lines.len() {
         let index = next;
         next += 1;
         if covered[index] {
+            prologue = false;
             continue;
         }
         let text = lines[index].trim();
@@ -1029,7 +1034,8 @@ fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Option<Vec<us
                 .all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
             // A lone string literal, such as `'use strict'`, has no effect. In a
             // shell script it is a command, such as the dispatcher `"$@"`.
-            || !matches!(language, "sh" | "bash")
+            || prologue
+                && !matches!(language, "sh" | "bash")
                 && ['\'', '"'].into_iter().any(|quote| {
                     literal.len() > 1
                         && literal.starts_with(quote)
@@ -1041,13 +1047,14 @@ fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Option<Vec<us
         }
         if let Some(quote) = ["\"\"\"", "'''"]
             .into_iter()
-            .find(|quote| language == "py" && text.starts_with(quote))
+            .find(|quote| prologue && language == "py" && text.starts_with(quote))
         {
             if !text[3..].contains(quote) {
                 docstring = Some(quote);
             }
             continue;
         }
+        prologue = false;
         if let Some(end) = module_binding(language, &lines, index) {
             next = end;
             continue;
