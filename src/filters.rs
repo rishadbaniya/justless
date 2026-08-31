@@ -71,26 +71,36 @@ fn display_options(mut args: &[&str], flags: &[&str], valued: &[&str], names: bo
 
 /// Skip package-runner prefixes such as `npx`, `uv run` and `bundle exec` so the
 /// tool they launch selects the profile.
-pub fn unwrap_tool<'a, 'b>(mut words: &'a [&'b str]) -> &'a [&'b str] {
+pub fn unwrap_tool<'a, 'b>(words: &'a [&'b str]) -> &'a [&'b str] {
+    runners(words).0
+}
+
+/// The tool behind any package-runner prefixes, and whether a prefix may download
+/// the tool or install packages before it runs.
+fn runners<'a, 'b>(mut words: &'a [&'b str]) -> (&'a [&'b str], bool) {
+    let mut fetches = false;
     loop {
-        let rest = match words {
-            ["npx" | "bunx" | "uvx" | "pnpx", rest @ ..] => rest,
-            ["pnpm" | "yarn" | "bun", "exec" | "dlx", rest @ ..] => rest,
-            [
-                "uv" | "poetry" | "pdm" | "hatch" | "pipenv" | "rye",
-                "run",
-                rest @ ..,
-            ] => rest,
-            ["bundle", "exec", rest @ ..] => rest,
-            ["python" | "python3", "-m", tool, ..] if *tool != "pytest" => &words[2..],
-            _ => return words,
+        let (rest, downloads) = match words {
+            ["npx" | "bunx" | "uvx" | "pnpx", rest @ ..] => (rest, true),
+            ["pnpm" | "yarn" | "bun", "dlx", rest @ ..] => (rest, true),
+            // `uv run` and `hatch run` sync the environment first, and the others
+            // can be configured to.
+            ["uv" | "pdm" | "hatch" | "rye", "run", rest @ ..] => (rest, true),
+            // These run a tool the project already installed.
+            ["pnpm" | "yarn" | "bun", "exec", rest @ ..]
+            | ["poetry" | "pipenv", "run", rest @ ..]
+            | ["bundle", "exec", rest @ ..] => (rest, false),
+            ["python" | "python3", "-m", tool, ..] if *tool != "pytest" => (&words[2..], false),
+            _ => return (words, fetches),
         };
         let rest = match rest {
             ["-y" | "--yes" | "--quiet" | "-q", tail @ ..] => tail,
             _ => rest,
         };
+        fetches |= downloads;
+        // An option such as `uv run --with PKG` stays with its runner.
         if rest.is_empty() || rest[0].starts_with('-') {
-            return words;
+            return (words, fetches);
         }
         words = rest;
     }
@@ -348,15 +358,17 @@ pub fn legacy_hook(words: &[&str]) -> bool {
 }
 
 /// Whether a routed command may also run without the client asking, for a client
-/// that approves every rewritten command, such as Codex. The tool must run directly,
-/// not through a package runner that may download it. Build tools are limited to
-/// conventional build and test targets and a few display options. No argument may
-/// name a path outside the working tree, so options such as `make -C /elsewhere` or
+/// that approves every rewritten command, such as Codex. A package runner that may
+/// download the tool or install packages, such as `npx` or `uv run`, fails at any
+/// position, while `bundle exec`, `poetry run` and the other runners of installed
+/// tools leave the decision to the tool. Build tools are limited to conventional
+/// build and test targets and a few display options. No argument may name a path
+/// outside the working tree, so options such as `make -C /elsewhere` or
 /// `pytest --basetemp=/tmp/x` fail, and `-f`, `-I` and `--config` fail for the tools
 /// that load code from them.
 pub fn approvable(words: &[&str]) -> bool {
-    let tool = unwrap_tool(words);
-    if tool.len() != words.len() && !matches!(words, ["python" | "python3", "-m", ..]) {
+    let (tool, fetches) = runners(words);
+    if fetches {
         return false;
     }
     let Some((&program, args)) = tool.split_first() else {
@@ -370,7 +382,7 @@ pub fn approvable(words: &[&str]) -> bool {
     if !args.iter().all(|arg| local_argument(arg)) {
         return false;
     }
-    const TARGETS: &[&str] = &["all", "build", "test", "check"];
+    const TARGETS: &[&str] = &["all", "build", "test", "check", "clean"];
     let target = |name: &str| TARGETS.contains(&name);
     match program {
         "make" | "gmake" => build_args(
@@ -602,13 +614,17 @@ fn build_args(
     true
 }
 
-/// Whether an argument, or the value after its `=`, stays inside the working tree:
-/// not absolute, not under `~`, and with no `..` component.
+/// Whether an argument, and every value inside it, stays inside the working tree:
+/// not absolute, not under `~`, and with no `..` component. A value follows any `=`
+/// or `:`, a leading `@` or a blank, so nested settings such as
+/// `--override-ini=log_file=/abs`, `--cov-report=html:/abs` and `@/abs/args.rsp`
+/// are checked too.
 fn local_argument(arg: &str) -> bool {
     let mut values = vec![arg];
-    if let Some((_, value)) = arg.split_once('=') {
-        values.push(value);
-    }
+    values.extend(
+        arg.match_indices(['=', ':', '@', ' ', '\t'])
+            .map(|(index, separator)| &arg[index + separator.len()..]),
+    );
     // An attached short option value, such as `-o/tmp/out` or `-I/opt/include`.
     let mut chars = arg.chars();
     if chars.next() == Some('-') && chars.next().is_some_and(|c| c != '-') {

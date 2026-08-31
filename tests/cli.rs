@@ -5125,6 +5125,25 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "dotnet build -t:Publish",
         "dotnet restore --source https://example.invalid/v3/index.json",
         "mypy --install-types --non-interactive .",
+        // A path after a later `=`, a `:` or a blank inside one argument.
+        "pytest --override-ini=log_file=/Users/me/.bashrc",
+        "python -m pytest --override-ini=log_file=/Users/me/.bashrc",
+        "pytest -o 'addopts=--basetemp /Users/me/Documents'",
+        "pytest --cov-report=html:/tmp/coverage",
+        "dotnet build @/tmp/publish.rsp",
+        // A runner that may download is refused behind any other prefix.
+        "python -m uv run pytest",
+        "python3 -m hatch run pytest",
+        "poetry run npx -y pytest",
+        "bundle exec npx rubocop",
+        "yarn dlx jest",
+        "uv run --with pytest-xdist pytest",
+        // Build options that change the build or name a directory still ask.
+        "make test VERBOSE=1",
+        "make -C ops test",
+        "mvn -Pci test",
+        "gradle test -Pci",
+        "dotnet test -p:CI=true",
     ] {
         assert_eq!(
             hook(&root, "before-command", call(command)),
@@ -5161,6 +5180,16 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "dotnet test --filter Unit",
         "dotnet build -c Release",
         "mypy app",
+        "make clean",
+        // Runners of tools the project installed decide like the tool alone.
+        "bundle exec rubocop",
+        "pnpm exec tsc",
+        "yarn exec jest",
+        "poetry run pytest",
+        "pipenv run pytest",
+        "poetry run mypy src",
+        "python -m poetry run pytest",
+        "pytest -o cache_dir=.cache/pytest tests",
     ] {
         let output = hook(&root, "before-command", call(command));
         assert_eq!(
@@ -5172,6 +5201,42 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
             format!("justless run -- {command}")
         );
         assert_eq!(cursor(command)["permission"], "allow", "{command}");
+    }
+    // `python -m RUNNER` decides exactly as `RUNNER` does.
+    for runner in [
+        "npx",
+        "bunx",
+        "uvx",
+        "pnpx",
+        "pnpm dlx",
+        "yarn dlx",
+        "bun dlx",
+        "uv run",
+        "pdm run",
+        "hatch run",
+        "rye run",
+        "pnpm exec",
+        "yarn exec",
+        "bun exec",
+        "poetry run",
+        "pipenv run",
+        "bundle exec",
+    ] {
+        let direct = hook(
+            &root,
+            "before-command",
+            call(&format!("{runner} pytest -q")),
+        );
+        let module = hook(
+            &root,
+            "before-command",
+            call(&format!("python -m {runner} pytest -q")),
+        );
+        assert_eq!(
+            direct["hookSpecificOutput"]["permissionDecision"],
+            module["hookSpecificOutput"]["permissionDecision"],
+            "{runner}: {direct} {module}"
+        );
     }
 }
 
