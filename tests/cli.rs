@@ -5081,6 +5081,39 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
     );
 }
 
+#[test]
+fn rewritten_commands_keep_unicode_spaces_that_belong_to_a_word() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    // The shell splits words on ASCII blanks only, so U+3000 and U+00A0 belong to
+    // the last argument and must reach the command unchanged.
+    for (agent, command, expected) in [
+        (
+            "hook-claude",
+            "git log --oneline -3\u{3000}",
+            "justless run -- git log --oneline -3\u{3000}",
+        ),
+        (
+            "hook-codex",
+            "git status --short\u{a0}",
+            "justless run -- git status --short\u{a0}",
+        ),
+        (
+            "hook-claude",
+            "git status; git diff\u{3000}",
+            "justless run -- git status; git diff\u{3000}",
+        ),
+        ("hook-claude", " git diff\t", " justless run -- git diff\t"),
+    ] {
+        let output = agent_hook(&root, agent, "before-command", call(command));
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["command"], expected,
+            "{agent} {command:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn init_edits_a_linked_instructions_file_once_and_keeps_the_link() {

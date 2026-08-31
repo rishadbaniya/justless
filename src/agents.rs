@@ -1045,8 +1045,8 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         |segment: &str| supported_command(segment) && !(rules.client_grep && runs_grep(segment));
     let mut plan = Plan::default();
     let Some(segments) = split_compound(command).filter(|s| s.len() > 1) else {
-        let start = command.len() - command.trim_start().len();
-        let range = start..command.trim_end().len().max(start);
+        let start = command.len() - command.trim_start_matches(SHELL_BLANKS).len();
+        let range = start..command.trim_end_matches(SHELL_BLANKS).len().max(start);
         if supported(command) {
             plan.wrap.push(range);
         } else {
@@ -1077,6 +1077,9 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
     }
     plan
 }
+
+/// The blanks that separate shell words. Other Unicode spaces belong to a word.
+const SHELL_BLANKS: [char; 2] = [' ', '\t'];
 
 /// A command that can change the shell's directory: `Some(Some(DIR))` for a plain
 /// `cd DIR`, and `Some(None)` for any other form, such as a bare `cd`, `cd -P DIR`,
@@ -1145,8 +1148,8 @@ fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
     let mut i = 0;
     let mut push = |start: usize, end: usize| {
         let text = &command[start..end];
-        let lead = text.len() - text.trim_start().len();
-        let trimmed = text.trim();
+        let lead = text.len() - text.trim_start_matches(SHELL_BLANKS).len();
+        let trimmed = text.trim_matches(SHELL_BLANKS);
         (!trimmed.is_empty()).then(|| segments.push(start + lead..start + lead + trimmed.len()))
     };
     while i < bytes.len() {
@@ -1181,12 +1184,10 @@ fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
         return None;
     }
     // A trailing `;` is valid shell, so only a nonempty tail adds a segment.
-    if !command[start..].trim().is_empty() {
+    let end = command.trim_end_matches(SHELL_BLANKS);
+    if !command[start..].trim_matches(SHELL_BLANKS).is_empty() {
         push(start, command.len())?;
-    } else if segments.is_empty()
-        || command.trim_end().ends_with("&&")
-        || command.trim_end().ends_with("||")
-    {
+    } else if segments.is_empty() || end.ends_with("&&") || end.ends_with("||") {
         return None;
     }
     Some(segments)
