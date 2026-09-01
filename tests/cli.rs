@@ -5156,7 +5156,7 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
     let claude = agent_hook(&root, "hook-claude", "before-command", call("make deploy"));
     assert_eq!(
         claude["hookSpecificOutput"]["updatedInput"]["command"],
-        "justless run -- make deploy"
+        "justless run --hook -- make deploy"
     );
     for command in [
         "make",
@@ -5198,7 +5198,7 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         );
         assert_eq!(
             output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!("justless run -- {command}")
+            format!("justless run --hook -- {command}")
         );
         assert_eq!(cursor(command)["permission"], "allow", "{command}");
     }
@@ -5251,19 +5251,23 @@ fn rewritten_commands_keep_unicode_spaces_that_belong_to_a_word() {
         (
             "hook-claude",
             "git log --oneline -3\u{3000}",
-            "justless run -- git log --oneline -3\u{3000}",
+            "justless run --hook -- git log --oneline -3\u{3000}",
         ),
         (
             "hook-codex",
             "git status --short\u{a0}",
-            "justless run -- git status --short\u{a0}",
+            "justless run --hook -- git status --short\u{a0}",
         ),
         (
             "hook-claude",
             "git status; git diff\u{3000}",
-            "justless run -- git status; git diff\u{3000}",
+            "justless run --hook -- git status; git diff\u{3000}",
         ),
-        ("hook-claude", " git diff\t", " justless run -- git diff\t"),
+        (
+            "hook-claude",
+            " git diff\t",
+            " justless run --hook -- git diff\t",
+        ),
     ] {
         let output = agent_hook(&root, agent, "before-command", call(command));
         assert_eq!(
