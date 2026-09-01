@@ -41,3 +41,6 @@ tree-sitter-zig = "1.1"
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
