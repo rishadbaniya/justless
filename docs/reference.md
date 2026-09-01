@@ -181,7 +181,7 @@ An empty prefix, an invalid expression or one that matches empty text stops the 
 
 `pack`, `map`, `affected`, `history`, `resume`, `query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
 
-Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Keep the directory private if a command prints secrets. The CLI runs offline after installation, and `--raw` skips recording.
+Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Justless creates `.justless/` with its own `.gitignore`, so `git status`, `git add -A` and `context --changes` never pick up archived output. Keep the directory private if a command prints secrets. The CLI runs offline after installation, and `--raw` skips recording.
 
 Reading the index takes no lock, so concurrent queries over unchanged sources run in parallel. Saving a refreshed index, recording a run baseline and applying edits take a project lock under `.justless/`. When another Justless process holds it, Justless says so on stderr after a second and gives up after 30 seconds, or after the number of seconds in `JUSTLESS_LOCK_TIMEOUT`. A query that gives up still answers from the files it read and leaves the saved index unchanged, and a run that gives up records no baseline.
 
@@ -210,7 +210,7 @@ The server uses `--root` when given. Otherwise it finds the project the way othe
 | `resume` | `resume` | `budget` |
 | `stats` | `stats` | none |
 
-File arguments must be workspace-relative, and unknown arguments are rejected. The server resolves the project root once at startup. Clients limit the size of a tool result, so the `log` tool returns at most 32 KiB of replayed output per call, with or without a line range. A longer replay ends on a line boundary with a note naming the stream and the `from` line of the next page. A single line longer than a page is cut, and the note gives the shell command that replays it whole. Queries refresh the index under `.justless/`, and log replays are counted in `stats`. Source files are never modified. Run `justless init` or add `/.justless/` to `.gitignore` to keep that local state out of Git.
+File arguments must be workspace-relative, and unknown arguments are rejected. The server resolves the project root once at startup. Clients limit the size of a tool result, so the `log` tool returns at most 32 KiB of replayed output per call, with or without a line range. A longer replay ends on a line boundary with a note naming the stream and the `from` line of the next page. A single line longer than a page is cut, and the note gives the shell command that replays it whole. Queries refresh the index under `.justless/`, and log replays are counted in `stats`. Source files are never modified. The `.justless/` directory holds its own `.gitignore` containing `*`, so Git never lists that local state, even in a checkout or nested repository that does not ignore it.
 
 Add the server to a project's client config from the project root. Select one or more clients. `--install` writes to the project found from the current directory, even when `CLAUDE_PROJECT_DIR` is set, and prints the absolute path of each file.
 

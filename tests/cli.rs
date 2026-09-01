@@ -5322,3 +5322,43 @@ fn init_edits_a_linked_instructions_file_once_and_keeps_the_link() {
     assert!(!broken.join(".justless").exists());
     assert!(!broken.join("CLAUDE.md").exists());
 }
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(["-c", "user.email=qa@example.com", "-c", "user.name=qa"])
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", stderr(&output));
+    stdout(&output)
+}
+
+#[test]
+fn state_directory_is_invisible_to_git_without_a_project_ignore_entry() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    // A state directory created by an older version gains the ignore file too.
+    fs::create_dir(root.join(".justless")).unwrap();
+    let run = cli(root, &["run", "--", "sh", "-c", "echo API_TOKEN=secret"]);
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert_eq!(
+        success(root, &["run", "--", "git", "status", "--porcelain"]),
+        ""
+    );
+    assert!(success(root, &["context", "--changes"]).contains("No changed files."));
+    git(root, &["add", "-A"]);
+    assert_eq!(git(root, &["ls-files", "--cached"]), "");
+
+    // A nested repository gets its own state directory, invisible in the same way.
+    let nested = root.join("vendor_lib");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    assert_eq!(
+        success(&nested, &["run", "--", "git", "status", "--short"]),
+        ""
+    );
+    assert_eq!(git(&nested, &["status", "--short"]), "");
+}

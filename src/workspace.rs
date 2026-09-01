@@ -192,7 +192,19 @@ impl Workspace {
     }
 
     pub fn prepare_state(&self) -> Result<()> {
-        private_dir(&self.state)
+        private_dir(&self.state)?;
+        // A directory whose own .gitignore says `*` is invisible to Git, so archived
+        // output never shows up in `git status`, diffs or `git add -A`, including in
+        // nested repositories and checkouts that do not ignore `.justless/`.
+        let ignore = self.state.join(".gitignore");
+        if fs::symlink_metadata(&ignore).is_err() {
+            let _ = File::options()
+                .write(true)
+                .create_new(true)
+                .open(&ignore)
+                .and_then(|mut file| file.write_all(b"*\n"));
+        }
+        Ok(())
     }
 
     pub fn settings(&self) -> Result<Settings> {
@@ -276,7 +288,8 @@ pub fn lock_state(path: &Path) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)?;
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
     let started = std::time::Instant::now();
     let timeout = std::env::var("JUSTLESS_LOCK_TIMEOUT")
         .ok()
