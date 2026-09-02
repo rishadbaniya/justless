@@ -20,6 +20,19 @@ One live pair using Haiku 5.5 produced the following provider-reported totals ac
 
 The Justless run used 87.3% fewer input tokens. A rerun on 2026-11-18 with the same model reproduced it: 22,364 input tokens for the plain run and 2,851 with Justless, 87.3% fewer, and both fixes passed the independent check. The model chose three direct source reads in that run and one in the plain run. This pair measures the benefit of compact command output on this fixture. The scripted mode exercises the task-pack path. It uses a fixed edit and makes no model calls.
 
+### Across current Claude models
+
+On 2026-11-18 the same three-turn task ran three times per model with `python3 scripts/repair_benchmark.py --api --model MODEL`. Each model's two variants used identical settings: Haiku 5.5 with thinking disabled, Sonnet 5.5 with `between_tools`, and Opus 5.5 and Fable 5.2 with adaptive thinking at low effort, because those two cannot turn thinking off. Every run produced a fix that passed the independent check.
+
+| Model | Plain input tokens (median) | Justless input tokens (median) | Fewer | Fixes verified |
+| --- | ---: | ---: | ---: | ---: |
+| Claude Haiku 5.5 | 22,367 | 2,847 | 87.3% | 6 of 6 |
+| Claude Sonnet 5.5 | 22,762 | 2,840 | 87.5% | 6 of 6 |
+| Claude Opus 5.5 | 22,762 | 2,852 | 87.5% | 6 of 6 |
+| Claude Fable 5.2 | 22,762 | 2,846 | 87.5% | 6 of 6 |
+
+Runs varied by under 0.5% within each model. The saving comes from what the tools return on this fixture, so it is nearly the same for every model; a multi-task benchmark with agent-chosen tool calls is in progress.
+
 ## Build checks and single-task replay
 
 Run these commands from the root of the Justless checkout.

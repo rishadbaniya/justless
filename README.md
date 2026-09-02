@@ -35,9 +35,12 @@
 | `grep -rn` | 200 KB | 16.4 KB |
 | `cargo check`, successful builds in three repositories | 26.5 KB | 0.5 KB |
 | One 21 KB source file: outline, then one symbol | 21 KB | 2.1 KB, then 60 B |
-| Three-turn repair task, provider-reported input tokens (Claude Haiku 5.5) | 22,364 | **2,851** (87% fewer) |
+| Three-turn repair task, provider-reported input tokens, median of 3 runs: Claude Haiku 5.5 | 22,367 | **2,847** (87.3% fewer) |
+| Same task: Claude Sonnet 5.5 | 22,762 | **2,840** (87.5% fewer) |
+| Same task: Claude Opus 5.5 | 22,762 | **2,852** (87.5% fewer) |
+| Same task: Claude Fable 5.2 | 22,762 | **2,846** (87.5% fewer) |
 
-Originals stay recoverable and exit codes matched in every run. The repair task is one task run twice; a broader benchmark is in progress. [Methods](docs/benchmarks.md)
+Originals stay recoverable and exit codes matched in every run. The repair task passed independent tests in all 24 runs (4 models, 3 runs, with and without justless); it is one task, and a broader benchmark is in progress. [Methods](docs/benchmarks.md)
 
 ### What it does not do
 
