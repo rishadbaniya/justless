@@ -15,14 +15,25 @@ import urllib.request
 from benchmark import CLAUDE_MODEL, FIXTURE, PROJECT, call, checked, parse_answer
 
 
-def provider_turn(messages, usage, api_key):
-    payload = {"model": CLAUDE_MODEL, "messages": messages, "max_tokens": 200,
-               "thinking": {"type": "disabled"}}
+# Current models differ in how thinking is turned off. Both variants of one model
+# always get identical settings, so each comparison stays fair.
+THINKING = {
+    "claude-haiku-5-5": ({"thinking": {"type": "disabled"}}, 200),
+    "claude-sonnet-5-5": ({"thinking": {"type": "between_tools"}}, 200),
+    # Opus 5.5 and Fable 5.2 cannot turn thinking off; keep it short with low effort.
+    "claude-opus-5-5": ({"output_config": {"effort": "low"}}, 4000),
+    "claude-fable-5-2": ({"output_config": {"effort": "low"}}, 4000),
+}
+
+
+def provider_turn(messages, usage, api_key, model=CLAUDE_MODEL):
+    settings, max_tokens = THINKING.get(model, ({"thinking": {"type": "disabled"}}, 200))
+    payload = {"model": model, "messages": messages, "max_tokens": max_tokens, **settings}
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode(),
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
                  "content-type": "application/json"})
-    with urllib.request.urlopen(req, timeout=45) as response:
+    with urllib.request.urlopen(req, timeout=180) as response:
         answer = json.load(response)
     counts = answer["usage"]
     usage["input_tokens"] += sum(counts.get(key, 0) for key in
@@ -61,7 +72,7 @@ def edit_expression(root, edit, files):
     return True
 
 
-def run_case(root, binary, variant, api_key):
+def run_case(root, binary, variant, api_key, model=CLAUDE_MODEL):
     live = bool(api_key)
     checked(root, ["cargo", "test", "--offline", "--no-run", "--quiet"])
     started = time.monotonic()
@@ -86,7 +97,7 @@ def run_case(root, binary, variant, api_key):
 
     def turn(prompt, scripted):
         messages.append({"role": "user", "content": prompt})
-        return provider_turn(messages, usage, api_key) if live else scripted
+        return provider_turn(messages, usage, api_key, model) if live else scripted
 
     files = sorted(str(p.relative_to(root)) for folder in ["src", "tests"] for p in (root / folder).glob("*.rs"))
     code, initial = test()
@@ -136,6 +147,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", action="store_true", help="Run three billed Claude turns per variant")
     parser.add_argument("--binary", type=Path, default=PROJECT / "target/debug/justless")
+    parser.add_argument("--model", default=CLAUDE_MODEL, help="Claude model for --api runs")
     args = parser.parse_args()
     api_key = os.environ.pop("ANTHROPIC_API_KEY", None) if args.api else None
     if args.api and not api_key:
@@ -148,7 +160,8 @@ def main():
         for variant in ("plain", "justless"):
             root = Path(temp) / variant
             shutil.copytree(FIXTURE, root, ignore=shutil.ignore_patterns("target", ".justless", "Cargo.lock"))
-            row = run_case(root, binary, variant, api_key)
+            row = run_case(root, binary, variant, api_key, args.model)
+            row["model"] = args.model if args.api else None
             print(json.dumps(row), flush=True)
             success &= row["task_success"]
     return int(not success)
