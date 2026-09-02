@@ -934,6 +934,11 @@ fn install_and_run_claude_and_agy_hooks() {
     let instructions = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
     assert!(instructions.starts_with("# Team rules\n"));
     assert_eq!(instructions.matches("<!-- justless:begin -->").count(), 1);
+    // The block rides in every model request, so keep it small.
+    let block = &instructions[instructions.find("<!-- justless:begin -->").unwrap()
+        ..instructions.find("<!-- justless:end -->").unwrap()];
+    assert!(block.len() < 1000, "{} bytes", block.len());
+    assert!(block.contains("justless run -- CMD") && block.contains("justless recall ID"));
     let [claude, agy] = installed.map(|s| serde_json::from_str::<Value>(&s).unwrap());
     assert_eq!(claude["permissions"]["defaultMode"], "default");
     assert_eq!(
@@ -1939,6 +1944,7 @@ fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
         context.contains(&format!(
             "{id} · mypy · exit 1 · 3 finding(s) in 2 rule(s), first return-value ×2"
         )) && context.contains("justless log RUN_ID")
+            && context.contains("justless context --run RUN_ID")
             && context.len() < 2400,
         "{context}"
     );
