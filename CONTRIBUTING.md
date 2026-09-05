@@ -16,7 +16,7 @@ Run the binary from `target/debug` so you test the code you are changing, not an
 
 ## Check a change
 
-CI runs these on every push to `main` and every pull request. It checks formatting and Clippy on Linux and runs the tests on Linux and macOS.
+Run these before every commit. There is no CI workflow for pushes or pull requests, so these local checks are the gate. The release workflow runs only when a version tag is pushed.
 
 ```sh
 cargo fmt --all -- --check
@@ -24,7 +24,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-CI also builds and lints on Windows. Tests run there too, but they do not gate the build, because hooks are disabled on Windows and several suites drive POSIX shell tools.
+Run the tests on Linux or macOS. Hooks are disabled on Windows and several suites drive POSIX shell tools, but the crate must still compile there, so gate Unix-only APIs with `cfg(unix)`.
 
 | If you change | Also run |
 | --- | --- |
@@ -44,9 +44,9 @@ If you change the facts the index extracts, make sure existing caches are rebuil
 
 ## Conventions
 
-- **Commits** use [Conventional Commits](https://www.conventionalcommits.org/) with a scope, as in `feat(source): support section edits` or `fix(hooks): leave grep to Claude Code's gitignore-aware shell`. Say in the body what changed for the user and why.
+- **Commits** use [Conventional Commits](https://www.conventionalcommits.org/), usually with a scope, as in `feat(source): support section edits` or `fix(hooks): leave grep to Claude Code's gitignore-aware shell`. Say in the body what changed for the user and why.
 - **Exactness.** A compact result must give the agent enough to act and a way back to the original. Preserve the child's exit status and exact stdout and stderr replay. `expand` returns the exact selected bytes. An edit verifies the revision it was based on.
-- **Agent instructions.** The text in `src/agents.rs` between `<!-- justless:begin -->` and `<!-- justless:end -->` is installed into other people's repositories. Edit it there to change what their agents see. Edit `AGENTS.md` for guidance about developing Justless itself.
+- **Agent instructions.** The text in `src/agents.rs` between `<!-- justless:begin -->` and `<!-- justless:end -->` is installed into other people's repositories, and their agents load it with every model request. Edit it there to change what their agents see, and keep it short: a test in `tests/cli.rs` fails once it reaches 1,000 bytes. Edit `AGENTS.md` for guidance about developing Justless itself.
 - **Existing setup.** `justless init` and `install.sh` must keep a project's existing instructions and settings, and running them twice must be safe.
 - **Documentation.** Keep the README to the goal, the architecture and the quick start. Put flags and details in [docs/reference.md](docs/reference.md) and walkthroughs in [docs/examples.md](docs/examples.md). Describe features in Justless's own terms. Every number in the docs should come from a measurement described next to it, or from [docs/benchmarks.md](docs/benchmarks.md).
 - **Changelog.** Add user-visible changes to the Unreleased section of [CHANGELOG.md](CHANGELOG.md).

@@ -35,7 +35,7 @@
 | `grep -rn` | 200 KB | 16.4 KB |
 | `cargo check`, successful builds in three repositories | 26.5 KB | 0.5 KB |
 | `cargo test` with one failing test, in [`fixtures/failing`](fixtures/failing) | 18,038 B | 700 B |
-| `cargo clippy -- -W clippy::pedantic` on this repository, 127 warnings | 71,858 B | 3,968 B |
+| `cargo clippy -- -W clippy::pedantic` on this repository, 142 warnings | 79,563 B | 3,916 B |
 | One 21 KB source file: outline, then one symbol | 21 KB | 2.1 KB, then 60 B |
 | Three-turn repair task, provider-reported input tokens, median of 3 runs: Claude Haiku 5.5 | 22,367 | **2,847** (87.3% fewer) |
 | Same task: Claude Sonnet 5.5 | 22,762 | **2,840** (87.5% fewer) |
@@ -44,7 +44,7 @@
 
 Originals stay recoverable and exit codes matched in every run. The repair task passed independent tests in all 24 runs (4 models, 3 runs, with and without justless); it is one task, and a broader benchmark is in progress. [Methods](docs/benchmarks.md)
 
-The `fixtures/failing` and Clippy rows were measured on 2026-11-18 at commit `0725fb0` on macOS with Rust 1.93.0. Each compares the bytes the command printed on stdout and stderr with the bytes its `justless run --hook` replacement printed, footer included. The grouped lint output is in the [examples](docs/examples.md#group-lint-findings-by-rule).
+The `fixtures/failing` and Clippy rows were measured on 2026-11-18 at commit `bbe3d44` on macOS with Rust 1.93.0, after a first build. Each compares the bytes the command printed on stdout and stderr with the bytes its `justless run --hook` replacement printed, footer included. The grouped lint output is in the [examples](docs/examples.md#group-lint-findings-by-rule).
 
 ### One failing test, before and after
 
@@ -85,7 +85,7 @@ The exit status is still 101. `[stdout:365-368]` points into the archived log: `
 
 ### What it does not do
 
-- **No changed commands.** Same command, arguments, directory, environment and exit code. Pipes, redirections, interactive flags and machine formats such as `--json` pass through. Output goes to files rather than a terminal, so a tool that adds color or progress bars only on a terminal prints plain text.
+- **No changed commands.** Same command, arguments, directory, environment and exit code. The one addition is an option that keeps a search out of `.justless/`. Pipes, redirections, interactive flags and machine formats such as `--json` pass through. Output goes to files rather than a terminal, so a tool that adds color or progress bars only on a terminal prints plain text.
 - **No network, no LLM, no telemetry.** justless never opens a network connection. Parsing is deterministic and local, and everything it stores stays in `.justless/` in your project. The installer goes online to download a release or build with Cargo. Your agent still sends its context to its model provider; with justless, that context holds the shortened output.
 - **No hidden failures.** Anything cut is marked and one command away.
 
@@ -233,7 +233,7 @@ Two other projects work on the same problem from different angles. Both are wort
 ## FAQ
 
 **Where is the output stored?**
-In `.justless/` at the project root. Each run has a directory with its exact `stdout`, `stderr` and a `record.json`. The same directory holds the code index, retired tool results and recent activity. On Unix it is created readable only by your user, and `justless init` adds it to `.gitignore`. Nothing is deleted automatically. You can delete the directory at any time: the index is rebuilt on the next query, and older run IDs stop resolving. Captured output can include secrets that a command printed, so keep it private. `justless run --raw -- COMMAND` runs a command without recording it.
+In `.justless/` at the project root. Each run has a directory with its exact `stdout`, `stderr` and a `record.json`. The same directory holds the code index, retired tool results and recent activity. On Unix it is created readable only by your user. It holds its own `.gitignore`, so Git ignores it even before `justless init` adds it to the project's `.gitignore`. Nothing is deleted automatically. You can delete the directory at any time: the index is rebuilt on the next query, and older run IDs stop resolving. Captured output can include secrets that a command printed, so keep it private. `justless run --raw -- COMMAND` runs a command without recording it.
 
 Routed searches skip the archive: `grep` and `ack` get an option that excludes `.justless/`, as do `rg` and `ag` when they search hidden files. A listing such as `find .` can still include the files under `.justless/runs/`.
 

@@ -1,6 +1,6 @@
 # Justless examples
 
-Every example here runs on a fixture or on this repository, so you can reproduce it from a checkout. The output was captured at commit `0725fb0` on macOS with Rust 1.93.0. Run IDs, revisions and thread IDs differ on every machine, and absolute paths are shortened to `…`.
+Every example here runs on a fixture or on this repository, so you can reproduce it from a checkout. The output was captured at commit `bbe3d44` on macOS with Rust 1.93.0 and ripgrep 15.2.0. Run IDs and thread IDs differ on every run. Revisions are hashes of the file path and content, so yours will match. Byte counts for runs that print a `Compiling` line depend on the length of the directory path, and absolute paths are shortened to `…`.
 
 Build the checkout binary and put it on your `PATH` first:
 
@@ -11,12 +11,13 @@ export PATH="$(pwd)/target/debug:$PATH"
 
 ## Diagnose and fix a failing test
 
-`fixtures/failing` has a test that logs 350 trace lines and then fails one assertion. Copy it to a temporary directory and run the tests through Justless. The output below was captured after a first build, so it has no `Compiling` line.
+`fixtures/failing` has a test that logs 351 trace lines and then fails one assertion. Copy it to a temporary directory and run the tests through Justless. The first command builds the tests, so the output has no `Compiling` line.
 
 ```sh
 demo_root=$(mktemp -d)
 cp -R fixtures/failing/. "$demo_root/"
 cd "$demo_root"
+cargo test --no-run   # build first so the output below has no Compiling line
 justless run -- cargo test
 ```
 
@@ -162,7 +163,7 @@ Recovery: 0 run(s) reopened in full · 3 targeted lookup(s) · 0 repeated source
 
 ## What a hook-routed command prints
 
-A command you type ends with the full footer shown above, which scripts can parse. Hooks run commands as `justless run --hook`, which adds a footer only when it tells the agent something. You can type `justless run --hook -- COMMAND` to see exactly what an agent would receive. These are from the same fixture:
+A command you type ends with the full footer shown above, which scripts can parse. Hooks run commands as `justless run --hook`, which adds a footer only when it tells the agent something. You can type `justless run --hook -- COMMAND` to see exactly what an agent would receive. These are from a fresh copy of `fixtures/failing`, before the fix:
 
 | Situation | Command | What follows the output |
 | --- | --- | --- |
@@ -170,65 +171,65 @@ A command you type ends with the full footer shown above, which scripts can pars
 | Search matched nothing | `rg -n no_such_symbol src` | Nothing, and the exit status stays 1. |
 | Failed, shown in full | `rg -n total missing` | `[justless run-FsqZyd9YoBZn · exit 2]` |
 | Shortened and failed | `cargo test` | `[justless run-Rh1dgeGqKvnq · 634 B of 17.6 KB shown · exit 101]` |
-| Shortened | `rg -n unwrap src tests` in this repository | `[justless run-av6t8NyOdXQ6 · 2.9 KB of 39.3 KB shown]` |
+| Shortened | `rg -n unwrap src tests` in this repository | `[justless run-yUmvc2zHMpO9 · 2.9 KB of 57.3 KB shown]` |
 
 Every run is archived either way. `justless history` lists it, and the run ID in a marker works with `log`, `search` and `context --run`. When a rerun prints byte-for-byte the same output with the same exit status, the preview can collapse to `Output unchanged since run-…`.
 
 ## Group search results by file
 
-When a search's stdout is larger than the preview budget, 4,096 bytes by default, Justless groups it by file. Files with the most matches come first. Each group shows its first matching lines exactly as printed and the range of its lines in the full log. This search over this repository's own source printed 40,279 bytes. The agent received 3,049 bytes, abridged here.
+When a search's stdout is larger than the preview budget, 4,096 bytes by default, Justless groups it by file. Files with the most matches come first. Each group shows its first matching lines exactly as printed and the range of its lines in the full log. This search over this repository's own source printed 58,723 bytes. The agent received 3,058 bytes, abridged here.
 
 ```sh
 justless run --hook -- rg -n unwrap src tests
 ```
 
 ```text
-rg: 558 matches in 25 files
-tests/cli.rs ×254 [stdout:6-259]
+rg: 817 matches in 25 files
+tests/cli.rs ×356 [stdout:6-361]
   10:    let target = TempDir::new().unwrap();
-  +253 more in file
-tests/progressive.rs ×62 [stdout:321-382]
+  +355 more in file
+tests/progressive.rs ×153 [stdout:469-621]
   12:        .args(["--root", root.to_str().unwrap()])
-  +61 more in file
-tests/mcp.rs ×47 [stdout:270-316]
+  +152 more in file
+tests/mcp.rs ×82 [stdout:372-453]
   11:    let target = TempDir::new().unwrap();
-  +46 more in file
-src/lint.rs ×29 [stdout:514-542]
-  28:    LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_]+)\])?: (.+)$").unwrap());
-  +28 more in file
+  +81 more in file
+src/lint.rs ×37 [stdout:744-780]
+  39:    LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_]+)\])?: (.+)$").unwrap());
+  +36 more in file
 [… 20 more files, one group each …]
-src/workspace.rs ×1 [stdout:469]
-  88:                .unwrap_or(&cwd)
-[justless run-av6t8NyOdXQ6 · 2.9 KB of 39.3 KB shown]
+src/workspace.rs ×1 [stdout:699]
+  115:                .unwrap_or(&start)
+[justless run-yUmvc2zHMpO9 · 2.9 KB of 57.3 KB shown]
 ```
 
-`justless log run-av6t8NyOdXQ6 --stream stdout --from 321 --to 382` returns every match in `tests/progressive.rs`. File listings from `find`, `fd`, `tree`, `git ls-files`, `ls -l` and `ls -R` are grouped by directory the same way. Dependency and build directories such as `node_modules` and `target` collapse into a count unless the command names them.
+`justless log run-yUmvc2zHMpO9 --stream stdout --from 469 --to 621` returns every match in `tests/progressive.rs`. File listings from `find`, `fd`, `tree`, `git ls-files`, `ls -l` and `ls -R` are grouped by directory the same way. Dependency and build directories such as `node_modules` and `target` collapse into a count unless the command names them.
 
 ## Group lint findings by rule
 
-Compiler and linter output collapses to one line per rule, with a count, the first message and up to four locations. This repository passes Clippy's default lints. With the pedantic group turned on, Clippy printed 71,858 bytes for 127 warnings. The agent received 3,968 bytes, abridged here.
+Compiler and linter output collapses to one group per rule, with a count, the first message and up to four locations. This repository passes Clippy's default lints. With the pedantic group turned on, Clippy printed 79,563 bytes for 142 warnings. The agent received 3,916 bytes, abridged here.
 
 ```sh
 justless run --hook -- cargo clippy -- -W clippy::pedantic
 ```
 
 ```text
-cargo clippy: 127 finding(s), 0 error(s), 127 warning(s) · 25 rule(s) · 21 file(s)
-warning clippy::format_push_string ×36  `format!(..)` appended to existing `String`
-  src/impact.rs:761:9, 769:9, src/lint.rs:361:13, 369:21 +32 more [stderr:571-583]
-warning clippy::too_many_lines ×21  this function has too many lines (105/100)
-  src/agents.rs:146:1, src/capture.rs:136:1, 455:1, src/context.rs:598:1 +17 more [stderr:98-106]
-warning clippy::semicolon_if_nothing_returned ×17  consider adding a `;` to the last statement for consistent formatting
-  src/lint.rs:385:25, src/map.rs:161:13, 227:9, src/rust_syntax.rs:266:17 +13 more [stderr:806-814]
-warning clippy::map_unwrap_or ×10  called `map(<f>).unwrap_or_else(<g>)` on an `Option` value
-  src/agents.rs:553:9, 575:9, 717:15, 920:31 +6 more [stderr:131-145]
-[… 20 more rules …]
-warning clippy::used_underscore_binding ×1  used underscore-prefixed binding
-  src/index.rs:243:14 [stderr:602-615]
-[justless run-Dx2yJZKpa3RB · 3.8 KB of 70.2 KB shown]
+cargo clippy: 142 finding(s), 0 error(s), 142 warning(s) · 24 rule(s) · 21 file(s)
+warning clippy::format_push_string ×41  `format!(..)` appended to existing `String`
+  src/impact.rs:761:9, 769:9, src/lint.rs:600:13, 629:21 +37 more [stderr:585-597]
+warning clippy::too_many_lines ×23  this function has too many lines (103/100)
+  src/agents.rs:208:1, src/capture.rs:139:1, 460:1, src/context.rs:818:1 +19 more [stderr:111-119]
+warning clippy::semicolon_if_nothing_returned ×20  consider adding a `;` to the last statement for consistent formatting
+  src/context.rs:688:17, src/lint.rs:815:17, 818:17, src/main.rs:333:13 +16 more [stderr:352-360]
+warning clippy::doc_markdown ×10  item in documentation is missing backticks
+  src/lint.rs:6:7, 8:53, 9:28, 9:37 +6 more [stderr:699-712]
+[… 19 more rules …]
+warning clippy::unnested_or_patterns ×1  unnested or-patterns
+  src/filters.rs:336:9 [stderr:1-25]
+[justless run-RoAAVolMv61r · 3.8 KB of 77.7 KB shown]
 ```
 
-Errors also keep the detail lines of their first occurrence, such as the expected and found types. A rerun lists the rules that appeared, changed count or are no longer reported. When the grouped report is larger than the ordinary preview, Justless shows the preview instead. That happened with `--all-targets` added here: 142 warnings over 26 rules. The [reference](reference.md#task-packs-and-run-history) lists the recognized tools.
+Errors also keep the detail lines of their first occurrence, such as the expected and found types. A rerun lists the rules that appeared, changed count, changed findings at the same count or are no longer reported, and says when the same findings only moved to other lines. When the grouped report is not smaller than the ordinary preview, Justless shows the preview instead. That happened with `--all-targets` added here, which also lints the tests: Clippy printed 102,700 bytes, and the agent received a 4,028-byte preview. The [reference](reference.md#task-packs-and-run-history) lists the recognized tools.
 
 ## Orient in a repository and trace a request from TypeScript to SQL
 
@@ -254,23 +255,23 @@ justless map
 ```text
 Map · 6 files · 5 symbols · 4 links (2 possible) · TypeScript 2 · Python 1 · SQL 1
 Areas · 4
-  backend/ · 2 files · 2 symbols · Python · hub list_orders backend/orders.py:7-8
+  backend/ · 2 files · 2 symbols · Python · hub list_orders backend/orders.py:6-8
   frontend/ · 2 files · 2 symbols · TypeScript · hub formatOrder frontend/format.ts:1-3
   db/ · 1 file · 1 symbol · SQL · hub purchase_orders db/schema.sql:1-3
   docs/ · 1 file · 0 symbols · text · docs/operations.md:1
 Hubs · in = dependents, out = dependencies
   formatOrder [function] frontend/format.ts:1-3 · in 1 · out 0
-  list_orders [function] backend/orders.py:7-8 · in 1 (1 possible) · out 1 (1 possible)
+  list_orders [function] backend/orders.py:6-8 · in 1 (1 possible) · out 1 (1 possible)
   purchase_orders [table] db/schema.sql:1-3 · in 1 (1 possible) · out 0
   fetchOrders [function] frontend/orders.ts:3-7 · in 0 · out 1 (1 possible)
 Communities · 2 groups of linked symbols
-  backend/orders.py · 2 symbols · list_orders backend/orders.py:7-8, router backend/orders.py:3
+  backend/orders.py · 2 symbols · list_orders backend/orders.py:6-8, router backend/orders.py:3
   frontend/format.ts +1 file · 2 symbols · formatOrder frontend/format.ts:1-3, fetchOrders frontend/orders.ts:3-7
 Cross-area links · 2
   backend/ → db/ · Python → SQL · possible SQL relation 1 · list_orders backend/orders.py:8 → purchase_orders db/schema.sql:1-3
-  frontend/ → backend/ · TypeScript → Python · possible HTTP route 1 · fetchOrders frontend/orders.ts:4 → list_orders backend/orders.py:7-8
+  frontend/ → backend/ · TypeScript → Python · possible HTTP route 1 · fetchOrders frontend/orders.ts:4 → list_orders backend/orders.py:6-8
 Entry points · 1
-  list_orders [function] backend/orders.py:7-8 · HTTP route /api/orders
+  list_orders [function] backend/orders.py:6-8 · HTTP route /api/orders
 Tests · none detected
 Next: justless expand FILE NAME, query NAME or affected NAME
 ```
@@ -283,7 +284,7 @@ justless path fetchOrders purchase_orders
 
 ```text
 frontend/orders.ts::fetchOrders [function] at frontend/orders.ts:3-7
-  → possible HTTP route at frontend/orders.ts:4 → backend/orders.py::list_orders [function] at backend/orders.py:7-8
+  → possible HTTP route at frontend/orders.ts:4 → backend/orders.py::list_orders [function] at backend/orders.py:6-8
   → possible SQL relation at backend/orders.py:8 → db/schema.sql::purchase_orders [table] at db/schema.sql:1-3
 ```
 
@@ -296,7 +297,7 @@ justless affected purchase_orders
 ```text
 Affected by purchase_orders [table] db/schema.sql:1-3 · 2 dependents within 3 hops
 Distance 1 · 1
-  list_orders [function] backend/orders.py:7-8 · possible SQL relation at backend/orders.py:8
+  list_orders [function] backend/orders.py:6-8 · possible SQL relation at backend/orders.py:8
 Distance 2 · 1
   fetchOrders [function] frontend/orders.ts:3-7 · possible HTTP route at frontend/orders.ts:4 → list_orders
 Tests · none reach the target through indexed links. Search with justless find.

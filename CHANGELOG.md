@@ -10,7 +10,7 @@ User-visible changes to Justless are recorded here. No release has been publishe
 - Test failures from `cargo test`, `go test` and `pytest` are grouped by their reported diagnostic. Each group links to its lines in the archived log. The JavaScript runners `npm`, `pnpm`, `yarn` and `bun test`, `jest`, `vitest run` and `node --test` drop passing-file lines and keep failures.
 - Compiler and linter findings are grouped by rule across both streams, with a count, the first message and up to four locations. Errors keep the detail of their first occurrence. Recognized tools include rustc and Clippy, Ruff, flake8, pylint, mypy, Pyright, ESLint, `tsc`, ShellCheck, golangci-lint, `go vet`, staticcheck, RuboCop, SwiftLint and hadolint. Package runners such as `npx`, `uv run` and `bundle exec` select the same grouping.
 - Large search output from `rg`, `git grep`, `ag`, `ack` and recursive `grep` is grouped by file, with match counts and the first matching lines exactly as printed. File listings from `find`, `fd`, `tree`, `git ls-files`, `ls -l` and `ls -R` are grouped by directory. Matches and entries inside dependency and build directories collapse into one line each. Small output stays verbatim.
-- Git diffs are summarized by hunk. `docker ps` and `kubectl get` count the rows and name the ones that need attention, and `docker logs` and `kubectl logs` collapse repeated lines.
+- Git diffs are summarized by hunk. `docker ps` and `kubectl get` for pods, deployments, statefulsets and nodes count the rows and name the ones that need attention, and `docker logs` and `kubectl logs` collapse repeated lines.
 - A rerun of the same command in the same directory and session shows which failures, rules, hunks, files or directories appeared, changed or disappeared. Identical output can collapse to one line.
 - Hook-routed runs print a footer only when it adds information: when output was shortened or when the command failed. On 13 routine commands, the earlier footer added 29.1% to the bytes an agent received, and the current one adds 3.7%.
 - `[[filters]]` entries in `.justless.toml` omit known noise lines from a command's preview. Lines that look like failures are always kept.
@@ -23,24 +23,32 @@ User-visible changes to Justless are recorded here. No release has been publishe
 - `map` summarizes a repository's areas, hubs, communities, cross-area links, entry points and test locations.
 - `affected` lists what depends on a symbol, a file or the current Git changes, hop by hop. It names the tests that reach the target and, for Rust, Python and Go layouts, a command that runs them. Deleted code is reported as a deletion rather than as a change to the line next to it.
 - `context --run RUN_ID` connects a captured failure to its assertion, its enclosing symbol and the functions it calls.
+- `NAME@FILE:LINE` selects one of several definitions that share a name, such as cfg-gated twins.
+- An unreadable or oversized file is skipped rather than failing every query. `index` lists the skipped files, and a query or `find` that finds nothing names them.
 
 ### Reads and edits
 
 - `read FILE --outline` returns a revision and numbered signatures with line ranges. `expand` returns the exact bytes of a symbol, Markdown section or line range.
 - `edit` replaces or inserts at a symbol or line range only when the file still matches the revision the agent read. A batch of same-file edits is checked as a whole, and a stale, ambiguous or overlapping edit rejects the batch. `--dry-run` shows a diff.
+- Without `--root`, `read`, `expand` and `edit` resolve a relative path from the current directory, falling back to the project root. `edit` refuses files the user cannot write and keeps hard links and extended attributes.
+- An outline of Rust source with a syntax error names the error and its line.
 
 ### Tool history and sessions
 
 - `mask` retires older tool results in an outbound request to `[justless recall ID]` references, and `recall` restores the original value. The OpenCode v1 plugin applies this automatically before each model request.
-- Claude Code and Codex hooks carry recent run IDs, outcomes and inspected file ranges across compaction. `resume` shows the same handoff from the terminal.
+- Claude Code and Codex hooks carry recent run IDs, outcomes and inspected file ranges across compaction, within 1,800 bytes. `resume` shows the same handoff from the terminal. Runs are named by their command, such as `git status` or `cargo test`.
 
 ### Agent setup
 
+- `.justless/` holds its own `.gitignore`, so archived output stays out of `git status` even in a project that never ran `justless init`.
 - `install.sh` installs a checksum-verified prebuilt binary when a release exists for the platform, and otherwise builds from source. Run from a project, it sets up every detected agent. It does not set up hooks when run from the home directory or `/`.
 - `justless init --hooks` configures Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot CLI, Antigravity CLI and OpenCode. It keeps existing instructions and settings, and running it again is safe.
-- Hooks rewrite supported commands inside `&&`, `||` and `;` lists and leave pipes, redirections and machine-readable output alone. The Claude Code hook leaves `grep` to Claude Code's gitignore-aware shell.
-- Claude Code's built-in Grep and Glob results are grouped when they are large, and a whole-file Read of a large text file can be replaced by its outline.
-- `justless mcp` serves the read-only commands as MCP tools over stdio. `justless mcp --install` adds the server to Claude Code, Cursor, Gemini CLI, VS Code or Codex project config.
+- Hooks rewrite supported commands, including inside `&&`, `||` and `;` lists, and leave pipes, redirections and machine-readable output alone. The Codex, Cursor, Copilot and Antigravity hooks pass a list through unchanged when it also contains an unsupported command, and every hook passes through a list that changes directory other than with a plain `cd DIR` inside the workspace. The Claude Code hook leaves `grep` to Claude Code's gitignore-aware shell and passes through commands started with `run_in_background`.
+- Codex and Cursor approve a rewritten command without asking, so their hooks rewrite only commands that run a local tool directly, with conventional build and test targets, a short list of display options and no argument outside the working tree. Other commands, such as deploy targets and package-runner downloads, pass through to the client's own approval.
+- Hooks route Git revisions that contain a tilde, such as `git diff HEAD~3` and `git log main~5..HEAD`. A `~` passes through only where the shell expands it: at the start of a word or after `=` or `:`.
+- The instruction block that `init` writes into `CLAUDE.md`, `AGENTS.md` or `GEMINI.md` is 886 bytes between its markers, down from 1,856, because agents load it with every request. It tells them to run supported commands plainly, to wrap one command in `justless run` when long output arrives raw, and to recover archived output with `search`, a ranged `log` or `context --run` instead of rerunning. Run `justless init` again to replace the block in an existing project. When `CLAUDE.md` links to `AGENTS.md`, `init` edits the linked file once.
+- Claude Code's built-in Grep and Glob results are grouped when they are large, and a whole-file Read of a large text file can be replaced by its outline. When a script has top-level code outside every outline row, the Read hook lists up to 20 such lines after the rows, and a script with more keeps its full read.
+- `justless mcp` serves the read-only commands as MCP tools over stdio. `justless mcp --install` adds the server to Claude Code, Cursor, Gemini CLI, VS Code or Codex project config. The `log` tool returns at most 32 KiB per call and names the next page.
 
 ### Reporting
 
