@@ -722,6 +722,24 @@ fn questions_need_a_searchable_word() {
 }
 
 #[test]
+fn the_reference_shows_real_output() {
+    let reference =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference.md"))
+            .unwrap();
+    let command = "$ justless lookup \"where are retries configured?\"\n";
+    let start = reference
+        .find(command)
+        .expect("example in docs/reference.md")
+        + command.len();
+    let documented = &reference[start..start + reference[start..].find("```").unwrap()];
+    let root = fixture();
+    assert_eq!(
+        lookup(root.path(), &["where are retries configured?"]),
+        documented
+    );
+}
+
+#[test]
 fn crlf_lines_and_deleted_files_keep_their_headers() {
     let root = fixture();
     let path = root.path();

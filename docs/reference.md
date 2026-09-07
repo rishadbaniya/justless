@@ -13,6 +13,7 @@
 | `justless map` | Areas, most connected symbols, communities, cross-area links, entry points and test locations, each with a file and line |
 | `justless affected SYMBOL --depth 3` | Dependents grouped by distance, then the tests that reach the target and a command to run them. Also takes a file path or `--changes`. |
 | `justless find TEXT` | Literal search across indexed text, with exact file and line matches. Stops at `--limit` matches, 20 by default, and says when more exist. |
+| `justless lookup "where are retries configured?"` | The few symbols, Markdown sections and configuration blocks that best answer a question, each with its line range, name and best-matching lines. `--logs` also ranks recent captured run output. |
 | `justless context --changes` | Current changes against `HEAD`, with nearby symbols and tests where available. Includes untracked files. A new file or a range across several symbols names each symbol, then shows each in source order with the members it contains, such as a class's methods. A pure deletion shows where the lines were, their text, any symbol removed whole and the surviving symbol that lost them, without pinning them on the line before. A deleted file is marked deleted. Needs a Git repository. |
 | `justless context --changes --staged` | Staged ranges for files that currently match the staged source |
 | `justless context --at src/lib.rs:8` | Enclosing symbol, relevant calls, and source around a line or range. A range across several symbols shows each of them. A line past the end of the file is an error. |
@@ -196,6 +197,7 @@ The server uses `--root` when given. Otherwise it finds the project the way othe
 | `query` | `query SYMBOL` | `symbol`, `view`, `budget` |
 | `path` | `path FROM TO` | `from`, `to`, `budget` |
 | `find` | `find TEXT` | `text`, `ignore_case`, `limit`, `budget` |
+| `lookup` | `lookup QUESTION` | `question`, `limit`, `budget` |
 | `context` | `context --at` or `--changes` | `at` or `changes` (with optional `staged`), `budget` |
 | `code` | `code FILE` | `file`, `from`, `to`, `budget` |
 | `read` | `read FILE` | `file`, `outline`, `match`, `limit`, `after`, `budget` |
@@ -286,3 +288,50 @@ Cursor, Gemini CLI and Copilot can block a tool call when its hook fails or exit
 `justless init` defaults to Codex. Omit `--hooks` to install only the selected client's project instructions and add `.justless/` to `.gitignore`. The `init-codex` alias is also supported. When an instructions file is a symlink to a file inside the project, such as `CLAUDE.md -> AGENTS.md`, setup edits that file once and keeps the link. A link that leaves the project is skipped with a warning, and the hooks are still installed. Setup checks every file before it creates `.justless/`, so a failed setup leaves the project unchanged.
 
 Run `justless run -- cargo test`, `justless run -- git diff`, or `justless run -- rg -n pattern src`. For interactive commands, live streaming, or pipelines that consume raw machine-readable output, use `justless run --raw -- …` or call the command directly. For shell expressions, pass the shell explicitly, as in `justless run -- sh -c 'cargo test && git diff'`.
+
+## Ranked lookup
+
+`justless lookup QUESTION` lists the few places most likely to answer a question about the repository, such as where a setting is configured or which function handles a case. Each result names a file and line range, the symbol, section or block it covers, and its best-matching lines. Use `find` when you know the exact text and `query` when you know the symbol.
+
+```sh
+justless lookup "where are retries configured?"
+justless lookup RetryPolicy --limit 3
+justless lookup "rollback steps" --json --budget 4000
+justless lookup "why did the upload fail" --logs
+```
+
+Quote the question, because `?` and `*` are wildcards in most shells. A question that starts with `-` needs `--` before it, as in `justless lookup -- "-v flag handling"`.
+
+On the `fixtures/lookup` sample project:
+
+```text
+$ justless lookup "where are retries configured?"
+src/net/retry.rs:5-9 struct RetryPolicy
+  5 | /// How many times a failed download is retried and how long to wait between attempts.
+  6 | pub struct RetryPolicy {
+web/client.ts:12-14 method DownloadQueue::retry
+  12 | retry(url: string): void {
+src/net/retry.rs:1-3 file retry
+  1 | //! Retry policy for outbound HTTP calls.
+docs/operations.md:9-13 section Retries
+  9 | ## Retries
+  11 | Downloads are retried five times with exponential backoff.
+config/app.toml:5-7 text retry
+  5 | [retry]
+scripts/fetch.py:5-12 function download
+  6 | """Download a file, retrying on failure."""
+tests/test_fetch.py:4-8 test test_download_retries
+  4 | def test_download_retries(monkeypatch):
+7 of 9 ranked · matched retries · no match configured
+Next: justless expand src/net/retry.rs L5-9
+```
+
+Code is split along the symbols the index finds, so each function, method, class or struct is one result, and lines outside any symbol form file sections. A symbol's range includes the doc comments and decorators directly above it. Markdown is split at headings. Configuration and other text is split at `[section]` headers and every 60 lines. Lockfiles, CSV, minified files and other data files are matched only by name, path and first line, and rank low. Use `find` for their contents.
+
+Words match across naming styles and word forms. `parseHttpHeader`, `parse_http_header` and `parse-http-header` share the words parse, http and header, and the first two also match as one identifier. "retries", "retrying" and "retry" match each other. A match in a symbol's name counts most, then its signature, then its doc comments or the section's parent headings, then its body. Results that match more of the question's words rank higher. Tests and data files rank lower unless the question mentions tests. Common words such as "where", "how" and "the" are ignored. Text written without spaces, such as Chinese or Japanese, matches only whole runs, so use `find` for it.
+
+At most two results come from one file. `--limit` sets the number of results, 8 by default, and `--budget` caps the output. A result that does not fit is left out whole and counted, and `[context budget reached]` follows the counts. The last lines say how many sections matched, which of your words matched and which did not, and give a command for the top result. That command is `expand` for a result of up to 80 lines, and otherwise a 40-line `code` excerpt around its best lines. `--json` returns the same results with scores and line excerpts, and `omitted` counts the results the budget left out.
+
+`--logs` also ranks 40-line windows of output from the 200 most recent runs captured by `justless run`. Log scores use their own statistics, so `--logs` adds results without reordering source results. A log result names its run, stream, lines and exit status, and the closing command replays it with `justless log`. The MCP `lookup` tool does not rank logs. Use `history` there.
+
+The lookup index is kept in `.justless/lookup/`. It uses the same files, ignore rules, size limit and change detection as the repository index, and parses only files that changed since the last lookup. Edits go to a small second segment that is folded into the main one once it grows. The first lookup in a large repository builds the index and says so on stderr. If the index cannot be saved, lookup still answers and says so on stderr. Deleting `.justless/lookup/` is always safe.
