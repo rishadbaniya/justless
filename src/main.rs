@@ -9,6 +9,7 @@ mod index;
 mod inventory;
 mod lint;
 mod listing;
+mod lookup;
 mod map;
 mod mcp;
 mod observations;
@@ -199,6 +200,7 @@ fn cli() -> Command<'static> {
                 .arg(number("limit", "20", "Maximum matching lines"))
                 .arg(budget()),
         )
+        .subcommand(lookup::command())
         .subcommand(
             Command::new("path")
                 .about("Trace a path between indexed symbols")
@@ -336,6 +338,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         ("mcp", sub) => mcp::run(&workspace, sub)?,
         ("map", sub) => map::run(&workspace, sub)?,
         ("affected", sub) => impact::run(&workspace, sub)?,
+        ("lookup", sub) => lookup::run(&workspace, sub)?,
         ("run", sub) => {
             let command: Vec<OsString> = sub
                 .values_of_os("command")
