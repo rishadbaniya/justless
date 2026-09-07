@@ -11,7 +11,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, display_path, lock_state, write_json};
 
-const VERSION: u32 = 7;
+pub(crate) const VERSION: u32 = 7;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -30,16 +30,16 @@ struct Parsed {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-struct FileStamp {
-    device: u64,
-    inode: u64,
-    bytes: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
+pub(crate) struct FileStamp {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) bytes: u64,
+    pub(crate) modified: (i64, i64),
+    pub(crate) changed: (i64, i64),
 }
 
 #[cfg(unix)]
-fn file_stamp(metadata: &fs::Metadata) -> Option<FileStamp> {
+pub(crate) fn file_stamp(metadata: &fs::Metadata) -> Option<FileStamp> {
     use std::os::unix::fs::MetadataExt;
     // Coarse file times can miss same-second edits. Hash those files as well.
     (metadata.ctime_nsec() != 0).then(|| FileStamp {
@@ -52,7 +52,7 @@ fn file_stamp(metadata: &fs::Metadata) -> Option<FileStamp> {
 }
 
 #[cfg(not(unix))]
-fn file_stamp(_: &fs::Metadata) -> Option<FileStamp> {
+pub(crate) fn file_stamp(_: &fs::Metadata) -> Option<FileStamp> {
     None
 }
 
@@ -816,7 +816,7 @@ fn import_target<'a>(
     }
 }
 
-fn inputs(
+pub(crate) fn inputs(
     workspace: &Workspace,
     skipped: &mut BTreeMap<String, String>,
 ) -> Result<BTreeSet<String>> {
