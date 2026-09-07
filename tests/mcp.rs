@@ -165,6 +165,12 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
             "find",
             json!({"text": "purchase_orders", "limit": 5}),
         ),
+        call(
+            "lookup",
+            "lookup",
+            json!({"question": "purchase orders", "limit": 3}),
+        ),
+        call("lookup-empty", "lookup", json!({"question": "?!"})),
         call("map", "map", json!({"budget": 1200})),
         call(
             "affected",
@@ -239,8 +245,8 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
     assert_eq!(
         names,
         BTreeSet::from([
-            "affected", "code", "context", "expand", "find", "history", "log", "map", "pack",
-            "path", "query", "read", "recall", "resume", "search", "stats",
+            "affected", "code", "context", "expand", "find", "history", "log", "lookup", "map",
+            "pack", "path", "query", "read", "recall", "resume", "search", "stats",
         ])
     );
     // The tool list rides along with every model request, so keep it compact.
@@ -276,6 +282,13 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
     assert!(succeeded(by_id(&responses, "context")).contains("backend/orders.py"));
     assert!(succeeded(by_id(&responses, "pack")).contains("purchase_orders"));
     assert!(succeeded(by_id(&responses, "find")).contains("db/schema.sql:1"));
+    let lookup = succeeded(by_id(&responses, "lookup"));
+    assert!(lookup.contains("db/schema.sql"), "{lookup}");
+    assert!(lookup.contains("Next: justless "), "{lookup}");
+    assert!(failed(by_id(&responses, "lookup-empty")).contains("enter a question or keywords"));
+    let tool = tools.iter().find(|tool| tool["name"] == "lookup").unwrap();
+    assert_eq!(tool["inputSchema"]["required"], json!(["question"]));
+    assert!(tool["inputSchema"]["properties"].get("logs").is_none());
     let map = succeeded(by_id(&responses, "map"));
     assert!(
         map.contains("  backend/ → db/ · Python → SQL · possible SQL relation 1 · list_orders backend/orders.py:8 → purchase_orders db/schema.sql:1-3"),
@@ -363,7 +376,7 @@ fn stateless_requests_declare_their_version() {
 
     let list = &by_id(&responses, "list")["result"];
     assert_eq!(list["resultType"], "complete");
-    assert_eq!(list["tools"].as_array().unwrap().len(), 16);
+    assert_eq!(list["tools"].as_array().unwrap().len(), 17);
     assert!(list["ttlMs"].is_u64());
 
     let call = by_id(&responses, "call");

@@ -54,7 +54,8 @@ Use these tools before reading whole files or grepping. `map` orients you in an 
 repository. `pack` answers an open question with budgeted evidence. `query` and `path` follow \
 symbols and the links between them. `affected` lists what depends on a symbol, file or the Git \
 changes, and the tests to run. `find` searches \
-literal text. `read` with outline=true lists a file's symbols so that `expand` or `code` can fetch \
+literal text. `lookup` ranks the code, docs and config that best match a plain-language question. \
+`read` with outline=true lists a file's symbols so that `expand` or `code` can fetch \
 only the lines you need. `log`, `search` and `history` reopen output captured by `justless run`. \
 File paths are relative to the repository root.";
 
@@ -550,23 +551,15 @@ const BUDGET: Param = option(
     "budget",
     "budget",
     Kind::Count(128, 1_000_000),
-    "Max output bytes (default 2400)",
+    "Max bytes (default 2400)",
 );
-const FILE: Param = positional(
-    "file",
-    Kind::File,
-    "Workspace-relative file path, such as src/main.rs",
-);
-const RUN_ID: Param = positional(
-    "run_id",
-    Kind::RunId,
-    "Run ID printed by `justless run`, such as run-1a2b3c",
-);
+const FILE: Param = positional("file", Kind::File, "Workspace-relative path");
+const RUN_ID: Param = positional("run_id", Kind::RunId, "Run ID from `justless run`");
 const STREAM: Param = option(
     "stream",
     "stream",
     Kind::Choice(STREAMS),
-    "Output stream to use (default both)",
+    "Stream (default both)",
 );
 
 const TOOLS: &[Tool] = &[
@@ -574,7 +567,7 @@ const TOOLS: &[Tool] = &[
         name: "query",
         title: "Find a symbol",
         command: "query",
-        description: "Definition, references, callers, tests or dependencies of a symbol from the repository index. Use before grepping or reading files.",
+        description: "Definition, references, callers, tests or dependencies of a symbol. Use before grepping or reading files.",
         params: &[
             positional("symbol", Kind::Text, "Symbol name, optionally qualified"),
             option(
@@ -610,7 +603,7 @@ const TOOLS: &[Tool] = &[
         name: "find",
         title: "Search indexed text",
         command: "find",
-        description: "Literal text search across indexed source, docs and configuration. Returns file:line matches.",
+        description: "Exact text across indexed source, docs and configuration, as file:line matches.",
         params: &[
             positional("text", Kind::Text, "Exact text to find"),
             option(
@@ -623,7 +616,24 @@ const TOOLS: &[Tool] = &[
                 "limit",
                 "limit",
                 Kind::Count(1, 1000),
-                "Maximum matching lines (default 20)",
+                "Max lines (default 20)",
+            ),
+            BUDGET,
+        ],
+        check: None,
+    },
+    Tool {
+        name: "lookup",
+        title: "Ranked search",
+        command: "lookup",
+        description: "Ranks the symbols, doc sections and config blocks that best answer a where-is question.",
+        params: &[
+            positional("question", Kind::Text, "Question or keywords"),
+            option(
+                "limit",
+                "limit",
+                Kind::Count(1, 50),
+                "Max results (default 8)",
             ),
             BUDGET,
         ],
@@ -633,21 +643,11 @@ const TOOLS: &[Tool] = &[
         name: "context",
         title: "Source around a location or diff",
         command: "context",
-        description: "Source around a location (`at`) or the current Git diff (`changes`), with enclosing symbols and related tests.",
+        description: "Source around a location (`at`) or the Git diff (`changes`), with enclosing symbols and related tests.",
         params: &[
-            option(
-                "at",
-                "at",
-                Kind::Location,
-                "PATH:LINE or PATH:START-END, such as src/lib.rs:40-52",
-            ),
+            option("at", "at", Kind::Location, "PATH:LINE or PATH:START-END"),
             option("changes", "changes", Kind::Flag, "Use current Git changes"),
-            option(
-                "staged",
-                "staged",
-                Kind::Flag,
-                "With changes, use staged changes only",
-            ),
+            option("staged", "staged", Kind::Flag, "Staged changes only"),
             BUDGET,
         ],
         check: Some(context_input),
@@ -663,11 +663,11 @@ const TOOLS: &[Tool] = &[
                 "from",
                 "from",
                 Kind::Count(1, MAX_LINE),
-                "First line, inclusive (default 1)",
+                "First line (default 1)",
             ),
             Param {
                 required: true,
-                ..option("to", "to", Kind::Count(1, MAX_LINE), "Last line, inclusive")
+                ..option("to", "to", Kind::Count(1, MAX_LINE), "Last line")
             },
             BUDGET,
         ],
@@ -684,19 +684,19 @@ const TOOLS: &[Tool] = &[
                 "outline",
                 "outline",
                 Kind::Flag,
-                "Return the outline even for a small file",
+                "Outline even a small file",
             ),
             option(
                 "match",
                 "match",
                 Kind::Text,
-                "Only rows whose name or signature contains this text",
+                "Rows whose name or signature contains this",
             ),
             option(
                 "limit",
                 "limit",
                 Kind::Count(1, 1000),
-                "Maximum outline rows per page (default 40)",
+                "Rows per page (default 40)",
             ),
             option(
                 "after",
@@ -718,7 +718,7 @@ const TOOLS: &[Tool] = &[
             positional(
                 "selector",
                 Kind::Text,
-                "Symbol name, qualified name, REV#ROW reference or line range such as L20-35",
+                "Symbol, REV#ROW or line range such as L20-35",
             ),
             option(
                 "revision",
@@ -776,14 +776,9 @@ const TOOLS: &[Tool] = &[
                 "from",
                 "from",
                 Kind::Count(1, MAX_LINE),
-                "First output line, inclusive (default 1)",
+                "First line (default 1)",
             ),
-            option(
-                "to",
-                "to",
-                Kind::Count(1, MAX_LINE),
-                "Last output line, inclusive",
-            ),
+            option("to", "to", Kind::Count(1, MAX_LINE), "Last line"),
         ],
         check: None,
     },
@@ -800,7 +795,7 @@ const TOOLS: &[Tool] = &[
                 "limit",
                 "limit",
                 Kind::Count(1, 1000),
-                "Maximum matching lines (default 20)",
+                "Max lines (default 20)",
             ),
         ],
         check: None,
@@ -829,7 +824,7 @@ const TOOLS: &[Tool] = &[
                 "limit",
                 "limit",
                 Kind::Count(1, 1000),
-                "Maximum runs or matching lines (default 12)",
+                "Max runs or lines (default 12)",
             ),
             BUDGET,
         ],
