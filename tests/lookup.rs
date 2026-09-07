@@ -610,6 +610,9 @@ fn git_checkouts_use_tracked_and_untracked_files() {
         "build/generated.rs",
         "pub fn reconnect_websocket_generated() {}\n",
     );
+    // Git lists a tracked symbolic link, which lookup must not follow.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("socket.rs", path.join("src/net/linked.rs")).unwrap();
     git(&["add", "src", "config"]);
     write(
         path,
@@ -623,6 +626,7 @@ fn git_checkouts_use_tracked_and_untracked_files() {
     );
     assert!(output.contains("src/net/untracked.rs"), "{output}");
     assert!(!output.contains("build/generated.rs"), "{output}");
+    assert!(!output.contains("src/net/linked.rs"), "{output}");
 }
 
 #[test]
@@ -758,4 +762,35 @@ fn crlf_lines_and_deleted_files_keep_their_headers() {
         "{output}"
     );
     assert!(!output.contains('\r'));
+}
+
+#[test]
+fn a_store_from_another_version_is_rebuilt() {
+    let root = fixture();
+    let path = root.path();
+    let expected = lookup(path, &["where are retries configured"]);
+    let manifest = store(path).join("manifest.bin");
+    let original = fs::read(&manifest).unwrap();
+    for at in [4, 8] {
+        let mut changed = original.clone();
+        changed[at] ^= 1;
+        fs::write(&manifest, &changed).unwrap();
+        assert_eq!(lookup(path, &["where are retries configured"]), expected);
+        assert_eq!(fs::read(&manifest).unwrap()[..12], original[..12]);
+    }
+}
+
+#[test]
+fn an_identifier_matches_through_its_parts() {
+    let root = fixture();
+    let output = lookup(root.path(), &["retryBudget"]);
+    let counts = output
+        .lines()
+        .find(|line| line.contains(" ranked"))
+        .unwrap();
+    assert!(
+        counts.ends_with(" ranked · matched retrybudget"),
+        "{output}"
+    );
+    assert!(!counts.contains("no match"), "{output}");
 }
