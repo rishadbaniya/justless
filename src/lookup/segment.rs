@@ -14,9 +14,10 @@ use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
+use tempfile::NamedTempFile;
 
 use super::chunks::{Chunk, Class, FIELDS, PATH};
 use super::tokens::{self, Tokenizer};
@@ -261,7 +262,13 @@ pub(crate) struct Segment {
 }
 
 impl Segment {
+    /// Opens a segment file. Anything but a regular file, such as a link a
+    /// repository committed into the store, is corrupt.
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        check(
+            fs::symlink_metadata(path)?.is_file(),
+            "segment is not a regular file",
+        )?;
         let mut file = File::open(path)?;
         let length = file.metadata()?.len();
         let mut header = [0u8; HEADER];
@@ -802,14 +809,22 @@ impl<'a> Input<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum Target<'a> {
     Memory,
-    /// Written beside its final path through temporary files, then renamed.
+    /// Written beside its final path through new temporary files, then renamed
+    /// over it. Temporary files get random names and are created exclusively,
+    /// so a link planted at a predictable name is never followed.
     Disk(&'a Path),
 }
 
-fn temporary(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    path.with_file_name(name)
+/// A new file beside `path`, named `<name>.<random>.tmp` so that a store
+/// cleanup finds it if the process stops before renaming it.
+fn partial(path: &Path) -> Result<NamedTempFile> {
+    let directory = path.parent().context("lookup segment directory")?;
+    let mut prefix = path.file_name().unwrap_or_default().to_os_string();
+    prefix.push(".");
+    Ok(tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(directory)?)
 }
 
 /// Merges the live files of every input into one path-ordered segment. Inputs
@@ -858,9 +873,10 @@ pub(crate) fn merge(inputs: &[Input], target: Target) -> Result<Segment> {
     let mut sink = match target {
         Target::Memory => Sink::Memory(Vec::new()),
         Target::Disk(path) => {
-            let postings = temporary(path, ".postings.tmp");
-            let file = File::create(&postings)?;
-            Sink::File(BufWriter::with_capacity(1 << 16, file), postings)
+            // Unnamed where the platform allows it, and removed when dropped.
+            let directory = path.parent().context("lookup segment directory")?;
+            let file = tempfile::tempfile_in(directory)?;
+            Sink::File(BufWriter::with_capacity(1 << 16, file))
         }
     };
     let mut dict = Vec::new();
@@ -924,7 +940,7 @@ pub(crate) fn merge(inputs: &[Input], target: Target) -> Result<Segment> {
         }
         match &mut sink {
             Sink::Memory(bytes) => bytes.extend_from_slice(&encoded),
-            Sink::File(writer, _) => writer.write_all(&encoded)?,
+            Sink::File(writer) => writer.write_all(&encoded)?,
         }
         dict.push((term, merged.len() as u32, encoded.len() as u32));
     }
@@ -937,18 +953,19 @@ pub(crate) fn merge(inputs: &[Input], target: Target) -> Result<Segment> {
             })?;
             Segment::from_bytes(bytes)
         }
-        (Sink::File(mut writer, postings), Target::Disk(path)) => {
-            writer.flush()?;
-            drop(writer);
-            let partial = temporary(path, ".tmp");
-            let mut out = BufWriter::with_capacity(1 << 16, File::create(&partial)?);
+        (Sink::File(writer), Target::Disk(path)) => {
+            let mut postings = writer
+                .into_inner()
+                .map_err(io::IntoInnerError::into_error)?;
+            postings.seek(SeekFrom::Start(0))?;
+            let mut out = BufWriter::with_capacity(1 << 16, partial(path)?);
             write_segment(&mut out, &names, &drafts, &dict, |out| {
-                io::copy(&mut File::open(&postings)?, out).map(|_| ())
+                io::copy(&mut postings, out).map(|_| ())
             })?;
-            out.flush()?;
-            drop(out);
-            fs::remove_file(&postings)?;
-            fs::rename(&partial, path)?;
+            drop(postings);
+            out.into_inner()
+                .map_err(io::IntoInnerError::into_error)?
+                .persist(path)?;
             Segment::open(path)
         }
         (Sink::File(..), Target::Memory) => unreachable!("the sink follows the target"),
@@ -957,7 +974,7 @@ pub(crate) fn merge(inputs: &[Input], target: Target) -> Result<Segment> {
 
 enum Sink {
     Memory(Vec<u8>),
-    File(BufWriter<File>, PathBuf),
+    File(BufWriter<File>),
 }
 
 #[cfg(test)]

@@ -490,17 +490,9 @@ fn a_damaged_store_is_rebuilt_without_touching_other_files() {
         fs::read_to_string(root.join("outside.txt")).unwrap(),
         "keep me\n"
     );
-    #[cfg(unix)]
-    assert!(
-        fs::symlink_metadata(store(root).join("base-99.seg"))
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    let rebuilt = segments(root, "base")
-        .into_iter()
-        .filter(|name| name != "base-99.seg")
-        .collect::<Vec<_>>();
+    // The link at a store name is removed, not followed.
+    assert!(fs::symlink_metadata(store(root).join("base-99.seg")).is_err());
+    let rebuilt = segments(root, "base");
     assert_eq!(rebuilt.len(), 1);
     let rebuilt = fs::read(store(root).join(&rebuilt[0])).unwrap();
     assert!(rebuilt.len() > 10);
@@ -508,6 +500,83 @@ fn a_damaged_store_is_rebuilt_without_touching_other_files() {
     let before = manifest_time(root);
     lookup(root, &["retry"]);
     assert_eq!(manifest_time(root), before);
+}
+
+/// Puts links at store names, as a repository that commits `.justless/` could.
+#[cfg(unix)]
+fn plant(root: &Path, target: &Path, names: &[&str]) {
+    fs::create_dir_all(store(root)).unwrap();
+    for name in names {
+        let link = store(root).join(name);
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn assert_no_links(root: &Path) {
+    for name in store_files(root) {
+        let metadata = fs::symlink_metadata(store(root).join(&name)).unwrap();
+        assert!(metadata.is_file(), "{name} is not a regular file");
+    }
+    let lock = fs::symlink_metadata(root.join(".justless/lookup.lock")).unwrap();
+    assert!(lock.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn planted_links_in_the_store_are_never_followed() {
+    let clean = fixture();
+    let planted = fixture();
+    let outside = TempDir::new().unwrap();
+    let victim = outside.path().join("victim.txt");
+    fs::write(&victim, "precious\n").unwrap();
+    for root in [clean.path(), planted.path()] {
+        add_modules(root, 60, "record ");
+    }
+    let root = planted.path();
+    plant(
+        root,
+        &victim,
+        &[
+            "manifest.bin",
+            "manifest.bin.tmp",
+            "base-1.seg",
+            "base-1.seg.tmp",
+            "base-1.seg.postings.tmp",
+        ],
+    );
+    let created = outside.path().join("created");
+    std::os::unix::fs::symlink(&created, root.join(".justless/lookup.lock")).unwrap();
+    let question = "where are retries configured";
+    assert_eq!(lookup(root, &[question]), lookup(clean.path(), &[question]));
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
+    assert!(!created.exists());
+    assert_no_links(root);
+
+    // An incremental refresh writes a delta segment and a new manifest.
+    plant(
+        root,
+        &victim,
+        &[
+            "manifest.bin.tmp",
+            "delta-2.seg",
+            "delta-2.seg.tmp",
+            "delta-2.seg.postings.tmp",
+        ],
+    );
+    for root in [clean.path(), planted.path()] {
+        let retry = fs::read_to_string(root.join("src/net/retry.rs")).unwrap();
+        write(
+            root,
+            "src/net/retry.rs",
+            &retry.replace("download", "upload"),
+        );
+    }
+    assert_eq!(lookup(root, &[question]), lookup(clean.path(), &[question]));
+    assert_eq!(segments(root, "delta"), ["delta-2.seg"]);
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
+    assert_no_links(root);
 }
 
 #[cfg(unix)]

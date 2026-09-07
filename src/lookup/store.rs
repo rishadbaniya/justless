@@ -222,7 +222,14 @@ pub(crate) fn load(workspace: &Workspace, logs: bool) -> Result<Loaded> {
     };
     let lock = private_dir(&workspace.state)
         .and_then(|()| private_dir(&store.directory))
-        .and_then(|()| lock_state(&workspace.state.join("lookup.lock")));
+        .and_then(|()| {
+            // Opening the lock creates it, so never through a link.
+            let path = workspace.state.join("lookup.lock");
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_symlink()) {
+                fs::remove_file(&path)?;
+            }
+            lock_state(&path)
+        });
     match lock {
         Ok(lock) => {
             let mut loaded = store.writable()?;
@@ -345,11 +352,13 @@ impl Store<'_> {
     }
 
     fn read(&self) -> Result<Option<Stored>> {
-        let bytes = match fs::read(self.directory.join(MANIFEST)) {
-            Ok(bytes) => bytes,
+        let path = self.directory.join(MANIFEST);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => check(metadata.is_file(), "manifest is not a regular file")?,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
-        };
+        }
+        let bytes = fs::read(path)?;
         let manifest = Manifest::decode(&bytes)?;
         let open = |kind: &str, generation: u64| -> Result<Option<Segment>> {
             if generation == 0 {
@@ -381,8 +390,8 @@ impl Store<'_> {
         }))
     }
 
-    /// Removes the store's own regular files except `keep`. Other files and
-    /// symbolic links are left alone.
+    /// Removes the store's own files except `keep`, and links at the store's
+    /// names without following them. Other files are left alone.
     fn clean(&self, keep: &[String]) {
         let Ok(entries) = fs::read_dir(&self.directory) else {
             return;
@@ -396,7 +405,9 @@ impl Store<'_> {
                 continue;
             }
             let path = entry.path();
-            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            if fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink())
+            {
                 let _ = fs::remove_file(path);
             }
         }
@@ -723,11 +734,14 @@ impl Store<'_> {
         }
         manifest.files = files;
         if write && manifest != previous {
-            let partial = self.directory.join(format!("{MANIFEST}.tmp"));
-            let mut file = File::create(&partial)?;
-            file.write_all(&manifest.encode())?;
-            drop(file);
-            fs::rename(&partial, self.directory.join(MANIFEST))?;
+            // A new, exclusively created file renamed over the manifest, so a
+            // link at either name is replaced rather than followed.
+            let mut partial = tempfile::Builder::new()
+                .prefix("manifest.bin.")
+                .suffix(".tmp")
+                .tempfile_in(&self.directory)?;
+            partial.write_all(&manifest.encode())?;
+            partial.persist(self.directory.join(MANIFEST))?;
             let keep = [
                 ("base", manifest.base),
                 ("delta", manifest.delta),
