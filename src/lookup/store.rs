@@ -213,6 +213,16 @@ pub(crate) struct Loaded {
 /// Refreshes the store and returns its segments. Errors only for problems
 /// outside the store, such as a broken `.justlessignore` or Git failure.
 pub(crate) fn load(workspace: &Workspace, logs: bool) -> Result<Loaded> {
+    open(workspace, logs, false)
+}
+
+/// Discards the store and builds it again, for damage found only while
+/// ranking, such as unreadable postings.
+pub(crate) fn rebuild(workspace: &Workspace, logs: bool) -> Result<Loaded> {
+    open(workspace, logs, true)
+}
+
+fn open(workspace: &Workspace, logs: bool, fresh: bool) -> Result<Loaded> {
     let store = Store {
         workspace,
         directory: workspace.state.join("lookup"),
@@ -232,13 +242,21 @@ pub(crate) fn load(workspace: &Workspace, logs: bool) -> Result<Loaded> {
         });
     match lock {
         Ok(lock) => {
-            let mut loaded = store.writable()?;
+            let mut loaded = if fresh {
+                store.rebuild()?
+            } else {
+                store.writable()?
+            };
             loaded._lock = Some(lock);
             Ok(loaded)
         }
         Err(error) => {
             eprintln!("lookup index not saved: {error:#}");
-            store.read_only()
+            if fresh {
+                store.apply(None, &store.scan(None)?, false)
+            } else {
+                store.read_only()
+            }
         }
     }
 }
@@ -318,15 +336,7 @@ impl Store<'_> {
             Err(error) => error,
         };
         if is_corrupt(&error) {
-            self.clean(&[]);
-            let scan = self.scan(None)?;
-            return match self.apply(None, &scan, true) {
-                Ok(loaded) => Ok(loaded),
-                Err(error) => {
-                    eprintln!("lookup index not saved: {error:#}");
-                    self.apply(None, &scan, false)
-                }
-            };
+            return self.rebuild();
         }
         eprintln!("lookup index not saved: {error:#}");
         // The scan was made against the manifest read above; answer from the
@@ -338,6 +348,20 @@ impl Store<'_> {
             },
             _ if cold => self.apply(None, &scan, false),
             _ => self.apply(None, &self.scan(None)?, false),
+        }
+    }
+
+    /// Removes every store file and builds the store from scratch, answering
+    /// from memory if it cannot be saved.
+    fn rebuild(&self) -> Result<Loaded> {
+        self.clean(&[]);
+        let scan = self.scan(None)?;
+        match self.apply(None, &scan, true) {
+            Ok(loaded) => Ok(loaded),
+            Err(error) => {
+                eprintln!("lookup index not saved: {error:#}");
+                self.apply(None, &scan, false)
+            }
         }
     }
 

@@ -133,6 +133,24 @@ pub(crate) fn rank(workspace: &Workspace, question: &str, options: &Options) -> 
     let question =
         Question::parse(question).ok_or_else(|| anyhow!("enter a question or keywords"))?;
     let loaded = store::load(workspace, options.logs)?;
+    // Postings are read only while scoring, so damage there shows up here.
+    match rank_in(workspace, &loaded, &question, options) {
+        Err(error) if segment::is_corrupt(&error) => {
+            drop(loaded);
+            eprintln!("lookup index was damaged and has been rebuilt");
+            let loaded = store::rebuild(workspace, options.logs)?;
+            rank_in(workspace, &loaded, &question, options)
+        }
+        result => result,
+    }
+}
+
+fn rank_in(
+    workspace: &Workspace,
+    loaded: &store::Loaded,
+    question: &Question,
+    options: &Options,
+) -> Result<Ranking> {
     let mut groups = vec![
         loaded
             .source
@@ -145,7 +163,7 @@ pub(crate) fn rank(workspace: &Workspace, question: &str, options: &Options) -> 
     }
     let scores = groups
         .iter()
-        .map(|parts| score::score(parts, &question))
+        .map(|parts| score::score(parts, question))
         .collect::<Result<Vec<Scores>>>()?;
     let file = |candidate: &Candidate| {
         let segment = groups[candidate.group][candidate.part].segment;
@@ -195,7 +213,7 @@ pub(crate) fn rank(workspace: &Workspace, question: &str, options: &Options) -> 
         .map(|candidate| {
             let segment = groups[candidate.group][candidate.part].segment;
             let idf = &scores[candidate.group].idf;
-            hit(workspace, segment, candidate, &question, idf)
+            hit(workspace, segment, candidate, question, idf)
         })
         .collect();
     let mut matched = Vec::new();

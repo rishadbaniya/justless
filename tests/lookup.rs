@@ -502,6 +502,36 @@ fn a_damaged_store_is_rebuilt_without_touching_other_files() {
     assert_eq!(manifest_time(root), before);
 }
 
+#[test]
+fn damaged_postings_are_rebuilt_on_the_next_lookup() {
+    let root = fixture();
+    let root = root.path();
+    let question = "where are retries configured";
+    let expected = lookup(root, &[question]);
+    let base = store(root).join(&segments(root, "base")[0]);
+    let original = fs::read(&base).unwrap();
+    // The header's fifth section offset is where the postings start.
+    let postings = u64::from_le_bytes(original[52..60].try_into().unwrap()) as usize;
+    assert!(postings < original.len());
+    let mut damaged = original.clone();
+    damaged[postings..].fill(0);
+    fs::write(&base, &damaged).unwrap();
+    let output = cli(root, &["lookup", question]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), expected);
+    assert!(
+        text(&output.stderr).contains("lookup index was damaged and has been rebuilt"),
+        "{}",
+        text(&output.stderr)
+    );
+    let rebuilt = segments(root, "base");
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(fs::read(store(root).join(&rebuilt[0])).unwrap(), original);
+    let output = cli(root, &["lookup", question]);
+    assert_eq!(text(&output.stdout), expected);
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+}
+
 /// Puts links at store names, as a repository that commits `.justless/` could.
 #[cfg(unix)]
 fn plant(root: &Path, target: &Path, names: &[&str]) {
