@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use super::chunks::{Class, FIELDS};
 use super::segment::{Posting, Row, Segment};
-use super::tokens::{self, Question};
+use super::tokens::Question;
 
 /// Field weights: name, signature, doc comments or parent headings, body, path.
 pub(crate) const WEIGHTS: [f64; FIELDS] = [4.0, 3.5, 3.0, 1.0, 0.5];
@@ -229,55 +229,6 @@ pub(crate) fn select<T: Copy, K: Eq + Hash, C: Eq + Hash>(
     }
 }
 
-/// A line's score for a question and the offset of its first matching word.
-pub(crate) fn line_score(line: &str, question: &Question, idf: &[f64]) -> (f64, Option<usize>) {
-    let mut seen = vec![false; question.terms.len()];
-    let mut first = None;
-    tokens::tokens(line, |token, offset| {
-        if let Ok(term) = question
-            .terms
-            .binary_search_by(|term| term.as_str().cmp(token))
-        {
-            seen[term] = true;
-            if first.is_none_or(|first| offset < first) {
-                first = Some(offset);
-            }
-        }
-    });
-    let score = seen
-        .iter()
-        .zip(idf)
-        .filter(|(seen, _)| **seen)
-        .map(|(_, idf)| idf)
-        .sum();
-    (score, first)
-}
-
-/// The (up to) two best lines among `candidates`, in line order. Each is a
-/// line number and the byte offset of its first matching word.
-pub(crate) fn best_lines(
-    candidates: &[(usize, &str)],
-    question: &Question,
-    idf: &[f64],
-) -> Vec<(usize, Option<usize>)> {
-    let mut scored = candidates
-        .iter()
-        .map(|&(number, text)| {
-            let (score, first) = line_score(text, question, idf);
-            (score, number, first)
-        })
-        .filter(|(score, _, _)| *score > 0.0)
-        .collect::<Vec<_>>();
-    scored.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
-    scored.truncate(2);
-    let mut lines = scored
-        .into_iter()
-        .map(|(_, number, first)| (number, first))
-        .collect::<Vec<_>>();
-    lines.sort_unstable();
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::chunks::Chunk;
@@ -481,23 +432,5 @@ mod tests {
         assert_eq!(names(&chosen[0].1), ["d.rs"]);
         assert!(chosen[1].1.is_empty());
         assert_eq!(names(&chosen[3].1), ["f.rs"]);
-    }
-
-    #[test]
-    fn snippet_lines_prefer_rarer_words() {
-        let question = Question::parse("retry policy").unwrap();
-        let idf = [2.0, 0.5];
-        let lines = [
-            (3, "let policy = 1;"),
-            (4, "fn retry() {}"),
-            (5, "// no match"),
-            (6, "retry with policy"),
-        ];
-        assert_eq!(question.terms, ["polici", "retri"]);
-        assert_eq!(
-            best_lines(&lines, &question, &idf),
-            [(3, Some(4)), (6, Some(0))]
-        );
-        assert!(best_lines(&lines[2..3], &question, &idf).is_empty());
     }
 }

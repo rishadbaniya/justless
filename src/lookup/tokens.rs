@@ -21,6 +21,7 @@ const MAX_WHOLE: usize = 64;
 
 /// Calls `emit` with every token of `text` and the byte offset of the word it
 /// came from. Words are runs of Unicode letters, digits and `_`.
+#[cfg(test)]
 pub(crate) fn tokens(text: &str, mut emit: impl FnMut(&str, usize)) {
     let mut tokenizer = Tokenizer::default();
     words(text, |offset, word| {

@@ -10,6 +10,7 @@ mod chunks;
 mod logs;
 mod score;
 mod segment;
+mod snippet;
 mod store;
 mod tokens;
 
@@ -28,8 +29,6 @@ use tokens::Question;
 
 const MARKER: &str = "[context budget reached]\n";
 const EXCERPT_LINES: usize = 40;
-const MAX_LINE: usize = 160;
-const LEAD: usize = 60;
 const MAX_WORDS: usize = 120;
 
 pub fn command() -> Command<'static> {
@@ -338,8 +337,8 @@ fn hit(
         .iter()
         .filter_map(|&number| Some((number, text.get(number.checked_sub(1)?)?.as_str())))
         .collect::<Vec<_>>();
-    let mut best = score::best_lines(&lines, question, idf);
-    if best.is_empty() {
+    hit.lines = snippet::lines(&lines, question, idf);
+    if hit.lines.is_empty() {
         let declaration = row.declaration as usize;
         let fallback = if class == Class::Code && candidates.contains(&declaration) {
             Some(declaration)
@@ -349,32 +348,11 @@ fn hit(
                 .find(|(_, line)| !line.trim().is_empty())
                 .map(|(number, _)| *number)
         };
-        best.extend(fallback.map(|number| (number, None)));
+        hit.lines.extend(
+            fallback.and_then(|number| Some((number, snippet::plain(text.get(number - 1)?)))),
+        );
     }
-    hit.lines = best
-        .into_iter()
-        .filter_map(|(number, first)| Some((number, excerpt(text.get(number - 1)?, first))))
-        .collect();
     hit
-}
-
-/// The trimmed line, clipped to 160 bytes. A longer line is windowed from 60
-/// bytes before its first matching word.
-fn excerpt(line: &str, first: Option<usize>) -> String {
-    let trimmed = line.trim();
-    if trimmed.len() <= MAX_LINE {
-        return trimmed.to_owned();
-    }
-    let indent = line.len() - line.trim_start().len();
-    let anchor = first.map_or(0, |first| first.saturating_sub(indent));
-    let start = trimmed.floor_char_boundary(anchor.saturating_sub(LEAD).min(trimmed.len()));
-    let prefix = if start > 0 { "…" } else { "" };
-    let room = MAX_LINE - prefix.len();
-    if trimmed.len() - start <= room {
-        return format!("{prefix}{}", &trimmed[start..]);
-    }
-    let end = trimmed.floor_char_boundary(start + room - '…'.len_utf8());
-    format!("{prefix}{}…", &trimmed[start..end])
 }
 
 fn quoted(file: &str) -> String {
@@ -733,18 +711,6 @@ mod tests {
             next(&log, 500),
             "justless log run-1 --stream stderr --from 7 --to 9"
         );
-    }
-
-    #[test]
-    fn long_lines_are_windowed_around_the_match() {
-        assert_eq!(excerpt("  short  \r", None), "short");
-        let line = format!("    {}needle{}", "a ".repeat(100), " b".repeat(100));
-        let clipped = excerpt(&line, Some(204));
-        assert!(clipped.len() <= MAX_LINE, "{}", clipped.len());
-        assert!(clipped.starts_with('…') && clipped.ends_with('…'));
-        assert!(clipped.contains("needle"));
-        let head = excerpt(&"é".repeat(100), None);
-        assert!(head.len() <= MAX_LINE && head.ends_with('…'));
     }
 
     #[test]
