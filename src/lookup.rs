@@ -107,6 +107,8 @@ pub(crate) struct Hit {
     pub lines: Vec<(usize, String)>,
     /// The size of the whole result in bytes, when its file could be read.
     pub bytes: Option<usize>,
+    /// Other files with the same lines, because their contents are identical.
+    pub same: Vec<String>,
 }
 
 pub(crate) struct Ranking {
@@ -205,15 +207,33 @@ fn rank_in(
         })
         .collect::<Vec<_>>();
     let total = candidates.len();
-    let chosen = score::select(candidates, options.limit, compare, |candidate| {
-        (candidate.group, file(candidate).0.as_str())
-    });
+    // Source files with the same contents give the same lines at the same
+    // place, so one result stands for all of them.
+    let copy = |candidate: &Candidate| {
+        let (file, row) = file(candidate);
+        let digest = loaded.digest(file).filter(|_| candidate.group == 0)?;
+        Some((*digest, row.start, row.end))
+    };
+    let chosen = score::select(
+        candidates,
+        options.limit,
+        compare,
+        |candidate| (candidate.group, file(candidate).0.as_str()),
+        copy,
+    );
     let hits = chosen
         .iter()
-        .map(|candidate| {
+        .map(|(candidate, copies)| {
             let segment = groups[candidate.group][candidate.part].segment;
             let idf = &scores[candidate.group].idf;
-            hit(workspace, segment, candidate, question, idf)
+            let mut hit = hit(workspace, segment, candidate, question, idf);
+            for copy in copies {
+                let other = file(copy).0;
+                if *other != hit.location.file && !hit.same.contains(other) {
+                    hit.same.push(other.clone());
+                }
+            }
+            hit
         })
         .collect();
     let mut matched = Vec::new();
@@ -268,6 +288,7 @@ fn hit(
         score: candidate.score,
         lines: Vec::new(),
         bytes: None,
+        same: Vec::new(),
     };
     let (text, candidates): (Vec<String>, Vec<usize>) = if class == Class::Log {
         let Some((run, stream)) = logs::parse_key(file) else {
@@ -401,7 +422,14 @@ fn block(hit: &Hit) -> String {
                 hit.name
             )
         }
-        None => format!("{} {} {}\n", hit.location, hit.kind, hit.name),
+        None => {
+            let same = match hit.same.as_slice() {
+                [] => String::new(),
+                [one] => format!(" · same in {one}"),
+                [first, rest @ ..] => format!(" · same in {first} +{} more", rest.len()),
+            };
+            format!("{} {} {}{same}\n", hit.location, hit.kind, hit.name)
+        }
     };
     for (line, text) in &hit.lines {
         block.push_str(&format!("  {line} | {text}\n"));
@@ -536,6 +564,9 @@ fn result_json(hit: &Hit) -> Value {
     result["name"] = json!(hit.name);
     result["score"] = json!(score);
     result["lines"] = json!(lines);
+    if !hit.same.is_empty() {
+        result["same"] = json!(hit.same);
+    }
     result
 }
 
@@ -658,6 +689,7 @@ mod tests {
                 .map(|(line, text)| (*line, (*text).to_owned()))
                 .collect(),
             bytes: Some((end + 1 - start) * 20),
+            same: Vec::new(),
         }
     }
 

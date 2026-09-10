@@ -181,12 +181,15 @@ pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
 }
 
 /// The best `limit` items in `compare` order, at most two from one file.
-pub(crate) fn select<T: Copy, K: Eq + Hash>(
+/// An item with the same `copy` key as a chosen one, such as the same lines
+/// of an identical file, is listed with it instead of taking a place.
+pub(crate) fn select<T: Copy, K: Eq + Hash, C: Eq + Hash>(
     mut items: Vec<T>,
     limit: usize,
     compare: impl Fn(&T, &T) -> Ordering,
     file: impl Fn(&T) -> K,
-) -> Vec<T> {
+    copy: impl Fn(&T) -> Option<C>,
+) -> Vec<(T, Vec<T>)> {
     let mut window = limit.saturating_mul(4).max(32);
     loop {
         let take = window.min(items.len());
@@ -198,18 +201,28 @@ pub(crate) fn select<T: Copy, K: Eq + Hash>(
         }
         items[..take].sort_by(&compare);
         let mut per_file = HashMap::new();
-        let mut chosen = Vec::new();
+        let mut copies = HashMap::<C, usize>::new();
+        let mut chosen = Vec::<(T, Vec<T>)>::new();
         for item in &items[..take] {
+            let key = copy(item);
+            if let Some(&index) = key.as_ref().and_then(|key| copies.get(key)) {
+                chosen[index].1.push(*item);
+                continue;
+            }
+            // Once full, the rest of the window is read only for copies.
+            if chosen.len() == limit {
+                continue;
+            }
             let count = per_file.entry(file(item)).or_insert(0);
             if *count < 2 {
                 *count += 1;
-                chosen.push(*item);
-                if chosen.len() == limit {
-                    return chosen;
+                if let Some(key) = key {
+                    copies.insert(key, chosen.len());
                 }
+                chosen.push((*item, Vec::new()));
             }
         }
-        if take == items.len() {
+        if chosen.len() == limit || take == items.len() {
             return chosen;
         }
         window = window.saturating_mul(4);
@@ -428,9 +441,10 @@ mod tests {
                 .then(left.1.cmp(right.1))
                 .then(left.2.cmp(&right.2))
         };
-        let chosen = select(items.clone(), 10, compare, |item| item.1);
+        let none = |_: &(f64, &str, usize)| None::<usize>;
+        let chosen = select(items.clone(), 10, compare, |item| item.1, none);
         assert_eq!(
-            chosen,
+            chosen.iter().map(|(item, _)| *item).collect::<Vec<_>>(),
             [
                 (2.0, "c.rs", 1),
                 (1.0, "a.rs", 2),
@@ -438,9 +452,35 @@ mod tests {
                 (1.0, "b.rs", 3)
             ]
         );
-        assert_eq!(select(items, 2, compare, |item| item.1).len(), 2);
+        assert_eq!(select(items, 2, compare, |item| item.1, none).len(), 2);
         let many = (0..500).map(|n| (f64::from(n), "x", n as usize)).collect();
-        assert_eq!(select(many, 3, compare, |item| item.2).len(), 3);
+        assert_eq!(select(many, 3, compare, |item| item.2, none).len(), 3);
+    }
+
+    #[test]
+    fn copies_join_the_result_they_repeat() {
+        // The third field is the content key: d.rs repeats a.rs, and f.rs
+        // repeats e.rs after the last place is taken.
+        let items = vec![
+            (5.0, "a.rs", 1),
+            (4.0, "d.rs", 1),
+            (3.0, "b.rs", 2),
+            (2.0, "c.rs", 3),
+            (1.5, "e.rs", 4),
+            (1.0, "f.rs", 4),
+        ];
+        let compare = |left: &(f64, &str, usize), right: &(f64, &str, usize)| {
+            right.0.total_cmp(&left.0).then(left.1.cmp(right.1))
+        };
+        let chosen = select(items, 4, compare, |item| item.1, |item| Some(item.2));
+        fn names(items: &[(f64, &'static str, usize)]) -> Vec<&'static str> {
+            items.iter().map(|item| item.1).collect()
+        }
+        let shown = chosen.iter().map(|(item, _)| item.1).collect::<Vec<_>>();
+        assert_eq!(shown, ["a.rs", "b.rs", "c.rs", "e.rs"]);
+        assert_eq!(names(&chosen[0].1), ["d.rs"]);
+        assert!(chosen[1].1.is_empty());
+        assert_eq!(names(&chosen[3].1), ["f.rs"]);
     }
 
     #[test]

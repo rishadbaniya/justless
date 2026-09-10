@@ -537,6 +537,58 @@ fn a_damaged_store_is_rebuilt_without_touching_other_files() {
 }
 
 #[test]
+fn identical_files_share_one_result() {
+    let root = fixture();
+    let root = root.path();
+    let question = "where are retries configured";
+    let original = lookup(root, &[question]);
+    let docs = fs::read_to_string(root.join("docs/operations.md")).unwrap();
+    write(root, "vendor/a/operations.md", &docs);
+    write(root, "vendor/b/operations.md", &docs);
+    let output = lookup(root, &[question]);
+    let header = "docs/operations.md:9-13 section Retries";
+    assert!(
+        output.contains(&format!(
+            "\n{header} · same in vendor/a/operations.md +1 more\n"
+        )),
+        "{output}"
+    );
+    assert!(!output.contains("vendor/a/operations.md:"), "{output}");
+    assert!(!output.contains("vendor/b/operations.md:"), "{output}");
+    // The copies take no places, so the same results are shown.
+    assert_eq!(
+        headers(&output)
+            .iter()
+            .map(|header| header.split(" · same in ").next().unwrap())
+            .collect::<Vec<_>>(),
+        headers(&original)
+    );
+    let value: Value = serde_json::from_str(&lookup(root, &[question, "--json"])).unwrap();
+    let docs_result = value["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["file"] == "docs/operations.md")
+        .unwrap();
+    assert_eq!(
+        docs_result["same"],
+        serde_json::json!(["vendor/a/operations.md", "vendor/b/operations.md"])
+    );
+    // A copy that changes stands on its own again.
+    write(
+        root,
+        "vendor/b/operations.md",
+        &docs.replace("five times", "seven times"),
+    );
+    let output = lookup(root, &[question, "--limit", "20"]);
+    assert!(
+        output.contains(&format!("\n{header} · same in vendor/a/operations.md\n")),
+        "{output}"
+    );
+    assert!(output.contains("\nvendor/b/operations.md:9-13 section Retries\n"));
+}
+
+#[test]
 fn damaged_postings_are_rebuilt_on_the_next_lookup() {
     let root = fixture();
     let root = root.path();

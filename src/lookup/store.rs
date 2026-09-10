@@ -206,8 +206,16 @@ impl<'a> Reader<'a> {
 pub(crate) struct Loaded {
     pub(crate) source: Vec<(Segment, Vec<bool>)>,
     pub(crate) logs: Option<(Segment, Vec<bool>)>,
+    files: BTreeMap<String, Record>,
     /// Held until ranking ends, because a refresh elsewhere may delete old segments.
     _lock: Option<File>,
+}
+
+impl Loaded {
+    /// The SHA-256 of a source file's contents when it was indexed.
+    pub(crate) fn digest(&self, file: &str) -> Option<&[u8; 32]> {
+        self.files.get(file).map(|record| &record.digest)
+    }
 }
 
 /// Refreshes the store and returns its segments. Errors only for problems
@@ -801,6 +809,7 @@ impl Store<'_> {
         Ok(Loaded {
             source,
             logs,
+            files: manifest.files,
             _lock: None,
         })
     }
