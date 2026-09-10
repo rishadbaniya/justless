@@ -368,13 +368,9 @@ fn next(hit: &Hit, budget: usize) -> String {
     let Location { file, start, end } = &hit.location;
     let fits = hit.bytes.is_some_and(|bytes| bytes <= budget);
     if let Some((run, stream)) = &hit.run {
-        let shown = |pick: fn(&[(usize, String)]) -> Option<&(usize, String)>, default| {
-            pick(&hit.lines).map_or(default, |(line, _)| *line)
-        };
-        let (from, to) = if fits {
-            (*start, *end)
-        } else {
-            (shown(<[_]>::first, *start), shown(<[_]>::last, *end))
+        let (from, to) = match (hit.lines.first(), hit.lines.last()) {
+            (Some((first, _)), Some((last, _))) if !fits => (*first, *last),
+            _ => (*start, *end),
         };
         return format!(
             "justless log {run} --stream {} --from {from} --to {to}",
