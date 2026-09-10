@@ -261,24 +261,40 @@ fn the_next_command_opens_the_top_result() {
 #[test]
 fn output_fits_the_budget_and_limit() {
     let root = fixture();
-    for budget in ["128", "400", "2400"] {
-        let output = lookup(
-            root.path(),
-            &["where are retries configured", "--budget", budget],
-        );
-        assert!(
-            output.len() <= budget.parse().unwrap(),
-            "{budget}: {output}"
-        );
+    let long = (0..40)
+        .map(|index| format!("missingword{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for question in ["where are retries configured", &format!("retries {long}")] {
+        for budget in ["128", "200", "400", "2400"] {
+            let output = lookup(root.path(), &[question, "--budget", budget]);
+            assert!(
+                output.len() <= budget.parse().unwrap(),
+                "{budget}: {output}"
+            );
+            // Even the smallest budget shows the top result's header.
+            assert!(
+                output.starts_with("src/net/retry.rs:"),
+                "{budget}: {output}"
+            );
+            let output = lookup(root.path(), &[question, "--budget", budget, "--json"]);
+            assert!(
+                output.len() <= budget.parse().unwrap(),
+                "{budget}: {output}"
+            );
+            serde_json::from_str::<Value>(&output).unwrap();
+        }
     }
     let output = lookup(
         root.path(),
         &["where are retries configured", "--budget", "128"],
     );
-    let lines = output.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2, "{output}");
-    assert!(lines[0].starts_with("0 of "), "{output}");
-    assert_eq!(lines[1], "[context budget reached]");
+    assert_eq!(
+        headers(&output),
+        ["src/net/retry.rs:5-9 struct RetryPolicy"],
+        "{output}"
+    );
+    assert!(output.contains("\n[context budget reached]\n"), "{output}");
     let output = lookup(
         root.path(),
         &["where are retries configured", "--limit", "1"],

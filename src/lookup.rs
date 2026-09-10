@@ -452,24 +452,20 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
     if blocks.iter().map(String::len).sum::<usize>() + all.len() + next.len() <= budget {
         return blocks.concat() + &all + &next;
     }
-    // Reserve the footer, then add whole results in rank order while they fit.
+    // Reserve the footer, then add whole results in rank order while they
+    // fit. A footer too large for the budget shortens its word lists first,
+    // then drops the closing command.
     let shown = ranking.hits.len();
     let mut limit = Some(MAX_WORDS);
     let mut next = Some(next);
     let footer = |limit, next: &Option<String>| {
         counts(ranking, shown, limit).len() + MARKER.len() + next.as_ref().map_or(0, String::len)
     };
+    while footer(limit, &next) > budget && limit.is_some() {
+        limit = limit.filter(|&words| words > 16).map(|words| words - 8);
+    }
     if footer(limit, &next) > budget {
         next = None;
-    }
-    while footer(limit, &next) > budget {
-        limit = match limit {
-            Some(words) if words > 16 => Some(words - 8),
-            _ => None,
-        };
-        if limit.is_none() {
-            break;
-        }
     }
     let mut used = footer(limit, &next);
     let mut shown = 0;
@@ -480,6 +476,11 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
         used += block.len();
         shown += 1;
     }
+    if shown == 0
+        && let Some(output) = squeezed(ranking, &blocks[0], next.as_deref(), budget)
+    {
+        return output;
+    }
     if shown == 0 {
         next = None;
     }
@@ -488,6 +489,33 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
     output.push_str(MARKER);
     output.push_str(next.as_deref().unwrap_or_default());
     output
+}
+
+/// The top result alone, for a budget too small to show it beside the word
+/// lists and the closing command. They give way to it and come back only
+/// while they still fit. A result too large on its own keeps just its header.
+fn squeezed(ranking: &Ranking, top: &str, next: Option<&str>, budget: usize) -> Option<String> {
+    let bare = counts(ranking, 1, None);
+    let fixed = bare.len() + MARKER.len();
+    let header = &top[..top.find('\n').map_or(top.len(), |at| at + 1)];
+    let top = [top, header]
+        .into_iter()
+        .find(|top| fixed + top.len() <= budget)?;
+    let mut used = fixed + top.len();
+    let next = next.filter(|next| used + next.len() <= budget);
+    used += next.map_or(0, str::len);
+    let mut limit = MAX_WORDS;
+    let counts = loop {
+        let line = counts(ranking, 1, Some(limit));
+        if used - bare.len() + line.len() <= budget {
+            break line;
+        }
+        if limit <= 16 {
+            break bare;
+        }
+        limit -= 8;
+    };
+    Some(format!("{top}{counts}{MARKER}{}", next.unwrap_or_default()))
 }
 
 fn result_json(hit: &Hit) -> Value {
@@ -515,40 +543,79 @@ fn result_json(hit: &Hit) -> Value {
     result
 }
 
+/// The words that fit in `limit` bytes when joined, and how many did not.
+fn cut(words: &[String], limit: usize) -> (&[String], usize) {
+    let mut used = 0;
+    let kept = words
+        .iter()
+        .take_while(|word| {
+            used += word.len() + 2;
+            used <= limit.saturating_add(2)
+        })
+        .count();
+    (&words[..kept], words.len() - kept)
+}
+
 fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<String> {
     let results = ranking
         .hits
         .iter()
         .map(|hit| serde_json::to_string(&result_json(hit)))
         .collect::<serde_json::Result<Vec<_>>>()?;
-    let envelope = |kept: usize| {
-        json!({
-            "query": question,
-            "matched": ranking.matched,
-            "unmatched": ranking.unmatched,
-            "total": ranking.total,
-            "omitted": ranking.hits.len() - kept,
-            "next": ranking.hits.first().filter(|_| kept > 0).map(|hit| next(hit, budget)),
-            "results": [],
-        })
-        .to_string()
+    // `limit` bounds the echoed question and each word list, in bytes.
+    let envelope = |kept: usize, limit: usize| {
+        let (matched, more) = cut(&ranking.matched, limit);
+        let (unmatched, less) = cut(&ranking.unmatched, limit);
+        let mut value = json!({
+            "query": chunks::clip(question, limit),
+            "matched": matched,
+            "unmatched": unmatched,
+        });
+        if more + less > 0 {
+            value["words_omitted"] = json!(more + less);
+        }
+        value["total"] = json!(ranking.total);
+        value["omitted"] = json!(ranking.hits.len() - kept);
+        value["next"] = json!(
+            ranking
+                .hits
+                .first()
+                .filter(|_| kept > 0)
+                .map(|hit| next(hit, budget))
+        );
+        value["results"] = json!([]);
+        value.to_string()
     };
-    let mut kept = results.len();
-    loop {
-        let base = envelope(kept);
-        let size = base.len()
+    let size = |base: &str, kept: usize| {
+        base.len()
             + results[..kept].iter().map(String::len).sum::<usize>()
             + kept.saturating_sub(1)
-            + 1;
-        if size <= budget || kept == 0 {
-            let body = format!("[{}]", results[..kept].join(","));
-            let base = base
-                .strip_suffix("[]}")
-                .expect("results come last in the envelope");
-            return Ok(format!("{base}{body}}}\n"));
-        }
-        kept -= 1;
-    }
+            + 1
+    };
+    let fits = |kept: usize, limit: usize| {
+        let base = envelope(kept, limit);
+        (size(&base, kept) <= budget).then_some((kept, base))
+    };
+    // Shorter lists, down to none, for the budgets too small for them.
+    let limits = || std::iter::successors(Some(MAX_WORDS), |limit| limit.checked_sub(8));
+    // As many results as fit beside the full envelope; otherwise the top
+    // result with a shorter question and word lists; otherwise none.
+    let (kept, base) = (1..=results.len())
+        .rev()
+        .find_map(|kept| fits(kept, usize::MAX))
+        .or_else(|| {
+            (!results.is_empty())
+                .then(|| limits().find_map(|limit| fits(1, limit)))
+                .flatten()
+        })
+        .or_else(|| fits(0, usize::MAX))
+        .or_else(|| limits().find_map(|limit| fits(0, limit)))
+        .unwrap_or_else(|| (0, envelope(0, 0)));
+    let body = format!("[{}]", results[..kept].join(","));
+    let base = base
+        .strip_suffix("[]}")
+        .expect("results come last in the envelope");
+    Ok(format!("{base}{body}}}\n"))
 }
 
 pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
@@ -671,16 +738,31 @@ mod tests {
             "{full}"
         );
         assert!(full.contains("5 of 8 ranked · matched retries · no match configured\n"));
-        for budget in [128, 200, 300, full.len() - 1] {
+        for budget in 128..full.len() {
             let output = render_text(&ranking, budget);
             assert!(output.len() <= budget, "{budget}: {output}");
             assert!(output.contains(MARKER), "{output}");
+            // The top result always shows, before the word lists and Next.
+            assert!(
+                output.starts_with("src/retry.rs:1-5 function retry\n  2 | let retries = 3;\n"),
+                "{budget}: {output}"
+            );
         }
         assert_eq!(render_text(&ranking, full.len()), full);
-        let small = render_text(&ranking, 128);
         assert_eq!(
-            small,
-            "0 of 8 ranked · matched retries · no match configured\n[context budget reached]\n"
+            render_text(&ranking, 128),
+            "src/retry.rs:1-5 function retry\n  2 | let retries = 3;\n1 of 8 ranked\n[context budget reached]\n"
+        );
+        assert_eq!(
+            render_text(&ranking, 200),
+            "src/retry.rs:1-5 function retry\n  2 | let retries = 3;\n1 of 8 ranked · matched retries · no match configured\n[context budget reached]\nNext: justless expand src/retry.rs L1-5\n"
+        );
+        // A top result too large for the budget keeps its header.
+        let long = "x".repeat(150);
+        let ranking = self::ranking(vec![hit("src/retry.rs", 1, 5, &[(2, &long)])]);
+        assert_eq!(
+            render_text(&ranking, 128),
+            "src/retry.rs:1-5 function retry\n1 of 4 ranked\n[context budget reached]\nNext: justless expand src/retry.rs L1-5\n"
         );
     }
 
@@ -712,6 +794,37 @@ mod tests {
         assert_eq!(value["omitted"], 4);
         assert_eq!(value["next"], Value::Null);
         assert_eq!(value["total"], 7);
+        assert!(value.get("words_omitted").is_none());
+        for budget in 128..full.len() {
+            let output = render_json("retries", &ranking, budget).unwrap();
+            assert!(output.len() <= budget, "{budget}: {output}");
+            serde_json::from_str::<Value>(&output).unwrap();
+        }
+    }
+
+    #[test]
+    fn json_shortens_the_question_and_word_lists_last() {
+        let words = (0..40)
+            .map(|index| format!("missingword{index}"))
+            .collect::<Vec<_>>();
+        let question = words.join(" ");
+        let mut ranking = ranking(vec![hit("src/retry.rs", 1, 1, &[(1, "retry")])]);
+        ranking.unmatched = words;
+        let full = render_json(&question, &ranking, 100_000).unwrap();
+        for budget in 128..full.len() {
+            let output = render_json(&question, &ranking, budget).unwrap();
+            assert!(output.len() <= budget, "{budget}: {output}");
+            serde_json::from_str::<Value>(&output).unwrap();
+        }
+        let value: Value =
+            serde_json::from_str(&render_json(&question, &ranking, 128).unwrap()).unwrap();
+        assert!(value["words_omitted"].as_u64().unwrap() > 30, "{value}");
+        assert!(value["query"].as_str().unwrap().ends_with('…'), "{value}");
+        // The top result is kept before the full word lists.
+        let value: Value =
+            serde_json::from_str(&render_json(&question, &ranking, 600).unwrap()).unwrap();
+        assert_eq!(value["results"].as_array().unwrap().len(), 1, "{value}");
+        assert!(value["words_omitted"].as_u64().unwrap() > 0, "{value}");
     }
 
     #[test]
@@ -734,7 +847,7 @@ mod tests {
         assert!(line.ends_with(" · first 64 terms used\n"), "{line}");
         let output = render_text(&ranking, 128);
         assert!(output.len() <= 128, "{output}");
-        assert!(output.ends_with(MARKER), "{output}");
+        assert!(output.contains(MARKER), "{output}");
         let empty = Ranking {
             hits: Vec::new(),
             total: 0,
