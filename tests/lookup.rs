@@ -211,7 +211,25 @@ fn the_next_command_opens_the_top_result() {
         assert!(opened.contains(&snippet), "{snippet} not in {opened}");
     }
 
-    // A result longer than 80 lines gets a budgeted 40-line excerpt instead.
+    // A short result made of long lines is too large to open whole.
+    let mut notes = String::from("# Quorum notes\n");
+    for line in 2..=12 {
+        notes.push_str(&format!("Line {line} {}\n", "word ".repeat(48)));
+    }
+    write(root.path(), "docs/quorum.md", &notes);
+    let output = lookup(root.path(), &["quorum notes"]);
+    assert!(
+        output.starts_with("docs/quorum.md:1-12 section Quorum notes\n"),
+        "{output}"
+    );
+    assert_eq!(
+        next_command(&output),
+        ["code", "docs/quorum.md", "--from", "1", "--to", "12"]
+    );
+    let output = lookup(root.path(), &["quorum notes", "--budget", "8000"]);
+    assert_eq!(next_command(&output), ["expand", "docs/quorum.md", "L1-12"]);
+
+    // A long result gets a budgeted 40-line excerpt instead.
     let mut runbook = String::from("# Runbook\n\n");
     for line in 3..=120 {
         if line == 100 {

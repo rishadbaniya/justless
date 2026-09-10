@@ -27,8 +27,6 @@ use score::{Part, Scores};
 use tokens::Question;
 
 const MARKER: &str = "[context budget reached]\n";
-/// The longest result `expand` is offered for, because it has no budget.
-const EXPAND_LINES: usize = 80;
 const EXCERPT_LINES: usize = 40;
 const MAX_LINE: usize = 160;
 const LEAD: usize = 60;
@@ -107,6 +105,8 @@ pub(crate) struct Hit {
     pub score: f64,
     /// Up to two best-matching lines, in line order.
     pub lines: Vec<(usize, String)>,
+    /// The size of the whole result in bytes, when its file could be read.
+    pub bytes: Option<usize>,
 }
 
 pub(crate) struct Ranking {
@@ -267,6 +267,7 @@ fn hit(
         name: segment.name(&row).to_owned(),
         score: candidate.score,
         lines: Vec::new(),
+        bytes: None,
     };
     let (text, candidates): (Vec<String>, Vec<usize>) = if class == Class::Log {
         let Some((run, stream)) = logs::parse_key(file) else {
@@ -279,6 +280,13 @@ fn hit(
         };
         hit.status = Some(record.status);
         let lines = logs::read_lines(&directory.join(stream.name()), end);
+        hit.bytes = Some(
+            lines
+                .iter()
+                .skip(start - 1)
+                .map(|line| line.len() + 1)
+                .sum(),
+        );
         (lines, (start..=end).collect())
     } else {
         let Some(text) = workspace
@@ -296,6 +304,13 @@ fn hit(
                 (other.start as usize, other.end as usize)
             });
         let indexed = chunks::indexed_lines(class, (start, end), others);
+        hit.bytes = Some(
+            text.split_inclusive('\n')
+                .skip(start - 1)
+                .take(end + 1 - start)
+                .map(str::len)
+                .sum(),
+        );
         (text.lines().map(str::to_owned).collect(), indexed)
     };
     let lines = candidates
@@ -345,17 +360,28 @@ fn quoted(file: &str) -> String {
     shlex::try_quote(file).map_or_else(|_| file.to_owned(), |quoted| quoted.into_owned())
 }
 
-/// The command that opens the top result: exact bytes for a short source
-/// result, a budgeted excerpt for a longer one, or the log lines.
-fn next(hit: &Hit) -> String {
+/// The command that opens the top result: its exact bytes when the whole
+/// result fits `budget`, because `expand` and `log` have no budget of their
+/// own. Otherwise a budgeted excerpt around its best lines, or for a log just
+/// the lines shown.
+fn next(hit: &Hit, budget: usize) -> String {
     let Location { file, start, end } = &hit.location;
+    let fits = hit.bytes.is_some_and(|bytes| bytes <= budget);
     if let Some((run, stream)) = &hit.run {
+        let shown = |pick: fn(&[(usize, String)]) -> Option<&(usize, String)>, default| {
+            pick(&hit.lines).map_or(default, |(line, _)| *line)
+        };
+        let (from, to) = if fits {
+            (*start, *end)
+        } else {
+            (shown(<[_]>::first, *start), shown(<[_]>::last, *end))
+        };
         return format!(
-            "justless log {run} --stream {} --from {start} --to {end}",
+            "justless log {run} --stream {} --from {from} --to {to}",
             stream.name()
         );
     }
-    if end - start < EXPAND_LINES {
+    if fits {
         return format!("justless expand {} L{start}-{end}", quoted(file));
     }
     let first = hit.lines.first().map_or(*start, |(line, _)| *line);
@@ -421,7 +447,7 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
         }
     }
     let blocks = ranking.hits.iter().map(block).collect::<Vec<_>>();
-    let next = format!("Next: {}\n", next(&ranking.hits[0]));
+    let next = format!("Next: {}\n", next(&ranking.hits[0], budget));
     let all = counts(ranking, blocks.len(), Some(MAX_WORDS));
     if blocks.iter().map(String::len).sum::<usize>() + all.len() + next.len() <= budget {
         return blocks.concat() + &all + &next;
@@ -502,7 +528,7 @@ fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<Strin
             "unmatched": ranking.unmatched,
             "total": ranking.total,
             "omitted": ranking.hits.len() - kept,
-            "next": ranking.hits.first().filter(|_| kept > 0).map(next),
+            "next": ranking.hits.first().filter(|_| kept > 0).map(|hit| next(hit, budget)),
             "results": [],
         })
         .to_string()
@@ -568,6 +594,7 @@ mod tests {
                 .iter()
                 .map(|(line, text)| (*line, (*text).to_owned()))
                 .collect(),
+            bytes: Some((end + 1 - start) * 20),
         }
     }
 
@@ -582,24 +609,34 @@ mod tests {
     }
 
     #[test]
-    fn next_offers_expand_only_for_short_results() {
+    fn next_offers_expand_only_when_the_whole_result_fits() {
         assert_eq!(
-            next(&hit("src/a b.rs", 5, 84, &[])),
+            next(&hit("src/a b.rs", 5, 84, &[]), 2400),
             "justless expand 'src/a b.rs' L5-84"
         );
+        // A few long lines are too large for the budget.
+        let mut long = hit("src/a.rs", 5, 15, &[(10, "x")]);
+        long.bytes = Some(3659);
+        assert_eq!(next(&long, 2400), "justless code src/a.rs --from 7 --to 15");
+        assert_eq!(next(&long, 4000), "justless expand src/a.rs L5-15");
+        long.bytes = None;
         assert_eq!(
-            next(&hit("src/a.rs", 5, 85, &[(50, "x")])),
-            "justless code src/a.rs --from 47 --to 85"
+            next(&long, 100_000),
+            "justless code src/a.rs --from 7 --to 15"
         );
         assert_eq!(
-            next(&hit("src/a.rs", 5, 300, &[(6, "x")])),
+            next(&hit("src/a.rs", 5, 300, &[(6, "x")]), 2400),
             "justless code src/a.rs --from 5 --to 44"
         );
-        let mut log = hit("run-1", 1, 40, &[]);
+        let mut log = hit("run-1", 1, 40, &[(7, "x"), (9, "y")]);
         log.run = Some(("run-1".into(), Stream::Stderr));
         assert_eq!(
-            next(&log),
+            next(&log, 2400),
             "justless log run-1 --stream stderr --from 1 --to 40"
+        );
+        assert_eq!(
+            next(&log, 500),
+            "justless log run-1 --stream stderr --from 7 --to 9"
         );
     }
 
