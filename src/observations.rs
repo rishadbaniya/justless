@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 
-use anyhow::{Context, Result, ensure};
-use clap::{Arg, ArgMatches, Command};
+use anyhow::{Context, Result, bail, ensure};
+use clap::{Arg, ArgGroup, ArgMatches, Command};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::capture::source_digest;
+use crate::history::{age, human_bytes, now_ms};
 use crate::workspace::{Workspace, private_dir, write_json};
 
 pub fn commands() -> Vec<Command<'static>> {
@@ -20,7 +22,12 @@ pub fn commands() -> Vec<Command<'static>> {
             .arg(Arg::new("stats").long("stats").help("Write byte counts to stderr"))
             .arg(Arg::new("restore").long("restore").help("Expand all archived references in a request")),
         Command::new("recall").about("Recover an archived tool result")
-            .arg(Arg::new("id").required(true)).arg(Arg::new("json").long("json").help("Emit the original typed JSON value")),
+            .arg(Arg::new("id").value_name("ID"))
+            .arg(Arg::new("tool-use").long("tool-use").value_name("TOOL_USE_ID").help("Print a result the proxy archived, by its tool_use ID"))
+            .arg(Arg::new("list").long("list").value_name("TEXT").min_values(0).max_values(1).help("List archived tool results whose tool or call matches TEXT"))
+            .arg(crate::number("limit", "20", "Maximum rows for --list"))
+            .arg(Arg::new("json").long("json").conflicts_with("list").help("Emit the original typed JSON value"))
+            .group(ArgGroup::new("target").required(true).args(&["id", "tool-use", "list"])),
     ]
 }
 
@@ -55,6 +62,185 @@ pub(crate) fn archive(ws: &Workspace, value: &Value) -> Result<String> {
         Err(error) => return Err(error.into()),
     }
     Ok(id)
+}
+
+/// An archived tool result, indexed by the tool_use ID the request carried it under.
+#[derive(Serialize, Deserialize)]
+struct ToolUse {
+    id: String,
+    observation: String,
+    tool: String,
+    call: String,
+    bytes: u64,
+    is_error: bool,
+    first_seen_ms: u64,
+}
+
+pub(crate) fn valid_tool_use_id(id: &str) -> bool {
+    (1..=200).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn tool_use_path(ws: &Workspace, id: &str) -> std::path::PathBuf {
+    // Hashing the ID keeps entries apart on case-insensitive file systems.
+    ws.state
+        .join("tool-uses")
+        .join(format!("{}.json", source_digest(id.as_bytes())))
+}
+
+/// Archives one tool result under its tool_use ID. The first copy wins, so a result
+/// the client later trims stays recoverable. Returns whether a new entry was made.
+pub(crate) fn archive_tool_use(
+    ws: &Workspace,
+    id: &str,
+    tool: &str,
+    call: &str,
+    content: &Value,
+    is_error: bool,
+) -> Result<bool> {
+    ensure!(valid_tool_use_id(id), "invalid tool_use ID");
+    let path = tool_use_path(ws, id);
+    if fs::symlink_metadata(&path).is_ok() {
+        return Ok(false);
+    }
+    ws.prepare_state()?;
+    let directory = ws.state.join("tool-uses");
+    private_dir(&directory)?;
+    let entry = ToolUse {
+        id: id.to_owned(),
+        observation: archive(ws, content)?,
+        tool: tool.to_owned(),
+        call: call.to_owned(),
+        bytes: serde_json::to_vec(content)?.len() as u64,
+        is_error,
+        first_seen_ms: now_ms(),
+    };
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    serde_json::to_writer(&mut temporary, &entry)?;
+    match temporary.persist_noclobber(&path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.error.into()),
+    }
+}
+
+fn tool_uses(ws: &Workspace) -> Result<Vec<ToolUse>> {
+    let mut entries = Vec::new();
+    let listing = match fs::read_dir(ws.state.join("tool-uses")) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(entries),
+        Err(error) => return Err(error.into()),
+    };
+    for file in listing {
+        let path = file?.path();
+        if path.extension().is_some_and(|e| e == "json")
+            && let Ok(entry) = serde_json::from_slice::<ToolUse>(&fs::read(&path)?)
+        {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|a, b| b.first_seen_ms.cmp(&a.first_seen_ms).then(a.id.cmp(&b.id)));
+    Ok(entries)
+}
+
+fn recall_tool_use(ws: &Workspace, id: &str, as_json: bool) -> Result<()> {
+    ensure!(valid_tool_use_id(id), "invalid tool_use ID");
+    let entry: ToolUse = match fs::read(tool_use_path(ws, id)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("read tool result index")?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!("no archived tool result for {id}")
+        }
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(entry.id == id, "tool result index mismatch for {id}");
+    let value = recover(ws, &entry.observation)?;
+    let mut out = io::stdout().lock();
+    if as_json {
+        return Ok(serde_json::to_writer(&mut out, &value)?);
+    }
+    match &value {
+        Value::Null => Ok(()),
+        Value::String(text) => Ok(out.write_all(text.as_bytes())?),
+        Value::Array(blocks) => {
+            let parts: Vec<String> = blocks.iter().map(block_text).collect();
+            Ok(out.write_all(parts.join("\n").as_bytes())?)
+        }
+        other => Ok(serde_json::to_writer(&mut out, other)?),
+    }
+}
+
+/// A content block as text: text blocks verbatim, anything else as a note that
+/// points to the exact JSON.
+fn block_text(block: &Value) -> String {
+    if block["type"] == "text"
+        && let Some(text) = block["text"].as_str()
+    {
+        return text.to_owned();
+    }
+    let source = &block["source"];
+    match (source["media_type"].as_str(), source["data"].as_str()) {
+        (Some(media), Some(data)) => format!(
+            "[{media} · {} base64 · use --json]",
+            human_bytes(data.len() as u64)
+        ),
+        _ => format!(
+            "[{} · use --json]",
+            block["type"].as_str().unwrap_or("block")
+        ),
+    }
+}
+
+fn list_tool_uses(ws: &Workspace, text: Option<&str>, limit: usize) -> Result<()> {
+    let entries = tool_uses(ws)?;
+    if entries.is_empty() {
+        println!(
+            "No archived tool results yet. `justless wrap claude` and `justless proxy` archive them."
+        );
+        return Ok(());
+    }
+    let needle = text.map(str::to_ascii_lowercase);
+    let matching: Vec<&ToolUse> = entries
+        .iter()
+        .filter(|entry| {
+            needle.as_deref().is_none_or(|needle| {
+                entry.tool.to_ascii_lowercase().contains(needle)
+                    || entry.call.to_ascii_lowercase().contains(needle)
+            })
+        })
+        .collect();
+    for entry in matching.iter().take(limit) {
+        println!(
+            "{}  {}  {}  {}  {}{}",
+            entry.id,
+            if entry.tool.is_empty() {
+                "?"
+            } else {
+                &entry.tool
+            },
+            entry.call,
+            human_bytes(entry.bytes),
+            age(entry.first_seen_ms),
+            if entry.is_error { "  error" } else { "" }
+        );
+    }
+    let summary = match text {
+        Some(text) => format!(
+            "{} of {} archived tool results match {text:?}",
+            matching.len(),
+            entries.len()
+        ),
+        None => format!("{} archived tool results", entries.len()),
+    };
+    let shown = matching.len().min(limit);
+    let newest = if shown < matching.len() {
+        format!(", newest {shown} shown")
+    } else {
+        String::new()
+    };
+    println!("{summary}{newest}. Print one with `justless recall --tool-use ID`.");
+    Ok(())
 }
 
 // JSON pointers refer only to array indices and fixed field names; no user-provided keys.
@@ -207,6 +393,16 @@ fn marker(value: &Value) -> Option<&str> {
 
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     if name == "recall" {
+        if let Some(id) = args.value_of("tool-use") {
+            return recall_tool_use(ws, id, args.is_present("json"));
+        }
+        if args.is_present("list") {
+            return list_tool_uses(
+                ws,
+                args.value_of("list"),
+                crate::read_num(args, "limit", 1)?,
+            );
+        }
         let value = recover(ws, args.value_of("id").unwrap())?;
         // Plain recall prints text: a string, or the parts of an all-text array
         // joined without a separator. `--json` prints the typed value.
@@ -425,4 +621,17 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_use_ids_are_plain_tokens() {
+        assert!(valid_tool_use_id("toolu_01HxV9mTq3K8c2YdL5aZ7wPe"));
+        assert!(valid_tool_use_id("call-1_A"));
+        for bad in ["", "../x", "a/b", "a b", &"x".repeat(201)] {
+            assert!(!valid_tool_use_id(bad), "{bad}");
+        }
+    }
 }

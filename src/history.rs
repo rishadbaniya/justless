@@ -104,7 +104,7 @@ fn millis(time: SystemTime) -> u64 {
         .as_millis() as u64
 }
 
-fn age(ms: u64) -> String {
+pub(crate) fn age(ms: u64) -> String {
     let seconds = now_ms().saturating_sub(ms) / 1000;
     match seconds {
         0..60 => format!("{seconds}s ago"),
@@ -403,6 +403,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         }
     }
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
+    let proxy = crate::proxy::report(workspace, since)?;
     let saved = raw.saturating_sub(preview);
     let mut commands: Vec<_> = families.into_values().collect();
     commands.sort_by(|a, b| {
@@ -422,6 +423,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "commands": commands,
             "repeated_source_reads": activity.repeat_reads,
             "hook_pass_through": activity.bypasses,
+            "proxy": proxy.as_ref().map(|p| p.json()),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -517,6 +519,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "Hooks passed through: {}. Run `justless discover` to see what agents ran without Justless.",
             passed.join(", ")
         );
+    }
+    if let Some(proxy) = &proxy {
+        proxy.print(days);
     }
     Ok(())
 }

@@ -15,6 +15,7 @@ mod mcp;
 mod observations;
 mod pack;
 mod polyglot;
+mod proxy;
 mod rust_syntax;
 mod search;
 mod source;
@@ -272,6 +273,7 @@ fn cli() -> Command<'static> {
         .subcommand(mcp::command())
         .subcommands(source::commands())
         .subcommands(observations::commands())
+        .subcommands(proxy::commands())
         .subcommands(["hook-codex", "hook-claude", "hook-agy"].map(|name| {
             Command::new(name)
                 .hide(true)
@@ -339,6 +341,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         ("map", sub) => map::run(&workspace, sub)?,
         ("affected", sub) => impact::run(&workspace, sub)?,
         ("lookup", sub) => lookup::run(&workspace, sub)?,
+        (name @ ("proxy" | "wrap"), sub) => return proxy::run(&workspace, name, sub),
         ("run", sub) => {
             let command: Vec<OsString> = sub
                 .values_of_os("command")
