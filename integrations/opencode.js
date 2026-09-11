@@ -1,9 +1,9 @@
 // Managed by Justless. OpenCode v1 project plugin.
 import { execFile } from "node:child_process";
 
-function mask(directory, parts) {
+function mask(directory, model, parts) {
   return new Promise((resolve, reject) => {
-    const child = execFile("justless", ["--root", directory, "mask"], {
+    const child = execFile("justless", ["--root", directory, "mask", "--model", model], {
       timeout: 5000, maxBuffer: 16 * 1024 * 1024, encoding: "utf8",
     }, (error, stdout) => {
       if (error) return reject(error);
@@ -15,8 +15,25 @@ function mask(directory, parts) {
   });
 }
 
+// The model decides whether retiring old results is safe. Justless leaves requests
+// for Claude models that tie thinking to earlier turns unchanged.
+function selectedModel(messages) {
+  for (const { info } of [...messages].reverse()) {
+    if (info.role === "user" && info.model?.providerID && info.model?.modelID) {
+      return `${info.model.providerID}/${info.model.modelID}`;
+    }
+  }
+  for (const { info } of [...messages].reverse()) {
+    if (info.role === "assistant" && info.providerID && info.modelID) {
+      return `${info.providerID}/${info.modelID}`;
+    }
+  }
+}
+
 export const Justless = async ({ directory }) => ({
   "experimental.chat.messages.transform": async (_input, { messages }) => {
+    const model = selectedModel(messages);
+    if (!model) return;
     const locations = [];
     for (const [i, message] of messages.entries()) {
       if (message.info.role !== "assistant") continue;
@@ -36,7 +53,7 @@ export const Justless = async ({ directory }) => ({
     });
     if (!parts.some(p => p.state.output?.length >= 256)) return;
     try {
-      const masked = await mask(directory, parts);
+      const masked = await mask(directory, model, parts);
       // Copy only changed parts into the outbound view. Keep session records intact.
       for (const [k, { i, j, part }] of locations.entries()) {
         const output = masked[k].state.output;

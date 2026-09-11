@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Arg, ArgGroup, ArgMatches, Command};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -20,7 +22,8 @@ pub fn commands() -> Vec<Command<'static>> {
             .arg(Arg::new("keep-tool").long("keep-tool").value_name("NAME").multiple_occurrences(true))
             .arg(Arg::new("pin").long("pin").value_name("CALL_ID").multiple_occurrences(true))
             .arg(Arg::new("stats").long("stats").help("Write byte counts to stderr"))
-            .arg(Arg::new("restore").long("restore").help("Expand all archived references in a request")),
+            .arg(Arg::new("restore").long("restore").help("Expand all archived references in a request"))
+            .arg(Arg::new("model").long("model").value_name("ID").help("Model the request is for; overrides its `model` field")),
         Command::new("recall").about("Recover an archived tool result")
             .arg(Arg::new("id").value_name("ID"))
             .arg(Arg::new("tool-use").long("tool-use").value_name("TOOL_USE_ID").help("Print a result the proxy archived, by its tool_use ID"))
@@ -243,6 +246,90 @@ fn list_tool_uses(ws: &Workspace, text: Option<&str>, limit: usize) -> Result<()
     Ok(())
 }
 
+/// Claude models whose thinking blocks are not tied to earlier turns, so rewriting
+/// an old tool result leaves the rest of the conversation valid.
+static UNBOUND_THINKING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^claude-(3-.*|(opus|sonnet|haiku)-4(-.*)?|(opus|sonnet|fable|mythos)-5(-\d{8})?|mythos-preview.*)$",
+    )
+    .expect("valid model pattern")
+});
+static VERSION_SUFFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-v\d+:\d+$").expect("valid suffix pattern"));
+
+/// A provider-qualified model name in first-party form, such as
+/// `us.anthropic.claude-opus-4-6-v1:0` as `claude-opus-4-6`.
+fn normalize_model(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    let mut name = lower.rsplit('/').next().unwrap_or_default();
+    for region in ["us.", "eu.", "apac.", "global."] {
+        if let Some(rest) = name.strip_prefix(region) {
+            name = rest;
+            break;
+        }
+    }
+    name = name.strip_prefix("anthropic.").unwrap_or(name);
+    name = name.split('@').next().unwrap_or_default();
+    name = name.strip_suffix("[1m]").unwrap_or(name);
+    VERSION_SUFFIX.replace(name, "").replace('.', "-")
+}
+
+/// The reason to leave a request unchanged, or `None` to retire results.
+///
+/// Rewriting an earlier tool result invalidates every later thinking block on models
+/// that tie thinking to the conversation, so Messages requests are rewritten only for
+/// an allowlist of other Claude models. The rule depends only on the model, so a
+/// retired result never changes back within a conversation.
+fn held(request: &Value, model: Option<&str>) -> Option<&'static str> {
+    let messages = request["messages"].as_array();
+    let opencode = messages.is_some_and(|list| {
+        list.iter()
+            .any(|m| m.get("info").is_some() && m.get("parts").is_some())
+    });
+    let chat = messages.is_some_and(|list| {
+        list.iter()
+            .any(|m| m["role"] == "tool" || m.get("tool_calls").is_some())
+    });
+    let anthropic = messages.is_some() && !opencode && !chat;
+    let Some(model) = model.or_else(|| request["model"].as_str()) else {
+        return if opencode {
+            Some("model-required")
+        } else if reasoning_present(request) {
+            Some("reasoning-present")
+        } else {
+            None
+        };
+    };
+    let name = normalize_model(model);
+    let claude = name.starts_with("claude-");
+    if (!anthropic && !claude) || UNBOUND_THINKING.is_match(&name) {
+        None
+    } else if claude {
+        Some("preserved-thinking")
+    } else {
+        Some("unknown-model")
+    }
+}
+
+/// Whether a model-less request carries reasoning tied to its history.
+fn reasoning_present(request: &Value) -> bool {
+    let messages = request["messages"].as_array().into_iter().flatten();
+    let input = request["input"].as_array().into_iter().flatten();
+    messages.chain(input).any(|item| {
+        item["type"] == "reasoning"
+            || item.get("reasoning_details").is_some()
+            || item.get("thinking_blocks").is_some()
+            || item["content"].as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+            })
+    })
+}
+
 // JSON pointers refer only to array indices and fixed field names; no user-provided keys.
 struct Output {
     path: String,
@@ -423,6 +510,15 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     let mut input = Vec::new();
     io::stdin().lock().read_to_end(&mut input)?;
     let (mut request, surrogates) = decode_request(&input)?;
+    if !args.is_present("restore")
+        && let Some(reason) = held(&request, args.value_of("model"))
+    {
+        if args.is_present("stats") {
+            eprintln!("{}", json!({"changed":0,"bytes_saved":0,"held":reason}));
+        }
+        // A held request is returned exactly as read.
+        return Ok(io::stdout().lock().write_all(&input)?);
+    }
     let candidates = outputs(&request)?;
     let keep = crate::read_num(args, "keep", 0)?;
     let minimum = crate::read_num(args, "min-bytes", 0)?;
@@ -506,7 +602,10 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
         *original = value;
     }
     if args.is_present("stats") {
-        eprintln!("{}", json!({"changed":count,"bytes_saved":saved_bytes}));
+        eprintln!(
+            "{}",
+            json!({"changed":count,"bytes_saved":saved_bytes,"held":null})
+        );
     }
     let output = encode_request(&request, surrogates.as_ref())?;
     io::stdout().lock().write_all(&output)?;
@@ -625,6 +724,47 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_provider_model_names() {
+        for (raw, expected) in [
+            (
+                "openrouter/anthropic/claude-sonnet-4.5",
+                "claude-sonnet-4-5",
+            ),
+            ("us.anthropic.claude-opus-5-5", "claude-opus-5-5"),
+            ("anthropic.claude-opus-4-6-v1:0", "claude-opus-4-6"),
+            ("global.anthropic.claude-haiku-5-5", "claude-haiku-5-5"),
+            ("claude-opus-4-5@20251101", "claude-opus-4-5"),
+            ("Claude-Opus-4-6[1m]", "claude-opus-4-6"),
+            ("gpt-5.5", "gpt-5-5"),
+        ] {
+            assert_eq!(normalize_model(raw), expected, "{raw}");
+        }
+        for unbound in [
+            "claude-3-5-sonnet-20241022",
+            "claude-opus-4-8",
+            "claude-haiku-4-5",
+            "claude-sonnet-4",
+            "claude-opus-5",
+            "claude-sonnet-5-20260115",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+        ] {
+            assert!(UNBOUND_THINKING.is_match(unbound), "{unbound}");
+        }
+        for bound in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-2",
+            "claude-opus-6",
+        ] {
+            assert!(!UNBOUND_THINKING.is_match(bound), "{bound}");
+        }
+    }
 
     #[test]
     fn tool_use_ids_are_plain_tokens() {

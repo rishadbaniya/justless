@@ -318,7 +318,11 @@ fn outbound_requests_restore_exact_values_and_protect_current_context() {
         ),
     ];
     for (original, pointer) in cases {
-        let masked = json_output(root, &["mask", "--keep", "1"], &original);
+        let masked = json_output(
+            root,
+            &["mask", "--keep", "1", "--model", "claude-sonnet-4-6"],
+            &original,
+        );
         let mut expected = original.clone();
         let stub = masked.pointer(pointer).unwrap();
         let text = stub.as_str().or_else(|| stub[0]["text"].as_str()).unwrap();
