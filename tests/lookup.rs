@@ -446,6 +446,30 @@ fn incremental_refresh_matches_a_rebuild() {
 }
 
 #[test]
+fn a_large_first_build_is_announced_once() {
+    let root = fixture();
+    let root = root.path();
+    for index in 0..2_000 {
+        write(
+            root,
+            &format!("notes/n{:02}/{index:04}.txt", index / 100),
+            &format!("note {index}\n"),
+        );
+    }
+    let question = "where are retries configured";
+    let first = cli(root, &["lookup", question]);
+    assert!(first.status.success());
+    assert_eq!(
+        text(&first.stderr),
+        "Building lookup index for 2009 files…\n"
+    );
+    write(root, "notes/n00/0000.txt", "changed note\n");
+    let second = cli(root, &["lookup", question]);
+    assert_eq!(second.stdout, first.stdout);
+    assert!(second.stderr.is_empty(), "{}", text(&second.stderr));
+}
+
+#[test]
 fn an_unchanged_repository_writes_nothing() {
     let root = fixture();
     lookup(root.path(), &["retry"]);
