@@ -225,6 +225,19 @@ pub(crate) fn chunk<'a>(file: &str, text: &'a str, parsers: &mut Parsers) -> Vec
     }
 }
 
+/// The chunks of a file split like plain text, for a file whose parser failed.
+pub(crate) fn plain_text<'a>(file: &str, text: &'a str) -> Vec<Chunk<'a>> {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let class = match classify(file, text, lines.len()) {
+        Class::Log => Class::Text,
+        class => class,
+    };
+    plain(file, &lines, class)
+}
+
 fn data<'a>(file: &str, lines: &[&'a str]) -> Vec<Chunk<'a>> {
     let name = file_name(file);
     let mut chunk = Chunk::new(1, lines.len(), name, "data", Class::Data);

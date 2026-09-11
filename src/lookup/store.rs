@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 
-use super::chunks;
+use super::chunks::{self, Chunk};
 use super::logs;
 use super::segment::{
     self, Builder, Input, LOOKUP_VERSION, Segment, Target, check, corrupt, get_varint, is_corrupt,
@@ -310,6 +311,23 @@ struct Slice {
     segment: Option<Segment>,
 }
 
+/// Chunks one file. A panic in a parser is a bug, but it must not stop every
+/// lookup in the repository, so the file is split like plain text instead
+/// and the next files get fresh parsers.
+fn chunk_file<'a>(
+    file: &str,
+    text: &'a str,
+    parsers: &mut Parsers,
+    chunk: impl FnOnce(&str, &'a str, &mut Parsers) -> Vec<Chunk<'a>>,
+) -> Vec<Chunk<'a>> {
+    if let Ok(chunks) = panic::catch_unwind(AssertUnwindSafe(|| chunk(file, text, parsers))) {
+        return chunks;
+    }
+    *parsers = Parsers::default();
+    eprintln!("lookup could not parse {file}, so it is indexed as plain text");
+    panic::catch_unwind(|| chunks::plain_text(file, text)).unwrap_or_default()
+}
+
 fn status(files: &BTreeMap<String, Record>, file: &str) -> Option<Status> {
     files.get(file).map(|record| record.status)
 }
@@ -586,7 +604,7 @@ impl Store<'_> {
             };
             match std::str::from_utf8(&bytes) {
                 Ok(text) if !text.contains('\0') => {
-                    let chunks = chunks::chunk(&job.file, text, parsers);
+                    let chunks = chunk_file(&job.file, text, parsers, chunks::chunk);
                     builder.add(&job.file, &chunks, true);
                     outcomes.push(Outcome::Changed(record(Status::Delta)));
                 }
@@ -934,6 +952,34 @@ mod tests {
         ] {
             assert!(!owned_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_parser_panic_falls_back_to_plain_text() {
+        let text = "/// Retries a download.\npub fn retry() {}\n";
+        let mut parsers = Parsers::default();
+        let chunks = chunk_file("src/a.rs", text, &mut parsers, |_, _, _| {
+            panic!("a parser bug")
+        });
+        let plain = chunks::plain_text("src/a.rs", text);
+        assert!(!chunks.is_empty());
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.start, chunk.end))
+                .collect::<Vec<_>>(),
+            plain
+                .iter()
+                .map(|chunk| (chunk.start, chunk.end))
+                .collect::<Vec<_>>()
+        );
+        // The parsers that replaced the broken ones still work.
+        let parsed = chunk_file("src/a.rs", text, &mut parsers, chunks::chunk);
+        assert!(
+            parsed.iter().any(|chunk| chunk.name == "retry"),
+            "{:?}",
+            parsed.iter().map(|chunk| &chunk.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
