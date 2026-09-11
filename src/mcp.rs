@@ -51,10 +51,11 @@ const LIST_TTL_MS: u64 = 3_600_000;
 
 const INSTRUCTIONS: &str = "Justless indexes this repository's source, docs and configuration. \
 Use these tools before reading whole files or grepping. `map` orients you in an unfamiliar \
-repository. `pack` answers an open question with budgeted evidence. `query` and `path` follow \
+repository. For a how or where question, start with `lookup`, which ranks the code, docs and \
+config that best match it. `pack` gathers budgeted evidence for a task, with links, changes and \
+recent failures. `query` and `path` follow \
 symbols and the links between them. `affected` lists what depends on a symbol, file or the Git \
-changes, and the tests to run. `find` searches \
-literal text. `lookup` ranks the code, docs and config that best match a plain-language question. \
+changes, and the tests to run. `find` searches literal text. \
 `read` with outline=true lists a file's symbols so that `expand` or `code` can fetch \
 only the lines you need. `log`, `search` and `history` reopen output captured by `justless run`. \
 File paths are relative to the repository root.";
@@ -626,7 +627,7 @@ const TOOLS: &[Tool] = &[
         name: "lookup",
         title: "Ranked search",
         command: "lookup",
-        description: "Ranks the symbols, doc sections and config blocks that best answer a where-is question.",
+        description: "Ranks the symbols, doc sections and config blocks that best match a question or keywords.",
         params: &[
             positional("question", Kind::Text, "Question or keywords"),
             option(

@@ -227,11 +227,14 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
     assert_eq!(initialize["protocolVersion"], "2025-06-18");
     assert_eq!(initialize["serverInfo"]["name"], "justless");
     assert!(initialize["capabilities"]["tools"].is_object());
+    // Questions go to `lookup` first; `pack` gathers evidence for a task.
+    let instructions = initialize["instructions"].as_str().unwrap();
+    let lookup = instructions.find("`lookup`").unwrap();
+    let pack = instructions.find("`pack`").unwrap();
+    assert!(lookup < pack, "{instructions}");
     assert!(
-        initialize["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("pack")
+        instructions[..lookup].ends_with("For a how or where question, start with "),
+        "{instructions}"
     );
     assert_eq!(by_id(&responses, 2)["result"], json!({}));
 
