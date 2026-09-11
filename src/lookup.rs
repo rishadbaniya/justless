@@ -29,6 +29,8 @@ use tokens::Question;
 
 const MARKER: &str = "[context budget reached]\n";
 const EXCERPT_LINES: usize = 40;
+/// The most log windows `--logs` adds.
+const LOG_RESULTS: usize = 3;
 const MAX_WORDS: usize = 120;
 
 pub fn command() -> Command<'static> {
@@ -120,9 +122,12 @@ pub(crate) struct Ranking {
     pub truncated: bool,
 }
 
+const SOURCE: usize = 0;
+const LOGS: usize = 1;
+
 #[derive(Clone, Copy)]
 struct Candidate {
-    /// 0 for source, 1 for logs.
+    /// [`SOURCE`] or [`LOGS`].
     group: usize,
     part: usize,
     chunk: u32,
@@ -178,7 +183,6 @@ fn rank_in(
         right
             .score
             .total_cmp(&left.score)
-            .then(left.group.cmp(&right.group))
             .then_with(|| left_file.cmp(right_file))
             .then(left_row.start.cmp(&right_row.start))
             .then(left_row.end.cmp(&right_row.end))
@@ -193,33 +197,43 @@ fn rank_in(
                     .cmp(segment(right).kind(&right_row))
             })
     };
-    let candidates = scores
-        .iter()
-        .enumerate()
-        .flat_map(|(group, scores)| {
-            scores.scored.iter().map(move |scored| Candidate {
+    // Source files with the same contents give the same lines at the same
+    // place, so one result stands for all of them.
+    let copy = |candidate: &Candidate| {
+        let (file, row) = file(candidate);
+        let digest = loaded.digest(file).filter(|_| candidate.group == SOURCE)?;
+        Some((*digest, row.start, row.end))
+    };
+    let mut total = 0;
+    let mut chosen = Vec::new();
+    // Log scores use their own statistics, so logs are not ranked against
+    // source. The few best log windows come first, because they were asked
+    // for, and take no places from source results.
+    for group in (0..scores.len()).rev() {
+        let candidates = scores[group]
+            .scored
+            .iter()
+            .map(|scored| Candidate {
                 group,
                 part: scored.part,
                 chunk: scored.chunk,
                 score: scored.score,
             })
-        })
-        .collect::<Vec<_>>();
-    let total = candidates.len();
-    // Source files with the same contents give the same lines at the same
-    // place, so one result stands for all of them.
-    let copy = |candidate: &Candidate| {
-        let (file, row) = file(candidate);
-        let digest = loaded.digest(file).filter(|_| candidate.group == 0)?;
-        Some((*digest, row.start, row.end))
-    };
-    let chosen = score::select(
-        candidates,
-        options.limit,
-        compare,
-        |candidate| (candidate.group, file(candidate).0.as_str()),
-        copy,
-    );
+            .collect::<Vec<_>>();
+        total += candidates.len();
+        let limit = if group == LOGS {
+            LOG_RESULTS.min(options.limit)
+        } else {
+            options.limit
+        };
+        chosen.extend(score::select(
+            candidates,
+            limit,
+            compare,
+            |candidate| file(candidate).0.as_str(),
+            copy,
+        ));
+    }
     let hits = chosen
         .iter()
         .map(|(candidate, copies)| {

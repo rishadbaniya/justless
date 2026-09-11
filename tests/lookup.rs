@@ -845,20 +845,13 @@ fn logs_add_ranked_run_output() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
-    let kept = sources(&with);
-    let original = sources(&without);
-    let common = original
-        .iter()
-        .filter(|header| kept.contains(header))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        kept.iter()
-            .filter(|header| common.contains(header))
-            .cloned()
-            .collect::<Vec<_>>(),
-        common
-    );
+    // Log windows come first and take no places from source results.
+    assert_eq!(headers(&with)[0], log, "{with}");
+    assert_eq!(sources(&with), sources(&without));
+    let limited = lookup(path, &["upload retrying", "--logs", "--limit", "2"]);
+    assert_eq!(sources(&limited).len(), 2, "{limited}");
+    assert_eq!(headers(&limited)[0], log, "{limited}");
+    assert!(limited.contains("\nNext: justless log run-"), "{limited}");
 
     let output = lookup(path, &["connection reset", "--logs"]);
     let run = log.split(' ').next().unwrap();
@@ -887,6 +880,42 @@ fn logs_add_ranked_run_output() {
     assert!(top.get("file").is_none());
     // Without --logs the log is not ranked.
     assert!(lookup(path, &["connection reset"]).starts_with("No ranked matches"));
+}
+
+#[test]
+fn logs_take_three_places_and_forget_deleted_runs() {
+    let root = fixture();
+    let path = root.path();
+    for shard in 0..5 {
+        let script = format!("echo \"quota exceeded on shard {shard}\"; exit 1");
+        assert_eq!(
+            cli(path, &["run", "--", "sh", "-c", &script]).status.code(),
+            Some(1)
+        );
+    }
+    let logs = |output: &str| {
+        headers(output)
+            .into_iter()
+            .filter(|header| header.contains(" log "))
+            .map(|header| header.split(' ').next().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let output = lookup(path, &["quota exceeded", "--logs"]);
+    assert_eq!(logs(&output).len(), 3, "{output}");
+    let runs = path.join(".justless/runs");
+    let mut ids = fs::read_dir(&runs)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("run-"))
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids.len(), 5);
+    let kept = ids.pop().unwrap();
+    for id in &ids {
+        fs::remove_dir_all(runs.join(id)).unwrap();
+    }
+    let output = lookup(path, &["quota exceeded", "--logs"]);
+    assert_eq!(logs(&output), [kept], "{output}");
 }
 
 #[test]
