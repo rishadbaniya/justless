@@ -22,6 +22,9 @@
 | `justless expand FILE SELECTOR` | Exact bytes for a symbol, entry, section or inclusive line range |
 | `justless edit FILE SELECTOR --revision REV` | Apply the replacement supplied on stdin after verifying the snapshot |
 | `justless mask` / `justless recall ID` | Retire older tool outputs from an outbound JSON request or retrieve the original result |
+| `justless wrap claude [ARGS…]` | Claude Code through a local proxy that asks the API to clear old tool results in rare, large steps and archives tool results |
+| `justless proxy --port N` | The same proxy for any Anthropic Messages client |
+| `justless recall --tool-use ID` / `justless recall --list TEXT` | The exact original of an archived tool result by its tool_use ID, or archived results whose tool or call matches TEXT |
 | `justless pack "What breaks if I rename purchase_orders?"` | A budgeted selection of definitions, graph links, source lines, working-tree changes, and relevant recorded failures |
 | `justless history "TimeoutError" --oldest --limit 1` | The matching log line from the earliest completed run among archived commands in this project. Omit the text to list recent runs. |
 | `justless resume` | Recent command outcomes, inspected source ranges, and files in the last pack. Stale source is marked. |
@@ -112,7 +115,7 @@ Justless validates the full batch before writing. Stale revisions, ambiguous sel
 
 ## Recoverable tool history
 
-`justless mask` reads a complete outbound request from stdin and writes JSON to stdout. It recognizes Anthropic Messages tool results, OpenAI Chat Completions tool messages, Responses API function outputs, and OpenCode v1 tool parts. By default it keeps the newest three results and considers older results of at least 1,024 serialized bytes. Controls include `--keep N`, `--min-bytes N`, `--trigger-bytes N`, repeatable `--pin CALL_ID` and `--keep-tool NAME`. The trigger applies to the combined size of eligible older results. Provider-marked errors, attachments, multimodal results and annotated text blocks stay intact.
+`justless mask` reads a complete outbound request from stdin and writes JSON to stdout. It recognizes Anthropic Messages tool results, OpenAI Chat Completions tool messages, Responses API function outputs, and OpenCode v1 tool parts. By default it keeps the newest three results and considers older results of at least 1,024 serialized bytes. Controls include `--keep N`, `--min-bytes N`, `--trigger-bytes N`, repeatable `--pin CALL_ID` and `--keep-tool NAME`. The trigger applies to the combined size of eligible older results. Provider-marked errors, attachments, multimodal results and annotated text blocks stay intact. Requests for Claude models that tie thinking to earlier turns are left unchanged; see [Request-boundary context management](#request-boundary-context-management).
 
 A retired result becomes `[justless recall ID]` in the same message and content format. The original value is stored locally in `.justless/observations/` and verified by SHA-256 on recall. The archive can contain sensitive tool output. `justless recall ID` prints the original text: the bytes of a string result, or the text of each part of an all-text result joined without a separator. `--json` returns the typed value. `justless mask --restore` expands references across a request. `--stats` writes a JSON change count and serialized byte delta to stderr. Reapplying the filter to a masked request preserves existing references. A request can contain unpaired UTF-16 surrogate escapes such as `\ud83d`, which JavaScript and Python write for a string cut inside a character. They are written back exactly as they arrived, and a result that contains one is not retired.
 
@@ -335,3 +338,132 @@ At most two results come from one file. Files with identical contents give one r
 `--logs` also ranks 40-line windows of output from the 200 most recent runs captured by `justless run`. Log windows are ranked apart from source, with their own statistics. Up to three of them come first and take no places from source results, and the closing command replays the top one with `justless log`, narrowed to the lines shown when the whole window would not fit the budget. A log result names its run, stream, lines and exit status. The MCP `lookup` tool does not rank logs. Use `history` there.
 
 The lookup index is kept in `.justless/lookup/`. It uses the same files, ignore rules, size limit and change detection as the repository index, and parses only files that changed since the last lookup. Edits go to a small second segment that is folded into the main one once it grows. The first lookup in a large repository builds the index and says so on stderr. If the index cannot be saved, lookup still answers and says so on stderr. A damaged index is rebuilt. A file its parser cannot handle is split like plain text, with a note on stderr. Deleting `.justless/lookup/` is always safe.
+
+## Request-boundary context management
+
+`justless proxy` sits between an agent and the Claude API on 127.0.0.1. It adds one request parameter that asks the API to replace old tool results with a short placeholder before the model reads the prompt. It also archives every tool result it relays and records what the API cleared. It never changes the system prompt, the tools or the messages. On Claude Opus 5.5, Sonnet 5.5, Haiku 5.5, and Fable and Mythos 5.1 and later, each thinking block is tied to the exact conversation before it, so a conversation that went through the proxy stays valid when the proxy is stopped, restarted or skipped. The request still carries every old result. What shrinks is what the model reads and what is billed and cached.
+
+### Start
+
+```sh
+justless wrap claude                      # Claude Code through a proxy on a free port
+justless wrap --keep 20 claude --resume   # proxy options before `claude`, Claude Code's after it
+justless proxy --port 8787                # standalone, for any Anthropic Messages client
+```
+
+`wrap` starts the proxy, launches `claude` from `PATH` with `ANTHROPIC_BASE_URL` pointing at it, and prints one line before the session and one after. `justless proxy` prints its address and an `export ANTHROPIC_BASE_URL=…` line for Claude Code, and stops on Ctrl-C. Both forward to `$ANTHROPIC_BASE_URL` when it is set, else to `https://api.anthropic.com`. `--upstream URL` overrides that for `proxy`, and a path prefix such as `https://gateway.example/anthropic` is kept. The archive and logs go to the project's `.justless/`, so run `recall` from another directory with `--root`.
+
+### What a request carries
+
+A conversation is identified by its first tool call. Once its boundary covers at least four calls, every request in that conversation carries a clearing edit, after any edit the client sent:
+
+```json
+"context_management": {"edits": [
+  {"type": "clear_thinking_20251015", "keep": "all"},
+  {"type": "clear_tool_uses_20250919",
+   "trigger": {"type": "tool_uses", "value": 61},
+   "keep": {"type": "tool_uses", "value": 12},
+   "clear_at_least": {"type": "input_tokens", "value": 20000}}
+]}
+```
+
+This request has 64 tool calls and a boundary after call 52. `keep` counts the calls after the boundary and `trigger` sits three below the total, so both grow as calls are appended and the same 52 results stay cleared until the boundary moves. `exclude_tools` and `clear_tool_inputs` are never sent, so every call stays visible. The `anthropic-beta` header gains `context-management-2025-06-27` unless a value already names it. Every other byte of the body and every other header value is forwarded as sent.
+
+The main conversation, subagents and workflows can move the boundary. Token counts, compaction requests, side requests and forks reuse it without moving it, so they read the same cached prefix. Claude Code labels its requests when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set, and unlabeled requests count as the main conversation.
+
+Requests pass through unchanged when the model is not a Claude model or is a Claude 3 model, when they use a message thread or the `compaction` parameter, and when the client sends its own tool-result clearing or compaction edit. A conversation the client clears itself is left to the client from then on.
+
+### When old results are cleared
+
+Nothing is cleared while the estimated prompt is under `--floor` (100,000 tokens), and a boundary never covers fewer than four calls. The newest `--keep` calls (12) are never cleared. A move must newly clear at least `--clear-at-least` estimated tokens (20,000), which is also sent to the API as `clear_at_least`.
+
+A move changes the prompt early in the messages. The prompt cache looks back at most 20 blocks from each breakpoint, so after a move the whole messages layer is written to the cache again. The proxy moves the boundary in two cases:
+
+- **The cache has expired.** The request writes everything again anyway, and clearing only shrinks that write. The cache counts as expired when the conversation has been idle for longer than its TTL plus 15 seconds, or for `--cold-after` seconds, and when the model changes. The TTL is 5 minutes, or 1 hour when a `cache_control` asks for it. This is the common case.
+- **The move pays back on a warm cache.** The extra cache write must be repaid by cheaper cache reads within `--payback` requests (12). On Opus and Sonnet 5.5, that needs the newly cleared results to be at least 2/3 of the messages layer.
+
+| Models | 5-minute cache | 1-hour cache |
+| --- | --- | --- |
+| Fable and Mythos 5.1 and 5.2 | 80% | 87% |
+| Opus and Sonnet 5.5 | 67% | 76% |
+| Others, Haiku 5.5 included | 49% | 61% |
+
+For example, Opus 5.5 costs $4 per million input tokens, $5 per million written to a 5-minute cache and $0.20 per million read from it. Take a conversation with 64 calls and 250K tokens of messages, 168K of them in the results of calls 1 to 52. Rewriting the remaining 82K costs about $0.39 once, and each later request then reads 168K fewer cached tokens, $0.034 less. That repays the move after about 12 requests, so the boundary moves while the cache is warm. Later, at 90 calls, clearing calls 53 to 78 would remove 60K of 170K tokens, too little for a warm move. After a 20-minute pause the cache has expired, and the boundary moves for free.
+
+With an API key, Claude Code's conversation cache lasts 5 minutes, so clears follow pauses longer than that. With a Claude subscription it lasts an hour, so clears are rare, and Claude Code's own compaction after an hour idle often comes first. Clearing mainly buys room in the context window. Anthropic measured that clearing a few calls on every request, the API's default shape, cost more than it saved, which is why the proxy clears in rare, large steps.
+
+### Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--keep N` | 12 | The newest N tool calls are never cleared. |
+| `--floor TOKENS` | 100000 | No clearing while the estimated prompt is smaller. |
+| `--clear-at-least TOKENS` | 20000 | Minimum estimated tokens one move clears. Also sent to the API. |
+| `--payback N` | 12 | A move on a warm cache must repay its cache write within N requests. 0 turns warm moves off. |
+| `--cold-after SECONDS` | Cache TTL + 15 | Idle time after which the cache counts as expired. 0 turns these moves off. |
+| `--no-clear` | | Archive and record only. |
+| `--no-archive` | | Do not archive tool results. |
+
+Token figures are estimates of UTF-8 bytes divided by four, with 1,600 tokens per image. Boundaries and idle times are kept in `.justless/proxy/conversations.json`, so a restarted proxy keeps clearing the same calls.
+
+### Recover a cleared result
+
+```console
+$ justless recall --list cargo
+toolu_01HxV9mTq3K8c2YdL5aZ7wPe  Bash  cargo test --locked  48.2 KB  14m ago
+toolu_01Qa2nB7rT4uX9kLm3cV8sDf  Bash  cargo build  22.1 KB  31m ago  error
+2 of 418 archived tool results match "cargo". Print one with `justless recall --tool-use ID`.
+$ justless recall --tool-use toolu_01HxV9mTq3K8c2YdL5aZ7wPe
+```
+
+`--list` matches TEXT against the tool name and the call's path, command, pattern, URL or query, ignoring case. It lists the newest first, 20 by default (`--limit N`). `--tool-use` prints text exactly as the tool returned it and notes other blocks, such as images. With `--json` it prints the original content value. The first copy the proxy saw is kept, and only results from requests the API accepted are archived, so a request rejected for its credentials adds nothing. The index is in `.justless/tool-uses/` and the content in `.justless/observations/`. Archived results can contain secrets from tool output.
+
+### Failures
+
+A body the proxy cannot parse is forwarded unchanged, and so is a body over 64 MiB. When the API rejects the clearing edit itself with a 400 or 422 that names it, the proxy sends the original request once more, relays that response, and leaves the edit off for that model until it restarts. Every other response, errors included, is relayed unchanged and never retried. An unreachable upstream returns a 502 with an error in the API's format. Compressed responses are relayed but not counted in `stats`.
+
+### Credentials and local files
+
+Header values are forwarded byte for byte and never stored. `.justless/proxy/` holds `conversations.json`, a ledger with one line per request in `requests-YYYY-MM.jsonl`, and `proxy.log` with starts, stops, fallbacks and errors. The ledger records the model, status, decision and the API's usage figures. None of these files holds request content or header values. The only identifiers kept are Claude Code's session, agent and request-class labels. The proxy listens on 127.0.0.1 only. Requests with an `Origin` header, which browsers send, are relayed but never planned or archived. Another user of the same machine with their own API key could still add results to the archive through the port, so use `--no-archive` on shared hosts.
+
+### Claude Code
+
+`wrap` works with an API key, an auth token or a claude.ai login, and the account's usual limits apply. It sets `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1` and `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` unless they are already set, because Claude Code turns both off behind a custom base URL. With them on, a session sends the same requests with or without the proxy, so it can be resumed either way. Remote Control is not available behind a custom base URL.
+
+`wrap` refuses to start when `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE` or `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` is set, inside a session that already runs through the proxy, and on Windows, where `justless proxy` with `ANTHROPIC_BASE_URL` works instead. It warns when `~/.claude/settings.json`, `.claude/settings.json` or `.claude/settings.local.json` sets `ANTHROPIC_BASE_URL` or a `CLAUDE_CODE_USE_*` variable, because Claude Code then bypasses the proxy. If no request reaches the proxy, the closing line says so. With `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` set, `wrap` archives and records without clearing. When Claude Code clears tool results in a conversation itself, the proxy leaves that conversation alone and the closing line counts it.
+
+Ctrl-C reaches Claude Code, and `wrap` keeps the proxy running until Claude Code exits, then exits with its status. Stopping only the `wrap` process, for example with `kill`, leaves Claude Code without its proxy.
+
+### Codex
+
+Codex is not supported. It uses the OpenAI Responses API, including a WebSocket transport, and manages its own context. That API has no equivalent request parameter for the proxy to add.
+
+### Thinking and history edits
+
+`justless mask` and the OpenCode plugin rewrite earlier tool results. On Claude models that tie thinking to the conversation, that invalidates every later thinking block, so they now return those requests byte for byte:
+
+| Request | Model | `mask` |
+| --- | --- | --- |
+| Messages | Claude 3 and 4 models, Opus, Sonnet, Fable and Mythos 5, Mythos Preview | Retires results as before |
+| Messages | Every other model, including Opus, Sonnet and Haiku 5.5, Fable and Mythos 5.1 and later, and unknown names | Unchanged |
+| Chat Completions, Responses or OpenCode | A Claude model | The same rule as Messages |
+| Chat Completions, Responses or OpenCode | Another model | Retires results as before |
+| OpenCode | None given with `--model` | Unchanged |
+| Messages, Chat Completions or Responses | None | Retires results, unless the request carries thinking or reasoning items |
+
+The model is `--model ID` when given, else the request's `model`. Provider prefixes and suffixes such as `openrouter/anthropic/`, `us.anthropic.`, `@20251101`, `-v1:0` and `[1m]` are ignored. `--stats` reports why a request was held, and `--restore` always expands references. The OpenCode plugin passes the session's selected model. Run `justless init --hooks --agent opencode` again to update an installed plugin, which leaves every request unchanged until then.
+
+### Stats
+
+`justless stats` adds a request-boundary section after its other output:
+
+```text
+Request boundary (justless proxy), last 7 day(s)
+  1,204 requests · old tool results cleared on 388 · 2 conversations left to Claude Code's own clearing · 0 refusals
+  412 old tool results cleared (6.1 MB, about 1.5M tokens estimated) in 4 clears: 3 on an expired cache, 1 on a warm cache (81.2K tokens written to cache on that request, reported by the API)
+  2.91M input tokens not sent to the model, summed over requests as reported by the API
+  7 tool calls repeated a cleared call
+  2,113 tool results archived (31.0 MB). `justless recall --list TEXT` finds one.
+```
+
+Cleared results, their bytes and their estimated tokens count each result once, when its boundary moved. Input tokens not sent are the API's own figures, summed over every request that carried the edit. A repeated call has the same tool and input as a cleared one, a sign that the model needed a result back. `--json` adds a `proxy` object with the same counts, the API's usage totals, moves split into `cold` and `payback`, `mismatches` where the API cleared a different number of calls than planned, and `unobserved` compressed responses. It is `null` when the proxy never ran in the project.
