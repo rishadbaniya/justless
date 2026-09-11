@@ -598,6 +598,27 @@ fn identical_files_share_one_result() {
         docs_result["same"],
         serde_json::json!(["vendor/a/operations.md", "vendor/b/operations.md"])
     );
+    // Copies share the two-per-file limit, so a third chunk of the
+    // original cannot come back through a copy.
+    let quorum = "# Quorum\n\n## Quorum reads\nReads need a quorum.\n\n## Quorum writes\nWrites need a quorum.\n\n## Quorum repair\nRepair restores a quorum.\n";
+    write(root, "docs/quorum.md", quorum);
+    write(root, "vendor/c/quorum.md", quorum);
+    let output = lookup(root, &["quorum", "--limit", "20"]);
+    let found = files(&output);
+    assert_eq!(
+        found
+            .iter()
+            .filter(|file| file.ends_with("quorum.md"))
+            .count(),
+        2,
+        "{output}"
+    );
+    assert!(!found.contains(&"vendor/c/quorum.md"), "{output}");
+    assert!(
+        output.contains(" · same in vendor/c/quorum.md\n"),
+        "{output}"
+    );
+
     // A copy that changes stands on its own again.
     write(
         root,

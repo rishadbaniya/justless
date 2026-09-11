@@ -198,11 +198,19 @@ fn rank_in(
             })
     };
     // Source files with the same contents give the same lines at the same
-    // place, so one result stands for all of them.
+    // place, so one result stands for all of them, and they share the
+    // two-per-file limit as one file.
+    let digest = |candidate: &Candidate| {
+        let digest = loaded.digest(file(candidate).0)?;
+        Some(*digest).filter(|_| candidate.group == SOURCE)
+    };
     let copy = |candidate: &Candidate| {
-        let (file, row) = file(candidate);
-        let digest = loaded.digest(file).filter(|_| candidate.group == SOURCE)?;
-        Some((*digest, row.start, row.end))
+        let row = file(candidate).1;
+        Some((digest(candidate)?, row.start, row.end))
+    };
+    let contents = |candidate: &Candidate| match digest(candidate) {
+        Some(digest) => (Some(digest), ""),
+        None => (None, file(candidate).0.as_str()),
     };
     let mut total = 0;
     let mut chosen = Vec::new();
@@ -226,13 +234,7 @@ fn rank_in(
         } else {
             options.limit
         };
-        chosen.extend(score::select(
-            candidates,
-            limit,
-            compare,
-            |candidate| file(candidate).0.as_str(),
-            copy,
-        ));
+        chosen.extend(score::select(candidates, limit, compare, contents, copy));
     }
     let hits = chosen
         .iter()
