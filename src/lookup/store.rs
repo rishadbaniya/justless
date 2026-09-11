@@ -466,7 +466,7 @@ impl Store<'_> {
     /// Stamps every listed file and reads, hashes and chunks only those whose
     /// stamp differs from the manifest.
     fn scan(&self, previous: Option<&Manifest>) -> Result<Scan> {
-        let candidates = index::inputs(self.workspace)?;
+        let candidates = index::inputs(self.workspace, &mut std::collections::BTreeMap::new())?;
         let mut files = BTreeMap::new();
         let mut jobs = Vec::new();
         for file in candidates {

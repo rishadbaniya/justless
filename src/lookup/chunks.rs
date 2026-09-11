@@ -408,10 +408,12 @@ fn code<'a>(
         chunk.add(NAME, definition.terms.clone());
         let mut used = vec![false; own.len()];
         let position = |number: usize| own.binary_search(&number).ok();
-        // Doc: the block above and comments between the start and the name.
+        // Doc: the block above, and comments or decorators between the start and the name
+        // (the index starts a decorated Python definition at its first decorator).
         for (slot, &number) in own.iter().enumerate() {
             if number < definition.start
-                || (number < definition.declaration && is_comment(line(number)))
+                || (number < definition.declaration
+                    && (is_comment(line(number)) || line(number).trim_start().starts_with('@')))
             {
                 chunk.add(DOC, line(number));
                 used[slot] = true;
