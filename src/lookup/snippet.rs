@@ -127,15 +127,17 @@ fn best<'a, 'b>(
 }
 
 /// Up to two of `candidates`, in line order, as line numbers and shown text.
-/// The first has the rarest question terms. The second is the one that adds
-/// the rarest terms the first does not show, or else the next best line,
-/// and never a copy of the first.
+/// Each is the line with the rarest question terms that neither `header`
+/// nor the line before it shows, then the rarest terms overall. The second
+/// is never a copy of the first.
 pub(crate) fn lines(
     candidates: &[(usize, &str)],
     question: &Question,
     idf: &[f64],
+    header: &str,
 ) -> Vec<(usize, String)> {
     let mut tokenizer = Tokenizer::default();
+    let seen = terms(&mentions(header, question, &mut tokenizer));
     let lines = candidates
         .iter()
         .map(|&(number, text)| {
@@ -149,10 +151,13 @@ pub(crate) fn lines(
         })
         .filter(|line| weight(line.terms, idf) > 0.0)
         .collect::<Vec<_>>();
-    let Some(first) = best(lines.iter(), |line| (weight(line.terms, idf), 0.0)) else {
+    let Some(first) = best(lines.iter(), |line| {
+        (weight(line.terms & !seen, idf), weight(line.terms, idf))
+    }) else {
         return Vec::new();
     };
-    let (text, shown) = clip(first.text, &first.mentions, idf, 0);
+    let (text, visible) = clip(first.text, &first.mentions, idf, seen);
+    let shown = seen | visible;
     let mut chosen = vec![(first.number, text)];
     let others = lines
         .iter()
@@ -190,13 +195,13 @@ mod tests {
         ];
         // No line adds a word, so the next best one follows.
         assert_eq!(
-            lines(&candidates, &question, &idf),
+            lines(&candidates, &question, &idf, ""),
             [
                 (4, "fn retry() {}".to_owned()),
                 (6, "retry with policy".to_owned())
             ]
         );
-        assert!(lines(&candidates[2..3], &question, &idf).is_empty());
+        assert!(lines(&candidates[2..3], &question, &idf, "").is_empty());
     }
 
     #[test]
@@ -210,7 +215,7 @@ mod tests {
             (3, "map h focus left"),
             (4, "map l focus right"),
         ];
-        let shown = lines(&candidates, &question, &idf);
+        let shown = lines(&candidates, &question, &idf, "");
         assert_eq!(
             shown,
             [
@@ -225,16 +230,43 @@ mod tests {
             (12, "map.clear();"),
         ];
         assert_eq!(
-            lines(&candidates, &question, &idf),
+            lines(&candidates, &question, &idf, ""),
             [
                 (7, "assert_ready(&map);".to_owned()),
                 (12, "map.clear();".to_owned())
             ]
         );
         assert_eq!(
-            lines(&candidates[..2], &question, &idf),
+            lines(&candidates[..2], &question, &idf, ""),
             [(7, "assert_ready(&map);".to_owned())]
         );
+    }
+
+    #[test]
+    fn words_in_the_header_count_as_shown() {
+        let question = Question::parse("kitty leader map").unwrap();
+        let idf = question
+            .terms
+            .iter()
+            .map(|term| match term.as_str() {
+                "map" => 2.0,
+                "leader" => 1.5,
+                _ => 1.8,
+            })
+            .collect::<Vec<_>>();
+        let candidates = [
+            (1, "# change the leader from ctrl-b"),
+            (6, "map h focus left"),
+            (12, "include kitty-themes/dark.conf"),
+        ];
+        let numbers = |header| {
+            lines(&candidates, &question, &idf, header)
+                .into_iter()
+                .map(|(number, _)| number)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(numbers(""), [6, 12]);
+        assert_eq!(numbers("kitty/kitty.conf text kitty.conf"), [1, 6]);
     }
 
     #[test]
@@ -246,7 +278,7 @@ mod tests {
             "  The alarm has two settings. {filler}It starts in quiet mode, and loud mode pages the whole team."
         );
         let candidates = [(3, "## Alarm"), (5, long.as_str())];
-        let shown = lines(&candidates, &question, &idf);
+        let shown = lines(&candidates, &question, &idf, "");
         assert_eq!(shown.len(), 2, "{shown:?}");
         assert_eq!(shown[0], (3, "## Alarm".to_owned()));
         let (number, text) = &shown[1];
@@ -266,7 +298,7 @@ mod tests {
         assert!(head.len() <= MAX_LINE && head.ends_with(CUT));
         let line = format!("    {}needle{}", "a ".repeat(100), " b".repeat(100));
         let question = Question::parse("needle").unwrap();
-        let shown = lines(&[(1, line.as_str())], &question, &[1.0]);
+        let shown = lines(&[(1, line.as_str())], &question, &[1.0], "");
         let text = &shown[0].1;
         assert!(text.len() <= MAX_LINE, "{}", text.len());
         assert!(text.starts_with(CUT) && text.ends_with(CUT), "{text}");

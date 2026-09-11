@@ -353,7 +353,9 @@ fn hit(
         .iter()
         .filter_map(|&number| Some((number, text.get(number.checked_sub(1)?)?.as_str())))
         .collect::<Vec<_>>();
-    hit.lines = snippet::lines(&lines, question, idf);
+    // Words the header already shows count as shown.
+    let header = format!("{} {} {}", hit.location.file, hit.kind, hit.name);
+    hit.lines = snippet::lines(&lines, question, idf, &header);
     if hit.lines.is_empty() {
         let declaration = row.declaration as usize;
         let fallback = if class == Class::Code && candidates.contains(&declaration) {
