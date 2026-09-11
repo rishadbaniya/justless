@@ -5,12 +5,12 @@ use std::ops::Range;
 
 /// Question words that never name anything in a repository. Code verbs such as
 /// get, find, use and handle stay searchable because they are common identifiers.
-pub(crate) const STOPWORDS: [&str; 58] = [
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from", "has",
-    "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "of", "on", "or", "our",
-    "so", "that", "the", "their", "them", "then", "there", "these", "this", "those", "to", "too",
-    "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with", "would",
-    "you", "your", "should", "could", "please",
+pub(crate) const STOPWORDS: [&str; 61] = [
+    "a", "an", "and", "are", "as", "at", "be", "been", "by", "can", "did", "do", "does", "for",
+    "from", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my",
+    "of", "on", "or", "our", "so", "that", "the", "their", "them", "then", "there", "these",
+    "this", "those", "to", "too", "was", "we", "were", "what", "when", "where", "which", "who",
+    "why", "will", "with", "would", "you", "your", "should", "could", "please",
 ];
 
 /// Query terms beyond this many are ignored.
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn stopwords_are_dropped_from_questions() {
-        assert_eq!(STOPWORDS.len(), 58);
+        assert_eq!(STOPWORDS.len(), 61);
         let question = Question::parse("where are errors handled").unwrap();
         let words = question
             .words
@@ -420,6 +420,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(words, ["errors", "handled"]);
         assert_eq!(question.terms, ["error", "handl"]);
+        let question = Question::parse("why did the upload fail").unwrap();
+        assert_eq!(question.terms, ["fail", "upload"]);
         let question = Question::parse("where is it").unwrap();
         assert_eq!(question.terms, ["is", "it", "wher"]);
         assert!(Question::parse("   ").is_none());
