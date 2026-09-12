@@ -31,6 +31,16 @@ pub enum SendError {
 impl Upstream {
     pub fn new(base: &str) -> Result<Self> {
         let base = base.trim_end_matches('/').to_owned();
+        // The URL is printed and logged, so it must not carry credentials.
+        let authority = base
+            .split_once("://")
+            .map_or(base.as_str(), |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        if authority.contains('@') {
+            bail!("the upstream URL cannot contain credentials; the client's headers carry them");
+        }
         let uri: http::Uri = match base.parse() {
             Ok(uri) => uri,
             Err(error) => bail!("invalid upstream URL {base}: {error}"),

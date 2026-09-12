@@ -288,6 +288,12 @@ impl Proxy {
         let dir = ws.state.join("proxy");
         private_dir(&dir)?;
         let log = Log::open(dir.join("proxy.log"));
+        // Under `wrap`, a panic message on stderr would land in Claude Code's
+        // terminal, so the proxy logs it instead.
+        let panics = log.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            panics.line(&format!("panic: {info}"));
+        }));
         log.line(&format!(
             "start {addr} → {} · keep {} · floor {} · clear-at-least {} · payback {} · cold-after {} · clear {} · archive {archive}",
             upstream.base,
@@ -735,7 +741,9 @@ fn handle(
         // archive its requests.
         Planned::pass("browser-origin")
     } else {
-        shared.plan(head, &body, endpoint, now)
+        // Fail open: a planning bug forwards the original request.
+        catch_unwind(AssertUnwindSafe(|| shared.plan(head, &body, endpoint, now)))
+            .unwrap_or_else(|_| Planned::pass("internal-error"))
     };
     let keep_alive = head.keep_alive() && !too_large;
     let sent = if too_large {

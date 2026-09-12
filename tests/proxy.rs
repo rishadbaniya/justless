@@ -810,6 +810,18 @@ fn upstream_prefix_and_unreachable() {
     );
     assert_eq!(refused.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("is this proxy"));
+    // The upstream URL is printed and logged, so credentials in it are refused.
+    let secret = justless(
+        dir.path(),
+        &[
+            "proxy",
+            "--upstream",
+            "https://user:SECRET3@gateway.example/v1",
+        ],
+    );
+    assert_eq!(secret.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&secret.stderr);
+    assert!(stderr.contains("cannot contain credentials") && !stderr.contains("SECRET3"));
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +958,45 @@ fn no_clear_and_no_archive_only_relay_and_record() {
         (Some("pass"), Some("no-clear"))
     );
     assert_eq!(records[0]["archived"], 0);
+}
+
+#[test]
+fn passes_threads_compaction_and_other_models_unchanged() {
+    let (dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
+    let sizes = [2000, 2000, 2000, 2000, 40, 40];
+    let mut thread = conversation("claude-haiku-4-5", &sizes);
+    thread["thread"] = json!({"id":"thr_01"});
+    let mut compaction = conversation("claude-haiku-4-5", &sizes);
+    compaction["compaction"] = json!({"trigger":{"type":"input_tokens","value":150000}});
+    let bodies = [
+        thread,
+        compaction,
+        conversation("claude-3-7-sonnet-20250219", &sizes),
+        conversation("gpt-5.5", &sizes),
+        conversation("claude-haiku-4-5", &[]),
+    ];
+    for body in &bodies {
+        assert_eq!(proxy.post(&[], body).status(), 200);
+    }
+    for (forwarded, body) in mock.seen().iter().zip(&bodies) {
+        assert_eq!(forwarded.body, serde_json::to_vec(body).unwrap());
+        assert!(forwarded.header("anthropic-beta").is_none());
+    }
+    proxy.stop();
+    let reasons: Vec<Value> = ledger(dir.path())
+        .iter()
+        .map(|r| r["reason"].clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            "thread",
+            "compaction-param",
+            "not-claude",
+            "not-claude",
+            "no-tool-uses"
+        ]
+    );
 }
 
 #[test]

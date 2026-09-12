@@ -420,7 +420,7 @@ $ justless recall --tool-use toolu_01HxV9mTq3K8c2YdL5aZ7wPe
 
 ### Failures
 
-A body the proxy cannot parse is forwarded unchanged, and so is a body over 64 MiB. When the API rejects the clearing edit itself with a 400 or 422 that names it, the proxy sends the original request once more, relays that response, and leaves the edit off for that model until it restarts. Every other response, errors included, is relayed unchanged and never retried. An unreachable upstream returns a 502 with an error in the API's format. Compressed responses are relayed but not counted in `stats`.
+A body the proxy cannot parse or plan is forwarded unchanged, and so is a body over 64 MiB. `--upstream` and `ANTHROPIC_BASE_URL` cannot carry credentials in the URL, because the proxy prints and logs it. When the API rejects the clearing edit itself with a 400 or 422 that names it, the proxy sends the original request once more, relays that response, and leaves the edit off for that model until it restarts. Every other response, errors included, is relayed unchanged and never retried. An unreachable upstream returns a 502 with an error in the API's format. Compressed responses are relayed but not counted in `stats`.
 
 ### Credentials and local files
 
