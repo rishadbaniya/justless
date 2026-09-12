@@ -199,6 +199,11 @@ fn provider_names_are_normalized_before_the_check() {
         ("us.anthropic.claude-opus-5-5", false),
         ("us.anthropic.claude-opus-4-6-v1:0", true),
         ("gpt-5.5", true),
+        // Gateways that prefix the first-party name with a dash or a colon.
+        ("databricks-claude-opus-5-5", false),
+        ("databricks/databricks-claude-opus-5-5", false),
+        ("anthropic:claude-opus-5-5", false),
+        ("databricks-claude-sonnet-4-5", true),
     ] {
         let input = serde_json::to_vec(&chat(model)).unwrap();
         let (output, held) = mask(dir.path(), &[], &input);
@@ -238,6 +243,15 @@ fn opencode_requests_require_a_model() {
         &input,
     );
     assert!(retired(&output, pointer));
+    let (output, held) = mask(
+        dir.path(),
+        &["--model", "databricks/databricks-claude-opus-5-5"],
+        &input,
+    );
+    assert_eq!(
+        (output.as_slice(), held),
+        (input.as_slice(), json!("preserved-thinking"))
+    );
 }
 
 #[test]

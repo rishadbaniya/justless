@@ -258,10 +258,16 @@ static VERSION_SUFFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-v\d+:\d+$").expect("valid suffix pattern"));
 
 /// A provider-qualified model name in first-party form, such as
-/// `us.anthropic.claude-opus-4-6-v1:0` as `claude-opus-4-6`.
+/// `us.anthropic.claude-opus-4-6-v1:0` or `databricks-claude-opus-5-5` as
+/// `claude-opus-4-6` or `claude-opus-5-5`.
 fn normalize_model(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
     let mut name = lower.rsplit('/').next().unwrap_or_default();
+    // Gateways put their own prefix before the first-party name, joined by a
+    // dot, a dash or a colon.
+    if let Some(start) = name.rfind("claude-") {
+        name = &name[start..];
+    }
     for region in ["us.", "eu.", "apac.", "global."] {
         if let Some(rest) = name.strip_prefix(region) {
             name = rest;
@@ -301,7 +307,8 @@ fn held(request: &Value, model: Option<&str>) -> Option<&'static str> {
         };
     };
     let name = normalize_model(model);
-    let claude = name.starts_with("claude-");
+    // Any name that mentions Claude is held unless it is known to be unbound.
+    let claude = name.contains("claude");
     if (!anthropic && !claude) || UNBOUND_THINKING.is_match(&name) {
         None
     } else if claude {
@@ -737,6 +744,13 @@ mod tests {
             ("global.anthropic.claude-haiku-5-5", "claude-haiku-5-5"),
             ("claude-opus-4-5@20251101", "claude-opus-4-5"),
             ("Claude-Opus-4-6[1m]", "claude-opus-4-6"),
+            ("databricks-claude-opus-5-5", "claude-opus-5-5"),
+            (
+                "databricks/databricks-claude-sonnet-4-5",
+                "claude-sonnet-4-5",
+            ),
+            ("anthropic:claude-opus-5-5", "claude-opus-5-5"),
+            ("vertex_ai/claude-opus-4-5@20251101", "claude-opus-4-5"),
             ("gpt-5.5", "gpt-5-5"),
         ] {
             assert_eq!(normalize_model(raw), expected, "{raw}");
