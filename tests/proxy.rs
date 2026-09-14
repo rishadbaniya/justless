@@ -1431,7 +1431,7 @@ fn archives_only_accepted_requests_and_recalls_exactly() {
     assert_eq!(unknown.status.code(), Some(2));
     assert_eq!(
         String::from_utf8_lossy(&unknown.stderr),
-        "justless: no archived tool result for toolu_missing\n"
+        "justless: no archived tool result for toolu_missing; try `justless recall --list TEXT`\n"
     );
     assert_eq!(
         justless(dir.path(), &["recall", "--list", "x", "--json"])
@@ -1440,6 +1440,144 @@ fn archives_only_accepted_requests_and_recalls_exactly() {
         Some(2)
     );
     assert_eq!(justless(dir.path(), &["recall"]).status.code(), Some(2));
+    // The positional form reaches the proxy's archive too, with the same text.
+    let positional = justless(dir.path(), &["recall", "toolu_01Bash"]);
+    assert!(positional.status.success());
+    assert_eq!(positional.stdout, text.as_bytes());
+    let missing = justless(dir.path(), &["recall", "toolu_missing"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("recall --list TEXT"));
+    let bad = justless(dir.path(), &["recall", "../x"]);
+    assert_eq!(bad.status.code(), Some(2));
+    // A line range is exact bytes; --grep prints numbered matching lines.
+    let range = justless(
+        dir.path(),
+        &["recall", "toolu_01Bash", "--from", "2", "--to", "3"],
+    );
+    assert_eq!(
+        range.stdout,
+        b"  with spacing\nexact \xf0\x9f\xa6\x80 output\r\n"
+    );
+    let grep = justless(
+        dir.path(),
+        &[
+            "recall",
+            "--tool-use",
+            "toolu_01Bash",
+            "--grep",
+            "spacing",
+            "--limit",
+            "2",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8(grep.stdout).unwrap(),
+        "2:   with spacing\n4:   with spacing\n"
+    );
+    let none = justless(dir.path(), &["recall", "toolu_01Bash", "--grep", "absent"]);
+    assert_eq!(none.stdout, b"No line matches \"absent\".\n");
+    let conflict = justless(
+        dir.path(),
+        &["recall", "toolu_01Bash", "--json", "--grep", "x"],
+    );
+    assert_eq!(conflict.status.code(), Some(2));
+    // MCP clients reach the same archive through the recall tool.
+    let mut mcp = Command::new(BIN)
+        .args(["mcp", "--root", dir.path().to_str().unwrap()])
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = mcp.stdin.take().unwrap();
+        for line in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"id":"toolu_02Read"}}}),
+        ] {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let output = mcp.wait_with_output().unwrap();
+    let reply: Value = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|message| message["id"] == 2)
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "first block\nsecond block"
+    );
+}
+
+#[test]
+fn list_matches_patterns_and_read_ranges() {
+    let (dir, _mock, proxy) = session(|_| ok_json(), &[]);
+    let calls = [
+        (
+            "toolu_g1",
+            "Grep",
+            json!({"pattern":"parse_trade","path":"/repo/src","glob":"*.rs"}),
+        ),
+        (
+            "toolu_g2",
+            "Glob",
+            json!({"pattern":"**/*_test.rs","path":"/repo"}),
+        ),
+        (
+            "toolu_r1",
+            "Read",
+            json!({"file_path":"/repo/src/lib.rs","offset":1,"limit":50}),
+        ),
+        (
+            "toolu_r2",
+            "Read",
+            json!({"file_path":"/repo/src/lib.rs","offset":900}),
+        ),
+        (
+            "toolu_w1",
+            "WebSearch",
+            json!({"query":"rust floor_char_boundary"}),
+        ),
+    ];
+    let mut messages = vec![json!({"role":"user","content":"go"})];
+    for (id, name, input) in &calls {
+        messages.push(json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":name,"input":input}]}));
+        messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"result"}]}));
+    }
+    let body = json!({"model":"claude-opus-5-5","max_tokens":1024,"messages":messages});
+    assert_eq!(proxy.post(&[], &body).status(), 200);
+    proxy.stop();
+    let list = |text: &str| {
+        String::from_utf8(justless(dir.path(), &["recall", "--list", text]).stdout).unwrap()
+    };
+    let grep = list("parse_trade");
+    assert!(
+        grep.contains("toolu_g1  Grep  parse_trade in /repo/src  "),
+        "{grep}"
+    );
+    let glob = list("_test");
+    assert!(
+        glob.contains("toolu_g2  Glob  **/*_test.rs in /repo  "),
+        "{glob}"
+    );
+    let reads = list("lib.rs");
+    assert!(
+        reads.contains("toolu_r1  Read  /repo/src/lib.rs:1+50  "),
+        "{reads}"
+    );
+    assert!(
+        reads.contains("toolu_r2  Read  /repo/src/lib.rs:900  "),
+        "{reads}"
+    );
+    // TEXT also matches the rest of the input, such as a Grep glob.
+    let by_glob = list("*.rs\"");
+    assert!(by_glob.starts_with("toolu_g1  "), "{by_glob}");
+    assert!(list("floor_char").contains("toolu_w1  WebSearch  rust floor_char_boundary  "));
 }
 
 #[test]

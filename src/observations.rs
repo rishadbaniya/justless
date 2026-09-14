@@ -25,11 +25,14 @@ pub fn commands() -> Vec<Command<'static>> {
             .arg(Arg::new("restore").long("restore").help("Expand all archived references in a request"))
             .arg(Arg::new("model").long("model").value_name("ID").help("Model the request is for; overrides its `model` field")),
         Command::new("recall").about("Recover an archived tool result")
-            .arg(Arg::new("id").value_name("ID"))
+            .arg(Arg::new("id").value_name("ID").help("Recall ID from a placeholder, or a tool_use ID the proxy archived"))
             .arg(Arg::new("tool-use").long("tool-use").value_name("TOOL_USE_ID").help("Print a result the proxy archived, by its tool_use ID"))
             .arg(Arg::new("list").long("list").value_name("TEXT").min_values(0).max_values(1).help("List archived tool results whose tool or call matches TEXT"))
-            .arg(crate::number("limit", "20", "Maximum rows for --list"))
-            .arg(Arg::new("json").long("json").conflicts_with("list").help("Emit the original typed JSON value"))
+            .arg(crate::number("limit", "20", "Maximum rows for --list or matching lines for --grep"))
+            .arg(Arg::new("from").long("from").value_name("N").help("First line to print, inclusive"))
+            .arg(Arg::new("to").long("to").value_name("N").help("Last line to print, inclusive"))
+            .arg(Arg::new("grep").long("grep").value_name("TEXT").help("Print only numbered lines that contain TEXT"))
+            .arg(Arg::new("json").long("json").conflicts_with_all(&["list", "from", "to", "grep"]).help("Emit the original typed JSON value"))
             .group(ArgGroup::new("target").required(true).args(&["id", "tool-use", "list"])),
     ]
 }
@@ -74,9 +77,93 @@ struct ToolUse {
     observation: String,
     tool: String,
     call: String,
+    /// The call's compact input JSON, cut near 512 bytes, for `--list` matching.
+    #[serde(default)]
+    input: String,
     bytes: u64,
     is_error: bool,
     first_seen_ms: u64,
+}
+
+/// What `recall` prints of a text result: all of it, a line range, or the
+/// numbered lines that contain some text.
+struct Selection<'a> {
+    from: usize,
+    to: usize,
+    grep: Option<&'a str>,
+    limit: usize,
+}
+
+impl<'a> Selection<'a> {
+    fn of(args: &'a ArgMatches) -> Result<Self> {
+        let line = |name: &str| -> Result<Option<usize>> {
+            args.value_of(name)
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .with_context(|| format!("--{name} expects a line number from 1"))
+                })
+                .transpose()
+        };
+        let (from, to) = (
+            line("from")?.unwrap_or(1),
+            line("to")?.unwrap_or(usize::MAX),
+        );
+        ensure!(from <= to, "--from must not be after --to");
+        Ok(Self {
+            from,
+            to,
+            grep: args.value_of("grep"),
+            limit: crate::read_num(args, "limit", 1)?,
+        })
+    }
+
+    fn whole(&self) -> bool {
+        self.from == 1 && self.to == usize::MAX && self.grep.is_none()
+    }
+
+    /// Prints the selected part of `text`: every byte, the exact bytes of a line
+    /// range, or numbered matching lines for `--grep`.
+    fn print(&self, text: &[u8]) -> Result<()> {
+        let mut out = io::stdout().lock();
+        if self.whole() {
+            return Ok(out.write_all(text)?);
+        }
+        let lines = text
+            .split_inclusive(|&byte| byte == b'\n')
+            .enumerate()
+            .map(|(i, line)| (i + 1, line))
+            .skip(self.from - 1)
+            .take_while(|(number, _)| *number <= self.to);
+        let Some(needle) = self.grep else {
+            for (_, line) in lines {
+                out.write_all(line)?;
+            }
+            return Ok(());
+        };
+        let mut shown = 0;
+        for (number, line) in lines {
+            let line = String::from_utf8_lossy(line);
+            let line = line.trim_end_matches(['\r', '\n']);
+            let Some(at) = line.find(needle) else {
+                continue;
+            };
+            // Long lines are cut around the match, as `justless search` does.
+            let start = line.floor_char_boundary(at.saturating_sub(100));
+            let end = line.floor_char_boundary((start + 400).min(line.len()));
+            writeln!(out, "{number}: {}", &line[start..end])?;
+            shown += 1;
+            if shown == self.limit {
+                break;
+            }
+        }
+        if shown == 0 {
+            writeln!(out, "No line matches {needle:?}.")?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn valid_tool_use_id(id: &str) -> bool {
@@ -95,14 +182,31 @@ fn tool_use_path(ws: &Workspace, id: &str) -> std::path::PathBuf {
 
 /// Archives one tool result under its tool_use ID. The first copy wins, so a result
 /// the client later trims stays recoverable. Returns whether a new entry was made.
+/// The call an archived result answered.
+pub(crate) struct ToolCall<'a> {
+    pub id: &'a str,
+    pub tool: &'a str,
+    /// A one-line summary, such as a path, a command or a pattern.
+    pub summary: &'a str,
+    pub input: &'a Value,
+}
+
+/// A call's compact input JSON, cut at a character boundary near 512 bytes.
+fn input_text(input: &Value) -> String {
+    if input.is_null() {
+        return String::new();
+    }
+    let text = serde_json::to_string(input).unwrap_or_default();
+    text[..text.floor_char_boundary(512)].to_owned()
+}
+
 pub(crate) fn archive_tool_use(
     ws: &Workspace,
-    id: &str,
-    tool: &str,
-    call: &str,
+    call: &ToolCall,
     content: &Value,
     is_error: bool,
 ) -> Result<bool> {
+    let id = call.id;
     ensure!(valid_tool_use_id(id), "invalid tool_use ID");
     let path = tool_use_path(ws, id);
     if fs::symlink_metadata(&path).is_ok() {
@@ -114,8 +218,9 @@ pub(crate) fn archive_tool_use(
     let entry = ToolUse {
         id: id.to_owned(),
         observation: archive(ws, content)?,
-        tool: tool.to_owned(),
-        call: call.to_owned(),
+        tool: call.tool.to_owned(),
+        call: call.summary.to_owned(),
+        input: input_text(call.input),
         bytes: serde_json::to_vec(content)?.len() as u64,
         is_error,
         first_seen_ms: now_ms(),
@@ -148,29 +253,28 @@ fn tool_uses(ws: &Workspace) -> Result<Vec<ToolUse>> {
     Ok(entries)
 }
 
-fn recall_tool_use(ws: &Workspace, id: &str, as_json: bool) -> Result<()> {
+fn recall_tool_use(ws: &Workspace, id: &str, as_json: bool, selection: &Selection) -> Result<()> {
     ensure!(valid_tool_use_id(id), "invalid tool_use ID");
     let entry: ToolUse = match fs::read(tool_use_path(ws, id)) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("read tool result index")?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            bail!("no archived tool result for {id}")
+            bail!("no archived tool result for {id}; try `justless recall --list TEXT`")
         }
         Err(error) => return Err(error.into()),
     };
     ensure!(entry.id == id, "tool result index mismatch for {id}");
     let value = recover(ws, &entry.observation)?;
-    let mut out = io::stdout().lock();
     if as_json {
-        return Ok(serde_json::to_writer(&mut out, &value)?);
+        return Ok(serde_json::to_writer(io::stdout().lock(), &value)?);
     }
     match &value {
         Value::Null => Ok(()),
-        Value::String(text) => Ok(out.write_all(text.as_bytes())?),
+        Value::String(text) => selection.print(text.as_bytes()),
         Value::Array(blocks) => {
             let parts: Vec<String> = blocks.iter().map(block_text).collect();
-            Ok(out.write_all(parts.join("\n").as_bytes())?)
+            selection.print(parts.join("\n").as_bytes())
         }
-        other => Ok(serde_json::to_writer(&mut out, other)?),
+        other => selection.print(&serde_json::to_vec(other)?),
     }
 }
 
@@ -208,8 +312,9 @@ fn list_tool_uses(ws: &Workspace, text: Option<&str>, limit: usize) -> Result<()
         .iter()
         .filter(|entry| {
             needle.as_deref().is_none_or(|needle| {
-                entry.tool.to_ascii_lowercase().contains(needle)
-                    || entry.call.to_ascii_lowercase().contains(needle)
+                [&entry.tool, &entry.call, &entry.input]
+                    .iter()
+                    .any(|field| field.to_ascii_lowercase().contains(needle))
             })
         })
         .collect();
@@ -487,31 +592,45 @@ fn marker(value: &Value) -> Option<&str> {
 
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     if name == "recall" {
+        let selection = Selection::of(args)?;
+        let as_json = args.is_present("json");
         if let Some(id) = args.value_of("tool-use") {
-            return recall_tool_use(ws, id, args.is_present("json"));
+            return recall_tool_use(ws, id, as_json, &selection);
         }
         if args.is_present("list") {
-            return list_tool_uses(
-                ws,
-                args.value_of("list"),
-                crate::read_num(args, "limit", 1)?,
+            ensure!(
+                selection.whole(),
+                "--from, --to and --grep select lines of one result, not --list rows"
             );
+            return list_tool_uses(ws, args.value_of("list"), selection.limit);
         }
-        let value = recover(ws, args.value_of("id").unwrap())?;
+        let id = args.value_of("id").unwrap();
+        // A tool_use ID reaches the proxy's archive, so `justless recall ID`
+        // works for a recall placeholder and for a cleared tool result alike.
+        if !valid_id(id) {
+            ensure!(
+                valid_tool_use_id(id),
+                "invalid ID: expected a 64-character recall ID or a tool_use ID"
+            );
+            return recall_tool_use(ws, id, as_json, &selection);
+        }
+        let value = recover(ws, id)?;
         // Plain recall prints text: a string, or the parts of an all-text array
         // joined without a separator. `--json` prints the typed value.
-        if !args.is_present("json") && text_kind(&value).is_some() {
-            let mut out = io::stdout().lock();
-            match value.as_array() {
-                Some(parts) => {
-                    for part in parts {
-                        out.write_all(part["text"].as_str().unwrap_or_default().as_bytes())?;
-                    }
-                }
-                None => out.write_all(value.as_str().unwrap_or_default().as_bytes())?,
-            }
-            return Ok(());
+        if !as_json && text_kind(&value).is_some() {
+            let text = match value.as_array() {
+                Some(parts) => parts
+                    .iter()
+                    .map(|part| part["text"].as_str().unwrap_or_default())
+                    .collect::<String>(),
+                None => value.as_str().unwrap_or_default().to_owned(),
+            };
+            return selection.print(text.as_bytes());
         }
+        ensure!(
+            selection.whole(),
+            "--from, --to and --grep need a text result; use --json for this one"
+        );
         return Ok(serde_json::to_writer(io::stdout().lock(), &value)?);
     }
     let mut input = Vec::new();

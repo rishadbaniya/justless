@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::plan::{self, Request};
 use crate::history::{human_bytes, now_ms, utc_date};
-use crate::observations::{archive_tool_use, valid_tool_use_id};
+use crate::observations::{ToolCall, archive_tool_use, valid_tool_use_id};
 use crate::workspace::{Workspace, lock_state};
 
 /// Results larger than this are not archived.
@@ -117,9 +117,10 @@ impl Log {
     }
 }
 
-/// The call summary kept with an archived result: the first path, command or query
-/// in the input, else its compact JSON, on one line of at most 160 characters.
-pub fn call_summary(input: &Value) -> String {
+/// The call summary kept with an archived result, on one line of at most 160
+/// characters: `PATTERN in PATH` for searches, `FILE:OFFSET+LIMIT` for partial
+/// reads, else the first path, command or query in the input, else its JSON.
+pub fn call_summary(tool: &str, input: &Value) -> String {
     const FIELDS: [&str; 9] = [
         "file_path",
         "path",
@@ -131,10 +132,27 @@ pub fn call_summary(input: &Value) -> String {
         "description",
         "prompt",
     ];
-    let text = FIELDS
-        .iter()
-        .find_map(|key| input.get(*key).and_then(Value::as_str))
-        .map(str::to_owned)
+    let text = |key: &str| input.get(key).and_then(Value::as_str);
+    let number = |key: &str| input.get(key).and_then(Value::as_u64);
+    let specific = match tool {
+        "Grep" | "Glob" => text("pattern").map(|pattern| match text("path") {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.to_owned(),
+        }),
+        "Read" => text("file_path").map(|file| {
+            let mut summary = file.to_owned();
+            if let Some(offset) = number("offset") {
+                summary.push_str(&format!(":{offset}"));
+            }
+            if let Some(limit) = number("limit") {
+                summary.push_str(&format!("+{limit}"));
+            }
+            summary
+        }),
+        _ => None,
+    };
+    let text = specific
+        .or_else(|| FIELDS.iter().find_map(|key| text(key)).map(str::to_owned))
         .unwrap_or_else(|| {
             if input.is_null() {
                 String::new()
@@ -205,15 +223,14 @@ impl Worker {
             }
             let block = request.block(at);
             let content = block.get("content").unwrap_or(&Value::Null);
-            let call = call_summary(&request.block(tool_use.call)["input"]);
-            match archive_tool_use(
-                &self.ws,
-                &tool_use.id,
-                &tool_use.name,
-                &call,
-                content,
-                block["is_error"] == true,
-            ) {
+            let input = &request.block(tool_use.call)["input"];
+            let call = ToolCall {
+                id: &tool_use.id,
+                tool: &tool_use.name,
+                summary: &call_summary(&tool_use.name, input),
+                input,
+            };
+            match archive_tool_use(&self.ws, &call, content, block["is_error"] == true) {
                 Ok(created) => {
                     self.seen.insert(tool_use.id.clone());
                     if created {
@@ -528,15 +545,35 @@ mod tests {
     #[test]
     fn summarizes_calls_on_one_short_line() {
         assert_eq!(
-            call_summary(&json!({"command":"cargo  test\n --locked"})),
+            call_summary("Bash", &json!({"command":"cargo  test\n --locked"})),
             "cargo test --locked"
         );
         assert_eq!(
-            call_summary(&json!({"description":"d","file_path":"src/a.rs"})),
+            call_summary("Edit", &json!({"description":"d","file_path":"src/a.rs"})),
             "src/a.rs"
         );
-        assert_eq!(call_summary(&json!({"n":1})), "{\"n\":1}");
-        let long = call_summary(&json!({"prompt":"é".repeat(300)}));
+        assert_eq!(call_summary("x", &json!({"n":1})), "{\"n\":1}");
+        let long = call_summary("Task", &json!({"prompt":"é".repeat(300)}));
         assert_eq!(long.chars().count(), 161);
+        // Searches lead with their pattern; partial reads show their range.
+        assert_eq!(
+            call_summary("Grep", &json!({"pattern":"parse_trade","path":"/repo/src"})),
+            "parse_trade in /repo/src"
+        );
+        assert_eq!(
+            call_summary("Glob", &json!({"pattern":"**/*_test.rs"})),
+            "**/*_test.rs"
+        );
+        assert_eq!(
+            call_summary(
+                "Read",
+                &json!({"file_path":"/repo/src/lib.rs","offset":900,"limit":200})
+            ),
+            "/repo/src/lib.rs:900+200"
+        );
+        assert_eq!(
+            call_summary("Read", &json!({"file_path":"/repo/src/lib.rs"})),
+            "/repo/src/lib.rs"
+        );
     }
 }

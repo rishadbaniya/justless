@@ -835,12 +835,8 @@ const TOOLS: &[Tool] = &[
         name: "recall",
         title: "Recover an archived tool result",
         command: "recall",
-        description: "Original value of a tool result that Justless archived, by ID.",
-        params: &[positional(
-            "id",
-            Kind::RecallId,
-            "64-character recall ID from the placeholder",
-        )],
+        description: "Original value of an archived tool result, by recall ID or tool_use ID.",
+        params: &[positional("id", Kind::RecallId, "Recall ID or tool_use ID")],
         check: None,
     },
     Tool {
@@ -1001,11 +997,12 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
         Kind::RunId => text.strip_prefix("run-").is_some_and(|suffix| {
             !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
         }),
+        // A 64-character recall ID, or a tool_use ID the proxy archived.
         Kind::RecallId => {
-            text.len() == 64
+            text.len() <= 200
                 && text
                     .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
         }
         Kind::Choice(values) => values.contains(&text),
         _ => true,
@@ -1017,7 +1014,7 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
         Kind::File => format!("`{name}` must be a workspace-relative path such as src/main.rs"),
         Kind::Location => format!("`{name}` must look like src/lib.rs:40 or src/lib.rs:40-52"),
         Kind::RunId => format!("`{name}` must be a run ID such as run-1a2b3c"),
-        Kind::RecallId => format!("`{name}` must be a 64-character lowercase hex recall ID"),
+        Kind::RecallId => format!("`{name}` must be a recall ID or a tool_use ID"),
         Kind::Choice(values) => format!("`{name}` must be one of {}", values.join(", ")),
         _ => format!("invalid `{name}`"),
     })
