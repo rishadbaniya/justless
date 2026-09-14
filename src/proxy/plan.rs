@@ -362,8 +362,9 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// The number of leading tool calls that stay cleared: one past the latest
-    /// stored boundary still present, so forks and rewinds stay consistent.
+    /// The number of leading tool calls that stay cleared: one past the furthest
+    /// stored boundary still present, so forks and rewinds stay consistent and the
+    /// order in which two processes merged their boundaries does not matter.
     pub fn boundary(&self, uses: &[Use]) -> usize {
         let positions: HashMap<&str, usize> = uses
             .iter()
@@ -372,8 +373,8 @@ impl Conversation {
             .collect();
         self.boundaries
             .iter()
-            .rev()
-            .find_map(|id| positions.get(id.as_str()))
+            .filter_map(|id| positions.get(id.as_str()))
+            .max()
             .map_or(0, |i| i + 1)
     }
 }
@@ -439,6 +440,10 @@ pub struct Decision {
     pub cold: bool,
     /// Newly cleared tokens over the messages layer after the best candidate move.
     pub ratio: Option<f64>,
+    /// The share `ratio` had to reach for a move on a warm cache.
+    pub threshold: Option<f64>,
+    /// Why the boundary stayed although calls past it could be cleared.
+    pub held: Option<&'static str>,
 }
 
 impl Decision {
@@ -447,12 +452,29 @@ impl Decision {
         if req.est_prompt < options.floor {
             "below-floor"
         } else {
-            "nothing-to-clear"
+            self.held.unwrap_or("nothing-to-clear")
         }
     }
 }
 
+/// The models whose prompt cache for this conversation may still be warm: every
+/// model that ran a Messages request within the cold window. The cache is per
+/// model but the boundary is shared, so a move rewrites each of these caches.
+fn warm_models(conversation: Option<&Conversation>, cold_after: u64, now_ms: u64) -> Vec<&str> {
+    conversation
+        .into_iter()
+        .flat_map(|c| &c.last_start)
+        .filter(|&(_, &start)| cold_after == 0 || now_ms.saturating_sub(start) <= cold_after * 1000)
+        .map(|(model, _)| model.as_str())
+        .collect()
+}
+
 /// Plans the boundary for a request that passed every gate.
+///
+/// The cache counts as expired only when every model that ran in the conversation
+/// has been idle past the cold window. A conversation seen for the first time, or
+/// only through token counts, counts as warm: a false "expired" would rewrite a
+/// live cache unpaid, while a false "warm" only postpones a clear.
 pub fn decide(
     req: &Request,
     model: &str,
@@ -464,18 +486,17 @@ pub fn decide(
     let before = conversation.map_or(0, |c| c.boundary(&req.uses));
     let ttl = if req.one_hour { 3600 } else { 300 };
     let cold_after = options.cold_after.unwrap_or(ttl + 15);
-    let cold = cold_after > 0
-        && conversation.is_some_and(|c| {
-            c.last_start
-                .get(model)
-                .is_none_or(|&start| now_ms.saturating_sub(start) > cold_after * 1000)
-        });
+    let known = conversation.is_some_and(|c| !c.last_start.is_empty());
+    let warm = warm_models(conversation, cold_after, now_ms);
+    let cold = cold_after > 0 && known && warm.is_empty();
     let mut decision = Decision {
         before,
         boundary: before,
         moved: None,
         cold,
         ratio: None,
+        threshold: None,
+        held: None,
     };
     let count = req.uses.len();
     if role != Role::Mover || count <= options.keep {
@@ -494,9 +515,28 @@ pub fn decide(
         + PLACEHOLDER_TOKENS * cleared.iter().filter(|u| u.result.is_some()).count() as u64;
     let ratio = tokens as f64 / rewrite.max(1) as f64;
     decision.ratio = Some(ratio);
-    let pays_back =
-        options.payback > 0 && ratio >= payback_ratio(model, req.one_hour, options.payback);
-    if req.est_prompt >= options.floor && tokens >= options.clear_at_least && (cold || pays_back) {
+    // A warm move must repay the rewrite of every warm cache, so the model with
+    // the cheapest cache reads sets the bar. With no model known, the requesting
+    // model's own cache is the one assumed warm.
+    let priced = if warm.is_empty() { vec![model] } else { warm };
+    let threshold = priced
+        .iter()
+        .map(|m| payback_ratio(m, req.one_hour, options.payback))
+        .fold(0.0, f64::max);
+    let pays_back = options.payback > 0 && ratio >= threshold;
+    if options.payback > 0 && !cold {
+        decision.threshold = Some(threshold);
+    }
+    decision.held = if req.est_prompt < options.floor {
+        Some("below-floor")
+    } else if tokens < options.clear_at_least {
+        Some("below-clear-at-least")
+    } else if !(cold || pays_back) {
+        Some("below-payback")
+    } else {
+        None
+    };
+    if decision.held.is_none() {
         decision.boundary = target;
         decision.moved = Some(Move {
             kind: if cold { Kind::Cold } else { Kind::Payback },
@@ -781,10 +821,28 @@ mod tests {
         assert_eq!(below.idle_reason(&req, &opts), "below-floor");
         opts.floor = 1000;
         opts.clear_at_least = 2005;
-        assert_eq!(
-            decide(&req, "claude-haiku-4-5", None, Role::Mover, &opts, 5).boundary,
-            0
-        );
+        let small_clear = decide(&req, "claude-haiku-4-5", None, Role::Mover, &opts, 5);
+        assert_eq!(small_clear.boundary, 0);
+        assert_eq!(small_clear.idle_reason(&req, &opts), "below-clear-at-least");
+        // A conversation known only from token counts has no start yet, and
+        // counts as warm like an unknown one.
+        opts.clear_at_least = 1;
+        opts.payback = 0;
+        let counted = Conversation::default();
+        for conversation in [None, Some(&counted)] {
+            let decision = decide(
+                &req,
+                "claude-haiku-4-5",
+                conversation,
+                Role::Mover,
+                &opts,
+                5_000_000,
+            );
+            assert!(!decision.cold);
+            assert_eq!(decision.boundary, 0);
+            assert_eq!(decision.idle_reason(&req, &opts), "below-payback");
+        }
+        opts.payback = 1000;
         // Fewer than four calls to clear never moves.
         opts.clear_at_least = 1;
         opts.keep = 3;
@@ -826,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn model_changes_count_as_cold_and_read_only_roles_never_move() {
+    fn a_model_change_moves_only_when_every_cache_has_expired() {
         let req = request(&conversation(&[2000; 6]));
         let opts = Options {
             payback: 0,
@@ -836,6 +894,8 @@ mod tests {
             last_start: [("claude-opus-5-5".to_string(), 1_000)].into(),
             ..Default::default()
         };
+        // Opus ran a second ago: its cache is warm, so switching to Sonnet is not
+        // an expired cache, and warm moves are off.
         let switched = decide(
             &req,
             "claude-sonnet-5-5",
@@ -844,15 +904,69 @@ mod tests {
             &opts,
             2_000,
         );
-        assert!(switched.cold);
-        assert_eq!(switched.boundary, 4);
+        assert!(!switched.cold);
+        assert_eq!((switched.boundary, switched.moved.as_ref()), (0, None));
+        assert_eq!(switched.idle_reason(&req, &opts), "below-payback");
+        // Once Opus has been idle past the window, no cache is warm.
+        let later = decide(
+            &req,
+            "claude-sonnet-5-5",
+            Some(&state),
+            Role::Mover,
+            &opts,
+            62_000,
+        );
+        assert!(later.cold);
+        assert_eq!(later.boundary, 4);
+        assert_eq!(later.moved.unwrap().kind, Kind::Cold);
+        // Any model that ran within the window keeps the conversation warm.
+        let both = Conversation {
+            last_start: [
+                ("claude-opus-5-5".to_string(), 1_000),
+                ("claude-haiku-4-5".to_string(), 61_000),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mixed = decide(
+            &req,
+            "claude-opus-5-5",
+            Some(&both),
+            Role::Mover,
+            &opts,
+            62_000,
+        );
+        assert!(!mixed.cold);
+        assert_eq!(mixed.boundary, 0);
+        // A warm move must pay back at the prices of the warm model with the
+        // cheapest cache reads, not only the requesting model's.
+        let fable = Conversation {
+            last_start: [("claude-fable-5-2".to_string(), 1_000)].into(),
+            ..Default::default()
+        };
+        let opts = Options {
+            payback: 12,
+            ..options()
+        };
+        let priced = decide(
+            &req,
+            "claude-haiku-4-5",
+            Some(&fable),
+            Role::Mover,
+            &opts,
+            2_000,
+        );
+        let threshold = priced.threshold.unwrap();
+        assert!((threshold - payback_ratio("claude-fable-5-2", false, 12)).abs() < 1e-9);
+        assert!(priced.ratio.unwrap() < threshold, "{priced:?}");
+        assert_eq!(priced.boundary, 0);
         let read_only = decide(
             &req,
             "claude-sonnet-5-5",
             Some(&state),
             Role::ReadOnly,
             &opts,
-            2_000,
+            62_000,
         );
         assert_eq!(read_only.boundary, 0);
         assert_eq!(Role::of(true, None, None), Role::Mover);

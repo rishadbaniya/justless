@@ -151,6 +151,35 @@ mod tests {
     }
 
     #[test]
+    fn merge_order_never_moves_a_boundary_back() {
+        use crate::proxy::plan::Use;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversations.json");
+        let mut first = Store::load(path.clone());
+        let mut second = Store::load(path.clone());
+        first.update("toolu_00", 10, |c| c.boundaries.push("toolu_04".into()));
+        second.update("toolu_00", 20, |c| c.boundaries.push("toolu_08".into()));
+        second.save().unwrap();
+        first.save().unwrap();
+        second.update("toolu_00", 30, |_| {});
+        second.save().unwrap();
+        let uses: Vec<Use> = (0..12)
+            .map(|i| Use {
+                id: format!("toolu_{i:02}"),
+                name: "Read".into(),
+                call: (i, 0),
+                result: None,
+                result_bytes: 0,
+                result_tokens: 0,
+            })
+            .collect();
+        for store in [&first, &second, &Store::load(path)] {
+            let c = store.get("toolu_00").unwrap();
+            assert_eq!(c.boundary(&uses), 9, "{:?}", c.boundaries);
+        }
+    }
+
+    #[test]
     fn keeps_the_most_recent_conversations_and_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conversations.json");

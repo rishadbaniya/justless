@@ -18,7 +18,9 @@ pub struct Upstream {
 
 pub enum Outbound<'a> {
     Bytes(&'a [u8]),
-    Stream(&'a mut dyn Read),
+    /// A body streamed through, with its declared length when it had one;
+    /// otherwise it is sent chunked.
+    Stream(&'a mut dyn Read, Option<u64>),
 }
 
 pub enum SendError {
@@ -120,9 +122,15 @@ impl Upstream {
                     builder.body(bytes).map(|r| self.agent.run(r))
                 }
             }
-            Outbound::Stream(reader) => builder
-                .body(SendBody::from_reader(reader))
-                .map(|r| self.agent.run(r)),
+            Outbound::Stream(reader, length) => {
+                // ureq keeps an explicit Content-Length instead of chunking.
+                if let Some(length) = length {
+                    builder = builder.header(http::header::CONTENT_LENGTH, length);
+                }
+                builder
+                    .body(SendBody::from_reader(reader))
+                    .map(|r| self.agent.run(r))
+            }
         };
         match result {
             Err(error) => Err(SendError::Request(error.to_string())),

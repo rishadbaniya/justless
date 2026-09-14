@@ -29,7 +29,7 @@ const PROVIDERS: [&str; 5] = [
 /// Claude Code turns these direct-connection defaults off behind a custom base URL.
 /// Setting them keeps a wrapped session's requests like an unwrapped one's, and the
 /// hint headers tell the proxy each request's class.
-const PARITY: [&str; 2] = [
+pub const PARITY: [&str; 2] = [
     "CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING",
     "CLAUDE_CODE_GATEWAY_HINT_HEADERS",
 ];

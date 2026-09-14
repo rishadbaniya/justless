@@ -697,6 +697,61 @@ fn accepts_chunked_bodies_and_expect_continue() {
 }
 
 #[test]
+fn a_body_cut_short_is_never_forwarded() {
+    let (_dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
+    let body = serde_json::to_vec(&conversation("claude-opus-5-5", &[40])).unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let head = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(&body[..60]).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let response = read_message(&mut BufReader::new(stream), false).unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.header("connection"), Some("close"));
+    let message = response.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("incomplete request body"), "{message}");
+    // A later complete request still goes through.
+    proxy.send("GET", "/v1/models", &[], b"");
+    let targets: Vec<String> = mock.seen().iter().map(|m| m.target().to_owned()).collect();
+    assert_eq!(targets, ["/v1/models"]);
+}
+
+#[test]
+fn bodies_over_64_mib_keep_their_content_length() {
+    let (_dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
+    let size = 64 * 1024 * 1024 + 1234;
+    let body: Vec<u8> = (0..size).map(|i| b"abcdefghij"[i % 10]).collect();
+    let response = proxy.send(
+        "POST",
+        "/v1/files",
+        &[("content-type", "application/octet-stream")],
+        &body,
+    );
+    assert_eq!(response.status(), 200);
+    let seen = mock.seen();
+    let forwarded = seen.last().unwrap();
+    assert_eq!(
+        forwarded.header("content-length"),
+        Some(size.to_string().as_str())
+    );
+    assert!(forwarded.header("transfer-encoding").is_none());
+    assert_eq!(
+        Sha256::digest(&forwarded.body),
+        Sha256::digest(&body),
+        "body changed"
+    );
+}
+
+#[test]
 fn passthrough_paths_and_invalid_bodies() {
     let (dir, mock, proxy) = session(
         |request| match request.first.split(' ').next().unwrap() {
@@ -1025,9 +1080,78 @@ fn cold_cache_move() {
     assert_eq!(trigger_keep(&edit), (4, 2));
     proxy.stop();
     let records = ledger(dir.path());
-    assert_eq!(records[0]["reason"], "nothing-to-clear");
+    // A first sighting counts as warm, and warm moves are off.
+    assert_eq!(records[0]["reason"], "below-payback");
     assert_eq!(records[1]["move"], "cold");
     assert_eq!(records[1]["boundary"], 5);
+}
+
+#[test]
+fn a_model_switch_never_rewrites_another_models_warm_cache() {
+    let args = [
+        "--floor",
+        "1000",
+        "--clear-at-least",
+        "100",
+        "--keep",
+        "2",
+        "--payback",
+        "0",
+    ];
+    let (dir, mock, proxy) = session(|_| ok_json(), &args);
+    let mut sizes = vec![2000; 6];
+    for model in ["claude-opus-5-5", "claude-haiku-4-5", "claude-opus-5-5"] {
+        proxy.post(&[], &conversation(model, &sizes));
+        sizes.push(2000);
+    }
+    assert!(mock.seen().iter().all(|m| our_edit(&m.json()).is_none()));
+    proxy.stop();
+    let reasons: Vec<Value> = ledger(dir.path())
+        .iter()
+        .map(|r| r["reason"].clone())
+        .collect();
+    assert_eq!(reasons, ["below-payback"; 3]);
+}
+
+#[test]
+fn a_token_count_first_does_not_change_the_decision() {
+    let args = [
+        "--floor",
+        "1000",
+        "--clear-at-least",
+        "100",
+        "--keep",
+        "2",
+        "--cold-after",
+        "1",
+        "--payback",
+        "0",
+    ];
+    let body = conversation("claude-opus-5-5", &[2000; 8]);
+    let mut count = body.clone();
+    count.as_object_mut().unwrap().remove("stream");
+    let count = serde_json::to_vec(&count).unwrap();
+    let mut decisions = Vec::new();
+    for count_first in [false, true] {
+        let (dir, mock, proxy) = session(|_| ok_json(), &args);
+        if count_first {
+            proxy.send(
+                "POST",
+                "/v1/messages/count_tokens",
+                &[("content-type", "application/json")],
+                &count,
+            );
+            thread::sleep(Duration::from_millis(1200));
+        }
+        proxy.post(&[], &body);
+        let forwarded = mock.seen().pop().unwrap();
+        assert!(our_edit(&forwarded.json()).is_none(), "{count_first}");
+        proxy.stop();
+        let last = ledger(dir.path()).pop().unwrap();
+        decisions.push((last["reason"].clone(), last["move"].clone()));
+    }
+    assert_eq!(decisions[0], decisions[1]);
+    assert_eq!(decisions[0], (json!("below-payback"), Value::Null));
 }
 
 #[test]

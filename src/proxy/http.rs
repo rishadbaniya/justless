@@ -252,11 +252,41 @@ impl<R: BufRead> Read for Chunked<R> {
     }
 }
 
+/// Exactly `remaining` bytes, or `UnexpectedEof` when the client stops sooner, so
+/// a body cut short is never forwarded as if it were complete.
+struct Exact<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let wanted = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buf[..wanted])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "request body ended before its content-length",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
 /// A reader over the request body that ends where the body ends.
 pub fn body_reader<'a, R: BufRead + 'a>(reader: R, framing: &Framing) -> Box<dyn Read + 'a> {
     match framing {
         Framing::Empty => Box::new(io::empty()),
-        Framing::Length(length) => Box::new(reader.take(*length)),
+        Framing::Length(length) => Box::new(Exact {
+            inner: reader,
+            remaining: *length,
+        }),
         Framing::Chunked => Box::new(Chunked::new(reader)),
     }
 }
@@ -377,6 +407,24 @@ mod tests {
                 .read_to_end(&mut broken)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_length_is_an_error() {
+        let mut body = Vec::new();
+        let error = body_reader(BufReader::new(&b"hel"[..]), &Framing::Length(5))
+            .read_to_end(&mut body)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let mut reader = BufReader::new(&b"hello world"[..]);
+        let mut exact = Vec::new();
+        body_reader(&mut reader, &Framing::Length(5))
+            .read_to_end(&mut exact)
+            .unwrap();
+        assert_eq!(exact, b"hello");
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b" world");
     }
 
     #[test]

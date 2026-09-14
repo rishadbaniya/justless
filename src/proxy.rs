@@ -194,7 +194,12 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<i32> {
     } else {
         println!("Archives tool results without asking the API to clear them. Archive: {archive}");
     }
-    println!("Claude Code:   export ANTHROPIC_BASE_URL=http://{addr}");
+    // Claude Code turns these off behind a custom base URL; with them on, its
+    // requests match an unproxied session's and carry their request class.
+    println!(
+        "Claude Code:   export ANTHROPIC_BASE_URL=http://{addr} {}",
+        wrap::PARITY.map(|name| format!("{name}=1")).join(" ")
+    );
     println!("Other Anthropic clients: base URL http://{addr}");
     signals::wait();
     proxy.stop();
@@ -518,6 +523,7 @@ struct Planned {
     boundary: Option<usize>,
     movement: Option<plan::Move>,
     ratio: Option<f64>,
+    threshold: Option<f64>,
     cold: bool,
     repeats: u64,
     client_new: bool,
@@ -642,17 +648,19 @@ impl Shared {
         if role == Role::Mover {
             planned.repeats = count_repeats(store.calls(key), req, decision.boundary);
         }
-        store.update(key, now, |c| {
-            if endpoint == Endpoint::Messages {
+        // Token counts never touch the prompt cache, so they leave the state alone.
+        if endpoint == Endpoint::Messages {
+            store.update(key, now, |c| {
                 c.last_start.insert(model.to_owned(), now);
-            }
-            if decision.moved.is_some() {
-                c.boundaries
-                    .push(req.uses[decision.boundary - 1].id.clone());
-            }
-        });
+                if decision.moved.is_some() {
+                    c.boundaries
+                        .push(req.uses[decision.boundary - 1].id.clone());
+                }
+            });
+        }
         drop(store);
         planned.ratio = decision.ratio;
+        planned.threshold = decision.threshold;
         planned.cold = decision.cold;
         planned.movement = decision.moved.clone();
         if decision.boundary < plan::MIN_BOUNDARY {
@@ -728,7 +736,19 @@ fn handle(
     let endpoint = Endpoint::of(head);
     let mut source = http::body_reader(&mut *reader, &framing);
     let mut body = Vec::new();
-    source.by_ref().take(MAX_BODY + 1).read_to_end(&mut body)?;
+    if let Err(error) = source.by_ref().take(MAX_BODY + 1).read_to_end(&mut body) {
+        // A body cut short or badly chunked is never forwarded.
+        if matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+        ) {
+            let message = format!("justless proxy: incomplete request body: {error}");
+            let reply = http::error_body("invalid_request_error", &message);
+            let _ = http::write_simple(writer, 400, JSON, &reply, true);
+            return Ok(false);
+        }
+        return Err(error);
+    }
     let too_large = body.len() as u64 > MAX_BODY;
     let browser = head.header("origin").is_some();
     let candidate = endpoint != Endpoint::Other && !too_large && !browser;
@@ -747,12 +767,18 @@ fn handle(
     };
     let keep_alive = head.keep_alive() && !too_large;
     let sent = if too_large {
+        // The declared length is forwarded with the streamed body, so the
+        // upstream sees the framing the client chose.
+        let length = match &framing {
+            Framing::Length(length) => Some(*length),
+            Framing::Empty | Framing::Chunked => None,
+        };
         let mut rest = io::Cursor::new(std::mem::take(&mut body)).chain(&mut source);
         shared.upstream.send(
             &head.method,
             &head.target,
             &head.headers,
-            Outbound::Stream(&mut rest),
+            Outbound::Stream(&mut rest, length),
         )
     } else if let Some(edited) = &planned.body {
         let mut headers = head.headers.clone();
@@ -942,7 +968,10 @@ fn verbose_line(record: &Record, planned: &Planned, elapsed: Duration) -> String
         )),
     }
     if let Some(ratio) = planned.ratio.filter(|_| planned.movement.is_none()) {
-        parts.push(format!("C/M {ratio:.2}"));
+        match planned.threshold {
+            Some(threshold) => parts.push(format!("C/M {ratio:.2} of {threshold:.2}")),
+            None => parts.push(format!("C/M {ratio:.2}")),
+        }
     }
     if let (Some(uses), Some(tokens)) = (record.api_cleared_uses, record.api_cleared_tokens) {
         parts.push(format!(
