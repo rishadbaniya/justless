@@ -19,7 +19,7 @@
 
 **justless** is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
 
-> **🔒 100% local. Zero network calls.** justless runs entirely on your machine, between your agent and your shell. It makes no network requests of any kind: no telemetry, no analytics, no cloud service, no LLM, no account. Your code and command output never leave your computer.
+> **🔒 100% local. Zero network calls.** justless runs entirely on your machine, between your agent and your shell. It sends nothing anywhere: no telemetry, no analytics, no cloud service, no LLM, no account. Your code and command output never leave your computer. The one exception is opt-in: `justless wrap claude` relays Claude Code's own API requests to Anthropic and adds no requests of its own.
 
 ## How it cuts tokens
 
@@ -27,7 +27,7 @@
 - **🎯 Exact Recall.** Every stream is archived byte for byte in `.justless/runs/<id>` with a SHA-256 digest. `justless log ID --from N --to M` replays exact lines; an identical rerun collapses to one line.
 - **🔬 Surgical Reads.** syn and Tree-sitter outlines across 21 languages with revision-bound row IDs. `expand` returns one symbol's exact bytes; `edit` writes only the replacement after checking the revision.
 - **🗺️ Code Map and Impact.** An incremental graph of symbols, calls, imports, HTTP routes and SQL relations. `pack` answers a question in one call; `affected` walks back to the tests that reach a change.
-- **🧹 Context Hygiene.** A footer only when output was cut or failed, and compaction hooks that carry run IDs and inspected ranges into the next turn.
+- **🧹 Context Hygiene.** A footer only when output was cut or failed, compaction hooks that carry run IDs and inspected ranges into the next turn, and an opt-in `justless wrap claude` that has the API clear old tool results server-side, with every original archived.
 
 
 <picture>
@@ -71,7 +71,7 @@ The exit status is still 101, and `justless log RUN_ID --stream stdout --from 36
 ### What it does not do
 
 - **No changed commands.** Same command, directory and exit code. Pipes, redirections, interactive and machine-readable output pass through.
-- **No network, no LLM, no telemetry.** Parsing is local and deterministic; everything stays in `.justless/`. Only the installer goes online.
+- **No network, no LLM, no telemetry.** Parsing is local and deterministic; everything stays in `.justless/`. Only the installer goes online, plus the opt-in `wrap` proxy, which relays your agent's own API requests.
 - **No hidden failures.** Anything cut is marked and one command away.
 
 ## Install
