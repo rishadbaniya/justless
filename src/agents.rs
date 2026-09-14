@@ -1495,3 +1495,79 @@ fn appended(existing: &str, text: &str) -> String {
     };
     format!("{existing}{separator}{text}\n")
 }
+
+// ---------------------------------------------------------------------------
+// Read-only views of what `init` writes, for `justless doctor`.
+
+/// Every agent `init` configures, by its `--agent` name.
+pub(crate) const AGENTS: [(&str, Agent); 7] = [
+    ("claude", Agent::Claude),
+    ("codex", Agent::Codex),
+    ("cursor", Agent::Cursor),
+    ("gemini", Agent::Gemini),
+    ("copilot", Agent::Copilot),
+    ("opencode", Agent::OpenCode),
+    ("agy", Agent::Agy),
+];
+
+impl Agent {
+    /// The hook file `init --hooks` writes, relative to the project root.
+    pub(crate) fn hook_file(self) -> PathBuf {
+        let (directory, file) = self.config();
+        Path::new(directory).join(file)
+    }
+
+    /// The instructions file the client loads, relative to the project root.
+    pub(crate) fn instructions_name(self) -> &'static str {
+        self.instructions()
+    }
+
+    /// Whether setup counts a handler that runs `CMD || true` as running `CMD`.
+    pub(crate) fn loose_hook_commands(self) -> bool {
+        matches!(self, Self::Cursor | Self::Gemini | Self::Copilot)
+    }
+}
+
+/// The instruction block `init` writes, and its start and end markers.
+pub(crate) fn instruction_block() -> (&'static str, &'static str, &'static str) {
+    (START, END, INSTRUCTIONS)
+}
+
+/// The file `init` edits for an instructions file, or `None` for a link that
+/// leaves the project, which `init` skips.
+pub(crate) fn instructions_target(root: &Path, path: &Path) -> Result<Option<PathBuf>> {
+    instructions_file(root, path)
+}
+
+/// What `init --hooks` would write to `agent`'s hook file in this project, or
+/// `None` when the file already has every entry. Reads only.
+pub(crate) fn pending_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<String>> {
+    Ok(prepare_hooks(workspace, agent)?.map(|(_, contents)| contents))
+}
+
+/// The hook file `init --hooks` writes for `agent` into a project that has none.
+pub(crate) fn fresh_hooks(agent: Agent) -> Result<String> {
+    // A missing directory reads as a project without hook files, so this runs the
+    // same merge as setup and touches no file.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "justless-fresh-hooks-{}-{nonce}",
+        std::process::id()
+    ));
+    ensure!(
+        fs::symlink_metadata(&root).is_err_and(|error| error.kind() == ErrorKind::NotFound),
+        "{} exists",
+        root.display()
+    );
+    let workspace = Workspace {
+        cwd: root.clone(),
+        state: root.join(".justless"),
+        root,
+    };
+    prepare_hooks(&workspace, agent)?
+        .map(|(_, contents)| contents)
+        .context("setup writes no hooks for this agent")
+}

@@ -1054,9 +1054,9 @@ pub enum Client {
 }
 
 impl Client {
-    const NAMES: [&'static str; 5] = ["claude", "cursor", "gemini", "vscode", "codex"];
+    pub(crate) const NAMES: [&'static str; 5] = ["claude", "cursor", "gemini", "vscode", "codex"];
 
-    fn parse(name: &str) -> Result<Self> {
+    pub(crate) fn parse(name: &str) -> Result<Self> {
         Ok(match name {
             "claude" => Self::Claude,
             "cursor" => Self::Cursor,
@@ -1067,7 +1067,7 @@ impl Client {
         })
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
             Self::Cursor => "Cursor",
@@ -1101,7 +1101,7 @@ impl Client {
         }
     }
 
-    fn servers_key(self) -> &'static str {
+    pub(crate) fn servers_key(self) -> &'static str {
         match self {
             Self::VsCode => "servers",
             Self::Codex => "mcp_servers",

@@ -2,6 +2,7 @@ mod agents;
 mod capture;
 mod context;
 mod discover;
+mod doctor;
 mod filters;
 mod history;
 mod impact;
@@ -271,6 +272,7 @@ fn cli() -> Command<'static> {
         .subcommand(map::command())
         .subcommand(impact::command())
         .subcommand(mcp::command())
+        .subcommand(doctor::command())
         .subcommands(source::commands())
         .subcommands(observations::commands())
         .subcommands(proxy::commands())
@@ -338,6 +340,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         }
         (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
         ("mcp", sub) => mcp::run(&workspace, sub)?,
+        ("doctor", sub) => return doctor::run(&workspace, sub, matches.is_present("root")),
         ("map", sub) => map::run(&workspace, sub)?,
         ("affected", sub) => impact::run(&workspace, sub)?,
         ("lookup", sub) => lookup::run(&workspace, sub)?,
