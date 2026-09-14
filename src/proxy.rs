@@ -719,6 +719,8 @@ impl Shared {
                 planned.body = Some(body);
                 planned.mode = "cleared";
                 planned.boundary = Some(decision.boundary);
+                // Why the boundary stayed where it is, when more could clear.
+                planned.reason = decision.held;
             }
             None => planned.reason = Some("unparsed"),
         }
@@ -1002,7 +1004,10 @@ fn verbose_line(record: &Record, planned: &Planned, elapsed: Duration) -> String
             if planned.cold { "cold" } else { "warm" },
             movement.tokens as f64 / movement.rewrite.max(1) as f64
         )),
-        (Some(boundary), None) => parts.push(format!("cleared {boundary}")),
+        (Some(boundary), None) => parts.push(match &record.reason {
+            Some(held) => format!("cleared {boundary}, held {held}"),
+            None => format!("cleared {boundary}"),
+        }),
         (None, _) => parts.push(format!(
             "{} {}",
             record.mode,

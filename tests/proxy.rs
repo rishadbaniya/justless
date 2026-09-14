@@ -941,6 +941,18 @@ fn adds_clear_tool_uses_with_stable_boundary() {
         [json!("payback"), Value::Null, Value::Null, json!("payback")]
     );
     assert!(records.iter().all(|r| r["mode"] == "cleared"));
+    // Between moves, the edit is still sent and the ledger says why the
+    // boundary held.
+    let reasons: Vec<Value> = records.iter().map(|r| r["reason"].clone()).collect();
+    assert_eq!(
+        reasons,
+        [
+            Value::Null,
+            json!("below-clear-at-least"),
+            json!("below-clear-at-least"),
+            Value::Null
+        ]
+    );
     assert_eq!(records[0]["newly_cleared"]["results"], 4);
     assert_eq!(records[0]["newly_cleared"]["bytes"], 4 * result_bytes(2000));
 }
