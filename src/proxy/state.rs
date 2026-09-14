@@ -26,7 +26,8 @@ struct Saved {
 #[derive(Default)]
 pub struct Calls {
     pub seen: HashSet<String>,
-    pub cleared: HashSet<u64>,
+    /// Hashes of cleared calls and the position of the latest one.
+    pub cleared: HashMap<u64, usize>,
     pub hashed: usize,
     pub started: bool,
 }

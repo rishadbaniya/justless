@@ -73,11 +73,17 @@ pub struct Record {
 /// Running totals for the summary `wrap` prints at exit.
 #[derive(Clone, Debug, Default)]
 pub struct Totals {
+    /// Every request, probes included. None means the client bypassed the proxy.
+    pub seen: u64,
+    /// Messages and token-count requests.
     pub requests: u64,
     pub moves: u64,
     pub cold_moves: u64,
+    /// Results the proxy's moves asked the API to clear.
     pub cleared_results: u64,
     pub tokens_not_sent: u64,
+    /// Requests where the API cleared a different number of calls than planned.
+    pub mismatches: u64,
     pub archived: u64,
     pub client_managed: u64,
 }
@@ -245,7 +251,9 @@ impl Worker {
 
     fn count(&self, record: &Record) {
         let mut totals = self.totals.lock().unwrap_or_else(|e| e.into_inner());
-        totals.requests += 1;
+        totals.seen += 1;
+        totals.requests += u64::from(record.path != "other");
+        totals.mismatches += u64::from(record.mismatch);
         if let Some(cleared) = &record.newly_cleared {
             totals.moves += 1;
             totals.cold_moves += u64::from(record.movement.as_deref() == Some("cold"));
@@ -341,7 +349,16 @@ pub fn report(ws: &Workspace, since_ms: u64) -> Result<Option<Report>> {
         token_source: "API usage",
         ..Default::default()
     };
+    // Monthly files that end before the window are skipped unread.
+    let first = format!("requests-{}.jsonl", &utc_date(since_ms)[..7]);
     for path in files {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name < first.as_str())
+        {
+            continue;
+        }
         let text = fs::read_to_string(&path)?;
         for record in text
             .lines()
@@ -394,7 +411,7 @@ impl Report {
         };
         println!("\nRequest boundary (justless proxy), last {days} day(s)");
         println!(
-            "  {} · old tool results cleared on {} · {} left to Claude Code's own clearing · {}",
+            "  {} · clearing requested on {} · {} left to Claude Code's own clearing · {}",
             plural(self.requests, "request", "requests"),
             thousands(self.cleared_requests),
             plural(
@@ -431,8 +448,8 @@ impl Report {
                 "  {} ({}, about {} tokens estimated) in {}: {}",
                 plural(
                     self.newly_cleared.results,
-                    "old tool result cleared",
-                    "old tool results cleared"
+                    "old tool result marked for clearing",
+                    "old tool results marked for clearing"
                 ),
                 human_bytes(self.newly_cleared.bytes),
                 short(self.newly_cleared.est_tokens),
@@ -446,8 +463,8 @@ impl Report {
         );
         if self.repeats > 0 {
             println!(
-                "  {} a cleared call",
-                plural(self.repeats, "tool call repeated", "tool calls repeated")
+                "  {} a cleared call with no file change in between",
+                plural(self.repeats, "read repeated", "reads repeated")
             );
         }
         if self.mismatches > 0 {
@@ -540,6 +557,34 @@ mod tests {
         assert_eq!(short(2_910_000), "2.91M");
         assert_eq!(short(1_500_000), "1.5M");
         assert_eq!(short(999_999), "1M");
+    }
+
+    #[test]
+    fn reports_skip_months_before_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace {
+            root: dir.path().to_owned(),
+            cwd: dir.path().to_owned(),
+            state: dir.path().join(".justless"),
+        };
+        let proxy = ledger_dir(&ws);
+        fs::create_dir_all(&proxy).unwrap();
+        let line = |ts: u64| {
+            let record = Record {
+                ts,
+                path: "messages".into(),
+                ..Default::default()
+            };
+            serde_json::to_string(&record).unwrap() + "\n"
+        };
+        let january = 1_767_571_200_000;
+        let november = 1_793_836_800_000;
+        fs::write(proxy.join("requests-2026-01.jsonl"), line(january)).unwrap();
+        // An unreadable older month is never opened.
+        fs::write(proxy.join("requests-2025-12.jsonl"), b"\xff not json").unwrap();
+        fs::write(proxy.join("requests-2026-11.jsonl"), line(november)).unwrap();
+        assert_eq!(report(&ws, november - 1).unwrap().unwrap().requests, 1);
+        assert_eq!(report(&ws, january - 1).unwrap().unwrap().requests, 2);
     }
 
     #[test]

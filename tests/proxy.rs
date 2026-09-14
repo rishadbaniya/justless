@@ -831,10 +831,15 @@ fn upstream_prefix_and_unreachable() {
     assert_eq!(response.status(), 200);
     assert_eq!(mock.seen()[0].target(), "/gw/v1/messages?beta=true");
     drop(proxy);
-    let dead = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // An upstream that closes every connection unanswered. It stays bound, so no
+    // other test can take its port.
+    let closing = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = closing.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in closing.incoming() {
+            drop(stream);
+        }
+    });
     let proxy = Proxy::start(dir.path(), &format!("http://{dead}"), &[]);
     let response = proxy.send("POST", "/v1/messages", &[], b"{}");
     assert_eq!(response.status(), 502);
@@ -847,12 +852,8 @@ fn upstream_prefix_and_unreachable() {
         "{message}"
     );
     proxy.stop();
-    // A proxy never forwards to itself.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // A proxy never forwards to itself, whether or not the port is free.
+    let port = dead.port();
     let refused = justless(
         dir.path(),
         &[
@@ -1644,14 +1645,14 @@ fn records_stats_from_api_usage() {
         text.contains("Request boundary (justless proxy), last 7 day(s)"),
         "{text}"
     );
-    assert!(text.contains("3 requests · old tool results cleared on 3 · 0 conversations left to Claude Code's own clearing · 0 refusals"), "{text}");
-    assert!(text.contains("4 old tool results cleared (8.1 KB, about 2.07K tokens estimated) in 1 clear: 1 on a warm cache (1.5K tokens written to cache on that request, reported by the API)"), "{text}");
+    assert!(text.contains("3 requests · clearing requested on 3 · 0 conversations left to Claude Code's own clearing · 0 refusals"), "{text}");
+    assert!(text.contains("4 old tool results marked for clearing (8.1 KB, about 2.07K tokens estimated) in 1 clear: 1 on a warm cache (1.5K tokens written to cache on that request, reported by the API)"), "{text}");
     assert!(
         text.contains("3.51K input tokens not sent to the model"),
         "{text}"
     );
     assert!(
-        text.contains("1 tool call repeated a cleared call"),
+        text.contains("1 read repeated a cleared call with no file change in between"),
         "{text}"
     );
     assert!(text.contains("7 tool results archived"), "{text}");
@@ -1901,6 +1902,64 @@ fn wrap_launches_claude_with_proxy_env() {
 }
 
 #[test]
+fn wrap_passes_every_later_argument_and_exempts_loopback_from_proxies() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let record = root.join("record");
+    let bin = fake_claude(
+        root,
+        &format!(
+            "{{ for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done; env | grep -E '^(NO_PROXY|no_proxy)='; }} > '{}'\nexit 0",
+            record.display()
+        ),
+    );
+    let mock = Mock::start(|_| ok_json());
+    let recorded = |args: &[&str], proxied: bool| {
+        let mut command = wrap_command(root, &bin, args);
+        command
+            .env("ANTHROPIC_BASE_URL", mock.url())
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy");
+        if proxied {
+            command
+                .env("HTTPS_PROXY", "http://proxy.corp.example:3128")
+                .env("NO_PROXY", "corp.example, .internal")
+                .env("no_proxy", "localhost");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&record).unwrap()
+    };
+    let args = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix("arg=").map(str::to_owned))
+            .collect()
+    };
+    // `--` and options Justless also has reach Claude Code unparsed.
+    let plain = recorded(&["claude", "--", "-p", "hi", "--root", "x"], false);
+    assert_eq!(args(&plain), ["--", "-p", "hi", "--root", "x"]);
+    assert!(!plain.contains("NO_PROXY"), "{plain}");
+    let proxied = recorded(&["--keep", "4", "claude", "--root", "x"], true);
+    assert_eq!(args(&proxied), ["--root", "x"]);
+    let hosts = "corp.example,.internal,localhost,127.0.0.1";
+    assert!(
+        proxied.contains(&format!("NO_PROXY={hosts}\n")),
+        "{proxied}"
+    );
+    assert!(
+        proxied.contains(&format!("no_proxy={hosts}\n")),
+        "{proxied}"
+    );
+    let other = wrap_command(root, &bin, &["codex"]).output().unwrap();
+    assert_eq!(other.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&other.stderr).contains("wrap launches Claude Code"));
+}
+
+#[test]
 fn wrap_relays_requests_and_summarizes_them() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -1952,7 +2011,7 @@ fn wrap_relays_requests_and_summarizes_them() {
     let canonical = root.canonicalize().unwrap();
     assert!(
         stderr.ends_with(&format!(
-            "justless: 1 request · 1 clear (0 on an expired cache) · 4 old tool results cleared · 2.01K input tokens not sent to the model · 6 tool results archived in {}/.justless\n",
+            "justless: 1 request · 1 clear (0 on an expired cache) · 4 old tool results marked for clearing · 2.01K input tokens not sent to the model · 6 tool results archived in {}/.justless\n",
             canonical.display()
         )),
         "{stderr}"

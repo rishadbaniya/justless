@@ -34,6 +34,46 @@ pub const PARITY: [&str; 2] = [
     "CLAUDE_CODE_GATEWAY_HINT_HEADERS",
 ];
 
+/// Claude Code sends its requests through `HTTPS_PROXY` or `HTTP_PROXY` when one is
+/// set, including requests for 127.0.0.1, unless `NO_PROXY` exempts them. Returns
+/// the list with loopback added, or `None` when no proxy is set or loopback is
+/// already exempt.
+fn no_proxy() -> Option<String> {
+    let set = |name: &str| env::var_os(name).is_some_and(|value| !value.is_empty());
+    let proxied = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| set(name));
+    if !proxied {
+        return None;
+    }
+    let mut hosts: Vec<String> = Vec::new();
+    for name in ["NO_PROXY", "no_proxy"] {
+        for host in env::var(name).unwrap_or_default().split(',') {
+            let host = host.trim();
+            if !host.is_empty() && !hosts.iter().any(|h| h == host) {
+                hosts.push(host.to_owned());
+            }
+        }
+    }
+    if hosts.iter().any(|h| h == "*") {
+        return None;
+    }
+    let before = hosts.len();
+    for host in ["127.0.0.1", "localhost"] {
+        if !hosts.iter().any(|h| h == host) {
+            hosts.push(host.to_owned());
+        }
+    }
+    (hosts.len() > before).then(|| hosts.join(","))
+}
+
 fn truthy(name: &str) -> bool {
     env::var(name).is_ok_and(|value| {
         let value = value.trim().to_ascii_lowercase();
@@ -102,7 +142,7 @@ fn plural(n: u64, one: &str, many: &str) -> String {
 }
 
 fn summary(totals: &Totals, archive: Option<&Path>) -> String {
-    if totals.requests == 0 {
+    if totals.seen == 0 {
         return "justless: the proxy received no requests. A settings file or managed policy may route Claude Code elsewhere.".into();
     }
     let mut parts = vec![
@@ -114,14 +154,20 @@ fn summary(totals: &Totals, archive: Option<&Path>) -> String {
         ),
         plural(
             totals.cleared_results,
-            "old tool result cleared",
-            "old tool results cleared",
+            "old tool result marked for clearing",
+            "old tool results marked for clearing",
         ),
         format!(
             "{} input tokens not sent to the model",
             short(totals.tokens_not_sent)
         ),
     ];
+    if totals.mismatches > 0 {
+        parts.push(format!(
+            "the API cleared a different number of calls on {}",
+            plural(totals.mismatches, "request", "requests")
+        ));
+    }
     if let Some(archive) = archive {
         parts.push(format!(
             "{} in {}",
@@ -163,6 +209,20 @@ fn ignore_terminal_signals() {
     }
 }
 
+/// Every argument after `claude`, exactly as given.
+fn claude_args(args: &ArgMatches) -> Result<Vec<OsString>> {
+    match args.subcommand() {
+        Some(("claude", sub)) => Ok(sub
+            .values_of_os("")
+            .map(|values| values.map(OsString::from).collect())
+            .unwrap_or_default()),
+        Some((other, _)) => bail!(
+            "wrap launches Claude Code: justless wrap [OPTIONS] claude [CLAUDE_ARGS]... (not {other})"
+        ),
+        None => bail!("usage: justless wrap [OPTIONS] claude [CLAUDE_ARGS]..."),
+    }
+}
+
 #[cfg(not(unix))]
 pub fn run(_ws: &Workspace, _args: &ArgMatches, _settings: Settings) -> Result<i32> {
     bail!(
@@ -172,11 +232,7 @@ pub fn run(_ws: &Workspace, _args: &ArgMatches, _settings: Settings) -> Result<i
 
 #[cfg(unix)]
 pub fn run(ws: &Workspace, args: &ArgMatches, settings: Settings) -> Result<i32> {
-    let claude_args: Vec<OsString> = args
-        .subcommand_matches("claude")
-        .and_then(|sub| sub.values_of_os("args"))
-        .map(|values| values.map(OsString::from).collect())
-        .unwrap_or_default();
+    let claude_args = claude_args(args)?;
     if env::var_os("JUSTLESS_PROXY").is_some() {
         bail!("this session already runs through a Justless proxy (JUSTLESS_PROXY is set)");
     }
@@ -228,6 +284,9 @@ pub fn run(ws: &Workspace, args: &ArgMatches, settings: Settings) -> Result<i32>
             command.env(name, "1");
         }
     }
+    if let Some(hosts) = no_proxy() {
+        command.env("NO_PROXY", &hosts).env("no_proxy", &hosts);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -251,19 +310,31 @@ mod tests {
 
     #[test]
     fn summarizes_a_session() {
-        let totals = Totals {
+        let mut totals = Totals {
+            seen: 230,
             requests: 214,
             moves: 4,
             cold_moves: 3,
             cleared_results: 412,
             tokens_not_sent: 2_910_000,
+            mismatches: 0,
             archived: 512,
             client_managed: 2,
         };
         assert_eq!(
             summary(&totals, Some(Path::new("/repo/.justless"))),
-            "justless: 214 requests · 4 clears (3 on an expired cache) · 412 old tool results cleared · 2.91M input tokens not sent to the model · 512 tool results archived in /repo/.justless · Claude Code cleared tool results itself in 2 conversations"
+            "justless: 214 requests · 4 clears (3 on an expired cache) · 412 old tool results marked for clearing · 2.91M input tokens not sent to the model · 512 tool results archived in /repo/.justless · Claude Code cleared tool results itself in 2 conversations"
         );
+        totals.mismatches = 3;
+        assert!(summary(&totals, None).contains(
+            "not sent to the model · the API cleared a different number of calls on 3 requests"
+        ));
         assert!(summary(&Totals::default(), None).contains("received no requests"));
+        // Probes alone show that Claude Code reached the proxy.
+        let probes = Totals {
+            seen: 2,
+            ..Totals::default()
+        };
+        assert!(summary(&probes, None).starts_with("justless: 0 requests"));
     }
 }

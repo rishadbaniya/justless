@@ -101,24 +101,16 @@ pub fn commands() -> Vec<Command<'static>> {
                     .help("Print one line per request to stderr, never bodies or header values"),
             )
             .args(clearing_args()),
+        // `claude` is taken as an external subcommand so that every argument after
+        // it, `--` and `--root` included, reaches Claude Code unparsed.
         Command::new("wrap")
             .about("Run Claude Code through a local proxy that clears old tool results")
+            .override_usage("justless wrap [OPTIONS] claude [CLAUDE_ARGS]...")
+            .after_help("Every argument after `claude` is passed to Claude Code unchanged.")
             .args(clearing_args())
             .subcommand_required(true)
-            .subcommand(
-                Command::new("claude")
-                    .about("Launch Claude Code; every later argument is passed to it")
-                    .trailing_var_arg(true)
-                    .allow_hyphen_values(true)
-                    .disable_help_flag(true)
-                    .arg(
-                        Arg::new("args")
-                            .multiple_values(true)
-                            .allow_hyphen_values(true)
-                            .allow_invalid_utf8(true)
-                            .value_name("CLAUDE_ARGS"),
-                    ),
-            ),
+            .allow_external_subcommands(true)
+            .allow_invalid_utf8_for_external_subcommands(true),
     ]
 }
 
@@ -277,16 +269,24 @@ impl Proxy {
         verbose: bool,
     ) -> Result<Self> {
         let upstream = Upstream::new(upstream)?;
+        let is_self = |port: u16| {
+            upstream.authority().is_some_and(|(host, upstream_port)| {
+                upstream_port == port
+                    && matches!(
+                        host.as_str(),
+                        "127.0.0.1" | "localhost" | "[::1]" | "::1" | "0.0.0.0"
+                    )
+            })
+        };
+        // Checked before binding a given port too, so the answer never depends
+        // on whether the port is free.
+        if port != 0 && is_self(port) {
+            bail!("the upstream {} is this proxy", upstream.base);
+        }
         let listener = TcpListener::bind(("127.0.0.1", port))
             .with_context(|| format!("listen on 127.0.0.1:{port}"))?;
         let addr = listener.local_addr()?;
-        if let Some((host, upstream_port)) = upstream.authority()
-            && upstream_port == addr.port()
-            && matches!(
-                host.as_str(),
-                "127.0.0.1" | "localhost" | "[::1]" | "::1" | "0.0.0.0"
-            )
-        {
+        if is_self(addr.port()) {
             bail!("the upstream {} is this proxy", upstream.base);
         }
         ws.prepare_state()?;
@@ -539,16 +539,52 @@ impl Planned {
     }
 }
 
-/// Counts new calls that repeat a cleared one, then remembers the calls cleared up
-/// to the boundary.
+/// Read-only tools: one repeated after its result was cleared suggests the model
+/// needed that result back.
+const READS: [&str; 6] = [
+    "Read",
+    "Grep",
+    "Glob",
+    "WebFetch",
+    "WebSearch",
+    "NotebookRead",
+];
+/// Tools that change files, after which reading again is expected.
+const WRITES: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+
+/// Counts new read-only calls that repeat a cleared one with no file change in
+/// between, then remembers the calls cleared up to the boundary. Reruns of tests
+/// or builds are not counted: their output is expected to change.
 fn count_repeats(calls: &mut state::Calls, req: &Request, boundary: usize) -> u64 {
-    let hash = |u: &plan::Use| plan::call_hash(&u.name, &req.block(u.call)["input"]);
+    let input = |u: &plan::Use| &req.block(u.call)["input"];
+    let hash = |u: &plan::Use| plan::call_hash(&u.name, input(u));
+    let path = |u: &plan::Use| {
+        let input = input(u);
+        input["file_path"]
+            .as_str()
+            .or_else(|| input["notebook_path"].as_str())
+    };
     let mut repeats = 0;
     if calls.started {
-        for tool_use in &req.uses {
-            if calls.seen.insert(tool_use.id.clone()) && calls.cleared.contains(&hash(tool_use)) {
-                repeats += 1;
+        for (at, tool_use) in req.uses.iter().enumerate() {
+            if !calls.seen.insert(tool_use.id.clone()) || !READS.contains(&tool_use.name.as_str()) {
+                continue;
             }
+            let Some(&cleared) = calls.cleared.get(&hash(tool_use)) else {
+                continue;
+            };
+            // A Read after an edit of its file, or a search after any edit,
+            // reads new content.
+            let changed = req
+                .uses
+                .get(cleared + 1..at)
+                .unwrap_or_default()
+                .iter()
+                .any(|between| {
+                    WRITES.contains(&between.name.as_str())
+                        && (tool_use.name != "Read" || path(between) == path(tool_use))
+                });
+            repeats += u64::from(!changed);
         }
     } else {
         // Calls already in the conversation when this process first sees it are
@@ -558,8 +594,14 @@ fn count_repeats(calls: &mut state::Calls, req: &Request, boundary: usize) -> u6
             .seen
             .extend(req.uses.iter().map(|tool_use| tool_use.id.clone()));
     }
-    for tool_use in req.uses.iter().take(boundary).skip(calls.hashed) {
-        calls.cleared.insert(hash(tool_use));
+    for (at, tool_use) in req
+        .uses
+        .iter()
+        .enumerate()
+        .take(boundary)
+        .skip(calls.hashed)
+    {
+        calls.cleared.insert(hash(tool_use), at);
     }
     calls.hashed = calls.hashed.max(boundary.min(req.uses.len()));
     repeats
@@ -1062,4 +1104,45 @@ fn relay(
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn request(calls: &[(&str, Value)]) -> Request {
+        let mut messages = vec![json!({"role":"user","content":"go"})];
+        for (i, (name, input)) in calls.iter().enumerate() {
+            let id = format!("toolu_{i:02}");
+            messages.push(json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":name,"input":input}]}));
+            messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"x"}]}));
+        }
+        let body =
+            serde_json::to_vec(&json!({"model":"claude-opus-5-5","messages":messages})).unwrap();
+        Request::read(&Body::parse(&body).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn repeats_count_only_reads_of_unchanged_content() {
+        let test = ("Bash", json!({"command":"cargo test --locked"}));
+        let read = ("Read", json!({"file_path":"src/parser.rs"}));
+        let other = ("Read", json!({"file_path":"src/lib.rs"}));
+        let grep = ("Grep", json!({"pattern":"parse"}));
+        let edit = (
+            "Edit",
+            json!({"file_path":"src/parser.rs","old_string":"a","new_string":"b"}),
+        );
+        let mut calls = state::Calls::default();
+        let first = [test.clone(), read.clone(), other.clone(), grep.clone()];
+        assert_eq!(count_repeats(&mut calls, &request(&first), 4), 0);
+        // Rerunning the tests is expected, and so is reading parser.rs or
+        // searching again after parser.rs was edited. Reading the unedited
+        // lib.rs again is the one repeat.
+        let mut later = first.to_vec();
+        later.extend([test, edit, read, other, grep]);
+        assert_eq!(count_repeats(&mut calls, &request(&later), 4), 1);
+        // A call is counted at most once.
+        assert_eq!(count_repeats(&mut calls, &request(&later), 4), 0);
+    }
 }
