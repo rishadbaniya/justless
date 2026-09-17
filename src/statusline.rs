@@ -491,12 +491,15 @@ fn prune(directory: &Path, keep: &Path) {
 }
 
 /// The user settings file Claude Code reads: `$CLAUDE_CONFIG_DIR/settings.json`,
-/// else `~/.claude/settings.json`.
+/// else `~/.claude/settings.json`, where `~` is `%USERPROFILE%` on Windows.
 fn user_settings() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|dir| !dir.is_empty())
+    let variable = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    variable("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .or_else(|| {
+            let home = variable("HOME").or_else(|| variable("USERPROFILE"))?;
+            Some(PathBuf::from(home).join(".claude"))
+        })
         .map(|dir| dir.join("settings.json"))
 }
 
@@ -545,7 +548,12 @@ enum Plan {
     /// A Justless status line already applies here, from the named file.
     Present(String),
     /// Another status line applies here, from the named file, with its command.
-    Kept(String, Option<String>),
+    /// `user` marks the user's settings, which apply in every project.
+    Kept {
+        label: String,
+        command: Option<String>,
+        user: bool,
+    },
 }
 
 fn plan(workspace: &Workspace) -> Result<Plan> {
@@ -566,16 +574,23 @@ fn plan(workspace: &Workspace) -> Result<Plan> {
         project.display()
     );
     let local = directory.join("settings.local.json");
+    // Each file with its label, whether a link is followed, and whether it is the
+    // user's own settings file.
     let mut sources = vec![
-        (local, ".claude/settings.local.json".to_owned(), true),
-        (project.clone(), ".claude/settings.json".to_owned(), false),
+        (local, ".claude/settings.local.json".to_owned(), true, false),
+        (
+            project.clone(),
+            ".claude/settings.json".to_owned(),
+            false,
+            false,
+        ),
     ];
     if let Some(user) = user {
         let label = user.display().to_string();
-        sources.push((user, label, true));
+        sources.push((user, label, true, true));
     }
     // The highest-precedence file that sets a status line decides which one shows.
-    for (path, label, follow) in &sources {
+    for (path, label, follow, user) in &sources {
         let Some(settings) = read_settings(path, *follow)? else {
             continue;
         };
@@ -587,7 +602,11 @@ fn plan(workspace: &Workspace) -> Result<Plan> {
         if command.as_deref().is_some_and(|c| c.contains(COMMAND)) {
             return Ok(Plan::Present(label.clone()));
         }
-        return Ok(Plan::Kept(label.clone(), command));
+        return Ok(Plan::Kept {
+            label: label.clone(),
+            command,
+            user: *user,
+        });
     }
     let mut settings = read_settings(&project, false)?.unwrap_or_else(|| json!({}));
     settings
@@ -641,10 +660,27 @@ pub fn install(workspace: &Workspace) -> Result<()> {
         Plan::Present(label) => {
             println!("{label} already shows Justless savings in the status line.");
         }
-        Plan::Kept(label, command) => {
+        Plan::Kept {
+            label,
+            command,
+            user: false,
+        } => {
             eprintln!(
                 "Kept the status line set in {label}. Claude Code shows each line a status line command prints as its own row, so to show both, set its \"command\" to:\n  {}",
                 serde_json::to_string(&combined(command.as_deref()))?
+            );
+        }
+        // Changing the user's command would add the Justless row to every project,
+        // so suggest the project's local settings, which override it here only.
+        Plan::Kept {
+            label,
+            command,
+            user: true,
+        } => {
+            let setting =
+                json!({"statusLine":{"type":"command","command":combined(command.as_deref())}});
+            eprintln!(
+                "Kept the status line set in {label}. Claude Code shows each line a status line command prints as its own row, so to show both in this project only, add this to .claude/settings.local.json:\n  {setting}"
             );
         }
     }

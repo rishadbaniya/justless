@@ -7124,9 +7124,22 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
             before
         );
         assert!(!root.join(".justless").exists());
-        // The suggested command prints both lines from the same session JSON.
-        let quoted = message.lines().last().unwrap().trim();
-        let combined: String = serde_json::from_str(quoted).unwrap();
+        // The suggested command prints both lines from the same session JSON. For
+        // a status line in the user's settings, it comes as a setting for this
+        // project's local file, so other projects keep theirs.
+        let suggested: serde_json::Value =
+            serde_json::from_str(message.lines().last().unwrap().trim()).unwrap();
+        let combined = if file.starts_with("user-config") {
+            assert!(message.contains("in this project only"), "{message}");
+            assert!(message.contains(".claude/settings.local.json"), "{message}");
+            assert_eq!(suggested["statusLine"]["type"], "command");
+            suggested["statusLine"]["command"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            suggested.as_str().unwrap().to_owned()
+        };
         let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         let mut child = Command::new("sh")
