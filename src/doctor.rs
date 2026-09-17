@@ -203,6 +203,23 @@ fn profiles() -> Vec<Profile> {
         .collect()
 }
 
+impl Profile {
+    /// A version requirement that finding the CLI on PATH does not show. The
+    /// installer runs `opencode --version`; doctor runs no agent CLI.
+    fn requirement(&self) -> &'static str {
+        if self.agent == Agent::OpenCode {
+            " (the plugin needs OpenCode v1)"
+        } else {
+            ""
+        }
+    }
+
+    /// The client's CLI line, such as `Claude Code: /usr/local/bin/claude`.
+    fn found(&self, cli: &Path) -> String {
+        format!("{}: {}{}", self.label, cli.display(), self.requirement())
+    }
+}
+
 /// One agent's hooks and instructions.
 struct AgentAudit<'p> {
     profile: &'p Profile,
@@ -275,7 +292,10 @@ impl Doctor<'_> {
             if set {
                 let mut section = Section::new(profile.name, profile.label);
                 section.checks.push(match &audit.cli {
-                    Some(cli) => Check::new(Status::Ok, format!("CLI: {}", cli.display())),
+                    Some(cli) => Check::new(
+                        Status::Ok,
+                        format!("CLI: {}{}", cli.display(), profile.requirement()),
+                    ),
                     None => Check::new(
                         Status::Warn,
                         format!(
@@ -312,9 +332,10 @@ impl Doctor<'_> {
                     Check::new(
                         Status::Warn,
                         format!(
-                            "{} is on PATH ({}) but not set up here",
+                            "{} is on PATH ({}) but not set up here{}",
                             profile.label,
-                            cli.display()
+                            cli.display(),
+                            profile.requirement()
                         ),
                     )
                     .fix(Fix::Init {
@@ -322,7 +343,7 @@ impl Doctor<'_> {
                         hooks: true,
                     })
                 } else {
-                    Check::new(Status::Ok, format!("{}: {}", profile.label, cli.display()))
+                    Check::new(Status::Ok, profile.found(cli))
                 });
             } else {
                 missing.push(profile.label);
@@ -399,10 +420,9 @@ impl Doctor<'_> {
         let mut agents_json = Vec::new();
         for (profile, cli) in profiles.iter().zip(clis) {
             match cli {
-                Some(cli) => agents.checks.push(Check::new(
-                    Status::Ok,
-                    format!("{}: {}", profile.label, cli.display()),
-                )),
+                Some(cli) => agents
+                    .checks
+                    .push(Check::new(Status::Ok, profile.found(cli))),
                 None => missing.push(profile.label),
             }
             agents_json.push(json!({
@@ -524,14 +544,14 @@ impl Doctor<'_> {
             .and_then(Path::parent)
             .map(quote)
             .unwrap_or_else(|| "DIR".into());
-        let use_this =
-            format!("export PATH={directory}:\"$PATH\"  # and add this line to your shell profile");
+        // Kept free of comments, which interactive zsh would pass to `export`.
+        let use_this = format!("export PATH={directory}:\"$PATH\"");
         let found = on_path("justless");
         match found.first() {
             None => section.checks.push(
                 Check::new(
                     Status::Fail,
-                    "`justless` is not on PATH. Hooks and MCP entries call it by name, so they cannot start.",
+                    "`justless` is not on PATH. Hooks and MCP entries call it by name, so they cannot start. Add the fix line to your shell profile too, so new agent sessions see it.",
                 )
                 .fix(Fix::Command(use_this)),
             ),
@@ -542,7 +562,7 @@ impl Doctor<'_> {
                 Some(version) if version == VERSION => Check::new(
                     Status::Warn,
                     format!(
-                        "`justless` on PATH is {}, another copy of {VERSION}. Hooks run that copy.",
+                        "`justless` on PATH is {}, another copy of {VERSION}. Hooks run that copy. To use this one, put its directory first on PATH here and in your shell profile.",
                         first.display()
                     ),
                 )
@@ -550,7 +570,7 @@ impl Doctor<'_> {
                 Some(version) => Check::new(
                     Status::Fail,
                     format!(
-                        "`justless` on PATH is {} at version {version}, but this binary is {VERSION}. Hooks run {version}, and doctor checks them against what {VERSION} writes.",
+                        "`justless` on PATH is {} at version {version}, but this binary is {VERSION}. Hooks run {version}, and doctor checks them against what {VERSION} writes. Put this binary's directory first on PATH here and in your shell profile, or install {VERSION} over that copy.",
                         first.display()
                     ),
                 )
@@ -1321,12 +1341,13 @@ fn routing_note(profile: &Profile, facts: &Facts) -> Option<Check> {
     ))
 }
 
-/// The `--agent` names of the clients found on PATH, in setup order.
+/// The `--agent` names of the clients found on PATH, in setup order. OpenCode is
+/// left out: its plugin needs v1, which only running `opencode` would show.
 fn detected(profiles: &[Profile], clis: &[Option<PathBuf>]) -> Vec<&'static str> {
     profiles
         .iter()
         .zip(clis)
-        .filter(|(_, cli)| cli.is_some())
+        .filter(|(profile, cli)| cli.is_some() && profile.requirement().is_empty())
         .map(|(profile, _)| profile.name)
         .collect()
 }

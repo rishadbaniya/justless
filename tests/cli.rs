@@ -5573,6 +5573,27 @@ fn doctor_names_stale_setup_and_its_fixes_clear_it() {
         "✗ Hooks: the before-command hook in .cursor/hooks.json has matcher \"^Shell$\", and setup writes \"Shell\"\n    by hand: In .cursor/hooks.json, set \"matcher\": \"Shell\" on the hook that runs `justless hook-cursor before-command`"
     ), "{text}");
     assert!(text.contains("3 problems"), "{text}");
+    let bin = tools.path().join("bin");
+    let output = doctor_shell(
+        root,
+        tools.path(),
+        bin.to_str().unwrap(),
+        "justless doctor --json",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["problems"], 3);
+    assert_eq!(
+        report["fixes"][0]["command"],
+        "justless init --hooks --agent claude"
+    );
+    assert!(
+        report["fixes"][1]["manual"]
+            .as_str()
+            .unwrap()
+            .starts_with("In .cursor/hooks.json, set \"matcher\": \"Shell\"")
+    );
 
     // The summary's command runs as printed and clears what setup can repair.
     let summary = text.split("To fix the problems:\n").nth(1).unwrap();
@@ -5653,15 +5674,17 @@ fn doctor_checks_the_justless_that_hooks_run() {
 #[cfg(unix)]
 #[test]
 fn doctor_outside_a_project_says_how_to_set_one_up() {
-    let tools = doctor_tools(&["gemini"]);
+    let tools = doctor_tools(&["gemini", "opencode"]);
     let folder = TempDir::new().unwrap();
     let before = doctor_snapshot(folder.path());
     let (status, text) = doctor_text(folder.path(), tools.path());
     assert_eq!(status, Some(0), "{text}");
     assert!(text.contains("justless doctor · no project at"), "{text}");
     assert!(text.contains("✓ Gemini CLI:"), "{text}");
+    // Without running `opencode --version`, doctor cannot tell whether it is v1.
+    assert!(text.contains("(the plugin needs OpenCode v1)"), "{text}");
     assert!(text.contains(
-        "If this folder is your project, set it up with: justless init --hooks --agent gemini"
+        "If this folder is your project, set it up with: justless init --hooks --agent gemini\n"
     ));
     assert_eq!(doctor_snapshot(folder.path()), before);
 
