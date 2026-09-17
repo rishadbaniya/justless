@@ -275,7 +275,7 @@ impl Index {
         refresh: Refresh,
     ) -> Self {
         let targets = targets(&cache.files, manifests);
-        let package_libraries = libraries(&targets);
+        let libraries = libraries(&targets);
         let units = source_units(&cache.files, &targets);
         let mut index = Self {
             definitions: Vec::new(),
@@ -367,7 +367,7 @@ impl Index {
                 .collect(),
             precise,
             imports,
-            package_libraries,
+            libraries,
             targets: &targets,
             definitions: &index.definitions,
             by_name: &index.by_name,
@@ -964,8 +964,11 @@ struct Target {
     entry: String,
     name: String,
     package: String,
+    /// Directory of the manifest that declares the target.
+    directory: String,
     library: bool,
-    dependencies: BTreeMap<String, String>,
+    /// Crate names from the manifest's dependency tables, as `dependencies()` reads them.
+    dependencies: BTreeMap<String, Option<String>>,
 }
 
 fn targets(
@@ -983,18 +986,10 @@ fn targets(
         };
         let package = rust_name(package);
         let directory = Path::new(path).parent().unwrap();
-        let dependencies = ["dependencies", "dev-dependencies", "build-dependencies"]
-            .into_iter()
-            .filter_map(|kind| manifest.get(kind).and_then(|item| item.as_table_like()))
-            .flat_map(|table| table.iter())
-            .map(|(name, item)| {
-                let declared = item
-                    .get("package")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or(name);
-                (rust_name(name), rust_name(declared))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let Some(manifest_directory) = normalize(directory) else {
+            continue;
+        };
+        let dependencies = dependencies(directory, manifest, manifests);
         let mut entries = BTreeSet::new();
         let mut add = |path: &str, name: &str, library| {
             if let Some(entry) = normalize(&directory.join(path))
@@ -1005,6 +1000,7 @@ fn targets(
                     entry,
                     name: rust_name(name),
                     package: package.clone(),
+                    directory: manifest_directory.clone(),
                     library,
                     dependencies: dependencies.clone(),
                 });
@@ -1070,23 +1066,81 @@ fn targets(
     targets
 }
 
+/// The crate names a manifest's dependency tables bring into scope, each mapped
+/// to the directory of the crate a path dependency points at. A registry or git
+/// dependency maps to `None`: it stays external even when a workspace crate has
+/// the same package name, as when a crate tests itself against its published
+/// release. `name.workspace = true` takes the path from the workspace root.
+fn dependencies(
+    directory: &Path,
+    manifest: &toml_edit::DocumentMut,
+    manifests: &BTreeMap<String, toml_edit::DocumentMut>,
+) -> BTreeMap<String, Option<String>> {
+    let workspace = workspace_root(directory, manifest, manifests);
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .filter_map(|kind| manifest.get(kind).and_then(|item| item.as_table_like()))
+        .flat_map(|table| table.iter())
+        .map(|(name, item)| {
+            let declared = if item.get("workspace").and_then(|item| item.as_bool()) == Some(true) {
+                workspace.as_ref().and_then(|(root, document)| {
+                    let entry = document.get("workspace")?.get("dependencies")?.get(name)?;
+                    Some((root.as_path(), entry))
+                })
+            } else {
+                Some((directory, item))
+            };
+            let source = declared
+                .and_then(|(base, entry)| normalize(&base.join(entry.get("path")?.as_str()?)));
+            (rust_name(name), source)
+        })
+        .collect()
+}
+
+/// The workspace root manifest and its directory for the manifest in
+/// `directory`: the manifest itself when it declares `[workspace]`, the root
+/// that `package.workspace` names, or the nearest enclosing `[workspace]`.
+fn workspace_root<'a>(
+    directory: &Path,
+    manifest: &'a toml_edit::DocumentMut,
+    manifests: &'a BTreeMap<String, toml_edit::DocumentMut>,
+) -> Option<(PathBuf, &'a toml_edit::DocumentMut)> {
+    if manifest.contains_key("workspace") {
+        return Some((directory.to_path_buf(), manifest));
+    }
+    let candidates = match manifest
+        .get("package")
+        .and_then(|item| item.get("workspace"))
+        .and_then(|item| item.as_str())
+    {
+        Some(root) => vec![directory.join(root)],
+        None => directory
+            .ancestors()
+            .skip(1)
+            .map(Path::to_path_buf)
+            .collect(),
+    };
+    candidates.into_iter().find_map(|root| {
+        let root = PathBuf::from(normalize(&root)?);
+        let document = manifests.get(&normalize(&root.join("Cargo.toml"))?)?;
+        document
+            .contains_key("workspace")
+            .then_some((root, document))
+    })
+}
+
 fn rust_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
-fn libraries(targets: &[Target]) -> BTreeMap<String, Vec<usize>> {
-    let mut names = BTreeMap::<String, Vec<usize>>::new();
-    for (id, target) in targets
+/// The library target of each manifest directory.
+fn libraries(targets: &[Target]) -> BTreeMap<&str, usize> {
+    targets
         .iter()
         .enumerate()
         .filter(|(_, target)| target.library)
-    {
-        names.entry(target.name.clone()).or_default().push(id);
-        if target.package != target.name {
-            names.entry(target.package.clone()).or_default().push(id);
-        }
-    }
-    names
+        .map(|(id, target)| (target.directory.as_str(), id))
+        .collect()
 }
 
 fn normalize(path: &Path) -> Option<String> {
@@ -1213,7 +1267,7 @@ struct Resolver<'a> {
     aliases: BTreeSet<&'a str>,
     precise: HashMap<(usize, Vec<String>), Vec<usize>>,
     imports: HashMap<(usize, Vec<String>), Vec<Binding<'a>>>,
-    package_libraries: BTreeMap<String, Vec<usize>>,
+    libraries: BTreeMap<&'a str, usize>,
     targets: &'a [Target],
     definitions: &'a [Definition],
     by_name: &'a BTreeMap<String, Vec<usize>>,
@@ -1389,13 +1443,17 @@ impl Resolver<'_> {
             }
         }
         let target = self.targets.get(namespace)?;
-        let package = target.dependencies.get(first).unwrap_or(first);
-        let library = self.package_libraries.get(package).and_then(|ids| {
-            unique(ids.iter().copied().filter(|&id| {
-                target.dependencies.contains_key(first)
-                    || self.targets[id].package == target.package
-            }))
-        })?;
+        let library = match target.dependencies.get(first) {
+            // A path dependency reaches the library in the directory it names.
+            // A registry or git dependency is external, whatever its package name.
+            Some(directory) => *self.libraries.get(directory.as_deref()?)?,
+            // Binaries, tests, examples and benches reach their own package's library.
+            None => {
+                let id = *self.libraries.get(target.directory.as_str())?;
+                let library = &self.targets[id];
+                (library.name == *first || library.package == *first).then_some(id)?
+            }
+        };
         self.resolve_path(library, &[], None, rest, IMPORT_HOPS, depth + 1)
     }
 }

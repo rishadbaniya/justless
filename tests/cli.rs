@@ -7517,3 +7517,120 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
     .unwrap();
     assert_eq!(listed, format!("{}\n", nested.display()));
 }
+
+/// Write `files` (path, contents) under `root`, creating parent directories.
+fn write_tree(root: &Path, files: &[(&str, &str)]) {
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+}
+
+#[test]
+fn renamed_registry_dependency_calls_are_not_local_callers() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_tree(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"ctrlc\", \"app\"]\n",
+            ),
+            (
+                "ctrlc/Cargo.toml",
+                "[package]\nname = \"ctrlc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dev-dependencies]\nupstream_ctrlc = { package = \"ctrlc\", version = \"=3.5.2\" }\n",
+            ),
+            (
+                "ctrlc/src/lib.rs",
+                "pub fn set_handler(handler: fn()) {\n    handler();\n}\n",
+            ),
+            (
+                "ctrlc/tests/signals.rs",
+                "fn through_registry() {\n    upstream_ctrlc::set_handler(|| {}).unwrap();\n}\n\
+                 fn through_local() {\n    ctrlc::set_handler(|| {});\n}\n",
+            ),
+            // A renamed dependency that really points at the workspace crate still resolves.
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nlocal_alias = { package = \"ctrlc\", path = \"../ctrlc\" }\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "pub fn install() {\n    local_alias::set_handler(|| {});\n}\n",
+            ),
+        ],
+    );
+    let callers = success(root, &["query", "ctrlc::set_handler", "--view", "callers"]);
+    assert!(
+        callers.contains("through_local") && callers.contains("ctrlc/tests/signals.rs:5"),
+        "{callers}"
+    );
+    assert!(
+        callers.contains("install") && callers.contains("app/src/lib.rs:2"),
+        "{callers}"
+    );
+    assert!(
+        !callers.contains("through_registry") && !callers.contains("signals.rs:2"),
+        "{callers}"
+    );
+}
+
+#[test]
+fn inherited_dependencies_resolve_to_the_crate_their_path_names() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_tree(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"engine\", \"app\", \"other\"]\n\n\
+                 [workspace.dependencies]\nengine = { path = \"engine\" }\n\
+                 fast = { package = \"engine\", path = \"./engine/\" }\n\
+                 published = { package = \"engine\", version = \"1\" }\n",
+            ),
+            (
+                "engine/Cargo.toml",
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("engine/src/lib.rs", "pub fn start() {}\n"),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nengine = { workspace = true }\nfast.workspace = true\n\
+                 published = { workspace = true }\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "pub fn through_path() {\n    engine::start();\n}\n\
+                 pub fn through_dotted() {\n    fast::start();\n}\n\
+                 pub fn through_published() {\n    published::start();\n}\n",
+            ),
+            // A registry dependency that shares the workspace crate's name stays external.
+            (
+                "other/Cargo.toml",
+                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nengine = \"1\"\n",
+            ),
+            (
+                "other/src/lib.rs",
+                "pub fn through_registry() {\n    engine::start();\n}\n",
+            ),
+        ],
+    );
+    let callers = success(root, &["query", "engine::start", "--view", "callers"]);
+    for expected in [
+        "app::through_path at app/src/lib.rs:2",
+        "app::through_dotted at app/src/lib.rs:5",
+    ] {
+        assert!(callers.contains(expected), "{expected}\n{callers}");
+    }
+    assert!(
+        !callers.contains("through_published") && !callers.contains("through_registry"),
+        "{callers}"
+    );
+}
