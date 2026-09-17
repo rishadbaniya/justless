@@ -92,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.
 
 Clients without hooks, such as VS Code, can use the read-only tools over MCP: `justless mcp --install vscode`. For another project later, run `justless init --hooks --agent claude` there.
 
-**Check it works:** `justless run -- git status` ends with a `[justless run-…]` line, and `justless stats` shows what was saved. To update or remove justless, see [install options](docs/reference.md#install-and-configure-agents) and the [FAQ](docs/faq.md).
+**Check it works:** `justless doctor` checks the setup and prints a fix for anything missing, `justless run -- git status` ends with a `[justless run-…]` line, and `justless stats` shows what was saved. To update or remove justless, see [install options](docs/reference.md#install-and-configure-agents) and the [FAQ](docs/faq.md).
 
 ## How it works
 

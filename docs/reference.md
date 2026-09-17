@@ -31,6 +31,7 @@
 | `justless stats --days 7 --json` | Bytes kept out of context with an estimated token count, a daily timeline, savings by command, full-log reopenings, repeated reads and commands passed through by hooks |
 | `justless discover --days 30 --json` | Shell commands Claude Code ran in this workspace, split into those routed through Justless, supported commands that were not routed, supported tools in a form the hooks pass through, and unsupported commands, with output sizes |
 | `justless mcp` | A stdio MCP server for the read-only commands. `--install CLIENT` adds it to a client's project config. |
+| `justless doctor --json` | Whether this project's setup works: the `justless` on `PATH`, each agent's CLI, hooks and instructions compared with what `init` writes, MCP entries and `.justless/`, with a fix for each problem. Exits 1 when something needs fixing. [Details](#check-the-setup) |
 
 ## Indexing and languages
 
@@ -469,3 +470,14 @@ Request boundary (justless proxy), last 7 day(s)
 ```
 
 Results marked for clearing, their bytes and their estimated tokens are the proxy's plan, counted once per result when its boundary moved. Input tokens not sent are the API's own figures, summed over every request that carried the edit, and a request where the API cleared a different number of calls than planned is listed separately, here and in the closing line of `wrap`. A repeated read is a Read, Grep, Glob, WebFetch, WebSearch or NotebookRead call with the same input as a cleared one and no edit of the file, or for searches no edit at all, in between: a sign that the model needed that result back. Test and build reruns are not counted. `--json` adds a `proxy` object with the same counts, the API's usage totals, moves split into `cold` and `payback`, `mismatches` where the API cleared a different number of calls than planned, and `unobserved` compressed responses. It is `null` when the proxy never ran in the project.
+
+## Check the setup
+
+`justless doctor` checks the project it runs in, or the one `--root` names. Each line starts with `✓` for a pass, `!` for something worth a look, `✗` for something that needs fixing, or `·` for information. A `!` or `✗` line names its fix: a command to run from the same directory, or an edit to make by hand. The report ends with the fixes for every `✗`, with the `init` runs combined into one command, and doctor exits 1 when any `✗` remains. `--json` returns the same checks with `status`, `message` and `fix`, plus the counts behind them.
+
+- **Binary.** The running version and path, and whether `justless` on `PATH` is the same file. Hooks and MCP entries call `justless` by name, so a missing one, or a copy with another version, is a `✗`. Shadowed copies are listed. An agent starts hooks with its own `PATH`, which can differ from your shell's.
+- **Agents.** Each client's CLI on `PATH`, detected as the installer detects it. A client with Justless hooks, or with a Justless section in `CLAUDE.md`, `GEMINI.md` or `AGENTS.md` and no hooks, has its hook file compared with what `init --hooks` writes now. Running `init` again adds a missing hook, such as a compaction hook added after setup, and replaces an older instruction block. Setup keeps an existing entry as it is, so a changed matcher, a Copilot command without `|| true` or another client's handler is fixed by hand, and doctor names the file and key. A changed timeout is a warning. When `CLAUDE.md` imports a file with a line such as `@AGENTS.md`, the imported file's section counts.
+- **MCP.** Each client config that lists a `justless` server, and whether its command and arguments start the server.
+- **State.** Whether `.justless/` is a writable, private directory with its own `.gitignore`, the index size and when it was saved, the number of runs, how many of the newest 500 hooks routed and when the last one ran, the size of archived runs and retired tool results, and whether `.justless.toml` loads. Runs do not record which client routed them, so a client with hooks gets a "has not routed a command" note only while no hook has routed or passed through any command.
+
+Doctor only reads. It does not refresh the index, take a lock, create `.justless/` or start an agent's CLI. It runs another `justless` only to ask its version. Outside a project, or in the home directory, it checks the binary and the agents on `PATH` and prints the `init` command for the clients it found.
