@@ -1373,11 +1373,15 @@ impl Resolver<'_> {
     /// Whether code in `unit` can call a method that definition `id` declares.
     /// A crate can only hold values of its own types and its dependencies', so
     /// `thread::Builder::new().name(…)` in one crate is not a call to a `name`
-    /// method of a crate it does not depend on. Code outside a known target can.
+    /// method of a crate it does not depend on. Only a library is shared: a
+    /// method of a test, example, bench, binary or build script is reachable
+    /// from that target alone. Code outside a known target can reach any method.
     fn reaches(&self, unit: &Unit, id: usize) -> bool {
         match (unit.target, self.owners[id]) {
             (Some(from), Some(owner)) => {
-                self.reach[from].contains(self.targets[owner].directory.as_str())
+                owner == from
+                    || (self.targets[owner].library
+                        && self.reach[from].contains(self.targets[owner].directory.as_str()))
             }
             _ => true,
         }
@@ -1404,7 +1408,10 @@ impl Resolver<'_> {
                 .flatten()
                 .copied()
                 .filter(|&id| self.definitions[id].kind == "method" && self.reaches(unit, id));
-            if let Some(id) = unique(candidates) {
+            // A method that calls its own name on a value of unknown type most
+            // often forwards to another type, as `alloc` does with
+            // `System.alloc(layout)`. A call through `self` already resolved.
+            if let Some(id) = unique(candidates).filter(|&id| Some(id) != from) {
                 resolved.push((id, reference.kind, true));
             }
             return;

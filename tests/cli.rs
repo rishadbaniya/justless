@@ -7888,3 +7888,57 @@ fn inferred_method_calls_stay_within_reachable_crates() {
     );
     assert!(!callers.contains("spawn_listener"), "{callers}");
 }
+
+#[test]
+fn inferred_method_calls_reach_test_methods_only_from_their_own_target() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"relay\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            // `tx` is a std channel sender, so its `send` is not the test's.
+            (
+                "src/lib.rs",
+                "pub mod alloc;\n\npub fn notify() {\n    let (tx, _rx) = std::sync::mpsc::channel();\n    tx.send(()).unwrap();\n}\n",
+            ),
+            // A method that forwards to a method of the same name on another
+            // value does not call itself.
+            (
+                "src/alloc.rs",
+                "pub struct Counting<A>(A);\n\nimpl<A> Counting<A> {\n    pub fn alloc(&self, size: usize) -> usize {\n        self.0.alloc(size)\n    }\n}\n",
+            ),
+            (
+                "tests/signals.rs",
+                "struct Run;\n\nimpl Run {\n    fn send(&mut self, name: &str) {\n        let _ = name;\n    }\n}\n\nfn check(script: impl Fn(&mut Run)) {\n    script(&mut Run);\n}\n\n#[test]\nfn sigint() {\n    check(|run| run.send(\"INT\"));\n}\n",
+            ),
+        ],
+    );
+    let callers = success(
+        root,
+        &[
+            "query",
+            "relay_test_signals::Run::send",
+            "--view",
+            "callers",
+        ],
+    );
+    assert!(
+        callers.contains("possible call from relay_test_signals::sigint at tests/signals.rs:15"),
+        "{callers}"
+    );
+    assert!(!callers.contains("notify"), "{callers}");
+    let alloc = success(
+        root,
+        &[
+            "query",
+            "relay::alloc::Counting::alloc",
+            "--view",
+            "callers",
+        ],
+    );
+    assert!(!alloc.contains("call from"), "{alloc}");
+}
