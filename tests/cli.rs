@@ -7890,6 +7890,62 @@ fn inferred_method_calls_stay_within_reachable_crates() {
 }
 
 #[test]
+fn inferred_method_calls_follow_workspace_and_platform_dependencies() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let manifest = |name: &str, dependencies: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{dependencies}"
+        )
+    };
+    let label = |name: &str| {
+        format!(
+            "pub fn {name}(functions: &[F]) -> usize {{\n    functions.iter().map(|f| f.name().len()).sum()\n}}\n"
+        )
+    };
+    let renamed = manifest("renamed", "[dependencies]\nwabi = { workspace = true }\n");
+    let unix = manifest(
+        "unix",
+        "[target.'cfg(unix)'.dependencies]\nabi = { path = \"../abi\" }\n",
+    );
+    let other = manifest("other", "");
+    let (renamed_label, unix_label, other_label) = (
+        label("renamed_label"),
+        label("unix_label"),
+        label("other_label"),
+    );
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"abi\", \"renamed\", \"unix\", \"other\"]\n\n[workspace.dependencies]\nwabi = { path = \"abi\", package = \"abi\" }\n",
+            ),
+            ("abi/Cargo.toml", &manifest("abi", "")),
+            (
+                "abi/src/lib.rs",
+                "pub struct Function {\n    name: String,\n}\n\nimpl Function {\n    pub fn name(&self) -> &str {\n        &self.name\n    }\n}\n",
+            ),
+            // The rename lives in `[workspace.dependencies]`.
+            ("renamed/Cargo.toml", &renamed),
+            ("renamed/src/lib.rs", &renamed_label),
+            ("unix/Cargo.toml", &unix),
+            ("unix/src/lib.rs", &unix_label),
+            // A crate that does not depend on `abi` cannot hold a `Function`.
+            ("other/Cargo.toml", &other),
+            ("other/src/lib.rs", &other_label),
+        ],
+    );
+    let callers = success(root, &["query", "abi::Function::name", "--view", "callers"]);
+    assert!(
+        callers.contains("possible call from renamed::renamed_label at renamed/src/lib.rs:2")
+            && callers.contains("possible call from unix::unix_label at unix/src/lib.rs:2"),
+        "{callers}"
+    );
+    assert!(!callers.contains("other_label"), "{callers}");
+}
+
+#[test]
 fn inferred_method_calls_reach_test_methods_only_from_their_own_target() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
