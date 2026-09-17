@@ -308,11 +308,13 @@ impl Index {
         };
         let mut precise = HashMap::<(usize, Vec<String>), Vec<usize>>::new();
         let mut origins = Vec::new();
+        let mut owners = Vec::new();
         for unit in &units {
             let parsed = &cache.files[&unit.file];
             origins.push(index.definitions.len());
             for symbol in &parsed.syntax.symbols {
                 let id = index.definitions.len();
+                owners.push(unit.target);
                 let mut path = unit.module.clone();
                 path.extend_from_slice(&symbol.path);
                 let prefix = unit
@@ -368,6 +370,8 @@ impl Index {
             precise,
             imports,
             libraries,
+            reach: reachable_packages(&targets),
+            owners,
             targets: &targets,
             definitions: &index.definitions,
             by_name: &index.by_name,
@@ -1186,6 +1190,47 @@ fn libraries(targets: &[Target]) -> BTreeMap<&str, usize> {
         .collect()
 }
 
+/// The package directories whose types code in each target can hold: its own
+/// and those it depends on through path dependencies, directly or through other
+/// packages in the workspace. A registry or git dependency reaches no indexed
+/// package, even one with the same name.
+fn reachable_packages(targets: &[Target]) -> Vec<BTreeSet<&str>> {
+    let mut dependencies = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for target in targets {
+        let reached = dependencies.entry(target.directory.as_str()).or_default();
+        for (name, dependency) in &target.dependencies {
+            match dependency {
+                Dependency::Path(directory) => {
+                    reached.insert(directory.as_str());
+                }
+                // Resolved as `resolve_path` does: the one indexed library of that name.
+                Dependency::Inherited => {
+                    let mut named = targets
+                        .iter()
+                        .filter(|t| t.library && (t.name == *name || t.package == *name));
+                    if let (Some(only), None) = (named.next(), named.next()) {
+                        reached.insert(only.directory.as_str());
+                    }
+                }
+                Dependency::External => {}
+            }
+        }
+    }
+    targets
+        .iter()
+        .map(|target| {
+            let mut reached = BTreeSet::new();
+            let mut queue = vec![target.directory.as_str()];
+            while let Some(directory) = queue.pop() {
+                if reached.insert(directory) {
+                    queue.extend(dependencies.get(directory).into_iter().flatten().copied());
+                }
+            }
+            reached
+        })
+        .collect()
+}
+
 fn normalize(path: &Path) -> Option<String> {
     let mut relative = PathBuf::new();
     for component in path.components() {
@@ -1311,6 +1356,10 @@ struct Resolver<'a> {
     precise: HashMap<(usize, Vec<String>), Vec<usize>>,
     imports: HashMap<(usize, Vec<String>), Vec<Binding<'a>>>,
     libraries: BTreeMap<&'a str, usize>,
+    /// The package directories each target can reach, by target.
+    reach: Vec<BTreeSet<&'a str>>,
+    /// The target that defines each Rust definition, by definition.
+    owners: Vec<Option<usize>>,
     targets: &'a [Target],
     definitions: &'a [Definition],
     by_name: &'a BTreeMap<String, Vec<usize>>,
@@ -1321,6 +1370,19 @@ struct Resolver<'a> {
 const IMPORT_HOPS: u8 = 3;
 
 impl Resolver<'_> {
+    /// Whether code in `unit` can call a method that definition `id` declares.
+    /// A crate can only hold values of its own types and its dependencies', so
+    /// `thread::Builder::new().name(…)` in one crate is not a call to a `name`
+    /// method of a crate it does not depend on. Code outside a known target can.
+    fn reaches(&self, unit: &Unit, id: usize) -> bool {
+        match (unit.target, self.owners[id]) {
+            (Some(from), Some(owner)) => {
+                self.reach[from].contains(self.targets[owner].directory.as_str())
+            }
+            _ => true,
+        }
+    }
+
     /// Targets of one reference: its own target, or every definition that shares
     /// that path (marked possible), plus the type that owns an enum variant or
     /// associated item, such as `Status` in `Status::Open` or `Widget` in `Widget::new()`.
@@ -1341,7 +1403,7 @@ impl Resolver<'_> {
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|&id| self.definitions[id].kind == "method");
+                .filter(|&id| self.definitions[id].kind == "method" && self.reaches(unit, id));
             if let Some(id) = unique(candidates) {
                 resolved.push((id, reference.kind, true));
             }

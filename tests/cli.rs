@@ -7839,3 +7839,52 @@ fn pack_surfaces_hook_configuration_for_a_hooks_question() {
         "{signals}"
     );
 }
+
+#[test]
+fn inferred_method_calls_stay_within_reachable_crates() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"abi\", \"signals\", \"app\"]\n",
+            ),
+            (
+                "abi/Cargo.toml",
+                "[package]\nname = \"abi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "abi/src/lib.rs",
+                "pub struct Function {\n    name: String,\n}\n\nimpl Function {\n    pub fn name(&self) -> &str {\n        &self.name\n    }\n}\n\npub fn describe(function: &Function) -> String {\n    function.name().to_owned()\n}\n",
+            ),
+            // `Builder::name` is std's, and this crate cannot reach `abi`.
+            (
+                "signals/Cargo.toml",
+                "[package]\nname = \"signals\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "signals/src/lib.rs",
+                "pub fn spawn_listener() {\n    std::thread::Builder::new()\n        .name(\"ctrl-c\".into())\n        .spawn(|| {})\n        .unwrap();\n}\n",
+            ),
+            // A dependent crate can hold a `Function`, so a call on an untyped
+            // closure parameter stays a possible call.
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nabi = { path = \"../abi\" }\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "pub fn label(functions: &[abi::Function]) -> usize {\n    functions.iter().map(|f| f.name().len()).sum()\n}\n",
+            ),
+        ],
+    );
+    let callers = success(root, &["query", "abi::Function::name", "--view", "callers"]);
+    assert!(
+        callers.contains("call from abi::describe")
+            && callers.contains("possible call from app::label at app/src/lib.rs:2"),
+        "{callers}"
+    );
+    assert!(!callers.contains("spawn_listener"), "{callers}");
+}
