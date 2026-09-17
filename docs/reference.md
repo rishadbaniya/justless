@@ -32,6 +32,7 @@
 | `justless discover --days 30 --json` | Shell commands Claude Code ran in this workspace, split into those routed through Justless, supported commands that were not routed, supported tools in a form the hooks pass through, and unsupported commands, with output sizes |
 | `justless mcp` | A stdio MCP server for the read-only commands. `--install CLIENT` adds it to a client's project config. |
 | `justless doctor --json` | Whether this project's setup works: the `justless` on `PATH`, each agent's CLI, hooks and instructions compared with what `init` writes, MCP entries and `.justless/`, with a fix for each problem. Exits 1 when something needs fixing. [Details](#check-the-setup) |
+| `justless init --remove --dry-run` | Each file that removing Justless from the project would change, and how. Drop `--dry-run` to make the changes. `--agent NAME` limits them to some clients, and `--purge` also deletes `.justless/`. |
 
 ## Indexing and languages
 
@@ -481,3 +482,13 @@ Results marked for clearing, their bytes and their estimated tokens are the prox
 - **State.** Whether `.justless/` is a private directory with its own `.gitignore`, whose directories accept new files and whose lock files open for writing, the index size and when it was saved, the number of runs, how many of the newest 500 hooks routed and when the last one ran, the size of archived runs and retired tool results, and whether `.justless.toml` loads. Runs do not record which client routed them, so a client with hooks gets a "has not routed a command" note only while no hook has routed or passed through any command.
 
 Doctor only reads. It does not refresh the index, take a lock, create `.justless/` or start an agent's CLI. It runs another `justless` only to ask its version. Outside a project, where neither the directory nor a parent has `.git`, `.justless/` or a project file such as `Cargo.toml` or `package.json`, or in the home directory, it checks the binary and the agents on `PATH` and prints the `init` command for the clients it found.
+
+## Remove Justless from a project
+
+`justless init --remove` undoes `init` and `mcp --install`. Without `--agent` it covers every client: the section between the Justless markers in `CLAUDE.md`, `AGENTS.md` and `GEMINI.md`, each hook handler that runs `justless hook-…`, a Claude Code `statusLine` that runs `justless`, the `justless` server in each MCP config and the OpenCode plugin. Every other instruction, hook, server and key stays. A file left with nothing else is deleted, along with a client directory such as `.github/hooks/` that it leaves empty. A linked instructions file is handled as setup handles it.
+
+Setup records each file it writes, as it was before, in `.justless/setup.json`. A file that still holds exactly what Justless wrote comes back byte for byte, including a layout, final newline or empty array that setup changed. Any other file, such as one edited since or one in a fresh clone, loses only the Justless entries, and the containers they leave empty, with the rest of its bytes unchanged. Setup writes JSON in a two-space layout, so such a file keeps that layout.
+
+Every file is read and checked first. A config file that does not parse, or an instructions file with incomplete or duplicate markers, stops the removal before anything changes, and the error names the file. Fix it, or leave its client out with `--agent`. `--dry-run` prints each change and makes none. A second run reports nothing to remove. `.justless/` and the `/.justless/` line in `.gitignore` stay unless you add `--purge`, which deletes the archived runs, index and history.
+
+`--agent NAME`, repeatable, removes only those clients' hooks, MCP entries and instructions. `--agent copilot` also covers VS Code's `.vscode/mcp.json`. A shared file such as `AGENTS.md` keeps its section while another client that reads it still has Justless hooks, its plugin or an MCP entry, and the output says which. `--purge` cannot be combined with `--agent`. Start a new agent session afterwards, since clients load hooks when a session starts.

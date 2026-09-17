@@ -6132,3 +6132,313 @@ fn doctor_finds_a_project_by_the_files_that_mark_its_root() {
         "{text}"
     );
 }
+
+/// Every path under `root` with its contents, link target or a directory marker.
+fn removal_tree(root: &Path) -> std::collections::BTreeMap<String, String> {
+    fn walk(root: &Path, dir: &Path, tree: &mut std::collections::BTreeMap<String, String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.file_type().is_symlink() {
+                let target = fs::read_link(&path).unwrap();
+                tree.insert(name, format!("link to {}", target.display()));
+            } else if metadata.is_dir() {
+                tree.insert(format!("{name}/"), "directory".into());
+                walk(root, &path, tree);
+            } else {
+                tree.insert(
+                    name,
+                    String::from_utf8_lossy(&fs::read(&path).unwrap()).into(),
+                );
+            }
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    walk(root, root, &mut tree);
+    tree
+}
+
+fn install_everything(root: &Path) {
+    success(
+        root,
+        &[
+            "init", "--hooks", "--agent", "codex", "--agent", "claude", "--agent", "agy",
+            "--agent", "opencode", "--agent", "cursor", "--agent", "gemini", "--agent", "copilot",
+        ],
+    );
+    success(
+        root,
+        &[
+            "mcp",
+            "--install",
+            "claude",
+            "cursor",
+            "gemini",
+            "vscode",
+            "codex",
+        ],
+    );
+}
+
+#[test]
+fn init_remove_restores_every_file_byte_for_byte() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    // Hand formatting, missing final newlines and empty containers, all of which
+    // setup reflows or fills, come back exactly.
+    write_files(
+        &root,
+        &[
+            ("package.json", "{\"name\":\"demo\"}\n"),
+            ("AGENTS.md", "# Team rules\n\nUse tabs."),
+            ("CLAUDE.md", "# Claude notes\n"),
+            (".gitignore", "target/\nnode_modules/"),
+            (
+                ".claude/settings.json",
+                "{\n    \"permissions\": { \"allow\": [\"Bash(ls:*)\"] },\n    \"hooks\": {\n        \"PreToolUse\": [],\n        \"PostToolUse\": [ { \"matcher\": \"Write\", \"hooks\": [ { \"type\": \"command\", \"command\": \"prettier --write\" } ] } ]\n    }\n}\n",
+            ),
+            (
+                ".codex/hooks.json",
+                r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}"#,
+            ),
+            (
+                ".codex/config.toml",
+                "# Codex\nmodel = \"o4\"  # pinned\n\n[mcp_servers.docs]\ncommand = \"docs-mcp\"\n",
+            ),
+            (
+                ".cursor/mcp.json",
+                "{\n  \"mcpServers\": {\n    \"linear\": { \"command\": \"linear-mcp\" }\n  }\n}\n",
+            ),
+            (
+                ".gemini/settings.json",
+                "{\n\t\"theme\": \"dark\",\n\t\"hooks\": {\"BeforeTool\": [{\"matcher\": \"write_file\", \"hooks\": [{\"type\": \"command\", \"command\": \"scan\"}]}]}\n}\n",
+            ),
+            (".vscode/mcp.json", "{ \"servers\": {}, \"inputs\": [] }\n"),
+            (
+                ".mcp.json",
+                r#"{"mcpServers": {"github": {"command": "gh-mcp", "args": ["--ro"]}}}"#,
+            ),
+            (".github/workflows/ci.yml", "name: ci\n"),
+        ],
+    );
+    let original = removal_tree(&root);
+
+    // Removal in a project without Justless changes nothing, not even .justless/.
+    let output = success(&root, &["init", "--remove"]);
+    assert_eq!(
+        output,
+        format!("Nothing to remove in {}.\n", root.display())
+    );
+    assert_eq!(removal_tree(&root), original);
+
+    install_everything(&root);
+    let installed = removal_tree(&root);
+    assert_ne!(installed, original);
+
+    let preview = success(&root, &["init", "--remove", "--dry-run"]);
+    assert_eq!(removal_tree(&root), installed);
+    for line in [
+        "\n  AGENTS.md: remove the Justless section\n",
+        "\n  GEMINI.md: remove the Justless section and delete the file, which held nothing else\n",
+        "\n  .claude/settings.json: remove 6 hooks\n",
+        "\n  .codex/config.toml: remove the justless MCP server\n",
+        "\n  .gemini/settings.json: remove 2 hooks and the justless MCP server\n",
+        "\n  .opencode/plugins/justless.js: delete the Justless plugin\n",
+        "\n  .github/hooks/justless.json: remove 2 hooks and delete the file, which held nothing else\n",
+        "\n  .github/hooks/: remove the empty directory\n",
+        "\n  .opencode/: remove the empty directory\n",
+        "\nKept .justless/ and the /.justless/ line in .gitignore. Add --purge to remove them too.\n",
+    ] {
+        assert!(preview.contains(line), "{line:?} in\n{preview}");
+    }
+    assert!(preview.starts_with(&format!(
+        "Dry run, nothing changed. Removing Justless from {} would change:\n",
+        root.display()
+    )));
+    assert!(!preview.contains(".gitignore:") && !preview.contains(".github/:"));
+
+    let removed = success(&root, &["init", "--remove"]);
+    assert!(removed.starts_with(&format!("Removed Justless from {}:\n", root.display())));
+    assert!(removed.contains("\n  .claude/settings.json: removed 6 hooks\n"));
+    assert!(removed.ends_with("Start a new agent session so the clients stop loading Justless.\n"));
+    let mut left = removal_tree(&root);
+    left.retain(|name, _| !name.starts_with(".justless/"));
+    let mut expected = original.clone();
+    expected.remove(".gitignore");
+    assert_eq!(
+        left.remove(".gitignore").unwrap(),
+        "target/\nnode_modules/\n\n/.justless/\n"
+    );
+    assert_eq!(left, expected);
+
+    // A second run finds nothing, and --purge restores the rest.
+    let again = success(&root, &["init", "--remove"]);
+    assert!(again.starts_with("Nothing to remove in "), "{again}");
+    let purged = success(&root, &["init", "--remove", "--purge"]);
+    assert!(purged.contains("\n  .gitignore: removed the /.justless/ line\n"));
+    assert!(purged.contains("\n  .justless/: deleted the archived runs, index and history\n"));
+    assert_eq!(removal_tree(&root), original);
+    let last = success(&root, &["init", "--remove", "--purge"]);
+    assert_eq!(last, format!("Nothing to remove in {}.\n", root.display()));
+}
+
+#[test]
+fn init_remove_without_a_record_deletes_only_justless_entries() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    // Without a setup record, as in a fresh clone, files whose layout setup kept
+    // still come back byte for byte.
+    write_files(
+        &root,
+        &[
+            ("package.json", "{}\n"),
+            ("AGENTS.md", "# Team rules\n"),
+            (".gitignore", "target/\n"),
+            (
+                ".claude/settings.json",
+                "{\n  \"permissions\": {\n    \"allow\": [\n      \"Bash(ls:*)\"\n    ]\n  }\n}\n",
+            ),
+            (".gemini/settings.json", "{\n  \"theme\": \"dark\"\n}\n"),
+            (
+                ".codex/config.toml",
+                "model = \"o4\"\n\n[mcp_servers.docs]\ncommand = \"docs-mcp\"\n",
+            ),
+        ],
+    );
+    let original = removal_tree(&root);
+    install_everything(&root);
+    fs::remove_file(root.join(".justless/setup.json")).unwrap();
+
+    // After setup, the user adds a status line that runs Justless, a handler of
+    // their own beside the Justless one and a hand-formatted hook.
+    let settings = root.join(".claude/settings.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    config["statusLine"] = serde_json::json!({"type":"command","command":"justless statusline"});
+    let mine = serde_json::json!({"type":"command","command":"notify-send started"});
+    config["hooks"]["SessionStart"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(mine.clone());
+    let edit = r#"{"matcher": "Edit", "hooks": [{"type": "command", "command": "lint"}]}"#;
+    let text = serde_json::to_string_pretty(&config).unwrap().replacen(
+        "\"PreToolUse\": [\n",
+        &format!("\"PreToolUse\": [\n      {edit},\n"),
+        1,
+    );
+    fs::write(&settings, format!("{text}\n")).unwrap();
+
+    let output = success(&root, &["init", "--remove", "--purge"]);
+    assert!(
+        output.contains("\n  .claude/settings.json: removed 6 hooks and the status line\n"),
+        "{output}"
+    );
+    let mut left = removal_tree(&root);
+    let settings = left.remove(".claude/settings.json").unwrap();
+    let mut expected = original.clone();
+    expected.remove(".claude/settings.json");
+    assert_eq!(left, expected);
+    assert!(!settings.contains("justless"), "{settings}");
+    assert!(
+        settings.contains(&format!("\n      {edit}\n")),
+        "{settings}"
+    );
+    let settings: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    assert_eq!(
+        settings,
+        serde_json::json!({
+            "permissions": {"allow": ["Bash(ls:*)"]},
+            "hooks": {
+                "SessionStart": [{"matcher": "^(startup|resume)$", "hooks": [mine]}],
+                "PreToolUse": [serde_json::from_str::<serde_json::Value>(edit).unwrap()]
+            }
+        })
+    );
+}
+
+#[test]
+fn init_remove_refuses_malformed_config_and_keeps_shared_instructions() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    success(
+        &root,
+        &[
+            "init", "--hooks", "--agent", "claude", "--agent", "codex", "--agent", "cursor",
+        ],
+    );
+    let installed = removal_tree(&root);
+
+    // One file that does not parse stops the whole removal, and the error names it.
+    let cursor = root.join(".cursor/hooks.json");
+    let good = fs::read_to_string(&cursor).unwrap();
+    fs::write(&cursor, "{\"hooks\": [").unwrap();
+    let broken = removal_tree(&root);
+    for args in [
+        &["init", "--remove"][..],
+        &["init", "--remove", "--dry-run"][..],
+    ] {
+        let output = cli(&root, args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            stderr(&output).contains("nothing was removed: .cursor/hooks.json is not valid JSON"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(removal_tree(&root), broken);
+    }
+    fs::write(&cursor, good).unwrap();
+    assert_eq!(removal_tree(&root), installed);
+
+    let output = cli(&root, &["init", "--remove", "--agent", "codex", "--purge"]);
+    assert!(stderr(&output).contains("run it without --agent"));
+    assert!(
+        !cli(&root, &["init", "--remove", "--hooks"])
+            .status
+            .success()
+    );
+    assert!(!cli(&root, &["init", "--purge"]).status.success());
+    assert_eq!(removal_tree(&root), installed);
+
+    // Codex still reads AGENTS.md, so removing Cursor keeps the section.
+    let output = success(&root, &["init", "--remove", "--agent", "cursor"]);
+    assert!(output.contains("\n  .cursor/hooks.json: removed 2 hooks and deleted the file"));
+    assert!(output.contains("\nKept the Justless section in AGENTS.md, which codex also reads.\n"));
+    assert!(!output.contains("--purge"));
+    assert!(!root.join(".cursor").exists());
+    let read = |name: &str| fs::read_to_string(root.join(name)).unwrap();
+    assert!(read("AGENTS.md").contains("justless:begin"));
+    assert!(read(".codex/hooks.json").contains("hook-codex"));
+    assert!(read("CLAUDE.md").contains("justless:begin"));
+
+    let output = success(&root, &["init-codex", "--remove", "--agent", "codex"]);
+    assert!(output.contains("\n  AGENTS.md: removed the Justless section and deleted the file"));
+    assert!(output.contains("\n  .codex/: removed the empty directory\n"));
+    assert!(!root.join("AGENTS.md").exists() && root.join("CLAUDE.md").exists());
+    assert!(read(".claude/settings.json").contains("hook-claude"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_remove_follows_a_linked_instructions_file_like_setup() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    // A link to AGENTS.md before the file exists, shared by two clients.
+    std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+    let original = removal_tree(&root);
+    let setup = ["init", "--hooks", "--agent", "claude", "--agent", "codex"];
+    success(&root, &setup);
+    assert!(root.join("AGENTS.md").is_file());
+    let output = success(&root, &["init", "--remove", "--agent", "claude"]);
+    assert!(output.contains("Kept the Justless section in AGENTS.md, which codex also reads."));
+    let output = success(&root, &["init", "--remove", "--purge"]);
+    assert!(output.contains("\n  AGENTS.md: removed the Justless section and deleted the file"));
+    assert!(!output.contains("CLAUDE.md"), "{output}");
+    assert_eq!(removal_tree(&root), original);
+}

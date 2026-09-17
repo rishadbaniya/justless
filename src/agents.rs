@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use crate::index::Index;
 use crate::workspace::{Workspace, lock_state, private_dir, write_text};
 
-const START: &str = "<!-- justless:begin -->";
-const END: &str = "<!-- justless:end -->";
+pub(crate) const START: &str = "<!-- justless:begin -->";
+pub(crate) const END: &str = "<!-- justless:end -->";
 const INSTRUCTIONS: &str = r#"<!-- justless:begin -->
 ## Justless
 
@@ -50,7 +50,7 @@ impl Agent {
         }
     }
 
-    fn config(self) -> (&'static str, &'static str) {
+    pub(crate) fn config(self) -> (&'static str, &'static str) {
         match self {
             Self::Codex => (".codex", "hooks.json"),
             Self::Claude => (".claude", "settings.json"),
@@ -81,7 +81,7 @@ impl Agent {
     /// <https://geminicli.com/docs/cli/gemini-md/>.
     /// Copilot CLI reads `AGENTS.md`, among others:
     /// <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions>.
-    fn instructions(self) -> &'static str {
+    pub(crate) fn instructions(self) -> &'static str {
         match self {
             Self::Claude => "CLAUDE.md",
             Self::Gemini => "GEMINI.md",
@@ -109,6 +109,7 @@ pub fn init(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<()> 
             private_dir(outer)?;
         }
         private_dir(parent)?;
+        crate::uninstall::remember(workspace, &path, &contents);
         write_text(&path, &contents)?;
         println!("Updated {}", path.display());
     }
@@ -176,7 +177,7 @@ fn planned_changes(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Resu
 /// `CLAUDE.md -> AGENTS.md`, resolves to its target when that stays inside the
 /// project, so the shared file is edited once and the link is kept. Returns `None`
 /// for a link that leaves the project.
-fn instructions_file(root: &Path, path: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn instructions_file(root: &Path, path: &Path) -> Result<Option<PathBuf>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {}
         Err(error) if error.kind() != ErrorKind::NotFound => return Err(error.into()),

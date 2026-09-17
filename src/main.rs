@@ -8,6 +8,7 @@ mod history;
 mod impact;
 mod index;
 mod inventory;
+mod json_edit;
 mod lint;
 mod listing;
 mod lookup;
@@ -21,6 +22,7 @@ mod rust_syntax;
 mod search;
 mod source;
 mod summary;
+mod uninstall;
 mod workspace;
 
 use std::ffi::OsString;
@@ -267,6 +269,24 @@ fn cli() -> Command<'static> {
                     Arg::new("hooks")
                         .long("hooks")
                         .help("Install project-local hooks"),
+                )
+                .arg(
+                    Arg::new("remove")
+                        .long("remove")
+                        .conflicts_with("hooks")
+                        .help("Remove what setup and mcp --install added, for every agent unless --agent selects some"),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .requires("remove")
+                        .help("With --remove, print each change without making it"),
+                )
+                .arg(
+                    Arg::new("purge")
+                        .long("purge")
+                        .requires("remove")
+                        .help("With --remove, also delete .justless/ and its .gitignore line"),
                 ),
         )
         .subcommand(map::command())
@@ -489,6 +509,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             read_num(sub, "to", 1)?,
             context_budget(&workspace, sub)?,
         )?,
+        ("init", sub) if sub.is_present("remove") => uninstall::run(&workspace, sub)?,
         ("init", sub) => {
             let selected = sub
                 .values_of("agent")
