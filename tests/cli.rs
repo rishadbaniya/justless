@@ -7063,19 +7063,26 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
         root
     };
 
-    // Added beside existing settings, once, without instructions for any agent.
+    // Added to the local settings beside their other keys, once, without
+    // instructions for any agent, and the shared settings stay as they were.
     let root = project("plain");
-    let settings = root.join(".claude/settings.json");
-    fs::write(&settings, r#"{"permissions":{"allow":["Bash(ls)"]}}"#).unwrap();
+    let shared_settings = r#"{"permissions":{"allow":["Bash(ls)"]}}"#;
+    fs::write(root.join(".claude/settings.json"), shared_settings).unwrap();
+    let settings = root.join(".claude/settings.local.json");
+    fs::write(&settings, r#"{"permissions":{"allow":["Bash(pwd)"]}}"#).unwrap();
     let output = with_config(&root, &config, &["init", "--statusline"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("Updated"), "{}", stdout(&output));
     let installed = fs::read_to_string(&settings).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&installed).unwrap();
-    assert_eq!(parsed["permissions"]["allow"][0], "Bash(ls)");
+    assert_eq!(parsed["permissions"]["allow"][0], "Bash(pwd)");
     assert_eq!(
         parsed["statusLine"],
         serde_json::json!({"type":"command","command":"justless statusline"})
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+        shared_settings
     );
     assert!(!root.join("AGENTS.md").exists() && !root.join("CLAUDE.md").exists());
     let again = with_config(&root, &config, &["init", "--statusline"]);
@@ -7090,11 +7097,16 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
     let both = project("both");
     let output = with_config(&both, &config, &[&hooks[..], &["--statusline"]].concat());
     assert!(output.status.success(), "{}", stderr(&output));
-    let parsed: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(both.join(".claude/settings.json")).unwrap())
-            .unwrap();
+    let read = |path: PathBuf| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let parsed = read(both.join(".claude/settings.json"));
     assert!(parsed["hooks"]["PreToolUse"].is_array());
-    assert_eq!(parsed["statusLine"]["command"], "justless statusline");
+    assert!(parsed["statusLine"].is_null());
+    assert_eq!(
+        read(both.join(".claude/settings.local.json"))["statusLine"]["command"],
+        "justless statusline"
+    );
     assert!(both.join("CLAUDE.md").is_file());
 
     // A status line in the project, its local settings or the user's settings
@@ -7113,32 +7125,39 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
         (&local, &config, ".claude/settings.local.json"),
         (&user, &user_config, "user-config/settings.json"),
     ] {
-        let before = fs::read_to_string(root.join(".claude/settings.json")).ok();
+        let files = |root: &Path| {
+            ["settings.json", "settings.local.json"]
+                .map(|file| fs::read_to_string(root.join(".claude").join(file)).ok())
+        };
+        let before = files(root);
         let output = with_config(root, config, &["init", "--statusline"]);
         assert!(output.status.success(), "{}", stderr(&output));
         let message = stderr(&output);
         assert!(message.contains("Kept the status line set in"), "{message}");
         assert!(message.contains(file), "{message}");
-        assert_eq!(
-            fs::read_to_string(root.join(".claude/settings.json")).ok(),
-            before
-        );
+        assert_eq!(files(root), before);
         assert!(!root.join(".justless").exists());
         // The suggested command prints both lines from the same session JSON. For
-        // a status line in the user's settings, it comes as a setting for this
-        // project's local file, so other projects keep theirs.
+        // a status line in the shared or user settings, it comes as a setting for
+        // this project's local file, so teammates and other projects keep theirs.
         let suggested: serde_json::Value =
             serde_json::from_str(message.lines().last().unwrap().trim()).unwrap();
-        let combined = if file.starts_with("user-config") {
-            assert!(message.contains("in this project only"), "{message}");
-            assert!(message.contains(".claude/settings.local.json"), "{message}");
+        let combined = if file == ".claude/settings.local.json" {
+            suggested.as_str().unwrap().to_owned()
+        } else {
+            assert!(
+                message.contains("in this project, for you only"),
+                "{message}"
+            );
+            assert!(
+                message.contains(".claude/settings.local.json:"),
+                "{message}"
+            );
             assert_eq!(suggested["statusLine"]["type"], "command");
             suggested["statusLine"]["command"]
                 .as_str()
                 .unwrap()
                 .to_owned()
-        } else {
-            suggested.as_str().unwrap().to_owned()
         };
         let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
@@ -7165,4 +7184,336 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
         stderr(&output)
     );
     assert!(!home.join(".claude/settings.json").exists());
+}
+
+/// Runs a suggested status line command under `sh` with this build's `justless`
+/// first on `PATH`, giving it session JSON on stdin as Claude Code does.
+#[cfg(unix)]
+fn run_status_command(root: &Path, command: &str) -> Output {
+    let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut child = Command::new("sh")
+        .args(["-c", command])
+        .current_dir(root)
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn statusline_suggestions_parse_and_keep_the_users_other_fields() {
+    let temp = TempDir::new().unwrap();
+    let project = |name: &str| {
+        let root = temp.path().join(name);
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        root
+    };
+    let last_json = |output: &Output| -> serde_json::Value {
+        assert!(output.status.success(), "{}", stderr(output));
+        serde_json::from_str(stderr(output).lines().last().unwrap().trim()).unwrap()
+    };
+
+    // A user status line whose command ends in `;`, with optional fields that the
+    // suggested local setting must keep, or it would turn them off here.
+    let user = project("user");
+    let user_config = temp.path().join("user-config");
+    fs::create_dir(&user_config).unwrap();
+    fs::write(
+        user_config.join("settings.json"),
+        r#"{"statusLine":{"type":"command","command":"echo hi;","padding":1,"refreshInterval":5,"hideVimModeIndicator":true}}"#,
+    )
+    .unwrap();
+    let suggested = last_json(&with_config(&user, &user_config, &["init", "--statusline"]));
+    let setting = &suggested["statusLine"];
+    assert_eq!(setting["type"], "command");
+    assert_eq!(setting["padding"], 1);
+    assert_eq!(setting["refreshInterval"], 5);
+    assert_eq!(setting["hideVimModeIndicator"], true);
+    let shown = run_status_command(&user, setting["command"].as_str().unwrap());
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert_eq!(stdout(&shown), "hi\njustless · ready\n");
+
+    // A local status line that ends in a comment, which would swallow a `; }`.
+    let local = project("local");
+    fs::write(
+        local.join(".claude/settings.local.json"),
+        r#"{"statusLine":{"type":"command","command":"echo mine # my own line"}}"#,
+    )
+    .unwrap();
+    let config = temp.path().join("config");
+    fs::create_dir(&config).unwrap();
+    let suggested = last_json(&with_config(&local, &config, &["init", "--statusline"]));
+    let shown = run_status_command(&local, suggested.as_str().unwrap());
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert_eq!(stdout(&shown), "mine\njustless · ready\n");
+}
+
+#[test]
+fn init_statusline_stops_before_writing_when_a_settings_file_is_unreadable() {
+    let temp = TempDir::new().unwrap();
+    let both = ["init", "--hooks", "--agent", "claude", "--statusline"];
+
+    // A trailing comma in the user settings may hide a status line, so setup
+    // stops before it writes hooks, instructions or state.
+    let broken = temp.path().join("broken-config");
+    fs::create_dir(&broken).unwrap();
+    fs::write(broken.join("settings.json"), r#"{"theme":"dark",}"#).unwrap();
+    let root = temp.path().join("user");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    for args in [&both[..], &["init", "--statusline"]] {
+        let output = with_config(&root, &broken, args);
+        assert!(!output.status.success(), "{args:?}");
+        let message = stderr(&output);
+        assert!(message.contains("cannot tell whether"), "{message}");
+        assert!(message.contains("broken-config"), "{message}");
+        for created in [".claude", "CLAUDE.md", ".gitignore", ".justless"] {
+            assert!(!root.join(created).exists(), "{args:?} created {created}");
+        }
+    }
+
+    // So does a malformed local settings file.
+    let config = temp.path().join("config");
+    fs::create_dir(&config).unwrap();
+    let root = temp.path().join("local");
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join(".claude/settings.local.json"), "{").unwrap();
+    let output = with_config(&root, &config, &both);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains(".claude/settings.local.json"),
+        "{}",
+        stderr(&output)
+    );
+    for created in [
+        ".claude/settings.json",
+        "CLAUDE.md",
+        ".gitignore",
+        ".justless",
+    ] {
+        assert!(!root.join(created).exists(), "created {created}");
+    }
+}
+
+/// Runs `program` with user settings and Git's global configuration in `config`.
+fn isolated(program: &str, root: &Path, config: &Path, args: &[&str]) -> Output {
+    let global = config.join("gitconfig");
+    if !global.exists() {
+        fs::write(&global, "").unwrap();
+    }
+    Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .env("HOME", config)
+        .env("CLAUDE_CONFIG_DIR", config)
+        .env("XDG_CONFIG_HOME", config.join("xdg"))
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn init_statusline_keeps_its_local_settings_out_of_git_and_names_missing_hooks() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    fs::create_dir(&config).unwrap();
+    let justless = |root: &Path, args: &[&str]| {
+        let output = isolated(env!("CARGO_BIN_EXE_justless"), root, &config, args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    };
+    let repository = |name: &str| {
+        let root = temp.path().join(name);
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        let output = isolated("git", &root, &config, &["init", "-q"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        root
+    };
+    let untracked = |root: &Path| {
+        stdout(&isolated(
+            "git",
+            root,
+            &config,
+            &["status", "--short", "--untracked-files=all"],
+        ))
+    };
+
+    // The local file is personal, so a repository that does not ignore it yet
+    // gets a .gitignore entry, and Git never offers to commit it. Without the
+    // hooks, setup says the line stays at `ready`.
+    let root = repository("repo");
+    let text = justless(&root, &["init", "--statusline"]);
+    assert!(text.contains("settings.local.json"), "{text}");
+    assert!(
+        text.contains("Updated") && text.contains(".gitignore"),
+        "{text}"
+    );
+    assert!(
+        text.contains("justless init --hooks --agent claude"),
+        "{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".gitignore")).unwrap(),
+        "/.claude/settings.local.json\n"
+    );
+    let status = untracked(&root);
+    assert!(!status.contains(".claude"), "{status}");
+    assert!(!status.contains(".justless"), "{status}");
+    // With the hooks installed, the note goes away and nothing is added twice.
+    let text = justless(
+        &root,
+        &["init", "--hooks", "--agent", "claude", "--statusline"],
+    );
+    assert!(text.contains("already shows Justless savings"), "{text}");
+    assert!(!text.contains("init --hooks"), "{text}");
+    let ignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert_eq!(ignore.matches("settings.local.json").count(), 1, "{ignore}");
+
+    // Git's global excludes may already list the file, as Claude Code adds it
+    // there, and then the project's .gitignore is left alone.
+    let excludes = config.join("xdg/git");
+    fs::create_dir_all(&excludes).unwrap();
+    fs::write(excludes.join("ignore"), "**/.claude/settings.local.json\n").unwrap();
+    let other = repository("other");
+    justless(&other, &["init", "--statusline"]);
+    assert!(other.join(".claude/settings.local.json").is_file());
+    assert!(!other.join(".gitignore").exists());
+    assert!(!untracked(&other).contains(".claude"));
+
+    // Outside a repository there is nothing to ignore.
+    let plain = temp.path().join("plain");
+    fs::create_dir(&plain).unwrap();
+    fs::write(plain.join("package.json"), "{}").unwrap();
+    justless(&plain, &["init", "--statusline"]);
+    assert!(plain.join(".claude/settings.local.json").is_file());
+    assert!(!plain.join(".gitignore").exists());
+}
+
+/// Runs a Claude Code hook in `cwd` for a session that started in `project`.
+#[cfg(unix)]
+fn claude_hook(
+    cwd: &Path,
+    project: &Path,
+    mode: &str,
+    input: serde_json::Value,
+) -> serde_json::Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["hook-claude", mode])
+        .current_dir(cwd)
+        .env("CLAUDE_PROJECT_DIR", project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
+    use serde_json::json;
+    let temp = TempDir::new().unwrap();
+    let outer = temp.path().canonicalize().unwrap().join("outer");
+    let nested = outer.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    git(&outer, &["init", "-q"]);
+    git(&nested, &["init", "-q"]);
+    fs::write(outer.join("package.json"), "{}").unwrap();
+    fs::write(nested.join("package.json"), "{}").unwrap();
+    let transcript = temp.path().join("transcript.jsonl");
+    fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"timestamp\":\"2020-01-01T00:00:00Z\",\"sessionId\":\"s1\"}\n",
+    )
+    .unwrap();
+
+    // The session, started in the outer project, routes a command that enters
+    // the nested repository, so its run is recorded there.
+    let event = json!({"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
+        "cwd":outer,"permission_mode":"default","tool_input":{"command":"cd nested && git status"}});
+    let routed = claude_hook(&outer, &outer, "before-command", event);
+    let command = routed["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let digest = command.split("--session ").nth(1).unwrap()[..24].to_owned();
+    let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let shell = Command::new("sh")
+        .args(["-c", &command])
+        .current_dir(&outer)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(shell.status.success(), "{}", stderr(&shell));
+    assert!(nested.join(".justless/runs").is_dir());
+    assert!(!outer.join(".justless/runs").exists());
+    // Then the agent works inside it: a large routed run and a replaced Read.
+    let run = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "run",
+            "--hook",
+            "--session",
+            &digest,
+            "--",
+            "seq",
+            "1",
+            "30000",
+        ])
+        .current_dir(&nested)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", stderr(&run));
+    let module = nested.join("module.py");
+    let source = format!(
+        "def calculate():\n{}    return 42\n",
+        "    # detail\n".repeat(400)
+    );
+    fs::write(&module, &source).unwrap();
+    let read = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+        "tool_input":{"file_path":module},"tool_response":{"type":"text","file":{"filePath":module,
+        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+    let replaced = claude_hook(&nested, &outer, "after-read", read);
+    assert!(replaced["hookSpecificOutput"]["updatedToolOutput"].is_object());
+
+    // The total stays when the session moves back out of the nested repository.
+    let line = |current: &Path, session: &str| {
+        let input = json!({"session_id":session,"transcript_path":transcript,"cwd":current,
+            "workspace":{"current_dir":current,"project_dir":outer}});
+        status_line(&outer, &[], input.to_string().as_bytes(), None)
+    };
+    let inside = line(&nested, "s1");
+    assert!(
+        inside.ends_with("this session · 2 runs · 1 read"),
+        "{inside}"
+    );
+    assert_eq!(line(&outer, "s1"), inside);
+    // Another session in the same project did not list the nested repository.
+    assert_eq!(line(&outer, "s2"), "justless · ready");
+    // The session's roots are kept in the project it started in.
+    let listed = fs::read_to_string(
+        outer
+            .join(".justless/sessions")
+            .join(format!("{digest}.roots")),
+    )
+    .unwrap();
+    assert_eq!(listed, format!("{}\n", nested.display()));
 }

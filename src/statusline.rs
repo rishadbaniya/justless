@@ -3,10 +3,12 @@
 //! The contract, from <https://code.claude.com/docs/en/statusline>:
 //!
 //! - Settings name it as `"statusLine": {"type": "command", "command": "…"}` in
-//!   user or project settings. `padding` and `refreshInterval` are optional.
-//! - Claude Code runs the command when a session starts or resumes and again after
-//!   each new assistant message, after `/compact` and on a few UI changes. Updates
-//!   are debounced at 300 ms, and a new update cancels a command still running.
+//!   user or project settings. `padding`, `refreshInterval` and
+//!   `hideVimModeIndicator` are optional.
+//! - The command runs in a shell (Git Bash or PowerShell on Windows) when a
+//!   session starts or resumes and again after each new assistant message, after
+//!   `/compact` and on a few UI changes. Updates are debounced at 300 ms, and a
+//!   new update cancels a command still running.
 //! - The command receives session JSON on stdin, including `session_id`,
 //!   `transcript_path`, `cwd`, `workspace.current_dir`, `workspace.project_dir`
 //!   and `cost.total_duration_ms`. Fields can be absent or null early on.
@@ -18,7 +20,13 @@
 //! Settings precedence, from <https://code.claude.com/docs/en/settings#settings-precedence>:
 //! managed, command line, `.claude/settings.local.json`, `.claude/settings.json`,
 //! then the user's `~/.claude/settings.json` (under `CLAUDE_CONFIG_DIR` when set).
-//! A key set higher overrides the same key lower down.
+//! A key set higher overrides the same key lower down. The local file holds
+//! personal overrides for one project, and Claude Code skips a settings file with
+//! invalid JSON after reporting it.
+//!
+//! Hooks, from <https://code.claude.com/docs/en/hooks>, run in the session's
+//! current directory with `CLAUDE_PROJECT_DIR` set to the project root where the
+//! session started.
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -42,8 +50,13 @@ const TRANSCRIPT_SCAN: u64 = 1 << 20;
 /// A run record is written once, when its command finishes. Records modified
 /// this long before the session began are skipped without being read.
 const RECORD_SLACK_MS: u64 = 60_000;
-/// Session ledgers untouched for this long are removed when a new one starts.
+/// Session ledgers and root lists untouched for this long are removed when a new
+/// one starts.
 const LEDGER_DAYS: u64 = 30;
+/// The settings file `init --statusline` writes, relative to the project root.
+const LOCAL: &str = ".claude/settings.local.json";
+/// How much of a session's root list is read.
+const ROOTS_SCAN: u64 = 64 << 10;
 
 pub fn command() -> Command<'static> {
     Command::new("statusline").about(
@@ -94,7 +107,11 @@ struct Tally {
 }
 
 fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> Option<String> {
-    let workspaces = workspaces(root, input);
+    let digest = input["session_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(session_digest);
+    let workspaces = workspaces(root, input, digest.as_deref());
     if workspaces.is_empty() {
         return None;
     }
@@ -104,9 +121,9 @@ fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> O
             tally.add_runs(workspace, start);
         }
     }
-    if let Some(session) = input["session_id"].as_str().filter(|id| !id.is_empty()) {
+    if let Some(digest) = &digest {
         for workspace in &workspaces {
-            tally.add_tools(workspace, session);
+            tally.add_tools(workspace, digest);
         }
     }
     Some(render(&tally, width))
@@ -114,12 +131,10 @@ fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> O
 
 /// The projects whose runs this session may have recorded. Hooks and routed
 /// commands store runs in the project around their working directory, which can
-/// be a nested repository the session moved into, so the session's current and
-/// launch directories are both read.
-fn workspaces(root: Option<&Path>, input: &Value) -> Vec<Workspace> {
-    if let Some(root) = root {
-        return Workspace::discover(Some(root)).into_iter().collect();
-    }
+/// be a nested repository the session moved into. So the session's current and
+/// launch directories are read, and so is every nested project that this
+/// session's runs and hooks listed in them, after the session has left it.
+fn workspaces(root: Option<&Path>, input: &Value, digest: Option<&str>) -> Vec<Workspace> {
     let starts: Vec<PathBuf> = [
         &input["workspace"]["current_dir"],
         &input["cwd"],
@@ -130,15 +145,41 @@ fn workspaces(root: Option<&Path>, input: &Value) -> Vec<Workspace> {
     .map(PathBuf::from)
     .filter(|dir| dir.is_absolute())
     .collect();
-    if starts.is_empty() {
-        return Workspace::discover(None).into_iter().collect();
-    }
     let mut found: Vec<Workspace> = Vec::new();
-    for start in starts {
-        if let Ok(workspace) = Workspace::discover_from(&start)
-            && !found.iter().any(|known| known.root == workspace.root)
-        {
-            found.push(workspace);
+    if root.is_some() || starts.is_empty() {
+        found.extend(Workspace::discover(root));
+    }
+    if root.is_none() {
+        for start in starts {
+            if let Ok(workspace) = Workspace::discover_from(&start)
+                && !found.iter().any(|known| known.root == workspace.root)
+            {
+                found.push(workspace);
+            }
+        }
+    }
+    let Some(digest) = digest else {
+        return found;
+    };
+    for index in 0..found.len() {
+        let Ok(file) = File::open(roots_file(&found[index].state, digest)) else {
+            continue;
+        };
+        let mut listed = String::new();
+        if file.take(ROOTS_SCAN).read_to_string(&mut listed).is_err() {
+            continue;
+        }
+        for line in listed.lines() {
+            let nested = Path::new(line);
+            // A list names only projects inside the one that holds it.
+            if nested == found[index].root || !nested.starts_with(&found[index].root) {
+                continue;
+            }
+            if let Ok(workspace) = Workspace::discover(Some(nested))
+                && !found.iter().any(|known| known.root == workspace.root)
+            {
+                found.push(workspace);
+            }
         }
     }
     found
@@ -314,8 +355,8 @@ impl Tally {
     }
 
     /// Adds the Read, Grep and Glob results this session's hooks replaced.
-    fn add_tools(&mut self, workspace: &Workspace, session: &str) {
-        let Ok(file) = File::open(ledger(workspace, session)) else {
+    fn add_tools(&mut self, workspace: &Workspace, digest: &str) {
+        let Ok(file) = File::open(ledger(&workspace.state, digest)) else {
             return;
         };
         for line in BufReader::new(file.take(8 << 20))
@@ -399,27 +440,64 @@ struct Replacement {
     shown: u64,
 }
 
-/// Each session's replacements are appended to their own file, named like the
-/// `--session` digest of routed commands, so a reader never needs a lock.
-fn ledger(workspace: &Workspace, session: &str) -> PathBuf {
-    let digest = crate::capture::source_digest(session.as_bytes());
-    workspace
-        .state
-        .join("sessions")
-        .join(format!("{}.jsonl", &digest[..24]))
+/// The digest that names a Claude Code session's files, the same one its hooks
+/// pass to routed commands as `--session`.
+fn session_digest(session: &str) -> String {
+    crate::capture::source_digest(session.as_bytes())[..24].to_owned()
 }
 
-/// Records a Read, Grep or Glob result that a Claude Code hook replaced, so the
-/// status line can count it toward the session that made the call. Errors are
-/// ignored: the hook's answer matters more than the tally.
+/// Each session's replacements are appended to their own file, named by its
+/// digest, so a reader never needs a lock.
+fn ledger(state: &Path, digest: &str) -> PathBuf {
+    state.join("sessions").join(format!("{digest}.jsonl"))
+}
+
+/// The nested projects where a session recorded runs or replacements, one root
+/// per line, kept in the project the session started in.
+fn roots_file(state: &Path, digest: &str) -> PathBuf {
+    state.join("sessions").join(format!("{digest}.roots"))
+}
+
+/// Appends `bytes` to a file in a state directory, creating it but never
+/// following a link. One short write per call, so concurrent writers do not
+/// interleave lines.
+fn append(path: &Path, bytes: &[u8]) -> Option<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).ok()?.write_all(bytes).ok()
+}
+
+/// Records what a Claude Code hook kept out of context, so the status line can
+/// count it toward the session that made the call. Errors are ignored: the
+/// hook's answer matters more than the tally.
 pub fn observe(workspace: &Workspace, mode: &str, input: &Value, output: &Value) {
-    if matches!(mode, "after-read" | "after-search") {
-        let _ = record(workspace, input, output);
+    let Some(session) = input["session_id"].as_str().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let digest = session_digest(session);
+    match mode {
+        "after-read" | "after-search" => {
+            let _ = record(workspace, &digest, input, output);
+        }
+        // A routed command can record its run in a nested project, such as one it
+        // enters with `cd`. Mark the session in the project it started in, where
+        // that run then lists its project. Any rewrite marks it, whatever form the
+        // routed command takes.
+        "before-command" if output["hookSpecificOutput"]["updatedInput"]["command"].is_string() => {
+            let launch = launch(workspace);
+            let _ = mark(launch.as_ref().unwrap_or(workspace), &digest);
+        }
+        _ => {}
     }
 }
 
-fn record(workspace: &Workspace, input: &Value, output: &Value) -> Option<()> {
-    let session = input["session_id"].as_str().filter(|id| !id.is_empty())?;
+/// Logs one Read, Grep or Glob result that a hook replaced.
+fn record(workspace: &Workspace, digest: &str, input: &Value, output: &Value) -> Option<()> {
     let tool = input["tool_name"].as_str()?;
     let hook = &output["hookSpecificOutput"];
     let updated = hook.get("updatedToolOutput")?;
@@ -434,21 +512,69 @@ fn record(workspace: &Workspace, input: &Value, output: &Value) -> Option<()> {
     workspace.prepare_state().ok()?;
     let directory = workspace.state.join("sessions");
     private_dir(&directory).ok()?;
-    let path = ledger(workspace, session);
+    let path = ledger(&workspace.state, digest);
     let new = fs::symlink_metadata(&path).is_err();
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    // One short append per result, so concurrent hooks do not interleave lines.
-    options.open(&path).ok()?.write_all(entry.as_bytes()).ok()?;
+    append(&path, entry.as_bytes())?;
     if new {
         prune(&directory, &path);
     }
+    // A hook that runs in a nested project logs there. List that project where
+    // the session started, so the status line still finds it after a `cd` out.
+    if let Some(launch) = launch(workspace) {
+        let _ = mark(&launch, digest);
+    }
+    register(&workspace.root, digest);
     Some(())
+}
+
+/// The project the session started in, from the `CLAUDE_PROJECT_DIR` that
+/// Claude Code gives its hooks, when it encloses `workspace` without being it.
+fn launch(workspace: &Workspace) -> Option<Workspace> {
+    let start = std::env::var_os("CLAUDE_PROJECT_DIR").filter(|dir| !dir.is_empty())?;
+    Workspace::discover_from(Path::new(&start))
+        .ok()
+        .filter(|launch| launch.root != workspace.root && workspace.root.starts_with(&launch.root))
+}
+
+/// Creates the session's root list in the project it started in, so that runs
+/// and hooks in nested projects can add themselves to it.
+fn mark(launch: &Workspace, digest: &str) -> Option<()> {
+    let path = roots_file(&launch.state, digest);
+    if fs::symlink_metadata(&path).is_ok() {
+        return Some(());
+    }
+    launch.prepare_state().ok()?;
+    let directory = launch.state.join("sessions");
+    private_dir(&directory).ok()?;
+    append(&path, b"")?;
+    prune(&directory, &path);
+    Some(())
+}
+
+/// Adds `root` to the root list of this session in each enclosing project that
+/// has one. Routed runs call it with their `--session` digest, so a run in a
+/// nested repository counts for its session wherever the session moves next.
+/// Errors are ignored: the run matters more than the tally.
+pub fn register(root: &Path, digest: &str) {
+    if digest.len() != 24 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return;
+    }
+    let Some(text) = root.to_str().filter(|text| !text.contains('\n')) else {
+        return;
+    };
+    for ancestor in root.ancestors().skip(1) {
+        let path = roots_file(&ancestor.join(".justless"), digest);
+        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        let mut listed = String::new();
+        let read = File::open(&path)
+            .and_then(|file| file.take(ROOTS_SCAN).read_to_string(&mut listed))
+            .is_ok();
+        if read && !listed.lines().any(|line| line == text) {
+            let _ = append(&path, format!("{text}\n").as_bytes());
+        }
+    }
 }
 
 /// The text a tool result gives the model: a Read's file content, a Grep's
@@ -479,7 +605,9 @@ fn prune(directory: &Path, keep: &Path) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path != keep
-            && path.extension().is_some_and(|ext| ext == "jsonl")
+            && path
+                .extension()
+                .is_some_and(|ext| ext == "jsonl" || ext == "roots")
             && entry
                 .metadata()
                 .and_then(|meta| meta.modified())
@@ -504,8 +632,8 @@ fn user_settings() -> Option<PathBuf> {
 }
 
 /// A settings file as JSON, or `None` when it does not exist. A link is followed
-/// only when `follow` is set: setup rewrites the project file, which would
-/// replace a link with a copy.
+/// only when `follow` is set: setup rewrites the local file, which would replace
+/// a link with a copy.
 fn read_settings(path: &Path, follow: bool) -> Result<Option<Value>> {
     let text = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() || (follow && metadata.file_type().is_symlink()) => {
@@ -544,16 +672,24 @@ fn resolved(path: &Path) -> PathBuf {
 
 /// What `init --statusline` would do.
 enum Plan {
-    Write(PathBuf, String),
+    /// Files to write, with their new contents: the project's local settings, and
+    /// `.gitignore` when it must list them.
+    Write(Vec<(PathBuf, String)>),
     /// A Justless status line already applies here, from the named file.
     Present(String),
-    /// Another status line applies here, from the named file, with its command.
-    /// `user` marks the user's settings, which apply in every project.
+    /// Another status line applies here: the file that sets it, its `statusLine`
+    /// value, and whether that file is the local one setup would write.
     Kept {
         label: String,
-        command: Option<String>,
-        user: bool,
+        existing: Value,
+        local: bool,
     },
+}
+
+/// Checks every file `init --statusline` reads, so that setup can stop before it
+/// changes anything else.
+pub fn check(workspace: &Workspace) -> Result<()> {
+    plan(workspace).map(|_| ())
 }
 
 fn plan(workspace: &Workspace) -> Result<Plan> {
@@ -564,51 +700,57 @@ fn plan(workspace: &Workspace) -> Result<Plan> {
         Err(error) => return Err(error.into()),
     }
     let project = directory.join("settings.json");
+    let local = workspace.root.join(LOCAL);
     let user = user_settings();
     // In the home directory the project file is the user's own settings file,
-    // which would show the status line in every project.
+    // and its local file would apply to every session started there.
     ensure!(
         user.as_deref()
             .is_none_or(|user| resolved(&project) != resolved(user)),
         "{} is your user settings file. Run `justless init --statusline` inside a project folder.",
         project.display()
     );
-    let local = directory.join("settings.local.json");
-    // Each file with its label, whether a link is followed, and whether it is the
-    // user's own settings file.
     let mut sources = vec![
-        (local, ".claude/settings.local.json".to_owned(), true, false),
-        (
-            project.clone(),
-            ".claude/settings.json".to_owned(),
-            false,
-            false,
-        ),
+        (local.clone(), LOCAL.to_owned()),
+        (project, ".claude/settings.json".to_owned()),
     ];
     if let Some(user) = user {
         let label = user.display().to_string();
-        sources.push((user, label, true, true));
+        sources.push((user, label));
     }
     // The highest-precedence file that sets a status line decides which one shows.
-    for (path, label, follow, user) in &sources {
-        let Some(settings) = read_settings(path, *follow)? else {
+    // A file that cannot be read may set one, so setup stops rather than hide it.
+    for (index, (path, label)) in sources.iter().enumerate() {
+        let Some(settings) = read_settings(path, true).with_context(|| {
+            format!("cannot tell whether {label} sets a status line, so nothing was changed")
+        })?
+        else {
             continue;
         };
         let existing = &settings["statusLine"];
         if existing.is_null() {
             continue;
         }
-        let command = existing["command"].as_str().map(str::to_owned);
-        if command.as_deref().is_some_and(|c| c.contains(COMMAND)) {
+        if existing["command"]
+            .as_str()
+            .is_some_and(|command| command.contains(COMMAND))
+        {
             return Ok(Plan::Present(label.clone()));
         }
         return Ok(Plan::Kept {
             label: label.clone(),
-            command,
-            user: *user,
+            existing: existing.clone(),
+            local: index == 0,
         });
     }
-    let mut settings = read_settings(&project, false)?.unwrap_or_else(|| json!({}));
+    let created = read_settings(&local, false)?;
+    let mut writes = Vec::new();
+    if created.is_none()
+        && let Some(ignore) = ignore_local(workspace)?
+    {
+        writes.push(ignore);
+    }
+    let mut settings = created.unwrap_or_else(|| json!({}));
     settings
         .as_object_mut()
         .context("settings must contain an object")?
@@ -616,24 +758,90 @@ fn plan(workspace: &Workspace) -> Result<Plan> {
             "statusLine".into(),
             json!({"type":"command","command":COMMAND}),
         );
-    Ok(Plan::Write(
-        project,
-        format!("{}\n", serde_json::to_string_pretty(&settings)?),
-    ))
+    writes.insert(
+        0,
+        (
+            local,
+            format!("{}\n", serde_json::to_string_pretty(&settings)?),
+        ),
+    );
+    Ok(Plan::Write(writes))
+}
+
+/// `.gitignore` with the local settings file added, when setup is about to create
+/// that file in a Git repository that does not ignore it yet. Claude Code keeps
+/// out of Git only the local file it creates itself. Nothing is changed outside
+/// the project, such as Git's global excludes.
+fn ignore_local(workspace: &Workspace) -> Result<Option<(PathBuf, String)>> {
+    // `check-ignore` takes no pathspec magic, so `Workspace::git` cannot run it.
+    let Ok(output) = std::process::Command::new("git")
+        .args(["check-ignore", "-q", "--", LOCAL])
+        .current_dir(&workspace.root)
+        .output()
+    else {
+        return Ok(None);
+    };
+    // 0 means ignored already, and 128 outside a repository.
+    if output.status.code() != Some(1) {
+        return Ok(None);
+    }
+    let path = workspace.root.join(".gitignore");
+    let original = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file(),
+                "{} must be a regular file",
+                path.display()
+            );
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let separator = if original.is_empty() || original.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    Ok(Some((path, format!("{original}{separator}/{LOCAL}\n"))))
 }
 
 /// A command that prints the user's status line and then the Justless one, each
-/// on its own row, from the same session JSON.
+/// on its own row, from the same session JSON. A newline rather than `;` ends the
+/// user's command, so one that ends in `;`, `&` or a `#` comment still parses.
 fn combined(existing: Option<&str>) -> String {
     let existing = existing.unwrap_or("YOUR_COMMAND");
     format!(
-        "input=$(cat); printf '%s' \"$input\" | {{ {existing}; }}; printf '%s' \"$input\" | {COMMAND}"
+        "input=$(cat); printf '%s' \"$input\" | {{\n{existing}\n}}; printf '%s' \"$input\" | {COMMAND}"
     )
 }
 
-/// Adds the Justless status line to the project's Claude Code settings, unless a
-/// status line already applies here. Then it leaves every file as it was and
-/// says how to show both.
+/// Whether the Claude Code hooks that record savings are set in the local,
+/// project or user settings. Unreadable files count as having none.
+fn hooks_installed(workspace: &Workspace) -> bool {
+    let directory = workspace.root.join(".claude");
+    [
+        Some(directory.join("settings.local.json")),
+        Some(directory.join("settings.json")),
+        user_settings(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|path| {
+        read_settings(&path, true)
+            .ok()
+            .flatten()
+            .is_some_and(|settings| {
+                settings["hooks"]
+                    .to_string()
+                    .contains("justless hook-claude")
+            })
+    })
+}
+
+/// Adds the Justless status line to the project's local Claude Code settings,
+/// unless a status line already applies here. Then it leaves every file as it
+/// was and says how to show both.
 pub fn install(workspace: &Workspace) -> Result<()> {
     // Check the files before creating the state directory. A write is planned
     // again under the setup lock that `init` takes; anything else changes nothing.
@@ -647,14 +855,16 @@ pub fn install(workspace: &Workspace) -> Result<()> {
         None
     };
     match planned {
-        Plan::Write(path, contents) => {
-            if let Some(parent) = path.parent() {
-                private_dir(parent)?;
+        Plan::Write(writes) => {
+            for (path, contents) in writes {
+                if let Some(parent) = path.parent() {
+                    private_dir(parent)?;
+                }
+                write_text(&path, &contents)?;
+                println!("Updated {}", path.display());
             }
-            write_text(&path, &contents)?;
-            println!("Updated {}", path.display());
             println!(
-                "Claude Code's status line now shows this session's Justless savings. It appears once the folder is trusted."
+                "Claude Code's status line now shows this session's Justless savings, for you in this project. It appears once the folder is trusted."
             );
         }
         Plan::Present(label) => {
@@ -662,27 +872,39 @@ pub fn install(workspace: &Workspace) -> Result<()> {
         }
         Plan::Kept {
             label,
-            command,
-            user: false,
+            existing,
+            local: true,
         } => {
             eprintln!(
                 "Kept the status line set in {label}. Claude Code shows each line a status line command prints as its own row, so to show both, set its \"command\" to:\n  {}",
-                serde_json::to_string(&combined(command.as_deref()))?
+                serde_json::to_string(&combined(existing["command"].as_str()))?
             );
         }
-        // Changing the user's command would add the Justless row to every project,
-        // so suggest the project's local settings, which override it here only.
+        // Changing a shared or user status line would add the Justless row for
+        // everyone in the project or in every project, so suggest a copy for the
+        // local file, which overrides it here only. Its other fields, such as
+        // `padding` or `refreshInterval`, carry over.
         Plan::Kept {
             label,
-            command,
-            user: true,
+            existing,
+            local: false,
         } => {
-            let setting =
-                json!({"statusLine":{"type":"command","command":combined(command.as_deref())}});
+            let mut setting = if existing.is_object() {
+                existing.clone()
+            } else {
+                json!({"type":"command"})
+            };
+            setting["command"] = json!(combined(existing["command"].as_str()));
             eprintln!(
-                "Kept the status line set in {label}. Claude Code shows each line a status line command prints as its own row, so to show both in this project only, add this to .claude/settings.local.json:\n  {setting}"
+                "Kept the status line set in {label}. Claude Code shows each line a status line command prints as its own row, so to show both in this project, for you only, add this to {LOCAL}:\n  {}",
+                json!({ "statusLine": setting })
             );
         }
+    }
+    if !hooks_installed(workspace) {
+        println!(
+            "Savings appear once the hooks route commands and reads: run `justless init --hooks --agent claude`."
+        );
     }
     Ok(())
 }

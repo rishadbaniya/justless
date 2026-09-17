@@ -55,5 +55,5 @@ User-visible changes to Justless are recorded here. No release has been publishe
 ### Reporting
 
 - `stats` reports bytes kept out of context by day and by command, with an estimated token count, full-log reopenings and runs whose output grew.
-- `statusline` prints the current Claude Code session's estimated savings on one line, from hook-routed runs and replaced Read, Grep and Glob results. `init --statusline` adds it to the project's Claude Code settings and never replaces an existing status line.
+- `statusline` prints the current Claude Code session's estimated savings on one line, from hook-routed runs and replaced Read, Grep and Glob results. `init --statusline` adds it to the project's local Claude Code settings, `.claude/settings.local.json`, and never replaces an existing status line.
 - `discover` reads Claude Code transcripts for the workspace and lists shell commands that bypassed Justless, with labels and byte counts only.

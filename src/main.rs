@@ -395,6 +395,13 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             };
             let default_session =
                 std::env::var("JUSTLESS_SESSION").unwrap_or_else(|_| "terminal".into());
+            // A hook-routed run in a nested project lists that project for its
+            // session's status line.
+            if sub.is_present("hook")
+                && let Some(session) = sub.value_of("session")
+            {
+                statusline::register(&workspace.root, session);
+            }
             return capture::execute(
                 &workspace,
                 &command,
@@ -533,6 +540,10 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             let hooks = sub.is_present("hooks");
             let statusline = sub.is_present("statusline");
             let before = statusline::project_settings(&workspace);
+            // Check the status line's files too before any agent setup is written.
+            if statusline {
+                statusline::check(&workspace)?;
+            }
             // `--statusline` alone changes only Claude Code's settings, not the
             // default agent's instructions.
             if !statusline || hooks || sub.occurrences_of("agent") > 0 {
