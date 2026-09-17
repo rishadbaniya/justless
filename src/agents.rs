@@ -646,6 +646,9 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
     } else {
         json!({})
     };
+    if agent == Agent::Claude {
+        crate::statusline::observe(workspace, mode, &input, &output);
+    }
     println!("{output}");
     Ok(())
 }

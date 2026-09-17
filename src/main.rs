@@ -21,6 +21,7 @@ mod proxy;
 mod rust_syntax;
 mod search;
 mod source;
+mod statusline;
 mod summary;
 mod uninstall;
 mod workspace;
@@ -287,9 +288,16 @@ fn cli() -> Command<'static> {
                         .long("purge")
                         .requires("remove")
                         .help("With --remove, also delete .justless/ and its .gitignore line"),
+                )
+                .arg(
+                    Arg::new("statusline")
+                        .long("statusline")
+                        .conflicts_with("remove")
+                        .help("Show this session's savings in Claude Code's status line"),
                 ),
         )
         .subcommand(map::command())
+        .subcommand(statusline::command())
         .subcommand(impact::command())
         .subcommand(mcp::command())
         .subcommand(doctor::command())
@@ -339,6 +347,12 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         && let Some(agent) = agents::client(name)
     {
         agents::run_client_hook(root, agent, sub.value_of("mode").unwrap_or_default());
+        return Ok(0);
+    }
+    // Claude Code blanks its status line when the command fails, so this one finds
+    // its projects from the session JSON and always prints a line.
+    if let Some(("statusline", _)) = matches.subcommand() {
+        statusline::run(root);
         return Ok(0);
     }
     // Claude Code starts MCP servers with CLAUDE_PROJECT_DIR set to its launch
@@ -516,7 +530,19 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 .unwrap()
                 .map(agents::Agent::parse)
                 .collect::<Result<Vec<_>>>()?;
-            agents::init(&workspace, &selected, sub.is_present("hooks"))?;
+            let hooks = sub.is_present("hooks");
+            let statusline = sub.is_present("statusline");
+            let before = statusline::project_settings(&workspace);
+            // `--statusline` alone changes only Claude Code's settings, not the
+            // default agent's instructions.
+            if !statusline || hooks || sub.occurrences_of("agent") > 0 {
+                agents::init(&workspace, &selected, hooks)?;
+            }
+            if statusline {
+                statusline::install(&workspace)?;
+            } else if hooks && selected.contains(&agents::Agent::Claude) {
+                statusline::hint(&workspace, before);
+            }
         }
         (name, sub) if name.starts_with("hook-") => {
             agents::run_hook(

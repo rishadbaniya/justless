@@ -6840,3 +6840,316 @@ fn init_remove_takes_no_setup_options() {
         assert_eq!(removal_tree(&root), installed, "{option}");
     }
 }
+
+/// Runs `justless statusline` with `input` on stdin and returns its single line.
+fn status_line(root: &Path, args: &[&str], input: &[u8], columns: Option<&str>) -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+    command
+        .args(args)
+        .arg("statusline")
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match columns {
+        Some(columns) => command.env("COLUMNS", columns),
+        None => command.env_remove("COLUMNS"),
+    };
+    let mut child = command.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    // Claude Code blanks the status line on a non-zero exit or empty output.
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "");
+    let text = stdout(&output);
+    assert_eq!(text.lines().count(), 1, "{text:?}");
+    text.trim_end().to_owned()
+}
+
+/// A run record as `justless run` stores it, with the fields the status line reads.
+fn synthetic_run(root: &Path, id: &str, completed_ms: u64, raw: u64, shown: u64, hook: bool) {
+    let directory = root.join(".justless/runs").join(id);
+    fs::create_dir_all(&directory).unwrap();
+    for stream in ["stdout", "stderr"] {
+        fs::write(directory.join(stream), "").unwrap();
+    }
+    let record = serde_json::json!({"id":id,"status":0,"raw_bytes":raw,"preview_bytes":shown,
+        "footer_bytes":48,"completed_ms":completed_ms,"family":"cargo test","label":"cargo test",
+        "hook":hook,"diagnostics":[],"source_digests":{}});
+    fs::write(directory.join("record.json"), record.to_string()).unwrap();
+}
+
+#[test]
+fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
+    use serde_json::json;
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    // The session's transcript starts at 2026-01-02T03:04:05.678Z, after records
+    // that carry no timestamp.
+    let start: u64 = 1_767_323_045_678;
+    let transcript = root.join("transcript.jsonl");
+    fs::write(
+        &transcript,
+        "{\"type\":\"permission-mode\",\"sessionId\":\"s1\"}\n{\"type\":\"user\",\"timestamp\":\"2026-01-02T03:04:05.678Z\",\"sessionId\":\"s1\"}\n",
+    )
+    .unwrap();
+    let event = |session: &str| {
+        json!({"session_id":session,"transcript_path":transcript,"cwd":root,
+            "workspace":{"current_dir":root,"project_dir":root},"cost":{"total_duration_ms":1000}})
+        .to_string()
+    };
+    let line = |session: &str| status_line(&root, &[], event(session).as_bytes(), None);
+    assert_eq!(line("s1"), "justless · ready");
+
+    // Before the session, typed by a person, still running, and unreadable: none count.
+    synthetic_run(&root, "run-before", start - 3_600_000, 100_000, 1_000, true);
+    synthetic_run(&root, "run-typed", start + 3_000, 90_000, 500, false);
+    fs::create_dir_all(root.join(".justless/runs/run-running")).unwrap();
+    fs::create_dir_all(root.join(".justless/runs/run-broken")).unwrap();
+    fs::write(root.join(".justless/runs/run-broken/record.json"), "{").unwrap();
+    // Two hook-routed runs in the session: one compacted, one shown verbatim.
+    synthetic_run(&root, "run-compact", start + 1_000, 40_000, 2_000, true);
+    synthetic_run(&root, "run-verbatim", start + 2_000, 952, 952, true);
+    // (40,000 + 952) - (2,048 + 1,000) bytes kept out = 37,904 bytes ≈ 9,476 tokens.
+    assert_eq!(
+        line("s1"),
+        "justless · ≈9.5k tokens saved this session · 2 runs"
+    );
+    assert_eq!(
+        status_line(&root, &[], event("s1").as_bytes(), Some("40")),
+        "justless · ≈9.5k tokens saved"
+    );
+
+    // A whole-file Read that the hook replaces with an outline counts for its session.
+    let path = root.join("module.py");
+    let source = format!(
+        "def calculate():\n{}    return 42\n",
+        "    # detail\n".repeat(400)
+    );
+    fs::write(&path, &source).unwrap();
+    let read = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+        "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
+        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+    let output = agent_hook(&root, "hook-claude", "after-read", read.clone());
+    let replaced = &output["hookSpecificOutput"];
+    assert!(replaced["updatedToolOutput"].is_object(), "{output}");
+    // A grouped Grep result counts as a search.
+    let raw = Command::new("grep")
+        .args(["-rn", "needle", "src"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let content = stdout(&raw).trim_end().to_owned();
+    let grep = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Grep","cwd":root,
+        "tool_input":{"pattern":"needle","output_mode":"content","-n":true},
+        "tool_response":{"mode":"content","numFiles":0,"filenames":[],"content":content,
+            "numLines":content.lines().count(),"appliedLimit":250}});
+    let grouped = agent_hook(&root, "hook-claude", "after-search", grep);
+    assert!(grouped["hookSpecificOutput"]["updatedToolOutput"].is_object());
+    let tool_saved = {
+        let shown = |hook: &serde_json::Value, text: &str| {
+            text.len() + hook["additionalContext"].as_str().unwrap().len()
+        };
+        let read_shown = shown(
+            replaced,
+            replaced["updatedToolOutput"]["file"]["content"]
+                .as_str()
+                .unwrap(),
+        );
+        let group = &grouped["hookSpecificOutput"];
+        let grep_shown = shown(
+            group,
+            group["updatedToolOutput"]["content"].as_str().unwrap(),
+        );
+        (source.len() - 1 - read_shown + content.len() - grep_shown) as u64
+    };
+    let tokens = format!("{:.1}", (37_904 + tool_saved).div_ceil(4) as f64 / 1000.0);
+    let expected = format!("≈{}k", tokens.strip_suffix(".0").unwrap_or(&tokens));
+    assert_eq!(
+        line("s1"),
+        format!("justless · {expected} tokens saved this session · 2 runs · 1 read · 1 search")
+    );
+    // Another session sees the shared project runs, but not this session's reads.
+    assert_eq!(
+        line("s2"),
+        "justless · ≈9.5k tokens saved this session · 2 runs"
+    );
+    // A Read the hook leaves alone, such as an explicit range, is not counted.
+    let mut ranged = read;
+    ranged["tool_input"]["limit"] = json!(20);
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-read", ranged),
+        json!({})
+    );
+    assert!(line("s1").ends_with("· 1 read · 1 search"));
+
+    // Without a transcript, the session began its running time ago. Ten years
+    // reaches back past every record.
+    let without = json!({"session_id":"s1","cwd":root,
+        "cost":{"total_duration_ms":315_360_000_000_u64}});
+    assert!(
+        status_line(&root, &[], without.to_string().as_bytes(), None)
+            .ends_with("this session · 3 runs · 1 read · 1 search")
+    );
+    // With no way to date the session, only its own tool results count.
+    let undated = json!({"session_id":"s1","workspace":{"current_dir":root}});
+    assert!(
+        status_line(&root, &[], undated.to_string().as_bytes(), None)
+            .ends_with("this session · 1 read · 1 search")
+    );
+}
+
+#[test]
+fn statusline_prints_one_line_whatever_its_input() {
+    let empty = TempDir::new().unwrap();
+    let root = empty.path();
+    assert_eq!(status_line(root, &[], b"", None), "justless · ready");
+    assert_eq!(
+        status_line(root, &[], b"not json", None),
+        "justless · ready"
+    );
+    assert_eq!(
+        status_line(root, &[], br#"{"session_id":null,"cwd":42}"#, None),
+        "justless · ready"
+    );
+    assert_eq!(
+        status_line(
+            root,
+            &[],
+            br#"{"transcript_path":"/nonexistent/t.jsonl","cost":{"total_duration_ms":"soon"}}"#,
+            None
+        ),
+        "justless · ready"
+    );
+    // A project that cannot be opened prints the bare fallback, still with exit 0.
+    assert_eq!(
+        status_line(
+            root,
+            &[],
+            br#"{"workspace":{"current_dir":"/nonexistent/project"}}"#,
+            None
+        ),
+        "justless"
+    );
+    assert_eq!(
+        status_line(root, &["--root", "/nonexistent/project"], b"{}", None),
+        "justless"
+    );
+    // The status line only reads: it creates no state directory.
+    assert!(!root.join(".justless").exists());
+}
+
+/// Runs `justless` with user settings in `config` instead of the real ones.
+fn with_config(root: &Path, config: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(args)
+        .current_dir(root)
+        .env("HOME", config)
+        .env("CLAUDE_CONFIG_DIR", config)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    fs::create_dir(&config).unwrap();
+    let project = |name: &str| {
+        let root = temp.path().join(name);
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        root
+    };
+
+    // Added beside existing settings, once, without instructions for any agent.
+    let root = project("plain");
+    let settings = root.join(".claude/settings.json");
+    fs::write(&settings, r#"{"permissions":{"allow":["Bash(ls)"]}}"#).unwrap();
+    let output = with_config(&root, &config, &["init", "--statusline"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("Updated"), "{}", stdout(&output));
+    let installed = fs::read_to_string(&settings).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&installed).unwrap();
+    assert_eq!(parsed["permissions"]["allow"][0], "Bash(ls)");
+    assert_eq!(
+        parsed["statusLine"],
+        serde_json::json!({"type":"command","command":"justless statusline"})
+    );
+    assert!(!root.join("AGENTS.md").exists() && !root.join("CLAUDE.md").exists());
+    let again = with_config(&root, &config, &["init", "--statusline"]);
+    assert!(stdout(&again).contains("already shows Justless savings"));
+    assert_eq!(fs::read_to_string(&settings).unwrap(), installed);
+
+    // Hooks for Claude Code mention the status line until one is configured.
+    let hooks = ["init", "--hooks", "--agent", "claude"];
+    assert!(!stdout(&with_config(&root, &config, &hooks)).contains("--statusline"));
+    let fresh = project("fresh");
+    assert!(stdout(&with_config(&fresh, &config, &hooks)).contains("justless init --statusline"));
+    let both = project("both");
+    let output = with_config(&both, &config, &[&hooks[..], &["--statusline"]].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(both.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert!(parsed["hooks"]["PreToolUse"].is_array());
+    assert_eq!(parsed["statusLine"]["command"], "justless statusline");
+    assert!(both.join("CLAUDE.md").is_file());
+
+    // A status line in the project, its local settings or the user's settings
+    // stays, and the message says how to show both.
+    let own = r#"{"statusLine":{"type":"command","command":"echo mine"}}"#;
+    let shared = project("shared");
+    fs::write(shared.join(".claude/settings.json"), own).unwrap();
+    let local = project("local");
+    fs::write(local.join(".claude/settings.local.json"), own).unwrap();
+    let user = project("user");
+    let user_config = temp.path().join("user-config");
+    fs::create_dir(&user_config).unwrap();
+    fs::write(user_config.join("settings.json"), own).unwrap();
+    for (root, config, file) in [
+        (&shared, &config, ".claude/settings.json"),
+        (&local, &config, ".claude/settings.local.json"),
+        (&user, &user_config, "user-config/settings.json"),
+    ] {
+        let before = fs::read_to_string(root.join(".claude/settings.json")).ok();
+        let output = with_config(root, config, &["init", "--statusline"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let message = stderr(&output);
+        assert!(message.contains("Kept the status line set in"), "{message}");
+        assert!(message.contains(file), "{message}");
+        assert_eq!(
+            fs::read_to_string(root.join(".claude/settings.json")).ok(),
+            before
+        );
+        assert!(!root.join(".justless").exists());
+        // The suggested command prints both lines from the same session JSON.
+        let quoted = message.lines().last().unwrap().trim();
+        let combined: String = serde_json::from_str(quoted).unwrap();
+        let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let mut child = Command::new("sh")
+            .args(["-c", &combined])
+            .current_dir(root)
+            .env("PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{}").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(stdout(&output), "mine\njustless · ready\n");
+    }
+
+    // In the home directory, the project file is the user's own settings file.
+    let home = project("home");
+    let output = with_config(&home, &home.join(".claude"), &["init", "--statusline"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("user settings file"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!home.join(".claude/settings.json").exists());
+}
