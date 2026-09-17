@@ -24,6 +24,7 @@ User-visible changes to Justless are recorded here. No release has been publishe
 - `affected` lists what depends on a symbol, a file or the current Git changes, hop by hop. It names the tests that reach the target and, for Rust, Python and Go layouts, a command that runs them. Deleted code is reported as a deletion rather than as a change to the line next to it.
 - `context --run RUN_ID` connects a captured failure to its assertion, its enclosing symbol and the functions it calls.
 - `NAME@FILE:LINE` selects one of several definitions that share a name, such as cfg-gated twins.
+- Rust paths into another crate of the repository resolve through the `path` its dependency names, directly, through `[workspace.dependencies]` or in a `[target.….dependencies]` table. A registry or renamed dependency that shares a workspace crate's package name, or an import such as `use upstream_ctrlc as ctrlc;`, is no longer linked to the local crate.
 - An unreadable or oversized file is skipped rather than failing every query. `index` lists the skipped files, and a query or `find` that finds nothing names them.
 
 ### Reads and edits

@@ -7634,3 +7634,148 @@ fn inherited_dependencies_resolve_to_the_crate_their_path_names() {
         "{callers}"
     );
 }
+
+#[test]
+fn import_that_renames_a_registry_crate_shadows_the_local_crate() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_tree(
+        root,
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"ctrlc\"]\n"),
+            (
+                "ctrlc/Cargo.toml",
+                "[package]\nname = \"ctrlc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dev-dependencies]\nupstream_ctrlc = { package = \"ctrlc\", version = \"=3.5.2\" }\n",
+            ),
+            (
+                "ctrlc/src/lib.rs",
+                "pub fn set_handler(handler: fn()) {\n    handler();\n}\n",
+            ),
+            (
+                "ctrlc/tests/signals.rs",
+                "fn direct() {\n    ctrlc::set_handler(|| {});\n}\n\
+                 fn scoped() {\n    use upstream_ctrlc as ctrlc;\n    ctrlc::set_handler(|| {});\n}\n\
+                 mod shadow {\n    use upstream_ctrlc as ctrlc;\n    fn renamed_registry() {\n        ctrlc::set_handler(|| {});\n    }\n\
+                 \x20   mod nested {\n        use super::*;\n        fn globbed_registry() {\n            ctrlc::set_handler(|| {});\n        }\n    }\n}\n\
+                 mod reimport {\n    use ctrlc;\n    fn reimported_local() {\n        ctrlc::set_handler(|| {});\n    }\n}\n",
+            ),
+        ],
+    );
+    let callers = success(root, &["query", "ctrlc::set_handler", "--view", "callers"]);
+    for expected in [
+        "ctrlc_test_signals::direct at ctrlc/tests/signals.rs:2",
+        "ctrlc_test_signals::reimport::reimported_local at ctrlc/tests/signals.rs:23",
+    ] {
+        assert!(callers.contains(expected), "{expected}\n{callers}");
+    }
+    for unexpected in ["scoped", "renamed_registry", "globbed_registry"] {
+        assert!(!callers.contains(unexpected), "{unexpected}\n{callers}");
+    }
+}
+
+#[test]
+fn platform_specific_path_dependency_resolves_to_the_workspace_crate() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_tree(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"engine\", \"platform\", \"other\"]\n",
+            ),
+            (
+                "engine/Cargo.toml",
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("engine/src/lib.rs", "pub fn start() {}\n"),
+            (
+                "platform/Cargo.toml",
+                "[package]\nname = \"platform\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [target.'cfg(unix)'.dependencies]\nengine = { path = \"../engine\" }\n",
+            ),
+            (
+                "platform/src/lib.rs",
+                "pub fn install() {\n    engine::start();\n}\n",
+            ),
+            // A platform-specific registry dependency stays external.
+            (
+                "other/Cargo.toml",
+                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [target.'cfg(windows)'.dependencies]\nengine = \"1\"\n",
+            ),
+            (
+                "other/src/lib.rs",
+                "pub fn published() {\n    engine::start();\n}\n",
+            ),
+        ],
+    );
+    let callers = success(root, &["query", "engine::start", "--view", "callers"]);
+    assert!(
+        callers.contains("platform::install at platform/src/lib.rs:2"),
+        "{callers}"
+    );
+    assert!(!callers.contains("published"), "{callers}");
+}
+
+#[test]
+fn inherited_dependency_resolves_by_name_when_the_workspace_root_is_outside_the_index() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_tree(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/util\", \"crates/app\", \"crates/other\"]\n\n\
+                 [workspace.dependencies]\nmy-util = { path = \"crates/util\" }\n",
+            ),
+            (
+                "crates/util/Cargo.toml",
+                "[package]\nname = \"my-util\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("crates/util/src/lib.rs", "pub fn helper() {}\n"),
+            (
+                "crates/app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nmy-util.workspace = true\n",
+            ),
+            (
+                "crates/app/src/lib.rs",
+                "pub fn inherited() {\n    my_util::helper();\n}\n",
+            ),
+            // A registry dependency names a version and no path, so it stays external.
+            (
+                "crates/other/Cargo.toml",
+                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nmy-util = \"1\"\n",
+            ),
+            (
+                "crates/other/src/lib.rs",
+                "pub fn published() {\n    my_util::helper();\n}\n",
+            ),
+        ],
+    );
+    for (args, expected) in [
+        (
+            &[
+                "--root",
+                "crates",
+                "query",
+                "my_util::helper",
+                "--view",
+                "callers",
+            ][..],
+            "app::inherited at app/src/lib.rs:2",
+        ),
+        (
+            &["query", "my_util::helper", "--view", "callers"][..],
+            "app::inherited at crates/app/src/lib.rs:2",
+        ),
+    ] {
+        let callers = success(root, args);
+        assert!(callers.contains(expected), "{expected}\n{callers}");
+        assert!(!callers.contains("published"), "{callers}");
+    }
+}

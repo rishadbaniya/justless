@@ -968,7 +968,7 @@ struct Target {
     directory: String,
     library: bool,
     /// Crate names from the manifest's dependency tables, as `dependencies()` reads them.
-    dependencies: BTreeMap<String, Option<String>>,
+    dependencies: BTreeMap<String, Dependency>,
 }
 
 fn targets(
@@ -1066,35 +1066,78 @@ fn targets(
     targets
 }
 
-/// The crate names a manifest's dependency tables bring into scope, each mapped
-/// to the directory of the crate a path dependency points at. A registry or git
-/// dependency maps to `None`: it stays external even when a workspace crate has
-/// the same package name, as when a crate tests itself against its published
-/// release. `name.workspace = true` takes the path from the workspace root.
+/// Where a crate name from a manifest's dependency tables leads.
+#[derive(Clone)]
+enum Dependency {
+    /// A path dependency: the directory of the crate it points at.
+    Path(String),
+    /// `name.workspace = true` whose workspace root manifest is outside the
+    /// index, so its source is unknown. It reaches a library with that name
+    /// when exactly one is indexed.
+    Inherited,
+    /// A registry or git dependency, or a path outside the index.
+    External,
+}
+
+/// The crate names a manifest's dependency tables bring into scope, including
+/// platform-specific `[target.….dependencies]`. A path dependency maps to the
+/// directory of the crate it points at. A registry or git dependency stays
+/// external even when a workspace crate has the same package name, as when a
+/// crate tests itself against its published release. `name.workspace = true`
+/// takes the source from `[workspace.dependencies]` in the workspace root.
 fn dependencies(
     directory: &Path,
     manifest: &toml_edit::DocumentMut,
     manifests: &BTreeMap<String, toml_edit::DocumentMut>,
-) -> BTreeMap<String, Option<String>> {
+) -> BTreeMap<String, Dependency> {
     let workspace = workspace_root(directory, manifest, manifests);
-    ["dependencies", "dev-dependencies", "build-dependencies"]
+    let platforms = manifest
+        .get("target")
+        .and_then(|item| item.as_table_like())
         .into_iter()
-        .filter_map(|kind| manifest.get(kind).and_then(|item| item.as_table_like()))
-        .flat_map(|table| table.iter())
-        .map(|(name, item)| {
-            let declared = if item.get("workspace").and_then(|item| item.as_bool()) == Some(true) {
-                workspace.as_ref().and_then(|(root, document)| {
-                    let entry = document.get("workspace")?.get("dependencies")?.get(name)?;
-                    Some((root.as_path(), entry))
-                })
-            } else {
-                Some((directory, item))
-            };
-            let source = declared
-                .and_then(|(base, entry)| normalize(&base.join(entry.get("path")?.as_str()?)));
-            (rust_name(name), source)
+        .flat_map(|table| table.iter().map(|(_, item)| item));
+    let mut dependencies = BTreeMap::new();
+    for table in std::iter::once(manifest.as_item())
+        .chain(platforms)
+        .flat_map(|scope| {
+            ["dependencies", "dev-dependencies", "build-dependencies"]
+                .into_iter()
+                .filter_map(|kind| scope.get(kind).and_then(|item| item.as_table_like()))
         })
-        .collect()
+    {
+        for (name, item) in table.iter() {
+            let source = if item.get("workspace").and_then(|item| item.as_bool()) == Some(true) {
+                match &workspace {
+                    Some((root, document)) => document
+                        .get("workspace")
+                        .and_then(|item| item.get("dependencies"))
+                        .and_then(|item| item.get(name))
+                        .map_or(Dependency::External, |entry| path_dependency(root, entry)),
+                    None => Dependency::Inherited,
+                }
+            } else {
+                path_dependency(directory, item)
+            };
+            // A crate declared in several tables, such as `[dependencies]` and a
+            // `[target.….dependencies]`, resolves through the first path any of them names.
+            let entry = dependencies
+                .entry(rust_name(name))
+                .or_insert(Dependency::External);
+            match (&*entry, &source) {
+                (Dependency::Path(_), _) | (Dependency::Inherited, Dependency::External) => {}
+                _ => *entry = source,
+            }
+        }
+    }
+    dependencies
+}
+
+fn path_dependency(base: &Path, entry: &toml_edit::Item) -> Dependency {
+    entry
+        .get("path")
+        .and_then(|item| item.as_str())
+        .and_then(|path| normalize(&base.join(path)))
+        .map_or(Dependency::External, Dependency::Path)
 }
 
 /// The workspace root manifest and its directory for the manifest in
@@ -1442,11 +1485,23 @@ impl Resolver<'_> {
                 return Some(ids);
             }
         }
+        // An import that binds the first segment shadows any crate of that name,
+        // as `use upstream_ctrlc as ctrlc;` does for the local `ctrlc` crate.
+        if hops > 0 && self.binds(namespace, module, from, first, hops) {
+            return None;
+        }
         let target = self.targets.get(namespace)?;
         let library = match target.dependencies.get(first) {
             // A path dependency reaches the library in the directory it names.
+            Some(Dependency::Path(directory)) => *self.libraries.get(directory.as_str())?,
+            Some(Dependency::Inherited) => {
+                unique(self.libraries.values().copied().filter(|&id| {
+                    let library = &self.targets[id];
+                    library.name == *first || library.package == *first
+                }))?
+            }
             // A registry or git dependency is external, whatever its package name.
-            Some(directory) => *self.libraries.get(directory.as_deref()?)?,
+            Some(Dependency::External) => return None,
             // Binaries, tests, examples and benches reach their own package's library.
             None => {
                 let id = *self.libraries.get(target.directory.as_str())?;
@@ -1456,6 +1511,54 @@ impl Resolver<'_> {
         };
         self.resolve_path(library, &[], None, rest, IMPORT_HOPS, depth + 1)
     }
+
+    /// Whether an import in `module` binds `name`: a named import or rename, or
+    /// a glob of a module of the same crate that binds it, such as `use super::*`
+    /// below `use upstream_ctrlc as ctrlc;`. Globs spend hops as in `resolve_path`.
+    fn binds(
+        &self,
+        namespace: usize,
+        module: &[String],
+        from: Option<usize>,
+        name: &str,
+        hops: u8,
+    ) -> bool {
+        let Some(bindings) = self.imports.get(&(namespace, module.to_vec())) else {
+            return false;
+        };
+        bindings
+            .iter()
+            .filter(|binding| binding.from.is_none() || binding.from == from)
+            .any(|binding| match &binding.import.alias {
+                Some(alias) => alias == name,
+                None => {
+                    hops > 1
+                        && local_module(module, &binding.import.path).is_some_and(|source| {
+                            source != module && self.binds(namespace, &source, None, name, hops - 1)
+                        })
+                }
+            })
+    }
+}
+
+/// The module of the same crate that an import path starting with `crate`,
+/// `self` or `super` names.
+fn local_module(module: &[String], path: &[String]) -> Option<Vec<String>> {
+    let (first, mut rest) = path.split_first()?;
+    let mut base = match first.as_str() {
+        "crate" => Vec::new(),
+        "self" => module.to_vec(),
+        "super" => module.split_last()?.1.to_vec(),
+        _ => return None,
+    };
+    while let Some((first, tail)) = rest.split_first()
+        && first == "super"
+    {
+        base.pop()?;
+        rest = tail;
+    }
+    base.extend_from_slice(rest);
+    Some(base)
 }
 
 fn unique(mut items: impl Iterator<Item = usize>) -> Option<usize> {
