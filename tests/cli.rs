@@ -7779,3 +7779,63 @@ fn inherited_dependency_resolves_by_name_when_the_workspace_root_is_outside_the_
         assert!(!callers.contains("published"), "{callers}");
     }
 }
+
+#[test]
+fn pack_surfaces_hook_configuration_for_a_hooks_question() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    write_files(
+        root,
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"sig\"]\n"),
+            (
+                "sig/Cargo.toml",
+                "[package]\nname = \"sig\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "sig/src/lib.rs",
+                "//! Installs a process-wide handler for SIGINT and SIGTERM.\nuse std::sync::Mutex;\n\nstatic HANDLER_SET: Mutex<bool> = Mutex::new(false);\n\n/// Registers `handler` to run on every SIGINT while the process keeps running.\npub fn set_handler<F: FnMut() + Send + 'static>(handler: F) -> Result<(), String> {\n    let mut set = HANDLER_SET.lock().unwrap();\n    if *set {\n        return Err(\"a handler is already configured\".into());\n    }\n    *set = true;\n    listen(handler);\n    Ok(())\n}\n\nfn listen<F: FnMut()>(mut handler: F) {\n    handler();\n}\n",
+            ),
+            (
+                "sig/tests/signals.rs",
+                "use sig::set_handler;\n\n#[test]\nfn sigint_runs_the_handler_and_the_process_keeps_running() {\n    set_handler(|| {}).unwrap();\n}\n\n#[test]\nfn set_handler_works_while_a_runtime_keeps_running() {\n    let _ = set_handler(|| {});\n}\n",
+            ),
+            (
+                ".codex/hooks.json",
+                "{\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"^(startup|resume)$\",\n        \"hooks\": [\n          { \"type\": \"command\", \"timeout\": 60, \"async\": true, \"command\": \"justless hook-codex session-start\" }\n        ]\n      }\n    ],\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"^Bash$\",\n        \"hooks\": [\n          { \"type\": \"command\", \"timeout\": 5, \"command\": \"justless hook-codex before-command\" }\n        ]\n      }\n    ]\n  }\n}\n",
+            ),
+        ],
+    );
+    // Signal-handler code shares words with the question ("handler", "running",
+    // "configured"), but the answer is the hook registration.
+    let hooks = success(
+        root,
+        &[
+            "pack",
+            "what hooks are configured and running in this checkout",
+        ],
+    );
+    assert!(
+        hooks.contains(".codex/hooks.json") && hooks.contains("justless hook-codex before-command"),
+        "{hooks}"
+    );
+    // The file named for the question leads, ahead of code that shares its
+    // everyday words, and lists the registered commands rather than bare keys.
+    assert!(hooks.starts_with("Text .codex/hooks.json:"), "{hooks}");
+    assert!(
+        hooks.contains("justless hook-codex session-start"),
+        "{hooks}"
+    );
+    // A signal question still reaches the signal-handler code.
+    let signals = success(root, &["pack", "how is SIGINT handled"]);
+    assert!(
+        signals.contains("sig::set_handler") && signals.contains("sig/src/lib.rs"),
+        "{signals}"
+    );
+}

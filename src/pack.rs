@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Result, ensure};
 
@@ -8,7 +9,7 @@ use crate::context::{Report, relationship};
 use crate::history;
 use crate::index::{Fingerprint, Index, nul_paths};
 use crate::summary::short;
-use crate::workspace::{Location, Workspace};
+use crate::workspace::{Location, Workspace, display_path};
 
 fn terms(text: &str) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
@@ -198,94 +199,272 @@ fn excerpt(
     }
 }
 
-struct Passage {
-    score: usize,
-    location: Location,
-    text: String,
+/// A question term with the light stem its inflections share, such as `hook`
+/// for `hooks`. A line matches the term anywhere, or its stem at the start of
+/// a word or identifier part, so `hooks` meets `hook-codex` but not `webhook`.
+struct Needle {
+    word: String,
+    stem: String,
+    prints: [Fingerprint; 2],
 }
 
-// Trigram fingerprints cheaply eliminate impossible files. Score verified lines by
-// how rare their matching terms are in this repository, then promote enclosing symbols.
+impl Needle {
+    fn new(word: String, inflected: bool) -> Self {
+        let stem = if inflected { stem(&word) } else { word.clone() };
+        Self {
+            prints: [Fingerprint::new(&word), Fingerprint::new(&stem)],
+            word,
+            stem,
+        }
+    }
+
+    fn possible(&self, fingerprint: Fingerprint) -> bool {
+        self.prints.iter().any(|&print| fingerprint.includes(print))
+    }
+
+    /// Whether the file's name, such as `hooks.json`, holds the term. A
+    /// directory is shared by every file under it, so only a term written as a
+    /// path, such as `src/pack.rs`, is matched against the whole path.
+    fn names(&self, file: &str) -> bool {
+        let name = if self.word.contains('/') {
+            file
+        } else {
+            Path::new(file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(file)
+        };
+        self.occurs(&name.to_lowercase(), name)
+    }
+
+    /// `folded` is `text` in lower case.
+    fn occurs(&self, folded: &str, text: &str) -> bool {
+        folded.contains(&self.word)
+            || (self.stem != self.word
+                && folded.match_indices(&self.stem).any(|(at, _)| {
+                    match folded[..at].chars().next_back() {
+                        None => true,
+                        Some(before) if !before.is_alphanumeric() => true,
+                        // A camelCase part starts at an upper-case letter.
+                        Some(_) => {
+                            text.is_ascii()
+                                && text.as_bytes()[at].is_ascii_uppercase()
+                                && text.as_bytes()[at - 1].is_ascii_lowercase()
+                        }
+                    }
+                }))
+    }
+}
+
+/// How rare a term is among `total` files, from 1 for a term in every file to
+/// 6 for one in under 1/32 of them. Names and text passages share this scale.
+fn rarity(total: usize, documents: usize) -> usize {
+    1 + ((total / documents.max(1)).max(1).ilog2() as usize).min(5)
+}
+
+/// The most that matching text adds to a rank, whether the text sits inside a
+/// definition or in a file without one. Names, of definitions or of the file
+/// that holds the text, count beyond it, so a long paragraph that mentions many
+/// task words does not outrank code by length alone.
+const TEXT_LIMIT: usize = 80;
+
+struct Passage {
+    score: usize,
+    /// The part of `score` that the file's path earns.
+    named: usize,
+    /// The line that best matches the question.
+    location: Location,
+    /// Up to three distinct matching lines, in file order.
+    lines: Vec<(usize, String)>,
+}
+
+impl Passage {
+    /// The rank of text that no definition encloses, on the scale of definitions.
+    fn rank(&self) -> usize {
+        self.named + (self.score - self.named).min(TEXT_LIMIT)
+    }
+}
+
+// Trigram fingerprints cheaply eliminate impossible files, but a large file's
+// fingerprint admits almost any short word, so term rarity is estimated from the
+// lines actually read. Files whose name holds a question term are read first.
+// In a file without definitions, such as configuration or prose, that name
+// counts like a definition's name, since it says what the whole file is about.
+// Matching lines then promote their enclosing definitions.
 fn passages(
     workspace: &Workspace,
     index: &Index,
     words: &BTreeSet<String>,
     question: &str,
 ) -> Vec<Passage> {
-    let mut needles: BTreeSet<String> = words.clone();
+    let mut needles: Vec<Needle> = words
+        .iter()
+        .map(|word| Needle::new(word.clone(), true))
+        .collect();
     for fragment in question
         .split_whitespace()
         .map(|s| s.trim_matches(['\'', '"', '`', '?', '.', ',']))
     {
-        if fragment.len() > 2 && fragment.contains(['/', '-', ':']) {
-            needles.insert(fragment.to_owned());
+        if fragment.len() > 2
+            && fragment.contains(['/', '-', ':'])
+            && !needles.iter().any(|needle| needle.word == fragment)
+        {
+            needles.push(Needle::new(fragment.to_owned(), false));
         }
     }
-    let mut weighted = Vec::new();
-    for word in needles {
-        let fp = Fingerprint::new(&word);
-        let docs = index
-            .fingerprints
-            .values()
-            .filter(|candidate| candidate.includes(fp))
-            .count();
-        if docs == 0 {
-            continue;
-        }
-        let weight = (1 + (index.files.len() / docs).ilog2() as usize) * word.len().min(16);
-        weighted.push((word, fp, weight));
-    }
+    let total = index.fingerprints.len().max(1);
+    let (needles, possible): (Vec<Needle>, Vec<usize>) = needles
+        .into_iter()
+        .map(|needle| {
+            let documents = index
+                .fingerprints
+                .values()
+                .filter(|&&print| needle.possible(print))
+                .count();
+            (needle, documents)
+        })
+        .filter(|&(_, documents)| documents > 0)
+        .unzip();
     let mut files = Vec::new();
-    for (file, fp) in &index.fingerprints {
-        let score: usize = weighted
-            .iter()
-            .filter(|(_, needle, _)| fp.includes(*needle))
-            .map(|(_, _, w)| w)
-            .sum();
-        if score > 0 {
-            files.push((Reverse(score), file));
+    for (file, &print) in &index.fingerprints {
+        let (mut named, mut likely) = (0, 0);
+        for (needle, &documents) in needles.iter().zip(&possible) {
+            let weight = rarity(total, documents);
+            if needle.names(file) {
+                named += weight;
+            }
+            if needle.possible(print) {
+                likely += weight;
+            }
+        }
+        if named + likely > 0 {
+            files.push((Reverse(named), Reverse(likely), file));
         }
     }
     files.sort_unstable();
-    let mut results = Vec::new();
-    for (_, file) in files.into_iter().take(96) {
+    let mut read = Vec::new();
+    let mut checked = vec![0; needles.len()];
+    let mut found = vec![0; needles.len()];
+    for (_, _, file) in files.into_iter().take(96) {
         let Ok(path) = workspace.source_path(file) else {
             continue;
         };
         let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
-        let mut best = 0;
-        let mut passage = None;
+        // Definitions carry the names in source files, including a file entry
+        // for most languages, so only a file without any is ranked by its name.
+        let whole = Location {
+            file: file.clone(),
+            start: 1,
+            end: usize::MAX,
+        };
+        let named: Vec<usize> = if index.at(&whole).is_empty() {
+            (0..needles.len())
+                .filter(|&n| needles[n].names(file))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut present = vec![false; needles.len()];
+        let mut lines = Vec::new();
         for (i, line) in text.lines().enumerate() {
             let folded = line.to_lowercase();
-            let score: usize = weighted
-                .iter()
-                .filter(|(word, _, _)| folded.contains(word))
-                .map(|(_, _, w)| w)
-                .sum();
-            if score > best {
-                best = score;
-                passage = Some(Passage {
-                    score,
-                    location: Location {
-                        file: file.clone(),
-                        start: i + 1,
-                        end: i + 1,
-                    },
-                    text: short(line.trim(), 160),
-                });
+            let covered: Vec<usize> = (0..needles.len())
+                .filter(|&n| needles[n].occurs(&folded, line))
+                .collect();
+            for &n in &covered {
+                present[n] = true;
+            }
+            if !covered.is_empty() {
+                lines.push((i + 1, covered, line.trim().to_owned()));
             }
         }
-        results.extend(passage);
+        let print = index.fingerprints[file];
+        for (n, needle) in needles.iter().enumerate() {
+            if needle.possible(print) {
+                checked[n] += 1;
+                found[n] += usize::from(present[n]);
+            }
+        }
+        read.push((file, named, lines));
     }
-    results.sort_by(|a, b| {
+    // A term's file count is its fingerprint matches scaled by the share of
+    // those that the files read confirmed. It is exact when all were read.
+    let weights: Vec<usize> = (0..needles.len())
+        .map(|n| {
+            let documents = if checked[n] == 0 {
+                possible[n]
+            } else {
+                (possible[n] * found[n]).div_ceil(checked[n])
+            };
+            16 * rarity(total, documents)
+        })
+        .collect();
+    let mut ranked = Vec::new();
+    for (file, named, lines) in read {
+        let path_score: usize = named.iter().map(|&n| weights[n]).sum();
+        let mut scored: Vec<_> = lines
+            .into_iter()
+            .map(|(line, covered, text)| {
+                let score = covered.iter().map(|&n| weights[n]).sum::<usize>() + path_score;
+                let words = text
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .count();
+                (score, words, line, text)
+            })
+            .collect();
+        let Some(best) = scored.iter().map(|&(score, ..)| score).max() else {
+            continue;
+        };
+        // Among the lines that match about as well as the best, show the ones
+        // that say the most, so a configured command outranks the bare key
+        // above it. Repeated lines show once.
+        scored.retain(|&(score, ..)| score * 2 >= best);
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        let mut distinct = BTreeSet::new();
+        scored.retain(|(.., text)| distinct.insert(text.clone()));
+        scored.truncate(3);
+        let primary = scored[0].2;
+        let mut lines: Vec<_> = scored
+            .into_iter()
+            .map(|(_, _, line, text)| (line, short(&text, 160)))
+            .collect();
+        lines.sort();
+        ranked.push(Passage {
+            score: best,
+            named: path_score,
+            location: Location {
+                file: file.clone(),
+                start: primary,
+                end: primary,
+            },
+            lines,
+        });
+    }
+    ranked.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
             .then_with(|| a.location.cmp(&b.location))
     });
-    results.truncate(8);
-    results
+    ranked.truncate(8);
+    ranked
+}
+
+fn show_text(report: &mut Report, hit: &Passage) {
+    let file = display_path(&hit.location.file);
+    for (at, (line, text)) in hit.lines.iter().enumerate() {
+        report.line(if at == 0 {
+            format!("Text {file}:{line} {text}")
+        } else {
+            format!("    {line} | {text}")
+        });
+    }
 }
 
 pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Result<()> {
@@ -321,10 +500,7 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
         }
     }
     let total = index.definitions.len().max(1);
-    let weight = |part: &str| {
-        let shared = frequency.get(part).copied().unwrap_or(0) + 1;
-        1 + ((total / shared).max(1).ilog2() as usize).min(5)
-    };
+    let weight = |part: &str| rarity(total, frequency.get(part).copied().unwrap_or(0) + 1);
     let mut ranks = BTreeMap::new();
     for (id, (def, (name, parts))) in index.definitions.iter().zip(&names).enumerate() {
         let lower = name.to_lowercase();
@@ -346,11 +522,26 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
         }
     }
     let passages = passages(workspace, index, &words, &question);
-    for hit in &passages {
-        for id in index.at(&hit.location) {
-            *ranks.entry(id).or_default() += hit.score.min(80);
+    // A matching line promotes the definitions around it, except the one it
+    // declares, whose name has already been scored. Text that no definition
+    // encloses, such as configuration or prose, ranks on the same scale as
+    // definitions and leads when it ranks higher.
+    let mut standalone = Vec::new();
+    for (at, hit) in passages.iter().enumerate() {
+        let enclosing = index.at(&hit.location);
+        if enclosing
+            .iter()
+            .all(|&id| matches!(index.definitions[id].kind.as_str(), "file" | "module"))
+        {
+            standalone.push(at);
+        }
+        for id in enclosing {
+            if index.definitions[id].declaration != hit.location.start {
+                *ranks.entry(id).or_default() += hit.score.min(TEXT_LIMIT);
+            }
         }
     }
+    standalone.sort_by_key(|&at| Reverse(passages[at].rank()));
     let mut report = Report::new(cap);
     let mut found_run = false;
     let mut latest = BTreeSet::new();
@@ -416,9 +607,22 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
     let best = ranked.first().map_or(0, |(_, s)| *s);
     let mut queue = VecDeque::new();
     let mut seen = BTreeSet::new();
+    let mut shown_text = BTreeSet::new();
+    let mut text_files = BTreeSet::new();
+    let mut standalone = standalone.into_iter().peekable();
     for (id, score) in ranked.into_iter().take(4) {
         if score < best / 2 || report.clipped {
             break;
+        }
+        while let Some(&at) = standalone.peek()
+            && passages[at].rank() > score
+            && shown_text.len() < 5
+            && !report.clipped
+        {
+            show_text(&mut report, &passages[at]);
+            shown_text.insert(at);
+            text_files.insert(passages[at].location.file.clone());
+            standalone.next();
         }
         let def = &index.definitions[id];
         report.line(format!(
@@ -497,8 +701,27 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
             }
         }
     }
-    let mut inspected: BTreeMap<_, _> = sources
+    for (at, hit) in passages.iter().enumerate() {
+        if report.clipped || shown_text.len() >= 5 {
+            break;
+        }
+        let file = &hit.location.file;
+        if shown_text.contains(&at)
+            || seen.iter().any(|&id| {
+                let d = &index.definitions[id];
+                d.location.file == *file
+                    && (d.declaration..=d.declaration + 2).contains(&hit.location.start)
+            })
+        {
+            continue;
+        }
+        show_text(&mut report, hit);
+        shown_text.insert(at);
+        text_files.insert(file.clone());
+    }
+    let inspected: BTreeMap<_, _> = sources
         .keys()
+        .chain(&text_files)
         .filter_map(|file| {
             index
                 .files
@@ -506,26 +729,7 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
                 .map(|hash| (file.clone(), hash.clone()))
         })
         .collect();
-    let mut text_hits = 0;
-    for hit in passages {
-        if report.clipped || text_hits >= 5 {
-            break;
-        }
-        let file = &hit.location.file;
-        if seen.iter().any(|&id| {
-            let d = &index.definitions[id];
-            d.location.file == *file
-                && (d.declaration..=d.declaration + 2).contains(&hit.location.start)
-        }) {
-            continue;
-        }
-        report.line(format!("Text {} {}", hit.location, hit.text));
-        if let Some(hash) = index.files.get(file) {
-            inspected.insert(file.clone(), hash.clone());
-        }
-        text_hits += 1;
-    }
-    if !found_run && seen.is_empty() && text_hits == 0 {
+    if !found_run && seen.is_empty() && shown_text.is_empty() {
         report.line("No matching source or recorded failure. Try a symbol, file name, or an error from the log.");
     }
     history::saw_pack(workspace, inspected);
