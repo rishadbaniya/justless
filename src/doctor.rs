@@ -3,13 +3,15 @@
 //! a fix for each problem. It only reads: it never opens the index, takes a lock or
 //! creates `.justless/`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::{Arg, ArgMatches, Command};
@@ -19,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::agents::{self, AGENTS, Agent};
 use crate::history::{human_bytes, now_ms};
 use crate::mcp::Client;
-use crate::workspace::{Settings, Workspace};
+use crate::workspace::{PROJECT_MARKERS, Settings, Workspace};
 
 pub fn command() -> Command<'static> {
     Command::new("doctor")
@@ -32,6 +34,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SCANNED_RUNS: usize = 500;
 /// Run directories measured for the archive size.
 const MEASURED_RUNS: usize = 20_000;
+/// Directories in `.justless/` that Justless creates files in.
+const STATE_DIRECTORIES: &[&str] = &["", "runs", "observations", "baselines"];
+/// The lock files `lock_state` opens in `.justless/`.
+const LOCK_FILES: &[&str] = &[
+    "activity.lock",
+    "capture.lock",
+    "edit.lock",
+    "index.lock",
+    "setup.lock",
+];
 /// Executable suffixes tried for a program name on PATH.
 const SUFFIXES: &[&str] = if cfg!(windows) {
     &[".exe", ".cmd", ".bat"]
@@ -86,8 +98,12 @@ impl Status {
 }
 
 enum Fix {
-    /// `justless init` for one agent, with or without `--hooks`.
-    Init { agent: &'static str, hooks: bool },
+    /// `justless init` for these agents, with or without `--hooks`, which doctor
+    /// has planned as `init` plans it and found to run.
+    Init {
+        agents: Vec<&'static str>,
+        hooks: bool,
+    },
     /// A shell command to run from the directory doctor ran in.
     Command(String),
     /// An edit to make by hand.
@@ -220,6 +236,33 @@ impl Profile {
     }
 }
 
+/// What doctor found in one agent's hook file.
+struct Hooks {
+    /// The file has Justless entries, or a problem doctor reports.
+    hooked: bool,
+    /// Its handlers call justless by a path, which `init` does not recognize.
+    by_path: bool,
+    checks: Vec<Check>,
+}
+
+impl Hooks {
+    fn none() -> Self {
+        Self {
+            hooked: false,
+            by_path: false,
+            checks: Vec::new(),
+        }
+    }
+
+    fn problem(check: Check) -> Self {
+        Self {
+            hooked: true,
+            by_path: false,
+            checks: vec![check],
+        }
+    }
+}
+
 /// One agent's hooks and instructions.
 struct AgentAudit<'p> {
     profile: &'p Profile,
@@ -275,9 +318,12 @@ impl Doctor<'_> {
         }
         let mcp = self.audit_mcp();
         let set_up = audits.iter().any(|audit| audit.hooked || audit.instructed) || !mcp.is_empty();
+        // The files `Workspace` finds a project root by, so a project gets the same
+        // report from its root as from its subdirectories.
         let marked = [".git", ".justless", ".justless.toml"]
             .iter()
-            .any(|name| fs::symlink_metadata(root.join(name)).is_ok());
+            .any(|name| fs::symlink_metadata(root.join(name)).is_ok())
+            || PROJECT_MARKERS.iter().any(|name| root.join(name).is_file());
         if !self.explicit_root && !set_up && !marked && here == Some(root.as_path()) {
             return self.outside(sections, &profiles, &clis, false);
         }
@@ -285,6 +331,21 @@ impl Doctor<'_> {
         let mut others = Section::new("agents", if set_up { "Other agents" } else { "Agents" });
         let mut missing = Vec::new();
         let mut agents_json = Vec::new();
+        // The agents the setup command names, without those whose files `init`
+        // cannot read: one of them would stop the whole run.
+        let candidates = if set_up {
+            Vec::new()
+        } else {
+            match detected(&profiles, &clis) {
+                detected if detected.is_empty() => vec!["claude"],
+                detected => detected,
+            }
+        };
+        let ready: Vec<&'static str> = candidates
+            .iter()
+            .copied()
+            .filter(|name| self.setup_error(&[name], true).is_none())
+            .collect();
         for audit in audits {
             let profile = audit.profile;
             let set = audit.hooked || audit.instructed;
@@ -315,10 +376,7 @@ impl Doctor<'_> {
                                 profile.label
                             ),
                         )
-                        .fix(Fix::Init {
-                            agent: profile.name,
-                            hooks: true,
-                        }),
+                        .fix(self.init_fix(profile.name, true)),
                     );
                 }
                 section.checks.extend(audit.checks);
@@ -338,10 +396,16 @@ impl Doctor<'_> {
                             profile.requirement()
                         ),
                     )
-                    .fix(Fix::Init {
-                        agent: profile.name,
-                        hooks: true,
-                    })
+                    .fix(self.init_fix(profile.name, true))
+                } else if candidates.contains(&profile.name) && !ready.contains(&profile.name) {
+                    Check::new(
+                        Status::Warn,
+                        format!(
+                            "{}, but setup cannot write its files here, so the setup command leaves it out",
+                            profile.found(cli)
+                        ),
+                    )
+                    .fix(self.init_fix(profile.name, true))
                 } else {
                     Check::new(Status::Ok, profile.found(cli))
                 });
@@ -366,23 +430,28 @@ impl Doctor<'_> {
             ));
         }
         if !set_up {
-            let detected = detected(&profiles, &clis);
             let mut message = String::from(
                 "Justless is not set up in this project: no agent hooks, instructions or MCP entries",
             );
-            if detected.is_empty() {
+            if detected(&profiles, &clis).is_empty() {
                 message.push_str(
                     ". Replace claude in the fix with your agent: codex, cursor, gemini, copilot, opencode or agy",
                 );
             }
-            let names = if detected.is_empty() {
-                vec!["claude"]
-            } else {
-                detected
+            let fix = match candidates.as_slice() {
+                _ if !ready.is_empty() => Fix::Init {
+                    agents: ready.clone(),
+                    hooks: true,
+                },
+                [only] => self.init_fix(only, true),
+                _ => Fix::Manual(format!(
+                    "Fix what stops setup for each agent above, then run `{}`",
+                    self.init(&candidates, true)
+                )),
             };
             others
                 .checks
-                .push(Check::new(Status::Fail, message).fix(Fix::Command(self.init(&names, true))));
+                .push(Check::new(Status::Fail, message).fix(fix));
         }
         sections.push(others);
         if !mcp.is_empty() {
@@ -445,18 +514,22 @@ impl Doctor<'_> {
         } else {
             detected
         };
-        let init = self.init(&names, true);
         let mut project = Section::new("project", "Project");
         project.checks.push(Check::new(
             Status::Info,
-            if at_home {
+            if !at_home {
                 format!(
-                    "{} is your home directory. Justless sets up hooks per project, so they never land in your global agent settings.",
+                    "{} has no Justless setup, and neither it nor a parent directory has .git, .justless/ or a project file such as Cargo.toml or package.json.",
+                    place.display()
+                )
+            } else if place.parent().is_none() {
+                format!(
+                    "{} is the filesystem root, not a project. Justless sets up hooks per project.",
                     place.display()
                 )
             } else {
                 format!(
-                    "{} has no Justless setup, and neither it nor a parent directory has .git or .justless/.",
+                    "{} is your home directory. Justless sets up hooks per project, so they never land in your global agent settings.",
                     place.display()
                 )
             },
@@ -465,14 +538,36 @@ impl Doctor<'_> {
             Status::Info,
             "Inside a project, doctor also checks each agent's hooks and instructions against what `justless init` writes, MCP entries and the .justless/ archive.",
         ));
-        project.checks.push(Check::new(
-            Status::Info,
-            if at_home {
-                format!("To set up a project, run this in its folder: {init}")
-            } else {
-                format!("If this folder is your project, set it up with: {init}")
-            },
-        ));
+        if at_home {
+            project.checks.push(Check::new(
+                Status::Info,
+                format!(
+                    "To set up a project, run this in its folder: {}",
+                    self.init(&names, true)
+                ),
+            ));
+        } else {
+            // Name only the agents whose files `init` can read here.
+            let mut ready = Vec::new();
+            for name in names {
+                match self.setup_error(&[name], true) {
+                    None => ready.push(name),
+                    Some(error) => project.checks.push(Check::new(
+                        Status::Info,
+                        format!("Setup for {name} cannot run in this folder: {error}"),
+                    )),
+                }
+            }
+            if !ready.is_empty() {
+                project.checks.push(Check::new(
+                    Status::Info,
+                    format!(
+                        "If this folder is your project, set it up with: {}",
+                        self.init(&ready, true)
+                    ),
+                ));
+            }
+        }
         sections.push(project);
         Report {
             project: false,
@@ -506,9 +601,90 @@ impl Doctor<'_> {
 
     fn fix_text(&self, fix: &Fix) -> String {
         match fix {
-            Fix::Init { agent, hooks } => self.init(&[agent], *hooks),
+            Fix::Init { agents, hooks } => self.init(agents, *hooks),
             Fix::Command(text) | Fix::Manual(text) => text.clone(),
         }
+    }
+
+    /// Why `init` for `names` would stop before writing anything, with project
+    /// paths shown relative to the root. Plans the run as `init` does.
+    fn setup_error(&self, names: &[&str], hooks: bool) -> Option<String> {
+        let agents: Vec<Agent> = names
+            .iter()
+            .filter_map(|name| Agent::parse(name).ok())
+            .collect();
+        let error = agents::setup_error(self.workspace, &agents, hooks)?;
+        Some(self.relative(&format!("{error:#}")))
+    }
+
+    fn relative(&self, text: &str) -> String {
+        text.replace(&format!("{}/", self.workspace.root.display()), "")
+    }
+
+    /// The `init` fix for one agent. When setup would stop on one of the
+    /// project's files, an edit by hand that names it and then runs `init`.
+    fn init_fix(&self, name: &'static str, hooks: bool) -> Fix {
+        let Some(error) = self.setup_error(&[name], hooks) else {
+            return Fix::Init {
+                agents: vec![name],
+                hooks,
+            };
+        };
+        let init = self.init(&[name], hooks);
+        // Name the hook file only when it, and not an instructions file, stops setup.
+        let blocker = Agent::parse(name)
+            .ok()
+            .filter(|_| hooks && self.setup_error(&[name], false).is_none())
+            .and_then(|agent| self.hook_blocker(agent));
+        Fix::Manual(match blocker {
+            Some(blocker) => format!("{blocker}, then run `{init}`"),
+            None => format!("Setup stops with \"{error}\". Fix that, then run `{init}`"),
+        })
+    }
+
+    /// What stops `init --hooks` from writing `agent`'s hook file, as the edit
+    /// that clears it, when doctor can tell.
+    fn hook_blocker(&self, agent: Agent) -> Option<String> {
+        let root = &self.workspace.root;
+        let relative = agent.hook_file();
+        // Setup writes hooks only into real directories, not through links.
+        let mut directory = PathBuf::new();
+        for part in relative.parent()?.components() {
+            directory.push(part);
+            let metadata = fs::symlink_metadata(root.join(&directory)).ok()?;
+            if metadata.file_type().is_symlink() {
+                return Some(format!(
+                    "Replace the {} link with a directory holding the same files (setup does not write through links)",
+                    directory.display()
+                ));
+            }
+            if !metadata.is_dir() {
+                return Some(format!(
+                    "Move the file {} aside, since setup keeps hooks in a directory there",
+                    directory.display()
+                ));
+            }
+        }
+        let file = relative.display();
+        let metadata = fs::symlink_metadata(root.join(&relative)).ok()?;
+        if !metadata.is_file() {
+            return Some(format!("Make {file} a regular file rather than a link"));
+        }
+        let text = fs::read_to_string(root.join(&relative)).ok()?;
+        if agent == Agent::OpenCode || serde_json::from_str::<Value>(&text).is_ok() {
+            return None;
+        }
+        let commented = text.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("//") || line.starts_with("/*")
+        });
+        Some(if commented {
+            format!("Remove the comments from {file}, which setup reads as plain JSON")
+        } else {
+            format!(
+                "Fix the JSON in {file}, which setup reads as plain JSON without comments or trailing commas"
+            )
+        })
     }
 
     /// A project path as one shell word for a fix command.
@@ -586,76 +762,76 @@ impl Doctor<'_> {
             }),
         }
         if found.len() > 1 {
-            let others: Vec<String> = found[1..].iter().map(|path| quote(path)).collect();
-            let mut check = Check::new(
+            // Listed only: a shadowed copy may be another install's, such as one
+            // that `cargo install` or a package manager owns.
+            let others: Vec<String> = found[1..]
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            section.checks.push(Check::new(
                 Status::Warn,
                 format!(
-                    "{} copies of justless are on PATH. Hooks run the first, {}, and the others are shadowed: {}",
+                    "{} copies of justless are on PATH. Hooks run the first, {}, and the others are shadowed: {}. Remove a copy you no longer use with the tool that installed it, such as `cargo uninstall justless`.",
                     found.len(),
                     found[0].display(),
                     others.join(", ")
                 ),
-            );
-            if same_file(&found[0], canonical.as_deref()) {
-                check = check.fix(Fix::Command(format!("rm {}", others.join(" "))));
-            }
-            section.checks.push(check);
+            ));
         }
         section
     }
 
     fn audit_agent<'p>(&self, profile: &'p Profile, cli: Option<PathBuf>) -> AgentAudit<'p> {
-        let (hooked, mut checks) = self.audit_hooks(profile);
-        let (block, instructions) = self.audit_instructions(profile, hooked);
+        let hooks = self.audit_hooks(profile);
+        // Offer `init --hooks` for the instructions only where it runs and adds no
+        // second copy of hooks that call justless by path.
+        let rerun =
+            hooks.hooked && !hooks.by_path && self.setup_error(&[profile.name], true).is_none();
+        let (block, instructions) = self.audit_instructions(profile, rerun);
         // Without hooks, a section in a file only this client reads still shows setup.
-        let instructed = !hooked
+        let instructed = !hooks.hooked
             && block
             && matches!(profile.agent, Agent::Claude | Agent::Gemini | Agent::Codex);
-        if hooked || instructed {
+        let mut checks = hooks.checks;
+        if hooks.hooked || instructed {
             checks.extend(instructions);
         }
         AgentAudit {
             profile,
             cli,
-            hooked,
+            hooked: hooks.hooked,
             instructed,
             checks,
         }
     }
 
-    /// Whether the agent's hook file holds Justless entries, and the checks for it.
-    fn audit_hooks(&self, profile: &Profile) -> (bool, Vec<Check>) {
+    /// The agent's hook file: whether it holds Justless entries, and its checks.
+    fn audit_hooks(&self, profile: &Profile) -> Hooks {
         let relative = profile.agent.hook_file();
         let file = relative.display().to_string();
-        let init = Fix::Init {
-            agent: profile.name,
-            hooks: true,
-        };
         let text = match fs::read_to_string(self.workspace.root.join(&relative)) {
             Ok(text) => text,
-            Err(error) if error.kind() == ErrorKind::NotFound => return (false, Vec::new()),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Hooks::none(),
             Err(error) => {
-                return (
-                    true,
-                    vec![
-                        Check::new(Status::Fail, format!("Hooks: cannot read {file}: {error}"))
-                            .fix(Fix::Manual(format!(
-                                "Make {file} a readable file, then run `{}`",
-                                self.fix_text(&init)
-                            ))),
-                    ],
+                return Hooks::problem(
+                    Check::new(Status::Fail, format!("Hooks: cannot read {file}: {error}")).fix(
+                        Fix::Manual(format!(
+                            "Make {file} a readable file, then run `{}`",
+                            self.init(&[profile.name], true)
+                        )),
+                    ),
                 );
             }
         };
         let pending = agents::pending_hooks(self.workspace, profile.agent);
         if profile.agent == Agent::OpenCode {
-            let check = match pending {
+            return Hooks::problem(match pending {
                 Ok(None) => Check::new(Status::Ok, format!("Plugin: {file} is current")),
                 Ok(Some(_)) => Check::new(
                     Status::Fail,
                     format!("Plugin: {file} is from another version of Justless"),
                 )
-                .fix(init),
+                .fix(self.init_fix(profile.name, true)),
                 Err(_) => {
                     let path = self.shell_path(&file);
                     Check::new(
@@ -664,70 +840,73 @@ impl Doctor<'_> {
                     )
                     .fix(Fix::Command(format!(
                         "mv {path} {path}.bak && {}",
-                        self.fix_text(&init)
+                        self.init(&[profile.name], true)
                     )))
                 }
-            };
-            return (true, vec![check]);
+            });
         }
         let tag = format!("justless hook-{}", profile.name);
         let config: Value = match serde_json::from_str(&text) {
             Ok(config) => config,
             Err(error) if text.contains(&tag) => {
-                return (
-                    true,
-                    vec![
-                        Check::new(
-                            Status::Fail,
-                            format!("Hooks: {file} is not valid JSON ({error})"),
-                        )
-                        .fix(Fix::Manual(format!(
-                            "Fix the JSON in {file}, then run `{}`",
-                            self.fix_text(&init)
-                        ))),
-                    ],
+                // Setup would add a second copy of a hook that calls justless by path.
+                let then = if text.contains(&format!("/{tag}")) {
+                    String::new()
+                } else {
+                    format!(", then run `{}`", self.init(&[profile.name], true))
+                };
+                return Hooks::problem(
+                    Check::new(
+                        Status::Fail,
+                        format!("Hooks: {file} is not valid JSON ({error})"),
+                    )
+                    .fix(Fix::Manual(format!(
+                        "Fix the JSON in {file}, which setup reads as plain JSON without comments or trailing commas{then}"
+                    ))),
                 );
             }
-            Err(_) => return (false, Vec::new()),
+            Err(_) => return Hooks::none(),
         };
         let expected = agents::fresh_hooks(profile.agent)
             .ok()
             .and_then(|fresh| serde_json::from_str::<Value>(&fresh).ok())
             .and_then(|fresh| expected_hooks(&fresh));
         let Some((group, expected)) = expected else {
-            return (
-                true,
-                vec![Check::new(
+            return Hooks::problem(
+                Check::new(
                     Status::Fail,
                     format!("Hooks: cannot work out the hooks setup writes to {file}"),
-                )],
+                )
+                .fix(Fix::Manual(
+                    "Reinstall justless, since this build cannot produce its own hook file, and report a bug if a fresh install does the same".into(),
+                )),
             );
         };
         let disk = audit_config(profile.agent, &config, &group, &expected);
         if let Some(shape) = &disk.shape {
             if !text.contains(&tag) {
-                return (false, Vec::new());
+                return Hooks::none();
             }
-            return (
-                true,
-                vec![
-                    Check::new(Status::Fail, format!("Hooks: in {file}, {shape}")).fix(
-                        Fix::Manual(format!(
-                            "Fix the structure of {file}, then run `{}`",
-                            self.fix_text(&init)
-                        )),
+            return Hooks::problem(
+                Check::new(Status::Fail, format!("Hooks: in {file}, {shape}")).fix(Fix::Manual(
+                    format!(
+                        "Fix the structure of {file}, then run `{}`",
+                        self.init(&[profile.name], true)
                     ),
-                ],
+                )),
             );
         }
         if disk.found == 0 && disk.unexpected.is_empty() {
-            return (false, Vec::new());
+            return Hooks::none();
         }
-        let mut checks = Vec::new();
+        let by_path = !disk.paths.is_empty();
+        let mut problems = Vec::new();
+        let mut notes = Vec::new();
         // Setup adds missing entries and leaves existing ones as they are, so audit
-        // what it would write: a problem left there needs a fix by hand.
+        // what it would write: a problem left there needs a fix by hand. Setup does
+        // not see handlers that call justless by path, so it would copy them.
         let merged = match &pending {
-            Ok(Some(contents)) => serde_json::from_str::<Value>(contents)
+            Ok(Some(contents)) if !by_path => serde_json::from_str::<Value>(contents)
                 .ok()
                 .map(|merged| audit_config(profile.agent, &merged, &group, &expected)),
             _ => None,
@@ -736,72 +915,118 @@ impl Doctor<'_> {
         if !disk.missing.is_empty() {
             let modes = list(disk.missing.iter().map(|&index| expected[index].mode()));
             let hooks = plural_word(disk.missing.len(), "hook");
-            checks.push(match &pending {
-                Ok(Some(_)) if after.missing.is_empty() => Check::new(
-                    Status::Fail,
-                    format!("Hooks: {file} lacks the {modes} {hooks}"),
-                )
-                .fix(init),
+            let lacks = format!("Hooks: {file} lacks the {modes} {hooks}");
+            problems.push(match &pending {
+                _ if by_path => Check::new(Status::Fail, lacks)
+                    .fix(Fix::Manual(add_by_hand(&file, &group, &expected, &disk))),
+                Ok(Some(_)) if after.missing.is_empty() => {
+                    Check::new(Status::Fail, lacks).fix(self.init_fix(profile.name, true))
+                }
                 Err(error) => Check::new(
                     Status::Fail,
                     format!(
-                        "Hooks: {file} lacks the {modes} {hooks}, and setup cannot add them: {error:#}"
+                        "{lacks}, and setup cannot add {}: {}",
+                        if disk.missing.len() == 1 {
+                            "it"
+                        } else {
+                            "them"
+                        },
+                        self.relative(&format!("{error:#}"))
                     ),
                 )
-                .fix(Fix::Manual(format!(
-                    "Fix {file} so setup can read it, then run `{}`",
-                    self.fix_text(&init)
-                ))),
+                .fix(self.init_fix(profile.name, true)),
                 _ => Check::new(
                     Status::Fail,
-                    format!(
-                        "Hooks: {file} lacks the {modes} {hooks}, which setup does not add over the entries it finds"
-                    ),
+                    format!("{lacks}, which setup does not add over the entries it finds"),
                 )
                 .fix(Fix::Manual(format!(
                     "Remove the Justless entries from {file}, then run `{}`",
-                    self.fix_text(&init)
+                    self.init(&[profile.name], true)
                 ))),
             });
-        } else {
+        } else if !by_path {
             match &pending {
-                Ok(Some(_)) => checks.push(
-                    Check::new(Status::Fail, format!("Hooks: setup would update {file}")).fix(init),
+                Ok(Some(_)) => problems.push(
+                    Check::new(Status::Fail, format!("Hooks: setup would update {file}"))
+                        .fix(self.init_fix(profile.name, true)),
                 ),
-                Err(error) => checks.push(
-                    Check::new(
-                        Status::Fail,
-                        format!("Hooks: setup cannot update {file}: {error:#}"),
-                    )
-                    .fix(Fix::Manual(format!(
-                        "Fix {file} so setup can read it, then run `{}`",
-                        self.fix_text(&init)
-                    ))),
-                ),
+                // Every hook is in place, so the hooks work, and only a later
+                // `init --hooks` would stop.
+                Err(error) => {
+                    let then = format!(
+                        "so a later `{}` can update it",
+                        self.init(&[profile.name], true)
+                    );
+                    let fix = match self.hook_blocker(profile.agent) {
+                        Some(blocker) => format!("{blocker}, {then}"),
+                        None => format!("Fix what stops setup, {then}"),
+                    };
+                    notes.push(
+                        Check::new(
+                            Status::Warn,
+                            format!(
+                                "Hooks: setup cannot update {file}: {}",
+                                self.relative(&format!("{error:#}"))
+                            ),
+                        )
+                        .fix(Fix::Manual(fix)),
+                    );
+                }
                 Ok(None) => {}
             }
         }
-        checks.extend(after.drift.iter().map(|drift| drift.check(&file)));
-        checks.extend(disk.unexpected.iter().map(|entry| {
+        if by_path {
+            notes.push(Check::new(
+                Status::Info,
+                format!(
+                    "Hooks: {file} calls justless by its path, {}. Setup looks only for the bare `justless` command, so `init --hooks` would add a second copy of each hook. Update this file by hand.",
+                    disk.paths.join(", ")
+                ),
+            ));
+            for path in &disk.paths {
+                if let Some(program) = expand(path)
+                    && !executable(&program)
+                {
+                    problems.push(
+                        Check::new(
+                            Status::Fail,
+                            format!("Hooks: {file} runs {path}, which is not an executable file"),
+                        )
+                        .fix(Fix::Manual(format!(
+                            "In {file}, point the Justless hooks at an installed justless, such as {}",
+                            std::env::current_exe()
+                                .map_or_else(|_| "justless".into(), |exe| quote(&exe))
+                        ))),
+                    );
+                }
+            }
+        }
+        problems.extend(after.drift.iter().map(|drift| drift.check(&file)));
+        problems.extend(disk.unexpected.iter().map(|entry| {
             Check::new(
                 Status::Warn,
                 format!("Hooks: {file} also runs {entry}, which setup does not write"),
             )
             .fix(Fix::Manual(format!("Remove that hook from {file}")))
         }));
-        if checks.is_empty() {
+        if problems.is_empty() {
             let modes: Vec<&str> = expected.iter().map(Expected::mode).collect();
             let all = match expected.len() {
                 1 => "its Justless hook".to_owned(),
                 2 => "both Justless hooks".to_owned(),
                 count => format!("all {count} Justless hooks"),
             };
-            checks.push(Check::new(
+            problems.push(Check::new(
                 Status::Ok,
                 format!("Hooks: {file} has {all} ({})", modes.join(", ")),
             ));
         }
-        (true, checks)
+        problems.extend(notes);
+        Hooks {
+            hooked: true,
+            by_path,
+            checks: problems,
+        }
     }
 
     /// Whether the agent's own instructions file has a Justless section, and the
@@ -810,16 +1035,13 @@ impl Doctor<'_> {
         let root = &self.workspace.root;
         let name = profile.agent.instructions_name();
         let path = root.join(name);
-        let init = Fix::Init {
-            agent: profile.name,
-            hooks,
-        };
+        let init = self.init(&[profile.name], hooks);
         // Setup skips a link that leaves the project.
         let editable =
             agents::instructions_target(root, &path).map_or(true, |target| target.is_some());
-        let rewrite = |init: Fix| {
+        let rewrite = || {
             if editable {
-                init
+                self.init_fix(profile.name, hooks)
             } else {
                 Fix::Manual(format!(
                     "{name} links outside the project, so setup skips it. Replace the link with a file, or update the Justless section in its target yourself"
@@ -833,7 +1055,7 @@ impl Doctor<'_> {
                     false,
                     vec![
                         Check::new(Status::Fail, format!("Instructions: {name} does not exist"))
-                            .fix(rewrite(init)),
+                            .fix(rewrite()),
                     ],
                 );
             }
@@ -846,8 +1068,7 @@ impl Doctor<'_> {
                             format!("Instructions: cannot read {name}: {error}"),
                         )
                         .fix(Fix::Manual(format!(
-                            "Make {name} a readable file, then run `{}`",
-                            self.fix_text(&init)
+                            "Make {name} a readable file, then run `{init}`"
                         ))),
                     ],
                 );
@@ -863,12 +1084,11 @@ impl Doctor<'_> {
                 Status::Fail,
                 format!("Instructions: {name} has an older Justless block"),
             )
-            .fix(rewrite(init)),
+            .fix(rewrite()),
             Block::Broken(why) => {
                 Check::new(Status::Fail, format!("Instructions: {name} has {why}")).fix(
                     Fix::Manual(format!(
-                        "Remove the partial Justless section from {name}, then run `{}`",
-                        self.fix_text(&init)
+                        "Remove the partial Justless section from {name}, then run `{init}`"
                     )),
                 )
             }
@@ -881,7 +1101,7 @@ impl Doctor<'_> {
                     Status::Fail,
                     format!("Instructions: {name} has no Justless block"),
                 )
-                .fix(rewrite(init)),
+                .fix(rewrite()),
             },
         };
         (state != Block::Absent, vec![check])
@@ -907,12 +1127,11 @@ impl Doctor<'_> {
             let Ok(imported) = fs::read_to_string(&path) else {
                 continue;
             };
-            let refresh = match target {
-                "AGENTS.md" => Fix::Command(self.init(&["codex"], false)),
-                "GEMINI.md" => Fix::Command(self.init(&["gemini"], false)),
-                _ => Fix::Manual(format!(
-                    "Update the Justless section in {target} to the one setup writes into AGENTS.md"
-                )),
+            // The client whose instructions file `init` writes there.
+            let owner = match target {
+                "AGENTS.md" => Some("codex"),
+                "GEMINI.md" => Some("gemini"),
+                _ => None,
             };
             return Some(match block_state(&imported) {
                 Block::Absent => continue,
@@ -928,15 +1147,25 @@ impl Doctor<'_> {
                         "Instructions: {name} imports {target}, which has an older Justless block"
                     ),
                 )
-                .fix(refresh),
+                .fix(match owner {
+                    Some(owner) => self.init_fix(owner, false),
+                    None => Fix::Manual(format!(
+                        "Update the Justless section in {target} to the one setup writes into AGENTS.md"
+                    )),
+                }),
                 Block::Broken(why) => Check::new(
                     Status::Fail,
                     format!("Instructions: {name} imports {target}, which has {why}"),
                 )
-                .fix(Fix::Manual(format!(
-                    "Remove the partial Justless section from {target}, then run `{}`",
-                    self.fix_text(&refresh)
-                ))),
+                .fix(Fix::Manual(match owner {
+                    Some(owner) => format!(
+                        "Remove the partial Justless section from {target}, then run `{}`",
+                        self.init(&[owner], false)
+                    ),
+                    None => format!(
+                        "Replace the partial Justless section in {target} with the one setup writes into AGENTS.md"
+                    ),
+                })),
             });
         }
         None
@@ -1013,7 +1242,16 @@ impl Doctor<'_> {
                 .join(" ");
             let want = strings(&client.server_entry()["args"]);
             let program = Path::new(&command);
-            let problem = if args.first().map(String::as_str) != Some("mcp") {
+            // `--root`, the one global option, may come before the subcommand.
+            let mut rest = args.as_slice();
+            loop {
+                match rest {
+                    [flag, _, tail @ ..] if flag == "--root" => rest = tail,
+                    [flag, tail @ ..] if flag.starts_with("--root=") => rest = tail,
+                    _ => break,
+                }
+            }
+            let problem = if rest.first().map(String::as_str) != Some("mcp") {
                 Some((
                     "which does not start the MCP server",
                     "args",
@@ -1055,10 +1293,15 @@ impl Doctor<'_> {
                     ".justless/ does not exist yet. The first routed command, query or `justless init` creates it.",
                 ));
             }
-            Err(error) => checks.push(Check::new(
-                Status::Fail,
-                format!("Cannot inspect .justless/: {error}"),
-            )),
+            Err(error) => checks.push(
+                Check::new(Status::Fail, format!("Cannot inspect .justless/: {error}")).fix(
+                    Fix::Manual(format!(
+                        "Give your user access to {} and its .justless/ directory; `ls -ld {}` shows their owners and modes",
+                        root.display(),
+                        self.shell_path(".")
+                    )),
+                ),
+            ),
             Ok(metadata) if !metadata.is_dir() => checks.push(
                 Check::new(
                     Status::Fail,
@@ -1075,34 +1318,28 @@ impl Doctor<'_> {
             ),
             Ok(metadata) => {
                 let before = checks.len();
-                let locked = [
-                    "",
-                    "runs",
-                    "observations",
-                    "baselines",
-                    "index.json",
-                    "activity.json",
-                ]
-                .iter()
-                .map(|name| state.join(name))
-                .filter(|path| path.exists())
-                .find(|path| !writable(path));
-                if let Some(path) = locked {
+                // State files are replaced by a rename, so only their directories
+                // need write access. Lock files are opened for reading and writing.
+                let locked = STATE_DIRECTORIES
+                    .iter()
+                    .map(|name| (state.join(name), true))
+                    .chain(LOCK_FILES.iter().map(|name| (state.join(name), false)))
+                    .find(|(path, _)| fs::symlink_metadata(path).is_ok() && !writable(path));
+                if let Some((path, directory_entry)) = locked {
                     let shown = path.strip_prefix(root).unwrap_or(&path).display();
                     let fix = if cfg!(unix) && foreign(&path, root) {
                         format!("sudo chown -R \"$(id -un)\" {directory}")
                     } else {
                         format!("chmod -R u+rwX {directory}")
                     };
-                    checks.push(
-                        Check::new(
-                            Status::Fail,
-                            format!(
-                                "{shown} is not writable, so runs and the index cannot be saved"
-                            ),
+                    let message = if directory_entry {
+                        format!("{shown} is not writable, so runs and the index cannot be saved")
+                    } else {
+                        format!(
+                            "{shown} cannot be opened for reading and writing, so commands that take this lock fail"
                         )
-                        .fix(Fix::Command(fix)),
-                    );
+                    };
+                    checks.push(Check::new(Status::Fail, message).fix(Fix::Command(fix)));
                 }
                 if shared(&metadata) {
                     checks.push(
@@ -1230,45 +1467,57 @@ impl Doctor<'_> {
             for (manual, fix) in self.fixes(report) {
                 let _ = writeln!(out, "  {}{fix}", if manual { "by hand: " } else { "" });
             }
-            out.push_str("Then run `justless doctor` again.\n");
+            let _ = writeln!(out, "Then run `{} doctor` again.", self.justless());
         }
         out
     }
 
-    /// The fix for every problem, and whether it is an edit by hand, with the
-    /// `init` runs combined into one command.
+    /// The fix for every problem, and whether it is an edit by hand: commands
+    /// first, such as one that puts `justless` on PATH, then the `init` runs
+    /// combined into one command, then the edits by hand. Each `init` fix was
+    /// planned on its own, so none of them depends on an edit by hand.
     fn fixes(&self, report: &Report) -> Vec<(bool, String)> {
-        let mut hooked = Vec::new();
-        let mut plain = Vec::new();
-        let mut other = Vec::new();
+        let mut hooked: Vec<&'static str> = Vec::new();
+        let mut plain: Vec<&'static str> = Vec::new();
+        let mut commands = Vec::new();
+        let mut manual = Vec::new();
         for check in report.checks().filter(|check| check.status == Status::Fail) {
             match &check.fix {
-                Some(Fix::Init { agent, hooks: true }) if !hooked.contains(agent) => {
-                    hooked.push(*agent);
-                }
-                Some(Fix::Init {
-                    agent,
-                    hooks: false,
-                }) if !plain.contains(agent) => plain.push(*agent),
-                Some(fix @ (Fix::Command(_) | Fix::Manual(_))) => {
-                    let fix = (matches!(fix, Fix::Manual(_)), self.fix_text(fix));
-                    if !other.contains(&fix) {
-                        other.push(fix);
+                Some(Fix::Init { agents, hooks }) => {
+                    let list = if *hooks { &mut hooked } else { &mut plain };
+                    for agent in agents {
+                        if !list.contains(agent) {
+                            list.push(agent);
+                        }
                     }
                 }
+                Some(Fix::Command(text)) if !commands.contains(text) => {
+                    commands.push(text.clone());
+                }
+                Some(Fix::Manual(text)) if !manual.contains(text) => manual.push(text.clone()),
                 _ => {}
             }
         }
         // `init --hooks` also writes the instructions.
         plain.retain(|agent| !hooked.contains(agent));
-        let mut fixes = Vec::new();
-        if !hooked.is_empty() {
-            fixes.push((false, self.init(&hooked, true)));
+        let mut fixes: Vec<(bool, String)> = commands.into_iter().map(|fix| (false, fix)).collect();
+        for (agents, hooks) in [(hooked, true), (plain, false)] {
+            if agents.is_empty() {
+                continue;
+            }
+            // `init` plans every file before it writes one, so one agent's file
+            // could stop the others in a combined run.
+            if agents.len() == 1 || self.setup_error(&agents, hooks).is_none() {
+                fixes.push((false, self.init(&agents, hooks)));
+            } else {
+                fixes.extend(
+                    agents
+                        .iter()
+                        .map(|agent| (false, self.init(&[agent], hooks))),
+                );
+            }
         }
-        if !plain.is_empty() {
-            fixes.push((false, self.init(&plain, false)));
-        }
-        fixes.extend(other);
+        fixes.extend(manual.into_iter().map(|fix| (true, fix)));
         fixes
     }
 
@@ -1416,6 +1665,31 @@ fn expected_hooks(fresh: &Value) -> Option<(String, Vec<Expected>)> {
     Some((group.clone(), expected))
 }
 
+/// A handler command with a path-qualified first word naming `justless`, such as
+/// `/opt/bin/justless hook-claude before-command`, written with the bare command
+/// as setup writes it, and that path.
+fn unqualified(command: &str) -> (Cow<'_, str>, Option<String>) {
+    let text = command.trim_start();
+    let (word, rest) = match text.chars().next() {
+        Some(quote @ ('\'' | '"')) => match text[1..].find(quote) {
+            Some(end) => (&text[1..=end], &text[end + 2..]),
+            None => return (command.into(), None),
+        },
+        _ => {
+            let end = text.find(char::is_whitespace).unwrap_or(text.len());
+            (&text[..end], &text[end..])
+        }
+    };
+    let named = Path::new(word)
+        .file_name()
+        .is_some_and(|name| name == "justless" || name == "justless.exe");
+    if word.contains('/') && named {
+        (format!("justless{rest}").into(), Some(word.to_owned()))
+    } else {
+        (command.into(), None)
+    }
+}
+
 #[derive(Default)]
 struct Audit {
     /// Expected hooks present in the file.
@@ -1427,6 +1701,8 @@ struct Audit {
     unexpected: Vec<String>,
     /// Why the file's structure cannot hold hooks.
     shape: Option<String>,
+    /// The paths that present handlers call justless by, instead of `justless`.
+    paths: Vec<String>,
 }
 
 /// A field of a present hook that differs from what setup writes.
@@ -1459,6 +1735,11 @@ impl Drift {
                 self.key, self.command
             ),
         };
+        let still = if self.key == "matcher" && !self.severe {
+            ". Both select the events the hook handles"
+        } else {
+            ""
+        };
         Check::new(
             if self.severe {
                 Status::Fail
@@ -1466,7 +1747,7 @@ impl Drift {
                 Status::Warn
             },
             format!(
-                "Hooks: the {} hook in {file} {have}, and setup writes {want}",
+                "Hooks: the {} hook in {file} {have}, and setup writes {want}{still}",
                 self.mode
             ),
         )
@@ -1501,6 +1782,16 @@ fn audit_config(agent: Agent, config: &Value, group: &str, expected: &[Expected]
         match hit {
             Some((entry, handler)) => {
                 audit.found += 1;
+                for text in ["command", "bash"]
+                    .iter()
+                    .filter_map(|key| handler.get(key)?.as_str())
+                {
+                    if let (_, Some(path)) = unqualified(text)
+                        && !audit.paths.contains(&path)
+                    {
+                        audit.paths.push(path);
+                    }
+                }
                 compare(hook, entry, handler, &mut audit.drift);
             }
             None => audit.missing.push(index),
@@ -1509,7 +1800,8 @@ fn audit_config(agent: Agent, config: &Value, group: &str, expected: &[Expected]
     for (event, entries) in hooks {
         for entry in entries.as_array().into_iter().flatten() {
             for command in commands(entry) {
-                let short = head(command);
+                let bare = unqualified(command).0;
+                let short = head(&bare);
                 if short.starts_with("justless hook-")
                     && !expected
                         .iter()
@@ -1543,13 +1835,15 @@ fn commands(entry: &Value) -> Vec<&str> {
 }
 
 /// The handler in `entry` that setup would count as `hook`, matched the way setup
-/// matches it, so doctor and setup agree on what is missing.
+/// matches it, so doctor and setup agree on what is missing. A handler that calls
+/// justless by path also counts, although setup would not see it.
 fn handler_for<'v>(agent: Agent, entry: &'v Value, hook: &Expected) -> Option<&'v Value> {
     let loose = agent.loose_hook_commands();
     let runs = |value: &Value| {
         value.as_str().is_some_and(|text| {
+            let text = unqualified(text).0;
             if loose {
-                head(text) == hook.command
+                head(&text) == hook.command
             } else {
                 text == hook.command
             }
@@ -1570,24 +1864,21 @@ fn handler_for<'v>(agent: Agent, entry: &'v Value, hook: &Expected) -> Option<&'
 
 fn compare(hook: &Expected, entry: &Value, handler: &Value, drift: &mut Vec<Drift>) {
     let mut differ = |key: &str, have: Option<&Value>, want: Option<&Value>, severe: bool| {
-        if have != want {
-            drift.push(Drift {
-                mode: hook.mode().to_owned(),
-                command: hook.command.clone(),
-                key: key.to_owned(),
-                have: have.cloned(),
-                want: want.cloned(),
-                severe,
-            });
-        }
+        drift.push(Drift {
+            mode: hook.mode().to_owned(),
+            command: hook.command.clone(),
+            key: key.to_owned(),
+            have: have.cloned(),
+            want: want.cloned(),
+            severe,
+        });
     };
-    // The matcher decides which tool calls reach the hook.
-    differ(
-        "matcher",
-        entry.get("matcher"),
-        hook.entry.get("matcher"),
-        true,
-    );
+    // The matcher decides which tool calls reach the hook. One that still selects
+    // every call setup's matcher selects is a warning: the handler checks the tool.
+    let (have, want) = (entry.get("matcher"), hook.entry.get("matcher"));
+    if have != want {
+        differ("matcher", have, want, !selects(have, want));
+    }
     for (key, want) in &hook.handler {
         if key == "matcher" {
             continue;
@@ -1595,17 +1886,112 @@ fn compare(hook: &Expected, entry: &Value, handler: &Value, drift: &mut Vec<Drif
         let have = handler.get(key);
         let severe = match key.as_str() {
             "type" => true,
-            // A command that lost its `|| true` can fail a client's tool call.
+            // A command that lost its `|| true` can fail a client's tool call. A
+            // path to justless in place of the bare command is reported elsewhere.
             "command" | "bash" => {
+                let text = have.and_then(Value::as_str);
+                if text.is_some_and(|text| unqualified(text).0 == want.as_str().unwrap_or("")) {
+                    continue;
+                }
                 want.as_str().is_some_and(|text| text.contains("||"))
-                    && !have
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| text.contains("||"))
+                    && !text.is_some_and(|text| text.contains("||"))
             }
             _ => false,
         };
-        differ(key, have, Some(want), severe);
+        if have != Some(want) {
+            differ(key, have, Some(want), severe);
+        }
     }
+}
+
+/// Whether a hook matcher selects every name that the matcher setup writes
+/// selects. A missing, empty or `*` matcher selects everything. Only a matcher
+/// that setup writes as an anchored pattern, such as `^Bash$` or
+/// `^(Grep|Glob)$`, is read as one, so for a client such as Cursor, which may
+/// compare matchers as plain names, any other matcher counts as a change.
+fn selects(have: Option<&Value>, want: Option<&Value>) -> bool {
+    let have = match have {
+        None => return true,
+        Some(Value::String(have)) if have.is_empty() || have == "*" => return true,
+        Some(Value::String(have)) => have,
+        Some(_) => return false,
+    };
+    let Some(names) = want
+        .and_then(Value::as_str)
+        .and_then(|want| want.strip_prefix('^')?.strip_suffix('$'))
+    else {
+        return false;
+    };
+    let names = names
+        .strip_prefix('(')
+        .and_then(|names| names.strip_suffix(')'))
+        .unwrap_or(names);
+    // Claude Code compares a matcher of letters, digits, `_` and `|` as a list of
+    // names, and tests any other as a regular expression. Either reading counts.
+    let listed = have
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '|');
+    let pattern = regex::Regex::new(have).ok();
+    names.split('|').all(|name| {
+        (listed && have.split('|').any(|item| item == name))
+            || pattern
+                .as_ref()
+                .is_some_and(|pattern| pattern.is_match(name))
+    })
+}
+
+/// The edit that adds missing hooks to a file whose others call justless by
+/// path, since `init --hooks` would also add a second copy of those.
+fn add_by_hand(file: &str, group: &str, expected: &[Expected], disk: &Audit) -> String {
+    let program = disk.paths.first().map_or_else(
+        || "justless".to_owned(),
+        |path| shlex::try_quote(path).map_or_else(|_| path.clone(), |quoted| quoted.into_owned()),
+    );
+    let entries: Vec<String> = disk
+        .missing
+        .iter()
+        .map(|&index| {
+            let hook = &expected[index];
+            let mut entry = Value::Object(hook.entry.clone());
+            qualify(&mut entry, &program);
+            format!("under \"{group}\".\"{}\" add {entry}", hook.event)
+        })
+        .collect();
+    format!(
+        "In {file}, {}. Setup looks only for the bare `justless` command, so `init --hooks` would add a second copy of the others",
+        entries.join("; ")
+    )
+}
+
+/// Points the handler commands in a hook entry at `program`.
+fn qualify(value: &mut Value, program: &str) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if let ("command" | "bash", Value::String(text)) = (key.as_str(), &mut *item)
+                    && let Some(rest) = text.strip_prefix("justless ")
+                {
+                    *text = format!("{program} {rest}");
+                } else {
+                    qualify(item, program);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| qualify(item, program)),
+        _ => {}
+    }
+}
+
+/// The file a hook's path to justless names, when doctor can tell without a shell.
+fn expand(path: &str) -> Option<PathBuf> {
+    if Path::new(path).is_absolute() {
+        return Some(PathBuf::from(path));
+    }
+    let home = std::env::home_dir()?;
+    ["~/", "$HOME/", "${HOME}/"]
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .map(|rest| home.join(rest))
 }
 
 // ---------------------------------------------------------------------------
@@ -1889,13 +2275,15 @@ fn identity(_: &fs::Metadata, path: &Path) -> (u64, u64, PathBuf) {
     (0, 0, path.to_path_buf())
 }
 
+/// Whether this user can create files in a directory, or open a file for
+/// reading and writing.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn writable(path: &Path) -> bool {
     use rustix::fs::{Access, access};
     let mode = if path.is_dir() {
         Access::WRITE_OK | Access::EXEC_OK
     } else {
-        Access::WRITE_OK
+        Access::READ_OK | Access::WRITE_OK
     };
     access(path, mode).is_ok()
 }
@@ -1975,7 +2363,9 @@ fn same_file(path: &Path, canonical: Option<&Path>) -> bool {
     canonical.is_some_and(|canonical| path.canonicalize().is_ok_and(|path| path == canonical))
 }
 
-/// The version another `justless` reports, waiting at most two seconds.
+/// The version another `justless` reports, waiting at most two seconds. Only its
+/// first line is read, on a helper thread, because a process it starts can keep
+/// the pipe open after it exits.
 fn version_of(binary: &Path) -> Option<String> {
     let mut child = Process::new(binary)
         .arg("--version")
@@ -1984,23 +2374,20 @@ fn version_of(binary: &Path) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout.take(4096)).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver.recv_timeout(Duration::from_secs(2));
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let output = child.wait_with_output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let version = text.trim().strip_prefix("justless ")?.trim();
+    let line = line.ok()?;
+    let version = line.trim().strip_prefix("justless ")?.trim();
     (!version.is_empty()).then(|| version.to_owned())
 }
 
@@ -2142,5 +2529,77 @@ mod tests {
         let check = facts.archive_check(None);
         assert!(check.status == Status::Info);
         assert!(check.message.contains("Justless deletes none of it"));
+    }
+
+    /// Fails once `.justless.toml` accepts archive limits while doctor still
+    /// reports that Justless keeps every run.
+    #[test]
+    fn retention_follows_the_archive_settings() {
+        for (text, key) in [
+            ("max_runs = 7", "max_runs"),
+            ("max_archive_bytes = 1048576", "max_archive_bytes"),
+        ] {
+            if let Ok(settings) = toml_edit::de::from_str::<Settings>(text) {
+                assert!(
+                    retention(&settings).is_some(),
+                    "Settings accepts {key}, so retention() must report the archive limits"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_matcher_that_still_selects_every_target_is_a_warning() {
+        let want = json!("^Bash$");
+        for have in ["Bash", "Bash|Read", ".*", "^Bash", "*", ""] {
+            assert!(selects(Some(&json!(have)), Some(&want)), "{have}");
+        }
+        assert!(selects(None, Some(&want)));
+        for have in ["Read", "bash", "^Shell$"] {
+            assert!(!selects(Some(&json!(have)), Some(&want)), "{have}");
+        }
+        // Every name the setup matcher selects must still be selected.
+        let want = json!("^(Grep|Glob)$");
+        assert!(selects(Some(&json!("Grep|Glob")), Some(&want)));
+        assert!(selects(Some(&json!("^G")), Some(&want)));
+        assert!(!selects(Some(&json!("Grep")), Some(&want)));
+        // A plain matcher, as Cursor and Copilot get, may be compared as a name.
+        assert!(!selects(Some(&json!("^Shell$")), Some(&json!("Shell"))));
+        assert!(selects(Some(&json!("*")), None));
+        assert!(!selects(Some(&json!("startup")), None));
+    }
+
+    #[test]
+    fn hooks_that_call_justless_by_path_are_present() {
+        assert_eq!(
+            unqualified("/opt/my tools/justless hook-claude after-read").1,
+            None,
+            "an unquoted path with a space is two words"
+        );
+        let (bare, path) = unqualified("'/opt/my tools/justless' hook-claude after-read");
+        assert_eq!(bare, "justless hook-claude after-read");
+        assert_eq!(path.as_deref(), Some("/opt/my tools/justless"));
+        assert_eq!(
+            unqualified("~/.cargo/bin/justless hook-copilot before-command || true").0,
+            "justless hook-copilot before-command || true"
+        );
+        assert_eq!(unqualified("notjustless hook-claude x").1, None);
+
+        for (_, agent) in AGENTS {
+            if agent == Agent::OpenCode {
+                continue;
+            }
+            let fresh = agents::fresh_hooks(agent).unwrap();
+            let (group, expected) = expected_hooks(&serde_json::from_str(&fresh).unwrap()).unwrap();
+            let config: Value = serde_json::from_str(
+                &fresh.replace("\"justless hook-", "\"/opt/bin/justless hook-"),
+            )
+            .unwrap();
+            let audit = audit_config(agent, &config, &group, &expected);
+            assert_eq!(audit.found, expected.len());
+            assert!(audit.missing.is_empty() && audit.unexpected.is_empty());
+            assert!(audit.drift.is_empty(), "{}", audit.drift[0].key);
+            assert_eq!(audit.paths, ["/opt/bin/justless"]);
+        }
     }
 }

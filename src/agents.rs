@@ -1571,3 +1571,13 @@ pub(crate) fn fresh_hooks(agent: Agent) -> Result<String> {
         .map(|(_, contents)| contents)
         .context("setup writes no hooks for this agent")
 }
+
+/// Why `init` for `agents` would stop before it writes anything, or `None` when
+/// its plan succeeds. Plans the run as `init` does and reads only.
+pub(crate) fn setup_error(
+    workspace: &Workspace,
+    agents: &[Agent],
+    hooks: bool,
+) -> Option<anyhow::Error> {
+    planned_changes(workspace, agents, hooks).err()
+}

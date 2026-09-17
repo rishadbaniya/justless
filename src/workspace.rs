@@ -41,7 +41,7 @@ pub struct Workspace {
     pub state: PathBuf,
 }
 
-const PROJECT_MARKERS: &[&str] = &[
+pub(crate) const PROJECT_MARKERS: &[&str] = &[
     ".justless.toml",
     "Cargo.toml",
     "package.json",
