@@ -103,16 +103,18 @@ pub fn init(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<()> 
         );
     }
     for (path, contents) in changes {
+        // Before the directories exist, so the record notes those setup creates.
+        crate::uninstall::remember(workspace, &path, &contents);
         // Copilot's hook file is two levels deep, in `.github/hooks/`.
         let parent = path.parent().unwrap();
         if let Some(outer) = parent.parent().filter(|outer| !outer.exists()) {
             private_dir(outer)?;
         }
         private_dir(parent)?;
-        crate::uninstall::remember(workspace, &path, &contents);
         write_text(&path, &contents)?;
         println!("Updated {}", path.display());
     }
+    crate::uninstall::remember_readers(workspace, agents);
     if hooks && agents.contains(&Agent::Codex) {
         println!("Review and trust the project hooks with /hooks in Codex.");
     }

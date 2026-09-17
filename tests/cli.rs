@@ -6226,6 +6226,8 @@ fn init_remove_restores_every_file_byte_for_byte() {
             (".github/workflows/ci.yml", "name: ci\n"),
         ],
     );
+    // An empty client directory the user made before setup stays after removal.
+    fs::create_dir(root.join(".agents")).unwrap();
     let original = removal_tree(&root);
 
     // Removal in a project without Justless changes nothing, not even .justless/.
@@ -6374,10 +6376,15 @@ fn init_remove_refuses_malformed_config_and_keeps_shared_instructions() {
     );
     let installed = removal_tree(&root);
 
-    // One file that does not parse stops the whole removal, and the error names it.
+    // One file that mentions Justless but does not parse stops the whole removal,
+    // and the error names it.
     let cursor = root.join(".cursor/hooks.json");
     let good = fs::read_to_string(&cursor).unwrap();
-    fs::write(&cursor, "{\"hooks\": [").unwrap();
+    fs::write(
+        &cursor,
+        "{\"hooks\": {\"preToolUse\": [{\"command\": \"justless hook-cursor before-command\"}",
+    )
+    .unwrap();
     let broken = removal_tree(&root);
     for args in [
         &["init", "--remove"][..],
@@ -6441,4 +6448,395 @@ fn init_remove_follows_a_linked_instructions_file_like_setup() {
     assert!(output.contains("\n  AGENTS.md: removed the Justless section and deleted the file"));
     assert!(!output.contains("CLAUDE.md"), "{output}");
     assert_eq!(removal_tree(&root), original);
+}
+
+#[test]
+fn init_remove_skips_config_without_justless_and_names_the_fix_for_one_with_it() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    // VS Code reads JSON with comments and trailing commas, which removal cannot edit.
+    let jsonc = "{ // team servers\n  \"servers\": {\"db\": {\"command\": \"db\"}},\n}\n";
+    write_files(
+        &root,
+        &[("package.json", "{}\n"), (".vscode/mcp.json", jsonc)],
+    );
+    let original = removal_tree(&root);
+    success(&root, &["init", "--hooks", "--agent", "claude"]);
+    let preview = success(&root, &["init", "--remove", "--dry-run"]);
+    assert!(
+        preview.contains("\n  .claude/settings.json: remove 6 hooks"),
+        "{preview}"
+    );
+    assert!(!preview.contains(".vscode"), "{preview}");
+
+    // A justless entry added by hand stops the removal until it is gone again.
+    let added = jsonc.replace(
+        "}},\n",
+        "}, \"justless\": {\"command\": \"justless\", \"args\": [\"mcp\"]}},\n",
+    );
+    fs::write(root.join(".vscode/mcp.json"), added).unwrap();
+    let installed = removal_tree(&root);
+    let output = cli(&root, &["init", "--remove", "--purge"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains(
+            "nothing was removed: .vscode/mcp.json is not valid JSON; fix it or delete its justless entries by hand, then run this again: "
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(removal_tree(&root), installed);
+    fs::write(root.join(".vscode/mcp.json"), jsonc).unwrap();
+    success(&root, &["init", "--remove", "--purge"]);
+    assert_eq!(removal_tree(&root), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_remove_needs_an_explicit_root_for_user_settings() {
+    // Not canonicalized, as HOME often is not, under /var on macOS.
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    write_files(
+        home,
+        &[
+            (
+                ".claude/settings.json",
+                "{\"statusLine\": {\"type\": \"command\", \"command\": \"justless statusline\"}}\n",
+            ),
+            (
+                ".codex/config.toml",
+                "[mcp_servers.justless]\ncommand = \"justless\"\nargs = [\"mcp\"]\n",
+            ),
+            ("work/notes/todo.txt", "x\n"),
+        ],
+    );
+    // Any command run in the home directory creates this, and root discovery from
+    // a folder below it stops there.
+    fs::create_dir(home.join(".justless")).unwrap();
+    let before = removal_tree(home);
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(args)
+            .current_dir(home.join("work/notes"))
+            .env("HOME", home)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["init", "--remove"][..],
+        &["init", "--remove", "--dry-run"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2));
+        let message = stderr(&output);
+        assert!(message.contains("is your home directory"), "{message}");
+        assert!(message.contains("inside a project folder, or pass --root"));
+    }
+    assert_eq!(removal_tree(home), before);
+
+    let named = home.canonicalize().unwrap();
+    let output = run(&[
+        "init",
+        "--remove",
+        "--dry-run",
+        "--root",
+        named.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("\n  .claude/settings.json: remove the status line"));
+
+    // A project whose .claude is Claude Code's config directory is refused too.
+    let project = TempDir::new().unwrap();
+    write_files(
+        project.path(),
+        &[("package.json", "{}\n"), (".claude/settings.json", "{}\n")],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["init", "--remove"])
+        .current_dir(project.path())
+        .env("CLAUDE_CONFIG_DIR", project.path().join(".claude"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("is your CLAUDE_CONFIG_DIR"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_remove_reports_what_it_did_before_a_failure_and_a_rerun_finishes() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    let original = removal_tree(&root);
+    let setup = [
+        "init", "--hooks", "--agent", "claude", "--agent", "cursor", "--agent", "codex",
+    ];
+    success(&root, &setup);
+
+    let cursor = root.join(".cursor");
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o555)).unwrap();
+    // A superuser can still delete there, which leaves nothing to fail.
+    let locked = fs::write(cursor.join("probe"), "").is_err();
+    let output = cli(&root, &["init", "--remove"]);
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o755)).unwrap();
+    if locked {
+        assert_eq!(output.status.code(), Some(2));
+        let shown = stdout(&output);
+        assert!(
+            shown.starts_with(&format!(
+                "Removed part of Justless from {} before an error:\n",
+                root.display()
+            )),
+            "{shown}"
+        );
+        for line in [
+            "\n  AGENTS.md: removed the Justless section and deleted the file",
+            "\n  .claude/settings.json: removed 6 hooks and deleted the file",
+            "\n  .claude/: removed the empty directory\n",
+            "\n  .codex/: removed the empty directory\n",
+        ] {
+            assert!(shown.contains(line), "{line:?} in\n{shown}");
+        }
+        assert!(
+            stderr(&output).contains(
+                "remove Justless from .cursor/hooks.json: Permission denied (os error 13). Fix it and run this command again to finish"
+            ),
+            "{}",
+            stderr(&output)
+        );
+        let rerun = success(&root, &["init", "--remove"]);
+        assert!(
+            rerun.contains("\n  .cursor/hooks.json: removed 2 hooks and deleted the file"),
+            "{rerun}"
+        );
+        assert!(rerun.contains("\n  .cursor/: removed the empty directory\n"));
+        assert!(!rerun.contains("AGENTS.md") && !rerun.contains(".claude"));
+    } else {
+        fs::remove_file(cursor.join("probe")).unwrap();
+        assert!(output.status.success());
+    }
+
+    // A directory setup created goes once it is empty, even with no file to delete.
+    success(&root, &["init", "--hooks", "--agent", "claude"]);
+    fs::remove_file(root.join(".claude/settings.json")).unwrap();
+    let output = success(&root, &["init", "--remove"]);
+    assert!(
+        output.contains("\n  .claude/: removed the empty directory\n"),
+        "{output}"
+    );
+    success(&root, &["init", "--remove", "--purge"]);
+    assert_eq!(removal_tree(&root), original);
+
+    // --purge deletes a directory or a link at .justless, never a file.
+    fs::write(root.join(".justless"), "notes\n").unwrap();
+    let output = cli(&root, &["init", "--remove", "--purge"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains(".justless is not a directory, so --purge would not delete it")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".justless")).unwrap(),
+        "notes\n"
+    );
+    // A link goes, and the directory it points to stays with its contents.
+    fs::remove_file(root.join(".justless")).unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    fs::write(elsewhere.path().join("kept.txt"), "x\n").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), root.join(".justless")).unwrap();
+    let output = success(&root, &["init", "--remove", "--purge"]);
+    assert!(
+        output.contains("\n  .justless: deleted the link\n"),
+        "{output}"
+    );
+    assert!(fs::symlink_metadata(root.join(".justless")).is_err());
+    assert_eq!(
+        fs::read_to_string(elsewhere.path().join("kept.txt")).unwrap(),
+        "x\n"
+    );
+    assert_eq!(removal_tree(&root), original);
+}
+
+#[test]
+fn init_remove_matches_justless_in_any_shell_form_and_names_what_it_leaves() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    let handler = |command: &str| serde_json::json!({"matcher": "^Bash$", "hooks": [{"type": "command", "command": command}]});
+    let wrapper = "input=$(cat); printf '%s' \"$input\" | { ~/bin/s.sh; }; printf '%s' \"$input\" | justless statusline";
+    let settings = serde_json::json!({
+        "statusLine": {"type": "command", "command": wrapper},
+        "hooks": {"PreToolUse": [
+            handler("\"/Users/Jane Doe/.cargo/bin/justless\" hook-claude before-command"),
+            handler("JUSTLESS_LOCK_TIMEOUT=1 justless hook-claude before-command"),
+            handler("\"$CLAUDE_PROJECT_DIR\"/bin/justless hook-claude before-command"),
+            handler("justless --root /work/app hook-claude before-command"),
+            handler("justless run -- npm run hook-setup"),
+        ]}
+    });
+    write_files(
+        &root,
+        &[
+            ("package.json", "{}\n"),
+            (
+                ".claude/settings.json",
+                &serde_json::to_string_pretty(&settings).unwrap(),
+            ),
+        ],
+    );
+    let output = success(&root, &["init", "--remove"]);
+    assert!(
+        output.contains(
+            "\n  .claude/settings.json: removed 4 hooks\nLeft in place, since setup does not write them in this form. Edit them by hand if they still run Justless:\n  .claude/settings.json /statusLine/command\n  .claude/settings.json /hooks/PreToolUse/0/hooks/0/command\n"
+        ),
+        "{output}"
+    );
+    let left: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        left,
+        serde_json::json!({
+            "statusLine": {"type": "command", "command": wrapper},
+            "hooks": {"PreToolUse": [handler("justless run -- npm run hook-setup")]}
+        })
+    );
+    // The mentions are named again, though nothing is left to remove.
+    let again = success(&root, &["init", "--remove"]);
+    assert!(again.starts_with("Nothing to remove in "), "{again}");
+    assert!(again.contains("\n  .claude/settings.json /statusLine/command\n"));
+}
+
+#[test]
+fn init_remove_keeps_client_directories_that_were_there_before() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    for directory in [".claude", ".github"] {
+        fs::create_dir(root.join(directory)).unwrap();
+    }
+    let original = removal_tree(&root);
+    success(
+        &root,
+        &["init", "--hooks", "--agent", "claude", "--agent", "copilot"],
+    );
+    success(&root, &["mcp", "--install", "vscode"]);
+    let output = success(&root, &["init", "--remove", "--purge"]);
+    for line in [
+        "\n  .github/hooks/: removed the empty directory\n",
+        "\n  .vscode/: removed the empty directory\n",
+    ] {
+        assert!(output.contains(line), "{line:?} in\n{output}");
+    }
+    assert!(
+        !output.contains("\n  .claude/:") && !output.contains("\n  .github/:"),
+        "{output}"
+    );
+    assert_eq!(removal_tree(&root), original);
+}
+
+#[test]
+fn init_remove_keeps_a_section_an_instructions_only_setup_still_reads() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    let original = removal_tree(&root);
+    // `init` alone sets up Codex's instructions, with no hooks.
+    success(&root, &["init"]);
+    success(&root, &["init", "--hooks", "--agent", "cursor"]);
+    let preview = success(
+        &root,
+        &["init", "--remove", "--agent", "cursor", "--dry-run"],
+    );
+    assert!(
+        preview.contains("\nKept the Justless section in AGENTS.md, which codex also reads.\n"),
+        "{preview}"
+    );
+    assert!(!preview.contains("AGENTS.md:"), "{preview}");
+    success(&root, &["init", "--remove", "--agent", "cursor"]);
+    assert!(
+        fs::read_to_string(root.join("AGENTS.md"))
+            .unwrap()
+            .contains("justless:begin")
+    );
+    // Removing Codex as well takes the section, since nothing else keeps it.
+    let output = success(&root, &["init", "--remove", "--agent", "codex"]);
+    assert!(
+        output.contains("\n  AGENTS.md: removed the Justless section and deleted the file"),
+        "{output}"
+    );
+
+    // Once the .gitignore line is gone, only .justless/ is kept.
+    fs::write(root.join(".gitignore"), "").unwrap();
+    let output = success(&root, &["init", "--remove"]);
+    assert!(
+        output.ends_with("\nKept .justless/. Add --purge to remove it too.\n"),
+        "{output}"
+    );
+    success(&root, &["init", "--remove", "--purge"]);
+    fs::remove_file(root.join(".gitignore")).unwrap();
+    assert_eq!(removal_tree(&root), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_remove_reads_only_the_links_it_needs() {
+    let project = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    success(&root, &["init", "--hooks", "--agent", "codex"]);
+    // A link to itself that only an unselected client would read.
+    std::os::unix::fs::symlink("GEMINI.md", root.join("GEMINI.md")).unwrap();
+    // A link outside the project to a file with no Justless section.
+    let notes = outside.path().join("notes.md");
+    fs::write(&notes, "# Mine\n").unwrap();
+    std::os::unix::fs::symlink(&notes, root.join("CLAUDE.md")).unwrap();
+
+    let output = cli(&root, &["init", "--remove", "--agent", "gemini"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("nothing was removed: inspect GEMINI.md: "),
+        "{}",
+        stderr(&output)
+    );
+    let output = cli(
+        &root,
+        &["init", "--remove", "--agent", "codex", "--agent", "claude"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "");
+    assert!(stdout(&output).contains("\n  AGENTS.md: removed the Justless section"));
+
+    // The warning returns once the target holds a section to remove by hand.
+    fs::write(
+        &notes,
+        "# Mine\n<!-- justless:begin -->\n<!-- justless:end -->\n",
+    )
+    .unwrap();
+    let output = cli(&root, &["init", "--remove", "--agent", "claude"]);
+    assert!(output.status.success());
+    assert!(
+        stderr(&output).contains("Skipped CLAUDE.md, a link to a file outside the project."),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn init_remove_takes_no_setup_options() {
+    let project = TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    success(&root, &["init", "--hooks", "--agent", "claude"]);
+    let installed = removal_tree(&root);
+    // Each setup option conflicts with --remove, so none of them can turn a
+    // removal into a setup, or a setup into a removal.
+    for option in ["--hooks", "--statusline"] {
+        let output = cli(&root, &["init", "--remove", option]);
+        assert_eq!(output.status.code(), Some(2), "{option}");
+        assert_eq!(removal_tree(&root), installed, "{option}");
+    }
 }

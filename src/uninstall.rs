@@ -2,18 +2,20 @@
 //!
 //! Setup records each file it writes in `.justless/setup.json`: a digest of the
 //! bytes it wrote and the file as it was without Justless, or that it did not
-//! exist. A file that still holds exactly what Justless wrote is restored from that
+//! exist. It also records the directories it creates and the clients each `init`
+//! set up. A file that still holds exactly what Justless wrote is restored from that
 //! record byte for byte. Any other file, such as one edited since, one set up by an
 //! older version or one in a fresh clone, is edited in place: only the instruction
 //! section, Justless hook handlers, a status line that runs `justless` and the
 //! `justless` MCP server are deleted, and every other byte stays.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::ArgMatches;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -32,6 +34,7 @@ const AGENTS: [&str; 7] = [
 const RECORD: &str = "setup.json";
 const IGNORE_LINE: &str = "/.justless/";
 const PLUGIN_HEADER: &str = "// Managed by Justless.";
+const FIX: &str = "fix it or delete its justless entries by hand, then run this again";
 
 pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     // `--agent` defaults to codex for setup. Removal without it covers every client.
@@ -52,12 +55,55 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         !(purge && selected.is_some()),
         "--purge deletes state that every client shares; run it without --agent"
     );
+    // Below the home directory, root discovery can stop at a `~/.justless/` that
+    // any command run there creates. The client folders there hold user settings
+    // that apply to every project, so only an explicit root reaches them.
+    if !matches.is_present("root")
+        && let Some(reason) = user_level(&workspace.root)
+    {
+        bail!(
+            "{reason}. Run `justless init --remove` inside a project folder, or pass --root {} to remove Justless from those settings",
+            workspace.root.display()
+        );
+    }
     remove(
         workspace,
         selected.as_deref(),
         matches.is_present("dry-run"),
         purge,
     )
+}
+
+/// Why `root` holds the user's own client settings, if it does.
+fn user_level(root: &Path) -> Option<String> {
+    let directory = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| PathBuf::from(value).canonicalize().ok())
+    };
+    if ["HOME", "USERPROFILE"]
+        .into_iter()
+        .any(|name| directory(name).as_deref() == Some(root))
+    {
+        return Some(format!(
+            "{} is your home directory, where .claude, .codex, .cursor and .gemini hold your user settings",
+            root.display()
+        ));
+    }
+    for (name, folder) in [("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")] {
+        if let Some(config) = directory(name)
+            && root
+                .join(folder)
+                .canonicalize()
+                .is_ok_and(|dir| dir == config)
+        {
+            return Some(format!(
+                "{folder} in {} is your {name}, which holds your user settings",
+                root.display()
+            ));
+        }
+    }
+    None
 }
 
 fn remove(
@@ -69,7 +115,7 @@ fn remove(
     // Removal never creates the state directory. It locks out a concurrent setup
     // only when the directory is already there.
     let state = fs::symlink_metadata(&workspace.state).is_ok_and(|meta| meta.is_dir());
-    let guard = if state && !dry_run {
+    let mut guard = if state && !dry_run {
         Some(lock_state(&workspace.state.join("setup.lock"))?)
     } else {
         None
@@ -79,8 +125,9 @@ fn remove(
     } else {
         Record::default()
     };
+    let chosen = selected.map_or_else(all_agents, <[Agent]>::to_vec);
     // Every file is read and checked before any is changed.
-    let plan = plan(workspace, selected, purge, &record).context("nothing was removed")?;
+    let plan = plan(workspace, &chosen, purge, &record).context("nothing was removed")?;
     let mut kept = Vec::new();
     if selected.is_none() && !purge {
         if state {
@@ -94,9 +141,6 @@ fn remove(
             kept.push("the /.justless/ line in .gitignore");
         }
     }
-    if !dry_run && !plan.is_empty() {
-        apply(workspace, &plan, &mut record, guard, state)?;
-    }
 
     for filename in &plan.skipped {
         eprintln!(
@@ -104,71 +148,138 @@ fn remove(
         );
     }
     let root = workspace.root.display();
+    if dry_run {
+        if plan.is_empty() {
+            println!("Nothing to remove in {root}.");
+        } else {
+            println!("Dry run, nothing changed. Removing Justless from {root} would change:");
+        }
+        for line in plan.lines(true) {
+            println!("  {line}");
+        }
+        plan.notes(&kept);
+        return Ok(());
+    }
+
+    let applied = apply(workspace, &plan, &mut guard);
+    if state && !applied.state && forget(&mut record, &plan, &applied, &chosen) {
+        // A stale entry never matches the edited file, so this is best effort.
+        let _ = save(workspace, &record);
+    }
+    drop(guard);
+    let lines = plan.applied(&applied);
+    if let Some(error) = applied.error {
+        if !lines.is_empty() {
+            println!("Removed part of Justless from {root} before an error:");
+            for line in &lines {
+                println!("  {line}");
+            }
+        }
+        bail!("{error:#}. Fix it and run this command again to finish");
+    }
     if plan.is_empty() {
         println!("Nothing to remove in {root}.");
-    } else if dry_run {
-        println!("Dry run, nothing changed. Removing Justless from {root} would change:");
     } else {
         println!("Removed Justless from {root}:");
     }
-    for line in plan.lines(dry_run) {
+    for line in &lines {
         println!("  {line}");
     }
-    for note in &plan.kept {
-        println!("{note}");
-    }
-    if !kept.is_empty() {
-        println!(
-            "Kept {}. Add --purge to remove them too.",
-            kept.join(" and ")
-        );
-    }
-    if !dry_run && plan.changes.iter().any(|change| change.config) {
+    plan.notes(&kept);
+    if plan.changes.iter().any(|change| change.config) {
         println!("Start a new agent session so the clients stop loading Justless.");
     }
     Ok(())
 }
 
-fn apply(
-    workspace: &Workspace,
-    plan: &Plan,
-    record: &mut Record,
-    guard: Option<fs::File>,
+/// What `apply` got done before it finished or stopped.
+#[derive(Default)]
+struct Applied {
+    /// How many of the planned file changes were made, in order.
+    changes: usize,
+    directories: Vec<PathBuf>,
     state: bool,
-) -> Result<()> {
+    error: Option<anyhow::Error>,
+}
+
+/// Make the planned changes in order, stopping at the first file that fails.
+fn apply(workspace: &Workspace, plan: &Plan, guard: &mut Option<fs::File>) -> Applied {
+    let mut applied = Applied::default();
     for change in &plan.changes {
-        match &change.outcome {
+        let result = match &change.outcome {
             Outcome::Write(text) => write_text(&change.path, text),
             Outcome::Delete => fs::remove_file(&change.path).map_err(Into::into),
+        };
+        if let Err(error) = result {
+            applied.error = Some(error.context(format!("remove Justless from {}", change.key)));
+            break;
         }
-        .with_context(|| format!("remove Justless from {}", change.key))?;
+        applied.changes += 1;
     }
+    // Directories go even after a file failed, since one that still holds that
+    // file is not empty and stays.
     for directory in &plan.directories {
-        fs::remove_dir(directory).with_context(|| format!("remove {}", directory.display()))?;
+        match fs::remove_dir(directory) {
+            Ok(()) => applied.directories.push(directory.clone()),
+            Err(error) if applied.error.is_none() => {
+                let name = key(&plan.root, directory).unwrap_or_default();
+                applied.error = Some(anyhow!(error).context(format!("remove {name}/")));
+            }
+            Err(_) => {}
+        }
     }
-    if plan.state {
+    if applied.error.is_none()
+        && let Some(purge) = plan.state
+    {
         // Release the setup lock, which lives in the directory.
-        drop(guard);
-        fs::remove_dir_all(&workspace.state).context("delete .justless/")?;
-    } else if state {
-        let before = record.files.len();
-        for change in &plan.changes {
-            record.files.remove(&change.key);
-        }
-        if record.files.len() != before {
-            // A stale entry never matches the edited file, so this is best effort.
-            let _ = save(workspace, record);
+        drop(guard.take());
+        let result = match purge {
+            Purge::Directory => fs::remove_dir_all(&workspace.state),
+            Purge::Link => fs::remove_file(&workspace.state),
+        };
+        match result {
+            Ok(()) => applied.state = true,
+            Err(error) => applied.error = Some(anyhow!(error).context("delete .justless")),
         }
     }
-    Ok(())
+    applied
+}
+
+/// Drop what was removed from the setup record, and the chosen clients from the
+/// files they read. Returns whether the record changed.
+fn forget(record: &mut Record, plan: &Plan, applied: &Applied, chosen: &[Agent]) -> bool {
+    let mut changed = false;
+    for change in &plan.changes[..applied.changes] {
+        changed |= record.files.remove(&change.key).is_some();
+        if change.instructions {
+            changed |= record.readers.remove(&change.key).is_some();
+        }
+    }
+    for directory in &applied.directories {
+        if let Ok(name) = key(&plan.root, directory) {
+            changed |= record.directories.remove(&name);
+        }
+    }
+    for readers in record.readers.values_mut() {
+        for &agent in chosen {
+            changed |= readers.remove(name(agent));
+        }
+    }
+    record.readers.retain(|_, readers| !readers.is_empty());
+    changed
 }
 
 // ---------------------------------------------------------------------------
 // Setup record
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Record {
     files: BTreeMap<String, Written>,
+    /// Directories setup created, relative to the root.
+    directories: BTreeSet<String>,
+    /// The clients `init` set up, by the instructions file each reads.
+    readers: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -203,47 +314,87 @@ fn digest(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
-/// Note that setup is about to replace `path` with `contents`. Setup calls this
-/// with the setup lock held. A missing record only costs exactness when Justless
-/// is removed, so a failure here never stops setup.
+/// Note that setup is about to replace `path` with `contents`, and the directories
+/// it is about to create for it, so call this before creating them. Setup calls
+/// this with the setup lock held. A missing record only costs exactness when
+/// Justless is removed, so a failure here never stops setup.
 pub fn remember(workspace: &Workspace, path: &Path, contents: &str) {
     let _ = try_remember(workspace, path, contents);
 }
 
 fn try_remember(workspace: &Workspace, path: &Path, contents: &str) -> Result<()> {
-    let key = key(&workspace.root, path)?;
+    let root = &workspace.root;
+    let file = key(root, path)?;
     let current = match fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
     let mut record = load(workspace);
-    let before = match (&current, record.files.get(&key)) {
+    for directory in path.ancestors().skip(1) {
+        if directory == root.as_path() || !directory.starts_with(root) {
+            break;
+        }
+        match fs::symlink_metadata(directory) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                record.directories.insert(key(root, directory)?);
+            }
+            // The ancestors of a directory that exists exist too.
+            _ => break,
+        }
+    }
+    let before = match (&current, record.files.get(&file)) {
         (None, _) => None,
         // Justless wrote the current bytes, so the earlier original still applies.
         (Some(text), Some(entry)) if entry.digest == digest(text) => entry.before.clone(),
         // Otherwise the original is the current file without any Justless setup
         // already in it, which is the file itself in the usual case.
-        (Some(text), _) => match strip(&key, kind_of(&key), text) {
-            Ok(None) => Some(text.clone()),
-            Ok(Some(found)) => match found.outcome {
+        (Some(text), _) => match strip(&file, kind_of(&file), text) {
+            Ok(Scan { found: None, .. }) => Some(text.clone()),
+            Ok(Scan {
+                found: Some(found), ..
+            }) => match found.outcome {
                 Outcome::Write(text) => Some(text),
                 Outcome::Delete => None,
             },
             Err(_) => {
-                record.files.remove(&key);
+                record.files.remove(&file);
                 return save(workspace, &record);
             }
         },
     };
     record.files.insert(
-        key,
+        file,
         Written {
             digest: digest(contents),
             before,
         },
     );
     save(workspace, &record)
+}
+
+/// Note the instructions file each client `init` set up reads, so removing another
+/// client that shares the file keeps the section while this one is still set up.
+pub fn remember_readers(workspace: &Workspace, clients: &[Agent]) {
+    let root = &workspace.root;
+    let mut record = load(workspace);
+    let mut changed = false;
+    for &agent in clients {
+        let Ok(Some(path)) = agents::instructions_file(root, &root.join(agent.instructions()))
+        else {
+            continue;
+        };
+        if let Ok(file) = key(root, &path) {
+            changed |= record
+                .readers
+                .entry(file)
+                .or_default()
+                .insert(name(agent).to_owned());
+        }
+    }
+    if changed {
+        let _ = save(workspace, &record);
+    }
 }
 
 /// A path relative to the root with `/` separators, as the record and output use.
@@ -385,11 +536,20 @@ struct Plan {
     directories: Vec<PathBuf>,
     /// Shared instruction sections left in place, with the reason.
     kept: Vec<String>,
-    /// Instruction files that link outside the project.
+    /// Justless mentions removal leaves in place, by file and JSON pointer or
+    /// TOML key, or with no location for a whole file.
+    leftover: Vec<(String, String)>,
+    /// Instruction files that link outside the project to a Justless section.
     skipped: Vec<&'static str>,
-    /// Delete `.justless/`.
-    state: bool,
+    /// Delete `.justless`.
+    state: Option<Purge>,
     root: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum Purge {
+    Directory,
+    Link,
 }
 
 struct Change {
@@ -401,6 +561,8 @@ struct Change {
     whole: bool,
     /// A client config file rather than instructions or `.gitignore`.
     config: bool,
+    /// An instructions file.
+    instructions: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -415,51 +577,114 @@ struct Found {
     outcome: Outcome,
 }
 
-impl Plan {
-    fn is_empty(&self) -> bool {
-        self.changes.is_empty() && self.directories.is_empty() && !self.state
-    }
+/// What reading one file found: what to remove, and the Justless mentions that
+/// stay because setup does not write them in that form.
+#[derive(Default)]
+struct Scan {
+    found: Option<Found>,
+    leftover: Vec<String>,
+}
 
-    fn lines(&self, dry_run: bool) -> Vec<String> {
-        let (remove, delete) = if dry_run {
-            ("remove", "delete")
-        } else {
-            ("removed", "deleted")
-        };
-        let mut lines = Vec::new();
-        for change in &self.changes {
-            let what = join(&change.what);
-            lines.push(match change.outcome {
-                Outcome::Delete if change.whole => format!("{}: {delete} {what}", change.key),
-                Outcome::Delete => format!(
-                    "{}: {remove} {what} and {delete} the file, which held nothing else",
-                    change.key
-                ),
-                Outcome::Write(_) => format!("{}: {remove} {what}", change.key),
-            });
-        }
-        for directory in &self.directories {
-            let name = key(&self.root, directory).unwrap_or_default();
-            lines.push(format!("{name}/: {remove} the empty directory"));
-        }
-        if self.state {
-            lines.push(format!(
-                ".justless/: {delete} the archived runs, index and history"
-            ));
-        }
-        lines
+fn verbs(dry_run: bool) -> (&'static str, &'static str) {
+    if dry_run {
+        ("remove", "delete")
+    } else {
+        ("removed", "deleted")
     }
 }
 
-fn plan(
-    workspace: &Workspace,
-    selected: Option<&[Agent]>,
-    purge: bool,
-    record: &Record,
-) -> Result<Plan> {
+impl Change {
+    fn line(&self, dry_run: bool) -> String {
+        let (remove, delete) = verbs(dry_run);
+        let what = join(&self.what);
+        match self.outcome {
+            Outcome::Delete if self.whole => format!("{}: {delete} {what}", self.key),
+            Outcome::Delete => format!(
+                "{}: {remove} {what} and {delete} the file, which held nothing else",
+                self.key
+            ),
+            Outcome::Write(_) => format!("{}: {remove} {what}", self.key),
+        }
+    }
+}
+
+impl Purge {
+    fn line(self, dry_run: bool) -> String {
+        let (_, delete) = verbs(dry_run);
+        match self {
+            Self::Directory => format!(".justless/: {delete} the archived runs, index and history"),
+            Self::Link => format!(".justless: {delete} the link"),
+        }
+    }
+}
+
+impl Plan {
+    fn is_empty(&self) -> bool {
+        self.changes.is_empty() && self.directories.is_empty() && self.state.is_none()
+    }
+
+    fn directory_line(&self, directory: &Path, dry_run: bool) -> String {
+        let (remove, _) = verbs(dry_run);
+        let name = key(&self.root, directory).unwrap_or_default();
+        format!("{name}/: {remove} the empty directory")
+    }
+
+    fn lines(&self, dry_run: bool) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .changes
+            .iter()
+            .map(|change| change.line(dry_run))
+            .collect();
+        for directory in &self.directories {
+            lines.push(self.directory_line(directory, dry_run));
+        }
+        lines.extend(self.state.map(|purge| purge.line(dry_run)));
+        lines
+    }
+
+    /// The lines for what was done, which is all of the plan unless it stopped.
+    fn applied(&self, applied: &Applied) -> Vec<String> {
+        let mut lines: Vec<String> = self.changes[..applied.changes]
+            .iter()
+            .map(|change| change.line(false))
+            .collect();
+        for directory in &applied.directories {
+            lines.push(self.directory_line(directory, false));
+        }
+        if applied.state {
+            lines.extend(self.state.map(|purge| purge.line(false)));
+        }
+        lines
+    }
+
+    fn notes(&self, kept: &[&str]) {
+        for note in &self.kept {
+            println!("{note}");
+        }
+        if !self.leftover.is_empty() {
+            println!(
+                "Left in place, since setup does not write them in this form. Edit them by hand if they still run Justless:"
+            );
+            for (file, at) in &self.leftover {
+                if at.is_empty() {
+                    println!("  {file}");
+                } else {
+                    println!("  {file} {at}");
+                }
+            }
+        }
+        if !kept.is_empty() {
+            println!(
+                "Kept {}. Add --purge to remove {} too.",
+                kept.join(" and "),
+                if kept.len() == 1 { "it" } else { "them" }
+            );
+        }
+    }
+}
+
+fn plan(workspace: &Workspace, chosen: &[Agent], purge: bool, record: &Record) -> Result<Plan> {
     let root = &workspace.root;
-    let everyone = all_agents();
-    let chosen = selected.map_or_else(|| everyone.clone(), <[Agent]>::to_vec);
     let mut plan = Plan {
         root: root.clone(),
         ..Plan::default()
@@ -468,14 +693,29 @@ fn plan(
     // Instruction files, grouped by the file each client reads, so a link such as
     // `CLAUDE.md -> AGENTS.md` is handled once, as setup does.
     let mut readers: Vec<(PathBuf, Vec<Agent>)> = Vec::new();
-    for &agent in &everyone {
+    for agent in all_agents() {
         let filename = agent.instructions();
-        match agents::instructions_file(root, &root.join(filename))? {
+        let file = root.join(filename);
+        let resolved = agents::instructions_file(root, &file);
+        let resolved = if chosen.contains(&agent) {
+            resolved.with_context(|| format!("inspect {filename}"))?
+        } else {
+            // A client cannot read a link that does not resolve, such as one to
+            // itself, so it shares no file with the chosen clients.
+            let Ok(resolved) = resolved else {
+                continue;
+            };
+            resolved
+        };
+        match resolved {
             Some(path) => match readers.iter_mut().find(|(file, _)| *file == path) {
                 Some((_, owners)) => owners.push(agent),
                 None => readers.push((path, vec![agent])),
             },
-            None if chosen.contains(&agent) && !plan.skipped.contains(&filename) => {
+            None if chosen.contains(&agent)
+                && !plan.skipped.contains(&filename)
+                && holds_section(&file) =>
+            {
                 plan.skipped.push(filename);
             }
             None => {}
@@ -486,14 +726,23 @@ fn plan(
             continue;
         }
         let key = key(root, &path)?;
-        let Some(change) = plan_file(workspace, record, &key, &path, Kind::Instructions)? else {
+        let Some(change) = plan_file(
+            workspace,
+            record,
+            &key,
+            &path,
+            Kind::Instructions,
+            &mut plan.leftover,
+        )?
+        else {
             continue;
         };
         // Keep a shared section while another client that reads it is still set up.
         let others: Vec<&str> = owners
             .iter()
-            .filter(|owner| !chosen.contains(owner) && configured(workspace, **owner))
-            .map(|owner| name(*owner))
+            .copied()
+            .filter(|&owner| !chosen.contains(&owner) && configured(workspace, record, owner, &key))
+            .map(name)
             .collect();
         if others.is_empty() {
             plan.changes.push(change);
@@ -512,71 +761,143 @@ fn plan(
             continue;
         }
         let path = root.join(&key);
-        if let Some(change) = plan_file(workspace, record, &key, &path, kind_of(&key))? {
+        if let Some(change) = plan_file(
+            workspace,
+            record,
+            &key,
+            &path,
+            kind_of(&key),
+            &mut plan.leftover,
+        )? {
             plan.changes.push(change);
         }
     }
 
     if purge {
         let path = root.join(".gitignore");
-        if let Some(change) = plan_file(workspace, record, ".gitignore", &path, Kind::Ignore)? {
+        if let Some(change) = plan_file(
+            workspace,
+            record,
+            ".gitignore",
+            &path,
+            Kind::Ignore,
+            &mut plan.leftover,
+        )? {
             plan.changes.push(change);
         }
-        plan.state = fs::symlink_metadata(&workspace.state).is_ok();
+        plan.state = match fs::symlink_metadata(&workspace.state) {
+            Ok(metadata) if metadata.is_dir() => Some(Purge::Directory),
+            Ok(metadata) if metadata.file_type().is_symlink() => Some(Purge::Link),
+            Ok(_) => bail!(
+                ".justless is not a directory, so --purge would not delete it. Move it away, or run without --purge"
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("inspect .justless"),
+        };
     }
 
-    // Remove the client directories that only held deleted files, deepest first.
-    let deleted: BTreeSet<&Path> = plan
-        .changes
+    plan.directories = empty_directories(root, chosen, record, &plan.changes);
+    Ok(plan)
+}
+
+/// The directories removal leaves empty and deletes, deepest first. A directory
+/// goes when setup created it, or when every deleted file in it is one setup has
+/// no record of, as in a fresh clone. A directory setup created that is already
+/// empty also goes, such as one left by a removal that stopped partway.
+fn empty_directories(
+    root: &Path,
+    chosen: &[Agent],
+    record: &Record,
+    changes: &[Change],
+) -> Vec<PathBuf> {
+    let deleted: Vec<&Path> = changes
         .iter()
         .filter(|change| change.config && change.outcome == Outcome::Delete)
         .map(|change| change.path.as_path())
         .collect();
-    let mut candidates: Vec<PathBuf> = deleted
+    let mut candidates: BTreeSet<PathBuf> = deleted
         .iter()
         .flat_map(|path| path.ancestors().skip(1))
-        .filter(|dir| dir.starts_with(root) && *dir != root.as_path())
+        .filter(|dir| dir.starts_with(root) && *dir != root)
         .map(Path::to_path_buf)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect();
-    candidates.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    let files = catalog();
+    for directory in &record.directories {
+        let prefix = format!("{directory}/");
+        if files
+            .iter()
+            .any(|(file, _, agent)| chosen.contains(agent) && file.starts_with(&prefix))
+        {
+            candidates.insert(root.join(directory));
+        }
+    }
+    let mut candidates: Vec<PathBuf> = candidates.into_iter().collect();
+    candidates.sort_by_key(|dir| Reverse(dir.components().count()));
+    let mut removed: Vec<PathBuf> = Vec::new();
     for directory in candidates {
+        let created = key(root, &directory).is_ok_and(|name| record.directories.contains(&name));
+        let unrecorded = || {
+            let mut inside = deleted
+                .iter()
+                .filter(|path| path.starts_with(&directory))
+                .peekable();
+            inside.peek().is_some()
+                && inside
+                    .all(|path| key(root, path).is_ok_and(|name| !record.files.contains_key(&name)))
+        };
+        let directory_here = real(root, &directory)
+            .ok()
+            .flatten()
+            .is_some_and(|meta| meta.is_dir());
+        if !(created || unrecorded()) || !directory_here {
+            continue;
+        }
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
         let empty = entries.into_iter().all(|entry| {
             entry.is_ok_and(|entry| {
                 let path = entry.path();
-                deleted.contains(path.as_path()) || plan.directories.contains(&path)
+                deleted.contains(&path.as_path()) || removed.contains(&path)
             })
         });
         if empty {
-            plan.directories.push(directory);
+            removed.push(directory);
         }
     }
-    Ok(plan)
+    removed
+}
+
+/// Whether an instructions file outside the project, reached through a link, may
+/// hold a Justless section.
+fn holds_section(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(text) => text.contains(START),
+        Err(error) => error.kind() == ErrorKind::PermissionDenied,
+    }
 }
 
 /// The change that takes Justless out of one file, or `None` when it holds nothing
-/// of Justless's.
+/// of Justless's. Mentions of Justless it leaves are added to `leftover`.
 fn plan_file(
     workspace: &Workspace,
     record: &Record,
     key: &str,
     path: &Path,
     kind: Kind,
+    leftover: &mut Vec<(String, String)>,
 ) -> Result<Option<Change>> {
     if !regular_file(&workspace.root, path)? {
         return Ok(None);
     }
     let text = fs::read_to_string(path).with_context(|| format!("read {key}"))?;
-    let found = strip(key, kind, &text)?;
+    let scan = strip(key, kind, &text)?;
+    leftover.extend(scan.leftover.into_iter().map(|at| (key.to_owned(), at)));
     let recorded = record
         .files
         .get(key)
         .filter(|entry| entry.digest == digest(&text));
-    let (what, outcome) = match (found, recorded) {
+    let (what, outcome) = match (scan.found, recorded) {
         (None, None) => return Ok(None),
         (Some(found), Some(entry)) => (found.what, entry.restore()),
         (Some(found), None) => (found.what, found.outcome),
@@ -592,52 +913,71 @@ fn plan_file(
         outcome,
         whole: matches!(kind, Kind::Plugin),
         config: matches!(kind, Kind::Json(_) | Kind::Toml | Kind::Plugin),
+        instructions: matches!(kind, Kind::Instructions),
     }))
 }
 
-/// Whether a client still has Justless hooks, its plugin or an MCP server here. A
+/// Whether a client is still set up to read the instructions `file`: `init`
+/// recorded it, or it has Justless hooks, its plugin or an MCP server here. A
 /// file that cannot be read counts, so a shared section is kept rather than lost.
-fn configured(workspace: &Workspace, agent: Agent) -> bool {
-    catalog()
-        .into_iter()
-        .filter(|(_, _, owner)| *owner == agent)
-        .any(|(key, _, _)| {
-            let path = workspace.root.join(&key);
-            match regular_file(&workspace.root, &path) {
-                Ok(false) => false,
-                Ok(true) => fs::read_to_string(&path).map_or(true, |text| {
-                    strip(&key, kind_of(&key), &text).map_or(true, |found| found.is_some())
-                }),
-                Err(_) => true,
-            }
-        })
+fn configured(workspace: &Workspace, record: &Record, agent: Agent, file: &str) -> bool {
+    record
+        .readers
+        .get(file)
+        .is_some_and(|readers| readers.contains(name(agent)))
+        || catalog()
+            .into_iter()
+            .filter(|(_, _, owner)| *owner == agent)
+            .any(|(key, _, _)| {
+                let path = workspace.root.join(&key);
+                match regular_file(&workspace.root, &path) {
+                    Ok(false) => false,
+                    Ok(true) => fs::read_to_string(&path).map_or(true, |text| {
+                        strip(&key, kind_of(&key), &text).map_or(true, |scan| scan.found.is_some())
+                    }),
+                    Err(_) => true,
+                }
+            })
 }
 
-/// Whether `path` is a regular file reached through real directories. Setup never
-/// writes through a link, so a linked file or directory holds nothing of Justless's.
-fn regular_file(root: &Path, path: &Path) -> Result<bool> {
+/// The metadata of `path` when it is reached through real directories, or `None`
+/// when it or a directory on the way is missing or a link. Setup never writes
+/// through a link, so a linked file or directory holds nothing of Justless's.
+fn real(root: &Path, path: &Path) -> Result<Option<fs::Metadata>> {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let parts: Vec<Component> = relative.components().collect();
     let mut current = root.to_path_buf();
     for (index, part) in parts.iter().enumerate() {
         current.push(part);
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if index + 1 == parts.len() => return Ok(metadata.is_file()),
+            Ok(metadata) if index + 1 == parts.len() => {
+                return Ok((!metadata.file_type().is_symlink()).then_some(metadata));
+            }
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(error).with_context(|| format!("inspect {}", current.display()));
             }
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Whether `path` is a regular file reached through real directories.
+fn regular_file(root: &Path, path: &Path) -> Result<bool> {
+    Ok(real(root, path)?.is_some_and(|metadata| metadata.is_file()))
 }
 
 // ---------------------------------------------------------------------------
 // Finding Justless in one file
 
-fn strip(key: &str, kind: Kind, text: &str) -> Result<Option<Found>> {
+/// Whether text mentions Justless in any letter case.
+fn mentions(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("justless")
+}
+
+fn strip(key: &str, kind: Kind, text: &str) -> Result<Scan> {
     let rest = |rest: String| {
         if rest.is_empty() {
             Outcome::Delete
@@ -645,19 +985,35 @@ fn strip(key: &str, kind: Kind, text: &str) -> Result<Option<Found>> {
             Outcome::Write(rest)
         }
     };
+    let found = |found: Option<Found>| Scan {
+        found,
+        leftover: Vec::new(),
+    };
     Ok(match kind {
-        Kind::Instructions => strip_section(key, text)?.map(|left| Found {
+        Kind::Instructions => found(strip_section(key, text)?.map(|left| Found {
             what: vec!["the Justless section".into()],
             outcome: rest(left),
-        }),
-        Kind::Ignore => strip_ignore(text).map(|left| Found {
+        })),
+        Kind::Ignore => found(strip_ignore(text).map(|left| Found {
             what: vec![format!("the {IGNORE_LINE} line")],
             outcome: rest(left),
-        }),
-        Kind::Plugin => text.starts_with(PLUGIN_HEADER).then(|| Found {
+        })),
+        Kind::Plugin if text.starts_with(PLUGIN_HEADER) => found(Some(Found {
             what: vec!["the Justless plugin".into()],
             outcome: Outcome::Delete,
-        }),
+        })),
+        // A plugin Justless did not write, such as one the user adapted.
+        Kind::Plugin => Scan {
+            found: None,
+            leftover: if mentions(text) {
+                vec![String::new()]
+            } else {
+                Vec::new()
+            },
+        },
+        // A config file that never mentions Justless holds nothing to remove, even
+        // in a form such as JSON with comments that removal cannot edit.
+        Kind::Json(_) | Kind::Toml if !mentions(text) => Scan::default(),
         Kind::Toml => strip_toml(key, text)?,
         Kind::Json(rules) => strip_json(key, rules, text)?,
     })
@@ -735,30 +1091,158 @@ fn cut(text: &str, start: usize, end: usize) -> String {
     format!("{prefix}{suffix}")
 }
 
-/// The arguments of a command whose program is `justless`, or `None`.
-fn justless_args(command: Option<&str>) -> Option<Vec<&str>> {
-    let mut words = command?.split_whitespace();
-    let program = words.next()?.trim_matches(['"', '\'']);
-    let name = Path::new(program).file_name()?.to_str()?;
-    matches!(name, "justless" | "justless.exe").then(|| words.collect())
+/// Whether a program path names the Justless binary, with `/` or `\` separators.
+fn is_justless(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name == "justless" || name.eq_ignore_ascii_case("justless.exe")
 }
 
-/// A hook handler that runs `justless hook-…`, in the `command` field most clients
-/// use or Copilot's `bash`.
-fn is_hook(handler: &Value) -> bool {
-    ["command", "bash"].into_iter().any(|field| {
-        justless_args(handler.get(field).and_then(Value::as_str))
-            .is_some_and(|args| args.iter().any(|arg| arg.starts_with("hook-")))
+/// A shell `NAME=value` assignment, as in `JUSTLESS_LOCK_TIMEOUT=1 justless …`.
+fn assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
     })
 }
 
-fn is_server(command: Option<&str>, args: &[&str]) -> bool {
-    justless_args(command).is_some_and(|words| words.contains(&"mcp") || args.contains(&"mcp"))
+/// The words after the program of a shell command whose program is `justless`,
+/// after any leading assignments or `env`, or `None`. Words are split as the shell
+/// splits them, so a quoted path may hold spaces, and as plain whitespace for a
+/// Windows path whose backslashes the shell would read as escapes.
+fn justless_args(command: Option<&str>) -> Option<Vec<String>> {
+    let command = command?;
+    let plain = command
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']).to_owned())
+        .collect();
+    [shlex::split(command), Some(plain)]
+        .into_iter()
+        .flatten()
+        .find_map(|words| {
+            let mut words = words
+                .into_iter()
+                .skip_while(|word| word == "env" || assignment(word));
+            let program = words.next()?;
+            is_justless(&program).then(|| words.collect())
+        })
 }
 
-fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Option<Found>> {
-    let config: Value =
-        serde_json::from_str(text).with_context(|| format!("{key} is not valid JSON"))?;
+/// The subcommand in Justless arguments: the first word that is neither an option
+/// nor the value of the global `--root`.
+fn subcommand(args: &[String]) -> Option<&str> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--root" {
+            args.next();
+        } else if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+/// A hook handler that runs `justless hook-CLIENT`, in the `command` field most
+/// clients use or Copilot's `bash`.
+fn is_hook(handler: &Value) -> bool {
+    ["command", "bash"].into_iter().any(|field| {
+        justless_args(handler.get(field).and_then(Value::as_str)).is_some_and(|args| {
+            subcommand(&args)
+                .and_then(|name| name.strip_prefix("hook-"))
+                .is_some_and(|client| AGENTS.contains(&client))
+        })
+    })
+}
+
+/// An MCP server entry that runs `justless mcp`. Clients start `command` directly,
+/// so a path with spaces needs no quotes there.
+fn is_server(command: Option<&str>, args: &[&str]) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    let mut words = if is_justless(command.trim()) {
+        Vec::new()
+    } else {
+        match justless_args(Some(command)) {
+            Some(words) => words,
+            None => return false,
+        }
+    };
+    words.extend(args.iter().map(|arg| (*arg).to_owned()));
+    subcommand(&words) == Some("mcp")
+}
+
+/// A JSON pointer, as in `/hooks/PreToolUse/0/command`.
+fn pointer(path: &[Step]) -> String {
+    path.iter()
+        .map(|step| match step {
+            Step::Key(name) => format!("/{}", name.replace('~', "~0").replace('/', "~1")),
+            Step::Index(index) => format!("/{index}"),
+        })
+        .collect()
+}
+
+/// A path into the original document as it reads once `deleted` are gone: each
+/// array index drops by the deleted elements before it.
+fn shifted(path: &[Step], deleted: &[Vec<Step>]) -> Vec<Step> {
+    let mut shifted = path.to_vec();
+    for (depth, step) in path.iter().enumerate() {
+        let Step::Index(index) = step else {
+            continue;
+        };
+        let before = deleted
+            .iter()
+            .filter(|gone| {
+                gone.len() == depth + 1
+                    && gone[..depth] == path[..depth]
+                    && matches!(gone[depth], Step::Index(other) if other < *index)
+            })
+            .count();
+        shifted[depth] = Step::Index(index - before);
+    }
+    shifted
+}
+
+/// Add the pointer of each string under `value` that mentions Justless and is not
+/// deleted, or of a key that does when nothing under it does, as the file reads
+/// after the deletions.
+fn mentions_at(value: &Value, at: Vec<Step>, deleted: &[Vec<Step>], found: &mut Vec<String>) {
+    if deleted.iter().any(|path| at.starts_with(path)) {
+        return;
+    }
+    match value {
+        Value::String(text) if mentions(text) => found.push(pointer(&shifted(&at, deleted))),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let mut next = at.clone();
+                next.push(Step::Index(index));
+                mentions_at(item, next, deleted, found);
+            }
+        }
+        Value::Object(members) => {
+            for (name, member) in members {
+                let mut next = at.clone();
+                next.push(Step::Key(name.clone()));
+                let before = found.len();
+                mentions_at(member, next.clone(), deleted, found);
+                if found.len() == before
+                    && mentions(name)
+                    && !deleted.iter().any(|path| next.starts_with(path))
+                {
+                    found.push(pointer(&shifted(&next, deleted)));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Scan> {
+    let config: Value = serde_json::from_str(text)
+        .map_err(|error| anyhow!("{key} is not valid JSON; {FIX}: {error}"))?;
     let root = config
         .as_object()
         .with_context(|| format!("{key} must contain a JSON object"))?;
@@ -805,8 +1289,23 @@ fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Option<Found>> 
             }
         }
     }
+    // Hooks, the status line and servers in a form setup does not write stay, so
+    // name any that still mention Justless.
+    let mut leftover = Vec::new();
+    for (name, value) in root {
+        let scanned = (rules.hooks && name == "hooks")
+            || (rules.group && name == "justless")
+            || (rules.status_line && name == "statusLine")
+            || rules.servers == Some(name.as_str());
+        if scanned {
+            mentions_at(value, vec![Step::Key(name.clone())], &paths, &mut leftover);
+        }
+    }
     if paths.is_empty() {
-        return Ok(None);
+        return Ok(Scan {
+            found: None,
+            leftover,
+        });
     }
     let mut what = Vec::new();
     if hooks > 0 {
@@ -837,7 +1336,10 @@ fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Option<Found>> 
             );
             Outcome::Write(edited)
         };
-    Ok(Some(Found { what, outcome }))
+    Ok(Scan {
+        found: Some(Found { what, outcome }),
+        leftover,
+    })
 }
 
 /// Add the paths that delete Justless handlers from one group of hook events, such
@@ -894,16 +1396,16 @@ fn prune_group(
     (found, emptied > 0 && emptied == events.len())
 }
 
-fn strip_toml(key: &str, text: &str) -> Result<Option<Found>> {
+fn strip_toml(key: &str, text: &str) -> Result<Scan> {
     let mut document = text
         .parse::<DocumentMut>()
-        .with_context(|| format!("{key} is not valid TOML"))?;
+        .map_err(|error| anyhow!("{key} is not valid TOML; {FIX}: {error}"))?;
     let table = document.as_table_mut();
     let Some(servers) = table
         .get_mut("mcp_servers")
         .and_then(Item::as_table_like_mut)
     else {
-        return Ok(None);
+        return Ok(Scan::default());
     };
     let ours = servers
         .get("justless")
@@ -916,8 +1418,18 @@ fn strip_toml(key: &str, text: &str) -> Result<Option<Found>> {
                 .unwrap_or_default();
             is_server(entry.get("command").and_then(Item::as_str), &args)
         });
+    let leftover: Vec<String> = servers
+        .iter()
+        .filter(|(name, item)| {
+            !(ours && *name == "justless") && (mentions(name) || mentions(&item.to_string()))
+        })
+        .map(|(name, _)| format!("mcp_servers.{name}"))
+        .collect();
     if !ours {
-        return Ok(None);
+        return Ok(Scan {
+            found: None,
+            leftover,
+        });
     }
     servers.remove("justless");
     // Setup adds an implicit `mcp_servers` table, one with no header of its own.
@@ -930,14 +1442,17 @@ fn strip_toml(key: &str, text: &str) -> Result<Option<Found>> {
         table.remove("mcp_servers");
     }
     let edited = document.to_string();
-    Ok(Some(Found {
-        what: vec!["the justless MCP server".into()],
-        outcome: if edited.trim().is_empty() {
-            Outcome::Delete
-        } else {
-            Outcome::Write(edited)
-        },
-    }))
+    Ok(Scan {
+        found: Some(Found {
+            what: vec!["the justless MCP server".into()],
+            outcome: if edited.trim().is_empty() {
+                Outcome::Delete
+            } else {
+                Outcome::Write(edited)
+            },
+        }),
+        leftover,
+    })
 }
 
 fn join(items: &[impl AsRef<str>]) -> String {
@@ -1021,6 +1536,86 @@ mod tests {
     }
 
     #[test]
+    fn hooks_match_in_every_shell_form_and_only_hook_subcommands() {
+        let hook = |command: &str| is_hook(&serde_json::json!({ "command": command }));
+        for command in [
+            "\"/Users/Jane Doe/.cargo/bin/justless\" hook-claude before-command",
+            "JUSTLESS_LOCK_TIMEOUT=1 justless hook-claude before-command",
+            "env A=1 B=2 justless hook-codex session-start",
+            "\"$CLAUDE_PROJECT_DIR\"/bin/justless hook-claude after-read",
+            "justless --root /work/app hook-claude before-command",
+            "justless --root=/work/app hook-gemini before-command",
+            "C:\\Users\\me\\.cargo\\bin\\justless.exe hook-claude before-command",
+        ] {
+            assert!(hook(command), "{command}");
+        }
+        for command in [
+            "justless run -- npm run hook-setup",
+            "justless hook-unknown before-command",
+            "justless statusline",
+            "input=$(cat); printf '%s' \"$input\" | { ~/bin/s.sh; }; printf '%s' \"$input\" | justless statusline",
+            "sh -c 'justless hook-claude before-command'",
+            "justless",
+        ] {
+            assert!(!hook(command), "{command}");
+        }
+        assert!(is_server(
+            Some("/Users/Jane Doe/.cargo/bin/justless"),
+            &["mcp"]
+        ));
+        assert!(is_server(Some("justless mcp"), &[]));
+        assert!(is_server(Some("justless"), &["--root", "mcp", "mcp"]));
+        assert!(!is_server(Some("justless"), &["run", "--", "mcp"]));
+    }
+
+    #[test]
+    fn unmatched_mentions_are_named_by_pointer() {
+        let text = serde_json::json!({
+            "permissions": {"allow": ["Bash(justless:*)"]},
+            "statusLine": {"type": "command", "command": "input=$(cat); echo \"$input\" | justless statusline"},
+            "hooks": {"PreToolUse": [
+                {"matcher": "^Bash$", "hooks": [{"type": "command", "command": "justless hook-claude before-command"}]},
+                {"matcher": "^Bash$", "hooks": [{"type": "command", "command": "sh -c 'justless hook-claude before-command'"}]}
+            ]},
+            "mcpServers": {"justless-dev": {"command": "node", "args": ["server.js"]}, "a/b~": {"command": "Justless"}}
+        })
+        .to_string();
+        let rules = JsonRules {
+            hooks: true,
+            status_line: true,
+            servers: Some("mcpServers"),
+            ..JsonRules::default()
+        };
+        let scan = strip_json("s", rules, &text).unwrap();
+        assert_eq!(scan.found.unwrap().what, ["1 hook"]);
+        assert_eq!(
+            scan.leftover,
+            [
+                "/statusLine/command",
+                "/hooks/PreToolUse/0/hooks/0/command",
+                "/mcpServers/justless-dev",
+                "/mcpServers/a~1b~0/command",
+            ]
+        );
+        // A file that never mentions Justless is not parsed at all.
+        let scan = strip("s", Kind::Json(rules), "{ // comment\n \"a\": 1, }").unwrap();
+        assert!(scan.found.is_none() && scan.leftover.is_empty());
+        let error = strip("s", Kind::Json(rules), "{ // justless\n}")
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("s is not valid JSON; {FIX}: ")),
+            "{error}"
+        );
+        let toml = "[mcp_servers.justless]\ncommand = \"justless\"\nargs = [\"mcp\"]\n\n[mcp_servers.dev]\ncommand = \"/opt/justless-dev/bin/server\"\n";
+        let scan = strip_toml("c", toml).unwrap();
+        assert!(scan.found.is_some());
+        assert_eq!(scan.leftover, ["mcp_servers.dev"]);
+    }
+
+    #[test]
     fn the_catalog_matches_setup() {
         let keys: Vec<String> = catalog().into_iter().map(|(key, _, _)| key).collect();
         for expected in [
@@ -1064,8 +1659,8 @@ mod tests {
         );
         servers.insert("justless", Item::Table(table));
         let installed = document.to_string();
-        let found = strip_toml("c", &installed).unwrap().unwrap();
+        let found = strip_toml("c", &installed).unwrap().found.unwrap();
         assert_eq!(found.outcome, Outcome::Write(original.into()));
-        assert!(strip_toml("c", original).unwrap().is_none());
+        assert!(strip_toml("c", original).unwrap().found.is_none());
     }
 }

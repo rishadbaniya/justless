@@ -1267,8 +1267,8 @@ fn install(workspace: &Workspace, clients: &BTreeSet<Client>) -> Result<()> {
         let path = file.path.display();
         match file.contents {
             Some(contents) => {
-                private_dir(file.path.parent().context("config directory")?)?;
                 crate::uninstall::remember(workspace, &file.path, &contents);
+                private_dir(file.path.parent().context("config directory")?)?;
                 write_text(&file.path, &contents)?;
                 println!("{}: added justless to {path}", file.client.label());
             }
