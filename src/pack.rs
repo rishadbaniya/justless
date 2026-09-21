@@ -456,14 +456,15 @@ fn passages(
     ranked
 }
 
+/// The best-matching line heads the passage, and the others follow in file order.
 fn show_text(report: &mut Report, hit: &Passage) {
     let file = display_path(&hit.location.file);
-    for (at, (line, text)) in hit.lines.iter().enumerate() {
-        report.line(if at == 0 {
-            format!("Text {file}:{line} {text}")
-        } else {
-            format!("    {line} | {text}")
-        });
+    let primary = hit.location.start;
+    for (line, text) in hit.lines.iter().filter(|(line, _)| *line == primary) {
+        report.line(format!("Text {file}:{line} {text}"));
+    }
+    for (line, text) in hit.lines.iter().filter(|(line, _)| *line != primary) {
+        report.line(format!("    {line} | {text}"));
     }
 }
 

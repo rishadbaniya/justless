@@ -1187,6 +1187,12 @@ fn task_packs_and_handoffs_link_live_and_historical_evidence() {
             <= 128
     );
     assert!(success(mixed.path(), &["pack", "canary-checkout"]).contains("docs/operations.md"));
+    // A passage is headed by its best line, not its first.
+    let route = success(mixed.path(), &["pack", "where is the api route for orders"]);
+    assert!(
+        route.contains("Text backend/orders.py:6 @router.get(\"/api/orders\")\n    1 | "),
+        "{route}"
+    );
     let repo = fixture();
     let root = repo.path();
     let args = [
