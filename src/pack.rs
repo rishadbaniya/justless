@@ -199,22 +199,85 @@ fn excerpt(
     }
 }
 
-/// A question term with the light stem its inflections share, such as `hook`
-/// for `hooks`. A line matches the term anywhere, or its stem at the start of
-/// a word or identifier part, so `hooks` meets `hook-codex` but not `webhook`.
+/// A word without its inflection, for matching text: `hooks` to `hook`,
+/// `notes` to `note`, `updated` to `updat`, `entries` to `entry`. Unlike
+/// `stem`, it keeps a final `e` and `y`, so `notes` does not become `not`.
+fn base(word: &str) -> String {
+    let long = |base: &&str| base.len() >= 3;
+    if let Some(root) = word
+        .strip_suffix("ies")
+        .or_else(|| word.strip_suffix("ied"))
+        .filter(long)
+    {
+        return format!("{root}y");
+    }
+    word.strip_suffix("ing")
+        .filter(long)
+        .or_else(|| word.strip_suffix("ed").filter(long))
+        .or_else(|| {
+            word.strip_suffix("es")
+                .filter(|base| long(base) && base.ends_with(['s', 'x', 'h']))
+        })
+        .or_else(|| {
+            word.strip_suffix('s')
+                .filter(|base| long(base) && !base.ends_with('s'))
+        })
+        .unwrap_or(word)
+        .to_owned()
+}
+
+/// Whether `token`, in lower case, is an inflection of `base`: the base itself
+/// or the base with `s`, `es`, `e`, `ed`, `ing`, `er` or `ers`, allowing for a
+/// final `e` or `y` that the suffix replaces and a doubled final consonant.
+/// So `hook` meets `hooks` and `hooked`, `note` meets `noted` and `noting`,
+/// and `run` meets `running`, but `note` does not meet `not` or `nothing`.
+fn inflects(token: &str, base: &str) -> bool {
+    const SUFFIXES: [&str; 8] = ["", "s", "es", "e", "ed", "ing", "er", "ers"];
+    let Some(last) = base.chars().next_back() else {
+        return false;
+    };
+    let cut = &base[..base.len() - last.len_utf8()];
+    let rest = |prefix: &str| token.strip_prefix(prefix);
+    rest(base).is_some_and(|rest| {
+        SUFFIXES.contains(&rest)
+            || (last == 'e' && ["d", "r", "rs"].contains(&rest))
+            || (!"aeiouy".contains(last)
+                && rest.strip_prefix(last).is_some_and(|rest| {
+                    ["ed", "ing", "er", "ers"].contains(&rest)
+                }))
+    }) || (last == 'e' && rest(cut) == Some("ing"))
+        || (last == 'y' && rest(cut).is_some_and(|rest| ["ies", "ied", "ier"].contains(&rest)))
+        // `running` leaves `runn`, which meets `run` and `runs`.
+        || (cut.len() >= 3 && ends_doubled(base) && matches!(rest(cut), Some("" | "s")))
+}
+
+/// A question term and the base its inflections share, such as `hook` for
+/// `hooks`. A line matches the term anywhere, or an inflection of its base as
+/// a whole word or identifier part, so `hooks` meets `hook-codex` and
+/// `set_hook`, but `notes` does not meet `not` or `Nothing`.
 struct Needle {
     word: String,
-    stem: String,
+    base: Option<String>,
+    /// What every form that matches starts with, to skip a line cheaply.
+    prefix: String,
     prints: [Fingerprint; 2],
 }
 
 impl Needle {
     fn new(word: String, inflected: bool) -> Self {
-        let stem = if inflected { stem(&word) } else { word.clone() };
+        let base = inflected.then(|| base(&word));
+        let prefix = match &base {
+            Some(base) if base.ends_with(['e', 'y']) || ends_doubled(base) => {
+                base[..base.len() - 1].to_owned()
+            }
+            Some(base) => base.clone(),
+            None => word.clone(),
+        };
         Self {
-            prints: [Fingerprint::new(&word), Fingerprint::new(&stem)],
+            prints: [Fingerprint::new(&word), Fingerprint::new(&prefix)],
             word,
-            stem,
+            base,
+            prefix,
         }
     }
 
@@ -239,21 +302,60 @@ impl Needle {
 
     /// `folded` is `text` in lower case.
     fn occurs(&self, folded: &str, text: &str) -> bool {
-        folded.contains(&self.word)
-            || (self.stem != self.word
-                && folded.match_indices(&self.stem).any(|(at, _)| {
-                    match folded[..at].chars().next_back() {
-                        None => true,
-                        Some(before) if !before.is_alphanumeric() => true,
-                        // A camelCase part starts at an upper-case letter.
-                        Some(_) => {
-                            text.is_ascii()
-                                && text.as_bytes()[at].is_ascii_uppercase()
-                                && text.as_bytes()[at - 1].is_ascii_lowercase()
-                        }
-                    }
-                }))
+        if folded.contains(&self.word) {
+            return true;
+        }
+        let Some(base) = &self.base else {
+            return false;
+        };
+        folded.contains(&self.prefix)
+            && words(text).any(|word| inflects(&word.to_lowercase(), base))
     }
+}
+
+/// Whether `base` ends in a doubled consonant, as `runn` from `running` does.
+fn ends_doubled(base: &str) -> bool {
+    let mut letters = base.chars().rev();
+    match (letters.next(), letters.next()) {
+        (Some(last), Some(before)) => {
+            last == before && last.is_ascii_alphabetic() && !"aeiouy".contains(last)
+        }
+        _ => false,
+    }
+}
+
+/// The words of `text` and the parts of each identifier: `hook-codex` gives
+/// `hook` and `codex`, `set_hook` gives `set` and `hook`, and `HookCodex`
+/// gives `HookCodex`, `Hook` and `Codex`.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .flat_map(|word| {
+            let mut parts = Vec::new();
+            let mut start = 0;
+            let letters: Vec<(usize, char)> = word.char_indices().collect();
+            for window in letters.windows(3) {
+                let [(_, a), (at, b), (_, c)] = [window[0], window[1], window[2]];
+                // `fooBar` splits before `B`, and `HTTPServer` before `S`.
+                if (a.is_lowercase() && b.is_uppercase())
+                    || (a.is_uppercase() && b.is_uppercase() && c.is_lowercase())
+                {
+                    parts.push(&word[start..at]);
+                    start = at;
+                }
+            }
+            if let [.., (_, a), (at, b)] = letters[..]
+                && a.is_lowercase()
+                && b.is_uppercase()
+            {
+                parts.push(&word[start..at]);
+                start = at;
+            }
+            if start > 0 {
+                parts.push(&word[start..]);
+            }
+            std::iter::once(word).chain(parts)
+        })
 }
 
 /// How rare a term is among `total` files, from 1 for a term in every file to

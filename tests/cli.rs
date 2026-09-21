@@ -8004,3 +8004,56 @@ fn inferred_method_calls_reach_test_methods_only_from_their_own_target() {
     );
     assert!(!alloc.contains("call from"), "{alloc}");
 }
+
+#[test]
+fn pack_matches_inflections_of_a_word_not_every_word_it_starts() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let mut files = vec![(
+        "docs/tagging.txt".to_owned(),
+        "Write the release notes in CHANGES before tagging a version.\n".to_owned(),
+    )];
+    // `not` and `Nothing` start like `notes` but are other words, so they must
+    // not make `notes` look common.
+    for n in 1..=6 {
+        files.push((
+            format!("docs/locks{n}.txt"),
+            "Locks\n=====\nDo not release the lock early; it is not kept after the worker exits.\nNothing else is stored here.\n".to_owned(),
+        ));
+    }
+    for n in 1..=8 {
+        files.push((
+            format!("docs/misc{n}.txt"),
+            format!("Misc {n}\nunrelated text about widgets and gadgets number {n}\n"),
+        ));
+    }
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    write_files(root, &files);
+    let notes = success(root, &["pack", "where are the release notes kept"]);
+    assert!(
+        notes.starts_with("Text docs/tagging.txt:1 Write the release notes"),
+        "{notes}"
+    );
+
+    // An inflection still meets its word in either direction.
+    let other = TempDir::new().unwrap();
+    write_files(
+        other.path(),
+        &[
+            ("docs/cadence.txt", "Releasing happens on Fridays.\n"),
+            ("docs/quiet.txt", "Not much else happens here.\n"),
+        ],
+    );
+    for question in ["when is a release cut", "what was released"] {
+        let pack = success(other.path(), &["pack", question]);
+        assert!(
+            pack.contains("Text docs/cadence.txt:1 Releasing"),
+            "{question}: {pack}"
+        );
+    }
+    let notes = success(other.path(), &["pack", "where are the notes"]);
+    assert!(!notes.contains("quiet.txt"), "{notes}");
+}
