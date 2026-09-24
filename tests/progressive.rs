@@ -16,7 +16,11 @@ fn run(root: &Path, args: &[&str], input: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    p.stdin.take().unwrap().write_all(input).unwrap();
+    // A command that does not read stdin, such as `recall`, may exit and close
+    // the pipe before the input is written.
+    if let Err(error) = p.stdin.take().unwrap().write_all(input) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+    }
     p.wait_with_output().unwrap()
 }
 
