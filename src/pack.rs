@@ -370,10 +370,20 @@ fn rarity(total: usize, documents: usize) -> usize {
 /// task words does not outrank code by length alone.
 const TEXT_LIMIT: usize = 80;
 
+/// Lines on which a term must recur for a file without definitions to be
+/// about it, as a name would say. It must also be on one line in sixteen, so a
+/// lockfile that lists a crate a few times among thousands of lines is not.
+const RECURS: usize = 3;
+
 struct Passage {
     score: usize,
     /// The part of `score` that the file's path earns.
     named: usize,
+    /// In a file without definitions, the weight of the rarest term the file
+    /// is about: one its name holds or that recurs on several of its lines.
+    focus: usize,
+    /// The weight of the rarest term on the best line.
+    rarest: usize,
     /// The line that best matches the question.
     location: Location,
     /// Up to three distinct matching lines, in file order.
@@ -391,14 +401,16 @@ impl Passage {
 // fingerprint admits almost any short word, so term rarity is estimated from the
 // lines actually read. Files whose name holds a question term are read first.
 // In a file without definitions, such as configuration or prose, that name
-// counts like a definition's name, since it says what the whole file is about.
-// Matching lines then promote their enclosing definitions.
+// counts like a definition's name, since it says what the whole file is about,
+// and so do terms that recur through the file. Matching lines then promote
+// their enclosing definitions. Each task word's weight is also returned, keyed
+// by the stem that definition names are matched by.
 fn passages(
     workspace: &Workspace,
     index: &Index,
     words: &BTreeSet<String>,
     question: &str,
-) -> Vec<Passage> {
+) -> (Vec<Passage>, BTreeMap<String, usize>) {
     let mut needles: Vec<Needle> = words
         .iter()
         .map(|word| Needle::new(word.clone(), true))
@@ -461,14 +473,15 @@ fn passages(
             start: 1,
             end: usize::MAX,
         };
-        let named: Vec<usize> = if index.at(&whole).is_empty() {
+        let bare = index.at(&whole).is_empty();
+        let named: Vec<usize> = if bare {
             (0..needles.len())
                 .filter(|&n| needles[n].names(file))
                 .collect()
         } else {
             Vec::new()
         };
-        let mut present = vec![false; needles.len()];
+        let mut counts = vec![0; needles.len()];
         let mut lines = Vec::new();
         for (i, line) in text.lines().enumerate() {
             let folded = line.to_lowercase();
@@ -476,7 +489,7 @@ fn passages(
                 .filter(|&n| needles[n].occurs(&folded, line))
                 .collect();
             for &n in &covered {
-                present[n] = true;
+                counts[n] += 1;
             }
             if !covered.is_empty() {
                 lines.push((i + 1, covered, line.trim().to_owned()));
@@ -486,10 +499,30 @@ fn passages(
         for (n, needle) in needles.iter().enumerate() {
             if needle.possible(print) {
                 checked[n] += 1;
-                found[n] += usize::from(present[n]);
+                found[n] += usize::from(counts[n] > 0);
             }
         }
-        read.push((file, named, lines));
+        // A word in the file's directory is shared by every file there, as
+        // `ctrlc` is by ctrlc/Cargo.toml and ctrlc/README.md, so recurring does
+        // not make it what one of them is about.
+        let length = text.lines().count();
+        let directory = Path::new(file)
+            .parent()
+            .and_then(|path| path.to_str())
+            .unwrap_or("");
+        let about: Vec<usize> = if bare {
+            (0..needles.len())
+                .filter(|&n| {
+                    named.contains(&n)
+                        || (counts[n] >= RECURS
+                            && counts[n] * 16 >= length
+                            && !needles[n].occurs(&directory.to_lowercase(), directory))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        read.push((file, named, about, lines));
     }
     // A term's file count is its fingerprint matches scaled by the share of
     // those that the files read confirmed. It is exact when all were read.
@@ -504,17 +537,19 @@ fn passages(
         })
         .collect();
     let mut ranked = Vec::new();
-    for (file, named, lines) in read {
+    for (file, named, about, lines) in read {
         let path_score: usize = named.iter().map(|&n| weights[n]).sum();
+        let focus = about.iter().map(|&n| weights[n]).max().unwrap_or(0);
         let mut scored: Vec<_> = lines
             .into_iter()
             .map(|(line, covered, text)| {
                 let score = covered.iter().map(|&n| weights[n]).sum::<usize>() + path_score;
+                let rarest = covered.iter().map(|&n| weights[n]).max().unwrap_or(0);
                 let words = text
                     .split(|c: char| !c.is_alphanumeric())
                     .filter(|word| !word.is_empty())
                     .count();
-                (score, words, line, text)
+                (score, words, line, rarest, text)
             })
             .collect();
         let Some(best) = scored.iter().map(|&(score, ..)| score).max() else {
@@ -532,15 +567,17 @@ fn passages(
         let mut distinct = BTreeSet::new();
         scored.retain(|(.., text)| distinct.insert(text.clone()));
         scored.truncate(3);
-        let primary = scored[0].2;
+        let (primary, rarest) = (scored[0].2, scored[0].3);
         let mut lines: Vec<_> = scored
             .into_iter()
-            .map(|(_, _, line, text)| (line, short(&text, 160)))
+            .map(|(_, _, line, _, text)| (line, short(&text, 160)))
             .collect();
         lines.sort();
         ranked.push(Passage {
             score: best,
             named: path_score,
+            focus,
+            rarest,
             location: Location {
                 file: file.clone(),
                 start: primary,
@@ -555,7 +592,15 @@ fn passages(
             .then_with(|| a.location.cmp(&b.location))
     });
     ranked.truncate(8);
-    ranked
+    // Each task word's weight, by the stem that definition names are matched by.
+    let mut by_stem = BTreeMap::<String, usize>::new();
+    for (needle, &weight) in needles.iter().zip(&weights) {
+        if needle.base.is_some() {
+            let entry = by_stem.entry(stem(&needle.word)).or_default();
+            *entry = (*entry).max(weight);
+        }
+    }
+    (ranked, by_stem)
 }
 
 /// The best-matching line heads the passage, and the others follow in file order.
@@ -624,12 +669,13 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
             ranks.insert(id, score);
         }
     }
-    let passages = passages(workspace, index, &words, &question);
+    let (passages, term_weights) = passages(workspace, index, &words, &question);
     // A matching line promotes the definitions around it, except the one it
     // declares, whose name has already been scored. Text that no definition
     // encloses, such as configuration or prose, ranks on the same scale as
     // definitions and leads when it ranks higher.
     let mut standalone = Vec::new();
+    let mut text_covers = BTreeMap::<usize, usize>::new();
     for (at, hit) in passages.iter().enumerate() {
         let enclosing = index.at(&hit.location);
         if enclosing
@@ -641,10 +687,29 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
         for id in enclosing {
             if index.definitions[id].declaration != hit.location.start {
                 *ranks.entry(id).or_default() += hit.score.min(TEXT_LIMIT);
+                let said = text_covers.entry(id).or_default();
+                *said = hit.rarest.max(*said);
             }
         }
     }
-    standalone.sort_by_key(|&at| Reverse(passages[at].rank()));
+    // A file about a task word comes before a line that only mentions some.
+    standalone.sort_by_key(|&at| Reverse(passages[at].rank() + passages[at].focus));
+    // The rarest task word, by the files that hold it, that a definition's
+    // name or the text that promoted it covers. A name the task spells as code
+    // is what was asked for.
+    let covers = |id: usize| {
+        let (name, parts) = &names[id];
+        if code_names.contains(&name.to_lowercase()) {
+            return usize::MAX;
+        }
+        parts
+            .iter()
+            .filter_map(|part| term_weights.get(part))
+            .chain(text_covers.get(&id))
+            .copied()
+            .max()
+            .unwrap_or(0)
+    };
     let mut report = Report::new(cap);
     let mut found_run = false;
     let mut latest = BTreeSet::new();
@@ -712,20 +777,26 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
     let mut seen = BTreeSet::new();
     let mut shown_text = BTreeSet::new();
     let mut text_files = BTreeSet::new();
-    let mut standalone = standalone.into_iter().peekable();
     for (id, score) in ranked.into_iter().take(4) {
         if score < best / 2 || report.clipped {
             break;
         }
-        while let Some(&at) = standalone.peek()
-            && passages[at].rank() > score
-            && shown_text.len() < 5
-            && !report.clipped
-        {
-            show_text(&mut report, &passages[at]);
-            shown_text.insert(at);
-            text_files.insert(passages[at].location.file.clone());
-            standalone.next();
+        // Text leads a definition when it ranks higher, or when its file is
+        // about a task word rarer than any the definition's name or promoting
+        // text covers. A test whose name holds `running`, which most files
+        // say, does not outrank the one file that registers hooks for "what
+        // hooks are configured and running", whatever that file is called.
+        let covered = covers(id);
+        for &at in &standalone {
+            let hit = &passages[at];
+            if shown_text.len() >= 5 || report.clipped {
+                break;
+            }
+            if !shown_text.contains(&at) && (hit.rank() > score || hit.focus > covered) {
+                show_text(&mut report, hit);
+                shown_text.insert(at);
+                text_files.insert(hit.location.file.clone());
+            }
         }
         let def = &index.definitions[id];
         report.line(format!(

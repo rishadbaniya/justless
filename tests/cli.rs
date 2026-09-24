@@ -7786,8 +7786,9 @@ fn inherited_dependency_resolves_by_name_when_the_workspace_root_is_outside_the_
     }
 }
 
-#[test]
-fn pack_surfaces_hook_configuration_for_a_hooks_question() {
+/// A repository whose Codex hooks are registered in `config`, beside
+/// signal-handler code that shares everyday words with a question about hooks.
+fn hook_repo(config: &str, extra: &[(&str, &str)]) -> TempDir {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     let git = Command::new("git")
@@ -7813,11 +7814,19 @@ fn pack_surfaces_hook_configuration_for_a_hooks_question() {
                 "use sig::set_handler;\n\n#[test]\nfn sigint_runs_the_handler_and_the_process_keeps_running() {\n    set_handler(|| {}).unwrap();\n}\n\n#[test]\nfn set_handler_works_while_a_runtime_keeps_running() {\n    let _ = set_handler(|| {});\n}\n",
             ),
             (
-                ".codex/hooks.json",
+                config,
                 "{\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"^(startup|resume)$\",\n        \"hooks\": [\n          { \"type\": \"command\", \"timeout\": 60, \"async\": true, \"command\": \"justless hook-codex session-start\" }\n        ]\n      }\n    ],\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"^Bash$\",\n        \"hooks\": [\n          { \"type\": \"command\", \"timeout\": 5, \"command\": \"justless hook-codex before-command\" }\n        ]\n      }\n    ]\n  }\n}\n",
             ),
         ],
     );
+    write_files(root, extra);
+    repo
+}
+
+#[test]
+fn pack_surfaces_hook_configuration_for_a_hooks_question() {
+    let repo = hook_repo(".codex/hooks.json", &[]);
+    let root = repo.path();
     // Signal-handler code shares words with the question ("handler", "running",
     // "configured"), but the answer is the hook registration.
     let hooks = success(
@@ -7839,6 +7848,53 @@ fn pack_surfaces_hook_configuration_for_a_hooks_question() {
         "{hooks}"
     );
     // A signal question still reaches the signal-handler code.
+    let signals = success(root, &["pack", "how is SIGINT handled"]);
+    assert!(
+        signals.contains("sig::set_handler") && signals.contains("sig/src/lib.rs"),
+        "{signals}"
+    );
+}
+
+#[test]
+fn pack_surfaces_hook_configuration_whatever_the_file_is_called() {
+    // The file name no longer says "hooks". Tests named for "running" rank high
+    // among definitions, since few names say it, yet most files do, and a
+    // README mentions the rarer "checkout" once. The configuration still
+    // leads: hooks recur on several of its lines, so it is about a word rarer
+    // than any those test names hold.
+    let codes: String = (0..32)
+        .map(|n| format!("pub fn code_{n}() -> u8 {{\n    {n}\n}}\n\n"))
+        .collect();
+    let service = "# Service\n\nKeep the service running while it drains.\n";
+    let repo = hook_repo(
+        ".codex/settings.json",
+        &[
+            (
+                "README.md",
+                "# sig\n\nRun the tests from a checkout of this repository.\n",
+            ),
+            ("sig/src/codes.rs", &codes),
+            ("docs/service1.md", service),
+            ("docs/service2.md", service),
+            ("docs/service3.md", service),
+            ("docs/service4.md", service),
+            ("docs/service5.md", service),
+            ("docs/service6.md", service),
+        ],
+    );
+    let root = repo.path();
+    let hooks = success(
+        root,
+        &[
+            "pack",
+            "what hooks are configured and running in this checkout",
+        ],
+    );
+    assert!(hooks.starts_with("Text .codex/settings.json:"), "{hooks}");
+    assert!(
+        hooks.contains("justless hook-codex before-command"),
+        "{hooks}"
+    );
     let signals = success(root, &["pack", "how is SIGINT handled"]);
     assert!(
         signals.contains("sig::set_handler") && signals.contains("sig/src/lib.rs"),
