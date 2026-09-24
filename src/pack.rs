@@ -202,37 +202,44 @@ fn excerpt(
 /// A word without its inflection, for matching text: `hooks` to `hook`,
 /// `notes` to `note`, `updated` to `updat`, `entries` to `entry`. Unlike
 /// `stem`, it keeps a final `e` and `y`, so `notes` does not become `not`.
-fn base(word: &str) -> String {
+/// The flag says whether `ed` or `ing` came off, which may have taken a final
+/// `e` with it, as in `updated`.
+fn base(word: &str) -> (String, bool) {
     let long = |base: &&str| base.len() >= 3;
     if let Some(root) = word
         .strip_suffix("ies")
         .or_else(|| word.strip_suffix("ied"))
         .filter(long)
     {
-        return format!("{root}y");
+        return (format!("{root}y"), false);
     }
-    word.strip_suffix("ing")
+    if let Some(root) = word
+        .strip_suffix("ing")
         .filter(long)
         .or_else(|| word.strip_suffix("ed").filter(long))
-        .or_else(|| {
-            word.strip_suffix("es")
-                .filter(|base| long(base) && base.ends_with(['s', 'x', 'h']))
-        })
+    {
+        return (root.to_owned(), true);
+    }
+    let root = word
+        .strip_suffix("es")
+        .filter(|base| long(base) && base.ends_with(['s', 'x', 'h']))
         .or_else(|| {
             word.strip_suffix('s')
                 .filter(|base| long(base) && !base.ends_with('s'))
         })
-        .unwrap_or(word)
-        .to_owned()
+        .unwrap_or(word);
+    (root.to_owned(), false)
 }
 
 /// Whether `token`, in lower case, is an inflection of `base`: the base itself
-/// or the base with `s`, `es`, `e`, `ed`, `ing`, `er` or `ers`, allowing for a
-/// final `e` or `y` that the suffix replaces and a doubled final consonant.
-/// So `hook` meets `hooks` and `hooked`, `note` meets `noted` and `noting`,
-/// and `run` meets `running`, but `note` does not meet `not` or `nothing`.
-fn inflects(token: &str, base: &str) -> bool {
-    const SUFFIXES: [&str; 8] = ["", "s", "es", "e", "ed", "ing", "er", "ers"];
+/// or the base with `s`, `ed`, `ing`, `er` or `ers`, or `es` after s, x, h or
+/// z, allowing for a final `e` or `y` that the suffix replaces and a doubled
+/// final consonant. A base that lost `ed` or `ing` (`elided`) may take back an
+/// `e`. So `hook` meets `hooks` and `hooked`, `note` meets `noted` and
+/// `noting`, `updated` meets `update`, and `run` meets `running`, but `note`
+/// does not meet `not` or `nothing`, and `stats` does not meet `state`.
+fn inflects(token: &str, base: &str, elided: bool) -> bool {
+    const SUFFIXES: [&str; 6] = ["", "s", "ed", "ing", "er", "ers"];
     let Some(last) = base.chars().next_back() else {
         return false;
     };
@@ -240,6 +247,8 @@ fn inflects(token: &str, base: &str) -> bool {
     let rest = |prefix: &str| token.strip_prefix(prefix);
     rest(base).is_some_and(|rest| {
         SUFFIXES.contains(&rest)
+            || (rest == "es" && ("sxhz".contains(last) || elided))
+            || (rest == "e" && elided)
             || (last == 'e' && ["d", "r", "rs"].contains(&rest))
             || (!"aeiouy".contains(last)
                 && rest.strip_prefix(last).is_some_and(|rest| {
@@ -257,7 +266,8 @@ fn inflects(token: &str, base: &str) -> bool {
 /// `set_hook`, but `notes` does not meet `not` or `Nothing`.
 struct Needle {
     word: String,
-    base: Option<String>,
+    /// The base and whether `ed` or `ing` came off it, for a term that inflects.
+    base: Option<(String, bool)>,
     /// What every form that matches starts with, to skip a line cheaply.
     prefix: String,
     prints: [Fingerprint; 2],
@@ -267,10 +277,10 @@ impl Needle {
     fn new(word: String, inflected: bool) -> Self {
         let base = inflected.then(|| base(&word));
         let prefix = match &base {
-            Some(base) if base.ends_with(['e', 'y']) || ends_doubled(base) => {
+            Some((base, _)) if base.ends_with(['e', 'y']) || ends_doubled(base) => {
                 base[..base.len() - 1].to_owned()
             }
-            Some(base) => base.clone(),
+            Some((base, _)) => base.clone(),
             None => word.clone(),
         };
         Self {
@@ -305,11 +315,11 @@ impl Needle {
         if folded.contains(&self.word) {
             return true;
         }
-        let Some(base) = &self.base else {
+        let Some((base, elided)) = &self.base else {
             return false;
         };
         folded.contains(&self.prefix)
-            && words(text).any(|word| inflects(&word.to_lowercase(), base))
+            && words(text).any(|word| inflects(&word.to_lowercase(), base, *elided))
     }
 }
 

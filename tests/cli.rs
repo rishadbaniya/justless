@@ -8101,6 +8101,7 @@ fn pack_matches_inflections_of_a_word_not_every_word_it_starts() {
         &[
             ("docs/cadence.txt", "Releasing happens on Fridays.\n"),
             ("docs/quiet.txt", "Not much else happens here.\n"),
+            ("docs/machine.txt", "The state machine is drawn below.\n"),
         ],
     );
     for question in ["when is a release cut", "what was released"] {
@@ -8112,4 +8113,7 @@ fn pack_matches_inflections_of_a_word_not_every_word_it_starts() {
     }
     let notes = success(other.path(), &["pack", "where are the notes"]);
     assert!(!notes.contains("quiet.txt"), "{notes}");
+    // Only a base that lost `ed` or `ing` takes back an `e`: `stats` is not `state`.
+    let stats = success(other.path(), &["pack", "where are the stats"]);
+    assert!(!stats.contains("machine.txt"), "{stats}");
 }
