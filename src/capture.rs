@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -28,6 +28,21 @@ static PYTHON_SOURCE: LazyLock<Regex> = LazyLock::new(|| {
 static TYPESCRIPT_SOURCE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*([^()\r\n]+)\((\d+),\s*\d+\):").expect("TypeScript diagnostic pattern")
 });
+/// A compiler or checker error after a `path:line[:col]:` or `path(line,col):` prefix.
+static LOCATED_ERROR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*(?:[A-Za-z]:)?[^\s:()]+(?:(?::\d+){1,2}:|\(\d+(?:,\s*\d+)?\):)\s*(?:fatal error|error)\b",
+    )
+    .expect("located error pattern")
+});
+/// An exception line such as `ValueError: bad input` or `TypeError: x is undefined`.
+static EXCEPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[A-Za-z_][\w.]*\.)?(?:[A-Z]\w*)?(?:Error|Exception):(?:\s|$)")
+        .expect("exception pattern")
+});
+/// A numbered source line under a rustc diagnostic, such as `42 |     call();`.
+static RUST_GUTTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\d+\s+\|").expect("source gutter pattern"));
 const SCAN_LINE_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +534,7 @@ impl Capture<'_> {
             }
             _ => None,
         };
+        let mut locations = Locations::default();
         let mut previews = Vec::new();
         for (index, stream) in Stream::BOTH.into_iter().enumerate() {
             let preview = scan(
@@ -533,11 +549,13 @@ impl Capture<'_> {
                     selection,
                     lint: &mut lint,
                     grouping: &mut grouping,
+                    locations: &mut locations,
                 },
             )
             .with_context(|| format!("read {}", stream.name()))?;
             previews.push((stream, preview));
         }
+        locations.finish(&mut run);
         let stdout_bytes = lengths[0];
 
         run.summary = parser.finish();
@@ -729,6 +747,7 @@ struct Observers<'a> {
     selection: &'a crate::filters::Selection,
     lint: &'a mut Option<crate::lint::Lint>,
     grouping: &'a mut Option<Grouping>,
+    locations: &'a mut Locations,
 }
 
 /// Groups stdout of a search by file, or of a file listing by directory.
@@ -751,6 +770,7 @@ fn scan(
         selection,
         lint,
         grouping,
+        locations,
     } = observers;
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
@@ -762,10 +782,13 @@ fn scan(
         digest: Sha256::new(),
     });
     let mut raw = Vec::new();
+    let mut end = Vec::new();
     let mut preview = Vec::new();
-    let mut head = Vec::new();
-    let mut failures = Vec::new();
-    let mut notes = Vec::new();
+    let mut head = Excerpt::new(payload / 6);
+    let mut section = Section::default();
+    let mut block: Option<Block> = None;
+    let mut patch = false;
+    let tail_limit = payload / 3;
     let mut tail = VecDeque::new();
     let mut tail_bytes = 0;
     let mut line_no = 0;
@@ -776,7 +799,10 @@ fn scan(
     } else {
         max_bytes
     };
-    while read_prefix(&mut file, &mut raw, line_limit)? {
+    loop {
+        let Some(cut) = read_line(&mut file, &mut raw, line_limit, &mut end, tail_limit)? else {
+            break;
+        };
         line_no += 1;
         let text = String::from_utf8_lossy(&raw);
         let text = ANSI.replace_all(&text, "");
@@ -793,72 +819,93 @@ fn scan(
             }
         }
         let structured = cargo_message(&text);
-        let locations: Vec<Location> = if let Some(message) = &structured {
-            json_locations(workspace, message)
-        } else {
-            source_location(workspace, &text).into_iter().collect()
-        };
-        let has_location = !locations.is_empty();
-        for location in locations {
-            if !run.source_digests.contains_key(&location.file)
-                && let Ok(source) = workspace
-                    .source_path(&location.file)
-                    .and_then(|p| fs::read(p).context("read diagnostic source"))
-            {
-                run.source_digests
-                    .insert(location.file.clone(), source_digest(&source));
+        let rendered = structured.as_ref().and_then(rendered_message);
+        let shown = rendered.as_deref().unwrap_or(&text);
+        let line = shown.trim_end_matches(['\n', '\r']);
+        // Lines inside a patch hunk are file content, not diagnostics.
+        patch = line.starts_with("@@ ")
+            || patch && (line.is_empty() || line.starts_with([' ', '+', '-', '\\']));
+
+        // A failure keeps the lines that explain it: a traceback through its
+        // exception line, a panic's message, or a compiler error's location.
+        let mut failure = false;
+        if let Some(open) = block.as_mut() {
+            match open.extend(line, shown) {
+                Extend::More => failure = true,
+                Extend::Last => {
+                    failure = true;
+                    section.add(block.take().unwrap(), payload / 2);
+                }
+                Extend::Stop => section.add(block.take().unwrap(), payload / 2),
             }
-            run.diagnostics.push(Diagnostic {
-                location,
-                log_line: line_no,
-                stream,
-            });
+        }
+        if !failure
+            && !patch
+            && let Some(tier) = failure_tier(line)
+        {
+            failure = true;
+            if let Some(earlier) = block.replace(Block::new(tier, line, shown)) {
+                section.add(earlier, payload / 2);
+            }
+        }
+        let found = if patch {
+            Vec::new()
+        } else if let Some(message) = &structured {
+            json_locations(workspace, locations, message)
+        } else {
+            source_location(workspace, locations, &text)
+                .into_iter()
+                .collect()
+        };
+        let has_location = !found.is_empty();
+        for location in found {
+            locations.add(workspace, location, line_no, stream, failure);
         }
 
         if !truncated {
             preview.extend_from_slice(&raw);
         } else {
-            let rendered = structured.as_ref().and_then(rendered_message);
-            let text = rendered.as_deref().unwrap_or(&text);
-            let line = text.trim_start();
-            let summary_limit = payload / 2;
-            if is_failure(line) {
-                append_excerpt(&mut failures, text, summary_limit);
-            } else if has_location || line.starts_with("warning") {
-                append_excerpt(&mut notes, text, summary_limit);
+            let trimmed = line.trim_start();
+            if !failure && !patch && (has_location || trimmed.starts_with("warning")) {
+                section.add(Block::new(Tier::Note, line, shown), payload / 2);
             }
-            append_excerpt(&mut head, text, payload / 6);
-            let mut excerpt = Vec::new();
-            let tail_limit = payload / 3;
-            if text.len() > tail_limit {
-                let start = text.ceil_char_boundary(text.len() - tail_limit);
-                append_excerpt(&mut excerpt, &text[start..], tail_limit);
+            head.push(shown);
+            // The tail ends where the stream ends, even inside an enormous line.
+            let mut excerpt = Excerpt::new(tail_limit);
+            if cut {
+                // Only the start of an enormous line was scanned. Show its real end.
+                let wanted = tail_limit.saturating_sub(end.len());
+                let mut suffix = raw[raw.len().saturating_sub(wanted)..].to_vec();
+                suffix.extend_from_slice(&end);
+                let suffix = String::from_utf8_lossy(&suffix);
+                excerpt.push_end(&ANSI.replace_all(&suffix, ""), true);
             } else {
-                append_excerpt(&mut excerpt, text, tail_limit);
+                excerpt.push_end(shown, false);
             }
-            if !excerpt.is_empty() {
-                tail_bytes += excerpt.len();
-                tail.push_back(excerpt);
+            if !excerpt.text.is_empty() {
+                tail_bytes += excerpt.text.len();
+                tail.push_back(excerpt.text);
                 while tail_bytes > tail_limit {
                     tail_bytes -= tail.pop_front().unwrap().len();
                 }
             }
         }
         raw.clear();
+        end.clear();
+    }
+    if let Some(open) = block.take() {
+        section.add(open, payload / 2);
     }
 
     if truncated {
-        preview.extend_from_slice(&head);
-        if !failures.is_empty() || !notes.is_empty() {
+        preview.extend_from_slice(head.text.as_bytes());
+        let diagnostics = section.render(payload / 2);
+        if !diagnostics.is_empty() {
             preview.extend_from_slice(DIAGNOSTICS);
-            let available = payload / 2 - failures.len();
-            let notes = std::str::from_utf8(&notes).expect("UTF-8 excerpt");
-            let end = notes.floor_char_boundary(available.min(notes.len()));
-            preview.extend_from_slice(&failures);
-            preview.extend_from_slice(&notes.as_bytes()[..end]);
+            preview.extend_from_slice(diagnostics.as_bytes());
         }
         preview.extend_from_slice(CLIPPED);
-        preview.extend(tail.into_iter().flatten());
+        preview.extend(tail.into_iter().flat_map(String::into_bytes));
     }
     run.digests
         .push(format!("{:x}", file.into_inner().digest.finalize()));
@@ -868,6 +915,318 @@ fn scan(
         return Ok(filtered);
     }
     Ok(preview)
+}
+
+/// Read one line. A line longer than `limit` keeps its first `limit` bytes in
+/// `prefix` and its last `end_limit` bytes in `end`, and returns `Some(true)`.
+fn read_line(
+    file: &mut impl BufRead,
+    prefix: &mut Vec<u8>,
+    limit: usize,
+    end: &mut Vec<u8>,
+    end_limit: usize,
+) -> io::Result<Option<bool>> {
+    let mut read = false;
+    let mut cut = false;
+    loop {
+        let chunk = file.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        read = true;
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let length = newline.map_or(chunk.len(), |index| index + 1);
+        let kept = length.min(limit.saturating_sub(prefix.len()));
+        prefix.extend_from_slice(&chunk[..kept]);
+        if kept < length {
+            cut = true;
+            end.extend_from_slice(&chunk[kept..length]);
+            if end.len() > end_limit.saturating_mul(2).max(4096) {
+                end.drain(..end.len() - end_limit);
+            }
+        }
+        file.consume(length);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if end.len() > end_limit {
+        end.drain(..end.len() - end_limit);
+    }
+    Ok(read.then_some(cut))
+}
+
+/// Marks a line that was cut to fit.
+const CUT: &str = "…";
+
+/// Whole lines up to a byte limit. The first line that does not fit is cut and
+/// marked, and nothing follows it, so the excerpt never skips a line.
+struct Excerpt {
+    text: String,
+    limit: usize,
+    closed: bool,
+}
+
+impl Excerpt {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+            closed: false,
+        }
+    }
+
+    fn push(&mut self, line: &str) -> bool {
+        if self.closed {
+            return false;
+        }
+        if self.text.len() + line.len() <= self.limit {
+            self.text.push_str(line);
+            return true;
+        }
+        self.closed = true;
+        let room = self.limit.saturating_sub(self.text.len() + CUT.len() + 1);
+        if room >= 16 {
+            self.text.push_str(&line[..line.floor_char_boundary(room)]);
+            self.text.push_str(CUT);
+            self.text.push('\n');
+        }
+        false
+    }
+
+    /// Keep the end of a line, marking when its start was left out.
+    fn push_end(&mut self, line: &str, cut: bool) {
+        if line.len() <= self.limit && !cut {
+            self.text.push_str(line);
+        } else if line.len() + CUT.len() <= self.limit {
+            self.text.push_str(CUT);
+            self.text.push_str(line);
+        } else if self.limit > CUT.len() {
+            let start = line.ceil_char_boundary(line.len() - (self.limit - CUT.len()));
+            self.text.push_str(CUT);
+            self.text.push_str(&line[start..]);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// Errors, panics, tracebacks and failed tests.
+    Failure,
+    /// An indented error line, which can also be a field in a debug dump.
+    Indented,
+    /// A located line or a warning.
+    Note,
+}
+
+/// A failure line and the lines that explain it.
+struct Block {
+    tier: Tier,
+    text: String,
+    indent: usize,
+    kind: Follow,
+    lines: usize,
+    frames: VecDeque<String>,
+    skipped: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    /// A Python traceback runs through its first line at the header's indentation.
+    Traceback,
+    /// A panic message follows `panicked at path:line:col:` until a blank line.
+    Panic,
+    /// Indented location and source lines under a compiler error.
+    Indented,
+    Nothing,
+}
+
+enum Extend {
+    More,
+    Last,
+    Stop,
+}
+
+const FOLLOW_LINES: usize = 4;
+const TRACEBACK_FRAMES: usize = 10;
+
+impl Block {
+    fn new(tier: Tier, line: &str, shown: &str) -> Self {
+        let trimmed = line.trim_start();
+        let kind = if tier == Tier::Note {
+            Follow::Nothing
+        } else if trimmed.starts_with("Traceback") {
+            Follow::Traceback
+        } else if trimmed.contains(" panicked at ") && trimmed.ends_with(':') {
+            Follow::Panic
+        } else if tier == Tier::Failure {
+            Follow::Indented
+        } else {
+            Follow::Nothing
+        };
+        let mut text = shown.to_owned();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        Self {
+            tier,
+            text,
+            indent: indentation(line),
+            kind,
+            lines: 0,
+            frames: VecDeque::new(),
+            skipped: 0,
+        }
+    }
+
+    fn extend(&mut self, line: &str, shown: &str) -> Extend {
+        let indent = indentation(line);
+        let blank = line.trim().is_empty();
+        let next = match self.kind {
+            Follow::Nothing => return Extend::Stop,
+            Follow::Traceback if blank || indent < self.indent => return Extend::Stop,
+            Follow::Traceback if indent > self.indent => {
+                self.frames.push_back(with_newline(shown));
+                if self.frames.len() > TRACEBACK_FRAMES {
+                    self.frames.pop_front();
+                    self.skipped += 1;
+                }
+                return Extend::More;
+            }
+            Follow::Traceback => {
+                // The exception line, such as `ValueError: bad input`.
+                self.finish_frames();
+                self.text.push_str(&with_newline(shown));
+                return Extend::Last;
+            }
+            Follow::Panic => {
+                let trimmed = line.trim_start();
+                !blank
+                    && !trimmed.starts_with("note:")
+                    && !trimmed.starts_with("stack backtrace:")
+                    && !trimmed.starts_with("---- ")
+            }
+            Follow::Indented => !blank && (indent > self.indent || RUST_GUTTER.is_match(line)),
+        };
+        if !next || self.lines >= FOLLOW_LINES {
+            return Extend::Stop;
+        }
+        self.lines += 1;
+        self.text.push_str(&with_newline(shown));
+        Extend::More
+    }
+
+    fn finish_frames(&mut self) {
+        if self.skipped > 0 {
+            self.text.push_str(&format!(
+                "{}{CUT} {} earlier frame line(s)\n",
+                " ".repeat(self.indent + 2),
+                self.skipped
+            ));
+            self.skipped = 0;
+        }
+        for frame in self.frames.drain(..) {
+            self.text.push_str(&frame);
+        }
+    }
+}
+
+fn with_newline(text: &str) -> String {
+    let mut text = text.to_owned();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+fn indentation(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The [diagnostics] section of a clipped stream: failures first, then indented
+/// error lines, then located lines and warnings. Repeated entries are counted
+/// rather than repeated.
+#[derive(Default)]
+struct Section {
+    entries: [Vec<(String, usize)>; 3],
+    bytes: [usize; 3],
+    index: HashMap<String, (usize, usize)>,
+}
+
+impl Section {
+    fn add(&mut self, mut block: Block, budget: usize) {
+        block.finish_frames();
+        let tier = block.tier as usize;
+        if let Some(&(tier, position)) = self.index.get(&block.text) {
+            self.entries[tier][position].1 += 1;
+            return;
+        }
+        // An entry past the budget could not be shown, so it is not kept either.
+        if self.bytes[tier] >= budget {
+            return;
+        }
+        self.bytes[tier] += block.text.len();
+        self.index
+            .insert(block.text.clone(), (tier, self.entries[tier].len()));
+        self.entries[tier].push((block.text, 1));
+    }
+
+    fn render(&self, budget: usize) -> String {
+        let mut out = Excerpt::new(budget);
+        for (text, count) in self.entries.iter().flatten() {
+            let mut lines = text.split_inclusive('\n');
+            let first = lines.next().unwrap_or_default();
+            let first = if *count > 1 {
+                format!("{}  [×{count}]\n", first.trim_end_matches(['\n', '\r']))
+            } else {
+                first.to_owned()
+            };
+            for line in std::iter::once(first.as_str()).chain(lines) {
+                if !out.push(line) {
+                    return out.text;
+                }
+            }
+        }
+        out.text
+    }
+}
+
+/// Classify a line that can explain why a command failed.
+fn failure_tier(line: &str) -> Option<Tier> {
+    let trimmed = line.trim_start();
+    // These prefixes mean a failure wherever they appear, including in indented
+    // build script output.
+    if [
+        "Traceback",
+        "FAILED",
+        "thread '",
+        "assertion ",
+        "left:",
+        "right:",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+        || trimmed.trim_end().ends_with("... FAILED")
+        || LOCATED_ERROR.is_match(line)
+    {
+        return Some(Tier::Failure);
+    }
+    let error = [
+        "error:",
+        "error[",
+        "ERROR",
+        "fatal:",
+        "failures:",
+        "test result: FAILED",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix));
+    if trimmed.len() == line.len() {
+        (error || EXCEPTION.is_match(line)).then_some(Tier::Failure)
+    } else {
+        // Indented `error:` lines are also struct fields and diff context.
+        error.then_some(Tier::Indented)
+    }
 }
 
 fn read_prefix(file: &mut impl BufRead, prefix: &mut Vec<u8>, limit: usize) -> io::Result<bool> {
@@ -889,39 +1248,17 @@ fn read_prefix(file: &mut impl BufRead, prefix: &mut Vec<u8>, limit: usize) -> i
     }
 }
 
-fn append_excerpt(output: &mut Vec<u8>, line: &str, limit: usize) {
-    let available = limit.saturating_sub(output.len());
-    let end = line.floor_char_boundary(available.min(line.len()));
-    output.extend_from_slice(&line.as_bytes()[..end]);
-}
-
-fn is_failure(line: &str) -> bool {
-    [
-        "error:",
-        "error[",
-        "ERROR",
-        "fatal:",
-        "Traceback",
-        "FAILED",
-        "failures:",
-        "test result: FAILED",
-        "thread '",
-        "assertion ",
-        "left:",
-        "right:",
-    ]
-    .iter()
-    .any(|prefix| line.starts_with(prefix))
-        || line.trim_end().ends_with("... FAILED")
-}
-
-fn source_location(workspace: &Workspace, text: &str) -> Option<Location> {
+fn source_location(
+    workspace: &Workspace,
+    locations: &mut Locations,
+    text: &str,
+) -> Option<Location> {
     if let Some(captures) = PYTHON_SOURCE
         .captures(text)
         .or_else(|| TYPESCRIPT_SOURCE.captures(text))
     {
         let start = captures[2].parse().ok()?;
-        return locate(workspace, &captures[1], start, start);
+        return locate(workspace, locations, &captures[1], start, start);
     }
     let candidate = if text.contains("panicked at ") {
         text.split_once("panicked at ")?.1
@@ -937,23 +1274,112 @@ fn source_location(workspace: &Workspace, text: &str) -> Option<Location> {
     let name = captures.get(1)?.as_str().trim();
     locate(
         workspace,
+        locations,
         name.strip_prefix("file://").unwrap_or(name),
         start,
         start,
     )
 }
 
-fn locate(workspace: &Workspace, name: &str, start: usize, end: usize) -> Option<Location> {
-    let path = Path::new(name);
+fn locate(
+    workspace: &Workspace,
+    locations: &mut Locations,
+    name: &str,
+    start: usize,
+    end: usize,
+) -> Option<Location> {
     if start == 0 || end < start {
         return None;
     }
-    let candidates = [workspace.cwd.join(path), workspace.root.join(path)];
-    let file = candidates.iter().find_map(|path| {
-        let canonical = path.canonicalize().ok()?;
-        workspace.relative_file(&canonical)
-    })?;
+    let file = locations.resolve(workspace, name)?;
     Some(Location { file, start, end })
+}
+
+/// The most source locations of each kind that a run record keeps.
+const KEPT_LOCATIONS: usize = 100;
+/// The most log lines of one kind a run record keeps for one source location.
+/// Progress output and the real error often name the same line, so a failure is
+/// kept even when other lines already named its location.
+const LINES_PER_LOCATION: usize = 4;
+
+/// Source locations named in the output, for `context --run`, packs and handoffs.
+/// Each location keeps a few log lines, those in failures first, so the record
+/// stays far smaller than output that names a location on every line.
+#[derive(Default)]
+struct Locations {
+    names: HashMap<String, Option<String>>,
+    /// Log lines kept for each location, by whether they were failures.
+    seen: BTreeMap<(Location, bool), usize>,
+    failures: Vec<Diagnostic>,
+    others: Vec<Diagnostic>,
+    source_digests: BTreeMap<String, String>,
+}
+
+impl Locations {
+    /// The workspace file a printed path names, resolved once per distinct path.
+    fn resolve(&mut self, workspace: &Workspace, name: &str) -> Option<String> {
+        if let Some(file) = self.names.get(name) {
+            return file.clone();
+        }
+        let path = Path::new(name);
+        let candidates = [workspace.cwd.join(path), workspace.root.join(path)];
+        let file = candidates.iter().find_map(|path| {
+            let canonical = path.canonicalize().ok()?;
+            workspace.relative_file(&canonical)
+        });
+        if self.names.len() < 8192 {
+            self.names.insert(name.to_owned(), file.clone());
+        }
+        file
+    }
+
+    fn add(
+        &mut self,
+        workspace: &Workspace,
+        location: Location,
+        log_line: usize,
+        stream: Stream,
+        failure: bool,
+    ) {
+        let kept = if failure {
+            self.failures.len()
+        } else {
+            self.others.len()
+        };
+        let lines = self
+            .seen
+            .get(&(location.clone(), failure))
+            .copied()
+            .unwrap_or(0);
+        if kept >= KEPT_LOCATIONS || lines >= LINES_PER_LOCATION {
+            return;
+        }
+        if !self.source_digests.contains_key(&location.file)
+            && let Ok(source) = workspace
+                .source_path(&location.file)
+                .and_then(|p| fs::read(p).context("read diagnostic source"))
+        {
+            self.source_digests
+                .insert(location.file.clone(), source_digest(&source));
+        }
+        self.seen.insert((location.clone(), failure), lines + 1);
+        let diagnostic = Diagnostic {
+            location,
+            log_line,
+            stream,
+        };
+        if failure {
+            self.failures.push(diagnostic);
+        } else {
+            self.others.push(diagnostic);
+        }
+    }
+
+    fn finish(self, run: &mut Run) {
+        run.diagnostics = self.failures;
+        run.diagnostics.extend(self.others);
+        run.source_digests = self.source_digests;
+    }
 }
 
 fn cargo_message(text: &str) -> Option<serde_json::Value> {
@@ -975,7 +1401,11 @@ fn rendered_message(message: &serde_json::Value) -> Option<String> {
     ))
 }
 
-fn json_locations(workspace: &Workspace, message: &serde_json::Value) -> Vec<Location> {
+fn json_locations(
+    workspace: &Workspace,
+    locations: &mut Locations,
+    message: &serde_json::Value,
+) -> Vec<Location> {
     let Some(spans) = message.get("spans").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
@@ -988,7 +1418,7 @@ fn json_locations(workspace: &Workspace, message: &serde_json::Value) -> Vec<Loc
             let file = span.get("file_name")?.as_str()?;
             let start = usize::try_from(span.get("line_start")?.as_u64()?).ok()?;
             let end = usize::try_from(span.get("line_end")?.as_u64()?).ok()?;
-            locate(workspace, file, start, end)
+            locate(workspace, locations, file, start, end)
         })
         .collect()
 }

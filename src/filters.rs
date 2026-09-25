@@ -829,7 +829,19 @@ fn diagnostic(line: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+/// Append whole lines that fit. A single line that does not fit is cut and ends
+/// with `…`, so a fragment never reads as a complete line.
 fn append(out: &mut String, text: &str, budget: usize) {
-    let available = budget.saturating_sub(out.len()).min(text.len());
-    out.push_str(&text[..text.floor_char_boundary(available)]);
+    let available = budget.saturating_sub(out.len());
+    if text.len() <= available {
+        out.push_str(text);
+        return;
+    }
+    let fit = &text[..text.floor_char_boundary(available)];
+    if let Some(end) = fit.rfind('\n') {
+        out.push_str(&fit[..=end]);
+    } else if available >= 20 {
+        out.push_str(&fit[..fit.floor_char_boundary(available - "…\n".len())]);
+        out.push_str("…\n");
+    }
 }

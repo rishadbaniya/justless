@@ -8335,3 +8335,218 @@ fn output_written_after_the_command_exits_is_labeled_in_the_log() {
         stderr(&log)
     );
 }
+
+/// The bounded preview of one stream, without the run footer.
+fn preview_of(text: &str) -> &str {
+    text.split("\n[justless run-").next().unwrap()
+}
+
+fn diagnostics_of(text: &str) -> &str {
+    text.split_once("[diagnostics]\n")
+        .map_or("", |(_, rest)| rest)
+        .split("\n[output clipped.")
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn a_located_compile_error_outranks_earlier_warnings() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let script = r#"exec 1>&2
+for i in $(seq 1 120); do echo "x.c:$i:20: warning: unused variable 'unused_$i' [-Wunused-variable]"; done
+echo "x.c:121:27: error: use of undeclared identifier 'undeclared_symbol_xyz'"
+echo "  121 | int broken(void) { return undeclared_symbol_xyz; }"
+echo "      |                           ^"
+for i in $(seq 122 240); do echo "x.c:$i:20: warning: unused variable 'unused_$i' [-Wunused-variable]"; done
+echo "240 warnings and 1 error generated."
+exit 2"#;
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
+    assert_eq!(output.status.code(), Some(2));
+    let preview = preview_of(&stderr(&output)).to_owned();
+    assert!(preview.len() <= 4096, "{}", preview.len());
+    let diagnostics = diagnostics_of(&preview);
+    assert!(
+        diagnostics.starts_with(
+            "x.c:121:27: error: use of undeclared identifier 'undeclared_symbol_xyz'\n  121 | int broken"
+        ),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn repeated_and_patch_error_lines_do_not_crowd_out_the_real_error() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let script = r#"for i in $(seq 1 300); do echo "    error: None,"; done
+echo "error[E0599]: no method named frobnicate found for struct Order"
+echo "  --> src/order.rs:42:10"
+seq 1 3000"#;
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
+    let preview = preview_of(&stdout(&output)).to_owned();
+    let diagnostics = diagnostics_of(&preview);
+    assert!(
+        diagnostics.starts_with(
+            "error[E0599]: no method named frobnicate found for struct Order\n  --> src/order.rs:42:10\n    error: None,  [×300]\n"
+        ),
+        "{diagnostics}"
+    );
+
+    // Context lines of a successful `git log -p` are file content, not failures.
+    let mut patch = String::new();
+    for i in 0..150 {
+        patch.push_str(&format!(
+            "diff --git a/types{i}.rs b/types{i}.rs\n--- a/types{i}.rs\n+++ b/types{i}.rs\n@@ -1,4 +1,4 @@\n pub struct S{i} {{\n-    id: u32,\n+    id: u64,\n     error: Option<String>,\n }}\n"
+        ));
+    }
+    fs::write(root.join("patch.txt"), patch).unwrap();
+    let output = cli(root, &["run", "--", "cat", "patch.txt"]);
+    assert!(output.status.success());
+    let preview = stdout(&output);
+    assert!(preview.contains("[output clipped."), "{preview}");
+    assert!(!preview.contains("[diagnostics]"), "{preview}");
+}
+
+#[test]
+fn a_clipped_traceback_keeps_its_exception_line() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let script = r#"for i in $(seq 1 300); do echo "processing record $i ok"; done
+echo 'Traceback (most recent call last):'
+echo '  File "job.py", line 5, in <module>'
+echo '    parse("x42")'
+echo '  File "job.py", line 3, in parse'
+echo '    raise ValueError(f"bad input {v}: expected integer")'
+echo 'ValueError: bad input x42: expected integer'
+for i in $(seq 300 600); do echo "processing record $i ok"; done
+exit 1"#;
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
+    assert_eq!(output.status.code(), Some(1));
+    let preview = preview_of(&stdout(&output)).to_owned();
+    assert!(
+        diagnostics_of(&preview).ends_with(
+            "  File \"job.py\", line 3, in parse\n    raise ValueError(f\"bad input {v}: expected integer\")\nValueError: bad input x42: expected integer\n"
+        ),
+        "{preview}"
+    );
+}
+
+#[test]
+fn clipped_excerpts_end_on_whole_lines_or_mark_the_cut() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--fresh",
+            "--max-bytes",
+            "512",
+            "--",
+            "seq",
+            "1",
+            "5000",
+        ],
+    );
+    let preview = stdout(&output);
+    let (head, rest) = preview.split_once("\n[output clipped.").unwrap();
+    let numbers: Vec<_> = head.lines().filter(|line| !line.is_empty()).collect();
+    let expected: Vec<_> = (1..=numbers.len()).map(|n| n.to_string()).collect();
+    assert_eq!(numbers, expected, "{preview}");
+    assert!(rest.ends_with("4999\n5000\n"), "{preview}");
+
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--max-bytes",
+            "512",
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 1 400); do echo \"removed /var/cache/app/shard-$i/index.db\"; done",
+        ],
+    );
+    let preview = stdout(&output);
+    for line in preview.lines().filter(|line| line.starts_with("removed")) {
+        assert!(
+            line.ends_with("/index.db") || line.ends_with('…'),
+            "{line:?} in {preview}"
+        );
+    }
+}
+
+#[test]
+fn the_tail_of_an_enormous_last_line_is_its_real_end() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let mut text: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+    text.push_str(&"x".repeat(300 * 1024));
+    text.push_str(" error: TRAILING_ERR\n");
+    fs::write(root.join("big.txt"), text).unwrap();
+    let output = cli(root, &["run", "--", "cat", "big.txt"]);
+    let preview = preview_of(&stdout(&output)).to_owned();
+    assert!(preview.len() <= 4096, "{}", preview.len());
+    assert!(preview.ends_with("xxxx error: TRAILING_ERR\n"), "{preview}");
+    assert!(preview.contains("\n…xxx"), "{preview}");
+}
+
+#[test]
+fn run_records_stay_small_when_every_line_names_a_location() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join("Cargo.toml"), "").unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    let mut output = String::new();
+    for file in 0..300 {
+        fs::write(root.join(format!("src/m{file}.rs")), "fn item() {}\n").unwrap();
+        for line in 1..=60 {
+            output.push_str(&format!(
+                "src/m{file}.rs:{line}:1: warning: unused item {file}_{line}\n"
+            ));
+        }
+    }
+    fs::write(root.join("src/broken.rs"), "fn broken() {}\n").unwrap();
+    output.push_str("src/broken.rs:1:4: error: cannot find value `x` in this scope\n");
+    fs::write(root.join("out.txt"), &output).unwrap();
+    let run = cli(root, &["run", "--", "cat", "out.txt"]);
+    let id = run_id(&run);
+    let record = fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap();
+    assert!(
+        record.len() * 20 < output.len(),
+        "{} record bytes for {} output bytes",
+        record.len(),
+        output.len()
+    );
+    let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
+    let diagnostics = record["diagnostics"].as_array().unwrap();
+    assert!(diagnostics.len() <= 200, "{}", diagnostics.len());
+    // The error comes first even though it is the last located line.
+    assert_eq!(diagnostics[0]["location"]["file"], "src/broken.rs");
+    assert!(success(root, &["history"]).contains(&id));
+}
+
+#[test]
+fn filtered_previews_never_end_on_an_unmarked_fragment() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(
+        root.join(".justless.toml"),
+        "max_output_bytes = 512\n[[filters]]\ncommand = [\"sh\"]\nomit = '^noise'\n",
+    )
+    .unwrap();
+    let script = "for i in $(seq 1 50); do echo noise; done; for i in $(seq 1 200); do echo \"kept line $i of the report\"; done";
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
+    let preview = preview_of(&stdout(&output)).to_owned();
+    assert!(
+        preview.starts_with("[200 retained lines, 50 filtered, 0 repeats]\n"),
+        "{preview}"
+    );
+    assert!(preview.len() <= 512, "{}", preview.len());
+    for line in preview.lines().filter(|line| line.starts_with("kept")) {
+        assert!(
+            line.ends_with("of the report") || line.ends_with('…'),
+            "{line:?} in {preview}"
+        );
+    }
+}
