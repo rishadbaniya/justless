@@ -8132,3 +8132,206 @@ fn pack_matches_inflections_of_a_word_not_every_word_it_starts() {
     let stats = success(other.path(), &["pack", "where are the stats"]);
     assert!(!stats.contains("machine.txt"), "{stats}");
 }
+
+#[cfg(unix)]
+#[test]
+fn missing_and_unrunnable_commands_exit_like_a_shell() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join("script.sh"), "echo hi\n").unwrap();
+    fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+    for mode in [&["run", "--"][..], &["run", "--raw", "--"]] {
+        let missing = cli(root, &[mode, &["no-such-tool-xyz", "--flag"]].concat());
+        assert_eq!(missing.status.code(), Some(127), "{}", stderr(&missing));
+        assert!(stderr(&missing).contains("no-such-tool-xyz: command not found"));
+        let path = cli(root, &[mode, &["./missing.sh"]].concat());
+        assert_eq!(path.status.code(), Some(127), "{}", stderr(&path));
+        let denied = cli(root, &[mode, &["./script.sh"]].concat());
+        assert_eq!(denied.status.code(), Some(126), "{}", stderr(&denied));
+        assert!(stderr(&denied).contains("./script.sh"));
+    }
+    // A command that never started leaves no run behind.
+    assert!(success(root, &["history"]).contains("No matching captured runs."));
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_state_still_runs_the_command_and_keeps_its_status() {
+    use std::os::unix::fs::PermissionsExt;
+    let set_mode = |path: &Path, mode| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    set_mode(&root, 0o555);
+    // Permissions do not restrict a superuser, so there is nothing to check.
+    if fs::write(root.join("probe"), "").is_ok() {
+        set_mode(&root, 0o755);
+        return;
+    }
+    let args = ["run", "--", "sh", "-c", "echo ran; touch ../marker; exit 3"];
+    let output = cli(&root, &args);
+    set_mode(&root, 0o755);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "ran\n");
+    assert!(stderr(&output).contains("running it without capture"));
+    assert!(repo.path().join("marker").exists());
+
+    // The same applies when only the run archive is read-only.
+    fs::create_dir_all(root.join(".justless/runs")).unwrap();
+    set_mode(&root.join(".justless/runs"), 0o500);
+    let output = cli(&root, &args);
+    set_mode(&root.join(".justless/runs"), 0o700);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "ran\n");
+}
+
+#[test]
+fn deleting_the_state_directory_during_a_run_keeps_output_and_status() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // `make clean` with `git clean -fdX` removes ignored directories such as .justless.
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo before; rm -rf .justless; echo after; echo oops >&2; exit 3",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "before\nafter\n");
+    assert!(stderr(&output).contains("oops\n"), "{}", stderr(&output));
+}
+
+#[cfg(unix)]
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !ready() {
+        assert!(
+            start.elapsed().as_secs() < 20,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn run_streams(root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(root.join(".justless/runs"))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().path().join("stdout"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[test]
+fn terminating_justless_forwards_the_signal_and_keeps_partial_output() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let script = "trap 'echo got-term; exit 7' TERM; echo partial; while :; do sleep 0.05; done";
+    let child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["run", "--", "sh", "-c", script])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("partial output", || {
+        run_streams(root)
+            .iter()
+            .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
+    });
+    let pid = child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "partial\ngot-term\n");
+    let id = run_id(&output);
+    assert_eq!(
+        success(root, &["log", &id, "--stream", "stdout"]),
+        "partial\ngot-term\n"
+    );
+    assert!(success(root, &["history"]).contains(&format!("{id} · sh · exit 7")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_killed_run_stays_listed_and_replayable() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo $$ > pid; echo partial; exec sleep 30",
+        ])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("partial output", || {
+        root.join("pid").exists()
+            && run_streams(root)
+                .iter()
+                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
+    });
+    // SIGKILL cannot be handled. The run stays listed with the output it produced.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let sleeper = fs::read_to_string(root.join("pid")).unwrap();
+    let _ = Command::new("kill")
+        .args(["-KILL", sleeper.trim()])
+        .status();
+    let history = success(root, &["history"]);
+    assert!(history.contains("unfinished"), "{history}");
+    let id = history.split(' ').next().unwrap();
+    assert_eq!(success(root, &["log", id]), "partial\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn output_written_after_the_command_exits_is_labeled_in_the_log() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "(sleep 0.3; echo late-line) & echo started",
+        ],
+    );
+    assert_eq!(stdout(&output), "started\n");
+    let id = run_id(&output);
+    let stream = root.join(".justless/runs").join(&id).join("stdout");
+    wait_until("the background write", || {
+        fs::read_to_string(&stream).is_ok_and(|text| text.contains("late-line"))
+    });
+    let log = cli(root, &["log", &id, "--stream", "stdout"]);
+    assert_eq!(stdout(&log), "started\nlate-line\n");
+    assert!(
+        stderr(&log)
+            .contains("the last 10 byte(s) of stdout were written after the command exited"),
+        "{}",
+        stderr(&log)
+    );
+}

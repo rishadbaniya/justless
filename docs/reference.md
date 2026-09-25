@@ -4,7 +4,7 @@
 
 | Command | Result |
 | --- | --- |
-| `justless run --max-bytes 4096 -- COMMAND ARG…` | Bounded previews for stdout and stderr, the child exit status, and the run ID |
+| `justless run --max-bytes 4096 -- COMMAND ARG…` | Bounded previews for stdout and stderr, the child exit status (127 or 126 when the command cannot be found or run), and the run ID |
 | `justless search RUN_ID TEXT` | Literal matches with stream and line numbers |
 | `justless log RUN_ID --stream stdout --from 10 --to 15` | Exact original bytes for the specified inclusive line range. Omit the range to replay the complete stream. |
 | `justless query SYMBOL --view VIEW` | Definition, references, callers, or related tests. Use `all` for the combined view. |
@@ -151,6 +151,8 @@ Only outputs present in the outbound payload can be retired. A provider-managed 
 A command you run yourself ends with a footer that names the run, its exit status and how many bytes were shown. Hooks add `--hook`, which prints a footer only when it adds information. When the agent received every byte and the command succeeded, or a search matched nothing, nothing is added. When output was clipped, grouped or collapsed, one line names the run and what was shown, such as `[justless run-7Gq2 · 3.9 KB of 46.6 KB shown]`. A failed command whose output was shown in full ends with `[justless run-7Gq2 · exit 2]`. Every run is archived either way and listed by `history`. `stats` counts the footer as part of what the agent received and reports runs that grew.
 
 Use `justless run --fresh -- COMMAND` for a fresh preview. Use `--session NAME` or `JUSTLESS_SESSION` to choose a comparison session from the terminal. Project hooks scope comparisons to the client's session identifier when supplied. Captured runs remain searchable across sessions. A marker such as `stdout:8-15` expands with `justless log RUN_ID --stream stdout --from 8 --to 15`. A range marked `prior stdout` belongs to the comparison run.
+
+`run` returns the status a shell would: the command's own exit status, 127 when the command is not found and 126 when it cannot be executed. If Justless cannot create its state directory or the run archive, as in a read-only checkout, it prints one warning and runs the command without capture. Once the command has started, its output and status always come back. If the archive cannot be read or saved afterwards, for example because `make clean` deleted `.justless/`, Justless prints both complete streams instead of a preview. SIGTERM and SIGHUP sent to Justless are forwarded to the command. A terminal interrupt reaches the command directly. Justless waits for the command to exit, then records the run and shows its preview. A run whose Justless process was killed outright stays in `history` as unfinished, and `log` replays the output it produced. A background process can keep writing to the archive after the command exits. `log` replays those bytes and notes how many arrived late.
 
 Container and cluster listings use the default table output. `docker ps` and `kubectl get pods`, `deployments`, `statefulsets` and `nodes` report how many rows were listed and name only the rows that need attention, such as unhealthy or exited containers, pods that are not ready or have restarted, and rollouts that are behind. A few healthy names are shown as examples. Each flagged row links to its original line. A failing command, an unrecognized header or a custom output format such as `-o wide` or `--format` keeps the ordinary preview.
 

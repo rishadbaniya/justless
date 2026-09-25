@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -140,10 +140,20 @@ pub fn records(
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
-            let record = entry.path().join("record.json");
+            let directory = entry.path();
+            let record = directory.join("record.json");
             let stamp = match fs::read(&record) {
                 Ok(bytes) => serde_json::from_slice::<Stamp>(&bytes).context("decode run record"),
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                // A run that Justless could not finish has streams but may lack a
+                // record. It sorts by the last write to its output.
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    if let Ok(modified) =
+                        fs::metadata(directory.join("stdout")).and_then(|meta| meta.modified())
+                    {
+                        entries.push((millis(modified), id));
+                    }
+                    continue;
+                }
                 Err(e) => Err(e).context("read run record"),
             };
             // Records stored before completion times existed sort by modification time.
@@ -209,8 +219,8 @@ struct Read {
 }
 
 fn get<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
-    match File::open(path) {
-        Ok(file) => Ok(serde_json::from_reader(std::io::BufReader::new(file))?),
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e.into()),
     }
@@ -561,10 +571,10 @@ pub fn history(
             }
         } else {
             report.line(format!(
-                "{} · {} · exit {} · {} (epoch ms {})",
+                "{} · {} · {} · {} (epoch ms {})",
                 run.id,
                 command(&run),
-                run.status,
+                outcome(&run),
                 age(run.completed_ms),
                 run.completed_ms
             ));
@@ -608,10 +618,10 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
         let run = run?;
         has_runs = true;
         report.line(format!(
-            "{} · {} · exit {}{}{}",
+            "{} · {} · {}{}{}",
             run.id,
             command(&run),
-            run.status,
+            outcome(&run),
             if run.unchanged {
                 " · unchanged output"
             } else {
@@ -694,6 +704,14 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
         report.line("No recorded project activity yet.");
     }
     Ok(report.into_string())
+}
+
+fn outcome(run: &Run) -> String {
+    if run.unfinished {
+        "unfinished, output so far in justless log".into()
+    } else {
+        format!("exit {}", run.status)
+    }
 }
 
 fn current(workspace: &Workspace, file: &str, old: &str) -> bool {
