@@ -704,23 +704,8 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
     }
     // A file about a task word comes before a line that only mentions some.
     standalone.sort_by_key(|&at| Reverse(passages[at].rank() + passages[at].focus));
-    // The rarest task word, by the files that hold it, that a definition's
-    // name or the text that promoted it covers. A name the task spells as code
-    // is what was asked for.
-    let covers = |id: usize| {
-        let (name, parts) = &names[id];
-        if code_names.contains(&name.to_lowercase()) {
-            return usize::MAX;
-        }
-        parts
-            .iter()
-            .filter_map(|part| term_weights.get(part))
-            .chain(text_covers.get(&id))
-            .copied()
-            .max()
-            .unwrap_or(0)
-    };
     let mut report = Report::new(cap);
+    let mut diagnosed = BTreeSet::new();
     let mut found_run = false;
     let mut latest = BTreeSet::new();
     let mut sources = BTreeMap::new();
@@ -774,12 +759,29 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
                 );
                 for id in index.at(&d.location) {
                     *ranks.entry(id).or_default() += 90;
+                    diagnosed.insert(id);
                 }
             }
         }
         found_run = true;
         break;
     }
+    // The rarest task word, by the files that hold it, that a definition's
+    // name or the text that promoted it covers. A name the task spells as code
+    // and the code a recorded failure points at are what was asked for.
+    let covers = |id: usize| {
+        let (name, parts) = &names[id];
+        if code_names.contains(&name.to_lowercase()) || diagnosed.contains(&id) {
+            return usize::MAX;
+        }
+        parts
+            .iter()
+            .filter_map(|part| term_weights.get(part))
+            .chain(text_covers.get(&id))
+            .copied()
+            .max()
+            .unwrap_or(0)
+    };
     let mut ranked: Vec<_> = ranks.into_iter().collect();
     ranked.sort_by_key(|(id, score)| (Reverse(*score), &index.definitions[*id].location, *id));
     let best = ranked.first().map_or(0, |(_, s)| *s);

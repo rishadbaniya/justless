@@ -1207,6 +1207,16 @@ fn task_packs_and_handoffs_link_live_and_historical_evidence() {
     let failed = cli(root, &args);
     assert_eq!(failed.status.code(), Some(101));
     let id = run_id(&failed);
+    // A workflow that repeats `checkout` does not displace the code the
+    // recorded failure points at.
+    let step = "    steps:\n      - uses: actions/checkout@v4\n      - run: cargo test\n";
+    write_files(
+        root,
+        &[(
+            ".github/workflows/ci.yml",
+            &format!("name: CI\non: [push]\njobs:\n  test:\n{step}  lint:\n{step}  docs:\n{step}"),
+        )],
+    );
     let evidence = success(root, &["pack", "diagnose the failing checkout test"]);
     for term in [
         &id,
@@ -1216,6 +1226,11 @@ fn task_packs_and_handoffs_link_live_and_historical_evidence() {
     ] {
         assert!(evidence.contains(term), "{evidence}");
     }
+    let lead = evidence.find("::total_includes_fee [function]").unwrap();
+    assert!(
+        evidence.find("ci.yml").is_none_or(|text| lead < text),
+        "{evidence}"
+    );
     let slice = ["code", "src/pricing.rs", "--from", "5", "--to", "7"];
     success(root, &slice);
     success(root, &slice);
