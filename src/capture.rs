@@ -449,34 +449,78 @@ fn id_of(directory: &Path) -> String {
 
 #[cfg(unix)]
 mod signals {
-    //! Forward SIGTERM and SIGHUP to the command. The command shares Justless's
-    //! process group, so a terminal interrupt or a signal to the whole group
-    //! already reaches it. Like a shell waiting for a foreground job, Justless
-    //! waits for the command to exit and then finishes the record. Once the
-    //! command has exited, the default dispositions return, so another signal
-    //! stops Justless as usual.
+    //! Forward SIGTERM and SIGHUP to the command at once. The command shares
+    //! Justless's process group, so a terminal interrupt or a SIGINT or SIGQUIT
+    //! sent to the whole group already reaches it. Justless forwards those only
+    //! when the command is still running a moment later, which stops it when the
+    //! signal was sent to Justless alone without interrupting a command twice
+    //! while it exits. Like a shell waiting for a foreground job, Justless waits
+    //! for the command to exit and then finishes the record. Once the command has
+    //! exited, the default dispositions return, so another signal stops Justless
+    //! as usual.
     use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
     static RECEIVED: AtomicI32 = AtomicI32::new(0);
+    /// The interrupt to forward when the grace period ends.
+    static PENDING: AtomicI32 = AtomicI32::new(0);
     static INSTALLED: AtomicU64 = AtomicU64::new(0);
     const FORWARDED: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
-    const OBSERVED: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT];
+    /// SIGALRM ends the grace period of an interrupt, so its handler goes first.
+    const OBSERVED: [libc::c_int; 5] = [
+        libc::SIGALRM,
+        libc::SIGTERM,
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+    ];
+    /// How long the command may take to exit from an interrupt it received itself.
+    const GRACE_MICROSECONDS: libc::suseconds_t = 200_000;
 
     extern "C" fn handle(signal: libc::c_int) {
-        RECEIVED.store(signal, Ordering::SeqCst);
         let child = CHILD.load(Ordering::SeqCst);
-        if child > 0 && FORWARDED.contains(&signal) {
-            // SAFETY: kill is async-signal-safe, and the command is not yet reaped.
-            unsafe { libc::kill(child, signal) };
+        if signal == libc::SIGALRM {
+            let pending = PENDING.swap(0, Ordering::SeqCst);
+            if child > 0 && pending != 0 {
+                // SAFETY: kill is async-signal-safe, and the command is not yet reaped.
+                unsafe { libc::kill(child, pending) };
+            }
+            return;
+        }
+        RECEIVED.store(signal, Ordering::SeqCst);
+        if FORWARDED.contains(&signal) {
+            if child > 0 {
+                // SAFETY: kill is async-signal-safe, and the command is not yet reaped.
+                unsafe { libc::kill(child, signal) };
+            }
+        } else {
+            PENDING.store(signal, Ordering::SeqCst);
+            if child > 0 {
+                arm(GRACE_MICROSECONDS);
+            }
+        }
+    }
+
+    /// Deliver SIGALRM after `microseconds`, or cancel it with 0. The timer is set
+    /// only while the SIGALRM handler is installed.
+    fn arm(microseconds: libc::suseconds_t) {
+        if INSTALLED.load(Ordering::SeqCst) & (1 << libc::SIGALRM) == 0 {
+            return;
+        }
+        // SAFETY: setitimer is a plain system call with no shared state in libc,
+        // and the structure is fully initialized.
+        unsafe {
+            let mut timer: libc::itimerval = std::mem::zeroed();
+            timer.it_value.tv_usec = microseconds;
+            libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut());
         }
     }
 
     pub fn install() {
         for signal in OBSERVED {
-            // SAFETY: the handler only touches atomics and calls kill. A signal
-            // that is already ignored, as under nohup, stays ignored so the
-            // command inherits that disposition.
+            // SAFETY: the handler only touches atomics and calls kill and
+            // setitimer. A signal that is already ignored, as under nohup, stays
+            // ignored so the command inherits that disposition.
             unsafe {
                 let mut current: libc::sigaction = std::mem::zeroed();
                 if libc::sigaction(signal, std::ptr::null(), &mut current) != 0
@@ -505,6 +549,8 @@ mod signals {
         if FORWARDED.contains(&early) {
             // SAFETY: pid is the command just started, and it is not yet reaped.
             unsafe { libc::kill(pid, early) };
+        } else if PENDING.load(Ordering::SeqCst) != 0 {
+            arm(GRACE_MICROSECONDS);
         }
     }
 
@@ -546,6 +592,9 @@ mod signals {
 
     pub fn restore() {
         CHILD.store(0, Ordering::SeqCst);
+        PENDING.store(0, Ordering::SeqCst);
+        // Cancel a grace period while its handler is still installed.
+        arm(0);
         let installed = INSTALLED.swap(0, Ordering::SeqCst);
         for signal in OBSERVED {
             if installed & (1 << signal) != 0 {

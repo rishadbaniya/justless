@@ -8254,7 +8254,9 @@ fn run_streams(root: &Path) -> Vec<PathBuf> {
 fn terminating_justless_forwards_the_signal_and_keeps_partial_output() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let script = "trap 'echo got-term; exit 7' TERM; echo partial; while :; do sleep 0.05; done";
+    // The loop ends on its own, so a failed run leaves no process behind.
+    let script = "trap 'echo got-term; exit 7' TERM; echo partial; \
+        i=0; while [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done";
     let child = Command::new(env!("CARGO_BIN_EXE_justless"))
         .args(["run", "--", "sh", "-c", script])
         .current_dir(root)
@@ -8765,6 +8767,94 @@ fn an_interrupted_command_stops_the_caller_after_the_preview() {
         "{}",
         stderr(&output)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interrupt_sent_to_justless_alone_stops_the_command() {
+    use std::os::unix::process::ExitStatusExt;
+    for (name, signal) in [("INT", 2), ("QUIT", 3)] {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        // The shell execs Justless, so the signal goes to Justless's pid only. A
+        // SIGQUIT leaves no core file.
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "ulimit -c 0; exec \"$0\" run -- sh -c 'echo started; exec sleep 30'",
+                env!("CARGO_BIN_EXE_justless"),
+            ])
+            .current_dir(root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_until("partial output", || {
+            run_streams(root)
+                .iter()
+                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("started")))
+        });
+        let sent = std::time::Instant::now();
+        assert!(
+            Command::new("kill")
+                .args([format!("-{name}"), child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            sent.elapsed().as_secs() < 10,
+            "{name} waited for the command"
+        );
+        assert_eq!(output.status.signal(), Some(signal), "{:?}", output.status);
+        assert_eq!(stdout(&output), "started\n");
+        let footer = format!("] exit {} · ", 128 + signal);
+        assert!(stderr(&output).contains(&footer), "{}", stderr(&output));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_command_that_handles_an_interrupt_receives_it_once() {
+    use std::os::unix::process::CommandExt;
+    let script = "trap 'echo got-int; exit 7' INT; echo started; \
+        i=0; while [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done; echo timeout";
+    // An interrupt to Justless alone is forwarded once the grace period passes. One
+    // to the whole group reaches the command directly, and it exits within the
+    // grace period, so it is not interrupted again.
+    for group in [false, true] {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        let child = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(["run", "--", "sh", "-c", script])
+            .current_dir(root)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_until("partial output", || {
+            run_streams(root)
+                .iter()
+                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("started")))
+        });
+        let target = if group {
+            format!("-{}", child.id())
+        } else {
+            child.id().to_string()
+        };
+        assert!(
+            Command::new("kill")
+                .args(["-INT", "--", &target])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(7), "group {group}: {output:?}");
+        assert_eq!(stdout(&output), "started\ngot-int\n", "group {group}");
+    }
 }
 
 #[cfg(unix)]
