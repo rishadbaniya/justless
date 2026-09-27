@@ -4,7 +4,8 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, ensure};
 use regex::Regex;
@@ -156,6 +157,10 @@ pub struct Run {
     /// writing to the archive afterwards.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stream_bytes: Vec<u64>,
+    /// Bytes the command wrote to each stream, kept only when a stream outgrew
+    /// `max_run_bytes` and its archive holds just the first bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produced_bytes: Vec<u64>,
     /// Set on the record written before the command starts. It stays set when
     /// Justless stopped before the command finished.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -185,9 +190,31 @@ impl Run {
             diagnostics: Vec::new(),
             source_digests: BTreeMap::new(),
             stream_bytes: Vec::new(),
+            produced_bytes: Vec::new(),
             unfinished: true,
         }
     }
+
+    /// One line per stream whose archive stopped at the cap, such as
+    /// `[stdout archive truncated at 256.0 MB of 1.2 GB]`.
+    fn truncation(&self) -> String {
+        truncation(&self.stream_bytes, &self.produced_bytes)
+    }
+}
+
+fn truncation(archived: &[u64], produced: &[u64]) -> String {
+    let mut text = String::new();
+    for ((stream, &kept), &produced) in Stream::BOTH.iter().zip(archived).zip(produced) {
+        if produced > kept {
+            text.push_str(&format!(
+                "[{} archive truncated at {} of {}]\n",
+                stream.name(),
+                history::human_bytes(kept),
+                history::human_bytes(produced)
+            ));
+        }
+    }
+    text
 }
 
 pub fn source_digest(bytes: &[u8]) -> String {
@@ -236,7 +263,7 @@ pub fn execute(
             return Ok(uncaptured(&mut command, &args[0]));
         }
     };
-    let exited = match archive.run(&mut command) {
+    let exited = match archive.run(&mut command, settings.max_run_bytes) {
         Ok(Ok(status)) => Some(status),
         Ok(Err(error)) => {
             eprintln!("justless: wait for {}: {error}", args[0].to_string_lossy());
@@ -275,6 +302,7 @@ pub fn execute(
         Err(error) => {
             eprintln!("justless: could not save run, restoring full output: {error:#}");
             archive.replay();
+            eprint!("{}", archive.truncation());
         }
     }
     signals::reraise(exited);
@@ -330,14 +358,28 @@ fn spawn_failure(program: &OsStr, error: &io::Error) -> i32 {
     }
 }
 
-/// A run directory and its streams. The command writes through its own handles
-/// while Justless reads through handles opened before the command starts, so the
-/// output stays readable even if the directory is deleted while the command runs.
+/// A run directory and its streams. The command writes into pipes that Justless
+/// copies to the archive, so Justless decides how much of each stream is stored.
+/// Justless writes and reads through handles opened before the command starts, so
+/// the output stays readable even if the directory is deleted while the command runs.
 struct Archive {
     directory: PathBuf,
     temporary: TempDir,
     writers: Vec<File>,
     readers: Vec<File>,
+    captured: Vec<Captured>,
+    /// A background process still held a stream open when the command exited, and
+    /// a drainer keeps adding its output to the archive.
+    late: bool,
+}
+
+/// What the command wrote to one stream.
+#[derive(Clone, Copy, Default)]
+struct Captured {
+    /// Bytes stored in the archive by the time the command exited.
+    archived: u64,
+    /// Bytes the command wrote, including any past the cap.
+    produced: u64,
 }
 
 impl Archive {
@@ -371,20 +413,66 @@ impl Archive {
             temporary,
             writers,
             readers,
+            captured: vec![Captured::default(); 2],
+            late: false,
         })
     }
 
-    /// Run the command into the archive. Termination signals sent to Justless
-    /// reach the command, and Justless finishes the record once the command exits.
-    fn run(&mut self, command: &mut Command) -> io::Result<io::Result<ExitStatus>> {
+    /// Run the command into the archive, storing at most `cap` bytes of each stream.
+    /// Output past the cap is still read and counted, so the command never blocks
+    /// and its exit status is unchanged. Termination signals sent to Justless reach
+    /// the command, and Justless finishes the record once the command exits.
+    fn run(&mut self, command: &mut Command, cap: u64) -> io::Result<io::Result<ExitStatus>> {
         let mut writers = std::mem::take(&mut self.writers).into_iter();
-        let (Some(stdout), Some(stderr)) = (writers.next(), writers.next()) else {
+        let (Some(stdout_file), Some(stderr_file)) = (writers.next(), writers.next()) else {
             return Err(io::Error::other("the command already ran"));
         };
-        command
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
-        supervise(command)
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        signals::install();
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                signals::restore();
+                return Err(error);
+            }
+        };
+        signals::watch(child.id());
+        let exited = Arc::new(AtomicBool::new(false));
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let stdout = stdout.map(|pipe| {
+            let exited = Arc::clone(&exited);
+            std::thread::spawn(move || pump(pipe, stdout_file, cap, Stream::Stdout, &exited))
+        });
+        let stderr = stderr.map(|pipe| {
+            let exited = Arc::clone(&exited);
+            std::thread::spawn(move || pump(pipe, stderr_file, cap, Stream::Stderr, &exited))
+        });
+        // Stop forwarding before the command is reaped, so a late signal can never
+        // reach a process that reuses its ID.
+        signals::settle(child.id());
+        exited.store(true, Ordering::SeqCst);
+        let status = child.wait();
+        // A pipe that a background process still holds goes to a drainer, so that
+        // process can keep writing, within the cap, after Justless exits.
+        if let Some(pumped) = stdout.map(joined) {
+            self.collect(Stream::Stdout, pumped, cap);
+        }
+        if let Some(pumped) = stderr.map(joined) {
+            self.collect(Stream::Stderr, pumped, cap);
+        }
+        Ok(status)
+    }
+
+    fn collect<R: Into<Stdio>>(&mut self, stream: Stream, pumped: Pumped<R>, cap: u64) {
+        let Pumped {
+            file,
+            captured,
+            open,
+        } = pumped;
+        self.captured[stream.index()] = captured;
+        if let Some(pipe) = open {
+            self.late |= hand_off(pipe, file, cap.saturating_sub(captured.archived));
+        }
     }
 
     fn id(&self) -> String {
@@ -393,11 +481,20 @@ impl Archive {
 
     /// Stream sizes when the command exited. Later writes by background processes
     /// stay in the archive but are not part of the record.
-    fn lengths(&self) -> io::Result<Vec<u64>> {
-        self.readers
-            .iter()
-            .map(|file| file.metadata().map(|m| m.len()))
-            .collect()
+    fn lengths(&self) -> Vec<u64> {
+        self.captured.iter().map(|c| c.archived).collect()
+    }
+
+    /// What each stream produced, when a stream outgrew the cap.
+    fn produced(&self) -> Vec<u64> {
+        if self.captured.iter().all(|c| c.produced == c.archived) {
+            return Vec::new();
+        }
+        self.captured.iter().map(|c| c.produced).collect()
+    }
+
+    fn truncation(&self) -> String {
+        truncation(&self.lengths(), &self.produced())
     }
 
     fn keep(&mut self) {
@@ -438,6 +535,175 @@ impl Archive {
             }
         }
     }
+}
+
+fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
+    thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// A stream's pipe after the command exited.
+struct Pumped<R> {
+    file: File,
+    captured: Captured,
+    /// The pipe, when a background process still held it open.
+    open: Option<R>,
+}
+
+#[cfg(unix)]
+trait Source: Read + std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsRawFd> Source for T {}
+#[cfg(not(unix))]
+trait Source: Read {}
+#[cfg(not(unix))]
+impl<T: Read> Source for T {}
+
+/// Copy a stream's pipe into its archive file until the pipe closes, storing at
+/// most `cap` bytes and counting the rest. Each chunk is written at once, so a
+/// killed Justless leaves what it read on disk. Once `exited` is set and the pipe
+/// is empty, every byte the command wrote has been read; a pipe that a background
+/// process still holds is then returned instead of waited on.
+fn pump<R: Source>(
+    mut pipe: R,
+    mut file: File,
+    cap: u64,
+    stream: Stream,
+    exited: &AtomicBool,
+) -> Pumped<R> {
+    let mut captured = Captured::default();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut failed = false;
+    loop {
+        let done = exited.load(Ordering::SeqCst);
+        match readable(&pipe, if done { 0 } else { 50 }) {
+            Ok(true) => {}
+            Ok(false) if done => {
+                return Pumped {
+                    file,
+                    captured,
+                    open: Some(pipe),
+                };
+            }
+            Ok(false) => continue,
+            Err(_) => break,
+        }
+        let read = match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        captured.produced += read as u64;
+        let room = usize::try_from(cap.saturating_sub(captured.archived)).unwrap_or(usize::MAX);
+        let mut chunk = &buffer[..read.min(room)];
+        while !failed && !chunk.is_empty() {
+            match file.write(chunk) {
+                Ok(0) => failed = true,
+                Ok(written) => {
+                    captured.archived += written as u64;
+                    chunk = &chunk[written..];
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!(
+                        "justless: could not archive {}: {error}; the rest is not stored",
+                        stream.name()
+                    );
+                    failed = true;
+                }
+            }
+        }
+    }
+    Pumped {
+        file,
+        captured,
+        open: None,
+    }
+}
+
+/// Whether the pipe has data or has closed, waiting up to `milliseconds`.
+#[cfg(unix)]
+fn readable(pipe: &impl std::os::fd::AsRawFd, milliseconds: libc::c_int) -> io::Result<bool> {
+    let mut poll = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one initialized pollfd for a descriptor this thread owns.
+        let ready = unsafe { libc::poll(&mut poll, 1, milliseconds) };
+        if ready >= 0 {
+            return Ok(ready > 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Without `poll`, a read waits for data, so the pipe is read until it closes.
+#[cfg(not(unix))]
+fn readable<T>(_: &T, _: i32) -> io::Result<bool> {
+    Ok(true)
+}
+
+/// Start `justless drain` with the pipe as its input and the archive file as its
+/// output, in its own process group so a terminal interrupt meant for the command
+/// does not stop it. Returns whether it started; otherwise the pipe closes.
+#[cfg(unix)]
+fn hand_off(pipe: impl Into<Stdio>, file: File, room: u64) -> bool {
+    use std::os::unix::process::CommandExt;
+    let Ok(program) = std::env::current_exe() else {
+        return false;
+    };
+    Command::new(program)
+        .args(["drain", &room.to_string()])
+        .current_dir("/")
+        .stdin(pipe)
+        .stdout(file)
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .is_ok()
+}
+
+#[cfg(not(unix))]
+fn hand_off(_: impl Into<Stdio>, _: File, _: u64) -> bool {
+    false
+}
+
+/// `justless drain ROOM`: copy up to ROOM bytes from standard input to standard
+/// output, then read and discard the rest until every writer closes the pipe. It
+/// stores output that a background process writes after its command exited.
+pub fn drain(room: u64) -> Result<i32> {
+    #[cfg(unix)]
+    let mut output = File::from(std::os::fd::AsFd::as_fd(&io::stdout()).try_clone_to_owned()?);
+    #[cfg(not(unix))]
+    let mut output = io::stdout().lock();
+    let mut input = io::stdin().lock();
+    let mut room = usize::try_from(room).unwrap_or(usize::MAX);
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = match input.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let keep = read.min(room);
+        if keep > 0 {
+            if output.write_all(&buffer[..keep]).is_err() {
+                room = 0;
+            } else {
+                room -= keep;
+            }
+        }
+    }
+    output.flush()?;
+    Ok(0)
 }
 
 fn id_of(directory: &Path) -> String {
@@ -652,11 +918,12 @@ impl Capture<'_> {
             retention,
         } = *self;
         let directory = archive.directory.clone();
-        let lengths = archive.lengths().context("read the captured streams")?;
+        let lengths = archive.lengths();
         let mut run = Run {
             status,
             raw_bytes: lengths.iter().sum(),
             stream_bytes: lengths.clone(),
+            produced_bytes: archive.produced(),
             unfinished: false,
             label: history::label(words),
             ..Run::unfinished(archive.id(), &family, "", hook)
@@ -726,9 +993,12 @@ impl Capture<'_> {
                 .map(|(_, run)| run)
                 .filter(|run| !run.unfinished)
         };
-        run.unchanged = previous
-            .as_ref()
-            .is_some_and(|p| p.digests == run.digests && p.status == run.status);
+        // A truncated archive holds only a prefix, so its digests cannot show that
+        // two runs printed the same output.
+        run.unchanged = run.produced_bytes.is_empty()
+            && previous.as_ref().is_some_and(|p| {
+                p.produced_bytes.is_empty() && p.digests == run.digests && p.status == run.status
+            });
         let lint = lint.and_then(|lint| {
             lint.finish(
                 &crate::filters::tool_label(args),
@@ -793,7 +1063,7 @@ impl Capture<'_> {
         run.footer_bytes = footer.len();
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
-        if let Some(prior) = previous.as_ref().filter(|_| run.unchanged) {
+        if let Some(prior) = previous.as_ref().filter(|_| run.unchanged && !archive.late) {
             archive.share(&workspace.state.join("runs").join(&prior.id), prior, &run);
         }
         if guard.is_some() {
@@ -819,15 +1089,18 @@ fn footer(
     selection: &crate::filters::Selection,
 ) -> Result<String> {
     let id = &run.id;
+    // A stream past `max_run_bytes` is never shown in full, so the marker always
+    // follows, even after a hook-routed run.
+    let truncation = run.truncation();
     if !hook {
         return Ok(format!(
-            "\n[justless {id}] exit {} · {} of {} output bytes · justless log {id}\n",
+            "\n[justless {id}] exit {} · {} of {} output bytes · justless log {id}\n{truncation}",
             run.status, run.preview_bytes, run.raw_bytes
         ));
     }
     // Compare the printed bytes with the archive itself: equal sizes alone can hide
     // a replaced or regrouped stream.
-    let mut verbatim = run.preview_bytes as u64 == run.raw_bytes;
+    let mut verbatim = truncation.is_empty() && run.preview_bytes as u64 == run.raw_bytes;
     for (stream, preview) in previews {
         if !verbatim {
             break;
@@ -844,7 +1117,7 @@ fn footer(
         Some((_, bytes)) if !bytes.ends_with(b"\n") => "\n",
         _ => "",
     };
-    Ok(if verbatim && (run.status == 0 || empty_search) {
+    let line = if verbatim && (run.status == 0 || empty_search) {
         String::new()
     } else if verbatim || run.unchanged {
         if run.status == 0 {
@@ -863,7 +1136,8 @@ fn footer(
             history::human_bytes(run.preview_bytes as u64),
             history::human_bytes(run.raw_bytes)
         )
-    })
+    };
+    Ok(line + &truncation)
 }
 
 fn fit(mut report: String, max_bytes: usize) -> String {
@@ -1624,19 +1898,34 @@ pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Resu
         from > 0 && from <= to,
         "expected a positive, ordered line range"
     );
-    #[derive(Deserialize)]
+    #[derive(Default, Deserialize)]
     struct Lengths {
         #[serde(default)]
         stream_bytes: Vec<u64>,
+        #[serde(default)]
+        produced_bytes: Vec<u64>,
     }
-    let recorded = fs::read(directory.join("record.json"))
+    let Lengths {
+        stream_bytes: recorded,
+        produced_bytes: produced,
+    } = fs::read(directory.join("record.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Lengths>(&bytes).ok())
-        .map(|lengths| lengths.stream_bytes)
         .unwrap_or_default();
     for &stream in streams {
         let path = directory.join(stream.name());
         replay_file(&path, stream, from, to)?;
+        if let (Some(&kept), Some(&total)) =
+            (recorded.get(stream.index()), produced.get(stream.index()))
+            && total > kept
+        {
+            eprintln!(
+                "[justless: {} archive truncated at {} of {}; the rest was not stored]",
+                stream.name(),
+                history::human_bytes(kept),
+                history::human_bytes(total)
+            );
+        }
         // A background process can keep writing after the command exits. Those
         // bytes stay in the archive, but no preview or record described them.
         if from == 1

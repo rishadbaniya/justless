@@ -9143,3 +9143,172 @@ fn a_stream_shared_by_unchanged_reruns_counts_until_its_last_link_goes() {
         stdout(&rerun)
     );
 }
+
+/// The run ID named by a full or compact footer.
+#[cfg(unix)]
+fn footer_id(output: &Output) -> String {
+    stderr(output)
+        .rsplit_once("[justless run-")
+        .map(|(_, rest)| {
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len());
+            format!("run-{}", &rest[..end])
+        })
+        .unwrap_or_else(|| panic!("no run footer: {}", stderr(output)))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_archives_at_most_max_run_bytes_of_each_stream() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
+    let script = "i=0; while [ $i -lt 1000 ]; do printf '%0999d\\n' $i; i=$((i + 1)); done; \
+        echo done >&2; exit 7";
+    let expected: String = (0..1000).map(|i| format!("{i:0999}\n")).collect();
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
+    // The command ran to completion and kept its own exit status.
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    let marker = "[stdout archive truncated at 64.0 KB of 976.6 KB]\n";
+    assert!(stderr(&output).ends_with(marker), "{}", stderr(&output));
+    let id = footer_id(&output);
+    let archive = root.join(".justless/runs").join(&id);
+    assert_eq!(fs::metadata(archive.join("stdout")).unwrap().len(), 65536);
+    // What was archived replays byte for byte, and the replay says what is missing.
+    let log = cli(root, &["log", &id, "--stream", "stdout"]);
+    assert_eq!(log.stdout, expected.as_bytes()[..65536]);
+    assert!(
+        stderr(&log).contains(
+            "[justless: stdout archive truncated at 64.0 KB of 976.6 KB; the rest was not stored]"
+        ),
+        "{}",
+        stderr(&log)
+    );
+    assert_eq!(success(root, &["log", &id, "--stream", "stderr"]), "");
+    assert_eq!(
+        stderr(&cli(root, &["log", &id, "--stream", "stderr"])),
+        "done\n"
+    );
+    let record = fs::read_to_string(archive.join("record.json")).unwrap();
+    assert!(
+        record.contains("\"produced_bytes\":[1000000,5]"),
+        "{record}"
+    );
+
+    // A cap below the preview budget still names the run after a hook-routed
+    // success, since the agent did not receive every byte.
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 1024\n").unwrap();
+    let output = cli(
+        root,
+        &["run", "--hook", "--", "sh", "-c", "printf '%02000d' 0"],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "0".repeat(1024));
+    assert!(
+        stderr(&output).contains(
+            " · 1.0 KB of 1.0 KB shown]\n[stdout archive truncated at 1.0 KB of 2.0 KB]\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_self_feeding_recursive_grep_stops_at_the_archive_cap() {
+    use std::os::unix::process::CommandExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
+    // More matching lines than the cap, so the archive fills whatever order grep
+    // reads the tree in, including its own growing stdout archive.
+    let seed: String = (0..6000).map(|i| format!("x seed line {i:06}\n")).collect();
+    fs::write(root.join("seed.txt"), seed).unwrap();
+    // `ulimit -f` stops a regression that writes the archive from the command
+    // itself; output through a pipe is not limited by it.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["run", "--", "sh", "-c", "ulimit -f 4096; grep -rn x ."])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = format!("-{}", child.id());
+    let state_bytes = || -> u64 {
+        fn size(path: &Path) -> u64 {
+            fs::read_dir(path).map_or(0, |entries| {
+                entries
+                    .flatten()
+                    .map(|entry| match entry.file_type() {
+                        Ok(kind) if kind.is_dir() => size(&entry.path()),
+                        _ => entry.metadata().map_or(0, |meta| meta.len()),
+                    })
+                    .sum()
+            })
+        }
+        size(&root.join(".justless"))
+    };
+    let start = std::time::Instant::now();
+    let finished = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if start.elapsed().as_secs() >= 60 || state_bytes() > 64 * 1024 * 1024 {
+            let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let output = child.wait_with_output().unwrap();
+    assert!(finished, "the grep did not stop: {} bytes", state_bytes());
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("[stdout archive truncated at 64.0 KB of "),
+        "{}",
+        stderr(&output)
+    );
+    let id = footer_id(&output);
+    let stream = root.join(".justless/runs").join(&id).join("stdout");
+    assert_eq!(fs::metadata(stream).unwrap().len(), 65536);
+    assert!(state_bytes() < 1024 * 1024, "{}", state_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_background_writer_returns_at_once_and_its_late_output_stays_within_the_cap() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
+    let start = std::time::Instant::now();
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "(sleep 3; yes late | head -c 200000; touch finished) & echo started",
+        ],
+    );
+    // Justless does not wait for a background process that keeps the output open.
+    assert!(start.elapsed().as_secs_f64() < 2.5, "{:?}", start.elapsed());
+    assert_eq!(stdout(&output), "started\n");
+    let id = footer_id(&output);
+    let stream = root.join(".justless/runs").join(&id).join("stdout");
+    wait_until("the background writer", || root.join("finished").exists());
+    wait_until("the late output", || {
+        fs::metadata(&stream).is_ok_and(|meta| meta.len() == 65536)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(fs::metadata(&stream).unwrap().len(), 65536);
+    let log = cli(root, &["log", &id, "--stream", "stdout"]);
+    assert!(log.stdout.starts_with(b"started\nlate\nlate\n"));
+    assert!(
+        stderr(&log)
+            .contains("the last 65528 byte(s) of stdout were written after the command exited"),
+        "{}",
+        stderr(&log)
+    );
+}

@@ -304,6 +304,12 @@ fn cli() -> Command<'static> {
         .subcommands(source::commands())
         .subcommands(observations::commands())
         .subcommands(proxy::commands())
+        .subcommand(
+            Command::new("drain")
+                .hide(true)
+                .about("Store a background process's late output in a run archive")
+                .arg(Arg::new("room").required(true)),
+        )
         .subcommands(["hook-codex", "hook-claude", "hook-agy"].map(|name| {
             Command::new(name)
                 .hide(true)
@@ -341,6 +347,11 @@ fn context_budget(workspace: &Workspace, matches: &ArgMatches) -> Result<usize> 
 
 fn dispatch(matches: &ArgMatches) -> Result<i32> {
     let root = matches.value_of_os("root").map(Path::new);
+    // A drainer started by `run` stores a background process's late output. It
+    // works on its standard streams alone, wherever it starts.
+    if let Some(("drain", sub)) = matches.subcommand() {
+        return capture::drain(sub.value_of_t("room")?);
+    }
     // Cursor, Gemini CLI and Copilot block a tool call when its hook fails, so these
     // handlers answer every error, including a missing workspace, with a no-op.
     if let Some((name, sub)) = matches.subcommand()

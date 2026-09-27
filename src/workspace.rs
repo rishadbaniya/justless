@@ -64,6 +64,9 @@ pub struct Settings {
     pub max_runs: usize,
     /// The most bytes those runs may hold. The newest run is always kept.
     pub max_archive_bytes: u64,
+    /// The most bytes one run archives from each stream. Output past it is read
+    /// and counted but not stored, so one command can never fill the disk.
+    pub max_run_bytes: u64,
 }
 
 impl Default for Settings {
@@ -75,6 +78,7 @@ impl Default for Settings {
             max_file_bytes: 2 * 1024 * 1024,
             max_runs: 200,
             max_archive_bytes: 256 * 1024 * 1024,
+            max_run_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -239,6 +243,7 @@ impl Workspace {
             "max_file_bytes must be positive"
         );
         ensure!(settings.max_runs > 0, "max_runs must be positive");
+        ensure!(settings.max_run_bytes > 0, "max_run_bytes must be positive");
         Ok(settings)
     }
 }
