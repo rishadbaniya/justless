@@ -237,7 +237,11 @@ pub fn execute(
         }
     };
     let status = match archive.run(&mut command) {
-        Ok(status) => exit_code(status),
+        Ok(Ok(status)) => exit_code(status),
+        Ok(Err(error)) => {
+            eprintln!("justless: wait for {}: {error}", args[0].to_string_lossy());
+            1
+        }
         Err(error) => return Ok(spawn_failure(&args[0], &error)),
     };
 
@@ -277,22 +281,32 @@ pub fn execute(
 
 /// Run without recording, with the same exit statuses a shell reports.
 fn uncaptured(command: &mut Command, program: &OsStr) -> i32 {
-    signals::install();
-    match command.spawn() {
-        Ok(mut child) => {
-            signals::watch(child.id());
-            let status = child.wait();
-            signals::release();
-            match status {
-                Ok(status) => exit_code(status),
-                Err(error) => {
-                    eprintln!("justless: wait for {}: {error}", program.to_string_lossy());
-                    1
-                }
-            }
+    match supervise(command) {
+        Ok(Ok(status)) => exit_code(status),
+        Ok(Err(error)) => {
+            eprintln!("justless: wait for {}: {error}", program.to_string_lossy());
+            1
         }
         Err(error) => spawn_failure(program, &error),
     }
+}
+
+/// Start the command and wait for it, forwarding termination signals to it. The
+/// outer error is a failure to start; the inner one a failure to wait.
+fn supervise(command: &mut Command) -> io::Result<io::Result<ExitStatus>> {
+    signals::install();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            signals::restore();
+            return Err(error);
+        }
+    };
+    signals::watch(child.id());
+    // Stop forwarding before the command is reaped, so a late signal can never
+    // reach a process that reuses its ID.
+    signals::settle(child.id());
+    Ok(child.wait())
 }
 
 /// A shell exits 127 when it cannot find a command and 126 when it cannot run one.
@@ -357,7 +371,7 @@ impl Archive {
 
     /// Run the command into the archive. Termination signals sent to Justless
     /// reach the command, and Justless finishes the record once the command exits.
-    fn run(&mut self, command: &mut Command) -> io::Result<ExitStatus> {
+    fn run(&mut self, command: &mut Command) -> io::Result<io::Result<ExitStatus>> {
         let mut writers = std::mem::take(&mut self.writers).into_iter();
         let (Some(stdout), Some(stderr)) = (writers.next(), writers.next()) else {
             return Err(io::Error::other("the command already ran"));
@@ -365,12 +379,7 @@ impl Archive {
         command
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
-        signals::install();
-        let mut child = command.spawn()?;
-        signals::watch(child.id());
-        let status = child.wait();
-        signals::release();
-        status
+        supervise(command)
     }
 
     fn id(&self) -> String {
@@ -438,11 +447,14 @@ mod signals {
     //! Forward SIGTERM and SIGHUP to the command. The command shares Justless's
     //! process group, so a terminal interrupt or a signal to the whole group
     //! already reaches it. Like a shell waiting for a foreground job, Justless
-    //! then waits for the command to exit and finishes the record.
-    use std::sync::atomic::{AtomicI32, Ordering};
+    //! waits for the command to exit and then finishes the record. Once the
+    //! command has exited, the default dispositions return, so another signal
+    //! stops Justless as usual.
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
     static RECEIVED: AtomicI32 = AtomicI32::new(0);
+    static INSTALLED: AtomicU64 = AtomicU64::new(0);
     const FORWARDED: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
     const OBSERVED: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT];
 
@@ -450,7 +462,7 @@ mod signals {
         RECEIVED.store(signal, Ordering::SeqCst);
         let child = CHILD.load(Ordering::SeqCst);
         if child > 0 && FORWARDED.contains(&signal) {
-            // SAFETY: kill is async-signal-safe.
+            // SAFETY: kill is async-signal-safe, and the command is not yet reaped.
             unsafe { libc::kill(child, signal) };
         }
     }
@@ -471,7 +483,9 @@ mod signals {
                 action.sa_sigaction = handle as extern "C" fn(libc::c_int) as libc::sighandler_t;
                 action.sa_flags = libc::SA_RESTART;
                 libc::sigemptyset(&mut action.sa_mask);
-                libc::sigaction(signal, &action, std::ptr::null_mut());
+                if libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 {
+                    INSTALLED.fetch_or(1 << signal, Ordering::SeqCst);
+                }
             }
         }
     }
@@ -484,13 +498,37 @@ mod signals {
         // A signal that arrived while the command was starting.
         let early = RECEIVED.load(Ordering::SeqCst);
         if FORWARDED.contains(&early) {
-            // SAFETY: pid is the command we just started and have not reaped.
+            // SAFETY: pid is the command just started, and it is not yet reaped.
             unsafe { libc::kill(pid, early) };
         }
     }
 
-    pub fn release() {
+    /// Wait until the command exits without reaping it, then stop forwarding.
+    pub fn settle(pid: u32) {
+        loop {
+            // SAFETY: WNOWAIT leaves the exited command for Child::wait to reap.
+            let waited = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+            };
+            if waited == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+        restore();
+    }
+
+    pub fn restore() {
         CHILD.store(0, Ordering::SeqCst);
+        let installed = INSTALLED.swap(0, Ordering::SeqCst);
+        for signal in OBSERVED {
+            if installed & (1 << signal) != 0 {
+                // SAFETY: restores the default action for a signal set above.
+                unsafe { libc::signal(signal, libc::SIG_DFL) };
+            }
+        }
     }
 }
 
@@ -498,7 +536,8 @@ mod signals {
 mod signals {
     pub fn install() {}
     pub fn watch(_: u32) {}
-    pub fn release() {}
+    pub fn settle(_: u32) {}
+    pub fn restore() {}
 }
 
 /// The preview of each stream, in display order.
