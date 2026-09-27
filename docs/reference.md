@@ -178,6 +178,8 @@ The optional `.justless.toml` controls project defaults. The values below are th
 context_budget = 2400
 max_output_bytes = 4096
 max_file_bytes = 2097152
+max_runs = 200
+max_archive_bytes = 268435456
 ```
 
 Add `[[filters]]` entries to omit known noise from a command's preview. `command` is an argument prefix matched against the program name and its leading arguments. The longest matching prefix applies. `omit` is a regular expression tested against each trimmed line. Lines that look like failures, errors, warnings or assertions, and the four lines after them, are always kept. The full stream stays in the log.
@@ -192,7 +194,7 @@ An empty prefix, an invalid expression or one that matches empty text stops the 
 
 `pack`, `map`, `affected`, `history`, `resume`, `query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
 
-Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Justless creates `.justless/` with its own `.gitignore`, so `git status`, `git add -A` and `context --changes` never pick up archived output. Keep the directory private if a command prints secrets. The CLI runs offline after installation, except for the opt-in `justless proxy` and `justless wrap claude`, which forward your agent's own API requests. `--raw` skips recording.
+Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. Justless creates `.justless/` with its own `.gitignore`, so `git status`, `git add -A` and `context --changes` never pick up archived output. Keep the directory private if a command prints secrets. After each run, Justless keeps the newest `max_runs` runs within `max_archive_bytes` and deletes older ones. The run just recorded and runs still in progress are always kept, and runs that a rerun compares against go last. An unchanged rerun links to the streams of the run it matched instead of storing a second copy. The CLI runs offline after installation, except for the opt-in `justless proxy` and `justless wrap claude`, which forward your agent's own API requests. `--raw` skips recording.
 
 Reading the index takes no lock, so concurrent queries over unchanged sources run in parallel. Saving a refreshed index, recording a run baseline and applying edits take a project lock under `.justless/`. When another Justless process holds it, Justless says so on stderr after a second and gives up after 30 seconds, or after the number of seconds in `JUSTLESS_LOCK_TIMEOUT`. A query that gives up still answers from the files it read and leaves the saved index unchanged, and a run that gives up records no baseline.
 

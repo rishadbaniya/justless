@@ -721,3 +721,123 @@ fn current(workspace: &Workspace, file: &str, old: &str) -> bool {
         .and_then(|p| fs::read(p).ok())
         .is_some_and(|b| capture::source_digest(&b) == old)
 }
+
+/// How long a run without a final record counts as still in progress.
+const IN_FLIGHT_MS: u64 = 24 * 60 * 60 * 1000;
+
+struct Stored {
+    id: String,
+    modified: u64,
+    referenced: bool,
+    files: Vec<(u64, u64, u64)>,
+}
+
+/// Delete the oldest runs beyond `max_runs` or `max_bytes`. The current run and runs
+/// still in progress are always kept, and runs that a rerun compares against go
+/// last. The caller holds the capture lock. Returns the number of deleted runs.
+pub fn prune(workspace: &Workspace, current: &str, max_runs: usize, max_bytes: u64) -> usize {
+    let runs = workspace.state.join("runs");
+    let Ok(entries) = fs::read_dir(&runs) else {
+        return 0;
+    };
+    let baselines: BTreeMap<String, Vec<std::path::PathBuf>> =
+        fs::read_dir(workspace.state.join("baselines"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let id = fs::read_to_string(entry.path()).ok()?;
+                Some((id.trim().to_owned(), entry.path()))
+            })
+            .fold(BTreeMap::new(), |mut map, (id, path)| {
+                map.entry(id).or_default().push(path);
+                map
+            });
+    let now = now_ms();
+    let mut stored = Vec::new();
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !id.starts_with("run-") || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let directory = entry.path();
+        let modified = fs::metadata(directory.join("record.json"))
+            .or_else(|_| fs::metadata(&directory))
+            .and_then(|meta| meta.modified())
+            .map_or(now, millis);
+        #[derive(Deserialize)]
+        struct State {
+            #[serde(default)]
+            unfinished: bool,
+        }
+        // Only a recent run can still be in progress, so older records stay unread.
+        let in_flight = id != current
+            && now.saturating_sub(modified) < IN_FLIGHT_MS
+            && fs::read(directory.join("record.json"))
+                .ok()
+                .is_none_or(|bytes| {
+                    serde_json::from_slice::<State>(&bytes).is_ok_and(|state| state.unfinished)
+                });
+        if in_flight {
+            continue;
+        }
+        let files = fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|file| file.metadata().ok())
+            .map(|meta| file_identity(&meta))
+            .collect();
+        stored.push(Stored {
+            referenced: baselines.contains_key(&id),
+            id,
+            modified,
+            files,
+        });
+    }
+    // Keep the current run, then runs that reruns compare against, then the newest.
+    stored.sort_by_key(|run| {
+        (
+            run.id != current,
+            !run.referenced,
+            std::cmp::Reverse(run.modified),
+        )
+    });
+    let mut seen = std::collections::BTreeSet::new();
+    let (mut count, mut bytes, mut deleted) = (0, 0, 0);
+    for run in stored {
+        // A file shared through a hard link with a newer run is counted once.
+        let size: u64 = run
+            .files
+            .iter()
+            .filter(|(device, inode, _)| *inode == 0 || seen.insert((*device, *inode)))
+            .map(|(_, _, size)| size)
+            .sum();
+        count += 1;
+        bytes += size;
+        if run.id == current || (count <= max_runs && bytes <= max_bytes) {
+            continue;
+        }
+        if fs::remove_dir_all(runs.join(&run.id)).is_ok() {
+            deleted += 1;
+            for baseline in baselines.get(&run.id).into_iter().flatten() {
+                let _ = fs::remove_file(baseline);
+            }
+        }
+        bytes -= size;
+        count -= 1;
+    }
+    deleted
+}
+
+fn file_identity(meta: &fs::Metadata) -> (u64, u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino(), meta.len())
+    }
+    #[cfg(not(unix))]
+    {
+        (0, 0, meta.len())
+    }
+}

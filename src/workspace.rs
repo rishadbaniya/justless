@@ -60,6 +60,10 @@ pub struct Settings {
     pub context_budget: usize,
     pub max_output_bytes: usize,
     pub max_file_bytes: u64,
+    /// The most captured runs kept under `.justless/runs/`, newest first.
+    pub max_runs: usize,
+    /// The most bytes those runs may hold. The newest run is always kept.
+    pub max_archive_bytes: u64,
 }
 
 impl Default for Settings {
@@ -69,6 +73,8 @@ impl Default for Settings {
             context_budget: 2400,
             max_output_bytes: 4096,
             max_file_bytes: 2 * 1024 * 1024,
+            max_runs: 200,
+            max_archive_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -229,6 +235,7 @@ impl Workspace {
             settings.max_file_bytes > 0,
             "max_file_bytes must be positive"
         );
+        ensure!(settings.max_runs > 0, "max_runs must be positive");
         Ok(settings)
     }
 }

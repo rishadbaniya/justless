@@ -8750,3 +8750,106 @@ exit 101
         "{report}"
     );
 }
+
+fn stored_runs(root: &Path) -> Vec<String> {
+    let mut runs: Vec<_> = fs::read_dir(root.join(".justless/runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    runs.sort();
+    runs
+}
+
+#[test]
+fn old_runs_are_pruned_to_the_configured_retention() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_runs = 3\n").unwrap();
+    let ids: Vec<_> = (0..5)
+        .map(|i| {
+            let output = cli(root, &["run", "--", "sh", "-c", &format!("echo run {i}")]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            run_id(&output)
+        })
+        .collect();
+    let mut newest = ids[2..].to_vec();
+    newest.sort();
+    assert_eq!(stored_runs(root), newest);
+    assert_eq!(success(root, &["log", &ids[4]]), "run 4\n");
+    assert!(!cli(root, &["log", &ids[0]]).status.success());
+    assert_eq!(success(root, &["history"]).lines().count(), 3);
+
+    // The newest run stays even when it alone exceeds the byte limit.
+    fs::write(root.join(".justless.toml"), "max_archive_bytes = 1000\n").unwrap();
+    let big = cli(root, &["run", "--", "sh", "-c", "seq 1 2000"]);
+    assert_eq!(stored_runs(root), vec![run_id(&big)]);
+
+    // A misconfigured limit stops the run like any other configuration error.
+    fs::write(root.join(".justless.toml"), "max_runs = 0\n").unwrap();
+    let invalid = cli(root, &["run", "--", "true"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(stderr(&invalid).contains("max_runs must be positive"));
+}
+
+#[cfg(unix)]
+#[test]
+fn pruning_never_removes_a_run_in_progress() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_runs = 1\n").unwrap();
+    let slow = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo started; while [ ! -f release ]; do sleep 0.02; done; echo finished",
+        ])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("the slow run to start", || {
+        run_streams(root)
+            .iter()
+            .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("started")))
+    });
+    for i in 0..3 {
+        assert!(
+            cli(root, &["run", "--", "sh", "-c", &format!("echo quick {i}")])
+                .status
+                .success()
+        );
+    }
+    fs::write(root.join("release"), "").unwrap();
+    let slow = slow.wait_with_output().unwrap();
+    assert!(slow.status.success(), "{}", stderr(&slow));
+    assert_eq!(stdout(&slow), "started\nfinished\n");
+    assert_eq!(
+        success(root, &["log", &run_id(&slow)]),
+        "started\nfinished\n"
+    );
+    assert_eq!(stored_runs(root), vec![run_id(&slow)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unchanged_rerun_shares_the_archived_streams() {
+    use std::os::unix::fs::MetadataExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let args = ["run", "--", "sh", "-c", "seq 1 20000"];
+    let first = run_id(&cli(root, &args));
+    let again = cli(root, &args);
+    assert!(stdout(&again).contains(&format!("Output unchanged since {first}")));
+    let second = run_id(&again);
+    let inode = |id: &str| {
+        fs::metadata(root.join(".justless/runs").join(id).join("stdout"))
+            .unwrap()
+            .ino()
+    };
+    assert_eq!(inode(&first), inode(&second));
+    let expected: String = (1..=20000).map(|n| format!("{n}\n")).collect();
+    assert_eq!(success(root, &["log", &second]), expected);
+}

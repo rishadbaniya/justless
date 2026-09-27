@@ -210,7 +210,8 @@ pub fn execute(
         return Ok(uncaptured(&mut command, &args[0]));
     }
 
-    let selection = crate::filters::Selection::for_run(args, &workspace.settings()?.filters)?;
+    let settings = workspace.settings()?;
+    let selection = crate::filters::Selection::for_run(args, &settings.filters)?;
     let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
     // A recursive grep would otherwise read the archived logs, including the stdout
     // file it is writing.
@@ -251,6 +252,7 @@ pub fn execute(
         session,
         fresh,
         hook,
+        retention: (settings.max_runs, settings.max_archive_bytes),
     };
     match capture.record(&mut archive, family, status) {
         Ok((previews, footer, _)) => {
@@ -388,6 +390,26 @@ impl Archive {
         self.temporary.disable_cleanup(true);
     }
 
+    /// Store an unchanged run's streams once: link them to the identical streams of
+    /// the run it matched instead of keeping a second copy.
+    fn share(&self, prior: &Path, earlier: &Run, run: &Run) {
+        if earlier.stream_bytes != run.stream_bytes {
+            return;
+        }
+        for (stream, &length) in Stream::BOTH.into_iter().zip(&run.stream_bytes) {
+            let source = prior.join(stream.name());
+            let target = self.directory.join(stream.name());
+            let same_length = |path: &Path| fs::metadata(path).is_ok_and(|m| m.len() == length);
+            if length == 0 || !same_length(&source) || !same_length(&target) {
+                continue;
+            }
+            let link = self.directory.join(format!(".{}.link", stream.name()));
+            if fs::hard_link(&source, &link).is_ok() && fs::rename(&link, &target).is_err() {
+                let _ = fs::remove_file(&link);
+            }
+        }
+    }
+
     /// Print both complete streams from the open handles.
     fn replay(&self) {
         for (stream, mut file) in Stream::BOTH.into_iter().zip(&self.readers) {
@@ -492,6 +514,8 @@ struct Capture<'a> {
     session: &'a str,
     fresh: bool,
     hook: bool,
+    /// The most runs and archive bytes to keep.
+    retention: (usize, u64),
 }
 
 impl Capture<'_> {
@@ -511,6 +535,7 @@ impl Capture<'_> {
             session,
             fresh,
             hook,
+            retention,
         } = *self;
         let directory = archive.directory.clone();
         let lengths = archive.lengths().context("read the captured streams")?;
@@ -654,10 +679,14 @@ impl Capture<'_> {
         run.footer_bytes = footer.len();
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
-        if guard.is_some()
-            && let Err(error) = crate::workspace::write_text(&baseline, &run.id)
-        {
-            eprintln!("justless: could not update run baseline: {error:#}");
+        if let Some(prior) = previous.as_ref().filter(|_| run.unchanged) {
+            archive.share(&workspace.state.join("runs").join(&prior.id), prior, &run);
+        }
+        if guard.is_some() {
+            if let Err(error) = crate::workspace::write_text(&baseline, &run.id) {
+                eprintln!("justless: could not update run baseline: {error:#}");
+            }
+            history::prune(workspace, &run.id, retention.0, retention.1);
         }
         drop(guard);
         Ok((previews, footer, run))
