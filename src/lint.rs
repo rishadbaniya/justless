@@ -646,16 +646,24 @@ impl Lint {
         if let Some((id, old)) = previous.filter(|(_, s)| s.kind == "lint") {
             tail.push_str(&compare(id, old, &summary));
         }
+        // Without a located error, an error without a location, such as a failed build
+        // script, explains the failure, so the outcomes come right after the header.
+        let mut lead = String::new();
+        let outcomes = if errors == 0 && self.unlocated_errors > 0 {
+            &mut lead
+        } else {
+            &mut tail
+        };
         let mut detail_room = max_bytes / 2;
         for (head, detail) in &self.outcomes {
-            tail.push_str(head);
-            tail.push('\n');
+            outcomes.push_str(head);
+            outcomes.push('\n');
             for line in detail {
                 if line.len() + 5 > detail_room {
                     break;
                 }
                 detail_room -= line.len() + 5;
-                tail.push_str(&format!("    {line}\n"));
+                outcomes.push_str(&format!("    {line}\n"));
             }
         }
         // One failed target keeps its original line. Several name each package with
@@ -729,7 +737,7 @@ impl Lint {
 
         // Every group's rule line and locations come before any excerpt, so a long
         // report drops detail lines first and then whole groups with a count.
-        let room = max_bytes.saturating_sub(header.len() + tail.len());
+        let room = max_bytes.saturating_sub(header.len() + lead.len() + tail.len());
         let compact: usize = sections.iter().map(|(h, _, p, _)| h.len() + p.len()).sum();
         let (shown, mut spare) = if compact <= room {
             (sections.len(), room - compact)
@@ -749,7 +757,7 @@ impl Lint {
                 .sum();
             (shown, room - used)
         };
-        let mut report = header;
+        let mut report = header + &lead;
         for (head, detail, places, _) in &sections[..shown] {
             report.push_str(head);
             if detail.len() <= spare {

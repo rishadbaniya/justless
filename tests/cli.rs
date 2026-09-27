@@ -8193,6 +8193,17 @@ fn unwritable_state_still_runs_the_command_and_keeps_its_status() {
     set_mode(&root.join(".justless/runs"), 0o700);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert_eq!(stdout(&output), "ran\n");
+
+    // Commands that need the state directory name the file they could not open.
+    set_mode(&root.join(".justless"), 0o500);
+    let query = cli(&root, &["query", "Anything"]);
+    set_mode(&root.join(".justless"), 0o700);
+    assert_eq!(query.status.code(), Some(2));
+    assert!(
+        stderr(&query).contains(".justless/index.lock: Permission denied"),
+        "{}",
+        stderr(&query)
+    );
 }
 
 #[test]
@@ -8680,8 +8691,12 @@ fn a_failed_build_script_shows_its_cause_in_the_lint_report() {
 for i in $(seq 1 30); do
   printf 'warning: unused variable: `unused_%s`\n --> a/src/lib.rs:%s:19\n  |\n%s | pub fn f() { let unused = 0; }\n  |                   ^^^^^^^^\n\n' $i $i $i
 done
+# Enough distinct rules that the grouped report outgrows the preview budget.
+for i in $(seq 1 80); do
+  printf 'warning: distinct problem number %s in this crate\n --> a/src/lib.rs:%s:1\n\n' $i $i
+done
 cat <<'EOF'
-warning: `a` (lib) generated 30 warnings
+warning: `a` (lib) generated 110 warnings
 error: failed to run custom build command for `b v0.1.0 (/work/b)`
 
 Caused by:
@@ -8700,14 +8715,55 @@ exit 101
     let report = stdout(&output);
     assert!(
         report.starts_with(
-            "cargo check: 30 finding(s), 0 error(s), 30 warning(s) · 1 rule(s) · 1 file(s) · 1 error(s) without a location\n"
+            "cargo check: 110 finding(s), 0 error(s), 110 warning(s) · 81 rule(s) · 1 file(s) · 1 error(s) without a location\nerror: failed to run custom build command for `b v0.1.0 (/work/b)` [stderr:"
         ),
         "{report}"
     );
     assert!(
-        report.contains("error: failed to run custom build command for `b v0.1.0 (/work/b)` [stderr:")
-            && report.contains("      thread 'main' (4242) panicked at b/build.rs:2:5:\n      OPENSSL_DIR is not set; install libssl-dev or set OPENSSL_DIR\n"),
+        report.contains("      thread 'main' (4242) panicked at b/build.rs:2:5:\n      OPENSSL_DIR is not set; install libssl-dev or set OPENSSL_DIR\n")
+            && report.len() <= 4096
+            && report.contains(" more rule(s) with ")
+            && report.ends_with(" finding(s) in full log\n"),
         "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interrupted_command_stops_the_caller_after_the_preview() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["run", "--", "sh", "-c", "echo partial; exec sleep 30"])
+        .current_dir(root)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("partial output", || {
+        run_streams(root)
+            .iter()
+            .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
+    });
+    // A terminal interrupt reaches the whole foreground process group.
+    let group = format!("-{}", child.id());
+    assert!(
+        Command::new("kill")
+            .args(["-INT", "--", &group])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = child.wait_with_output().unwrap();
+    // Justless dies from the same signal, so a calling shell stops its script.
+    assert_eq!(output.status.signal(), Some(2), "{:?}", output.status);
+    assert_eq!(stdout(&output), "partial\n");
+    assert!(
+        stderr(&output).contains("] exit 130 · "),
+        "{}",
+        stderr(&output)
     );
 }
 

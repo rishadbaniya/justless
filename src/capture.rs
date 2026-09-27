@@ -236,14 +236,15 @@ pub fn execute(
             return Ok(uncaptured(&mut command, &args[0]));
         }
     };
-    let status = match archive.run(&mut command) {
-        Ok(Ok(status)) => exit_code(status),
+    let exited = match archive.run(&mut command) {
+        Ok(Ok(status)) => Some(status),
         Ok(Err(error)) => {
             eprintln!("justless: wait for {}: {error}", args[0].to_string_lossy());
-            1
+            None
         }
         Err(error) => return Ok(spawn_failure(&args[0], &error)),
     };
+    let status = exited.map_or(1, exit_code);
 
     // The command has run. From here on its output and exit status always reach the
     // caller, even when the archive cannot be read back or saved.
@@ -276,13 +277,17 @@ pub fn execute(
             archive.replay();
         }
     }
+    signals::reraise(exited);
     Ok(status)
 }
 
 /// Run without recording, with the same exit statuses a shell reports.
 fn uncaptured(command: &mut Command, program: &OsStr) -> i32 {
     match supervise(command) {
-        Ok(Ok(status)) => exit_code(status),
+        Ok(Ok(status)) => {
+            signals::reraise(Some(status));
+            exit_code(status)
+        }
         Ok(Err(error)) => {
             eprintln!("justless: wait for {}: {error}", program.to_string_lossy());
             1
@@ -520,6 +525,25 @@ mod signals {
         restore();
     }
 
+    /// Exit from the signal that stopped the command when Justless received it
+    /// too, after the preview is out, so a calling shell stops its script just as
+    /// it would for the command itself.
+    pub fn reraise(status: Option<std::process::ExitStatus>) {
+        use std::os::unix::process::ExitStatusExt;
+        let Some(signal) = status.and_then(|status| status.signal()) else {
+            return;
+        };
+        if RECEIVED.load(Ordering::SeqCst) != signal {
+            return;
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // SAFETY: restores the default action and raises the signal on Justless.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
     pub fn restore() {
         CHILD.store(0, Ordering::SeqCst);
         let installed = INSTALLED.swap(0, Ordering::SeqCst);
@@ -537,6 +561,7 @@ mod signals {
     pub fn install() {}
     pub fn watch(_: u32) {}
     pub fn settle(_: u32) {}
+    pub fn reraise(_: Option<std::process::ExitStatus>) {}
     pub fn restore() {}
 }
 
