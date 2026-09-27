@@ -626,8 +626,12 @@ impl Capture<'_> {
         } else if let Some((report, _)) = lint {
             // Findings replace both streams: the grouped report names every rule and
             // location, and each group links to its original lines in the full log.
-            if report.len() < shown || previous.is_some() {
-                previews[0].1 = fit(report, max_bytes).into_bytes();
+            // Output that fits the budget and is smaller than the report stays
+            // verbatim, even on a rerun.
+            let report = fit(report, max_bytes);
+            let clipped = lengths.iter().any(|&length| length > max_bytes as u64);
+            if report.len() < shown || clipped {
+                previews[0].1 = report.into_bytes();
                 previews[1].1.clear();
             }
         } else if let Some((report, _)) = grouped {

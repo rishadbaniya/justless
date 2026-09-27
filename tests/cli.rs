@@ -3713,7 +3713,14 @@ fn lint_reruns_compare_severity_and_findings_within_the_budget() {
             fs::write(&path, record.to_string()).unwrap();
         }
     };
-    let eslint = lint_fixture("eslint.txt");
+    // Enough files that the report is smaller than the output it replaces; smaller
+    // output stays verbatim, even on a rerun.
+    let padding: String = (0..40)
+        .map(|i| {
+            format!("\n/work/web/pad{i}.js\n  1:1  error  'pad{i}' is not defined  no-undef\n")
+        })
+        .collect();
+    let eslint = format!("{padding}{}", lint_fixture("eslint.txt"));
     lint_preview(root, "eslint", &["."], &eslint, "");
     forget_severities();
     let without_eqeqeq: String = eslint
@@ -8659,4 +8666,87 @@ fn a_diff_rerun_reports_only_hunks_that_changed_after_line_numbers_shift() {
         .collect();
     assert_eq!(changes.len(), 1, "{rerun}");
     assert!(changes[0].starts_with("+ f.txt @@ -1,3 +1,4 @@"), "{rerun}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_build_script_shows_its_cause_in_the_lint_report() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let cargo = fake_program(
+        root,
+        "cargo",
+        r#"exec 1>&2
+for i in $(seq 1 30); do
+  printf 'warning: unused variable: `unused_%s`\n --> a/src/lib.rs:%s:19\n  |\n%s | pub fn f() { let unused = 0; }\n  |                   ^^^^^^^^\n\n' $i $i $i
+done
+cat <<'EOF'
+warning: `a` (lib) generated 30 warnings
+error: failed to run custom build command for `b v0.1.0 (/work/b)`
+
+Caused by:
+  process didn't exit successfully: `/work/target/debug/build/b-1/build-script-build` (exit status: 101)
+  --- stderr
+
+  thread 'main' (4242) panicked at b/build.rs:2:5:
+  OPENSSL_DIR is not set; install libssl-dev or set OPENSSL_DIR
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+EOF
+exit 101
+"#,
+    );
+    let output = cli(root, &["run", "--", cargo.to_str().unwrap(), "check"]);
+    assert_eq!(output.status.code(), Some(101));
+    let report = stdout(&output);
+    assert!(
+        report.starts_with(
+            "cargo check: 30 finding(s), 0 error(s), 30 warning(s) · 1 rule(s) · 1 file(s) · 1 error(s) without a location\n"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("error: failed to run custom build command for `b v0.1.0 (/work/b)` [stderr:")
+            && report.contains("      thread 'main' (4242) panicked at b/build.rs:2:5:\n      OPENSSL_DIR is not set; install libssl-dev or set OPENSSL_DIR\n"),
+        "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn short_rustc_errors_count_as_errors_and_small_output_stays_verbatim() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let cargo = fake_program(
+        root,
+        "cargo",
+        r#"exec 1>&2
+echo 'src/lib.rs:1:18: warning: unused variable: `unused`'
+for i in $(seq 1 "$(cat count)"); do
+  echo "src/lib.rs:$i:21: error[E0308]: mismatched types: expected \`u32\`, found \`&str\`"
+done
+echo 'error: could not compile `shortfmt` (lib) due to previous errors'
+exit 101
+"#,
+    );
+    let cargo = cargo.to_str().unwrap();
+    let args = ["run", "--", cargo, "check", "--message-format=short"];
+    fs::write(root.join("count"), "1").unwrap();
+    cli(root, &args);
+    fs::write(root.join("count"), "2").unwrap();
+    // The report would be larger than this output, so the output stays verbatim.
+    let rerun = cli(root, &args);
+    assert_eq!(rerun.status.code(), Some(101));
+    assert!(
+        stderr(&rerun).starts_with("src/lib.rs:1:18: warning: unused variable: `unused`\n"),
+        "{}",
+        stderr(&rerun)
+    );
+    fs::write(root.join("count"), "200").unwrap();
+    let report = stdout(&cli(root, &args));
+    assert!(
+        report.starts_with("cargo check: 201 finding(s), 200 error(s), 1 warning(s) · 2 rule(s)")
+            && report.contains("error E0308 ×200  mismatched types: expected `u32`, found `&str`")
+            && report.contains("~ error E0308 ×2 → ×200"),
+        "{report}"
+    );
 }
