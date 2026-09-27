@@ -452,12 +452,13 @@ mod signals {
     //! Forward SIGTERM and SIGHUP to the command at once. The command shares
     //! Justless's process group, so a terminal interrupt or a SIGINT or SIGQUIT
     //! sent to the whole group already reaches it. Justless forwards those only
-    //! when the command is still running a moment later, which stops it when the
-    //! signal was sent to Justless alone without interrupting a command twice
-    //! while it exits. Like a shell waiting for a foreground job, Justless waits
-    //! for the command to exit and then finishes the record. Once the command has
-    //! exited, the default dispositions return, so another signal stops Justless
-    //! as usual.
+    //! if the command is still running 200 ms after Justless received one, so a
+    //! signal sent to Justless alone still stops the command, and a command that
+    //! exits promptly from a group interrupt is not interrupted again. One that
+    //! takes longer to exit receives it twice. Like a shell waiting for a
+    //! foreground job, Justless waits for the command to exit and then finishes
+    //! the record. Once the command has exited, the default dispositions return,
+    //! so another signal stops Justless as usual.
     use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
