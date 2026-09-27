@@ -79,6 +79,26 @@ impl Default for Settings {
     }
 }
 
+/// The marked root of a workspace entered at `cwd` when no `--root` is given: the
+/// nearest Git checkout, then the nearest Justless state or settings, then the
+/// nearest project manifest. Without one, `cwd` itself is the root.
+pub fn marked_root(cwd: &Path) -> Option<&Path> {
+    cwd.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .or_else(|| {
+            cwd.ancestors().find(|ancestor| {
+                ancestor.join(".justless").is_dir() || ancestor.join(".justless.toml").is_file()
+            })
+        })
+        .or_else(|| {
+            cwd.ancestors().find(|ancestor| {
+                PROJECT_MARKERS
+                    .iter()
+                    .any(|name| ancestor.join(name).is_file())
+            })
+        })
+}
+
 impl Workspace {
     pub fn discover(root: Option<&Path>) -> Result<Self> {
         Self::locate(root, None)
@@ -102,24 +122,7 @@ impl Workspace {
             Some(root) => root
                 .canonicalize()
                 .with_context(|| format!("open {}", root.display()))?,
-            None => start
-                .ancestors()
-                .find(|ancestor| ancestor.join(".git").exists())
-                .or_else(|| {
-                    start.ancestors().find(|ancestor| {
-                        ancestor.join(".justless").is_dir()
-                            || ancestor.join(".justless.toml").is_file()
-                    })
-                })
-                .or_else(|| {
-                    start.ancestors().find(|ancestor| {
-                        PROJECT_MARKERS
-                            .iter()
-                            .any(|name| ancestor.join(name).is_file())
-                    })
-                })
-                .unwrap_or(&start)
-                .to_path_buf(),
+            None => marked_root(&start).unwrap_or(&start).to_path_buf(),
         };
         ensure!(root.is_dir(), "{} is not a directory", root.display());
         let cwd = if cwd.starts_with(&root) {

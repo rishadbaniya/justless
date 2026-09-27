@@ -891,12 +891,14 @@ fn wrap_event(
             )
         })
         .unwrap_or_default();
-    // Follow each `cd` so a later one is checked from the directory it starts in.
-    let mut directory = cwd.to_path_buf();
+    // Follow each `cd` so a later one is checked from the directory it starts in,
+    // and each wrapped command knows where it runs.
+    let mut directories = vec![cwd.to_path_buf()];
     let plan = plan(command, rules, |entered| {
-        match directory.join(entered).canonicalize() {
+        let current = directories.last().map_or(cwd, PathBuf::as_path);
+        match current.join(entered).canonicalize() {
             Ok(next) if next.is_dir() && next.starts_with(&workspace.root) => {
-                directory = next;
+                directories.push(next);
                 true
             }
             _ => false,
@@ -912,16 +914,45 @@ fn wrap_event(
     // shell still sees the original operators, spacing and unsupported commands.
     let mut rewritten = String::with_capacity(command.len() + 64);
     let mut copied = 0;
-    for range in plan.wrap {
+    for (range, entered) in plan.wrap {
+        let root = directories
+            .get(entered)
+            .map(|directory| root_option(workspace, directory))
+            .unwrap_or_default();
         rewritten.push_str(&command[copied..range.start]);
         rewritten.push_str(&format!(
-            "justless run --hook{session} -- {}",
+            "justless{root} run --hook{session} -- {}",
             &command[range.clone()]
         ));
         copied = range.end;
     }
     rewritten.push_str(&command[copied..]);
     Some(rewritten)
+}
+
+/// ` --root ROOT` when `justless run` started in `directory` would find another
+/// marked root, as inside a nested Git repository or submodule, so the run is
+/// still recorded in this workspace. A directory that resolves outside the root
+/// gets no option, because `--root` would move the command to the root.
+fn root_option(workspace: &Workspace, directory: &Path) -> String {
+    let Some(Ok(start)) = directory
+        .ancestors()
+        .find(|path| path.exists())
+        .map(Path::canonicalize)
+    else {
+        return String::new();
+    };
+    if !start.starts_with(&workspace.root)
+        || crate::workspace::marked_root(&start).is_none_or(|found| found == workspace.root)
+    {
+        return String::new();
+    }
+    workspace
+        .root
+        .to_str()
+        .and_then(|root| shlex::try_quote(root).ok())
+        .map(|root| format!(" --root {root}"))
+        .unwrap_or_default()
 }
 
 /// A `justless read` command for a single-file `cat` of a large workspace text file
@@ -1170,7 +1201,8 @@ fn module_binding(language: &str, lines: &[&str], start: usize) -> Option<usize>
 /// others that it counts as passed through.
 #[derive(Default)]
 struct Plan {
-    wrap: Vec<Range<usize>>,
+    /// Each command to wrap, with the number of `cd` commands accepted before it.
+    wrap: Vec<(Range<usize>, usize)>,
     other: Vec<Range<usize>>,
 }
 
@@ -1192,18 +1224,19 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         let start = command.len() - command.trim_start_matches(SHELL_BLANKS).len();
         let range = start..command.trim_end_matches(SHELL_BLANKS).len().max(start);
         if supported(command) {
-            plan.wrap.push(range);
+            plan.wrap.push((range, 0));
         } else {
             plan.other.push(range);
         }
         return plan;
     };
+    let mut entered = 0;
     for range in &segments {
         let segment = &command[range.clone()];
         match directory_change(segment) {
-            None if supported(segment) => plan.wrap.push(range.clone()),
+            None if supported(segment) => plan.wrap.push((range.clone(), entered)),
             None => plan.other.push(range.clone()),
-            Some(Some(directory)) if descends(&directory) && enter(&directory) => {}
+            Some(Some(directory)) if descends(&directory) && enter(&directory) => entered += 1,
             Some(_) => {
                 return Plan {
                     wrap: Vec::new(),
@@ -1217,7 +1250,8 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         }
     }
     if !rules.mixed && !plan.other.is_empty() {
-        plan.other.append(&mut plan.wrap);
+        plan.other
+            .extend(plan.wrap.drain(..).map(|(range, _)| range));
     }
     plan
 }

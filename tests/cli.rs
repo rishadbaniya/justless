@@ -8142,6 +8142,77 @@ fn pack_matches_inflections_of_a_word_not_every_word_it_starts() {
 
 #[cfg(unix)]
 #[test]
+fn a_hook_keeps_runs_from_a_nested_repository_in_the_workspace() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    fs::create_dir(root.join("src")).unwrap();
+    let nested = root.join("vendor_lib");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    fs::write(nested.join("a.txt"), "x\n").unwrap();
+    git(&nested, &["add", "."]);
+    git(&nested, &["commit", "-qm", "init"]);
+    let rewrite = |agent: &str, cwd: &Path, command: &str| {
+        let call = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+            "cwd":cwd,"tool_input":{"command":command}});
+        agent_hook(&root, agent, "before-command", call)["hookSpecificOutput"]["updatedInput"]
+            ["command"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    // A command anywhere else in the checkout finds this root by itself.
+    for cwd in [root.clone(), root.join("src")] {
+        assert_eq!(
+            rewrite("hook-claude", &cwd, "git status --short").as_deref(),
+            Some("justless run --hook -- git status --short")
+        );
+    }
+    // In a nested repository it would find that repository instead.
+    let named = format!(
+        "justless --root {} run --hook -- git status --short",
+        root.display()
+    );
+    assert_eq!(
+        rewrite("hook-claude", &nested, "git status --short"),
+        Some(named.clone())
+    );
+    for agent in ["hook-claude", "hook-codex"] {
+        assert_eq!(
+            rewrite(agent, &root, "cd vendor_lib && git status --short"),
+            Some(format!("cd vendor_lib && {named}")),
+            "{agent}"
+        );
+    }
+
+    // The rewritten command leaves the nested checkout clean, and its run can be
+    // replayed from the workspace.
+    let binary = Path::new(env!("CARGO_BIN_EXE_justless"));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(binary.parent().unwrap().to_path_buf()).chain(std::env::split_paths(&path)),
+    )
+    .unwrap();
+    let output = Command::new("sh")
+        .args(["-c", &named])
+        .current_dir(&nested)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert!(!nested.join(".justless").exists());
+    assert_eq!(git(&nested, &["status", "--short"]), "");
+    // A hook run that reached the agent verbatim prints no footer, so find it in the
+    // workspace history.
+    let history = success(&root, &["history"]);
+    assert!(history.contains("· git status ·"), "{history}");
+    let id = history.split(' ').next().unwrap();
+    assert!(cli(&root, &["log", id]).status.success());
+}
+
+#[cfg(unix)]
+#[test]
 fn missing_and_unrunnable_commands_exit_like_a_shell() {
     use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
