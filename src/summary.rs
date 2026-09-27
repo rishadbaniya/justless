@@ -1,5 +1,5 @@
 //! Compact records point back to inclusive line ranges in the original stdout.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,8 @@ pub struct Parser {
     pending: Option<Item>,
     failures: BTreeMap<String, Item>,
     current_test: String,
+    /// Message lines still expected after `panicked at path:line:col:`.
+    panic_lines: usize,
     discarded: bool,
 }
 
@@ -80,6 +82,7 @@ impl Parser {
             pending: None,
             failures: BTreeMap::new(),
             current_test: String::new(),
+            panic_lines: 0,
             discarded: false,
         }
     }
@@ -154,8 +157,12 @@ impl Parser {
             item.detail = short(line, 360);
         }
         if let Some(item) = &mut self.pending {
-            self.hash.update(line.as_bytes());
-            self.hash.update(b"\n");
+            // A hunk is compared by its lines, not by where it starts, so hunks
+            // keep their identity when an earlier change shifts them.
+            if !line.starts_with("@@ ") {
+                self.hash.update(line.as_bytes());
+                self.hash.update(b"\n");
+            }
             item.last = n;
         }
     }
@@ -193,6 +200,25 @@ impl Parser {
         {
             self.current_test = short(name, 240);
         }
+        // Since Rust 1.73 the panic message follows the location on its own lines,
+        // and it is what tells failures at the same location apart.
+        let mut message = false;
+        if self.panic_lines > 0 {
+            if line.is_empty()
+                || line.starts_with("note:")
+                || line.starts_with("stack backtrace:")
+                || line.starts_with("---- ")
+            {
+                self.panic_lines = 0;
+            } else if let Some(item) = self.failures.get_mut(&self.current_test) {
+                item.digest =
+                    crate::capture::source_digest(format!("{}{}", item.digest, line).as_bytes());
+                item.detail = short(&format!("{} {}", item.detail, short(line, 200)), 440);
+                item.last = n;
+                self.panic_lines -= 1;
+                message = true;
+            }
+        }
         if let Some((_, location)) = line.split_once(" panicked at ")
             && let Some(item) = self.failures.get_mut(&self.current_test)
         {
@@ -200,10 +226,12 @@ impl Parser {
             item.last = n;
             item.digest = crate::capture::source_digest(location.as_bytes());
             item.detail = short(location, 200);
+            self.panic_lines = if location.ends_with(':') { 3 } else { 0 };
         }
-        if (line.starts_with("assertion ")
-            || line.starts_with("left:")
-            || line.starts_with("right:"))
+        if !message
+            && (line.starts_with("assertion ")
+                || line.starts_with("left:")
+                || line.starts_with("right:"))
             && let Some(item) = self.failures.get_mut(&self.current_test)
             && n.saturating_sub(item.last) <= 2
         {
@@ -251,9 +279,25 @@ impl Item {
             last: n,
         }
     }
+    /// The identity used to compare runs. A patch hunk drops its line ranges,
+    /// which shift whenever an earlier hunk grows or shrinks.
     fn key(&self) -> (&str, &str, &str) {
-        (&self.name, &self.detail, &self.digest)
+        let detail = match self.detail.strip_prefix("@@ ") {
+            Some(ranges) => ranges
+                .split_once(" @@")
+                .map_or(ranges, |(_, context)| context),
+            None => &self.detail,
+        };
+        (&self.name, detail, &self.digest)
     }
+    fn counts(items: &[Item]) -> BTreeMap<(&str, &str, &str), usize> {
+        let mut counts = BTreeMap::new();
+        for item in items {
+            *counts.entry(item.key()).or_default() += 1;
+        }
+        counts
+    }
+
     fn display(&self) -> String {
         format!(
             "{} {} [stdout:{}-{}]",
@@ -321,17 +365,26 @@ impl Summary {
         }
         let previous = previous.filter(|(_, s)| s.kind == self.kind);
         if let Some((id, old)) = previous {
-            let known: BTreeSet<_> = old.items.iter().map(Item::key).collect();
-            let current: BTreeSet<_> = self.items.iter().map(Item::key).collect();
+            // Compare as multisets so identical hunks are matched one for one.
+            let known = Item::counts(&old.items);
+            let current = Item::counts(&self.items);
             report.push_str(&format!("Compared with {id}:\n"));
-            for item in self.items.iter().filter(|i| !known.contains(&i.key())) {
-                report.push_str(&format!("+ {}\n", item.display()));
+            let mut unmatched = known.clone();
+            for item in &self.items {
+                match unmatched.get_mut(&item.key()) {
+                    Some(left) if *left > 0 => *left -= 1,
+                    _ => report.push_str(&format!("+ {}\n", item.display())),
+                }
             }
-            for item in old.items.iter().filter(|i| !current.contains(&i.key())) {
-                report.push_str(&format!(
-                    "- {} {} [prior stdout:{}-{}]\n",
-                    item.name, item.detail, item.first, item.last
-                ));
+            let mut unmatched = current.clone();
+            for item in &old.items {
+                match unmatched.get_mut(&item.key()) {
+                    Some(left) if *left > 0 => *left -= 1,
+                    _ => report.push_str(&format!(
+                        "- {} {} [prior stdout:{}-{}]\n",
+                        item.name, item.detail, item.first, item.last
+                    )),
+                }
             }
             if known == current {
                 report.push_str(if self.kind == "inventory" {

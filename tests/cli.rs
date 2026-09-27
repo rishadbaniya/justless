@@ -8550,3 +8550,113 @@ fn filtered_previews_never_end_on_an_unmarked_fragment() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn cargo_test_summaries_carry_panic_messages_and_notice_a_changed_one() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // The thread ID changes on every run, and the message is what matters.
+    let cargo = fake_program(
+        root,
+        "cargo",
+        r#"cat <<EOF
+running 3 tests
+test tests::parses_alpha ... FAILED
+test tests::parses_empty ... FAILED
+test tests::value_is_five ... FAILED
+
+failures:
+
+---- tests::parses_alpha stdout ----
+
+thread 'tests::parses_alpha' ($$) panicked at src/lib.rs:2:57:
+called \`Result::unwrap()\` on an \`Err\` value: ParseIntError { kind: InvalidDigit }
+note: run with \`RUST_BACKTRACE=1\` environment variable to display a backtrace
+
+---- tests::parses_empty stdout ----
+
+thread 'tests::parses_empty' ($$) panicked at src/lib.rs:2:57:
+called \`Result::unwrap()\` on an \`Err\` value: ParseIntError { kind: Empty }
+
+---- tests::value_is_five stdout ----
+
+thread 'tests::value_is_five' ($$) panicked at src/lib.rs:8:51:
+expected 5 but got $(cat value)
+
+
+failures:
+    tests::parses_alpha
+    tests::parses_empty
+    tests::value_is_five
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EOF
+exit 101
+"#,
+    );
+    let cargo = cargo.to_str().unwrap();
+    fs::write(root.join("value"), "6").unwrap();
+    let first = cli(root, &["run", "--", cargo, "test"]);
+    assert_eq!(first.status.code(), Some(101));
+    let report = stdout(&first);
+    for expected in [
+        "tests::parses_alpha src/lib.rs:2:57: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit } [stdout:",
+        "tests::parses_empty src/lib.rs:2:57: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: Empty } [stdout:",
+        "tests::value_is_five src/lib.rs:8:51: expected 5 but got 6 [stdout:",
+    ] {
+        assert!(report.contains(expected), "{expected} in {report}");
+    }
+    assert!(!report.contains("2 test(s)"), "{report}");
+    let id = run_id(&first);
+
+    let again = success_or_status(root, &["run", "--", cargo, "test"]);
+    assert!(
+        again.contains(&format!("Compared with {id}:\nIndexed items unchanged")),
+        "{again}"
+    );
+
+    fs::write(root.join("value"), "7").unwrap();
+    let changed = success_or_status(root, &["run", "--", cargo, "test"]);
+    assert!(
+        changed.contains("+ tests::value_is_five src/lib.rs:8:51: expected 5 but got 7 [stdout:")
+            && changed.contains(
+                "- tests::value_is_five src/lib.rs:8:51: expected 5 but got 6 [prior stdout:"
+            )
+            && !changed.contains("parses_"),
+        "{changed}"
+    );
+}
+
+/// The stdout of a run that is expected to fail.
+fn success_or_status(root: &Path, args: &[&str]) -> String {
+    let output = cli(root, args);
+    assert!(output.status.code().is_some(), "{}", stderr(&output));
+    stdout(&output)
+}
+
+#[test]
+fn a_diff_rerun_reports_only_hunks_that_changed_after_line_numbers_shift() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    let numbers: String = (1..=200).map(|n| format!("{n}\n")).collect();
+    fs::write(root.join("f.txt"), &numbers).unwrap();
+    git(root, &["add", "f.txt"]);
+    git(root, &["commit", "-qm", "init"]);
+    let edited = numbers
+        .replace("\n100\n", "\none hundred\n")
+        .replace("\n150\n", "\none fifty\n");
+    fs::write(root.join("f.txt"), &edited).unwrap();
+    let first = success(root, &["run", "--", "git", "diff"]);
+    assert!(first.contains("2 diff section(s)"), "{first}");
+    fs::write(root.join("f.txt"), format!("new first line\n{edited}")).unwrap();
+    let rerun = success(root, &["run", "--", "git", "diff"]);
+    let changes: Vec<_> = rerun
+        .lines()
+        .filter(|line| line.starts_with("+ ") || line.starts_with("- "))
+        .collect();
+    assert_eq!(changes.len(), 1, "{rerun}");
+    assert!(changes[0].starts_with("+ f.txt @@ -1,3 +1,4 @@"), "{rerun}");
+}
