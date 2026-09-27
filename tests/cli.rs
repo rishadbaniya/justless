@@ -8909,3 +8909,76 @@ fn an_unchanged_rerun_shares_the_archived_streams() {
     let expected: String = (1..=20000).map(|n| format!("{n}\n")).collect();
     assert_eq!(success(root, &["log", &second]), expected);
 }
+
+/// The bytes stored under `.justless/runs`, counting a hard-linked file once.
+#[cfg(unix)]
+fn archived_bytes(root: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut files = std::collections::BTreeMap::new();
+    for run in fs::read_dir(root.join(".justless/runs")).unwrap() {
+        for file in fs::read_dir(run.unwrap().path()).unwrap() {
+            let meta = file.unwrap().metadata().unwrap();
+            files.insert((meta.dev(), meta.ino()), meta.len());
+        }
+    }
+    files.values().sum()
+}
+
+/// Write 100,000 bytes for `cat NAME` to print, and run it.
+#[cfg(unix)]
+fn cat_run(root: &Path, name: &str, line: &str) -> String {
+    fs::write(root.join(name), format!("{line:<9}\n").repeat(10_000)).unwrap();
+    let output = cli(root, &["run", "--", "cat", name]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    run_id(&output)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stream_shared_by_unchanged_reruns_counts_until_its_last_link_goes() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let limit = 250_000;
+    fs::write(
+        root.join(".justless.toml"),
+        format!("max_archive_bytes = {limit}\n"),
+    )
+    .unwrap();
+    // Three unchanged runs share one stream, so they fit beside a second command.
+    let same: Vec<_> = (0..3).map(|_| cat_run(root, "same", "same")).collect();
+    let first = cat_run(root, "first", "first");
+    let mut expected = [same.clone(), vec![first.clone()]].concat();
+    expected.sort();
+    assert_eq!(stored_runs(root), expected);
+    // A third distinct stream does not fit. The shared one goes from every run that
+    // links it, so the bytes on disk stay within the limit.
+    let second = cat_run(root, "second", "second");
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(stored_runs(root), expected);
+    assert!(archived_bytes(root) <= limit, "{}", archived_bytes(root));
+
+    // Older copies of a stream go before the run that reruns compare against.
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(
+        root.join(".justless.toml"),
+        format!("max_archive_bytes = {limit}\n"),
+    )
+    .unwrap();
+    for _ in 0..3 {
+        cat_run(root, "page", "old");
+    }
+    let changed = cat_run(root, "page", "new");
+    let other = cat_run(root, "other", "other");
+    let mut expected = vec![changed.clone(), other];
+    expected.sort();
+    assert_eq!(stored_runs(root), expected);
+    assert!(archived_bytes(root) <= limit, "{}", archived_bytes(root));
+    let rerun = cli(root, &["run", "--", "cat", "page"]);
+    assert!(
+        stdout(&rerun).contains(&format!("Output unchanged since {changed}")),
+        "{}",
+        stdout(&rerun)
+    );
+}

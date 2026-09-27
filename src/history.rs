@@ -803,29 +803,29 @@ pub fn prune(workspace: &Workspace, current: &str, max_runs: usize, max_bytes: u
             std::cmp::Reverse(run.modified),
         )
     });
-    let mut seen = std::collections::BTreeSet::new();
+    // Files that kept runs hold. A file shared through hard links stays on disk while
+    // any kept run links it, so it counts once, against the first run kept with it.
+    // A deleted run holds nothing, so an older run that shares its file pays for it.
+    let mut held = std::collections::BTreeSet::new();
     let (mut count, mut bytes, mut deleted) = (0, 0, 0);
     for run in stored {
-        // A file shared through a hard link with a newer run is counted once.
-        let size: u64 = run
+        let added: Vec<_> = run
             .files
             .iter()
-            .filter(|(device, inode, _)| *inode == 0 || seen.insert((*device, *inode)))
-            .map(|(_, _, size)| size)
-            .sum();
-        count += 1;
-        bytes += size;
-        if run.id == current || (count <= max_runs && bytes <= max_bytes) {
-            continue;
-        }
-        if fs::remove_dir_all(runs.join(&run.id)).is_ok() {
+            .filter(|(device, inode, _)| *inode == 0 || !held.contains(&(*device, *inode)))
+            .collect();
+        let size: u64 = added.iter().map(|(_, _, size)| size).sum();
+        let keep = run.id == current || (count < max_runs && bytes + size <= max_bytes);
+        if !keep && fs::remove_dir_all(runs.join(&run.id)).is_ok() {
             deleted += 1;
             for baseline in baselines.get(&run.id).into_iter().flatten() {
                 let _ = fs::remove_file(baseline);
             }
+            continue;
         }
-        bytes -= size;
-        count -= 1;
+        count += 1;
+        bytes += size;
+        held.extend(added.iter().map(|(device, inode, _)| (*device, *inode)));
     }
     deleted
 }
