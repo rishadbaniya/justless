@@ -9312,3 +9312,87 @@ fn a_background_writer_returns_at_once_and_its_late_output_stays_within_the_cap(
         stderr(&log)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_hook_run_stopped_by_a_timeout_is_recorded_with_its_exit() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // A client that times out a command sends SIGTERM. The loop ends on its own,
+    // so a failed run leaves no process behind.
+    let script = "trap 'echo got-term; exit 7' TERM; echo partial; \
+        i=0; while [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done";
+    let child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["run", "--hook", "--", "sh", "-c", script])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("partial output", || {
+        run_streams(root)
+            .iter()
+            .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
+    });
+    let pid = child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "partial\ngot-term\n");
+    // The output reached the agent in full, so the compact marker names the exit.
+    let id = footer_id(&output);
+    assert!(
+        stderr(&output).ends_with(&format!("[justless {id} · exit 7]\n")),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(success(root, &["log", &id]), "partial\ngot-term\n");
+    assert!(success(root, &["history"]).contains(&format!("{id} · sh · exit 7")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_killed_hook_run_stays_listed_and_replayable() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "run",
+            "--hook",
+            "--",
+            "sh",
+            "-c",
+            "echo $$ > pid; echo partial; exec sleep 30",
+        ])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("partial output", || {
+        root.join("pid").exists()
+            && run_streams(root)
+                .iter()
+                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
+    });
+    // A client that gives up on a command can kill Justless outright.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let sleeper = fs::read_to_string(root.join("pid")).unwrap();
+    let _ = Command::new("kill")
+        .args(["-KILL", sleeper.trim()])
+        .status();
+    let history = success(root, &["history"]);
+    assert!(history.contains(" · sh · unfinished"), "{history}");
+    let id = history.split(' ').next().unwrap();
+    assert_eq!(success(root, &["log", id]), "partial\n");
+    let record =
+        fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap();
+    assert!(record.contains("\"hook\":true"), "{record}");
+}
