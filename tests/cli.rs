@@ -2595,6 +2595,7 @@ fn search_repo() -> TempDir {
     repo
 }
 
+#[cfg(unix)]
 fn log_range(line: &str) -> (String, String) {
     let range = line
         .rsplit_once("[stdout:")
@@ -8721,6 +8722,7 @@ exit 101
 }
 
 /// The stdout of a run that is expected to fail.
+#[cfg(unix)]
 fn success_or_status(root: &Path, args: &[&str]) -> String {
     let output = cli(root, args);
     assert!(output.status.code().is_some(), "{}", stderr(&output));
