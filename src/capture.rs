@@ -196,7 +196,7 @@ impl Run {
     }
 
     /// One line per stream whose archive stopped at the cap, such as
-    /// `[stdout archive truncated at 256.0 MB of 1.2 GB]`.
+    /// `[stdout archive truncated at 256.0 MB of 1228.8 MB]`.
     fn truncation(&self) -> String {
         truncation(&self.stream_bytes, &self.produced_bytes)
     }
@@ -562,9 +562,10 @@ impl<T: Read> Source for T {}
 
 /// Copy a stream's pipe into its archive file until the pipe closes, storing at
 /// most `cap` bytes and counting the rest. Each chunk is written at once, so a
-/// killed Justless leaves what it read on disk. Once `exited` is set and the pipe
-/// is empty, every byte the command wrote has been read; a pipe that a background
-/// process still holds is then returned instead of waited on.
+/// killed Justless leaves what it read on disk. Once `exited` is set, only the
+/// bytes already waiting in the pipe are still the command's. After them, a pipe
+/// that a background process still holds is returned instead of waited on, even
+/// when that process keeps writing.
 fn pump<R: Source>(
     mut pipe: R,
     mut file: File,
@@ -575,9 +576,23 @@ fn pump<R: Source>(
     let mut captured = Captured::default();
     let mut buffer = vec![0; 64 * 1024];
     let mut failed = false;
+    // The command's bytes still in the pipe, counted when its exit is first seen.
+    let mut left = None;
     loop {
         let done = exited.load(Ordering::SeqCst);
-        match readable(&pipe, if done { 0 } else { 50 }) {
+        if done && left.is_none() {
+            left = pending(&pipe);
+        }
+        let ready = match left {
+            // Readable with nothing waiting means every writer closed the pipe.
+            Some(0) => match pending(&pipe) {
+                Some(0) => readable(&pipe, 0),
+                _ => Ok(false),
+            },
+            Some(_) => Ok(true),
+            None => readable(&pipe, if done { 0 } else { 50 }),
+        };
+        match ready {
             Ok(true) => {}
             Ok(false) if done => {
                 return Pumped {
@@ -589,12 +604,18 @@ fn pump<R: Source>(
             Ok(false) => continue,
             Err(_) => break,
         }
-        let read = match pipe.read(&mut buffer) {
+        let limit = left.map_or(buffer.len(), |left| {
+            usize::try_from(left).map_or(buffer.len(), |left| left.clamp(1, buffer.len()))
+        });
+        let read = match pipe.read(&mut buffer[..limit]) {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
+        if let Some(left) = &mut left {
+            *left = left.saturating_sub(read as u64);
+        }
         captured.produced += read as u64;
         let room = usize::try_from(cap.saturating_sub(captured.archived)).unwrap_or(usize::MAX);
         let mut chunk = &buffer[..read.min(room)];
@@ -648,6 +669,20 @@ fn readable(pipe: &impl std::os::fd::AsRawFd, milliseconds: libc::c_int) -> io::
 #[cfg(not(unix))]
 fn readable<T>(_: &T, _: i32) -> io::Result<bool> {
     Ok(true)
+}
+
+/// The bytes waiting in the pipe.
+#[cfg(unix)]
+fn pending(pipe: &impl std::os::fd::AsRawFd) -> Option<u64> {
+    let mut count: libc::c_int = 0;
+    // SAFETY: FIONREAD stores the byte count in the initialized integer.
+    let result = unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut count) };
+    (result == 0).then(|| u64::try_from(count).unwrap_or(0))
+}
+
+#[cfg(not(unix))]
+fn pending<T>(_: &T) -> Option<u64> {
+    None
 }
 
 /// Start `justless drain` with the pipe as its input and the archive file as its

@@ -9398,3 +9398,53 @@ fn a_killed_hook_run_stays_listed_and_replayable() {
         fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap();
     assert!(record.contains("\"hook\":true"), "{record}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_background_process_that_keeps_writing_does_not_hold_the_run() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "for i in 1 2 3 4; do yes & echo $! >> writers; done; sleep 0.2; echo started",
+        ])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let returned = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if start.elapsed().as_secs() >= 10 {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // Stop the writers either way, so the drainer sees the pipe close. Several of
+    // them keep the pipe from ever running empty.
+    let writers = fs::read_to_string(root.join("writers")).unwrap();
+    let _ = Command::new("kill")
+        .args(writers.split_whitespace())
+        .status();
+    let output = child.wait_with_output().unwrap();
+    assert!(returned, "Justless waited for the background writers");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("[stdout archive truncated at 64.0 KB of "),
+        "{}",
+        stderr(&output)
+    );
+    let stream = root
+        .join(".justless/runs")
+        .join(footer_id(&output))
+        .join("stdout");
+    assert!(fs::metadata(stream).unwrap().len() <= 65536);
+}
