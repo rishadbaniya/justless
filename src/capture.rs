@@ -358,6 +358,11 @@ fn spawn_failure(program: &OsStr, error: &io::Error) -> i32 {
     }
 }
 
+/// The file in a run directory that the Justless process recording the run keeps
+/// locked until it exits. A run with an unfinished record and a free lock belongs
+/// to a Justless process that was killed.
+pub const ACTIVE_LOCK: &str = "active.lock";
+
 /// A run directory and its streams. The command writes into pipes that Justless
 /// copies to the archive, so Justless decides how much of each stream is stored.
 /// Justless writes and reads through handles opened before the command starts, so
@@ -371,6 +376,8 @@ struct Archive {
     /// A background process still held a stream open when the command exited, and
     /// a drainer keeps adding its output to the archive.
     late: bool,
+    /// The locked `ACTIVE_LOCK`, held until Justless exits.
+    active: Option<File>,
 }
 
 /// What the command wrote to one stream.
@@ -393,6 +400,9 @@ impl Archive {
             .tempdir_in(&runs)
             .with_context(|| format!("create a run in {}", runs.display()))?;
         let directory = temporary.path().to_path_buf();
+        // Lock before the first record exists, so `prune` never sees a record of a
+        // live run without its lock held.
+        let active = lock_active(&directory.join(ACTIVE_LOCK));
         let mut writers = Vec::new();
         let mut readers = Vec::new();
         for stream in Stream::BOTH {
@@ -415,7 +425,16 @@ impl Archive {
             readers,
             captured: vec![Captured::default(); 2],
             late: false,
+            active,
         })
+    }
+
+    /// The final record is saved, so the run no longer needs its lock file. The
+    /// lock itself is held until Justless exits.
+    fn finish(&self) {
+        if self.active.is_some() {
+            let _ = fs::remove_file(self.directory.join(ACTIVE_LOCK));
+        }
     }
 
     /// Run the command into the archive, storing at most `cap` bytes of each stream.
@@ -739,6 +758,31 @@ pub fn drain(room: u64) -> Result<i32> {
     }
     output.flush()?;
     Ok(0)
+}
+
+/// Create and lock a run's `ACTIVE_LOCK`. The handle is not inherited by the
+/// command, so the lock ends with Justless. Where locks are unavailable, the file is
+/// removed and `prune` judges the run by its age instead.
+fn lock_active(path: &Path) -> Option<File> {
+    let file = File::create(path).ok()?;
+    if file.lock().is_ok() {
+        return Some(file);
+    }
+    drop(file);
+    let _ = fs::remove_file(path);
+    None
+}
+
+/// Whether a run whose record is unfinished or missing is still being recorded.
+/// `None` means the run has no lock file, from a Justless that could not lock it
+/// or that did not create one, or because its directory was created a moment ago.
+pub fn recording(directory: &Path) -> Option<bool> {
+    let file = File::open(directory.join(ACTIVE_LOCK)).ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(false),
+        Err(fs::TryLockError::WouldBlock) => Some(true),
+        Err(fs::TryLockError::Error(_)) => None,
+    }
 }
 
 fn id_of(directory: &Path) -> String {
@@ -1098,6 +1142,7 @@ impl Capture<'_> {
         run.footer_bytes = footer.len();
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
+        archive.finish();
         if let Some(prior) = previous.as_ref().filter(|_| run.unchanged && !archive.late) {
             archive.share(&workspace.state.join("runs").join(&prior.id), prior, &run);
         }

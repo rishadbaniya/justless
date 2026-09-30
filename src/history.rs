@@ -722,8 +722,39 @@ fn current(workspace: &Workspace, file: &str, old: &str) -> bool {
         .is_some_and(|b| capture::source_digest(&b) == old)
 }
 
-/// How long a run without a final record counts as still in progress.
-const IN_FLIGHT_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a run directory without a record or a lock can still be starting.
+/// Justless locks a new run before it writes the run's first record.
+const STARTING_MS: u64 = 60 * 1000;
+/// How long an unfinished run without a lock file, recorded where locks are
+/// unavailable or by an earlier Justless, counts as still in progress.
+const UNLOCKED_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether another Justless process is still recording this run. That process
+/// holds the run's lock for as long as it lives, so a free lock means it was killed
+/// and the run is pruned like any other. A finished run has no lock file.
+fn in_flight(directory: &std::path::Path, age_ms: u64) -> bool {
+    #[derive(Deserialize)]
+    struct State {
+        #[serde(default)]
+        unfinished: bool,
+    }
+    let record = directory.join("record.json");
+    match capture::recording(directory) {
+        // The first record is written once the lock is held, so a free lock without
+        // a record can belong to a run that is just starting.
+        Some(recording) => recording || age_ms < STARTING_MS && !record.exists(),
+        // Only a recent run can still be in progress, so older records stay unread.
+        None => {
+            age_ms < UNLOCKED_MS
+                && match fs::read(&record) {
+                    Ok(bytes) => {
+                        serde_json::from_slice::<State>(&bytes).is_ok_and(|state| state.unfinished)
+                    }
+                    Err(_) => age_ms < STARTING_MS,
+                }
+        }
+    }
+}
 
 struct Stored {
     id: String,
@@ -733,8 +764,9 @@ struct Stored {
 }
 
 /// Delete the oldest runs beyond `max_runs` or `max_bytes`. The current run and runs
-/// still in progress are always kept, and runs that a rerun compares against go
-/// last. The caller holds the capture lock. Returns the number of deleted runs.
+/// that another live Justless process is still recording are always kept, and runs
+/// that a rerun compares against go last. The caller holds the capture lock.
+/// Returns the number of deleted runs.
 pub fn prune(workspace: &Workspace, current: &str, max_runs: usize, max_bytes: u64) -> usize {
     let runs = workspace.state.join("runs");
     let Ok(entries) = fs::read_dir(&runs) else {
@@ -765,20 +797,7 @@ pub fn prune(workspace: &Workspace, current: &str, max_runs: usize, max_bytes: u
             .or_else(|_| fs::metadata(&directory))
             .and_then(|meta| meta.modified())
             .map_or(now, millis);
-        #[derive(Deserialize)]
-        struct State {
-            #[serde(default)]
-            unfinished: bool,
-        }
-        // Only a recent run can still be in progress, so older records stay unread.
-        let in_flight = id != current
-            && now.saturating_sub(modified) < IN_FLIGHT_MS
-            && fs::read(directory.join("record.json"))
-                .ok()
-                .is_none_or(|bytes| {
-                    serde_json::from_slice::<State>(&bytes).is_ok_and(|state| state.unfinished)
-                });
-        if in_flight {
+        if id != current && in_flight(&directory, now.saturating_sub(modified)) {
             continue;
         }
         let files = fs::read_dir(&directory)

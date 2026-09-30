@@ -9448,3 +9448,46 @@ fn a_background_process_that_keeps_writing_does_not_hold_the_run() {
         .join("stdout");
     assert!(fs::metadata(stream).unwrap().len() <= 65536);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_run_whose_justless_was_killed_is_pruned_like_any_other() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_runs = 1\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo $$ > pid; echo partial; exec sleep 30",
+        ])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("partial output", || {
+        root.join("pid").exists()
+            && run_streams(root)
+                .iter()
+                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
+    });
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let sleeper = fs::read_to_string(root.join("pid")).unwrap();
+    let sleeper = sleeper.trim();
+    // The command outlives the killed Justless, but it does not keep the run in
+    // progress, so the next run prunes it to stay within `max_runs`.
+    let next = cli(root, &["run", "--", "echo", "next"]);
+    let alive = Command::new("kill")
+        .args(["-0", sleeper])
+        .status()
+        .unwrap()
+        .success();
+    let _ = Command::new("kill").args(["-KILL", sleeper]).status();
+    assert!(alive, "the orphaned command stopped before the next run");
+    assert!(next.status.success(), "{}", stderr(&next));
+    assert_eq!(stored_runs(root), vec![run_id(&next)]);
+}
