@@ -9491,3 +9491,25 @@ fn a_run_whose_justless_was_killed_is_pruned_like_any_other() {
     assert!(next.status.success(), "{}", stderr(&next));
     assert_eq!(stored_runs(root), vec![run_id(&next)]);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_verbatim_hook_run_ignores_output_written_after_the_command_exited() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // Each command differs, so no run is reported as unchanged.
+    for (i, delay) in ["0.01", "0.02", "0.03", "0.05", "0.08"]
+        .iter()
+        .cycle()
+        .take(15)
+        .enumerate()
+    {
+        let script = format!("(sleep {delay}; echo late) & echo started-{i}");
+        let output = cli(root, &["run", "--hook", "--", "sh", "-c", &script]);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        // A write that lands before Justless sees the exit belongs to the command.
+        assert!(stdout(&output).starts_with(&format!("started-{i}\n")));
+        // The agent received every byte the command wrote before it exited.
+        assert_eq!(stderr(&output), "", "after a {delay} s delay");
+    }
+}

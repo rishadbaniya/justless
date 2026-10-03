@@ -1138,7 +1138,7 @@ impl Capture<'_> {
             previews[0].1 = fit(summary, max_bytes).into_bytes();
         }
         run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();
-        let footer = footer(&run, &previews, &directory, hook, selection)?;
+        let footer = footer(&run, &previews, &archive.readers, hook, selection)?;
         run.footer_bytes = footer.len();
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
@@ -1164,7 +1164,7 @@ impl Capture<'_> {
 fn footer(
     run: &Run,
     previews: &[(Stream, Vec<u8>)],
-    directory: &Path,
+    readers: &[File],
     hook: bool,
     selection: &crate::filters::Selection,
 ) -> Result<String> {
@@ -1178,16 +1178,25 @@ fn footer(
             run.status, run.preview_bytes, run.raw_bytes
         ));
     }
-    // Compare the printed bytes with the archive itself: equal sizes alone can hide
-    // a replaced or regrouped stream.
+    // Compare the printed bytes with what the command wrote before it exited: equal
+    // sizes alone can hide a replaced or regrouped stream. A background process can
+    // keep adding to the archive, so only the bytes counted at exit are read.
     let mut verbatim = truncation.is_empty() && run.preview_bytes as u64 == run.raw_bytes;
     for (stream, preview) in previews {
         if !verbatim {
             break;
         }
-        let path = directory.join(stream.name());
-        verbatim =
-            fs::metadata(&path)?.len() == preview.len() as u64 && fs::read(&path)? == *preview;
+        let index = stream.index();
+        verbatim = run.stream_bytes.get(index) == Some(&(preview.len() as u64))
+            && match readers.get(index) {
+                Some(mut file) => {
+                    let mut stored = Vec::with_capacity(preview.len());
+                    file.seek(SeekFrom::Start(0))?;
+                    file.take(preview.len() as u64).read_to_end(&mut stored)?;
+                    stored == *preview
+                }
+                None => false,
+            };
     }
     // A search that matched nothing exits 1 with no output; that is an answer, not a failure.
     let empty_search = run.status == 1
