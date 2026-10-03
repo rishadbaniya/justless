@@ -300,14 +300,20 @@ pub fn execute(
                     eprintln!("justless: could not display {}: {error}", stream.name());
                 }
             }
+            // The footer goes to stderr, so a preview line still buffered on stdout
+            // must reach the caller first.
+            let _ = io::stdout().flush();
             if !footer.is_empty() {
                 eprint!("{footer}");
             }
         }
         Err(error) => {
             eprintln!("justless: could not save run, restoring full output: {error:#}");
-            archive.replay();
-            eprint!("{}", archive.truncation());
+            let last = archive.replay();
+            let truncation = archive.truncation();
+            if !truncation.is_empty() {
+                eprint!("{}{truncation}", separator(last));
+            }
         }
     }
     signals::reraise(exited);
@@ -547,19 +553,21 @@ impl Archive {
         }
     }
 
-    /// Print both complete streams from the open handles.
-    fn replay(&self) {
+    /// Print both complete streams from the open handles. Returns the last byte
+    /// printed.
+    fn replay(&self) -> Option<u8> {
+        let mut last = None;
         for (stream, mut file) in Stream::BOTH.into_iter().zip(&self.readers) {
-            let copied = file.seek(SeekFrom::Start(0)).and_then(|_| match stream {
-                Stream::Stdout => io::copy(&mut file, &mut io::stdout().lock()),
-                Stream::Stderr => io::copy(&mut file, &mut io::stderr().lock()),
-            });
-            if let Err(error) = copied
-                && error.kind() != io::ErrorKind::BrokenPipe
+            match file
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| copy_out(&mut file, stream))
             {
-                eprintln!("justless: could not replay {}: {error}", stream.name());
+                Ok(byte) => last = byte.or(last),
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                Err(error) => eprintln!("justless: could not replay {}: {error}", stream.name()),
             }
         }
+        last
     }
 }
 
@@ -1210,10 +1218,12 @@ fn footer(
     let empty_search = run.status == 1
         && run.raw_bytes == 0
         && selection.profile == Some(crate::filters::Profile::Search);
-    let separator = match previews.iter().rev().find(|(_, bytes)| !bytes.is_empty()) {
-        Some((_, bytes)) if !bytes.ends_with(b"\n") => "\n",
-        _ => "",
-    };
+    let separator = separator(
+        previews
+            .iter()
+            .rev()
+            .find_map(|(_, bytes)| bytes.last().copied()),
+    );
     let line = if verbatim && (run.status == 0 || empty_search) {
         String::new()
     } else if verbatim || run.unchanged {
@@ -2011,17 +2021,18 @@ pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Resu
         .unwrap_or_default();
     for &stream in streams {
         let path = directory.join(stream.name());
-        replay_file(&path, stream, from, to)?;
+        let last = replay_file(&path, stream, from, to)?;
+        let mut notes = String::new();
         if let (Some(&kept), Some(&total)) =
             (recorded.get(stream.index()), produced.get(stream.index()))
             && total > kept
         {
-            eprintln!(
-                "[justless: {} archive truncated at {} of {}; the rest was not stored]",
+            notes.push_str(&format!(
+                "[justless: {} archive truncated at {} of {}; the rest was not stored]\n",
                 stream.name(),
                 history::human_bytes(kept),
                 history::human_bytes(total)
-            );
+            ));
         }
         // A background process can keep writing after the command exits. Those
         // bytes stay in the archive, but no preview or record described them.
@@ -2031,38 +2042,78 @@ pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Resu
             && let Ok(meta) = fs::metadata(&path)
             && meta.len() > expected
         {
-            eprintln!(
-                "[justless: the last {} byte(s) of {} were written after the command exited]",
+            notes.push_str(&format!(
+                "[justless: the last {} byte(s) of {} were written after the command exited]\n",
                 meta.len() - expected,
                 stream.name()
-            );
+            ));
+        }
+        if !notes.is_empty() {
+            eprint!("{}{notes}", separator(last));
         }
     }
     Ok(())
 }
 
-fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<()> {
-    let file = File::open(path)?;
+/// Replay a stream file, or a range of its lines, and flush it. Returns the last
+/// byte printed.
+fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<Option<u8>> {
+    let mut file = File::open(path)?;
     if from == 1 && to == usize::MAX {
-        let mut file = file;
-        match stream {
-            Stream::Stdout => io::copy(&mut file, &mut io::stdout().lock())?,
-            Stream::Stderr => io::copy(&mut file, &mut io::stderr().lock())?,
-        };
-    } else {
-        let mut file = BufReader::new(file);
-        let mut line = Vec::new();
-        for number in 1..=to {
-            if file.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            if number >= from {
-                stream.print(&line)?;
-            }
-            line.clear();
-        }
+        return Ok(copy_out(&mut file, stream)?);
     }
-    Ok(())
+    let mut file = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut last = None;
+    for number in 1..=to {
+        if file.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if number >= from {
+            stream.print(&line)?;
+            last = line.last().copied().or(last);
+        }
+        line.clear();
+    }
+    if stream == Stream::Stdout {
+        io::stdout().flush()?;
+    }
+    Ok(last)
+}
+
+/// Copy a stream to Justless's own stdout or stderr and flush it, so a note that
+/// follows on stderr comes after it even when both go to one file. Returns the
+/// last byte copied.
+fn copy_out(reader: &mut impl Read, stream: Stream) -> io::Result<Option<u8>> {
+    fn copy(reader: &mut impl Read, mut output: impl Write) -> io::Result<Option<u8>> {
+        let mut buffer = vec![0; 64 * 1024];
+        let mut last = None;
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            output.write_all(&buffer[..read])?;
+            last = Some(buffer[read - 1]);
+        }
+        output.flush()?;
+        Ok(last)
+    }
+    match stream {
+        Stream::Stdout => copy(reader, io::stdout().lock()),
+        Stream::Stderr => copy(reader, io::stderr().lock()),
+    }
+}
+
+/// What starts a note on stderr after output that ended with `last`, so a line the
+/// archive cut short does not run into the note.
+fn separator(last: Option<u8>) -> &'static str {
+    match last {
+        Some(byte) if byte != b'\n' => "\n",
+        _ => "",
+    }
 }
 
 pub fn search(directory: &Path, streams: &[Stream], needle: &str, limit: usize) -> Result<()> {

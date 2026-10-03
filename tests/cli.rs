@@ -9540,3 +9540,67 @@ fn an_unchanged_rerun_never_links_a_stream_that_a_background_process_still_write
     assert_eq!(stdout(&log), "started\n");
     assert_eq!(stderr(&log), "");
 }
+
+/// Run Justless with stdout and stderr written to one file, as `2>&1` does.
+#[cfg(unix)]
+fn merged(root: &Path, args: &[&str]) -> String {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("merged");
+    let file = fs::File::create(&path).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(args)
+        .current_dir(root)
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
+        .status()
+        .unwrap();
+    fs::read_to_string(path).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn notes_on_stderr_follow_the_output_they_describe() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 1024\n").unwrap();
+    let script = "i=0; while [ $i -lt 300 ]; do echo \"entry $i\"; i=$((i + 1)); done";
+    let full: String = (0..300).map(|i| format!("entry {i}\n")).collect();
+    // The cap cuts the stream inside a line.
+    let kept = &full[..1024];
+    assert!(!kept.ends_with('\n'));
+    let id = footer_id(&cli(root, &["run", "--", "sh", "-c", script]));
+    let note =
+        "[justless: stdout archive truncated at 1.0 KB of 2.8 KB; the rest was not stored]\n";
+    assert_eq!(merged(root, &["log", &id]), format!("{kept}\n{note}"));
+
+    // The run footer comes after a preview that ends inside a line.
+    let output = merged(root, &["run", "--", "printf", "abc"]);
+    assert!(output.starts_with("abc\n[justless run-"), "{output:?}");
+    let output = merged(
+        root,
+        &["run", "--hook", "--", "sh", "-c", "printf abc; exit 3"],
+    );
+    assert!(output.starts_with("abc\n[justless run-"), "{output:?}");
+    assert!(output.ends_with(" · exit 3]\n"), "{output:?}");
+
+    // So does the truncation marker after the fallback replay of both streams.
+    let output = merged(
+        root,
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!("{script}; rm -rf .justless"),
+        ],
+    );
+    let replayed = output
+        .split_once("restoring full output: ")
+        .and_then(|(_, rest)| rest.split_once('\n'))
+        .map_or("", |(_, rest)| rest);
+    assert_eq!(
+        replayed,
+        format!("{kept}\n[stdout archive truncated at 1.0 KB of 2.8 KB]\n"),
+        "{output:?}"
+    );
+}
