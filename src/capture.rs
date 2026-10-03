@@ -165,6 +165,10 @@ pub struct Run {
     /// Justless stopped before the command finished.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unfinished: bool,
+    /// A background process still held a stream when the command exited, and a
+    /// drainer can keep adding its output to the archive.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub drained: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -192,6 +196,7 @@ impl Run {
             stream_bytes: Vec::new(),
             produced_bytes: Vec::new(),
             unfinished: true,
+            drained: false,
         }
     }
 
@@ -521,9 +526,11 @@ impl Archive {
     }
 
     /// Store an unchanged run's streams once: link them to the identical streams of
-    /// the run it matched instead of keeping a second copy.
+    /// the run it matched instead of keeping a second copy. A stream that a drainer
+    /// can still extend is never linked, so neither run takes on the other's late
+    /// output.
     fn share(&self, prior: &Path, earlier: &Run, run: &Run) {
-        if earlier.stream_bytes != run.stream_bytes {
+        if earlier.drained || run.drained || earlier.stream_bytes != run.stream_bytes {
             return;
         }
         for (stream, &length) in Stream::BOTH.into_iter().zip(&run.stream_bytes) {
@@ -1004,6 +1011,7 @@ impl Capture<'_> {
             stream_bytes: lengths.clone(),
             produced_bytes: archive.produced(),
             unfinished: false,
+            drained: archive.late,
             label: history::label(words),
             ..Run::unfinished(archive.id(), &family, "", hook)
         };
@@ -1143,7 +1151,7 @@ impl Capture<'_> {
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
         archive.finish();
-        if let Some(prior) = previous.as_ref().filter(|_| run.unchanged && !archive.late) {
+        if let Some(prior) = previous.as_ref().filter(|_| run.unchanged) {
             archive.share(&workspace.state.join("runs").join(&prior.id), prior, &run);
         }
         if guard.is_some() {

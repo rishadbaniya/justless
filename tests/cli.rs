@@ -9513,3 +9513,30 @@ fn a_verbatim_hook_run_ignores_output_written_after_the_command_exited() {
         assert_eq!(stderr(&output), "", "after a {delay} s delay");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn an_unchanged_rerun_never_links_a_stream_that_a_background_process_still_writes() {
+    use std::os::unix::fs::MetadataExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let script = "if [ ! -f first ]; then touch first; \
+        (sleep 1; echo late-from-first-run) & fi; echo started";
+    let args = ["run", "--", "sh", "-c", script];
+    let first = run_id(&cli(root, &args));
+    let again = cli(root, &args);
+    assert_eq!(stdout(&again), "started\n");
+    let second = run_id(&again);
+    let runs = root.join(".justless/runs");
+    let record = fs::read_to_string(runs.join(&second).join("record.json")).unwrap();
+    assert!(record.contains("\"unchanged\":true"), "{record}");
+    wait_until("the first run's late output", || {
+        fs::read_to_string(runs.join(&first).join("stdout"))
+            .is_ok_and(|text| text.contains("late-from-first-run"))
+    });
+    let inode = |id: &str| fs::metadata(runs.join(id).join("stdout")).unwrap().ino();
+    assert_ne!(inode(&first), inode(&second));
+    let log = cli(root, &["log", &second]);
+    assert_eq!(stdout(&log), "started\n");
+    assert_eq!(stderr(&log), "");
+}
