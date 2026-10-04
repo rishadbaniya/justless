@@ -581,7 +581,7 @@ How written rules are kept or removed:
 - The block holds at most 8 rules (`--limit`) and 1,200 bytes. Claude Code removes HTML comments such as the block markers before the file reaches the model.
 - Machine rules describe the computer that ran `learn`. Review them before committing a shared instructions file.
 
-Runs recorded before this version carry no command line and are skipped.
+The run archive keeps each command line in `.justless/runs/*/record.json` so `learn` can pair runs. A command line that looks like it carries a credential, an address or a URL, or runs a network tool, is not stored; `learn` counts such runs as dropped for a possible credential. Runs recorded before this version carry no command line and are skipped.
 
 ```sh
 justless learn

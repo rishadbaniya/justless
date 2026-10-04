@@ -23,6 +23,14 @@ use patterns::{Candidate, Check, Env, Scope};
 
 const DAY_MS: u64 = 86_400_000;
 
+/// Whether the run archive should leave out a command line because it may carry a
+/// credential or an address, or runs a network tool. `learn` drops such commands
+/// anyway, so withholding them loses no evidence.
+pub(crate) fn withhold_command(argv: &[String]) -> bool {
+    let raw = shlex::try_join(argv.iter().map(String::as_str)).unwrap_or_else(|_| argv.join(" "));
+    privacy::carries_credential(&raw, &[])
+}
+
 pub fn command() -> Command<'static> {
     Command::new("learn")
         .about("Propose project rules from command mistakes agents corrected or keep repeating")
@@ -186,7 +194,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     }
     let mut skipped = BTreeMap::from([
         ("typos", analysis.typos),
-        ("credentials", analysis.credentials),
+        ("credentials", analysis.credentials + run_stats.withheld),
         ("contradicted", count(&rules, Reason::Contradicted)),
         ("stale", count(&rules, Reason::Stale)),
         ("nested_checkout", analysis.nested_checkout),

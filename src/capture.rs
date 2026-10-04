@@ -152,9 +152,12 @@ pub struct Run {
     #[serde(default)]
     pub hook: bool,
     /// The command line, its directory relative to the root (empty at the root) and
-    /// the session, so `learn` can pair a failure with its correction.
+    /// the session, so `learn` can pair a failure with its correction. A command line
+    /// that may carry a credential is left empty and marked withheld.
     #[serde(default)]
     pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub argv_withheld: bool,
     #[serde(default)]
     pub cwd: String,
     #[serde(default)]
@@ -200,6 +203,7 @@ impl Run {
             footer_bytes: 0,
             hook,
             argv: Vec::new(),
+            argv_withheld: false,
             cwd: String::new(),
             session: String::new(),
             diagnostics: Vec::new(),
@@ -1024,6 +1028,11 @@ impl Capture<'_> {
         } = *self;
         let directory = archive.directory.clone();
         let lengths = archive.lengths();
+        let argv: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let argv_withheld = crate::learn::withhold_command(&argv);
         let mut run = Run {
             status,
             raw_bytes: lengths.iter().sum(),
@@ -1032,10 +1041,8 @@ impl Capture<'_> {
             unfinished: false,
             drained: archive.late,
             label: history::label(words),
-            argv: args
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect(),
+            argv: if argv_withheld { Vec::new() } else { argv },
+            argv_withheld,
             cwd: workspace
                 .cwd
                 .strip_prefix(&workspace.root)

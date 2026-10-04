@@ -1678,6 +1678,49 @@ fn learn_without_sources() {
     }
 }
 
+#[test]
+fn learn_archive_withholds_credentials() {
+    let lab = Lab::new();
+    lab.tool("tool", "exit 1");
+    let records = |output: &Output| -> Value {
+        let id = run_id(output);
+        serde_json::from_str(&lab.read(&format!(".justless/runs/{id}/record.json"))).unwrap()
+    };
+    for args in [
+        &[
+            "tool",
+            "-c",
+            "http.extraHeader=Authorization: Bearer abc",
+            "--version",
+        ][..],
+        &["tool", "publish", "--token", "abc"],
+        &["tool", "clone", "https://user:secret@example.invalid/x"],
+    ] {
+        let mut all = vec!["--"];
+        all.extend(args);
+        let record = records(&lab.run("", &all));
+        assert_eq!(
+            (&record["argv"], &record["argv_withheld"]),
+            (&json!([]), &json!(true)),
+            "{args:?}"
+        );
+        assert!(!record.to_string().contains("abc") && !record.to_string().contains("secret"));
+    }
+    let record = records(&lab.run("", &["--", "tool", "build"]));
+    assert_eq!(record["argv"], json!(["tool", "build"]));
+    assert!(record.get("argv_withheld").is_none(), "{record:#}");
+
+    let report = lab.json(&[]);
+    assert_eq!(report["skipped"]["credentials"], 3, "{report:#}");
+    assert_eq!(report["sources"]["runs"]["without_command"], 0);
+    assert!(
+        lab.text(&[])
+            .contains("3 dropped for a possible credential"),
+        "{}",
+        lab.text(&[])
+    );
+}
+
 /// `cargo test` output when a test fails, captured from a scratch crate (exit 101).
 const CARGO_FAILED: &str = "running 1 test\ntest tests::it_works ... FAILED\n\nfailures:\n\n---- tests::it_works stdout ----\n\nthread 'tests::it_works' (3914681) panicked at src/lib.rs:5:9:\nassertion `left == right` failed\n  left: 2\n right: 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    tests::it_works\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Compiling scratch v0.1.0 (/x/scratch)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/scratch-87369008df97ec58)\nerror: test failed, to rerun pass `--lib`";
 

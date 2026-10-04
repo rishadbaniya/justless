@@ -196,6 +196,8 @@ pub struct RunStats {
     pub linked: u64,
     pub covered_by_transcripts: u64,
     pub capped: bool,
+    /// Runs whose command line the archive withheld for a possible credential.
+    pub withheld: u64,
 }
 
 pub struct Transcripts {
@@ -463,6 +465,10 @@ pub fn runs(
             break;
         }
         stats.scanned += 1;
+        if run.argv_withheld {
+            stats.withheld += 1;
+            continue;
+        }
         if run.argv.is_empty() {
             stats.without_command += 1;
             continue;
