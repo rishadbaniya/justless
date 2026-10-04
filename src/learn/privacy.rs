@@ -35,6 +35,20 @@ static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .expect("address patterns")
 });
+/// npm dist-tags, as in `left-pad@latest`, which name a release rather than a host.
+const DIST_TAGS: &[&str] = &[
+    "latest", "next", "beta", "alpha", "canary", "rc", "stable", "lts", "nightly",
+];
+
+fn address(text: &str) -> bool {
+    ADDRESS.find_iter(text).any(|found| {
+        let Some((_, host)) = found.as_str().split_once('@') else {
+            return true;
+        };
+        !DIST_TAGS.contains(&host) || text[found.end()..].starts_with('.')
+    })
+}
+
 static SCOPE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^@[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$").expect("npm scope pattern")
 });
@@ -111,7 +125,7 @@ pub fn carries_credential(raw: &str, env: &[String]) -> bool {
 }
 
 fn screen(raw: &str, env: &[String], root: Option<&Path>) -> bool {
-    if TOKENS.is_match(raw) || raw.contains("://") || ADDRESS.is_match(raw) {
+    if TOKENS.is_match(raw) || raw.contains("://") || address(raw) {
         return true;
     }
     let lower = raw.to_ascii_lowercase();
@@ -121,6 +135,13 @@ fn screen(raw: &str, env: &[String], root: Option<&Path>) -> bool {
     let words =
         shlex::split(raw).unwrap_or_else(|| raw.split_whitespace().map(str::to_owned).collect());
     if env.iter().chain(&words).any(|word| secret_assignment(word)) {
+        return true;
+    }
+    // A script passed as one word, as in `sh -c '...'`, is screened like a command.
+    // Each level is shorter than the last, so this ends.
+    if words.iter().any(|word| {
+        word.len() < raw.len() && word.contains(char::is_whitespace) && screen(word, &[], root)
+    }) {
         return true;
     }
     let root = root.map(Path::to_string_lossy);
@@ -281,6 +302,10 @@ mod tests {
             "git -c http.extraHeader=X-Thing:abc --version",
             "git -c 'http.extraHeader=Authorization: Bearer abc' fetch",
             "cargo publish --token abc",
+            "mail me@latest.example",
+            "sh -c 'true && API_TOKEN=x make'",
+            "bash -c \"sh -c 'make --password hunter2'\"",
+            "sh -c 'cat /home/someone/x'",
         ] {
             assert!(unsafe_command(raw, &[], root), "{raw}");
         }
@@ -290,6 +315,8 @@ mod tests {
             "cd /work/repo/server && make",
             "git log --oneline -n 5 2>/dev/null",
             "npm install left-pad@1.3.0",
+            "npm install left-pad@latest @types/node@next",
+            "sh -c 'cd server && make test'",
             "git rev-parse 3f9a1c2e7b40d3c1a8e9f0b2c4d6e8f0a1b3c5d7",
         ] {
             assert!(!unsafe_command(raw, &[], root), "{raw}");

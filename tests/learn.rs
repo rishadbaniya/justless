@@ -2026,6 +2026,10 @@ fn learn_archive_withholds_credentials() {
         ][..],
         &["tool", "publish", "--token", "quux-value"],
         &["tool", "clone", "https://user:quux-value@example.invalid/x"],
+        // A shell script is screened word by word, like a typed command.
+        &["/bin/sh", "-c", "true && API_TOKEN=quux-value tool"],
+        &["/bin/sh", "-c", "tool publish --token quux-value"],
+        &["/bin/sh", "-c", "true && ssh host make quux-value"],
     ] {
         let mut all = vec!["--"];
         all.extend(args);
@@ -2037,16 +2041,24 @@ fn learn_archive_withholds_credentials() {
         );
         assert!(!record.to_string().contains("quux-value"), "{record:#}");
     }
-    let record = records(&lab.run("", &["--", "tool", "build"]));
-    assert_eq!(record["argv"], json!(["tool", "build"]));
-    assert!(record.get("argv_withheld").is_none(), "{record:#}");
+    for args in [
+        &["tool", "build"][..],
+        &["tool", "install", "left-pad@latest"],
+        &["/bin/sh", "-c", "tool build && tool test"],
+    ] {
+        let mut all = vec!["--"];
+        all.extend(args);
+        let record = records(&lab.run("", &all));
+        assert_eq!(record["argv"], json!(args), "{record:#}");
+        assert!(record.get("argv_withheld").is_none(), "{record:#}");
+    }
 
     let report = lab.json(&[]);
-    assert_eq!(report["skipped"]["credentials"], 3, "{report:#}");
+    assert_eq!(report["skipped"]["credentials"], 6, "{report:#}");
     assert_eq!(report["sources"]["runs"]["without_command"], 0);
     assert!(
         lab.text(&[])
-            .contains("3 dropped for a possible credential"),
+            .contains("6 dropped for a possible credential"),
         "{}",
         lab.text(&[])
     );
