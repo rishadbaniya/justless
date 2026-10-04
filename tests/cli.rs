@@ -8299,6 +8299,35 @@ fn deleting_the_state_directory_during_a_run_keeps_output_and_status() {
 }
 
 #[cfg(unix)]
+#[test]
+fn deleting_the_state_directory_during_a_hook_run_keeps_output_and_status() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let output = cli(
+        root,
+        &[
+            "run",
+            "--hook",
+            "--",
+            "sh",
+            "-c",
+            "echo before; rm -rf .justless; echo after; echo oops >&2; exit 3",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "before\nafter\n");
+    let stderr = stderr(&output);
+    assert!(stderr.ends_with("oops\n"), "{stderr}");
+    // The run was shown in full before the record failed, and the error names the
+    // record that could not be saved.
+    assert!(
+        stderr.contains("restoring full output: save run record: ")
+            && stderr.contains(".justless/runs/run-"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
 fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     let start = std::time::Instant::now();
     while !ready() {
