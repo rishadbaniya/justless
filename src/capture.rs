@@ -148,7 +148,7 @@ pub struct Run {
     /// the agent received.
     #[serde(default)]
     pub footer_bytes: usize,
-    /// The run was routed by an agent hook rather than typed by a person.
+    /// The run printed the agent footer: it was routed by a hook or started by `exec`.
     #[serde(default)]
     pub hook: bool,
     /// The command line, its directory relative to the root (empty at the root) and
@@ -241,6 +241,27 @@ pub fn source_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// How a capture is labelled, started and previewed. `execute` passes `run`'s flags.
+pub struct Shape<'a> {
+    pub max_bytes: usize,
+    pub raw: bool,
+    pub session: &'a str,
+    pub fresh: bool,
+    /// Print the agent footer, which is empty when every byte was shown and the command succeeded.
+    pub hook: bool,
+    /// Label for stats, history and resume, such as `exec python3`.
+    pub family: Option<String>,
+    /// Rank a stdout preview that exceeds the budget against this text.
+    pub intent: Option<&'a str>,
+    /// Starts the process, given the run directory and the write ends of its stdout
+    /// and stderr pipes, and returns its exit status once every process it started
+    /// has stopped. Justless copies the pipes into the archive within
+    /// `max_run_bytes`, as for any captured run.
+    pub spawn: Option<Spawn<'a>>,
+}
+
+pub type Spawn<'a> = Box<dyn FnOnce(&Path, Stdio, Stdio) -> Result<i32> + 'a>;
+
 pub fn execute(
     workspace: &Workspace,
     args: &[OsString],
@@ -250,6 +271,33 @@ pub fn execute(
     fresh: bool,
     hook: bool,
 ) -> Result<i32> {
+    execute_shaped(
+        workspace,
+        args,
+        Shape {
+            max_bytes,
+            raw,
+            session,
+            fresh,
+            hook,
+            family: None,
+            intent: None,
+            spawn: None,
+        },
+    )
+}
+
+pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>) -> Result<i32> {
+    let Shape {
+        max_bytes,
+        raw,
+        session,
+        fresh,
+        hook,
+        family,
+        intent,
+        spawn,
+    } = shape;
     let mut command = Command::new(&args[0]);
     command.current_dir(&workspace.cwd);
     if raw {
@@ -266,7 +314,7 @@ pub fn execute(
         command.arg(exclude);
     }
     command.args(&args[1..]);
-    let family = match selection.profile {
+    let family = family.unwrap_or_else(|| match selection.profile {
         Some(
             crate::filters::Profile::Lint
             | crate::filters::Profile::Search
@@ -274,24 +322,31 @@ pub fn execute(
         ) => crate::filters::tool_label(args),
         Some(profile) => profile.label().to_owned(),
         None => crate::summary::family(args),
-    };
+    });
     // A read-only checkout or sandbox must not stop the command itself.
     let mut archive = match Archive::create(workspace, &family, &history::label(&words), hook) {
         Ok(archive) => archive,
+        // A process that `spawn` starts needs its run directory.
+        Err(error) if spawn.is_some() => return Err(error.context("cannot record this run")),
         Err(error) => {
             eprintln!("justless: cannot record this run ({error:#}); running it without capture");
             return Ok(uncaptured(&mut command, &args[0]));
         }
     };
-    let exited = match archive.run(&mut command, settings.max_run_bytes) {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(error)) => {
-            eprintln!("justless: wait for {}: {error}", args[0].to_string_lossy());
-            None
+    let (status, exited) = match spawn {
+        Some(spawn) => (archive.run_with(spawn, settings.max_run_bytes)?, None),
+        None => {
+            let exited = match archive.run(&mut command, settings.max_run_bytes) {
+                Ok(Ok(status)) => Some(status),
+                Ok(Err(error)) => {
+                    eprintln!("justless: wait for {}: {error}", args[0].to_string_lossy());
+                    None
+                }
+                Err(error) => return Ok(spawn_failure(&args[0], &error)),
+            };
+            (exited.map_or(1, exit_code), exited)
         }
-        Err(error) => return Ok(spawn_failure(&args[0], &error)),
     };
-    let status = exited.map_or(1, exit_code);
 
     // The command has run. From here on its output and exit status always reach the
     // caller, even when the archive cannot be read back or saved.
@@ -304,6 +359,7 @@ pub fn execute(
         session,
         fresh,
         hook,
+        intent,
         retention: (settings.max_runs, settings.max_archive_bytes),
     };
     match capture.record(&mut archive, family, status) {
@@ -506,6 +562,34 @@ impl Archive {
             self.collect(Stream::Stderr, pumped, cap);
         }
         Ok(status)
+    }
+
+    /// Run a process that `spawn` starts on the write ends of the stream pipes, storing
+    /// at most `cap` bytes of each stream. The pipes are read while `spawn` runs, and
+    /// once it returns they are read as `run` reads them after its command exits.
+    /// `spawn` handles signals and stops what it started.
+    fn run_with(&mut self, spawn: Spawn<'_>, cap: u64) -> Result<i32> {
+        let mut writers = std::mem::take(&mut self.writers).into_iter();
+        let (Some(stdout_file), Some(stderr_file)) = (writers.next(), writers.next()) else {
+            anyhow::bail!("the command already ran");
+        };
+        let (stdout_pipe, stdout_end) = io::pipe().context("create the stdout pipe")?;
+        let (stderr_pipe, stderr_end) = io::pipe().context("create the stderr pipe")?;
+        let exited = Arc::new(AtomicBool::new(false));
+        let stdout = {
+            let exited = Arc::clone(&exited);
+            std::thread::spawn(move || pump(stdout_pipe, stdout_file, cap, Stream::Stdout, &exited))
+        };
+        let stderr = {
+            let exited = Arc::clone(&exited);
+            std::thread::spawn(move || pump(stderr_pipe, stderr_file, cap, Stream::Stderr, &exited))
+        };
+        // `spawn` owns the write ends, so they are closed once it returns.
+        let status = spawn(&self.directory, stdout_end.into(), stderr_end.into());
+        exited.store(true, Ordering::SeqCst);
+        self.collect(Stream::Stdout, joined(stdout), cap);
+        self.collect(Stream::Stderr, joined(stderr), cap);
+        status
     }
 
     fn collect<R: Into<Stdio>>(&mut self, stream: Stream, pumped: Pumped<R>, cap: u64) {
@@ -1003,6 +1087,8 @@ struct Capture<'a> {
     session: &'a str,
     fresh: bool,
     hook: bool,
+    /// Rank a stdout preview that exceeds the budget against this text.
+    intent: Option<&'a str>,
     /// The most runs and archive bytes to keep.
     retention: (usize, u64),
 }
@@ -1024,6 +1110,7 @@ impl Capture<'_> {
             session,
             fresh,
             hook,
+            intent,
             retention,
         } = *self;
         let directory = archive.directory.clone();
@@ -1180,6 +1267,18 @@ impl Capture<'_> {
             || summary.len() < previews[0].1.len())
         {
             previews[0].1 = fit(summary, max_bytes).into_bytes();
+        }
+        if let Some(intent) = intent
+            && !run.unchanged
+            && stdout_bytes > max_bytes as u64
+        {
+            match crate::focus::preview(&directory.join("stdout"), intent, max_bytes, &run.id) {
+                Ok(focused) if focused.len() <= max_bytes => previews[0].1 = focused,
+                Ok(_) => {
+                    eprintln!("justless: could not rank stdout for --intent: preview over budget")
+                }
+                Err(error) => eprintln!("justless: could not rank stdout for --intent: {error:#}"),
+            }
         }
         run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();
         let footer = footer(&run, &previews, &archive.readers, hook, selection)?;
@@ -1910,7 +2009,10 @@ impl Locations {
         if kept >= KEPT_LOCATIONS || lines >= LINES_PER_LOCATION {
             return;
         }
+        // A script `exec` saved under the state directory never changes, and the
+        // index leaves that directory out, so a digest would always look stale.
         if !self.source_digests.contains_key(&location.file)
+            && !Path::new(&location.file).starts_with(".justless")
             && let Ok(source) = workspace
                 .source_path(&location.file)
                 .and_then(|p| fs::read(p).context("read diagnostic source"))
@@ -1979,7 +2081,7 @@ fn json_locations(
         .collect()
 }
 
-fn exit_code(status: ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;

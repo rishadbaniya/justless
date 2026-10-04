@@ -3,7 +3,9 @@ mod capture;
 mod context;
 mod discover;
 mod doctor;
+mod exec;
 mod filters;
+mod focus;
 mod history;
 mod impact;
 mod index;
@@ -298,6 +300,7 @@ fn cli() -> Command<'static> {
                         .help("Show this session's savings in Claude Code's status line"),
                 ),
         )
+        .subcommand(exec::command())
         .subcommand(map::command())
         .subcommand(statusline::command())
         .subcommand(impact::command())
@@ -388,6 +391,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
         ("mcp", sub) => mcp::run(&workspace, sub)?,
         ("doctor", sub) => return doctor::run(&workspace, sub, matches.is_present("root")),
+        ("exec", sub) => return exec::run(&workspace, sub),
         ("map", sub) => map::run(&workspace, sub)?,
         ("affected", sub) => impact::run(&workspace, sub)?,
         ("lookup", sub) => lookup::run(&workspace, sub)?,
