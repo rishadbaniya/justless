@@ -204,6 +204,17 @@ impl Lab {
         fs::read_to_string(self.root.join(file)).unwrap()
     }
 
+    /// Move every failing check's first failure two days back, as if a day had passed.
+    fn backdate(&self) {
+        let mut state: Value = serde_json::from_str(&self.read(STATE)).unwrap();
+        for rule in state["rules"].as_object_mut().unwrap().values_mut() {
+            if rule.get("stale_since_ms").is_some() {
+                rule["stale_since_ms"] = json!(now_ms() - 2 * DAY);
+            }
+        }
+        self.write(STATE, &state.to_string());
+    }
+
     /// Write a transcript, one call per minute starting `start_ms`.
     fn transcript(&self, file: &str, session: &str, start_ms: u64, calls: Vec<Call>) {
         let mut lines = Vec::new();
@@ -281,6 +292,7 @@ fn held<'a>(report: &'a Value, class: &str) -> Vec<&'a Value> {
 }
 
 const GLOB: &str = "(eval):1: no matches found: --include=*.rs";
+const STATE: &str = ".justless/learned.json";
 
 fn glob_calls() -> Vec<Call> {
     vec![call(
@@ -1424,8 +1436,17 @@ fn learn_apply_persists_dismisses_expires() {
     );
     fs::rename(&saved, lab.transcripts()).unwrap();
 
-    // A stale rule is removed; a user line in the block keeps its place.
+    // A machine rule whose check fails stays until the check still fails a day later;
+    // then it is removed, and a user line in the block keeps its place.
     lab.tool("gh", "exit 0");
+    let output = lab.text(&["--apply"]);
+    assert!(
+        output.contains("AGENTS.md is up to date (2 learned rule(s)).")
+            && output.contains("Kept 1 written rule(s) whose check fails here (gh is on PATH)"),
+        "{output}"
+    );
+    assert_eq!(lab.read("AGENTS.md"), applied);
+    lab.backdate();
     let output = lab.text(&["--apply"]);
     assert!(
         output.contains("(1 removed: its check no longer holds)"),
@@ -1459,7 +1480,73 @@ fn learn_apply_persists_dismisses_expires() {
     let mut lab = lab;
     lab.shell = "/bin/bash".into();
     lab.text(&["--apply"]);
+    assert_ne!(lab.read("AGENTS.md"), original);
+    lab.backdate();
+    lab.text(&["--apply"]);
     assert_eq!(lab.read("AGENTS.md"), original);
+}
+
+#[test]
+fn learn_apply_survives_environment_flips() {
+    let mut lab = Lab::new();
+    lab.write("AGENTS.md", "# Project\n");
+    lab.sessions("h", 3, gh_calls);
+    lab.sessions("g", 2, glob_calls);
+    lab.text(&["--apply"]);
+    let applied = lab.read("AGENTS.md");
+    assert!(
+        applied.contains(&format!("- {GH_RULE}\n- {GLOB_RULE}\n")),
+        "{applied}"
+    );
+
+    // A PATH entry or another shell for one run changes nothing in the file.
+    lab.tool("gh", "exit 0");
+    lab.text(&["--apply"]);
+    assert_eq!(lab.read("AGENTS.md"), applied);
+    assert!(lab.read(STATE).contains("stale_since_ms"));
+    fs::remove_file(lab.bin.join("gh")).unwrap();
+    lab.text(&["--apply"]);
+    assert_eq!(lab.read("AGENTS.md"), applied);
+    assert!(
+        !lab.read(STATE).contains("stale_since_ms"),
+        "{}",
+        lab.read(STATE)
+    );
+    lab.shell = "/bin/bash".into();
+    lab.text(&["--apply"]);
+    lab.shell = "/bin/zsh".into();
+    lab.text(&["--apply"]);
+    assert_eq!(lab.read("AGENTS.md"), applied);
+
+    // A rule removed after a day returns to its own line when its check holds again.
+    lab.tool("gh", "exit 0");
+    lab.text(&["--apply"]);
+    lab.backdate();
+    lab.text(&["--apply"]);
+    assert_eq!(
+        lab.read("AGENTS.md"),
+        applied.replace(&format!("- {GH_RULE}\n"), "")
+    );
+    fs::remove_file(lab.bin.join("gh")).unwrap();
+    let output = lab.text(&["--apply"]);
+    assert!(output.contains("(1 added)"), "{output}");
+    assert_eq!(lab.read("AGENTS.md"), applied);
+    lab.shell = "/bin/bash".into();
+    lab.text(&["--apply"]);
+    lab.backdate();
+    lab.text(&["--apply"]);
+    assert_eq!(
+        lab.read("AGENTS.md"),
+        applied.replace(&format!("- {GLOB_RULE}\n"), "")
+    );
+    lab.shell = "/bin/zsh".into();
+    lab.text(&["--apply"]);
+    assert_eq!(lab.read("AGENTS.md"), applied);
+    assert!(
+        !lab.read(STATE).contains("\"removed\""),
+        "{}",
+        lab.read(STATE)
+    );
 }
 
 #[test]
@@ -1480,7 +1567,224 @@ fn learn_apply_rejects_bad_markers() {
         assert!(stderr(&output).contains("AGENTS.md"), "{}", stderr(&output));
         assert_eq!(lab.read("AGENTS.md"), broken);
         assert_eq!(lab.read("GEMINI.md"), "# Gemini\n");
+        // A preview reports the file and still shows the rules.
+        let report = lab.json(&[]);
+        let notes = report["notes"].to_string();
+        assert!(
+            notes.contains("AGENTS.md") && notes.contains("`--apply` stops on it."),
+            "{report:#}"
+        );
+        rule(report["rules"].as_array().unwrap(), GLOB_RULE);
     }
+}
+
+#[test]
+fn learn_preview_fails_open() {
+    let lab = Lab::new();
+    lab.sessions("g", 2, glob_calls);
+    fs::write(lab.root.join("AGENTS.md"), b"# A\n\xff\xfe\n").unwrap();
+    for args in [&[][..], &["--target", "agents"]] {
+        let report = lab.json(args);
+        assert_eq!(
+            report["notes"],
+            json!([
+                "AGENTS.md is not UTF-8: invalid utf-8 sequence of 1 bytes from index 4; `--apply` stops on it."
+            ]),
+            "{report:#}"
+        );
+        rule(report["rules"].as_array().unwrap(), GLOB_RULE);
+        let mut apply = vec!["--apply"];
+        apply.extend(args);
+        let output = lab.learn(&apply);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&output).contains("AGENTS.md is not UTF-8"));
+    }
+    assert!(!lab.root.join("CLAUDE.md").exists());
+
+    let lab = Lab::new();
+    lab.sessions("g", 2, glob_calls);
+    lab.write(STATE, "{not json");
+    let report = lab.json(&[]);
+    assert!(
+        report["notes"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("decode .justless/learned.json"),
+        "{report:#}"
+    );
+    rule(report["rules"].as_array().unwrap(), GLOB_RULE);
+    let output = lab.learn(&["--apply"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(lab.read(STATE), "{not json");
+}
+
+#[test]
+fn learn_notes_only_with_rules() {
+    // Without rules, a CLAUDE.md above the root is not worth a note.
+    let lab = Lab::new();
+    lab.write("AGENTS.md", "# Agents\n");
+    fs::write(lab.base.join("CLAUDE.md"), "# Parent\n").unwrap();
+    assert_eq!(lab.json(&[])["notes"], json!([]));
+
+    // A preview names the files it would skip.
+    lab.sessions("g", 2, glob_calls);
+    lab.write("CLAUDE.md", "@AGENTS.md\n");
+    let text = lab.text(&[]);
+    assert!(
+        text.contains("Skipped CLAUDE.md: it imports AGENTS.md.\n")
+            && text.contains(
+                "Preview only. `justless learn --apply` writes these rules to AGENTS.md."
+            ),
+        "{text}"
+    );
+    lab.text(&["--apply"]);
+    assert!(
+        lab.text(&[])
+            .contains("Preview only. AGENTS.md already up to date."),
+        "{}",
+        lab.text(&[])
+    );
+}
+
+#[test]
+fn learn_apply_reports_a_full_block() {
+    let lab = Lab::new();
+    lab.write("AGENTS.md", "# Agents\n");
+    for index in 1..=8 {
+        lab.sessions(&format!("t{index}-"), 2, || {
+            vec![call(
+                &format!("tool{index} x"),
+                failure(127, format!("zsh:1: command not found: tool{index}")),
+            )]
+        });
+    }
+    let output = lab.text(&["--apply", "--target", "agents"]);
+    assert!(output.contains("(8 added)"), "{output}");
+    let written = lab.read("AGENTS.md");
+    lab.sessions("n", 3, || {
+        vec![call(
+            "newtool x",
+            failure(127, "zsh:1: command not found: newtool"),
+        )]
+    });
+    let newtool = "`newtool` is not installed on this machine.";
+    for args in [
+        &["--target", "agents"][..],
+        &["--apply", "--target", "agents"],
+    ] {
+        let text = lab.text(args);
+        assert!(
+            text.contains("\nNot written, the block is full:\n- `newtool` is not installed on this machine.\nDelete a rule's line between the markers to dismiss it and make room.\n")
+                && !text.contains(&format!(". {newtool}"))
+                && !text.contains("beyond --limit")
+                && text.contains("8 rule(s)"),
+            "{text}"
+        );
+        let report = lab.json(args);
+        let rules = report["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 8, "{report:#}");
+        assert!(rules.iter().all(|rule| rule["text"] != newtool));
+        assert_eq!(report["held"][0]["text"], newtool);
+        assert_eq!(report["held"][0]["reason"], "block_full");
+        assert_eq!(report["skipped"]["over_limit"], 0);
+    }
+    assert!(
+        lab.text(&["--apply"])
+            .contains("AGENTS.md unchanged: 8 learned rule(s); 1 rule(s) did not fit."),
+        "{}",
+        lab.text(&["--apply"])
+    );
+    assert_eq!(lab.read("AGENTS.md"), written);
+}
+
+/// A real Git repository in the lab, with `git` on the lab's PATH.
+fn git_lab() -> Lab {
+    let lab = Lab::new();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git on PATH");
+    lab.tool("git", &format!("exec '{}' \"$@\"", git.display()));
+    fs::remove_dir_all(lab.root.join(".git")).unwrap();
+    let init = Command::new(&git)
+        .args(["init", "-q"])
+        .current_dir(&lab.root)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    lab
+}
+
+fn make_calls() -> Vec<Call> {
+    vec![
+        call(
+            "make test",
+            Outcome::Fail(
+                2,
+                "make: *** No targets specified and no makefile found.  Stop.",
+            ),
+        ),
+        call("make -C server test", Outcome::Ok("ok")),
+    ]
+}
+
+#[test]
+fn learn_keeps_machine_rules_out_of_shared_files() {
+    let make_rule = "Run `make` from `server/`; the repository root has no Makefile.";
+    let lab = git_lab();
+    lab.write("server/Makefile", "test:\n");
+    lab.write("AGENTS.md", "# Agents\n");
+    lab.sessions("g", 2, glob_calls);
+    lab.sessions("m", 2, make_calls);
+    let report = lab.json(&[]);
+    let rules = report["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 1, "{report:#}");
+    assert_eq!(rules[0]["text"], make_rule);
+    assert_eq!(held(&report, "zsh_glob")[0]["reason"], "machine_scope");
+    let text = lab.text(&[]);
+    assert!(
+        text.contains(&format!(
+            "\nAbout this machine, kept out of files Git shares:\n- {GLOB_RULE}\n"
+        )) && text.contains("Rules about this machine stay out of AGENTS.md, which Git shares")
+            && text.contains("`--include-machine` writes them"),
+        "{text}"
+    );
+    lab.text(&["--apply"]);
+    let agents = lab.read("AGENTS.md");
+    assert!(
+        agents.contains(make_rule) && !agents.contains(GLOB_RULE),
+        "{agents}"
+    );
+
+    // --include-machine writes them, and a later plain run keeps them.
+    let output = lab.text(&["--apply", "--include-machine"]);
+    assert!(output.contains("(1 added)"), "{output}");
+    let agents = lab.read("AGENTS.md");
+    assert!(agents.contains(GLOB_RULE), "{agents}");
+    let output = lab.text(&["--apply"]);
+    assert!(
+        output.contains("is up to date (2 learned rule(s))"),
+        "{output}"
+    );
+    assert_eq!(lab.read("AGENTS.md"), agents);
+
+    // An ignored file is personal and takes machine rules.
+    let lab = git_lab();
+    lab.write("server/Makefile", "test:\n");
+    lab.write(".gitignore", "CLAUDE.md\n");
+    lab.write("AGENTS.md", "# Agents\n");
+    lab.write("CLAUDE.md", "# Claude\n");
+    lab.sessions("g", 2, glob_calls);
+    lab.sessions("m", 2, make_calls);
+    let report = lab.json(&["--apply"]);
+    assert_eq!(report["rules"].as_array().unwrap().len(), 2, "{report:#}");
+    assert_eq!(report["held"], json!([]), "{report:#}");
+    assert!(!lab.read("AGENTS.md").contains(GLOB_RULE));
+    let claude = lab.read("CLAUDE.md");
+    assert!(
+        claude.contains(GLOB_RULE) && claude.contains(make_rule),
+        "{claude}"
+    );
 }
 
 #[test]

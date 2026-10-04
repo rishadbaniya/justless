@@ -28,12 +28,18 @@ pub const FILES: [(&str, &str); 3] = [
     ("gemini", "GEMINI.md"),
 ];
 
+/// Removed rules remembered for their place, so a rule that comes back returns there.
+const TOMBSTONES: usize = 32;
+
 /// `.justless/learned.json`: rules this clone wrote and rules a person dismissed.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub version: u32,
     pub rules: BTreeMap<String, Applied>,
     pub dismissed: BTreeSet<String>,
+    /// Rules removed from a file, with the line they followed there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub removed: BTreeMap<String, Removed>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -46,6 +52,17 @@ pub struct Applied {
     pub failures: u64,
     pub last_seen_ms: u64,
     pub files: BTreeSet<String>,
+    /// When `--apply` first found a `PATH` or `$SHELL` check failing; cleared when it
+    /// holds again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_since_ms: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Removed {
+    pub at_ms: u64,
+    /// Per file, the block line the rule followed, or `None` at the top.
+    pub after: BTreeMap<String, Option<String>>,
 }
 
 fn state_path(workspace: &Workspace) -> PathBuf {
@@ -68,22 +85,47 @@ pub struct Proposal {
     pub id: String,
     pub text: String,
     pub applied: Applied,
+    /// Facts about this machine, which stay out of files Git shares by default.
+    pub machine: bool,
 }
 
 pub struct Targets {
     pub files: Vec<String>,
+    /// Files Git shares: tracked, or not ignored.
+    pub shared: BTreeSet<String>,
     pub skipped: Vec<(String, String)>,
     pub notes: Vec<String>,
+    /// A CLAUDE.md that keeps Claude Code from reading the only target, AGENTS.md.
+    pub shadow: Option<PathBuf>,
 }
 
 /// Choose the instructions files. Explicit names select exactly those files; without
 /// them, each existing regular AGENTS.md, CLAUDE.md and GEMINI.md that does not import
-/// another is chosen once.
-pub fn targets(root: &Path, explicit: &[String], transcripts: bool) -> Result<Targets> {
+/// another is chosen once. Unless `strict`, a file that cannot be read is left out
+/// with a note instead of stopping the run.
+pub fn targets(
+    workspace: &Workspace,
+    explicit: &[String],
+    transcripts: bool,
+    strict: bool,
+) -> Result<Targets> {
+    let root = workspace.root.as_path();
     let mut targets = Targets {
         files: Vec::new(),
+        shared: BTreeSet::new(),
         skipped: Vec::new(),
         notes: Vec::new(),
+        shadow: None,
+    };
+    let readable = |file: &str, notes: &mut Vec<String>| -> Result<Option<String>> {
+        match read(root, file) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if !strict => {
+                notes.push(format!("{error:#}; `--apply` stops on it."));
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     };
     if !explicit.is_empty() {
         for name in explicit {
@@ -99,7 +141,9 @@ pub fn targets(root: &Path, explicit: &[String], transcripts: bool) -> Result<Ta
                 }
                 Ok(metadata) => {
                     ensure!(metadata.is_file(), "{file} must be a regular file");
-                    read(root, file)?;
+                    if readable(file, &mut targets.notes)?.is_none() {
+                        continue;
+                    }
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     if *file == CLAUDE && fs::symlink_metadata(root.join(AGENTS)).is_ok() {
@@ -121,7 +165,11 @@ pub fn targets(root: &Path, explicit: &[String], transcripts: bool) -> Result<Ta
                         .skipped
                         .push((file.to_owned(), "symbolic link".into()));
                 }
-                Ok(metadata) if metadata.is_file() => present.push((file, read(root, file)?)),
+                Ok(metadata) if metadata.is_file() => {
+                    // An unreadable file is still present: it must not be recreated.
+                    let text = readable(file, &mut targets.notes)?;
+                    present.push((file, text));
+                }
                 Ok(_) => targets
                     .skipped
                     .push((file.to_owned(), "not a regular file".into())),
@@ -130,9 +178,16 @@ pub fn targets(root: &Path, explicit: &[String], transcripts: bool) -> Result<Ta
             }
         }
         for (file, text) in &present {
+            let Some(text) = text else {
+                continue;
+            };
             // An importer already shows the imported file's rules to its client.
             let imported = present.iter().find(|(other, other_text)| {
-                other != file && imports(text, other) && !imports(other_text, file)
+                other != file
+                    && imports(text, other)
+                    && !other_text
+                        .as_deref()
+                        .is_some_and(|other_text| imports(other_text, file))
             });
             match imported {
                 Some((other, _)) => targets
@@ -154,15 +209,29 @@ pub fn targets(root: &Path, explicit: &[String], transcripts: bool) -> Result<Ta
             }
         }
     }
-    if targets.files == [AGENTS]
-        && let Some(shadow) = shadow(root)
-    {
-        targets.notes.push(format!(
-            "Claude Code reads {} here, not AGENTS.md; add a CLAUDE.md with the line @AGENTS.md so it reads these rules.",
-            shadow.display()
-        ));
+    if targets.files == [AGENTS] {
+        targets.shadow = shadow(root);
     }
+    targets.shared = targets
+        .files
+        .iter()
+        .filter(|file| shared(workspace, file))
+        .cloned()
+        .collect();
     Ok(targets)
+}
+
+/// Whether Git shares a file: `git check-ignore` exits 1 for a tracked file and for one
+/// that is not ignored, including one not created yet. Outside a repository, or
+/// without Git, nothing is shared. check-ignore rejects `--literal-pathspecs`, and the
+/// names here are fixed, so `Workspace::git` is not used.
+fn shared(workspace: &Workspace, file: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["check-ignore", "-q", "--", file])
+        .current_dir(&workspace.root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.code() == Some(1))
 }
 
 /// A file that makes Claude Code ignore this AGENTS.md: an independent CLAUDE.md or a
@@ -279,14 +348,30 @@ pub struct Change {
     pub file: String,
     pub content: Option<String>,
     pub lines: usize,
+    /// The written rules in block order after the merge.
+    pub present: Vec<String>,
     pub added: Vec<String>,
     pub removed: Vec<(String, &'static str)>,
     pub dismissed: Vec<String>,
+    /// Proposals the block had no room for because of the rules already in it.
     pub full: Vec<String>,
+    /// Proposals that lost their room to higher-ranked rules added in this run.
+    pub over: Vec<String>,
+    /// Machine rules kept out of a file Git shares.
+    pub machine: Vec<String>,
+}
+
+fn render(state: &State, line: &Line) -> String {
+    match line {
+        Line::Generated(id) => format!("- {}", state.rules[id].text),
+        Line::User(text) => text.clone(),
+    }
 }
 
 /// Merge proposals into one file. `removals` maps an applied rule to the reason it no
-/// longer holds; such a line is removed only where this clone wrote it.
+/// longer holds; such a line is removed only where this clone wrote it. Machine rules
+/// are added only when `machine` allows them here.
+#[allow(clippy::too_many_arguments)]
 fn merge(
     file: &str,
     text: &str,
@@ -294,6 +379,8 @@ fn merge(
     proposals: &[Proposal],
     removals: &BTreeMap<String, &'static str>,
     limit: usize,
+    machine: bool,
+    now: u64,
 ) -> Result<Change> {
     let span = locate(text, file)?;
     let eol = if text
@@ -366,17 +453,26 @@ fn merge(
             unlink(state, id, file);
         }
     }
-    lines.retain(|line| match line {
-        Line::Generated(id) => match removals.get(id) {
-            Some(reason) => {
-                change.removed.push((id.clone(), reason));
-                unlink(state, id, file);
-                false
-            }
-            None => true,
-        },
-        Line::User(_) => true,
-    });
+    // A removed rule remembers the line it followed, so it can return to its place.
+    let mut kept: Vec<Line> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if let Line::Generated(id) = &line
+            && let Some(reason) = removals.get(id)
+        {
+            change.removed.push((id.clone(), reason));
+            let after = kept.last().map(|line| render(state, line));
+            let removed = state.removed.entry(id.clone()).or_insert_with(|| Removed {
+                at_ms: now,
+                after: BTreeMap::new(),
+            });
+            removed.at_ms = now;
+            removed.after.insert(file.to_owned(), after);
+            unlink(state, id, file);
+            continue;
+        }
+        kept.push(line);
+    }
+    let mut lines = kept;
     // On a clone without learned.json, a line with a proposal's exact text is adopted.
     for line in &mut lines {
         if let Line::User(text) = line
@@ -407,6 +503,7 @@ fn merge(
             Line::User(_) => 0,
         })
         .sum();
+    let (count_before, bytes_before) = (count, bytes);
     for proposal in proposals {
         if present(&lines, &proposal.id) {
             // Refresh the counts of a rule that is still proposed; its text stays.
@@ -420,24 +517,51 @@ fn merge(
         if state.dismissed.contains(&proposal.id) {
             continue;
         }
-        if count < limit && bytes + proposal.text.len() + 3 <= MAX_BYTES {
+        if proposal.machine && !machine {
+            change.machine.push(proposal.id.clone());
+            continue;
+        }
+        let width = proposal.text.len() + 3;
+        if count < limit && bytes + width <= MAX_BYTES {
             count += 1;
-            bytes += proposal.text.len() + 3;
+            bytes += width;
+            // A rule that was removed here returns after the line it followed.
+            let place = state
+                .removed
+                .get(&proposal.id)
+                .and_then(|removed| removed.after.get(file))
+                .and_then(|after| match after {
+                    None => Some(0),
+                    Some(text) => lines
+                        .iter()
+                        .position(|line| render(state, line) == *text)
+                        .map(|at| at + 1),
+                })
+                .unwrap_or(lines.len());
             link(state, proposal, file);
-            lines.push(Line::Generated(proposal.id.clone()));
+            lines.insert(place, Line::Generated(proposal.id.clone()));
             change.added.push(proposal.id.clone());
+            if let Some(removed) = state.removed.get_mut(&proposal.id) {
+                removed.after.remove(file);
+                if removed.after.is_empty() {
+                    state.removed.remove(&proposal.id);
+                }
+            }
+        } else if count_before < limit && bytes_before + width <= MAX_BYTES {
+            change.over.push(proposal.id.clone());
         } else {
             change.full.push(proposal.id.clone());
         }
     }
     change.lines = count;
-    let rendered: Vec<String> = lines
+    change.present = lines
         .iter()
-        .map(|line| match line {
-            Line::Generated(id) => format!("- {}", state.rules[id].text),
-            Line::User(text) => text.clone(),
+        .filter_map(|line| match line {
+            Line::Generated(id) => Some(id.clone()),
+            Line::User(_) => None,
         })
         .collect();
+    let rendered: Vec<String> = lines.iter().map(|line| render(state, line)).collect();
     let block = (!rendered.is_empty()).then(|| {
         [BEGIN, HEADING, ""]
             .into_iter()
@@ -514,33 +638,76 @@ pub struct Outcome {
     pub changes: Vec<Change>,
 }
 
-/// Merge every target first, so a marker error in any file writes nothing, then write
-/// the changed files and the state. Callers hold `.justless/setup.lock`.
-pub fn apply(
+/// What `--apply` would change: merge every target in memory. Unless `strict`, a
+/// file whose block cannot be merged is left out with a note.
+pub struct Plan<'a> {
+    pub targets: &'a Targets,
+    pub proposals: &'a [Proposal],
+    pub removals: &'a BTreeMap<String, &'static str>,
+    pub limit: usize,
+    pub include_machine: bool,
+    pub strict: bool,
+    pub now: u64,
+}
+
+pub fn plan(
+    root: &Path,
+    state: &mut State,
+    plan: &Plan,
+    notes: &mut Vec<String>,
+) -> Result<Outcome> {
+    let mut changes = Vec::new();
+    for file in &plan.targets.files {
+        let machine = plan.include_machine || !plan.targets.shared.contains(file);
+        let merged = read(root, file).and_then(|text| {
+            merge(
+                file,
+                &text,
+                state,
+                plan.proposals,
+                plan.removals,
+                plan.limit,
+                machine,
+                plan.now,
+            )
+        });
+        match merged {
+            Ok(change) => changes.push(change),
+            Err(error) if !plan.strict => notes.push(format!("{error:#}; `--apply` stops on it.")),
+            Err(error) => return Err(error),
+        }
+    }
+    while state.removed.len() > TOMBSTONES {
+        let oldest = state
+            .removed
+            .iter()
+            .min_by_key(|(id, removed)| (removed.at_ms, (*id).clone()))
+            .map(|(id, _)| id.clone())
+            .expect("a tombstone");
+        state.removed.remove(&oldest);
+    }
+    Ok(Outcome { changes })
+}
+
+/// Write the changed files and the state after a strict plan, so a marker error in any
+/// file writes nothing. Callers hold `.justless/setup.lock`.
+pub fn write(
     workspace: &Workspace,
     state: &mut State,
-    files: &[String],
-    proposals: &[Proposal],
-    removals: &BTreeMap<String, &'static str>,
-    limit: usize,
-) -> Result<Outcome> {
-    let original = state.clone();
-    let mut changes = Vec::new();
-    for file in files {
-        let text = read(&workspace.root, file)?;
-        changes.push(merge(file, &text, state, proposals, removals, limit)?);
-    }
-    for change in &changes {
+    original: &State,
+    outcome: &Outcome,
+) -> Result<()> {
+    for change in &outcome.changes {
         if let Some(content) = &change.content {
             write_text(&workspace.root.join(&change.file), content)
                 .with_context(|| format!("write {}", change.file))?;
         }
     }
     state.version = 1;
-    if *state != original {
+    if state != original {
         write_json(&state_path(workspace), state).context("write .justless/learned.json")?;
     }
-    Ok(Outcome { changes })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -560,7 +727,60 @@ mod tests {
                 failures: 3,
                 last_seen_ms: 0,
                 files: BTreeSet::new(),
+                stale_since_ms: None,
             },
+            machine: false,
+        }
+    }
+
+    fn merge(
+        file: &str,
+        text: &str,
+        state: &mut State,
+        proposals: &[Proposal],
+        removals: &BTreeMap<String, &'static str>,
+        limit: usize,
+    ) -> Result<Change> {
+        super::merge(file, text, state, proposals, removals, limit, true, 0)
+    }
+
+    #[test]
+    fn removed_rule_returns_to_its_line() {
+        let proposals = [
+            proposal("a", "Rule A."),
+            proposal("b", "Rule B."),
+            proposal("c", "Rule C."),
+        ];
+        let mut state = State::default();
+        let written = merge(
+            "AGENTS.md",
+            "# A\n",
+            &mut state,
+            &proposals,
+            &BTreeMap::new(),
+            8,
+        )
+        .unwrap()
+        .content
+        .unwrap();
+        for id in ["a", "b", "c"] {
+            let removals = BTreeMap::from([(id.to_owned(), "stale")]);
+            let without = merge("AGENTS.md", &written, &mut state, &[], &removals, 8)
+                .unwrap()
+                .content
+                .unwrap();
+            assert!(!without.contains(&format!("Rule {}.", id.to_uppercase())));
+            let back = merge(
+                "AGENTS.md",
+                &without,
+                &mut state,
+                &proposals,
+                &BTreeMap::new(),
+                8,
+            )
+            .unwrap();
+            assert_eq!(back.content.unwrap(), written, "{id}");
+            assert!(state.removed.is_empty());
         }
     }
 

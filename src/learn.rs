@@ -70,6 +70,11 @@ pub fn command() -> Command<'static> {
                 .possible_values(["agents", "claude", "gemini"])
                 .help("Instructions file to update (repeatable; default: those that exist)"),
         )
+        .arg(
+            Arg::new("include-machine")
+                .long("include-machine")
+                .help("Also write rules about this machine into files Git shares"),
+        )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,9 +84,19 @@ enum Reason {
     Stale,
     UnsafeText,
     BlockFull,
+    MachineScope,
 }
 
 impl Reason {
+    /// Reasons counted in `held_counts`; contradicted and stale rules are counted in
+    /// `skipped`.
+    const COUNTED: [Self; 4] = [
+        Self::BelowMinSessions,
+        Self::UnsafeText,
+        Self::BlockFull,
+        Self::MachineScope,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Self::BelowMinSessions => "below_min_sessions",
@@ -89,6 +104,7 @@ impl Reason {
             Self::Stale => "stale",
             Self::UnsafeText => "unsafe_text",
             Self::BlockFull => "block_full",
+            Self::MachineScope => "machine_scope",
         }
     }
 }
@@ -121,6 +137,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let limit = number(matches, "limit", 1, 32)? as usize;
     let as_json = matches.is_present("json");
     let apply = matches.is_present("apply");
+    let include_machine = matches.is_present("include-machine");
     let explicit: Vec<String> = matches
         .values_of("target")
         .map(|values| values.map(str::to_owned).collect())
@@ -182,8 +199,20 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
             .then(x.id.cmp(&y.id))
     });
 
-    // Learned state is read without creating .justless; only --apply writes it.
-    let mut state = block::load(workspace)?;
+    // Learned state is read without creating .justless; only --apply writes it. A
+    // preview notes a state file it cannot read and carries on without it.
+    let mut notes = Vec::new();
+    let mut state = match block::load(workspace) {
+        Ok(state) => state,
+        Err(error) if !apply => {
+            notes.push(format!("{error:#}; `--apply` stops on it."));
+            block::State {
+                version: 1,
+                ..block::State::default()
+            }
+        }
+        Err(error) => return Err(error),
+    };
     // Written rules keep the text they were written with.
     for rule in &mut rules {
         if let Some(applied) = state.rules.get(&rule.candidate.id)
@@ -201,104 +230,121 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         ("dismissed", 0),
         ("over_limit", 0),
     ]);
-    let mut proposed: Vec<&Rule> = Vec::new();
-    for rule in rules.iter().filter(|rule| rule.held.is_none()) {
-        if state.dismissed.contains(&rule.candidate.id) {
-            *skipped.get_mut("dismissed").expect("key") += 1;
-        } else if proposed.len() < limit {
-            proposed.push(rule);
-        } else {
-            *skipped.get_mut("over_limit").expect("key") += 1;
-        }
-    }
-    let transcripts_contributed = proposed.iter().any(|rule| rule.candidate.transcript);
-    let targets = block::targets(&workspace.root, &explicit, transcripts_contributed)?;
-    let mut notes = targets.notes.clone();
+    let ready: Vec<&Rule> = rules.iter().filter(|rule| rule.held.is_none()).collect();
+    let transcripts_contributed = ready.iter().any(|rule| rule.candidate.transcript);
+    let targets = block::targets(workspace, &explicit, transcripts_contributed, apply)?;
+    notes.extend(targets.notes.iter().cloned());
 
-    let mut held: Vec<(&Rule, Reason)> = rules
-        .iter()
-        .filter_map(|rule| Some((rule, rule.held?)))
-        .collect();
-    let mut applied = None;
-    if apply {
+    let _guard = if apply {
         workspace.prepare_state()?;
-        let _guard = lock_state(&workspace.state.join("setup.lock"))?;
+        let guard = lock_state(&workspace.state.join("setup.lock"))?;
         // Reload under the lock in case another learn or init ran meanwhile.
         state = block::load(workspace)?;
-        let removals: BTreeMap<String, &'static str> = state
-            .rules
-            .iter()
-            .filter_map(|(id, written)| {
-                let class = patterns::Class::parse(&written.class)?;
-                if let Check::Stale(_) =
-                    patterns::check(&workspace.root, &env, class, &written.slots)
-                {
-                    Some((id.clone(), "its check no longer holds"))
-                } else if rules
-                    .iter()
-                    .any(|rule| rule.candidate.id == *id && rule.candidate.contradicted)
-                {
-                    Some((id.clone(), "the command later succeeded"))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let proposals: Vec<block::Proposal> = proposed
-            .iter()
-            .map(|rule| {
-                let candidate = rule.candidate;
-                let text = rule.text.clone().expect("proposed text");
-                block::Proposal {
-                    id: candidate.id.clone(),
-                    text: text.clone(),
-                    applied: block::Applied {
-                        class: candidate.class.name().to_owned(),
-                        scope: rule.scope.name().to_owned(),
-                        text,
-                        slots: candidate.slots.clone(),
-                        sessions: candidate.sessions.len() as u64,
-                        failures: candidate.failures,
-                        last_seen_ms: candidate.last_ms,
-                        files: BTreeSet::new(),
-                    },
-                }
-            })
-            .collect();
-        let outcome = block::apply(
-            workspace,
-            &mut state,
-            &targets.files,
-            &proposals,
-            &removals,
-            limit,
-        )?;
-        let mut full: Vec<(&Rule, Reason)> = Vec::new();
-        for change in &outcome.changes {
-            for id in &change.full {
-                if let Some(rule) = rules.iter().find(|rule| rule.candidate.id == *id)
-                    && !full.iter().any(|(seen, _)| seen.candidate.id == *id)
-                {
-                    full.push((rule, Reason::BlockFull));
-                }
-            }
+        Some(guard)
+    } else {
+        None
+    };
+    let mut eligible: Vec<&Rule> = Vec::new();
+    for rule in ready {
+        if state.dismissed.contains(&rule.candidate.id) {
+            *skipped.get_mut("dismissed").expect("key") += 1;
+        } else {
+            eligible.push(rule);
         }
-        // Rules the block had no room for come first, so --limit never hides them.
-        held.splice(0..0, full);
-        applied = Some((outcome, removals));
     }
+    let original = state.clone();
+    let (removals, kept) = removals(&mut state, &workspace.root, &env, &rules, now);
+    // Every eligible rule is offered in rank order: rules already in the block stay
+    // whatever --limit says, and new ones fill the room that is left.
+    let proposals: Vec<block::Proposal> = eligible
+        .iter()
+        .map(|rule| {
+            let candidate = rule.candidate;
+            let text = rule.text.clone().expect("eligible text");
+            block::Proposal {
+                id: candidate.id.clone(),
+                text: text.clone(),
+                applied: block::Applied {
+                    class: candidate.class.name().to_owned(),
+                    scope: rule.scope.name().to_owned(),
+                    text,
+                    slots: candidate.slots.clone(),
+                    sessions: candidate.sessions.len() as u64,
+                    failures: candidate.failures,
+                    last_seen_ms: candidate.last_ms,
+                    files: BTreeSet::new(),
+                    stale_since_ms: None,
+                },
+                machine: rule.scope == Scope::Machine,
+            }
+        })
+        .collect();
+    // A preview plans the same merge in memory, so it shows what --apply would write.
+    let outcome = block::plan(
+        &workspace.root,
+        &mut state,
+        &block::Plan {
+            targets: &targets,
+            proposals: &proposals,
+            removals: &removals,
+            limit,
+            include_machine,
+            strict: apply,
+            now,
+        },
+        &mut notes,
+    )?;
+    if apply {
+        block::write(workspace, &mut state, &original, &outcome)?;
+    }
+
+    let within = |id: &str, pick: fn(&block::Change) -> &Vec<String>| {
+        outcome
+            .changes
+            .iter()
+            .any(|change| pick(change).iter().any(|other| other == id))
+    };
+    let mut proposed: Vec<&Rule> = Vec::new();
+    let mut full: Vec<(&Rule, Reason)> = Vec::new();
+    let mut machine: Vec<(&Rule, Reason)> = Vec::new();
+    for rule in eligible {
+        let id = rule.candidate.id.as_str();
+        let counter = if outcome.changes.is_empty() {
+            // No file can take rules: show the best ones up to --limit.
+            if proposed.len() < limit {
+                proposed.push(rule);
+                continue;
+            }
+            "over_limit"
+        } else if within(id, |change| &change.present) {
+            proposed.push(rule);
+            continue;
+        } else if within(id, |change| &change.dismissed) {
+            "dismissed"
+        } else if within(id, |change| &change.full) {
+            full.push((rule, Reason::BlockFull));
+            continue;
+        } else if within(id, |change| &change.machine) && !within(id, |change| &change.over) {
+            machine.push((rule, Reason::MachineScope));
+            continue;
+        } else {
+            "over_limit"
+        };
+        *skipped.get_mut(counter).expect("key") += 1;
+    }
+
+    // Rules the block had no room for come first, so --limit never hides them.
+    let mut held: Vec<(&Rule, Reason)> = full;
+    held.extend(machine);
+    held.extend(rules.iter().filter_map(|rule| Some((rule, rule.held?))));
     // Count every held rule before the list is cut to --limit.
-    let held_counts: BTreeMap<&'static str, u64> = [
-        Reason::BelowMinSessions,
-        Reason::UnsafeText,
-        Reason::BlockFull,
-    ]
-    .into_iter()
-    .map(|reason| {
-        let count = held.iter().filter(|(_, held)| *held == reason).count();
-        (reason.name(), count as u64)
-    })
-    .collect();
+    let held_counts: BTreeMap<&'static str, u64> = Reason::COUNTED
+        .into_iter()
+        .map(|reason| {
+            let count = held.iter().filter(|(_, held)| *held == reason).count();
+            (reason.name(), count as u64)
+        })
+        .collect();
     held.truncate(limit);
     if run_stats.without_command > 0 {
         notes.insert(
@@ -308,6 +354,29 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
                 run_stats.without_command
             ),
         );
+    }
+    if !kept.is_empty() {
+        let details: BTreeSet<&str> = kept.iter().map(String::as_str).collect();
+        notes.push(format!(
+            "Kept {} written rule(s) whose check fails here ({}); `--apply` removes them if the check still fails a day later.",
+            kept.len(),
+            details.into_iter().collect::<Vec<_>>().join("; ")
+        ));
+    }
+    if held_counts[Reason::MachineScope.name()] > 0 {
+        let shared: Vec<&str> = targets.shared.iter().map(String::as_str).collect();
+        notes.push(format!(
+            "Rules about this machine stay out of {}, which Git shares, so teammates and CI are not told them; `--include-machine` writes them, or copy them to a personal file such as ~/.claude/CLAUDE.md.",
+            shared.join(" and ")
+        ));
+    }
+    if !proposed.is_empty()
+        && let Some(shadow) = &targets.shadow
+    {
+        notes.push(format!(
+            "Claude Code reads {} here, not AGENTS.md; add a CLAUDE.md with the line @AGENTS.md so it reads these rules.",
+            shadow.display()
+        ));
     }
 
     let report = Report {
@@ -321,7 +390,8 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         skipped: &skipped,
         notes: &notes,
         targets: &targets,
-        applied: applied.as_ref().map(|(outcome, _)| outcome),
+        outcome: &outcome,
+        applied: apply,
     };
     if as_json {
         println!("{}", serde_json::to_string_pretty(&report.json())?);
@@ -329,6 +399,48 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         print!("{}", report.text());
     }
     Ok(())
+}
+
+/// Written rules to remove now, and the details of machine checks that fail here but
+/// have not failed for a day. A `PATH` or `$SHELL` check can fail in one shell, such
+/// as an activated virtual environment, and hold in the next, so one failure is not
+/// enough to rewrite the instructions.
+fn removals(
+    state: &mut block::State,
+    root: &std::path::Path,
+    env: &Env,
+    rules: &[Rule],
+    now: u64,
+) -> (BTreeMap<String, &'static str>, Vec<String>) {
+    let mut removals = BTreeMap::new();
+    let mut kept = Vec::new();
+    for (id, written) in &mut state.rules {
+        let Some(class) = patterns::Class::parse(&written.class) else {
+            continue;
+        };
+        if rules
+            .iter()
+            .any(|rule| rule.candidate.id == *id && rule.candidate.contradicted)
+        {
+            removals.insert(id.clone(), "the command later succeeded");
+            continue;
+        }
+        match patterns::check(root, env, class, &written.slots) {
+            Check::Stale(detail) if patterns::scope(class, &written.slots) == Scope::Machine => {
+                let since = *written.stale_since_ms.get_or_insert(now);
+                if now.saturating_sub(since) >= DAY_MS {
+                    removals.insert(id.clone(), "its check no longer holds");
+                } else {
+                    kept.push(detail);
+                }
+            }
+            Check::Stale(_) => {
+                removals.insert(id.clone(), "its check no longer holds");
+            }
+            _ => written.stale_since_ms = None,
+        }
+    }
+    (removals, kept)
 }
 
 fn count(rules: &[Rule], reason: Reason) -> u64 {
@@ -349,7 +461,9 @@ struct Report<'a> {
     skipped: &'a BTreeMap<&'static str, u64>,
     notes: &'a [String],
     targets: &'a block::Targets,
-    applied: Option<&'a block::Outcome>,
+    /// The merge `--apply` made, or a preview planned.
+    outcome: &'a block::Outcome,
+    applied: bool,
 }
 
 impl Report<'_> {
@@ -420,23 +534,25 @@ impl Report<'_> {
         .iter()
         .map(|key| ((*key).to_owned(), Value::from(self.skipped[key])))
         .collect();
-        let apply = match self.applied {
-            Some(outcome) => json!({
+        let outcome = self.outcome;
+        let apply = if self.applied {
+            json!({
                 "applied": true,
                 "targets": self.targets.files,
                 "changed": outcome.changes.iter().filter(|c| c.content.is_some()).map(|c| &c.file).collect::<Vec<_>>(),
                 "skipped": self.skipped_targets(),
                 "added": unique(outcome.changes.iter().flat_map(|c| &c.added)),
                 "removed": unique(outcome.changes.iter().flat_map(|c| c.removed.iter().map(|(id, _)| id))),
-            }),
-            None => json!({
+            })
+        } else {
+            json!({
                 "applied": false,
                 "targets": self.targets.files,
                 "changed": [],
                 "skipped": self.skipped_targets(),
                 "added": [],
                 "removed": [],
-            }),
+            })
         };
         json!({
             "days": self.days,
@@ -486,7 +602,15 @@ impl Report<'_> {
             thousands(t.results),
             thousands(self.runs.scanned),
         );
-        if self.proposed.is_empty() {
+        let listed = |reason: Reason| -> Vec<&str> {
+            self.held
+                .iter()
+                .filter(|(_, held)| *held == reason)
+                .filter_map(|(rule, _)| rule.text.as_deref())
+                .collect()
+        };
+        let (full, machine) = (listed(Reason::BlockFull), listed(Reason::MachineScope));
+        if self.proposed.is_empty() && full.is_empty() && machine.is_empty() {
             out.push_str(&format!(
                 "No repeated command mistakes in the last {} day(s): {sessions} Claude Code session(s), {results} shell results, {runs} archived run(s).\n",
                 self.days
@@ -515,8 +639,13 @@ impl Report<'_> {
         }
         if !self.proposed.is_empty() {
             out.push_str(&format!(
-                "{} rule(s) proposed, most frequent first:\n\n",
-                self.proposed.len()
+                "{} rule(s) {}, most frequent first:\n\n",
+                self.proposed.len(),
+                if self.applied {
+                    "in the learned block"
+                } else {
+                    "proposed"
+                }
             ));
             for (index, rule) in self.proposed.iter().enumerate() {
                 out.push_str(&format!(
@@ -546,24 +675,63 @@ impl Report<'_> {
                 }
             }
         }
+        if !full.is_empty() {
+            out.push_str("\nNot written, the block is full:\n");
+            for text in &full {
+                out.push_str(&format!("- {text}\n"));
+            }
+            out.push_str("Delete a rule's line between the markers to dismiss it and make room.\n");
+        }
+        if !machine.is_empty() {
+            out.push_str("\nAbout this machine, kept out of files Git shares:\n");
+            for text in &machine {
+                out.push_str(&format!("- {text}\n"));
+            }
+        }
         let held = self.held_line();
-        if !held.is_empty() || !self.notes.is_empty() {
+        let skipped = self.applied || !self.proposed.is_empty();
+        if !held.is_empty() || !self.notes.is_empty() || skipped && !self.targets.skipped.is_empty()
+        {
             out.push('\n');
         }
         if !held.is_empty() {
             out.push_str(&format!("Held back: {held}\n"));
         }
+        if skipped {
+            for (file, reason) in &self.targets.skipped {
+                let reason = match reason.as_str() {
+                    "symbolic link" => "it is a symbolic link".to_owned(),
+                    "not a regular file" => "it is not a regular file".to_owned(),
+                    other => format!("it {other}"),
+                };
+                out.push_str(&format!("Skipped {file}: {reason}.\n"));
+            }
+        }
         for note in self.notes {
             out.push_str(note);
             out.push('\n');
         }
-        let files = self.targets.files.join(" and ");
-        match self.applied {
-            None if !self.proposed.is_empty() && !files.is_empty() => out.push_str(&format!(
-                "Preview only. `justless learn --apply` writes these rules to {files}.\n"
-            )),
-            None => {}
-            Some(outcome) => out.push_str(&self.apply_text(outcome)),
+        if self.applied {
+            out.push_str(&self.apply_text());
+        } else if !self.proposed.is_empty() {
+            let changed: Vec<&str> = self
+                .outcome
+                .changes
+                .iter()
+                .filter(|change| change.content.is_some())
+                .map(|change| change.file.as_str())
+                .collect();
+            if !changed.is_empty() {
+                out.push_str(&format!(
+                    "Preview only. `justless learn --apply` writes these rules to {}.\n",
+                    changed.join(" and ")
+                ));
+            } else if !self.outcome.changes.is_empty() {
+                out.push_str(&format!(
+                    "Preview only. {} already up to date.\n",
+                    self.targets.files.join(" and ")
+                ));
+            }
         }
         out
     }
@@ -592,7 +760,6 @@ impl Report<'_> {
             ),
             (s("dismissed"), "dismissed"),
             (s("over_limit"), "beyond --limit"),
-            (held(Reason::BlockFull), "not written: the block is full"),
         ] {
             if value > 0 {
                 parts.push(format!("{value} {label}"));
@@ -601,18 +768,10 @@ impl Report<'_> {
         parts.join(" · ")
     }
 
-    fn apply_text(&self, outcome: &block::Outcome) -> String {
+    fn apply_text(&self) -> String {
         let mut out = String::new();
-        for (file, reason) in &self.targets.skipped {
-            let reason = match reason.as_str() {
-                "symbolic link" => "it is a symbolic link".to_owned(),
-                "not a regular file" => "it is not a regular file".to_owned(),
-                other => format!("it {other}"),
-            };
-            out.push_str(&format!("Skipped {file}: {reason}.\n"));
-        }
         let mut wrote = false;
-        for change in &outcome.changes {
+        for change in &self.outcome.changes {
             if change.content.is_some() {
                 let mut parts = Vec::new();
                 if !change.added.is_empty() {
@@ -634,6 +793,14 @@ impl Report<'_> {
                 out.push_str(&format!(
                     "Updated {}: {} learned rule(s){detail}.\n",
                     change.file, change.lines
+                ));
+                wrote = true;
+            } else if !change.full.is_empty() {
+                out.push_str(&format!(
+                    "{} unchanged: {} learned rule(s); {} rule(s) did not fit.\n",
+                    change.file,
+                    change.lines,
+                    change.full.len()
                 ));
                 wrote = true;
             } else if change.lines > 0 {

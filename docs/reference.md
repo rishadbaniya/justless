@@ -524,7 +524,9 @@ Every file is read and checked first. A config file that never mentions justless
 
 ## Learned command rules
 
-`justless learn` reads this workspace's archived runs and its Claude Code transcripts from the last 30 days (`--days`), including subagent and workflow transcripts. It proposes short rules for command mistakes that agents corrected or keep repeating. It runs locally, makes no model calls and runs no commands.
+`justless learn` reads this workspace's archived runs and its Claude Code transcripts from the last 30 days (`--days`), including subagent and workflow transcripts. It proposes short rules for command mistakes that agents corrected or keep repeating. It runs locally, makes no model calls and runs none of the recorded commands; the only program it starts is `git check-ignore`, to learn which instruction files Git shares.
+
+Without `--apply`, the report shows what `--apply` would write. An instructions file it cannot read, a learned block with bad markers or an unreadable `.justless/learned.json` becomes a note in the preview; `--apply` stops on it before writing anything.
 
 Each rule comes with:
 - failure and correction counts, sessions and agent threads
@@ -565,7 +567,8 @@ What rules contain:
 `--apply` writes the proposed rules into a block between `<!-- justless:learned:begin -->` and `<!-- justless:learned:end -->`.
 - Without `--target`, it updates each existing `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` once. It skips symbolic links and any file that imports another, as `@AGENTS.md` does at the start of a line or after a space, outside code.
 - When none exists, it creates `CLAUDE.md` if the rules came from Claude Code transcripts, and `AGENTS.md` otherwise.
-- When it writes only `AGENTS.md` but a `CLAUDE.md` here or in a parent directory would stop Claude Code from reading it, the report says so.
+- When it has rules for only `AGENTS.md` but a `CLAUDE.md` here or in a parent directory would stop Claude Code from reading it, the report says so.
+- Rules with `machine` scope stay out of files Git shares, tracked or not ignored, because teammates and CI may have other programs and another shell. The report lists them. `--include-machine` writes them anyway, and an ignored file, such as a `CLAUDE.md` listed in `.gitignore`, takes them by default.
 - Repeat `--target agents|claude|gemini` to choose the files.
 - `--target claude` does not create `CLAUDE.md` next to an existing `AGENTS.md`, because Claude Code then stops reading `AGENTS.md`. Start `CLAUDE.md` with the line `@AGENTS.md` first. [Claude Code and AGENTS.md](https://code.claude.com/docs/en/memory#agents-md)
 - The block goes after the Justless instructions block when the file has one, and at the end otherwise.
@@ -573,13 +576,14 @@ What rules contain:
 - A file with an incomplete or repeated learned block, or one inside the Justless instructions block, stops the run before any file is written.
 
 How written rules are kept or removed:
-- Written lines keep their place and wording. New rules are added at the end, and a full block holds new rules back instead of replacing old ones.
+- Written lines keep their place and wording. New rules are added at the end, and a full block holds new rules back instead of replacing old ones. With `--apply`, the report lists the rules in the block and, separately, those that did not fit.
 - A written rule stays when its evidence ages out of the window, because a rule that works stops the failures that produced it.
-- It is removed when its check fails or the wrong form succeeds again. Only the clone that wrote a rule removes it, so a teammate with a different `PATH` does not change the committed file.
-- Delete a rule's line to dismiss it. Justless records the dismissal in `.justless/learned.json` and does not add the rule back.
+- It is removed when the wrong form succeeds again, or when its check fails. A failing check against the tree removes it at once. A failing `PATH` or `$SHELL` check removes it only when it still fails on an `--apply` a day or more after the first failure, so one shell with an activated environment does not rewrite the file.
+- A removed rule that qualifies again returns to the line it left.
+- Only the clone that wrote a rule removes it, so a teammate with a different `PATH` does not change the committed file.
+- Delete a rule's line to dismiss it, or to make room in a full block. Justless records the dismissal in `.justless/learned.json` and does not add the rule back.
 - Lines you add inside the block are kept.
 - The block holds at most 8 rules (`--limit`) and 1,200 bytes. Claude Code removes HTML comments such as the block markers before the file reaches the model.
-- Machine rules describe the computer that ran `learn`. Review them before committing a shared instructions file.
 
 The run archive keeps each command line in `.justless/runs/*/record.json` so `learn` can pair runs. A command line that looks like it carries a credential, an address or a URL, or runs a network tool, is not stored; `learn` counts such runs as dropped for a possible credential. Runs recorded before this version carry no command line and are skipped.
 
@@ -587,4 +591,5 @@ The run archive keeps each command line in `.justless/runs/*/record.json` so `le
 justless learn
 justless learn --days 60 --min-sessions 1 --json
 justless learn --apply --target agents
+justless learn --apply --include-machine
 ```
