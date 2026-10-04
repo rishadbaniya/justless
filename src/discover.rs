@@ -66,7 +66,7 @@ struct Call {
     date: String,
 }
 
-fn transcript_dir(root: &Path) -> Option<PathBuf> {
+pub(crate) fn transcript_dir(root: &Path) -> Option<PathBuf> {
     let base = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))?;
@@ -78,7 +78,7 @@ fn transcript_dir(root: &Path) -> Option<PathBuf> {
     Some(base.join("projects").join(slug))
 }
 
-fn transcripts(dir: &Path, since: SystemTime, depth: usize, out: &mut Vec<PathBuf>) {
+pub(crate) fn transcripts(dir: &Path, since: SystemTime, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };

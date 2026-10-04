@@ -9,6 +9,7 @@ mod impact;
 mod index;
 mod inventory;
 mod json_edit;
+mod learn;
 mod lint;
 mod listing;
 mod lookup;
@@ -171,6 +172,7 @@ fn cli() -> Command<'static> {
                 .arg(number("days", "30", "Days of transcripts to scan"))
                 .arg(Arg::new("json").long("json").help("Print a JSON report")),
         )
+        .subcommand(learn::command())
         .subcommand(Command::new("index").about("Refresh the incremental repository index"))
         .subcommand(
             Command::new("query")
@@ -474,6 +476,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             read_num(sub, "days", 1)? as u64,
             sub.is_present("json"),
         )?,
+        ("learn", sub) => learn::run(&workspace, sub)?,
         ("stats", sub) => history::stats(
             &workspace,
             read_num(sub, "days", 1)? as u64,

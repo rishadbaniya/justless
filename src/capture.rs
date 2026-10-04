@@ -151,6 +151,14 @@ pub struct Run {
     /// The run was routed by an agent hook rather than typed by a person.
     #[serde(default)]
     pub hook: bool,
+    /// The command line, its directory relative to the root (empty at the root) and
+    /// the session, so `learn` can pair a failure with its correction.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub session: String,
     pub diagnostics: Vec<Diagnostic>,
     pub source_digests: BTreeMap<String, String>,
     /// Bytes each stream held when the command exited. A background process can keep
@@ -191,6 +199,9 @@ impl Run {
             unchanged: false,
             footer_bytes: 0,
             hook,
+            argv: Vec::new(),
+            cwd: String::new(),
+            session: String::new(),
             diagnostics: Vec::new(),
             source_digests: BTreeMap::new(),
             stream_bytes: Vec::new(),
@@ -1021,6 +1032,16 @@ impl Capture<'_> {
             unfinished: false,
             drained: archive.late,
             label: history::label(words),
+            argv: args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+            cwd: workspace
+                .cwd
+                .strip_prefix(&workspace.root)
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            session: session.to_owned(),
             ..Run::unfinished(archive.id(), &family, "", hook)
         };
         let mut parser = Parser::new(&run.family, selection.profile);
