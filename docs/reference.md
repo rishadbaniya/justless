@@ -672,7 +672,7 @@ When the limit passes, Justless sends SIGINT to the script and every process it 
 
 When the script exits, processes it left running in the background are stopped, so the archived output is final. If Justless itself is stopped, for example by the client's timeout or an interrupt, the script and everything it started are stopped too, and the run is not recorded. A process that starts its own session or process group escapes both.
 
-Otherwise `exec` exits with the script's status, or with 128 plus the signal number when a signal ended it. An error before the script starts, such as a missing interpreter or input file, exits with 2 and records nothing. A script that fails always ends with a `[justless run-…` line. On Windows there is no process group: the time limit stops only the interpreter, and processes it leaves running are not stopped.
+Otherwise `exec` exits with the script's status, or with 128 plus the signal number when a signal ended it. An error before the script starts, such as a missing interpreter or input file, exits with 2 and records nothing. A script that fails always prints a `[justless run-…` line. On Windows there is no process group: the time limit stops only the interpreter, and processes it leaves running are not stopped.
 
 ### Not a sandbox
 
