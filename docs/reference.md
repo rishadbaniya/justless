@@ -528,11 +528,11 @@ Every file is read and checked first. A config file that never mentions justless
 
 Each rule comes with:
 - failure and correction counts, sessions and agent threads
-- the bytes of failed output the mistakes returned to the agent
+- the bytes of failed output the mistakes returned to the agent; for a mistake inside a list of commands or an exit-0 result, only its error line counts
 - the last date it was seen
 - its scope: `project` for facts about this repository, `machine` for facts about this computer's programs and shell
 - a check against the current tree, `PATH` or `$SHELL`
-- the run behind it, when there is one, so `justless log RUN_ID --stream stderr` replays the original failure
+- its evidence: the run behind it, so `justless log RUN_ID --stream stderr` replays the original failure, or else the transcript file and line
 
 Add `--json` for structured fields, and `--limit N` (default 8, at most 32) to show fewer rules.
 
@@ -551,18 +551,19 @@ How rules qualify:
 - A rule needs evidence from two sessions (`--min-sessions`). Subagents count toward their parent's session, so one agent fanning out cannot create a rule alone.
 - A missing program with an alternative, a wrong directory or a wrong package manager needs one correction when the current tree confirms it, such as a lockfile that names the manager.
 - Rules are ranked by how many sessions showed the mistake, with recent sessions weighing more.
-- Test failures, compiler errors, searches that find nothing, permission denials, and rejected, interrupted, timed-out or background tool calls are not mistakes.
+- Test failures, compiler errors, searches that find nothing, permission denials, and rejected, interrupted, timed-out or background tool calls are not mistakes. A flag named in a failed test run's output, such as Cargo's `to rerun pass --lib`, is not a missing option.
+- A missing `./script` counts only when the command that ran it can be read, so its directory is known.
 - A correction of one or two characters is a typo and is not learned.
 - A rule is held back when the wrong form later succeeded, or when its check fails now, for example because `python` is now installed. The report counts held rules and how to list them.
 
 What rules contain:
 - Program names, flags, script, target and package names, and workspace-relative paths.
 - A correction is dropped whole when either command carries a credential-like environment assignment or option, a known token format, a URL, an e-mail address, a host, or a path outside the workspace.
-- Nothing is learned from network and credential tools such as `ssh`, `curl` and `aws`.
+- Nothing is learned from network and credential tools such as `ssh`, `curl` and `aws`, or from a command with a credential, even when its error alone would show the mistake.
 - Command lines and output are never printed.
 
 `--apply` writes the proposed rules into a block between `<!-- justless:learned:begin -->` and `<!-- justless:learned:end -->`.
-- Without `--target`, it updates each existing `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` once. It skips symbolic links and any file that imports another with a line such as `@AGENTS.md`.
+- Without `--target`, it updates each existing `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` once. It skips symbolic links and any file that imports another, as `@AGENTS.md` does at the start of a line or after a space, outside code.
 - When none exists, it creates `CLAUDE.md` if the rules came from Claude Code transcripts, and `AGENTS.md` otherwise.
 - When it writes only `AGENTS.md` but a `CLAUDE.md` here or in a parent directory would stop Claude Code from reading it, the report says so.
 - Repeat `--target agents|claude|gemini` to choose the files.

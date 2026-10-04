@@ -517,15 +517,24 @@ impl Report<'_> {
                     rule.text.as_deref().unwrap_or_default(),
                     stats_line(rule)
                 ));
-                if let Some(Pointer::Run { id, stream }) = rule
-                    .candidate
-                    .evidence()
-                    .into_iter()
+                let evidence = rule.candidate.evidence();
+                // A run replays its output; a transcript line holds the call and result.
+                match evidence
+                    .iter()
                     .find(|pointer| matches!(pointer, Pointer::Run { .. }))
+                    .or(evidence.first())
                 {
-                    out.push_str(&format!(
+                    Some(Pointer::Run { id, stream }) => out.push_str(&format!(
                         "   evidence: justless log {id} --stream {stream}\n"
-                    ));
+                    )),
+                    Some(Pointer::Transcript { file, line }) => {
+                        let path = t.directory.as_ref().map_or_else(
+                            || file.clone(),
+                            |dir| dir.join(file).display().to_string(),
+                        );
+                        out.push_str(&format!("   evidence: {path}:{line}\n"));
+                    }
+                    None => {}
                 }
             }
         }

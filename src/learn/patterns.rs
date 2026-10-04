@@ -232,7 +232,8 @@ enum SelfHit {
     Equals,
 }
 
-fn self_evident(event: &Event) -> Vec<SelfHit> {
+/// Self-evident hits, each with the bytes of the error line that shows it.
+fn self_evident(event: &Event) -> Vec<(SelfHit, u64)> {
     let mut hits = Vec::new();
     let text = event.transcript_text();
     if !event.transcript || event.status == Status::Unknown {
@@ -243,6 +244,7 @@ fn self_evident(event: &Event) -> Vec<SelfHit> {
         || text.contains("No such file or directory")
         || text.contains("No module named");
     let words: Vec<&str> = event.raw.split_whitespace().collect();
+    let line = |found: regex::Match| found.as_str().len() as u64 + 1;
     if maybe_missing {
         for (pattern, kind) in MISSING.iter() {
             for captures in pattern.captures_iter(text) {
@@ -261,29 +263,29 @@ fn self_evident(event: &Event) -> Vec<SelfHit> {
                 };
                 if gated
                     && !hits.iter().any(
-                        |hit| matches!(hit, SelfHit::Missing(k, o) if k == kind && *o == operand),
+                        |(hit, _)| matches!(hit, SelfHit::Missing(k, o) if k == kind && *o == operand),
                     )
                 {
-                    hits.push(SelfHit::Missing(*kind, operand));
+                    hits.push((SelfHit::Missing(*kind, operand), line(captures.get(0).expect("match"))));
                 }
             }
         }
     }
     if text.contains("no matches found")
-        && let Some(operand) = GLOB
+        && let Some(captures) = GLOB
             .captures_iter(text)
-            .map(|captures| captures[1].to_owned())
-            .find(|operand| event.raw.contains(operand.as_str()))
+            .find(|captures| event.raw.contains(&captures[1]))
     {
-        hits.push(SelfHit::Glob(operand));
+        let bytes = line(captures.get(0).expect("match"));
+        hits.push((SelfHit::Glob(captures[1].to_owned()), bytes));
     }
     if text.contains(" not found") {
         let unquoted = unquoted_words(&event.raw);
-        if EQUALS
+        if let Some(captures) = EQUALS
             .captures_iter(text)
-            .any(|captures| unquoted.contains(&format!("={}", &captures[1])))
+            .find(|captures| unquoted.contains(&format!("={}", &captures[1])))
         {
-            hits.push(SelfHit::Equals);
+            hits.push((SelfHit::Equals, line(captures.get(0).expect("match"))));
         }
     }
     hits
@@ -604,7 +606,7 @@ impl Candidate {
         }
     }
 
-    fn fail(&mut self, at: (usize, usize), event: &Event, pointer: Pointer) {
+    fn fail(&mut self, at: (usize, usize), event: &Event, pointer: Pointer, bytes: u64) {
         if !self.counted.insert(at) {
             return;
         }
@@ -612,7 +614,7 @@ impl Candidate {
         let last = self.sessions.entry(event.session.clone()).or_default();
         *last = (*last).max(event.time_ms);
         self.threads.insert(event.thread.clone());
-        self.failure_bytes += event.failure_bytes;
+        self.failure_bytes += bytes;
         self.first_ms = self.first_ms.min(event.time_ms);
         self.last_ms = self.last_ms.max(event.time_ms);
         self.transcript |= event.transcript;
@@ -764,14 +766,43 @@ impl Builder<'_> {
     fn self_evident(&mut self, thread: &Thread, at: usize) {
         let event = thread.events[at];
         let place = (thread.index, at);
-        for hit in self_evident(event) {
+        let hits = self_evident(event);
+        if hits.is_empty() {
+            return;
+        }
+        // A command with a credential teaches nothing, and a remote shell's error
+        // describes another machine. `PATH` and zsh do not depend on the directory, so
+        // a path outside the workspace is no reason to drop these; a missing relative
+        // path needs a parsed command, whose directory is always inside the root.
+        if privacy::carries_credential(&event.raw, &event.env) {
+            self.credentials += 1;
+            return;
+        }
+        // A simple failed command cost its whole result; in a list or an exit-0
+        // result, only the error line and the exit header are the mistake's.
+        let whole = event.simple().is_some() && event.status != Status::Code(0);
+        let header = match event.status {
+            Status::Code(code) if code != 0 => format!("Exit code {code}\n").len() as u64,
+            _ => 0,
+        };
+        for (hit, line) in hits {
+            let bytes = if whole {
+                event.failure_bytes
+            } else {
+                (line + header).min(event.failure_bytes)
+            };
             match hit {
                 SelfHit::Missing(kind, operand) => {
                     let failed = failed_piece(event, kind, &operand);
+                    // A missing relative path is checked in the directory that ran it,
+                    // which only a parsed command shows.
+                    if kind == Missing::Relative && failed.is_none() {
+                        continue;
+                    }
                     let python = failed
                         .filter(|_| kind == Missing::Module)
                         .map(|cmd| basename(&cmd.argv[0]).to_owned());
-                    let dir = failed.map_or(event.dir.clone(), |cmd| cmd.dir.clone());
+                    let dir = failed.map(|cmd| cmd.dir.clone()).unwrap_or_default();
                     let alternative = (kind != Missing::Relative)
                         .then(|| {
                             failed.and_then(|cmd| alternative(thread, at, kind, &operand, cmd))
@@ -785,7 +816,7 @@ impl Builder<'_> {
                         Class::MissingProgram,
                         &[("kind", kind.name().to_owned()), ("program", operand)],
                     );
-                    candidate.fail(place, event, event.pointer.clone());
+                    candidate.fail(place, event, event.pointer.clone(), bytes);
                     candidate.expect(Wrong::Program(lead));
                     if kind == Missing::Relative {
                         candidate.context(event.time_ms, &[("dir", dir)]);
@@ -803,12 +834,16 @@ impl Builder<'_> {
                 }
                 SelfHit::Glob(operand) => {
                     let candidate = self.entry(Class::ZshGlob, &[]);
-                    candidate.fail(place, event, event.pointer.clone());
+                    candidate.fail(place, event, event.pointer.clone(), bytes);
                     candidate.vote("example", &operand);
                 }
                 SelfHit::Equals => {
-                    self.entry(Class::ZshEquals, &[])
-                        .fail(place, event, event.pointer.clone());
+                    self.entry(Class::ZshEquals, &[]).fail(
+                        place,
+                        event,
+                        event.pointer.clone(),
+                        bytes,
+                    );
                 }
             }
         }
@@ -851,8 +886,9 @@ impl Builder<'_> {
                 return;
             }
         }
-        if hits.is_empty() && code != 0 {
-            // Any failure text that names the flag the correction adds.
+        if hits.is_empty() && code != 0 && !test_run(f, event) {
+            // Any failure text that names the flag the correction adds. A failed test
+            // run is left out: cargo's `to rerun pass --lib` is not a missing option.
             let found = find(thread, at, false, |_, g| missing_option(f, g, None, event));
             if let Some((g, outcome)) = found {
                 self.record(thread, at, g, outcome, event.pointer.clone(), None);
@@ -888,7 +924,7 @@ impl Builder<'_> {
         }
         let f = event.simple().expect("simple failure");
         let candidate = self.entry(outcome.class, &outcome.key);
-        candidate.fail((thread.index, at), event, pointer);
+        candidate.fail((thread.index, at), event, pointer, event.failure_bytes);
         candidate.correct((thread.index, g));
         candidate.context(event.time_ms, &outcome.context);
         candidate.expect(outcome.wrong);
@@ -917,7 +953,12 @@ impl Builder<'_> {
                         .map(|(_, pointer)| pointer.clone())
                 })
                 .unwrap_or_else(|| earlier.pointer.clone());
-            candidate.fail((thread.index, before), earlier, pointer);
+            candidate.fail(
+                (thread.index, before),
+                earlier,
+                pointer,
+                earlier.failure_bytes,
+            );
         }
     }
 }
@@ -1064,7 +1105,10 @@ fn unknown_target(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
             )
         }
         Hit::MissingScript(name)
-            if program == "npm" && before[1] == "run" && index == 2 && wrong == *name =>
+            if program == "npm"
+                && before.get(1).is_some_and(|word| word == "run")
+                && index == 2
+                && wrong == *name =>
         {
             (
                 "script",
@@ -1377,9 +1421,9 @@ fn alternative(
             if !related(kind, operand, failed, words) {
                 continue;
             }
-            let missing = self_evident(next)
-                .into_iter()
-                .any(|hit| matches!(hit, SelfHit::Missing(_, ref program) if *program == words[0]));
+            let missing = self_evident(next).into_iter().any(
+                |(hit, _)| matches!(hit, SelfHit::Missing(_, ref program) if *program == words[0]),
+            );
             if !missing {
                 return Some((later, words.join(" "), cmd.dir.clone()));
             }
@@ -1458,7 +1502,7 @@ fn contradicts(candidate: &Candidate, event: &Event) -> bool {
         Wrong::Command { dir, argv } => {
             code == 0
                 && cmd.dir == *dir
-                && canonical(&cmd.argv) == *argv
+                && canonical(&cmd.argv) == canonical(argv)
                 && event_hits(event).is_empty()
         }
         Wrong::Program(lead) => {
@@ -1468,14 +1512,55 @@ fn contradicts(candidate: &Candidate, event: &Event) -> bool {
                 && cmd.argv[1..lead.len()] == lead[1..]
                 && !self_evident(event)
                     .iter()
-                    .any(|hit| matches!(hit, SelfHit::Missing(..)))
+                    .any(|(hit, _)| matches!(hit, SelfHit::Missing(..)))
         }
         Wrong::Tests { dir, argv } => {
             cmd.dir == *dir
-                && cmd.argv == *argv
+                && canonical(&cmd.argv) == canonical(argv)
                 && events::runner(argv).is_some_and(|runner| ran_tests(runner, event))
         }
     })
+}
+
+/// Test runners that do not name themselves with `test`.
+const TEST_PROGRAMS: &[&str] = &[
+    "jest",
+    "mocha",
+    "rspec",
+    "phpunit",
+    "ava",
+    "tox",
+    "nox",
+    "karma",
+    "cypress",
+    "playwright",
+];
+/// Lines test runners print when tests fail [here: cargo, go test, unittest].
+const TEST_FAILED: &[&str] = &[
+    "test result: FAILED",
+    "to rerun pass",
+    "--- FAIL",
+    "FAILED (",
+    "tests failed",
+    "Tests failed",
+];
+
+/// A test run: a known runner, a program or subcommand named for tests, or output
+/// that reports failed tests.
+fn test_run(cmd: &Cmd, event: &Event) -> bool {
+    let words = canonical(events::unwrap(&cmd.argv));
+    events::runner(&cmd.argv).is_some()
+        || words
+            .first()
+            .is_some_and(|program| TEST_PROGRAMS.contains(&basename(program)))
+        || words.iter().take(3).enumerate().any(|(index, word)| {
+            let word = if index == 0 { basename(word) } else { word };
+            word.to_ascii_lowercase().contains("test")
+        })
+        || event
+            .texts
+            .iter()
+            .any(|text| TEST_FAILED.iter().any(|marker| text.body.contains(marker)))
 }
 
 /// A search or comparison that exits 1 to say it found nothing.

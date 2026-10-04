@@ -137,8 +137,6 @@ pub struct Event {
     pub session: String,
     pub transcript: bool,
     pub time_ms: u64,
-    /// The directory the command started in, within its checkout.
-    pub dir: String,
     /// The command as the agent wrote it. Used for privacy and operand checks only.
     pub raw: String,
     /// Leading `NAME=value` words, kept for the privacy check.
@@ -414,13 +412,11 @@ fn accept(
         body,
     });
     let (shape, env) = normalizer.shell(&call.cwd, &call.command);
-    let (_, dir) = normalizer.rebase(&call.cwd);
     Some(Event {
         thread: thread.to_owned(),
         session: call.session,
         transcript: true,
         time_ms: call.time_ms,
-        dir,
         raw: call.command,
         env,
         shape,
@@ -504,13 +500,11 @@ pub fn runs(
         } else {
             Tests::default()
         };
-        let (_, dir) = normalizer.rebase(&run.cwd);
         events.push(Event {
             thread: format!("run:{}", run.session),
             session: run.session.clone(),
             transcript: false,
             time_ms: run.completed_ms,
-            dir,
             raw: shlex::try_join(run.argv.iter().map(String::as_str))
                 .unwrap_or_else(|_| run.argv.join(" ")),
             env,

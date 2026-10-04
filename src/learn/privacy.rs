@@ -57,6 +57,7 @@ const KEYWORDS: &[&str] = &[
     "cookie",
     "session_id",
     "bearer",
+    "header",
 ];
 const HEADERS: &[&str] = &["authorization", "cookie", "token", "api-key"];
 const NETWORK: &[&str] = &[
@@ -100,7 +101,21 @@ const WRAPPERS: &[&str] = &["sudo", "doas", "env", "time", "nohup", "command", "
 /// Whether a raw command, with its stripped `NAME=value` words, may carry a credential,
 /// an address, a path outside the workspace or a network tool.
 pub fn unsafe_command(raw: &str, env: &[String], root: &Path) -> bool {
+    screen(raw, env, Some(root))
+}
+
+/// Whether a command may carry a credential or an address, or runs a network tool,
+/// whatever its paths. A zsh glob error is the local shell's wherever it ran.
+pub fn carries_credential(raw: &str, env: &[String]) -> bool {
+    screen(raw, env, None)
+}
+
+fn screen(raw: &str, env: &[String], root: Option<&Path>) -> bool {
     if TOKENS.is_match(raw) || raw.contains("://") || ADDRESS.is_match(raw) {
+        return true;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("authorization:") || lower.contains("bearer ") {
         return true;
     }
     let words =
@@ -108,7 +123,7 @@ pub fn unsafe_command(raw: &str, env: &[String], root: &Path) -> bool {
     if env.iter().chain(&words).any(|word| secret_assignment(word)) {
         return true;
     }
-    let root = root.to_string_lossy();
+    let root = root.map(Path::to_string_lossy);
     for (index, word) in words.iter().enumerate() {
         let next = words.get(index + 1).map(String::as_str);
         if let Some(name) = word.strip_prefix('-') {
@@ -129,12 +144,15 @@ pub fn unsafe_command(raw: &str, env: &[String], root: &Path) -> bool {
             }
         }
         for part in std::iter::once(word.as_str()).chain(word.split_once('=').map(|(_, v)| v)) {
-            if random(part)
-                || part.starts_with('~')
-                || part.starts_with('/')
-                    && part != root
-                    && !part.starts_with(&format!("{root}/"))
-                    && !part.starts_with("/dev/null")
+            if random(part) {
+                return true;
+            }
+            if let Some(root) = &root
+                && (part.starts_with('~')
+                    || part.starts_with('/')
+                        && part != root
+                        && !part.starts_with(&format!("{root}/"))
+                        && !part.starts_with("/dev/null"))
             {
                 return true;
             }
@@ -167,11 +185,14 @@ fn keyword(name: &str) -> bool {
     KEYWORDS.iter().any(|keyword| name.contains(keyword))
 }
 
+/// `NAME=value`, including dotted configuration keys such as git's `-c a.b=value`.
 fn secret_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, value)| {
         !name.is_empty()
             && !name.starts_with('-')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
             && !value.is_empty()
             && keyword(name)
     })
@@ -257,6 +278,9 @@ mod tests {
             "ping 10.0.0.1",
             "git push git@github.com",
             "ls ~/secrets",
+            "git -c http.extraHeader=X-Thing:abc --version",
+            "git -c 'http.extraHeader=Authorization: Bearer abc' fetch",
+            "cargo publish --token abc",
         ] {
             assert!(unsafe_command(raw, &[], root), "{raw}");
         }
@@ -271,6 +295,10 @@ mod tests {
             assert!(!unsafe_command(raw, &[], root), "{raw}");
         }
         assert!(unsafe_command("make", &["DB_PASSWORD=x".into()], root));
+        // Paths outside the workspace count only for unsafe_command.
+        assert!(!carries_credential("cd /srv/other && ls *.log", &[]));
+        assert!(carries_credential("ssh host ls *.log", &[]));
+        assert!(carries_credential("TOKEN=x ls *.log", &[]));
     }
 
     #[test]

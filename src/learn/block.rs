@@ -202,17 +202,40 @@ fn read(root: &Path, file: &str) -> Result<String> {
     }
 }
 
-/// A line `@NAME` or `@./NAME` outside fenced code, as Claude Code imports files.
+/// `@NAME` or `@./NAME` at the start of a line or after whitespace, up to the next
+/// whitespace, outside fenced code and backtick spans, as Claude Code imports files.
+/// A trailing period or other character makes a different path, which is not taken
+/// as an import, so the worst case is a rule shown twice rather than never.
 fn imports(text: &str, name: &str) -> bool {
     let mut fenced = false;
     for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with("```") || line.starts_with("~~~") {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced = !fenced;
-        } else if !fenced
-            && line
-                .strip_prefix('@')
-                .is_some_and(|path| path == name || path.strip_prefix("./") == Some(name))
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        // Drop backtick spans: each run of backticks opens or closes one.
+        let mut plain = String::with_capacity(line.len());
+        let mut code = false;
+        let mut previous = None;
+        for c in line.chars() {
+            if c == '`' {
+                if previous != Some('`') {
+                    code = !code;
+                }
+                plain.push(' ');
+            } else {
+                plain.push(if code { ' ' } else { c });
+            }
+            previous = Some(c);
+        }
+        if plain
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix('@'))
+            .any(|path| path == name || path.strip_prefix("./") == Some(name))
         {
             return true;
         }
@@ -599,7 +622,12 @@ mod tests {
     fn finds_imports_outside_fences() {
         assert!(imports("@AGENTS.md\n", "AGENTS.md"));
         assert!(imports("intro\n  @./AGENTS.md\n", "AGENTS.md"));
+        assert!(imports("Follow @AGENTS.md for everything.\n", "AGENTS.md"));
+        assert!(imports("See @README and\t@./AGENTS.md\n", "AGENTS.md"));
         assert!(!imports("See `@AGENTS.md`.\n", "AGENTS.md"));
+        assert!(!imports("Run ``x @AGENTS.md y`` here\n", "AGENTS.md"));
         assert!(!imports("```\n@AGENTS.md\n```\n", "AGENTS.md"));
+        assert!(!imports("mail me@AGENTS.md or @AGENTS.mdx\n", "AGENTS.md"));
+        assert!(!imports("See @AGENTS.md.\n", "AGENTS.md"));
     }
 }

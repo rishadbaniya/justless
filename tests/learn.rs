@@ -1677,3 +1677,237 @@ fn learn_without_sources() {
         assert!(stdout(&output).contains(GLOB_RULE), "{}", stdout(&output));
     }
 }
+
+/// `cargo test` output when a test fails, captured from a scratch crate (exit 101).
+const CARGO_FAILED: &str = "running 1 test\ntest tests::it_works ... FAILED\n\nfailures:\n\n---- tests::it_works stdout ----\n\nthread 'tests::it_works' (3914681) panicked at src/lib.rs:5:9:\nassertion `left == right` failed\n  left: 2\n right: 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    tests::it_works\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Compiling scratch v0.1.0 (/x/scratch)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/scratch-87369008df97ec58)\nerror: test failed, to rerun pass `--lib`";
+
+#[test]
+fn learn_test_failures_are_not_missing_options() {
+    let lab = Lab::new();
+    lab.sessions("t", 2, || {
+        vec![
+            call("cargo test", failure(101, CARGO_FAILED)),
+            call("cargo test --lib", Outcome::Ok("test result: ok. 1 passed")),
+            call(
+                "cargo test",
+                failure(101, CARGO_FAILED.replace("`--lib`", "`--test cli`")),
+            ),
+            call(
+                "cargo test --test cli",
+                Outcome::Ok("test result: ok. 1 passed"),
+            ),
+            call(
+                "npm test",
+                failure(
+                    1,
+                    "> x@1.0.0 test\n> vitest run\n\n FAIL  api.test.ts\nTests  1 failed | 3 passed\nTry --workspace to run one package",
+                ),
+            ),
+            call("npm test --workspace=api", Outcome::Ok("Tests  3 passed")),
+        ]
+    });
+    let report = lab.json(&["--min-sessions", "1"]);
+    assert_eq!(report["rules"], json!([]), "{report:#}");
+    assert_eq!(report["held"], json!([]), "{report:#}");
+
+    // A failure that names the flag its correction adds is still learned.
+    let lab = Lab::new();
+    lab.sessions("p", 2, || {
+        vec![
+            call(
+                "git push",
+                failure(
+                    128,
+                    "fatal: The current branch feature has no upstream branch.\nTo push the current branch and set the remote as upstream, use\n\n    git push --set-upstream origin feature\n",
+                ),
+            ),
+            call("git push --set-upstream origin feature", Outcome::Ok("done")),
+        ]
+    });
+    rule(&lab.rules(&[]), "Pass `--set-upstream` to `git push`.");
+}
+
+#[test]
+fn learn_npm_test_success_contradicts() {
+    let lab = Lab::new();
+    lab.write("web/package.json", "{}\n");
+    let missing = "npm error code ENOENT\nnpm error syscall open\nnpm error path /x/package.json\nnpm error enoent Could not read package.json";
+    lab.transcript(
+        "a.jsonl",
+        "a",
+        now_ms() - DAY,
+        vec![
+            call("npm test", Outcome::Fail(254, missing)),
+            call("npm --prefix web test", Outcome::Ok("ok")),
+        ],
+    );
+    let text = "Run `npm` from `web/`; the repository root has no package.json.";
+    rule(&lab.rules(&[]), text);
+    lab.transcript(
+        "b.jsonl",
+        "b",
+        now_ms() - MINUTE,
+        vec![call("npm test", Outcome::Ok("ok"))],
+    );
+    let report = lab.json(&[]);
+    assert_eq!(report["rules"], json!([]), "{report:#}");
+    assert_eq!(
+        held(&report, "wrong_directory")[0]["reason"],
+        "contradicted"
+    );
+}
+
+#[test]
+fn learn_self_evident_privacy_and_directory() {
+    let lab = Lab::new();
+    lab.sessions("s", 2, || {
+        vec![
+            call(
+                "ssh devbox kubectl get pods",
+                Outcome::Fail(127, "bash: kubectl: command not found"),
+            ),
+            call(
+                "API_TOKEN=s3cr3t rgx foo",
+                Outcome::Fail(127, "zsh:1: command not found: rgx"),
+            ),
+            call(
+                "cd /srv/other/app && ./gradlew build",
+                Outcome::Fail(127, "zsh:1: no such file or directory: ./gradlew"),
+            ),
+            // Opaque within the root: the directory that ran ./mvnw is unknown.
+            call(
+                "D=sub\ncd $D && ./mvnw test",
+                Outcome::Fail(127, "(eval):2: no such file or directory: ./mvnw"),
+            ),
+        ]
+    });
+    let report = lab.json(&["--min-sessions", "1"]);
+    assert_eq!(report["rules"], json!([]), "{report:#}");
+    assert_eq!(report["held"], json!([]), "{report:#}");
+    assert_eq!(report["skipped"]["credentials"], 4, "{report:#}");
+
+    // A parsed command keeps its directory.
+    let lab = Lab::new();
+    lab.sessions("r", 2, || {
+        vec![call(
+            "cd server && ./gradlew build",
+            Outcome::Fail(127, "zsh:1: no such file or directory: ./gradlew"),
+        )]
+    });
+    let found = lab.rules(&[]);
+    let found = rule(
+        &found,
+        "`./gradlew` does not exist here; check the path before running it.",
+    );
+    assert_eq!(found["check"]["detail"], "./gradlew is missing");
+    lab.write("server/gradlew", "#!/bin/sh\n");
+    let report = lab.json(&[]);
+    assert_eq!(held(&report, "missing_program")[0]["reason"], "stale");
+}
+
+#[test]
+fn learn_never_crashes_on_bare_programs() {
+    let lines = [
+        "make: *** No targets specified and no makefile found.  Stop.",
+        "make: *** No rule to make target `lint'.  Stop.",
+        "error: could not find `Cargo.toml` in `/x` or any parent directory",
+        "npm error code ENOENT\nnpm error path /x/package.json",
+        "error: No `pyproject.toml` found in current directory or any parent directory",
+        "error: package ID specification `core` did not match any packages",
+        "error: no test target named `api`.",
+        "error: no such command: `nextest`",
+        "git: 'stauts' is not a git command. See 'git --help'.",
+        "npm error Missing script: \"test\"",
+        "error: unexpected argument '--nope' found",
+        "error: unknown option `ammend'",
+        "head: invalid option -- 'z'",
+        "tool.py: error: the following arguments are required: --x",
+        "ERROR: file or directory not found: tests/test_api.py",
+        "Could not find 'tests/x.test.js'",
+        "npm error Unsupported URL Type \"workspace:\": workspace:*",
+        "Usage Error: This project is configured to use pnpm because /x/package.json has a \"packageManager\" field",
+        "zsh:1: command not found: x",
+        "zsh:1: no such file or directory: ./x",
+        "/usr/bin/python3: No module named pytest",
+    ];
+    let lab = Lab::new();
+    for (index, program) in [
+        "npm",
+        "cargo",
+        "git",
+        "make",
+        "pytest",
+        "node",
+        "yarn",
+        "timeout 5",
+        "env",
+        "python3",
+        "./x",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut calls = Vec::new();
+        for line in lines {
+            calls.push(call(program, failure(1, line)));
+            calls.push(call("pnpm", Outcome::Ok("ok")));
+            calls.push(call(program, failure(2, line)));
+            calls.push(call(&format!("{program} x"), Outcome::Ok("ok")));
+        }
+        let session = format!("b{index}");
+        lab.transcript(&format!("{session}.jsonl"), &session, now_ms() - DAY, calls);
+    }
+    for args in [&[][..], &["--min-sessions", "1"]] {
+        let output = lab.learn(args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+}
+
+#[test]
+fn learn_apply_inline_import() {
+    let lab = Lab::new();
+    lab.sessions("g", 2, glob_calls);
+    lab.write("AGENTS.md", "# Agents\n");
+    let claude = "# Claude\n\nFollow @AGENTS.md for everything.\n";
+    lab.write("CLAUDE.md", claude);
+    let report = lab.json(&["--apply"]);
+    assert_eq!(report["apply"]["changed"], json!(["AGENTS.md"]));
+    assert_eq!(
+        report["apply"]["skipped"],
+        json!([{"file": "CLAUDE.md", "reason": "imports AGENTS.md"}])
+    );
+    assert_eq!(lab.read("CLAUDE.md"), claude);
+}
+
+#[test]
+fn learn_counts_only_error_lines_of_lists() {
+    let lab = Lab::new();
+    let other = "x".repeat(4000);
+    lab.sessions("g", 2, || {
+        let output = format!("{GLOB}\n{other}");
+        vec![call(
+            "grep -rn needle --include=*.rs .; cat notes.txt",
+            Outcome::Raw(
+                output.clone(),
+                false,
+                json!({"stdout": output, "interrupted": false}),
+            ),
+        )]
+    });
+    lab.sessions("h", 2, gh_calls);
+    let rules = lab.rules(&[]);
+    assert_eq!(
+        rule(&rules, GLOB_RULE)["failure_bytes"],
+        2 * (GLOB.len() + 1)
+    );
+    let gh = "Exit code 127\nzsh:1: command not found: gh";
+    assert_eq!(rule(&rules, GH_RULE)["failure_bytes"], 2 * gh.len());
+
+    // Transcript evidence points at the thread file and line.
+    let text = lab.text(&[]);
+    let path = lab.transcripts().join("g0.jsonl");
+    assert!(
+        text.contains(&format!("   evidence: {}:2\n", path.display())),
+        "{text}"
+    );
+}
