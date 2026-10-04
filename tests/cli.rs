@@ -7475,7 +7475,8 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
     .unwrap();
 
     // The session, started in the outer project, routes a command that enters
-    // the nested repository, so its run is recorded there.
+    // the nested repository. The hook names the outer workspace root, so that
+    // run is recorded in the outer project, where `justless log` finds it.
     let event = json!({"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
         "cwd":outer,"permission_mode":"default","tool_input":{"command":"cd nested && git status"}});
     let routed = claude_hook(&outer, &outer, "before-command", event);
@@ -7493,9 +7494,14 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
         .output()
         .unwrap();
     assert!(shell.status.success(), "{}", stderr(&shell));
-    assert!(nested.join(".justless/runs").is_dir());
-    assert!(!outer.join(".justless/runs").exists());
-    // Then the agent works inside it: a large routed run and a replaced Read.
+    assert!(
+        command.contains(&format!("--root {}", outer.display())),
+        "{command}"
+    );
+    assert!(outer.join(".justless/runs").is_dir());
+    assert!(!nested.join(".justless/runs").exists());
+    // Then the agent works inside it: a large run recorded in the nested
+    // repository itself, and a replaced Read.
     let run = Command::new(env!("CARGO_BIN_EXE_justless"))
         .args([
             "run",
@@ -7535,8 +7541,13 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
         "{inside}"
     );
     assert_eq!(line(&outer, "s1"), inside);
-    // Another session in the same project did not list the nested repository.
-    assert_eq!(line(&outer, "s2"), "justless · ready");
+    // Another session in the same project did not list the nested repository,
+    // so it sees only the outer project's run (run records do not name their
+    // session), not the nested run or the read.
+    assert_eq!(
+        line(&outer, "s2"),
+        "justless · ≈0 tokens saved this session · 1 run"
+    );
     // The session's roots are kept in the project it started in.
     let listed = fs::read_to_string(
         outer

@@ -1565,8 +1565,8 @@ impl Doctor<'_> {
 
 /// The archive limits `justless run` enforces, or `None` when this version keeps
 /// every run until it is deleted by hand.
-fn retention(_settings: &Settings) -> Option<(usize, u64)> {
-    None
+fn retention(settings: &Settings) -> Option<(usize, u64)> {
+    Some((settings.max_runs, settings.max_archive_bytes))
 }
 
 /// The note for a configured client when no hook has routed a command yet. Runs
