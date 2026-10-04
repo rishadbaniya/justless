@@ -263,9 +263,11 @@ pub fn transcripts(
             let Ok(line) = line else {
                 break;
             };
-            if line.starts_with(BLOB)
-                || !line.contains("\"tool_use\"") && !line.contains("\"tool_result\"")
-            {
+            // Parse only a line that can start a shell call or finish a pending one;
+            // other tools' calls and results are most of a transcript.
+            let starts = line.contains("\"tool_use\"") && line.contains("\"Bash\"");
+            let finishes = !pending.is_empty() && line.contains("\"tool_result\"");
+            if line.starts_with(BLOB) || !starts && !finishes {
                 continue;
             }
             let Ok(entry) = serde_json::from_str::<Value>(&line) else {
@@ -413,6 +415,7 @@ fn accept(
         stream: "",
         body,
     });
+    release(&mut texts, status);
     let (shape, env) = normalizer.shell(&call.cwd, &call.command);
     Some(Event {
         thread: thread.to_owned(),
@@ -506,6 +509,7 @@ pub fn runs(
         } else {
             Tests::default()
         };
+        release(&mut texts, Status::Code(run.status));
         events.push(Event {
             thread: format!("run:{}", run.session),
             session: run.session.clone(),
@@ -528,6 +532,21 @@ pub fn runs(
     // Oldest first, so a correction follows its failure.
     events.sort_by(|a, b| a.time_ms.cmp(&b.time_ms));
     events
+}
+
+/// Free the output a success cannot use, once its test counts are read. A success
+/// matters only through a signature or a self-evident error in its text, so a body
+/// without any of their words is emptied; the run and stream stay for evidence
+/// pointers. A failure keeps everything, and an unknown status is never read.
+fn release(texts: &mut [Text], status: Status) {
+    if matches!(status, Status::Code(code) if code != 0) {
+        return;
+    }
+    for text in texts {
+        if status == Status::Unknown || !super::patterns::may_signal(&text.body) {
+            text.body = String::new();
+        }
+    }
 }
 
 /// A test runner whose output or exit status reports how many tests ran.

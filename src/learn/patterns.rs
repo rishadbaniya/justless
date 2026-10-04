@@ -430,6 +430,46 @@ static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
     }
 });
 
+/// Words at least one of which every signature and self-evident error contains. A
+/// text without any of them can match neither, so its body need not be kept.
+static SIGNALS: LazyLock<Regex> = LazyLock::new(|| {
+    let words = [
+        "not found",
+        "no such file or directory",
+        "No such file or directory",
+        "No module named",
+        "no matches found",
+        "no makefile found",
+        "No rule to make target",
+        "Cargo.toml",
+        "ENOENT",
+        "pyproject.toml",
+        "did not match any packages",
+        "target named",
+        "no such command",
+        "is not a git command",
+        "Missing script",
+        "unexpected argument",
+        "which wasn't expected",
+        "unrecognized argument",
+        "unrecognized option",
+        "unknown option",
+        "unknown switch",
+        "invalid option",
+        "illegal option",
+        "arguments are required",
+        "Could not find",
+        "Unsupported URL Type",
+        "is configured to use",
+    ];
+    let pattern = words.map(regex::escape).join("|");
+    Regex::new(&pattern).expect("signal words")
+});
+
+pub fn may_signal(text: &str) -> bool {
+    SIGNALS.is_match(text)
+}
+
 fn hits(text: &str) -> Vec<Hit> {
     let s = &*SIGNATURES;
     let mut hits = Vec::new();
@@ -2439,7 +2479,11 @@ mod tests {
         ];
         for (line, expected) in cases {
             assert!(hits(line).contains(expected), "{line}: {:?}", hits(line));
+            assert!(may_signal(line), "{line}");
         }
+        assert!(!may_signal(
+            "   Compiling x v0.1.0\n    Finished `dev` profile\ntest result: ok."
+        ));
         assert!(hits("head: invalid option -- '-'").is_empty());
     }
 
@@ -2481,6 +2525,13 @@ mod tests {
             ),
         ] {
             assert_eq!(missing(line), [(kind, operand.to_owned())], "{line}");
+            assert!(may_signal(line), "{line}");
+        }
+        for line in [
+            "zsh:1: no matches found: --include=*.zz",
+            "zsh:1: ==== not found",
+        ] {
+            assert!(may_signal(line), "{line}");
         }
         assert!(missing("ModuleNotFoundError: No module named 'requests'").is_empty());
         let glob = GLOB
