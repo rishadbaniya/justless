@@ -481,6 +481,47 @@ fn ruby_and_perl_receive_file_argument() {
     }
 }
 
+/// Deno, Bun and a `python`-only system, through stub interpreters that print argv.
+#[cfg(unix)]
+#[test]
+fn interpreter_table_builds_each_command_line() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_directory, root) = workspace();
+    fs::write(root.join("data.txt"), "x\n").unwrap();
+    let stubs = TempDir::new().unwrap();
+    for name in ["deno", "bun", "python"] {
+        let stub = stubs.path().join(name);
+        fs::write(&stub, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let data = root.join("data.txt").display().to_string();
+    for (lang, prefix, extension) in [
+        ("deno", &["run", "--allow-all", "--quiet"][..], "ts"),
+        ("bun", &["run"], "ts"),
+        ("python3", &[], "py"),
+    ] {
+        let output = justless(&root)
+            .args([
+                "exec", "--lang", lang, "--file", "data.txt", "code", "--", "arg",
+            ])
+            .env("PATH", stubs.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{lang}: {}", stderr(&output));
+        let text = stdout(&output);
+        let argv: Vec<_> = text.lines().collect();
+        let script = format!(
+            "{}/.justless/runs/{}/script.{extension}",
+            root.display(),
+            argv[prefix.len()].rsplit('/').nth(1).unwrap()
+        );
+        let mut expected: Vec<&str> = prefix.to_vec();
+        expected.extend([script.as_str(), data.as_str(), "arg"]);
+        assert_eq!(argv, expected, "{lang}");
+        assert_eq!(fs::read(&script).unwrap(), b"code");
+    }
+}
+
 #[test]
 fn missing_interpreter_is_a_clear_error() {
     let (_directory, root) = workspace();
@@ -635,6 +676,13 @@ fn killing_justless_stops_the_script() {
         assert!(!alive(pid.trim()), "{file} survived");
     }
     assert_eq!(runs(&root).len(), 0);
+    // The unrecorded run directory left behind does not disturb later commands.
+    for args in [&["history"][..], &["stats"], &["resume"]] {
+        let output = cli(&root, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    let output = exec(&root, &["--lang", "sh", "echo after"]);
+    assert_eq!(stdout(&output), "after\n", "{}", stderr(&output));
 }
 
 #[cfg(unix)]
