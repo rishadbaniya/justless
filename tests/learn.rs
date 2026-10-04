@@ -1619,6 +1619,33 @@ fn learn_preview_fails_open() {
 }
 
 #[test]
+fn learn_counts_corrections_across_nested_checkouts() {
+    // The same directory in a worktree is another checkout, not another directory.
+    let lab = Lab::new();
+    lab.write(".claude/worktrees/w1/.git", "gitdir: elsewhere\n");
+    lab.sessions("n", 2, || {
+        vec![
+            call(
+                "make test",
+                Outcome::Fail(
+                    2,
+                    "make: *** No targets specified and no makefile found.  Stop.",
+                ),
+            ),
+            call_in(".claude/worktrees/w1", "make test", Outcome::Ok("ok")),
+        ]
+    });
+    let report = lab.json(&["--min-sessions", "1"]);
+    assert_eq!(report["rules"], json!([]), "{report:#}");
+    assert_eq!(report["skipped"]["nested_checkout"], 2, "{report:#}");
+    assert!(
+        lab.text(&[]).contains("2 split across nested checkouts"),
+        "{}",
+        lab.text(&[])
+    );
+}
+
+#[test]
 fn learn_notes_only_with_rules() {
     // Without rules, a CLAUDE.md above the root is not worth a note.
     let lab = Lab::new();
@@ -1994,11 +2021,11 @@ fn learn_archive_withholds_credentials() {
         &[
             "tool",
             "-c",
-            "http.extraHeader=Authorization: Bearer abc",
+            "http.extraHeader=Authorization: Bearer quux-value",
             "--version",
         ][..],
-        &["tool", "publish", "--token", "abc"],
-        &["tool", "clone", "https://user:secret@example.invalid/x"],
+        &["tool", "publish", "--token", "quux-value"],
+        &["tool", "clone", "https://user:quux-value@example.invalid/x"],
     ] {
         let mut all = vec!["--"];
         all.extend(args);
@@ -2008,7 +2035,7 @@ fn learn_archive_withholds_credentials() {
             (&json!([]), &json!(true)),
             "{args:?}"
         );
-        assert!(!record.to_string().contains("abc") && !record.to_string().contains("secret"));
+        assert!(!record.to_string().contains("quux-value"), "{record:#}");
     }
     let record = records(&lab.run("", &["--", "tool", "build"]));
     assert_eq!(record["argv"], json!(["tool", "build"]));
