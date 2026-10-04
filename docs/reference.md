@@ -31,6 +31,7 @@
 | `justless stats --days 7 --json` | Bytes kept out of context with an estimated token count, a daily timeline, savings by command, full-log reopenings, repeated reads and commands passed through by hooks |
 | `justless statusline` | One line for Claude Code's status line, such as `justless · ≈41.2k tokens saved this session · 23 runs · 4 reads`, from the session JSON Claude Code passes on stdin. `justless init --statusline` installs it. |
 | `justless discover --days 30 --json` | Shell commands Claude Code ran in this workspace, split into those routed through Justless, supported commands that were not routed, supported tools in a form the hooks pass through, and unsupported commands, with output sizes |
+| `justless learn --days 30 --json` | Command mistakes agents corrected or keep repeating, as proposed rules with failure, session and thread counts, the failed output they cost, the last date seen, a check against the current tree and the run behind each rule. `--apply` writes them to a managed block in the project instructions. |
 | `justless mcp` | A stdio MCP server for the read-only commands. `--install CLIENT` adds it to a client's project config. |
 | `justless doctor --json` | Whether this project's setup works: the `justless` on `PATH`, each agent's CLI, hooks and instructions compared with what `init` writes, MCP entries and `.justless/`, with a fix for each problem. Exits 1 when something needs fixing. [Details](#check-the-setup) |
 | `justless init --remove --dry-run` | Each file that removing Justless from the project would change, and how. Drop `--dry-run` to make the changes. `--agent NAME` limits them to some clients, and `--purge` also deletes `.justless/`. |
@@ -520,3 +521,69 @@ Setup records each file it writes, as it was before, in `.justless/setup.json`, 
 Every file is read and checked first. A config file that never mentions justless is left alone, even when it does not parse, such as a `.vscode/mcp.json` with comments. One that does mention it but does not parse, or an instructions file with incomplete or duplicate markers, stops the removal before anything changes, and the error names the file. Fix it or delete its justless entries by hand, or leave its client out with `--agent`. A hook, status line or server that mentions justless in a form setup does not write, such as a wrapper script, stays, and the output lists it by file and JSON pointer to edit by hand. If a change fails partway, the output lists what was already removed, and running the command again finishes the rest. `--dry-run` prints each change and makes none. A second run reports nothing to remove. `.justless/` and the `/.justless/` line in `.gitignore` stay unless you add `--purge`, which deletes the archived runs, index and history.
 
 `--agent NAME`, repeatable, removes only those clients' hooks, MCP entries and instructions. `--agent copilot` also covers VS Code's `.vscode/mcp.json`. A shared file such as `AGENTS.md` keeps its section while another client that reads it was set up by `init` or still has Justless hooks, its plugin or an MCP entry, and the output says which. `--purge` cannot be combined with `--agent`. In the home directory, or a project whose `.claude` or `.codex` is `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, the client folders hold user settings, so removal runs there only with an explicit `--root`. Start a new agent session afterwards, since clients load hooks when a session starts.
+
+## Learned command rules
+
+`justless learn` reads this workspace's archived runs and its Claude Code transcripts from the last 30 days (`--days`), including subagent and workflow transcripts. It proposes short rules for command mistakes that agents corrected or keep repeating. It runs locally, makes no model calls and runs no commands.
+
+Each rule comes with:
+- failure and correction counts, sessions and agent threads
+- the bytes of failed output the mistakes returned to the agent
+- the last date it was seen
+- its scope: `project` for facts about this repository, `machine` for facts about this computer's programs and shell
+- a check against the current tree, `PATH` or `$SHELL`
+- the run behind it, when there is one, so `justless log RUN_ID --stream stderr` replays the original failure
+
+Add `--json` for structured fields, and `--limit N` (default 8, at most 32) to show fewer rules.
+
+| Pattern | Evidence | Example rule |
+| --- | --- | --- |
+| Missing program | The shell reports `command not found` and the program is still not on `PATH`. A later command with the same arguments under a related name supplies the alternative. | Use `python3`, not `python`; `python` is not installed on this machine. |
+| Wrong directory | Make, Cargo, npm or uv finds no `Makefile`, `Cargo.toml`, `package.json` or `pyproject.toml`, then the same command succeeds in another directory | Run `make` from `server/`; the repository root has no Makefile. |
+| Unknown package, script or target | Cargo, npm, Make or Git rejects a name, then the same command succeeds with another | Run `npm run test:unit`; there is no `test` script. |
+| Unknown or missing option | The tool rejects a flag or asks for one, then the command succeeds without it or with it | Pass `--config` to `./deploy.py`. |
+| Wrong test path | pytest or `node --test` cannot find a path, then succeeds with a path in another directory | `pytest` tests are under `api/tests/`, not `tests/`. |
+| Empty test run | `cargo test` runs no tests or pytest exits 5, then a variant runs some | Run tests with `cargo test -p core`; plain `cargo test` here runs no tests. |
+| Wrong package manager | npm rejects a `workspace:` dependency or Corepack names the project's manager, then another manager succeeds | Use `pnpm`, not `npm`; this project has pnpm-lock.yaml. |
+| Shell quirks | zsh stops a command at an unmatched glob or at a word that starts with `=` | Quote glob patterns in shell arguments, as in `--include='*.rs'`; zsh stops a command at an unmatched glob. |
+
+How rules qualify:
+- A rule needs evidence from two sessions (`--min-sessions`). Subagents count toward their parent's session, so one agent fanning out cannot create a rule alone.
+- A missing program with an alternative, a wrong directory or a wrong package manager needs one correction when the current tree confirms it, such as a lockfile that names the manager.
+- Rules are ranked by how many sessions showed the mistake, with recent sessions weighing more.
+- Test failures, compiler errors, searches that find nothing, permission denials, and rejected, interrupted, timed-out or background tool calls are not mistakes.
+- A correction of one or two characters is a typo and is not learned.
+- A rule is held back when the wrong form later succeeded, or when its check fails now, for example because `python` is now installed. The report counts held rules and how to list them.
+
+What rules contain:
+- Program names, flags, script, target and package names, and workspace-relative paths.
+- A correction is dropped whole when either command carries a credential-like environment assignment or option, a known token format, a URL, an e-mail address, a host, or a path outside the workspace.
+- Nothing is learned from network and credential tools such as `ssh`, `curl` and `aws`.
+- Command lines and output are never printed.
+
+`--apply` writes the proposed rules into a block between `<!-- justless:learned:begin -->` and `<!-- justless:learned:end -->`.
+- Without `--target`, it updates each existing `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` once. It skips symbolic links and any file that imports another with a line such as `@AGENTS.md`.
+- When none exists, it creates `CLAUDE.md` if the rules came from Claude Code transcripts, and `AGENTS.md` otherwise.
+- When it writes only `AGENTS.md` but a `CLAUDE.md` here or in a parent directory would stop Claude Code from reading it, the report says so.
+- Repeat `--target agents|claude|gemini` to choose the files.
+- `--target claude` does not create `CLAUDE.md` next to an existing `AGENTS.md`, because Claude Code then stops reading `AGENTS.md`. Start `CLAUDE.md` with the line `@AGENTS.md` first. [Claude Code and AGENTS.md](https://code.claude.com/docs/en/memory#agents-md)
+- The block goes after the Justless instructions block when the file has one, and at the end otherwise.
+- Text outside the block keeps its exact bytes, and a second run with the same evidence changes nothing.
+- A file with an incomplete or repeated learned block, or one inside the Justless instructions block, stops the run before any file is written.
+
+How written rules are kept or removed:
+- Written lines keep their place and wording. New rules are added at the end, and a full block holds new rules back instead of replacing old ones.
+- A written rule stays when its evidence ages out of the window, because a rule that works stops the failures that produced it.
+- It is removed when its check fails or the wrong form succeeds again. Only the clone that wrote a rule removes it, so a teammate with a different `PATH` does not change the committed file.
+- Delete a rule's line to dismiss it. Justless records the dismissal in `.justless/learned.json` and does not add the rule back.
+- Lines you add inside the block are kept.
+- The block holds at most 8 rules (`--limit`) and 1,200 bytes. Claude Code removes HTML comments such as the block markers before the file reaches the model.
+- Machine rules describe the computer that ran `learn`. Review them before committing a shared instructions file.
+
+Runs recorded before this version carry no command line and are skipped.
+
+```sh
+justless learn
+justless learn --days 60 --min-sessions 1 --json
+justless learn --apply --target agents
+```
