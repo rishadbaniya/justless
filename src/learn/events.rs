@@ -463,6 +463,11 @@ pub fn runs(
         if run.completed_ms < since_ms {
             break;
         }
+        // A run whose Justless stopped before the command finished has no exit
+        // status or final command line to learn from.
+        if run.unfinished {
+            continue;
+        }
         if stats.scanned == RUN_CAP {
             stats.capped = true;
             break;

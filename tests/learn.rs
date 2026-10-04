@@ -2297,3 +2297,28 @@ fn learn_counts_only_error_lines_of_lists() {
         "{text}"
     );
 }
+
+/// A run whose Justless was killed keeps the record written before its command
+/// started, with no command line or exit status, and is not mistaken for a run
+/// recorded before command capture.
+#[test]
+fn learn_skips_runs_left_unfinished() {
+    let lab = Lab::new();
+    lab.tool("tool", "exit 1");
+    let id = run_id(&lab.run("", &["--", "tool", "build"]));
+    let file = format!(".justless/runs/{id}/record.json");
+    let mut record: Value = serde_json::from_str(&lab.read(&file)).unwrap();
+    record["unfinished"] = json!(true);
+    record["status"] = json!(-1);
+    record["argv"] = json!([]);
+    lab.write(&file, &record.to_string());
+
+    let report = lab.json(&[]);
+    assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
+    assert_eq!(
+        report["sources"]["runs"]["without_command"], 0,
+        "{report:#}"
+    );
+    let text = lab.text(&[]);
+    assert!(!text.contains("predate command capture"), "{text}");
+}
