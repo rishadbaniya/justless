@@ -85,3 +85,22 @@ Build with `cargo build --release --locked` and run `python3 scripts/context_ben
 | Edit reference plus replacement | 88 |
 
 The same run generates an outbound request with six build results. Retiring the oldest three reduced the serialized request from 38,306 to 19,952 bytes. Restoring the references reproduced the original JSON values. These measurements count local UTF-8 bytes. Provider token counts and prompt-cache effects depend on the model and client.
+
+## Script runner
+
+```sh
+cargo build --locked
+python3 scripts/exec_benchmark.py --binary ./target/debug/justless
+```
+
+The script generates seeded data locally, runs a short analysis script over each file through `justless exec`, and compares what the agent receives with the input and with `justless run -- cat FILE`. It makes no network or model calls.
+
+| Task | Input | `justless run -- cat` | `justless exec` |
+| --- | ---: | ---: | ---: |
+| Summarize an 8,000-issue JSON export | 5,953,169 bytes | 2,143 bytes, no answer | 257 bytes |
+| Count log errors by service and code | 19,051,254 bytes | 2,121 bytes, no answer | 310 bytes |
+| Revenue and refunds by region from a CSV | 4,395,204 bytes | 2,149 bytes, no answer | 186 bytes |
+
+Printing an input would put every byte of it in context. `run -- cat` stays bounded, but its head and tail do not contain the answer. The `exec` column is everything the agent received: a successful script whose output fits adds no footer.
+
+A fourth script lists 2,176 slow requests in 119,694 bytes, 61 of them payment timeouts. The default preview, 2,084 bytes, showed 1 of those lines. `--intent "payments timeouts"` showed 58 within the 4,096-byte preview, 4,128 bytes with its footer. Measured on macOS arm64. Spacing from `uniq -c` differs on Linux, so the log row can change by a few bytes.
