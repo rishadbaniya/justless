@@ -916,6 +916,29 @@ fn saved_script_path_is_relative_to_the_working_directory() {
     }
 }
 
+/// Each name before `:N` is resolved once per stream, so a repeated file location keeps
+/// every diagnostic and timestamps never become one.
+#[test]
+fn repeated_locations_resolve_once_and_timestamps_stay_data() {
+    let (_directory, root) = workspace();
+    fs::write(root.join("price.py"), "def price():\n    return 1\n").unwrap();
+    let script = "i=0; while [ $i -lt 2000 ]; do echo \"2025-03-10T00:$((i % 60)):00 INFO row $i\"; if [ $((i % 700)) -eq 0 ]; then echo \"price.py:2: bad row $i\"; fi; i=$((i + 1)); done; exit 1";
+    let output = exec(&root, &["--lang", "sh", script]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let id = run_id(&output);
+    let context = stdout(&cli(&root, &["context", "--run", &id, "--budget", "12000"]));
+    for line in [2, 703, 1404] {
+        assert!(
+            context.contains(&format!("price.py:2 · log stdout:{line}")),
+            "{line}: {context}"
+        );
+    }
+    assert!(
+        context.starts_with(&format!("Run {id} · 3 source locations\n")),
+        "{context}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn signal_death_maps_to_128_plus_n() {
