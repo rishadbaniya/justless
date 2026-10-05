@@ -4,11 +4,11 @@
 //!
 //! This isolates output, not code: scripts run with the caller's permissions.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,9 @@ use crate::workspace::Workspace;
 const STDIN_LIMIT: u64 = 1024 * 1024;
 /// Time between SIGINT and SIGKILL once the limit passes.
 const GRACE: Duration = Duration::from_secs(2);
+/// How long processes the script left running, such as the reader of `> >(sort)`, may
+/// keep writing after it exits.
+const DRAIN: Duration = Duration::from_secs(2);
 const LANGUAGES: &str = "sh, bash, python3, node, ruby, perl, deno, bun";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,13 +126,65 @@ impl Lang {
         }
     }
 
-    /// Arguments placed before the script path.
-    fn prefix(self) -> &'static [&'static str] {
+    /// Arguments placed before the script path: the options on the script's `#!`
+    /// line, which for Deno and Bun replace the default `run` options.
+    fn prefix(self, options: &[String]) -> Vec<String> {
         match self {
-            Self::Deno => &["run", "--allow-all", "--quiet"],
-            Self::Bun => &["run"],
-            _ => &[],
+            Self::Deno | Self::Bun if options.first().is_some_and(|word| word == "run") => {
+                options.to_vec()
+            }
+            Self::Deno if options.is_empty() => ["run", "--allow-all", "--quiet"]
+                .map(str::to_owned)
+                .to_vec(),
+            Self::Deno | Self::Bun => std::iter::once("run".to_owned())
+                .chain(options.iter().cloned())
+                .collect(),
+            _ => options.to_vec(),
         }
+    }
+}
+
+/// A `#!` first line: the interpreter it names, the options it passes, and the
+/// variables an `env` form sets.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Shebang {
+    program: String,
+    options: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+impl Shebang {
+    /// Reads `#!/bin/sh -e`, `#!/usr/bin/env -S bash -eu` or
+    /// `#!/usr/bin/env PYTHONUTF8=1 python3`. Options are split at whitespace, as
+    /// macOS does; Linux would pass them as one argument.
+    fn parse(code: &[u8]) -> Option<Self> {
+        let line = code.strip_prefix(b"#!")?;
+        let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
+        let line = String::from_utf8_lossy(line);
+        let mut words = line.trim_end_matches('\r').split_whitespace();
+        let basename = |word: &str| word.rsplit('/').next().unwrap_or(word).to_owned();
+        let mut program = basename(words.next()?);
+        let mut env = Vec::new();
+        if program == "env" {
+            program = loop {
+                let word = words.next()?;
+                if matches!(word, "-u" | "-C" | "-P" | "--unset" | "--chdir") {
+                    // The next word is this option's value.
+                    words.next();
+                } else if word.starts_with('-') {
+                    // `-S` and other options of `env` itself.
+                } else if let Some((name, value)) = word.split_once('=') {
+                    env.push((name.to_owned(), value.to_owned()));
+                } else {
+                    break basename(word);
+                }
+            };
+        }
+        Some(Self {
+            program,
+            options: words.map(str::to_owned).collect(),
+            env,
+        })
     }
 }
 
@@ -171,7 +226,7 @@ pub fn command() -> clap::Command<'static> {
             Arg::new("intent")
                 .long("intent")
                 .value_name("TEXT")
-                .help("Show the stdout lines most relevant to TEXT when output exceeds the preview"),
+                .help("Show the stdout lines most relevant to TEXT when output exceeds the preview; print one record per line"),
         )
         .arg(
             Arg::new("timeout")
@@ -225,7 +280,16 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
     }
 
     let (script, code_on_stdin) = load(matches)?;
-    let lang = language(matches, &script)?;
+    let shebang = Shebang::parse(match &script {
+        Script::Inline(code) => code,
+        Script::File { head, .. } => head,
+    });
+    let lang = language(matches, shebang.as_ref(), &script)?;
+    // The options and variables on a `#!` line apply when it names the language that
+    // runs, as they would if the file were run directly.
+    let shebang = shebang
+        .filter(|line| Lang::from_interpreter(&line.program) == Some(lang))
+        .unwrap_or_default();
     let interpreter = find_on_path(lang.candidates()).with_context(|| {
         let candidates = lang.candidates();
         if candidates.len() > 1 {
@@ -259,7 +323,12 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
     // outside the terminal's foreground process group.
     let pass_stdin = !code_on_stdin && !io::stdin().is_terminal();
     let timed_out = Cell::new(false);
+    let left_running = Cell::new(false);
+    let run_id = RefCell::new(String::new());
     let spawn = |directory: &Path, stdout: Stdio, stderr: Stdio| -> Result<i32> {
+        if let Some(name) = directory.file_name() {
+            *run_id.borrow_mut() = name.to_string_lossy().into_owned();
+        }
         let path = match &script {
             Script::Inline(code) => {
                 let path = directory.join(format!("script.{}", lang.extension()));
@@ -270,13 +339,14 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
                     write_private(&directory.join("package.json"), b"{}\n")
                         .context("save the script")?;
                 }
-                path
+                // Every traceback frame repeats this path, so it is kept short.
+                relative(&path, &workspace.cwd, &workspace.root)
             }
             Script::File { path, .. } => path.clone(),
         };
         let mut command = Command::new(&interpreter);
         command
-            .args(lang.prefix())
+            .args(lang.prefix(&shebang.options))
             .arg(&path)
             .args(files.iter().map(|(_, path)| path))
             .args(&extra)
@@ -291,17 +361,19 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
         if std::env::var_os("NO_COLOR").is_none() {
             command.env("NO_COLOR", "1");
         }
+        command.envs(shebang.env.iter().map(|(name, value)| (name, value)));
         match files.first() {
             Some((_, path)) => command.env("JUSTLESS_FILE", path),
             None => command.env_remove("JUSTLESS_FILE"),
         };
-        let (status, expired) =
+        let outcome =
             supervise(command, timeout).with_context(|| format!("start {}", lang.label()))?;
-        timed_out.set(expired);
-        Ok(if expired {
+        timed_out.set(outcome.expired);
+        left_running.set(outcome.left_running);
+        Ok(if outcome.expired {
             124
         } else {
-            capture::exit_code(status)
+            capture::exit_code(outcome.status)
         })
     };
     let session = std::env::var("JUSTLESS_SESSION").unwrap_or_else(|_| "terminal".into());
@@ -323,6 +395,12 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
     )?;
     if timed_out.get() {
         eprintln!("[justless] stopped at --timeout {seconds}s");
+    } else if left_running.get() {
+        // A verbatim success prints no footer, so the notice names the run itself.
+        eprintln!(
+            "[justless {}] stopped processes the script left running; output they had not written is missing",
+            run_id.borrow()
+        );
     }
     Ok(status)
 }
@@ -375,17 +453,13 @@ fn load(matches: &ArgMatches) -> Result<(Script, bool)> {
 
 /// `--lang`, then a `#!` line naming a supported interpreter, then the extension of a
 /// `--script` file. Justless never guesses from the code itself.
-fn language(matches: &ArgMatches, script: &Script) -> Result<Lang> {
+fn language(matches: &ArgMatches, shebang: Option<&Shebang>, script: &Script) -> Result<Lang> {
     if let Some(name) = matches.value_of("lang") {
         return Lang::parse(name).with_context(|| format!("unknown language {name}"));
     }
-    let head = match script {
-        Script::Inline(code) => code,
-        Script::File { head, .. } => head,
-    };
-    if let Some(name) = shebang_name(head) {
-        return Lang::from_interpreter(&name)
-            .with_context(|| format!("the #! line names {name}; pass --lang"));
+    if let Some(line) = shebang {
+        return Lang::from_interpreter(&line.program)
+            .with_context(|| format!("the #! line names {}; pass --lang", line.program));
     }
     if let Script::File { path, .. } = script
         && let Some(lang) = Lang::from_extension(path)
@@ -395,22 +469,14 @@ fn language(matches: &ArgMatches, script: &Script) -> Result<Lang> {
     bail!("name the language with --lang ({LANGUAGES}) or start the script with #!")
 }
 
-/// The interpreter named on a `#!` first line, following `env` and its options. The
-/// line only selects the language: Justless runs its own interpreter for it.
-fn shebang_name(code: &[u8]) -> Option<String> {
-    let line = code.strip_prefix(b"#!")?;
-    let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
-    let line = String::from_utf8_lossy(line);
-    let mut words = line.trim_end_matches('\r').split_whitespace();
-    let basename = |word: &str| word.rsplit('/').next().unwrap_or(word).to_owned();
-    let program = basename(words.next()?);
-    if program != "env" {
-        return Some(program);
-    }
-    // `env -S python3 -u` and `env PYTHONUTF8=1 python3` both name python3.
-    words
-        .find(|word| !word.starts_with('-') && !word.contains('='))
-        .map(basename)
+/// `path` relative to the working directory when both lie under the root, as in
+/// `.justless/runs/run-…/script.py` or `../.justless/…`. Otherwise `path` itself.
+fn relative(path: &Path, cwd: &Path, root: &Path) -> PathBuf {
+    let (Ok(inside), Ok(depth)) = (path.strip_prefix(root), cwd.strip_prefix(root)) else {
+        return path.to_owned();
+    };
+    let up: PathBuf = depth.components().map(|_| Component::ParentDir).collect();
+    up.join(inside)
 }
 
 /// Looks up an interpreter the way a shell does, returning the absolute path to run.
@@ -461,91 +527,201 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     options.open(path)?.write_all(bytes)
 }
 
-/// The watchdog leads the script's process group. A line on its stdin names a signal
-/// for the whole group, which it ignores itself; end of input, including when Justless
-/// dies from any signal, kills the group and the watchdog with it.
-#[cfg(unix)]
-const WATCHDOG: &str =
-    "trap '' INT TERM HUP; while read -r s; do kill -s \"$s\" 0; done; kill -s KILL 0";
+/// The processes a script started, as far as Justless can reach them.
+trait Group {
+    /// Sends `signal` to every process in the group; false when it cannot be sent.
+    fn signal(&mut self, signal: &str) -> bool;
+    /// Whether any process is left in the group.
+    fn occupied(&mut self) -> bool;
+}
 
-/// Runs the script and waits until it and everything it started have stopped. Returns
-/// its status and whether the time limit stopped it.
+/// No group, as on Windows or without `/bin/sh`: only the interpreter can be stopped.
+struct Alone;
+
+impl Group for Alone {
+    fn signal(&mut self, _: &str) -> bool {
+        false
+    }
+
+    fn occupied(&mut self) -> bool {
+        false
+    }
+}
+
+/// The script leads its own process group, and the watchdog leads another, so no
+/// signal the script sends its group reaches the watchdog. The first input line names
+/// the script's group. Each later line names a signal for that group, or is `0` to ask
+/// whether any member is left, answered with 1 or 0. End of input, including when
+/// Justless dies from any signal, kills the group.
 #[cfg(unix)]
-fn supervise(mut command: Command, timeout: Option<Duration>) -> Result<(ExitStatus, bool)> {
+const WATCHDOG: &str = "trap '' INT TERM HUP QUIT PIPE; read -r g || exit; \
+    while read -r s; do if [ \"$s\" = 0 ]; then kill -s 0 -- \"-$g\" 2>/dev/null && echo 1 || echo 0; \
+    else kill -s \"$s\" -- \"-$g\" 2>/dev/null; fi; done; kill -s KILL -- \"-$g\" 2>/dev/null";
+
+#[cfg(unix)]
+struct Watchdog {
+    process: Child,
+    input: std::process::ChildStdin,
+    answers: std::sync::mpsc::Receiver<bool>,
+}
+
+#[cfg(unix)]
+impl Watchdog {
+    fn start() -> io::Result<Self> {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut process = Command::new("/bin/sh")
+            .args(["-c", WATCHDOG])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let input = process.stdin.take().expect("piped stdin");
+        let output = process.stdout.take().expect("piped stdout");
+        let (sender, answers) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in io::BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line == "1").is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            process,
+            input,
+            answers,
+        })
+    }
+
+    /// A write to a watchdog that already exited fails with EPIPE, since Rust ignores
+    /// SIGPIPE.
+    fn send(&mut self, line: &str) -> bool {
+        self.input.write_all(format!("{line}\n").as_bytes()).is_ok()
+    }
+
+    /// Kills what is left of the group and waits for the watchdog to exit.
+    fn finish(self) {
+        let Self {
+            mut process, input, ..
+        } = self;
+        drop(input);
+        let _ = process.wait();
+    }
+}
+
+#[cfg(unix)]
+impl Group for Watchdog {
+    fn signal(&mut self, signal: &str) -> bool {
+        self.send(signal)
+    }
+
+    fn occupied(&mut self) -> bool {
+        // The answer is immediate. A watchdog that cannot answer cannot stop anything
+        // either, so there is nothing to wait for.
+        self.send("0")
+            && self
+                .answers
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or(false)
+    }
+}
+
+/// How the script ended.
+struct Outcome {
+    status: ExitStatus,
+    /// The time limit passed and the script was stopped.
+    expired: bool,
+    /// Processes it left running were still there `DRAIN` after it exited, and were
+    /// stopped.
+    left_running: bool,
+}
+
+/// Runs the script and waits until it and everything it started have stopped.
+#[cfg(unix)]
+fn supervise(mut command: Command, timeout: Option<Duration>) -> Result<Outcome> {
     use std::os::unix::process::CommandExt;
 
-    let watchdog = Command::new("/bin/sh")
-        .args(["-c", WATCHDOG])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
-    // Without a watchdog, as in a sandbox lacking /bin/sh or process groups, the time
-    // limit stops only the interpreter.
-    let Ok(mut watchdog) = watchdog else {
+    // Without a watchdog, as in a sandbox lacking /bin/sh, the script stays in
+    // Justless's process group and the time limit stops only the interpreter.
+    let Ok(mut watchdog) = Watchdog::start() else {
         let mut child = command.spawn()?;
-        return Ok(wait(&mut child, timeout, |child, _| {
-            let _ = child.kill();
-        })?);
+        return Ok(wait(&mut child, timeout, &mut Alone)?);
     };
-    let mut pipe = watchdog.stdin.take();
-    let group = i32::try_from(watchdog.id()).context("process group ID")?;
-    let result = command
-        .process_group(group)
-        .spawn()
-        .map_err(anyhow::Error::from)
-        .and_then(|mut child| {
-            Ok(wait(&mut child, timeout, |_, signal| {
-                // A write to a watchdog that already exited fails with EPIPE, since
-                // Rust ignores SIGPIPE, and there is nothing left to stop.
-                if let Some(pipe) = pipe.as_mut() {
-                    let _ = pipe.write_all(format!("{signal}\n").as_bytes());
-                }
-            })?)
-        });
-    // Closing the pipe stops processes the script left running, so its streams are
-    // final before they are read.
-    drop(pipe);
-    let _ = watchdog.wait();
-    result
+    let mut child = match command.process_group(0).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            watchdog.finish();
+            return Err(error.into());
+        }
+    };
+    watchdog.send(&child.id().to_string());
+    let outcome = wait(&mut child, timeout, &mut watchdog);
+    // Closing its input kills what is left of the group, so the streams are final
+    // before they are read.
+    watchdog.finish();
+    Ok(outcome?)
 }
 
 #[cfg(not(unix))]
-fn supervise(mut command: Command, timeout: Option<Duration>) -> Result<(ExitStatus, bool)> {
+fn supervise(mut command: Command, timeout: Option<Duration>) -> Result<Outcome> {
     let mut child = command.spawn()?;
-    Ok(wait(&mut child, timeout, |child, _| {
-        let _ = child.kill();
-    })?)
+    Ok(wait(&mut child, timeout, &mut Alone)?)
 }
 
-/// Polls the child until it exits. At the deadline `stop` receives `INT`, and `KILL`
-/// after the grace period.
+/// Polls the interpreter until it exits. At the deadline the group receives SIGINT, and
+/// SIGKILL after the grace period. SIGKILL also goes to the interpreter itself, which
+/// may have left the group. After a normal exit, processes left in the group get up to
+/// `DRAIN`, within the deadline, to finish writing.
 fn wait(
     child: &mut Child,
     timeout: Option<Duration>,
-    mut stop: impl FnMut(&mut Child, &str),
-) -> io::Result<(ExitStatus, bool)> {
+    group: &mut dyn Group,
+) -> io::Result<Outcome> {
     let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
     let mut grace = None;
     let mut expired = false;
     let mut pause = Duration::from_millis(1);
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait()? {
-            return Ok((status, expired));
+            break status;
         }
         let now = Instant::now();
         if !expired && deadline.is_some_and(|deadline| now >= deadline) {
             expired = true;
-            stop(child, "INT");
+            if !group.signal("INT") {
+                let _ = child.kill();
+            }
             grace = Some(now + GRACE);
         } else if grace.is_some_and(|grace| now >= grace) {
-            stop(child, "KILL");
+            group.signal("KILL");
+            let _ = child.kill();
             grace = None;
         }
         std::thread::sleep(pause);
         pause = (pause * 2).min(Duration::from_millis(20));
+    };
+    let mut left_running = false;
+    if !expired {
+        let exited = Instant::now();
+        let until = deadline.map_or(exited + DRAIN, |deadline| deadline.min(exited + DRAIN));
+        let mut pause = Duration::from_millis(5);
+        while group.occupied() {
+            if Instant::now() >= until {
+                left_running = true;
+                break;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(50));
+        }
     }
+    Ok(Outcome {
+        status,
+        expired,
+        left_running,
+    })
 }
 
 #[cfg(test)]
@@ -553,7 +729,7 @@ mod tests {
     use super::*;
 
     fn shebang(code: &str) -> Option<String> {
-        shebang_name(code.as_bytes())
+        Shebang::parse(code.as_bytes()).map(|line| line.program)
     }
 
     #[test]
@@ -572,6 +748,10 @@ mod tests {
             Some("python3")
         );
         assert_eq!(
+            shebang("#!/usr/bin/env -u PYTHONPATH python3\n").as_deref(),
+            Some("python3")
+        );
+        assert_eq!(
             shebang("#! /usr/local/bin/python3.12\r\nprint(1)").as_deref(),
             Some("python3.12")
         );
@@ -581,8 +761,73 @@ mod tests {
             Some("Rscript")
         );
         assert_eq!(shebang("#!/usr/bin/env\n"), None);
+        assert_eq!(shebang("#!/usr/bin/env -S\n"), None);
         assert_eq!(shebang("#!\n"), None);
         assert_eq!(shebang("print(1)\n#!/bin/sh"), None);
+    }
+
+    #[test]
+    fn shebang_keeps_options_and_variables() {
+        let parse = |code: &str| Shebang::parse(code.as_bytes()).unwrap();
+        let options = |code: &str| parse(code).options;
+        assert_eq!(options("#!/bin/sh -e\nfalse"), ["-e"]);
+        assert_eq!(options("#!/usr/bin/env -S bash -eu\r\n"), ["-eu"]);
+        assert_eq!(options("#!/usr/bin/perl -w -T\n"), ["-w", "-T"]);
+        assert_eq!(options("#!/usr/bin/env python3\n"), Vec::<String>::new());
+        assert_eq!(
+            options("#!/usr/bin/env -S deno run --allow-read=./data\n"),
+            ["run", "--allow-read=./data"]
+        );
+        assert_eq!(
+            parse("#!/usr/bin/env -S PYTHONUTF8=1 A=b=c python3 -X dev\n"),
+            Shebang {
+                program: "python3".into(),
+                options: vec!["-X".into(), "dev".into()],
+                env: vec![
+                    ("PYTHONUTF8".into(), "1".into()),
+                    ("A".into(), "b=c".into())
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn deno_and_bun_options_replace_the_default_run() {
+        let words = |list: &[&str]| list.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            Lang::Deno.prefix(&[]),
+            words(&["run", "--allow-all", "--quiet"])
+        );
+        assert_eq!(
+            Lang::Deno.prefix(&words(&["run", "--allow-read=."])),
+            words(&["run", "--allow-read=."])
+        );
+        assert_eq!(
+            Lang::Deno.prefix(&words(&["--allow-net"])),
+            words(&["run", "--allow-net"])
+        );
+        assert_eq!(Lang::Bun.prefix(&[]), words(&["run"]));
+        assert_eq!(
+            Lang::Bun.prefix(&words(&["--smol"])),
+            words(&["run", "--smol"])
+        );
+        assert_eq!(Lang::Sh.prefix(&words(&["-e"])), words(&["-e"]));
+        assert!(Lang::Python3.prefix(&[]).is_empty());
+    }
+
+    #[test]
+    fn saved_scripts_are_named_relative_to_the_working_directory() {
+        let root = Path::new("/w");
+        let script = Path::new("/w/.justless/runs/run-1/script.py");
+        assert_eq!(
+            relative(script, root, root),
+            Path::new(".justless/runs/run-1/script.py")
+        );
+        assert_eq!(
+            relative(script, Path::new("/w/src/app"), root),
+            Path::new("../../.justless/runs/run-1/script.py")
+        );
+        assert_eq!(relative(script, Path::new("/elsewhere"), root), script);
     }
 
     #[test]

@@ -495,14 +495,17 @@ fn interpreter_table_builds_each_command_line() {
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let data = root.join("data.txt").display().to_string();
-    for (lang, prefix, extension) in [
-        ("deno", &["run", "--allow-all", "--quiet"][..], "ts"),
-        ("bun", &["run"], "ts"),
-        ("python3", &[], "py"),
+    let deno_line = "#!/usr/bin/env -S deno run --allow-read=./data\ncode";
+    for (lang, code, prefix, extension) in [
+        ("deno", "code", &["run", "--allow-all", "--quiet"][..], "ts"),
+        ("bun", "code", &["run"], "ts"),
+        ("python3", "code", &[], "py"),
+        // A narrower grant on the `#!` line replaces the default `--allow-all`.
+        ("deno", deno_line, &["run", "--allow-read=./data"], "ts"),
     ] {
         let output = justless(&root)
             .args([
-                "exec", "--lang", lang, "--file", "data.txt", "code", "--", "arg",
+                "exec", "--lang", lang, "--file", "data.txt", code, "--", "arg",
             ])
             .env("PATH", stubs.path())
             .output()
@@ -510,16 +513,64 @@ fn interpreter_table_builds_each_command_line() {
         assert!(output.status.success(), "{lang}: {}", stderr(&output));
         let text = stdout(&output);
         let argv: Vec<_> = text.lines().collect();
+        // The saved script is named relative to the working directory.
         let script = format!(
-            "{}/.justless/runs/{}/script.{extension}",
-            root.display(),
+            ".justless/runs/{}/script.{extension}",
             argv[prefix.len()].rsplit('/').nth(1).unwrap()
         );
         let mut expected: Vec<&str> = prefix.to_vec();
         expected.extend([script.as_str(), data.as_str(), "arg"]);
         assert_eq!(argv, expected, "{lang}");
-        assert_eq!(fs::read(&script).unwrap(), b"code");
+        assert_eq!(fs::read(root.join(&script)).unwrap(), code.as_bytes());
     }
+}
+
+/// Options on the `#!` line reach the interpreter, so `-e` and `-u` keep their effect
+/// on the exit status.
+#[cfg(unix)]
+#[test]
+fn shebang_options_keep_the_exit_status() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_directory, root) = workspace();
+    fs::create_dir(root.join("tools")).unwrap();
+    let check = root.join("tools/check.sh");
+    fs::write(&check, "#!/bin/sh -e\nfalse\necho continued past failure\n").unwrap();
+    fs::set_permissions(&check, fs::Permissions::from_mode(0o755)).unwrap();
+    let direct = Command::new(&check).current_dir(&root).output().unwrap();
+    let output = exec(&root, &["--script", "tools/check.sh"]);
+    assert_eq!(output.status.code(), direct.status.code());
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+
+    let inline = exec(&root, &["#!/bin/sh -e\nfalse\necho continued"]);
+    assert_eq!(inline.status.code(), Some(1), "{}", stderr(&inline));
+    assert_eq!(stdout(&inline), "");
+
+    if have("bash") {
+        let output = exec(
+            &root,
+            &["#!/usr/bin/env -S bash -eu\necho \"$UNSET_VAR_X\"\necho continued"],
+        );
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert_eq!(stdout(&output), "");
+        assert!(
+            stderr(&output).contains("UNSET_VAR_X: unbound variable"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    // Variables set by `env` on the `#!` line reach the script.
+    let output = exec(
+        &root,
+        &["#!/usr/bin/env GREETING=hi sh\necho \"$GREETING\""],
+    );
+    assert_eq!(stdout(&output), "hi\n", "{}", stderr(&output));
+    // A `#!` line for another language than --lang contributes no options.
+    let output = exec(
+        &root,
+        &["--lang", "sh", "#!/usr/bin/env -S python3 -u\necho sh-ran"],
+    );
+    assert_eq!(stdout(&output), "sh-ran\n", "{}", stderr(&output));
 }
 
 #[test]
@@ -695,10 +746,174 @@ fn background_children_do_not_outlive_a_normal_exit() {
         &["--lang", "sh", "sleep 30 & echo $! > bg.pid; echo done"],
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(started.elapsed() < Duration::from_secs(10));
+    // The sleep gets two seconds to finish, then is stopped, and the notice names the
+    // run although every byte was shown.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_secs(10),
+        "{elapsed:?}"
+    );
     assert_eq!(stdout(&output), "done\n");
+    let id = new_run(&root, &[]);
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "[justless {id}] stopped processes the script left running; output they had not written is missing\n"
+        )
+    );
     let pid = fs::read_to_string(root.join("bg.pid")).unwrap();
     assert!(!alive(pid.trim()), "background sleep survived");
+}
+
+/// Output that a process substitution writes after the shell exits is archived whole.
+#[cfg(unix)]
+#[test]
+fn readers_the_script_leaves_running_finish_writing() {
+    if !have("bash") || !have("seq") {
+        return;
+    }
+    let (_directory, root) = workspace();
+    let output = exec(
+        &root,
+        &["--lang", "bash", "seq 1 100000 > >(sort -rn | head -3)"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "100000\n99999\n99998\n");
+    assert_eq!(stderr(&output), "");
+
+    let before = runs(&root);
+    let output = exec(&root, &["--lang", "bash", "seq 1 100000 > >(sort -rn)"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("stopped"), "{}", stderr(&output));
+    let id = new_run(&root, &before);
+    let replay = cli(&root, &["log", &id, "--stream", "stdout"]);
+    assert_eq!(stdout(&replay).lines().count(), 100000);
+
+    // A reader that starts late still finishes within the two seconds.
+    let before = runs(&root);
+    let output = exec(
+        &root,
+        &[
+            "--lang",
+            "bash",
+            "exec > >(sleep 0.5; while read -r l; do echo \"p $l\"; done); seq 1 2000",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("stopped"), "{}", stderr(&output));
+    let id = new_run(&root, &before);
+    let replay = stdout(&cli(&root, &["log", &id, "--stream", "stdout"]));
+    assert_eq!(replay.lines().count(), 2000);
+    assert_eq!(replay.lines().last(), Some("p 2000"));
+}
+
+/// A script that ignores SIGINT is killed when the grace period ends.
+#[cfg(unix)]
+#[test]
+fn timeout_kills_a_script_that_ignores_the_interrupt() {
+    let (_directory, root) = workspace();
+    let started = Instant::now();
+    let output = exec(
+        &root,
+        &[
+            "--lang",
+            "sh",
+            "--timeout",
+            "1",
+            "trap '' INT; echo waiting; sleep 30 & echo $! > bg.pid; wait",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
+    assert!(
+        elapsed >= Duration::from_millis(2900) && elapsed < Duration::from_secs(15),
+        "{elapsed:?}"
+    );
+    assert_eq!(stdout(&output), "waiting\n");
+    assert!(
+        stderr(&output).ends_with("[justless] stopped at --timeout 1s\n"),
+        "{}",
+        stderr(&output)
+    );
+    let pid = fs::read_to_string(root.join("bg.pid")).unwrap();
+    assert!(!alive(pid.trim()), "background sleep survived");
+}
+
+/// Signals a script sends its own group do not disable the time limit.
+#[cfg(unix)]
+#[test]
+fn timeout_holds_when_the_script_signals_its_group() {
+    let (_directory, root) = workspace();
+    let started = Instant::now();
+    let output = exec(
+        &root,
+        &[
+            "--lang",
+            "sh",
+            "--timeout",
+            "1",
+            "trap '' USR1; kill -USR1 0; echo signalled; sleep 30; echo finished",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(stdout(&output), "signalled\n");
+}
+
+/// An interpreter that moves to another process group is still stopped.
+#[cfg(unix)]
+#[test]
+fn timeout_stops_an_interpreter_that_leaves_its_group() {
+    if !have("python3") {
+        return;
+    }
+    let (_directory, root) = workspace();
+    let started = Instant::now();
+    let output = exec(
+        &root,
+        &[
+            "--lang",
+            "python3",
+            "--timeout",
+            "1",
+            "import os, signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nos.setpgid(0, os.getpgid(os.getppid()))\nprint('left', flush=True)\ntime.sleep(30)\nprint('finished')",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
+    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+    assert_eq!(stdout(&output), "left\n");
+}
+
+/// Shells and Ruby print the saved script's path as given, relative to the directory
+/// the script runs in.
+#[test]
+fn saved_script_path_is_relative_to_the_working_directory() {
+    let (_directory, root) = workspace();
+    fs::create_dir(root.join("src")).unwrap();
+    let before = runs(&root);
+    let output = exec(&root.join("src"), &["--lang", "sh", "echo \"$0\""]);
+    let id = new_run(&root, &before);
+    assert_eq!(
+        stdout(&output),
+        format!("../.justless/runs/{id}/script.sh\n"),
+        "{}",
+        stderr(&output)
+    );
+    if have("ruby") {
+        let output = exec(&root.join("src"), &["--lang", "ruby", "raise 'boom'"]);
+        let id = run_id(&output);
+        assert!(
+            stderr(&output).starts_with(&format!("../.justless/runs/{id}/script.rb:1:")),
+            "{}",
+            stderr(&output)
+        );
+        let context = stdout(&cli(&root, &["context", "--run", &id]));
+        assert!(
+            context.contains(&format!(".justless/runs/{id}/script.rb:1")),
+            "{context}"
+        );
+    }
 }
 
 #[cfg(unix)]
