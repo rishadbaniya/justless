@@ -618,9 +618,11 @@ Quote the heredoc delimiter, as in `<<'PY'`, so the shell passes the script thro
 
 Pass the script as one argument, as `-` to read it from stdin, or with `--script FILE` to run an existing file in place. A script read from stdin is limited to 1 MiB. Without a script, `exec` stops with an error and does not run what is on stdin. An argument that names an existing file is also rejected, with a pointer to `--script`. An argument that starts with `-` is read as an option, so start such code with a space or pass it on stdin.
 
-`--lang` selects the interpreter: `sh`, `bash`, `python3` (or `python`), `node` (or `js`), `ruby`, `perl`, and `deno` or `bun` when installed. Without it, a `#!` first line that names one of these decides. After that comes the extension of a `--script` file (`.sh`, `.bash`, `.py`, `.js`, `.mjs`, `.cjs`, `.rb` or `.pl`). Otherwise `exec` asks for `--lang`; it never guesses from the code. The `#!` line only selects the language, and Justless runs the interpreter it finds on `PATH`. `python3` falls back to `python` when only that is on `PATH`, and `deno` runs with `--allow-all`.
+`--lang` selects the interpreter: `sh`, `bash`, `python3` (or `python`), `node` (or `js`), `ruby`, `perl`, and `deno` or `bun` when installed. Without it, a `#!` first line that names one of these decides. After that comes the extension of a `--script` file (`.sh`, `.bash`, `.py`, `.js`, `.mjs`, `.cjs`, `.rb` or `.pl`). Otherwise `exec` asks for `--lang`; it never guesses from the code. Justless runs the interpreter it finds on `PATH`, and `python3` falls back to `python` when only that is on `PATH`.
 
-Inline code is saved as `script.EXT` in the run's directory under `.justless/runs/` and runs from there. The archive therefore keeps the code that produced the output, and a traceback names a file that `justless code` and `justless context --run` can show. Python does not add the working directory to `sys.path`, so a project file such as `json.py` cannot shadow the standard library. Node resolves packages from the directories above `.justless/`, which include the workspace root. A `package.json` beside the script makes `require` work in projects that declare `"type": "module"`, and Node 22.7 and later also accept `import`.
+Options on a `#!` line reach the interpreter as they would if the file ran directly, so `#!/bin/sh -e` and `#!/usr/bin/env -S bash -eu` keep their exit status. They are split at spaces, and variables that `env` sets on the line, as in `#!/usr/bin/env PYTHONUTF8=1 python3`, are set too. They apply only when the line names the language that runs. `deno` runs with `run --allow-all --quiet` unless its `#!` line gives options, which then replace those, so a narrower grant such as `#!/usr/bin/env -S deno run --allow-read=./data` holds. `bun` runs with `run` followed by any options from the line.
+
+Inline code is saved as `script.EXT` in the run's directory under `.justless/runs/` and runs from there. The archive therefore keeps the code that produced the output, and a traceback names a file that `justless code` and `justless context --run` can show. The interpreter receives that path relative to the current directory, as in `.justless/runs/run-7Gq2/script.sh`, which shell, Perl and Ruby messages repeat. Python and Node print it as an absolute path. Python does not add the working directory to `sys.path`, so a project file such as `json.py` cannot shadow the standard library. Node resolves packages from the directories above `.justless/`, which include the workspace root. A `package.json` beside the script makes `require` work in projects that declare `"type": "module"`, and Node 22.7 and later also accept `import`.
 
 ### Handing it data
 
@@ -639,7 +641,16 @@ Justless checks that each path exists and reads nothing from it, so paths outsid
 
 ### Output
 
-Each stream within `--max-bytes`, which defaults to `max_output_bytes` (4096) with a minimum of 512, is shown verbatim. Longer output gets the usual head, diagnostics and tail preview. stderr always gets that preview, so a traceback stays visible. Command profiles and rerun comparisons do not apply, so every run shows its own output.
+Each stream within `--max-bytes`, which defaults to `max_output_bytes` (4096) with a minimum of 512, is shown verbatim. Longer stdout shows whole lines from its start and its end, filling the budget, around one line that names the lines left out and the command that replays them:
+
+```text
+slow requests (>20s) by line
+130: auth db_deadlock 25017ms request_id=671854443
+[justless] stdout lines 38-2140 left out · justless log run-7Gq2 --stream stdout --from 38 --to 2140
+total 2174 slow error requests
+```
+
+A line too long for its half of the budget is cut on a character boundary, marked with `…`, and counted in the range, which then reads `not shown in full`. Longer stderr gets the usual head, diagnostics and tail preview, so a traceback stays visible. Command profiles and rerun comparisons do not apply, so every run shows its own output.
 
 Like a hook-routed run, `exec` adds a footer only when it adds information:
 
@@ -653,7 +664,9 @@ Runs appear in `stats` and `history` as `exec python3`, `exec sh` and so on. Run
 
 With `--intent TEXT`, stdout that exceeds the preview is replaced by the lines most relevant to TEXT. Justless ranks lines by BM25 over their words. It splits `camelCase` words, folds plurals, `-ed`, `-ing` and a final `e`, ignores common words such as "the" and "what", and treats a double-quoted phrase as one case-insensitive term. Lines that contain every term rank first.
 
-The chosen lines appear in log order with `stdout:N` markers, which `justless log RUN_ID --stream stdout --from N --to N` expands. A long line is cut to an excerpt around its first match. The first and last lines of stdout are kept with them when they fit, because they often hold a title and a total. The last line counts the matching lines not shown and names a `justless search` for them. When no line matches, the preview shows the first and last lines with markers. The same output and intent always give the same preview. An intent made only of common words is rejected before the script runs.
+Ranking works line by line, so print one record per line, for example JSON Lines or one `json.dumps` per row, so that each line carries the fields the intent names. When no line holds every term but neighboring lines do, as in pretty-printed JSON, a second header line says so.
+
+The chosen lines appear in log order with `stdout:N` markers, which `justless log RUN_ID --stream stdout --from N --to N` expands. The first and last lines of stdout are kept with them when they fit, because they often hold a title and a total. The last line counts the matching lines not shown, lists the first runs of them, and gives the `justless log` command for the first run. When no line matches, the preview shows the first and last lines with markers. The same output and intent always give the same preview. An intent made only of common words is rejected before the script runs.
 
 ```text
 [focus] "payments timeouts": 61 of 2176 lines match every term, 589 match some
@@ -661,16 +674,18 @@ stdout:1: slow requests (>20s) by line
 stdout:9: 685: payments timeout 28314ms request_id=666844578
 …
 stdout:2176: total 2174 slow error requests
-[focus] 3 more match every term, 589 more match some · justless search run-7Gq2 payments
+[focus] 5 more match every term (1943, 2038, 2072, …), 589 more match some · justless log run-7Gq2 --stream stdout --from 1943 --to 1943
 ```
+
+A line longer than 240 bytes shows the parts of it that hold the most terms, the closest together first, so one `print(json.dumps(rows))` still fills the preview with matching records, each part marked `stdout:1:`. The last line then counts the matches the parts leave out. Lines are ranked on their first 4 MiB. When a longer line is present, the preview never says that nothing matched or that every match is shown; it says the lines were not read whole, and `justless search RUN_ID TEXT` searches them in full.
 
 ### Time limit and exit status
 
 `--timeout` defaults to 60 seconds, and `0` removes the limit. Keep it below the client's own shell timeout, such as Claude Code's 2 minutes, so Justless can stop the script and keep its output.
 
-When the limit passes, Justless sends SIGINT to the script and every process it started, then SIGKILL 2 seconds later. It records what was printed, ends with `[justless] stopped at --timeout 60s` and exits with 124. Python prints where it stopped. An interpreter can lose output it had not yet written.
+When the limit passes, Justless sends SIGINT to the script and every process it started, then SIGKILL 2 seconds later, which also goes to the interpreter itself in case it moved to another process group. It records what was printed, ends with `[justless] stopped at --timeout 60s` and exits with 124. Python prints where it stopped. An interpreter can lose output it had not yet written. The script runs in its own process group and Justless's watchdog in another, so signals the script sends its own group cannot disable the limit.
 
-When the script exits, processes it left running in the background are stopped, so the archived output is final. If Justless itself is stopped, for example by the client's timeout or an interrupt, the script and everything it started are stopped too, and the run is not recorded. A process that starts its own session or process group escapes both.
+When the script exits, processes it left running get up to 2 seconds, within the time limit, to finish writing, so the reader of a process substitution such as `> >(sort)` completes its output. Anything still running then is stopped, and `[justless run-7Gq2] stopped processes the script left running; output they had not written is missing` names the run. A plain `cmd &` that the script never waits for therefore adds up to 2 seconds. The archived output is final once `exec` returns. If Justless itself is stopped, for example by the client's timeout or an interrupt, the script and everything it started are stopped too, and the run is not recorded. A process that starts its own session or process group escapes both.
 
 Otherwise `exec` exits with the script's status, or with 128 plus the signal number when a signal ended it. An error before the script starts, such as a missing interpreter or input file, exits with 2 and records nothing. A script that fails always prints a `[justless run-…` line. On Windows there is no process group: the time limit stops only the interpreter, and processes it leaves running are not stopped.
 
@@ -680,4 +695,4 @@ Otherwise `exec` exits with the script's status, or with 128 plus the signal num
 
 Hooks pass `exec` commands through unchanged, so the client decides whether to ask, as for any other shell command. A rule that allows every `justless` command also allows every script, so limit allow rules to read-only subcommands such as `justless query`. The MCP server does not offer `exec`.
 
-The archive keeps the script and whatever it printed, so keep `.justless/` private. A recursive search over the whole workspace, such as `grep -r` from the root, also reads archived runs under `.justless/`, so exclude that directory.
+The archive keeps the script and whatever it printed, so keep `.justless/` private. Every byte is kept for exact replay, with no size cap or expiry, so a script that prints hundreds of megabytes stores them all; delete old directories under `.justless/runs/` to reclaim the space. A recursive search over the whole workspace, such as `grep -r` from the root, also reads archived runs under `.justless/`, so exclude that directory.

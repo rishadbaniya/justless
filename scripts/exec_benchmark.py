@@ -95,6 +95,14 @@ def measure(binary, work):
         ("Count log errors by service and code", "app.log", "sh", COUNT_ERRORS, b"ERROR lines:"),
         ("Revenue and refunds by region from a CSV", "orders.csv", "python3", REVENUE_CSV, b"120000 orders"),
     ]
+    def direct(lang, script, data):
+        """Bytes the same script prints when it runs without Justless."""
+        path = work / ("direct.py" if lang == "python3" else "direct.sh")
+        path.write_text(script)
+        flags = ["-I"] if lang == "python3" else []
+        result = subprocess.run([lang, *flags, path.name, data], cwd=work, capture_output=True)
+        return result.stdout + result.stderr
+
     rows = []
     for name, data, lang, script, answer in tasks:
         status, out, err = call("exec", "--lang", lang, "--file", data, "-", code=script.encode())
@@ -105,6 +113,7 @@ def measure(binary, work):
             "input_bytes": (work / data).stat().st_size,
             "run_cat_bytes": len(cat_out) + len(cat_err),
             "run_cat_has_answer": answer in cat_out,
+            "direct_bytes": len(direct(lang, script, data)),
             "exec_bytes": len(out) + len(err),
         })
     relevant = b"payments timeout"
@@ -112,15 +121,17 @@ def measure(binary, work):
     _, ranked, ranked_err = call("exec", "--script", "slow.py", "--file", "app.log",
                                  "--intent", "payments timeouts")
     assert b"[focus]" in ranked and len(ranked) <= 4096, ranked
-    # Count only marked stdout lines: the [focus] header repeats the intent itself.
+    # Count only shown output lines: the [focus] header repeats the intent itself.
     ranked_lines = [line for line in ranked.splitlines() if line.startswith(b"stdout:")]
-    full = subprocess.run(["python3", "-I", "slow.py", "app.log"], cwd=work, capture_output=True).stdout
+    plain_lines = [line for line in plain.splitlines() if not line.startswith(b"[justless]")]
+    full = direct("python3", SLOW_REQUESTS, "app.log")
     rows.append({
-        "task": "Slow requests listing, with and without --intent",
-        "script_output_bytes": len(full),
+        "task": "List slow requests, with and without --intent",
+        "input_bytes": (work / "app.log").stat().st_size,
+        "direct_bytes": len(full),
         "relevant_lines_in_output": full.count(relevant),
         "default_preview_bytes": len(plain) + len(plain_err),
-        "default_relevant_lines": plain.count(relevant),
+        "default_relevant_lines": sum(relevant in line for line in plain_lines),
         "intent_preview_bytes": len(ranked) + len(ranked_err),
         "intent_relevant_lines": sum(relevant in line for line in ranked_lines),
     })
