@@ -389,12 +389,15 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             fresh: true,
             hook: true,
             family: Some(format!("exec {}", lang.label())),
-            stdout_preview: intent.map(|intent| -> capture::StdoutPreview<'_> {
-                Box::new(move |stdout: &Path, id: &str| {
-                    crate::focus::preview(stdout, intent, max_bytes, id)
-                        .context("could not rank stdout for --intent")
-                })
-            }),
+            // Script output is mostly data, so a long stdout keeps whole lines and names
+            // the ones left out, or is ranked against the intent.
+            stdout_preview: Some(Box::new(move |stdout: &Path, id: &str| match intent {
+                Some(intent) => crate::focus::preview(stdout, intent, max_bytes, id)
+                    .context("could not rank stdout for --intent"),
+                None => {
+                    crate::focus::outline(stdout, max_bytes, id).context("could not outline stdout")
+                }
+            })),
             spawn: Some(Box::new(spawn)),
         },
     )?;

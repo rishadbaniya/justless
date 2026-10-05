@@ -976,6 +976,127 @@ fn log_clause(run_id: &str, (first, last): (usize, usize)) -> String {
     format!(" · justless log {run_id} --stream stdout --from {first} --to {last}")
 }
 
+/// A long stdout without an intent: whole lines from its start and its end within
+/// `max_bytes`, around one line that names the lines left out and the command that
+/// replays them. A line too long for its half is cut and marked with an ellipsis, and
+/// counts as left out. Returns `None` when the usual preview should stay.
+pub fn outline(stdout: &Path, max_bytes: usize, run_id: &str) -> Result<Option<Vec<u8>>> {
+    let mut file = File::open(stdout)?;
+    let size = file.metadata()?.len();
+    let mut newlines = 0;
+    let mut last = b'\n';
+    {
+        let mut reader = BufReader::new(&file);
+        loop {
+            let chunk = reader.fill_buf()?;
+            let Some(&end) = chunk.last() else { break };
+            newlines += newlines_in(chunk);
+            last = end;
+            let length = chunk.len();
+            reader.consume(length);
+        }
+    }
+    let lines = newlines + usize::from(last != b'\n');
+    let marker = |from: usize, to: usize, cut: bool| {
+        let range = if from == to {
+            format!("line {from}")
+        } else {
+            format!("lines {from}-{to}")
+        };
+        let what = if cut { "not shown in full" } else { "left out" };
+        format!(
+            "[justless] stdout {range} {what}{}\n",
+            log_clause(run_id, (from, to))
+        )
+    };
+    // Room for the widest marker and two ellipses with their newline.
+    let widest = marker(lines, lines + 1, true).len();
+    let body = max_bytes.saturating_sub(widest + 2 * '…'.len_utf8() + 1);
+    if body as u64 >= size {
+        return Ok(None);
+    }
+
+    let head = read_at(&mut file, 0, body / 2)?;
+    let mut cut = false;
+    let (head, head_end, head_lines) = match head.iter().rposition(|&byte| byte == b'\n') {
+        Some(index) => (
+            head[..=index].to_vec(),
+            index + 1,
+            newlines_in(&head[..=index]),
+        ),
+        None => {
+            cut = true;
+            let end = whole_chars(&head);
+            ([&head[..end], "…\n".as_bytes()].concat(), end, 0)
+        }
+    };
+    let room = body - head.len();
+    let start = size.saturating_sub(room as u64).max(head_end as u64);
+    let at_line = start == 0 || read_at(&mut file, start - 1, 1)? == b"\n";
+    let tail = read_at(&mut file, start, room)?;
+    let inner = tail.strip_suffix(b"\n").unwrap_or(&tail);
+    let (tail, whole) = match inner.iter().position(|&byte| byte == b'\n') {
+        found if at_line || found.is_some() => {
+            let tail = found
+                .filter(|_| !at_line)
+                .map_or(tail.clone(), |index| tail[index + 1..].to_vec());
+            let whole =
+                newlines_in(&tail) + usize::from(!tail.is_empty() && !tail.ends_with(b"\n"));
+            (tail, whole)
+        }
+        _ => {
+            // Part of the last line; a character the start cuts through is dropped.
+            cut = true;
+            let from = tail.iter().take_while(|&&byte| byte & 0xC0 == 0x80).count();
+            (["…".as_bytes(), &tail[from..]].concat(), 0)
+        }
+    };
+    let (from, to) = (head_lines + 1, lines.saturating_sub(whole));
+    if from > to {
+        return Ok(None);
+    }
+    let mut output = String::from_utf8_lossy(&head).into_owned();
+    output.push_str(&marker(from, to, cut));
+    output.push_str(&String::from_utf8_lossy(&tail));
+    // Invalid UTF-8 can grow when it is replaced; the usual preview handles it.
+    Ok((output.len() <= max_bytes).then(|| output.into_bytes()))
+}
+
+fn read_at(file: &mut File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::with_capacity(length);
+    file.take(length as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn newlines_in(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&byte| byte == b'\n').count()
+}
+
+/// The length of `bytes` without a UTF-8 character that their end cuts through.
+fn whole_chars(bytes: &[u8]) -> usize {
+    let mut start = bytes.len();
+    while start > 0 && bytes.len() - start < 3 && bytes[start - 1] & 0xC0 == 0x80 {
+        start -= 1;
+    }
+    match start.checked_sub(1).map(|lead| (lead, bytes[lead])) {
+        Some((lead, byte)) if byte >= 0xC0 => {
+            let width = match byte {
+                0xF0.. => 4,
+                0xE0.. => 3,
+                _ => 2,
+            };
+            if lead + width > bytes.len() {
+                lead
+            } else {
+                bytes.len()
+            }
+        }
+        _ => bytes.len(),
+    }
+}
+
 /// When no line matches, the first and last lines with their markers. With the run ID
 /// of a stdout that had lines too long to read whole, it says so and names the search
 /// that reads them.
@@ -1443,5 +1564,78 @@ mod tests {
                 .ends_with("lines over 4 MiB were ranked on their first 4 MiB"),
             "{text}"
         );
+    }
+
+    fn outlined(bytes: &[u8], budget: usize) -> String {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+        let shown = outline(file.path(), budget, "run-Ab12Cd34Ef56")
+            .unwrap()
+            .expect("an outline");
+        assert!(shown.len() <= budget, "{budget}: {}", shown.len());
+        String::from_utf8(shown).unwrap()
+    }
+
+    #[test]
+    fn outline_keeps_whole_lines_and_names_the_rest() {
+        let lines: Vec<String> = (1..=3000).map(|n| format!("row {n} ok")).collect();
+        let text = outlined(format!("{}\n", lines.join("\n")).as_bytes(), 1024);
+        let marker = text
+            .lines()
+            .find(|line| line.starts_with("[justless] "))
+            .unwrap();
+        let (from, to) = marker
+            .split_once(" --from ")
+            .and_then(|(_, range)| range.split_once(" --to "))
+            .map(|(from, to)| (from.parse::<usize>().unwrap(), to.parse::<usize>().unwrap()))
+            .unwrap();
+        assert_eq!(
+            marker,
+            format!(
+                "[justless] stdout lines {from}-{to} left out · justless log run-Ab12Cd34Ef56 --stream stdout --from {from} --to {to}"
+            )
+        );
+        // The shown lines and the range add up to the whole stream, in order.
+        let shown: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.starts_with("[justless]"))
+            .collect();
+        let mut expected: Vec<&str> = lines[..from - 1].iter().map(String::as_str).collect();
+        expected.extend(lines[to..].iter().map(String::as_str));
+        assert_eq!(shown, expected);
+        // Most of the budget is used.
+        assert!(text.len() > 900, "{}", text.len());
+    }
+
+    #[test]
+    fn outline_cuts_a_long_line_on_character_boundaries() {
+        let text = outlined(format!("{}\n", "é✓".repeat(5000)).as_bytes(), 1024);
+        let mut parts = text.lines();
+        let head = parts.next().unwrap();
+        assert!(head.starts_with("é✓") && head.ends_with('…'), "{head}");
+        assert_eq!(
+            parts.next().unwrap(),
+            "[justless] stdout line 1 not shown in full · justless log run-Ab12Cd34Ef56 --stream stdout --from 1 --to 1"
+        );
+        let tail = parts.next().unwrap();
+        assert!(tail.starts_with('…') && tail.ends_with("é✓"), "{tail}");
+        assert!(text.len() > 900, "{}", text.len());
+
+        // An unterminated last line is kept whole when it fits.
+        let mut bytes: String = (1..=500).map(|n| format!("line {n}\n")).collect();
+        bytes.push_str("last words");
+        let text = outlined(bytes.as_bytes(), 512);
+        assert!(text.ends_with("line 500\nlast words"), "{text}");
+        assert!(text.starts_with("line 1\n"), "{text}");
+    }
+
+    #[test]
+    fn whole_chars_drops_a_character_cut_at_the_end() {
+        let text = "aé✓😀".as_bytes();
+        assert_eq!(whole_chars(text), text.len());
+        assert_eq!(whole_chars(&text[..text.len() - 1]), text.len() - 4);
+        assert_eq!(whole_chars(&text[..4]), 3);
+        assert_eq!(whole_chars(&text[..2]), 1);
+        assert_eq!(whole_chars(b""), 0);
     }
 }

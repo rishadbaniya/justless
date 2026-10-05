@@ -178,10 +178,25 @@ fn clipped_output_gets_the_short_footer_and_keeps_the_full_log() {
         "{footer}"
     );
     let replay = cli(&root, &["log", &id, "--stream", "stdout"]);
-    assert_eq!(
-        String::from_utf8(replay.stdout).unwrap().lines().count(),
-        3000
+    let full = String::from_utf8(replay.stdout).unwrap();
+    assert_eq!(full.lines().count(), 3000);
+
+    // Whole lines from both ends, and a line naming the rest, whose command replays
+    // exactly what is missing.
+    let text = stdout(&output);
+    let (head, rest) = text.split_once("[justless] stdout lines ").unwrap();
+    let (marker, tail) = rest.split_once('\n').unwrap();
+    assert!(
+        head.starts_with("line 1 ok\n") && head.ends_with(" ok\n"),
+        "{text}"
     );
+    assert!(tail.ends_with("line 3000 ok\n"), "{text}");
+    let command = marker.split_once(" · ").unwrap().1;
+    let words: Vec<&str> = command.split(' ').collect();
+    assert_eq!(&words[..5], ["justless", "log", &id, "--stream", "stdout"]);
+    let missing = cli(&root, &words[1..]);
+    assert_eq!(format!("{head}{}{tail}", stdout(&missing)), full);
+    assert!(text.len() > 900, "{}", text.len());
 }
 
 #[test]
