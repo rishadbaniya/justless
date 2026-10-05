@@ -389,7 +389,12 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             fresh: true,
             hook: true,
             family: Some(format!("exec {}", lang.label())),
-            intent,
+            stdout_preview: intent.map(|intent| -> capture::StdoutPreview<'_> {
+                Box::new(move |stdout: &Path, id: &str| {
+                    crate::focus::preview(stdout, intent, max_bytes, id)
+                        .context("could not rank stdout for --intent")
+                })
+            }),
             spawn: Some(Box::new(spawn)),
         },
     )?;

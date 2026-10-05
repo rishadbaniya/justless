@@ -971,10 +971,7 @@ fn intent_ranks_long_stdout_within_budget() {
     }
     let lines = markers(&text);
     assert!(lines.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
-    assert!(
-        text.ends_with("[focus] every matching line is shown\n"),
-        "{text}"
-    );
+    assert!(text.ends_with("[focus] every match is shown\n"), "{text}");
     let footer = stderr(&output);
     assert!(footer.contains(" shown]"), "{footer}");
     // The marker expands to the original line.
@@ -994,7 +991,7 @@ fn intent_ranks_long_stdout_within_budget() {
 }
 
 #[test]
-fn intent_names_a_search_for_lines_left_out() {
+fn intent_names_lines_left_out_for_log() {
     let (_directory, root) = workspace();
     let script = "i=1; while [ $i -le 400 ]; do echo \"$i: payments timeout request_id=$i\"; echo \"$i: orders timeout\"; i=$((i + 1)); done";
     let output = exec(
@@ -1009,23 +1006,26 @@ fn intent_names_a_search_for_lines_left_out() {
         ),
         "{text}"
     );
-    let id = run_id(&output);
-    let trailer = text.lines().last().unwrap();
-    assert!(trailer.starts_with("[focus] "), "{trailer}");
-    assert!(
-        trailer.ends_with(&format!("more match some · justless search {id} payments")),
-        "{trailer}"
-    );
+    let shown = markers(&text);
     // Lines that contain every term rank above those that contain one.
     for line in text.lines().filter(|line| line.starts_with("stdout:")) {
         let number: usize = markers(line)[0];
         assert!(number == 800 || line.contains("payments"), "{line}");
     }
-    let search = cli(&root, &["search", &id, "payments", "--limit", "1"]);
-    assert_eq!(
-        stdout(&search),
-        "stdout:1: 1: payments timeout request_id=1\n"
-    );
+    // The trailer lists matching lines that were left out and how to read the first.
+    let id = run_id(&output);
+    let trailer = text.lines().last().unwrap();
+    let (counts, command) = trailer
+        .split_once(" · ")
+        .unwrap_or_else(|| panic!("{trailer}"));
+    assert!(counts.contains(" more match every term ("), "{trailer}");
+    let words: Vec<&str> = command.split(' ').collect();
+    assert_eq!(&words[..5], ["justless", "log", &id, "--stream", "stdout"]);
+    let from: usize = words[6].parse().unwrap();
+    assert!(!shown.contains(&from), "{from} is already shown: {text}");
+    let replay = cli(&root, &words[1..]);
+    let first = stdout(&replay).lines().next().unwrap().to_owned();
+    assert!(first.contains("payments timeout"), "{first}");
 }
 
 #[test]
@@ -1084,6 +1084,70 @@ fn intent_respects_utf8_and_long_lines() {
         let excerpt = line.split_once(": ").unwrap().1;
         assert!(excerpt.len() <= 240, "{}", excerpt.len());
     }
+}
+
+/// A match past the part of a line that was ranked is never denied, and the preview
+/// names the search that reads whole lines.
+#[test]
+fn intent_points_to_search_when_a_line_is_too_long_to_rank() {
+    if !have("yes") || !have("head") {
+        return;
+    }
+    let (_directory, root) = workspace();
+    let output = exec(
+        &root,
+        &[
+            "--lang",
+            "sh",
+            "--intent",
+            "quota_exceeded",
+            "yes ok | head -c 4300000 | tr '\\n' ' '; echo quota_exceeded",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.starts_with("[focus] no line matches \"quota_exceeded\" in its first 4 MiB;"),
+        "{text}"
+    );
+    let id = run_id(&output);
+    let hint = format!("[focus] justless search {id} TEXT reads whole lines\n");
+    assert!(text.ends_with(&hint), "{text}");
+    let search = stdout(&cli(&root, &["search", &id, "quota_exceeded"]));
+    assert!(search.starts_with("stdout:1: "), "{search}");
+}
+
+/// One long line, such as `print(json.dumps(rows))`, fills the preview with the parts
+/// that hold every term.
+#[test]
+fn intent_shows_several_parts_of_one_long_line() {
+    let (_directory, root) = workspace();
+    let script = "i=1; while [ $i -le 300 ]; do if [ $((i % 10)) -eq 3 ]; then s=PNUTUSDT; else s=BTCUSDT; fi; if [ $((i % 2)) -eq 1 ]; then d=SELL; else d=BUY; fi; printf '{\"id\": %d, \"symbol\": \"%s\", \"side\": \"%s\"}, ' $i $s $d; i=$((i + 1)); done; echo";
+    let output = exec(
+        &root,
+        &["--lang", "sh", "--intent", "PNUTUSDT SELL", script],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let parts: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("stdout:1: "))
+        .collect();
+    assert!(parts.len() >= 10, "{text}");
+    for part in &parts {
+        assert!(
+            part.contains("\"symbol\": \"PNUTUSDT\", \"side\": \"SELL\""),
+            "{part}"
+        );
+    }
+    assert!(text.len() > 3000, "{}", text.len());
+    assert!(
+        text.lines()
+            .last()
+            .unwrap()
+            .contains("print one record per line"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -1177,7 +1241,7 @@ fn intent_folds_word_endings_and_matches_quoted_phrases() {
     );
     let text = stdout(&output);
     assert!(
-        text.starts_with("[focus] \"\"connection reset\"\": 2 of 307 lines match\n"),
+        text.starts_with("[focus] \"connection reset\": 2 of 307 lines match\n"),
         "{text}"
     );
     assert!(

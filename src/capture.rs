@@ -251,8 +251,9 @@ pub struct Shape<'a> {
     pub hook: bool,
     /// Label for stats, history and resume, such as `exec python3`.
     pub family: Option<String>,
-    /// Rank a stdout preview that exceeds the budget against this text.
-    pub intent: Option<&'a str>,
+    /// Replaces the preview of a stdout longer than `max_bytes`, given the stdout file
+    /// and the run ID. When it returns `None`, the usual preview stays.
+    pub stdout_preview: Option<StdoutPreview<'a>>,
     /// Starts the process, given the run directory and the write ends of its stdout
     /// and stderr pipes, and returns its exit status once every process it started
     /// has stopped. Justless copies the pipes into the archive within
@@ -261,6 +262,7 @@ pub struct Shape<'a> {
 }
 
 pub type Spawn<'a> = Box<dyn FnOnce(&Path, Stdio, Stdio) -> Result<i32> + 'a>;
+pub type StdoutPreview<'a> = Box<dyn FnOnce(&Path, &str) -> Result<Option<Vec<u8>>> + 'a>;
 
 pub fn execute(
     workspace: &Workspace,
@@ -281,7 +283,7 @@ pub fn execute(
             fresh,
             hook,
             family: None,
-            intent: None,
+            stdout_preview: None,
             spawn: None,
         },
     )
@@ -295,7 +297,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         fresh,
         hook,
         family,
-        intent,
+        stdout_preview,
         spawn,
     } = shape;
     let mut command = Command::new(&args[0]);
@@ -359,10 +361,9 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         session,
         fresh,
         hook,
-        intent,
         retention: (settings.max_runs, settings.max_archive_bytes),
     };
-    match capture.record(&mut archive, family, status) {
+    match capture.record(&mut archive, family, status, stdout_preview) {
         Ok((previews, footer, _)) => {
             for (stream, preview) in previews {
                 if let Err(error) = stream.print(&preview)
@@ -1087,19 +1088,19 @@ struct Capture<'a> {
     session: &'a str,
     fresh: bool,
     hook: bool,
-    /// Rank a stdout preview that exceeds the budget against this text.
-    intent: Option<&'a str>,
     /// The most runs and archive bytes to keep.
     retention: (usize, u64),
 }
 
 impl Capture<'_> {
     /// Scan the archived streams, save the record and return the previews and footer.
+    /// `stdout_preview` can replace the preview of a stdout longer than `max_bytes`.
     fn record(
         &self,
         archive: &mut Archive,
         family: String,
         status: i32,
+        stdout_preview: Option<StdoutPreview<'_>>,
     ) -> Result<(Previews, String, Run)> {
         let Self {
             workspace,
@@ -1110,7 +1111,6 @@ impl Capture<'_> {
             session,
             fresh,
             hook,
-            intent,
             retention,
         } = *self;
         let directory = archive.directory.clone();
@@ -1268,16 +1268,15 @@ impl Capture<'_> {
         {
             previews[0].1 = fit(summary, max_bytes).into_bytes();
         }
-        if let Some(intent) = intent
+        if let Some(shape_stdout) = stdout_preview
             && !run.unchanged
             && stdout_bytes > max_bytes as u64
         {
-            match crate::focus::preview(&directory.join("stdout"), intent, max_bytes, &run.id) {
-                Ok(focused) if focused.len() <= max_bytes => previews[0].1 = focused,
-                Ok(_) => {
-                    eprintln!("justless: could not rank stdout for --intent: preview over budget")
-                }
-                Err(error) => eprintln!("justless: could not rank stdout for --intent: {error:#}"),
+            match shape_stdout(&directory.join("stdout"), &run.id) {
+                Ok(Some(shaped)) if shaped.len() <= max_bytes => previews[0].1 = shaped,
+                Ok(Some(_)) => eprintln!("justless: the shaped stdout preview exceeded its budget"),
+                Ok(None) => {}
+                Err(error) => eprintln!("justless: {error:#}"),
             }
         }
         run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();

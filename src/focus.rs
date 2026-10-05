@@ -3,7 +3,8 @@
 //!
 //! Ranking is deterministic and offline: BM25 over each line's words, with a light
 //! stemmer applied to both sides, plus double-quoted phrases. Lines that contain every
-//! term rank first. Each shown line keeps its `stdout:N` marker for `justless log`.
+//! term rank first. A long line shows the windows of it that hold the most terms. Each
+//! excerpt keeps its `stdout:N` marker for `justless log`.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, VecDeque};
@@ -18,16 +19,25 @@ use regex::Regex;
 static ANSI: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("ANSI pattern"));
 
-/// Bytes of one line that are read; the rest of the line is skipped.
-const LINE_LIMIT: usize = 256 * 1024;
+/// Bytes of one line that are ranked; the rest of the line is skipped.
+const LINE_LIMIT: usize = 4 * 1024 * 1024;
+const LINE_LIMIT_SHOWN: &str = "4 MiB";
 const MAX_TERMS: usize = 16;
+/// Matches remembered per line, which bounds the windows a long line can offer.
+const SPAN_LIMIT: usize = 4096;
+/// Runs of matching lines remembered for the trailer.
+const RANGE_LIMIT: usize = 1024;
+const RANGES_SHOWN: usize = 3;
+/// Lines that hold different terms within this distance may be one record.
+const NEARBY: usize = 8;
 /// Longest excerpt of a matching line, and of an anchor or fallback line.
 const EXCERPT: usize = 240;
 const ANCHOR: usize = 160;
 /// Bytes kept before the first match when a long line is windowed.
 const LEAD: usize = 80;
+/// Smallest body worth the full trailer; below it, the trailer drops line numbers.
+const ROOMY: usize = 200;
 const INTENT_SHOWN: usize = 60;
-const WORD_SHOWN: usize = 40;
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 const STOPWORDS: &[&str] = &[
@@ -112,7 +122,8 @@ fn tokens(text: &str, mut emit: impl FnMut(usize, &str)) {
 }
 
 /// Folds plurals, `-ing`, `-ed` and a final `e`, so parse, parsed and parsing meet.
-/// Words with a digit, such as E0382, stay whole.
+/// Words with a digit, such as E0382, stay whole. A stem is at most 5 bytes shorter
+/// than its word and never longer.
 fn stem(word: &str) -> String {
     let mut word = word.to_owned();
     if word.bytes().any(|b| b.is_ascii_digit()) {
@@ -145,38 +156,60 @@ fn stem(word: &str) -> String {
     word
 }
 
-/// Term frequencies of one line, the first match of each term, and its word count.
+/// One match of a term in a line.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start: usize,
+    len: usize,
+    term: usize,
+}
+
+/// Term frequencies of one line, where its matches lie, and its word count.
 struct Analysis {
     counts: Vec<u32>,
-    /// Byte offset and length of each term's first match.
-    first: Vec<Option<(usize, usize)>>,
+    /// Matches in line order, at most `SPAN_LIMIT`.
+    spans: Vec<Span>,
     words: usize,
+    /// Byte lengths an ASCII word needs to stem to a word term.
+    shortest: usize,
+    longest: usize,
 }
 
 impl Analysis {
-    fn new(terms: usize) -> Self {
+    fn new(terms: &[Term]) -> Self {
+        let words = terms.iter().filter(|term| !term.phrase);
         Self {
-            counts: vec![0; terms],
-            first: vec![None; terms],
+            counts: vec![0; terms.len()],
+            spans: Vec::new(),
             words: 0,
+            shortest: words.clone().map(|term| term.text.len()).min().unwrap_or(0),
+            longest: words.map(|term| term.text.len() + 5).max().unwrap_or(0),
         }
     }
 
     fn run(&mut self, line: &str, terms: &[Term]) {
         self.counts.fill(0);
-        self.first.fill(None);
+        self.spans.clear();
         self.words = 0;
         let has_words = terms.iter().any(|term| !term.phrase);
+        let (shortest, longest) = (self.shortest, self.longest);
         tokens(line, |start, token| {
             self.words += 1;
-            if !has_words {
+            // Most words cannot stem to a term, and skipping them saves an allocation.
+            if !has_words || token.is_ascii() && !(shortest..=longest).contains(&token.len()) {
                 return;
             }
             let word = stem(&token.to_lowercase());
             for (index, term) in terms.iter().enumerate() {
                 if !term.phrase && term.text == word {
                     self.counts[index] += 1;
-                    self.first[index].get_or_insert((start, token.len()));
+                    if self.spans.len() < SPAN_LIMIT {
+                        self.spans.push(Span {
+                            start,
+                            len: token.len(),
+                            term: index,
+                        });
+                    }
                 }
             }
         });
@@ -187,10 +220,17 @@ impl Analysis {
                 if term.phrase {
                     for (start, _) in lower.match_indices(&term.text) {
                         self.counts[index] += 1;
-                        self.first[index].get_or_insert((start, term.text.len()));
+                        if self.spans.len() < SPAN_LIMIT {
+                            self.spans.push(Span {
+                                start,
+                                len: term.text.len(),
+                                term: index,
+                            });
+                        }
                     }
                 }
             }
+            self.spans.sort_by_key(|span| span.start);
         }
     }
 
@@ -198,17 +238,22 @@ impl Analysis {
         self.counts.iter().filter(|&&count| count > 0).count()
     }
 
-    fn focus(&self) -> usize {
-        self.first
+    /// The terms present, one bit each.
+    fn mask(&self) -> u32 {
+        self.counts
             .iter()
-            .flatten()
-            .map(|&(start, _)| start)
-            .min()
-            .unwrap_or(0)
+            .enumerate()
+            .filter(|&(_, &count)| count > 0)
+            .fold(0, |mask, (index, _)| mask | 1 << index)
+    }
+
+    fn matches(&self) -> usize {
+        self.counts.iter().map(|&count| count as usize).sum()
     }
 }
 
-/// Up to 240 bytes of a line around its first match, enough for any excerpt.
+/// Up to 240 bytes of a line, with the byte offset to keep in view when it is narrowed.
+#[derive(Clone)]
 struct Excerpt {
     text: String,
     focus: usize,
@@ -241,14 +286,15 @@ impl Excerpt {
         }
     }
 
-    /// The excerpt within `cap` bytes, marking each clipped side with an ellipsis.
-    fn render(&self, cap: usize) -> String {
+    /// The excerpt within `cap` bytes, marking each clipped side with an ellipsis, and
+    /// the range of `text` it shows.
+    fn render(&self, cap: usize) -> (String, usize, usize) {
         if !self.before && !self.after && self.text.len() <= cap {
-            return self.text.clone();
+            return (self.text.clone(), 0, self.text.len());
         }
         let room = cap.saturating_sub(2 * '…'.len_utf8());
         let text = &self.text;
-        // A narrow excerpt keeps less before the match, so the match stays visible.
+        // A narrow excerpt keeps less before the focus, so the focus stays visible.
         let lead = LEAD.min(room / 3);
         let start = text.floor_char_boundary(
             self.focus
@@ -264,17 +310,137 @@ impl Excerpt {
         if self.after || end < text.len() {
             excerpt.push('…');
         }
-        excerpt
+        (excerpt, start, end)
     }
+}
+
+/// A part of a line with the matches inside it.
+#[derive(Clone)]
+struct Window {
+    /// Byte offset of the excerpt in the line.
+    start: usize,
+    excerpt: Excerpt,
+    /// Matches inside the excerpt, as byte ranges of its text.
+    spans: Vec<(usize, usize)>,
+}
+
+impl Window {
+    fn at(line: &str, start: usize, spans: &[Span]) -> Self {
+        let end = line.floor_char_boundary((start + EXCERPT).min(line.len()));
+        let inside: Vec<(usize, usize)> = spans
+            .iter()
+            .filter(|span| span.start >= start && span.start + span.len <= end)
+            .map(|span| (span.start - start, span.len))
+            .collect();
+        Self {
+            start,
+            excerpt: Excerpt {
+                text: line[start..end].to_owned(),
+                focus: inside.first().map_or(0, |&(offset, _)| offset),
+                before: start > 0,
+                after: end < line.len(),
+            },
+            spans: inside,
+        }
+    }
+}
+
+/// Up to `limit` windows of `line` that do not overlap, best first: the most distinct
+/// terms weighted by rarity, then the closest together, then the most matches, then
+/// the earliest. Terms close together usually belong to one record.
+fn windows(line: &str, spans: &[Span], idf: &[f64], limit: usize) -> Vec<Window> {
+    if line.len() <= EXCERPT || spans.is_empty() {
+        return vec![Window::at(line, 0, spans)];
+    }
+    let last = line.len() - EXCERPT;
+    // A window that starts `LEAD` bytes before each match, scored by what it holds.
+    let mut scored: Vec<(usize, u32, f64, usize, usize)> = Vec::new();
+    for span in spans {
+        let start = line.floor_char_boundary(span.start.saturating_sub(LEAD).min(last));
+        if scored
+            .last()
+            .is_some_and(|&(previous, ..)| previous == start)
+        {
+            continue;
+        }
+        let end = start + EXCERPT;
+        let first = spans.partition_point(|inner| inner.start < start);
+        let inside: Vec<Span> = spans[first..]
+            .iter()
+            .take_while(|inner| inner.start < end)
+            .filter(|inner| inner.start + inner.len <= end)
+            .copied()
+            .collect();
+        let (mut seen, mut weight) = (0u32, 0.0);
+        for inner in &inside {
+            if seen & 1 << inner.term == 0 {
+                seen |= 1 << inner.term;
+                weight += idf[inner.term];
+            }
+        }
+        scored.push((
+            start,
+            seen.count_ones(),
+            weight,
+            tightest(&inside, seen),
+            inside.len(),
+        ));
+    }
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(b.2.total_cmp(&a.2))
+            .then(a.3.cmp(&b.3))
+            .then(b.4.cmp(&a.4))
+            .then(a.0.cmp(&b.0))
+    });
+    let mut chosen: Vec<usize> = Vec::new();
+    for (start, ..) in scored {
+        if chosen.len() == limit {
+            break;
+        }
+        if chosen
+            .iter()
+            .all(|&other| start + EXCERPT <= other || other + EXCERPT <= start)
+        {
+            chosen.push(start);
+        }
+    }
+    chosen
+        .into_iter()
+        .map(|start| Window::at(line, start, spans))
+        .collect()
+}
+
+/// Bytes of the shortest run of `spans`, in line order, that holds every term in `terms`.
+fn tightest(spans: &[Span], terms: u32) -> usize {
+    let mut counts = [0u32; MAX_TERMS];
+    let mut covered = 0u32;
+    let mut best = usize::MAX;
+    let mut left = 0;
+    for right in spans {
+        counts[right.term] += 1;
+        covered |= 1 << right.term;
+        while covered == terms && left < spans.len() {
+            let first = spans[left];
+            best = best.min((right.start + right.len).saturating_sub(first.start));
+            counts[first.term] -= 1;
+            if counts[first.term] == 0 {
+                covered &= !(1 << first.term);
+            }
+            left += 1;
+        }
+    }
+    best
 }
 
 struct Candidate {
     line: usize,
     distinct: usize,
     score: f64,
-    excerpt: Excerpt,
-    /// Text of the line's rarest matched term, as printed, for `justless search`.
-    word: String,
+    /// Matches of any term in the line, counted in full.
+    matches: usize,
+    /// The line's best window; other windows are found only if there is room for them.
+    first: Window,
 }
 
 /// Ranks distinct terms matched, then score, then the earlier line: greater is better.
@@ -311,34 +477,204 @@ impl Ord for Candidate {
     }
 }
 
-/// A line chosen for the preview.
+/// Line numbers in ascending runs, at most `RANGE_LIMIT` runs.
+#[derive(Default)]
+struct Runs(Vec<(usize, usize)>);
+
+impl Runs {
+    fn add(&mut self, line: usize) {
+        if let Some((_, end)) = self.0.last_mut()
+            && *end + 1 == line
+        {
+            *end = line;
+        } else if self.0.len() < RANGE_LIMIT {
+            self.0.push((line, line));
+        }
+    }
+
+    /// The first runs that remain once the `shown` lines, in ascending order, are
+    /// taken out.
+    fn without(&self, shown: &[usize], wanted: usize) -> Vec<(usize, usize)> {
+        let mut left = Vec::new();
+        for &(first, last) in &self.0 {
+            let mut start = first;
+            let from = shown.partition_point(|&line| line < first);
+            for &line in shown[from..].iter().take_while(|&&line| line <= last) {
+                if line > start {
+                    left.push((start, line - 1));
+                }
+                start = line + 1;
+            }
+            if start <= last {
+                left.push((start, last));
+            }
+            if left.len() >= wanted {
+                left.truncate(wanted);
+                break;
+            }
+        }
+        left
+    }
+}
+
+/// An excerpt chosen for the preview.
 struct Shown {
     line: usize,
+    start: usize,
     distinct: usize,
+    /// Matches inside the shown text.
+    matches: usize,
     entry: String,
+}
+
+/// Excerpts placed within the body budget.
+struct Layout {
+    body: usize,
+    used: usize,
+    shown: Vec<Shown>,
+}
+
+impl Layout {
+    fn has(&self, line: usize) -> bool {
+        self.shown.iter().any(|shown| shown.line == line)
+    }
+
+    /// Adds the window clipped to `limit` when it fits. An anchor is skipped once any
+    /// part of its line is shown.
+    fn place(
+        &mut self,
+        line: usize,
+        distinct: usize,
+        window: &Window,
+        limit: usize,
+        anchor: bool,
+    ) -> bool {
+        if self
+            .shown
+            .iter()
+            .any(|shown| shown.line == line && (anchor || shown.start == window.start))
+        {
+            return false;
+        }
+        let marker = format!("stdout:{line}: ");
+        let cap = limit.min(self.body.saturating_sub(marker.len() + 1));
+        let (text, from, to) = window.excerpt.render(cap);
+        let entry = format!("{marker}{text}\n");
+        if cap == 0 || self.used + entry.len() > self.body {
+            return false;
+        }
+        self.used += entry.len();
+        let matches = window
+            .spans
+            .iter()
+            .filter(|&&(start, len)| start >= from && start + len <= to)
+            .count();
+        self.shown.push(Shown {
+            line,
+            start: window.start,
+            distinct,
+            matches,
+            entry,
+        });
+        true
+    }
+}
+
+/// What the last line of a preview reports.
+struct Trailer<'a> {
+    several: bool,
+    /// Matching lines not shown: with every term, and with only some.
+    every: usize,
+    some: usize,
+    /// Matches inside shown lines that their excerpts leave out.
+    inside: usize,
+    /// Some line was longer than `LINE_LIMIT`.
+    cut: bool,
+    /// ` (12-14, 20, …)` after the count the runs belong to, and the command for the
+    /// first of them.
+    runs: &'a str,
+    log: &'a str,
+}
+
+impl Trailer<'_> {
+    fn render(&self) -> String {
+        let mut text = String::from("[focus] ");
+        if self.every == 0 && self.some == 0 {
+            if self.cut {
+                // A cut line may match past the part that was read.
+            } else if self.inside == 0 {
+                return "[focus] every match is shown\n".to_owned();
+            } else {
+                text.push_str("every matching line is shown");
+            }
+        } else if self.several {
+            let (every_runs, some_runs) = if self.every > 0 {
+                (self.runs, "")
+            } else {
+                ("", self.runs)
+            };
+            text.push_str(&format!(
+                "{} more match every term{every_runs}, {} more match some{some_runs}",
+                self.every, self.some
+            ));
+        } else {
+            text.push_str(&format!("{} more match{}", self.every, self.runs));
+        }
+        let mut clauses = Vec::new();
+        if self.inside > 0 {
+            clauses.push(format!(
+                "{} more matches inside shown lines; print one record per line to rank them",
+                self.inside
+            ));
+        }
+        if self.cut {
+            clauses.push(format!(
+                "lines over {LINE_LIMIT_SHOWN} were ranked on their first {LINE_LIMIT_SHOWN}"
+            ));
+        }
+        for clause in clauses {
+            if !text.ends_with(' ') {
+                text.push_str("; ");
+            }
+            text.push_str(&clause);
+        }
+        text.push_str(self.log);
+        text.push('\n');
+        text
+    }
 }
 
 /// Replaces a long stdout preview with the lines most relevant to `intent`, in log
 /// order, within `max_bytes`. The output is UTF-8 and the same for the same input.
-pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> Result<Vec<u8>> {
+/// Returns `None` when the usual preview says more, as when nothing matched in lines
+/// too long to read whole.
+pub fn preview(
+    stdout: &Path,
+    intent: &str,
+    max_bytes: usize,
+    run_id: &str,
+) -> Result<Option<Vec<u8>>> {
     let terms = terms(intent);
     ensure!(!terms.is_empty(), "the intent has no search terms");
-    let mut analysis = Analysis::new(terms.len());
+    let mut analysis = Analysis::new(&terms);
 
     let mut lines = 0;
     let mut words = 0;
+    let mut cut = false;
     let mut frequency = vec![0usize; terms.len()];
-    each_line(stdout, |_, line| {
+    each_line(stdout, |_, line, clipped| {
         analysis.run(line, &terms);
         lines += 1;
         words += analysis.words;
+        cut |= clipped;
         for (count, &n) in frequency.iter_mut().zip(&analysis.counts) {
             *count += usize::from(n > 0);
         }
     })?;
-    let shown_intent = clip_intent(intent);
+    let shown_intent = show_intent(intent);
     if frequency.iter().all(|&count| count == 0) {
-        return fallback(stdout, &shown_intent, lines, max_bytes);
+        let cut = cut.then_some(run_id);
+        return fallback(stdout, &shown_intent, lines, max_bytes, cut).map(Some);
     }
 
     let average = if words == 0 {
@@ -350,26 +686,43 @@ pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> R
         .iter()
         .map(|&df| (1.0 + (lines as f64 - df as f64 + 0.5) / (df as f64 + 0.5)).ln())
         .collect();
-    // The term to search for: the rarest one, which narrows `justless search` most.
-    let mut rarity: Vec<usize> = (0..terms.len()).collect();
-    rarity.sort_by_key(|&index| frequency[index]);
+    let all = (1u32 << terms.len()) - 1;
+    let several = terms.len() > 1;
     let keep = max_bytes / 24 + 1;
     let mut best = BinaryHeap::new();
-    let (mut every, mut some) = (0, 0);
-    let mut anchors: Vec<(usize, usize, Excerpt)> = Vec::new();
-    each_line(stdout, |number, line| {
+    let (mut every, mut some, mut total) = (0, 0, 0);
+    let (mut every_runs, mut some_runs) = (Runs::default(), Runs::default());
+    let mut recent: VecDeque<(usize, u32)> = VecDeque::new();
+    let mut nearby = false;
+    let mut anchors: Vec<(usize, usize, usize, Window)> = Vec::new();
+    each_line(stdout, |number, line, _| {
         analysis.run(line, &terms);
         let distinct = analysis.distinct();
-        if (number == 1 || number == lines) && !line.trim().is_empty() {
-            anchors.push((number, distinct, Excerpt::new(line, 0)));
-        }
+        let anchor = (number == 1 || number == lines) && !line.trim().is_empty();
         if distinct == 0 {
+            if anchor {
+                anchors.push((number, 0, 0, Window::at(line, 0, &[])));
+            }
             return;
         }
+        let matches = analysis.matches();
+        total += matches;
         if distinct == terms.len() {
             every += 1;
+            every_runs.add(number);
         } else {
             some += 1;
+            some_runs.add(number);
+            // A record printed over several lines spreads its terms among them.
+            let mask = analysis.mask();
+            while recent
+                .front()
+                .is_some_and(|&(line, _)| line + NEARBY <= number)
+            {
+                recent.pop_front();
+            }
+            nearby |= recent.iter().fold(mask, |union, &(_, other)| union | other) == all;
+            recent.push_back((number, mask));
         }
         let length = analysis.words as f64 / average;
         let score: f64 = analysis
@@ -382,27 +735,29 @@ pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> R
                 idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * length))
             })
             .sum();
-        // Lines that would be dropped at once need no excerpt.
-        if best.len() >= keep
+        // Lines that would be dropped at once need no window.
+        let dropped = best.len() >= keep
             && best
                 .peek()
                 .is_some_and(|Reverse(worst): &Reverse<Candidate>| {
                     rank((distinct, score, number), worst.key()).is_le()
-                })
-        {
+                });
+        if dropped && !anchor {
             return;
         }
-        let word = rarity
-            .iter()
-            .find_map(|&index| analysis.first[index])
-            .map(|(start, length)| line[start..start + length].to_owned())
-            .unwrap_or_default();
+        let first = windows(line, &analysis.spans, &idf, 1).remove(0);
+        if anchor {
+            anchors.push((number, distinct, matches, first.clone()));
+        }
+        if dropped {
+            return;
+        }
         best.push(Reverse(Candidate {
             line: number,
             distinct,
             score,
-            excerpt: Excerpt::new(line, analysis.focus()),
-            word,
+            matches,
+            first,
         }));
         if best.len() > keep {
             best.pop();
@@ -414,103 +769,246 @@ pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> R
         .map(|Reverse(candidate)| candidate)
         .collect();
 
-    let several = terms.len() > 1;
-    let header = if several {
+    let mut header = if several {
         format!(
-            "[focus] \"{shown_intent}\": {every} of {lines} lines match every term, {some} match some\n"
+            "[focus] {shown_intent}: {every} of {lines} lines match every term, {some} match some\n"
         )
     } else {
-        format!("[focus] \"{shown_intent}\": {every} of {lines} lines match\n")
+        format!("[focus] {shown_intent}: {every} of {lines} lines match\n")
     };
-    let search = ranked
-        .first()
-        .and_then(|top| search_clause(run_id, &top.word))
-        .unwrap_or_default();
-    let trailer = |every: usize, some: usize| {
-        if every == 0 && some == 0 {
-            "[focus] every matching line is shown\n".to_owned()
-        } else if several {
-            format!("[focus] {every} more match every term, {some} more match some{search}\n")
-        } else {
-            format!("[focus] {every} more match{search}\n")
-        }
-    };
-    // The trailer's counts only shrink as lines are shown, so this reserves enough.
-    let reserve = trailer(every, some).len().max(trailer(0, 0).len());
-    let body = max_bytes.saturating_sub(header.len() + reserve);
-
-    let mut shown: Vec<Shown> = Vec::new();
-    let mut used = 0;
-    let mut place = |line: usize, distinct: usize, excerpt: &Excerpt, limit: usize| {
-        if shown.iter().any(|shown| shown.line == line) {
-            return;
-        }
-        let marker = format!("stdout:{line}: ");
-        let cap = limit.min(body.saturating_sub(marker.len() + 1));
-        let entry = format!("{marker}{}\n", excerpt.render(cap));
-        if cap > 0 && used + entry.len() <= body {
-            used += entry.len();
-            shown.push(Shown {
-                line,
-                distinct,
-                entry,
-            });
-        }
-    };
-    let mut ranked = ranked.iter();
-    // The best line is always shown, clipped to fit; then the last and first lines,
-    // which often hold a total and a title; then the rest in rank order.
-    if let Some(top) = ranked.next() {
-        place(top.line, top.distinct, &top.excerpt, EXCERPT);
-    }
-    for (line, distinct, excerpt) in anchors.iter().rev() {
-        place(*line, *distinct, excerpt, ANCHOR);
-    }
-    for candidate in ranked {
-        place(
-            candidate.line,
-            candidate.distinct,
-            &candidate.excerpt,
-            EXCERPT,
+    if several && every == 0 && nearby {
+        header.push_str(
+            "[focus] no line has every term, but neighboring lines do; print one record per line\n",
         );
     }
-    shown.sort_by_key(|shown| shown.line);
-    let shown_every = shown
+    // The trailer's counts only shrink as lines are shown, and its line numbers are
+    // at most `lines`, so the widest form bounds it.
+    let widest = "9".repeat(lines.to_string().len());
+    let widest_runs = format!(" ({widest}-{widest}, {widest}-{widest}, {widest}-{widest}, …)");
+    let widest_log = log_clause(run_id, (lines, lines));
+    let reserve = |runs: &str, log: &str| {
+        [(every, some), (0, 0)]
+            .into_iter()
+            .map(|(every, some)| {
+                Trailer {
+                    several,
+                    every,
+                    some,
+                    inside: total,
+                    cut,
+                    runs,
+                    log,
+                }
+                .render()
+                .len()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let full = max_bytes.saturating_sub(header.len() + reserve(&widest_runs, &widest_log));
+    let roomy = full >= ROOMY;
+    let body = if roomy {
+        full
+    } else {
+        max_bytes.saturating_sub(header.len() + reserve("", ""))
+    };
+
+    let mut layout = Layout {
+        body,
+        used: 0,
+        shown: Vec::new(),
+    };
+    // The best line is always shown, clipped to fit; then the last and first lines,
+    // which often hold a total and a title; then the rest in rank order.
+    if let Some(top) = ranked.first() {
+        layout.place(top.line, top.distinct, &top.first, EXCERPT, false);
+    }
+    for (line, distinct, _, window) in anchors.iter().rev() {
+        layout.place(*line, *distinct, window, ANCHOR, true);
+    }
+    for candidate in ranked.iter().skip(1) {
+        layout.place(
+            candidate.line,
+            candidate.distinct,
+            &candidate.first,
+            EXCERPT,
+            false,
+        );
+    }
+    // Then, while room remains, more windows of long lines already shown, one per line
+    // in rank order at a time. They are found in another pass, only for those lines.
+    let room = layout.body.saturating_sub(layout.used) / EXCERPT;
+    let mut longer: Vec<&Candidate> = ranked
         .iter()
-        .filter(|shown| shown.distinct == terms.len())
-        .count();
-    let shown_some = shown
+        .filter(|candidate| {
+            candidate.matches > candidate.first.spans.len() && layout.has(candidate.line)
+        })
+        .collect();
+    if room > 0 && !longer.is_empty() {
+        let each = room / longer.len() + 2;
+        let mut wanted: Vec<usize> = longer.iter().map(|candidate| candidate.line).collect();
+        wanted.sort_unstable();
+        let mut found: Vec<(usize, Vec<Window>)> = Vec::new();
+        each_line(stdout, |number, line, _| {
+            if wanted.binary_search(&number).is_ok() {
+                analysis.run(line, &terms);
+                found.push((number, windows(line, &analysis.spans, &idf, each)));
+            }
+        })?;
+        for index in 1..each {
+            let mut placed = false;
+            longer.retain(|candidate| {
+                let window = found
+                    .iter()
+                    .find(|(line, _)| *line == candidate.line)
+                    .and_then(|(_, windows)| windows.get(index));
+                let Some(window) = window else {
+                    return false;
+                };
+                placed |= layout.place(candidate.line, candidate.distinct, window, EXCERPT, false);
+                true
+            });
+            if !placed {
+                break;
+            }
+        }
+    }
+    let mut shown = layout.shown;
+    shown.sort_by_key(|shown| (shown.line, shown.start));
+
+    let mut lines_shown: Vec<(usize, usize)> = Vec::new();
+    let mut inside = 0;
+    for entry in &shown {
+        if lines_shown
+            .last()
+            .is_none_or(|&(line, _)| line != entry.line)
+        {
+            lines_shown.push((entry.line, entry.distinct));
+            let matches = ranked
+                .iter()
+                .find(|candidate| candidate.line == entry.line)
+                .map(|candidate| candidate.matches)
+                .or_else(|| {
+                    anchors
+                        .iter()
+                        .find(|anchor| anchor.0 == entry.line)
+                        .map(|anchor| anchor.2)
+                })
+                .unwrap_or(0);
+            let visible: usize = shown
+                .iter()
+                .filter(|other| other.line == entry.line)
+                .map(|other| other.matches)
+                .sum();
+            inside += matches.saturating_sub(visible);
+        }
+    }
+    let shown_every = lines_shown
         .iter()
-        .filter(|shown| shown.distinct > 0 && shown.distinct < terms.len())
+        .filter(|&&(_, distinct)| distinct == terms.len())
         .count();
+    let shown_some = lines_shown
+        .iter()
+        .filter(|&&(_, distinct)| distinct > 0 && distinct < terms.len())
+        .count();
+    let (every, some) = (every - shown_every, some - shown_some);
+
+    let numbers: Vec<usize> = lines_shown.iter().map(|&(line, _)| line).collect();
+    let (runs, left) = if every > 0 {
+        (&every_runs, every)
+    } else {
+        (&some_runs, some)
+    };
+    let next = if roomy {
+        runs.without(&numbers, RANGES_SHOWN)
+    } else {
+        Vec::new()
+    };
+    let listed: usize = next.iter().map(|&(first, last)| last - first + 1).sum();
+    let runs_text = if next.is_empty() {
+        String::new()
+    } else {
+        let mut parts: Vec<String> = next
+            .iter()
+            .map(|&(first, last)| {
+                if first == last {
+                    first.to_string()
+                } else {
+                    format!("{first}-{last}")
+                }
+            })
+            .collect();
+        if listed < left {
+            parts.push("…".to_owned());
+        }
+        format!(" ({})", parts.join(", "))
+    };
+    let log = next
+        .first()
+        .map(|&range| log_clause(run_id, range))
+        .unwrap_or_default();
 
     let mut output = header;
     for shown in &shown {
         output.push_str(&shown.entry);
     }
-    output.push_str(&trailer(every - shown_every, some - shown_some));
+    output.push_str(
+        &Trailer {
+            several,
+            every,
+            some,
+            inside,
+            cut,
+            runs: &runs_text,
+            log: &log,
+        }
+        .render(),
+    );
     ensure!(
         output.len() <= max_bytes,
         "the focused preview needs more than {max_bytes} bytes"
     );
-    Ok(output.into_bytes())
+    Ok(Some(output.into_bytes()))
 }
 
-/// When no line matches, the first and last lines with their markers.
-fn fallback(stdout: &Path, intent: &str, lines: usize, max_bytes: usize) -> Result<Vec<u8>> {
-    let header =
-        format!("[focus] no line matches \"{intent}\"; first and last of {lines} lines:\n");
-    let body = max_bytes.saturating_sub(header.len());
+/// ` · justless log RUN --stream stdout --from A --to B`.
+fn log_clause(run_id: &str, (first, last): (usize, usize)) -> String {
+    format!(" · justless log {run_id} --stream stdout --from {first} --to {last}")
+}
+
+/// When no line matches, the first and last lines with their markers. With the run ID
+/// of a stdout that had lines too long to read whole, it says so and names the search
+/// that reads them.
+fn fallback(
+    stdout: &Path,
+    intent: &str,
+    lines: usize,
+    max_bytes: usize,
+    cut: Option<&str>,
+) -> Result<Vec<u8>> {
+    let (header, trailer) = match cut {
+        None => (
+            format!("[focus] no line matches {intent}; first and last of {lines} lines:\n"),
+            String::new(),
+        ),
+        Some(run_id) => (
+            format!(
+                "[focus] no line matches {intent} in its first {LINE_LIMIT_SHOWN}; first and last of {lines} lines:\n"
+            ),
+            format!("[focus] justless search {run_id} TEXT reads whole lines\n"),
+        ),
+    };
+    let body = max_bytes.saturating_sub(header.len() + trailer.len());
     let entry = |number: usize, line: &str| {
         let marker = format!("stdout:{number}: ");
         let cap = ANCHOR.min(body.saturating_sub(marker.len() + 1));
-        format!("{marker}{}\n", Excerpt::new(line, 0).render(cap))
+        format!("{marker}{}\n", Excerpt::new(line, 0).render(cap).0)
     };
     let mut head = Vec::new();
     let mut head_bytes = 0;
     let mut tail = VecDeque::new();
     let mut tail_bytes = 0;
-    each_line(stdout, |number, line| {
+    each_line(stdout, |number, line, _| {
         let entry = entry(number, line);
         if tail.is_empty() && head_bytes + entry.len() <= body / 3 {
             head_bytes += entry.len();
@@ -527,6 +1025,7 @@ fn fallback(stdout: &Path, intent: &str, lines: usize, max_bytes: usize) -> Resu
     for entry in head.iter().chain(&tail) {
         output.push_str(entry);
     }
+    output.push_str(&trailer);
     ensure!(
         output.len() <= max_bytes,
         "the focused preview needs more than {max_bytes} bytes"
@@ -534,61 +1033,61 @@ fn fallback(stdout: &Path, intent: &str, lines: usize, max_bytes: usize) -> Resu
     Ok(output.into_bytes())
 }
 
-/// ` · justless search RUN WORD`, or nothing when the word cannot be quoted compactly.
-fn search_clause(run_id: &str, word: &str) -> Option<String> {
-    let word = word.get(..word.floor_char_boundary(word.len().min(WORD_SHOWN)))?;
-    let word = word.trim();
-    if word.is_empty() {
-        return None;
-    }
-    let quoted = shlex::try_quote(word).ok()?;
-    (quoted.len() <= WORD_SHOWN + 16).then(|| format!(" · justless search {run_id} {quoted}"))
-}
-
-/// The intent on one line, at most 60 bytes.
-fn clip_intent(intent: &str) -> String {
+/// The intent on one line, at most 60 bytes, in double quotes unless it has its own.
+fn show_intent(intent: &str) -> String {
     let flat: String = intent
         .trim()
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    if flat.len() <= INTENT_SHOWN {
-        return flat;
+    let clipped = if flat.len() <= INTENT_SHOWN {
+        flat
+    } else {
+        format!("{}…", &flat[..flat.floor_char_boundary(INTENT_SHOWN)])
+    };
+    if clipped.contains('"') {
+        clipped
+    } else {
+        format!("\"{clipped}\"")
     }
-    format!("{}…", &flat[..flat.floor_char_boundary(INTENT_SHOWN)])
 }
 
-/// Calls `visit` with each line's number and text, without ANSI escapes or the line
-/// ending. A line longer than 256 KiB is cut there. A final unterminated line counts.
-fn each_line(path: &Path, mut visit: impl FnMut(usize, &str)) -> io::Result<()> {
+/// Calls `visit` with each line's number, its text without ANSI escapes or the line
+/// ending, and whether it was cut at `LINE_LIMIT`. A final unterminated line counts.
+fn each_line(path: &Path, mut visit: impl FnMut(usize, &str, bool)) -> io::Result<()> {
     let mut file = BufReader::new(File::open(path)?);
     let mut raw = Vec::new();
     let mut number = 0;
-    while read_line(&mut file, &mut raw)? {
+    while let Some(cut) = read_line(&mut file, &mut raw)? {
         number += 1;
         let text = String::from_utf8_lossy(&raw);
         let text = ANSI.replace_all(&text, "");
-        visit(number, text.trim_end_matches(['\n', '\r']));
+        visit(number, text.trim_end_matches(['\n', '\r']), cut);
         raw.clear();
     }
     Ok(())
 }
 
-fn read_line(file: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<bool> {
+/// Reads one line, keeping at most `LINE_LIMIT` bytes of it. Returns whether bytes
+/// were dropped, or `None` at the end of the file.
+fn read_line(file: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<Option<bool>> {
     let mut read = false;
+    let mut cut = false;
     loop {
         let chunk = file.fill_buf()?;
         if chunk.is_empty() {
-            return Ok(read);
+            return Ok(read.then_some(cut));
         }
         read = true;
         let newline = chunk.iter().position(|&byte| byte == b'\n');
         let length = newline.map_or(chunk.len(), |index| index + 1);
         let kept = length.min(LINE_LIMIT.saturating_sub(line.len()));
+        // The newline itself may be the byte that does not fit.
+        cut |= chunk[..length][kept..].iter().any(|&byte| byte != b'\n');
         line.extend_from_slice(&chunk[..kept]);
         file.consume(length);
         if newline.is_some() {
-            return Ok(true);
+            return Ok(Some(cut));
         }
     }
 }
@@ -624,6 +1123,11 @@ mod tests {
             ("sha256s", "sha256s"),
         ] {
             assert_eq!(stem(word), stemmed, "{word}");
+        }
+        // The length filter in `Analysis::run` relies on this bound.
+        for word in ["seeings", "queries", "classes", "buildings", "parsed", "ab"] {
+            let stemmed = stem(word);
+            assert!(stemmed.len() <= word.len() && stemmed.len() + 5 >= word.len());
         }
     }
 
@@ -677,13 +1181,73 @@ mod tests {
         let focus = line.find("payments").unwrap();
         let excerpt = Excerpt::new(&line, focus);
         for cap in [20, 64, 100, 240] {
-            let shown = excerpt.render(cap);
+            let (shown, ..) = excerpt.render(cap);
             assert!(shown.len() <= cap, "{cap}: {}", shown.len());
             assert!(shown.starts_with('…') && shown.ends_with('…'), "{shown}");
             assert!(shown.contains("pay"), "{cap}: {shown}");
         }
-        assert!(excerpt.render(240).contains("payments timeout"));
-        assert_eq!(Excerpt::new("short", 0).render(240), "short");
+        assert!(excerpt.render(240).0.contains("payments timeout"));
+        assert_eq!(Excerpt::new("short", 0).render(240).0, "short");
+    }
+
+    #[test]
+    fn windows_prefer_the_part_with_every_term() {
+        // "sell" appears early alone; "pnut" and "sell" appear together later.
+        let line = format!(
+            "{}side sell{}market pnut side buy{}market pnut side sell{}",
+            "x ".repeat(100),
+            " filler".repeat(60),
+            " filler".repeat(60),
+            " filler".repeat(60)
+        );
+        let terms = terms("pnut sell");
+        let mut analysis = Analysis::new(&terms);
+        analysis.run(&line, &terms);
+        let found = windows(&line, &analysis.spans, &[1.0, 1.0], 3);
+        assert!(
+            found[0].excerpt.text.contains("market pnut side sell"),
+            "{}",
+            found[0].excerpt.text
+        );
+        assert_eq!(found.len(), 3);
+        for pair in found.windows(2) {
+            assert!(pair[0].start.abs_diff(pair[1].start) >= EXCERPT);
+        }
+    }
+
+    #[test]
+    fn runs_leave_out_shown_lines() {
+        let mut runs = Runs::default();
+        for line in [3, 4, 5, 6, 9, 12, 13] {
+            runs.add(line);
+        }
+        assert_eq!(runs.without(&[], 5), [(3, 6), (9, 9), (12, 13)]);
+        assert_eq!(runs.without(&[3, 5, 9, 13], 5), [(4, 4), (6, 6), (12, 12)]);
+        assert_eq!(runs.without(&[1, 4], 2), [(3, 3), (5, 6)]);
+        assert!(runs.without(&[3, 4, 5, 6, 9, 12, 13], 3).is_empty());
+    }
+
+    #[test]
+    fn long_lines_report_their_cut() {
+        let mut reader = io::Cursor::new(format!("{}\nshort\n", "a".repeat(LINE_LIMIT + 3)));
+        let mut line = Vec::new();
+        assert_eq!(read_line(&mut reader, &mut line).unwrap(), Some(true));
+        assert_eq!(line.len(), LINE_LIMIT);
+        line.clear();
+        assert_eq!(read_line(&mut reader, &mut line).unwrap(), Some(false));
+        assert_eq!(line, b"short\n");
+        line.clear();
+        assert_eq!(read_line(&mut reader, &mut line).unwrap(), None);
+        // A line of exactly the limit keeps everything but its newline.
+        let mut reader = io::Cursor::new(format!("{}\n", "b".repeat(LINE_LIMIT)));
+        assert_eq!(read_line(&mut reader, &mut line).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn intents_with_their_own_quotes_are_not_quoted_again() {
+        assert_eq!(show_intent("payments timeouts"), "\"payments timeouts\"");
+        assert_eq!(show_intent("\"connection reset\""), "\"connection reset\"");
+        assert_eq!(show_intent("a\nb"), "\"a b\"");
     }
 
     fn write(lines: &[String]) -> tempfile::NamedTempFile {
@@ -693,6 +1257,14 @@ mod tests {
             std::io::Write::write_all(&mut file, b"\n").unwrap();
         }
         file
+    }
+
+    fn focused(file: &tempfile::NamedTempFile, intent: &str, budget: usize) -> String {
+        let preview = preview(file.path(), intent, budget, "run-Ab12Cd34Ef56")
+            .unwrap()
+            .expect("a focused preview");
+        assert!(preview.len() <= budget, "{budget}: {}", preview.len());
+        String::from_utf8(preview).unwrap()
     }
 
     #[test]
@@ -719,9 +1291,7 @@ mod tests {
         ];
         for intent in &intents {
             for budget in [512, 700, 1024, 4096] {
-                let preview = preview(file.path(), intent, budget, "run-Ab12Cd34Ef56").unwrap();
-                assert!(preview.len() <= budget, "{budget}: {}", preview.len());
-                let text = String::from_utf8(preview).unwrap();
+                let text = focused(&file, intent, budget);
                 assert!(text.starts_with("[focus] \""), "{text}");
                 assert!(text.contains("stdout:7: "), "{budget} {intent}: {text}");
                 assert!(
@@ -736,14 +1306,142 @@ mod tests {
     fn preview_without_matches_shows_marked_head_and_tail() {
         let lines: Vec<String> = (1..=3000).map(|n| format!("line {n} ok")).collect();
         let file = write(&lines);
-        let preview = preview(file.path(), "zebra", 1024, "run-X").unwrap();
-        let text = String::from_utf8(preview).unwrap();
-        assert!(text.len() <= 1024);
+        let text = focused(&file, "zebra", 1024);
         assert!(
             text.starts_with("[focus] no line matches \"zebra\"; first and last of 3000 lines:\n"),
             "{text}"
         );
         assert!(text.contains("stdout:1: line 1 ok\n"), "{text}");
         assert!(text.ends_with("stdout:3000: line 3000 ok\n"), "{text}");
+    }
+
+    #[test]
+    fn preview_fills_the_budget_from_one_long_line() {
+        let record = |n: usize, symbol: &str, side: &str| {
+            format!("{{\"order_id\": {n}, \"market_symbol\": \"{symbol}\", \"side\": \"{side}\"}}")
+        };
+        let mut records = Vec::new();
+        for n in 0..300 {
+            let (symbol, side) = match n % 10 {
+                3 => ("PNUTUSDT", "SELL"),
+                7 => ("PNUTUSDT", "BUY"),
+                _ => ("BTCUSDT", if n % 2 == 0 { "SELL" } else { "BUY" }),
+            };
+            records.push(record(n, symbol, side));
+        }
+        let file = write(&[format!("[{}]", records.join(", "))]);
+        let text = focused(&file, "PNUTUSDT SELL", 4096);
+        let excerpts: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("stdout:1: "))
+            .collect();
+        assert!(excerpts.len() > 8, "{text}");
+        // The first window holds both terms, not a SELL of another symbol.
+        assert!(
+            excerpts[0].contains("\"PNUTUSDT\", \"side\": \"SELL\""),
+            "{text}"
+        );
+        assert!(text.len() > 3000, "{}", text.len());
+        let trailer = text.lines().last().unwrap();
+        assert!(
+            trailer.starts_with("[focus] every matching line is shown; ")
+                && trailer.ends_with(
+                    " more matches inside shown lines; print one record per line to rank them"
+                ),
+            "{trailer}"
+        );
+    }
+
+    #[test]
+    fn preview_lists_lines_left_out_for_log() {
+        let lines: Vec<String> = (1..=600)
+            .map(|n| match n % 3 {
+                0 => format!("{n}: payments timeout request_id={n}"),
+                1 => format!("{n}: orders timeout"),
+                _ => format!("{n}: fine"),
+            })
+            .collect();
+        let file = write(&lines);
+        let text = focused(&file, "payments timeouts", 1024);
+        let shown: Vec<usize> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("stdout:"))
+            .map(|rest| rest.split(':').next().unwrap().parse().unwrap())
+            .collect();
+        let trailer = text.lines().last().unwrap();
+        // The listed lines match every term and none of them is shown already.
+        let listed = trailer
+            .split_once("every term (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(list, _)| list)
+            .unwrap_or_else(|| panic!("{trailer}"));
+        let first: usize = listed.split([',', '-']).next().unwrap().parse().unwrap();
+        assert_eq!(first % 3, 0, "{trailer}");
+        assert!(!shown.contains(&first), "{text}");
+        assert!(
+            trailer.ends_with(&format!(
+                " · justless log run-Ab12Cd34Ef56 --stream stdout --from {first} --to {first}"
+            )),
+            "{trailer}"
+        );
+    }
+
+    #[test]
+    fn preview_hints_at_records_split_across_lines() {
+        let mut lines = Vec::new();
+        for n in 0..400 {
+            lines.push("{".to_owned());
+            lines.push(format!(
+                "  \"symbol\": \"{}\",",
+                if n % 5 == 0 { "PNUT" } else { "BTC" }
+            ));
+            lines.push(format!(
+                "  \"side\": \"{}\"",
+                if n % 2 == 0 { "SELL" } else { "BUY" }
+            ));
+            lines.push("},".to_owned());
+        }
+        let file = write(&lines);
+        let text = focused(&file, "PNUT SELL", 4096);
+        assert!(
+            text.lines().nth(1).unwrap()
+                == "[focus] no line has every term, but neighboring lines do; print one record per line",
+            "{text}"
+        );
+        let text = focused(&file, "PNUT", 4096);
+        assert!(!text.contains("neighboring"), "{text}");
+    }
+
+    #[test]
+    fn matches_past_the_line_limit_are_not_denied() {
+        let tail = "quota_exceeded";
+        let line = format!("{}{tail}", "ok ".repeat(LINE_LIMIT / 3 + 10));
+        let file = write(&[line.clone(), "other".to_owned()]);
+        // Nothing matched in what was read, which the preview says, with a way to
+        // search whole lines.
+        let text = focused(&file, tail, 1024);
+        assert!(
+            text.starts_with(
+                "[focus] no line matches \"quota_exceeded\" in its first 4 MiB; first and last of 2 lines:\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "stdout:2: other\n[focus] justless search run-Ab12Cd34Ef56 TEXT reads whole lines\n"
+            ),
+            "{text}"
+        );
+        let file = write(&[line, format!("the {tail} line")]);
+        let text = focused(&file, tail, 4096);
+        assert!(text.contains("stdout:2: the quota_exceeded line"), "{text}");
+        assert!(!text.contains("every match"), "{text}");
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .ends_with("lines over 4 MiB were ranked on their first 4 MiB"),
+            "{text}"
+        );
     }
 }
