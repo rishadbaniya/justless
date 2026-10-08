@@ -646,14 +646,7 @@ impl Trailer<'_> {
 
 /// Replaces a long stdout preview with the lines most relevant to `intent`, in log
 /// order, within `max_bytes`. The output is UTF-8 and the same for the same input.
-/// Returns `None` when the usual preview says more, as when nothing matched in lines
-/// too long to read whole.
-pub fn preview(
-    stdout: &Path,
-    intent: &str,
-    max_bytes: usize,
-    run_id: &str,
-) -> Result<Option<Vec<u8>>> {
+pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> Result<Vec<u8>> {
     let terms = terms(intent);
     ensure!(!terms.is_empty(), "the intent has no search terms");
     let mut analysis = Analysis::new(&terms);
@@ -674,7 +667,7 @@ pub fn preview(
     let shown_intent = show_intent(intent);
     if frequency.iter().all(|&count| count == 0) {
         let cut = cut.then_some(run_id);
-        return fallback(stdout, &shown_intent, lines, max_bytes, cut).map(Some);
+        return fallback(stdout, &shown_intent, lines, max_bytes, cut);
     }
 
     let average = if words == 0 {
@@ -968,7 +961,7 @@ pub fn preview(
         output.len() <= max_bytes,
         "the focused preview needs more than {max_bytes} bytes"
     );
-    Ok(Some(output.into_bytes()))
+    Ok(output.into_bytes())
 }
 
 /// ` · justless log RUN --stream stdout --from A --to B`.
@@ -1381,9 +1374,7 @@ mod tests {
     }
 
     fn focused(file: &tempfile::NamedTempFile, intent: &str, budget: usize) -> String {
-        let preview = preview(file.path(), intent, budget, "run-Ab12Cd34Ef56")
-            .unwrap()
-            .expect("a focused preview");
+        let preview = preview(file.path(), intent, budget, "run-Ab12Cd34Ef56").unwrap();
         assert!(preview.len() <= budget, "{budget}: {}", preview.len());
         String::from_utf8(preview).unwrap()
     }

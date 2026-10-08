@@ -393,6 +393,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             // the ones left out, or is ranked against the intent.
             stdout_preview: Some(Box::new(move |stdout: &Path, id: &str| match intent {
                 Some(intent) => crate::focus::preview(stdout, intent, max_bytes, id)
+                    .map(Some)
                     .context("could not rank stdout for --intent"),
                 None => {
                     crate::focus::outline(stdout, max_bytes, id).context("could not outline stdout")
