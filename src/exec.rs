@@ -542,6 +542,9 @@ trait Group {
     fn signal(&mut self, signal: &str) -> bool;
     /// Whether any process is left in the group.
     fn occupied(&mut self) -> bool;
+    /// Whether a process that has not exited is left. Linux counts a zombie as a
+    /// member, and an init that does not reap orphans leaves them in the group.
+    fn running(&mut self) -> bool;
 }
 
 /// No group, as on Windows or without `/bin/sh`: only the interpreter can be stopped.
@@ -555,6 +558,32 @@ impl Group for Alone {
     fn occupied(&mut self) -> bool {
         false
     }
+
+    fn running(&mut self) -> bool {
+        false
+    }
+}
+
+/// Whether `ps` lists a process of `group` that has not exited, or `ps` cannot tell.
+#[cfg(unix)]
+fn running_in(group: u32) -> bool {
+    let Ok(listing) = Command::new("ps")
+        .args(["-A", "-o", "pgid=", "-o", "stat="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return true;
+    };
+    let group = group.to_string();
+    !listing.status.success()
+        || String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .any(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next() == Some(group.as_str())
+                    && fields.next().is_some_and(|stat| !stat.starts_with('Z'))
+            })
 }
 
 /// The script leads its own process group, and the watchdog leads another, so no
@@ -572,6 +601,8 @@ struct Watchdog {
     process: Child,
     input: std::process::ChildStdin,
     answers: std::sync::mpsc::Receiver<bool>,
+    /// The script's process group, once the watchdog has it.
+    group: Option<u32>,
 }
 
 #[cfg(unix)]
@@ -602,7 +633,15 @@ impl Watchdog {
             process,
             input,
             answers,
+            group: None,
         })
+    }
+
+    /// Hands the watchdog the script's process group.
+    fn watch(&mut self, group: u32) {
+        if self.send(&group.to_string()) {
+            self.group = Some(group);
+        }
     }
 
     /// A write to a watchdog that already exited fails with EPIPE, since Rust ignores
@@ -624,17 +663,22 @@ impl Watchdog {
 #[cfg(unix)]
 impl Group for Watchdog {
     fn signal(&mut self, signal: &str) -> bool {
-        self.send(signal)
+        self.group.is_some() && self.send(signal)
     }
 
     fn occupied(&mut self) -> bool {
         // The answer is immediate. A watchdog that cannot answer cannot stop anything
         // either, so there is nothing to wait for.
-        self.send("0")
+        self.group.is_some()
+            && self.send("0")
             && self
                 .answers
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap_or(false)
+    }
+
+    fn running(&mut self) -> bool {
+        self.group.is_some_and(running_in)
     }
 }
 
@@ -666,7 +710,7 @@ fn supervise(mut command: Command, timeout: Option<Duration>) -> Result<Outcome>
             return Err(error.into());
         }
     };
-    watchdog.send(&child.id().to_string());
+    watchdog.watch(child.id());
     let outcome = wait(&mut child, timeout, &mut watchdog);
     // Closing its input kills what is left of the group, so the streams are final
     // before they are read.
@@ -719,7 +763,8 @@ fn wait(
         let mut pause = Duration::from_millis(5);
         while group.occupied() {
             if Instant::now() >= until {
-                left_running = true;
+                // Only zombies that nothing reaps lose no output.
+                left_running = group.running();
                 break;
             }
             std::thread::sleep(pause);
@@ -837,6 +882,29 @@ mod tests {
             Path::new("../../.justless/runs/run-1/script.py")
         );
         assert_eq!(relative(script, Path::new("/elsewhere"), root), script);
+    }
+
+    /// A zombie left in the group, as under an init that does not reap, is not running.
+    #[cfg(unix)]
+    #[test]
+    fn ps_tells_running_members_from_zombies() {
+        use std::os::unix::process::CommandExt;
+        if Command::new("ps").arg("-A").output().is_err() {
+            return;
+        }
+        let mut sleeper = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = sleeper.id();
+        assert!(running_in(group));
+        sleeper.kill().unwrap();
+        // Unreaped, the sleeper stays a zombie member of its group.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!running_in(group));
+        sleeper.wait().unwrap();
+        assert!(!running_in(group));
     }
 
     #[test]

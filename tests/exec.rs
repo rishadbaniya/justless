@@ -811,7 +811,7 @@ fn readers_the_script_leaves_running_finish_writing() {
         &[
             "--lang",
             "bash",
-            "exec > >(sleep 0.5; while read -r l; do echo \"p $l\"; done); seq 1 2000",
+            "exec > >(sleep 0.2; while read -r l; do echo \"p $l\"; done); seq 1 2000",
         ],
     );
     assert!(output.status.success(), "{}", stderr(&output));
