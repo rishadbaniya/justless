@@ -769,7 +769,7 @@ const TOOLS: &[Tool] = &[
         name: "log",
         title: "Replay a captured run",
         command: "log",
-        description: "Exact output of a run captured by `justless run`, optionally one stream and line range.",
+        description: "Output of a `justless run` capture, secrets redacted. Optional stream and line range.",
         params: &[
             RUN_ID,
             STREAM,

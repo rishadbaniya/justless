@@ -1,7 +1,8 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,7 +92,7 @@ pub fn diagnostic_excerpt(directory: &Path, diagnostic: &Diagnostic) -> Result<V
     let start = diagnostic.log_line.saturating_sub(2).max(1);
     let end = diagnostic.log_line.saturating_add(2);
     let mut excerpt = Vec::new();
-    let mut file = BufReader::new(file);
+    let mut file = crate::redact::Reader::new(file, crate::redact::for_archive(directory));
     let mut raw = Vec::new();
     for line in 1..=end {
         if !read_prefix(&mut file, &mut raw, SCAN_LINE_LIMIT)? {
@@ -162,6 +163,9 @@ pub struct Run {
     pub cwd: String,
     #[serde(default)]
     pub session: String,
+    /// Secrets replaced in the previews; absent when redaction was off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<crate::redact::Found>,
     pub diagnostics: Vec<Diagnostic>,
     pub source_digests: BTreeMap<String, String>,
     /// Bytes each stream held when the command exited. A background process can keep
@@ -206,6 +210,7 @@ impl Run {
             argv_withheld: false,
             cwd: String::new(),
             session: String::new(),
+            redaction: None,
             diagnostics: Vec::new(),
             source_digests: BTreeMap::new(),
             stream_bytes: Vec::new(),
@@ -314,6 +319,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
 
     let settings = workspace.settings()?;
     let selection = crate::filters::Selection::for_run(args, &settings.filters)?;
+    let redactor = crate::redact::for_run(workspace)?;
     let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
     // A recursive grep would otherwise read the archived logs, including the stdout
     // file it is writing.
@@ -367,6 +373,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         fresh,
         hook,
         agent_footer,
+        redactor,
         retention: (settings.max_runs, settings.max_archive_bytes),
     };
     match capture.record(&mut archive, family, status, stdout_preview) {
@@ -1095,6 +1102,8 @@ struct Capture<'a> {
     fresh: bool,
     hook: bool,
     agent_footer: bool,
+    /// Replaces secrets in what the agent sees; the archive keeps the original bytes.
+    redactor: Option<&'a crate::redact::Redactor>,
     /// The most runs and archive bytes to keep.
     retention: (usize, u64),
 }
@@ -1119,6 +1128,7 @@ impl Capture<'_> {
             fresh,
             hook,
             agent_footer,
+            redactor,
             retention,
         } = *self;
         let directory = archive.directory.clone();
@@ -1144,6 +1154,7 @@ impl Capture<'_> {
                 .map(|dir| dir.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             session: session.to_owned(),
+            redaction: redactor.map(|r| crate::redact::Found::new(r.fingerprint())),
             ..Run::unfinished(archive.id(), &family, "", hook)
         };
         let mut parser = Parser::new(&run.family, selection.profile);
@@ -1167,6 +1178,7 @@ impl Capture<'_> {
                 lengths[index],
                 stream,
                 max_bytes,
+                redactor,
                 &mut run,
                 &mut Observers {
                     parser: &mut parser,
@@ -1240,10 +1252,12 @@ impl Capture<'_> {
             run.summary = summary.clone();
         }
         let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
+        let mut notice = false;
         if let Some(prior) = &previous
             && run.unchanged
         {
             if shown > 64 {
+                notice = true;
                 let target = usize::from(previews[0].1.is_empty());
                 for (_, bytes) in &mut previews {
                     bytes.clear();
@@ -1287,8 +1301,28 @@ impl Capture<'_> {
                 Err(error) => eprintln!("justless: {error:#}"),
             }
         }
+        if let Some(redactor) = redactor {
+            // Reports can quote an earlier record, such as a rerun's previous failures,
+            // and a shaped stdout preview reads the archive itself.
+            for (_, preview) in &mut previews {
+                if let Cow::Owned(redacted) = redactor.bytes(preview) {
+                    *preview = redacted;
+                }
+            }
+        }
         run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();
-        let footer = footer(&run, &previews, &archive.readers, agent_footer, selection)?;
+        let footer = footer(
+            &run,
+            &previews,
+            &archive.readers,
+            Shown {
+                agent: agent_footer,
+                selection,
+                redactor,
+                max_bytes,
+                notice,
+            },
+        )?;
         run.footer_bytes = footer.len();
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
@@ -1307,43 +1341,76 @@ impl Capture<'_> {
     }
 }
 
+/// How a run's previews were produced, for its footer.
+struct Shown<'a> {
+    /// Print the agent footer.
+    agent: bool,
+    selection: &'a crate::filters::Selection,
+    redactor: Option<&'a crate::redact::Redactor>,
+    max_bytes: usize,
+    /// The unchanged notice replaced the previews.
+    notice: bool,
+}
+
 /// The line printed after the preview. A command typed by a person keeps the full
 /// footer. A hook-routed command or `exec` script whose output reached the agent
 /// verbatim prints nothing, since the agent already has every byte; otherwise one
-/// short marker names the run so the agent can recover what was left out.
+/// short marker names the run so the agent can recover what was left out. Shown
+/// secrets are always counted, so the agent knows Justless wrote the markers and
+/// which run holds the originals.
 fn footer(
     run: &Run,
     previews: &[(Stream, Vec<u8>)],
     readers: &[File],
-    agent: bool,
-    selection: &crate::filters::Selection,
+    shown: Shown,
 ) -> Result<String> {
     let id = &run.id;
+    let secrets = run.redaction.as_ref().map_or(0, |found| found.count);
+    let redacted = match secrets {
+        _ if shown.notice => String::new(),
+        0 => String::new(),
+        1 => " · 1 secret redacted".to_owned(),
+        n => format!(" · {n} secrets redacted"),
+    };
     // A stream past `max_run_bytes` is never shown in full, so the marker always
     // follows, even after a hook-routed run.
     let truncation = run.truncation();
-    if !agent {
+    if !shown.agent {
         return Ok(format!(
-            "\n[justless {id}] exit {} · {} of {} output bytes · justless log {id}\n{truncation}",
+            "\n[justless {id}] exit {} · {} of {} output bytes{redacted} · justless log {id}\n{truncation}",
             run.status, run.preview_bytes, run.raw_bytes
         ));
     }
     // Compare the printed bytes with what the command wrote before it exited: equal
     // sizes alone can hide a replaced or regrouped stream. A background process can
-    // keep adding to the archive, so only the bytes counted at exit are read.
-    let mut verbatim = truncation.is_empty() && run.preview_bytes as u64 == run.raw_bytes;
+    // keep adding to the archive, so only the bytes counted at exit are read. With
+    // secrets, compare with the redacted archive.
+    let redactor = shown.redactor.filter(|_| secrets > 0);
+    let mut verbatim =
+        truncation.is_empty() && (secrets > 0 || run.preview_bytes as u64 == run.raw_bytes);
     for (stream, preview) in previews {
         if !verbatim {
             break;
         }
         let index = stream.index();
-        verbatim = run.stream_bytes.get(index) == Some(&(preview.len() as u64))
+        let Some(&length) = run.stream_bytes.get(index) else {
+            verbatim = false;
+            break;
+        };
+        let sized = match redactor {
+            None => length == preview.len() as u64,
+            Some(_) => length <= shown.max_bytes as u64,
+        };
+        verbatim = sized
             && match readers.get(index) {
                 Some(mut file) => {
-                    let mut stored = Vec::with_capacity(preview.len());
+                    let mut stored = Vec::with_capacity(length as usize);
                     file.seek(SeekFrom::Start(0))?;
-                    file.take(preview.len() as u64).read_to_end(&mut stored)?;
-                    stored == *preview
+                    file.take(length).read_to_end(&mut stored)?;
+                    match redactor {
+                        None => stored == *preview,
+                        Some(redactor) => *redactor.bytes(&stored) == **preview,
+                    }
                 }
                 None => false,
             };
@@ -1351,20 +1418,30 @@ fn footer(
     // A search that matched nothing exits 1 with no output; that is an answer, not a failure.
     let empty_search = run.status == 1
         && run.raw_bytes == 0
-        && selection.profile == Some(crate::filters::Profile::Search);
+        && shown.selection.profile == Some(crate::filters::Profile::Search);
     let separator = separator(
         previews
             .iter()
             .rev()
             .find_map(|(_, bytes)| bytes.last().copied()),
     );
-    let line = if verbatim && (run.status == 0 || empty_search) {
-        String::new()
-    } else if verbatim || run.unchanged {
-        if run.status == 0 {
+    let only_count = || {
+        if redacted.is_empty() {
             String::new()
         } else {
-            format!("{separator}[justless {id} · exit {}]\n", run.status)
+            format!("{separator}[justless {id}{redacted}]\n")
+        }
+    };
+    let line = if verbatim && (run.status == 0 || empty_search) {
+        only_count()
+    } else if verbatim || run.unchanged {
+        if run.status == 0 {
+            only_count()
+        } else {
+            format!(
+                "{separator}[justless {id}{redacted} · exit {}]\n",
+                run.status
+            )
         }
     } else {
         let exit = if run.status == 0 {
@@ -1373,7 +1450,7 @@ fn footer(
             format!(" · exit {}", run.status)
         };
         format!(
-            "{separator}[justless {id} · {} of {} shown{exit}]\n",
+            "{separator}[justless {id} · {} of {} shown{redacted}{exit}]\n",
             history::human_bytes(run.preview_bytes as u64),
             history::human_bytes(run.raw_bytes)
         )
@@ -1424,6 +1501,7 @@ fn scan(
     length: u64,
     stream: Stream,
     max_bytes: usize,
+    redactor: Option<&crate::redact::Redactor>,
     run: &mut Run,
     observers: &mut Observers,
 ) -> Result<Vec<u8>> {
@@ -1439,10 +1517,14 @@ fn scan(
     let truncated = length > max_bytes as u64;
     let payload = max_bytes - DIAGNOSTICS.len() - CLIPPED.len();
     file.seek(SeekFrom::Start(0))?;
-    let mut file = BufReader::new(HashedFile {
-        file: file.take(length),
-        digest: Sha256::new(),
-    });
+    // Every consumer below sees redacted lines; the digest covers the raw bytes.
+    let mut file = crate::redact::Reader::new(
+        HashedFile {
+            file: file.take(length),
+            digest: Sha256::new(),
+        },
+        redactor,
+    );
     let mut raw = Vec::new();
     let mut end = Vec::new();
     let mut preview = Vec::new();
@@ -1456,10 +1538,11 @@ fn scan(
     let mut line_no = 0;
     let mut filter = crate::filters::LineFilter::new(selection, max_bytes);
 
+    // A stream that fits is shown whole, including lines that markers made longer.
     let line_limit = if truncated {
         SCAN_LINE_LIMIT
     } else {
-        max_bytes
+        usize::MAX
     };
     loop {
         let Some(cut) = read_line(&mut file, &mut raw, line_limit, &mut end, tail_limit)? else {
@@ -1568,6 +1651,9 @@ fn scan(
         }
         preview.extend_from_slice(CLIPPED);
         preview.extend(tail.into_iter().flat_map(String::into_bytes));
+    }
+    if let Some(found) = run.redaction.as_mut() {
+        found.count += file.found().count;
     }
     run.digests
         .push(format!("{:x}", file.into_inner().digest.finalize()));
@@ -2195,11 +2281,11 @@ pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Resu
 /// Replay a stream file, or a range of its lines, and flush it. Returns the last
 /// byte printed.
 fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<Option<u8>> {
-    let mut file = File::open(path)?;
+    let redactor = path.parent().and_then(crate::redact::for_archive);
+    let mut file = crate::redact::Reader::new(File::open(path)?, redactor);
     if from == 1 && to == usize::MAX {
         return Ok(copy_out(&mut file, stream)?);
     }
-    let mut file = BufReader::new(file);
     let mut line = Vec::new();
     let mut last = None;
     for number in 1..=to {
@@ -2270,7 +2356,10 @@ pub fn matches(
     mut emit: impl FnMut(Stream, usize, &str) -> bool,
 ) -> Result<()> {
     for &stream in streams {
-        let mut file = BufReader::new(File::open(directory.join(stream.name()))?);
+        let mut file = crate::redact::Reader::new(
+            File::open(directory.join(stream.name()))?,
+            crate::redact::for_archive(directory),
+        );
         let mut window = Vec::new();
         let mut line_number = 1;
         let mut matched = false;

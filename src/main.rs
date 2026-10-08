@@ -21,6 +21,7 @@ mod observations;
 mod pack;
 mod polyglot;
 mod proxy;
+mod redact;
 mod rust_syntax;
 mod search;
 mod source;
@@ -133,7 +134,8 @@ fn cli() -> Command<'static> {
                         .long("to")
                         .value_name("N")
                         .help("Last output line, inclusive"),
-                ),
+                )
+                .arg(redact::unredacted()),
         )
         .subcommand(
             Command::new("search")
@@ -141,7 +143,8 @@ fn cli() -> Command<'static> {
                 .arg(id())
                 .arg(Arg::new("text").required(true).value_name("TEXT"))
                 .arg(streams())
-                .arg(number("limit", "20", "Maximum matching lines")),
+                .arg(number("limit", "20", "Maximum matching lines"))
+                .arg(redact::unredacted()),
         )
         .subcommand(
             Command::new("pack")
@@ -431,6 +434,10 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         }
         ("log", sub) => {
             let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
+            if sub.is_present("unredacted") {
+                redact::bypass();
+                history::recall(&directory, "unredacted");
+            }
             let to = if sub.is_present("to") {
                 read_num(sub, "to", 1)?
             } else {
@@ -453,6 +460,10 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         }
         ("search", sub) => {
             let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
+            if sub.is_present("unredacted") {
+                redact::bypass();
+                history::recall(&directory, "unredacted");
+            }
             capture::search(
                 &directory,
                 Stream::select(sub.value_of("stream").unwrap()),

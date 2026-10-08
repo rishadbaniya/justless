@@ -67,6 +67,10 @@ pub struct Settings {
     /// The most bytes one run archives from each stream. Output past it is read
     /// and counted but not stored, so one command can never fill the disk.
     pub max_run_bytes: u64,
+    /// Replace secrets in captured command output with markers.
+    pub redact: bool,
+    /// Regular expressions for detected values to leave visible.
+    pub redact_allow: Vec<String>,
 }
 
 impl Default for Settings {
@@ -79,6 +83,8 @@ impl Default for Settings {
             max_runs: 200,
             max_archive_bytes: 256 * 1024 * 1024,
             max_run_bytes: 256 * 1024 * 1024,
+            redact: true,
+            redact_allow: Vec::new(),
         }
     }
 }

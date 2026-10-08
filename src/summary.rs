@@ -5,6 +5,9 @@ use std::ffi::OsString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Text in a summary comes from captured output. Records written before redaction can
+/// hold raw secrets, so code that prints a stored summary must pass it through
+/// `redact::Redactor`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Summary {
     pub kind: String,

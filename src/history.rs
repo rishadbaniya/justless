@@ -199,6 +199,9 @@ struct Recalls {
     range: u64,
     search: u64,
     context: u64,
+    /// Replays with `--unredacted`, counted on top of the full, range or search call.
+    #[serde(default)]
+    unredacted: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -251,6 +254,7 @@ pub fn recall(directory: &Path, operation: &str) {
             "full" => r.full += 1,
             "range" => r.range += 1,
             "search" => r.search += 1,
+            "unredacted" => r.unredacted += 1,
             _ => r.context += 1,
         },
     );
@@ -377,6 +381,7 @@ pub fn utc_date(ms: u64) -> String {
 pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
     let (mut count, mut raw, mut preview) = (0u64, 0u64, 0u64);
+    let (mut secrets, mut unredacted) = (0u64, 0u64);
     let mut families: BTreeMap<String, FamilyStats> = BTreeMap::new();
     let mut timeline: BTreeMap<String, DayStats> = BTreeMap::new();
     for run in records(workspace, false)? {
@@ -386,6 +391,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         count += 1;
         raw += run.raw_bytes;
         preview += shown;
+        secrets += run.redaction.as_ref().map_or(0, |found| found.count);
         let c: Recalls = get_or_warn(
             &workspace
                 .state
@@ -393,6 +399,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
                 .join(&run.id)
                 .join("recalls.json"),
         );
+        unredacted += c.unredacted;
         let f = families.entry(run.family.clone()).or_default();
         f.family = run.family;
         f.runs += 1;
@@ -432,6 +439,8 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "days": timeline.into_values().collect::<Vec<_>>(),
             "commands": commands,
             "repeated_source_reads": activity.repeat_reads,
+            "redacted_secrets": secrets,
+            "unredacted_replays": unredacted,
             "hook_pass_through": activity.bypasses,
             "proxy": proxy.as_ref().map(|p| p.json()),
         });
@@ -453,6 +462,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "≈{} tokens saved (estimated as bytes ÷ 4)",
             estimated_tokens(saved)
         );
+        if secrets > 0 {
+            println!("Redacted {secrets} secret(s) in captured output");
+        }
         if !timeline.is_empty() {
             println!("\nLast {days} day(s), UTC");
             let peak = timeline
@@ -515,8 +527,13 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     let targeted: u64 = commands.iter().map(|f| f.targeted_lookups).sum();
     if count > 0 || activity.repeat_reads > 0 {
         println!(
-            "\nRecovery: {reopened} run(s) reopened in full · {targeted} targeted lookup(s) · {} repeated source-range read(s)",
-            activity.repeat_reads
+            "\nRecovery: {reopened} run(s) reopened in full · {targeted} targeted lookup(s) · {} repeated source-range read(s){}",
+            activity.repeat_reads,
+            if unredacted > 0 {
+                format!(" · {unredacted} unredacted replay(s)")
+            } else {
+                String::new()
+            }
         );
     }
     if !activity.bypasses.is_empty() {
@@ -629,6 +646,10 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
             },
             run.summary
                 .headline()
+                .map(|h| match crate::redact::for_workspace(workspace) {
+                    Some(redactor) => redactor.text(&h).into_owned(),
+                    None => h,
+                })
                 .map(|h| format!(" · {}", crate::summary::short(&h, 160)))
                 .unwrap_or_default()
         ));
