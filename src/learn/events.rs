@@ -468,6 +468,10 @@ pub fn runs(
         if run.unfinished {
             continue;
         }
+        // `justless exec` records a script the agent wrote, not a command line.
+        if run.family.starts_with("exec ") {
+            continue;
+        }
         if stats.scanned == RUN_CAP {
             stats.capped = true;
             break;

@@ -741,12 +741,26 @@ fn killing_justless_stops_the_script() {
         let pid = fs::read_to_string(root.join(file)).unwrap();
         assert!(!alive(pid.trim()), "{file} survived");
     }
-    assert_eq!(runs(&root).len(), 0);
-    // The unrecorded run directory left behind does not disturb later commands.
+    // Like a `run` whose Justless was killed, the run stays listed as unfinished,
+    // and it does not disturb later commands.
+    let left = runs(&root);
+    assert_eq!(left.len(), 1);
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            root.join(".justless/runs")
+                .join(&left[0])
+                .join("record.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["unfinished"], true, "{record}");
     for args in [&["history"][..], &["stats"], &["resume"]] {
         let output = cli(&root, args);
         assert!(output.status.success(), "{args:?}: {}", stderr(&output));
     }
+    let history = stdout(&cli(&root, &["history"]));
+    assert!(history.contains("exec sh · unfinished"), "{history}");
     let output = exec(&root, &["--lang", "sh", "echo after"]);
     assert_eq!(stdout(&output), "after\n", "{}", stderr(&output));
 }
@@ -1366,4 +1380,48 @@ fn hooks_leave_exec_unwrapped() {
     );
     assert_eq!(hook("hook-codex", bash(mixed)), serde_json::json!({}));
     assert!(hook("hook-agy", agy(mixed)).get("overwrite").is_none());
+}
+
+/// An `exec` run prints the agent footer, but hooks did not route it, so `doctor` and
+/// the status line do not count it as a hook-routed run.
+#[test]
+fn exec_runs_are_not_recorded_as_hook_routed() {
+    let (_directory, root) = workspace();
+    let output = exec(&root, &["--lang", "sh", "echo ok; exit 3"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let id = run_id(&output);
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["hook"], false, "{record}");
+    assert_eq!(record["family"], "exec sh", "{record}");
+    // The agent footer, not the footer printed for a person.
+    assert_eq!(stderr(&output), format!("[justless {id} · exit 3]\n"));
+}
+
+/// Script output goes through the same pipes as `run`, so `max_run_bytes` caps what
+/// each stream stores while the script still runs to completion.
+#[test]
+fn exec_output_is_capped_by_max_run_bytes() {
+    let (_directory, root) = workspace();
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 1000\n").unwrap();
+    let output = exec(
+        &root,
+        &[
+            "--lang",
+            "sh",
+            "i=0; while [ $i -lt 100 ]; do echo 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghij'; i=$((i + 1)); done; echo done >&2; exit 4",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let id = run_id(&output);
+    let directory = root.join(".justless/runs").join(&id);
+    assert_eq!(fs::metadata(directory.join("stdout")).unwrap().len(), 1000);
+    assert_eq!(fs::read(directory.join("stderr")).unwrap(), b"done\n");
+    let message = stderr(&output);
+    assert!(
+        message.contains("[stdout archive truncated at 1000 B of 4.6 KB]"),
+        "{message}"
+    );
 }

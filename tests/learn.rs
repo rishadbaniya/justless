@@ -2322,3 +2322,20 @@ fn learn_skips_runs_left_unfinished() {
     let text = lab.text(&[]);
     assert!(!text.contains("predate command capture"), "{text}");
 }
+
+/// `justless exec` records a script the agent wrote under a key such as
+/// `exec sh -- ARGS`, which is not a command line, so learn leaves its runs out.
+#[cfg(unix)]
+#[test]
+fn learn_skips_exec_runs() {
+    let lab = Lab::new();
+    std::os::unix::fs::symlink("/bin/sh", lab.bin.join("sh")).unwrap();
+    let script = "echo 'sh: nope: command not found' >&2; exit 127";
+    let output = lab
+        .command("", &["exec", "--lang", "sh", script])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127), "{}", stderr(&output));
+    let report = lab.json(&[]);
+    assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
+}

@@ -148,7 +148,7 @@ pub struct Run {
     /// the agent received.
     #[serde(default)]
     pub footer_bytes: usize,
-    /// The run printed the agent footer: it was routed by a hook or started by `exec`.
+    /// The run was routed by an agent hook rather than typed by a person.
     #[serde(default)]
     pub hook: bool,
     /// The command line, its directory relative to the root (empty at the root) and
@@ -247,8 +247,11 @@ pub struct Shape<'a> {
     pub raw: bool,
     pub session: &'a str,
     pub fresh: bool,
-    /// Print the agent footer, which is empty when every byte was shown and the command succeeded.
+    /// The run was routed by an agent hook rather than typed by a person.
     pub hook: bool,
+    /// Print the agent footer, as after a hook-routed run: nothing when every byte was
+    /// shown and the command succeeded, otherwise one short line naming the run.
+    pub agent_footer: bool,
     /// Label for stats, history and resume, such as `exec python3`.
     pub family: Option<String>,
     /// Replaces the preview of a stdout longer than `max_bytes`, given the stdout file
@@ -282,6 +285,7 @@ pub fn execute(
             session,
             fresh,
             hook,
+            agent_footer: hook,
             family: None,
             stdout_preview: None,
             spawn: None,
@@ -296,6 +300,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         session,
         fresh,
         hook,
+        agent_footer,
         family,
         stdout_preview,
         spawn,
@@ -361,6 +366,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         session,
         fresh,
         hook,
+        agent_footer,
         retention: (settings.max_runs, settings.max_archive_bytes),
     };
     match capture.record(&mut archive, family, status, stdout_preview) {
@@ -1088,6 +1094,7 @@ struct Capture<'a> {
     session: &'a str,
     fresh: bool,
     hook: bool,
+    agent_footer: bool,
     /// The most runs and archive bytes to keep.
     retention: (usize, u64),
 }
@@ -1111,6 +1118,7 @@ impl Capture<'_> {
             session,
             fresh,
             hook,
+            agent_footer,
             retention,
         } = *self;
         let directory = archive.directory.clone();
@@ -1280,7 +1288,7 @@ impl Capture<'_> {
             }
         }
         run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();
-        let footer = footer(&run, &previews, &archive.readers, hook, selection)?;
+        let footer = footer(&run, &previews, &archive.readers, agent_footer, selection)?;
         run.footer_bytes = footer.len();
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
@@ -1300,21 +1308,21 @@ impl Capture<'_> {
 }
 
 /// The line printed after the preview. A command typed by a person keeps the full
-/// footer. A hook-routed command that reached the agent verbatim prints nothing, since
-/// the agent already has every byte; otherwise one short marker names the run so the
-/// agent can recover what was left out.
+/// footer. A hook-routed command or `exec` script whose output reached the agent
+/// verbatim prints nothing, since the agent already has every byte; otherwise one
+/// short marker names the run so the agent can recover what was left out.
 fn footer(
     run: &Run,
     previews: &[(Stream, Vec<u8>)],
     readers: &[File],
-    hook: bool,
+    agent: bool,
     selection: &crate::filters::Selection,
 ) -> Result<String> {
     let id = &run.id;
     // A stream past `max_run_bytes` is never shown in full, so the marker always
     // follows, even after a hook-routed run.
     let truncation = run.truncation();
-    if !hook {
+    if !agent {
         return Ok(format!(
             "\n[justless {id}] exit {} · {} of {} output bytes · justless log {id}\n{truncation}",
             run.status, run.preview_bytes, run.raw_bytes
