@@ -1024,3 +1024,175 @@ fn output_that_fits_once_redacted_is_shown_whole() {
     );
     assert_eq!(text(&output.stdout).lines().count(), dump.lines().count());
 }
+
+/// `exec` shapes a long stdout from the archive itself, as a line outline or ranked
+/// by `--intent`, and the shaped preview is redacted like any other.
+#[test]
+fn exec_previews_redact_outlined_and_ranked_stdout() {
+    let project = Project::new();
+    let secret = value("exec");
+    let script = format!(
+        "echo api_key={secret}; i=0; while [ $i -lt 400 ]; do echo \"row $i of the export\"; i=$((i + 1)); done; echo api_key={secret}"
+    );
+    for intent in [None, Some("api_key")] {
+        let mut args = vec!["exec", "--lang", "sh"];
+        if let Some(intent) = intent {
+            args.extend(["--intent", intent]);
+        }
+        args.push(&script);
+        let output = project.cli(&args);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        let shown = text(&output.stdout);
+        assert!(
+            shown.contains("api_key=[redacted:secret:"),
+            "{intent:?}: {shown}"
+        );
+        assert!(hidden(&shown, &secret), "{intent:?}: {shown}");
+        let id = run_id(&output);
+        assert!(
+            text(&output.stderr).contains("secrets redacted"),
+            "{intent:?}"
+        );
+        let exact = project.ok(&["log", &id, "--stream", "stdout", "--unredacted"]);
+        assert_eq!(exact.stdout, project.archive(&id, "stdout"));
+        assert!(text(&exact.stdout).contains(&secret));
+    }
+}
+
+/// When the record cannot be saved, Justless prints both streams in place of a
+/// preview, and they are redacted like the preview would have been.
+#[cfg(unix)]
+#[test]
+fn the_full_replay_after_a_failed_save_is_redacted() {
+    let project = Project::new();
+    let secret = value("unsaved");
+    let script =
+        format!("echo api_key={secret}; rm -rf .justless; echo \"token={secret}\" >&2; exit 3");
+    let output = project.cli(&["run", "--hook", "--", "sh", "-c", &script]);
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output.stderr));
+    let (shown, errors) = (text(&output.stdout), text(&output.stderr));
+    assert!(errors.contains("restoring full output"), "{errors}");
+    assert!(shown.starts_with("api_key=[redacted:secret"), "{shown}");
+    assert!(
+        hidden(&shown, &secret) && hidden(&errors, &secret),
+        "{shown}{errors}"
+    );
+}
+
+/// A background process can add output to a run after its scan. Such a run is never
+/// replayed as clean, so its late secrets are redacted too.
+#[cfg(unix)]
+#[test]
+fn late_output_of_a_drained_run_is_redacted() {
+    let project = Project::new();
+    let secret = value("late");
+    let script = format!("(sleep 0.3; echo api_key={secret}) & echo started");
+    let output = project.ok(&["run", "--", "sh", "-c", &script]);
+    let id = run_id(&output);
+    let record = project.record(&id);
+    assert_eq!(record["drained"], true, "{record}");
+    assert_eq!(record["redaction"]["count"], 0, "{record}");
+    let stream = project.run_dir(&id).join("stdout");
+    let start = std::time::Instant::now();
+    while !fs::read_to_string(&stream).is_ok_and(|text| text.contains(&secret)) {
+        assert!(start.elapsed().as_secs() < 10, "the background write");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let log = text(&project.ok(&["log", &id, "--stream", "stdout"]).stdout);
+    assert!(
+        log.starts_with("started\napi_key=[redacted:secret:"),
+        "{log}"
+    );
+    let search = text(&project.ok(&["search", &id, "api_key"]).stdout);
+    assert!(hidden(&search, &secret), "{search}");
+    let exact = project.ok(&["log", &id, "--stream", "stdout", "--unredacted"]);
+    assert!(text(&exact.stdout).contains(&secret));
+}
+
+/// `lookup --logs` ranks and quotes captured output, so its log results are redacted.
+#[test]
+fn lookup_log_results_are_redacted() {
+    let project = Project::new();
+    let secret = value("lookup");
+    let script = format!("echo 'upload failed for bucket assets'; echo api_key={secret}");
+    project.ok(&["run", "--", "sh", "-c", &script]);
+    let output = project.ok(&["lookup", "upload failed api_key", "--logs"]);
+    let shown = text(&output.stdout);
+    assert!(shown.contains("[redacted:secret:"), "{shown}");
+    assert!(hidden(&shown, &secret), "{shown}");
+}
+
+/// `exec` with `cat "$1"` over `data`, so the script prints exactly that file.
+fn exec_cat(project: &Project, data: &str, extra: &[&str]) -> String {
+    fs::write(project.root().join("data.txt"), data).unwrap();
+    let mut args = vec!["exec", "--lang", "sh", "--file", "data.txt"];
+    args.extend(extra);
+    args.push("cat \"$1\"");
+    let output = project.cli(&args);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    text(&output.stdout)
+}
+
+/// The `exec` outline cuts a line too long for its half of the budget. It cuts the
+/// redacted stream, so a cut never leaves part of a token that no longer matches.
+#[test]
+fn exec_outline_cuts_never_split_a_secret() {
+    let project = Project::new();
+    let token = github("outline-cut");
+    let filler = "filler line of the export\n".repeat(200);
+    let mut cuts = 0;
+    for pad in (140..=260).step_by(3) {
+        let data = format!(
+            "{} {token} end\n{filler}{token} {}\n",
+            "x".repeat(pad),
+            "y".repeat(pad)
+        );
+        let shown = exec_cat(&project, &data, &["--max-bytes", "512"]);
+        cuts += usize::from(shown.contains("not shown in full"));
+        assert!(hidden(&shown, &token), "{pad}: {shown}");
+    }
+    assert!(cuts > 0, "no line was cut");
+}
+
+/// `--intent` shows windows of lines longer than 240 bytes. A window edge never
+/// leaves part of a token.
+#[test]
+fn exec_intent_windows_never_split_a_secret() {
+    let project = Project::new();
+    let token = github("intent-window");
+    let mut data = String::new();
+    for gap in 0..60 {
+        data.push_str(&format!(
+            "{} needle {} {token} {}\n",
+            "a".repeat(120),
+            "b".repeat(gap * 5),
+            "c".repeat(300)
+        ));
+    }
+    let shown = exec_cat(
+        &project,
+        &data,
+        &["--intent", "needle", "--max-bytes", "8000"],
+    );
+    assert!(shown.starts_with("[focus]"), "{shown}");
+    assert!(hidden(&shown, &token), "{shown}");
+}
+
+/// A private key whose `BEGIN` line falls in the outline's head and whose `END` line
+/// is left out still shows only its marker.
+#[test]
+fn exec_outline_keeps_a_split_private_key_hidden() {
+    let project = Project::new();
+    let (key, body) = private_key("outline-key", 64);
+    let data = format!("{key}{}", "filler line of the export\n".repeat(300));
+    let shown = exec_cat(&project, &data, &["--max-bytes", "1024"]);
+    assert!(shown.contains("left out"), "{shown}");
+    assert!(shown.contains("[redacted:private-key"), "{shown}");
+    assert!(body_hidden(&shown, &body), "{shown}");
+    for line in body.as_bytes().chunks(64).filter(|line| line.len() == 64) {
+        assert!(
+            !shown.contains(std::str::from_utf8(line).unwrap()),
+            "{shown}"
+        );
+    }
+}

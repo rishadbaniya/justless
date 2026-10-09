@@ -394,7 +394,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         }
         Err(error) => {
             eprintln!("justless: could not save run, restoring full output: {error:#}");
-            let last = archive.replay();
+            let last = archive.replay(redactor);
             let truncation = archive.truncation();
             if !truncation.is_empty() {
                 eprint!("{}{truncation}", separator(last));
@@ -666,14 +666,14 @@ impl Archive {
         }
     }
 
-    /// Print both complete streams from the open handles. Returns the last byte
-    /// printed.
-    fn replay(&self) -> Option<u8> {
+    /// Print both complete streams from the open handles, with secrets replaced as
+    /// in a preview. Returns the last byte printed.
+    fn replay(&self, redactor: Option<&crate::redact::Redactor>) -> Option<u8> {
         let mut last = None;
         for (stream, mut file) in Stream::BOTH.into_iter().zip(&self.readers) {
             match file
                 .seek(SeekFrom::Start(0))
-                .and_then(|_| copy_out(&mut file, stream))
+                .and_then(|_| copy_out(&mut crate::redact::Reader::new(file, redactor), stream))
             {
                 Ok(byte) => last = byte.or(last),
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
@@ -1171,9 +1171,12 @@ impl Capture<'_> {
         };
         let mut locations = Locations::default();
         let mut previews = Vec::new();
-        // Whether stdout, after redaction, fits the budget and is shown whole.
-        let mut stdout_fits = true;
+        // Whether each stream, after redaction, fits the budget and is shown whole,
+        // and how many secrets it held.
+        let mut fit_whole = [true; 2];
+        let mut secrets = [0; 2];
         for (index, stream) in Stream::BOTH.into_iter().enumerate() {
+            let before = run.redaction.as_ref().map_or(0, |found| found.count);
             let (preview, fits) = scan(
                 workspace,
                 &archive.readers[index],
@@ -1191,13 +1194,12 @@ impl Capture<'_> {
                 },
             )
             .with_context(|| format!("read {}", stream.name()))?;
-            if stream == Stream::Stdout {
-                stdout_fits = fits;
-            }
+            fit_whole[index] = fits;
+            secrets[index] = run.redaction.as_ref().map_or(0, |found| found.count) - before;
             previews.push((stream, preview));
         }
         locations.finish(&mut run);
-        let stdout_bytes = lengths[0];
+        let stdout_fits = fit_whole[0];
 
         run.summary = parser.finish();
         let mut key = Sha256::new();
@@ -1275,7 +1277,7 @@ impl Capture<'_> {
             // Output that fits the budget and is smaller than the report stays
             // verbatim, even on a rerun.
             let report = fit(report, max_bytes);
-            let clipped = lengths.iter().any(|&length| length > max_bytes as u64);
+            let clipped = fit_whole.contains(&false);
             if report.len() < shown || clipped {
                 previews[0].1 = report.into_bytes();
                 previews[1].1.clear();
@@ -1295,9 +1297,25 @@ impl Capture<'_> {
         }
         if let Some(shape_stdout) = stdout_preview
             && !run.unchanged
-            && stdout_bytes > max_bytes as u64
+            && !stdout_fits
         {
-            match shape_stdout(&directory.join("stdout"), &run.id) {
+            // The shaper cuts lines and windows out of stdout, and a cut through a
+            // secret can leave a part that no longer looks like one. When stdout held
+            // a secret, it reads a redacted copy, whose line numbers match the archive.
+            let copy = redactor
+                .filter(|_| secrets[0] > 0)
+                .map(|redactor| {
+                    redacted_copy(&archive.readers[0], lengths[0], &directory, redactor)
+                })
+                .transpose();
+            let shaped = copy.and_then(|copy| {
+                let path = copy.as_ref().map_or_else(
+                    || directory.join("stdout"),
+                    |copy| copy.path().to_path_buf(),
+                );
+                shape_stdout(&path, &run.id)
+            });
+            match shaped {
                 Ok(Some(shaped)) if shaped.len() <= max_bytes => previews[0].1 = shaped,
                 Ok(Some(_)) => eprintln!("justless: the shaped stdout preview exceeded its budget"),
                 Ok(None) => {}
@@ -1305,8 +1323,7 @@ impl Capture<'_> {
             }
         }
         if let Some(redactor) = redactor {
-            // Reports can quote an earlier record, such as a rerun's previous failures,
-            // and a shaped stdout preview reads the archive itself.
+            // Reports can quote an earlier record, such as a rerun's previous failures.
             for (_, preview) in &mut previews {
                 if let Cow::Owned(redacted) = redactor.bytes(preview) {
                     *preview = redacted;
@@ -1341,6 +1358,28 @@ impl Capture<'_> {
         drop(guard);
         Ok((previews, footer, run))
     }
+}
+
+/// The first `length` bytes of a stream with its secrets replaced, in a temporary
+/// file in the run directory. Redaction keeps every line break, so line numbers
+/// match the archive.
+fn redacted_copy(
+    mut file: &File,
+    length: u64,
+    directory: &Path,
+    redactor: &crate::redact::Redactor,
+) -> Result<tempfile::NamedTempFile> {
+    let mut copy = Builder::new()
+        .prefix(".redacted-")
+        .tempfile_in(directory)
+        .context("create a redacted copy of stdout")?;
+    file.seek(SeekFrom::Start(0))?;
+    io::copy(
+        &mut crate::redact::Reader::new(file.take(length), Some(redactor)),
+        copy.as_file_mut(),
+    )
+    .context("write a redacted copy of stdout")?;
+    Ok(copy)
 }
 
 /// How a run's previews were produced, for its footer.
@@ -1491,6 +1530,9 @@ enum Grouping {
     Listing(crate::listing::Listing),
 }
 
+/// Read one stream once, through the redactor, and return its preview and whether
+/// the redacted stream fit the budget whole.
+#[allow(clippy::too_many_arguments)]
 fn scan(
     workspace: &Workspace,
     mut file: &File,

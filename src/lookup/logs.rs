@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, Read};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -53,12 +53,14 @@ pub(crate) fn parse_key(key: &str) -> Option<(&str, Stream)> {
     Some((run, stream))
 }
 
-/// Up to `limit` lines of a captured stream as text without terminal escapes.
+/// Up to `limit` lines of a captured stream as text without terminal escapes, with
+/// secrets replaced as in `log`.
 pub(crate) fn read_lines(path: &Path, limit: usize) -> Vec<String> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
-    let mut reader = BufReader::new(file);
+    let redactor = path.parent().and_then(crate::redact::for_archive);
+    let mut reader = crate::redact::Reader::new(file, redactor);
     let mut lines = Vec::new();
     let mut raw = Vec::new();
     while lines.len() < limit {

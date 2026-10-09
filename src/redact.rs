@@ -1731,15 +1731,23 @@ fn lenient(root: &Path, state: &Path) -> Option<&'static Redactor> {
         .as_ref()
 }
 
+/// Whether a run's record says its archive holds no secret under these rules. A
+/// run whose streams a background process could still extend after the scan is
+/// never clean, and neither is one Justless did not finish recording.
 fn recorded_clean(directory: &Path, fingerprint: &str) -> bool {
     #[derive(Deserialize)]
     struct Record {
         #[serde(default)]
         redaction: Option<Found>,
+        #[serde(default)]
+        drained: bool,
+        #[serde(default)]
+        unfinished: bool,
     }
     File::open(directory.join("record.json"))
         .ok()
         .and_then(|file| serde_json::from_reader::<_, Record>(BufReader::new(file)).ok())
+        .filter(|record| !record.drained && !record.unfinished)
         .and_then(|record| record.redaction)
         .is_some_and(|found| found.count == 0 && found.rules == fingerprint)
 }

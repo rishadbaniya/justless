@@ -24,7 +24,7 @@
 ## How it cuts tokens
 
 - **⚡ Compact Output.** `justless run` parses each tool's output: test failures grouped by diagnostic (cargo, pytest, Go, Jest/Vitest), lint findings grouped by rule ID with `file:line` (rustc, Clippy, Ruff, mypy, ESLint, tsc and more), searches grouped by file, listings by directory. Anything else becomes a 4 KB head, tail and error-line preview.
-- **🎯 Exact Recall.** Every stream is archived byte for byte, up to 256 MiB, in `.justless/runs/<id>` with a SHA-256 digest. `justless log ID --from N --to M` replays exact lines; an identical rerun collapses to one line.
+- **🎯 Exact Recall.** Every stream is archived byte for byte, up to 256 MiB, in `.justless/runs/<id>` with a SHA-256 digest. `justless log ID --from N --to M` replays exact lines, with secrets masked unless you add `--unredacted`; an identical rerun collapses to one line.
 - **🔬 Surgical Reads.** syn and Tree-sitter outlines across 21 languages with revision-bound row IDs. `expand` returns one symbol's exact bytes; `edit` writes only the replacement after checking the revision.
 - **🗺️ Code Map and Impact.** An incremental graph of symbols, calls, imports, HTTP routes and SQL relations. `pack` answers a question in one call; `affected` walks back to the tests that reach a change.
 - **🧹 Context Hygiene.** A footer only when output was cut or failed, compaction hooks that carry run IDs and inspected ranges into the next turn, and an opt-in `justless wrap claude` that has the API clear old tool results server-side, with every original archived.
