@@ -1,0 +1,26 @@
+[
+  {
+    "name": "fixture: apply_fee adds 2",
+    "file": "fixtures/failing/src/pricing.rs",
+    "find": "subtotal + fee + 1",
+    "replace": "subtotal + fee + 2"
+  },
+  {
+    "name": "fixture: mixed SQL table renamed",
+    "file": "fixtures/mixed/db/schema.sql",
+    "find": "purchase_orders",
+    "replace": "purchase_order_rows"
+  },
+  {
+    "name": "test: one progressive test body",
+    "file": "tests/progressive.rs",
+    "find": "assert!(",
+    "replace": "assert!(true);\n    assert!("
+  },
+  {
+    "name": "src: summary short() body",
+    "file": "src/summary.rs",
+    "find": "s[..s.floor_char_boundary(s.len().min(len))].to_owned()",
+    "replace": "s[..s.floor_char_boundary(len.min(s.len()))].to_owned()"
+  }
+]

@@ -315,3 +315,133 @@ docs/operations.md:3: The deployment follows the canary-checkout procedure.
 ```
 
 In a Git checkout, `justless affected --changes` starts the same walk from your uncommitted changes, and `justless query frontend/orders.ts --view dependencies` lists a file's imports.
+
+## Run only the tests a change reaches
+
+`fixtures/affected` is a Cargo workspace with three packages: `ledger-core`, `api`, which depends on it and has a binary with a black-box CLI test, and the independent `reports`. Copy it, commit it, and build its tests once:
+
+```sh
+affected_repo=$(mktemp -d)
+cp -R fixtures/affected/. "$affected_repo/"
+cd "$affected_repo"
+git init -q && git add -A && git commit -qm fixture
+cargo test --offline --no-run
+```
+
+Make value-added tax one cent too high, then ask what would run. The revision after `HEAD` is your fixture commit and differs from the one below.
+
+```sh
+perl -pi -e 's{cents \* RATE / 100$}{cents * RATE / 100 + 1}' ledger/src/tax.rs
+justless test --affected --dry-run
+```
+
+```text
+Affected tests · working tree vs HEAD ae17dc5 · 1 changed file · 1 starting symbol
+Changed ledger/src/tax.rs · modified
+Start tax::vat [function] ledger/src/tax.rs:1-8 · changed ledger/src/tax.rs:7-7
+cargo · subset · 7 of 20 indexed tests in 4 of 7 test targets
+  Run (selected tests): cargo test -p api -p ledger-core --lib -- money::tests::adds_vat tax::tests::vat_is_a_fifth tax::tests::vat_rounds_down tests::invoice_total_adds_vat --exact
+  Run (whole targets): cargo test -p api -p ledger-core --test cli --test totals
+  Run (doctests): cargo test -p ledger-core --doc -- tax::vat
+  tax::vat (doctest) · --doc · exact · documentation example on a reached item
+  tests::invoice_total_adds_vat · api --lib · possible · call at api/src/lib.rs:18 → invoice_total · possible call at api/src/lib.rs:5 → money::Money::with_vat · call at ledger/src/money.rs:7 → tax::vat
+  api/tests/cli.rs (whole target) · api --test cli · scope · api/tests/cli.rs runs the api binary, which the change reaches
+  money::tests::adds_vat · ledger-core --lib · possible · possible call at ledger/src/money.rs:28 → money::Money::with_vat · call at ledger/src/money.rs:7 → tax::vat
+  tax::tests::vat_is_a_fifth · ledger-core --lib · exact · call at ledger/src/tax.rs:23 → tax::vat
+  tax::tests::vat_rounds_down · ledger-core --lib · exact · call at ledger/src/tax.rs:28 → tax::vat
+  invoice_includes_vat · ledger-core --test totals · possible · names vat at ledger/tests/totals.rs:11
+  ledger/tests/totals.rs (whole target) · ledger-core --test totals · exact · import at ledger/tests/totals.rs:1 → tax::vat
+  zero_has_no_vat · ledger-core --test totals · possible · names vat at ledger/tests/totals.rs:16
+Nothing ran (dry run).
+```
+
+The `reports` package and the tests of `net`, `Display` and `greeting` are left out. `tests/totals.rs` runs whole because its tests call `vat` inside a local `check!` macro the index does not expand; the name match finds them too. `api/tests/cli.rs` runs whole because it runs the `api` binary. `tests/needs.rs` requires a feature the command does not enable, so it never appears, just as `cargo test` skips it. Run it with the command you would normally use:
+
+```sh
+justless test --affected -- cargo test --offline
+```
+
+```text
+Affected tests · working tree vs HEAD ae17dc5 · 1 changed file · 1 starting symbol
+cargo · subset · 7 of 20 indexed tests in 4 of 7 test targets
+Run: cargo test --offline -p api -p ledger-core --lib -- <4 test names> --exact
+1 reported failing test(s)
+1 test(s): tests::invoice_total_adds_vat api/src/lib.rs:18:9: assertion `left == right` failed left: "12.01" right: "12.00" [stdout:9-12]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+   Compiling ledger-core v0.1.0 (…/ledger)
+   Compiling api v0.1.0 (…/api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running unittests src/lib.rs (target/debug/deps/api-aca6214acba402d6)
+error: test failed, to rerun pass `-p api --lib`
+
+[justless run-ewOytdva2e6P] exit 101 · 745 of 975 output bytes · justless log run-ewOytdva2e6P
+Run: cargo test --offline -p api -p ledger-core --test cli --test totals
+…
+Run: cargo test --offline -p ledger-core --doc -- tax::vat
+…
+Subset failed (cargo): 3 of 3 tests that ran failed, exit 101 (7 of 20 indexed tests selected, 13 not run); the full suite was not run (2.7 s).
+  ledger/src/tax.rs - tax::vat (line 3) · exact · documentation example on a reached item
+  tests::invoice_total_adds_vat · possible · call at api/src/lib.rs:18 → invoice_total
+  prints_the_total
+Full suite: justless test · Why: justless test --why run-ewOytdva2e6P
+```
+
+The exit status is Cargo's 101. Cargo stops at the first failing test binary in each step, as `cargo test` does, so `ledger-core`'s own unit tests did not get to run; add `--no-fail-fast` to the command to see every failure. `justless test --why` shows why a test was chosen, from the record archived with the run:
+
+```sh
+justless test --why run-ewOytdva2e6P --test vat_rounds_down
+```
+
+```text
+run-ewOytdva2e6P · cargo test (affected subset) · exit 101 · subset · HEAD ae17dc5
+…
+Changed ledger/src/tax.rs · modified
+Start tax::vat [function] ledger/src/tax.rs:1-8 · changed ledger/src/tax.rs:7-7
+Step filtered · run-ewOytdva2e6P · exit 101 · 1 ran · cargo test --offline -p api -p ledger-core --lib -- money::tests::adds_vat tax::tests::vat_is_a_fifth tax::tests::vat_rounds_down tests::invoice_total_adds_vat --exact
+Step unfiltered · run-fPb8byuARoFI · exit 101 · 1 ran · cargo test --offline -p api -p ledger-core --test cli --test totals
+Step doctests · run-4gvQHsYTYblg · exit 101 · 1 ran · cargo test --offline -p ledger-core --doc -- tax::vat
+  tax::tests::vat_rounds_down · ledger-core --lib · exact · call at ledger/src/tax.rs:28 → tax::vat
+Cost: 2.7 s · 2193 of 2593 output bytes shown
+```
+
+After a fix, the same command compares each step with its previous run and still labels the result a subset:
+
+```sh
+perl -pi -e 's{cents \* RATE / 100 \+ 1$}{(cents * RATE) / 100}' ledger/src/tax.rs
+justless test --affected -- cargo test --offline
+```
+
+```text
+…
+Compared with run-ewOytdva2e6P:
+- tests::invoice_total_adds_vat api/src/lib.rs:18:9: assertion `left == right` failed left: "12.01" right: "12.00" [prior stdout:9-12]
+…
+Subset passed (cargo): ran 8 tests reachable from your changes (7 of 20 indexed tests selected, 13 not run); the full suite was not run (3.5 s).
+Full suite: justless test · Why: justless test --why run-EXOQcFyIjl9N
+```
+
+Before saying the tests pass, run the full suite:
+
+```sh
+justless test -- cargo test --offline
+```
+
+```text
+…
+Full suite (cargo): exit 0, 21 tests ran, 0 failed (5.0 s).
+```
+
+A change no test reaches runs the full suite and says why, and `--no-fallback` keeps a labeled low-confidence subset instead:
+
+```sh
+git checkout -q -- .
+perl -pi -e 's/\{name\},\{cents\}/{name};{cents}/' ledger/src/report.rs
+justless test --affected --dry-run | head -4
+```
+
+```text
+Affected tests · working tree vs HEAD ae17dc5 · 1 changed file · 1 starting symbol
+Changed ledger/src/report.rs · modified
+Start report::csv [function] ledger/src/report.rs:1-6 · changed ledger/src/report.rs:4-4
+cargo · full suite · no test reaches report::csv (ledger/src/report.rs:1-6) through indexed links
+```

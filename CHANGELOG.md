@@ -24,6 +24,8 @@ User-visible changes to Justless are recorded here. No release has been publishe
 - `justless exec` runs a script an agent writes over large data, with the same archive and exit status as `run`. Long stdout shows whole head and tail lines and the range left out, and `--intent TEXT` ranks the lines that match it.
 - `justless learn` reads recent Claude Code transcripts and proposes project rules from command mistakes agents corrected or repeated, such as an unquoted glob or a tool that is not installed. `--apply` writes them to a managed block in `AGENTS.md` or `CLAUDE.md`. Rules that could carry a credential are held back.
 
+- `justless test --affected` runs only the tests that can reach the current Git changes, with Cargo, pytest, Jest, Vitest or Go, through the same capture as `run`. The result is labeled as a subset in the verdict and in `resume`, `history` and `stats`, and keeps the runner's exit status. It runs the full suite instead, and says why, for lockfiles, build or runner configuration, unindexed or unmentioned files, a changed symbol no test reaches or reaches only through inferred links, or a selection of 60% or more of the tests. `--dry-run` prints the plan, `--why RUN_ID` prints why each test ran, and `justless test` runs the full suite.
+
 ### Code navigation
 
 - A local index covers Rust, JavaScript, TypeScript and TSX, Python, Go, Java, Kotlin, Scala, C, C++, C#, Swift, Dart, Ruby, PHP, Lua, Zig, Bash, SQL and HCL, including Terraform. It refreshes on every query and reuses unchanged files.

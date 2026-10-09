@@ -14,6 +14,10 @@
 | `justless path FROM TO` | A short relationship chain with the location and direction of each edge |
 | `justless map` | Areas, most connected symbols, communities, cross-area links, entry points and test locations, each with a file and line |
 | `justless affected SYMBOL --depth 3` | Dependents grouped by distance, then the tests that reach the target and a command to run them. Also takes a file path or `--changes`. |
+| `justless test --affected [-- RUNNER ARG…]` | Runs only the tests that can reach the current Git changes, with the project's own runner, through the same capture as `run`. The result is labeled as a subset, keeps the runner's exit status, and falls back to the full suite with a stated reason when the selection cannot be trusted. |
+| `justless test [-- RUNNER ARG…]` | Runs the full suite of each detected runner, or of the given command, labeled as the full suite |
+| `justless test --affected --dry-run [--json]` | The selection, the reasons, each test's evidence and the exact commands, without running anything |
+| `justless test --why RUN_ID [--test NAME]` | Why a recorded `test` run chose its tests, with changed files whose source has moved since marked `[source changed]` |
 | `justless find TEXT` | Literal search across indexed text, with exact file and line matches. Stops at `--limit` matches, 20 by default, and says when more exist. |
 | `justless lookup "where are retries configured?"` | The few symbols, Markdown sections and configuration blocks that best answer a question, each with its line range, name and best-matching lines. `--logs` also ranks recent captured run output. |
 | `justless context --changes` | Current changes against `HEAD`, with nearby symbols and tests where available. Includes untracked files. A new file or a range across several symbols names each symbol, then shows each in source order with the members it contains, such as a class's methods. A pure deletion shows where the lines were, their text, any symbol removed whole and the surviving symbol that lost them, without pinning them on the line before. A deleted file is marked deleted. Needs a Git repository. |
@@ -87,6 +91,95 @@ justless affected --changes
 ```
 
 With `--json`, both commands return the rows selected for the budget as structured fields, with an `omitted` count per section and a `capped` flag.
+
+To run the tests `affected --changes` points at, with fallbacks and labeling, use `justless test --affected`.
+
+## Affected tests
+
+`justless test --affected` runs the tests that can reach the current Git changes with the project's own runner. Every step goes through the same capture as `justless run`, so its output is grouped, archived under a run ID and replayable, and the runner's exit status is the command's. `justless test` without `--affected` runs each runner's full suite. Run it before reporting that tests pass: a subset is always labeled as one, and Justless never reports that all tests pass after a subset.
+
+```sh
+justless test --affected                                  # detected runners
+justless test --affected -- cargo test --offline          # this command's full suite, narrowed
+justless test --affected --dry-run                        # the plan, nothing runs
+justless test --affected --no-fallback                    # keep a low-confidence subset
+justless test --why run-k2P9xq --test vat                 # why those tests ran
+justless test                                             # the full suite
+```
+
+`--session`, `--fresh` and `--max-bytes` mean what they mean for `run`, and apply to every step. Without `--`, the runners come from the project files listed below; a project with several, such as a Cargo workspace beside a Python package, runs each in turn.
+
+### How tests are chosen
+
+1. **Changes.** The working tree and untracked files against `HEAD`, as `context --changes` reads them. Lines removed without a replacement, deleted files and renamed definitions are handled too: a definition present at `HEAD` and gone now is looked up by name, and the code that still names it becomes a starting point.
+2. **Starting symbols.** The innermost definition around each changed range, and any definition whose declaration line changed. A change outside any definition, such as a `use` line, starts from the definitions in that file that use the names on the changed lines. A trait method that is called implicitly, such as `fmt`, `from` or `eq`, is also traced through its type.
+3. **Reach.** Each starting symbol is walked on its own, 64 hops deep, through every indexed relationship, so every changed symbol is accounted for. Inferred links are kept and mark the tests behind them as possible.
+4. **Safety nets.** Tests whose body names a changed symbol are added, which catches calls inside macros the index does not expand. A changed file mentioned by path in indexed code, such as an `include_str!` fixture or a directory a test copies, selects the tests and functions that mention it. A Rust integration test that runs a binary through `CARGO_BIN_EXE_<bin>` or `cargo_bin("<bin>")` runs whole when the change reaches that binary's package, and so does a test target with more test attributes than indexed tests, which usually means tests a macro generates. A test file reached through a file-level import runs whole, and a pytest file whose text names a changed module, such as `billing.rates` in an import or a `mock.patch` target, runs whole too.
+5. **Every change accounted for.** Each changed symbol in a runner's scope must reach at least one test through exact links. Code in a binary that an integration test runs whole counts as reached. Otherwise the runner falls back, as listed below.
+6. **Scope.** Each runner turns the selection into its own arguments, then the checks below decide whether the subset stands.
+
+| Runner | Found from | Unit | Command |
+| --- | --- | --- | --- |
+| Cargo | `Cargo.toml`, read with `cargo metadata --no-deps --offline` | Test name within a target | `cargo test -p PKG --lib --test T -- NAME… --exact`, plus whole targets, doctests and build-only targets in separate steps |
+| pytest | `pytest.ini`, `[tool.pytest.ini_options]`, `tox.ini` `[pytest]`, `setup.cfg` `[tool:pytest]`, or test files at the root | Node ID, or a whole test file | `.venv/bin/python -m pytest` when that exists, else `python3 -m pytest`, followed by node IDs and files |
+| Jest, Vitest | A `package.json` that lists `jest` or `vitest`, or their config files | Test file | `node_modules/.bin/jest FILE…` or `node_modules/.bin/vitest run FILE…` |
+| Go | `go.mod` | Test function within packages | `go test ./PKG… -run '^(TestA\|TestB)$'` |
+| Other | Any other command after `--` | — | The command unchanged, as the full suite |
+
+A command after `--` is the base. Justless adds its package and target flags after the command's own options and its test names after any test arguments that follow `--`, so `--offline`, `--features` and `-- --nocapture` keep working. A command that already selects tests, such as `cargo test -p api`, a test name, `pytest tests/x.py` or `--lf`, runs as given. `npm test`, `pnpm test`, `yarn test` and `bun test` run the `jest` or `vitest` script from `node_modules/.bin` when the script is that tool with plain flags, and otherwise as given.
+
+Cargo steps:
+
+| Step | When | Arguments |
+| --- | --- | --- |
+| Whole packages | A member `Cargo.toml` or `build.rs` changed, a source file was deleted, a `macro_rules!` body changed, or a proc-macro crate changed. A macro in an integration test file runs only that target. | `-p PKG` for the package and every member that depends on it |
+| Selected tests | Tests reached by name | `-p PKG… --lib --bin B --test T -- NAME… --exact`. `--exact` is dropped when an `#[rstest]` or `#[test_case]` test is selected. Changed targets ride along so they compile. |
+| Whole targets | Black-box, opaque, custom-harness and file-imported targets, or more than 300 names | `-p PKG… --test T…` |
+| Doctests | A reached library item has a fenced example in its documentation | `-p PKG --doc -- PATH…` |
+| Build only | A changed target has no test step | `--no-run` for those targets |
+
+Packages and targets come from `cargo metadata`, not from the index, so `-p` gets each package's name as written. A target with `test = false`, or with `required-features` the command does not enable, is never selected and is listed as skipped like `cargo test` would skip it. A `harness = false` target never receives test-name filters. A Cargo package nested inside another one that is not a workspace member, such as a test fixture, is never run; its changes reach the tests that mention its path. When a passing selected-tests step never reported a selected name, the name's target runs again whole, with the note `widened: N selected tests reported no result under their libtest names`. Cargo stops at the first failing test binary in a step, as `cargo test` does; add `--no-fail-fast` to the command to see every failure.
+
+pytest reruns the selected node IDs as whole files when it exits 4, which is how it reports a node ID it cannot find, and runs the full suite when it collects none of the selected tests (exit 5).
+
+### When the full suite runs instead
+
+| Reason | When |
+| --- | --- |
+| `lockfile` | `Cargo.lock`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, `requirements*.txt`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock` or `go.sum` changed, for the runner it belongs to |
+| `workspace-config` | The Cargo workspace manifest with `[workspace]` or `[profile]`, a single-package root manifest, `.cargo/config*`, `rust-toolchain*`, a root `pyproject.toml`, `setup.py` or `setup.cfg`, a JavaScript root `package.json`, `tsconfig*.json`, Babel or SWC configuration, `go.mod` or `go.work` changed |
+| `test-config` | `pytest.ini`, `tox.ini`, the root `conftest.py`, a Jest, Vitest or Vite config, or `.env*` changed |
+| `configured` | A changed file matches `[test] full_suite_on` |
+| `parse-error` | A changed source file does not parse |
+| `unindexed` | A changed source file is not indexed, for example because it is larger than `max_file_bytes` |
+| `data-unlinked` | A changed file that is not code is not mentioned by indexed source and is not documentation or repository metadata |
+| `deleted-module` | A Python, JavaScript, TypeScript or Go source file was deleted. A deleted Rust file runs its package whole instead. |
+| `no-tests` | A changed symbol is reached by no test. A definition that is new, has no incoming links and whose name appears nowhere outside itself is the exception: it only has to compile. |
+| `inferred-only` | Every test that reaches a changed symbol does so through an inferred link or a name match |
+| `walk-capped` | A walk or a name search stopped at its cap |
+| `too-broad` | The subset reaches 60% or more of the runner's indexed tests |
+| `unknown-runner` | The command is not one Justless can narrow, such as `make test` or `cargo nextest` |
+| `runner-facts` | `cargo metadata` failed, or a detected runner is not installed |
+| `no-git` | The project is not a Git checkout |
+
+Each reason is printed with its message on the runner line and in `--dry-run`. `--no-fallback` keeps the subset instead and labels it `low-confidence subset (CODES)`, or `build only, low confidence (CODES)` when no test reaches the change. Documentation, `README*`, `CHANGELOG*`, `LICENSE*`, `.gitignore`, `.github/` and agent instruction files that no code mentions have no test impact, and a change to them alone runs nothing.
+
+### Output, exit status and records
+
+The first lines name the base revision, then one line per runner: `cargo · subset · 7 of 20 indexed tests in 4 of 7 test targets`, `cargo · full suite · Cargo.lock changed: …`, `cargo · build only · …` or `cargo · nothing to run · …`. Each step prints `Run: COMMAND` with test names collapsed to a count, then the usual capture preview and footer. The verdict comes last on stderr:
+
+```text
+Subset passed (cargo): ran 8 tests reachable from your changes (7 of 20 indexed tests selected, 13 not run); the full suite was not run (1.3 s).
+Full suite: justless test · Why: justless test --why run-k2P9xq
+```
+
+A failing subset adds up to three failing tests with the first link of their evidence. Build-only and nothing-ran results say `this is not a test result`. A fallback says `Full suite (fallback from --affected: CODES)`. The exit status is the runner's, or with several steps or runners the first nonzero status in the order they ran; later steps still run. A runner that cannot start counts as exit 127 for its step. Nothing to run exits 0. Errors before any step runs, such as an unknown run ID or no detected runner, exit 2.
+
+Each step's run directory holds `selection.json` beside the streams: the base revision, the changed files and their digests, the starting symbols, the runner's plan with every selected test, its confidence (`exact`, `possible`, `mention`, `scope`, `changed-test`) and its evidence chain, each step's command, run ID and status, and the verdict with time and bytes. It holds paths and names, never output. `--why RUN_ID` prints it within `--budget`, and `--test NAME` keeps the tests whose name contains `NAME`. `resume`, `history` and `stats` show these runs as `cargo test (affected subset)`, `(affected low-confidence subset)` or `(affected build only)`. A fallback and plain `justless test` record the runner's usual family, such as `cargo test`.
+
+`--dry-run` runs nothing and records no run; it reads the index and runs `cargo metadata`. `--json` prints the same plan as data, identical across runs on the same tree.
+
+Hooks never narrow a test command; `justless test` is something an agent asks for. `test` executes project code, so like `run` it is not an MCP tool; the read-only `affected` tool shows the same reach.
 
 ## Progressive reads and verified edits
 
@@ -196,6 +289,16 @@ omit = '^make\[\d+\]: (Entering|Leaving) directory'
 
 An empty prefix, an invalid expression or one that matches empty text stops the run with an error.
 
+`[test]` tunes `justless test --affected`. Both lists take gitignore-style patterns and are empty by default. `full_suite_on` names files whose change runs every runner's full suite. `ignore` names changed files that have no test impact, which otherwise count as unlinked data and run the full suite.
+
+```toml
+[test]
+full_suite_on = ["migrations/**"]
+ignore = ["*.svg", "notebooks/**"]
+```
+
+The 60% share that counts as too broad, the 300 test names and 32 KiB of names before Cargo filters collapse to whole targets, and the 64-hop walk are fixed.
+
 `pack`, `map`, `affected`, `history`, `resume`, `query`, `path`, `find`, `context`, and `code` accept `--budget`. The renderer uses one UTF-8 byte per budget unit as a conservative ceiling for byte-based tokenizers. Agent totals can also include the prompt, history, and tool metadata.
 
 Full output is retained locally under `.justless/runs/`, including output short enough to display in full. The archive keeps the streams separately, with byte-for-byte replay for each. `log` replaces secrets with markers unless given `--unredacted`, as [Secret redaction](#secret-redaction) describes. Justless creates `.justless/` with its own `.gitignore`, so `git status`, `git add -A` and `context --changes` never pick up archived output. When a shell hook rewrites a command that starts inside a nested Git repository or submodule, the rewrite adds `--root`, so the run lands in this workspace's archive instead of a new `.justless/` there. Keep the directory private if a command prints secrets. The command writes into pipes that Justless copies to the archive, and each stream of a run stores at most `max_run_bytes`, 256 MiB by default, so a command such as `sh -c 'grep -rn x .'` that reads its own growing archive stops at the cap instead of filling the disk. Justless keeps reading and counting a stream past the cap, so the command never blocks and runs to completion with its own exit status. Everything stored still replays byte for byte. The record keeps how many bytes the command wrote, and the footer, the fallback replay and `log` end with a marker such as `[stdout archive truncated at 256.0 MB of 1433.6 MB]`, also after a hook-routed run. A truncated run is never reported as unchanged. After each run, Justless keeps the newest `max_runs` runs within `max_archive_bytes` and deletes older ones. The run just recorded and runs that a live Justless process is still recording are always kept, and runs that a rerun compares against go last. An unchanged rerun links to the streams of the run it matched instead of storing a second copy, unless a background process may still write to the streams of either run. A linked stream counts once against `max_archive_bytes` and stays counted until every run that links it is deleted, so the limit holds for the bytes on disk. The CLI runs offline after installation, except for the opt-in `justless proxy` and `justless wrap claude`, which forward your agent's own API requests. `--raw` skips recording.
@@ -204,7 +307,7 @@ Reading the index takes no lock, so concurrent queries over unchanged sources ru
 
 ## MCP server
 
-`justless mcp` serves the read-only commands as MCP tools over stdio. Use it with clients that have no Justless hooks, or when an agent should call navigation tools instead of shell commands. Each tool runs the matching command against the project root and returns its output as text. A failed command or an invalid argument comes back as a tool error that the agent can correct. `run`, `edit`, `mask` and `init` are not exposed, so every change still goes through the client's own permission prompts.
+`justless mcp` serves the read-only commands as MCP tools over stdio. Use it with clients that have no Justless hooks, or when an agent should call navigation tools instead of shell commands. Each tool runs the matching command against the project root and returns its output as text. A failed command or an invalid argument comes back as a tool error that the agent can correct. `run`, `test`, `edit`, `mask` and `init` are not exposed, so every change still goes through the client's own permission prompts.
 
 The server uses `--root` when given. Otherwise it finds the project the way other commands do, searching upward for `.git`, `.justless` or a project marker. The search starts from `CLAUDE_PROJECT_DIR`, which Claude Code sets to its launch directory, or else from the directory the client starts the server in. A server started in a subdirectory therefore shares the project's state with hooks and commands. The tool list is kept under 8 KB because clients send it with every model request. Arguments are fully validated when a tool is called.
 

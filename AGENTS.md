@@ -25,6 +25,7 @@ On a returning checkout, `./target/debug/justless resume` shows recent runs and 
 | Command profiles and grouped output | `src/filters.rs` → `src/lint.rs`, `src/inventory.rs` | Route only display-oriented invocations; machine formats, watch modes and pipes keep the ordinary preview. A grouped report replaces the preview only when it is smaller and every group links back to its original log lines. Build fixtures from real tool output where possible. |
 | Savings reports | `src/history.rs` (`stats`), `src/discover.rs` | Report measured bytes; label token figures as bytes ÷ 4 estimates. `discover` prints command labels and byte counts only, never full command lines or output. |
 | Search, relationships and task packs | `src/rust_syntax.rs`, `src/polyglot.rs` → `src/index.rs` → `src/context.rs`, `src/pack.rs` | Rust uses syn and other structured languages use Tree-sitter. Keep plain-text search available for unfamiliar formats and mark inferred links. Check cache invalidation when changing extracted facts. |
+| Affected test selection | `src/impact.rs` → `src/selection.rs` → `src/runners.rs` → `src/testrun.rs` | Label every subset and never report it as the suite. Preserve the runner's exit status. Never select a target the base command would not run. Widen names that did not run instead of passing them. Fall back with a stated reason. |
 | Outlines, expansion and edits | `src/source.rs` and the two parsers | Expansion returns the exact selected bytes. Edits verify the path-bound revision. A stale or overlapping edit rejects the whole same-file batch. |
 | Tool history retirement | `src/observations.rs`, `integrations/opencode.js` | Archive a result before replacing it. Recall must reproduce its original value. OpenCode v1 automates this on outbound requests. Other API clients can call `mask` at the request boundary. |
 | MCP server and client config | `src/mcp.rs` | Stdout carries only JSON-RPC messages, so tools run the CLI in a child process. Expose only read-only commands. Client setup merges into existing config without touching other keys. |
@@ -45,7 +46,9 @@ cargo test --locked
 
 For an installer change, also run `sh scripts/test_install.sh` (and `sh scripts/test_install.sh dash` where available). It installs from local fake releases with a stub Cargo.
 
-`tests/cli.rs` exercises the binary, including command capture, navigation and hooks. `tests/progressive.rs` covers exact spans, stale and concurrent edits, and observation recovery. `fixtures/failing` is deliberately broken so the tests can diagnose and repair disposable copies. `fixtures/mixed` exercises links across TypeScript, Python and SQL.
+`tests/cli.rs` exercises the binary, including command capture, navigation and hooks. `tests/progressive.rs` covers exact spans, stale and concurrent edits, and observation recovery. `fixtures/failing` is deliberately broken so the tests can diagnose and repair disposable copies. `fixtures/mixed` exercises links across TypeScript, Python and SQL. `fixtures/affected` is a three-package Cargo workspace for `test --affected`: a required-features target, a black-box CLI test, a test macro, an embedded data file and untested code.
+
+For a test-selection change, run `python3 scripts/affected_benchmark.py --binary ./target/debug/justless`. It mutates a disposable copy of `fixtures/affected`, runs each mutant as a subset and as the full suite, and exits nonzero on any missed failure.
 
 For a context-size change, run `python3 scripts/context_benchmark.py --binary ./target/debug/justless` after building. It applies a verified repair and round-trips a masked request locally. Report byte measurements as bytes. Provider token counts come from the separate API benchmarks. [Benchmark methods and results](docs/benchmarks.md)
 
