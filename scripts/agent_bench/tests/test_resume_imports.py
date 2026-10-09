@@ -78,6 +78,44 @@ class ResumeTests(unittest.TestCase):
         run_module.schedule(self.settings, TASKS, ["claude-haiku-5-5"], ["a", "b"], 1, "cc-default", "m", 1)
         self.assertEqual(len(self.rows()), before)
 
+    def test_cap_aborts_do_not_use_up_the_retry_budget(self):
+        rid = config.run_id("c", "claude-haiku-5-5", "cc-default", "a", "impact-x-01", 1, "m", "j", "h", "cap")
+        with open(str(self.dir / "results.jsonl"), "w") as handle:
+            for attempt in (1, 2):
+                handle.write(json.dumps({"run_id": rid, "attempt": attempt, "failure_mode": "aborted_global_cap"}) + "\n")
+        done = run_module.terminal_ids(self.dir / "results.jsonl")
+        self.assertEqual(done[("attempts", rid)], 2)
+        self.assertEqual(done.get(("errors", rid), 0), 0)
+        self.fake(lambda task, arm, attempt: "harness_error" if attempt == 3 else "success")
+        run_module.schedule(self.settings, TASKS[1:], ["claude-haiku-5-5"], ["a"], 1, "cc-default", "m", 1)
+        rows = [r for r in self.rows() if r["run_id"] == rid]
+        self.assertEqual([(r["attempt"], r["failure_mode"]) for r in rows[2:]], [(3, "harness_error"), (4, "success")])
+
+    def test_paid_commands_refuse_dry_campaigns(self):
+        home = self.dir / "store"
+        run_module.mark_dry(home / "campaigns" / "dry-correct")
+        with self.assertRaises(SystemExit):
+            run_module.refuse_dry_campaign(home, "dry-correct")
+        (home / "campaigns" / "main").mkdir(parents=True)
+        (home / "campaigns" / "main" / "fake_requests.jsonl").write_text("")
+        with self.assertRaises(SystemExit):
+            run_module.refuse_dry_campaign(home, "main")
+        run_module.refuse_dry_campaign(home, "fresh")
+
+    def test_dry_commands_default_to_their_own_campaigns(self):
+        seen = {}
+        original = dict(run_module.__dict__)
+        try:
+            run_module.cmd_dry_run = lambda args: seen.setdefault("dry-run", args.campaign) and 0
+            run_module.cmd_validate_tasks = lambda args: seen.setdefault("validate-tasks", args.campaign) and 0
+            run_module.cmd_estimate = lambda args: seen.setdefault("estimate", args.campaign) and 0
+            for command in ("dry-run", "validate-tasks", "estimate"):
+                run_module.main([command, "--home", str(self.dir)])
+        finally:
+            for name in ("cmd_dry_run", "cmd_validate_tasks", "cmd_estimate"):
+                setattr(run_module, name, original[name])
+        self.assertEqual(seen, {"dry-run": "dry", "validate-tasks": "validate", "estimate": "main"})
+
     def test_arm_order_is_seeded_permutation(self):
         order = config.arm_order("claude-haiku-5-5", "t", 1, ["a", "b", "c", "d"])
         self.assertEqual(sorted(order), ["a", "b", "c", "d"])
@@ -95,7 +133,8 @@ class ImportTests(unittest.TestCase):
             "argparse", "ast", "base64", "concurrent", "copy", "datetime", "difflib", "hashlib", "hmac", "http", "io",
             "json", "math", "os", "pathlib", "random", "re", "shlex", "shutil", "signal", "socket", "subprocess", "sys",
             "tempfile", "threading", "time", "tokenize", "urllib", "uuid", "unittest", "select", "socketserver", "ssl",
-            "queue", "struct", "collections", "itertools", "functools", "contextlib", "string", "textwrap"}
+            "queue", "struct", "collections", "itertools", "functools", "contextlib", "string", "textwrap",
+            "fcntl", "secrets", "statistics"}
         for path in sorted(helpers.BENCH.glob("*.py")):
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):

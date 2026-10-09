@@ -335,21 +335,25 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
 
 
 def terminal_ids(results_path):
+    """{run_id: terminal row}, plus ("attempts", run_id) -> the highest attempt number written and
+    ("errors", run_id) -> how many attempts ended in a harness error. Only harness errors use up the retry
+    budget: a cap abort or an infrastructure pause is re-run without counting against the run."""
     done = {}
     if not results_path.exists():
         return done
-    with open(results_path) as handle:
+    with open(str(results_path)) as handle:
         for line in handle:
             try:
                 row = json.loads(line)
             except ValueError:
                 continue
-            key = (row["run_id"])
+            key = row["run_id"]
             if row.get("failure_mode") in TERMINAL:
                 done[key] = row
-            else:
-                done.setdefault(("attempts", key), 0)
-                done[("attempts", key)] = max(done[("attempts", key)], row.get("attempt", 1))
+                continue
+            done[("attempts", key)] = max(done.get(("attempts", key), 0), row.get("attempt", 1))
+            if row.get("failure_mode") == "harness_error":
+                done[("errors", key)] = done.get(("errors", key), 0) + 1
     return done
 
 
@@ -374,6 +378,7 @@ def schedule(settings, task_list, models, arms, reps, effort, manifest, workers,
                 if rid in done:
                     continue
                 attempt = done.get(("attempts", rid), 0) + 1
+                errors = done.get(("errors", rid), 0)
                 while True:
                     try:
                         record = run_once(settings, task, model, effort, arm, rep, attempt, manifest, position, phase)
@@ -382,8 +387,11 @@ def schedule(settings, task_list, models, arms, reps, effort, manifest, workers,
                                   "task_id": task["id"], "family": task["family"], "rep": rep, "run_id": rid,
                                   "attempt": attempt, "failure_mode": "harness_error", "success": False,
                                   "harness_error": "%s: %s" % (type(error).__name__, error)}
-                    if record["failure_mode"] == "harness_error" and attempt >= config.MAX_ATTEMPTS:
-                        record["failure_mode"] = "harness_unrecoverable"
+                    if record["failure_mode"] == "harness_error":
+                        errors += 1
+                        if errors >= config.MAX_ATTEMPTS:
+                            record["failure_mode"] = "harness_unrecoverable"
+                    record["harness_error_attempts"] = errors
                     settings.logs["results"].write(record)
                     out.append(record)
                     if record["failure_mode"] == "aborted_global_cap":
@@ -432,27 +440,42 @@ def full_manifest(args):
 
 
 def paid_spend(home, exclude=None):
-    """Spend recorded by every paid campaign (dry runs use fake usage and are skipped)."""
-    total = 0.0
-    for path in sorted((Path(home) / "campaigns").glob("*/ledger.jsonl")):
-        if path.parent.name == exclude or (path.parent / "fake_requests.jsonl").exists():
-            continue
-        with open(str(path)) as handle:
-            for line in handle:
-                try:
-                    total += float(json.loads(line).get("cost_usd") or 0)
-                except ValueError:
-                    pass
-    return total
+    """Spend recorded by paid requests in every campaign (dry-run usage is fake and never counts)."""
+    return accounting.paid_spend(home, exclude)
+
+
+def refuse_dry_campaign(home, campaign):
+    """Paid commands never share a campaign directory with dry-run or validation data."""
+    directory = Path(home) / "campaigns" / campaign
+    if accounting.directory_is_dry(directory):
+        raise SystemExit("campaign %s holds dry-run data (%s); choose another --campaign for paid runs" % (
+            campaign, "DRY_RUN marker" if (directory / "DRY_RUN").exists() else "fake_requests.jsonl"))
+    ledger = directory / "ledger.jsonl"
+    if ledger.exists():
+        for line in open(str(ledger)):
+            try:
+                if accounting.entry_is_fake(json.loads(line)):
+                    raise SystemExit("campaign %s has fake ledger entries; choose another --campaign" % campaign)
+            except ValueError:
+                continue
+
+
+def mark_dry(directory):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "DRY_RUN").write_text("fake model; never paid spend\n")
 
 
 def make_settings(args, campaign, fake=None, variant=None):
     profile = cc_profile.load(args.home, getattr(args, "profile_source", "auto"))
     pricing = accounting.Pricing()
+    if fake is not None:
+        mark_dry(Path(args.home) / "campaigns" / campaign)
+    home = args.home
     ledger = accounting.Ledger(Path(args.home) / "campaigns" / campaign / "ledger.jsonl", args.budget_usd,
                                reserve_usd=config.RESERVE_USD if args.budget_usd >= config.CAMPAIGN_CAP_USD else 0.0,
-                               use_reserve=args.use_reserve,
-                               prior_usd=0.0 if fake is not None else paid_spend(args.home, exclude=campaign),
+                               use_reserve=args.use_reserve, fake=fake is not None,
+                               prior_fn=None if fake is not None else (lambda: paid_spend(home, exclude=campaign)),
                                global_cap_usd=None if fake is not None else config.CAMPAIGN_CAP_USD)
     if fake is not None:
         def factory():
@@ -476,7 +499,7 @@ def cmd_dry_run(args):
     planted = "sk-ant-FAKE-planted-parent-env-secret-0000000000"
     os.environ["ANTHROPIC_API_KEY"] = planted
     campaign_dir = Path(args.home) / "campaigns" / args.campaign
-    campaign_dir.mkdir(parents=True, exist_ok=True)
+    mark_dry(campaign_dir)
     fake = fake_api.FakeAPI(0, str(campaign_dir / "fake_requests.jsonl")).start()
     variants = args.variants.split(",")
     summary = []
@@ -529,6 +552,7 @@ def cmd_run(args, phase="main"):
         raise SystemExit("refusing the stale qa/bin build; build Justless from the commit under test")
     if harness_commit().find("dirty") >= 0 and not args.allow_dirty:
         raise SystemExit("the harness tree is dirty; commit or pass --allow-dirty")
+    refuse_dry_campaign(args.home, args.campaign)
     parity = Path(args.home) / "cc_capture" / "parity_report.json"
     if not parity.exists() and not args.accept_deviation:
         raise SystemExit("run parity-diff first (or pass --accept-deviation with the documented items)")
@@ -615,8 +639,10 @@ def cmd_estimate(args):
         per_run, source = pilot_per_run(args)
     spent = paid_spend(args.home)
     pilot_total, _ = accounting.plan_cost(accounting.PILOT_PLAN, per_run)
-    result = accounting.estimate(per_run, spent=spent)
-    out = {"source": source, "spent_usd": round(spent, 4), "pilot_expected_usd": round(pilot_total, 2), "main": result}
+    result = accounting.estimate(per_run, spent=spent, use_reserve=args.use_reserve)
+    limit = accounting.enforced_limit(use_reserve=args.use_reserve)
+    out = {"source": source, "spent_usd": round(spent, 4), "enforced_limit_usd": limit,
+           "pilot_expected_usd": round(pilot_total, 2), "main": result}
     if args.assume != "prepilot":
         path = Path(args.home) / "campaigns" / args.campaign / "results.jsonl"
         rows = [json.loads(l) for l in open(str(path))] if path.exists() else []
@@ -624,10 +650,10 @@ def cmd_estimate(args):
                  and r.get("model") == "claude-haiku-5-5"]
         out["ce_trigger_rule"] = {"plain_arm_peaks": sorted(peaks), "T": config.ce_trigger_rule(peaks)}
         # Effort rule: after dropping Opus, a plan that still does not fit moves every arm to medium effort.
-        without_opus = accounting.estimate(per_run, spent=spent,
+        without_opus = accounting.estimate(per_run, spent=spent, use_reserve=args.use_reserve,
                                            plan=[c for c in accounting.MAIN_PLAN if c["name"] != "opus"])
         out["effort_rule"] = {"expected_without_opus": without_opus["expected_usd"],
-                              "switch_to_medium": without_opus["expected_usd"] > config.CAMPAIGN_CAP_USD - spent}
+                              "switch_to_medium": without_opus["expected_usd"] > limit - spent}
     print(json.dumps(out, indent=1))
     return 0
 
@@ -702,7 +728,8 @@ def parser():
         sp.add_argument("--runroot", type=Path, default=config.RUNROOT)
         sp.add_argument("--binary")
         sp.add_argument("--cc-binary", default=config.CC_BINARY)
-        sp.add_argument("--campaign", default="main")
+        sp.add_argument("--campaign", help="default: dry for dry-run, validate for validate-tasks, anchor-dry for "
+                        "anchor --dry-anchor, otherwise main")
         sp.add_argument("--tasks", default="all")
         sp.add_argument("--families")
         sp.add_argument("--per-family", type=int)
@@ -750,6 +777,10 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     args.home = Path(args.home)
+    if args.campaign is None:
+        # Dry and validation runs never default into a paid campaign's directory.
+        args.campaign = {"dry-run": "dry", "validate-tasks": "validate"}.get(args.command) or (
+            "anchor-dry" if getattr(args, "dry_anchor", False) else "main")
     commands = {
         "prepare": cmd_prepare, "validate-tasks": cmd_validate_tasks, "review-tasks": cmd_review,
         "cc-capture": cmd_cc_capture, "parity-diff": cmd_parity_diff, "sandbox-check": cmd_sandbox_check,

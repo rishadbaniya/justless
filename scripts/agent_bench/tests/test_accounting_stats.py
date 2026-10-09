@@ -1,9 +1,11 @@
 import json
+import threading
 import unittest
 
 import helpers
 
 import accounting
+import config
 import stats
 
 
@@ -54,6 +56,83 @@ class PricingTests(unittest.TestCase):
         self.assertTrue(result["fits"])
         pilot, _ = accounting.plan_cost(accounting.PILOT_PLAN, accounting.PREPILOT)
         self.assertLessEqual(pilot, 3.0)
+
+    def test_estimate_and_ledger_enforce_the_same_limit(self):
+        """A plan that estimate calls fitting must not trip Ledger.check's global limit, and vice versa."""
+        spent = 60.0
+        result = accounting.estimate(accounting.PREPILOT, spent=spent)
+        self.assertEqual(result["enforced_limit_usd"], config.CAMPAIGN_CAP_USD - config.RESERVE_USD)
+        room = result["room_usd"]
+        path = helpers.tempdir(self) / "ledger.jsonl"
+        ledger = accounting.Ledger(path, config.CAMPAIGN_CAP_USD, prior_usd=spent,
+                                   global_cap_usd=config.CAMPAIGN_CAP_USD)
+        ledger.check(room - 0.01)
+        ledger.release(room - 0.01)
+        with self.assertRaises(accounting.BudgetExceeded):
+            ledger.check(room + 0.01)
+        released = accounting.estimate(accounting.PREPILOT, spent=spent, use_reserve=True)
+        self.assertAlmostEqual(released["room_usd"], room + config.RESERVE_USD)
+
+    def test_worst_case_prices_a_fresh_prefix_as_a_cache_write(self):
+        tier = self.p.table["models"]["claude-sonnet-5-5"]["tiers"][-1]
+        self.assertAlmostEqual(self.p.worst_case("claude-sonnet-5-5", 1000000, 0), tier["cache_write_1h"])
+
+    def test_concurrent_checks_reserve_the_last_dollar(self):
+        path = helpers.tempdir(self) / "ledger.jsonl"
+        ledger = accounting.Ledger(path, 3.0, reserve_usd=0.0)
+        ledger.record({"cost_usd": 2.80})
+        passed = []
+        barrier = threading.Barrier(3)
+
+        def worker():
+            barrier.wait()
+            try:
+                passed.append(ledger.check(0.15))
+            except accounting.BudgetExceeded:
+                pass
+        threads = [threading.Thread(target=worker) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(passed), 1)
+        ledger.record({"cost_usd": 0.15}, reserved=passed[0])
+        self.assertAlmostEqual(ledger.spent, 2.95)
+        self.assertAlmostEqual(ledger.pending, 0.0)
+
+    def test_two_processes_on_one_ledger_see_each_other(self):
+        path = helpers.tempdir(self) / "ledger.jsonl"
+        one = accounting.Ledger(path, 3.0, reserve_usd=0.0)
+        two = accounting.Ledger(path, 3.0, reserve_usd=0.0)
+        one.record({"cost_usd": 2.9})
+        with self.assertRaises(accounting.BudgetExceeded):
+            two.check(0.2)
+        two.record({"cost_usd": 0.05})
+        self.assertAlmostEqual(one.spent, 2.9)
+        one.check(0.01)
+        self.assertAlmostEqual(one.spent, 2.95)
+        totals = [json.loads(l)["ledger_total"] for l in open(str(path))]
+        self.assertEqual(totals, [2.9, 2.95])
+
+    def test_paid_spend_skips_fake_entries_wherever_they_are(self):
+        home = helpers.tempdir(self)
+        campaigns = home / "campaigns"
+        # A dry run plants fake_requests.jsonl in its base directory and writes ledgers to <base>-<variant>.
+        for name, fake, cost in (("main", False, 60.0), ("pilot", False, 2.5), ("main-correct", True, 4.0)):
+            ledger = accounting.Ledger(campaigns / name / "ledger.jsonl", 90.0, fake=fake)
+            ledger.record({"cost_usd": cost, "phase": "dry-run" if fake else "main"})
+        (campaigns / "main" / "fake_requests.jsonl").write_text("")
+        self.assertAlmostEqual(accounting.paid_spend(home), 62.5)
+        self.assertAlmostEqual(accounting.paid_spend(home, exclude="main"), 2.5)
+        # Entries from before the fake flag: the dry-run phase or a marker in their directory decides.
+        legacy = campaigns / "old-correct"
+        legacy.mkdir()
+        (legacy / "ledger.jsonl").write_text(json.dumps({"cost_usd": 1.0, "phase": "dry-run"}) + "\n")
+        anchor = campaigns / "anchor-dry1"
+        anchor.mkdir()
+        (anchor / "fake_requests.jsonl").write_text("")
+        (anchor / "ledger.jsonl").write_text(json.dumps({"cost_usd": 1.0, "phase": "anchor"}) + "\n")
+        self.assertAlmostEqual(accounting.paid_spend(home), 62.5)
 
 
 def row(task, rep, arm, ok, cost, mode=None, model="claude-sonnet-5-5"):

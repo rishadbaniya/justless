@@ -43,9 +43,11 @@ class Pricing:
                 + read * tier["cache_read"] + output * tier["output"]) / MTOK
 
     def worst_case(self, model, prompt_tokens, max_tokens):
-        """Upper bound for the next request: the whole prompt uncached at the top tier plus max output."""
+        """Upper bound for the next request: the whole prompt at the top tier's dearest prompt rate (a fresh
+        prefix is billed as a cache write, which costs more than uncached input) plus max output."""
         tier = self.table["models"][model]["tiers"][-1]
-        return (prompt_tokens * tier["input"] + max_tokens * tier["output"]) / MTOK
+        rate = max(tier["input"], tier["cache_write_5m"], tier["cache_write_1h"])
+        return (prompt_tokens * rate + max_tokens * tier["output"]) / MTOK
 
     def reprice_1h(self, model, usage, ttl_expiry_rewrite=False):
         """Sensitivity: price cache writes at the 1-hour rate; a TTL-expiry rewrite becomes a read."""
@@ -73,54 +75,146 @@ class BudgetExceeded(Exception):
         self.kind = kind
 
 
+def entry_is_fake(entry, directory_fake=False):
+    """Whether a ledger entry records fake (dry-run) usage. Entries carry `fake`; older entries are judged by
+    their phase or by a dry-run marker in their directory."""
+    if "fake" in entry:
+        return bool(entry["fake"])
+    return entry.get("phase") == "dry-run" or directory_fake
+
+
+def directory_is_dry(directory):
+    directory = Path(directory)
+    return (directory / "DRY_RUN").exists() or (directory / "fake_requests.jsonl").exists()
+
+
+class _FileLock:
+    """An exclusive flock on a sidecar file, so processes sharing a campaign ledger see each other's spend."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.handle = None
+
+    def __enter__(self):
+        import fcntl
+        self.handle = open(self.path, "a")
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+        return False
+
+
 class Ledger:
-    """Append-only spend ledger shared by every worker in a campaign directory."""
+    """Append-only spend ledger shared by every worker and process in a campaign directory.
+
+    check() reserves a request's worst case until record() or release() settles it, so concurrent workers
+    cannot all pass the same last dollar. Each check re-reads entries other processes appended since the last
+    read, under an exclusive file lock, and asks prior_fn for other campaigns' paid spend."""
 
     def __init__(self, path, cap_usd, reserve_usd=config.RESERVE_USD, use_reserve=False, prior_usd=0.0,
-                 global_cap_usd=None):
-        """cap_usd bounds this campaign; prior_usd is what other paid campaigns already spent, checked
-        together with this one against global_cap_usd (the $90 campaign total, its last $10 behind
-        use_reserve)."""
+                 global_cap_usd=None, fake=False, prior_fn=None):
+        """cap_usd bounds this campaign; prior_usd (or prior_fn()) is what other paid campaigns already spent,
+        checked together with this one against global_cap_usd (the $90 campaign total, its last $10 behind
+        use_reserve). fake marks every entry as dry-run usage that never counts as paid spend."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.cap = float(cap_usd)
         self.reserve = float(reserve_usd)
         self.use_reserve = use_reserve
         self.prior = float(prior_usd)
+        self.prior_fn = prior_fn
         self.global_cap = None if global_cap_usd is None else float(global_cap_usd)
-        self.lock = threading.Lock()
+        self.fake = bool(fake)
+        self.lock = threading.RLock()
+        self.file_lock = self.path.with_name(self.path.name + ".lock")
         self.spent = 0.0
-        if self.path.exists():
-            with open(self.path) as handle:
-                for line in handle:
-                    try:
-                        self.spent += float(json.loads(line).get("cost_usd") or 0)
-                    except ValueError:
-                        pass
+        self.pending = 0.0
+        self.offset = 0
+        self._refresh()
+
+    def _refresh(self):
+        """Add entries appended since the last read; a partial last line waits for the next read."""
+        if not self.path.exists():
+            return
+        with open(str(self.path), "rb") as handle:
+            handle.seek(self.offset)
+            data = handle.read()
+        end = data.rfind(b"\n")
+        if end < 0:
+            return
+        for line in data[:end + 1].split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                self.spent += float(json.loads(line.decode("utf-8")).get("cost_usd") or 0)
+            except ValueError:
+                pass
+        self.offset += end + 1
 
     @property
     def limit(self):
         return self.cap if self.use_reserve else self.cap - self.reserve
 
-    def check(self, worst_case_usd):
-        with self.lock:
-            if self.spent + worst_case_usd > self.limit:
-                raise BudgetExceeded("aborted_global_cap", "spent %.4f + next %.4f > %.4f" % (
-                    self.spent, worst_case_usd, self.limit))
-            if self.global_cap is not None:
-                limit = self.global_cap if self.use_reserve else self.global_cap - config.RESERVE_USD
-                if self.prior + self.spent + worst_case_usd > limit:
-                    raise BudgetExceeded("aborted_global_cap", "all campaigns %.4f + next %.4f > %.4f" % (
-                        self.prior + self.spent, worst_case_usd, limit))
+    @property
+    def global_limit(self):
+        if self.global_cap is None:
+            return None
+        return self.global_cap if self.use_reserve else self.global_cap - config.RESERVE_USD
 
-    def record(self, entry):
+    def check(self, worst_case_usd):
+        """Raise BudgetExceeded, or reserve worst_case_usd and return it for record() or release()."""
+        with self.lock, _FileLock(self.file_lock):
+            self._refresh()
+            committed = self.spent + self.pending
+            if committed + worst_case_usd > self.limit:
+                raise BudgetExceeded("aborted_global_cap", "spent %.4f + pending %.4f + next %.4f > %.4f" % (
+                    self.spent, self.pending, worst_case_usd, self.limit))
+            if self.global_limit is not None:
+                prior = self.prior_fn() if self.prior_fn else self.prior
+                if prior + committed + worst_case_usd > self.global_limit:
+                    raise BudgetExceeded("aborted_global_cap", "all campaigns %.4f + next %.4f > %.4f" % (
+                        prior + committed, worst_case_usd, self.global_limit))
+            self.pending += worst_case_usd
+            return worst_case_usd
+
+    def release(self, reserved):
         with self.lock:
-            self.spent += float(entry.get("cost_usd") or 0)
-            entry = dict(entry, ledger_total=round(self.spent, 6), t=time.time())
-            with open(self.path, "a") as handle:
+            self.pending = max(0.0, self.pending - float(reserved or 0))
+
+    def record(self, entry, reserved=0.0):
+        with self.lock, _FileLock(self.file_lock):
+            self.pending = max(0.0, self.pending - float(reserved or 0))
+            self._refresh()
+            cost = float(entry.get("cost_usd") or 0)
+            entry = dict(entry, fake=self.fake, ledger_total=round(self.spent + cost, 6), t=time.time())
+            with open(str(self.path), "a") as handle:
                 handle.write(json.dumps(entry) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            self._refresh()
+
+
+def paid_spend(home, exclude=None):
+    """Spend recorded by paid requests in every campaign of a store. Dry-run usage is fake and never counts,
+    whichever directory its ledger is in."""
+    total = 0.0
+    for path in sorted((Path(home) / "campaigns").glob("*/ledger.jsonl")):
+        if path.parent.name == exclude:
+            continue
+        directory_fake = directory_is_dry(path.parent)
+        with open(str(path)) as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not entry_is_fake(entry, directory_fake):
+                    total += float(entry.get("cost_usd") or 0)
+    return total
 
 
 # Pre-pilot assumptions (median USD per run) from the design.
@@ -168,8 +262,14 @@ SCALE_UP = [("opus", {"tasks_per_family": 2}), ("sonnet", {"reps": 4}),
                            "families": ["bugfix", "lint"]})]
 
 
-def estimate(per_run, spent=0.0, budget=config.CAMPAIGN_CAP_USD, plan=None):
-    """Apply the pre-registered scale orders to a per-run cost table. Returns a dict for printing."""
+def enforced_limit(budget=config.CAMPAIGN_CAP_USD, use_reserve=False):
+    """The total that Ledger.check enforces across campaigns: the cap less the reserve unless it is released."""
+    return budget if use_reserve else budget - config.RESERVE_USD
+
+
+def estimate(per_run, spent=0.0, budget=config.CAMPAIGN_CAP_USD, plan=None, use_reserve=False):
+    """Apply the pre-registered scale orders to a per-run cost table against the limit the ledger enforces.
+    Returns a dict for printing."""
     import copy
     plan = copy.deepcopy(plan or MAIN_PLAN)
 
@@ -190,7 +290,8 @@ def estimate(per_run, spent=0.0, budget=config.CAMPAIGN_CAP_USD, plan=None):
 
     applied = []
     expected, rows = total(plan)
-    room = budget - spent
+    limit = enforced_limit(budget, use_reserve)
+    room = limit - spent
     if expected > room:
         for name, change in SCALE_DOWN:
             for cell in plan:
@@ -214,5 +315,6 @@ def estimate(per_run, spent=0.0, budget=config.CAMPAIGN_CAP_USD, plan=None):
                 plan = trial
                 applied.append("up:%s" % name)
         expected, rows = total(plan)
-    return {"expected_usd": round(expected, 2), "room_usd": round(room, 2), "rows": rows, "applied": applied,
-            "fits": expected <= room}
+    return {"expected_usd": round(expected, 2), "enforced_limit_usd": round(limit, 2), "spent_usd": round(spent, 4),
+            "room_usd": round(room, 2), "rows": rows, "applied": applied, "fits": expected <= room,
+            "reserve_released": bool(use_reserve)}

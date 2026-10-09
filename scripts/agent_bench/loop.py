@@ -250,26 +250,30 @@ class Run:
                                                                             len(json.dumps(body).encode()) // 2)
         worst = self.pricing.worst_case(self.spec["model"], estimate, body["max_tokens"])
         try:
-            self.ledger.check(worst)
+            reserved = self.ledger.check(worst)
         except accounting.BudgetExceeded:
             raise HarnessError("aborted_global_cap", "campaign cap reached")
-        for message in self.messages[-2:]:
-            if message["role"] == "assistant":
-                continue
-            hits = secret_hits(json.dumps(message), self.api_key, self.allowed_secrets)
-            if hits:
-                raise HarnessError("secret_blocked", ",".join(hits))
         now = time.time()
         gap = None if self.last_request_start is None else now - self.last_request_start
-        self.last_request_start = now
         try:
+            for message in self.messages[-2:]:
+                if message["role"] == "assistant":
+                    continue
+                hits = secret_hits(json.dumps(message), self.api_key, self.allowed_secrets)
+                if hits:
+                    raise HarnessError("secret_blocked", ",".join(hits))
+            self.last_request_start = now
             response, meta = self.client.create(body)
         except api_module.APIError as error:
+            self.ledger.release(reserved)
             self.logs["attempts"].write({"run_id": self.spec["run_id"], "attempt": self.spec["attempt"],
                                          "turn": self.totals["requests"], "status": error.status,
                                          "error": str(error)[:500], "append_only": error.append_only_bug,
                                          "api_attempts": error.attempts})
             raise HarnessError("api_%s" % error.status, str(error)[:300], error.append_only_bug)
+        except BaseException:
+            self.ledger.release(reserved)
+            raise
         usage = response.get("usage") or {}
         cost = self.pricing.cost(self.spec["model"], usage)
         prompt = accounting.prompt_tokens(usage)
@@ -303,7 +307,8 @@ class Run:
         tier = self.pricing.tier_index(self.spec["model"], prompt)
         self.ledger.record({"run_id": self.spec["run_id"], "attempt": self.spec["attempt"],
                             "campaign": self.spec["campaign"], "phase": self.spec.get("phase", "main"),
-                            "model": self.spec["model"], "arm": self.spec["arm"], "cost_usd": cost})
+                            "model": self.spec["model"], "arm": self.spec["arm"], "cost_usd": cost},
+                           reserved=reserved)
         self.logs["requests"].write({
             "run_id": self.spec["run_id"], "attempt": self.spec["attempt"], "turn": self.totals["requests"],
             "t": now, "gap_s": None if gap is None else round(gap, 3), "latency_s": meta["latency_s"],
