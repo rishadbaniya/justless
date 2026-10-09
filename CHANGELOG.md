@@ -20,6 +20,10 @@ User-visible changes to Justless are recorded here. No release has been publishe
 - Each stream of a run stores at most `max_run_bytes`, 256 MiB by default, so a command that reads its own archive, such as `sh -c 'grep -rn x .'`, can no longer fill the disk. The command still runs to completion with its own exit status, and the footer and `log` say where the archive was truncated. On Unix, Justless returns when the command exits, and output that a background process writes later is still stored within the cap. On Windows, `run` waits until such a process closes the output.
 - After each run, Justless keeps the newest `max_runs` runs within `max_archive_bytes`, and an unchanged rerun links to the streams of the run it matched instead of storing them again.
 
+- Secrets in command output, such as cloud keys, tokens and private keys, are masked in previews, footers, `log`, `search`, `history`, `lookup --logs` and MCP results. The archive keeps the exact bytes, and `log --unredacted` returns them. Command lines that may carry a credential are not stored.
+- `justless exec` runs a script an agent writes over large data, with the same archive and exit status as `run`. Long stdout shows whole head and tail lines and the range left out, and `--intent TEXT` ranks the lines that match it.
+- `justless learn` reads recent Claude Code transcripts and proposes project rules from command mistakes agents corrected or repeated, such as an unquoted glob or a tool that is not installed. `--apply` writes them to a managed block in `AGENTS.md` or `CLAUDE.md`. Rules that could carry a credential are held back.
+
 ### Code navigation
 
 - A local index covers Rust, JavaScript, TypeScript and TSX, Python, Go, Java, Kotlin, Scala, C, C++, C#, Swift, Dart, Ruby, PHP, Lua, Zig, Bash, SQL and HCL, including Terraform. It refreshes on every query and reuses unchanged files.

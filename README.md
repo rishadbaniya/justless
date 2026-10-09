@@ -27,7 +27,7 @@
 - **🎯 Exact Recall.** Every stream is archived byte for byte, up to 256 MiB, in `.justless/runs/<id>` with a SHA-256 digest. `justless log ID --from N --to M` replays exact lines, with secrets masked unless you add `--unredacted`; an identical rerun collapses to one line.
 - **🔬 Surgical Reads.** syn and Tree-sitter outlines across 21 languages with revision-bound row IDs. `expand` returns one symbol's exact bytes; `edit` writes only the replacement after checking the revision.
 - **🗺️ Code Map and Impact.** An incremental graph of symbols, calls, imports, HTTP routes and SQL relations. `pack` answers a question in one call; `affected` walks back to the tests that reach a change.
-- **🧹 Context Hygiene.** A footer only when output was cut or failed, compaction hooks that carry run IDs and inspected ranges into the next turn, and an opt-in `justless wrap claude` that has the API clear old tool results server-side, with every original archived.
+- **🧹 Context Hygiene.** A footer only when output was cut, failed or had a secret masked, compaction hooks that carry run IDs and inspected ranges into the next turn, and an opt-in `justless wrap claude` that has the API clear old tool results server-side, with every original archived.
 
 
 <picture>
