@@ -542,12 +542,13 @@ def current_pins(settings, args, models, manifest):
     arms = args.arms.split(",")
     base = {"justless_sha256": settings.justless_sha, "harness_tree": settings.harness,
             "capture_hash": settings.profile.capture_hash, "manifest_hash": manifest,
-            "pricing_hash": settings.pricing.hash, "limits": settings.limits, "seed": settings.seed,
+            "pricing_hash": settings.pricing.hash, "seed": settings.seed,
             "anthropic_version": config.ANTHROPIC_VERSION, "betas": config.BETAS, "cc_version": config.CC_VERSION}
     cells = {}
     for model in models:
+        # Limits are per model: the pilot sets a token limit for each.
         cell = {"max_output_tokens": settings.max_output, "run_budget": settings.run_budget(model),
-                "profile": settings.profile.model_pins(model, settings.max_output)}
+                "limits": settings.limits, "profile": settings.profile.model_pins(model, settings.max_output)}
         if any(config.ARMS[a]["ce"] for a in arms):
             cell["ce_trigger"] = settings.ce_trigger
         cells["%s|%s" % (model, args.effort)] = cell
@@ -872,6 +873,9 @@ def cmd_estimate(args):
             if cumulative:
                 out["token_limit_rule"][model] = {"plain_arm_runs": len(cumulative), "max": max(cumulative),
                                                   "token_limit": config.token_limit_rule(cumulative)}
+        sonnet = out["token_limit_rule"].get("claude-sonnet-5-5")
+        if sonnet and "claude-opus-5-5" not in out["token_limit_rule"]:
+            out["token_limit_rule"]["claude-opus-5-5"] = dict(sonnet, note="no Opus pilot runs; the Sonnet value")
         # Effort rule: after dropping Opus, a plan that still does not fit moves every arm to medium effort.
         without_opus = accounting.estimate(per_run, spent=spent, use_reserve=args.use_reserve,
                                            plan=[c for c in accounting.MAIN_PLAN if c["name"] != "opus"])

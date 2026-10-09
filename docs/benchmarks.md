@@ -15,7 +15,7 @@ No result has been recorded yet. The table at the end of this section is filled 
 | c, plain + context editing | No | `clear_tool_uses_20250919` |
 | d, justless + context editing | As in b | As in c |
 
-Every request in every arm is otherwise identical: model, effort, `max_tokens` (Claude Code's value capped at 32,000), adaptive thinking with `block_binding.prefix_mismatch_behavior: "error"`, the same `anthropic-beta` header, Claude Code's system prompt, its Bash, Read, Edit and Write definitions, and the same first messages. A check on the first request of each paired run fails on any other difference. The context-editing trigger T is set by rule from plain-arm pilot data: the median per-run peak prompt, rounded up to 5,000 and clamped to 30,000-100,000, with `keep` 3 tool uses and `clear_at_least` 5,000 tokens. Anthropic describes context editing as a context-window tool rather than a savings lever, so the contrasts involving c and d claim only "server-side clearing at this configuration".
+Every request in every arm is otherwise identical: model, effort, `max_tokens` (Claude Code's value capped at 32,000), adaptive thinking with `block_binding.prefix_mismatch_behavior: "error"`, the same `anthropic-beta` header, Claude Code's system prompt, its Bash, Read, Edit and Write definitions, and the same first messages. Every run saves its first request. The dry run and the report compare the two arms of each block and flag any other difference. The context-editing trigger T is set by rule from plain-arm pilot data: the median per-run peak prompt, rounded up to 5,000 and clamped to 30,000-100,000, with `keep` 3 tool uses and `clear_at_least` 5,000 tokens. Anthropic describes context editing as a context-window tool rather than a savings lever, so the contrasts involving c and d claim only "server-side clearing at this configuration".
 
 ### Claude Code parity
 
@@ -47,18 +47,24 @@ The 32 tasks come from five of the owner's repositories, eight per family. Gener
 
 | Family | Task | Success |
 | --- | --- | --- |
-| Bug fix | A deterministic operator, constant or argument mutation that makes `cargo test` fail; one Python task with harness-held tests | Every test name that passed at baseline passes, no test or test configuration was edited, and the diff touches the mutated function. Python tasks also pass hidden tests. |
-| Lint | Three to five behavior-preserving rewrites in a clippy-clean package that trigger default clippy lints | Clippy reports nothing, no `allow` or `expect` attribute or lint configuration was added, and the baseline tests pass |
-| Location | A literal from a log, error, panic, SQL migration or Neovim mapping, quoted verbatim in half the questions and paraphrased in the other half | The first answer names the right file and enclosing symbol |
+| Bug fix | A deterministic operator, constant or argument mutation that makes `cargo test` fail; one Python task with harness-held tests | Every test name that passed at baseline passes, no test or test configuration was edited, and the diff touches the mutated function. Added library code must not switch on `cfg(test)` or `debug_assertions`, so a fix that only exists under test fails; a new `#[cfg(test)] mod` is allowed. Python tasks also pass hidden tests. |
+| Lint | Three to five behavior-preserving rewrites in a clippy-clean package that trigger default clippy lints | Clippy reports nothing, no `allow` or `expect` attribute or lint configuration was added, and the baseline tests pass. Comments and strings that mention a lint are not suppressions. |
+| Location | A literal from a log, error, panic, SQL migration or Neovim mapping, quoted verbatim in half the questions and paraphrased in the other half | The first answer names the right file and enclosing symbol. Forms that tools print are accepted: an absolute path, a `:line` suffix, module-qualified names such as `crate_a::mod_b::name` or `pkg.module.name`, and a `file.ext::` prefix. A different owning type is still wrong. |
 | Impact | A uniquely defined public symbol referenced from 3 to 25 files | Recall of 0.9 or more and precision of 0.8 or more. Files that mention the symbol only in comments, strings or docs are neutral. |
 
 A bug-fix candidate is accepted only if its failure repeats identically, its tests are not flaky over three baseline runs, and a second mutation in the same function also fails them. The repository mix is Rust-heavy: 25 tasks are Rust, 5 Python, 1 a SQL migration and 1 Lua. The planned Lua impact task was replaced by a Rust one because no Lua symbol is referenced from 3 to 25 files. In a Cargo workspace the lint prompt and oracle name the package, because other members carry their own warnings. Results apply to tasks like these on these repositories.
+
+Every impact task can be solved with grep by construction. Its truth is the `rg -w` hits for a uniquely named symbol, less files that mention it only in comments or strings. The impact family therefore measures cost on lexical cases, where semantic navigation cannot change success. Its results apply to uniquely named symbols. Location tasks record whether grep alone solves them, and the report splits them on it.
 
 Each run clones a warm Cargo target built for its task, then deletes the fingerprints of the repository's own crates so they are rebuilt in the run directory. Test binaries embed their crate's absolute path, and without the rebuild they read fixtures from the snapshot.
 
 ### Run isolation
 
 Each run clones the task snapshot and its warm Cargo target with APFS clones into a fresh directory, installs the arm, sets every file's time to 2026-01-01, and makes one fixed-date Git commit, so neither `ls -lt`, `find -newer`, Git history nor Justless's change views reveal the mutation. Tools, hooks and oracles run under `sandbox-exec`. The profile denies reading the task store, the corpus, other runs and the user's home outside the Rust toolchain, denies executing any unpinned `justless`, `claude` or `codex`, and denies outbound network other than 127.0.0.1. The tool environment is an allowlist with no `ANTHROPIC_*` variable. The run directory is deleted after grading.
+
+The corpus repositories depend on one another through Git, so Cargo's git cache holds unmutated copies of task files. Each run hides every checkout and database of the task's own repository, and every checkout revision or database its `Cargo.lock` does not use. A repository never depends on itself, and the harness refuses a task whose lock says otherwise. A database that the build needs stays readable. `validate-tasks` lists any task whose original is still reachable that way under `answer_key_exposure`. One lint task in the big workspace is listed there and should be regenerated with its injection moved. Tool calls that name the Cargo git cache are counted as possible answer-key access.
+
+Writes to the Cargo home are limited to Cargo's lock and usage-tracking files, so a run cannot install binaries or change configuration for later runs. Each record notes any change to `~/.cargo/bin` or its configuration. The binary under test is copied into the store under its SHA-256 at the start of a campaign. Every run installs that copy and checks its hash, so a rebuild at the original path cannot change later runs.
 
 ### Pre-registered analysis
 
@@ -67,20 +73,28 @@ The unit of analysis is a paired (model, task, repetition) block, with a seeded 
 - E1, the success difference: Δs is the mean over blocks of success(b) minus success(a).
 - E2, the relative saving in cost per successful task: S = 1 − [(Σ cost b / Σ successes b) / (Σ cost a / Σ successes a)].
 
-Confidence intervals come from a task-cluster bootstrap with 10,000 resamples and seed 20261118. If more than 1% of resamples have no success in an arm, S is reported as undefined and cost per run is used instead. The decision rule applies in this order, and the first match wins:
+Confidence intervals come from a task-cluster bootstrap with 10,000 resamples and seed 20261118. If more than 1% of resamples have no success in an arm, S is reported as undefined. The rule then uses R = 1 − (Σ cost b / Σ cost a), the relative saving in cost per run, with its own bootstrap interval, and the report says so. The decision rule applies in this order, and the first match wins. "S" below means R when S is undefined.
 
 1. WORSE: the upper bound of S is below 0, or the upper bound of Δs is below −0.10.
 2. WIN: the lower bound of S is above 0, the lower bound of Δs is above −0.10, and the point estimate of Δs is at least −0.05. The result is worded "Justless reduced cost per successful task by S [CI] while success was not worse by more than 10 percentage points (Δs [CI])".
-3. CHEAPER-BUT-SUCCESS-UNCERTAIN: the lower bound of S is above 0, but the success conditions of rule 2 fail.
+3. CHEAPER-BUT-SUCCESS-UNCERTAIN: the lower bound of S is above 0, but the success conditions of rule 2 fail. The result is worded "Justless reduced cost per successful task by S [CI]. Success was not shown to be within 10 percentage points (Δs [CI]); at this sample size that is not evidence that success fell."
 4. NO DEMONSTRATED SAVING: everything else.
 
-Key secondaries are the edit families (bug fix and lint) and each family on its own; a negative family estimate must be stated with the headline. The context-editing contrasts (d against c, c against a, d against a) are tested only on Haiku 5.5, with Holm-adjusted sign-flip p-values. Opus 5.5 is descriptive. Sensitivity analyses treat limit hits as censored, reprice cache writes at the 1-hour rate, drop the Python task, and split location tasks by style and by grep-solvability. Harness errors are retried up to three times with a new nonce and then count as failures. If any arm's unrecoverable rate exceeds 2%, or arms differ by more than 2 points, the campaign pauses.
+The success endpoint is underpowered for its 10-point margin at the planned size. For the primary contrast, 32 tasks × 3 repetitions is 96 blocks. At a planning ICC of 0.3 the success MDE is 16 points with 20% discordant blocks and 11 points with 10%. In a simulation of a tool with no effect on success, with task success rates spread from 0.2 to 0.95, the success conditions of WIN held in 38% of campaigns of this size. The median Δs half-width was 0.104, wider than the margin. With mostly deterministic tasks they held in 80%. A verdict other than WIN can therefore reflect sample size rather than lower success. The report prints the observed Δs half-width next to the 10-point margin, the MDE at the measured discordance and ICC, and the share of simulated no-effect campaigns of the observed size that meet the success conditions. After the pilot, `estimate` and the report give the measured discordance. If it implies an MDE above 10 points, the lead either moves budget into the primary contrast, for example a fourth or fifth Sonnet repetition funded by fewer Haiku repetitions, or keeps the plan and the rule-3 wording above.
+
+Key secondaries are the edit families (bug fix and lint) and each family on its own; a negative family estimate must be stated with the headline. The context-editing contrasts (d against c, c against a, d against a) are tested only on Haiku 5.5, with Holm-adjusted sign-flip p-values. Opus 5.5 is descriptive.
+
+Every run is graded on its final repository and answer, however it stopped. A run that hits the turn, token, run-budget or wall-time limit, or stops on `max_tokens` or a refusal, records why in `stopped_by`. Its success is the oracle's verdict, so a fix already on disk counts. The token limit is in the unit Justless reduces, so it must rarely bind. The pilot sets it as at least three times the plain arm's 95th-percentile cumulative prompt tokens per run, and never below 3,000,000; `estimate` prints the value. The wall-time limit is a two-hour hang guard that excludes API retry back-off. The report gives each arm's limit-hit rate and the censored contrast with bootstrap intervals.
+
+Sensitivity analyses treat limit hits as censored, reprice cache writes at the 1-hour rate, drop the Python task, and split location tasks by style and by grep-solvability. Harness errors are retried up to three times with a new nonce and then count as failures. Cap aborts and infrastructure pauses do not use up those retries. The campaign pauses when any arm's unrecoverable rate exceeds 2%, or when arms differ by more than 2 points in that rate or in their limit-hit rate. The rule is checked once every arm has 20 graded runs. `run` stops starting new blocks, exits with status 3, and continues after review with `--ignore-gate`. `count_tokens` is retried like any request, and if it still fails the campaign pauses instead of re-rolling the run.
+
+Arms pair only within one set of pins: binary hash, harness tree hash, capture hash, task manifest, pricing and effort. A campaign records its pins in `pins.json` on first start and refuses to resume with different ones. These are the binary, harness, capture, manifest, pricing, limits and seed, and per model the effort, `max_tokens`, run budget and the context-editing trigger. `--new-pins` starts a new generation, and the report never pairs runs across generations. A contrast with more than one pin set is reported as MIXED PINS, and every pin set is listed. The harness hash covers the files under `scripts/agent_bench` except the tests, so commits elsewhere in the repository do not re-key finished runs.
 
 A small anchor run uses the real `claude -p` on 8 tasks in arms a and b through `proxy.py`, which logs usage and swaps a dummy key for the campaign key so the key never enters the sandbox. The fidelity flag is raised if the anchor's b/a cost ratio falls outside the harness's 95% interval for the same tasks, if a hook firing rate differs by more than 2×, or if plain-arm cost per run differs by more than 35%. A raised flag must appear next to the primary result.
 
 ### Budget
 
-Prices come from the pricing page as checked on 2026-11-18 and live in `data/pricing.json`. Haiku 5.5 changes tier per request at 100,000 prompt tokens, counting cache reads and writes. Every request first checks that the campaign ledger plus a worst-case estimate of the request stays under $80 ($90 with `--use-reserve`). Per-run caps are $0.30 for Haiku, $3 for Sonnet and $6 for Opus, with 60 requests, 3,000,000 cumulative prompt tokens and 30 minutes per run.
+Prices come from the pricing page as checked on 2026-11-18 and live in `data/pricing.json`. Haiku 5.5 changes tier per request at 100,000 prompt tokens, counting cache reads and writes. Every request first checks that paid spend in all campaigns, plus a worst-case estimate of the request, stays under $80 ($90 with `--use-reserve`). The worst case prices the whole prompt at the dearest cache-write rate. The check reserves that amount until the response is recorded, so parallel workers cannot all pass the same last dollar. It also re-reads the ledger under a file lock, so it sees what other processes in the campaign spent. Dry runs mark every ledger entry as fake, and fake usage never counts as paid spend. Per-run caps are $0.30 for Haiku, $3 for Sonnet and $6 for Opus, with 60 requests, the pilot-set token limit and the two-hour hang guard. The anchor's proxy applies the same campaign check before forwarding each Claude Code request. It records each cost when the response arrives and refuses further requests once the campaign cap or the run's budget is reached.
 
 | Phase | Runs | Expected cost |
 | --- | ---: | ---: |
@@ -90,7 +104,7 @@ Prices come from the pricing page as checked on 2026-11-18 and live in `data/pri
 | Anchor: Sonnet, 8 tasks × arms a and b in real Claude Code | 16 | about $6 |
 | Opus: 4 tasks × 3 repetitions × arms a and b | 24 | about $11 |
 
-After the pilot, `run.py estimate` replaces each assumption with the pilot cost and applies the pre-registered scale order: drop Opus, then cut Haiku to 3 repetitions, the anchor to 4 tasks, and Sonnet to 24 tasks. Below $70 it scales up in the order Opus to 8 tasks, a fourth Sonnet repetition, then Sonnet context-editing arms on the edit families. If the 90th percentile at Claude Code's default effort still exceeds the budget, every arm of that model switches to `medium` effort.
+`run.py estimate` compares plans with the same $80 limit that the ledger enforces, or $90 with `--use-reserve`. After the pilot, it replaces each assumption with the pilot cost and applies the pre-registered scale order: drop Opus, then cut Haiku to 3 repetitions, the anchor to 4 tasks, and Sonnet to 24 tasks. Below $70 it scales up in the order Opus to 8 tasks, a fourth Sonnet repetition, then Sonnet context-editing arms on the edit families. If the 90th percentile at Claude Code's default effort still exceeds the budget, every arm of that model switches to `medium` effort.
 
 ### How to run
 
@@ -109,9 +123,11 @@ python3 scripts/agent_bench/run.py prepare --generate
 python3 scripts/agent_bench/run.py validate-tasks --tasks all --binary $B
 python3 scripts/agent_bench/run.py review-tasks --approve
 python3 scripts/agent_bench/run.py dry-run --tasks all-public --arms a,b,c,d --binary $B
-python3 scripts/agent_bench/run.py anchor --dry-anchor --tasks all-public --binary $B --campaign anchor-dry
+python3 scripts/agent_bench/run.py anchor --dry-anchor --tasks all-public --binary $B
 python3 scripts/agent_bench/run.py estimate --assume prepilot
 ```
+
+Dry runs, validation and the dry anchor default to the campaigns `dry`, `validate` and `anchor-dry`. Paid commands refuse any campaign directory that holds dry-run data.
 
 The paid steps need `ANTHROPIC_API_KEY` for a dedicated key and workspace:
 
@@ -120,16 +136,19 @@ python3 scripts/agent_bench/run.py pilot --campaign pilot --model claude-haiku-5
 python3 scripts/agent_bench/run.py pilot --campaign pilot --model claude-sonnet-5-5 --arms a,b --per-family 1 --budget-usd 3 --binary $B
 python3 scripts/agent_bench/run.py reconcile --campaign pilot --provider-usd <amount from the cost report>
 python3 scripts/agent_bench/run.py estimate --campaign pilot
-python3 scripts/agent_bench/run.py run --campaign main --model claude-sonnet-5-5 --arms a,b --reps 3 --binary $B
-python3 scripts/agent_bench/run.py run --campaign main --model claude-haiku-5-5 --arms a,b,c,d --reps 4 --ce-trigger <T> --binary $B
+python3 scripts/agent_bench/run.py run --campaign main --model claude-sonnet-5-5 --arms a,b --reps 3 --token-limit <L sonnet> --binary $B
+python3 scripts/agent_bench/run.py run --campaign main --model claude-haiku-5-5 --arms a,b,c,d --reps 4 --ce-trigger <T> --token-limit <L haiku> --binary $B
 python3 scripts/agent_bench/run.py anchor --campaign main --model claude-sonnet-5-5 --per-family 2 --binary $B
-python3 scripts/agent_bench/run.py run --campaign main --model claude-opus-5-5 --arms a,b --reps 3 --per-family 1 --binary $B
+python3 scripts/agent_bench/run.py run --campaign main --model claude-opus-5-5 --arms a,b --reps 3 --per-family 1 --token-limit <L opus> --binary $B
 python3 scripts/agent_bench/run.py report --campaign main
+python3 scripts/agent_bench/run.py export-audit --campaign main
 ```
 
-Runs are resumable. A run with a terminal record is skipped, and the report is written to `$AGENT_BENCH_HOME/reports/<campaign>/`.
+`estimate --campaign pilot` prints T, each model's token limit L and the effort rule. Opus has no pilot runs, so its limit is the Sonnet value. The main campaign and its report run only on the task manifest frozen by `review-tasks --approve`.
 
-The free steps check the harness before any money is spent. `validate-tasks` runs every task through the exact run-time path with scripted agents: doing nothing must fail, the reference fix must succeed in both arms, and tampering with tests, suppressing lints or giving a wrong answer must fail with the expected failure mode. `dry-run` adds a probe agent and then checks the logs: paired first requests differ only in the CLAUDE.md block and the SessionStart context, plain arms run no hook and cannot run `justless`, the planted parent-environment key appears nowhere, `ls -lt` and `find -newer` show no edited file, and the ledger matches costs recomputed from the logged usage. `anchor --dry-anchor` runs real Claude Code through the proxy against the fake API.
+Runs are resumable. A run with a terminal record is skipped, and the report is written to `$AGENT_BENCH_HOME/reports/<campaign>/`. A resume with different pins is refused, as described above. `run` exits with status 3 when the campaign pauses. `export-audit` writes every successful bug-fix or lint diff that is not an exact revert of the mutation to `reports/<campaign>/audit/` for a blind review. The patches name the task but not the arm, and `audit_key.json` maps them back to runs.
+
+The free steps check the harness before any money is spent. `validate-tasks` runs every task through the exact run-time path with scripted agents. Doing nothing must fail, and the reference fix must succeed in both arms. Answers in the qualified forms that tools print must succeed. Tampering with tests, suppressing lints, a `#[cfg(test)]` twin of the buggy function or a wrong answer must fail with the expected failure mode. `dry-run` also runs an agent that finishes the task and then keeps going until the turn limit stops it, which must still grade as success. It adds a probe agent and then checks the logs: paired first requests differ only in the CLAUDE.md block and the SessionStart context, plain arms run no hook and cannot run `justless`, the planted parent-environment key appears nowhere, `ls -lt` and `find -newer` show no edited file, and the ledger matches costs recomputed from the logged usage. `anchor --dry-anchor` runs real Claude Code through the proxy against the fake API.
 
 ### Results
 
