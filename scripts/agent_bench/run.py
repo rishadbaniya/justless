@@ -84,6 +84,11 @@ def install_pinned(source, dest, sha):
 
 # ----------------------------------------------------------------------------- snapshots
 
+def own_repos(task):
+    """Repository names whose Cargo git cache a run of this task must not read (vendor fixtures have none)."""
+    return [] if task.get("source_root") else [task["repo"]]
+
+
 def snapshot_dir(home, task):
     return Path(home) / "snapshots" / task["id"]
 
@@ -269,9 +274,11 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
     env = workspace.tool_env(repo.resolve(), home, bindir, target, justless_dir, tmp=run_dir / "tmp")
     deny = sandbox.default_denies(config, [settings.home, settings.runroot])
     allow_read = sandbox.default_allows(config) + [Path(settings.cc_binary)]
-    text = sandbox.profile(run_dir, deny_read=deny, allow_read=allow_read, allow_write=[config.CARGO_HOME],
-                           allow_exec=allow_exec)
+    hidden = sandbox.cargo_git_denies(config.CARGO_HOME, own_repos(task), snap / "repo")
+    text = sandbox.profile(run_dir, deny_read=deny, allow_read=allow_read, deny_after=hidden,
+                           write_regexes=sandbox.cargo_write_regexes(config.CARGO_HOME), allow_exec=allow_exec)
     profile_path, profile_hash = sandbox.write_profile(run_dir, text)
+    cargo_before = sandbox.cargo_home_state(config.CARGO_HOME)
 
     def runner(argv, timeout):
         proc = subprocess.run(sandbox.wrap(argv, profile_path), cwd=str(repo), env=env, stdin=subprocess.DEVNULL,
@@ -346,6 +353,7 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         grade = oracles.grade(task, repo, reference, runner, run.final_text)
         failure_mode = grade["failure_mode"]
     timings["oracle_s"] = round(time.time() - t3, 3)
+    cargo_after = sandbox.cargo_home_state(config.CARGO_HOME)
     store = settings.dir / "runs" / ("%s-%d" % (rid, attempt))
     store.mkdir(parents=True, exist_ok=True)
     transcript = json.dumps(run.transcript(), indent=1)
@@ -383,6 +391,8 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         "tool_counts": run.tool_counts,
         "hook_events": [e.record() for e in hooks.events] if hooks else [],
         "timings": timings, "diff_files": len(changes),
+        "cargo_home_changed": sorted(k for k in set(cargo_before) | set(cargo_after)
+                                     if cargo_before.get(k) != cargo_after.get(k)),
         "diff_lines": sum(1 for l in diff_lines if l[:1] in "+-" and not l.startswith(("+++", "---"))),
         "settings": {"limits": settings.limits, "run_budget": spec["run_budget"], "ce_trigger": settings.ce_trigger,
                      "seed": settings.seed, "max_output_tokens": settings.max_output, "nonce_salt": config.PROCESS_SALT},
@@ -815,9 +825,19 @@ def cmd_validate_tasks(args):
     code = cmd_dry_run(args)
     truth_failures = {t["id"]: gen_tasks.truth_checks(t) for t in task_list}
     corpus_after = {r: workspace.tree_hash(config.CORPUS / r) for r in corpus_repos}
+    exposure = {}
+    for task in task_list:
+        if task["family"] in ("bugfix", "lint"):
+            hidden = sandbox.cargo_git_denies(config.CARGO_HOME, own_repos(task), snapshot_dir(args.home, task) / "repo")
+            found = sandbox.answer_key_exposure(task, config.CARGO_HOME, hidden)
+            if found:
+                exposure[task["id"]] = ["%s in %s" % pair for pair in found]
     report = {"snapshots_match_stored_hash": snapshot_ok, "truth_check_failures": {k: v for k, v in
                                                                                    truth_failures.items() if v},
-              "corpus_unchanged": corpus_after == corpus_before, "corpus_hashes": corpus_after}
+              "corpus_unchanged": corpus_after == corpus_before, "corpus_hashes": corpus_after,
+              # Unmutated originals still readable in a Cargo git database the build needs. Not a failure of
+              # the run path, but such a task should be regenerated with its injection moved elsewhere.
+              "answer_key_exposure": exposure}
     out = Path(args.home) / "campaigns" / args.campaign / "validate_report.json"
     out.write_text(json.dumps(report, indent=1))
     print(json.dumps({k: v for k, v in report.items() if k != "corpus_hashes"}, indent=1))

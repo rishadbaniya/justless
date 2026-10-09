@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 import threading
 import time
 
@@ -11,6 +12,10 @@ import cc_tools
 import config
 import fake_api
 import workspace as ws_module
+
+
+CARGO_CACHE_INPUT = re.compile(r"\.cargo/git\b|\bCARGO_HOME\b")
+CARGO_CACHE_OUTPUT = re.compile(r"\.cargo/git/(?:checkouts|db)/")
 
 
 class HarnessError(Exception):
@@ -113,7 +118,8 @@ class Run:
                        "max_prompt_tokens": 0, "ce_edits": 0, "ce_cleared_tool_uses": 0, "ce_cleared_input_tokens": 0,
                        "ttl_expiry_rewrites": 0, "ttl_expiry_cost": 0.0, "api_s": 0.0, "tools_s": 0.0,
                        "hooks_s": 0.0, "retry_wait_s": 0.0, "tool_bytes_raw": 0, "tool_bytes_seen": 0,
-                       "hook_bytes_removed": 0, "denials": 0, "input_transformations": 0, "stop_max_tokens": 0}
+                       "hook_bytes_removed": 0, "denials": 0, "input_transformations": 0, "stop_max_tokens": 0,
+                       "cargo_cache_access": 0, "cargo_cache_mentions": 0}
         self.tool_counts = {}
         self.failure_mode = None
         self.final_text = ""
@@ -213,6 +219,13 @@ class Run:
             program, _ = cc_tools.last_segment_program(original)
             if program in ("grep", "rg", "find", "egrep", "fgrep", "ag", "ack"):
                 self.count("Bash", "search")
+        # The Cargo git cache can hold unmutated originals of task files. The sandbox hides the task's own
+        # repository; any tool call that names the cache is logged as an access, any output that does as a
+        # mention (compiler messages about git dependencies print such paths too).
+        cache_access = bool(CARGO_CACHE_INPUT.search(json.dumps(tool_input)))
+        cache_mention = bool(CARGO_CACHE_OUTPUT.search(raw_text))
+        self.totals["cargo_cache_access"] += int(cache_access)
+        self.totals["cargo_cache_mentions"] += int(cache_mention)
         if name == "Read" and outcome.extra.get("hook_replaced"):
             kind = "outlined"
         self.count(name)
@@ -223,7 +236,8 @@ class Run:
                       duration_s=round(tool_seconds, 3), hook_s=round(hook_seconds, 3),
                       bytes_raw=len(raw_text.encode("utf-8")), bytes_seen=len(seen.encode("utf-8")),
                       hooks=[e.record() for e in hook_events], notes=len(notes),
-                      denials=outcome.extra.get("denials", 0), partial=outcome.extra.get("partial"))
+                      denials=outcome.extra.get("denials", 0), partial=outcome.extra.get("partial"),
+                      cargo_cache_access=cache_access, cargo_cache_mention=cache_mention)
         self.logs["tools"].write(record)
         result = {"type": "tool_result", "tool_use_id": tool_id, "content": seen}
         if outcome.is_error:
