@@ -399,19 +399,32 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         "diff_lines": sum(1 for l in diff_lines if l[:1] in "+-" and not l.startswith(("+++", "---"))),
         "settings": {"limits": settings.limits, "run_budget": spec["run_budget"], "ce_trigger": settings.ce_trigger,
                      "seed": settings.seed, "max_output_tokens": settings.max_output, "nonce_salt": config.PROCESS_SALT},
-        "pins": {"justless_sha256": settings.justless_sha, "harness_tree": settings.harness,
-                 "harness_commit": settings.commit,
-                 "capture_hash": settings.profile.capture_hash, "profile_source": settings.profile.source,
-                 "patch_hash": settings.profile.patch_hash, "pricing_hash": settings.pricing.hash,
-                 "manifest_hash": manifest, "sandbox_profile_hash": profile_hash,
-                 "model_profile": settings.profile.model_pins(model, settings.max_output),
-                 "anthropic_version": config.ANTHROPIC_VERSION, "betas": config.BETAS,
-                 "cc_version": config.CC_VERSION, "cc_binary": settings.cc_binary},
+        "pins": dict(block_pins(settings, manifest), profile_source=settings.profile.source,
+                     patch_hash=settings.profile.patch_hash, sandbox_profile_hash=profile_hash,
+                     model_profile=settings.profile.model_pins(model, settings.max_output),
+                     anthropic_version=config.ANTHROPIC_VERSION, betas=config.BETAS, cc_version=config.CC_VERSION,
+                     cc_binary=settings.cc_binary),
         "transcript": str(store / "transcript.json"),
     }
     if not getattr(args, "keep_runs", False):
         workspace.remove(run_dir)
     return record
+
+
+def block_pins(settings, manifest):
+    """The pins stats.pin_key pairs arms on, shared by graded runs and setup-failure records."""
+    pricing = getattr(settings, "pricing", None)
+    return {"justless_sha256": settings.justless_sha, "harness_tree": getattr(settings, "harness", None),
+            "harness_commit": getattr(settings, "commit", None), "capture_hash": settings.profile.capture_hash,
+            "manifest_hash": manifest, "pricing_hash": pricing.hash if pricing is not None else None}
+
+
+def block_identity(settings, task, model, effort_name, arm, rep, manifest):
+    """Fields every result record of a block carries, whether or not the run got far enough to be graded."""
+    return {"campaign": settings.campaign, "agent": "harness", "model": model, "effort_setting": effort_name,
+            "arm": arm, "task_id": task["id"], "family": task["family"], "repo": task.get("repo"),
+            "language": task.get("language"), "style": task.get("style"), "rep": rep,
+            "pins": block_pins(settings, manifest)}
 
 
 def terminal_ids(results_path):
@@ -466,10 +479,11 @@ def schedule(settings, task_list, models, arms, reps, effort, manifest, workers,
                     try:
                         record = run_once(settings, task, model, effort, arm, rep, attempt, manifest, position, phase)
                     except Exception as error:  # setup failures are harness errors too
-                        record = {"campaign": settings.campaign, "phase": phase, "model": model, "arm": arm,
-                                  "task_id": task["id"], "family": task["family"], "rep": rep, "run_id": rid,
-                                  "attempt": attempt, "failure_mode": "harness_error", "success": False,
-                                  "harness_error": "%s: %s" % (type(error).__name__, error)}
+                        # The same identity and pins as a graded run, so after three failures the run still
+                        # pairs with the other arm as an intention-to-treat failure.
+                        record = dict(block_identity(settings, task, model, effort, arm, rep, manifest),
+                                      phase=phase, run_id=rid, attempt=attempt, failure_mode="harness_error",
+                                      success=False, harness_error="%s: %s" % (type(error).__name__, error))
                     if record["failure_mode"] == "harness_error":
                         errors += 1
                         if errors >= config.MAX_ATTEMPTS:

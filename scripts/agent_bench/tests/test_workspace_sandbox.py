@@ -58,6 +58,54 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(workspace.secret_scan(root, ["a.env:1:generic_secret"]), [])
 
 
+class CargoCacheTests(unittest.TestCase):
+    """The Cargo git cache can hold unmutated originals of task files."""
+
+    def fake_cargo_home(self):
+        home = helpers.tempdir(self) / "cargo"
+        for ident, revisions in (("proj-0123456789abcdef", ["aaaaaaa"]), ("dep-fedcba9876543210", ["1111111", "2222222"]),
+                                 ("other-00112233445566aa", ["3333333"])):
+            for revision in revisions:
+                (home / "git" / "checkouts" / ident / revision).mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "--bare", str(home / "git" / "db" / ident)], check=True)
+        return home
+
+    def store_blob(self, db, text):
+        subprocess.run(["git", "--git-dir", str(db), "hash-object", "-w", "--stdin"], input=text.encode(),
+                       capture_output=True, check=True)
+
+    def test_hides_own_repository_unlocked_revisions_and_unused_databases(self):
+        home = self.fake_cargo_home()
+        repo = helpers.tempdir(self) / "repo"
+        repo.mkdir()
+        (repo / "Cargo.lock").write_text('[[package]]\nname = "dep"\nsource = "git+https://example.invalid/org/dep.git'
+                                         '?branch=main#1111111aaaabbbbccccddddeeeeffff00001111"\n')
+        hidden = {str(p.relative_to(home)) for p in sandbox.cargo_git_denies(home, ["proj"], repo)}
+        self.assertIn("git/checkouts/proj-0123456789abcdef", hidden)
+        self.assertIn("git/db/proj-0123456789abcdef", hidden)
+        self.assertIn("git/checkouts/dep-fedcba9876543210/2222222", hidden)
+        self.assertNotIn("git/checkouts/dep-fedcba9876543210/1111111", hidden)
+        self.assertNotIn("git/db/dep-fedcba9876543210", hidden)
+        self.assertIn("git/db/other-00112233445566aa", hidden)
+        (repo / "Cargo.lock").write_text('source = "git+https://example.invalid/org/proj#aaaaaaa1"\n')
+        with self.assertRaises(ValueError):
+            sandbox.cargo_git_denies(home, ["proj"], repo)
+
+    def test_originals_reachable_in_a_needed_database_are_reported(self):
+        home = self.fake_cargo_home()
+        repo = helpers.tempdir(self) / "repo"
+        repo.mkdir()
+        (repo / "Cargo.lock").write_text('source = "git+https://example.invalid/org/dep.git#1111111aaaa"\n')
+        self.store_blob(home / "git" / "db" / "dep-fedcba9876543210", "fn original() {}\n")
+        self.store_blob(home / "git" / "db" / "proj-0123456789abcdef", "fn hidden_copy() {}\n")
+        denies = sandbox.cargo_git_denies(home, ["proj"], repo)
+        found = sandbox.reachable_blobs({"src/a.rs": "fn original() {}\n", "src/b.rs": "fn hidden_copy() {}\n",
+                                         "src/c.rs": "fn new() {}\n"}, home, denies)
+        self.assertEqual(found, {"src/a.rs": ["dep-fedcba9876543210"]})
+        task = {"controls": {"inverse_files": {"src/a.rs": "fn original() {}\n"}}}
+        self.assertEqual(sandbox.answer_key_exposure(task, home, denies), [("src/a.rs", "dep-fedcba9876543210")])
+
+
 @unittest.skipUnless(sandbox.available(), "sandbox-exec not available")
 class SandboxTests(unittest.TestCase):
     def test_self_test(self):

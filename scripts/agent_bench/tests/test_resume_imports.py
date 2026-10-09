@@ -92,6 +92,56 @@ class ResumeTests(unittest.TestCase):
         rows = [r for r in self.rows() if r["run_id"] == rid]
         self.assertEqual([(r["attempt"], r["failure_mode"]) for r in rows[2:]], [(3, "harness_error"), (4, "success")])
 
+    def test_setup_failures_pair_as_failures_not_as_a_new_pin_set(self):
+        """Three setup exceptions in arm b end as an unrecoverable b run that still pairs with arm a."""
+        import stats
+
+        def run_once(settings, task, model, effort, arm, rep, attempt, manifest, position=None, phase="main"):
+            if arm == "b" and task["id"] == "impact-x-01":
+                raise RuntimeError("justless init failed")
+            rid = config.run_id(settings.campaign, model, effort, arm, task["id"], rep, manifest,
+                                settings.justless_sha, settings.harness, settings.profile.capture_hash)
+            return dict(run_module.block_identity(settings, task, model, effort, arm, rep, manifest), run_id=rid,
+                        attempt=attempt, failure_mode="success", success=True, totals={"cost_usd": 1.0})
+        run_module.run_once = run_once
+        run_module.schedule(self.settings, TASKS, ["claude-haiku-5-5"], ["a", "b"], 1, "cc-default", "m", 1)
+        rows = [r for r in self.rows() if r["failure_mode"] in run_module.TERMINAL]
+        failed = [r for r in rows if r["failure_mode"] == "harness_unrecoverable"]
+        self.assertEqual(len(failed), 1)
+        clusters = stats.pairs(rows, "b", "a", "claude-haiku-5-5")
+        self.assertEqual(sorted(clusters), ["impact-x-01", "location-x-01"])
+        self.assertFalse(clusters["impact-x-01"][0][0]["success"])
+        result = stats.contrast(rows, "b", "a", "claude-haiku-5-5", B=50)
+        self.assertNotEqual(result["verdict"], "MIXED PINS")
+        self.assertEqual(result["estimate"]["n_blocks"], 2)
+
+    def test_export_audit_writes_blind_non_revert_successes(self):
+        home = self.dir / "store"
+        base = home / "campaigns" / "c"
+        base.mkdir(parents=True)
+        rows = []
+        for i, (family, success, revert) in enumerate((("bugfix", True, False), ("lint", True, True),
+                                                       ("bugfix", False, False), ("location", True, None))):
+            store = base / "runs" / ("r%d-1" % i)
+            store.mkdir(parents=True)
+            (store / "diff.patch").write_text("--- a/src/x.rs\n+++ b/src/x.rs\n-old %d\n+new %d\n" % (i, i))
+            rows.append({"run_id": "r%d" % i, "attempt": 1, "agent": "harness", "model": "m", "arm": "ab"[i % 2],
+                         "task_id": "%s-x-0%d" % (family, i), "family": family, "rep": 1, "success": success,
+                         "failure_mode": "success" if success else "wrong_fix",
+                         "oracle": {"details": {"exact_revert": revert}}, "transcript": str(store / "transcript.json")})
+        with open(str(base / "results.jsonl"), "w") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        self.assertEqual(run_module.main(["export-audit", "--home", str(home), "--campaign", "c"]), 0)
+        audit = home / "reports" / "c" / "audit"
+        index = json.loads((audit / "index.json").read_text())
+        self.assertEqual([entry["task"] for entry in index], ["bugfix-x-00"])
+        self.assertNotIn("arm", json.dumps(index))
+        patch = (audit / ("%s.patch" % index[0]["id"])).read_text()
+        self.assertIn("+new 0", patch)
+        key = json.loads((audit.parent / "audit_key.json").read_text())
+        self.assertEqual(key[index[0]["id"]]["arm"], "a")
+
     def test_paid_commands_refuse_dry_campaigns(self):
         home = self.dir / "store"
         run_module.mark_dry(home / "campaigns" / "dry-correct")

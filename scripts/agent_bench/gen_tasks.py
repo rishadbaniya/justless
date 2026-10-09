@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import baseline_build  # noqa: E402
 import config  # noqa: E402
 import oracles  # noqa: E402
+import sandbox  # noqa: E402
 import tasks as tasks_module  # noqa: E402
 import workspace  # noqa: E402
 
@@ -253,6 +254,14 @@ def work_copy(base, name):
     return work, target
 
 
+def exposed_files(repo, root, rels):
+    """Files whose current content is stored in a Cargo git database that a run of this repository can still
+    read. A mutation or lint injection there would leave its answer key reachable, so generation skips them."""
+    denies = sandbox.cargo_git_denies(config.CARGO_HOME, [repo], root)
+    texts = {rel: (Path(root) / rel).read_bytes() for rel in rels}
+    return set(sandbox.reachable_blobs(texts, config.CARGO_HOME, denies))
+
+
 def gen_rust_bugfix(repo, count, seed):
     base = config.HOME / "pristine" / repo
     pristine = base / "repo"
@@ -277,6 +286,7 @@ def gen_rust_bugfix(repo, count, seed):
     for site in sites:
         sites_by_fn.setdefault((site["file"], site["fn"]), []).append(site)
     order = balanced(list(sites), rng)
+    exposed = exposed_files(repo, pristine, sorted({s["file"] for s in sites}))
     work, target = work_copy(base, "work_bugfix")
     accepted = []
     used_fns = set()
@@ -285,6 +295,8 @@ def gen_rust_bugfix(repo, count, seed):
     for index, candidate in enumerate(order):
         if len(accepted) >= count:
             break
+        if candidate["file"] in exposed:
+            continue
         if (candidate["file"], candidate["fn"]) in used_fns or candidate["file"] in used_files:
             continue
         result, reason = validate_rust_candidate(repo, work, target, candidate, sites_by_fn, rng, flaky)
@@ -604,6 +616,7 @@ def gen_lint(repo, count, seed):
             eligible.append(package)
     order = list(eligible)
     rng.shuffle(order)
+    exposed = exposed_files(repo, pristine, sorted({rel for rels in packages.values() for rel in rels}))
     tasks_out = []
     used_files = set()
     verdicts = {}
@@ -628,6 +641,8 @@ def gen_lint(repo, count, seed):
         for candidate in candidates:
             if len(singles) >= 5:
                 break
+            if candidate["file"] in exposed:
+                continue
             if used.get(candidate["lint"], 0) >= 2 or any(
                     s["file"] == candidate["file"] and abs(s["offset"] - candidate["offset"]) < 200 for s in singles):
                 continue

@@ -114,7 +114,7 @@ def git_lock_sources(repo_root):
     lock = Path(repo_root) / "Cargo.lock"
     if not lock.exists():
         return []
-    prefix = 'source = "' + "g" + "it+"
+    prefix = 'source = "git+'
     out = set()
     for line in lock.read_text(errors="replace").split("\n"):
         if not line.startswith(prefix):
@@ -172,24 +172,39 @@ def git_blob_sha(text):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
+def readable_databases(cargo_home, denies):
+    db_root = Path(cargo_home) / "git" / "db"
+    if not db_root.is_dir():
+        return []
+    hidden = {str(Path(d)) for d in denies}
+    return [d for d in sorted(db_root.iterdir()) if d.is_dir() and str(d) not in hidden]
+
+
+def reachable_blobs(texts, cargo_home, denies):
+    """{text_key: [database names]} for file contents stored as a blob in a Cargo git database a run can read.
+    texts maps a key (such as a path) to file content; one `git cat-file --batch-check` per database."""
+    shas = {key: git_blob_sha(text) for key, text in texts.items()}
+    found = {}
+    if not shas:
+        return found
+    query = "".join(sha + "\n" for sha in sorted(set(shas.values()))).encode()
+    for db in readable_databases(cargo_home, denies):
+        proc = subprocess.run(["git", "--git-dir", str(db), "cat-file", "--batch-check"], input=query,
+                              capture_output=True)
+        present = {line.split()[0] for line in proc.stdout.decode("utf-8", "replace").splitlines()
+                   if line.strip() and not line.endswith(" missing")}
+        for key, sha in shas.items():
+            if sha in present:
+                found.setdefault(key, []).append(db.name)
+    return found
+
+
 def answer_key_exposure(task, cargo_home, denies):
     """[(file, database)] where an unmutated original of an edit task's file is still readable from a Cargo git
     database the build needs. The sandbox cannot hide those; validate-tasks reports them."""
     originals = (task.get("controls") or {}).get("inverse_files") or {}
-    db_root = Path(cargo_home) / "git" / "db"
-    if not originals or not db_root.is_dir():
-        return []
-    hidden = {str(Path(d)) for d in denies}
-    readable = [d for d in sorted(db_root.iterdir()) if d.is_dir() and str(d) not in hidden]
-    found = []
-    for rel, text in sorted(originals.items()):
-        sha = git_blob_sha(text)
-        for db in readable:
-            proc = subprocess.run(["g" + "it", "--git-dir", str(db), "cat-file", "-e", sha],
-                                  capture_output=True)
-            if proc.returncode == 0:
-                found.append((rel, db.name))
-    return found
+    found = reachable_blobs(originals, cargo_home, denies)
+    return [(rel, db) for rel in sorted(found) for db in found[rel]]
 
 
 def cargo_home_state(cargo_home):
