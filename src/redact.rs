@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 use crate::workspace::Workspace;
 
 /// Bump whenever a built-in rule changes, so archives scanned clean are scanned again.
-const RULES_VERSION: &str = "1";
+const RULES_VERSION: &str = "2";
 const READ_SIZE: usize = 64 * 1024;
 /// Lines longer than this are redacted in windows instead of being held whole.
 const WINDOW: usize = 1024 * 1024;
@@ -47,6 +47,14 @@ const WINDOW: usize = 1024 * 1024;
 const HOLD: usize = 8 * 1024;
 /// A private key block longer than this many lines ends the block.
 const PEM_LINES: usize = 1024;
+/// A private key block holding more than this many bytes ends, so memory stays bounded.
+const PEM_BYTES: usize = 256 * 1024;
+/// A key body line with more base64 than this is not key material.
+const PEM_LINE_BYTES: usize = 16 * 1024;
+/// Wrapped base64 is at most this wide; a longer first line starts no block.
+const WRAP_WIDTH: usize = 128;
+/// Text before a key header longer than this is not treated as a line prefix.
+const PREFIX_BYTES: usize = 256;
 
 const TRIGGERS: &[&str] = &[
     "AKIA",
@@ -97,6 +105,8 @@ const KEYWORDS: &[&str] = &[
     "credential",
     "authorization",
     "bearer",
+    "passphrase",
+    "pass_phrase",
 ];
 
 #[derive(Clone, Copy)]
@@ -218,9 +228,11 @@ const SPECS: &[Spec] = &[
         check: Check::Entropy(3.0),
         tail: r"[A-Za-z0-9_-]",
     },
+    // An image reference such as `docker://ubuntu:22.04@sha256:…` has a tag, not a
+    // password, before its digest.
     Spec {
         kind: "url-password",
-        pattern: r#"(?i-u)\b[a-z][a-z0-9+.-]{1,20}://[^\s:/?#@'"<>]{0,128}:(?P<s>[^\s/?#@'"<>]{4,256})@"#,
+        pattern: r#"(?i-u)\b[a-z][a-z0-9+.-]{1,20}://[^\s:/?#@'"<>]{0,128}:(?P<s>[^\s/?#@'"<>]{4,256})@(?P<x>sha(?:256|384|512):)?"#,
         check: Check::None,
         tail: r#"[^\s/?#@'"<>]"#,
     },
@@ -236,17 +248,20 @@ const SPECS: &[Spec] = &[
         check: Check::Generic(3.0),
         tail: r"[A-Za-z0-9._~+/=-]",
     },
+    // The value runs to whitespace, a quote or a backslash, so symbols such as `$`,
+    // `@` or `(` stay inside it. `n` is the rest of the name, `sep` the separator and
+    // `q` an opening quote; `Check::Generic` reads them.
     Spec {
         kind: "secret",
-        pattern: r#"(?i-u)(?:password|passwd|secret|token|api[_.-]?key|apikey|access[_.-]?key|private[_.-]?key|credentials?)[A-Za-z0-9_.-]{0,20}(?:\\?["'])?\s{0,3}(?::=|=>|=|:)\s{0,3}(?:\\?["'`])?(?P<s>[A-Za-z0-9+/_.~=!#%^&*-]{12,})"#,
+        pattern: r#"(?i-u)(?:password|passwd|pass[_.-]?phrase|secret|token|api[_.-]?key|apikey|access[_.-]?key|private[_.-]?key|credentials?)(?P<n>[A-Za-z0-9_.-]{0,20})(?:\\?["'])?\s{0,3}(?P<sep>:=|=>|=|:)\s{0,3}(?P<q>\\?["'`])?(?P<s>[^\s"'`\\]{12,})"#,
         check: Check::Generic(3.5),
-        tail: r"[A-Za-z0-9+/_.~=!#%^&*-]",
+        tail: r#"[^\s"'`\\]"#,
     },
     Spec {
         kind: "secret",
-        pattern: r#"(?i-u)--[a-z0-9-]{0,30}(?:password|secret|token|api-key)[a-z0-9-]{0,20}\s{1,3}["']?(?P<s>[A-Za-z0-9+/_.~=!#%^&*-]{12,})"#,
+        pattern: r#"(?i-u)--[a-z0-9-]{0,30}(?:password|pass-?phrase|secret|token|api-key)[a-z0-9-]{0,20}\s{1,3}(?P<q>["'])?(?P<s>[^\s"'`\\]{12,})"#,
         check: Check::Generic(3.5),
-        tail: r"[A-Za-z0-9+/_.~=!#%^&*-]",
+        tail: r#"[^\s"'`\\]"#,
     },
 ];
 
@@ -312,10 +327,47 @@ static PEM_END: LazyLock<Regex> =
 /// What may follow a header that opens a block on the next lines: string syntax only.
 static PEM_TAIL: LazyLock<Regex> =
     LazyLock::new(|| compile(r#"(?-u)^(?:\s|\\[nr]|\\|["'`,+;().])*$"#));
-/// A body line: optional string syntax around base64 or an RFC 1421 header.
+/// A body line: optional string syntax around base64 or an RFC 1421 header. The
+/// length of the base64 is checked in code, so an unwrapped body still matches.
 static PEM_BODY: LazyLock<Regex> = LazyLock::new(|| {
     compile(
-        r#"(?-u)^(\s*["'`]?)([A-Za-z0-9+/=]{1,128}|(?:Proc-Type|DEK-Info|Comment|Version|Hash):[^"'`\\]*|)((?:\\[nr])*\\?["'`]?\s*[,+;)]*\s*\\?)\s*$"#,
+        r#"(?-u)^(\s*["'`]?)([A-Za-z0-9+/=]+|(?:Proc-Type|DEK-Info|Comment|Version|Hash):[^"'`\\]*|)((?:\\[nr])*\\?["'`]?\s*[,+;)]*\s*\\?)\s*$"#,
+    )
+});
+/// A line of wrapped base64, such as the output of `base64` or `openssl base64`.
+static ENCODED_LINE: LazyLock<Regex> =
+    LazyLock::new(|| compile(r"(?-u)^\s*([A-Za-z0-9+/]+={0,2})\s*$"));
+/// An unquoted value that is code: a call, macro, index, tuple or generic type, such
+/// as `hashlib.sha256(x)`, `Token![=](span),`, `buf.read::<u32>()?;`,
+/// `&self.0[i2];` or `Option<Ed25519PrivateKey>,`, or a path such as
+/// `&secp256k1::SecretKey`. What follows the bracket ends in closing syntax or holds
+/// only identifier characters, as when a space cut it off; after a method such as
+/// `path.match(` it can be anything. Symbols that code rarely holds, such as `@`, `%`
+/// or a `$` outside a macro variable, mark a generated password.
+static CODE: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(?-u)^[&*!]?(?:::)?(?:(?:[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|::|->)[A-Za-z0-9_]+)*(?:::)?!?)?[(\[<](?:(?:[^@$%^]|\$[A-Za-z_(])*[)\]>,;?{|]|[A-Za-z0-9_.:&*!<(\[]*)|[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+|[A-Za-z_][A-Za-z0-9_]*(?:\.|->)[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|::|->)[A-Za-z0-9_]+)*[(\[].*)$"#,
+    )
+});
+/// Template and placeholder syntax such as `{token2}`, `${{ secrets.X }}`, `%(pw)s`,
+/// `$(cat f)` or `<api-key-1>`, an interpolation such as `${config.url}/token`, or
+/// a character class such as `[A-Za-z0-9._~+/-]+`.
+static TEMPLATE: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r"(?-u)^(?:\$?\{.*\}|%\([A-Za-z_][A-Za-z0-9_]*\)[sdr]|\$\(.*\)|<.*>)$|\$\{[A-Za-z_][A-Za-z0-9_.]*\}|a-z|A-Z|0-9",
+    )
+});
+/// A checksum labelled with its algorithm, such as `sha256=4f9c…` or `sha512-…`.
+static DIGEST: LazyLock<Regex> = LazyLock::new(|| {
+    compile(r"(?i-u)^(?:sha1|sha224|sha256|sha384|sha512|md5|blake2b?|blake3)[-=:]")
+});
+/// A file extension ending a name, such as the `.rs` of `token.rs`.
+static EXTENSION: LazyLock<Regex> = LazyLock::new(|| compile(r"(?-u)\.[A-Za-z0-9]{1,8}$"));
+/// A source file name ending a key, such as `src/to_tokens.rs` in a checksum map.
+/// Files that could hold a secret themselves, such as `.txt` or `.env`, are not here.
+static SOURCE_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r"(?i-u)\.(?:rs|js|mjs|cjs|ts|tsx|jsx|css|scss|py|go|rb|java|kt|swift|c|h|cc|cpp|hpp|md|html|toml|lock|map|svg|png|xml|proto|wasm)$",
     )
 });
 
@@ -402,6 +454,25 @@ impl Redactor {
         }
     }
 
+    /// Whether redacting `input` gives exactly `expected`. Reading stops as soon as
+    /// the redacted text differs, so a large stream costs little.
+    pub fn matches(&self, input: impl Read, expected: &[u8]) -> io::Result<bool> {
+        let mut reader = Reader::new(input, Some(self));
+        let mut at = 0;
+        loop {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                return Ok(at == expected.len());
+            }
+            let length = chunk.len();
+            if expected.get(at..at + length) != Some(chunk) {
+                return Ok(false);
+            }
+            at += length;
+            reader.consume(length);
+        }
+    }
+
     pub fn text<'a>(&self, input: &'a str) -> Cow<'a, str> {
         match self.bytes(input.as_bytes()) {
             Cow::Borrowed(_) => Cow::Borrowed(input),
@@ -419,17 +490,12 @@ impl Redactor {
             && !self.allow.iter().any(|allow| allow.is_match(value))
     }
 
-    fn accepts(&self, check: Check, value: &[u8]) -> bool {
+    fn accepts(&self, check: Check, value: &[u8], context: Context) -> bool {
         self.shared(value)
             && match check {
                 Check::None => true,
                 Check::Entropy(minimum) => entropy(value) >= minimum,
-                Check::Generic(minimum) => {
-                    entropy(value) >= minimum
-                        && value.iter().any(u8::is_ascii_alphabetic)
-                        && value.iter().any(u8::is_ascii_digit)
-                        && !name_shaped(value)
-                }
+                Check::Generic(minimum) => generic(value, minimum, context),
                 Check::PemBody => base64_bytes(value) >= 32,
                 Check::PemBase64 => {
                     let start = decode_base64(&value[..value.len().min(64)]);
@@ -503,28 +569,106 @@ fn entropy(value: &[u8]) -> f64 {
         .sum()
 }
 
-/// Paths; identifier chains such as `ML_KEM_512_SHARED_SECRET_LENGTH` or
-/// `child1_token.child_token`, where every segment is letters followed by digits; and
-/// type names such as `Ed25519PrivateKey` that say what they hold. A random value
-/// contains one of those words about once in 2,000 tries.
-fn name_shaped(value: &[u8]) -> bool {
-    if [&b"/"[..], b"./", b"../", b"~/"]
+/// What surrounds a value matched after a keyword.
+#[derive(Clone, Copy)]
+struct Context<'a> {
+    /// The value follows an opening quote, so it is a string rather than code.
+    quoted: bool,
+    /// The separator was a bare `:`, as in a type annotation.
+    colon: bool,
+    /// The value before closing punctuation was trimmed from it.
+    untrimmed: &'a [u8],
+}
+
+/// A value after a keyword: high entropy with a letter and a digit, two symbols such
+/// as `@` or `$` as in a generated password, or a long run of mixed-case letters that
+/// is not CamelCase, and not code, a template, a checksum, a URL, a path or a name.
+fn generic(value: &[u8], minimum: f64, context: Context) -> bool {
+    let symbols = value
         .iter()
-        .any(|prefix| value.starts_with(prefix))
-    {
+        .filter(|byte| b"!@#$%^*?~+=|".contains(byte))
+        .count();
+    let entropy = entropy(value);
+    let random_letters = || {
+        value.len() >= 20
+            && entropy >= 4.0
+            && value.iter().any(u8::is_ascii_uppercase)
+            && value.iter().any(u8::is_ascii_lowercase)
+            && !value
+                .split(|byte| !byte.is_ascii_alphanumeric())
+                .all(word_like)
+    };
+    value.len() >= 12
+        && entropy >= minimum
+        && value.iter().any(u8::is_ascii_alphabetic)
+        && (symbols >= 2 || value.iter().any(u8::is_ascii_digit) || random_letters())
+        // `token::Kind` is a path, not `token: :Kind`.
+        && !(context.colon && !context.quoted && value.starts_with(b":"))
+        && !value.windows(3).any(|window| window == b"://")
+        && !DIGEST.is_match(value)
+        // A public 20-byte account address such as a token contract's; private keys
+        // are 32 bytes.
+        && !(value.len() == 42
+            && value.starts_with(b"0x")
+            && value[2..].iter().all(u8::is_ascii_hexdigit))
+        && !TEMPLATE.is_match(value)
+        && !TEMPLATE.is_match(context.untrimmed)
+        && !path_shaped(value)
+        && !identifier_chain(value)
+        && (context.quoted || !CODE.is_match(context.untrimmed) && !CODE.is_match(value))
+        && !(context.colon && !context.quoted && type_name(value))
+}
+
+/// A path such as `config/secrets/prod-2024`, `~/keys/ci_ed25519.pem` or
+/// `/Users/Me/MyProject`: it has a slash and no `+`, and every part between `/ . _ -`
+/// is a lowercase, uppercase or capitalised word with digits. A random base64 value
+/// with a slash has a long mixed-case part, so it is still treated as a secret.
+fn path_shaped(value: &[u8]) -> bool {
+    value.contains(&b'/')
+        && !value.contains(&b'+')
+        && value.split(|byte| b"/._-~@:".contains(byte)).all(word_like)
+}
+
+fn word_like(part: &[u8]) -> bool {
+    if !part.iter().all(u8::is_ascii_alphanumeric) {
+        return false;
+    }
+    if !part.iter().any(u8::is_ascii_uppercase) || !part.iter().any(u8::is_ascii_lowercase) {
         return true;
     }
-    // A reference such as `&X25519SharedSecret` is still a type.
-    let name = value.strip_prefix(b"&").unwrap_or(value);
-    if name.first().is_some_and(u8::is_ascii_uppercase)
-        && name
+    // CamelCase: each capital starts a word of lowercase letters, then digits.
+    let mut index = part
+        .iter()
+        .take_while(|byte| !byte.is_ascii_uppercase())
+        .count();
+    while index < part.len() {
+        index += 1;
+        let letters = part[index..]
             .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        && NAMED.is_match(name)
-    {
-        return true;
+            .take_while(|byte| byte.is_ascii_lowercase())
+            .count();
+        if letters == 0 {
+            return false;
+        }
+        index += letters;
+        index += part[index..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
     }
-    let separator = |byte: &u8| matches!(byte, b'_' | b'.' | b'-');
+    true
+}
+
+/// Identifier chains and simple expressions such as `ML_KEM_512_SHARED_SECRET_LENGTH`,
+/// `child1_token.child_token`, `&p256::PRIVATE_KEY_OPS`, `s->s3.mac_secret_size` or
+/// `params.secret_len*2`, where every segment is letters followed by digits.
+fn identifier_chain(value: &[u8]) -> bool {
+    let start = value
+        .iter()
+        .take_while(|byte| b"&*/".contains(byte))
+        .count();
+    let value = &value[start..];
+    let separator = |byte: &u8| matches!(byte, b'_' | b'.' | b'-' | b':' | b'*' | b'>' | b',');
     value.iter().any(separator)
         && value.split(separator).all(|segment| {
             let letters = segment
@@ -533,6 +677,96 @@ fn name_shaped(value: &[u8]) -> bool {
                 .count();
             segment[letters..].iter().all(u8::is_ascii_digit)
         })
+}
+
+/// A type name such as `Ed25519PrivateKey` in `private_key: Ed25519PrivateKey`:
+/// capitalised and alphanumeric, naming what it holds, with at most two runs of
+/// digits. Only a value after a bare `:` is checked for it, so `PASSWORD=MyPass2024`
+/// is still redacted.
+fn type_name(value: &[u8]) -> bool {
+    // A reference such as `&X25519SharedSecret` is still a type.
+    let name = value.strip_prefix(b"&").unwrap_or(value);
+    let digit_runs = name
+        .iter()
+        .enumerate()
+        .filter(|&(index, byte)| {
+            byte.is_ascii_digit() && (index == 0 || !name[index - 1].is_ascii_digit())
+        })
+        .count();
+    name.first().is_some_and(u8::is_ascii_uppercase)
+        && name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        && NAMED.is_match(name)
+        && digit_runs <= 2
+}
+
+/// Hex of a checksum's length or longer, as in a checksum map.
+fn hex_digest(value: &[u8]) -> bool {
+    value.len() >= 32 && value.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// The keyword is part of a file name or path, such as `src/token.rs` or
+/// `secrets/db_password`, as a search prints before each line.
+fn file_name(hay: &[u8], start: usize, name: &[u8]) -> bool {
+    let floor = start.saturating_sub(PREFIX_BYTES);
+    let word = hay[floor..start]
+        .iter()
+        .rposition(|byte| !(byte.is_ascii_alphanumeric() || b"_.-/".contains(byte)))
+        .map_or(floor, |index| floor + index + 1);
+    hay[word..start].contains(&b'/') || EXTENSION.is_match(name)
+}
+
+/// The length of a leading line number such as `107:` or `12-`.
+fn line_number(value: &[u8]) -> usize {
+    let digits = value
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    match value.get(digits) {
+        Some(b':' | b'-') if digits > 0 => digits + 1,
+        _ => 0,
+    }
+}
+
+/// Whether `at` falls inside a marker, such as the `password` in
+/// `[redacted:url-password:1b03]`, so redacting twice changes nothing.
+fn inside_marker(hay: &[u8], at: usize) -> bool {
+    let floor = at.saturating_sub(40);
+    hay[floor..at]
+        .iter()
+        .rposition(|&byte| byte == b'[' || byte == b']')
+        .is_some_and(|index| hay[floor + index..].starts_with(b"[redacted:"))
+}
+
+/// Drops punctuation that ends an unquoted value rather than belonging to it: a
+/// trailing comma or colon, or a bracket the value did not open.
+fn trim(hay: &[u8], mut range: Range<usize>, quoted: bool) -> Range<usize> {
+    const PAIRS: [(u8, u8); 4] = [(b'(', b')'), (b'[', b']'), (b'{', b'}'), (b'<', b'>')];
+    // Opened minus closed, per bracket pair.
+    let mut open = [0isize; 4];
+    for byte in &hay[range.clone()] {
+        for (index, (opener, closer)) in PAIRS.iter().enumerate() {
+            open[index] += isize::from(byte == opener) - isize::from(byte == closer);
+        }
+    }
+    while range.end > range.start {
+        let last = hay[range.end - 1];
+        let pair = PAIRS.iter().position(|(_, closer)| *closer == last);
+        let drop = !quoted
+            && match pair {
+                Some(index) => open[index] < 0,
+                None => b",;:.".contains(&last),
+            };
+        if !drop {
+            break;
+        }
+        if let Some(index) = pair {
+            open[index] += 1;
+        }
+        range.end -= 1;
+    }
+    range
 }
 
 /// Base64 bytes in a value, not counting `\n` and `\r` escapes.
@@ -587,13 +821,94 @@ fn content_len(line: &[u8]) -> usize {
 }
 
 /// A private key header with nothing but string syntax after it, so the key follows
-/// on the next lines.
-fn pem_opens(text: &[u8]) -> bool {
-    let Some(begin) = PEM_BEGIN.find_iter(text).last() else {
-        return false;
-    };
+/// on the next lines. Returns the shape of the text before the header, which each
+/// body line repeats when a tool prefixes lines, as `rg -n`, `git diff` or a
+/// timestamped log do.
+fn pem_opens(text: &[u8]) -> Option<Prefix> {
+    let text = without_colors(text);
+    let begin = PEM_BEGIN.find_iter(&text).last()?;
     let tail = &text[begin.end()..];
-    !PEM_END.is_match(tail) && PEM_TAIL.is_match(tail)
+    (!PEM_END.is_match(tail) && PEM_TAIL.is_match(tail))
+        .then(|| Prefix::new(&text[..begin.start()]))
+}
+
+fn without_colors(text: &[u8]) -> Cow<'_, [u8]> {
+    if text.contains(&0x1b) {
+        ANSI.replace_all(text, &b""[..])
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Token {
+    /// A diff marker: `+`, `-` or a space.
+    Diff,
+    /// One or more digits, such as a line number.
+    Digits,
+    /// Spaces or tabs, possibly none.
+    Space,
+    /// `:` or `-`, which search tools use for matches and context lines.
+    Separator,
+    Byte(u8),
+}
+
+/// The shape of the text before a key header, such as `+`, `12:`, `id_rsa-3-`,
+/// `     4\t` or `2026-11-18T10:00:00Z `. Body lines carry the same shape with their
+/// own line numbers, times or diff markers.
+#[derive(Default)]
+struct Prefix(Vec<Token>);
+
+impl Prefix {
+    fn new(text: &[u8]) -> Self {
+        if text.len() > PREFIX_BYTES {
+            return Self::default();
+        }
+        let mut tokens = Vec::new();
+        let mut index = 0;
+        while index < text.len() {
+            let byte = text[index];
+            let run = |test: fn(&u8) -> bool| text[index..].iter().take_while(|b| test(b)).count();
+            let (token, length) = if index == 0 && (byte == b'+' || byte == b'-' || text == b" ") {
+                (Token::Diff, 1)
+            } else if byte.is_ascii_digit() {
+                (Token::Digits, run(u8::is_ascii_digit))
+            } else if byte == b' ' || byte == b'\t' {
+                (Token::Space, run(|b| *b == b' ' || *b == b'\t'))
+            } else if byte == b':' || byte == b'-' {
+                (Token::Separator, 1)
+            } else {
+                (Token::Byte(byte), 1)
+            };
+            tokens.push(token);
+            index += length;
+        }
+        Self(tokens)
+    }
+
+    /// The length of this shape at the start of `line`, if the line has it.
+    fn find(&self, line: &[u8]) -> Option<usize> {
+        let mut at = 0;
+        for token in &self.0 {
+            let rest = &line[at..];
+            let run = |test: fn(&u8) -> bool| rest.iter().take_while(|b| test(b)).count();
+            let length = match token {
+                Token::Diff => usize::from(matches!(rest.first(), Some(b'+' | b'-' | b' '))),
+                Token::Digits => run(u8::is_ascii_digit),
+                Token::Space => {
+                    at += run(|b| *b == b' ' || *b == b'\t');
+                    continue;
+                }
+                Token::Separator => usize::from(matches!(rest.first(), Some(b':' | b'-'))),
+                Token::Byte(byte) => usize::from(rest.first() == Some(byte)),
+            };
+            if length == 0 {
+                return None;
+            }
+            at += length;
+        }
+        Some(at)
+    }
 }
 
 struct Hit {
@@ -613,11 +928,41 @@ struct Continuation {
     last: u8,
 }
 
+/// A line buffered inside a key block.
+struct PemLine {
+    original: Vec<u8>,
+    /// The line without terminal colors, when it had any. Ranges index this text.
+    plain: Option<Vec<u8>>,
+    /// Key material or an RFC 1421 header value, removed when the block is redacted.
+    range: Range<usize>,
+    material: bool,
+}
+
+/// A private key block being buffered, so its whole body gets one marker.
 #[derive(Default)]
 struct Pem {
-    /// Each buffered line, its material or header range, and whether it is key material.
-    lines: Vec<(Vec<u8>, Range<usize>, bool)>,
+    prefix: Prefix,
+    lines: Vec<PemLine>,
     material: Vec<u8>,
+    bytes: usize,
+    /// Wrapped base64 of a whole key, with the width of its first line, which was
+    /// already redacted and counted.
+    encoded: Option<usize>,
+}
+
+impl Pem {
+    fn push(&mut self, line: PemLine) {
+        self.bytes += line.original.len();
+        if line.material {
+            let text = line.plain.as_ref().unwrap_or(&line.original);
+            self.material.extend_from_slice(&text[line.range.clone()]);
+        }
+        self.lines.push(line);
+    }
+
+    fn full(&self, line: &[u8]) -> bool {
+        self.lines.len() >= PEM_LINES || self.bytes + line.len() > PEM_BYTES
+    }
 }
 
 /// Push-based redaction state for one stream.
@@ -633,6 +978,9 @@ struct Engine<'r> {
     partial: bool,
     continuation: Option<Continuation>,
     pem: Option<Pem>,
+    /// Markers the last `redact` call wrote: where in its output, the rule, and the
+    /// secret's range in its input.
+    spans: Vec<(Range<usize>, usize, Range<usize>)>,
     count: u64,
 }
 
@@ -649,6 +997,7 @@ impl<'r> Engine<'r> {
             partial: false,
             continuation: None,
             pem: None,
+            spans: Vec::new(),
             count: 0,
         }
     }
@@ -778,8 +1127,11 @@ impl<'r> Engine<'r> {
             let end = content_len(&line).max(self.context);
             let start = out.len();
             self.redact(&line[..end], self.context, None, out);
-            if pem_opens(&out[start..]) {
-                self.pem = Some(Pem::default());
+            if let Some(prefix) = pem_opens(&out[start..]) {
+                self.pem = Some(Pem {
+                    prefix,
+                    ..Pem::default()
+                });
             }
             out.extend_from_slice(&line[end..]);
         } else {
@@ -806,19 +1158,56 @@ impl<'r> Engine<'r> {
     fn candidate(&mut self, line: &[u8], out: &mut Vec<u8>) {
         let (body, terminator) = line.split_at(content_len(line));
         let start = out.len();
-        if body.contains(&0x1b) {
+        let stripped;
+        let hay = if body.contains(&0x1b) {
             // Colors can split a keyword from its value. Match without them, and keep
             // the original bytes unless something was redacted.
-            let stripped = ANSI.replace_all(body, &b""[..]);
+            stripped = ANSI.replace_all(body, &b""[..]);
             let before = self.count;
             let mut redacted = Vec::with_capacity(stripped.len());
             self.redact(&stripped, 0, None, &mut redacted);
-            out.extend_from_slice(if self.count > before { &redacted } else { body });
+            if self.count > before {
+                out.extend_from_slice(&redacted);
+                &stripped[..]
+            } else {
+                out.extend_from_slice(body);
+                body
+            }
         } else {
             self.redact(body, 0, None, out);
-        }
-        if pem_opens(&out[start..]) {
-            self.pem = Some(Pem::default());
+            body
+        };
+        if let Some(prefix) = pem_opens(&out[start..]) {
+            self.pem = Some(Pem {
+                prefix,
+                ..Pem::default()
+            });
+        } else if let Some((marker, secret)) =
+            self.spans.iter().find_map(|(marker, rule, secret)| {
+                // Base64 of a whole key that `base64` or `openssl base64` wrapped: the
+                // next lines hold the rest of it.
+                (matches!(RULES.list[*rule].check, Check::PemBase64)
+                    && secret.len() <= WRAP_WIDTH
+                    && hay[secret.end..].iter().all(u8::is_ascii_whitespace))
+                .then(|| (marker.clone(), hay[secret.clone()].to_vec()))
+            })
+        {
+            let mut first = out.split_off(start);
+            let prefix = Prefix::new(&first[..marker.start]);
+            first.extend_from_slice(terminator);
+            self.pem = Some(Pem {
+                prefix,
+                bytes: first.len(),
+                lines: vec![PemLine {
+                    original: first,
+                    plain: None,
+                    range: marker,
+                    material: true,
+                }],
+                encoded: Some(secret.len()),
+                material: secret,
+            });
+            return;
         }
         out.extend_from_slice(terminator);
     }
@@ -826,32 +1215,98 @@ impl<'r> Engine<'r> {
     /// Buffers a line inside a key block. Returns false when the line ends the block
     /// without belonging to it.
     fn pem_line(&mut self, line: &[u8], out: &mut Vec<u8>) -> bool {
+        let pem = self.pem.as_ref().expect("key block");
         let body = &line[..content_len(line)];
-        if PEM_END.is_match(body) {
-            let pem = self.pem.as_mut().expect("key block");
-            pem.lines.push((line.to_vec(), 0..0, false));
+        let text = without_colors(body);
+        let plain =
+            matches!(text, Cow::Owned(_)).then(|| [&text[..], &line[body.len()..]].concat());
+        if pem.encoded.is_some() {
+            return self.encoded_line(line, &text, plain, out);
+        }
+        if PEM_END.is_match(&text) {
+            let line = PemLine {
+                original: line.to_vec(),
+                plain: None,
+                range: 0..0,
+                material: false,
+            };
+            self.pem.as_mut().expect("key block").push(line);
             self.flush_pem(out);
             return true;
         }
-        let pem = self.pem.as_mut().expect("key block");
-        if pem.lines.len() < PEM_LINES
-            && let Some(captures) = PEM_BODY.captures(body)
-        {
-            let range = captures.get(2).expect("material group").range();
-            let value = &body[range.clone()];
-            let material = !value.is_empty() && !value.contains(&b':');
-            if material {
-                if pem.material.is_empty() && value.len() < 16 {
-                    self.flush_pem(out);
-                    return false;
-                }
-                pem.material.extend_from_slice(value);
-            }
-            pem.lines.push((line.to_vec(), range, material));
-            return true;
+        let found = (!pem.full(line))
+            .then(|| {
+                // Prefer the header's prefix, such as `12-` or `+`; string syntax and
+                // indentation are part of the body pattern.
+                pem.prefix
+                    .find(&text)
+                    .and_then(|start| {
+                        pem_body(&text[start..])
+                            .map(|(range, m)| (range.start + start..range.end + start, m))
+                    })
+                    .or_else(|| pem_body(&text))
+            })
+            .flatten();
+        let Some((range, material)) = found else {
+            self.flush_pem(out);
+            return false;
+        };
+        if material && pem.material.is_empty() && range.len() < 16 {
+            self.flush_pem(out);
+            return false;
         }
-        self.flush_pem(out);
-        false
+        let line = PemLine {
+            original: line.to_vec(),
+            plain,
+            range,
+            material,
+        };
+        self.pem.as_mut().expect("key block").push(line);
+        true
+    }
+
+    /// Buffers a line of wrapped base64 after the first. Lines as wide as the first
+    /// continue the block; a shorter line ends it when the decoded text then ends a key.
+    fn encoded_line(
+        &mut self,
+        line: &[u8],
+        text: &[u8],
+        plain: Option<Vec<u8>>,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let pem = self.pem.as_ref().expect("key block");
+        let width = pem.encoded.expect("encoded block");
+        let found = pem
+            .prefix
+            .find(text)
+            .and_then(|start| {
+                encoded_body(&text[start..]).map(|range| range.start + start..range.end + start)
+            })
+            .or_else(|| encoded_body(text))
+            .filter(|range| range.len() <= width && !pem.full(line));
+        let last = found.as_ref().is_some_and(|range| range.len() < width);
+        let accepted = found.filter(|range| {
+            !last || {
+                let mut material = pem.material.clone();
+                material.extend_from_slice(&text[range.clone()]);
+                material.len().is_multiple_of(4) && ends_key(&material)
+            }
+        });
+        let Some(range) = accepted else {
+            self.flush_pem(out);
+            return false;
+        };
+        let line = PemLine {
+            original: line.to_vec(),
+            plain,
+            range,
+            material: true,
+        };
+        self.pem.as_mut().expect("key block").push(line);
+        if last {
+            self.flush_pem(out);
+        }
+        true
     }
 
     /// Emits a buffered key block: the first material line becomes one marker, the
@@ -860,20 +1315,30 @@ impl<'r> Engine<'r> {
         let Some(pem) = self.pem.take() else {
             return;
         };
-        if pem.material.is_empty() || !self.redactor.shared(&pem.material) {
-            for (line, ..) in pem.lines {
-                out.extend_from_slice(&line);
+        let encoded = pem.encoded.is_some();
+        if !encoded && (pem.material.is_empty() || !self.redactor.shared(&pem.material)) {
+            for line in pem.lines {
+                out.extend_from_slice(&line.original);
             }
             return;
         }
-        self.count += 1;
+        // The first line of encoded base64 was already counted when it was redacted.
+        if !encoded {
+            self.count += 1;
+        }
         let mut marker = Some(self.redactor.marker("private-key", &pem.material));
-        for (line, range, material) in pem.lines {
-            out.extend_from_slice(&line[..range.start]);
-            if material && let Some(marker) = marker.take() {
+        for line in pem.lines {
+            let text = match &line.plain {
+                Some(plain) if !line.range.is_empty() => plain,
+                _ => &line.original,
+            };
+            out.extend_from_slice(&text[..line.range.start]);
+            if line.material
+                && let Some(marker) = marker.take()
+            {
                 out.extend_from_slice(&marker);
             }
-            out.extend_from_slice(&line[range.end..]);
+            out.extend_from_slice(&text[line.range.end..]);
         }
     }
 
@@ -890,7 +1355,7 @@ impl<'r> Engine<'r> {
     ) -> (usize, Option<Continuation>) {
         let end = hay.len();
         let hits = if from < end && PREFILTER.is_match_at(hay, from) {
-            hits(self.redactor, hay, from)
+            hits(self.redactor, hay, from, hold.is_some())
         } else {
             Vec::new()
         };
@@ -925,12 +1390,22 @@ impl<'r> Engine<'r> {
                 });
             }
         }
+        // A secret that ends before its match, as in `user:pw@` at the window's end,
+        // is emitted whole rather than cut.
+        if let Some((secret, _)) = spans.last() {
+            emit = emit.max(secret.end);
+        }
+        let base = out.len();
+        self.spans.clear();
         let mut at = from;
-        for (secret, rule) in &spans {
+        for (secret, rule) in spans {
             out.extend_from_slice(&hay[at..secret.start]);
             if secret.end != end || continuation.is_none() {
-                let kind = RULES.list[*rule].kind;
+                let kind = RULES.list[rule].kind;
+                let start = out.len() - base;
                 out.extend_from_slice(&self.redactor.marker(kind, &hay[secret.clone()]));
+                self.spans
+                    .push((start..out.len() - base, rule, secret.clone()));
             }
             self.count += 1;
             at = secret.end;
@@ -940,16 +1415,48 @@ impl<'r> Engine<'r> {
     }
 }
 
+/// The material or header range of a key body line, and whether it is material.
+fn pem_body(text: &[u8]) -> Option<(Range<usize>, bool)> {
+    let captures = PEM_BODY.captures(text)?;
+    let range = captures.get(2).expect("material group").range();
+    let value = &text[range.clone()];
+    let material = !value.is_empty() && !value.contains(&b':');
+    (!material || value.len() <= PEM_LINE_BYTES).then_some((range, material))
+}
+
+/// The base64 of a line of wrapped base64.
+fn encoded_body(text: &[u8]) -> Option<Range<usize>> {
+    Some(
+        ENCODED_LINE
+            .captures(text)?
+            .get(1)
+            .expect("base64 group")
+            .range(),
+    )
+}
+
+/// Whether complete base64 decodes to text ending in a PEM footer's dashes.
+fn ends_key(material: &[u8]) -> bool {
+    let decoded = decode_base64(&material[material.len().saturating_sub(64)..]);
+    let end = decoded
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index + 1);
+    decoded[..end].ends_with(b"-----")
+}
+
 fn line_end(data: &[u8]) -> usize {
     data.iter()
         .position(|&byte| byte == b'\n')
         .map_or(data.len(), |index| index + 1)
 }
 
-/// Every rule match from `from`, accepted or not, in rule order.
-fn hits(redactor: &Redactor, hay: &[u8], from: usize) -> Vec<Hit> {
+/// Every rule match from `from`, accepted or not, in rule order. With `open_end`, the
+/// line goes on past `hay`, so a value that reaches its end is kept whole.
+fn hits(redactor: &Redactor, hay: &[u8], from: usize, open_end: bool) -> Vec<Hit> {
     let rules = &*RULES;
     let mut hits = Vec::new();
+    let mut rescan = 2 * (hay.len() - from) + 4096;
     for index in rules.set.matches_at(hay, from).iter() {
         let rule = &rules.list[index];
         let mut at = from;
@@ -957,15 +1464,53 @@ fn hits(redactor: &Redactor, hay: &[u8], from: usize) -> Vec<Hit> {
             && let Some(captures) = rule.re.captures_at(hay, at)
         {
             let whole = captures.get(0).expect("match");
-            let secret = captures.name("s").expect("secret group");
+            let found = captures.name("s").expect("secret group");
+            let quoted = captures.name("q").is_some();
+            let generic = matches!(rule.check, Check::Generic(_));
+            let name = captures.name("n").map_or(&b""[..], |name| name.as_bytes());
+            let colon = captures
+                .name("sep")
+                .is_some_and(|sep| sep.as_bytes() == b":");
+            let mut start = found.start();
+            if generic && colon && !quoted && file_name(hay, whole.start(), name) {
+                // After a file name, as in `src/token.rs:107:` from a search, the value
+                // is the line's text, so its line number is not part of it.
+                start += line_number(&hay[start..found.end()]);
+            }
+            let secret = if generic && !(open_end && found.end() == hay.len()) {
+                trim(hay, start..found.end(), quoted)
+            } else {
+                start..found.end()
+            };
+            let context = Context {
+                quoted,
+                colon,
+                untrimmed: &hay[start..found.end()],
+            };
+            let value = &hay[secret.clone()];
+            // An `x` group marks a match to leave alone, such as an image digest.
+            let ok = captures.name("x").is_none()
+                && redactor.accepts(rule.check, value, context)
+                && !inside_marker(hay, whole.start())
+                // A checksum after a source file name such as `src/to_tokens.rs`.
+                && !(generic && hex_digest(value) && SOURCE_FILE.is_match(name));
             hits.push(Hit {
                 start: whole.start(),
                 end: whole.end(),
-                secret: secret.range(),
+                secret,
                 rule: index,
-                ok: redactor.accepts(rule.check, secret.as_bytes()),
+                ok,
             });
-            at = whole.end().max(whole.start() + 1);
+            // A rejected value can hold another assignment, as in
+            // `token_url=https://h/?token=…`, so look inside it, within a budget
+            // that keeps a long run of keywords linear.
+            let next = if generic && !ok && found.len() <= rescan {
+                rescan -= found.len();
+                found.start()
+            } else {
+                whole.end()
+            };
+            at = next.max(whole.start() + 1);
         }
     }
     hits
@@ -1785,6 +2330,93 @@ mod tests {
         }
     }
 
+    /// A key block whose lines carry `prefix(line number)`, with a trailing newline.
+    fn prefixed(seed: &str, prefix: impl Fn(usize) -> String) -> String {
+        private_key_block(seed, "", 6)
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("{}{line}\n", prefix(index + 1)))
+            .collect()
+    }
+
+    /// A key block base64-encoded and wrapped at `width`, with a trailing newline.
+    fn wrapped(seed: &str, width: usize) -> String {
+        let block = private_key_block(seed, "", 6).join("\n") + "\n";
+        base64(block.as_bytes())
+            .as_bytes()
+            .chunks(width)
+            .map(|line| format!("{}\n", std::str::from_utf8(line).unwrap()))
+            .collect()
+    }
+
+    fn key_marker(output: &str) -> &str {
+        let start = output.find("[redacted:private-key:").expect("marker");
+        &output[start..start + 27]
+    }
+
+    #[test]
+    fn prefixed_colored_and_wrapped_blocks() {
+        let redactor = redactor();
+        let body = pem_body("", 6);
+        let plain = text(&prefixed("", |_| String::new()));
+        let expected = key_marker(&plain).to_owned();
+        let shapes: [&dyn Fn(usize) -> String; 7] = [
+            &|n| format!("{n}:"),
+            &|n| {
+                format!(
+                    "id_rsa{}{n}{}",
+                    if n == 1 { ":" } else { "-" },
+                    if n == 1 { ":" } else { "-" }
+                )
+            },
+            &|n| format!("{n:>6}\t"),
+            &|n| if n % 2 == 0 { "-".into() } else { "+".into() },
+            &|n| format!("2026-11-18T10:00:{n:02}.{}Z ", "5".repeat(n % 4 + 1)),
+            &|_| "\x1b[32m+\x1b[m\x1b[32m".into(),
+            &|_| "    ".into(),
+        ];
+        for shape in shapes {
+            let input = prefixed("", shape);
+            let (output, count) = redact(&redactor, input.as_bytes());
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(count, 1, "{input}");
+            assert_eq!(key_marker(&output), expected, "{output}");
+            assert_eq!(output.lines().count(), input.lines().count());
+            assert!(
+                body.iter().all(|line| !output.contains(&line[..32])),
+                "{output}"
+            );
+            // The prefix of the first body line stays.
+            let second = input.lines().nth(1).unwrap();
+            let prefix = &second[..second.find(&body[0]).unwrap()];
+            let prefix = ANSI.replace_all(prefix.as_bytes(), &b""[..]);
+            assert!(
+                output
+                    .lines()
+                    .nth(1)
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(&prefix)
+            );
+            assert_eq!(
+                redactor.bytes(output.as_bytes()),
+                Cow::Borrowed(output.as_bytes())
+            );
+        }
+
+        let one = text(&wrapped("wrapped", 64));
+        let two = text(&wrapped("wrapped", 76));
+        assert_eq!(key_marker(&one), key_marker(&two));
+        assert!(one.lines().skip(1).all(str::is_empty), "{one}");
+        assert_ne!(key_marker(&one), key_marker(&text(&wrapped("other", 64))));
+        // A short line that does not end the key is not part of it.
+        let mut cut = wrapped("cut", 64);
+        cut.truncate(cut.rfind('\n').unwrap());
+        cut.truncate(cut.rfind('\n').unwrap() + 1);
+        let output = text(&format!("{cut}done\n"));
+        assert!(output.ends_with("\ndone\n"), "{output}");
+    }
+
     #[test]
     fn chunked_input_matches_whole_input() {
         let redactor = redactor();
@@ -1794,7 +2426,10 @@ mod tests {
             input.push_str("\r\n");
         }
         input.push_str(&private_key_block("chunks", "EC ", 3).join("\n"));
-        input.push_str("\n\x1b[31mpassword\x1b[0m: ");
+        input.push('\n');
+        input.push_str(&prefixed("chunks-diff", |n| format!("\x1b[32m{n}:\x1b[m")));
+        input.push_str(&wrapped("chunks-b64", 64));
+        input.push_str("\x1b[31mpassword\x1b[0m: ");
         input.push_str(&base62("ansi", 16));
         let whole = redactor.bytes(input.as_bytes()).into_owned();
         for size in [1, 7, 4096] {
@@ -1810,7 +2445,7 @@ mod tests {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
         assert_eq!(output, whole);
-        assert_eq!(reader.found().count, 18);
+        assert_eq!(reader.found().count, 20);
         assert_eq!(reader.found().rules, redactor.fingerprint());
     }
 
@@ -1831,9 +2466,16 @@ mod tests {
         let filler = base62("filler", 3 * window);
         let secret = format!("{}{}", "gh", "p_") + &base62("window", 36);
         let generic = base62("generic-window", 30);
+        let symbols = format!("{}$(x)@y,", base62("symbols-window", 20));
+        let url = format!("redis://u:{}@h", base62("url-window", 12));
         // Sweep across both the hold-back cut and the window end.
         for offset in (window - hold - 300..window + 300).step_by(7) {
-            for (value, prefix) in [(&secret, " "), (&generic, " api_key=")] {
+            for (value, prefix) in [
+                (&secret, " "),
+                (&generic, " api_key="),
+                (&symbols, " password="),
+                (&url, " "),
+            ] {
                 let mut line = filler[..offset].to_owned();
                 line.push_str(prefix);
                 line.push_str(value);
@@ -1884,6 +2526,14 @@ mod tests {
             text,
             String::from_utf8(redact(&redactor, line.as_bytes()).0).unwrap()
         );
+        // Punctuation after a value that runs past a window is absorbed with it,
+        // wherever the window falls.
+        for offset in (0..64).step_by(3) {
+            let line = format!("{} token={value}, tail\n", "-".repeat(3000 + offset));
+            let text = String::from_utf8(windowed(&redactor, line.as_bytes(), 8192, 1024)).unwrap();
+            assert!(text.ends_with(" tail\n"), "{offset}");
+            assert!(!text.contains(&value[value.len() - 16..]), "{offset}");
+        }
     }
 
     #[test]
@@ -1935,7 +2585,7 @@ mod tests {
         assert_eq!(redact(&allowed, line.as_bytes()).1, 0);
         assert_eq!(redact(&redactor(), line.as_bytes()).1, 1);
         assert_ne!(allowed.fingerprint(), redactor().fingerprint());
-        assert!(redactor().fingerprint().starts_with("r1-"));
+        assert!(redactor().fingerprint().starts_with("r2-"));
 
         let error = Redactor::build(&["[".to_owned()], KeySource::Fixed(None))
             .err()
@@ -1983,10 +2633,33 @@ mod tests {
             decode_base64(base64(b"hello world!").as_bytes()),
             b"hello world!"
         );
-        assert!(name_shaped(b"ML_KEM_512_SHARED_SECRET_LENGTH"));
-        assert!(name_shaped(b"password.encode_utf16"));
-        assert!(name_shaped(b"./target/debug"));
-        assert!(!name_shaped(b"a8F3kQ9zR2"));
+        assert!(identifier_chain(b"ML_KEM_512_SHARED_SECRET_LENGTH"));
+        assert!(identifier_chain(b"password.encode_utf16"));
+        assert!(!identifier_chain(b"a8F3kQ9zR2"));
+        for path in [
+            &b"./target/debug"[..],
+            b"/Users/Alice/MyProject/.secrets/creds-2024.json",
+            b"models/llama-3.1-8b/tokenizer.model",
+            b"C:/Users/Bob/AppData/Local/token.txt",
+        ] {
+            assert!(path_shaped(path), "{}", String::from_utf8_lossy(path));
+        }
+        assert!(!path_shaped(b"/x+049UNErhjZhmElZuZ1Y9tDRd6GtHUlsTizT2D"));
+        assert!(!path_shaped(b"/xQ049UNErhjZhmElZuZ1Y9tDRd6GtHUlsTizT2D"));
+        assert!(type_name(b"Ed25519PrivateKey") && type_name(b"&X25519SharedSecret"));
+        assert!(!type_name(b"KeyLm2Qp7Rt4Vw8ZnB3c"));
+        let line = b"f(token=abc123)), x";
+        assert_eq!(trim(line, 8..15, false), 8..14);
+        assert_eq!(trim(b"(a1)", 0..4, false), 0..4);
+        assert_eq!(trim(b"abc),", 0..5, true), 0..5);
+        assert_eq!(Prefix::new(b"id_rsa:12:").find(b"id_rsa-13-MIIE"), Some(10));
+        assert_eq!(Prefix::new(b"     9\t").find(b"    10\tMIIE"), Some(7));
+        assert_eq!(Prefix::new(b"+").find(b"-MIIE"), Some(1));
+        assert_eq!(Prefix::new(b"12:").find(b"MIIE"), None);
+        assert!(ends_key(
+            base64(b"...\n-----END PRIVATE KEY-----\n").as_bytes()
+        ));
+        assert!(!ends_key(format!("{}done", base64(b"-----\n")).as_bytes()));
         assert_eq!(base64_bytes(br"ab\ncd\r=="), 6);
         assert!(entropy(b"aaaaaaaaaaaa") < 0.1);
     }

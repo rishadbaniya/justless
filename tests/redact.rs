@@ -782,3 +782,245 @@ fn real_build_and_source_output_have_nothing_to_redact() {
         }
     }
 }
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::new();
+    for chunk in bytes.chunks(3) {
+        let value = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &b)| acc | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                output.push(ALPHABET[(value >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                output.push('=');
+            }
+        }
+    }
+    output
+}
+
+/// A private key file whose body is wrapped at `width` columns, and its body.
+fn private_key(seed: &str, width: usize) -> (String, String) {
+    let body = base64(base62(seed, 1200).as_bytes());
+    let mut file = format!("{}BEGIN RSA PRIVATE KEY-----\n", "-----");
+    for line in body.as_bytes().chunks(width) {
+        file.push_str(std::str::from_utf8(line).unwrap());
+        file.push('\n');
+    }
+    file.push_str(&format!("{}END RSA PRIVATE KEY-----\n", "-----"));
+    (file, body)
+}
+
+/// No 40-character piece of `body` appears in `haystack`.
+fn body_hidden(haystack: &str, body: &str) -> bool {
+    body.as_bytes()
+        .chunks(40)
+        .filter(|piece| piece.len() == 40)
+        .all(|piece| !haystack.contains(std::str::from_utf8(piece).unwrap()))
+}
+
+fn key_marker(shown: &str) -> &str {
+    let start = shown.find("[redacted:private-key:").expect("a key marker");
+    &shown[start..start + shown[start..].find(']').unwrap() + 1]
+}
+
+#[test]
+fn private_keys_keep_one_marker_whatever_prefixes_their_lines() {
+    let project = Project::new();
+    let (key, body) = private_key("prefixed", 64);
+    fs::write(project.root().join("id_rsa"), &key).unwrap();
+    let colored: String = key
+        .lines()
+        .map(|line| format!("\x1b[32m+\x1b[m\x1b[32m{line}\x1b[m\n"))
+        .collect();
+    fs::write(project.root().join("colored.diff"), colored).unwrap();
+    let reference = project.ok(&["run", "--", "cat", "id_rsa"]);
+    let expected = key_marker(&text(&reference.stdout)).to_owned();
+    let commands: [&[&str]; 8] = [
+        &["grep", "-n", "-A40", "BEGIN", "id_rsa"],
+        &["grep", "-H", "-n", "", "id_rsa"],
+        &["grep", "-r", "-n", "--include=id_rsa", "", "."],
+        &["cat", "-n", "id_rsa"],
+        &["diff", "-u", "id_rsa", "/dev/null"],
+        &["sed", "s/^/+/", "id_rsa"],
+        &["awk", r#"{print "2026-11-18T10:00:00.5Z " $0}"#, "id_rsa"],
+        &["cat", "colored.diff"],
+    ];
+    for command in commands {
+        let mut args = vec!["run", "--fresh", "--max-bytes", "65536", "--"];
+        args.extend(command);
+        let output = project.cli(&args);
+        let shown = text(&output.stdout);
+        let id = project.latest_run();
+        let record = project.record(&id);
+        assert_eq!(record["redaction"]["count"], 1, "{command:?}: {shown}");
+        assert!(body_hidden(&shown, &body), "{command:?}: {shown}");
+        // The prefix stays on each line and is not part of the hashed key.
+        assert_eq!(key_marker(&shown), expected, "{command:?}: {shown}");
+        let archive = text(&project.archive(&id, "stdout"));
+        assert_eq!(shown.lines().count(), archive.lines().count());
+        let log = text(&project.ok(&["log", &id]).stdout);
+        assert!(body_hidden(&log, &body), "{command:?}: {log}");
+    }
+}
+
+#[test]
+fn unwrapped_wide_and_base64_wrapped_keys_are_hidden() {
+    let project = Project::new();
+    let (wide, body) = private_key("wide", 132);
+    let (unwrapped, _) = private_key("wide", 4096);
+    assert_eq!(unwrapped.lines().count(), 3);
+    let (key, _) = private_key("encoded", 64);
+    let encoded = base64(key.as_bytes());
+    let wrap = |width: usize| -> String {
+        let mut text: String = encoded
+            .as_bytes()
+            .chunks(width)
+            .map(|line| format!("{}\n", std::str::from_utf8(line).unwrap()))
+            .collect();
+        text.push_str("done\n");
+        text
+    };
+    for (name, content) in [
+        ("wide.pem", wide),
+        ("unwrapped.pem", unwrapped),
+        ("key64.b64", wrap(64)),
+        ("key76.b64", wrap(76)),
+    ] {
+        fs::write(project.root().join(name), &content).unwrap();
+        let output = project.cli(&["run", "--max-bytes", "65536", "--", "cat", name]);
+        let shown = text(&output.stdout);
+        let id = project.latest_run();
+        let record = project.record(&id);
+        assert_eq!(record["redaction"]["count"], 1, "{name}: {shown}");
+        assert_eq!(shown.lines().count(), content.lines().count(), "{name}");
+        if name.ends_with(".b64") {
+            assert!(body_hidden(&shown, &encoded), "{name}: {shown}");
+            assert!(shown.ends_with("\ndone\n"), "{name}: {shown}");
+        } else {
+            assert!(body_hidden(&shown, &body), "{name}: {shown}");
+        }
+    }
+    // The wrapping width does not change the marker.
+    let markers: Vec<String> = ["key64.b64", "key76.b64"]
+        .iter()
+        .map(|name| key_marker(&text(&project.ok(&["run", "--", "cat", name]).stdout)).to_owned())
+        .collect();
+    assert_eq!(markers[0], markers[1]);
+}
+
+#[test]
+fn values_keep_their_symbols_while_paths_digests_and_code_stay_visible() {
+    let project = Project::new();
+    let symbols = format!("{}$Zt8@Wq3(n)Lm5?x", base62("symbols", 10));
+    let django = format!("r8u&t3)x+5k@q!d9z(w2y#n7v$b4m%{}", base62("django", 6));
+    let slash = format!("/x+{}", base62("slash", 37));
+    let pass = format!("{}{}2024", "MyPass", "word");
+    let phrase = base62("phrase", 32);
+    let positives = [
+        (format!("DB_PASSWORD={symbols}"), &symbols),
+        (format!("password: \"{symbols}\""), &symbols),
+        (format!("api_key='{symbols}'"), &symbols),
+        (format!("DJANGO_SECRET_KEY={django}"), &django),
+        (format!("SECRET_KEY = 'django-insecure-{django}'"), &django),
+        (format!("AWS_SECRET_ACCESS_KEY={slash}"), &slash),
+        (format!("DB_PASSWORD={pass}"), &pass),
+        (format!("POLY_PASSPHRASE={phrase}"), &phrase),
+        (format!("--passphrase {phrase}"), &phrase),
+        // A search over secret files prints each file's name before its content.
+        (format!("secrets/db_password:{phrase}"), &phrase),
+        (format!("password.txt:{phrase}"), &phrase),
+    ];
+    let digest = "4f9c2b1a3d5e7f9a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a";
+    let ci = format!(".{}hub/tokens/ci-v2.json", "git");
+    let negatives = [
+        "secrets_dir = config/secrets/prod-2024".to_owned(),
+        format!("--token-file {ci}"),
+        "password_file=deploy/k8s/db-password.v3.yaml".to_owned(),
+        "TOKENIZER_PATH=models/llama-3.1-8b/tokenizer.model".to_owned(),
+        "token_path = target/debug/build/token-abc123/out".to_owned(),
+        "CREDENTIALS=/Users/Alice/MyProject/.secrets/creds-2024.json".to_owned(),
+        format!("tokenizer.json: sha256={digest}"),
+        format!(r#"{{"files":{{"src/to_tokens.rs":"{digest}","token.css":"{digest}"}}}}"#),
+        format!("Copying from docker://ubuntu:22.04@sha256:{digest}"),
+        "api_passphrase: Option<SecretString>,".to_owned(),
+        r#"passphrase: """#.to_owned(),
+        "    let token = hmac_sha256(key, data);".to_owned(),
+        "    secret_key = hashlib.sha256(x2)".to_owned(),
+        r#"    println!("token={token_value2}");"#.to_owned(),
+        "    let enum_token = input.parse::<Token![enum]>()?;".to_owned(),
+        "    let secret_key = buf.read_i32::<BigEndian>()?;".to_owned(),
+        "    fn from_secret_key(secret_key: &secp256k1::SecretKey) -> Self {".to_owned(),
+        "    let password = url.password().and_then(|pass| {".to_owned(),
+        r#"  "token": "0xA604060890923Ff400e8c6f5290461A83AEDACec""#.to_owned(),
+        "    let der_private_key: EcPrivateKeyRfc5915Der = key.as_der()?;".to_owned(),
+        // Search output names a file before each line.
+        "quinn/src/token.rs:107:pub(crate) struct IncomingToken {".to_owned(),
+        "crypto/err/trust_token.errordata:1:TRUST_TOKEN,111,BAD_VALIDITY_CHECK".to_owned(),
+        // JavaScript.
+        r"    const tokens = path.match(/(?::[^\/]+)|(?:\/\*$)|./g) || [];".to_owned(),
+        "      token: `${config.baseUrl}/realms/${config.realm}/protocol/token`,".to_owned(),
+        r#"const TOKEN_STRINGS = "[A-Za-z0-9._~+/-]+=*";"#.to_owned(),
+    ];
+    let mut probe = String::new();
+    for line in positives.iter().map(|(line, _)| line).chain(&negatives) {
+        probe.push_str(line);
+        probe.push('\n');
+    }
+    fs::write(project.root().join("probe.txt"), &probe).unwrap();
+    let output = project.ok(&["run", "--max-bytes", "65536", "--", "cat", "probe.txt"]);
+    let shown = text(&output.stdout);
+    let lines: Vec<&str> = shown.lines().collect();
+    for (index, (line, value)) in positives.iter().enumerate() {
+        let redacted = lines[index];
+        assert!(hidden(redacted, value), "{line} -> {redacted}");
+        // Nothing of the value is left after the marker.
+        let tail = &redacted[redacted.rfind("[redacted:secret:").expect(line)..];
+        assert!(
+            tail.ends_with(']') || tail.ends_with("]\"") || tail.ends_with("]'"),
+            "{line} -> {redacted}"
+        );
+    }
+    for (index, line) in negatives.iter().enumerate() {
+        assert_eq!(lines[positives.len() + index], line);
+    }
+    let id = run_id(&output);
+    assert_eq!(project.record(&id)["redaction"]["count"], positives.len());
+}
+
+#[test]
+fn output_that_fits_once_redacted_is_shown_whole() {
+    let project = Project::new();
+    let (key, body) = private_key("fits", 64);
+    let mut dump = String::new();
+    for i in 0..30 {
+        dump.push_str(&format!("manifest line {i} with some padding text here\n"));
+    }
+    dump.push_str(&key);
+    for i in 0..30 {
+        dump.push_str(&format!("after line {i} with some more padding text\n"));
+    }
+    assert!(dump.len() > 4096);
+    fs::write(project.root().join("dump.txt"), &dump).unwrap();
+    let output = project.ok(&["run", "--", "cat", "dump.txt"]);
+    let id = run_id(&output);
+    let shown = text(&output.stdout);
+    assert!(!shown.contains("[output clipped"), "{shown}");
+    assert!(body_hidden(&shown, &body));
+    let log = project.ok(&["log", &id, "--stream", "stdout"]);
+    assert_eq!(output.stdout, log.stdout);
+
+    let args = [
+        "run", "--hook", "--fresh", "--", "grep", "-n", "", "dump.txt",
+    ];
+    let output = project.ok(&args);
+    let id = run_id(&output);
+    assert_eq!(
+        text(&output.stderr),
+        format!("[justless {id} · 1 secret redacted]\n")
+    );
+    assert_eq!(text(&output.stdout).lines().count(), dump.lines().count());
+}

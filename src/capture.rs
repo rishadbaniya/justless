@@ -1171,8 +1171,10 @@ impl Capture<'_> {
         };
         let mut locations = Locations::default();
         let mut previews = Vec::new();
+        // Whether stdout, after redaction, fits the budget and is shown whole.
+        let mut stdout_fits = true;
         for (index, stream) in Stream::BOTH.into_iter().enumerate() {
-            let preview = scan(
+            let (preview, fits) = scan(
                 workspace,
                 &archive.readers[index],
                 lengths[index],
@@ -1189,6 +1191,9 @@ impl Capture<'_> {
                 },
             )
             .with_context(|| format!("read {}", stream.name()))?;
+            if stream == Stream::Stdout {
+                stdout_fits = fits;
+            }
             previews.push((stream, preview));
         }
         locations.finish(&mut run);
@@ -1278,15 +1283,13 @@ impl Capture<'_> {
         } else if let Some((report, _)) = grouped {
             // Search and listing groups replace a large stdout only. Smaller output stays
             // verbatim, and stderr keeps messages such as unreadable directories.
-            if stdout_bytes > max_bytes as u64 && !report.is_empty() {
+            if !stdout_fits && !report.is_empty() {
                 previews[0].1 = fit(report, max_bytes).into_bytes();
             }
         } else if let Some(summary) = run.summary.render(
             previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
             run.status,
-        ) && (stdout_bytes > max_bytes as u64
-            || previous.is_some()
-            || summary.len() < previews[0].1.len())
+        ) && (!stdout_fits || previous.is_some() || summary.len() < previews[0].1.len())
         {
             previews[0].1 = fit(summary, max_bytes).into_bytes();
         }
@@ -1319,7 +1322,6 @@ impl Capture<'_> {
                 agent: agent_footer,
                 selection,
                 redactor,
-                max_bytes,
                 notice,
             },
         )?;
@@ -1347,7 +1349,6 @@ struct Shown<'a> {
     agent: bool,
     selection: &'a crate::filters::Selection,
     redactor: Option<&'a crate::redact::Redactor>,
-    max_bytes: usize,
     /// The unchanged notice replaced the previews.
     notice: bool,
 }
@@ -1393,27 +1394,22 @@ fn footer(
             break;
         }
         let index = stream.index();
-        let Some(&length) = run.stream_bytes.get(index) else {
+        let (Some(&length), Some(mut file)) = (run.stream_bytes.get(index), readers.get(index))
+        else {
             verbatim = false;
             break;
         };
-        let sized = match redactor {
-            None => length == preview.len() as u64,
-            Some(_) => length <= shown.max_bytes as u64,
-        };
-        verbatim = sized
-            && match readers.get(index) {
-                Some(mut file) => {
-                    let mut stored = Vec::with_capacity(length as usize);
-                    file.seek(SeekFrom::Start(0))?;
+        file.seek(SeekFrom::Start(0))?;
+        verbatim = match redactor {
+            None => {
+                length == preview.len() as u64 && {
+                    let mut stored = Vec::with_capacity(preview.len());
                     file.take(length).read_to_end(&mut stored)?;
-                    match redactor {
-                        None => stored == *preview,
-                        Some(redactor) => *redactor.bytes(&stored) == **preview,
-                    }
+                    stored == *preview
                 }
-                None => false,
-            };
+            }
+            Some(redactor) => redactor.matches(file.take(length), preview)?,
+        };
     }
     // A search that matched nothing exits 1 with no output; that is an answer, not a failure.
     let empty_search = run.status == 1
@@ -1504,7 +1500,7 @@ fn scan(
     redactor: Option<&crate::redact::Redactor>,
     run: &mut Run,
     observers: &mut Observers,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     let Observers {
         parser,
         selection,
@@ -1514,7 +1510,10 @@ fn scan(
     } = observers;
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
-    let truncated = length > max_bytes as u64;
+    let mut truncated = length > max_bytes as u64;
+    // Redaction can bring output under the budget, as when a private key body
+    // collapses to one marker, so keep the redacted stream while it still fits.
+    let mut whole = (truncated && redactor.is_some()).then(Vec::new);
     let payload = max_bytes - DIAGNOSTICS.len() - CLIPPED.len();
     file.seek(SeekFrom::Start(0))?;
     // Every consumer below sees redacted lines; the digest covers the raw bytes.
@@ -1607,6 +1606,13 @@ fn scan(
             locations.add(workspace, location, line_no, stream, failure);
         }
 
+        if let Some(buffer) = whole.as_mut() {
+            if !cut && buffer.len() + raw.len() <= max_bytes {
+                buffer.extend_from_slice(&raw);
+            } else {
+                whole = None;
+            }
+        }
         if !truncated {
             preview.extend_from_slice(&raw);
         } else {
@@ -1642,6 +1648,10 @@ fn scan(
         section.add(open, payload / 2);
     }
 
+    if let Some(buffer) = whole {
+        truncated = false;
+        preview = buffer;
+    }
     if truncated {
         preview.extend_from_slice(head.text.as_bytes());
         let diagnostics = section.render(payload / 2);
@@ -1660,9 +1670,9 @@ fn scan(
     if let Some(filtered) = filter.finish()
         && (filtered.len() < preview.len() || truncated && filtered.len() <= max_bytes)
     {
-        return Ok(filtered);
+        return Ok((filtered, !truncated));
     }
-    Ok(preview)
+    Ok((preview, !truncated))
 }
 
 /// Read one line. A line longer than `limit` keeps its first `limit` bytes in
@@ -2020,6 +2030,10 @@ fn source_location(
     let captures = SOURCE.captures(candidate)?;
     let start: usize = captures[2].parse().ok()?;
     let name = captures.get(1)?.as_str().trim();
+    // A marker such as `[redacted:secret:1d0d]` looks like `name:line`.
+    if name.contains("[redacted:") {
+        return None;
+    }
     locate(
         workspace,
         locations,

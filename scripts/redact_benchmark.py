@@ -4,6 +4,8 @@
 Each input is written to a temporary project, captured with `justless run -- cat`
 with redaction on and off, then replayed with `log` and `log --unredacted`. Times are
 the fastest of several repeats, reported in seconds and MiB/s next to the byte count.
+With --cpu they are the CPU time Justless used, user plus system, which other load on
+the machine disturbs less than elapsed time.
 Sample secrets are generated at runtime.
 """
 
@@ -12,6 +14,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import resource
 import subprocess
 import sys
 import tempfile
@@ -118,13 +121,21 @@ def write_line(path, size, secret):
     return 1 if secret else 0
 
 
+def child_cpu():
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
+
+
+CLOCK = time.perf_counter
+
+
 def timed(args, cwd, repeat):
     best, result = None, None
     for _ in range(repeat):
-        start = time.perf_counter()
+        start = CLOCK()
         result = subprocess.run(args, cwd=cwd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE)
-        elapsed = time.perf_counter() - start
+        elapsed = CLOCK() - start
         best = elapsed if best is None else min(best, elapsed)
     return best, result
 
@@ -182,9 +193,14 @@ def main():
     parser.add_argument("--inputs", nargs="+", choices=["mix", "dense", "line", "line+secret"],
                         help="measure only these inputs (default all; --check needs all)")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--cpu", action="store_true",
+                        help="report CPU time instead of elapsed time")
     parser.add_argument("--check", action="store_true",
                         help="fail when redaction overhead or the clean fast path regresses")
     args = parser.parse_args()
+    if args.cpu:
+        global CLOCK
+        CLOCK = child_cpu
     binary = str(args.binary.resolve())
     baseline = str(args.baseline.resolve()) if args.baseline else None
     size = args.size_mb * MIB
