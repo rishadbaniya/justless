@@ -1,0 +1,7 @@
+{question}
+
+Answer with the file and the enclosing function (use Type::name for a method). End your final message with a fenced block tagged `answer` that contains JSON in this form, most likely answer first:
+
+```answer
+{"answers": [{"file": "<repo-relative path>", "symbol": "<name or Type::name>"}]}
+```

@@ -1,0 +1,60 @@
+[
+  {
+    "name": "Bash",
+    "description": "Run a shell command in the project and return its combined output. The working directory persists between calls while it stays inside the project. Timeout is in milliseconds (default 120000, max 600000).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {"type": "string", "description": "The command to run"},
+        "timeout": {"type": "number", "description": "Timeout in milliseconds"},
+        "description": {"type": "string", "description": "A few words on what the command does"},
+        "run_in_background": {"type": "boolean", "description": "Run the command in the background"}
+      },
+      "required": ["command"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "Edit",
+    "description": "Replace an exact string in a file. old_string must occur exactly once unless replace_all is true.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {"type": "string", "description": "Absolute path of the file"},
+        "old_string": {"type": "string", "description": "Text to replace"},
+        "new_string": {"type": "string", "description": "Replacement text"},
+        "replace_all": {"type": "boolean", "description": "Replace every occurrence"}
+      },
+      "required": ["file_path", "old_string", "new_string"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "Read",
+    "description": "Read a text file. Lines are returned as '<number>\\t<text>'. Reads up to 2000 lines unless offset and limit are given. Large files return a first page; allow_large reads the whole file.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {"type": "string", "description": "Absolute path of the file"},
+        "offset": {"type": "integer", "description": "First line number to read"},
+        "limit": {"type": "integer", "description": "Number of lines to read"},
+        "allow_large": {"type": "boolean", "description": "Read a file over the usual size limits"}
+      },
+      "required": ["file_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "Write",
+    "description": "Write a file, replacing any existing content.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {"type": "string", "description": "Absolute path of the file"},
+        "content": {"type": "string", "description": "The full file content"}
+      },
+      "required": ["file_path", "content"],
+      "additionalProperties": false
+    }
+  }
+]

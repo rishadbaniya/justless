@@ -1,0 +1,7 @@
+If `{symbol}` (defined in {file}) were renamed, which files would have to change? List every file, including the definition. Do not make the change.
+
+End your final message with a fenced block tagged `answer` that contains JSON in this form:
+
+```answer
+{"files": ["<repo-relative path>", "..."]}
+```

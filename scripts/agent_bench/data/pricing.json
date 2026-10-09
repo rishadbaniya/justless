@@ -1,0 +1,28 @@
+{
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "checked": "2026-11-18",
+  "unit": "USD per million tokens",
+  "notes": [
+    "A request's prompt length counts all of its input tokens, including cache reads and cache writes. Each request is priced on its own.",
+    "Thinking tokens are billed inside output_tokens.",
+    "The tool-use system prompt adds 286 tokens on all three models, the same in every arm."
+  ],
+  "models": {
+    "claude-haiku-5-5": {
+      "tiers": [
+        {"max_prompt_tokens": 100000, "input": 0.10, "cache_write_5m": 0.125, "cache_write_1h": 0.20, "cache_read": 0.01, "output": 0.50},
+        {"max_prompt_tokens": null, "input": 0.50, "cache_write_5m": 0.625, "cache_write_1h": 1.00, "cache_read": 0.05, "output": 2.50}
+      ]
+    },
+    "claude-sonnet-5-5": {
+      "tiers": [
+        {"max_prompt_tokens": null, "input": 2.00, "cache_write_5m": 2.50, "cache_write_1h": 4.00, "cache_read": 0.10, "output": 10.00}
+      ]
+    },
+    "claude-opus-5-5": {
+      "tiers": [
+        {"max_prompt_tokens": null, "input": 4.00, "cache_write_5m": 5.00, "cache_write_1h": 8.00, "cache_read": 0.20, "output": 20.00}
+      ]
+    }
+  }
+}

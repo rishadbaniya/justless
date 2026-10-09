@@ -1,0 +1,185 @@
+{
+ "note": "Vendor fixtures. Used only for dry runs, unit tests and the parity capture; never analyzed.",
+ "tasks": [
+  {
+   "baseline": {
+    "flaky": [],
+    "test_names": {
+     "checkout@tests/checkout.rs::total_includes_fee": "ok"
+    }
+   },
+   "controls": {
+    "inverse": [
+     {
+      "file": "src/pricing.rs",
+      "new": "subtotal + fee",
+      "old": "subtotal + fee + 1"
+     }
+    ],
+    "inverse_files": {
+     "src/pricing.rs": "pub fn checkout_total(subtotal: u32, fee: u32) -> u32 {\n    apply_fee(subtotal, fee)\n}\n\nfn apply_fee(subtotal: u32, fee: u32) -> u32 {\n    subtotal + fee\n}\n"
+    }
+   },
+   "family": "bugfix",
+   "generator": {
+    "note": "vendor fixture; dry runs, unit tests and parity only; never analyzed"
+   },
+   "id": "bugfix-failing-01",
+   "language": "rust",
+   "oracle": {
+    "anchor_line": "    subtotal + fee + 1",
+    "mutated_file": "src/pricing.rs",
+    "mutated_fn": "apply_fee",
+    "mutated_span": [
+     4,
+     6
+    ],
+    "noop_comment": " // checked",
+    "tamper_edit": {
+     "file": "tests/checkout.rs",
+     "new": "#[test]\n#[ignore]\nfn total_includes_fee",
+     "old": "#[test]\nfn total_includes_fee"
+    },
+    "test_command": [
+     "cargo",
+     "test",
+     "--offline",
+     "--no-fail-fast"
+    ]
+   },
+   "package": "checkout-fixture",
+   "prompt": "`cargo test --offline -p checkout-fixture` fails in this repository. Find the bug in the library code and fix it. Do not modify, delete or ignore tests. Run the tests to confirm before you finish, then reply with one sentence describing the fix.",
+   "repo": "fixture-failing",
+   "setup": {
+    "kind": "fixture"
+   },
+   "source_root": "fixtures/failing",
+   "visible_command": "cargo test --offline -p checkout-fixture"
+  },
+  {
+   "baseline": {
+    "flaky": [],
+    "test_names": {
+     "checkout@tests/checkout.rs::total_includes_fee": "ok"
+    }
+   },
+   "controls": {
+    "inverse": [
+     {
+      "file": "src/pricing.rs",
+      "new": "    apply_fee(subtotal, fee)\n",
+      "old": "    return apply_fee(subtotal, fee);\n"
+     },
+     {
+      "file": "src/obsolete.rs",
+      "new": "    0\n",
+      "old": "    let result = 0;\n    result\n"
+     }
+    ],
+    "inverse_files": {
+     "src/obsolete.rs": "pub fn obsolete_helper() -> u32 {\n    0\n}\n",
+     "src/pricing.rs": "pub fn checkout_total(subtotal: u32, fee: u32) -> u32 {\n    apply_fee(subtotal, fee)\n}\n\nfn apply_fee(subtotal: u32, fee: u32) -> u32 {\n    subtotal + fee\n}\n"
+    }
+   },
+   "family": "lint",
+   "generator": {
+    "note": "vendor fixture; dry runs, unit tests and parity only; never analyzed"
+   },
+   "id": "lint-failing-01",
+   "language": "rust",
+   "oracle": {
+    "clippy_command": [
+     "cargo",
+     "clippy",
+     "--offline",
+     "--all-targets",
+     "--message-format=json",
+     "--",
+     "-D",
+     "warnings"
+    ],
+    "injected_lints": [
+     "clippy::needless_return",
+     "clippy::let_and_return"
+    ],
+    "test_command": [
+     "cargo",
+     "test",
+     "--offline",
+     "--no-fail-fast"
+    ]
+   },
+   "package": "checkout-fixture",
+   "prompt": "`cargo clippy --offline --all-targets -- -D warnings` reports warnings in this repository that were not there before. Fix them without changing behavior. Do not add allow attributes or change lint configuration. Make sure the tests still pass.",
+   "repo": "fixture-failing",
+   "setup": {
+    "files": {
+     "src/obsolete.rs": "pub fn obsolete_helper() -> u32 {\n    let result = 0;\n    result\n}\n",
+     "src/pricing.rs": "pub fn checkout_total(subtotal: u32, fee: u32) -> u32 {\n    return apply_fee(subtotal, fee);\n}\n\nfn apply_fee(subtotal: u32, fee: u32) -> u32 {\n    subtotal + fee\n}\n"
+    },
+    "kind": "lint_injection"
+   },
+   "source_root": "fixtures/failing"
+  },
+  {
+   "family": "location",
+   "generator": {
+    "note": "vendor fixture; dry runs, unit tests and parity only; never analyzed"
+   },
+   "grep_solvable": true,
+   "id": "location-mixed-01",
+   "language": "python",
+   "oracle": {
+    "kind": "first_answer"
+   },
+   "prompt": "A user pasted this line from the program's output: `SELECT order_id FROM purchase_orders`. Which function produces it?\n\nAnswer with the file and the enclosing function (use Type::name for a method). End your final message with a fenced block tagged `answer` that contains JSON in this form, most likely answer first:\n\n```answer\n{\"answers\": [{\"file\": \"<repo-relative path>\", \"symbol\": \"<name or Type::name>\"}]}\n```",
+   "repo": "fixture-mixed",
+   "setup": {
+    "kind": "none"
+   },
+   "source_root": "fixtures/mixed",
+   "style": "verbatim",
+   "truth": {
+    "accepted_symbols": [
+     "list_orders"
+    ],
+    "category": "text",
+    "file": "backend/orders.py",
+    "line": 8,
+    "literal": "SELECT order_id FROM purchase_orders",
+    "span": [
+     6,
+     8
+    ],
+    "symbol": "list_orders"
+   }
+  },
+  {
+   "family": "impact",
+   "generator": {
+    "note": "vendor fixture; dry runs, unit tests and parity only; never analyzed"
+   },
+   "id": "impact-mixed-01",
+   "language": "typescript",
+   "oracle": {
+    "definition_file": "frontend/format.ts",
+    "precision": 0.8,
+    "recall": 0.9,
+    "symbol": "formatOrder"
+   },
+   "prompt": "If `formatOrder` (defined in frontend/format.ts) were renamed, which files would have to change? List every file, including the definition. Do not make the change.\n\nEnd your final message with a fenced block tagged `answer` that contains JSON in this form:\n\n```answer\n{\"files\": [\"<repo-relative path>\", \"...\"]}\n```",
+   "repo": "fixture-mixed",
+   "setup": {
+    "kind": "none"
+   },
+   "source_root": "fixtures/mixed",
+   "truth": {
+    "neutral": [],
+    "required": [
+     "frontend/format.ts",
+     "frontend/orders.ts"
+    ]
+   }
+  }
+ ]
+}

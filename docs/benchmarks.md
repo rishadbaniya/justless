@@ -1,6 +1,147 @@
 # Benchmarks
 
-## Three-turn repair
+## Agent benchmark (four arms)
+
+This benchmark measures whether Justless reduces the cost of real coding-agent work without reducing task success. A model works on 32 frozen tasks from the owner's repositories through a reimplementation of Claude Code 2.1.327's default macOS setup over the Messages API. Arms differ only in the Justless install and in Anthropic's server-side context editing. The harness lives in `scripts/agent_bench/`. Its tasks, snapshots, ground truth, hidden tests, transcripts and the Claude Code capture stay outside Git in `$AGENT_BENCH_HOME`.
+
+No result has been recorded yet. The table at the end of this section is filled only from `report.py` output after the paid campaign.
+
+### Arms
+
+| Arm | Justless | Context editing |
+| --- | --- | --- |
+| a, plain | No | No |
+| b, justless | `justless init --hooks --agent claude` before the baseline commit, and the pinned binary on `PATH` | No |
+| c, plain + context editing | No | `clear_tool_uses_20250919` |
+| d, justless + context editing | As in b | As in c |
+
+Every request in every arm is otherwise identical: model, effort, `max_tokens` (Claude Code's value capped at 32,000), adaptive thinking with `block_binding.prefix_mismatch_behavior: "error"`, the same `anthropic-beta` header, Claude Code's system prompt, its Bash, Read, Edit and Write definitions, and the same first messages. A check on the first request of each paired run fails on any other difference. The context-editing trigger T is set by rule from plain-arm pilot data: the median per-run peak prompt, rounded up to 5,000 and clamped to 30,000-100,000, with `keep` 3 tool uses and `clear_at_least` 5,000 tokens. Anthropic describes context editing as a context-window tool rather than a savings lever, so the contrasts involving c and d claim only "server-side clearing at this configuration".
+
+### Claude Code parity
+
+`run.py cc-capture` drives the real Claude Code binary against `fake_api.py` on 127.0.0.1, with a dummy key, nonessential traffic disabled, an isolated `HOME` and a sandbox that denies every other outbound connection. Scripted sessions record what Claude Code sends: its system prompt, tool definitions, cache breakpoints, effort, the first-message layout, hook input fields, and the exact text of each tool result. `run.py parity-diff` replays the same scripts through the harness and compares every tool result, error flag, follow-up system note and hook input. The last capture verified 65 of 68 scripted steps byte for byte after normalizing paths, timings and run IDs. The other three are documented deviations.
+
+The harness reproduces these Claude Code behaviors:
+
+- Bash runs in zsh after Claude Code's shell snapshot, so `grep` and `find` are Claude Code's embedded ugrep and bfs. Streams are merged and trailing whitespace is removed. The working directory persists only after a successful command that stays inside the project.
+- A successful command whose output exceeds 30,000 characters is saved to a file and replaced by a 2 KB preview. A failing command shows `Exit code N` and its output; above 10,000 characters it shows the first and last 5,000 characters of the first 30,000. Exit status 1 counts as success for grep, rg, find, diff, test and `git diff`.
+- Read numbers lines, reads 2,000 lines by default, refuses unbounded reads over 256 KB, and pages a file over 25,000 tokens with a PARTIAL-view note. Claude Code counts those tokens with the `count_tokens` endpoint, and so does the harness in paid runs. `allow_large` reads the whole file.
+- Edit works on files that were never read. Write is refused only after a PARTIAL view.
+- Claude Code adds system notes after tool results: hook context, the PARTIAL-view notice, a working-directory update, a note when a read file changed on disk, and a progress reminder after 5, 10 and 15 tool calls without text. The harness adds the same notes.
+- Hooks run from the project's `.claude/settings.json` with Claude Code's input fields. A PreToolUse `updatedInput` replaces the executed command while the transcript keeps the original. A PostToolUse `updatedToolOutput` that does not match the tool's output schema is ignored. SessionStart context joins the environment note of the first request.
+
+Deviations from Claude Code:
+
+- The harness offers only Bash, Read, Edit and Write. Claude Code also offers Agent, Skill, ToolSearch, Workflow and scheduling tools; their text is removed from the captured prompt by one fixed patch whose hash is recorded.
+- Requests are not streamed, use `anthropic-version` 2026-10-21 instead of 2023-06-01, and send only the betas the harness implements.
+- A `Session: <nonce>` system block, unique per attempt, replaces Claude Code's billing header. Runs never share a prompt cache, so every run pays for its own prefix in every arm.
+- Background Bash is rejected in every arm. Claude Code runs it.
+- The project CLAUDE.md is included as interactive Claude Code includes it. `claude -p` under an isolated `HOME` did not include it in the offline capture, so the anchor runs record whether it reached the API.
+- The PARTIAL-view page size and the progress-reminder trigger are fitted to captured examples and marked approximate in `data/cc_parity.json`.
+
+On macOS and Linux Claude Code has no Grep or Glob tool, so Justless's after-search hook cannot fire in this benchmark. `justless mask` and `recall` are not exercised: rewriting earlier tool results would break the append-only history that preserved thinking requires.
+
+### Tasks and oracles
+
+The 32 tasks come from five of the owner's repositories, eight per family. Generation is seeded (seed 20261118) and never runs Justless. Candidates are sorted and shuffled, and each task records its candidate pool and index. The repository fixtures are used only for dry runs, unit tests and the parity capture.
+
+| Family | Task | Success |
+| --- | --- | --- |
+| Bug fix | A deterministic operator, constant or argument mutation that makes `cargo test` fail; one Python task with harness-held tests | Every test name that passed at baseline passes, no test or test configuration was edited, and the diff touches the mutated function. Python tasks also pass hidden tests. |
+| Lint | Three to five behavior-preserving rewrites in a clippy-clean package that trigger default clippy lints | Clippy reports nothing, no `allow` or `expect` attribute or lint configuration was added, and the baseline tests pass |
+| Location | A literal from a log, error, panic, SQL migration or Neovim mapping, quoted verbatim in half the questions and paraphrased in the other half | The first answer names the right file and enclosing symbol |
+| Impact | A uniquely defined public symbol referenced from 3 to 25 files | Recall of 0.9 or more and precision of 0.8 or more. Files that mention the symbol only in comments, strings or docs are neutral. |
+
+A bug-fix candidate is accepted only if its failure repeats identically, its tests are not flaky over three baseline runs, and a second mutation in the same function also fails them. The repository mix is Rust-heavy: 25 tasks are Rust, 5 Python, 1 a SQL migration and 1 Lua. The planned Lua impact task was replaced by a Rust one because no Lua symbol is referenced from 3 to 25 files. In a Cargo workspace the lint prompt and oracle name the package, because other members carry their own warnings. Results apply to tasks like these on these repositories.
+
+Each run clones a warm Cargo target built for its task, then deletes the fingerprints of the repository's own crates so they are rebuilt in the run directory. Test binaries embed their crate's absolute path, and without the rebuild they read fixtures from the snapshot.
+
+### Run isolation
+
+Each run clones the task snapshot and its warm Cargo target with APFS clones into a fresh directory, installs the arm, sets every file's time to 2026-01-01, and makes one fixed-date Git commit, so neither `ls -lt`, `find -newer`, Git history nor Justless's change views reveal the mutation. Tools, hooks and oracles run under `sandbox-exec`. The profile denies reading the task store, the corpus, other runs and the user's home outside the Rust toolchain, denies executing any unpinned `justless`, `claude` or `codex`, and denies outbound network other than 127.0.0.1. The tool environment is an allowlist with no `ANTHROPIC_*` variable. The run directory is deleted after grading.
+
+### Pre-registered analysis
+
+The unit of analysis is a paired (model, task, repetition) block, with a seeded arm order inside each block. The primary contrast is b against a on Sonnet 5.5 over all 32 tasks, with two endpoints:
+
+- E1, the success difference: Δs is the mean over blocks of success(b) minus success(a).
+- E2, the relative saving in cost per successful task: S = 1 − [(Σ cost b / Σ successes b) / (Σ cost a / Σ successes a)].
+
+Confidence intervals come from a task-cluster bootstrap with 10,000 resamples and seed 20261118. If more than 1% of resamples have no success in an arm, S is reported as undefined and cost per run is used instead. The decision rule applies in this order, and the first match wins:
+
+1. WORSE: the upper bound of S is below 0, or the upper bound of Δs is below −0.10.
+2. WIN: the lower bound of S is above 0, the lower bound of Δs is above −0.10, and the point estimate of Δs is at least −0.05. The result is worded "Justless reduced cost per successful task by S [CI] while success was not worse by more than 10 percentage points (Δs [CI])".
+3. CHEAPER-BUT-SUCCESS-UNCERTAIN: the lower bound of S is above 0, but the success conditions of rule 2 fail.
+4. NO DEMONSTRATED SAVING: everything else.
+
+Key secondaries are the edit families (bug fix and lint) and each family on its own; a negative family estimate must be stated with the headline. The context-editing contrasts (d against c, c against a, d against a) are tested only on Haiku 5.5, with Holm-adjusted sign-flip p-values. Opus 5.5 is descriptive. Sensitivity analyses treat limit hits as censored, reprice cache writes at the 1-hour rate, drop the Python task, and split location tasks by style and by grep-solvability. Harness errors are retried up to three times with a new nonce and then count as failures. If any arm's unrecoverable rate exceeds 2%, or arms differ by more than 2 points, the campaign pauses.
+
+A small anchor run uses the real `claude -p` on 8 tasks in arms a and b through `proxy.py`, which logs usage and swaps a dummy key for the campaign key so the key never enters the sandbox. The fidelity flag is raised if the anchor's b/a cost ratio falls outside the harness's 95% interval for the same tasks, if a hook firing rate differs by more than 2×, or if plain-arm cost per run differs by more than 35%. A raised flag must appear next to the primary result.
+
+### Budget
+
+Prices come from the pricing page as checked on 2026-11-18 and live in `data/pricing.json`. Haiku 5.5 changes tier per request at 100,000 prompt tokens, counting cache reads and writes. Every request first checks that the campaign ledger plus a worst-case estimate of the request stays under $80 ($90 with `--use-reserve`). Per-run caps are $0.30 for Haiku, $3 for Sonnet and $6 for Opus, with 60 requests, 3,000,000 cumulative prompt tokens and 30 minutes per run.
+
+| Phase | Runs | Expected cost |
+| --- | ---: | ---: |
+| Pilot: Haiku, 8 tasks × 4 arms; Sonnet, 4 tasks × arms a and b | 40 | about $2.80, capped at $3 |
+| Sonnet: 32 tasks × 3 repetitions × arms a and b | 192 | about $47 |
+| Haiku: 32 tasks × 4 repetitions × 4 arms | 512 | about $10 |
+| Anchor: Sonnet, 8 tasks × arms a and b in real Claude Code | 16 | about $6 |
+| Opus: 4 tasks × 3 repetitions × arms a and b | 24 | about $11 |
+
+After the pilot, `run.py estimate` replaces each assumption with the pilot cost and applies the pre-registered scale order: drop Opus, then cut Haiku to 3 repetitions, the anchor to 4 tasks, and Sonnet to 24 tasks. Below $70 it scales up in the order Opus to 8 tasks, a fourth Sonnet repetition, then Sonnet context-editing arms on the edit families. If the 90th percentile at Claude Code's default effort still exceeds the budget, every arm of that model switches to `medium` effort.
+
+### How to run
+
+Set `AGENT_BENCH_HOME` and `AGENT_BENCH_RUNROOT` to durable private directories first; the defaults live in a scratch directory that can be wiped. The Python bug-fix target is described in `$AGENT_BENCH_HOME/private/python_task.json`, outside the repository because it names private code. Paid commands refuse to start until every secret-scan hit in the snapshots is reviewed: `prepare` lists them, and reviewed `path:line:kind` entries go in `$AGENT_BENCH_HOME/secret_allowlist.json`.
+
+Build the binary under test from the commit being measured, then run these from the repository root. Every step before `pilot` is free.
+
+```sh
+cargo build --release --locked
+B=target/release/justless
+python3 -m unittest discover -s scripts/agent_bench/tests -t scripts/agent_bench/tests
+python3 scripts/agent_bench/run.py sandbox-check
+python3 scripts/agent_bench/run.py cc-capture --binary $B
+python3 scripts/agent_bench/run.py parity-diff --binary $B
+python3 scripts/agent_bench/run.py prepare --generate
+python3 scripts/agent_bench/run.py validate-tasks --tasks all --binary $B
+python3 scripts/agent_bench/run.py review-tasks --approve
+python3 scripts/agent_bench/run.py dry-run --tasks all-public --arms a,b,c,d --binary $B
+python3 scripts/agent_bench/run.py anchor --dry-anchor --tasks all-public --binary $B --campaign anchor-dry
+python3 scripts/agent_bench/run.py estimate --assume prepilot
+```
+
+The paid steps need `ANTHROPIC_API_KEY` for a dedicated key and workspace:
+
+```sh
+python3 scripts/agent_bench/run.py pilot --campaign pilot --model claude-haiku-5-5 --arms a,b,c,d --per-family 2 --budget-usd 3 --binary $B
+python3 scripts/agent_bench/run.py pilot --campaign pilot --model claude-sonnet-5-5 --arms a,b --per-family 1 --budget-usd 3 --binary $B
+python3 scripts/agent_bench/run.py reconcile --campaign pilot --provider-usd <amount from the cost report>
+python3 scripts/agent_bench/run.py estimate --campaign pilot
+python3 scripts/agent_bench/run.py run --campaign main --model claude-sonnet-5-5 --arms a,b --reps 3 --binary $B
+python3 scripts/agent_bench/run.py run --campaign main --model claude-haiku-5-5 --arms a,b,c,d --reps 4 --ce-trigger <T> --binary $B
+python3 scripts/agent_bench/run.py anchor --campaign main --model claude-sonnet-5-5 --per-family 2 --binary $B
+python3 scripts/agent_bench/run.py run --campaign main --model claude-opus-5-5 --arms a,b --reps 3 --per-family 1 --binary $B
+python3 scripts/agent_bench/run.py report --campaign main
+```
+
+Runs are resumable. A run with a terminal record is skipped, and the report is written to `$AGENT_BENCH_HOME/reports/<campaign>/`.
+
+The free steps check the harness before any money is spent. `validate-tasks` runs every task through the exact run-time path with scripted agents: doing nothing must fail, the reference fix must succeed in both arms, and tampering with tests, suppressing lints or giving a wrong answer must fail with the expected failure mode. `dry-run` adds a probe agent and then checks the logs: paired first requests differ only in the CLAUDE.md block and the SessionStart context, plain arms run no hook and cannot run `justless`, the planted parent-environment key appears nowhere, `ls -lt` and `find -newer` show no edited file, and the ledger matches costs recomputed from the logged usage. `anchor --dry-anchor` runs real Claude Code through the proxy against the fake API.
+
+### Results
+
+| Model | Contrast | Success | Cost per successful task | Δs [95% CI] | S [95% CI] | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sonnet 5.5 | b vs a | not run | not run | not run | not run | not run |
+
+## Earlier single-task illustrations
+
+The results below come from single pairs on a vendor-written fixture. They illustrate the mechanism and are not evidence of task-level savings.
+
+### Three-turn repair (n=1)
 
 The repair benchmark starts with a failing test, offers source retrieval, applies a single proposed arithmetic edit, and reruns the tests. An independent test checks additional inputs. Each variant uses a fresh fixture. In API mode the model selects files to read or, with Justless, can request a task pack. Tool-call counts include file listing, individual source reads or a pack, the edit, and both test runs. The separate correctness check stays outside the model conversation.
 
@@ -20,7 +161,7 @@ One live pair using Haiku 5.5 produced the following provider-reported totals ac
 
 The Justless run used 87.3% fewer input tokens. A rerun on 2026-11-18 with the same model reproduced it: 22,364 input tokens for the plain run and 2,851 with Justless, 87.3% fewer, and both fixes passed the independent check. The model chose three direct source reads in that run and one in the plain run. This pair measures the benefit of compact command output on this fixture. The scripted mode exercises the task-pack path. It uses a fixed edit and makes no model calls.
 
-### Across current Claude models
+### Across current Claude models (one task, 3 runs per model)
 
 On 2026-11-18 the same three-turn task ran three times per model with `python3 scripts/repair_benchmark.py --api --model MODEL`. Each model's two variants used identical settings: Haiku 5.5 with thinking disabled, Sonnet 5.5 with `between_tools`, and Opus 5.5 and Fable 5.2 with adaptive thinking at low effort, because those two cannot turn thinking off. Every run produced a fix that passed the independent check.
 
@@ -33,7 +174,7 @@ On 2026-11-18 the same three-turn task ran three times per model with `python3 s
 
 Runs varied by under 0.5% within each model. The saving comes from what the tools return on this fixture, so it is nearly the same for every model; a multi-task benchmark with agent-chosen tool calls is in progress.
 
-## Build checks and single-task replay
+### Build checks and single-task replay
 
 Run these commands from the root of the Justless checkout.
 
@@ -59,7 +200,7 @@ Justless delivered 89.8% fewer bytes in this local replay.
 
 On a separate synthetic corpus of 950 source and text files, a release build indexed from scratch in 0.795 s and refreshed the unchanged index in 0.191 s. A query after one TypeScript edit returned the new definition in 0.211 s.
 
-## Claude API replay
+### Claude API replay (n=1)
 
 With `ANTHROPIC_API_KEY` set in the environment, run `python3 scripts/benchmark.py --mode claude-api`. Anthropic receives only the synthetic fixture’s pre-collected evidence. The benchmark makes two paid requests with a 160-token output cap and reasoning disabled. It checks the returned JSON against the fixture’s expected answer. [Claude Messages API](https://platform.claude.com/docs/en/api/http/messages)
 
@@ -72,7 +213,7 @@ One calibrated pair with Haiku 5.5 returned these provider-reported counts.
 
 The Justless replay used 85.0% fewer input tokens. The direct replay identified the test function where the answer required its call target. An earlier pair with default reasoning used the full output cap without returning an answer. The API replay measures one fixture with supplied evidence. Live agent behavior and native Codex hook loading require a separate session.
 
-## Progressive reads, edits and tool history
+### Progressive reads, edits and tool history
 
 Build with `cargo build --release --locked` and run `python3 scripts/context_benchmark.py`. The local fixture has 451 Python functions. The runner browses the first outline page, filters for the function that needs fixing, expands it, submits one revision-bound replacement and checks the result with an independent Python assertion.
 

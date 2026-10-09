@@ -1,0 +1,1 @@
+`{command}` fails in this repository. Find the bug in the library code and fix it. Do not modify, delete or ignore tests. Run the tests to confirm before you finish, then reply with one sentence describing the fix.

@@ -1,0 +1,31 @@
+# Claude Code 2.1.327 shell snapshot (zsh), reduced to the parts that change command
+# behavior: aliases removed, rg/find/grep shadowed by the embedded rg, bfs and ugrep.
+# {cc_binary} is the Claude Code binary passed with --cc-binary.
+unalias -a 2>/dev/null || true
+\builtin setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL NO_BRACE_CCL NO_MAGIC_EQUAL_SUBST NO_EQUALS 2>/dev/null || true
+{ \builtin unalias -- 'which'; \builtin unset -f -- 'which'; } >/dev/null 2>&1 || true
+{ \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true
+if ! hash rg 2>/dev/null && ! typeset -f rg >/dev/null 2>&1; then
+  function rg {
+  if [[ -x {cc_binary} ]]; then
+    ARGV0=rg {cc_binary} ${1+"$@"}
+  else command rg ${1+"$@"}; fi
+}
+fi
+unalias find 2>/dev/null || true
+unalias grep 2>/dev/null || true
+function find {
+  if [[ -x {cc_binary} ]]; then
+    ARGV0=bfs {cc_binary} -S dfs -regextype findutils-default ${1+"$@"}
+  else command find ${1+"$@"}; fi
+}
+function grep {
+  local _cc_a
+  for _cc_a in ${1+"$@"}; do
+    case "$_cc_a" in -*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data) command grep ${1+"$@"}; return ;; esac
+  done
+  if [[ -x {cc_binary} ]]; then
+    ARGV0=ugrep {cc_binary} -G --ignore-files --hidden -I --encoding=UTF-8 --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl ${1+"$@"}
+  else command grep ${1+"$@"}; fi
+}
+export PATH={path}

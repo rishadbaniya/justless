@@ -1,0 +1,1 @@
+`{command}` reports warnings in this repository that were not there before. Fix them without changing behavior. Do not add allow attributes or change lint configuration. Make sure the tests still pass.
