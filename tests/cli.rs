@@ -9644,3 +9644,728 @@ fn notes_on_stderr_follow_the_output_they_describe() {
         "{output:?}"
     );
 }
+
+/// A committed copy of the multi-package Cargo workspace in fixtures/affected.
+fn affected_fixture() -> TempDir {
+    fn copy(from: &Path, to: &Path) {
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == "target" || name == ".justless" || name == "Cargo.lock" {
+                continue;
+            }
+            let path = entry.path();
+            let destination = to.join(&name);
+            if path.is_dir() {
+                fs::create_dir_all(&destination).unwrap();
+                copy(&path, &destination);
+            } else {
+                fs::copy(&path, &destination).unwrap();
+            }
+        }
+    }
+    let repo = TempDir::new().unwrap();
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/affected"),
+        repo.path(),
+    );
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    repo
+}
+
+fn replace_in(root: &Path, file: &str, from: &str, to: &str) {
+    let path = root.join(file);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains(from), "{from:?} is not in {file}");
+    fs::write(&path, text.replacen(from, to, 1)).unwrap();
+}
+
+/// A subset never reads as the whole suite.
+fn assert_no_suite_claim(output: &Output) {
+    let text = format!("{}{}", stdout(output), stderr(output)).to_lowercase();
+    for claim in ["all tests pass", "all tests passed", "suite passed"] {
+        assert!(!text.contains(claim), "{claim:?} in\n{text}");
+    }
+}
+
+fn why_id(output: &Output) -> String {
+    stderr(output)
+        .split_once("justless test --why ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn affected_tests_run_a_labeled_subset_with_the_runners_own_status() {
+    let repo = affected_fixture();
+    let root = repo.path();
+    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
+
+    let clean = cli(root, &affected);
+    assert!(clean.status.success(), "{}", stderr(&clean));
+    has_line(
+        &stdout(&clean),
+        "cargo · nothing to run · no change reaches its tests",
+    );
+    assert!(stderr(&clean).contains("Nothing ran for cargo; this is not a test result."));
+
+    // One cent too much: the subset fails the way the full suite would.
+    replace_in(
+        root,
+        "ledger/src/tax.rs",
+        "cents * RATE / 100",
+        "cents * RATE / 100 + 1",
+    );
+    let failing = cli(root, &affected);
+    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
+    let out = stdout(&failing);
+    let err = stderr(&failing);
+    has_line(
+        &out,
+        "cargo · subset · 7 of 20 indexed tests in 4 of 7 test targets",
+    );
+    has_line(
+        &out,
+        "Run: cargo test --offline -p api -p ledger-core --lib -- <4 test names> --exact",
+    );
+    has_line(
+        &out,
+        "Run: cargo test --offline -p api -p ledger-core --test cli --test totals",
+    );
+    has_line(
+        &out,
+        "Run: cargo test --offline -p ledger-core --doc -- tax::vat",
+    );
+    assert!(
+        !out.contains("-p reports") && !out.contains("--test needs"),
+        "{out}"
+    );
+    // Cargo stops at the first failing test binary in each step, as `cargo test` does.
+    assert!(
+        err.contains("Subset failed (cargo): 3 of 3 tests that ran failed, exit 101 (7 of 20 indexed tests selected, 13 not run); the full suite was not run"),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "  tests::invoice_total_adds_vat · possible · call at api/src/lib.rs:18 → invoice_total"
+        ),
+        "{err}"
+    );
+    assert_no_suite_claim(&failing);
+    let id = why_id(&failing);
+
+    // History, resume and the archived evidence keep the subset label.
+    let resume = success(root, &["resume"]);
+    assert!(
+        resume.contains("cargo test (affected subset) · exit 101"),
+        "{resume}"
+    );
+    let why = success(root, &["test", "--why", &id, "--test", "vat_rounds_down"]);
+    assert!(
+        why.contains("cargo test (affected subset) · exit 101 · subset"),
+        "{why}"
+    );
+    has_line(
+        &why,
+        "  tax::tests::vat_rounds_down · ledger-core --lib · exact · call at ledger/src/tax.rs:28 → tax::vat",
+    );
+    assert!(
+        why.contains("Changed ledger/src/tax.rs · modified"),
+        "{why}"
+    );
+    assert!(
+        !why.contains("  money::tests::adds_vat · ledger-core --lib"),
+        "{why}"
+    );
+
+    // Fixed: the subset passes and still says it is one.
+    replace_in(
+        root,
+        "ledger/src/tax.rs",
+        "cents * RATE / 100 + 1",
+        "(cents * RATE) / 100",
+    );
+    let why = success(root, &["test", "--why", &id]);
+    assert!(
+        why.contains("Changed ledger/src/tax.rs · modified [source changed]"),
+        "{why}"
+    );
+    let passing = cli(root, &affected);
+    assert!(passing.status.success(), "{}", stderr(&passing));
+    assert!(
+        stderr(&passing).contains("Subset passed (cargo): ran 8 tests reachable from your changes (7 of 20 indexed tests selected, 13 not run); the full suite was not run"),
+        "{}",
+        stderr(&passing)
+    );
+    assert!(stderr(&passing).contains("Full suite: justless test · Why: justless test --why run-"));
+    assert_no_suite_claim(&passing);
+
+    // The full suite is one command away and labeled as such.
+    let full = cli(root, &["test", "--", "cargo", "test", "--offline"]);
+    assert!(full.status.success(), "{}", stderr(&full));
+    has_line(&stdout(&full), "cargo · full suite");
+    assert!(
+        stderr(&full).contains("Full suite (cargo): exit 0, 21 tests ran, 0 failed"),
+        "{}",
+        stderr(&full)
+    );
+    let history = success(root, &["history"]);
+    assert!(history.contains("· cargo test · exit 0"), "{history}");
+
+    let unknown = cli(root, &["test", "--why", "run-missing"]);
+    assert_eq!(unknown.status.code(), Some(2));
+}
+
+#[test]
+fn affected_dry_run_explains_fallbacks_scopes_and_what_it_leaves_out() {
+    let repo = affected_fixture();
+    let root = repo.path();
+    let plan = |extra: &[&str]| {
+        let mut args = vec!["test", "--affected", "--dry-run", "--budget", "6000"];
+        args.extend_from_slice(extra);
+        let output = cli(root, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        let text = stdout(&output);
+        assert!(
+            !text.contains("--test needs"),
+            "required-features target selected:\n{text}"
+        );
+        text
+    };
+    let reset = || {
+        git(root, &["checkout", "-q", "--", "."]);
+        git(root, &["clean", "-qfd", "--exclude=.justless"]);
+    };
+
+    // Code no test reaches: the full suite, or a labeled low-confidence subset.
+    replace_in(
+        root,
+        "ledger/src/report.rs",
+        "{name},{cents}",
+        "{name};{cents}",
+    );
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "cargo · full suite · no test reaches report::csv (ledger/src/report.rs:1-6) through indexed links",
+    );
+    has_line(&text, "  Run (full suite): cargo test");
+    let text = plan(&["--no-fallback"]);
+    assert!(
+        text.contains("cargo · low-confidence subset (no-tests)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  Run (build only): cargo test -p ledger-core --lib --no-run"),
+        "{text}"
+    );
+    reset();
+
+    // A trait method called implicitly is traced through its type, at low confidence.
+    replace_in(root, "ledger/src/money.rs", "\"{}.{:02}\"", "\"{}.{:02} \"");
+    let text = plan(&[]);
+    assert!(text.contains("inferred-only: money::Money::fmt"), "{text}");
+    assert!(
+        text.contains("money::tests::displays_cents · ledger-core --lib · possible · fmt is called implicitly; traced through type money::Money"),
+        "{text}"
+    );
+    reset();
+
+    // Documentation alone runs nothing.
+    fs::write(root.join("docs/pricing.md"), "# Pricing\n\nUpdated.\n").unwrap();
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "docs/pricing.md · no test impact (documentation or repository metadata)",
+    );
+    has_line(
+        &text,
+        "cargo · nothing to run · no change reaches its tests",
+    );
+    reset();
+
+    // A data file selects the test that embeds it; an unmentioned one runs everything.
+    replace_in(
+        root,
+        "ledger/fixtures/rates.json",
+        "\"reduced\": 5",
+        "\"reduced\": 7",
+    );
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "  Run (selected tests): cargo test -p ledger-core --test data -- rates_file_lists_the_standard_rate --exact",
+    );
+    fs::write(root.join("ledger/fixtures/extra.bin"), [0u8, 159, 146, 150]).unwrap();
+    let text = plan(&[]);
+    assert!(
+        text.contains(
+            "data-unlinked: ledger/fixtures/extra.bin is not mentioned by indexed source"
+        ),
+        "{text}"
+    );
+    reset();
+
+    // A member manifest runs its package whole; a removed name reaches its users.
+    fs::write(
+        root.join("reports/Cargo.toml"),
+        "[package]\nname = \"reports\"\nversion = \"0.1.1\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let text = plan(&[]);
+    has_line(&text, "  Run (whole packages): cargo test -p reports");
+    assert!(!text.contains("-p api"), "{text}");
+    reset();
+    replace_in(root, "ledger/src/tax.rs", "pub fn net(", "pub fn net_of(");
+    let text = plan(&[]);
+    has_line(&text, "Start net · removed from ledger/src/tax.rs");
+    assert!(
+        text.contains(
+            "tax::tests::net_removes_tax [test] ledger/src/tax.rs:31-34 · references removed net"
+        ),
+        "{text}"
+    );
+    reset();
+
+    // A deleted source file can leave a stale `mod`: its package builds and runs whole.
+    fs::remove_file(root.join("ledger/src/report.rs")).unwrap();
+    let text = plan(&[]);
+    assert!(
+        text.contains(
+            "deleted-file: ledger/src/report.rs was deleted: ledger-core and its dependents run in full"
+        ),
+        "{text}"
+    );
+    has_line(
+        &text,
+        "  Run (whole packages): cargo test -p api -p ledger-core",
+    );
+    reset();
+
+    // A new function nothing uses only has to compile; no test reaching it is no
+    // reason to fall back. The black-box CLI test still runs the changed library.
+    replace_in(
+        root,
+        "ledger/src/tax.rs",
+        "const RATE",
+        "pub fn gross_of(net: u64) -> u64 {\n    net + vat(net)\n}\n\nconst RATE",
+    );
+    let text = plan(&[]);
+    assert!(text.contains("tax::gross_of [function] ledger/src/tax.rs:15-17 · changed ledger/src/tax.rs:15-18 (new)"), "{text}");
+    assert!(!text.contains("no-tests"), "{text}");
+    has_line(
+        &text,
+        "  Run (build only): cargo test -p ledger-core --lib --no-run",
+    );
+    has_line(&text, "  Run (whole targets): cargo test -p api --test cli");
+    reset();
+
+    // Project settings: globs that force the full suite or mark files inert.
+    fs::write(
+        root.join(".justless.toml"),
+        "[test]\nfull_suite_on = [\"ledger/fixtures/**\"]\nignore = [\"*.bin\"]\n",
+    )
+    .unwrap();
+    fs::write(root.join("ledger/extra.bin"), [0u8, 1, 2]).unwrap();
+    let text = plan(&[]);
+    has_line(&text, "ledger/extra.bin · no test impact (test.ignore)");
+    has_line(
+        &text,
+        "cargo · nothing to run · no change reaches its tests",
+    );
+    replace_in(
+        root,
+        "ledger/fixtures/rates.json",
+        "\"reduced\": 5",
+        "\"reduced\": 7",
+    );
+    let text = plan(&[]);
+    assert!(
+        text.contains("configured: ledger/fixtures/rates.json matches test.full_suite_on"),
+        "{text}"
+    );
+    has_line(&text, "  Run (full suite): cargo test");
+    reset();
+
+    // Build configuration runs the full suite and says why.
+    fs::create_dir_all(root.join(".cargo")).unwrap();
+    fs::write(root.join(".cargo/config.toml"), "[term]\nverbose = false\n").unwrap();
+    let text = plan(&[]);
+    assert!(
+        text.contains(
+            "workspace-config: .cargo/config.toml changed: build configuration can affect every test"
+        ),
+        "{text}"
+    );
+    // A command that already selects tests runs as given.
+    let text = plan(&["--", "cargo", "test", "-p", "api"]);
+    has_line(
+        &text,
+        "cargo · command as given · the command already selects tests (-p)",
+    );
+    reset();
+
+    // Planning is deterministic and archives nothing.
+    replace_in(
+        root,
+        "reports/src/stats.rs",
+        "values.len() as u64",
+        "(values.len() as u64)",
+    );
+    let first = success(root, &["test", "--affected", "--dry-run", "--json"]);
+    assert_eq!(
+        first,
+        success(root, &["test", "--affected", "--dry-run", "--json"])
+    );
+    let json: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(json["runners"][0]["mode"], "subset");
+    assert_eq!(
+        json["runners"][0]["steps"][0]["argv"],
+        serde_json::json!([
+            "cargo",
+            "test",
+            "-p",
+            "reports",
+            "--lib",
+            "--",
+            "stats::tests::mean_of_nothing_is_zero",
+            "stats::tests::mean_rounds_down",
+            "--exact"
+        ])
+    );
+    // An integration test file that imports the change runs whole.
+    assert_eq!(
+        json["runners"][0]["steps"][1]["argv"],
+        serde_json::json!(["cargo", "test", "-p", "reports", "--test", "summary"])
+    );
+    let runs = root.join(".justless/runs");
+    assert!(
+        !runs.exists() || fs::read_dir(&runs).unwrap().next().is_none(),
+        "a dry run archived a run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn affected_tests_drive_pytest_jest_and_go_with_their_own_selectors() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let write = |file: &str, text: &str| {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    let tool = |file: &str, text: &str| {
+        write(file, text);
+        fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write(".gitignore", "node_modules/\n.venv/\ncalls.log\n");
+    write(
+        "pyproject.toml",
+        "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+    );
+    write("billing/__init__.py", "");
+    write(
+        "billing/rates.py",
+        "RATE = 20\n\n\ndef vat(cents):\n    return cents * RATE // 100\n",
+    );
+    write(
+        "tests/test_rates.py",
+        "from billing.rates import vat\n\n\ndef test_vat_is_a_fifth():\n    assert vat(500) == 100\n",
+    );
+    // A test that reaches the change only through another module gets a node ID.
+    write(
+        "billing/invoice.py",
+        "from billing.rates import vat\n\n\ndef total(cents):\n    return cents + vat(cents)\n",
+    );
+    write(
+        "tests/test_invoice.py",
+        "from billing.invoice import total\n\n\ndef test_total():\n    assert total(500) == 600\n\n\ndef test_unrelated():\n    assert True\n",
+    );
+    for name in ["test_names", "test_dates", "test_other"] {
+        write(
+            &format!("tests/{name}.py"),
+            "def test_one():\n    assert 1\n\n\ndef test_two():\n    assert 2\n",
+        );
+    }
+    write(
+        "web/package.json",
+        "{\"name\": \"web\", \"devDependencies\": {\"jest\": \"29\"}}\n",
+    );
+    write(
+        "web/src/format.ts",
+        "export function money(cents: number): string {\n  return (cents / 100).toFixed(2);\n}\n",
+    );
+    write(
+        "web/src/format.test.ts",
+        "import { money } from \"./format\";\n\ntest(\"money\", () => {\n  expect(money(1234)).toBe(\"12.34\");\n});\n",
+    );
+    write("web/src/cart.ts", "export const items = 1;\n");
+    write(
+        "web/src/cart.test.ts",
+        "import { items } from \"./cart\";\n\ntest(\"items\", () => {\n  expect(items).toBe(1);\n});\n",
+    );
+    write("shop/go.mod", "module example.com/shop\n\ngo 1.22\n");
+    write(
+        "shop/price/price.go",
+        "package price\n\nfunc Vat(cents int) int {\n\treturn cents * 20 / 100\n}\n",
+    );
+    write(
+        "shop/price/price_test.go",
+        "package price\n\nimport \"testing\"\n\nfunc TestVat(t *testing.T) {\n\tif Vat(500) != 100 {\n\t\tt.Fatal(\"vat\")\n\t}\n}\n",
+    );
+    // Recording stand-ins for the runners, which these tests do not install.
+    let log = root.join("calls.log");
+    let fake_pytest = format!(
+        "#!/bin/sh\necho \"pytest $*\" >> '{}'\nif [ -n \"$FAIL\" ]; then echo 'FAILED tests/test_rates.py::test_vat_is_a_fifth - assert 101 == 100'; echo '==== 1 failed in 0.01s ===='; exit 1; fi\necho '==== 1 passed in 0.01s ===='\n",
+        log.display()
+    );
+    tool("tools/pytest", &fake_pytest);
+    // A project virtualenv's interpreter is preferred over python3.
+    tool(".venv/bin/python", &fake_pytest);
+    tool(
+        "web/node_modules/.bin/jest",
+        &format!(
+            "#!/bin/sh\necho \"jest $*\" >> '{}'\necho 'PASS src/format.test.ts' >&2\necho 'Tests:       1 passed, 1 total' >&2\n",
+            log.display()
+        ),
+    );
+    tool(
+        "tools/go",
+        &format!(
+            "#!/bin/sh\necho \"go $*\" >> '{}'\nprintf 'ok  \\texample.com/shop/price\\t(cached)\\n'\n",
+            log.display()
+        ),
+    );
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    let pytest = root.join("tools/pytest");
+    let pytest = pytest.to_str().unwrap();
+
+    // An edited test runs by its node ID.
+    replace_in(
+        root,
+        "tests/test_invoice.py",
+        "def test_unrelated():\n    assert True",
+        "def test_unrelated():\n    assert 1",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["test", "--affected", "--dry-run", "--", pytest, "-q"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let text = stdout(&output);
+    has_line(&text, "pytest · subset · 1 of 9 indexed tests");
+    has_line(
+        &text,
+        &format!("  Run (selected tests): {pytest} -q tests/test_invoice.py::test_unrelated"),
+    );
+    git(root, &["checkout", "-q", "--", "tests/test_invoice.py"]);
+
+    replace_in(root, "billing/rates.py", "RATE // 100", "RATE // 100 + 1");
+    replace_in(root, "web/src/format.ts", "toFixed(2)", "toFixed(3)");
+    replace_in(root, "shop/price/price.go", "20 / 100", "21 / 100");
+    let justless = |args: &[&str], fail: bool| {
+        let path = format!(
+            "{}:{}",
+            root.join("tools").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+        command.args(args).current_dir(root).env("PATH", path);
+        if fail {
+            command.env("FAIL", "1");
+        }
+        command.output().unwrap()
+    };
+    // pytest: test files that import the changed module, directly or not, by path.
+    let output = justless(
+        &["test", "--affected", "--dry-run", "--", pytest, "-q"],
+        false,
+    );
+    let text = stdout(&output);
+    has_line(&text, "pytest · subset · 3 of 9 indexed tests");
+    has_line(
+        &text,
+        "  tests/test_rates.py · tests/test_rates.py · exact · import at tests/test_rates.py:1 → vat",
+    );
+    has_line(
+        &text,
+        "  tests/test_invoice.py · tests/test_invoice.py · exact · import at tests/test_invoice.py:1 → billing/invoice.py · import at billing/invoice.py:1 → vat",
+    );
+
+    // Go: packages and a -run pattern, kept here as a low-confidence subset.
+    let output = justless(&["test", "--affected", "--dry-run", "--no-fallback"], false);
+    let text = stdout(&output);
+    has_line(
+        &text,
+        "go (shop) · low-confidence subset (inferred-only, too-broad) · 1 of 1 indexed test",
+    );
+    has_line(
+        &text,
+        "  Run (selected tests): go test ./price -run '^(TestVat)$'",
+    );
+
+    // Detected runners: the pytest file and the Jest file that import the change,
+    // and Go in full because its links are inferred by name.
+    let output = justless(&["test", "--affected"], false);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    let err = stderr(&output);
+    has_line(&out, "pytest · subset · 3 of 9 indexed tests");
+    has_line(
+        &out,
+        "Run: .venv/bin/python -m pytest tests/test_invoice.py tests/test_rates.py",
+    );
+    has_line(&out, "jest (web) · subset · 1 of 2 indexed test files");
+    has_line(&out, "Run: node_modules/.bin/jest src/format.test.ts");
+    assert!(
+        out.contains(
+            "go (shop) · full suite · Vat (shop/price/price.go:3-5) reaches tests only through inferred links"
+        ),
+        "{out}"
+    );
+    has_line(&out, "Run: go test ./...");
+    assert!(
+        err.contains("Subset passed (jest): ran 1 test reachable from your changes (1 of 2 indexed test files selected, 1 not run); the full suite was not run"),
+        "{err}"
+    );
+    assert!(
+        err.contains("Full suite (fallback from --affected: inferred-only, too-broad) (go): exit 0, 1 package reported, 1 replayed from Go's test cache"),
+        "{err}"
+    );
+    assert_no_suite_claim(&output);
+    let calls = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls,
+        "pytest -m pytest tests/test_invoice.py tests/test_rates.py\njest src/format.test.ts\ngo test ./...\n"
+    );
+
+    // A failing runner's status is the command's status, and later runners still run.
+    fs::remove_file(&log).unwrap();
+    let output = justless(&["test", "--affected"], true);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("Subset failed (pytest): 1 of 1 test that ran failed, exit 1"),
+        "{err}"
+    );
+    assert!(
+        err.contains("  tests/test_rates.py::test_vat_is_a_fifth"),
+        "{err}"
+    );
+    assert!(err.contains("Subset passed (jest)"), "{err}");
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 3);
+
+    // A command given after -- runs with the selection appended.
+    fs::remove_file(&log).unwrap();
+    let output = justless(&["test", "--affected", "--", pytest, "-q"], false);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        "pytest -q tests/test_invoice.py tests/test_rates.py\n"
+    );
+}
+
+#[test]
+fn agent_hooks_never_narrow_or_rewrap_justless_test() {
+    let repo = affected_fixture();
+    let root = repo.path();
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    for command in [
+        "justless test --affected",
+        "justless test --affected -- cargo test --offline",
+        "cd api && justless test --affected",
+        "justless test",
+    ] {
+        for handler in ["hook-claude", "hook-codex"] {
+            assert_eq!(
+                agent_hook(root, handler, "before-command", call(command)),
+                serde_json::json!({}),
+                "{handler}: {command}"
+            );
+        }
+    }
+}
+
+#[test]
+fn affected_tests_from_a_member_directory_keep_what_dependencies_reach() {
+    // `cargo test` in api/ tests api only, but a change to ledger-core, which api
+    // depends on, still reaches api's tests and its black-box CLI test.
+    let repo = affected_fixture();
+    let root = repo.path();
+    replace_in(
+        root,
+        "ledger/src/tax.rs",
+        "cents * RATE / 100",
+        "cents * RATE / 100 + 1",
+    );
+    let api = root.join("api");
+    let text = success(
+        &api,
+        &[
+            "test",
+            "--affected",
+            "--dry-run",
+            "--no-fallback",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+        ],
+    );
+    assert!(
+        text.contains("cargo · low-confidence subset (inferred-only"),
+        "{text}"
+    );
+    has_line(
+        &text,
+        "  Run (whole targets): cargo test --offline -p api --test cli",
+    );
+    assert!(!text.contains("-p ledger-core"), "{text}");
+    let text = success(
+        &api,
+        &[
+            "test",
+            "--affected",
+            "--dry-run",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+        ],
+    );
+    has_line(&text, "  Run (full suite): cargo test --offline");
+    // A change to a package api does not use concerns nothing that runs here.
+    git(root, &["checkout", "-q", "--", "."]);
+    replace_in(
+        root,
+        "reports/src/stats.rs",
+        "values.len() as u64",
+        "(values.len() as u64)",
+    );
+    let text = success(
+        &api,
+        &[
+            "test",
+            "--affected",
+            "--dry-run",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+        ],
+    );
+    has_line(
+        &text,
+        "cargo · nothing to run · no change reaches its tests",
+    );
+}

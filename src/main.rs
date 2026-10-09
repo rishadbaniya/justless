@@ -22,12 +22,15 @@ mod pack;
 mod polyglot;
 mod proxy;
 mod redact;
+mod runners;
 mod rust_syntax;
 mod search;
+mod selection;
 mod source;
 mod statusline;
 mod summary;
 mod uninstall;
+mod testrun;
 mod workspace;
 
 use std::ffi::OsString;
@@ -307,6 +310,7 @@ fn cli() -> Command<'static> {
         .subcommand(map::command())
         .subcommand(statusline::command())
         .subcommand(impact::command())
+        .subcommand(testrun::command())
         .subcommand(mcp::command())
         .subcommand(doctor::command())
         .subcommands(source::commands())
@@ -399,6 +403,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         ("affected", sub) => impact::run(&workspace, sub)?,
         ("lookup", sub) => lookup::run(&workspace, sub)?,
         (name @ ("proxy" | "wrap"), sub) => return proxy::run(&workspace, name, sub),
+        ("test", sub) => return testrun::run(&workspace, sub),
         ("run", sub) => {
             let command: Vec<OsString> = sub
                 .values_of_os("command")

@@ -71,6 +71,8 @@ pub struct Settings {
     pub redact: bool,
     /// Regular expressions for detected values to leave visible.
     pub redact_allow: Vec<String>,
+    /// `[test]`: which changes run the full suite or have no test impact.
+    pub test: crate::selection::TestSettings,
 }
 
 impl Default for Settings {
@@ -85,6 +87,7 @@ impl Default for Settings {
             max_run_bytes: 256 * 1024 * 1024,
             redact: true,
             redact_allow: Vec::new(),
+            test: crate::selection::TestSettings::default(),
         }
     }
 }

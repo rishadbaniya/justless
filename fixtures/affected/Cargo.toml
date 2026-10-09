@@ -1,0 +1,3 @@
+[workspace]
+members = ["ledger", "api", "reports"]
+resolver = "2"

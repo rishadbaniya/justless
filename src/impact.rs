@@ -299,7 +299,7 @@ fn resolve(index: &Index, target: &str) -> Result<(Option<String>, Vec<usize>)> 
 /// longer exists, so its impact starts at the code that still names it. Lines
 /// removed inside a surviving symbol change that symbol. Anything else is reported
 /// as unknown rather than pinned on a neighbor.
-fn deleted(
+pub(crate) fn deleted(
     workspace: &Workspace,
     index: &Index,
     file: &str,
@@ -393,7 +393,7 @@ fn deleted(
 }
 
 /// Lines in indexed files that mention `name` as a whole identifier.
-fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Vec<(String, usize)> {
+pub(crate) fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Vec<(String, usize)> {
     const LIMIT: usize = 256;
     let identifier = |c: char| c.is_alphanumeric() || c == '_';
     let fingerprint = crate::index::Fingerprint::new(name);
@@ -430,15 +430,28 @@ fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Vec<(String, us
 /// Symbols touched by the current changes: the innermost definition around each
 /// changed range, and any definition whose declaration line changed.
 fn changed(workspace: &Workspace, index: &Index, staged: bool) -> Result<(Vec<usize>, Section)> {
+    Ok(changed_in(
+        workspace,
+        index,
+        &changes(workspace, index, staged)?,
+    ))
+}
+
+/// [`changed`] over a change set the caller already collected.
+pub(crate) fn changed_in(
+    workspace: &Workspace,
+    index: &Index,
+    changes: &[(String, Change)],
+) -> (Vec<usize>, Section) {
     let definitions = &index.definitions;
     let mut seeds = BTreeSet::new();
     let mut section = Section::new("changed", String::new(), 4);
-    for (file, change) in changes(workspace, index, staged)? {
+    for (file, change) in changes {
         let ranges = match change {
             Change::Ranges(ranges) => ranges,
             Change::Deleted(deletions) => {
                 for deletion in deletions {
-                    deleted(workspace, index, &file, &deletion, &mut seeds, &mut section);
+                    deleted(workspace, index, file, deletion, &mut seeds, &mut section);
                 }
                 continue;
             }
@@ -455,7 +468,7 @@ fn changed(workspace: &Workspace, index: &Index, staged: bool) -> Result<(Vec<us
                 continue;
             }
         };
-        for (start, end) in ranges {
+        for &(start, end) in ranges {
             let overlapping = index.at(&Location {
                 file: file.clone(),
                 start,
@@ -496,33 +509,33 @@ fn changed(workspace: &Workspace, index: &Index, staged: bool) -> Result<(Vec<us
         }
     }
     section.title = format!("Changed · {}", plural(seeds.len(), "symbol"));
-    Ok((seeds.into_iter().collect(), section))
+    (seeds.into_iter().collect(), section)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Dependent<'a> {
+pub(crate) enum Dependent<'a> {
     Symbol(usize),
     /// A file-scope reference, such as a Rust `use` outside any item.
     Scope(&'a str),
 }
 
-struct Reach<'a> {
-    dependent: Dependent<'a>,
-    edge: &'a Edge,
+pub(crate) struct Reach<'a> {
+    pub dependent: Dependent<'a>,
+    pub edge: &'a Edge,
     /// The symbol this dependent links to, one hop nearer the target.
-    via: usize,
+    pub via: usize,
     /// Whether any link on the way is inferred.
-    possible: bool,
+    pub possible: bool,
 }
 
-struct Walk<'a> {
-    levels: Vec<Vec<Reach<'a>>>,
+pub(crate) struct Walk<'a> {
+    pub levels: Vec<Vec<Reach<'a>>>,
     /// Distinct dependents one hop past the depth limit.
-    beyond: usize,
+    pub beyond: usize,
     /// Symbols with more new dependents than the fan-out cap, and how many they had.
-    fanned: Vec<(usize, usize)>,
+    pub fanned: Vec<(usize, usize)>,
     /// Whether the walk stopped at `MAX_REACHED`.
-    full: bool,
+    pub full: bool,
 }
 
 /// Links into `id` from other symbols, and from file scopes in other files.
@@ -537,7 +550,7 @@ fn links_into(index: &Index, id: usize) -> impl Iterator<Item = &Edge> {
 
 /// Breadth-first over incoming links. Each dependent appears once, at its
 /// shortest distance, through its most certain link, so cycles terminate.
-fn walk<'a>(index: &'a Index, seeds: &[usize], depth: usize) -> Walk<'a> {
+pub(crate) fn walk<'a>(index: &'a Index, seeds: &[usize], depth: usize) -> Walk<'a> {
     let definitions = &index.definitions;
     let dependent = |edge: &'a Edge| match edge.from {
         Some(from) => Dependent::Symbol(from),
