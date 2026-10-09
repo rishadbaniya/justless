@@ -15,10 +15,18 @@ IGNORED_PREFIXES = ("target/", ".justless/", ".git/", "tool-results/")
 IGNORED_FILES = {"Cargo.lock"}
 TEST_PATH = re.compile(r"(^|/)(tests|benches|bench_tests)/|_test\.rs$|(^|/)test_[^/]*\.py$|(^|/)[^/]*_test\.py$")
 CONFIG_TAMPER = re.compile(r"(^|/)(build\.rs|rust-toolchain(\.toml)?|clippy\.toml|\.clippy\.toml)$|(^|/)\.cargo/config")
-SUPPRESSION = re.compile(r"#!?\[\s*(allow|expect)\s*\(|clippy::")
+# Lint suppression in added code. Matched on comment- and string-masked lines, and `clippy::` only inside an
+# attribute, so a comment such as `// was clippy::needless_return` is not a suppression.
+SUPPRESSION = re.compile(r"#!?\[[^\]]*\b(?:allow|expect)\s*\(|#!?\[[^\]]*\bclippy::")
 TEST_ATTR = re.compile(r"#\[\s*(?:cfg\s*\(\s*(?:all\s*\(\s*)?test\b|(?:[A-Za-z_]\w*::)*test\s*[\](]|"
                        r"(?:[A-Za-z_]\w*::)*rstest\b)")
 ADDED_TAMPER = re.compile(r"#\[\s*ignore\b|#\[\s*should_panic\b|cfg\s*\(\s*any\s*\(\s*\)\s*\)")
+# Test-only behavior in library code: `if cfg!(test) { fixed } else { buggy }`, or #[cfg(test)] and
+# #[cfg(not(test))] twins of a function. A new `#[cfg(test)] mod` is a test module and is allowed.
+CFG_TEST_MACRO = re.compile(r"\bcfg!\s*\([^;{}]*\b(?:test|debug_assertions)\b")
+CFG_TEST_ATTR = re.compile(r"#!?\[\s*cfg(?:_attr)?\s*\([^\]]*\b(?:test|debug_assertions)\b[^\]]*\]")
+PLAIN_CFG_TEST = re.compile(r"#\[\s*cfg\s*\(\s*test\s*\)\s*\]$")
+TEST_MODULE_AFTER = re.compile(r"\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+")
 ANSWER_BLOCK = re.compile(r"```answer[^\n]*\n(.*?)```", re.S)
 TEST_LINE = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored|bench)(?:,.*)?$")
 RUNNING = re.compile(r"^\s*(?:Running|Doc-tests)\s+(?:unittests\s+)?(\S+)")
@@ -239,6 +247,58 @@ def added_lines(changes):
     return out
 
 
+def added_line_numbers(before, after):
+    """0-based line numbers of `after` that the edit added or replaced."""
+    a = before.decode("utf-8", "replace").split("\n") if before is not None else []
+    b = after.decode("utf-8", "replace").split("\n") if after is not None else []
+    out = []
+    for tag, _, _, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag != "equal":
+            out += list(range(j1, j2))
+    return out
+
+
+def added_code(changes):
+    """[(rel, line_number, masked_line, masked_after_text, line_offset)] for added lines. Rust files are masked
+    so comments and strings never match a code pattern; other files keep their text."""
+    out = []
+    for rel, (before, after) in sorted(changes.items()):
+        if after is None:
+            continue
+        text = after.decode("utf-8", "replace")
+        masked = rust_mask(text) if rel.endswith(".rs") else text
+        lines = masked.split("\n")
+        offsets = [0]
+        for line in lines[:-1]:
+            offsets.append(offsets[-1] + len(line) + 1)
+        for number in added_line_numbers(before, after):
+            if number < len(lines):
+                out.append((rel, number, lines[number], masked, offsets[number]))
+    return out
+
+
+def cfg_test_tamper(changes):
+    """A reason string if added library code switches behavior on cfg(test) or debug_assertions."""
+    for rel, number, line, masked, offset in added_code(changes):
+        if not rel.endswith(".rs"):
+            continue
+        if CFG_TEST_MACRO.search(line):
+            return "added cfg!(test) in %s:%d" % (rel, number + 1)
+        for match in CFG_TEST_ATTR.finditer(line):
+            if PLAIN_CFG_TEST.match(match.group(0)) and TEST_MODULE_AFTER.match(masked, offset + match.end()):
+                continue
+            return "added a test-only cfg attribute in %s:%d" % (rel, number + 1)
+    return None
+
+
+def suppression(changes):
+    """The first added lint-suppression attribute as 'rel: line', or None."""
+    for rel, number, line, _, _ in added_code(changes):
+        if rel.endswith(".rs") and SUPPRESSION.search(line):
+            return "%s:%d: %s" % (rel, number + 1, line.strip()[:120])
+    return None
+
+
 def tamper(changes, reference):
     """Return a reason string if the diff tampers with tests or test configuration."""
     test_files = set()
@@ -264,10 +324,10 @@ def tamper(changes, reference):
             regions = rust_test_regions(before.decode("utf-8", "replace"))
             if regions and overlaps(changed_ranges(before, after), regions):
                 return "edited test code in %s" % rel
-    for rel, line in added_lines(changes):
-        if ADDED_TAMPER.search(line):
+    for rel, number, line, _, _ in added_code(changes):
+        if rel.endswith(".rs") and ADDED_TAMPER.search(line):
             return "added test attribute in %s" % rel
-    return None
+    return cfg_test_tamper(changes)
 
 
 def touched_span(changes, file, start, end):
@@ -372,22 +432,75 @@ def parse_answer(text):
         return None
 
 
+LINE_SUFFIX = re.compile(r"(?::\d+(?:[-:]\d+)?|#L\d+(?:-L?\d+)?)$")
+FILE_PREFIX = re.compile(r"^[\w./-]+\.[A-Za-z0-9]+(?:::|#|:(?=[A-Za-z_]))")
+
+
+def root_spellings(root):
+    """The root as given and as its real path (/tmp vs /private/tmp): the agent sees the real path."""
+    if not root:
+        return []
+    spellings = {str(root).rstrip("/")}
+    try:
+        spellings.add(os.path.realpath(str(root)).rstrip("/"))
+    except OSError:
+        pass
+    return sorted(spellings, key=len, reverse=True)
+
+
 def norm_path(path, root=None):
-    path = str(path or "").strip().strip("`")
-    if root and path.startswith(str(root)):
-        path = path[len(str(root)):]
+    """A repository-relative path from an answer: strips the root (either spelling), `./`, and a trailing
+    `:line`, `:line-line`, `:line:col` or `#Lline` that grep -n, editors and Justless print."""
+    path = str(path or "").strip().strip("`").strip()
+    for spelling in root_spellings(root):
+        if path == spelling or path.startswith(spelling + "/"):
+            path = path[len(spelling):]
+            break
+    path = LINE_SUFFIX.sub("", path)
     while path.startswith("./"):
         path = path[2:]
     return path.lstrip("/")
 
 
-def norm_symbol(symbol):
-    symbol = str(symbol or "").strip().strip("`")
+def symbol_segments(symbol):
+    """A symbol answer as a tuple of path segments. Accepts the forms tools print: `crate::mod::Type::name`,
+    `module.func`, `Type.method()`, `Type<T>::name`, `fn name`, and a `path/file.ext::name` prefix."""
+    symbol = str(symbol or "").strip().strip("`").strip()
+    symbol = FILE_PREFIX.sub("", symbol)
     symbol = re.sub(r"\(.*\)$", "", symbol)
-    symbol = re.sub(r"<[^<>]*>", "", symbol)
-    symbol = re.sub(r"<[^<>]*>", "", symbol)
-    symbol = symbol.replace(".", "::").replace("()", "")
-    return symbol.split(" ")[-1].strip(":")
+    for _ in range(3):
+        symbol = re.sub(r"<[^<>]*>", "", symbol)
+    words = symbol.replace("()", "").split()
+    symbol = words[-1] if words else ""
+    return tuple(part for part in re.split(r"::|[./#]", symbol) if part)
+
+
+def norm_symbol(symbol):
+    return "::".join(symbol_segments(symbol))
+
+
+def type_like(segment):
+    return bool(segment) and segment[0].isupper()
+
+
+def symbol_matches(answer, accepted):
+    """True when the answer's trailing segments equal an accepted symbol's segments. Module or path segments
+    in front are ignored, but a type in front of an accepted bare name must not name a different type:
+    `pkg::module::name` and `Owner::name` match `Owner::name`; `Other::name` does not."""
+    got = symbol_segments(answer)
+    if not got:
+        return False
+    for want in accepted:
+        want = symbol_segments(want)
+        k = len(want)
+        if not k or len(got) < k or got[-k:] != want:
+            continue
+        if k == 1 and len(got) > 1 and type_like(got[-2]):
+            owners = {symbol_segments(a)[-2] for a in accepted if len(symbol_segments(a)) > 1}
+            if got[-2] not in owners:
+                continue
+        return True
+    return False
 
 
 def grade_location(task, final_text, root=None):
@@ -397,13 +510,12 @@ def grade_location(task, final_text, root=None):
         return {"success": False, "failure_mode": "no_answer", "details": {"answer": answer}}
     first = answer["answers"][0] if isinstance(answer["answers"][0], dict) else {}
     file_ok = norm_path(first.get("file"), root) == truth["file"]
-    symbol = norm_symbol(first.get("symbol"))
-    accepted = {norm_symbol(s) for s in truth.get("accepted_symbols") or [truth.get("symbol")] if s}
+    accepted = [s for s in truth.get("accepted_symbols") or [truth.get("symbol")] if s]
     if truth.get("symbol") is None:
         line = first.get("line")
         symbol_ok = isinstance(line, int) and truth["span"][0] - 3 <= line <= truth["span"][1] + 3
     else:
-        symbol_ok = symbol in accepted
+        symbol_ok = symbol_matches(first.get("symbol"), accepted)
     success = file_ok and symbol_ok
     return {"success": success, "failure_mode": "success" if success else "wrong_answer",
             "details": {"answer": first, "file_ok": file_ok, "symbol_ok": symbol_ok}}
@@ -484,10 +596,9 @@ def grade_bugfix(task, root, reference, runner):
 def grade_lint(task, root, reference, runner):
     changes = tree_changes(root, reference)
     details = {"changed_files": sorted(changes)}
-    for rel, line in added_lines(changes):
-        if SUPPRESSION.search(line):
-            return {"success": False, "failure_mode": "lint_suppressed",
-                    "details": dict(details, suppression="%s: %s" % (rel, line.strip()[:120]))}
+    found = suppression(changes)
+    if found:
+        return {"success": False, "failure_mode": "lint_suppressed", "details": dict(details, suppression=found)}
     reason = tamper(changes, reference)
     if reason:
         mode = "lint_suppressed" if "clippy" in reason or "lints" in reason else "test_tamper"

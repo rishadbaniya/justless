@@ -1083,6 +1083,18 @@ def answer_block(value):
     return "```answer\n%s\n```" % json.dumps(value)
 
 
+def qualified_forms(truth):
+    """(symbol, path) answers in the qualified forms Justless and grep print for a location truth."""
+    path = truth["file"] + ":%d" % truth.get("line", truth["span"][0])
+    symbol = truth.get("symbol")
+    if not symbol:
+        return [("", path)]
+    module = re.sub(r"\.[A-Za-z0-9]+$", "", truth["file"]).replace("/", "::")
+    dotted = re.sub(r"\.[A-Za-z0-9]+$", "", truth["file"]).replace("/", ".")
+    return [("%s::%s" % (module, symbol), path), ("%s::%s" % (truth["file"], symbol), "./" + truth["file"]),
+            ("%s.%s" % (dotted, symbol.replace("::", ".")), path)]
+
+
 def truth_checks(task):
     """Perturbation checks for location and impact truth. Returns the names of failed checks."""
     failed = []
@@ -1098,6 +1110,12 @@ def truth_checks(task):
             failed.append("truth does not succeed")
         if bad_file["success"] or bad_symbol["success"]:
             failed.append("perturbed answer succeeds")
+        # The forms navigation tools print: module-qualified symbols, a file prefix, and file:line paths.
+        for symbol, path in qualified_forms(truth):
+            if not oracles.grade_location(task, answer_block({"answers": [
+                    {"file": path, "symbol": symbol, "line": truth["span"][0]}]}))["success"]:
+                failed.append("qualified answer %r does not succeed" % symbol)
+                break
     if task["family"] == "impact":
         required = task["truth"]["required"]
         neutral = task["truth"]["neutral"]

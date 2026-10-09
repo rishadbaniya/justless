@@ -482,9 +482,12 @@ def cmd_dry_run(args):
     summary = []
     try:
         for variant in variants:
+            chosen = [t for t in task_list if fake_agent.applies(variant, t)]
+            if not chosen:
+                continue
             settings = make_settings(args, "%s-%s" % (args.campaign, variant), fake, variant)
             manifest = full_manifest(args)
-            rows = schedule(settings, task_list, [args.model], args.arms.split(","), args.reps, args.effort,
+            rows = schedule(settings, chosen, [args.model], args.arms.split(","), args.reps, args.effort,
                             manifest, args.workers, phase="dry-run")
             for row in rows:
                 want = fake_agent.expected(variant, next(t for t in task_list if t["id"] == row["task_id"]))
@@ -590,7 +593,7 @@ def cmd_validate_tasks(args):
         snap = snapshot_dir(args.home, task)
         stored = (snap / "tree_hash").read_text() if (snap / "tree_hash").exists() else None
         snapshot_ok[task["id"]] = stored is not None and stored == workspace.tree_hash(snap / "repo")
-    args.variants = args.variants or "noop,correct,tamper,wrong"
+    args.variants = args.variants or "noop,correct,tamper,wrong,qualified,cfgtest"
     args.arms = args.arms or "a"
     code = cmd_dry_run(args)
     truth_failures = {t["id"]: gen_tasks.truth_checks(t) for t in task_list}
@@ -733,7 +736,7 @@ def parser():
     common(sub.add_parser("parity-diff"))
     common(sub.add_parser("sandbox-check"))
     dry = common(sub.add_parser("dry-run"))
-    dry.add_argument("--variants", default="correct,wrong,tamper,unread_edit,probe")
+    dry.add_argument("--variants", default="correct,wrong,tamper,unread_edit,probe,qualified,cfgtest")
     common(sub.add_parser("pilot"))
     common(sub.add_parser("estimate")).add_argument("--assume", default="pilot", choices=["pilot", "prepilot"])
     common(sub.add_parser("run"))

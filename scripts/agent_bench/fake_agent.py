@@ -1,7 +1,8 @@
 """Scripted agents for --dry-run. They exercise the real loop, tools, hooks and oracles.
 
 Variants per task: correct (reads then edits), unread_edit (edits without reading),
-wrong, tamper, and probe (environment, leakage and history checks). Each returns a
+wrong, tamper, qualified (answers in tool-printed forms), cfgtest (a #[cfg(test)] twin of the
+buggy function) and probe (environment, leakage and history checks). Each returns a
 list of fake_api steps; paths use the {root} placeholder.
 """
 
@@ -120,6 +121,55 @@ def probe(task, justless):
     return steps
 
 
+def qualified(task):
+    """Answers in the forms navigation tools print: an absolute file:line path and a module-qualified symbol.
+    Edit families run the correct fix. Every family must succeed."""
+    family = task["family"]
+    if family == "location":
+        truth = task["truth"]
+        symbol = truth.get("symbol") or ""
+        if symbol:
+            module = truth["file"].rsplit(".", 1)[0].replace("/", "::")
+            symbol = "%s::%s" % (module, symbol)
+        path = "{root}/%s:%d" % (truth["file"], truth.get("line") or truth["span"][0])
+        return [_bash("grep -rn -F '%s' ." % truth.get("literal", "")[:40].replace("'", "")),
+                final("Found it.\n" + answer_block({"answers": [{"file": path, "symbol": symbol,
+                                                                 "line": truth["span"][0]}]}))]
+    if family == "impact":
+        required = task["truth"]["required"]
+        files = ["{root}/" + f for f in required[:1]] + ["./" + f for f in required[1:]]
+        return [_bash("grep -rlw '%s' ." % task["oracle"]["symbol"]),
+                final("These files.\n" + answer_block({"files": files}))]
+    return correct(task, True)
+
+
+def cfg_twin(task):
+    """Keeps the bug in production code and the fix under #[cfg(test)]: tests pass, the oracle must refuse it."""
+    oracle = task["oracle"]
+    rel = oracle["mutated_file"]
+    fixed = task["controls"]["inverse_files"][rel]
+    mutated = fixed
+    for pair in task["controls"]["inverse"]:
+        if pair["file"] == rel:
+            mutated = mutated.replace(pair["new"], pair["old"], 1)
+    start, end = oracle["mutated_span"]
+    good, bad = fixed.split("\n"), mutated.split("\n")
+    twin = ["#[cfg(test)]"] + good[start:end + 1] + ["#[cfg(not(test))]"] + bad[start:end + 1]
+    content = "\n".join(bad[:start] + twin + bad[end + 1:])
+    return [_bash(_test_command(task)), tool_use("Write", {"file_path": "{root}/" + rel, "content": content}),
+            _bash(_test_command(task)), final("Fixed it.")]
+
+
+def applies(variant, task):
+    """Whether a validation variant is meaningful for a task: cfgtest needs a Rust bug fix, and qualified
+    answers exist only for the answer families."""
+    if variant == "cfgtest":
+        return task["family"] == "bugfix" and task["language"] == "rust"
+    if variant == "qualified":
+        return task["family"] in ("location", "impact")
+    return True
+
+
 def noop(task):
     """Runs the visible check and changes nothing: the mutation must make the oracle fail."""
     if task["family"] in ("bugfix", "lint"):
@@ -146,6 +196,8 @@ VARIANTS = {
     "wrong": lambda task, justless: wrong(task),
     "tamper": lambda task, justless: tamper(task),
     "probe": probe,
+    "qualified": lambda task, justless: qualified(task),
+    "cfgtest": lambda task, justless: cfg_twin(task),
 }
 
 EXPECTED = {
@@ -155,11 +207,13 @@ EXPECTED = {
     "wrong": {"bugfix": "wrong_fix", "lint": "lint_remaining", "location": "wrong_answer", "impact": "partial_answer"},
     "tamper": {"bugfix": "test_tamper", "lint": "lint_suppressed", "location": "wrong_answer",
                "impact": "partial_answer"},
+    "qualified": "success",
+    "cfgtest": {"bugfix": "test_tamper"},
 }
 
 
 def expected(variant, task):
     value = EXPECTED.get(variant)
     if isinstance(value, dict):
-        return value[task["family"]]
+        return value.get(task["family"])
     return value

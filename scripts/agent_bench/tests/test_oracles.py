@@ -147,6 +147,48 @@ class RustOracleTests(unittest.TestCase):
         result = oracles.grade(task, self.root, self.reference, lambda a, t: (0, ""), "")
         self.assertEqual(result["failure_mode"], "lint_suppressed")
 
+    def test_cfg_test_twin_is_tamper(self):
+        """The fix under #[cfg(test)] and the bug under #[cfg(not(test))]: the tests pass, the bug ships."""
+        lines = MUTATED.split("\n")
+        start, end = 4, 10
+        twin = (["#[cfg(test)]"] + LIB.split("\n")[start:end + 1] + ["#[cfg(not(test))]"] + lines[start:end + 1])
+        self.write("src/lib.rs", "\n".join(lines[:start] + twin + lines[end + 1:]))
+        result = self.grade()
+        self.assertEqual(result["failure_mode"], "test_tamper", result)
+        self.assertIn("cfg", result["details"]["tamper"])
+
+    def test_cfg_macro_switch_is_tamper(self):
+        self.write("src/lib.rs", MUTATED.replace("if sum < max {", "if if cfg!(test) { sum > max } else { sum < max } {"))
+        self.assertEqual(self.grade()["failure_mode"], "test_tamper")
+
+    def test_new_test_module_is_allowed(self):
+        self.write("src/lib.rs", LIB + "\n#[cfg(test)]\nmod regression {\n    #[test]\n    fn fixed() {\n"
+                   "        assert_eq!(super::clamp_add(9, 9, 10), 10);\n    }\n}\n")
+        result = self.grade()
+        self.assertTrue(result["success"], result)
+
+
+class SuppressionTests(unittest.TestCase):
+    def changes(self, before, after):
+        return {"src/lib.rs": (before.encode(), after.encode())}
+
+    def test_comment_mentioning_clippy_is_not_suppression(self):
+        before = "fn f() -> u32 {\n    return 1;\n}\n"
+        after = "fn f() -> u32 {\n    // was clippy::needless_return\n    1\n}\n"
+        self.assertIsNone(oracles.suppression(self.changes(before, after)))
+        self.assertIsNone(oracles.tamper(self.changes(before, after), {"src/lib.rs": before.encode()}))
+
+    def test_attributes_are_suppression(self):
+        before = "fn f() -> u32 {\n    1\n}\n"
+        for attr in ("#[allow(clippy::needless_return)]", "#![allow(dead_code)]", "#[expect(unused)]",
+                     "#[cfg_attr(test, allow(clippy::all))]", "#[clippy::msrv = \"1.70\"]"):
+            self.assertIsNotNone(oracles.suppression(self.changes(before, attr + "\n" + before)), attr)
+
+    def test_string_with_cfg_test_is_not_tamper(self):
+        before = "fn f() -> &'static str {\n    \"a\"\n}\n"
+        after = "fn f() -> &'static str {\n    \"cfg!(test) and #[cfg(test)]\"\n}\n"
+        self.assertIsNone(oracles.tamper(self.changes(before, after), {"src/lib.rs": before.encode()}))
+
 
 class LexerTests(unittest.TestCase):
     def test_mask_keeps_length_and_hides_strings(self):
@@ -222,6 +264,46 @@ class AnswerTests(unittest.TestCase):
             self.assertTrue(result["success"], symbol)
         result = oracles.grade_location(self.TASK, answer({"answers": [{"file": "/r/src/a.rs", "symbol": "apply"}]}), "/r")
         self.assertTrue(result["success"])
+
+    def test_qualified_symbols_and_paths_from_tools(self):
+        """Navigation tools print module-qualified names and file:line paths; both arms may copy them."""
+        good = ("crate_a::mod_b::Book::apply", "pkg::Book::apply()", "src/a.rs::Book::apply", "mod_b.Book.apply",
+                "crate_a::mod_b::apply", "fn apply", "<Book as Trait>::apply")
+        for symbol in good:
+            result = oracles.grade_location(self.TASK, answer({"answers": [{"file": "src/a.rs", "symbol": symbol}]}))
+            self.assertTrue(result["success"], symbol)
+        for symbol in ("Other::apply", "crate_a::Other::apply", "apply_all", "Book::apply_all", "Book"):
+            result = oracles.grade_location(self.TASK, answer({"answers": [{"file": "src/a.rs", "symbol": symbol}]}))
+            self.assertFalse(result["success"], symbol)
+        root = helpers.tempdir(self)
+        for path in ("src/a.rs:12", "src/a.rs:12:4", "src/a.rs:10-20", "./src/a.rs#L12", str(root) + "/src/a.rs:3"):
+            result = oracles.grade_location(self.TASK, answer({"answers": [{"file": path, "symbol": "apply"}]}), root)
+            self.assertTrue(result["success"], path)
+
+    def test_root_matches_in_either_spelling(self):
+        real = helpers.tempdir(self)
+        (real / "repo").mkdir()
+        link = real / "link"
+        link.symlink_to(real / "repo")
+        result = oracles.grade_location(self.TASK, answer({"answers": [
+            {"file": str(real / "repo") + "/src/a.rs", "symbol": "apply"}]}), link)
+        self.assertTrue(result["success"])
+        self.assertEqual(oracles.norm_path(str(link) + "/src/a.rs", link), "src/a.rs")
+
+    def test_truth_checks_include_qualified_forms(self):
+        import gen_tasks
+        import tasks as tasks_module
+        task = dict(self.TASK, id="location-x-01", truth=dict(self.TASK["truth"], line=12))
+        self.assertEqual(gen_tasks.truth_checks(task), [])
+        for public in tasks_module.load_public():
+            self.assertEqual(gen_tasks.truth_checks(public), [], public["id"])
+
+    def test_free_function_rejects_a_type_owner(self):
+        task = {"family": "location", "truth": {"file": "app/core.py", "symbol": "func_c",
+                                                "accepted_symbols": ["func_c", "func_c"], "span": [3, 9]}, "oracle": {}}
+        for symbol, ok in (("app.core.func_c", True), ("app/core.py::func_c", True), ("Widget.func_c", False)):
+            result = oracles.grade_location(task, answer({"answers": [{"file": "app/core.py", "symbol": symbol}]}))
+            self.assertEqual(result["success"], ok, symbol)
 
     def test_location_first_answer_only(self):
         result = oracles.grade_location(self.TASK, answer({"answers": [{"file": "src/b.rs", "symbol": "x"},
