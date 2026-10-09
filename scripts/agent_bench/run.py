@@ -36,7 +36,12 @@ import workspace  # noqa: E402
 TERMINAL = {"success", "wrong_fix", "untouched_site", "build_broken", "test_tamper", "lint_remaining",
             "lint_suppressed", "wrong_answer", "partial_answer", "no_answer", "turn_limit", "token_limit",
             "run_budget", "wall_timeout", "max_tokens", "refusal", "harness_unrecoverable"}
-RERUN = {"harness_error", "aborted_global_cap"}
+# Re-run without using up the harness-error retry budget: a cap abort, or an infrastructure pause such as
+# count_tokens failing after its retries.
+RERUN = {"harness_error", "aborted_global_cap", "paused_infra"}
+LIMIT_STOPS = {"turn_limit", "token_limit", "run_budget", "wall_timeout"}
+GATE_MIN_RUNS = 20
+GATE_POINTS = 0.02
 
 
 def harness_commit():
@@ -52,6 +57,29 @@ def harness_commit():
         return commit[:12]
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
+
+
+def pin_binary(home, binary):
+    """Copy the binary under test into the store under its SHA-256 and return the copy. Every run installs
+    from the copy, so a rebuild at the original path during a campaign cannot change what later runs use."""
+    binary = Path(binary).resolve()
+    sha = config.sha256_file(binary)
+    dest = Path(home) / "bins" / ("justless-" + sha[:16])
+    if not dest.exists() or config.sha256_file(dest) != sha:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp%d" % os.getpid())
+        shutil.copy2(str(binary), str(tmp))
+        os.chmod(str(tmp), 0o555)
+        os.replace(str(tmp), str(dest))
+    if config.sha256_file(dest) != sha:
+        raise RuntimeError("the pinned justless copy does not match %s" % sha)
+    return dest, sha
+
+
+def install_pinned(source, dest, sha):
+    workspace.install_binary(source, dest)
+    if config.sha256_file(dest) != sha:
+        raise RuntimeError("installed justless %s does not match the pinned sha256 %s" % (dest, sha[:16]))
 
 
 # ----------------------------------------------------------------------------- snapshots
@@ -137,17 +165,35 @@ class Settings:
         self.variant = variant
         self.home = Path(args.home)
         self.runroot = Path(args.runroot)
-        self.binary = Path(args.binary).resolve() if args.binary else None
-        self.justless_sha = config.sha256_file(self.binary) if self.binary else "none"
+        if args.binary:
+            self.binary, self.justless_sha = pin_binary(self.home, args.binary)
+        else:
+            self.binary, self.justless_sha = None, "none"
         self.cc_binary = args.cc_binary
         self.commit = harness_commit()
+        self.harness = config.harness_tree_hash()
         self.dir = self.home / "campaigns" / campaign
         self.dir.mkdir(parents=True, exist_ok=True)
         self.logs = {name: loop.JsonlWriter(self.dir / ("%s.jsonl" % name))
                      for name in ("requests", "tools", "attempts", "results")}
         self.ce_trigger = getattr(args, "ce_trigger", None) or config.CE_PILOT_TRIGGER
+        self.seed = getattr(args, "seed", None) or config.SEED
+        self.max_output = getattr(args, "max_output_tokens", None) or config.MAX_OUTPUT_CAP
+        self.limits = {"turn_limit": getattr(args, "max_turns", None) or config.LIMITS["turn_limit"],
+                       "token_limit": getattr(args, "token_limit", None) or config.LIMITS["token_limit"],
+                       "wall_timeout": config.LIMITS["wall_timeout"]}
+        self.ignore_gate = bool(getattr(args, "ignore_gate", False))
+        self.pause_reason = None
         self.task_locks = {}
         self.lock = threading.Lock()
+
+    def run_budget(self, model):
+        return getattr(self.args, "run_cap_usd", None) or config.MODELS[model]["run_budget"]
+
+    def pause(self, reason):
+        with self.lock:
+            if self.pause_reason is None:
+                self.pause_reason = reason
 
     def task_lock(self, task_id):
         with self.lock:
@@ -174,7 +220,9 @@ def make_token_counter(client, model, cache):
         try:
             value = client.count_tokens(model, text)
         except api_module.APIError as error:
-            raise loop.HarnessError("count_tokens", str(error)[:300])
+            # count_tokens already retried with backoff; a persistent failure pauses the campaign instead of
+            # re-rolling the run, which would give the arm that reads more large files more re-rolls.
+            raise loop.HarnessError("infra_pause", "count_tokens: %s" % str(error)[:300])
         with _count_lock:
             data = {}
             if cache.exists():
@@ -194,7 +242,7 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
     args = settings.args
     effort = settings.profile.effort(model) if effort_name == "cc-default" else effort_name
     rid = config.run_id(settings.campaign, model, effort_name, arm, task["id"], rep, manifest,
-                        settings.justless_sha, settings.commit, settings.profile.capture_hash)
+                        settings.justless_sha, settings.harness, settings.profile.capture_hash)
     nonce = config.nonce(rid, attempt)
     run_dir = settings.runroot / hashlib.sha256((rid + str(attempt)).encode()).hexdigest()[:12]
     if run_dir.exists():
@@ -216,7 +264,7 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
     allow_exec = []
     if config.ARMS[arm]["justless"]:
         justless_dir = run_dir / "jlbin"
-        workspace.install_binary(settings.binary, justless_dir / "justless")
+        install_pinned(settings.binary, justless_dir / "justless", settings.justless_sha)
         allow_exec.append(justless_dir / "justless")
     env = workspace.tool_env(repo.resolve(), home, bindir, target, justless_dir, tmp=run_dir / "tmp")
     deny = sandbox.default_denies(config, [settings.home, settings.runroot])
@@ -274,20 +322,27 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         variant = None
     spec = {"campaign": settings.campaign, "model": model, "effort": effort, "arm": arm, "run_id": rid,
             "attempt": attempt, "nonce": nonce, "home": str(home), "prompt": task["prompt"],
-            "run_budget": getattr(args, "run_cap_usd", None) or config.MODELS[model]["run_budget"],
-            "ce_trigger": settings.ce_trigger, "phase": phase}
+            "run_budget": settings.run_budget(model), "ce_trigger": settings.ce_trigger, "phase": phase,
+            "max_output_tokens": settings.max_output}
     client = settings.client_factory()
-    limits = {"turn_limit": args.max_turns}
     allowed = workspace.allowed_secret_texts(repo, load_allowlist(settings.home))
     run = loop.Run(spec, client, settings.profile, settings.ledger, settings.pricing, tools_ws, hooks,
-                   settings.logs, limits=limits, api_key=getattr(client, "api_key", None), allowed_secrets=allowed)
+                   settings.logs, limits=settings.limits, api_key=getattr(client, "api_key", None),
+                   allowed_secrets=allowed)
     run.run(session_context)
     t3 = time.time()
     grade = None
-    failure_mode = run.failure_mode
+    # A limit stop (turns, tokens, run budget, wall time), max_tokens or a refusal ends the run; the oracle
+    # still grades the final repository and answer, so a fix already on disk counts. stopped_by records why.
+    stopped_by = run.failure_mode or "end_turn"
     if run.harness_error is not None:
-        failure_mode = "aborted_global_cap" if run.harness_error.kind == "aborted_global_cap" else "harness_error"
-    elif failure_mode is None:
+        kind = run.harness_error.kind
+        failure_mode = {"aborted_global_cap": "aborted_global_cap", "infra_pause": "paused_infra"}.get(
+            kind, "harness_error")
+        if failure_mode == "paused_infra":
+            settings.pause(str(run.harness_error))
+        stopped_by = "harness"
+    else:
         grade = oracles.grade(task, repo, reference, runner, run.final_text)
         failure_mode = grade["failure_mode"]
     timings["oracle_s"] = round(time.time() - t3, 3)
@@ -298,6 +353,11 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
     if key and key in transcript:
         transcript = transcript.replace(key, "[REDACTED]")
     (store / "transcript.json").write_text(transcript)
+    if run.first_body is not None:
+        first = json.dumps(run.first_body)
+        if key and key in first:
+            first = first.replace(key, "[REDACTED]")
+        (store / "first_request.json").write_text(first)
     changes = oracles.tree_changes(repo, reference)
     diff_lines = []
     for rel, (before, after) in sorted(changes.items()):
@@ -310,10 +370,13 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         "campaign": settings.campaign, "phase": phase, "agent": "harness", "model": model, "effort": effort,
         "effort_setting": effort_name, "arm": arm, "task_id": task["id"], "family": task["family"],
         "repo": task["repo"], "language": task["language"], "style": task.get("style"),
-        "grep_solvable": task.get("grep_solvable"), "rep": rep, "arm_order_position": order_position,
+        # Impact truth is the rg -w hits of a unique name, so every impact task is grep-solvable by construction.
+        "grep_solvable": task.get("grep_solvable", True if task["family"] == "impact" else None),
+        "rep": rep, "arm_order_position": order_position,
         "run_id": rid, "attempt": attempt, "nonce": nonce, "variant": variant,
         "success": bool(grade and grade["success"]) and failure_mode == "success",
-        "failure_mode": failure_mode, "oracle": grade,
+        "failure_mode": failure_mode, "stopped_by": stopped_by, "limit_hit": stopped_by in LIMIT_STOPS,
+        "oracle": grade,
         "harness_error": str(run.harness_error) if run.harness_error else None,
         "append_only_bug": bool(run.harness_error and run.harness_error.append_only),
         "totals": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in run.totals.items()},
@@ -321,10 +384,14 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         "hook_events": [e.record() for e in hooks.events] if hooks else [],
         "timings": timings, "diff_files": len(changes),
         "diff_lines": sum(1 for l in diff_lines if l[:1] in "+-" and not l.startswith(("+++", "---"))),
-        "pins": {"justless_sha256": settings.justless_sha, "harness_commit": settings.commit,
+        "settings": {"limits": settings.limits, "run_budget": spec["run_budget"], "ce_trigger": settings.ce_trigger,
+                     "seed": settings.seed, "max_output_tokens": settings.max_output, "nonce_salt": config.PROCESS_SALT},
+        "pins": {"justless_sha256": settings.justless_sha, "harness_tree": settings.harness,
+                 "harness_commit": settings.commit,
                  "capture_hash": settings.profile.capture_hash, "profile_source": settings.profile.source,
                  "patch_hash": settings.profile.patch_hash, "pricing_hash": settings.pricing.hash,
                  "manifest_hash": manifest, "sandbox_profile_hash": profile_hash,
+                 "model_profile": settings.profile.model_pins(model, settings.max_output),
                  "anthropic_version": config.ANTHROPIC_VERSION, "betas": config.BETAS,
                  "cc_version": config.CC_VERSION, "cc_binary": settings.cc_binary},
         "transcript": str(store / "transcript.json"),
@@ -361,20 +428,23 @@ def schedule(settings, task_list, models, arms, reps, effort, manifest, workers,
     """Run every (model, task, rep) block with a seeded arm order; resumable; ITT after 3 attempts."""
     results_path = settings.dir / "results.jsonl"
     done = terminal_ids(results_path)
+    seed = getattr(settings, "seed", config.SEED)
     blocks = []
     for model in models:
         for rep in range(1, reps + 1):
-            for task in tasks_module.ordered(task_list):
+            for task in tasks_module.ordered(task_list, seed):
                 blocks.append((model, task, rep))
     rows = []
 
     def block_job(model, task, rep):
         out = []
-        order = config.arm_order(model, task["id"], rep, arms)
+        if getattr(settings, "pause_reason", None):
+            return out
+        order = config.arm_order(model, task["id"], rep, arms, seed)
         with settings.task_lock(task["id"]):
             for position, arm in enumerate(order):
                 rid = config.run_id(settings.campaign, model, effort, arm, task["id"], rep, manifest,
-                                    settings.justless_sha, settings.commit, settings.profile.capture_hash)
+                                    settings.justless_sha, settings.harness, settings.profile.capture_hash)
                 if rid in done:
                     continue
                 attempt = done.get(("attempts", rid), 0) + 1
@@ -394,11 +464,15 @@ def schedule(settings, task_list, models, arms, reps, effort, manifest, workers,
                     record["harness_error_attempts"] = errors
                     settings.logs["results"].write(record)
                     out.append(record)
-                    if record["failure_mode"] == "aborted_global_cap":
+                    if record["failure_mode"] in ("aborted_global_cap", "paused_infra"):
                         return out
                     if record["failure_mode"] != "harness_error":
                         break
                     attempt += 1
+        if phase != "dry-run" and not getattr(settings, "ignore_gate", True):
+            reasons = campaign_gate(read_rows(results_path), model, arms)
+            if reasons:
+                settings.pause("gate: " + "; ".join(reasons))
         return out
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
@@ -406,6 +480,112 @@ def schedule(settings, task_list, models, arms, reps, effort, manifest, workers,
         for future in concurrent.futures.as_completed(futures):
             rows += future.result()
     return rows
+
+
+def read_rows(path):
+    rows = []
+    if Path(path).exists():
+        with open(str(path)) as handle:
+            for line in handle:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+    return rows
+
+
+def campaign_gate(rows, model, arms, min_runs=GATE_MIN_RUNS, points=GATE_POINTS):
+    """The pre-registered pause rule for one model's harness runs: an arm's unrecoverable harness-error rate
+    above 2%, or arms differing by more than 2 points in that rate or in their limit-hit rate. Evaluated once
+    every arm has min_runs terminal runs, so one early event does not pause a campaign."""
+    latest = {}
+    for row in rows:
+        if row.get("model") == model and (row.get("agent") or "harness") == "harness" \
+                and row.get("failure_mode") in TERMINAL:
+            latest[row["run_id"]] = row
+    by_arm = {}
+    for row in latest.values():
+        by_arm.setdefault(row["arm"], []).append(row)
+    if any(len(by_arm.get(arm, [])) < min_runs for arm in arms):
+        return []
+    unrecoverable = {a: sum(r["failure_mode"] == "harness_unrecoverable" for r in by_arm[a]) / float(len(by_arm[a]))
+                     for a in arms}
+    limits = {a: sum(bool(r.get("limit_hit") or r.get("failure_mode") in LIMIT_STOPS) for r in by_arm[a])
+              / float(len(by_arm[a])) for a in arms}
+    reasons = []
+    for arm, rate in sorted(unrecoverable.items()):
+        if rate > points:
+            reasons.append("arm %s unrecoverable harness errors %.1f%%" % (arm, 100 * rate))
+    if max(unrecoverable.values()) - min(unrecoverable.values()) > points:
+        reasons.append("unrecoverable rates differ by more than 2 points: %s" % json.dumps(unrecoverable))
+    if max(limits.values()) - min(limits.values()) > points:
+        reasons.append("limit-hit rates differ by more than 2 points: %s" % json.dumps(
+            {a: round(v, 4) for a, v in limits.items()}))
+    return reasons
+
+
+def current_pins(settings, args, models, manifest):
+    """Campaign-wide pins and per-(model, effort) cell pins for a paid invocation."""
+    arms = args.arms.split(",")
+    base = {"justless_sha256": settings.justless_sha, "harness_tree": settings.harness,
+            "capture_hash": settings.profile.capture_hash, "manifest_hash": manifest,
+            "pricing_hash": settings.pricing.hash, "limits": settings.limits, "seed": settings.seed,
+            "anthropic_version": config.ANTHROPIC_VERSION, "betas": config.BETAS, "cc_version": config.CC_VERSION}
+    cells = {}
+    for model in models:
+        cell = {"max_output_tokens": settings.max_output, "run_budget": settings.run_budget(model),
+                "profile": settings.profile.model_pins(model, settings.max_output)}
+        if any(config.ARMS[a]["ce"] for a in arms):
+            cell["ce_trigger"] = settings.ce_trigger
+        cells["%s|%s" % (model, args.effort)] = cell
+    return base, cells
+
+
+def check_pins(directory, base, cells, new_pins=False):
+    """Compare an invocation's pins with the campaign's pins.json and refuse a silent change. Keys a stored
+    generation does not have yet are added (the anchor pins fewer keys than the harness); --new-pins starts
+    a new generation, which the report keeps apart."""
+    path = Path(directory) / "pins.json"
+    stored = json.loads(path.read_text()) if path.exists() else {"generations": []}
+    generations = stored["generations"]
+    if generations and not new_pins:
+        current = generations[-1]
+        diffs = ["%s: %s -> %s" % (k, json.dumps(current["base"][k]), json.dumps(v)) for k, v in sorted(base.items())
+                 if k in current["base"] and current["base"][k] != v]
+        for key, cell in sorted(cells.items()):
+            old = current["cells"].get(key) or {}
+            diffs += ["%s %s: %s -> %s" % (key, k, json.dumps(old[k]), json.dumps(v)) for k, v in sorted(cell.items())
+                      if k in old and old[k] != v]
+        if diffs:
+            raise SystemExit("this invocation's pins differ from campaign %s:\n  %s\nRestore them, or pass "
+                             "--new-pins to start a new generation (the report never pairs runs across "
+                             "generations)." % (Path(directory).name, "\n  ".join(diffs)))
+        for k, v in base.items():
+            current["base"].setdefault(k, v)
+        for key, cell in cells.items():
+            current["cells"].setdefault(key, {}).update(cell)
+    else:
+        generations.append({"started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "base": base,
+                            "cells": cells})
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(stored, indent=1, sort_keys=True))
+    os.replace(str(tmp), str(path))
+    return stored
+
+
+def frozen_manifest(home):
+    path = tasks_module.private_dir(home) / "_manifest.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text()).get("hash")
+
+
+def require_frozen_manifest(home, manifest):
+    """The main campaign and its report run only on the task set frozen by review-tasks --approve."""
+    frozen = frozen_manifest(home)
+    if frozen != manifest:
+        raise SystemExit("the task manifest %s is not the frozen manifest %s; run review-tasks --approve after "
+                         "the review, or restore the frozen tasks" % (manifest, frozen))
 
 
 # ----------------------------------------------------------------------------- commands
@@ -514,9 +694,12 @@ def cmd_dry_run(args):
                             manifest, args.workers, phase="dry-run")
             for row in rows:
                 want = fake_agent.expected(variant, next(t for t in task_list if t["id"] == row["task_id"]))
+                stop = fake_agent.EXPECTED_STOP.get(variant)
                 summary.append({"variant": variant, "task": row["task_id"], "arm": row["arm"],
                                 "failure_mode": row["failure_mode"], "expected": want,
-                                "ok": want is None or row["failure_mode"] == want,
+                                "stopped_by": row.get("stopped_by"),
+                                "ok": (want is None or row["failure_mode"] == want)
+                                and (stop is None or row.get("stopped_by") == stop),
                                 "cost": row.get("totals", {}).get("cost_usd"),
                                 "requests": row.get("totals", {}).get("requests"),
                                 "tool_counts": row.get("tool_counts"), "error": row.get("harness_error")})
@@ -550,9 +733,13 @@ def cmd_run(args, phase="main"):
         raise SystemExit("--binary is required for arms b and d")
     if args.binary and "qa/bin" in str(args.binary):
         raise SystemExit("refusing the stale qa/bin build; build Justless from the commit under test")
-    if harness_commit().find("dirty") >= 0 and not args.allow_dirty:
-        raise SystemExit("the harness tree is dirty; commit or pass --allow-dirty")
+    commit = harness_commit()
+    if (commit == "unknown" or "dirty" in commit) and not args.allow_dirty:
+        raise SystemExit("the harness tree is %s; commit it (or pass --allow-dirty, which the pins record)" % (
+            "dirty" if "dirty" in commit else "not in a Git checkout"))
     refuse_dry_campaign(args.home, args.campaign)
+    if phase == "main":
+        require_frozen_manifest(args.home, full_manifest(args))
     parity = Path(args.home) / "cc_capture" / "parity_report.json"
     if not parity.exists() and not args.accept_deviation:
         raise SystemExit("run parity-diff first (or pass --accept-deviation with the documented items)")
@@ -567,9 +754,15 @@ def cmd_run(args, phase="main"):
     settings = make_settings(args, args.campaign)
     manifest = full_manifest(args)
     models = args.model.split(",")
+    base, cells = current_pins(settings, args, models, manifest)
+    check_pins(settings.dir, base, cells, args.new_pins)
     rows = schedule(settings, task_list, models, args.arms.split(","), args.reps, args.effort, manifest,
                     args.workers, phase=phase)
     print("%d records written to %s" % (len(rows), settings.dir / "results.jsonl"))
+    if settings.pause_reason:
+        print("CAMPAIGN PAUSED: %s\nReview the runs, then resume (pass --ignore-gate to continue past a gate "
+              "after review)." % settings.pause_reason)
+        return 3
     return 0
 
 
@@ -649,6 +842,13 @@ def cmd_estimate(args):
         peaks = [r["totals"]["max_prompt_tokens"] for r in rows if r.get("arm") == "a" and r.get("totals")
                  and r.get("model") == "claude-haiku-5-5"]
         out["ce_trigger_rule"] = {"plain_arm_peaks": sorted(peaks), "T": config.ce_trigger_rule(peaks)}
+        out["token_limit_rule"] = {}
+        for model in config.MODELS:
+            cumulative = [r["totals"]["prompt_tokens"] for r in rows if r.get("arm") == "a" and r.get("totals")
+                          and r.get("model") == model and (r.get("agent") or "harness") == "harness"]
+            if cumulative:
+                out["token_limit_rule"][model] = {"plain_arm_runs": len(cumulative), "max": max(cumulative),
+                                                  "token_limit": config.token_limit_rule(cumulative)}
         # Effort rule: after dropping Opus, a plan that still does not fit moves every arm to medium effort.
         without_opus = accounting.estimate(per_run, spent=spent, use_reserve=args.use_reserve,
                                            plan=[c for c in accounting.MAIN_PLAN if c["name"] != "opus"])
@@ -739,7 +939,10 @@ def parser():
         sp.add_argument("--reps", type=int, default=1)
         sp.add_argument("--workers", type=int, default=3)
         sp.add_argument("--max-turns", type=int, default=config.LIMITS["turn_limit"])
-        sp.add_argument("--max-output-tokens", type=int, default=config.MAX_OUTPUT_CAP)
+        sp.add_argument("--token-limit", type=int, default=config.LIMITS["token_limit"],
+                        help="cumulative prompt tokens per run; set from the pilot (estimate prints the rule)")
+        sp.add_argument("--max-output-tokens", type=int, default=config.MAX_OUTPUT_CAP,
+                        help="caps Claude Code's max_tokens for every arm")
         sp.add_argument("--budget-usd", type=float, default=config.CAMPAIGN_CAP_USD)
         sp.add_argument("--run-cap-usd", type=float)
         sp.add_argument("--use-reserve", action="store_true")
@@ -747,8 +950,12 @@ def parser():
         sp.add_argument("--allow-dirty", action="store_true")
         sp.add_argument("--accept-deviation", action="append")
         sp.add_argument("--ce-trigger", type=int)
-        sp.add_argument("--seed", type=int, default=config.SEED)
-        sp.add_argument("--plan")
+        sp.add_argument("--seed", type=int, default=config.SEED,
+                        help="arm and block order; task subsets and the bootstrap keep the pre-registered seed")
+        sp.add_argument("--new-pins", action="store_true",
+                        help="start a new pin generation in this campaign instead of refusing changed pins")
+        sp.add_argument("--ignore-gate", action="store_true",
+                        help="continue past the harness-error and limit-hit pause rule after reviewing it")
         sp.add_argument("--keep-runs", action="store_true")
         sp.add_argument("--estimator", action="store_true", help="use the bytes/2 Read counter instead of count_tokens")
         sp.add_argument("--profile-source", default="auto", choices=["auto", "capture", "paraphrase"])
@@ -763,7 +970,7 @@ def parser():
     common(sub.add_parser("parity-diff"))
     common(sub.add_parser("sandbox-check"))
     dry = common(sub.add_parser("dry-run"))
-    dry.add_argument("--variants", default="correct,wrong,tamper,unread_edit,probe,qualified,cfgtest")
+    dry.add_argument("--variants", default="correct,wrong,tamper,unread_edit,probe,qualified,cfgtest,overrun")
     common(sub.add_parser("pilot"))
     common(sub.add_parser("estimate")).add_argument("--assume", default="pilot", choices=["pilot", "prepilot"])
     common(sub.add_parser("run"))

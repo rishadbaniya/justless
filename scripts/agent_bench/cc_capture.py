@@ -389,6 +389,10 @@ def capture(cc_binary, justless_binary, out_dir, workdir):
         rows = load_requests(meta["requests"])
         if rows:
             report["models"][model] = summarize_request(rows[0]["body"], rows[0]["headers"])
+            # The profile reads each model's environment text, attribution, effort and max_tokens from this
+            # file, so it moves with cc_capture/ and is part of the capture hash.
+            with open(out_dir / ("first_request_model_%s.json" % model), "w") as handle:
+                json.dump({"headers": rows[0]["headers"], "body": rows[0]["body"]}, handle, indent=1)
     with open(out_dir / "capture.json", "w") as handle:
         json.dump(report, handle, indent=1, default=str)
     return report

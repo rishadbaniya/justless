@@ -159,6 +159,7 @@
    "generator": {
     "note": "vendor fixture; dry runs, unit tests and parity only; never analyzed"
    },
+   "grep_solvable": true,
    "id": "impact-mixed-01",
    "language": "typescript",
    "oracle": {

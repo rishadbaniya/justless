@@ -72,6 +72,9 @@ class Client:
 
     def create(self, body):
         """POST /v1/messages. Returns (response, meta). Raises APIError after retries or on a fatal status."""
+        return self._with_retries("/v1/messages", body)
+
+    def _with_retries(self, path, body):
         attempts = []
         wait_total = 0.0
         for attempt in range(1, self.max_attempts + 1):
@@ -81,7 +84,7 @@ class Client:
             headers = {}
             error_kind = None
             try:
-                status, payload, headers = self._post("/v1/messages", body)
+                status, payload, headers = self._post(path, body)
             except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as error:
                 error_kind = type(error).__name__
             latency = time.time() - started
@@ -114,8 +117,7 @@ class Client:
         raise APIError(0, "unreachable")
 
     def count_tokens(self, model, text):
-        status, payload, _ = self._post("/v1/messages/count_tokens", {
+        """POST /v1/messages/count_tokens with the same retries and back-off as create (429, 5xx, network)."""
+        payload, _ = self._with_retries("/v1/messages/count_tokens", {
             "model": model, "messages": [{"role": "user", "content": text}], "tools": []})
-        if status != 200:
-            raise APIError(status, payload)
         return int(payload["input_tokens"])

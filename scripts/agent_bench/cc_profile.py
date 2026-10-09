@@ -112,8 +112,15 @@ class Profile:
     def effort(self, model):
         return self.effort_by_model.get(model) or config.MODELS[model]["api_default_effort"]
 
-    def max_tokens(self, model):
-        return min(int(self.max_tokens_by_model.get(model) or config.MAX_OUTPUT_CAP), config.MAX_OUTPUT_CAP)
+    def max_tokens(self, model, cap=config.MAX_OUTPUT_CAP):
+        return min(int(self.max_tokens_by_model.get(model) or cap), int(cap))
+
+    def model_pins(self, model, cap=config.MAX_OUTPUT_CAP):
+        """What this profile sends for a model, for every result's pins."""
+        env = self.env_by_model.get(model) or self.env_by_model.get("default")
+        return {"effort": self.effort(model), "max_tokens": self.max_tokens(model, cap),
+                "env_hash": config.sha256_json(env)[:12],
+                "attribution_hash": config.sha256_json(self.attribution_by_model.get(model))[:12]}
 
     def first_messages(self, model, root, home, prompt, session_context=""):
         content = []
@@ -157,6 +164,32 @@ def patch_env(text):
     return text
 
 
+def model_first_request(capture_dir, work, model):
+    """The first request Claude Code sent for a model. Read from cc_capture/, where cc-capture writes it; an
+    older store keeps it only in cc_capture_work/, so it is copied into cc_capture/ on first use. Missing in
+    both places is an error: falling back would silently change effort, attribution and environment text."""
+    frozen = capture_dir / ("first_request_model_%s.json" % model)
+    if frozen.exists():
+        return json.loads(frozen.read_text())["body"]
+    log = work / ("requests_model_%s.jsonl" % model)
+    rows = _requests(log) if log.exists() else []
+    if not rows:
+        raise ValueError("the Claude Code capture has no first request for %s (looked for %s and %s); "
+                         "run cc-capture again" % (model, frozen, log))
+    tmp = frozen.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"headers": rows[0].get("headers") or {}, "body": rows[0]["body"]}, indent=1))
+    tmp.replace(frozen)
+    return rows[0]["body"]
+
+
+def profile_hash(system, tools, env_by_model, attribution_by_model, effort_by_model, max_tokens_by_model, base_cm):
+    """A hash of the effective profile every request is built from, not of the capture files."""
+    return config.sha256_json({"system": system, "tools": tools, "env": env_by_model,
+                               "attribution": attribution_by_model, "effort": effort_by_model,
+                               "max_tokens": max_tokens_by_model, "context_management": base_cm,
+                               "patch": SYSTEM_PATCH})[:16]
+
+
 def from_capture(home):
     capture_dir = Path(home) / "cc_capture"
     work = Path(home) / "cc_capture_work"
@@ -181,13 +214,7 @@ def from_capture(home):
     max_tokens_by_model = {}
     base_cm = body.get("context_management")
     for model in config.MODELS:
-        log = work / ("requests_model_%s.jsonl" % model)
-        if not log.exists():
-            continue
-        rows = _requests(log)
-        if not rows:
-            continue
-        mbody = rows[0]["body"]
+        mbody = model_first_request(capture_dir, work, model)
         env_text = patch_env(_text(mbody["messages"][1]["content"]))
         # Take the capture's paths from the captured text, so a moved store still templates correctly.
         found = re.search(r"Primary working directory: (\S+)", env_text)
@@ -202,8 +229,8 @@ def from_capture(home):
         effort_by_model[model] = (mbody.get("output_config") or {}).get("effort")
         max_tokens_by_model[model] = mbody.get("max_tokens")
     env_by_model["default"] = templatize(patch_env(_text(body["messages"][1]["content"])), root, cc_home)
-    digest = hashlib.sha256((capture_dir / "capture.json").read_bytes() + (capture_dir / "first_request_tools.json")
-                            .read_bytes()).hexdigest()[:16]
+    digest = profile_hash(system, tools, env_by_model, attribution_by_model, effort_by_model, max_tokens_by_model,
+                          base_cm)
     return Profile("capture", system, tools, env_by_model, attribution_by_model, effort_by_model,
                    max_tokens_by_model, base_cm, digest)
 
@@ -216,10 +243,12 @@ def paraphrase():
            " - Is a git repository: true\n - Platform: darwin\n - Shell: zsh\n\nToday's date is %s." % config.FIXED_DATE)
     system = [{"type": "text", "text": "You are a coding agent working in a terminal.", "cache_control": {"type": "ephemeral"}},
               {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
-    digest = hashlib.sha256((text + json.dumps(tools)).encode()).hexdigest()[:16]
-    return Profile("paraphrase", system, tools, {"default": env}, {}, {m: "medium" for m in config.MODELS},
-                   {m: config.MAX_OUTPUT_CAP for m in config.MODELS},
-                   {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}, "paraphrase-" + digest)
+    effort = {m: "medium" for m in config.MODELS}
+    max_tokens = {m: config.MAX_OUTPUT_CAP for m in config.MODELS}
+    base_cm = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+    digest = profile_hash(system, tools, {"default": env}, {}, effort, max_tokens, base_cm)
+    return Profile("paraphrase", system, tools, {"default": env}, {}, effort, max_tokens, base_cm,
+                   "paraphrase-" + digest)
 
 
 def load(home, source="auto"):

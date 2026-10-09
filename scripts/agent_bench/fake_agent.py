@@ -160,6 +160,16 @@ def cfg_twin(task):
             _bash(_test_command(task)), final("Fixed it.")]
 
 
+def overrun(task, justless):
+    """Does the task, then keeps calling tools until the turn limit stops the run: the oracle must still
+    grade the final state (success, stopped_by turn_limit)."""
+    steps = [s for s in correct(task, True) if s.get("stop_reason") == "tool_use"]
+    if task["family"] in ("location", "impact"):
+        answer = correct(task, True)[-1]["content"][0]["text"]
+        steps.append(tool_use("Bash", {"command": "true", "description": "Check", "timeout": 600000}, text=answer))
+    return steps + [_bash("true")] * 80
+
+
 def applies(variant, task):
     """Whether a validation variant is meaningful for a task: cfgtest needs a Rust bug fix, and qualified
     answers exist only for the answer families."""
@@ -198,7 +208,11 @@ VARIANTS = {
     "probe": probe,
     "qualified": lambda task, justless: qualified(task),
     "cfgtest": lambda task, justless: cfg_twin(task),
+    "overrun": overrun,
 }
+
+# Variants whose runs must end on a specific stop, besides their graded failure mode.
+EXPECTED_STOP = {"overrun": "turn_limit"}
 
 EXPECTED = {
     "noop": {"bugfix": "wrong_fix", "lint": "lint_remaining", "location": "no_answer", "impact": "no_answer"},
@@ -209,6 +223,7 @@ EXPECTED = {
                "impact": "partial_answer"},
     "qualified": "success",
     "cfgtest": {"bugfix": "test_tamper"},
+    "overrun": "success",
 }
 
 

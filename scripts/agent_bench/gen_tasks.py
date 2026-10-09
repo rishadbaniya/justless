@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tokenize
 from pathlib import Path
 
@@ -1018,6 +1019,8 @@ def gen_impact(repo, count, seed):
             "prompt": fill(template("impact"), symbol=name, file=d["file"]), "setup": {"kind": "none"},
             "oracle": {"recall": 0.9, "precision": 0.8, "symbol": name, "definition_file": d["file"]},
             "truth": {"required": sorted(required), "neutral": sorted(neutral)},
+            # By construction: the truth is the `rg -w` hits minus comment-only mentions of a unique name.
+            "grep_solvable": True,
             "generator": {"seed": seed, "candidate_index": index, "candidate_pool_size": len(pool), "kind": d["kind"]},
         })
     return out
@@ -1073,7 +1076,8 @@ def public_tasks():
          "source_root": "fixtures/mixed", "prompt": fill(template("impact"), symbol="formatOrder", file="frontend/format.ts"),
          "setup": {"kind": "none"},
          "oracle": {"recall": 0.9, "precision": 0.8, "symbol": "formatOrder", "definition_file": "frontend/format.ts"},
-         "truth": {"required": ["frontend/format.ts", "frontend/orders.ts"], "neutral": []}, "generator": note},
+         "truth": {"required": ["frontend/format.ts", "frontend/orders.ts"], "neutral": []}, "grep_solvable": True,
+         "generator": note},
     ]
 
 
@@ -1139,11 +1143,16 @@ def review(args):
         print(task["id"], task.get("style") or "", "grep_solvable=%s" % task.get("grep_solvable"))
         print(task["prompt"])
         print("truth:", json.dumps(task.get("truth") or {"mutated_fn": task.get("oracle", {}).get("mutated_fn")}))
-    manifest = tasks_module.manifest_hash(task_list)
+    # The same hash every run ID carries (public and private tasks), so run.py and report.py can compare it.
+    public = tasks_module.load_public()
+    manifest = tasks_module.manifest_hash(public + task_list)
     print("manifest hash:", manifest)
     if getattr(args, "approve", False):
         path = tasks_module.private_dir(args.home) / "_manifest.json"
-        path.write_text(json.dumps({"hash": manifest, "tasks": sorted(t["id"] for t in task_list)}, indent=1))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"hash": manifest, "private_hash": tasks_module.manifest_hash(task_list),
+                                    "tasks": sorted(t["id"] for t in public + task_list),
+                                    "frozen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=1))
         print("frozen", path)
     return 0
 

@@ -22,6 +22,7 @@ class FakeSettings:
         self.campaign = "c"
         self.justless_sha = "j"
         self.commit = "h"
+        self.harness = "h"
         self.profile = type("P", (), {"capture_hash": "cap"})()
         self.logs = {"results": loop.JsonlWriter(directory / "results.jsonl")}
         self.locks = {}
@@ -41,7 +42,7 @@ class ResumeTests(unittest.TestCase):
     def fake(self, behavior):
         def run_once(settings, task, model, effort, arm, rep, attempt, manifest, position=None, phase="main"):
             rid = config.run_id(settings.campaign, model, effort, arm, task["id"], rep, manifest,
-                                settings.justless_sha, settings.commit, settings.profile.capture_hash)
+                                settings.justless_sha, settings.harness, settings.profile.capture_hash)
             self.calls.append((task["id"], arm, attempt))
             mode = behavior(task, arm, attempt)
             if mode == "crash":

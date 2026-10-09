@@ -59,7 +59,23 @@ ARMS = {
     "d": {"name": "justless+ce", "justless": True, "ce": True},
 }
 
-LIMITS = {"turn_limit": 60, "token_limit": 3_000_000, "wall_timeout": 1800}
+# Runs stopped by a limit are still graded on their final state (run.py records stopped_by). The token limit
+# is a placeholder until the pilot sets it (estimate prints the rule); the wall timeout is a hang guard and
+# excludes API retry back-off.
+LIMITS = {"turn_limit": 60, "token_limit": 3_000_000, "wall_timeout": 7200}
+TOKEN_LIMIT_FLOOR = 3_000_000
+
+
+def token_limit_rule(plain_cumulative_prompts):
+    """At least 3x the plain arm's 95th-percentile cumulative prompt tokens per run, never below the floor, so
+    the cap binds in about 1% of runs or fewer instead of turning higher usage into failures."""
+    values = sorted(plain_cumulative_prompts)
+    if not values:
+        return TOKEN_LIMIT_FLOOR
+    k = (len(values) - 1) * 0.95
+    lo, hi = int(k), min(int(k) + 1, len(values) - 1)
+    p95 = values[lo] + (values[hi] - values[lo]) * (k - lo)
+    return max(TOKEN_LIMIT_FLOOR, int(-(-3 * p95 // 100000) * 100000))
 CAMPAIGN_CAP_USD = 90.0
 RESERVE_USD = 10.0
 MAX_ATTEMPTS = 3
@@ -106,19 +122,46 @@ def sha256_json(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def run_id(campaign, model, effort, arm, task_id, rep, manifest_hash, justless_sha, harness_commit, capture_hash):
+def run_id(campaign, model, effort, arm, task_id, rep, manifest_hash, justless_sha, harness_hash, capture_hash):
+    """harness_hash is the content hash of the harness tree (harness_tree_hash), so commits elsewhere in the
+    repository do not re-key finished runs."""
     key = "|".join(str(x) for x in (campaign, model, effort, arm, task_id, rep, manifest_hash,
-                                     justless_sha, harness_commit, capture_hash))
+                                     justless_sha, harness_hash, capture_hash))
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def nonce(run, attempt):
-    return hashlib.sha256(("%s|%d" % (run, attempt)).encode()).hexdigest()[:16]
+# A random salt per process: an attempt that crashed after billing requests has no result row, so its resume
+# reuses the attempt number. The salt keeps that resume from reading the crashed attempt's cached prefix.
+PROCESS_SALT = os.urandom(8).hex()
 
 
-def arm_order(model, task_id, rep, arms):
+def nonce(run, attempt, salt=None):
+    salt = PROCESS_SALT if salt is None else salt
+    return hashlib.sha256(("%s|%d|%s" % (run, attempt, salt)).encode()).hexdigest()[:16]
+
+
+HARNESS_SKIP_DIRS = {"__pycache__", "tests"}
+
+
+def harness_tree_hash(root=BENCH_DIR):
+    """Content hash of every file the harness runs with (code, data, prompts, public tasks), without Git.
+    Tests and caches are excluded; any other edit, committed or not, changes the hash."""
+    digest = hashlib.sha256()
+    root = Path(root)
+    for dirpath, dirnames, filenames in os.walk(str(root)):
+        dirnames[:] = sorted(d for d in dirnames if d not in HARNESS_SKIP_DIRS and not d.startswith("."))
+        for name in sorted(filenames):
+            if name.endswith((".pyc", ".pyo")) or name.startswith("."):
+                continue
+            path = Path(dirpath) / name
+            digest.update(str(path.relative_to(root)).encode() + b"\0")
+            digest.update(path.read_bytes() + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def arm_order(model, task_id, rep, arms, seed=SEED):
     """A seeded permutation of arms for one (model, task, rep) block."""
-    seed = int(hashlib.sha256(("%d|%s|%s|%d" % (SEED, model, task_id, rep)).encode()).hexdigest(), 16)
+    seed = int(hashlib.sha256(("%d|%s|%s|%d" % (seed, model, task_id, rep)).encode()).hexdigest(), 16)
     order = sorted(arms)
     random.Random(seed).shuffle(order)
     return order

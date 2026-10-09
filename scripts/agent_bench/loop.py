@@ -119,6 +119,7 @@ class Run:
         self.final_text = ""
         self.harness_error = None
         self.last_request_start = None
+        self.first_body = None
 
     def body(self, session_context):
         model = self.spec["model"]
@@ -127,7 +128,7 @@ class Run:
                                                         session_context)
         body = {
             "model": model,
-            "max_tokens": self.profile.max_tokens(model),
+            "max_tokens": self.profile.max_tokens(model, self.spec.get("max_output_tokens") or config.MAX_OUTPUT_CAP),
             "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}},
             "output_config": {"effort": self.spec["effort"]},
             "system": self.profile.system(self.spec["nonce"], self.ws.root, self.spec["home"]),
@@ -181,7 +182,7 @@ class Run:
             try:
                 outcome = self.ws.read(executed)
             except api_module.APIError as error:
-                raise HarnessError("count_tokens", str(error)[:300])
+                raise HarnessError("infra_pause", "count_tokens: %s" % str(error)[:300])
         elif name == "Edit":
             outcome = self.ws.edit(executed)
         else:
@@ -241,10 +242,13 @@ class Run:
             return self.stop("token_limit")
         if self.totals["cost_usd"] >= self.spec["run_budget"]:
             return self.stop("run_budget")
-        if time.time() - started > self.limits["wall_timeout"]:
+        # A hang guard, not a pace limit: API retry back-off is not the agent's time.
+        if time.time() - started - self.totals["retry_wait_s"] > self.limits["wall_timeout"]:
             return self.stop("wall_timeout")
         body = self.body(session_context)
         self.guard.check(body)
+        if self.first_body is None:
+            self.first_body = copy.deepcopy(body)
         new_bytes = len(json.dumps(self.messages[-1]).encode())
         estimate = self.totals.get("last_prompt", 0) + new_bytes // 2 + (0 if self.totals["requests"] else
                                                                             len(json.dumps(body).encode()) // 2)
