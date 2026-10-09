@@ -726,16 +726,20 @@ A marker names the kind of secret and a four-character hash keyed by a random va
 | `openai-key`, `anthropic-key`, `google-api-key` | `sk-proj-`, `sk-svcacct-`, `sk-admin-` and legacy OpenAI keys, `sk-ant-` keys and `AIza` keys |
 | `npm-token`, `pypi-token`, `huggingface-token` | `npm_`, `pypi-` and `hf_` tokens |
 | `jwt` | Signed JSON Web Tokens |
-| `private-key` | The body of a PEM or OpenSSH private key, whether written over several lines, on one line with `\n` escapes, inside a string literal, or base64-encoded as in a Kubernetes secret. The `BEGIN` and `END` lines stay. |
+| `private-key` | The body of a PEM or OpenSSH private key, whether wrapped over several lines or unwrapped, on one line with `\n` escapes, inside a string literal, or base64-encoded as in a Kubernetes secret or by `base64`. Body lines may carry a prefix that the `BEGIN` line also has, such as a diff marker, `path:line:` from a search, `cat -n` numbering, a timestamp or terminal colors. The prefixes and the `BEGIN` and `END` lines stay. |
 | `url-password` | The password in `scheme://user:password@host` when it has at least four characters |
 | `authorization` | The credential after `Authorization: Bearer`, `Basic`, `Token` or `Digest`, and a standalone `Bearer` token |
-| `secret` | A value assigned with `=`, `:`, `:=` or `=>` to a name containing password, passwd, secret, token, API key, access key, private key or credential, or passed to a flag such as `--password`. The value needs at least 12 characters, a letter, a digit and high entropy, and must not look like an identifier or a path. |
+| `secret` | A value assigned with `=`, `:`, `:=` or `=>` to a name containing password, passwd, passphrase, secret, token, API key, access key, private key or credential, or passed to a flag such as `--password`. The value runs to the next space, quote or backslash, so symbols such as `$`, `@` and `(` are replaced with the rest. It needs at least 12 characters, high entropy, a letter, and a digit, two symbols such as `@` or `$`, or 20 mixed-case letters that are not CamelCase. |
 
 Some values stay visible:
 - values containing `EXAMPLE`, `example`, `placeholder`, `changeme`, `dummy` or `your_`;
 - runs such as `xxxxxx` or `***`;
-- variable references such as `$TOKEN` or `${TOKEN}`;
-- identifiers and type names, such as `ML_KEM_512_SHARED_SECRET_LENGTH` or the `Ed25519PrivateKey` in `private_key: Ed25519PrivateKey`.
+- variable references, templates and patterns such as `$TOKEN`, `${TOKEN}`, `{token}` or `[A-Za-z0-9]+`;
+- identifiers such as `ML_KEM_512_SHARED_SECRET_LENGTH`, and type names after a bare `:`, such as the `Ed25519PrivateKey` in `private_key: Ed25519PrivateKey`;
+- code after an unquoted assignment, such as `hashlib.sha256(x)`, `Option<SecretString>` or `&secp256k1::SecretKey`;
+- paths such as `config/secrets/prod-2024` or `/Users/me/.secrets/db.json`, and checksums after a source file name, as in a checksum list;
+- checksums labelled with their algorithm, such as `sha256=…`, and `0x` account addresses of 40 hex digits;
+- the tag of an image reference such as `docker://ubuntu:22.04@sha256:…`.
 
 Every view of a captured run is redacted:
 - the `run` preview, with its grouped test, lint, search and listing reports and rerun comparisons;
@@ -756,8 +760,8 @@ Source views are not redacted:
 Redaction replaces only the secret and never adds or removes a line break, so line numbers, `--from` and `--to` ranges, and markers such as `stdout:8-15` match the archive:
 - A private key keeps its line count: its first body line becomes the marker and the other body lines become empty.
 - Output with nothing to redact replays byte for byte.
-- A line that holds both a secret and terminal color codes loses its color codes.
-- A marker can make a preview up to 24 bytes longer than `--max-bytes` per secret shown. Output that fits the budget is still shown whole.
+- A line that holds both a secret and terminal color codes, including a line of a key block, loses its color codes.
+- A marker can make a preview up to 24 bytes longer than `--max-bytes` per secret shown. Output that fits the budget is still shown whole, including output that fits only once a private key collapses to its marker.
 
 Add `--unredacted` to `log` or `search` for the original bytes. Without it, `search` and `history` match the redacted text: searching for a secret's value finds nothing, and searching for `redacted:github-token` lists where tokens appeared. `history` always matches redacted text; find the run there, then replay the range you need.
 
@@ -785,17 +789,11 @@ Redaction keeps secrets out of the agent's context by default. It is not access 
 
 These are not detected:
 - short or dictionary-word passwords in a plain assignment, unless they appear in a URL or an Authorization header;
+- generated passwords with no digit and fewer than two of `! @ # $ % ^ * ? ~ + = |`, under the same condition;
+- the last character of an unquoted value when it is `,`, `;`, `:`, `.` or a closing bracket the value did not open, which reads as punctuation;
 - cookies, `.netrc` lines and Docker `auth` entries;
 - Kubernetes secret values under names without a keyword;
 - a keyword broken up by terminal color codes inside the word;
 - formats not in the table.
 
-Lines without a trigger word pass a single literal prefilter, and only the lines it hits are matched against the rules. Lines longer than 1 MiB are redacted in windows that overlap by 8 KiB, so memory stays bounded and any secret up to 8 KiB is found wherever the window falls. Replaying a run in which nothing was redacted copies the archive directly. `scripts/redact_benchmark.py` measures 200 MiB inputs with redaction on and off:
-
-| Input (200 MiB) | `run` without | `run` with | `log` | `log --unredacted` |
-| --- | --- | --- | --- | --- |
-| This repository's Git history, source, docs and lockfiles, with 24 secrets | 2.96 s | 3.33 s | 0.42 s | 0.07 s |
-| Every line holding a keyword, no secrets | 1.46 s | 2.60 s | 0.06 s | 0.06 s |
-| One line of base64, no secrets | 0.47 s | 0.81 s | 0.05 s | 0.05 s |
-
-These are release-build times on Apple Silicon while other jobs kept the load average between 14 and 30, so the mix varied from 4% faster to 37% slower across three runs. The keyword-dense and single-line figures repeated within 10%. Redaction adds 155,248 bytes (0.3%) to the release binary.
+Lines without a trigger word pass a single literal prefilter, and only the lines it hits are matched against the rules. Lines longer than 1 MiB are redacted in windows that overlap by 8 KiB, so memory stays bounded and any secret up to 8 KiB is found wherever the window falls. Replaying a run in which nothing was redacted copies the archive directly. `scripts/redact_benchmark.py` measures the cost. [Benchmarks](benchmarks.md#secret-redaction)

@@ -105,3 +105,16 @@ The script generates seeded data locally, runs a short analysis script over each
 Each column is everything the agent received, footer included. When a script's output is large, `exec` bounds it: the first row's listing would put 119,694 bytes in context, and `exec` shows whole lines from both ends with the range left out, or with `--intent` the matching lines. When the output fits, `exec` prints exactly what the script prints and adds no footer to a success, so the last three rows match the direct run; there `exec` adds the archive under a run ID and the time limit, and the bytes saved come from writing a script instead of reading the input. `run -- cat` stays bounded, but its head and tail do not contain the answer.
 
 Measured on macOS arm64. Spacing from `uniq -c` differs on Linux, so the log errors row can change by a few bytes.
+
+## Secret redaction
+
+Build with `cargo build --release --locked` and run `python3 scripts/redact_benchmark.py --binary target/release/justless --cpu`. Each 200 MiB input is captured with `run -- cat` with redaction off and on, then replayed with `log` and `log --unredacted`. `--cpu` reports the CPU time Justless used, user plus system, as the fastest of three repeats. Elapsed time also counts waiting for other jobs, so it varies more on a busy machine.
+
+| Input (200 MiB) | Secrets found | `run` without | `run` with | `log` | `log --unredacted` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| This repository's history, source, docs and lockfiles, with 24 secrets added | 174 | 3.66 s | 4.36 s | 0.64 s | 0.06 s |
+| Every line holding a keyword, no secrets | 0 | 1.73 s | 3.54 s | 0.06 s | 0.06 s |
+| One line of base64, no secrets | 0 | 0.56 s | 0.92 s | 0.05 s | 0.05 s |
+| One line of base64 holding one secret | 1 | 0.49 s | 0.90 s | 0.42 s | 0.05 s |
+
+The history holds test fixtures that are redacted too, such as passwords in example URLs, so the first input finds more than the 24 secrets added and `--check` reports the difference. These are release-build figures on Apple Silicon while other jobs kept the load average between 60 and 80. Redaction adds about 159 KB (0.3%) to the release binary.
