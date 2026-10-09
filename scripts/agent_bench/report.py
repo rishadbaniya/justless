@@ -7,8 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import accounting  # noqa: E402
 import config  # noqa: E402
 import stats  # noqa: E402
+import tasks as tasks_module  # noqa: E402
 
 FAMILIES = ["bugfix", "lint", "location", "impact"]
 PRIMARY_MODEL = "claude-sonnet-5-5"
@@ -67,7 +69,8 @@ def median_iqr_money(values):
 
 
 def final_rows(rows):
-    """The terminal record per run_id (latest attempt)."""
+    """The latest record per run_id, then one record per (agent, model, effort, arm, task, rep, pins): a later
+    record of the same block and pins replaces an earlier one instead of being counted twice."""
     latest = {}
     for row in rows:
         key = row.get("run_id")
@@ -75,7 +78,60 @@ def final_rows(rows):
             continue
         if key not in latest or row.get("attempt", 1) >= latest[key].get("attempt", 1):
             latest[key] = row
-    return list(latest.values())
+    blocks = {}
+    for row in latest.values():
+        key = (row.get("agent") or "harness", row.get("model"), row.get("effort_setting") or row.get("effort"),
+               row.get("arm"), row.get("task_id"), row.get("rep"), stats.pin_key(row))
+        blocks[key] = row
+    return list(blocks.values())
+
+
+def harness_only(rows):
+    """Rows of harness runs that ended in a graded or terminal state: no anchor runs, no harness errors, cap
+    aborts or infrastructure pauses (those are re-run and reported in section 1)."""
+    return [r for r in rows if (r.get("agent") or "harness") == "harness"
+            and r.get("failure_mode") not in stats.EXCLUDED_MODES]
+
+
+def first_request_check(rows, pairs_of):
+    """Compare the saved first request of the two arms of every block outside the regions arms may differ in
+    (the documented first-request check, run on paid runs)."""
+    import dry_checks
+    checked = 0
+    failures = []
+    for (x_arm, y_arm), clusters in pairs_of.items():
+        allow_ce = config.ARMS[x_arm]["ce"] != config.ARMS[y_arm]["ce"]
+        for task, blocks in clusters.items():
+            for x, y in blocks:
+                bodies = []
+                for row in (x, y):
+                    path = Path(row.get("transcript") or "").parent / "first_request.json"
+                    bodies.append(json.loads(path.read_text()) if row.get("transcript") and path.exists() else None)
+                if None in bodies:
+                    continue
+                checked += 1
+                problems = dry_checks.compare_pair(bodies[0], bodies[1], allow_ce)
+                if problems:
+                    failures.append("%s %s rep %s %s/%s: %s" % (x.get("model"), task, x.get("rep"), x_arm, y_arm,
+                                                                "; ".join(problems)))
+    return checked, failures
+
+
+def repriced_1h(rows, requests, pricing):
+    """Rows with cost re-priced at the 1-hour cache-write rate from the logged usage of their own requests."""
+    model_of = {(r.get("run_id"), r.get("attempt")): r.get("model") for r in rows}
+    by_run = {}
+    for q in requests:
+        key = (q.get("run_id"), q.get("attempt"))
+        if model_of.get(key) in config.MODELS:
+            by_run[key] = by_run.get(key, 0.0) + pricing.reprice_1h(model_of[key], q.get("usage") or {})
+    out = []
+    for row in rows:
+        key = (row.get("run_id"), row.get("attempt"))
+        if key in by_run:
+            row = dict(row, totals=dict(row.get("totals") or {}, cost_usd=by_run[key]))
+        out.append(row)
+    return out
 
 
 def arm_table(rows, model):
@@ -120,10 +176,15 @@ def arm_table(rows, model):
     return lines
 
 
-def contrast_section(rows, x, y, model, families=None, B=stats.B_DEFAULT):
-    result = stats.contrast(rows, x, y, model, families, B)
+def contrast_section(rows, x, y, model, families=None, B=stats.B_DEFAULT, power=False):
+    result = stats.contrast(rows, x, y, model, families, B, power=power)
     if not result.get("estimate"):
         return result, ["No complete %s/%s blocks for %s." % (x, y, model)]
+    if result["verdict"] == "MIXED PINS":
+        return result, ["**MIXED PINS: %s/%s on %s has runs from %d pin sets; no contrast is computed.** Split the "
+                        "campaign or re-run under one set of pins. Pin sets (binary, harness, capture, manifest, "
+                        "pricing, effort, rows): %s" % (x, y, model, len(result["pin_sets"]),
+                                                         json.dumps(result["pin_sets"]))]
     est = result["estimate"]
     boot = result["bootstrap"]
     lines = [
@@ -142,20 +203,40 @@ def contrast_section(rows, x, y, model, families=None, B=stats.B_DEFAULT):
         "- Exact McNemar (ignores clustering): b=%d, c=%d, p=%.3f." % (
             result["mcnemar"]["b"], result["mcnemar"]["c"], result["mcnemar"]["p"]),
     ]
+    if not boot.get("S_ci"):
+        lines.append("- Cost endpoint: S is undefined, so the rule used R, the saving in cost per run: %s %s." % (
+            pct(est.get("R")), ci(boot.get("R_ci"))))
     if boot["delta_s_ci"][0] is not None and (boot["delta_s_ci"][0] > 0 or boot["delta_s_ci"][1] < 0):
         lines.append("- **The Δs CI excludes 0.**")
+    power_info = result.get("power") or {}
+    if power_info.get("delta_s_half_width") is not None:
+        mde = power_info.get("mde") or {}
+        line = ("- Power: the Δs CI half-width is %s against the 10-point margin; success MDE %s at the measured "
+                "discordance %s and ICC %s." % (
+                    stats.pp(power_info["delta_s_half_width"]).lstrip("+"), pct(mde.get("success_mde")),
+                    pct(power_info.get("discordant_share")),
+                    "n/a" if power_info.get("icc") is None else "%.2f" % power_info["icc"]))
+        null = power_info.get("null")
+        if null:
+            line += (" A tool with no effect on success meets the success conditions of WIN in %s of %d simulated "
+                     "campaigns of this size." % (pct(null["success_conditions_met"]), null["sims"]))
+        if power_info["delta_s_half_width"] >= 0.10:
+            line += " **WIN was out of reach for the success endpoint at this sample size.**"
+        lines.append(line)
     return result, lines
 
 
 def build(home, campaign, dry=False, B=stats.B_DEFAULT):
     base = Path(home) / "campaigns" / campaign
-    rows = final_rows(read_jsonl(base / "results.jsonl"))
+    all_rows = final_rows(read_jsonl(base / "results.jsonl"))
+    rows = harness_only(all_rows)
+    anchor_rows = [r for r in all_rows if r.get("agent") == "claude-code"]
     attempts = read_jsonl(base / "results.jsonl")
     requests = read_jsonl(base / "requests.jsonl")
     tools = read_jsonl(base / "tools.jsonl")
     ledger = read_jsonl(base / "ledger.jsonl")
     out = []
-    summary = {"campaign": campaign, "dry_run": dry, "runs": len(rows)}
+    summary = {"campaign": campaign, "dry_run": dry, "runs": len(rows), "anchor_runs": len(anchor_rows)}
     if dry:
         out += ["> **DRY RUN - fake model, numbers meaningless.**", ""]
     out += ["# Agent benchmark report: %s" % campaign, "",
@@ -168,18 +249,38 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
     pins = (rows[0].get("pins") if rows else {}) or {}
     harness_errors = {}
     for row in attempts:
-        if row.get("failure_mode") in ("harness_error", "harness_unrecoverable"):
+        if row.get("failure_mode") in ("harness_error", "harness_unrecoverable", "aborted_global_cap",
+                                       "paused_infra"):
             key = (row.get("arm"), row["failure_mode"])
             harness_errors[key] = harness_errors.get(key, 0) + 1
+    sets = {}
+    for row in all_rows:
+        key = ((row.get("agent") or "harness"), row.get("model")) + stats.pin_key(row)
+        sets[key] = sets.get(key, 0) + 1
+    frozen_path = tasks_module.private_dir(home) / "_manifest.json"
+    frozen = json.loads(frozen_path.read_text()).get("hash") if frozen_path.exists() else None
+    manifests = sorted({str((r.get("pins") or {}).get("manifest_hash")) for r in all_rows})
+    manifest_ok = bool(frozen) and manifests == [frozen]
+    if campaign == "main" and not dry and all_rows and not manifest_ok:
+        raise SystemExit("campaign main ran on task manifest(s) %s, not the frozen manifest %s; refusing to report"
+                         % (", ".join(manifests), frozen))
     out += ["## 1. Manifest", ""] + ["- %s: `%s`" % (k, v) for k, v in sorted(pins.items())] + [
-        "- runs (terminal records): %d; attempts: %d" % (len(rows), len(attempts)),
-        "- harness errors by arm: %s" % (", ".join("%s %s=%d" % (a, m, n) for (a, m), n in sorted(
+        "- frozen task manifest: `%s`; manifests in this campaign: %s%s" % (
+            frozen, ", ".join("`%s`" % m for m in manifests) or "none",
+            "" if manifest_ok or not all_rows else " **(differs from the frozen manifest)**"),
+        "- pin sets (agent, model, binary, harness, capture, manifest, pricing, effort: runs):"] + [
+        "  - %s: %d" % (" / ".join(str(x)[:16] for x in key), n) for key, n in sorted(sets.items(), key=str)] + [
+        "- runs (terminal harness records): %d; anchor runs: %d; attempts: %d" % (len(rows), len(anchor_rows),
+                                                                                 len(attempts)),
+        "- harness errors, cap aborts and pauses by arm: %s" % (", ".join("%s %s=%d" % (a, m, n) for (a, m), n in sorted(
             harness_errors.items())) or "none"), ""]
     summary["pins"] = pins
+    summary["pin_sets"] = [list(k) + [n] for k, n in sorted(sets.items(), key=str)]
+    summary["frozen_manifest"] = {"frozen": frozen, "campaign": manifests, "ok": manifest_ok}
     summary["harness_errors"] = {"%s:%s" % k: v for k, v in harness_errors.items()}
 
     out += ["## 2. Pre-registered primary result (%s, b vs a)" % PRIMARY_MODEL, ""]
-    primary, lines = contrast_section(rows, "b", "a", PRIMARY_MODEL, B=B)
+    primary, lines = contrast_section(rows, "b", "a", PRIMARY_MODEL, B=B, power=True)
     out += lines + [""]
     summary["primary"] = primary
     edit, lines = contrast_section(rows, "b", "a", PRIMARY_MODEL, ["bugfix", "lint"], B=B)
@@ -199,13 +300,16 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
     summary["per_family"] = per_family
 
     out += ["## 3. Fidelity anchor", ""]
-    anchor = [r for r in rows if r.get("agent") == "claude-code"]
+    anchor = [r for r in anchor_rows if r.get("failure_mode") not in stats.EXCLUDED_MODES]
     if anchor:
+        out += ["| Arm | Runs | Success | Cost per run | Limit hits | CLAUDE.md seen |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
         for arm in ("a", "b"):
             cell = [r for r in anchor if r["arm"] == arm]
-            out.append("- anchor arm %s: %d/%d success, cost per run %s" % (
-                arm, sum(1 for r in cell if r.get("success")), len(cell),
-                money(sum(stats.cost(r) for r in cell) / len(cell) if cell else None)))
+            if cell:
+                out.append("| %s | %d | %d/%d | %s | %d | %d |" % (
+                    arm, len(cell), sum(1 for r in cell if r.get("success")), len(cell),
+                    money(sum(stats.cost(r) for r in cell) / len(cell)), sum(1 for r in cell if stats.limit_hit(r)),
+                    sum(1 for r in cell if r.get("claude_md_seen"))))
     else:
         out.append("No anchor runs in this campaign.")
     out.append("")
@@ -256,11 +360,28 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
 
     out += ["## 7. Sensitivity analyses", ""]
     sens = {}
+    out.append("- Limit-hit rates (runs stopped by turns, tokens, run budget or wall time; every run is graded on its "
+               "final state):")
+    limit_rates = {}
+    for model in config.MODELS:
+        for arm in sorted(config.ARMS):
+            cell = [r for r in rows if r.get("model") == model and r.get("arm") == arm]
+            if cell:
+                hits = sum(1 for r in cell if stats.limit_hit(r))
+                limit_rates["%s %s" % (model, arm)] = hits / float(len(cell))
+                out.append("  - %s arm %s: %d/%d (%s)" % (model, arm, hits, len(cell), pct(hits / float(len(cell)))))
+    sens["limit_hit_rates"] = limit_rates
     clusters = stats.censored(stats.pairs(rows, "b", "a", PRIMARY_MODEL))
     est = stats.estimates(clusters)
-    sens["limits_censored"] = est
-    out.append("- Limit hits censored: %s" % ("n/a" if not est else "Δs %s, S %s" % (
-        stats.pp(est["delta_s"]), pct(est["S"]))))
+    boot = stats.bootstrap(clusters, B=min(B, 2000)) if est else None
+    sens["limits_censored"] = {"estimate": est, "bootstrap": boot}
+    out.append("- Limit hits censored: %s" % ("n/a" if not est else "Δs %s %s, S %s %s (%d blocks)" % (
+        stats.pp(est["delta_s"]), ci(boot["delta_s_ci"], stats.pp), pct(est["S"]), ci(boot.get("S_ci")),
+        est["n_blocks"])))
+    repriced = repriced_1h(rows, requests, accounting.Pricing())
+    est = stats.estimates(stats.pairs(repriced, "b", "a", PRIMARY_MODEL))
+    sens["cache_writes_1h"] = est
+    out.append("- Cache writes re-priced at the 1-hour rate: %s" % ("n/a" if not est else "S %s" % pct(est["S"])))
     without_py = [r for r in rows if not (r.get("family") == "bugfix" and r.get("language") == "python")]
     est = stats.estimates(stats.pairs(without_py, "b", "a", PRIMARY_MODEL))
     sens["without_python"] = est
@@ -272,6 +393,17 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
         sens["location_" + style] = est
         out.append("- Location %s: %s" % (style, "n/a" if not est else "success b %s vs a %s" % (
             pct(est["success_x"]), pct(est["success_y"]))))
+    for solvable in (True, False):
+        subset = [r for r in rows if r.get("family") != "location" or bool(r.get("grep_solvable")) == solvable]
+        est = stats.estimates(stats.pairs(subset, "b", "a", PRIMARY_MODEL, ["location"]))
+        sens["location_grep_solvable_%s" % solvable] = est
+        out.append("- Location tasks %s with grep: %s" % ("solvable" if solvable else "not solvable",
+                                                          "n/a" if not est else "success b %s vs a %s, S %s" % (
+                                                              pct(est["success_x"]), pct(est["success_y"]),
+                                                              pct(est["S"]))))
+    out.append("- Impact tasks are grep-solvable by construction (uniquely named symbols; truth is the `rg -w` "
+               "hits less comment-only mentions), so the impact family measures cost on lexical cases where "
+               "semantic navigation cannot change success.")
     out.append("")
     summary["sensitivity"] = sens
 
@@ -307,6 +439,19 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
                 diffs.append("%s %s: b %d vs a %d; transcripts %s" % (
                     model, task, sb, sa, ", ".join(x.get("transcript", "") for x, _ in blocks[:2])))
     out += (["- " + d for d in diffs] or ["None."]) + [""]
+
+    out += ["## 9b. First-request check", ""]
+    pairs_of = {}
+    for model in config.MODELS:
+        for x, y in (("b", "a"), ("d", "c"), ("c", "a"), ("d", "a")):
+            clusters = stats.pairs(rows, x, y, model)
+            if clusters:
+                pairs_of.setdefault((x, y), {}).update({"%s %s" % (model, t): v for t, v in clusters.items()})
+    checked, failures = first_request_check(rows, pairs_of)
+    out.append("- paired blocks checked: %d; differing outside the CLAUDE.md block, the SessionStart context and "
+               "context management: %d" % (checked, len(failures)))
+    out += ["  - %s" % f for f in failures[:20]] + [""]
+    summary["first_request_check"] = {"checked": checked, "failures": failures}
 
     out += ["## 10. Context-editing activity", ""]
     for arm in ("c", "d"):
@@ -350,6 +495,14 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
     out.append("- renders: %s" % json.dumps(renders, sort_keys=True))
     out.append("- PARTIAL views passed through: %d" % sum(1 for t in tools if t.get("kind") == "partial_view"))
     out.append("- sandbox denials: %d" % sum(t.get("denials") or 0 for t in tools))
+    out.append("- tool calls naming the Cargo git cache (possible answer-key access): %d in %d runs; outputs that "
+               "mention it: %d" % (sum(1 for t in tools if t.get("cargo_cache_access")),
+                                   sum(1 for r in rows if (r.get("totals") or {}).get("cargo_cache_access")),
+                                   sum(1 for t in tools if t.get("cargo_cache_mention"))))
+    changed = [r for r in rows if r.get("cargo_home_changed")]
+    out.append("- runs after which ~/.cargo bin or config changed: %d%s" % (
+        len(changed), (" (%s)" % ", ".join(sorted({k for r in changed for k in r["cargo_home_changed"]}))[:300])
+        if changed else ""))
     deltas = []
     for model in config.MODELS:
         for task, blocks in stats.pairs(rows, "b", "a", model).items():
@@ -363,16 +516,21 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
 
     out += ["## 12. Spend", ""]
     by = {}
+    directory_fake = accounting.directory_is_dry(base)
     for entry in ledger:
-        key = "%s %s %s" % (entry.get("phase"), entry.get("model"), entry.get("arm"))
+        key = "%s %s %s%s" % (entry.get("phase"), entry.get("model"), entry.get("arm"),
+                              " (fake)" if accounting.entry_is_fake(entry, directory_fake) else "")
         by[key] = by.get(key, 0.0) + float(entry.get("cost_usd") or 0)
     for key, value in sorted(by.items()):
         out.append("- %s: %s" % (key, money(value)))
-    total = sum(by.values())
-    out.append("- total: %s of the %s cap; reserve untouched: %s" % (
-        money(total), money(config.CAMPAIGN_CAP_USD), total <= config.CAMPAIGN_CAP_USD - config.RESERVE_USD))
+    total = sum(v for k, v in by.items() if not k.endswith("(fake)"))
+    fake_total = sum(v for k, v in by.items() if k.endswith("(fake)"))
+    out.append("- paid total in this campaign: %s of the %s cap; all campaigns: %s; reserve untouched: %s%s" % (
+        money(total), money(config.CAMPAIGN_CAP_USD), money(accounting.paid_spend(home)),
+        accounting.paid_spend(home) <= config.CAMPAIGN_CAP_USD - config.RESERVE_USD,
+        "; fake usage (never paid): %s" % money(fake_total) if fake_total else ""))
     out.append("")
-    summary["spend"] = {"total": total, "by": by}
+    summary["spend"] = {"total": total, "fake": fake_total, "by": by}
 
     out += ["## 13. Deviations", "",
             "- No Agent/subagent, Skill, ToolSearch, Workflow or scheduling tools; their text is patched out of "

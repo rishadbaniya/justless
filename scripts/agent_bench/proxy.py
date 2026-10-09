@@ -64,6 +64,15 @@ class Proxy:
             with open(self.log_path, "a") as handle:
                 handle.write(json.dumps(row) + "\n")
 
+    def before_messages(self, sent):
+        """Called before a /v1/messages request is forwarded. Return None to forward it, or (status, payload)
+        to answer it locally; a subclass enforces budgets here. The returned token reaches after_messages."""
+        return None, None
+
+    def after_messages(self, sent, status, model, usage, token):
+        """Called after a /v1/messages response, with the token before_messages returned."""
+        return None
+
     def _handler(self):
         proxy = self
 
@@ -73,32 +82,49 @@ class Proxy:
             def log_message(self, *args):
                 pass
 
-            def _forward(self, method):
-                length = int(self.headers.get("content-length") or 0)
-                body = self.rfile.read(length) if length else None
-                headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
-                request = urllib.request.Request(proxy.upstream + self.path, data=body, headers=headers, method=method)
-                started = time.time()
-                try:
-                    response = urllib.request.urlopen(request, timeout=900)
-                    status = response.status
-                except urllib.error.HTTPError as error:
-                    response = error
-                    status = error.code
-                raw = response.read()
+            def _reply(self, status, payload):
+                raw = json.dumps(payload).encode("utf-8")
                 self.send_response(status)
-                for key, value in response.headers.items():
-                    if key.lower() not in HOP:
-                        self.send_header(key, value)
+                self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
+
+            def _forward(self, method):
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else None
                 path = self.path.split("?")[0]
-                if path.endswith("/v1/messages"):
+                messages = path.endswith("/v1/messages") and method == "POST"
+                sent = {}
+                if messages:
                     try:
                         sent = json.loads(body.decode("utf-8")) if body else {}
                     except ValueError:
                         sent = {}
+                token = None
+                if messages:
+                    refusal, token = proxy.before_messages(sent)
+                    if refusal is not None:
+                        self._reply(*refusal)
+                        proxy.log({"t": time.time(), "status": refusal[0], "path": path, "refused": True,
+                                   "model": sent.get("model"), "usage": {}, "error": refusal[1]})
+                        return
+                headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+                request = urllib.request.Request(proxy.upstream + self.path, data=body, headers=headers, method=method)
+                started = time.time()
+                try:
+                    try:
+                        response = urllib.request.urlopen(request, timeout=900)
+                        status = response.status
+                    except urllib.error.HTTPError as error:
+                        response = error
+                        status = error.code
+                    raw = response.read()
+                except Exception:
+                    if messages:
+                        proxy.after_messages(sent, 0, None, {}, token)
+                    raise
+                if messages:
                     ctype = response.headers.get("content-type", "")
                     if "event-stream" in ctype:
                         model, usage, stop = sse_usage(raw)
@@ -108,6 +134,17 @@ class Proxy:
                         except ValueError:
                             parsed = {}
                         model, usage, stop = parsed.get("model"), parsed.get("usage") or {}, parsed.get("stop_reason")
+                    # Settle the spend before the client sees the response, so its next request is checked
+                    # against it.
+                    proxy.after_messages(sent, status, model or sent.get("model"), usage, token)
+                self.send_response(status)
+                for key, value in response.headers.items():
+                    if key.lower() not in HOP:
+                        self.send_header(key, value)
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                if messages:
                     proxy.log({"t": started, "latency_s": round(time.time() - started, 3), "status": status,
                                "path": path, "request_id": response.headers.get("request-id"),
                                "model": model or sent.get("model"), "usage": usage, "stop_reason": stop,

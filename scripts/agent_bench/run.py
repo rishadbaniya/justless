@@ -2,7 +2,7 @@
 """Real-agent A/B benchmark for Justless. Run `python3 scripts/agent_bench/run.py <command> --help`.
 
 Commands: prepare, validate-tasks, review-tasks, cc-capture, parity-diff, sandbox-check,
-dry-run, pilot, estimate, run, anchor, reconcile, report.
+dry-run, pilot, estimate, run, anchor, reconcile, report, export-audit.
 """
 
 import argparse
@@ -135,6 +135,9 @@ def warm_target(home, task, runner_env_factory):
         proc = subprocess.run(command, cwd=str(snap / "repo"), env=env, capture_output=True, timeout=3600)
         if proc.returncode != 0 and task["family"] == "bugfix" and "--no-run" not in command:
             raise RuntimeError("warm build failed: %s" % proc.stderr.decode()[-800:])
+    # A library without a committed Cargo.lock gets one from the build; record the snapshot as runs see it.
+    workspace.normalize_mtimes(snap / "repo")
+    (snap / "tree_hash").write_text(workspace.tree_hash(snap / "repo"))
     marker.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     return target
 
@@ -899,6 +902,37 @@ def cmd_report(args):
     return report.main(["--home", str(args.home), "--campaign", args.campaign] + (["--dry"] if args.dry else []))
 
 
+def cmd_export_audit(args):
+    """Every successful edit-family run whose diff is not an exact revert, exported for a blind review: the
+    patches are named by a random-looking ID and list the task but not the arm; key.json maps IDs to runs."""
+    import report
+    rows = report.harness_only(report.final_rows(read_rows(Path(args.home) / "campaigns" / args.campaign
+                                                           / "results.jsonl")))
+    chosen = [r for r in rows if r.get("success") and r.get("family") in ("bugfix", "lint")
+              and not ((r.get("oracle") or {}).get("details") or {}).get("exact_revert")]
+    out = Path(args.home) / "reports" / args.campaign / "audit"
+    if out.exists():
+        shutil.rmtree(str(out))
+    out.mkdir(parents=True)
+    salt = os.urandom(8).hex()
+    index, key = [], {}
+    def blind_id(row):
+        return hashlib.sha256((salt + row["run_id"] + str(row.get("attempt"))).encode()).hexdigest()[:10]
+
+    for row in sorted(chosen, key=blind_id):
+        blind = blind_id(row)
+        patch = Path(row.get("transcript") or "").parent / "diff.patch"
+        text = patch.read_text() if row.get("transcript") and patch.exists() else "(diff missing)\n"
+        (out / ("%s.patch" % blind)).write_text("# task %s\n%s" % (row["task_id"], text))
+        index.append({"id": blind, "task": row["task_id"], "family": row["family"]})
+        key[blind] = {"run_id": row["run_id"], "attempt": row.get("attempt"), "model": row.get("model"),
+                      "arm": row.get("arm"), "rep": row.get("rep")}
+    (out / "index.json").write_text(json.dumps(index, indent=1))
+    (out.parent / "audit_key.json").write_text(json.dumps(key, indent=1, sort_keys=True))
+    print("%d non-revert successful edits exported to %s (key in %s)" % (len(index), out, out.parent / "audit_key.json"))
+    return 0
+
+
 def cmd_sandbox_check(args):
     results = sandbox.self_test(config, Path(args.runroot) / "_sandbox_check")
     ok = all(r[1] for r in results)
@@ -998,6 +1032,7 @@ def parser():
                                                     help="upstream is the fake API with a scripted agent (free)")
     common(sub.add_parser("reconcile")).add_argument("--provider-usd", type=float)
     common(sub.add_parser("report")).add_argument("--dry", action="store_true")
+    common(sub.add_parser("export-audit"))
     return p
 
 
@@ -1013,6 +1048,7 @@ def main(argv=None):
         "cc-capture": cmd_cc_capture, "parity-diff": cmd_parity_diff, "sandbox-check": cmd_sandbox_check,
         "dry-run": cmd_dry_run, "pilot": lambda a: cmd_run(a, phase="pilot"), "estimate": cmd_estimate,
         "run": cmd_run, "anchor": cmd_anchor, "reconcile": cmd_reconcile, "report": cmd_report,
+        "export-audit": cmd_export_audit,
     }
     return commands[args.command](args)
 

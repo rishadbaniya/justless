@@ -621,6 +621,7 @@ def grade_lint(task, root, reference, runner):
         return {"success": False, "failure_mode": "build_broken", "details": details}
     if missing or not results:
         return {"success": False, "failure_mode": "wrong_fix", "details": details}
+    details["exact_revert"] = exact_revert(root, task)
     return {"success": True, "failure_mode": "success", "details": details}
 
 

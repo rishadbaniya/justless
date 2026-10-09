@@ -111,7 +111,7 @@ class PricingTests(unittest.TestCase):
         self.assertAlmostEqual(one.spent, 2.9)
         one.check(0.01)
         self.assertAlmostEqual(one.spent, 2.95)
-        totals = [json.loads(l)["ledger_total"] for l in open(str(path))]
+        totals = [json.loads(l)["ledger_total"] for l in path.read_text().splitlines()]
         self.assertEqual(totals, [2.9, 2.95])
 
     def test_paid_spend_skips_fake_entries_wherever_they_are(self):
@@ -210,6 +210,114 @@ class StatsTests(unittest.TestCase):
         result = stats.mde(96, reps=3)
         self.assertAlmostEqual(result["design_effect"], 1.6)
         self.assertTrue(0.15 < result["cost_mde"] < 0.25)
+
+    def test_undefined_s_falls_back_to_cost_per_run(self):
+        """The documented fallback: when S is undefined, the rule uses the saving in cost per run."""
+        rows = []
+        for t in range(8):
+            rows.append(row("t%d" % t, 1, "a", t < 2, 1.0))
+            rows.append(row("t%d" % t, 1, "b", t >= 6, 0.5))
+        clusters = stats.pairs(rows, "b", "a", "claude-sonnet-5-5")
+        boot = stats.bootstrap(clusters, B=300)
+        self.assertIsNone(boot["S_ci"])
+        self.assertTrue(boot["R_ci"][0] > 0.4)
+        verdict, wording = stats.decide(stats.estimates(clusters), boot)
+        self.assertEqual(verdict, "CHEAPER-BUT-SUCCESS-UNCERTAIN")
+        self.assertIn("cost per run", wording)
+        self.assertIn("not evidence that success fell", wording)
+
+    def test_arms_never_pair_across_pin_sets(self):
+        def pinned(r, sha):
+            return dict(r, pins={"justless_sha256": sha, "harness_tree": "h", "capture_hash": "c",
+                                 "manifest_hash": "m", "pricing_hash": "p"})
+        rows = [pinned(row("t0", 1, "a", True, 1.0), "old"), pinned(row("t0", 1, "b", True, 0.5), "new")]
+        self.assertEqual(stats.pairs(rows, "b", "a", "claude-sonnet-5-5"), {})
+        rows += [pinned(row("t0", 1, "a", True, 1.0), "new"), pinned(row("t1", 1, "b", True, 0.5), "old"),
+                 pinned(row("t1", 1, "a", True, 1.0), "old")]
+        self.assertEqual(sum(len(v) for v in stats.pairs(rows, "b", "a", "claude-sonnet-5-5").values()), 2)
+        result = stats.contrast(rows, "b", "a", "claude-sonnet-5-5", B=50)
+        self.assertEqual(result["verdict"], "MIXED PINS")
+        self.assertEqual(len(result["pin_sets"]), 2)
+
+    def test_power_is_reported(self):
+        import random
+        rng = random.Random(7)
+        rows = []
+        for t in range(12):
+            for rep in (1, 2, 3):
+                rows.append(row("t%d" % t, rep, "a", rng.random() < 0.6, 1.0))
+                rows.append(row("t%d" % t, rep, "b", rng.random() < 0.6, 0.5))
+        result = stats.contrast(rows, "b", "a", "claude-sonnet-5-5", B=200, power=True)
+        power = result["power"]
+        self.assertGreater(power["delta_s_half_width"], 0.05)
+        self.assertGreater(power["discordant_share"], 0.3)
+        self.assertTrue(0.0 <= power["null"]["success_conditions_met"] <= 1.0)
+        self.assertIn("success_mde", power["mde"])
+
+    def test_limit_hit_reads_stopped_by(self):
+        self.assertTrue(stats.limit_hit({"stopped_by": "token_limit", "failure_mode": "success"}))
+        self.assertTrue(stats.limit_hit({"failure_mode": "turn_limit"}))
+        self.assertFalse(stats.limit_hit({"stopped_by": "end_turn", "failure_mode": "wrong_fix"}))
+
+
+class ReportTests(unittest.TestCase):
+    def campaign(self, rows):
+        home = helpers.tempdir(self)
+        base = home / "campaigns" / "c1"
+        base.mkdir(parents=True)
+        with open(str(base / "results.jsonl"), "w") as handle:
+            for r in rows:
+                handle.write(json.dumps(r) + "\n")
+        return home
+
+    def test_descriptive_tables_hold_only_graded_harness_runs(self):
+        import report
+        rows = [dict(row("t0", 1, "a", True, 0.30), run_id="r1"),
+                dict(row("t0", 1, "a", False, 0.90), run_id="r2", agent="claude-code"),
+                dict(row("t1", 1, "a", False, 0.05, "harness_error"), run_id="r3")]
+        text, summary = report.build(self.campaign(rows), "c1", dry=True, B=50)
+        line = [l for l in text.split("\n") if l.startswith("| a (plain)")][0]
+        self.assertIn("| 1 | 1/1 (100.0%) | $0.3000 |", line)
+        self.assertEqual(summary["anchor_runs"], 1)
+
+    def test_resumed_duplicates_are_counted_once(self):
+        import report
+        first = dict(row("t0", 1, "a", False, 1.0), run_id="r1")
+        again = dict(row("t0", 1, "a", True, 1.0), run_id="r2")
+        self.assertEqual(len(report.final_rows([first, again])), 1)
+        self.assertTrue(report.final_rows([first, again])[0]["success"])
+
+    def test_main_report_requires_the_frozen_manifest(self):
+        import report
+        rows = [dict(row("t0", 1, "a", True, 1.0), run_id="r1", pins={"manifest_hash": "m1"})]
+        home = self.campaign(rows)
+        (home / "campaigns" / "c1").rename(home / "campaigns" / "main")
+        with self.assertRaises(SystemExit):
+            report.build(home, "main", dry=False, B=50)
+        (home / "tasks").mkdir()
+        (home / "tasks" / "_manifest.json").write_text(json.dumps({"hash": "m1"}))
+        text, summary = report.build(home, "main", dry=False, B=50)
+        self.assertTrue(summary["frozen_manifest"]["ok"])
+
+    def test_first_request_check_flags_a_difference(self):
+        import report
+        home = helpers.tempdir(self)
+        body = {"model": "m", "max_tokens": 10, "system": [{"type": "text", "text": "Session: 1"},
+                                                         {"type": "text", "text": "sys"}],
+                "tools": [], "messages": [{"role": "user", "content": [{"type": "text", "text": "go"}]},
+                                          {"role": "system", "content": [{"type": "text", "text": "env"}]}]}
+        rows = []
+        for arm, text in (("a", "sys"), ("b", "other")):
+            store = home / arm
+            store.mkdir()
+            sent = json.loads(json.dumps(body))
+            sent["system"][1]["text"] = text
+            (store / "first_request.json").write_text(json.dumps(sent))
+            rows.append(dict(row("t0", 1, arm, True, 1.0), transcript=str(store / "transcript.json")))
+        clusters = stats.pairs(rows, "b", "a", "claude-sonnet-5-5")
+        checked, failures = report.first_request_check(rows, {("b", "a"): clusters})
+        self.assertEqual(checked, 1)
+        self.assertIn("system differs", failures[0])
 
 
 if __name__ == "__main__":
