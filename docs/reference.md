@@ -8,7 +8,7 @@
 | `justless exec --lang python3 --file data.json CODE` | Runs a short script and returns only what it prints, with its exit status. The full output keeps a run ID. The code can also come from stdin (`-`) or `--script FILE`. |
 | `justless exec … --intent TEXT` | Replaces stdout longer than the preview with the lines most relevant to TEXT, each marked for `justless log` |
 | `justless search RUN_ID TEXT` | Literal matches with stream and line numbers |
-| `justless log RUN_ID --stream stdout --from 10 --to 15` | Exact original bytes for the specified inclusive line range. Omit the range to replay the complete stream. |
+| `justless log RUN_ID --stream stdout --from 10 --to 15` | Original bytes for the specified inclusive line range, with secrets replaced by markers. `--unredacted` returns the exact bytes. Omit the range to replay the complete stream. |
 | `justless query SYMBOL --view VIEW` | Definition, references, callers, or related tests. Use `all` for the combined view. |
 | `justless query SYMBOL --view dependencies` | Outgoing calls, imports, and other indexed relationships |
 | `justless path FROM TO` | A short relationship chain with the location and direction of each edge |
@@ -696,3 +696,106 @@ Otherwise `exec` exits with the script's status, or with 128 plus the signal num
 Hooks pass `exec` commands through unchanged, so the client decides whether to ask, as for any other shell command. A rule that allows every `justless` command also allows every script, so limit allow rules to read-only subcommands such as `justless query`. The MCP server does not offer `exec`.
 
 The archive keeps the script and whatever it printed, so keep `.justless/` private. As for `run`, each stream stores at most `max_run_bytes` for exact replay, and older runs are deleted under `max_runs` and `max_archive_bytes`. A recursive search over the whole workspace, such as `grep -r` from the root, also reads archived runs under `.justless/`, so exclude that directory.
+
+## Secret redaction
+
+`run` replaces API keys, tokens, passwords and private keys in captured output with markers before the agent sees them. The archive in `.justless/runs/` keeps the original bytes, so keep that directory private.
+
+```text
+$ justless run -- printenv
+…
+GITHUB_TOKEN=[redacted:github-token:4f1c]
+DATABASE_URL=postgres://app:[redacted:url-password:91d0]@db:5432/app
+…
+
+[justless run-8Kq2xZ] exit 0 · 1204 of 1260 output bytes · 2 secrets redacted · justless log run-8Kq2xZ
+```
+
+A marker names the kind of secret and a four-character hash keyed by a random value in `.justless/redact.key`:
+- The same value gets the same marker in every run, search and handoff in the project. Different values usually get different hashes.
+- A marker cannot be used to confirm a guessed value.
+- If the key cannot be read or created, markers omit the hash, as in `[redacted:github-token]`.
+
+| Kind | What is replaced |
+| --- | --- |
+| `aws-access-key` | Access key IDs starting with `AKIA`, `ASIA`, `ABIA`, `ACCA` or `A3T` |
+| `github-token` | Tokens starting with `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or `github_pat_` |
+| `gitlab-token` | Tokens starting with `glpat-`, `gldt-`, `glrt-` or `glptt-` |
+| `slack-token`, `slack-webhook` | `xox…-` and `xapp-` tokens, and the secret path of a `hooks.slack.com` webhook |
+| `stripe-key` | Live secret and restricted keys, `sk_live_` and `rk_live_` |
+| `openai-key`, `anthropic-key`, `google-api-key` | `sk-proj-`, `sk-svcacct-`, `sk-admin-` and legacy OpenAI keys, `sk-ant-` keys and `AIza` keys |
+| `npm-token`, `pypi-token`, `huggingface-token` | `npm_`, `pypi-` and `hf_` tokens |
+| `jwt` | Signed JSON Web Tokens |
+| `private-key` | The body of a PEM or OpenSSH private key, whether written over several lines, on one line with `\n` escapes, inside a string literal, or base64-encoded as in a Kubernetes secret. The `BEGIN` and `END` lines stay. |
+| `url-password` | The password in `scheme://user:password@host` when it has at least four characters |
+| `authorization` | The credential after `Authorization: Bearer`, `Basic`, `Token` or `Digest`, and a standalone `Bearer` token |
+| `secret` | A value assigned with `=`, `:`, `:=` or `=>` to a name containing password, passwd, secret, token, API key, access key, private key or credential, or passed to a flag such as `--password`. The value needs at least 12 characters, a letter, a digit and high entropy, and must not look like an identifier or a path. |
+
+Some values stay visible:
+- values containing `EXAMPLE`, `example`, `placeholder`, `changeme`, `dummy` or `your_`;
+- runs such as `xxxxxx` or `***`;
+- variable references such as `$TOKEN` or `${TOKEN}`;
+- identifiers and type names, such as `ML_KEM_512_SHARED_SECRET_LENGTH` or the `Ed25519PrivateKey` in `private_key: Ed25519PrivateKey`.
+
+Every view of a captured run is redacted:
+- the `run` preview, with its grouped test, lint, search and listing reports and rerun comparisons;
+- the footer;
+- `log`, `search` and `history`;
+- `context --run` and the recorded failures in `pack`;
+- `resume` and the compaction handoffs.
+
+MCP tools run the same commands, so their results are redacted too, and the server offers no way to turn this off. The run record stores how many secrets were found, and `stats` reports the total and how often originals were replayed.
+
+A hook-routed command whose output was shown in full still ends with a footer when something was redacted, such as `[justless run-8Kq2xZ · 2 secrets redacted]`, so the agent knows Justless wrote the markers and which run holds the originals. A run reported as unchanged carries no count.
+
+Source views are not redacted:
+- `read`, `expand`, `code`, `find`, `query`, `context --at`, source lines in `pack`, and Claude Code's Read, Grep and Glob results show workspace files that the agent can also open with its own tools.
+- `edit` relies on `expand` returning the exact bytes a replacement will overwrite.
+- `recall` returns archived tool results exactly, since they came from the agent's client.
+
+Redaction replaces only the secret and never adds or removes a line break, so line numbers, `--from` and `--to` ranges, and markers such as `stdout:8-15` match the archive:
+- A private key keeps its line count: its first body line becomes the marker and the other body lines become empty.
+- Output with nothing to redact replays byte for byte.
+- A line that holds both a secret and terminal color codes loses its color codes.
+- A marker can make a preview up to 24 bytes longer than `--max-bytes` per secret shown. Output that fits the budget is still shown whole.
+
+Add `--unredacted` to `log` or `search` for the original bytes. Without it, `search` and `history` match the redacted text: searching for a secret's value finds nothing, and searching for `redacted:github-token` lists where tokens appeared. `history` always matches redacted text; find the run there, then replay the range you need.
+
+```sh
+justless search run-8Kq2xZ redacted:url-password
+justless log run-8Kq2xZ --stream stdout --from 2 --to 2 --unredacted
+```
+
+```toml
+redact = true
+redact_allow = ['^sk_live_0{24}$', 'EXAMPLE$']
+```
+
+`redact = true` is the default, and `redact = false` turns redaction off for the project. Each `redact_allow` entry is a regular expression tested against every detected value; a match leaves that value visible.
+
+An invalid expression, or one that matches empty text, stops `run` with an error before the command starts, like `[[filters]]`. Replays of earlier runs with `log`, `search` and `history`, and the compaction handoff, keep working when the configuration cannot be read. They redact with the built-in rules and print a note on stderr. `--unredacted` works whatever the configuration. Commands that take their default `--budget` from `.justless.toml`, such as `history` and `resume`, still need the file to parse unless `--budget` is given.
+
+Test fixtures that look like secrets are redacted too. Two markers with different hashes mean the values differ. To see the original, read the test source, replay the range with `--unredacted`, or add a `redact_allow` entry.
+
+Redaction keeps secrets out of the agent's context by default. It is not access control: these all show the original bytes:
+- `--unredacted`;
+- `run --raw`;
+- commands that hooks pass through unchanged, such as pipelines;
+- reading `.justless/runs/` directly.
+
+These are not detected:
+- short or dictionary-word passwords in a plain assignment, unless they appear in a URL or an Authorization header;
+- cookies, `.netrc` lines and Docker `auth` entries;
+- Kubernetes secret values under names without a keyword;
+- a keyword broken up by terminal color codes inside the word;
+- formats not in the table.
+
+Lines without a trigger word pass a single literal prefilter, and only the lines it hits are matched against the rules. Lines longer than 1 MiB are redacted in windows that overlap by 8 KiB, so memory stays bounded and any secret up to 8 KiB is found wherever the window falls. Replaying a run in which nothing was redacted copies the archive directly. `scripts/redact_benchmark.py` measures 200 MiB inputs with redaction on and off:
+
+| Input (200 MiB) | `run` without | `run` with | `log` | `log --unredacted` |
+| --- | --- | --- | --- | --- |
+| This repository's Git history, source, docs and lockfiles, with 24 secrets | 2.96 s | 3.33 s | 0.42 s | 0.07 s |
+| Every line holding a keyword, no secrets | 1.46 s | 2.60 s | 0.06 s | 0.06 s |
+| One line of base64, no secrets | 0.47 s | 0.81 s | 0.05 s | 0.05 s |
+
+These are release-build times on Apple Silicon while other jobs kept the load average between 14 and 30, so the mix varied from 4% faster to 37% slower across three runs. The keyword-dense and single-line figures repeated within 10%. Redaction adds 155,248 bytes (0.3%) to the release binary.
