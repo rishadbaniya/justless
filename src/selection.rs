@@ -2067,11 +2067,14 @@ fn plan_runner(
         if !concerned {
             continue;
         }
-        // Code in a binary that an integration test runs whole is exercised by it.
+        // Code in a binary that an integration test runs whole is exercised by
+        // it. Example code no test calls only has to compile, which the plan
+        // builds; benchmarks `cargo test` does not build at all.
         if let Some(cargo) = &runner.cargo
             && let Some((_, target)) = target_of(cargo, definition)
-            && target.kind == "bin"
-            && covered_bins.contains(&target.name)
+            && ((target.kind == "bin" && covered_bins.contains(&target.name))
+                || target.kind == "example"
+                || (target.kind == "bench" && !target.test))
         {
             continue;
         }
@@ -2095,8 +2098,19 @@ fn plan_runner(
                     "{label} reaches tests only through inferred links or name matches"
                 ),
             });
-        } else if seed.new && seed.unused && seed.dependents.is_empty() {
-            // Nothing can call a definition that did not exist and has no users.
+        } else if seed.new
+            && ((seed.unused && seed.dependents.is_empty())
+                || (!seed.dependents.is_empty()
+                    && seed.dependents.keys().all(|&dependent| {
+                        runner
+                            .cargo
+                            .as_ref()
+                            .and_then(|cargo| target_of(cargo, &definitions[dependent]))
+                            .is_some_and(|(_, target)| target.kind == "example")
+                    })))
+        {
+            // Nothing can call a definition that did not exist and has no
+            // users, or only examples, which the plan builds.
         } else {
             reasons.push(Reason {
                 code: "no-tests",

@@ -10369,3 +10369,616 @@ fn affected_tests_from_a_member_directory_keep_what_dependencies_reach() {
         "cargo · nothing to run · no change reaches its tests",
     );
 }
+
+/// The affected fixture plus the shapes that once let a subset pass where
+/// `cargo test` fails: a helper reached through `Display`, crate-level and
+/// included doc examples, an example binary and an SQL migration a test reads.
+fn affected_fixture_with_hidden_users() -> TempDir {
+    let repo = affected_fixture();
+    let root = repo.path();
+    let write = |file: &str, text: &str| {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(
+        "ledger/src/money.rs",
+        r#"use std::fmt;
+
+pub struct Money(pub u64);
+
+impl Money {
+    pub fn with_vat(&self) -> Money {
+        Money(self.0 + crate::tax::vat(self.0))
+    }
+}
+
+/// Whole units with a comma between each group of three digits.
+pub fn grouped(units: u64) -> String {
+    let digits = units.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+macro_rules! bracket {
+    ($value:expr) => {
+        format!("[{}]", $value)
+    };
+}
+
+/// A count of whole units in brackets.
+pub fn label(units: u64) -> String {
+    bracket!(grouped(units))
+}
+
+impl fmt::Display for Money {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{:02}", grouped(self.0 / 100), self.0 % 100)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn displays_cents() {
+        assert_eq!(Money(1234).to_string(), "12.34");
+    }
+
+    #[test]
+    fn adds_vat() {
+        assert_eq!(Money(1000).with_vat().0, 1200);
+    }
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(grouped(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn labels_are_bracketed() {
+        assert_eq!(label(1000), "[1,000]");
+    }
+}
+"#,
+    );
+    let lib = fs::read_to_string(root.join("reports/src/lib.rs")).unwrap();
+    write(
+        "reports/src/lib.rs",
+        &format!(
+            "#![doc = include_str!(\"../README.md\")]\n//! Report helpers.\n//!\n//! ```\n//! assert_eq!(reports::stats::peak(&[1, 9, 3]), 9);\n//! ```\n{lib}"
+        ),
+    );
+    write(
+        "reports/README.md",
+        "# reports\n\n```\nassert_eq!(reports::stats::mean(&[2, 4]), 3);\n```\n",
+    );
+    let stats = fs::read_to_string(root.join("reports/src/stats.rs")).unwrap();
+    write(
+        "reports/src/stats.rs",
+        &stats.replacen(
+            "#[cfg(test)]",
+            "/// The distance between the largest and the smallest value.\npub fn spread(values: &[u64]) -> u64 {\n    peak(values) - values.iter().copied().min().unwrap_or(0)\n}\n\n#[cfg(test)]",
+            1,
+        ),
+    );
+    write(
+        "reports/examples/weekly.rs",
+        "fn main() {\n    println!(\"{}\", reports::stats::spread(&[4, 8, 6]));\n}\n",
+    );
+    write(
+        "ledger/migrations/001_init.sql",
+        "CREATE TABLE invoices (\n    id INTEGER PRIMARY KEY\n);\n",
+    );
+    write(
+        "ledger/tests/migrations.rs",
+        "use std::fs;\nuse std::path::Path;\n\n#[test]\nfn every_migration_creates_a_table() {\n    let dir = Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"migrations\");\n    for entry in fs::read_dir(dir).unwrap() {\n        let text = fs::read_to_string(entry.unwrap().path()).unwrap();\n        assert!(text.contains(\"CREATE TABLE\"), \"no table\");\n    }\n}\n",
+    );
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "hidden users"]);
+    repo
+}
+
+#[test]
+fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
+    let repo = affected_fixture_with_hidden_users();
+    let root = repo.path();
+    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
+    let plan = || {
+        success(
+            root,
+            &[
+                "test",
+                "--affected",
+                "--dry-run",
+                "--budget",
+                "8000",
+                "--",
+                "cargo",
+                "test",
+                "--offline",
+            ],
+        )
+    };
+    let reset = || git(root, &["checkout", "-q", "--", "."]);
+
+    // A helper called inside `write!` in a Display impl reaches every test that
+    // formats the type, and one called inside an unindexed macro reaches the
+    // tests of the function around it.
+    replace_in(
+        root,
+        "ledger/src/money.rs",
+        "let digits = units.to_string();",
+        "let digits = format!(\"{units:0>3}\");",
+    );
+    let text = plan();
+    assert!(
+        text.contains(
+            "  money::tests::groups_thousands · ledger-core --lib · exact · call at ledger/src/money.rs"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  money::tests::displays_cents · ledger-core --lib · possible · fmt is called implicitly; traced through type money::Money"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  tests::invoice_total_adds_vat · api --lib · possible · fmt is called implicitly"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  money::tests::labels_are_bracketed · ledger-core --lib · possible · names grouped at ledger/src/money.rs:32"
+        ),
+        "{text}"
+    );
+    // `cargo test` fails here, and so does the subset.
+    let failing = cli(root, &affected);
+    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
+    assert!(
+        stderr(&failing).contains("Subset failed (cargo)"),
+        "{}",
+        stderr(&failing)
+    );
+    assert_no_suite_claim(&failing);
+    reset();
+
+    // Crate-level examples run when they name a changed function.
+    replace_in(
+        root,
+        "reports/src/stats.rs",
+        "values.iter().copied().max().unwrap_or(0)\n",
+        "values.iter().max().copied().unwrap_or(0)\n",
+    );
+    let text = plan();
+    has_line(
+        &text,
+        "  Run (doctests): cargo test --offline -p reports --doc -- 'src/lib.rs - '",
+    );
+    has_line(
+        &text,
+        "  src/lib.rs (doctest) · --doc · mention · its example names peak at reports/src/lib.rs:5",
+    );
+    reset();
+
+    // A README included as crate docs runs as doctests when it changes.
+    replace_in(root, "reports/README.md", "&[2, 4]), 3)", "&[2, 4]), 4)");
+    let text = plan();
+    has_line(
+        &text,
+        "  Run (doctests): cargo test --offline -p reports --doc -- 'src/lib.rs - '",
+    );
+    assert!(!text.contains("no test impact"), "{text}");
+    let failing = cli(root, &affected);
+    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
+    assert!(
+        stderr(&failing).contains("  reports/src/lib.rs - (line"),
+        "{}",
+        stderr(&failing)
+    );
+    reset();
+
+    // A rename that breaks an example fails the build, as `cargo test` would,
+    // and the verdict names what it built.
+    replace_in(
+        root,
+        "reports/src/stats.rs",
+        "pub fn spread(",
+        "pub fn range(",
+    );
+    let text = plan();
+    has_line(
+        &text,
+        "cargo · build only · no test reaches the changed code",
+    );
+    has_line(
+        &text,
+        "  Run (build only): cargo test --offline -p reports --lib --example weekly --no-run",
+    );
+    let failing = cli(root, &affected);
+    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
+    assert!(
+        stderr(&failing).contains(
+            "Build only (cargo) failed with exit 101 building reports --lib, reports --example weekly"
+        ),
+        "{}",
+        stderr(&failing)
+    );
+    // Fixed in the example too: an example nothing tests only has to build.
+    replace_in(
+        root,
+        "reports/examples/weekly.rs",
+        "stats::spread(",
+        "stats::range(",
+    );
+    let passing = cli(root, &affected);
+    assert!(passing.status.success(), "{}", stderr(&passing));
+    assert!(
+        stderr(&passing)
+            .contains("Build only (cargo): reports --lib, reports --example weekly compiled"),
+        "{}",
+        stderr(&passing)
+    );
+    assert_no_suite_claim(&passing);
+    reset();
+
+    // SQL that nothing names, in a language no runner here runs, is data.
+    replace_in(
+        root,
+        "ledger/migrations/001_init.sql",
+        "CREATE TABLE",
+        "CREATE VIEW",
+    );
+    let text = plan();
+    has_line(
+        &text,
+        "  data-unlinked: ledger/migrations/001_init.sql is not mentioned by indexed source, and no runner here runs its language",
+    );
+    has_line(&text, "  Run (full suite): cargo test --offline");
+}
+
+/// A stand-in for `go test`: `-run` matches top-level `func TestX(t *testing.T)`
+/// only, suite methods run as subtests of the function that calls suite.Run, and
+/// `-v` names each test. `$FAIL` names a test or suite method that fails.
+#[cfg(unix)]
+const FAKE_GO: &str = r#"#!/bin/sh
+echo "go $*" >> "$CALLS"
+shift
+verbose=""; pattern=""; packages=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -v) verbose=1; shift;;
+    -run) pattern="$2"; shift 2;;
+    ./...) packages="$packages $(ls -d */ | sed 's|/$||; s|^|./|')"; shift;;
+    -*) shift;;
+    *) packages="$packages $1"; shift;;
+  esac
+done
+module=$(sed -n 's/^module //p' go.mod)
+status=0
+for package in $packages; do
+  name="$module/${package#./}"
+  tops=$(cat "$package"/*_test.go | sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing\.T).*/\1/p')
+  methods=$(cat "$package"/*_test.go | sed -n 's/^func ([a-z]* \*[A-Za-z]*) \(Test[A-Za-z0-9_]*\)().*/\1/p')
+  ran=""; failed=""
+  for test in $tops; do
+    if [ -n "$pattern" ] && ! echo "$test" | grep -Eq "$pattern"; then continue; fi
+    ran=1
+    [ -n "$verbose" ] && echo "=== RUN   $test"
+    result=PASS
+    [ "$test" = "$FAIL" ] && result=FAIL
+    if grep -A2 "func $test(t" "$package"/*_test.go | grep -q suite.Run; then
+      for method in $methods; do
+        sub=PASS
+        [ "$method" = "$FAIL" ] && sub=FAIL && result=FAIL
+        if [ -n "$verbose" ] || [ "$sub" = FAIL ]; then echo "    --- $sub: $test/$method (0.00s)"; fi
+      done
+    fi
+    [ "$result" = FAIL ] && failed=1
+    if [ -n "$verbose" ] || [ "$result" = FAIL ]; then echo "--- $result: $test (0.00s)"; fi
+  done
+  if [ -z "$ran" ]; then
+    printf 'ok  \t%s\t0.001s [no tests to run]\n' "$name"
+  elif [ -n "$failed" ]; then
+    echo FAIL; printf 'FAIL\t%s\t0.001s\n' "$name"; status=1
+  else
+    [ -n "$verbose" ] && echo PASS
+    printf 'ok  \t%s\t0.001s\n' "$name"
+  fi
+done
+exit $status
+"#;
+
+/// A stand-in for pytest whose exit status per call comes from `$PLAN`, such as
+/// `4,0`: the first call exits 4 as for an unknown node ID, the second passes.
+#[cfg(unix)]
+const FAKE_PYTEST: &str = r#"#!/bin/sh
+count=$(cat "$CALLS.count" 2>/dev/null || echo 0); count=$((count + 1)); echo $count > "$CALLS.count"
+echo "pytest $*" >> "$CALLS"
+status=$(echo "${PLAN:-0}" | cut -d, -f$count); [ -z "$status" ] && status=0
+case $status in
+  0) echo '==== 3 passed in 0.02s ====';;
+  1) echo 'FAILED tests/test_rates.py::test_vat - assert 1 == 2'; echo '==== 1 failed, 2 passed in 0.02s ====';;
+  4) echo "ERROR: not found: $2" >&2; echo '==== no tests ran in 0.01s ====';;
+  5) echo '==== no tests ran in 0.01s ====';;
+esac
+exit $status
+"#;
+
+#[cfg(unix)]
+#[test]
+fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let write = |file: &str, text: &str| {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    let tool = |file: &str, text: &str| {
+        write(file, text);
+        fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write(".gitignore", "tools/\ncalls.log*\n");
+    tool("tools/go", FAKE_GO);
+    tool("tools/pytest", FAKE_PYTEST);
+    // pytest collects `*_tests.py` here, under tests/ only.
+    write(
+        "pyproject.toml",
+        "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npython_files = [\"test_*.py\", \"*_tests.py\"]\n",
+    );
+    write("billing/__init__.py", "");
+    write(
+        "billing/rates.py",
+        "def vat(amount):\n    return amount // 5\n",
+    );
+    write(
+        "billing/invoice.py",
+        "from billing.rates import vat\n\n\ndef total(amount):\n    return amount + vat(amount)\n",
+    );
+    write(
+        "billing/shipping.py",
+        "def fee(weight):\n    return weight * 2\n",
+    );
+    write(
+        "tests/invoice_tests.py",
+        "from billing.invoice import total\n\n\ndef test_total():\n    assert total(10) == 12\n",
+    );
+    write(
+        "tests/test_rates.py",
+        "from billing.rates import vat\n\n\ndef test_vat():\n    assert vat(10) == 2\n",
+    );
+    // A file pytest does not collect: its tests satisfy nothing.
+    write(
+        "tests/shipping_check.py",
+        "from billing.shipping import fee\n\n\ndef test_fee():\n    assert fee(2) == 4\n",
+    );
+    for name in ["test_names", "test_dates", "test_other"] {
+        write(
+            &format!("tests/{name}.py"),
+            "def test_one():\n    assert 1\n\n\ndef test_two():\n    assert 2\n",
+        );
+    }
+    write("shop/go.mod", "module example.com/shop\n\ngo 1.22\n");
+    write(
+        "shop/cart/cart.go",
+        "package cart\n\nfunc Count(items []int) int {\n\treturn len(items)\n}\n",
+    );
+    write(
+        "shop/cart/cart_test.go",
+        "package cart\n\nimport \"testing\"\n\nfunc TestCount(t *testing.T) {\n\tif Count([]int{1}) != 1 {\n\t\tt.Fatal(\"count\")\n\t}\n}\n",
+    );
+    write(
+        "shop/cart/suite_test.go",
+        "package cart\n\nimport (\n\t\"testing\"\n\n\t\"github.com/stretchr/testify/suite\"\n)\n\ntype CartSuite struct {\n\tsuite.Suite\n}\n\nfunc (s *CartSuite) TestCountTwo() {\n\ts.Equal(2, Count([]int{1, 2}))\n}\n\nfunc TestCartSuite(t *testing.T) {\n\tsuite.Run(t, new(CartSuite))\n}\n",
+    );
+    write(
+        "shop/price/price.go",
+        "package price\n\nfunc Vat(cents int) int {\n\treturn cents / 5\n}\n",
+    );
+    write(
+        "shop/price/price_test.go",
+        "package price\n\nimport \"testing\"\n\nfunc TestVat(t *testing.T) {\n\tif Vat(100) != 20 {\n\t\tt.Fatal(\"vat\")\n\t}\n}\n",
+    );
+    write(
+        "shop/ship/ship_test.go",
+        "package ship\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {}\n\nfunc TestB(t *testing.T) {}\n\nfunc TestC(t *testing.T) {}\n\nfunc TestD(t *testing.T) {}\n",
+    );
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    let calls = root.join("calls.log");
+    let pytest = root.join("tools/pytest");
+    let pytest = pytest.to_str().unwrap().to_owned();
+    let justless = |args: &[&str], env: &[(&str, &str)]| {
+        let _ = fs::remove_file(&calls);
+        let _ = fs::remove_file(root.join("calls.log.count"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+        command
+            .args(args)
+            .current_dir(root)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    root.join("tools").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("CALLS", &calls);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    };
+    let reset = || git(root, &["checkout", "-q", "--", "."]);
+
+    // Go: an edited suite method runs its package whole, since `-run` cannot
+    // name a subtest; a failure in it fails the subset.
+    replace_in(root, "shop/cart/suite_test.go", "s.Equal(2,", "s.Equal(3,");
+    let output = justless(&["test", "--affected", "--dry-run"], &[]);
+    let text = stdout(&output);
+    has_line(&text, "go (shop) · subset · 3 of 8 indexed tests");
+    has_line(&text, "  Run (whole targets): go test -v ./cart");
+    let output = justless(&["test", "--affected"], &[("FAIL", "TestCountTwo")]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("Subset failed (go): 2 of 3 tests that ran failed, exit 1"),
+        "{}",
+        stderr(&output)
+    );
+    assert_no_suite_claim(&output);
+    reset();
+
+    // A top-level test runs by name and is counted from Go's own lines.
+    replace_in(root, "shop/price/price_test.go", "!= 20", "!= 20+0");
+    let output = justless(&["test", "--affected"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "go test -v ./price -run ^(TestVat)$\n"
+    );
+    assert!(
+        stderr(&output).contains("Subset passed (go): ran 1 test reachable from your changes"),
+        "{}",
+        stderr(&output)
+    );
+    reset();
+
+    // pytest: python_files decides what counts as a test file.
+    replace_in(
+        root,
+        "billing/invoice.py",
+        "amount + vat",
+        "amount + 0 + vat",
+    );
+    let output = justless(
+        &["test", "--affected", "--dry-run", "--", &pytest, "-q"],
+        &[],
+    );
+    has_line(
+        &stdout(&output),
+        &format!("  Run (selected tests): {pytest} -q tests/invoice_tests.py"),
+    );
+    reset();
+    // A change only an uncollected file tests has no subset to run.
+    replace_in(root, "billing/shipping.py", "weight * 2", "weight * 2 + 0");
+    let output = justless(
+        &["test", "--affected", "--dry-run", "--", &pytest, "-q"],
+        &[],
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains(
+            "no-tests: no test reaches fee (billing/shipping.py:1-2) through indexed links"
+        ),
+        "{text}"
+    );
+    has_line(&text, &format!("  Run (full suite): {pytest} -q"));
+    reset();
+
+    // pytest rejecting the selection is not the result: the wider run's is.
+    replace_in(root, "tests/test_rates.py", "== 2", "== 2  # edited");
+    let affected = ["test", "--affected", "--", pytest.as_str(), "-q"];
+    let output = justless(&affected, &[("PLAN", "4,0")]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("Subset passed (pytest)")
+            && err.contains("widened: pytest did not find 1 node ID"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pytest -q tests/test_rates.py::test_vat\npytest -q tests/test_rates.py\n"
+    );
+    let output = justless(&affected, &[("PLAN", "4,1")]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    // An empty collection runs the full suite, labeled as the fallback it is.
+    let output = justless(&affected, &[("PLAN", "5,0")]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("Full suite (fallback from --affected: runner-mismatch) (pytest): exit 0"),
+        "{err}"
+    );
+    assert!(!err.contains("full suite was not run"), "{err}");
+    let history = success(root, &["history"]);
+    let newest = history.lines().next().unwrap_or_default();
+    assert!(newest.contains(" · pytest · exit 0"), "{history}");
+    reset();
+}
+
+#[cfg(unix)]
+#[test]
+fn stray_python_tests_add_no_runner_and_missing_runners_are_not_results() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let write = |file: &str, text: &str| {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write("go.mod", "module example.com/tool\n\ngo 1.22\n");
+    write(
+        "tool_test.go",
+        "package tool\n\nimport \"testing\"\n\nfunc TestTool(t *testing.T) {}\n",
+    );
+    write(
+        "scripts/test_release.py",
+        "def test_release():\n    assert True\n",
+    );
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    // A test-named script outside the root and tests/ is not a pytest suite.
+    let text = success(root, &["test", "--dry-run"]);
+    assert!(!text.contains("pytest"), "{text}");
+    has_line(&text, "go · full suite");
+
+    // With tests at the root, pytest is detected; a Python without pytest is
+    // reported as a runner that could not start, with its status.
+    write("tests/test_tool.py", "def test_tool():\n    assert True\n");
+    write(
+        ".venv/bin/python",
+        "#!/bin/sh\necho \"$0: No module named pytest\" >&2\nexit 1\n",
+    );
+    fs::set_permissions(
+        root.join(".venv/bin/python"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["test", "--", ".venv/bin/python", "-m", "pytest"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "Runner not available (pytest): No module named pytest; exit 1. Its tests did not run; this is not a test result"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    let output = cli(root, &["test", "--", "no-such-runner-for-justless"]);
+    assert_eq!(output.status.code(), Some(127), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("Runner not available (command): no-such-runner-for-justless could not be started; exit 127"),
+        "{}",
+        stderr(&output)
+    );
+}

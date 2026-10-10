@@ -961,6 +961,9 @@ fn verdict(plan: &RunnerPlan, result: &RunnerResult, affected: bool) -> String {
                             || doctest.as_deref() == Some(test.id.as_str())
                             || name.ends_with(&format!("::{}", test.id))
                             || test.id.ends_with(&format!("::{name}"))
+                            // Go names a suite method `TestCartSuite/TestCountTwo`.
+                            || (plan.runner == Kind::Go
+                                && name.ends_with(&format!("/{}", test.id)))
                     })
                 };
                 // Failures with the most direct evidence first; runners report in
@@ -1239,6 +1242,37 @@ mod tests {
                 "ledger_core".to_owned(),
                 vec!["tax::tests::gone".to_owned()]
             )])
+        );
+    }
+
+    #[test]
+    fn quiet_output_and_go_packages_are_checked_by_what_they_report() {
+        // `cargo test -q`: no names and no `Running` lines, only summaries.
+        let step = filtered(&[("reports", &["stats::tests::a", "stats::tests::b"])], &[]);
+        let quiet = |passed: usize| {
+            runners::tally(
+                Kind::Cargo,
+                &format!(
+                    "\nrunning {passed} tests\n..\ntest result: ok. {passed} passed; 0 failed; 0 ignored; 0 measured; 8 filtered out\n"
+                ),
+                "",
+            )
+        };
+        assert!(missing_names(&step, &quiet(2)).is_empty());
+        assert_eq!(missing_names(&step, &quiet(1)).len(), 1);
+        // Go: a package where `-run` matched nothing names no test.
+        let step = filtered(
+            &[("./price", &["TestVat"]), ("./cart", &["TestCount"])],
+            &[],
+        );
+        let tally = runners::tally(
+            Kind::Go,
+            "=== RUN   TestVat\n--- PASS: TestVat (0.00s)\nPASS\nok  \texample.com/shop/price\t0.01s\nok  \texample.com/shop/cart\t0.01s [no tests to run]\n",
+            "",
+        );
+        assert_eq!(
+            missing_names(&step, &tally),
+            BTreeMap::from([("./cart".to_owned(), vec!["TestCount".to_owned()])])
         );
     }
 
