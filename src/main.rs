@@ -455,14 +455,11 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 read_num(sub, "from", 1)?,
                 to,
             )?;
-            history::recall(
-                &directory,
-                if to == usize::MAX && sub.value_of("from") == Some("1") {
-                    "full"
-                } else {
-                    "range"
-                },
-            );
+            let full = to == usize::MAX && sub.value_of("from") == Some("1");
+            history::recall(&directory, if full { "full" } else { "range" });
+            if full {
+                adaptive::note_replay(&directory, sub.value_of("stream").unwrap());
+            }
         }
         ("search", sub) => {
             let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
