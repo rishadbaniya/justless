@@ -74,6 +74,10 @@ pub(crate) struct Runner {
     pub cargo: Option<Cargo>,
     /// Where a command the user gave runs: their own directory.
     pub cwd: Option<String>,
+    /// pytest's `python_files` patterns, empty for its defaults.
+    pub python_files: Vec<String>,
+    /// pytest's `testpaths`, as workspace-relative directories.
+    pub testpaths: Vec<String>,
 }
 
 impl Runner {
@@ -87,7 +91,28 @@ impl Runner {
             error: None,
             cargo: None,
             cwd: None,
+            python_files: Vec::new(),
+            testpaths: Vec::new(),
         }
+    }
+
+    /// Whether pytest's full suite collects a workspace-relative file: its
+    /// name matches `python_files` and it lies under `testpaths`, if set.
+    pub fn pytest_collects(&self, file: &str) -> bool {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        let defaults = ["test_*.py".to_owned(), "*_test.py".to_owned()];
+        let patterns = if self.python_files.is_empty() {
+            &defaults[..]
+        } else {
+            &self.python_files[..]
+        };
+        name.ends_with(".py")
+            && patterns.iter().any(|pattern| wildcard(pattern, name))
+            && (self.testpaths.is_empty()
+                || self.testpaths.iter().any(|directory| {
+                    under(file, directory)
+                        || (directory.contains(['*', '?']) && wildcard(directory, file))
+                }))
     }
 
     /// Whether a workspace-relative file lies under this runner's root.
@@ -114,6 +139,117 @@ pub(crate) fn under(file: &str, directory: &str) -> bool {
         || file
             .strip_prefix(directory)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// A shell-style pattern with `*` and `?`, as pytest's `python_files` uses.
+pub(crate) fn wildcard(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((at, matched)) = star {
+            p = at + 1;
+            t = matched + 1;
+            star = Some((at, matched + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
+}
+
+/// pytest's `python_files` and `testpaths` from the configuration in
+/// `directory`, checked in pytest's order, with testpaths made workspace-relative.
+fn pytest_options(workspace: &Workspace, directory: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let read = |name: &str| fs::read_to_string(workspace.root.join(directory).join(name)).ok();
+    let (files, paths) = if let Some(text) = read("pytest.ini") {
+        ini_options(&text, "pytest")?
+    } else if let Some(options) = read("pyproject.toml").and_then(|text| {
+        let document = text.parse::<toml_edit::DocumentMut>().ok()?;
+        let section = document.get("tool")?.get("pytest")?.get("ini_options")?;
+        let list = |key: &str| -> Vec<String> {
+            match section.get(key) {
+                Some(item) if item.as_array().is_some() => item
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                    .map(str::to_owned)
+                    .collect(),
+                Some(item) => item
+                    .as_str()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        Some((list("python_files"), list("testpaths")))
+    }) {
+        options
+    } else if let Some(options) = read("tox.ini").and_then(|text| ini_options(&text, "pytest")) {
+        options
+    } else {
+        read("setup.cfg").and_then(|text| ini_options(&text, "tool:pytest"))?
+    };
+    let paths = paths
+        .iter()
+        .map(|path| {
+            let path = path.trim_start_matches("./").trim_end_matches('/');
+            if directory.is_empty() {
+                path.to_owned()
+            } else {
+                format!("{directory}/{path}")
+            }
+        })
+        .collect();
+    Some((files, paths))
+}
+
+/// `python_files` and `testpaths` in an ini file's section, or `None` without the section.
+fn ini_options(text: &str, section: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let header = format!("[{section}]");
+    let mut inside = false;
+    let mut found = false;
+    let mut key = String::new();
+    let mut values = BTreeMap::<String, Vec<String>>::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            inside = trimmed == header;
+            found |= inside;
+            key.clear();
+            continue;
+        }
+        if !inside || trimmed.is_empty() || trimmed.starts_with(['#', ';']) {
+            continue;
+        }
+        let words =
+            |value: &str| -> Vec<String> { value.split_whitespace().map(str::to_owned).collect() };
+        if line.starts_with(char::is_whitespace) && !key.is_empty() {
+            values
+                .entry(key.clone())
+                .or_default()
+                .extend(words(trimmed));
+        } else if let Some((name, value)) = trimmed.split_once(['=', ':']) {
+            key = name.trim().to_owned();
+            values.entry(key.clone()).or_default().extend(words(value));
+        }
+    }
+    found.then(|| {
+        (
+            values.remove("python_files").unwrap_or_default(),
+            values.remove("testpaths").unwrap_or_default(),
+        )
+    })
 }
 
 fn parent(file: &str) -> &str {
@@ -171,6 +307,15 @@ impl Target {
         })
     }
 
+    /// The flag that builds this target. Plain `cargo test` compiles every
+    /// example, even one whose tests are off, so an example always has one.
+    pub fn build_flag(&self) -> Option<Vec<String>> {
+        match self.kind.as_str() {
+            "example" => Some(vec!["--example".into(), self.name.clone()]),
+            _ => self.flag(),
+        }
+    }
+
     pub fn is_lib(&self) -> bool {
         matches!(
             self.kind.as_str(),
@@ -180,7 +325,7 @@ impl Target {
 
     /// How the plan names the target: `ledger-core --lib`, `api --test cli`.
     pub fn describe(&self, package: &str) -> String {
-        match self.flag() {
+        match self.build_flag() {
             Some(flag) => format!("{package} {}", flag.join(" ")),
             None => format!("{package} {} {}", self.kind, self.name),
         }
@@ -634,10 +779,16 @@ pub(crate) fn detect(
             pytest_roots.insert(parent(file).to_owned());
         }
     }
+    // Without configuration, only test files where pytest's own discovery from
+    // the root would start count: at the root or in a top-level tests directory.
+    // A stray script elsewhere, such as scripts/test_tool.py, is not a suite.
     if pytest_roots.is_empty()
         && index.files.keys().any(|file| {
             let name = file.rsplit('/').next().unwrap_or(file);
-            file.ends_with(".py")
+            let place =
+                !file.contains('/') || file.starts_with("tests/") || file.starts_with("test/");
+            place
+                && file.ends_with(".py")
                 && (name == "conftest.py"
                     || name.starts_with("test_")
                     || name.ends_with("_test.py"))
@@ -652,7 +803,9 @@ pub(crate) fn detect(
         } else {
             words(&["python3", "-m", "pytest"])
         };
-        runners.push(Runner::new(Kind::Pytest, root, base));
+        let mut runner = Runner::new(Kind::Pytest, root, base);
+        pytest_configure(workspace, &mut runner);
+        runners.push(runner);
     }
     // Jest and Vitest: package.json files that name them.
     for file in index.files.keys() {
@@ -831,7 +984,26 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
     {
         runner.root = parent(&facts.root_manifest).to_owned();
     }
+    if runner.kind == Kind::Pytest {
+        pytest_configure(workspace, &mut runner);
+    }
     runner
+}
+
+/// Reads pytest's options from the nearest configuration at or above the root.
+fn pytest_configure(workspace: &Workspace, runner: &mut Runner) {
+    let mut directory = runner.root.clone();
+    loop {
+        if let Some((files, paths)) = pytest_options(workspace, &directory) {
+            runner.python_files = files;
+            runner.testpaths = paths;
+            return;
+        }
+        if directory.is_empty() {
+            return;
+        }
+        directory = parent(&directory).to_owned();
+    }
 }
 
 /// `npm test` and friends: a plain `jest` or `vitest` test script is run from
@@ -1132,6 +1304,9 @@ pub(crate) struct Tally {
     pub known: bool,
     /// Reported test names by target key (Cargo: the test binary's crate name).
     pub names: BTreeMap<String, BTreeSet<String>>,
+    /// Tests each target's summary line reports, passed, failed or ignored.
+    /// Under `cargo test -q` libtest prints counts but no names.
+    pub counts: BTreeMap<String, usize>,
     /// Doc-test result lines.
     pub doctests: usize,
     /// Go packages served from the test cache, and packages that ran.
@@ -1194,6 +1369,8 @@ fn cargo_tally(stdout: &str, stderr: &str) -> Tally {
     let paired = blocks == binaries.len();
     let mut block = 0usize;
     let mut current = String::from("*");
+    // Tests the current block reported by name, to add what only its summary counts.
+    let mut named = 0usize;
     for line in stdout.lines() {
         if line.starts_with("running ") && (line.ends_with(" tests") || line.ends_with(" test")) {
             current = if paired {
@@ -1202,6 +1379,7 @@ fn cargo_tally(stdout: &str, stderr: &str) -> Tally {
                 "*".into()
             };
             block += 1;
+            named = 0;
             continue;
         }
         if let Some(rest) = line.strip_prefix("test ")
@@ -1220,6 +1398,7 @@ fn cargo_tally(stdout: &str, stderr: &str) -> Tally {
                 _ => continue,
             }
             tally.ran += 1;
+            named += 1;
             if current.starts_with("doc:") {
                 tally.doctests += 1;
             }
@@ -1230,6 +1409,25 @@ fn cargo_tally(stdout: &str, stderr: &str) -> Tally {
                 .insert(name.to_owned());
         } else if line.starts_with("test result:") {
             tally.known = true;
+            // `test result: ok. 3 passed; 0 failed; 1 ignored; ...`
+            let count = |word| count_before(line, word).unwrap_or(0);
+            let ran = count("passed") + count("failed");
+            *tally.counts.entry(current.clone()).or_default() += ran + count("ignored");
+            // Quiet output prints dots, not names: the summary is the count.
+            if ran > named {
+                tally.ran += ran - named;
+                if current.starts_with("doc:") {
+                    tally.doctests += ran - named;
+                }
+            }
+            named = ran.max(named);
+        } else if let Some(name) = line
+            .strip_prefix("---- ")
+            .and_then(|rest| rest.strip_suffix(" stdout ----"))
+            && !tally.failed.iter().any(|failed| failed == name)
+        {
+            // A failure's captured output names it, in quiet output too.
+            tally.failed.push(name.to_owned());
         }
     }
     tally
@@ -1328,12 +1526,24 @@ fn go_tally(stdout: &str) -> Tally {
         } else if trimmed.starts_with("FAIL\t") || trimmed.starts_with("FAIL ") {
             tally.known = true;
             tally.packages += 1;
-        } else if let Some(rest) = trimmed.strip_prefix("--- FAIL: ") {
+        } else if let Some((rest, failed)) = trimmed
+            .strip_prefix("--- FAIL: ")
+            .map(|rest| (rest, true))
+            .or_else(|| trimmed.strip_prefix("--- PASS: ").map(|rest| (rest, false)))
+        {
             let name = rest.split_whitespace().next().unwrap_or(rest);
-            tally.failed.push(name.to_owned());
+            if failed {
+                tally.failed.push(name.to_owned());
+            }
             tally.ran += 1;
-        } else if trimmed.starts_with("--- PASS: ") {
-            tally.ran += 1;
+            // Unindented results are top-level tests, the names `-run` selects.
+            if line.starts_with("--- ") {
+                tally
+                    .names
+                    .entry("*".into())
+                    .or_default()
+                    .insert(name.to_owned());
+            }
         } else if trimmed.starts_with("--- SKIP: ") {
             tally.ignored += 1;
         }
@@ -1355,6 +1565,80 @@ mod tests {
         assert_eq!(tally.doctests, 1);
         assert!(tally.names["ledger_core"].contains("tax::tests::a"));
         assert!(!tally.names.contains_key("totals"));
+    }
+
+    #[test]
+    fn quiet_cargo_output_is_counted_from_its_summaries() {
+        // `cargo test -q` prints dots and no `Running` lines.
+        let stdout = "\nrunning 3 tests\n..F\nfailures:\n\n---- tax::tests::b stdout ----\npanicked\n\nfailures:\n    tax::tests::b\n\ntest result: FAILED. 2 passed; 1 failed; 1 ignored; 0 measured; 9 filtered out\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let quiet = tally(Kind::Cargo, stdout, "");
+        assert_eq!(quiet.ran, 4);
+        assert_eq!(quiet.failed, ["tax::tests::b"]);
+        assert!(quiet.names.is_empty());
+        assert_eq!(quiet.counts["*"], 5);
+        // Named output counts each test once.
+        let stdout = "\nrunning 2 tests\ntest a ... ok\ntest b ... FAILED\n\n---- b stdout ----\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n";
+        let named = tally(Kind::Cargo, stdout, "");
+        assert_eq!((named.ran, named.failed.len()), (2, 1));
+    }
+
+    #[test]
+    fn go_names_top_level_tests_only() {
+        let stdout = "=== RUN   TestVat\n--- PASS: TestVat (0.00s)\n=== RUN   TestCartSuite\n    --- FAIL: TestCartSuite/TestCountTwo (0.00s)\n--- FAIL: TestCartSuite (0.00s)\nFAIL\nFAIL\texample.com/shop/cart\t0.01s\nok  \texample.com/shop/price\t0.01s [no tests to run]\n";
+        let tally = go_tally(stdout);
+        assert_eq!(
+            tally.names["*"],
+            BTreeSet::from(["TestVat".to_owned(), "TestCartSuite".to_owned()])
+        );
+        assert_eq!(tally.packages, 2);
+        assert!(
+            tally
+                .failed
+                .contains(&"TestCartSuite/TestCountTwo".to_owned())
+        );
+    }
+
+    #[test]
+    fn pytest_options_follow_python_files_and_testpaths() {
+        assert!(wildcard("test_*.py", "test_rates.py"));
+        assert!(wildcard("*_tests.py", "invoice_tests.py"));
+        assert!(!wildcard("test_*.py", "invoice_tests.py"));
+        assert!(wildcard("check_?.py", "check_a.py"));
+        let (files, paths) = ini_options(
+            "[tool:pytest]\npython_files = check_*.py\n    *_tests.py\ntestpaths: tests\n[other]\npython_files = nope.py\n",
+            "tool:pytest",
+        )
+        .unwrap();
+        assert_eq!(files, ["check_*.py", "*_tests.py"]);
+        assert_eq!(paths, ["tests"]);
+        assert!(ini_options("[tox]\nenvlist = py3\n", "pytest").is_none());
+        let mut runner = Runner::new(Kind::Pytest, "api".into(), Vec::new());
+        assert!(runner.pytest_collects("api/tests/test_rates.py"));
+        assert!(!runner.pytest_collects("api/tests/invoice_tests.py"));
+        runner.python_files = files;
+        runner.testpaths = vec!["api/tests".into()];
+        assert!(runner.pytest_collects("api/tests/invoice_tests.py"));
+        assert!(!runner.pytest_collects("api/scripts/check_a.py"));
+    }
+
+    #[test]
+    fn examples_always_build() {
+        let example = Target {
+            kind: "example".into(),
+            name: "weekly".into(),
+            src: "examples/weekly.rs".into(),
+            required: Vec::new(),
+            test: false,
+            doctest: false,
+            harness: true,
+            index_name: "reports_example_weekly".into(),
+        };
+        assert_eq!(example.flag(), None);
+        assert_eq!(
+            example.build_flag(),
+            Some(vec!["--example".to_owned(), "weekly".to_owned()])
+        );
+        assert_eq!(example.describe("reports"), "reports --example weekly");
     }
 
     #[test]

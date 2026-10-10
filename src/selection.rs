@@ -167,6 +167,9 @@ pub(crate) struct Step {
     /// How to run each target key in full when its names did not all run.
     #[serde(skip)]
     pub widen: BTreeMap<String, Vec<String>>,
+    /// The targets a build-only step compiles, as `reports --example weekly`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub built: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -461,6 +464,221 @@ fn inert(file: &str) -> bool {
         || file.starts_with(".justless/")
 }
 
+/// Whether a line holds only a comment, which names things without using them.
+fn comment_only(line: &str) -> bool {
+    let line = line.trim_start();
+    (line.starts_with("//") && !doc_line(line))
+        || (line.starts_with('#') && !line.starts_with("#[") && !line.starts_with("#!["))
+        || line.starts_with("--")
+        || line.starts_with("/*")
+        || line.starts_with("* ")
+        || line == "*"
+}
+
+/// Whether a Rust line is documentation, whose examples run as doctests.
+fn doc_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("///")
+        || line.starts_with("//!")
+        || line.starts_with("#[doc")
+        || line.starts_with("#![doc")
+}
+
+/// Whether a line uses `word` the way code uses a definition of `kind`:
+/// functions and methods by a call, anything else by name.
+fn used_as(line: &str, word: &str, kind: &str) -> bool {
+    if !matches!(kind, "function" | "method") {
+        return has_word(line, word);
+    }
+    line.match_indices(word).any(|(at, _)| {
+        let after = &line[at + word.len()..];
+        let before = &line[..at];
+        // `fn main(` defines a function of the same name; it does not call one.
+        let defines = before
+            .trim_end()
+            .rsplit(|c: char| !identifier(c))
+            .next()
+            .is_some_and(|keyword| matches!(keyword, "fn" | "def" | "func" | "function"));
+        !before.chars().next_back().is_some_and(identifier)
+            && !defines
+            && (after.trim_start().starts_with('(') || after.starts_with("::<"))
+    })
+}
+
+/// The type behind a trait method its callers reach implicitly, such as
+/// `Money` for `Money::fmt`, which `format!` and `to_string` call.
+fn implicit_type(index: &Index, id: usize) -> Option<usize> {
+    let definition = &index.definitions[id];
+    if definition.kind != "method" || !UBIQUITOUS.contains(&short(definition)) {
+        return None;
+    }
+    let (parent, _) = definition.qualified.rsplit_once("::")?;
+    index
+        .definitions
+        .iter()
+        .position(|other| other.qualified == parent && other.kind != "method")
+}
+
+fn implicitly(definitions: &[Definition], method: usize, type_id: usize) -> String {
+    format!(
+        "{} is called implicitly; traced through type {}",
+        short(&definitions[method]),
+        name(&definitions[type_id])
+    )
+}
+
+/// Quoted strings on a line, single or double.
+fn literals(line: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for quote in ['"', '\''] {
+        let mut parts = line.split(quote);
+        parts.next();
+        while let Some(inside) = parts.next() {
+            if !inside.is_empty() {
+                found.push(inside.to_owned());
+            }
+            parts.next();
+        }
+    }
+    found
+}
+
+/// A path written relative to the file that names it, as a workspace path.
+fn resolve(from: &str, literal: &str) -> Option<String> {
+    if literal.is_empty() || literal.starts_with('/') || literal.contains("://") {
+        return None;
+    }
+    let mut parts: Vec<&str> = match from.rsplit_once('/') {
+        Some((directory, _)) => directory.split('/').collect(),
+        None => Vec::new(),
+    };
+    for part in literal.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Files Rust documentation includes, such as a README behind
+/// `#![doc = include_str!("../README.md")]`, with the including file and item.
+type DocIncludes = BTreeMap<String, Vec<(String, Option<usize>)>>;
+
+fn doc_includes(index: &Index, texts: &mut Texts) -> DocIncludes {
+    let mut found = DocIncludes::new();
+    for (path, line) in find(index, texts, "include_str!", false).unwrap_or_default() {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+        let Some(text) = texts
+            .get(&path)
+            .and_then(|text| text.lines().nth(line - 1))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let trimmed = text.trim_start();
+        if !(trimmed.starts_with("#![doc") || trimmed.starts_with("#[doc")) {
+            continue;
+        }
+        let item = if trimmed.starts_with("#![") {
+            None
+        } else {
+            documented_item(index, &path, line)
+        };
+        for literal in literals(&text) {
+            if let Some(included) = resolve(&path, &literal) {
+                found
+                    .entry(included)
+                    .or_default()
+                    .push((path.clone(), item));
+            }
+        }
+    }
+    found
+}
+
+/// The item whose `///` docs hold a line, or `None` for a file's own docs.
+fn documented_item(index: &Index, file: &str, line: usize) -> Option<usize> {
+    enclosing(index, file, line)
+        .filter(|&id| !matches!(index.definitions[id].kind.as_str(), "file" | "module"))
+}
+
+/// Whether a line lies inside a fenced code block: of the documentation
+/// comment around it in Rust, or of the whole file elsewhere.
+fn in_fence(text: &str, line: usize, rust: bool) -> bool {
+    let before: Vec<&str> = text.lines().take(line.saturating_sub(1)).collect();
+    let fences = before
+        .iter()
+        .rev()
+        .take_while(|text| !rust || doc_line(text))
+        .filter(|text| text.contains("```"))
+        .count();
+    fences % 2 == 1
+}
+
+/// Records the Rust documentation examples on `path:line` when that line is
+/// documentation, or lies in a file documentation includes. With `fenced`, the
+/// line must sit in a code block, as the examples rustdoc runs do. Returns
+/// whether it was documentation.
+#[allow(clippy::too_many_arguments)]
+fn doc_example(
+    index: &Index,
+    texts: &mut Texts,
+    includes: &DocIncludes,
+    path: &str,
+    line: usize,
+    fenced: bool,
+    why: &str,
+    examples: &mut BTreeMap<(String, Option<usize>), String>,
+) -> bool {
+    if let Some(includers) = includes.get(path) {
+        if !fenced
+            || texts
+                .get(path)
+                .is_some_and(|text| in_fence(text, line, false))
+        {
+            for (file, item) in includers {
+                examples
+                    .entry((file.clone(), *item))
+                    .or_insert_with(|| why.to_owned());
+            }
+        }
+        return true;
+    }
+    if !path.ends_with(".rs") {
+        return false;
+    }
+    let Some(whole) = texts.get(path) else {
+        return false;
+    };
+    let Some(text) = whole.lines().nth(line - 1) else {
+        return false;
+    };
+    if !doc_line(text) {
+        return false;
+    }
+    if fenced && !in_fence(whole, line, true) {
+        return true;
+    }
+    let trimmed = text.trim_start();
+    let item = if trimmed.starts_with("//!") || trimmed.starts_with("#![doc") {
+        None
+    } else if trimmed.starts_with("///") || trimmed.starts_with("#[doc") {
+        documented_item(index, path, line)
+    } else {
+        return false;
+    };
+    examples
+        .entry((path.to_owned(), item))
+        .or_insert_with(|| why.to_owned());
+    true
+}
+
 /// Which runners a dependency or configuration file belongs to.
 fn concerns(kind: Kind, name: &str, file: &str) -> bool {
     let javascript = matches!(kind, Kind::Jest | Kind::Vitest);
@@ -574,6 +792,11 @@ struct Analysis {
     macros: Vec<(String, usize, String)>,
     /// Files deleted outright.
     deleted: BTreeSet<String>,
+    /// Rust documentation examples a change reaches: the file and documented
+    /// item, or `None` for the file's own docs, with why.
+    doc_examples: BTreeMap<(String, Option<usize>), String>,
+    /// Changed code files that nothing names by path.
+    unmentioned_code: BTreeSet<String>,
 }
 
 impl Analysis {
@@ -631,7 +854,34 @@ pub(crate) fn plan(
     let base = git_text(workspace, &["rev-parse", "--short", "HEAD"])
         .map_or_else(|| "no commits yet".to_owned(), |rev| format!("HEAD {rev}"));
     let changes = changes(workspace, index, false)?;
-    let analysis = analyze(workspace, index, &changes, settings)?;
+    let mut analysis = analyze(workspace, index, &changes, settings)?;
+    // Code in a language no runner here runs, such as SQL or shell, reaches
+    // tests only through what names it or links to it; otherwise it is data.
+    for file in std::mem::take(&mut analysis.unmentioned_code) {
+        let runnable = runners
+            .iter()
+            .any(|runner| in_scope_language(runner, &file));
+        let linked = analysis.seeds.iter().any(|seed| {
+            index.definitions[seed.id].location.file == file
+                && (!seed.tests.is_empty() || !seed.files.is_empty())
+        });
+        if runnable || linked {
+            continue;
+        }
+        if inert(&file) {
+            analysis.ignored.push(Note {
+                subject: file,
+                detail: "no test impact (documentation or repository metadata)".into(),
+            });
+        } else {
+            analysis.unlinked.entry(file.clone()).or_insert(Reason {
+                code: "data-unlinked",
+                message: format!(
+                    "{file} is not mentioned by indexed source, and no runner here runs its language"
+                ),
+            });
+        }
+    }
     let changes_notes: Vec<Note> = analysis
         .files
         .iter()
@@ -700,7 +950,10 @@ fn analyze(
         mentioned_files: BTreeMap::new(),
         macros: Vec::new(),
         deleted: BTreeSet::new(),
+        doc_examples: BTreeMap::new(),
+        unmentioned_code: BTreeSet::new(),
     };
+    let doc_includes = doc_includes(index, &mut texts);
     let ignore_globs = if settings.ignore.is_empty() {
         None
     } else {
@@ -922,24 +1175,6 @@ fn analyze(
     }
     analysis.files.sort();
 
-    // A trait method changed through an implicit call is traced through its type.
-    let mut extra = Vec::new();
-    for seed in &analysis.seeds {
-        let definition = &definitions[seed.id];
-        if definition.kind != "method" || !UBIQUITOUS.contains(&short(definition)) {
-            continue;
-        }
-        let Some((parent, _)) = definition.qualified.rsplit_once("::") else {
-            continue;
-        };
-        if let Some(id) = definitions
-            .iter()
-            .position(|other| other.qualified == parent && other.kind != "method")
-        {
-            extra.push((seed.id, id));
-        }
-    }
-
     // Path mentions: a changed file named in indexed text selects what names it.
     let changed_files: Vec<String> = analysis.files.iter().map(|(f, _)| f.clone()).collect();
     for file in &changed_files {
@@ -957,7 +1192,7 @@ fn analyze(
         }
         candidates.sort();
         candidates.dedup();
-        let mut mentioned = false;
+        let mut mentions = Vec::<(String, String, usize)>::new();
         for candidate in &candidates {
             let Some(lines) = find(index, &mut texts, candidate, false) else {
                 // Named too often to follow. Code is traced through its symbols;
@@ -972,41 +1207,114 @@ fn analyze(
                 }
                 continue;
             };
-            for (path, line) in lines {
-                if &path == file || under(&path, file) {
+            mentions.extend(
+                lines
+                    .into_iter()
+                    .map(|(path, line)| (candidate.clone(), path, line)),
+            );
+        }
+        // Paths relative to the file that names them, such as
+        // `include_str!("../README.md")`, whatever the base name.
+        if base_name.len() >= 3 {
+            for (path, line) in find(index, &mut texts, base_name, false).unwrap_or_default() {
+                let Some(text) = texts.get(&path).and_then(|text| text.lines().nth(line - 1))
+                else {
                     continue;
+                };
+                for literal in literals(text) {
+                    if literal.ends_with(base_name)
+                        && literal.contains('/')
+                        && resolve(&path, &literal).as_deref() == Some(file.as_str())
+                    {
+                        mentions.push((literal, path.clone(), line));
+                    }
                 }
-                // Ancestor directories count only from code, not from prose.
-                if language(&path).is_none() {
-                    continue;
+            }
+        }
+        let mut mentioned = false;
+        for (candidate, path, line) in mentions {
+            if &path == file || under(&path, file) {
+                continue;
+            }
+            // Ancestor directories count only from code, not from prose.
+            if language(&path).is_none() {
+                continue;
+            }
+            let hit = || Hit {
+                hops: 0,
+                possible: true,
+                why: format!("mentions {candidate} at {path}:{line}"),
+            };
+            // Documentation that includes the file: its examples run.
+            if doc_example(
+                index,
+                &mut texts,
+                &doc_includes,
+                &path,
+                line,
+                false,
+                &format!("its documentation includes {file} at {path}:{line}"),
+                &mut analysis.doc_examples,
+            ) {
+                mentioned = true;
+                continue;
+            }
+            if let Some(test) = enclosing_test(index, &path, line) {
+                analysis.mentioned_tests.entry(test).or_insert_with(hit);
+                mentioned = true;
+                continue;
+            }
+            let around = enclosing(index, &path, line);
+            if let Some(id) = around
+                && !matches!(definitions[id].kind.as_str(), "file" | "module")
+            {
+                let added = add_seed(
+                    &mut analysis,
+                    id,
+                    format!("mentions changed {file} as {candidate} at {path}:{line}"),
+                );
+                // A mention is data flow, not a code change: no per-symbol rules.
+                if added && let Some(seed) = analysis.seeds.iter_mut().find(|seed| seed.id == id) {
+                    seed.rules = false;
                 }
                 mentioned = true;
-                let hit = || Hit {
-                    hops: 0,
-                    possible: true,
-                    why: format!("mentions {candidate} at {path}:{line}"),
-                };
-                if let Some(test) = enclosing_test(index, &path, line) {
-                    analysis.mentioned_tests.entry(test).or_insert_with(hit);
-                } else if let Some(id) = enclosing(index, &path, line)
-                    && !matches!(definitions[id].kind.as_str(), "file" | "module")
-                {
-                    let added = add_seed(
-                        &mut analysis,
-                        id,
-                        format!("mentions changed {file} as {candidate} at {path}:{line}"),
-                    );
-                    // A mention is data flow, not a code change: no per-symbol rules.
-                    if added
-                        && let Some(seed) = analysis.seeds.iter_mut().find(|seed| seed.id == id)
-                    {
-                        seed.rules = false;
+            } else if is_test_file(&path) {
+                analysis
+                    .mentioned_files
+                    .entry(path.clone())
+                    .or_insert_with(hit);
+                mentioned = true;
+            } else if !texts
+                .get(&path)
+                .and_then(|text| text.lines().nth(line - 1))
+                .is_none_or(comment_only)
+            {
+                // Code at the top level of a non-test file uses the file. Its
+                // importers depend on it; Rust has no such link, so its target
+                // builds and the plan cannot vouch for a subset.
+                mentioned = true;
+                match around {
+                    Some(module) if !path.ends_with(".rs") => {
+                        if add_seed(
+                            &mut analysis,
+                            module,
+                            format!("mentions changed {file} as {candidate} at {path}:{line}"),
+                        ) && let Some(seed) = analysis.seeds.last_mut()
+                        {
+                            seed.rules = false;
+                        }
                     }
-                } else if is_test_file(&path) {
-                    analysis
-                        .mentioned_files
-                        .entry(path.clone())
-                        .or_insert_with(hit);
+                    _ => {
+                        if path.ends_with(".rs") {
+                            analysis.compile_files.insert(path.clone());
+                        }
+                        analysis.unlinked.entry(file.clone()).or_insert(Reason {
+                            code: "data-unlinked",
+                            message: format!(
+                                "{file} is used at the top level of {path}:{line}, which no test definition links to"
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -1033,6 +1341,9 @@ fn analyze(
                 code: "data-unlinked",
                 message: format!("{file} is not mentioned by indexed source"),
             });
+        } else {
+            // Code nothing names: data too, unless a runner runs its language.
+            analysis.unmentioned_code.insert(file.clone());
         }
     }
 
@@ -1040,20 +1351,6 @@ fn analyze(
     let mut name_cache = BTreeMap::<String, Option<Vec<(String, usize)>>>::new();
     for position in 0..analysis.seeds.len() {
         let id = analysis.seeds[position].id;
-        let mut starts = vec![(id, false, String::new())];
-        for &(method, type_id) in &extra {
-            if method == id {
-                starts.push((
-                    type_id,
-                    true,
-                    format!(
-                        "{} is called implicitly; traced through type {}",
-                        short(&definitions[id]),
-                        name(&definitions[type_id])
-                    ),
-                ));
-            }
-        }
         let mut seed = Seed {
             id,
             origin: String::new(),
@@ -1065,15 +1362,29 @@ fn analyze(
             unused: false,
             rules: true,
         };
-        for (start, through_type, note) in &starts {
-            let reached = walk(index, &[*start], DEPTH);
-            if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
-                seed.capped = Some(name(&definitions[*start]).to_owned());
-            }
-            collect(index, &reached, *start, *through_type, note, &mut seed);
+        if definitions[id].test {
+            seed.tests.insert(
+                id,
+                Hit {
+                    hops: 0,
+                    possible: false,
+                    why: "changed test".into(),
+                },
+            );
+        }
+        let reached = walk(index, &[id], DEPTH);
+        if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
+            seed.capped = Some(name(&definitions[id]).to_owned());
+        }
+        collect(index, &reached, &BTreeMap::new(), false, &mut seed);
+        // Walks that start past the symbol: the types of trait methods called
+        // implicitly, and code that names the symbol where the index has no link.
+        let mut further = BTreeMap::<usize, String>::new();
+        if let Some(type_id) = implicit_type(index, id) {
+            further.insert(type_id, implicitly(definitions, id, type_id));
         }
         // The name net: tests whose body names the symbol, such as inside a
-        // macro the index does not expand.
+        // macro the index does not expand, and other code that does the same.
         let definition = &definitions[id];
         let word = short(definition);
         let family = language_family(&definition.location.file);
@@ -1089,6 +1400,21 @@ fn analyze(
             match lines {
                 Some(lines) => {
                     for (path, line) in lines {
+                        // Documentation examples that name the symbol, wherever they sit.
+                        if family == Some("Rust")
+                            && doc_example(
+                                index,
+                                &mut texts,
+                                &doc_includes,
+                                &path,
+                                line,
+                                true,
+                                &format!("its example names {word} at {path}:{line}"),
+                                &mut analysis.doc_examples,
+                            )
+                        {
+                            continue;
+                        }
                         // Names only count within one language.
                         if language_family(&path) != family {
                             continue;
@@ -1101,23 +1427,80 @@ fn analyze(
                                 possible: true,
                                 why: format!("names {word} at {path}:{line}"),
                             });
-                        } else if family == Some("JavaScript")
-                            && is_test_file(&path)
-                            && enclosing(index, &path, line).is_none_or(|enclosing| {
-                                matches!(definitions[enclosing].kind.as_str(), "file" | "module")
-                            })
-                        {
+                            continue;
+                        }
+                        let around = enclosing(index, &path, line);
+                        let scope = around.is_none_or(|enclosing| {
+                            matches!(definitions[enclosing].kind.as_str(), "file" | "module")
+                        });
+                        if family == Some("JavaScript") && is_test_file(&path) && scope {
                             // JavaScript tests are calls, not definitions: the file is the unit.
                             seed.files.entry(path.clone()).or_insert(Hit {
                                 hops: 1,
                                 possible: true,
                                 why: format!("names {word} at {path}:{line}"),
                             });
+                        } else if let Some(user) = around
+                            && !scope
+                            && user != id
+                            && !definitions[user].test
+                            && definitions[user].kind != "import"
+                            && !seed.dependents.contains_key(&user)
+                            && texts.get(&path).is_some_and(|text| {
+                                text.lines().nth(line - 1).is_some_and(|text| {
+                                    !comment_only(text) && used_as(text, word, &definition.kind)
+                                })
+                            })
+                        {
+                            // Code that uses the symbol without an indexed link,
+                            // such as inside `write!`: a possible dependent.
+                            seed.dependents.insert(user, 1);
+                            further
+                                .entry(user)
+                                .or_insert_with(|| format!("names {word} at {path}:{line}"));
                         }
                     }
                 }
                 None => seed.capped = Some(word.to_owned()),
             }
+        }
+        // A trait method reached on the way, such as `fmt` calling the change, is
+        // traced through its type too, since its callers are implicit.
+        for &dependent in seed.dependents.keys() {
+            if let Some(type_id) = implicit_type(index, dependent) {
+                further
+                    .entry(type_id)
+                    .or_insert_with(|| implicitly(definitions, dependent, type_id));
+            }
+        }
+        let mut started = BTreeSet::from([id]);
+        for _ in 0..8 {
+            further.retain(|start, _| started.insert(*start));
+            if further.is_empty() {
+                break;
+            }
+            let starts: Vec<usize> = further.keys().copied().collect();
+            let reached = walk(index, &starts, DEPTH);
+            if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
+                seed.capped = Some(name(&definitions[starts[0]]).to_owned());
+            }
+            let known: BTreeSet<usize> = seed.dependents.keys().copied().collect();
+            collect(index, &reached, &further, true, &mut seed);
+            further.clear();
+            for &dependent in seed.dependents.keys() {
+                if !known.contains(&dependent)
+                    && let Some(type_id) = implicit_type(index, dependent)
+                    && !started.contains(&type_id)
+                {
+                    further
+                        .entry(type_id)
+                        .or_insert_with(|| implicitly(definitions, dependent, type_id));
+                }
+            }
+        }
+        further.retain(|start, _| !started.contains(start));
+        if !further.is_empty() {
+            seed.capped = Some(word.to_owned());
         }
         let target = &mut analysis.seeds[position];
         target.tests = seed.tests;
@@ -1225,13 +1608,14 @@ fn macro_spans(lines: &[String]) -> Vec<(String, usize, usize)> {
     spans
 }
 
-/// Records what one walk reached into `seed`.
+/// Records what one walk reached into `seed`. `notes` says how each start was
+/// reached, for walks that start past the changed symbol itself; everything
+/// such a walk reaches is possible.
 fn collect(
     index: &Index,
     reached: &Walk,
-    start: usize,
+    notes: &BTreeMap<usize, String>,
     through_type: bool,
-    note: &str,
     seed: &mut Seed,
 ) {
     let definitions = &index.definitions;
@@ -1244,6 +1628,7 @@ fn collect(
     let chain = |from: Dependent| -> String {
         let mut links = Vec::new();
         let mut current = from;
+        let mut root = None;
         while let Some((_, reach)) = by_dependent.get(&current) {
             links.push(format!(
                 "{}{} at {} → {}",
@@ -1252,24 +1637,20 @@ fn collect(
                 reach.edge.location,
                 name(&definitions[reach.via])
             ));
-            if links.len() == CHAIN || reach.via == start {
+            root = Some(reach.via);
+            if links.len() == CHAIN {
                 break;
             }
             current = Dependent::Symbol(reach.via);
         }
         let mut why = links.join(" · ");
-        if !note.is_empty() {
+        if let Some(note) = root.and_then(|root| notes.get(&root))
+            && !note.is_empty()
+        {
             why = format!("{note} · {why}");
         }
         why
     };
-    if definitions[start].test && !through_type {
-        seed.tests.entry(start).or_insert(Hit {
-            hops: 0,
-            possible: false,
-            why: "changed test".into(),
-        });
-    }
     for (offset, level) in reached.levels.iter().enumerate() {
         let hops = offset + 1;
         for reach in level {
@@ -1352,6 +1733,7 @@ fn full_plan(runner: &Runner, reasons: Vec<Reason>) -> RunnerPlan {
             argv: runner.base.clone(),
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
+            built: Vec::new(),
         }],
         tests: Vec::new(),
         skipped: Vec::new(),
@@ -1655,7 +2037,9 @@ fn plan_runner(
 
     // Per-seed rules: every changed symbol must reach a test through an exact link.
     let definitions = &index.definitions;
-    let runnable = |id: usize| in_scope(runner, &definitions[id].location.file);
+    // Only tests the runner's plan keeps count: a test file pytest would not
+    // collect satisfies nothing, so its change falls back instead.
+    let runnable = |file: &str| in_scope(runner, file) && collects(runner, file);
     for seed in &analysis.seeds {
         let definition = &definitions[seed.id];
         if !seed.rules || definition.test {
@@ -1664,12 +2048,12 @@ fn plan_runner(
         let tests: Vec<&Hit> = seed
             .tests
             .iter()
-            .filter(|(id, _)| runnable(**id))
+            .filter(|(id, _)| runnable(&definitions[**id].location.file))
             .map(|(_, hit)| hit)
             .chain(
                 seed.files
                     .iter()
-                    .filter(|(file, _)| in_scope(runner, file))
+                    .filter(|(file, _)| runnable(file))
                     .map(|(_, hit)| hit),
             )
             .collect();
@@ -1732,7 +2116,7 @@ fn plan_runner(
         ),
         Kind::Pytest => file_plan(workspace, index, runner, analysis, true),
         Kind::Jest | Kind::Vitest => file_plan(workspace, index, runner, analysis, false),
-        Kind::Go => go_plan(index, runner, analysis),
+        Kind::Go => go_plan(workspace, index, runner, analysis),
         Kind::Command => full_plan(runner, Vec::new()),
     };
     // Package scope is a subset reason, not a fallback; say why it widened.
@@ -1860,6 +2244,20 @@ fn runs(package: &Package, target: &Target, args: &[String]) -> Result<(), Strin
             target.src
         ));
     }
+    features_on(package, target, args)
+}
+
+/// Whether plain `cargo test` compiles a target: one it runs, or any example.
+fn builds(package: &Package, target: &Target, args: &[String]) -> bool {
+    if target.kind == "example" {
+        features_on(package, target, args).is_ok()
+    } else {
+        runs(package, target, args).is_ok()
+    }
+}
+
+/// Whether the target's required features are on under the base command.
+fn features_on(package: &Package, target: &Target, args: &[String]) -> Result<(), String> {
     if !target.required.is_empty()
         && let Some(enabled) = enabled_features(package, args)
     {
@@ -1940,8 +2338,8 @@ fn cargo_plan(
     let mut build = BTreeSet::<(String, String)>::new();
     let add_build = |package: &Package, target: &Target, build: &mut BTreeSet<(String, String)>| {
         if cargo.scope.contains(&package.name)
-            && target.flag().is_some()
-            && runs(package, target, &user_args).is_ok()
+            && target.build_flag().is_some()
+            && builds(package, target, &user_args)
         {
             build.insert((package.name.clone(), target.name.clone()));
         }
@@ -2230,8 +2628,8 @@ fn cargo_plan(
                 && let Some(target) = package
                     .targets
                     .iter()
-                    .find(|t| &t.name == target && t.flag().is_some())
-                && let Some(flag) = target.flag()
+                    .find(|t| &t.name == target && t.build_flag().is_some())
+                && let Some(flag) = target.build_flag()
                 && seen.insert(flag.clone())
             {
                 flags.extend(flag);
@@ -2258,6 +2656,7 @@ fn cargo_plan(
             argv: cargo_argv(&runner.base, &flags, &[]),
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
+            built: Vec::new(),
         });
     }
     // Compile coverage rides along with the filtered step.
@@ -2295,6 +2694,7 @@ fn cargo_plan(
             argv: cargo_argv(&runner.base, &target_flags(&filtered), &test_args),
             names: step_names,
             widen,
+            built: Vec::new(),
         });
     }
     if !unfiltered.is_empty() {
@@ -2303,11 +2703,12 @@ fn cargo_plan(
             argv: cargo_argv(&runner.base, &target_flags(&unfiltered), &[]),
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
+            built: Vec::new(),
         });
     }
     // Doctests of reached library items that carry an example.
     let mut doc_packages = BTreeSet::new();
-    let mut doc_paths = BTreeSet::new();
+    let mut doc_paths = BTreeMap::<String, (&'static str, String)>::new();
     let mut reached_ids: BTreeSet<usize> = BTreeSet::new();
     for seed in &analysis.seeds {
         reached_ids.insert(seed.id);
@@ -2345,8 +2746,54 @@ fn cargo_plan(
             .unwrap_or(false);
         if documented {
             doc_packages.insert(package.name.clone());
-            doc_paths.insert(name(definition).to_owned());
+            doc_paths.insert(
+                name(definition).to_owned(),
+                (
+                    "exact",
+                    "documentation example on a reached item".to_owned(),
+                ),
+            );
         }
+    }
+    // Examples elsewhere that name a change, such as crate docs or an included README.
+    for ((file, item), why) in &analysis.doc_examples {
+        if !in_scope(runner, file) {
+            continue;
+        }
+        let owner = match item {
+            Some(id) => target_of(cargo, &definitions[*id]),
+            None => definitions
+                .iter()
+                .filter(|d| &d.location.file == file)
+                .find_map(|d| target_of(cargo, d))
+                .or_else(|| {
+                    let package = cargo.owner(file)?;
+                    Some((package, package.targets.iter().find(|t| t.is_lib())?))
+                }),
+        };
+        let Some((package, target)) = owner else {
+            continue;
+        };
+        if !target.is_lib()
+            || !target.doctest
+            || !cargo.scope.contains(&package.name)
+            || packages.contains(&package.name)
+        {
+            continue;
+        }
+        // Doctests are named `reports/src/lib.rs - stats::peak (line 3)`, or
+        // without an item for a file's own docs.
+        let filter = match item {
+            Some(id) => name(&definitions[*id]).to_owned(),
+            None => {
+                let within = file
+                    .strip_prefix(&package.dir)
+                    .map_or(file.as_str(), |rest| rest.trim_start_matches('/'));
+                format!("{within} - ")
+            }
+        };
+        doc_packages.insert(package.name.clone());
+        doc_paths.entry(filter).or_insert(("mention", why.clone()));
     }
     if !doc_packages.is_empty() {
         let mut flags = Vec::new();
@@ -2355,13 +2802,13 @@ fn cargo_plan(
             flags.push(package.clone());
         }
         flags.push("--doc".into());
-        let paths: Vec<String> = doc_paths.iter().cloned().collect();
-        for path in &paths {
+        let paths: Vec<String> = doc_paths.keys().cloned().collect();
+        for (path, (confidence, why)) in &doc_paths {
             selected.push(Selected {
-                id: format!("{path} (doctest)"),
+                id: format!("{} (doctest)", path.trim_end_matches(" - ")),
                 target: "--doc".into(),
-                confidence: "exact",
-                why: "documentation example on a reached item".into(),
+                confidence,
+                why: why.clone(),
             });
         }
         plan.steps.push(Step {
@@ -2369,6 +2816,7 @@ fn cargo_plan(
             argv: cargo_argv(&runner.base, &flags, &paths),
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
+            built: Vec::new(),
         });
     }
     // Changed targets with no test step still build, as the full suite would.
@@ -2380,11 +2828,23 @@ fn cargo_plan(
             .position(|word| word == "--")
             .unwrap_or(argv.len());
         argv.insert(at, "--no-run".into());
+        let built = coverage
+            .iter()
+            .filter_map(|(package, target)| {
+                let package = cargo.package(package)?;
+                let target = package
+                    .targets
+                    .iter()
+                    .find(|t| &t.name == target && t.build_flag().is_some())?;
+                Some(target.describe(&package.name))
+            })
+            .collect();
         plan.steps.push(Step {
             kind: StepKind::Build,
             argv,
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
+            built,
         });
         if only {
             plan.mode = Mode::BuildOnly;
@@ -2483,13 +2943,20 @@ fn pytest_node(definition: &Definition) -> Option<String> {
     collected.then(|| parts.join("::"))
 }
 
-fn collectable_python(file: &str) -> bool {
-    let name = file.rsplit('/').next().unwrap_or(file);
-    name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"))
-}
-
 fn collectable_js(file: &str) -> bool {
     matches!(language(file), Some("JavaScript" | "TypeScript" | "TSX")) && is_test_file(file)
+}
+
+/// Whether the runner's full suite runs tests in `file`: pytest's
+/// `python_files` and `testpaths`, Jest and Vitest test files, Go test files.
+fn collects(runner: &Runner, file: &str) -> bool {
+    runner.contains(file)
+        && match runner.kind {
+            Kind::Pytest => runner.pytest_collects(file),
+            Kind::Jest | Kind::Vitest => collectable_js(file),
+            Kind::Go => file.ends_with("_test.go"),
+            Kind::Cargo | Kind::Command => true,
+        }
 }
 
 /// pytest (node IDs) and Jest/Vitest (test files): one step naming what to run.
@@ -2504,14 +2971,7 @@ fn file_plan(
     let mut plan = full_plan(runner, Vec::new());
     plan.mode = Mode::Subset;
     plan.steps.clear();
-    let collectable = |file: &str| {
-        runner.contains(file)
-            && if python {
-                collectable_python(file)
-            } else {
-                collectable_js(file)
-            }
-    };
+    let collectable = |file: &str| collects(runner, file);
     let (tests, files) = gather(index, runner, analysis);
     let mut units = BTreeMap::<String, Selected>::new();
     let mut whole_files = BTreeSet::new();
@@ -2662,6 +3122,7 @@ fn file_plan(
             argv,
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
+            built: Vec::new(),
         });
     } else {
         plan.mode = Mode::Nothing;
@@ -2672,20 +3133,56 @@ fn file_plan(
     plan
 }
 
-/// Go: `go test PACKAGES -run '^(TestA|TestB)$'`.
-fn go_plan(index: &Index, runner: &Runner, analysis: &Analysis) -> RunnerPlan {
+/// Go's command for some packages: the base command with `./...` replaced,
+/// and `-v` so the tests that ran are named and can be checked.
+pub(crate) fn go_argv(base: &[String], packages: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = base
+        .iter()
+        .filter(|word| *word != "./...")
+        .cloned()
+        .collect();
+    let named = argv
+        .iter()
+        .any(|word| word == "-json" || word == "-v" || word.starts_with("-v="));
+    if !named && let Some(at) = argv.iter().position(|word| word == "test") {
+        argv.insert(at + 1, "-v".into());
+    }
+    argv.extend(packages.iter().cloned());
+    argv
+}
+
+/// Go: `go test -v PACKAGES -run '^(TestA|TestB)$'` for top-level tests, and
+/// whole packages for tests `-run` cannot name, such as suite methods.
+fn go_plan(
+    workspace: &Workspace,
+    index: &Index,
+    runner: &Runner,
+    analysis: &Analysis,
+) -> RunnerPlan {
     let definitions = &index.definitions;
     let mut plan = full_plan(runner, Vec::new());
     plan.mode = Mode::Subset;
     plan.steps.clear();
+    let mut texts = Texts::new(workspace);
     let (tests, files) = gather(index, runner, analysis);
-    let mut packages = BTreeSet::new();
-    let mut names = BTreeSet::new();
+    // Package → names for `-run`, and packages that run whole.
+    let mut named = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut whole = BTreeSet::<String>::new();
     let mut selected = Vec::new();
-    let go_test = |definition: &Definition| {
+    let test_like = |definition: &Definition| {
         definition.location.file.ends_with("_test.go")
+            && runner.contains(&definition.location.file)
+            && short(definition).starts_with("Test")
+    };
+    // `-run` matches only top-level `func TestX(t *testing.T)`; a suite method
+    // such as `func (s *CartSuite) TestCount()` runs as a subtest of another.
+    let top_level = |texts: &mut Texts, definition: &Definition| {
+        definition.kind == "function"
             && !name(definition).contains("::")
-            && name(definition).starts_with("Test")
+            && texts
+                .get(&definition.location.file)
+                .and_then(|text| text.lines().nth(definition.declaration.saturating_sub(1)))
+                .is_some_and(|line| line.contains("*testing.T"))
     };
     let package_of = |file: &str| -> String {
         match runner.relative(file).rsplit_once('/') {
@@ -2693,61 +3190,87 @@ fn go_plan(index: &Index, runner: &Runner, analysis: &Analysis) -> RunnerPlan {
             None => ".".into(),
         }
     };
-    for (&id, hit) in &tests {
-        let definition = &definitions[id];
-        if !go_test(definition) {
-            continue;
+    let mut choose = |definition: &Definition, hit: &Hit, texts: &mut Texts| {
+        let package = package_of(&definition.location.file);
+        if top_level(texts, definition) {
+            named
+                .entry(package.clone())
+                .or_default()
+                .insert(name(definition).to_owned());
+        } else {
+            whole.insert(package.clone());
         }
-        packages.insert(package_of(&definition.location.file));
-        names.insert(name(definition).to_owned());
         selected.push(Selected {
-            id: name(definition).to_owned(),
-            target: package_of(&definition.location.file),
+            id: short(definition).to_owned(),
+            target: package,
             confidence: confidence(hit),
             why: hit.why.clone(),
         });
+    };
+    for (&id, hit) in &tests {
+        if test_like(&definitions[id]) {
+            choose(&definitions[id], hit, &mut texts);
+        }
     }
     for (file, hit) in &files {
         if file.ends_with("_test.go") && runner.contains(file) {
             for definition in definitions
                 .iter()
-                .filter(|d| &d.location.file == file && go_test(d))
+                .filter(|d| &d.location.file == file && test_like(d))
             {
-                packages.insert(package_of(file));
-                names.insert(name(definition).to_owned());
-                selected.push(Selected {
-                    id: name(definition).to_owned(),
-                    target: package_of(file),
-                    confidence: confidence(hit),
-                    why: hit.why.clone(),
-                });
+                choose(definition, hit, &mut texts);
             }
         }
     }
-    plan.indexed = definitions
+    named.retain(|package, _| !whole.contains(package));
+    plan.indexed = definitions.iter().filter(|d| test_like(d)).count();
+    plan.selected = definitions
         .iter()
-        .filter(|d| go_test(d) && runner.contains(&d.location.file))
+        .filter(|d| {
+            test_like(d) && {
+                let package = package_of(&d.location.file);
+                whole.contains(&package)
+                    || named
+                        .get(&package)
+                        .is_some_and(|names| names.contains(name(d)))
+            }
+        })
         .count();
-    plan.selected = selected.len();
-    if names.is_empty() {
-        plan.mode = Mode::Nothing;
-    } else {
-        let mut argv: Vec<String> = runner
-            .base
-            .iter()
-            .filter(|word| *word != "./...")
-            .cloned()
-            .collect();
-        argv.extend(packages.iter().cloned());
+    if !named.is_empty() {
+        let packages: Vec<String> = named.keys().cloned().collect();
+        let mut argv = go_argv(&runner.base, &packages);
         argv.push("-run".into());
-        let list: Vec<String> = names.into_iter().collect();
-        argv.push(format!("^({})$", list.join("|")));
+        let list: BTreeSet<&String> = named.values().flatten().collect();
+        argv.push(format!(
+            "^({})$",
+            list.into_iter().cloned().collect::<Vec<_>>().join("|")
+        ));
         plan.steps.push(Step {
             kind: StepKind::Filtered,
             argv,
+            widen: packages
+                .iter()
+                .map(|package| (package.clone(), vec![package.clone()]))
+                .collect(),
+            names: named
+                .into_iter()
+                .map(|(package, names)| (package, names.into_iter().collect()))
+                .collect(),
+            built: Vec::new(),
+        });
+    }
+    if !whole.is_empty() {
+        let packages: Vec<String> = whole.into_iter().collect();
+        plan.steps.push(Step {
+            kind: StepKind::Unfiltered,
+            argv: go_argv(&runner.base, &packages),
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
+            built: Vec::new(),
         });
+    }
+    if plan.steps.is_empty() {
+        plan.mode = Mode::Nothing;
     }
     plan.tests = selected;
     plan
@@ -2846,6 +3369,73 @@ mod tests {
             "#[allow(dead_code)]",
         ]);
         assert_eq!(found, BTreeSet::from(["tax".to_owned(), "vat".to_owned()]));
+    }
+
+    #[test]
+    fn code_uses_functions_by_calling_them() {
+        assert!(used_as(
+            "        write!(f, \"{}\", grouped(self.0))",
+            "grouped",
+            "function"
+        ));
+        assert!(used_as(
+            "    let x = parse::<u8>(text);",
+            "parse",
+            "function"
+        ));
+        assert!(!used_as("    let grouped = 3;", "grouped", "function"));
+        assert!(!used_as("fn main() {", "main", "function"));
+        assert!(!used_as("    regrouped(1)", "grouped", "function"));
+        assert!(used_as("    let rate: Rate = x;", "Rate", "struct"));
+        assert!(comment_only("    // grouped(1)"));
+        assert!(!comment_only("    /// grouped(1)"));
+        assert!(!comment_only("#[test]"));
+        assert!(doc_line("//! assert_eq!(peak(&[1]), 1);"));
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_file_that_names_them() {
+        assert_eq!(
+            literals("#![doc = include_str!(\"../README.md\")]"),
+            ["../README.md"]
+        );
+        assert_eq!(literals("open('data/rates.json')"), ["data/rates.json"]);
+        assert_eq!(
+            resolve("reports/src/lib.rs", "../README.md").as_deref(),
+            Some("reports/README.md")
+        );
+        assert_eq!(
+            resolve("src/lib.rs", "./data/x.json").as_deref(),
+            Some("src/data/x.json")
+        );
+        assert_eq!(resolve("lib.rs", "../../x"), None);
+        assert_eq!(resolve("src/lib.rs", "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn doc_examples_are_the_fenced_lines() {
+        let rust = "//! Helpers.\n//!\n//! ```\n//! assert_eq!(peak(&[1]), 1);\n//! ```\n/// Uses peak.\nfn a() {}\n";
+        assert!(in_fence(rust, 4, true));
+        assert!(!in_fence(rust, 6, true));
+        let markdown = "# x\n\n```\nassert_eq!(mean(&[2]), 2);\n```\nmean is the average.\n";
+        assert!(in_fence(markdown, 4, false));
+        assert!(!in_fence(markdown, 6, false));
+    }
+
+    #[test]
+    fn go_subsets_name_the_tests_they_ran() {
+        let base: Vec<String> = ["go", "test", "-count=1", "./..."]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            go_argv(&base, &["./cart".into()]).join(" "),
+            "go test -v -count=1 ./cart"
+        );
+        let json: Vec<String> = ["go", "test", "-json"].map(String::from).to_vec();
+        assert_eq!(
+            go_argv(&json, &["./cart".into()]).join(" "),
+            "go test -json ./cart"
+        );
     }
 
     #[test]

@@ -10211,7 +10211,7 @@ fn affected_tests_drive_pytest_jest_and_go_with_their_own_selectors() {
     );
     has_line(
         &text,
-        "  Run (selected tests): go test ./price -run '^(TestVat)$'",
+        "  Run (selected tests): go test -v ./price -run '^(TestVat)$'",
     );
 
     // Detected runners: the pytest file and the Jest file that import the change,
