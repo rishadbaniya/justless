@@ -475,6 +475,15 @@ fn comment_only(line: &str) -> bool {
         || line == "*"
 }
 
+/// Whether a file is code in a language some runner tests: Rust, Python,
+/// JavaScript or TypeScript, or Go. Anything else changes tests only as data.
+fn runner_language(file: &str) -> bool {
+    file.ends_with(".rs")
+        || file.ends_with(".py")
+        || file.ends_with(".go")
+        || matches!(language(file), Some("JavaScript" | "TypeScript" | "TSX"))
+}
+
 /// Whether a Rust line is documentation, whose examples run as doctests.
 fn doc_line(line: &str) -> bool {
     let line = line.trim_start();
@@ -1284,12 +1293,16 @@ fn analyze(
                     .entry(path.clone())
                     .or_insert_with(hit);
                 mentioned = true;
+            } else if runner_language(file) {
+                // Code is traced through its own symbols; a path such as
+                // `#[path = "..."]` or `include!` adds nothing to follow.
+                mentioned = true;
             } else if !texts
                 .get(&path)
                 .and_then(|text| text.lines().nth(line - 1))
                 .is_none_or(comment_only)
             {
-                // Code at the top level of a non-test file uses the file. Its
+                // Code at the top level of a non-test file uses the data. Its
                 // importers depend on it; Rust has no such link, so its target
                 // builds and the plan cannot vouch for a subset.
                 mentioned = true;
@@ -3183,10 +3196,14 @@ fn go_plan(
     let mut named = BTreeMap::<String, BTreeSet<String>>::new();
     let mut whole = BTreeSet::<String>::new();
     let mut selected = Vec::new();
+    // `go test` runs tests, examples and fuzz seeds; a selected example or fuzz
+    // target has no `*testing.T` and runs with its whole package.
     let test_like = |definition: &Definition| {
         definition.location.file.ends_with("_test.go")
             && runner.contains(&definition.location.file)
-            && short(definition).starts_with("Test")
+            && ["Test", "Example", "Fuzz"]
+                .iter()
+                .any(|prefix| short(definition).starts_with(prefix))
     };
     // `-run` matches only top-level `func TestX(t *testing.T)`; a suite method
     // such as `func (s *CartSuite) TestCount()` runs as a subtest of another.
