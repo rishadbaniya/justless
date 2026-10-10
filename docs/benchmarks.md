@@ -291,24 +291,24 @@ python3 scripts/affected_benchmark.py --binary ./target/release/justless --proje
 python3 scripts/affected_benchmark.py --binary ./target/release/justless --project . --edits scripts/affected_edits.json --no-fallback
 ```
 
-Measured on 2026-11-18 on macOS arm64 with Rust 1.93.0 and a release build, while other Cargo builds ran on the same machine, so single timings vary by about a second. Medians are over the mutants or edits in each row.
+Measured on 2026-11-18 on macOS arm64 with Rust 1.93.0 and a release build, after the selection rules for helpers behind `Display`, crate-level and included doc examples, example binaries and unmentioned SQL were added. Single timings vary by about a second. Medians are over the mutants or edits in each row.
 
-| Project and edits | Missed failures | Ran as a subset | Selected tests (median) | Subset time | Full-suite time | Subset bytes | Full-suite bytes |
+| Project and edits | Missed failures | Ran as a subset | Selected tests (median) | Subset time | Full-suite time | Bytes, affected | Bytes, full suite |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fixtures/affected`, a panic in each of 13 functions | 0 of 12 | 10 of 13 | 10% of 20 | 2.01 s | 1.08 s | 3,506 | 2,435 |
-| `fixtures/affected`, a no-op in each of 13 functions | none failed | 10 of 13 | 10% of 20 | 2.20 s | 2.57 s | 1,475 | 2,145 |
-| This repository, 4 edits: a `fixtures/failing` fee, a `fixtures/mixed` table name, one test in `tests/progressive.rs`, one `src/` function | 0 of 2 | 3 of 4 | 17% of 127 | 3.94 s | 12.63 s | 1,596 | 1,408 |
-| A single-crate Rust library from a private codebase, with 87 unit tests and crates.io dependencies, a panic in 12 sampled functions | 0 of 3 | 2 of 12 | 7% of 87 | 1.79 s | 2.84 s | 2,779 | 1,999 |
-| The same library, a no-op in the same 12 functions | none failed | 2 of 12 | 7% of 87 | 1.49 s | 3.19 s | 958 | 991 |
+| `fixtures/affected`, a panic in each of 13 functions | 0 of 12 | 10 of 13 | 10% of 20 | 1.42 s | 0.95 s | 3,409 | 2,222 |
+| `fixtures/affected`, a no-op in each of 13 functions | none failed | 10 of 13 | 10% of 20 | 1.38 s | 2.09 s | 1,475 | 2,145 |
+| This repository, 4 edits: a `fixtures/failing` fee, a `fixtures/mixed` table name, one test in `tests/progressive.rs`, one `src/` function | 0 of 2 | 2 of 4 | 16% of 143 | 2.27 s | 10.77 s | 1,509 | 1,415 |
+| A single-crate Rust library from a private codebase, with 87 unit tests and crates.io dependencies, a panic in 12 sampled functions | 0 of 3 | 2 of 12 | 7% of 87 | 1.48 s | 2.63 s | 1,792 | 1,576 |
+| The same library, a no-op in the same 12 functions | none failed | 2 of 12 | 7% of 87 | 1.36 s | 3.24 s | 1,213 | 991 |
 
-Times and bytes in the subset columns are for the edits that ran as a subset, compared with the full suite on the same edits; a fallback costs a full suite plus the planning, which took 0.1 s on `fixtures/affected` and 0.2 s on this repository with a warm index; the fallback rows differ from their full suites by less than the timing noise.
+The time columns are for the edits that ran as a subset, compared with the full suite on the same edits; the byte columns are medians over every edit in the row, fallbacks included. A fallback costs a full suite plus the planning, which took 0.1 s on `fixtures/affected` and 0.2 s on this repository with a warm index; the fallback rows differ from their full suites by less than the timing noise.
 
 What the rows show:
 
-- **No missed failures.** Every edit that failed the full suite failed the subset, with and without `--no-fallback`.
+- **No missed failures.** Every edit that failed the full suite failed the subset, with and without `--no-fallback`. The edits a review found to pass a subset while `cargo test` failed, a helper called inside `write!` in a `Display` impl, a crate-level doc example, a README included as crate docs, a renamed function an example calls and an SQL migration a test reads, are now covered by `tests/cli.rs`.
 - **On a small workspace a failing subset is slower and longer.** `cargo test` stops at the first failing test binary, so the full suite of `fixtures/affected` ends after one binary, while the subset runs its selected tests, whole targets and doctests as separate Cargo invocations. A passing edit is where the subset saves time, by not building or running the packages the change does not reach.
-- **The gain grows with the suite.** On this repository the subset took 7.7 s against 12.4 s for the fixture edit, 1.9 s against 12.6 s for the SQL edit and 3.9 s against 13.3 s for the edited test, and printed 951 bytes against 1,423 for the passing one. Both failing edits failed the full suite too, which stopped early at its first failing binary, so the subset printed slightly more.
-- **Fallbacks are honest, and frequent where links are inferred.** A method reached only through a name match, or a trait method such as `Display::fmt`, runs the full suite. On the single-crate library, 7 of the 12 sampled functions have no test that reaches them, so the full suite ran, and 3 more are methods reached only through inferred links or a name match. With `--no-fallback` the 7 untested functions only build and the 3 methods run a labeled low-confidence subset, in a median 1.09 s against 3.17 s for the full suite, and each of the 3 mutants the full suite caught still failed; that is a measurement on 12 mutants, not a guarantee.
+- **The gain grows with the suite.** On this repository the subset took 1.6 s against 9.3 s for the SQL edit and 2.9 s against 12.3 s for the edited test, and printed 951 bytes against 1,423 for the passing one.
+- **Fallbacks are honest, and frequent where links are inferred.** The `fixtures/failing` fee edit runs the full suite: `apply_fee` is reached only by tests whose body names it, a name match, while the exact links run through the `fixture()` helper that copies the directory. On the single-crate library, 10 of the 12 sampled functions fall back, because no test reaches them or only inferred links and name matches do. With `--no-fallback` the untested functions only build and the rest run a labeled low-confidence subset, in a median 1.02 s against 3.13 s for the full suite, and each of the 3 mutants the full suite caught still failed; that is a measurement on 12 mutants, not a guarantee.
 - **A change to a binary's code on this repository runs everything.** Every integration test here runs the `justless` binary, so a `src/` edit reaches all of them and the subset is too broad.
 
 `fixtures/failing` has one test, and `fixtures/mixed` has no test runner, so neither is a meaningful subset benchmark on its own; the `justless` rows above include edits to both, which reach the tests that copy them.
