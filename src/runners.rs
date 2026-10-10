@@ -316,6 +316,13 @@ impl Target {
         }
     }
 
+    /// The target's identity within its package. A name alone is ambiguous:
+    /// `api` can be both a library and a binary, and `summary` both an
+    /// integration test and an example.
+    pub fn id(&self) -> String {
+        format!("{}:{}", self.kind, self.name)
+    }
+
     pub fn is_lib(&self) -> bool {
         matches!(
             self.kind.as_str(),
@@ -329,6 +336,13 @@ impl Target {
             Some(flag) => format!("{package} {}", flag.join(" ")),
             None => format!("{package} {} {}", self.kind, self.name),
         }
+    }
+}
+
+impl Package {
+    /// The target with an identity from [`Target::id`].
+    pub fn target_by_id(&self, id: &str) -> Option<&Target> {
+        self.targets.iter().find(|target| target.id() == id)
     }
 }
 

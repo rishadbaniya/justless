@@ -10473,6 +10473,26 @@ mod tests {
         "reports/examples/weekly.rs",
         "fn main() {\n    println!(\"{}\", reports::stats::spread(&[4, 8, 6]));\n}\n",
     );
+    // An example named like an integration test: `--example summary` must not
+    // stand in for `--test summary`.
+    write(
+        "reports/examples/summary.rs",
+        "fn main() {\n    println!(\"{}\", reports::stats::mean(&[4, 8]));\n}\n",
+    );
+    // A function only a test behind an unmet required feature calls.
+    let tax = fs::read_to_string(root.join("ledger/src/tax.rs")).unwrap();
+    write(
+        "ledger/src/tax.rs",
+        &tax.replacen(
+            "const RATE",
+            "/// A rate behind the `extra` feature.\npub fn extra_rate() -> u64 {\n    7\n}\n\nconst RATE",
+            1,
+        ),
+    );
+    write(
+        "ledger/tests/needs.rs",
+        "#[test]\nfn extra_feature_is_enabled() {\n    assert!(cfg!(feature = \"extra\"));\n    assert_eq!(ledger_core::tax::extra_rate(), 7);\n}\n",
+    );
     write(
         "ledger/migrations/001_init.sql",
         "CREATE TABLE invoices (\n    id INTEGER PRIMARY KEY\n);\n",
@@ -10558,8 +10578,8 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
     replace_in(
         root,
         "reports/src/stats.rs",
-        "values.iter().copied().max().unwrap_or(0)\n",
-        "values.iter().max().copied().unwrap_or(0)\n",
+        "values.iter().copied().max().unwrap_or(0)",
+        "values.iter().max().copied().unwrap_or(0)",
     );
     let text = plan();
     has_line(
@@ -10570,6 +10590,31 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
         &text,
         "  src/lib.rs (doctest) · --doc · mention · its example names peak at reports/src/lib.rs:5",
     );
+    reset();
+
+    // A test target and an example with the same name stay apart.
+    replace_in(
+        root,
+        "reports/src/stats.rs",
+        "values.len() as u64",
+        "(values.len() as u64)",
+    );
+    let text = plan();
+    has_line(
+        &text,
+        "  Run (whole targets): cargo test --offline -p reports --test summary",
+    );
+    reset();
+
+    // A test the base command never runs, behind an unmet required feature,
+    // vouches for nothing.
+    replace_in(root, "ledger/src/tax.rs", "    7\n", "    8\n");
+    let text = plan();
+    assert!(
+        text.contains("  no-tests: no test reaches tax::extra_rate (ledger/src/tax.rs:"),
+        "{text}"
+    );
+    has_line(&text, "  Run (full suite): cargo test --offline");
     reset();
 
     // A README included as crate docs runs as doctests when it changes.
@@ -10604,13 +10649,13 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
     );
     has_line(
         &text,
-        "  Run (build only): cargo test --offline -p reports --lib --example weekly --no-run",
+        "  Run (build only): cargo test --offline -p reports --example weekly --lib --no-run",
     );
     let failing = cli(root, &affected);
     assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
     assert!(
         stderr(&failing).contains(
-            "Build only (cargo) failed with exit 101 building reports --lib, reports --example weekly"
+            "Build only (cargo) failed with exit 101 building reports --example weekly, reports --lib"
         ),
         "{}",
         stderr(&failing)
@@ -10626,7 +10671,7 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
     assert!(passing.status.success(), "{}", stderr(&passing));
     assert!(
         stderr(&passing)
-            .contains("Build only (cargo): reports --lib, reports --example weekly compiled"),
+            .contains("Build only (cargo): reports --example weekly, reports --lib compiled"),
         "{}",
         stderr(&passing)
     );
@@ -10650,7 +10695,8 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
 
 /// A stand-in for `go test`: `-run` matches top-level `func TestX(t *testing.T)`
 /// only, suite methods run as subtests of the function that calls suite.Run, and
-/// `-v` names each test. `$FAIL` names a test or suite method that fails.
+/// `-v` names each test. `$FAIL` names a test or suite method that fails, and
+/// `$NOMATCH` makes `-run` match nothing, as for a name Go does not know.
 #[cfg(unix)]
 const FAKE_GO: &str = r#"#!/bin/sh
 echo "go $*" >> "$CALLS"
@@ -10672,6 +10718,7 @@ for package in $packages; do
   tops=$(cat "$package"/*_test.go | sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t \*testing\.T).*/\1/p')
   methods=$(cat "$package"/*_test.go | sed -n 's/^func ([a-z]* \*[A-Za-z]*) \(Test[A-Za-z0-9_]*\)().*/\1/p')
   ran=""; failed=""
+  if [ -n "$pattern" ] && [ -n "$NOMATCH" ]; then tops=""; fi
   for test in $tops; do
     if [ -n "$pattern" ] && ! echo "$test" | grep -Eq "$pattern"; then continue; fi
     ran=1
@@ -10852,6 +10899,20 @@ fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
     );
     assert!(
         stderr(&output).contains("Subset passed (go): ran 1 test reachable from your changes"),
+        "{}",
+        stderr(&output)
+    );
+    // `[no tests to run]` is not a pass: the package runs again without -run.
+    let output = justless(&["test", "--affected"], &[("NOMATCH", "1")]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "go test -v ./price -run ^(TestVat)$\ngo test -v ./price\n"
+    );
+    assert!(
+        stderr(&output).contains(
+            "widened: 1 selected test reported no result under their test names; running their packages in full"
+        ),
         "{}",
         stderr(&output)
     );

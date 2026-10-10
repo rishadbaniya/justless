@@ -515,10 +515,15 @@ fn used_as(line: &str, word: &str, kind: &str) -> bool {
 }
 
 /// The type behind a trait method its callers reach implicitly, such as
-/// `Money` for `Money::fmt`, which `format!` and `to_string` call.
-fn implicit_type(index: &Index, id: usize) -> Option<usize> {
+/// `Money` for `Money::fmt`, which `format!` and `to_string` call. For a method
+/// the walk `reached`, `new` is left out: callers name it, so its links are in
+/// the index, and its type's users are no closer to the change.
+fn implicit_type(index: &Index, id: usize, reached: bool) -> Option<usize> {
     let definition = &index.definitions[id];
-    if definition.kind != "method" || !UBIQUITOUS.contains(&short(definition)) {
+    if definition.kind != "method"
+        || !UBIQUITOUS.contains(&short(definition))
+        || (reached && matches!(short(definition), "new" | "constructor" | "__init__"))
+    {
         return None;
     }
     let (parent, _) = definition.qualified.rsplit_once("::")?;
@@ -1232,7 +1237,6 @@ fn analyze(
                 };
                 for literal in literals(text) {
                     if literal.ends_with(base_name)
-                        && literal.contains('/')
                         && resolve(&path, &literal).as_deref() == Some(file.as_str())
                     {
                         mentions.push((literal, path.clone(), line));
@@ -1393,7 +1397,7 @@ fn analyze(
         // Walks that start past the symbol: the types of trait methods called
         // implicitly, and code that names the symbol where the index has no link.
         let mut further = BTreeMap::<usize, String>::new();
-        if let Some(type_id) = implicit_type(index, id) {
+        if let Some(type_id) = implicit_type(index, id, false) {
             further.insert(type_id, implicitly(definitions, id, type_id));
         }
         // The name net: tests whose body names the symbol, such as inside a
@@ -1480,7 +1484,7 @@ fn analyze(
         // A trait method reached on the way, such as `fmt` calling the change, is
         // traced through its type too, since its callers are implicit.
         for &dependent in seed.dependents.keys() {
-            if let Some(type_id) = implicit_type(index, dependent) {
+            if let Some(type_id) = implicit_type(index, dependent, true) {
                 further
                     .entry(type_id)
                     .or_insert_with(|| implicitly(definitions, dependent, type_id));
@@ -1502,7 +1506,7 @@ fn analyze(
             further.clear();
             for &dependent in seed.dependents.keys() {
                 if !known.contains(&dependent)
-                    && let Some(type_id) = implicit_type(index, dependent)
+                    && let Some(type_id) = implicit_type(index, dependent, true)
                     && !started.contains(&type_id)
                 {
                     further
@@ -2012,7 +2016,7 @@ fn plan_runner(
                                 .is_some_and(|dir| under(file, dir)))
                 });
                 if let Some(target) = local {
-                    whole_targets.insert((package.name.clone(), target.name.clone()), reason);
+                    whole_targets.insert((package.name.clone(), target.id()), reason);
                     continue;
                 }
             }
@@ -2053,6 +2057,24 @@ fn plan_runner(
     // Only tests the runner's plan keeps count: a test file pytest would not
     // collect satisfies nothing, so its change falls back instead.
     let runnable = |file: &str| in_scope(runner, file) && collects(runner, file);
+    let user_args: Vec<String> = runner.base[2.min(runner.base.len())..]
+        .iter()
+        .take_while(|word| *word != "--")
+        .cloned()
+        .collect();
+    // The same rules the runner's plan keeps a test by: a Cargo target the base
+    // command runs (a test with no target runs with its package), a Go test,
+    // example or fuzz target.
+    let kept = |id: usize| {
+        let definition = &definitions[id];
+        runnable(&definition.location.file)
+            && match (runner.kind, &runner.cargo) {
+                (Kind::Cargo, Some(cargo)) => target_of(cargo, definition)
+                    .is_none_or(|(package, target)| runs(package, target, &user_args).is_ok()),
+                (Kind::Go, _) => go_test_like(definition),
+                _ => true,
+            }
+    };
     for seed in &analysis.seeds {
         let definition = &definitions[seed.id];
         if !seed.rules || definition.test {
@@ -2061,7 +2083,7 @@ fn plan_runner(
         let tests: Vec<&Hit> = seed
             .tests
             .iter()
-            .filter(|(id, _)| runnable(&definitions[**id].location.file))
+            .filter(|(id, _)| kept(**id))
             .map(|(_, hit)| hit)
             .chain(
                 seed.files
@@ -2368,7 +2390,7 @@ fn cargo_plan(
             && target.build_flag().is_some()
             && builds(package, target, &user_args)
         {
-            build.insert((package.name.clone(), target.name.clone()));
+            build.insert((package.name.clone(), target.id()));
         }
     };
     let shared = |target: &Target| !matches!(target.kind.as_str(), "test" | "example" | "bench");
@@ -2478,7 +2500,7 @@ fn cargo_plan(
         if packages.contains(&package.name) {
             continue;
         }
-        let key = (package.name.clone(), target.name.clone());
+        let key = (package.name.clone(), target.id());
         if !target.harness {
             unfiltered.insert(key);
             continue;
@@ -2518,7 +2540,7 @@ fn cargo_plan(
                                 why: hit.why.clone(),
                             });
                             if !packages.contains(&package.name) {
-                                unfiltered.insert((package.name.clone(), target.name.clone()));
+                                unfiltered.insert((package.name.clone(), target.id()));
                             }
                         }
                         Err(why) => plan.skipped.push(Note {
@@ -2543,7 +2565,7 @@ fn cargo_plan(
             let Some(text) = texts.get(&target.src).map(str::to_owned) else {
                 continue;
             };
-            let key = (package.name.clone(), target.name.clone());
+            let key = (package.name.clone(), target.id());
             let mut why = None;
             for bin in black_box_bins(&text) {
                 let owner = cargo
@@ -2603,11 +2625,11 @@ fn cargo_plan(
             }
         }
     }
-    for ((package_name, target_name), reason) in whole_targets {
+    for ((package_name, target_id), reason) in whole_targets {
         let Some(package) = cargo.package(package_name) else {
             continue;
         };
-        let Some(target) = package.targets.iter().find(|t| &t.name == target_name) else {
+        let Some(target) = package.target_by_id(target_id) else {
             continue;
         };
         if packages.contains(package_name) {
@@ -2615,7 +2637,7 @@ fn cargo_plan(
         }
         match runs(package, target, &user_args) {
             Ok(()) => {
-                if unfiltered.insert((package_name.clone(), target_name.clone())) {
+                if unfiltered.insert((package_name.clone(), target_id.clone())) {
                     selected.push(Selected {
                         id: format!("{} (whole target)", target.src),
                         target: target.describe(package_name),
@@ -2655,7 +2677,7 @@ fn cargo_plan(
                 && let Some(target) = package
                     .targets
                     .iter()
-                    .find(|t| &t.name == target && t.build_flag().is_some())
+                    .find(|t| &t.id() == target && t.build_flag().is_some())
                 && let Some(flag) = target.build_flag()
                 && seen.insert(flag.clone())
             {
@@ -2667,9 +2689,15 @@ fn cargo_plan(
     let target_key = |package: &str, target: &str| -> String {
         cargo
             .package(package)
-            .and_then(|p| p.targets.iter().find(|t| t.name == target))
+            .and_then(|p| p.target_by_id(target))
             .map(|t| t.name.replace('-', "_"))
-            .unwrap_or_else(|| target.replace('-', "_"))
+            .unwrap_or_else(|| {
+                target
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or(target)
+                    .replace('-', "_")
+            })
     };
 
     if !packages.is_empty() {
@@ -2862,7 +2890,7 @@ fn cargo_plan(
                 let target = package
                     .targets
                     .iter()
-                    .find(|t| &t.name == target && t.build_flag().is_some())?;
+                    .find(|t| &t.id() == target && t.build_flag().is_some())?;
                 Some(target.describe(&package.name))
             })
             .collect();
@@ -2890,7 +2918,7 @@ fn cargo_plan(
         if !cargo.scope.contains(&package.name) || runs(package, target, &user_args).is_err() {
             continue;
         }
-        let key = (package.name.clone(), target.name.clone());
+        let key = (package.name.clone(), target.id());
         let whole = packages.contains(&package.name) || unfiltered.contains(&key);
         let by_name = named
             .get(&key)
@@ -2920,7 +2948,7 @@ fn package_targets(cargo: &Cargo, package: &str, args: &[String]) -> Vec<(String
             p.targets
                 .iter()
                 .filter(|t| t.flag().is_some() && runs(p, t, args).is_ok())
-                .map(|t| (p.name.clone(), t.name.clone()))
+                .map(|t| (p.name.clone(), t.id()))
                 .collect()
         })
         .unwrap_or_default()
@@ -3160,6 +3188,15 @@ fn file_plan(
     plan
 }
 
+/// What `go test` runs: tests, examples and fuzz seeds in `_test.go` files. An
+/// example or fuzz target has no `*testing.T` and runs with its whole package.
+fn go_test_like(definition: &Definition) -> bool {
+    definition.location.file.ends_with("_test.go")
+        && ["Test", "Example", "Fuzz"]
+            .iter()
+            .any(|prefix| short(definition).starts_with(prefix))
+}
+
 /// Go's command for some packages: the base command with `./...` replaced,
 /// and `-v` so the tests that ran are named and can be checked.
 pub(crate) fn go_argv(base: &[String], packages: &[String]) -> Vec<String> {
@@ -3196,14 +3233,8 @@ fn go_plan(
     let mut named = BTreeMap::<String, BTreeSet<String>>::new();
     let mut whole = BTreeSet::<String>::new();
     let mut selected = Vec::new();
-    // `go test` runs tests, examples and fuzz seeds; a selected example or fuzz
-    // target has no `*testing.T` and runs with its whole package.
     let test_like = |definition: &Definition| {
-        definition.location.file.ends_with("_test.go")
-            && runner.contains(&definition.location.file)
-            && ["Test", "Example", "Fuzz"]
-                .iter()
-                .any(|prefix| short(definition).starts_with(prefix))
+        go_test_like(definition) && runner.contains(&definition.location.file)
     };
     // `-run` matches only top-level `func TestX(t *testing.T)`; a suite method
     // such as `func (s *CartSuite) TestCount()` runs as a subtest of another.
