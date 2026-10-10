@@ -11043,3 +11043,315 @@ fn stray_python_tests_add_no_runner_and_missing_runners_are_not_results() {
         stderr(&output)
     );
 }
+
+/// A plain 70 KB log, recorded under the `sh` budget key (family `other`, label `sh`).
+#[cfg(unix)]
+const BUDGET_LOG: &str =
+    "i=0; while [ $i -lt 2000 ]; do echo \"row $i of the synthetic build log\"; i=$((i+1)); done";
+
+#[cfg(unix)]
+fn budget_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Seeds `count` finished `sh` runs that showed `shown` of 70,000 bytes, one second
+/// apart and ending before `end_ms`. The first `reopened` were replayed in full,
+/// and every run had targeted lookups, which never move a budget.
+#[cfg(unix)]
+fn seed_budget_runs(
+    root: &Path,
+    tag: &str,
+    count: usize,
+    reopened: usize,
+    shown: u64,
+    end_ms: u64,
+) {
+    seed_budget_runs_for(root, ("other", "sh"), tag, count, reopened, shown, end_ms);
+}
+
+/// Seeds runs as `seed_budget_runs` does, recorded under `family` and `label`.
+#[cfg(unix)]
+fn seed_budget_runs_for(
+    root: &Path,
+    (family, label): (&str, &str),
+    tag: &str,
+    count: usize,
+    reopened: usize,
+    shown: u64,
+    end_ms: u64,
+) {
+    let runs = root.join(".justless/runs");
+    fs::create_dir_all(&runs).unwrap();
+    for i in 0..count {
+        let id = format!("run-{tag}{i:03}");
+        let directory = runs.join(&id);
+        fs::create_dir(&directory).unwrap();
+        let record = serde_json::json!({
+            "id": id, "status": 0, "raw_bytes": 70_000, "preview_bytes": shown,
+            "completed_ms": end_ms - (count - i) as u64 * 1000, "family": family,
+            "label": label, "diagnostics": [], "source_digests": {},
+        });
+        fs::write(directory.join("record.json"), record.to_string()).unwrap();
+        let recalls = serde_json::json!({
+            "full": u64::from(i < reopened), "range": 2, "search": 1, "context": 0,
+        });
+        fs::write(directory.join("recalls.json"), recalls.to_string()).unwrap();
+    }
+}
+
+/// Runs the long log and returns the new run's record. `--fresh` keeps a repeat
+/// from collapsing to an unchanged notice, which says nothing about the budget.
+#[cfg(unix)]
+fn budget_run(root: &Path, options: &[&str]) -> serde_json::Value {
+    let mut args = vec!["run", "--fresh"];
+    args.extend_from_slice(options);
+    args.extend(["--", "sh", "-c", BUDGET_LOG]);
+    let output = cli(root, &args);
+    assert!(output.status.success(), "{}", stderr(&output));
+    budget_run_record(root, &output)
+}
+
+/// The record of the run whose footer `output` printed.
+#[cfg(unix)]
+fn budget_run_record(root: &Path, output: &Output) -> serde_json::Value {
+    let id: String = stderr(output)
+        .rsplit_once("[justless ")
+        .unwrap()
+        .1
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let record = fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap();
+    serde_json::from_slice(&record).unwrap()
+}
+
+#[cfg(unix)]
+fn budget_shown(record: &serde_json::Value) -> u64 {
+    record["preview_bytes"].as_u64().unwrap()
+}
+
+#[cfg(unix)]
+fn budget_report(root: &Path) -> serde_json::Value {
+    let stats: serde_json::Value =
+        serde_json::from_str(&success(root, &["stats", "--json"])).unwrap();
+    stats["preview_budgets"].clone()
+}
+
+#[cfg(unix)]
+fn budget_row(root: &Path) -> serde_json::Value {
+    let report = budget_report(root);
+    report["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["family"] == "sh")
+        .cloned()
+        .unwrap_or_else(|| panic!("no sh budget in {report}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_budgets_rise_one_step_when_clipped_logs_are_reopened() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    // A clipped plain stream shows about half of its budget: 2,043 bytes of 4,096.
+    seed_budget_runs(root, "Seed", 9, 4, 2043, budget_now_ms());
+    let raised = budget_run(root, &[]);
+    assert_eq!(raised["family"], "other");
+    assert_eq!(raised["label"], "sh");
+    assert!((2100..=4096).contains(&budget_shown(&raised)), "{raised}");
+    let row = budget_row(root);
+    assert_eq!(row["budget_bytes"], 8192, "{row}");
+    assert_eq!(row["adjustment"], "raised");
+    assert_eq!(
+        row["reason"],
+        "raised from 4.0 KB: 4 of the last 9 clipped runs were reopened in full \
+         · since then 0 of 1 reopened, 5 needed"
+    );
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains(
+            "Preview budgets per stream (default 4.0 KB, adapting from 2.0 KB to 16.0 KB)\n  \
+             sh    8.0 KB · raised from 4.0 KB: 4 of the last 9 clipped runs were reopened in full"
+        ),
+        "{text}"
+    );
+
+    // The step is judged by the runs it produced, so the evidence that raised it
+    // does not raise it again on the next run.
+    assert!((2100..=4096).contains(&budget_shown(&budget_run(root, &[]))));
+    // Hook-routed runs share the budget. An explicit budget always wins and
+    // leaves the family's step alone.
+    assert!((2100..=4096).contains(&budget_shown(&budget_run(root, &["--hook"]))));
+    let state = fs::read_to_string(root.join(".justless/budgets.json")).unwrap();
+    assert!(budget_shown(&budget_run(root, &["--max-bytes", "1024"])) <= 1024);
+    assert_eq!(
+        fs::read_to_string(root.join(".justless/budgets.json")).unwrap(),
+        state
+    );
+    assert_eq!(budget_row(root)["budget_bytes"], 8192);
+    // The cached run sizes are derived data: a damaged cache is rebuilt from the
+    // records, and a run seeded after it was written is still read.
+    let index = root.join(".justless/budget-runs.json");
+    assert!(index.is_file());
+    fs::write(&index, "{").unwrap();
+    seed_budget_runs(root, "Late", 4, 4, 4094, budget_now_ms() + 10_000);
+    assert!(budget_shown(&budget_run(root, &[])) > 4096);
+    let rebuilt: serde_json::Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+    // Seeded, earlier real and late runs: the run being advised did not exist yet.
+    assert_eq!(rebuilt["runs"].as_object().unwrap().len(), 9 + 4 + 4);
+    assert_eq!(budget_row(root)["budget_bytes"], 16384);
+
+    // Two reopened of nine is under a quarter, and four runs are not a sample yet.
+    for (count, reopened, reason) in [
+        (
+            9,
+            2,
+            "default · 2 of the last 9 clipped runs were reopened in full",
+        ),
+        (
+            4,
+            4,
+            "default · 4 of 4 clipped runs reopened in full, 5 needed",
+        ),
+    ] {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        seed_budget_runs(root, "Seed", count, reopened, 2043, budget_now_ms());
+        assert_eq!(budget_row(root)["reason"], reason);
+        assert!(budget_shown(&budget_run(root, &[])) <= 2100);
+        assert!(!root.join(".justless/budgets.json").exists());
+    }
+
+    // A summary well under the budget, such as a failing `cargo test` in 634 bytes,
+    // is not clipped: reopening it keeps the budget, and stats says why.
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    seed_budget_runs(root, "Seed", 6, 6, 634, budget_now_ms());
+    let row = budget_row(root);
+    assert_eq!(row["budget_bytes"], 4096, "{row}");
+    assert_eq!(row["clipped_runs"], 0);
+    assert_eq!(row["summaries_reopened"], 6);
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains(
+            "  sh    4.0 KB · default · 6 of the last 6 shortened runs were reopened in full, \
+             but their previews were summaries under a third of the budget, \
+             which a larger budget would not change"
+        ),
+        "{text}"
+    );
+}
+
+/// The advisor names a command's family before it runs, as capture does after.
+/// Seeding runs under the family and label a real run recorded, then running
+/// again, must move that family's budget. The cases cover a lint profile, a
+/// profile family that differs from its label and a Git subcommand label.
+#[cfg(unix)]
+#[test]
+fn preview_budget_keys_match_the_families_runs_record() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    fs::write(root.join("app.py"), "x = 1\n").unwrap();
+    git(root, &["add", "app.py"]);
+    git(root, &["commit", "-q", "-m", "start"]);
+    fs::write(root.join("output.txt"), lint_fixture("mypy.txt").repeat(20)).unwrap();
+    let mypy = fake_program(root, "mypy", "cat output.txt\nexit 1\n");
+    let kubectl = fake_program(root, "kubectl", "echo 'NAME READY STATUS'\n");
+    let (mypy, kubectl) = (mypy.to_str().unwrap(), kubectl.to_str().unwrap());
+    for (tag, command, key) in [
+        ("Mypy", vec![mypy, "app.py"], "mypy"),
+        ("Pods", vec![kubectl, "get", "pods"], "kubectl get pods"),
+        ("Gitlog", vec!["git", "log"], "git log"),
+    ] {
+        let mut args = vec!["run", "--fresh", "--"];
+        args.extend(command);
+        let record = budget_run_record(root, &cli(root, &args));
+        let names = (
+            record["family"].as_str().unwrap(),
+            record["label"].as_str().unwrap(),
+        );
+        seed_budget_runs_for(root, names, tag, 5, 5, 2043, budget_now_ms());
+        cli(root, &args);
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(".justless/budgets.json")).unwrap())
+                .unwrap();
+        assert_eq!(state[key]["level"], 1, "{names:?}: {state}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_budgets_fall_after_a_clean_window_within_cap_floor_and_setting() {
+    // Twenty clipped runs that nobody reopened in full halve the budget.
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    seed_budget_runs(root, "Seed", 19, 0, 2043, budget_now_ms());
+    assert_eq!(
+        budget_row(root)["reason"],
+        "default · 0 of the last 19 clipped runs were reopened in full"
+    );
+    assert!((1100..=2100).contains(&budget_shown(&budget_run(root, &[]))));
+    let row = budget_row(root);
+    assert_eq!(row["budget_bytes"], 2048, "{row}");
+    assert_eq!(row["adjustment"], "lowered");
+    assert_eq!(
+        row["reason"],
+        "lowered from 4.0 KB: none of the last 20 clipped runs was reopened in full"
+    );
+    assert!(budget_shown(&budget_run(root, &[])) <= 1100);
+
+    // A configured cap and floor bound the steps.
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(
+        root.join(".justless.toml"),
+        "adaptive_cap_bytes = 6000\nadaptive_floor_bytes = 3000\n",
+    )
+    .unwrap();
+    seed_budget_runs(root, "Seed", 6, 6, 2043, budget_now_ms());
+    assert!((2100..=3100).contains(&budget_shown(&budget_run(root, &[]))));
+    // More reopened runs at the cap keep it there.
+    seed_budget_runs(root, "More", 6, 6, 2990, budget_now_ms() + 10_000);
+    assert!((2100..=3100).contains(&budget_shown(&budget_run(root, &[]))));
+    let row = budget_row(root);
+    assert_eq!(row["budget_bytes"], 6000, "{row}");
+    assert!(
+        row["reason"].as_str().unwrap().ends_with("· at the cap"),
+        "{row}"
+    );
+    let report = budget_report(root);
+    assert_eq!(report["floor_bytes"], 3000);
+    assert_eq!(report["cap_bytes"], 6000);
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "adaptive_floor_bytes = 3000\n").unwrap();
+    seed_budget_runs(root, "Seed", 20, 0, 2043, budget_now_ms());
+    let lowered = budget_shown(&budget_run(root, &[]));
+    assert!((1100..=1600).contains(&lowered), "{lowered}");
+
+    // Turned off, every run uses max_output_bytes and no step is saved.
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "adaptive_previews = false\n").unwrap();
+    seed_budget_runs(root, "Seed", 9, 9, 2043, budget_now_ms());
+    assert!(budget_shown(&budget_run(root, &[])) <= 2100);
+    assert!(!root.join(".justless/budgets.json").exists());
+    assert_eq!(budget_report(root)["adaptive"], false);
+    assert!(success(root, &["stats"]).contains(
+        "Preview budgets: adaptive_previews is off, so every run uses 4.0 KB per stream"
+    ));
+
+    // A cap below the default is rejected like any other invalid setting.
+    fs::write(root.join(".justless.toml"), "adaptive_cap_bytes = 1000\n").unwrap();
+    let output = cli(root, &["run", "--", "sh", "-c", "echo hi"]);
+    assert!(
+        stderr(&output).contains("adaptive_cap_bytes must be at least max_output_bytes"),
+        "{}",
+        stderr(&output)
+    );
+}

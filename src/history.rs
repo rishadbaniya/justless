@@ -443,6 +443,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "unredacted_replays": unredacted,
             "hook_pass_through": activity.bypasses,
             "proxy": proxy.as_ref().map(|p| p.json()),
+            "preview_budgets": crate::adaptive::stats_json(workspace),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -522,6 +523,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
                 }
             );
         }
+        crate::adaptive::print_stats(workspace);
     }
     let reopened: u64 = commands.iter().map(|f| f.reopened_runs).sum();
     let targeted: u64 = commands.iter().map(|f| f.targeted_lookups).sum();

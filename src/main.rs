@@ -1,3 +1,4 @@
+mod adaptive;
 mod agents;
 mod capture;
 mod context;
@@ -104,7 +105,7 @@ fn cli() -> Command<'static> {
                     Arg::new("max-bytes")
                         .long("max-bytes")
                         .value_name("N")
-                        .help("Maximum preview bytes per stream (default 4096)"),
+                        .help("Maximum preview bytes per stream (default 4096, adapted per command family; see `stats`)"),
                 )
                 .arg(
                     Arg::new("raw")
@@ -416,7 +417,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             } else if sub.is_present("max-bytes") {
                 read_num(sub, "max-bytes", 512)?
             } else {
-                workspace.settings()?.max_output_bytes
+                adaptive::preview_budget(&workspace, &command)?
             };
             let default_session =
                 std::env::var("JUSTLESS_SESSION").unwrap_or_else(|_| "terminal".into());

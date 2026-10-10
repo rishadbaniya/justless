@@ -73,6 +73,13 @@ pub struct Settings {
     pub redact_allow: Vec<String>,
     /// `[test]`: which changes run the full suite or have no test impact.
     pub test: crate::selection::TestSettings,
+    /// Adapt each command family's preview budget to how often agents reopened
+    /// its clipped logs in full. See `adaptive.rs`.
+    pub adaptive_previews: bool,
+    /// The highest adapted budget. Defaults to four times `max_output_bytes`.
+    pub adaptive_cap_bytes: Option<usize>,
+    /// The lowest adapted budget. Defaults to half of `max_output_bytes`, at least 512.
+    pub adaptive_floor_bytes: Option<usize>,
 }
 
 impl Default for Settings {
@@ -88,6 +95,9 @@ impl Default for Settings {
             redact: true,
             redact_allow: Vec::new(),
             test: crate::selection::TestSettings::default(),
+            adaptive_previews: true,
+            adaptive_cap_bytes: None,
+            adaptive_floor_bytes: None,
         }
     }
 }
@@ -253,6 +263,18 @@ impl Workspace {
         );
         ensure!(settings.max_runs > 0, "max_runs must be positive");
         ensure!(settings.max_run_bytes > 0, "max_run_bytes must be positive");
+        ensure!(
+            settings
+                .adaptive_cap_bytes
+                .is_none_or(|cap| cap >= settings.max_output_bytes),
+            "adaptive_cap_bytes must be at least max_output_bytes"
+        );
+        ensure!(
+            settings
+                .adaptive_floor_bytes
+                .is_none_or(|floor| (512..=settings.max_output_bytes).contains(&floor)),
+            "adaptive_floor_bytes must be at least 512 and at most max_output_bytes"
+        );
         Ok(settings)
     }
 }

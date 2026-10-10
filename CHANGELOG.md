@@ -26,6 +26,8 @@ User-visible changes to Justless are recorded here. No release has been publishe
 
 - `justless test --affected` runs only the tests that can reach the current Git changes, with Cargo, pytest, Jest, Vitest or Go, through the same capture as `run`. The result is labeled as a subset in the verdict and in `resume`, `history` and `stats`, and keeps the runner's exit status. It runs the full suite instead, and says why, for lockfiles, build or runner configuration, unindexed or unmentioned files, a changed symbol no test reaches or reaches only through inferred links, or a selection of 60% or more of the tests. `--dry-run` prints the plan, `--why RUN_ID` prints why each test ran, and `justless test` runs the full suite.
 
+- Without `--max-bytes`, each command family's preview budget adapts to the project's own history. It doubles, up to four times `max_output_bytes`, when at least a quarter of five or more clipped runs were reopened in full, and halves, down to half of it, after 20 clipped runs that nobody reopened. Each step is judged only by the runs made since the previous one, and an explicit `--max-bytes` always wins. Set `adaptive_previews = false` in `.justless.toml` to turn it off.
+
 ### Code navigation
 
 - A local index covers Rust, JavaScript, TypeScript and TSX, Python, Go, Java, Kotlin, Scala, C, C++, C#, Swift, Dart, Ruby, PHP, Lua, Zig, Bash, SQL and HCL, including Terraform. It refreshes on every query and reuses unchanged files.
@@ -68,4 +70,6 @@ User-visible changes to Justless are recorded here. No release has been publishe
 
 - `stats` reports bytes kept out of context by day and by command, with an estimated token count, full-log reopenings and runs whose output grew.
 - `statusline` prints the current Claude Code session's estimated savings on one line, from hook-routed runs and replaced Read, Grep and Glob results. `init --statusline` adds it to the project's local Claude Code settings, `.claude/settings.local.json`, and never replaces an existing status line.
+
+- `stats` reports bytes kept out of context by day and by command, with an estimated token count, full-log reopenings, runs whose output grew and each command family's preview budget with the reason for it.
 - `discover` reads Claude Code transcripts for the workspace and lists shell commands that bypassed Justless, with labels and byte counts only.

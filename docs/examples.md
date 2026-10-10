@@ -175,6 +175,18 @@ A command you type ends with the full footer shown above, which scripts can pars
 
 Every run is archived either way. `justless history` lists it, and the run ID in a marker works with `log`, `search` and `context --run`. When a rerun prints byte-for-byte the same output with the same exit status, the preview can collapse to `Output unchanged since run-…`.
 
+## Let preview budgets follow what agents reopen
+
+Without `--max-bytes`, each command family's preview budget moves with the project's own history. In a copy of this repository, seven hook-routed searches ran with `justless run --hook -- rg -n PATTERN` for `unwrap`, `expect`, `clone`, `pub fn`, `impl `, `fn ` and `Result<`. The second and fourth were replayed with `justless log RUN_ID`. Five clipped searches with two replays is more than a quarter, so the sixth search ran at 8 KB and showed 7.0 KB of 66.9 KB, where the first had shown 3.2 KB of 62.9 KB. Then 21 runs of `git log --stat -n N`, for N from 41 to 61, were never replayed in full, though three had a five-line `log` lookup. After 20 clipped runs, the 21st ran at 2 KB and showed 1012 B of 50.9 KB. `justless stats` ends with the reasons:
+
+```text
+Preview budgets per stream (default 4.0 KB, adapting from 2.0 KB to 16.0 KB)
+  git log    2.0 KB · lowered from 4.0 KB: none of the last 20 clipped runs was reopened in full · since then 0 of 1 reopened, 5 needed
+  rg         8.0 KB · raised from 4.0 KB: 2 of the last 5 clipped runs were reopened in full · since then 0 of 2 reopened, 5 needed
+```
+
+The `git log` budget is keyed by its command label because the `git` family covers every Git subcommand. Each later step is judged only by runs made at the new budget, and `adaptive_previews = false` in `.justless.toml` turns this off.
+
 ## Group search results by file
 
 When a search's stdout is larger than the preview budget, 4,096 bytes by default, Justless groups it by file. Files with the most matches come first. Each group shows its first matching lines exactly as printed and the range of its lines in the full log. This search over this repository's own source printed 58,723 bytes. The agent received 3,058 bytes, abridged here.
