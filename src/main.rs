@@ -30,8 +30,8 @@ mod selection;
 mod source;
 mod statusline;
 mod summary;
-mod uninstall;
 mod testrun;
+mod uninstall;
 mod workspace;
 
 use std::ffi::OsString;
