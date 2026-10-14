@@ -278,6 +278,22 @@ fn native_reads_preserve_explicit_windows_and_reject_mismatched_content() {
     event["tool_input"]["limit"] = json!(32);
     assert_eq!(post(&event), json!({}));
     event["tool_input"].as_object_mut().unwrap().remove("limit");
+    // `allow_large` asks for the whole file, so it arrives as Claude Code read it.
+    // Claude Code also accepts the flag as a string.
+    for flag in [json!(true), json!("true")] {
+        event["tool_input"]["allow_large"] = flag;
+        assert_eq!(post(&event), json!({}));
+    }
+    for flag in [json!(false), json!("false"), Value::Null] {
+        event["tool_input"]["allow_large"] = flag;
+        let result = post(&event);
+        let compact = &result["hookSpecificOutput"]["updatedToolOutput"]["file"];
+        assert!(!compact["content"].as_str().unwrap().contains("# detail"));
+    }
+    event["tool_input"]
+        .as_object_mut()
+        .unwrap()
+        .remove("allow_large");
     fs::write(&path, source.replace("42", "43")).unwrap();
     assert_eq!(post(&event), json!({}));
     let command = |cmd: &str| json!({"tool_name":"Bash","hook_event_name":"PreToolUse","tool_input":{"command":cmd,"workdir":subdir}});

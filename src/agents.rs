@@ -722,9 +722,15 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
         return None;
     }
     let args = &input["tool_input"];
+    // A range, or `allow_large`, asks for those lines as they are. Claude Code
+    // 2.1.327's Read schema describes `allow_large` as "Set to true to read a text
+    // file, or a line range of one, that is over the usual size limits", and reads
+    // the strings "true" and "false" as booleans.
     if ["limit", "offset", "pages"]
         .iter()
         .any(|key| args.get(key).is_some_and(|v| !v.is_null()))
+        || matches!(&args["allow_large"], Value::Bool(true))
+        || args["allow_large"] == "true"
     {
         return None;
     }
