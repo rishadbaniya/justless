@@ -12437,3 +12437,376 @@ fn a_merged_run_archives_one_capped_pipe_and_redacts_what_it_shows() {
     assert_eq!(fs::metadata(archive.join("stdout")).unwrap().len(), 1024);
     assert_eq!(fs::metadata(archive.join("stderr")).unwrap().len(), 0);
 }
+
+fn bash_result(stdout: &str) -> serde_json::Value {
+    serde_json::json!({"stdout":stdout,"stderr":"","interrupted":false,"isImage":false,
+        "noOutputExpected":false})
+}
+
+fn after_bash(
+    root: &Path,
+    cwd: &Path,
+    command: &str,
+    response: serde_json::Value,
+) -> serde_json::Value {
+    let event = serde_json::json!({"session_id":"s1","hook_event_name":"PostToolUse",
+        "tool_name":"Bash","cwd":cwd,"tool_input":{"command":command,"description":"check"},
+        "tool_response":response});
+    agent_hook(root, "hook-claude", "after-bash", event)
+}
+
+fn shown_stdout(output: &serde_json::Value) -> String {
+    output["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no rewrite: {output}"))
+        .to_owned()
+}
+
+fn marker_run(text: &str) -> String {
+    let last = text.lines().last().unwrap();
+    last.strip_prefix("[justless ")
+        .unwrap_or_else(|| panic!("no marker: {text}"))
+        .split([' ', ']'])
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
+    use serde_json::json;
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let grep = |dir: &Path, path: &str| {
+        let output = Command::new("grep")
+            .args(["-rn", "needle", path])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        stdout(&output)
+    };
+    let content = grep(&root, "src");
+
+    // Claude Code runs its own grep, which the command hook leaves alone. The
+    // result is grouped by file and ends with the run marker; every other field,
+    // such as Claude Code's own note in stderr, reaches Claude as it was.
+    let mut response = bash_result(&content);
+    response["stderr"] = json!("Shell cwd was reset to /work");
+    let output = after_bash(&root, &root, "grep -rn needle src", response.clone());
+    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+    let text = shown_stdout(&output);
+    assert!(text.len() * 3 < content.len(), "{text}");
+    assert!(
+        text.starts_with("grep: ") && text.contains("\nsrc/big.rs ×150 [stdout:"),
+        "{text}"
+    );
+    let last = text.lines().last().unwrap();
+    assert!(last.ends_with(" shown]"), "{last}");
+    for key in ["stderr", "interrupted", "isImage", "noOutputExpected"] {
+        assert_eq!(updated[key], response[key], "{key}");
+    }
+    // The archive replays the exact output and says how it was captured.
+    let id = marker_run(&text);
+    assert_eq!(success(&root, &["log", &id, "--stream", "stdout"]), content);
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        record["note"]
+            .as_str()
+            .unwrap()
+            .contains("after the command ran"),
+        "{record}"
+    );
+    assert!(success(&root, &["history"]).contains(&format!("{id} · grep · exit 0")));
+
+    // A `cd`, an environment prefix, `2>&1` and a filter that keeps whole lines
+    // select the same grouping. A subagent's session directory stays where it was,
+    // while the main session's follows the `cd`.
+    let nested = grep(&root.join("src"), ".");
+    for cwd in [root.clone(), root.join("src")] {
+        let output = after_bash(
+            &root,
+            &cwd,
+            "cd src && LC_ALL=C grep -rn needle . 2>&1 | head -1000",
+            bash_result(&nested),
+        );
+        let text = shown_stdout(&output);
+        assert!(text.contains("big.rs ×150 [stdout:"), "{text}");
+        let id = marker_run(&text);
+        assert!(success(&root, &["history"]).contains(&format!("{id} · grep | head · exit 0")));
+    }
+    // A `cd` from the home directory resolves through `HOME`, and the archived run
+    // answers `search` like any other.
+    let event = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash",
+        "cwd":root,"tool_input":{"command":"cd ~/src && grep -rn needle ."},
+        "tool_response":bash_result(&nested)});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["hook-claude", "after-bash"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    let output: serde_json::Value =
+        serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap();
+    let text = shown_stdout(&output);
+    assert!(text.contains("big.rs ×150 [stdout:"), "{text}");
+    let found = success(&root, &["search", &marker_run(&text), "needle_149"]);
+    assert!(found.contains("needle_149 = load(needle, 149);"), "{found}");
+
+    // A test report cut by `| tail` names no failing test, so the failure lines it
+    // could not attribute follow it, with their lines in the archive.
+    let mut log: String = (0..300)
+        .map(|i| format!("billing-trace step={i} state=ready\n"))
+        .collect();
+    log.push_str(
+        "\nthread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:\n\
+         assertion `left == right` failed\n  left: 106\n right: 105\n\nfailures:\n    \
+         total_includes_fee\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; \
+         0 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `--test checkout`\n",
+    );
+    let output = after_bash(
+        &root,
+        &root,
+        "cargo test 2>&1 | tail -320",
+        bash_result(&log),
+    );
+    let text = shown_stdout(&output);
+    for expected in [
+        "test result: FAILED. 0 passed; 1 failed",
+        "stdout:302: thread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:",
+        "stdout:304: left: 106",
+        "stdout:305: right: 105",
+        "stdout:312: error: test failed, to rerun pass `--test checkout`",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+    assert!(!text.contains("step=150"), "{text}");
+    let id = marker_run(&text);
+    assert!(success(&root, &["history"]).contains(&format!("{id} · cargo test | tail · exit 0")));
+
+    // An environment prefix leaves a passing test run to its summary.
+    let passing: String = (0..400)
+        .map(|i| format!("test pricing::case_{i} ... ok\n"))
+        .chain(std::iter::once(
+            "\ntest result: ok. 400 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s\n".to_owned(),
+        ))
+        .collect();
+    let output = after_bash(
+        &root,
+        &root,
+        "RUST_BACKTRACE=1 cargo test",
+        bash_result(&passing),
+    );
+    let text = shown_stdout(&output);
+    assert!(
+        text.starts_with("0 reported failing test(s)\ntest result: ok. 400 passed;"),
+        "{text}"
+    );
+    assert!(!text.contains("Error lines"), "{text}");
+
+    // A compile error interleaved after a passing target is not hidden by the
+    // report of the target that ran.
+    let broken = format!(
+        "{passing}error[E0425]: cannot find value `rate` in this scope\n --> tests/api.rs:4:13\n\
+         error: could not compile `shop` (test \"api\") due to 1 previous error\n"
+    );
+    let text = shown_stdout(&after_bash(
+        &root,
+        &root,
+        "cargo test 2>&1 | tail -500",
+        bash_result(&broken),
+    ));
+    assert!(
+        text.contains(
+            "Error lines not shown above:\nstdout:403: error[E0425]: cannot find value `rate` in this scope\n\
+             stdout:405: error: could not compile `shop` (test \"api\") due to 1 previous error\n"
+        ),
+        "{text}"
+    );
+
+    // Claude Code reports exit 1 as a valid result only with an interpretation,
+    // and the marker keeps that status.
+    let diff: String = (0..60)
+        .map(|i| {
+            format!(
+                "diff --git a/src/f{i}.rs b/src/f{i}.rs\nindex 1111111..2222222 100644\n--- a/src/f{i}.rs\n+++ b/src/f{i}.rs\n@@ -1,3 +1,3 @@\n fn f() {{\n-    old({i});\n+    new({i});\n }}\n"
+            )
+        })
+        .collect();
+    let mut response = bash_result(&diff);
+    response["returnCodeInterpretation"] = json!("Changes found");
+    let text = shown_stdout(&after_bash(&root, &root, "git diff --exit-code", response));
+    assert!(text.starts_with("60 diff section(s)\n"), "{text}");
+    assert!(text.trim_end().ends_with(" · exit 1]"), "{text}");
+
+    // A result over Claude Code's inline limit holds only the start of the output
+    // and points to the full copy in the session's tool-results directory. The
+    // whole copy is archived and grouped, and the result is shown inline.
+    let session = TempDir::new().unwrap();
+    let results = session.path().join("tool-results");
+    fs::create_dir(&results).unwrap();
+    let full = content.repeat(4);
+    let saved = results.join("b1.txt");
+    fs::write(&saved, &full).unwrap();
+    let mut response = bash_result(&full[..30000]);
+    response["persistedOutputPath"] = json!(saved);
+    response["persistedOutputSize"] = json!(full.len());
+    response["stdoutHoldsOutputEnd"] = json!(false);
+    let output = after_bash(&root, &root, "grep -rn needle src", response.clone());
+    let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
+    for key in [
+        "persistedOutputPath",
+        "persistedOutputSize",
+        "stdoutHoldsOutputEnd",
+    ] {
+        assert!(updated.get(key).is_none(), "{key}: {updated}");
+    }
+    let text = shown_stdout(&output);
+    assert!(text.contains("src/big.rs ×600"), "{text}");
+    let id = marker_run(&text);
+    assert_eq!(success(&root, &["log", &id, "--stream", "stdout"]), full);
+
+    // A copy cut at Claude Code's limit or holding another result is not used.
+    let mut short = response.clone();
+    short["persistedOutputSize"] = json!(full.len() + 1);
+    let mut other = response.clone();
+    other["persistedOutputPath"] = json!(results.join("b2.txt"));
+    fs::write(results.join("b2.txt"), "other output\n".repeat(4000)).unwrap();
+    let runs = || fs::read_dir(root.join(".justless/runs")).unwrap().count();
+    let before = runs();
+    for response in [short, other] {
+        assert_eq!(
+            after_bash(&root, &root, "grep -rn needle src", response),
+            json!({})
+        );
+    }
+
+    // Routed and recovery commands, file readers, reshaped output, redirections,
+    // substitutions, subshells, background jobs, loops, comments, here-documents
+    // and lists of different tools reach Claude unchanged.
+    for command in [
+        "justless run --hook -- grep -rn needle src",
+        "cargo fmt && justless run --hook -- cargo test",
+        "cd src && justless log run-abc | head -400",
+        "/opt/bin/justless recall abc",
+        "cat src/big.rs",
+        "sed -n 1,400p src/big.rs",
+        "python3 report.py",
+        "grep -rn needle src | cut -c1-40",
+        "grep -rn needle src | awk '{print $1}'",
+        "grep -rn needle src | grep -n call",
+        "grep -rn needle src | sort | uniq -c",
+        "grep -rn needle src > matches.txt",
+        "grep -rn needle src &> matches.txt",
+        "grep -rn $(echo needle) src",
+        "grep -rn needle src &",
+        "(cd src && grep -rn needle .)",
+        "cargo test 2>&1; grep -rn needle src",
+        "for f in src/*; do grep -rn needle $f; done",
+        "cd ~ && grep -rn needle .",
+        "cd - && grep -rn needle .",
+        "grep -rn needle src # all",
+        "grep -rn needle src <<END",
+    ] {
+        assert_eq!(
+            after_bash(&root, &root, command, bash_result(&content)),
+            json!({}),
+            "{command}"
+        );
+    }
+    // Output that already carries a marker, small output and shapes this handler
+    // does not know stay as they were.
+    let marked = format!("{content}[justless run-Abc123 · 2.0 KB of 9.1 KB shown]\n");
+    let small = "src/big.rs:1:let needle_0 = load(needle, 0);\n";
+    for response in [
+        bash_result(&marked),
+        bash_result(small),
+        json!(content),
+        json!({ "stdout": content }),
+    ] {
+        assert_eq!(
+            after_bash(&root, &root, "grep -rn needle src", response),
+            json!({})
+        );
+    }
+    // So do results Claude Code did not finish in the foreground.
+    for (key, value) in [
+        ("interrupted", json!(true)),
+        ("isImage", json!(true)),
+        ("backgroundTaskId", json!("b1")),
+        ("timedOutAfterMs", json!(120000)),
+        ("structuredContent", json!([{"type":"text","text":"x"}])),
+    ] {
+        let mut response = bash_result(&content);
+        response[key] = value;
+        assert_eq!(
+            after_bash(&root, &root, "grep -rn needle src", response),
+            json!({}),
+            "{key}"
+        );
+    }
+    let event = json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd":root,
+        "tool_input":{"command":"grep -rn needle src","run_in_background":true},
+        "tool_response":bash_result(&content)});
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-bash", event),
+        json!({})
+    );
+    // Nothing above was archived.
+    assert_eq!(runs(), before);
+
+    // Input that is not JSON still answers with no change.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["hook-claude", "after-bash"])
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{not json").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(stdout(&output).trim(), "{}");
+}
+
+#[test]
+fn claude_setup_adds_the_bash_output_hook_to_existing_installs() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::create_dir(root.join(".claude")).unwrap();
+    // An install from before this hook existed, with a Bash hook of the user's own.
+    let earlier = serde_json::json!({"hooks":{"PostToolUse":[
+        {"matcher":"^Read$","hooks":[{"type":"command","timeout":5,"command":"justless hook-claude after-read"}]},
+        {"matcher":"^Bash$","hooks":[{"type":"command","command":"./scripts/audit.sh"}]}
+    ]}});
+    fs::write(root.join(".claude/settings.json"), earlier.to_string()).unwrap();
+    success(root, &["init", "--hooks", "--agent", "claude"]);
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".claude/settings.json")).unwrap()).unwrap();
+    let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
+    let bash: Vec<_> = post
+        .iter()
+        .filter(|entry| entry["hooks"][0]["command"] == "justless hook-claude after-bash")
+        .collect();
+    assert_eq!(bash.len(), 1, "{settings:#}");
+    assert_eq!(bash[0]["matcher"], "^Bash$");
+    assert_eq!(bash[0]["hooks"][0]["timeout"], 10);
+    assert!(
+        post.iter()
+            .any(|entry| entry["hooks"][0]["command"] == "./scripts/audit.sh")
+    );
+    // Running setup again changes nothing.
+    let again = success(root, &["init", "--hooks", "--agent", "claude"]);
+    assert!(!again.contains("settings.json"), "{again}");
+}

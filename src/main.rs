@@ -22,6 +22,7 @@ mod merge;
 mod observations;
 mod pack;
 mod polyglot;
+mod postroute;
 mod proxy;
 mod redact;
 mod runners;
@@ -339,6 +340,7 @@ fn cli() -> Command<'static> {
                     "before-command",
                     "after-read",
                     "after-search",
+                    "after-bash",
                     "after-compact",
                     "before-compact",
                 ]))

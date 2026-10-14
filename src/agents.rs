@@ -264,6 +264,9 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         ),
         ("PostToolUse", "after-read", "^Read$", 5),
         ("PostToolUse", "after-search", "^(Grep|Glob)$", 5),
+        // Bash output the command hook left alone, such as a pipe or Claude Code's
+        // own grep, is archived and compacted after it ran.
+        ("PostToolUse", "after-bash", "^Bash$", 10),
         // Compaction drops earlier tool results. Restore the run IDs and source ranges
         // that recover them. This handler stays synchronous so its context is applied
         // before the next model request.
@@ -272,6 +275,7 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
     ] {
         let supported = match mode {
             "after-read" | "after-search" | "before-compact" => agent == Agent::Claude,
+            "after-bash" => agent == Agent::Claude,
             "after-compact" => matches!(agent, Agent::Claude | Agent::Codex),
             _ => true,
         };
@@ -606,6 +610,13 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
         claude_read(workspace, &input).unwrap_or_else(|| json!({}))
     } else if agent == Agent::Claude && mode == "after-search" {
         crate::search::claude_tool_output(workspace, &input).unwrap_or_else(|| json!({}))
+    } else if agent == Agent::Claude && mode == "after-bash" {
+        // Any failure, even a panic, answers with no change, so Claude reads the
+        // original output.
+        std::panic::catch_unwind(|| crate::postroute::claude_bash(workspace, &input))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| json!({}))
     } else if mode == "after-compact"
         && input["hook_event_name"] == "SessionStart"
         && input["source"]
@@ -1523,6 +1534,28 @@ fn supported_command(command: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Whether the command hook would route these words as one plain command, for a
+/// command that already ran in another form, such as behind a pipe. Characters a
+/// literal command may not contain, such as `$` or `\` in a grep pattern, never
+/// decide whether a tool is supported, so they are replaced first.
+pub(crate) fn supported_words(words: &[&str]) -> bool {
+    let words: Vec<String> = words
+        .iter()
+        .map(|word| {
+            word.chars()
+                .map(|c| {
+                    if matches!(c, '$' | '\\' | '`' | '"') || c.is_control() {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    shlex::try_join(words.iter().map(String::as_str)).is_ok_and(|line| supported_command(&line))
 }
 
 fn literal_command(command: &str) -> Option<Vec<String>> {

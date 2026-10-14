@@ -157,6 +157,10 @@ pub struct Run {
     /// The run was routed by an agent hook rather than typed by a person.
     #[serde(default)]
     pub hook: bool,
+    /// How output that Justless did not capture itself reached the archive, such
+    /// as a Claude Code Bash result recorded after the command ran.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
     /// The command line, its directory relative to the root (empty at the root) and
     /// the session, so `learn` can pair a failure with its correction. A command line
     /// that may carry a credential is left empty and marked withheld.
@@ -211,6 +215,7 @@ impl Run {
             unchanged: false,
             footer_bytes: 0,
             hook,
+            note: String::new(),
             argv: Vec::new(),
             argv_withheld: false,
             cwd: String::new(),
@@ -340,15 +345,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         command.arg(exclude);
     }
     command.args(&args[1..]);
-    let family = family.unwrap_or_else(|| match selection.profile {
-        Some(
-            crate::filters::Profile::Lint
-            | crate::filters::Profile::Search
-            | crate::filters::Profile::Listing,
-        ) => crate::filters::tool_label(args),
-        Some(profile) => profile.label().to_owned(),
-        None => crate::summary::family(args),
-    });
+    let family = family.unwrap_or_else(|| family_of(args, &selection));
     // A read-only checkout or sandbox must not stop the command itself.
     let mut archive = match Archive::create(workspace, &family, &history::label(&words), hook) {
         Ok(archive) => archive,
@@ -391,6 +388,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         merged,
         redactor,
         retention: (settings.max_runs, settings.max_archive_bytes),
+        origin: None,
     };
     match capture.record(&mut archive, family, status, stdout_preview) {
         Ok((previews, footer, _)) => {
@@ -419,6 +417,85 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
     }
     signals::reraise(exited);
     Ok(status)
+}
+
+/// How stats, history and resume label a run of `args`.
+fn family_of(args: &[OsString], selection: &crate::filters::Selection) -> String {
+    match selection.profile {
+        Some(
+            crate::filters::Profile::Lint
+            | crate::filters::Profile::Search
+            | crate::filters::Profile::Listing,
+        ) => crate::filters::tool_label(args),
+        Some(profile) => profile.label().to_owned(),
+        None => crate::summary::family(args),
+    }
+}
+
+/// A command that ran elsewhere, such as in Claude Code's own shell, whose output
+/// Justless archives after the fact.
+pub struct Origin {
+    /// The whole command line. It keys the run apart from runs Justless started, so
+    /// a piped `cargo test | tail` never supersedes or compares with `cargo test`.
+    /// It is hashed into the key and not stored.
+    pub command: String,
+    /// How `history` and `resume` name the run, such as `cargo test | tail`.
+    pub label: String,
+    /// Stored in the run record: how the output was captured and what it may lack.
+    pub note: String,
+}
+
+/// What a recorded run shows the agent: each stream's preview, with secrets
+/// replaced as in any run's preview, and the footer.
+pub struct Recorded {
+    pub run: Run,
+    pub previews: Vec<(Stream, Vec<u8>)>,
+    pub footer: String,
+}
+
+/// Archive output that another program captured and compact it exactly as a
+/// hook-routed `execute` of `args` would, without rerun comparisons. `output` is
+/// stored as stdout within `max_run_bytes`, and `status` is the exit status
+/// reported with it.
+pub fn record(
+    workspace: &Workspace,
+    args: &[OsString],
+    output: &[u8],
+    status: i32,
+    max_bytes: usize,
+    session: &str,
+    origin: &Origin,
+) -> Result<Recorded> {
+    ensure!(!args.is_empty(), "no command to record");
+    let settings = workspace.settings()?;
+    let selection = crate::filters::Selection::for_run(args, &settings.filters)?;
+    let redactor = crate::redact::for_run(workspace)?;
+    let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+    let family = family_of(args, &selection);
+    let mut archive = Archive::create(workspace, &family, &origin.label, true)?;
+    archive.store(output, settings.max_run_bytes)?;
+    let capture = Capture {
+        workspace,
+        args,
+        words: &words,
+        selection: &selection,
+        max_bytes,
+        session,
+        fresh: true,
+        hook: true,
+        agent_footer: true,
+        merge: false,
+        merged: false,
+        redactor,
+        retention: (settings.max_runs, settings.max_archive_bytes),
+        origin: Some(origin),
+    };
+    let (previews, footer, run) = capture.record(&mut archive, family, status, None)?;
+    Ok(Recorded {
+        run,
+        previews,
+        footer,
+    })
 }
 
 /// Run without recording, with the same exit statuses a shell reports.
@@ -539,6 +616,22 @@ impl Archive {
             late: false,
             active,
         })
+    }
+
+    /// Store output that another program captured as stdout, at most `cap` bytes of
+    /// it, and leave stderr empty.
+    fn store(&mut self, output: &[u8], cap: u64) -> Result<()> {
+        let mut writers = std::mem::take(&mut self.writers).into_iter();
+        let Some(mut stdout) = writers.next() else {
+            anyhow::bail!("the output is already stored");
+        };
+        let kept = &output[..output.len().min(usize::try_from(cap).unwrap_or(usize::MAX))];
+        stdout.write_all(kept).context("archive stdout")?;
+        self.captured[Stream::Stdout.index()] = Captured {
+            archived: kept.len() as u64,
+            produced: output.len() as u64,
+        };
+        Ok(())
     }
 
     /// The final record is saved, so the run no longer needs its lock file. The
@@ -1161,6 +1254,8 @@ struct Capture<'a> {
     redactor: Option<&'a crate::redact::Redactor>,
     /// The most runs and archive bytes to keep.
     retention: (usize, u64),
+    /// Output another program captured, recorded after its command ran.
+    origin: Option<&'a Origin>,
 }
 
 impl Capture<'_> {
@@ -1187,6 +1282,7 @@ impl Capture<'_> {
             merged,
             redactor,
             retention,
+            origin,
         } = *self;
         let directory = archive.directory.clone();
         let lengths = archive.lengths();
@@ -1202,7 +1298,8 @@ impl Capture<'_> {
             produced_bytes: archive.produced(),
             unfinished: false,
             drained: archive.late,
-            label: history::label(words),
+            label: origin.map_or_else(|| history::label(words), |o| o.label.clone()),
+            note: origin.map(|o| o.note.clone()).unwrap_or_default(),
             argv: if argv_withheld { Vec::new() } else { argv },
             argv_withheld,
             cwd: workspace
@@ -1262,6 +1359,7 @@ impl Capture<'_> {
         let mut key = Sha256::new();
         for field in std::iter::once(workspace.cwd.as_os_str().as_encoded_bytes())
             .chain(args.iter().map(|arg| arg.as_encoded_bytes()))
+            .chain(origin.map(|o| o.command.as_bytes()))
         {
             key.update((field.len() as u64).to_le_bytes());
             key.update(field);
