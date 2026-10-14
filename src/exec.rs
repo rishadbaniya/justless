@@ -392,6 +392,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             hook: false,
             agent_footer: true,
             family: Some(format!("exec {}", lang.label())),
+            merge: false,
             // Script output is mostly data, so a long stdout keeps whole lines and names
             // the ones left out, or is ranked against the intent.
             stdout_preview: Some(Box::new(move |stdout: &Path, id: &str| match intent {

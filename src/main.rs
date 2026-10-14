@@ -18,6 +18,7 @@ mod listing;
 mod lookup;
 mod map;
 mod mcp;
+mod merge;
 mod observations;
 mod pack;
 mod polyglot;
@@ -118,6 +119,12 @@ fn cli() -> Command<'static> {
                         .long("hook")
                         .hide(true)
                         .help("Routed by an agent hook: print a footer only when it adds information"),
+                )
+                .arg(
+                    Arg::new("merge")
+                        .long("merge")
+                        .hide(true)
+                        .help("Archive stderr with stdout in the order written, for a command run with 2>&1"),
                 )
                 .arg(
                     Arg::new("command")
@@ -437,6 +444,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 sub.value_of("session").unwrap_or(&default_session),
                 sub.is_present("fresh"),
                 sub.is_present("hook"),
+                sub.is_present("merge"),
             );
         }
         ("log", sub) => {

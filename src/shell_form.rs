@@ -3,9 +3,10 @@
 //! Leading `NAME=value` assignments stay in front of `justless run`, so the variables
 //! reach both Justless and the command, while the command words alone choose the
 //! output profile. A final `2>&1` stays at the end, so it merges the stdout and
-//! stderr previews Justless prints, the way it merged the command's own streams.
+//! stderr Justless prints, and the hook adds `--merge`, so the command writes both
+//! streams in order to one archive, the way the original `2>&1` merged them.
 //! `RUST_BACKTRACE=1 cargo test 2>&1` becomes
-//! `RUST_BACKTRACE=1 justless run --hook -- cargo test 2>&1`.
+//! `RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1`.
 use std::ops::Range;
 
 /// The redirection that merges stderr into stdout.
@@ -42,6 +43,94 @@ pub fn merge_at(bytes: &[u8], at: usize) -> bool {
             || next.starts_with(b"||"))
 }
 
+/// Whether the text that follows a wrapped command's words starts with the final
+/// `2>&1` that `parse` left out of them.
+pub fn merges(rest: &str) -> bool {
+    rest.trim_start_matches([' ', '\t'])
+        .strip_prefix(MERGE)
+        .is_some_and(|after| after.is_empty() || after.starts_with([' ', '\t', ';']))
+}
+
+/// Whether a command of a list may change, for the commands after it, a variable
+/// that decides which Justless runs or how. That is a command made only of
+/// assignments, such as `PATH=/x` or `PATH=/x 2>&1`, an assignment before a POSIX
+/// special builtin such as `:`, which the shell keeps, or `export`, `declare`,
+/// `typeset`, `readonly`, `local` or `unset` naming such a variable, also behind
+/// `builtin` or `command`. A hook then passes the whole list through, as for a
+/// change of directory.
+pub fn steers_justless(segment: &str) -> bool {
+    let Some(words) = words(segment) else {
+        return true;
+    };
+    // Each word with its quotes removed.
+    let words: Vec<String> = words
+        .iter()
+        .map(|word| {
+            shlex::split(&segment[word.clone()])
+                .and_then(|word| word.into_iter().next())
+                .unwrap_or_default()
+        })
+        .collect();
+    let words = match words.as_slice() {
+        [rest @ .., last] if last == MERGE => rest,
+        all => all,
+    };
+    // The variable a word names, as in `NAME=value`, or `NAME+=value`, which appends
+    // in bash and zsh.
+    let name = |word: &str| {
+        let name = word.split_once('=')?.0;
+        let name = name.strip_suffix('+').unwrap_or(name);
+        (name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| name.to_owned())
+    };
+    let program = words.iter().position(|word| name(word).is_none());
+    let assigned = words[..program.unwrap_or(words.len())]
+        .iter()
+        .filter_map(|word| name(word))
+        .any(|name| steers(&name));
+    let Some(program) = program else {
+        return assigned;
+    };
+    let mut rest = words[program..]
+        .iter()
+        .map(String::as_str)
+        .skip_while(|word| matches!(*word, "builtin" | "command"));
+    let Some(program) = rest.next() else {
+        return assigned;
+    };
+    let declares = matches!(
+        program,
+        "export" | "declare" | "typeset" | "readonly" | "local" | "unset"
+    );
+    (assigned && SPECIAL.contains(&program))
+        || (declares
+            && rest.any(|word| {
+                let name = word.split_once('=').map_or(word, |(name, _)| name);
+                steers(name.strip_suffix('+').unwrap_or(name))
+            }))
+}
+
+/// POSIX special builtins, after which a shell keeps the assignments that precede
+/// them.
+const SPECIAL: &[&str] = &[
+    ":", ".", "break", "continue", "eval", "exec", "exit", "export", "readonly", "return", "set",
+    "shift", "times", "trap", "unset",
+];
+
+/// Whether a variable decides which Justless the shell starts or how it runs:
+/// `PATH`, and `path`, which zsh ties to it, `LD_*` and `DYLD_*`, which load code
+/// into it, and `JUSTLESS_*`, which configure it. An empty name stands for an
+/// assignment the shell would not take literally.
+fn steers(name: &str) -> bool {
+    name.is_empty()
+        || name == "PATH"
+        || name == "path"
+        || name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || name.starts_with("JUSTLESS_")
+}
+
 /// Split a trimmed simple command into its assignments and command words, leaving
 /// out a final `2>&1`. Returns `None` for unbalanced quotes or when nothing but
 /// assignments remains. A `2>&1` anywhere else stays in the command words, where
@@ -65,33 +154,38 @@ pub fn parse(segment: &str) -> Option<Form> {
 }
 
 impl Form {
-    /// Whether Justless itself runs unchanged under these assignments. `PATH`, and
-    /// `path`, which zsh ties to it, decide which `justless` the shell starts,
-    /// `LD_*` and `DYLD_*` load code into it, and `JUSTLESS_*` configure it, so a
-    /// command with any of them is left whole.
+    /// Whether Justless itself runs unchanged under these assignments. A command
+    /// with a variable that `steers` Justless is left whole.
     pub fn keeps_justless(&self, segment: &str) -> bool {
-        self.variables(segment).all(|(name, _)| {
-            !name.is_empty()
-                && name != "PATH"
-                && name != "path"
-                && !name.starts_with("LD_")
-                && !name.starts_with("DYLD_")
-                && !name.starts_with("JUSTLESS_")
-        })
+        self.variables(segment).all(|(name, _)| !steers(&name))
     }
 
     /// Whether a client that may run the rewritten command without asking can take
     /// these assignments: display and diagnostic settings with plain values only.
     /// Variables such as `RUSTFLAGS`, `NODE_OPTIONS`, `PYTEST_ADDOPTS` or
     /// `GIT_EXTERNAL_DIFF` can run other code or write elsewhere, so they are left
-    /// to the client's own approval, as is a value with a path.
+    /// to the client's own approval, as is a value with a path. `make` reads every
+    /// environment variable as a make variable, which a recipe may use, so it takes
+    /// no assignment, as it takes no `NAME=value` argument.
     pub fn approvable(&self, segment: &str) -> bool {
-        self.variables(segment).all(|(name, value)| {
-            (DISPLAY.contains(&name.as_str()) || name.starts_with("LC_"))
-                && value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "_.,:=@%+-".contains(c))
-        })
+        let make = || {
+            shlex::split(&segment[self.command.clone()]).is_none_or(|words| {
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                crate::filters::unwrap_tool(&words)
+                    .first()
+                    .is_some_and(|program| {
+                        let name = std::path::Path::new(program).file_name();
+                        name.is_some_and(|name| name == "make" || name == "gmake")
+                    })
+            })
+        };
+        (self.assignments.is_empty() || !make())
+            && self.variables(segment).all(|(name, value)| {
+                (DISPLAY.contains(&name.as_str()) || name.starts_with("LC_"))
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_.,:=@%+-".contains(c))
+            })
     }
 
     /// Each assignment's name and its value after quote removal. An assignment the
@@ -110,9 +204,10 @@ impl Form {
 }
 
 /// Variables that only change how a tool reports, colors, localizes or paces its
-/// output, so setting them cannot make a build or test run other code.
+/// output, so setting them cannot make a build or test run other code. `CI` and
+/// `NODE_ENV` are left out: builds, test setups and Makefiles branch on them, for
+/// example to choose a production configuration or skip a step.
 const DISPLAY: &[&str] = &[
-    "CI",
     "NO_COLOR",
     "FORCE_COLOR",
     "CLICOLOR",
@@ -133,7 +228,6 @@ const DISPLAY: &[&str] = &[
     "CARGO_TERM_QUIET",
     "CARGO_INCREMENTAL",
     "CARGO_BUILD_JOBS",
-    "NODE_ENV",
     "PYTHONUNBUFFERED",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONHASHSEED",

@@ -11862,30 +11862,33 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
     // Every client wraps the command words in place, so assignments still reach the
     // command and `2>&1` merges the previews Justless prints.
     for (command, expected) in [
-        ("cargo test 2>&1", "justless run --hook -- cargo test 2>&1"),
+        (
+            "cargo test 2>&1",
+            "justless run --hook --merge -- cargo test 2>&1",
+        ),
         (
             "RUST_BACKTRACE=1 cargo test",
             "RUST_BACKTRACE=1 justless run --hook -- cargo test",
         ),
         (
-            "RUST_LOG=\"debug\" CI=1  cargo test   2>&1",
-            "RUST_LOG=\"debug\" CI=1  justless run --hook -- cargo test   2>&1",
+            "RUST_LOG=\"debug\" NO_COLOR=1  cargo test   2>&1",
+            "RUST_LOG=\"debug\" NO_COLOR=1  justless run --hook --merge -- cargo test   2>&1",
         ),
         (
             "cd web && RUST_BACKTRACE=full npm test 2>&1 && git status 2>&1",
-            "cd web && RUST_BACKTRACE=full justless run --hook -- npm test 2>&1 && justless run --hook -- git status 2>&1",
+            "cd web && RUST_BACKTRACE=full justless run --hook --merge -- npm test 2>&1 && justless run --hook --merge -- git status 2>&1",
         ),
         (
             "git diff 2>&1; git status",
-            "justless run --hook -- git diff 2>&1; justless run --hook -- git status",
+            "justless run --hook --merge -- git diff 2>&1; justless run --hook -- git status",
         ),
         (
             "cargo build 2>&1 || cargo test\t2>&1",
-            "justless run --hook -- cargo build 2>&1 || justless run --hook -- cargo test\t2>&1",
+            "justless run --hook --merge -- cargo build 2>&1 || justless run --hook --merge -- cargo test\t2>&1",
         ),
         (
             "LC_ALL=C NO_COLOR=1 TERM=dumb git log --oneline -5 2>&1",
-            "LC_ALL=C NO_COLOR=1 TERM=dumb justless run --hook -- git log --oneline -5 2>&1",
+            "LC_ALL=C NO_COLOR=1 TERM=dumb justless run --hook --merge -- git log --oneline -5 2>&1",
         ),
         // A quoted `2>&1` is an argument.
         (
@@ -11908,7 +11911,7 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         ),
         (
             "NODE_OPTIONS=--require=./hook.js npm test 2>&1",
-            "NODE_OPTIONS=--require=./hook.js justless run --hook -- npm test 2>&1",
+            "NODE_OPTIONS=--require=./hook.js justless run --hook --merge -- npm test 2>&1",
         ),
         (
             "GIT_EXTERNAL_DIFF=./x git diff",
@@ -11924,11 +11927,37 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         ),
         (
             "RUST_BACKTRACE=1 cargo test 2>&1 && git push",
-            "RUST_BACKTRACE=1 justless run --hook -- cargo test 2>&1 && git push",
+            "RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1 && git push",
         ),
         (
             "PATH=/tmp/bin cargo test && git status",
             "PATH=/tmp/bin cargo test && justless run --hook -- git status",
+        ),
+        (
+            "NODE_ENV=production npm test",
+            "NODE_ENV=production justless run --hook -- npm test",
+        ),
+        (
+            "NODE_ENV=production pytest",
+            "NODE_ENV=production justless run --hook -- pytest",
+        ),
+        ("CI=1 make test", "CI=1 justless run --hook -- make test"),
+        (
+            "CI=true cargo test",
+            "CI=true justless run --hook -- cargo test",
+        ),
+        (
+            "TERM=dumb make test 2>&1",
+            "TERM=dumb justless run --hook --merge -- make test 2>&1",
+        ),
+        // Setting other variables for later commands changes nothing Justless needs.
+        (
+            "FOO=1; cargo test",
+            "FOO=1; justless run --hook -- cargo test",
+        ),
+        (
+            "export FOO=1 && cargo test",
+            "export FOO=1 && justless run --hook -- cargo test",
         ),
     ] {
         for (client, rewritten) in rewrites(&root, command) {
@@ -11948,6 +11977,26 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         "LD_LIBRARY_PATH=. cargo test",
         "DYLD_INSERT_LIBRARIES=./x.dylib cargo test",
         "JUSTLESS_SESSION=x cargo test",
+        // The same variables set for the commands after them.
+        "PATH=/x 2>&1 && cargo test",
+        "PATH=/x; cargo test",
+        "PATH=/x && cargo test",
+        "PATH+=:/x; cargo test",
+        "path=/x; cargo test",
+        "export PATH=/x && cargo test",
+        "export FOO=1 PATH=/x && cargo test",
+        "builtin export PATH=/x; cargo test",
+        "command export 'PATH=/x' && cargo test",
+        "declare -x PATH=/x; cargo test",
+        "typeset -x PATH=/x; cargo test",
+        "readonly PATH=/x; cargo test",
+        "unset PATH; cargo test",
+        "PATH=/x : && cargo test",
+        "PATH=/x export FOO=1 && cargo test",
+        "JUSTLESS_SESSION=x; cargo test",
+        "LD_PRELOAD=./x.so; cargo test",
+        "export DYLD_INSERT_LIBRARIES=./x.dylib; cargo test",
+        "cargo fmt && PATH=/x; cargo test",
         // Other redirections, and a `2>&1` anywhere but last.
         "cargo test 2>&1 | tail -50",
         "cargo test >&2",
@@ -12023,7 +12072,7 @@ fn routed_assignments_reach_the_command_and_merged_previews_keep_its_status() {
     let rewritten = rewrites(&root, original)[0].1.clone().unwrap();
     assert_eq!(
         rewritten,
-        "RUST_BACKTRACE=1 justless run --hook -- cargo test 2>&1"
+        "RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1"
     );
     let plain = shell(original);
     let routed = shell(&rewritten);
@@ -12040,10 +12089,11 @@ fn routed_assignments_reach_the_command_and_merged_previews_keep_its_status() {
         .strip_prefix("[justless ")
         .and_then(|rest| rest.strip_suffix(" · exit 101]\n"))
         .unwrap_or_else(|| panic!("{footer:?}"));
-    // Each stream is archived exactly, and the profile comes from the command words.
+    // The merged stream is archived exactly, and the profile comes from the command
+    // words.
     assert_eq!(
         success(&root, &["log", id, "--stream", "stdout"]),
-        "backtrace=1\npartial"
+        "backtrace=1\npartialerror: failed\n"
     );
     let record: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap(),
@@ -12051,4 +12101,244 @@ fn routed_assignments_reach_the_command_and_merged_previews_keep_its_status() {
     .unwrap();
     assert_eq!(record["label"], "cargo test");
     assert_eq!(record["status"], 101);
+}
+
+/// A shell in `root` whose `PATH` starts with the fake programs in `root/bin` and a
+/// link to this build of Justless, with each extra variable set.
+#[cfg(unix)]
+fn merge_shell(root: &Path) -> impl Fn(&str, &[(&str, &str)]) -> Output + '_ {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    if !bin.join("justless").exists() {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_justless"), bin.join("justless")).unwrap();
+    }
+    move |command, vars| {
+        Command::new("sh")
+            .args(["-c", command])
+            .current_dir(root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_routed_stderr_merge_keeps_the_order_the_command_wrote_its_streams_in() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    // `cargo build` interleaves the streams and ends stderr without a newline.
+    // `cargo test` reports passing or failing tests on stdout with an unrelated error
+    // on stderr between their lines, which a test summary of stdout would drop.
+    fake_program(
+        &root,
+        "cargo",
+        r#"if [ "$1" = build ]; then
+  echo 'step 1'
+  echo 'warning: step 2 is slow' >&2
+  echo 'step 3'
+  printf 'note: no newline' >&2
+  exit "${EXIT:-0}"
+fi
+if [ -n "$PASS" ]; then
+  echo 'running 2 tests'
+  echo 'test a ... ok'
+  echo 'error: could not write the coverage report' >&2
+  echo 'test b ... ok'
+  echo
+  echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+  exit 0
+fi
+echo 'running 2 tests'
+echo 'test a ... ok'
+echo 'test b ... FAILED'
+echo 'error: could not write the coverage report' >&2
+echo
+echo 'failures:'
+echo
+echo '---- b stdout ----'
+echo "thread 'b' panicked at src/lib.rs:5:9:"
+echo 'assertion failed: total == 105'
+echo
+echo 'failures:'
+echo '    b'
+echo
+echo 'test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'
+exit 101
+"#,
+    );
+    let shell = merge_shell(&root);
+    // The footer's separator and ending: a final line without a newline is ended
+    // before the footer.
+    for (original, vars, code, footer) in [
+        ("cargo build 2>&1", ("EXIT", "0"), 0, None),
+        (
+            "cargo build 2>&1",
+            ("EXIT", "1"),
+            1,
+            Some(("\n", " · exit 1]\n")),
+        ),
+        ("cargo test 2>&1", ("PASS", "1"), 0, None),
+        (
+            "cargo test 2>&1",
+            ("PASS", ""),
+            101,
+            Some(("", " · exit 101]\n")),
+        ),
+    ] {
+        let rewritten = rewrites(&root, original)[0].1.clone().unwrap();
+        assert_eq!(
+            rewritten,
+            format!("justless run --hook --merge -- {original}")
+        );
+        let plain = shell(original, &[vars]);
+        let routed = shell(&rewritten, &[vars]);
+        assert!(
+            stdout(&plain).contains("\nerror: could not write") == (original == "cargo test 2>&1")
+        );
+        assert_eq!(plain.status.code(), Some(code));
+        assert_eq!(routed.status.code(), Some(code), "{}", stderr(&routed));
+        assert_eq!(stderr(&routed), "");
+        // The agent receives the bytes the command printed, in the same order, and a
+        // footer only for a failure.
+        let Some((separator, ending)) = footer else {
+            assert_eq!(stdout(&routed), stdout(&plain), "{original}");
+            continue;
+        };
+        let routed = stdout(&routed);
+        let id = routed
+            .strip_prefix(&stdout(&plain))
+            .and_then(|rest| rest.strip_prefix(separator))
+            .and_then(|rest| rest.strip_prefix("[justless "))
+            .and_then(|rest| rest.strip_suffix(ending))
+            .unwrap_or_else(|| panic!("{original}: {routed:?}"));
+        // The archive replays the merged stream byte for byte.
+        assert_eq!(success(&root, &["log", id]), stdout(&plain));
+        let replay = cli(&root, &["log", id, "--stream", "stderr"]);
+        assert_eq!(
+            (stdout(&replay), stderr(&replay)),
+            (String::new(), String::new())
+        );
+    }
+    // Without `2>&1` the streams stay apart, and a summary replaces stdout alone.
+    for (pass, summary) in [
+        ("1", "0 reported failing test(s)\n"),
+        ("", "1 reported failing test(s)\n"),
+    ] {
+        let separate = shell("justless run --hook -- cargo test", &[("PASS", pass)]);
+        assert!(
+            stdout(&separate).starts_with(summary),
+            "{}",
+            stdout(&separate)
+        );
+        assert!(stderr(&separate).starts_with("error: could not write the coverage report\n"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_routed_search_with_a_stderr_merge_keeps_its_messages_and_names_the_run() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "needle\n").unwrap();
+    // Search groups read stdout alone, so a search keeps its streams apart: the
+    // message about the unreadable directory follows the matches.
+    fake_program(
+        &root,
+        "rg",
+        r#"i=1
+while [ "$i" -le "$COUNT" ]; do
+  echo "src/a.rs:$i:let needle = $i; // a line long enough to fill the preview budget"
+  [ "$i" -eq 2 ] && echo 'rg: ./locked: Permission denied (os error 13)' >&2
+  i=$((i + 1))
+done
+exit 2
+"#,
+    );
+    let shell = merge_shell(&root);
+    let rewritten = rewrites(&root, "rg needle 2>&1")[0].1.clone().unwrap();
+    assert_eq!(rewritten, "justless run --hook --merge -- rg needle 2>&1");
+    let small = shell(&rewritten, &[("COUNT", "3")]);
+    assert_eq!(small.status.code(), Some(2));
+    let text = stdout(&small);
+    let (shown, footer) = text.rsplit_once("[justless ").unwrap();
+    assert_eq!(
+        shown,
+        "src/a.rs:1:let needle = 1; // a line long enough to fill the preview budget\n\
+         src/a.rs:2:let needle = 2; // a line long enough to fill the preview budget\n\
+         src/a.rs:3:let needle = 3; // a line long enough to fill the preview budget\n\
+         rg: ./locked: Permission denied (os error 13)\n"
+    );
+    let id = footer
+        .strip_suffix(" · stderr after stdout · exit 2]\n")
+        .unwrap_or_else(|| panic!("{footer:?}"));
+    assert_eq!(
+        stderr(&cli(&root, &["log", id, "--stream", "stderr"])),
+        "rg: ./locked: Permission denied (os error 13)\n"
+    );
+    // A large search is grouped, and the message still reaches the agent.
+    let large = shell(&rewritten, &[("COUNT", "200")]);
+    assert_eq!(large.status.code(), Some(2));
+    let text = stdout(&large);
+    assert!(text.starts_with("rg: 200 matches in 1 file"), "{text}");
+    assert!(text.contains("\nrg: ./locked: Permission denied (os error 13)\n[justless "));
+    assert!(text.ends_with(" shown · exit 2]\n"), "{text}");
+}
+
+#[test]
+fn discover_counts_a_merged_search_footer_as_routed() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let config = repo.path().join("claude");
+    write_transcripts(
+        &root,
+        &config,
+        &[(
+            "S.jsonl",
+            &[
+                (
+                    "rg needle 2>&1",
+                    "src/a.rs:1:needle\nrg: ./locked: Permission denied (os error 13)\n[justless run-Ab1 · stderr after stdout · exit 2]",
+                ),
+                (
+                    "cargo test 2>&1",
+                    "running 1 test\nwarning: slow\n[justless run-Cd2 · stderr after stdout]",
+                ),
+                (
+                    "git diff 2>&1",
+                    "[justless run-Ef3 · stderr after stdout here]",
+                ),
+            ],
+        )],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["discover", "--json"])
+        .current_dir(&root)
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let labels = |route: &str| -> Vec<String> {
+        report["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["route"] == route)
+            .map(|g| {
+                g["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| l["label"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(labels("through_justless"), ["cargo test", "rg"]);
+    assert_eq!(labels("supported_not_routed"), ["git diff"]);
 }

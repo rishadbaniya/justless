@@ -42,11 +42,11 @@ impl Route {
 
 /// The footer `justless run` prints on its own line after a captured command:
 /// `[justless run-ID] exit N · …` when a person runs it, and the bracketed
-/// `[justless run-ID · exit N]` or `[justless run-ID · 2.0 KB of 9.1 KB shown]`
-/// markers of a hook-routed run.
+/// `[justless run-ID · exit N]`, `[justless run-ID · 2.0 KB of 9.1 KB shown]` or
+/// `[justless run-ID · stderr after stdout]` markers of a hook-routed run.
 static FOOTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\[justless run-[A-Za-z0-9]+(?:\] exit -?[0-9]+| · (?:exit -?[0-9]+|[^\]\n]+ shown(?: · exit -?[0-9]+)?)\]$)",
+        r"(?m)^\[justless run-[A-Za-z0-9]+(?:\] exit -?[0-9]+| · (?:exit -?[0-9]+|(?:[^\]\n]+ shown|stderr after stdout)(?: · exit -?[0-9]+)?)\]$)",
     )
     .unwrap()
 });

@@ -312,3 +312,16 @@ What the rows show:
 - **A change to a binary's code on this repository runs everything.** Every integration test here runs the `justless` binary, so a `src/` edit reaches all of them and the subset is too broad.
 
 `fixtures/failing` has one test, and `fixtures/mixed` has no test runner, so neither is a meaningful subset benchmark on its own; the `justless` rows above include edits to both, which reach the tests that copy them.
+
+## Assignments and a final `2>&1`
+
+`justless discover --days 365 --json` read this repository's own Claude Code transcripts, 7,935 commands with 19,769,363 bytes of output, before and after the hooks began routing leading `NAME=value` assignments and a final `2>&1`.
+
+| Discover group | Before | After |
+| --- | ---: | ---: |
+| Supported but not routed | 255 commands, 927,392 bytes | 264 commands, 933,232 bytes |
+| Supported tool in a form that passes through | 1,269 commands, 2,042,885 bytes | 1,263 commands, 2,038,905 bytes |
+
+The new forms cover 9 more commands with 5,840 bytes of output. Pipes account for far more: in the same transcripts, 1,959 commands with 2,004,988 bytes end a command in `2>&1` followed by a pipe, such as `cargo test 2>&1 | tail -50`, and 1,948 commands with 3,047,325 bytes start with an assignment and contain a pipe. Those still pass through.
+
+On a copy of `fixtures/failing`, `RUST_BACKTRACE=1 cargo test 2>&1` printed 19,255 bytes and exited with status 101. Its hook form, `RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1`, printed 2,536 bytes with the same status: the head of the output, the failure lines including Cargo's `error: test failed`, the tail and a footer naming the run. Without `--merge`, the test summary and the stderr preview take 914 bytes, but a summary of a merged stream would drop errors the command wrote to stderr, so a merged run keeps its own preview. That costs most on a large passing run: a crate with 300 passing tests printed 8,918 bytes for `cargo test 2>&1`, 2,089 bytes through `--merge`, and 558 bytes as a summary with a separate stderr preview. The byte counts include absolute paths under the scratch directory, so they vary with the checkout location.

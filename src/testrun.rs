@@ -456,6 +456,7 @@ fn run_step(
         &options.session,
         options.fresh,
         false,
+        false,
     ) {
         Ok(status) => status,
         // A runner that cannot start fails its step like a missing command in a

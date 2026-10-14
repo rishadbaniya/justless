@@ -920,8 +920,15 @@ fn wrap_event(
             .map(|directory| root_option(workspace, directory))
             .unwrap_or_default();
         rewritten.push_str(&command[copied..range.start]);
+        // A final `2>&1` joins Justless's own streams, and `--merge` joins the
+        // command's, so its archive and preview keep the order it wrote them in.
+        let merge = if crate::shell_form::merges(&command[range.end..]) {
+            " --merge"
+        } else {
+            ""
+        };
         rewritten.push_str(&format!(
-            "justless{root} run --hook{session} -- {}",
+            "justless{root} run --hook{merge}{session} -- {}",
             &command[range.clone()]
         ));
         copied = range.end;
@@ -1245,7 +1252,15 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
     let mut entered = 0;
     for range in &segments {
         let segment = &command[range.clone()];
-        match directory_change(segment) {
+        // A command that changes `PATH` or another variable that steers Justless for
+        // the commands after it, such as `PATH=/x;` or `export PATH=/x &&`, passes
+        // the list through like a change of directory.
+        let change = if crate::shell_form::steers_justless(segment) {
+            Some(None)
+        } else {
+            directory_change(segment)
+        };
+        match change {
             None => match supported(segment) {
                 Some(words) => plan.wrap.push((within(range, words), entered)),
                 None => plan.other.push(range.clone()),

@@ -264,6 +264,10 @@ pub struct Shape<'a> {
     pub agent_footer: bool,
     /// Label for stats, history and resume, such as `exec python3`.
     pub family: Option<String>,
+    /// `run --merge`, for a command that ended in `2>&1`: the command writes both
+    /// streams to one pipe, archived as stdout, unless `merge::joins` keeps them
+    /// apart.
+    pub merge: bool,
     /// Replaces the preview of a stdout longer than `max_bytes`, given the stdout file
     /// and the run ID. When it returns `None`, the usual preview stays.
     pub stdout_preview: Option<StdoutPreview<'a>>,
@@ -277,6 +281,7 @@ pub struct Shape<'a> {
 pub type Spawn<'a> = Box<dyn FnOnce(&Path, Stdio, Stdio) -> Result<i32> + 'a>;
 pub type StdoutPreview<'a> = Box<dyn FnOnce(&Path, &str) -> Result<Option<Vec<u8>>> + 'a>;
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute(
     workspace: &Workspace,
     args: &[OsString],
@@ -285,6 +290,7 @@ pub fn execute(
     session: &str,
     fresh: bool,
     hook: bool,
+    merge: bool,
 ) -> Result<i32> {
     execute_shaped(
         workspace,
@@ -297,6 +303,7 @@ pub fn execute(
             hook,
             agent_footer: hook,
             family: None,
+            merge,
             stdout_preview: None,
             spawn: None,
         },
@@ -312,6 +319,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         hook,
         agent_footer,
         family,
+        merge,
         stdout_preview,
         spawn,
     } = shape;
@@ -351,10 +359,11 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
             return Ok(uncaptured(&mut command, &args[0]));
         }
     };
+    let merged = crate::merge::joins(merge, selection.profile);
     let (status, exited) = match spawn {
         Some(spawn) => (archive.run_with(spawn, settings.max_run_bytes)?, None),
         None => {
-            let exited = match archive.run(&mut command, settings.max_run_bytes) {
+            let exited = match archive.run(&mut command, settings.max_run_bytes, merged) {
                 Ok(Ok(status)) => Some(status),
                 Ok(Err(error)) => {
                     eprintln!("justless: wait for {}: {error}", args[0].to_string_lossy());
@@ -378,6 +387,8 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         fresh,
         hook,
         agent_footer,
+        merge,
+        merged,
         redactor,
         retention: (settings.max_runs, settings.max_archive_bytes),
     };
@@ -541,15 +552,36 @@ impl Archive {
     /// Run the command into the archive, storing at most `cap` bytes of each stream.
     /// Output past the cap is still read and counted, so the command never blocks
     /// and its exit status is unchanged. Termination signals sent to Justless reach
-    /// the command, and Justless finishes the record once the command exits.
-    fn run(&mut self, command: &mut Command, cap: u64) -> io::Result<io::Result<ExitStatus>> {
+    /// the command, and Justless finishes the record once the command exits. With
+    /// `merged`, the command writes both streams to one pipe, as a shell's `2>&1`
+    /// gives it, and the stdout archive keeps them in the order they were written,
+    /// under the same cap. The stderr archive then stays empty.
+    fn run(
+        &mut self,
+        command: &mut Command,
+        cap: u64,
+        merged: bool,
+    ) -> io::Result<io::Result<ExitStatus>> {
         let mut writers = std::mem::take(&mut self.writers).into_iter();
         let (Some(stdout_file), Some(stderr_file)) = (writers.next(), writers.next()) else {
             return Err(io::Error::other("the command already ran"));
         };
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let shared = if merged {
+            let (reader, writer) = io::pipe()?;
+            command.stdout(writer.try_clone()?).stderr(writer);
+            Some(reader)
+        } else {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            None
+        };
         signals::install();
-        let mut child = match command.spawn() {
+        let spawned = command.spawn();
+        if shared.is_some() {
+            // `Command` keeps the write ends it was given. Close them here, so the
+            // pipe closes once the command and its children are done with it.
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let mut child = match spawned {
             Ok(child) => child,
             Err(error) => {
                 signals::restore();
@@ -558,10 +590,21 @@ impl Archive {
         };
         signals::watch(child.id());
         let exited = Arc::new(AtomicBool::new(false));
+        // A merged run has one pipe, which fills the stdout archive.
+        let (shared, stdout_file) = match shared {
+            Some(pipe) => {
+                let exited = Arc::clone(&exited);
+                let pumped = std::thread::spawn(move || {
+                    pump(pipe, stdout_file, cap, Stream::Stdout, &exited)
+                });
+                (Some(pumped), None)
+            }
+            None => (None, Some(stdout_file)),
+        };
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let stdout = stdout.map(|pipe| {
+        let stdout = stdout.zip(stdout_file).map(|(pipe, file)| {
             let exited = Arc::clone(&exited);
-            std::thread::spawn(move || pump(pipe, stdout_file, cap, Stream::Stdout, &exited))
+            std::thread::spawn(move || pump(pipe, file, cap, Stream::Stdout, &exited))
         });
         let stderr = stderr.map(|pipe| {
             let exited = Arc::clone(&exited);
@@ -574,6 +617,9 @@ impl Archive {
         let status = child.wait();
         // A pipe that a background process still holds goes to a drainer, so that
         // process can keep writing, within the cap, after Justless exits.
+        if let Some(pumped) = shared.map(joined) {
+            self.collect(Stream::Stdout, pumped, cap);
+        }
         if let Some(pumped) = stdout.map(joined) {
             self.collect(Stream::Stdout, pumped, cap);
         }
@@ -1107,6 +1153,10 @@ struct Capture<'a> {
     fresh: bool,
     hook: bool,
     agent_footer: bool,
+    /// `run --merge` was given.
+    merge: bool,
+    /// The command wrote both streams to the stdout archive.
+    merged: bool,
     /// Replaces secrets in what the agent sees; the archive keeps the original bytes.
     redactor: Option<&'a crate::redact::Redactor>,
     /// The most runs and archive bytes to keep.
@@ -1133,6 +1183,8 @@ impl Capture<'_> {
             fresh,
             hook,
             agent_footer,
+            merge,
+            merged,
             redactor,
             retention,
         } = *self;
@@ -1293,11 +1345,15 @@ impl Capture<'_> {
             if !stdout_fits && !report.is_empty() {
                 previews[0].1 = fit(report, max_bytes).into_bytes();
             }
-        } else if let Some(summary) = run.summary.render(
-            previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
-            run.status,
-        ) && (!stdout_fits || previous.is_some() || summary.len() < previews[0].1.len())
+        } else if !merged
+            && let Some(summary) = run.summary.render(
+                previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
+                run.status,
+            )
+            && (!stdout_fits || previous.is_some() || summary.len() < previews[0].1.len())
         {
+            // A merged stdout also holds the command's stderr, which a test, diff or
+            // inventory summary of stdout would drop, so that run keeps its preview.
             previews[0].1 = fit(summary, max_bytes).into_bytes();
         }
         if let Some(shape_stdout) = stdout_preview
@@ -1336,6 +1392,9 @@ impl Capture<'_> {
             }
         }
         run.preview_bytes = previews.iter().map(|(_, s)| s.len()).sum();
+        // A `--merge` search or listing kept its streams apart, so its stderr follows
+        // stdout rather than interleaving with it.
+        let split = merge && !merged && previews.iter().all(|(_, bytes)| !bytes.is_empty());
         let footer = footer(
             &run,
             &previews,
@@ -1345,6 +1404,7 @@ impl Capture<'_> {
                 selection,
                 redactor,
                 notice,
+                split,
             },
         )?;
         run.footer_bytes = footer.len();
@@ -1395,6 +1455,8 @@ struct Shown<'a> {
     redactor: Option<&'a crate::redact::Redactor>,
     /// The unchanged notice replaced the previews.
     notice: bool,
+    /// Both streams have output that a `--merge` run kept apart.
+    split: bool,
 }
 
 /// The line printed after the preview. A command typed by a person keeps the full
@@ -1472,7 +1534,14 @@ fn footer(
             format!("{separator}[justless {id}{redacted}]\n")
         }
     };
-    let line = if verbatim && (run.status == 0 || empty_search) {
+    let line = if verbatim && shown.split {
+        let exit = if run.status == 0 {
+            String::new()
+        } else {
+            format!(" · exit {}", run.status)
+        };
+        format!("{separator}[justless {id}{redacted} · stderr after stdout{exit}]\n")
+    } else if verbatim && (run.status == 0 || empty_search) {
         only_count()
     } else if verbatim || run.unchanged {
         if run.status == 0 {
