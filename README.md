@@ -71,7 +71,7 @@ The exit status is still 101, and `justless log RUN_ID --stream stdout --from 36
 
 ### What it does not do
 
-- **No changed commands.** Same command, directory and exit code. Pipes, redirections, interactive and machine-readable output pass through.
+- **No changed commands.** Same command, directory and exit code. Pipes, redirections other than a final `2>&1`, interactive and machine-readable output pass through.
 - **No network, no LLM, no telemetry.** Parsing is local and deterministic; everything stays in `.justless/`. Only the installer goes online, plus the opt-in `wrap` proxy, which relays your agent's own API requests.
 - **No hidden failures.** Anything cut is marked and one command away.
 

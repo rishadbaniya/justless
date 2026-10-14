@@ -17,7 +17,7 @@ pub(crate) const END: &str = "<!-- justless:end -->";
 const INSTRUCTIONS: &str = r#"<!-- justless:begin -->
 ## Justless
 
-- Run builds, tests, lints, diffs and searches plainly; env prefixes, `2>&1`, pipes and redirects bypass the hooks. In OpenCode, or if long build, test, lint or diff output arrives raw, run that one command as `justless run -- CMD`.
+- Run builds, tests, lints, diffs and searches plainly; pipes and redirects other than `2>&1` bypass the hooks. In OpenCode, or if long build, test, lint or diff output arrives raw, run that one command as `justless run -- CMD`.
 - `[justless RUN ...]` names an archived run. Instead of rerunning, use `justless search RUN TEXT`, `justless log RUN --stream S --from A --to B` for an `[S:A-B]` tag, or `justless context --run RUN`. `justless recall ID` restores `[justless recall ID]`.
 - Before changing shared code, `justless affected NAME|FILE|--changes` lists dependents and tests to run.
 - Orient with `justless pack "TASK"` or `map`; trace code with `query NAME` or `path A B`.
@@ -1210,23 +1210,35 @@ struct Plan {
 /// way other than a plain `cd DIR` into the workspace, accepted by `enter`, passes
 /// through whole, so a wrapped command never runs from outside the workspace.
 fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Plan {
+    // The range of the words to wrap inside a supported command, after any
+    // `NAME=value` assignments and before a final `2>&1`, which stay where they are.
     let supported = |segment: &str| {
-        supported_command(segment)
-            && !(rules.client_grep && runs_grep(segment))
+        let form = crate::shell_form::parse(segment)?;
+        let words = &segment[form.command.clone()];
+        // A client that approves a rewrite, or may not check it again, takes only
+        // display settings.
+        let env = form.keeps_justless(segment)
+            && (rules.mixed && !rules.approves || form.approvable(segment));
+        (env && literal_command(&segment[..form.command.end]).is_some()
+            && supported_command(words)
+            && !(rules.client_grep && runs_grep(words))
             && (!rules.approves
-                || literal_command(segment).is_some_and(|words| {
+                || literal_command(words).is_some_and(|words| {
                     let words: Vec<&str> = words.iter().map(String::as_str).collect();
                     crate::filters::approvable(&words)
-                }))
+                })))
+        .then_some(form.command)
+    };
+    let within = |range: &Range<usize>, words: Range<usize>| {
+        range.start + words.start..range.start + words.end
     };
     let mut plan = Plan::default();
     let Some(segments) = split_compound(command).filter(|s| s.len() > 1) else {
         let start = command.len() - command.trim_start_matches(SHELL_BLANKS).len();
         let range = start..command.trim_end_matches(SHELL_BLANKS).len().max(start);
-        if supported(command) {
-            plan.wrap.push((range, 0));
-        } else {
-            plan.other.push(range);
+        match supported(&command[range.clone()]) {
+            Some(words) => plan.wrap.push((within(&range, words), 0)),
+            None => plan.other.push(range),
         }
         return plan;
     };
@@ -1234,8 +1246,10 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
     for range in &segments {
         let segment = &command[range.clone()];
         match directory_change(segment) {
-            None if supported(segment) => plan.wrap.push((range.clone(), entered)),
-            None => plan.other.push(range.clone()),
+            None => match supported(segment) {
+                Some(words) => plan.wrap.push((within(range, words), entered)),
+                None => plan.other.push(range.clone()),
+            },
             Some(Some(directory)) if descends(&directory) && enter(&directory) => entered += 1,
             Some(_) => {
                 return Plan {
@@ -1286,7 +1300,13 @@ fn directory_change(segment: &str) -> Option<Option<String>> {
             )
     })?;
     match words.as_slice() {
-        [cd, directory] if cd == "cd" && !directory.is_empty() && !directory.starts_with('-') => {
+        // `cd 2>&1` is a bare `cd`, not a directory named `2>&1`.
+        [cd, directory]
+            if cd == "cd"
+                && !directory.is_empty()
+                && !directory.starts_with('-')
+                && !segment.ends_with("2>&1") =>
+        {
             Some(Some(directory.clone()))
         }
         _ if matches!(
@@ -1316,8 +1336,9 @@ fn descends(directory: &str) -> bool {
 }
 
 /// Split a command list on top-level `&&`, `||` and `;`, returning the trimmed byte
-/// range of each command. Expansions, pipes, redirections, grouping, background
-/// jobs and comments return `None` so the whole command passes through unchanged.
+/// range of each command. Expansions, pipes, redirections other than `2>&1`,
+/// grouping, background jobs and comments return `None` so the whole command passes
+/// through unchanged.
 fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
@@ -1349,6 +1370,11 @@ fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
                 b';' if bytes.get(i + 1) != Some(&b';') => {
                     push(start, i)?;
                     start = i + 1;
+                }
+                // `2>&1` stays with its command, which `plan` wraps before it.
+                b'>' if crate::shell_form::merge_at(bytes, i) => {
+                    i += 3;
+                    continue;
                 }
                 b'&' | b'|' | b';' | b'<' | b'>' | b'(' | b')' | b'{' | b'}' | b'#' | b'!' => {
                     return None;
@@ -1398,13 +1424,17 @@ pub fn command_label(command: &str) -> String {
                 .collect()
         });
     let is_cd = |s: &&str| s.split_whitespace().next() == Some("cd");
+    // Label `RUST_BACKTRACE=1 cargo test 2>&1` by the words a hook wraps.
+    let words_of =
+        |s: &str| crate::shell_form::parse(s).map_or(s.to_owned(), |f| s[f.command].to_owned());
     let first = segments
         .iter()
-        .find(|s| !is_cd(s) && supported_command(s))
+        .find(|s| !is_cd(s) && supported_command(&words_of(s)))
         .or_else(|| segments.iter().find(|s| !is_cd(s)))
         .or(segments.first())
         .copied()
         .unwrap_or(command);
+    let first = &words_of(first);
     let words = literal_command(first)
         .unwrap_or_else(|| first.split_whitespace().map(str::to_owned).collect());
     let words: Vec<_> = words

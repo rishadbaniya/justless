@@ -11790,3 +11790,265 @@ fn runs_with_an_explicit_budget_leave_the_adaptive_budget_alone() {
     assert_eq!(budget_state(root), serde_json::Value::Null);
     assert_eq!(budget_row(root)["clipped_runs"], 2);
 }
+
+/// The command each shell hook would run instead, or `None` when it passes through.
+fn rewrites(root: &Path, command: &str) -> Vec<(&'static str, Option<String>)> {
+    use serde_json::json;
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
+    let bash = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
+        "tool_input":{"command":command}});
+    let call = |handler: &str, input: serde_json::Value| {
+        agent_hook(root, handler, "before-command", input)
+    };
+    vec![
+        (
+            "claude",
+            text(
+                &call("hook-claude", bash.clone())["hookSpecificOutput"]["updatedInput"]["command"],
+            ),
+        ),
+        (
+            "gemini",
+            text(
+                &call(
+                    "hook-gemini",
+                    json!({"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
+                        "cwd":root,"tool_input":{"command":command}}),
+                )["hookSpecificOutput"]["tool_input"]["command"],
+            ),
+        ),
+        (
+            "codex",
+            text(&call("hook-codex", bash)["hookSpecificOutput"]["updatedInput"]["command"]),
+        ),
+        (
+            "cursor",
+            text(
+                &call(
+                    "hook-cursor",
+                    json!({"tool_name":"Shell","cwd":root,"tool_input":{"command":command}}),
+                )["updated_input"]["command"],
+            ),
+        ),
+        (
+            "copilot",
+            text(
+                &call(
+                    "hook-copilot",
+                    json!({"cwd":root,"toolName":"bash","toolArgs":{"command":command}}),
+                )["modifiedArgs"]["command"],
+            ),
+        ),
+        (
+            "agy",
+            text(
+                &call(
+                    "hook-agy",
+                    json!({"workspacePaths":[root],"toolCall":{"name":"run_command",
+                        "args":{"CommandLine":command,"Cwd":root}}}),
+                )["overwrite"]["CommandLine"],
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join("web")).unwrap();
+    // `cd 2>&1` changes to the home directory, even when this one exists.
+    fs::create_dir(root.join("2>&1")).unwrap();
+    // Every client wraps the command words in place, so assignments still reach the
+    // command and `2>&1` merges the previews Justless prints.
+    for (command, expected) in [
+        ("cargo test 2>&1", "justless run --hook -- cargo test 2>&1"),
+        (
+            "RUST_BACKTRACE=1 cargo test",
+            "RUST_BACKTRACE=1 justless run --hook -- cargo test",
+        ),
+        (
+            "RUST_LOG=\"debug\" CI=1  cargo test   2>&1",
+            "RUST_LOG=\"debug\" CI=1  justless run --hook -- cargo test   2>&1",
+        ),
+        (
+            "cd web && RUST_BACKTRACE=full npm test 2>&1 && git status 2>&1",
+            "cd web && RUST_BACKTRACE=full justless run --hook -- npm test 2>&1 && justless run --hook -- git status 2>&1",
+        ),
+        (
+            "git diff 2>&1; git status",
+            "justless run --hook -- git diff 2>&1; justless run --hook -- git status",
+        ),
+        (
+            "cargo build 2>&1 || cargo test\t2>&1",
+            "justless run --hook -- cargo build 2>&1 || justless run --hook -- cargo test\t2>&1",
+        ),
+        (
+            "LC_ALL=C NO_COLOR=1 TERM=dumb git log --oneline -5 2>&1",
+            "LC_ALL=C NO_COLOR=1 TERM=dumb justless run --hook -- git log --oneline -5 2>&1",
+        ),
+        // A quoted `2>&1` is an argument.
+        (
+            "cargo test '2>&1'",
+            "justless run --hook -- cargo test '2>&1'",
+        ),
+    ] {
+        for (client, rewritten) in rewrites(&root, command) {
+            assert_eq!(rewritten.as_deref(), Some(expected), "{client}: {command}");
+        }
+    }
+    // Claude Code and Gemini CLI check the rewritten command, so any other variable
+    // is kept. The clients that may run a rewrite without asking, or that rewrite
+    // only lists made entirely of supported commands, take display settings with
+    // plain values alone and leave the rest to their own approval.
+    for (command, expected) in [
+        (
+            "FOO='a b' cargo test",
+            "FOO='a b' justless run --hook -- cargo test",
+        ),
+        (
+            "NODE_OPTIONS=--require=./hook.js npm test 2>&1",
+            "NODE_OPTIONS=--require=./hook.js justless run --hook -- npm test 2>&1",
+        ),
+        (
+            "GIT_EXTERNAL_DIFF=./x git diff",
+            "GIT_EXTERNAL_DIFF=./x justless run --hook -- git diff",
+        ),
+        (
+            "RUSTC_WRAPPER=./wrap cargo test",
+            "RUSTC_WRAPPER=./wrap justless run --hook -- cargo test",
+        ),
+        (
+            "LANG=/tmp/locale cargo test",
+            "LANG=/tmp/locale justless run --hook -- cargo test",
+        ),
+        (
+            "RUST_BACKTRACE=1 cargo test 2>&1 && git push",
+            "RUST_BACKTRACE=1 justless run --hook -- cargo test 2>&1 && git push",
+        ),
+        (
+            "PATH=/tmp/bin cargo test && git status",
+            "PATH=/tmp/bin cargo test && justless run --hook -- git status",
+        ),
+    ] {
+        for (client, rewritten) in rewrites(&root, command) {
+            let mixed = matches!(client, "claude" | "gemini");
+            assert_eq!(
+                rewritten.as_deref(),
+                mixed.then_some(expected),
+                "{client}: {command}"
+            );
+        }
+    }
+    for command in [
+        // These would change which Justless runs, or load code into it.
+        "PATH=/tmp/bin:/usr/bin cargo test",
+        "path=/tmp/bin cargo test",
+        "LD_PRELOAD=./x.so cargo test",
+        "LD_LIBRARY_PATH=. cargo test",
+        "DYLD_INSERT_LIBRARIES=./x.dylib cargo test",
+        "JUSTLESS_SESSION=x cargo test",
+        // Other redirections, and a `2>&1` anywhere but last.
+        "cargo test 2>&1 | tail -50",
+        "cargo test >&2",
+        "cargo test 1>&2",
+        "cargo test 2>err.txt",
+        "cargo test &> out.txt",
+        "cargo test |& tail",
+        "cargo test 2>&1 >out.txt",
+        "cargo test >out.txt 2>&1",
+        "cargo test <input.txt",
+        "cargo test 2>&1 &",
+        "cargo test 2>&1 2>&1",
+        "2>&1 cargo test",
+        "cargo test 2>&1 --nocapture",
+        "cargo test2>&1",
+        "cargo test 12>&1",
+        "cargo test 2>&10",
+        "cargo test 2>&1x",
+        "cargo test 2>&1&& git status",
+        "cd web 2>&1 && cargo test",
+        // A `2>&1` before `cd` must not hide the change of directory.
+        "git status && 2>&1 cd /tmp && cargo test",
+        " 2>&1 cd /tmp && cargo test",
+        "git status && builtin 2>&1 cd /tmp && cargo test",
+        "cd 2>&1 && cargo test",
+        // Assignments the shell would expand, and words that are not assignments.
+        "env RUST_BACKTRACE=1 cargo test",
+        "RUST_BACKTRACE=$LEVEL cargo test",
+        "FOO=`id` cargo test",
+        "FOO=~/x cargo test",
+        "FOO=a:~/x cargo test",
+        "\"FOO=1\" cargo test",
+        "FOO+=1 cargo test",
+        "FOO=1",
+        "FOO=1 2>&1",
+        "FOO=1 cd web && cargo test",
+    ] {
+        for (client, rewritten) in rewrites(&root, command) {
+            assert_eq!(rewritten, None, "{client}: {command}");
+        }
+    }
+    // Claude Code leaves `grep` to its own shell behind an assignment too.
+    let grep = rewrites(&root, "LC_ALL=C grep -r needle .");
+    assert_eq!(grep[0], ("claude", None));
+    assert_eq!(
+        grep[2].1.as_deref(),
+        Some("LC_ALL=C justless run --hook -- grep -r needle .")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn routed_assignments_reach_the_command_and_merged_previews_keep_its_status() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    // The last stdout line has no newline, so it must still come before stderr.
+    let cargo = fake_program(
+        &root,
+        "cargo",
+        "echo \"backtrace=$RUST_BACKTRACE\"\nprintf partial\necho 'error: failed' >&2\nexit 101\n",
+    );
+    let bin = cargo.parent().unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_justless"), bin.join("justless")).unwrap();
+    let shell = |command: &str| {
+        Command::new("sh")
+            .args(["-c", command])
+            .current_dir(&root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap()
+    };
+    let original = "RUST_BACKTRACE=1 cargo test 2>&1";
+    let rewritten = rewrites(&root, original)[0].1.clone().unwrap();
+    assert_eq!(
+        rewritten,
+        "RUST_BACKTRACE=1 justless run --hook -- cargo test 2>&1"
+    );
+    let plain = shell(original);
+    let routed = shell(&rewritten);
+    assert_eq!(plain.status.code(), Some(101));
+    assert_eq!(routed.status.code(), Some(101), "{}", stderr(&routed));
+    // The same merged bytes reach stdout, followed by the run and its exit status.
+    assert_eq!(stdout(&plain), "backtrace=1\npartialerror: failed\n");
+    assert_eq!(stderr(&routed), "");
+    let footer = stdout(&routed)
+        .strip_prefix(&stdout(&plain))
+        .unwrap()
+        .to_owned();
+    let id = footer
+        .strip_prefix("[justless ")
+        .and_then(|rest| rest.strip_suffix(" · exit 101]\n"))
+        .unwrap_or_else(|| panic!("{footer:?}"));
+    // Each stream is archived exactly, and the profile comes from the command words.
+    assert_eq!(
+        success(&root, &["log", id, "--stream", "stdout"]),
+        "backtrace=1\npartial"
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["label"], "cargo test");
+    assert_eq!(record["status"], 101);
+}

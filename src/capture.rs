@@ -81,7 +81,12 @@ impl Stream {
 
     fn print(self, bytes: &[u8]) -> io::Result<()> {
         match self {
-            Self::Stdout => io::stdout().lock().write_all(bytes),
+            // Flush a final partial line now, so a shell's `2>&1` keeps it ahead of
+            // the stderr preview and the footer.
+            Self::Stdout => {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(bytes).and_then(|()| stdout.flush())
+            }
             Self::Stderr => io::stderr().lock().write_all(bytes),
         }
     }

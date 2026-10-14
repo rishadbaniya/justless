@@ -27,6 +27,7 @@ mod runners;
 mod rust_syntax;
 mod search;
 mod selection;
+mod shell_form;
 mod source;
 mod statusline;
 mod summary;
