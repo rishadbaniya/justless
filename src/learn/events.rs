@@ -472,6 +472,12 @@ pub fn runs(
         if run.family.starts_with("exec ") {
             continue;
         }
+        // Output the Bash post-command hook recorded after the command ran carries
+        // the whole command line's status, such as a pipe's, not that of the command
+        // its words name.
+        if !run.note.is_empty() {
+            continue;
+        }
         if stats.scanned == RUN_CAP {
             stats.capped = true;
             break;

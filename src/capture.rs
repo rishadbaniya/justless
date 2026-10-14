@@ -617,7 +617,7 @@ impl Archive {
         let temporary = Builder::new()
             .prefix("run-")
             .rand_bytes(12)
-            .tempdir_in(&runs)
+            .tempdir_in(runs)
             .with_context(|| format!("create a run in {}", runs.display()))?;
         let directory = temporary.path().to_path_buf();
         // Lock before the first record exists, so `prune` never sees a record of a

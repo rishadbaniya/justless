@@ -5523,7 +5523,7 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
     assert_eq!(status, Some(0), "{text}");
     assert!(!text.contains('✗'), "{text}");
     assert!(text.contains(
-        "✓ Hooks: .claude/settings.json has all 6 Justless hooks (session-start, after-compact, before-command, after-read, after-search, before-compact)"
+        "✓ Hooks: .claude/settings.json has all 7 Justless hooks (session-start, after-compact, before-command, after-read, after-search, after-bash, before-compact)"
     ));
     for file in [
         ".codex/hooks.json has all 3",
@@ -5646,7 +5646,7 @@ fn doctor_names_stale_setup_and_its_fixes_clear_it() {
     let (status, text) = doctor_text(root, tools.path());
     assert_eq!(status, Some(1), "{text}");
     assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 6"),
+        text.contains("✓ Hooks: .claude/settings.json has all 7"),
         "{text}"
     );
     assert!(text.contains("✓ Instructions: CLAUDE.md has the current"));
@@ -5881,7 +5881,7 @@ fn doctor_accepts_current_hooks_behind_a_linked_config_directory() {
     let (status, text) = doctor_text(&root, tools.path());
     assert_eq!(status, Some(0), "{text}");
     assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 6"),
+        text.contains("✓ Hooks: .claude/settings.json has all 7"),
         "{text}"
     );
     assert!(text.contains("! Hooks: setup cannot update .claude/settings.json: .claude must be a directory\n    by hand: Replace the .claude link with a directory"), "{text}");
@@ -5925,11 +5925,11 @@ fn doctor_accepts_hooks_that_call_justless_by_path_and_never_copies_them() {
             .matches("hook-claude")
             .count()
     };
-    assert_eq!(handlers(), 6);
+    assert_eq!(handlers(), 7);
     let (status, text) = doctor_text(root, tools.path());
     assert_eq!(status, Some(0), "{text}");
     assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 6"),
+        text.contains("✓ Hooks: .claude/settings.json has all 7"),
         "{text}"
     );
     assert!(text.contains("· Hooks: .claude/settings.json calls justless by its path"));
@@ -5944,7 +5944,7 @@ fn doctor_accepts_hooks_that_call_justless_by_path_and_never_copies_them() {
         [(false, "justless init --agent claude".to_owned())]
     );
     assert!(doctor_apply(root, tools.path(), &text).is_empty());
-    assert_eq!(handlers(), 6);
+    assert_eq!(handlers(), 7);
     let (status, text) = doctor_text(root, tools.path());
     assert_eq!(status, Some(0), "{text}");
 
@@ -6270,13 +6270,19 @@ fn init_remove_restores_every_file_byte_for_byte() {
     install_everything(&root);
     let installed = removal_tree(&root);
     assert_ne!(installed, original);
+    // The Bash post-command hook is one of the Claude Code hooks removal takes out.
+    assert!(
+        installed[".claude/settings.json"].contains("\"justless hook-claude after-bash\""),
+        "{}",
+        installed[".claude/settings.json"]
+    );
 
     let preview = success(&root, &["init", "--remove", "--dry-run"]);
     assert_eq!(removal_tree(&root), installed);
     for line in [
         "\n  AGENTS.md: remove the Justless section\n",
         "\n  GEMINI.md: remove the Justless section and delete the file, which held nothing else\n",
-        "\n  .claude/settings.json: remove 6 hooks\n",
+        "\n  .claude/settings.json: remove 7 hooks\n",
         "\n  .codex/config.toml: remove the justless MCP server\n",
         "\n  .gemini/settings.json: remove 2 hooks and the justless MCP server\n",
         "\n  .opencode/plugins/justless.js: delete the Justless plugin\n",
@@ -6295,7 +6301,7 @@ fn init_remove_restores_every_file_byte_for_byte() {
 
     let removed = success(&root, &["init", "--remove"]);
     assert!(removed.starts_with(&format!("Removed Justless from {}:\n", root.display())));
-    assert!(removed.contains("\n  .claude/settings.json: removed 6 hooks\n"));
+    assert!(removed.contains("\n  .claude/settings.json: removed 7 hooks\n"));
     assert!(removed.ends_with("Start a new agent session so the clients stop loading Justless.\n"));
     let mut left = removal_tree(&root);
     left.retain(|name, _| !name.starts_with(".justless/"));
@@ -6366,7 +6372,7 @@ fn init_remove_without_a_record_deletes_only_justless_entries() {
 
     let output = success(&root, &["init", "--remove", "--purge"]);
     assert!(
-        output.contains("\n  .claude/settings.json: removed 6 hooks and the status line\n"),
+        output.contains("\n  .claude/settings.json: removed 7 hooks and the status line\n"),
         "{output}"
     );
     let mut left = removal_tree(&root);
@@ -6493,7 +6499,7 @@ fn init_remove_skips_config_without_justless_and_names_the_fix_for_one_with_it()
     success(&root, &["init", "--hooks", "--agent", "claude"]);
     let preview = success(&root, &["init", "--remove", "--dry-run"]);
     assert!(
-        preview.contains("\n  .claude/settings.json: remove 6 hooks"),
+        preview.contains("\n  .claude/settings.json: remove 7 hooks"),
         "{preview}"
     );
     assert!(!preview.contains(".vscode"), "{preview}");
@@ -6624,7 +6630,7 @@ fn init_remove_reports_what_it_did_before_a_failure_and_a_rerun_finishes() {
         );
         for line in [
             "\n  AGENTS.md: removed the Justless section and deleted the file",
-            "\n  .claude/settings.json: removed 6 hooks and deleted the file",
+            "\n  .claude/settings.json: removed 7 hooks and deleted the file",
             "\n  .claude/: removed the empty directory\n",
             "\n  .codex/: removed the empty directory\n",
         ] {
@@ -13172,8 +13178,11 @@ fn claude_bash_large_results_stay_within_the_hook_timeout_and_preview() {
     assert!(!runs.join(".staged").join(&id).exists());
     let history = success(&root, &["history"]);
     assert!(history.contains(&id), "{history}");
+    // Staged runs are never listed. A run directory in `runs/` without a final
+    // record is listed as unfinished, as for any run Justless is still capturing.
+    assert!(!history.contains("Staged"), "{history}");
     assert!(
-        !history.contains("Staged") && !history.contains("InProgress"),
+        history.contains("run-InProgress01 · unknown · unfinished"),
         "{history}"
     );
 }
@@ -13219,4 +13228,274 @@ fn claude_setup_warns_about_other_hooks_on_bash_results() {
             stderr(&output)
         );
     }
+}
+
+/// No 8-byte piece of `secret` appears in `haystack`.
+#[cfg(unix)]
+fn hides(haystack: &str, secret: &str) -> bool {
+    secret
+        .as_bytes()
+        .windows(8)
+        .all(|piece| !haystack.contains(std::str::from_utf8(piece).unwrap()))
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_bash_replacements_redact_secrets_and_respect_the_archive_cap() {
+    use serde_json::json;
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let key = access_key();
+    let content = stdout(
+        &Command::new("grep")
+            .args(["-rn", "needle", "src"])
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    // A secret on a match line the grouped report quotes, on an error line from the
+    // interleaved stderr that the report leaves out, and in Claude Code's stderr.
+    let original = format!(
+        "src/keys.rs:1:let needle = \"{key}\";\n{content}grep: src/{key}.bin: Permission denied\n"
+    );
+    let mut response = bash_result(&original);
+    response["stderr"] = json!(format!("Shell cwd was reset; key {key}"));
+    let output = after_bash(&root, &root, "grep -rn needle src", response);
+    // The replacement Claude reads holds no part of the key anywhere.
+    assert!(hides(&output.to_string(), &key), "{output}");
+    let text = shown_stdout(&output);
+    assert!(text.len() < original.len() / 2, "{text}");
+    assert!(
+        text.contains("src/keys.rs:1:let needle = \"[redacted:aws-access-key:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nError lines not shown above:\nstdout:"),
+        "{text}"
+    );
+    assert!(
+        text.contains(": grep: src/[redacted:aws-access-key:"),
+        "{text}"
+    );
+    assert!(text.ends_with(" secrets redacted]\n"), "{text}");
+    assert!(
+        output["hookSpecificOutput"]["updatedToolOutput"]["stderr"]
+            .as_str()
+            .unwrap()
+            .starts_with("Shell cwd was reset; key [redacted:aws-access-key:"),
+        "{output}"
+    );
+    // The archive keeps the exact output for `log --unredacted`, and the other
+    // views redact it.
+    let id = marker_run(&text);
+    let exact = cli(&root, &["log", &id, "--unredacted", "--stream", "stdout"]);
+    assert_eq!(exact.stdout, original.as_bytes());
+    assert!(hides(&success(&root, &["log", &id]), &key));
+    assert!(hides(&success(&root, &["search", &id, "Permission"]), &key));
+    let archive = root.join(".justless/runs").join(&id);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
+    assert_eq!(record["hook"], true);
+    assert_eq!(record["redaction"]["count"], 2);
+    assert!(
+        record["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("Captured from a Claude Code Bash result"),
+        "{record}"
+    );
+    // What the record counts as shown is what the agent received.
+    assert_eq!(
+        record["preview_bytes"].as_u64().unwrap() + record["footer_bytes"].as_u64().unwrap(),
+        text.len() as u64,
+        "{record}"
+    );
+
+    // The archived output stops at `max_run_bytes`, as for any run, and the
+    // replacement says where. An error line past the cap is not listed, since
+    // `log` could not replay it by its number.
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 4096\n").unwrap();
+    let capped = format!("{content}grep: src/locked: Permission denied\n");
+    let output = after_bash(&root, &root, "grep -rn needle src", bash_result(&capped));
+    let text = shown_stdout(&output);
+    let truncated = format!(
+        "\n[stdout archive truncated at 4.0 KB of {:.1} KB]\n",
+        capped.len() as f64 / 1024.0
+    );
+    assert!(text.ends_with(&truncated), "{text}");
+    assert!(!text.contains("Permission denied"), "{text}");
+    let id = text
+        .rsplit_once("[justless ")
+        .unwrap()
+        .1
+        .split([' ', ']'])
+        .next()
+        .unwrap()
+        .to_owned();
+    let archive = root.join(".justless/runs").join(&id);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
+    assert_eq!(record["stream_bytes"], json!([4096, 0]));
+    assert_eq!(record["produced_bytes"], json!([capped.len(), 0]));
+    assert_eq!(
+        cli(&root, &["log", &id, "--unredacted", "--stream", "stdout"]).stdout,
+        capped.as_bytes()[..4096]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn statusline_counts_replaced_bash_results_as_hook_runs_of_the_session() {
+    use serde_json::json;
+    let temp = TempDir::new().unwrap();
+    let outer = temp.path().canonicalize().unwrap().join("outer");
+    fs::create_dir_all(&outer).unwrap();
+    git(&outer, &["init", "-q"]);
+    fs::write(outer.join("package.json"), "{}").unwrap();
+    // A nested repository holding the search fixture's files.
+    let fixture = search_repo();
+    let nested = outer.join("nested");
+    assert!(
+        Command::new("cp")
+            .arg("-R")
+            .arg(fixture.path())
+            .arg(&nested)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(&nested, &["init", "-q"]);
+    let transcript = temp.path().join("transcript.jsonl");
+    fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"timestamp\":\"2020-01-01T00:00:00Z\",\"sessionId\":\"s1\"}\n",
+    )
+    .unwrap();
+    let event = |cwd: &Path, content: &str| {
+        json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","cwd":cwd,
+            "tool_input":{"command":"grep -rn needle src"},"tool_response":bash_result(content)})
+    };
+    let line = |current: &Path, session: &str| {
+        let input = json!({"session_id":session,"transcript_path":transcript,"cwd":current,
+            "workspace":{"current_dir":current,"project_dir":outer}});
+        status_line(&outer, &[], input.to_string().as_bytes(), None)
+    };
+    assert_eq!(line(&outer, "s1"), "justless · ready");
+
+    // The session started in the outer project and replaced a Bash result inside
+    // the nested repository, where the hook recorded the run.
+    let content = stdout(
+        &Command::new("grep")
+            .args(["-rn", "needle", "src"])
+            .current_dir(&nested)
+            .output()
+            .unwrap(),
+    );
+    let output = claude_hook(&nested, &outer, "after-bash", event(&nested, &content));
+    let text = shown_stdout(&output);
+    let id = marker_run(&text);
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(nested.join(".justless/runs").join(&id).join("record.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["hook"], true);
+    let saved = record["raw_bytes"].as_u64().unwrap()
+        - record["preview_bytes"].as_u64().unwrap()
+        - record["footer_bytes"].as_u64().unwrap();
+    assert_eq!(saved, (content.len() - text.len()) as u64);
+    let tokens = format!("{:.1}", saved.div_ceil(4) as f64 / 1000.0);
+    let expected = format!(
+        "justless · ≈{}k tokens saved this session · 1 run",
+        tokens.strip_suffix(".0").unwrap_or(&tokens)
+    );
+    // It counts while the session is inside the nested repository and after the
+    // session moves back out, but not for another session.
+    assert_eq!(line(&nested, "s1"), expected);
+    assert_eq!(line(&outer, "s1"), expected);
+    assert_eq!(line(&outer, "s2"), "justless · ready");
+    // A result the hook leaves alone records and counts nothing.
+    let small = claude_hook(
+        &nested,
+        &outer,
+        "after-bash",
+        event(&nested, "src/a.rs:1:needle\n"),
+    );
+    assert_eq!(small, json!({}));
+    assert_eq!(line(&outer, "s1"), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_counts_the_bash_output_hook_in_the_current_claude_set() {
+    let tools = doctor_tools(&["claude"]);
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    success(root, &["init", "--hooks", "--agent", "claude"]);
+    // An install from before the post-command hook.
+    let claude = root.join(".claude/settings.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+    config["hooks"]["PostToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["matcher"] != "^Bash$");
+    fs::write(&claude, config.to_string()).unwrap();
+    let (status, text) = doctor_text(root, tools.path());
+    assert_eq!(status, Some(1), "{text}");
+    assert!(
+        text.contains(
+            "✗ Hooks: .claude/settings.json lacks the after-bash hook\n    fix: justless init --hooks --agent claude"
+        ),
+        "{text}"
+    );
+    // Running the fix adds it, and the set is current again.
+    let bin = tools.path().join("bin");
+    let applied = doctor_shell(
+        root,
+        tools.path(),
+        bin.to_str().unwrap(),
+        "justless init --hooks --agent claude",
+    );
+    assert!(applied.status.success(), "{}", stderr(&applied));
+    let (status, text) = doctor_text(root, tools.path());
+    assert!(
+        text.contains("✓ Hooks: .claude/settings.json has all 7"),
+        "{text}"
+    );
+    assert_eq!(status, Some(0), "{text}");
+    // Removal takes it out with the others.
+    let removed = success(root, &["init", "--remove"]);
+    assert!(
+        removed.contains("\n  .claude/settings.json: removed 7 hooks"),
+        "{removed}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_bash_replacements_use_the_preview_budget_run_would_give() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    // About 7 KB of search output: over the default 4 KB budget, under 8 KB.
+    let output: String = (0..200)
+        .map(|i| format!("src/a{}.rs:{i}:let needle = {i};\n", i % 7))
+        .collect();
+    assert!((4096..8192).contains(&output.len()), "{}", output.len());
+    let replace = || after_bash(&root, &root, "grep -rn needle src", bash_result(&output));
+    let text = shown_stdout(&replace());
+    assert!(text.len() <= 4096 + 256, "{text}");
+    // Once the family's budget has been raised to 8 KB, `run` would show this
+    // output whole, so the hook leaves it alone too.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fs::write(
+        root.join(".justless/budgets.json"),
+        serde_json::json!({"grep": {"level": 1, "since_ms": now}}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(replace(), serde_json::json!({}));
 }

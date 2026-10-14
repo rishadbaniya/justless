@@ -492,6 +492,15 @@ pub fn observe(workspace: &Workspace, mode: &str, input: &Value, output: &Value)
             let launch = launch(workspace);
             let _ = mark(launch.as_ref().unwrap_or(workspace), &digest);
         }
+        // A replaced Bash result is a hook-routed run, which the status line counts
+        // from its record like any other. List the project that holds it where the
+        // session started, as a routed command in a nested project does.
+        "after-bash" if output["hookSpecificOutput"]["updatedToolOutput"].is_object() => {
+            if let Some(launch) = launch(workspace) {
+                let _ = mark(&launch, &digest);
+            }
+            register(&workspace.root, &digest);
+        }
         _ => {}
     }
 }

@@ -1,10 +1,12 @@
 //! Compact Claude Code Bash output that the command hook left alone.
 //!
-//! The command hook routes a supported command only when it is written plainly.
-//! Pipes such as `cargo test 2>&1 | tail -50`, `2>&1` suffixes, environment
-//! prefixes and Claude Code's own `grep` reach the agent whole. This PostToolUse
-//! handler archives such a result as a run and replaces it with the compaction
+//! The command hook routes a supported command only when it can rewrite it in
+//! place. Pipes such as `cargo test 2>&1 | tail -50`, lists it passes through and
+//! Claude Code's own `grep` reach the agent whole. This PostToolUse handler
+//! archives such a result as a run and replaces it with the compaction
 //! `justless run --hook` gives the same command, followed by the run marker.
+//! Secrets in the replacement are redacted as in any run's preview, and the
+//! archive keeps the exact output for `log --unredacted`.
 //!
 //! Contract, from the hooks reference
 //! (<https://code.claude.com/docs/en/hooks#posttooluse-decision-control>):
@@ -37,6 +39,7 @@
 //! `persistedOutputPath` is set. Claude Code's shell captures stderr into
 //! `stdout`; in transcripts `stderr` only ever held its own `Shell cwd was reset`
 //! note, so it is left as it is.
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
@@ -134,10 +137,8 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         return None;
     }
     let settings = ws.settings().ok()?;
-    // The run path shows output up to this size verbatim.
-    let threshold = settings.context_budget.max(settings.max_output_bytes);
     let persisted = response.get("persistedOutputPath").and_then(Value::as_str);
-    if persisted.is_none() && stdout.len() <= threshold {
+    if persisted.is_none() && stdout.len() <= settings.context_budget {
         return None;
     }
     let plan = plan(command)?;
@@ -150,6 +151,17 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         return None;
     }
     let directory = entered(&cwd, &ws.root, &plan.cd)?;
+    let run_ws = Workspace {
+        root: ws.root.clone(),
+        cwd: directory,
+        state: ws.state.clone(),
+    };
+    let args: Vec<OsString> = plan.words.iter().map(OsString::from).collect();
+    // The preview budget `justless run` would give these words, which adapts to
+    // how often agents reopened the family's clipped logs. The run path shows
+    // output up to this size, or the context budget, verbatim.
+    let run_budget = crate::adaptive::preview_budget(&run_ws, &args).ok()?;
+    let threshold = settings.context_budget.max(run_budget);
     let output = match persisted {
         Some(path) => read_persisted(path, response.get("persistedOutputSize")?, stdout)?,
         None => stdout.as_bytes().to_vec(),
@@ -170,9 +182,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             .map(char::len_utf8)
             .sum::<usize>()
     });
-    let budget = preview.map_or(settings.max_output_bytes, |preview| {
-        settings.max_output_bytes.min(preview * 3 / 4)
-    });
+    let budget = preview.map_or(run_budget, |preview| run_budget.min(preview * 3 / 4));
     // Claude Code reports exit 1 as a valid result only with an interpretation,
     // such as "No matches found".
     let status = i32::from(
@@ -200,12 +210,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         label: plan.label.clone(),
         note,
     };
-    let run_ws = Workspace {
-        root: ws.root.clone(),
-        cwd: directory,
-        state: ws.state.clone(),
-    };
-    let args: Vec<OsString> = plan.words.iter().map(OsString::from).collect();
+    // The same redactor the capture uses for the previews and footer. A
+    // configuration it cannot read stops the capture too.
+    let redactor = crate::redact::for_run(ws).ok()?;
     let mut shown =
         capture::record(&run_ws, &args, &output, status, budget, &session, &origin).ok()?;
     let archive = ws.state.join("runs").join(&shown.run.id);
@@ -223,13 +230,44 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     } else {
         let failures =
             summary.kind.is_empty() || summary.kind == "tests" && summary.items.is_empty();
-        unshown_errors(&output, &text, &plan.program, failures, budget / 4)
+        // The previews are redacted, so the error lines come from a redacted copy,
+        // whose line numbers match the archive. A line clipped to fit then never
+        // keeps part of a secret.
+        let redacted = redactor.map_or(Cow::Borrowed(output.as_slice()), |r| r.bytes(&output));
+        // Past `max_run_bytes` the archive holds no lines, so `log` could not replay
+        // an error line listed there by its number.
+        let archived = shown.run.stream_bytes.first().map_or(usize::MAX, |&bytes| {
+            usize::try_from(bytes).unwrap_or(usize::MAX)
+        });
+        let whole_lines = if archived >= output.len() {
+            usize::MAX
+        } else {
+            output[..archived]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count()
+        };
+        unshown_errors(
+            &redacted,
+            &text,
+            &plan.program,
+            failures,
+            budget / 4,
+            whole_lines,
+        )
     };
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     text.push_str(&errors);
     text.push_str(shown.footer.trim_start_matches('\n'));
+    // Previews go through the redactor once more before they are printed, so the
+    // whole replacement does too.
+    if let Some(redactor) = redactor
+        && let Cow::Owned(redacted) = redactor.text(&text)
+    {
+        text = redacted;
+    }
     let small = match preview {
         Some(preview) => text.len() > preview,
         None => output.len().saturating_sub(text.len()) < (output.len() / 4).max(512),
@@ -250,6 +288,14 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     let mut updated = input["tool_response"].clone();
     let fields = updated.as_object_mut()?;
     fields.insert("stdout".into(), json!(text));
+    // The rewrite replaces the whole result, so the stderr it carries is redacted
+    // like stdout.
+    if let Some(redactor) = redactor
+        && let Some(Value::String(stderr)) = fields.get_mut("stderr")
+        && let Cow::Owned(redacted) = redactor.text(stderr)
+    {
+        *stderr = redacted;
+    }
     // The compaction covers the whole output, so it is shown inline.
     for key in [
         "persistedOutputPath",
@@ -312,18 +358,20 @@ fn read_persisted(path: &str, size: &Value, stdout: &str) -> Option<Vec<u8>> {
 
 /// Lines of `output` that report an error, or with `failures` a failing test, and
 /// do not appear in `shown`, with their original stdout line numbers, within
-/// `budget` bytes.
+/// `budget` bytes. Only the first `archived` lines, those the archive holds whole,
+/// are listed.
 fn unshown_errors(
     output: &[u8],
     shown: &str,
     program: &str,
     failures: bool,
     budget: usize,
+    archived: usize,
 ) -> String {
     let text = String::from_utf8_lossy(output);
     let mut lines = String::new();
     let (mut listed, mut more) = (0, 0);
-    for (index, line) in text.lines().enumerate() {
+    for (index, line) in text.lines().enumerate().take(archived) {
         let trimmed = line.trim();
         if trimmed.is_empty()
             || !(reports_error(line, program) || failures && FAILURE_LINE.is_match(line))

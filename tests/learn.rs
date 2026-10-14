@@ -2339,3 +2339,37 @@ fn learn_skips_exec_runs() {
     let report = lab.json(&[]);
     assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
 }
+
+/// Claude Code's Bash post-command hook records a result after the command ran,
+/// with the whole command line's status, such as a pipe's 0 after a failing
+/// command, so learn leaves those runs out.
+#[test]
+fn learn_skips_bash_results_recorded_after_the_command_ran() {
+    use std::io::Write;
+    let lab = Lab::new();
+    let output: String = (0..400)
+        .map(|i| format!("src/a{}.rs:{i}:let needle = {i};\n", i % 7))
+        .collect();
+    let event = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash",
+        "cwd":lab.root,"tool_input":{"command":"grep -rn needle src | head -400"},
+        "tool_response":{"stdout":output,"stderr":"","interrupted":false,"isImage":false}});
+    let mut child = lab
+        .command("", &["hook-claude", "after-bash"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    let answer: Value = serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap();
+    assert!(
+        answer["hookSpecificOutput"]["updatedToolOutput"].is_object(),
+        "{answer}"
+    );
+    let report = lab.json(&[]);
+    assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
+}
