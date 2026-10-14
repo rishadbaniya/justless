@@ -1,7 +1,9 @@
 //! Compact records point back to inclusive line ranges in the original stdout.
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -314,6 +316,20 @@ pub fn short(s: &str, len: usize) -> String {
 }
 
 impl Summary {
+    /// A test outcome line that reports failures, such as `test result: FAILED.` or
+    /// `1 failed, 2 passed in 0.10s`. Output cut by `| tail` can keep this line and
+    /// lose the names of the failing tests.
+    fn failing_outcome(&self) -> Option<&str> {
+        static FAILED: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\bFAILED\b|\bFAIL\b|(?:^|[^0-9])[1-9][0-9]* (?:failed|failing)\b")
+                .expect("failing outcome pattern")
+        });
+        (self.kind == "tests")
+            .then(|| self.outcomes.iter().find(|line| FAILED.is_match(line)))
+            .flatten()
+            .map(String::as_str)
+    }
+
     /// A one-line outcome for handoffs, such as a failing test count or top lint rule.
     pub fn headline(&self) -> Option<String> {
         match self.kind.as_str() {
@@ -322,6 +338,7 @@ impl Summary {
                 self.items.len(),
                 self.items[0].name
             )),
+            "tests" => self.failing_outcome().map(str::to_owned),
             "lint" => {
                 let total: usize = self
                     .items
@@ -364,7 +381,11 @@ impl Summary {
             if status != 0 && self.items.is_empty() {
                 return None;
             }
-            report.push_str(&format!("{} reported failing test(s)\n", self.items.len()));
+            if self.items.is_empty() && self.failing_outcome().is_some() {
+                report.push_str("failing test names not in the captured output\n");
+            } else {
+                report.push_str(&format!("{} reported failing test(s)\n", self.items.len()));
+            }
         }
         let previous = previous.filter(|(_, s)| s.kind == self.kind);
         if let Some((id, old)) = previous {

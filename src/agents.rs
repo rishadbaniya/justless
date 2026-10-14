@@ -118,7 +118,60 @@ pub fn init(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<()> 
     if hooks && agents.contains(&Agent::Codex) {
         println!("Review and trust the project hooks with /hooks in Codex.");
     }
+    if hooks && agents.contains(&Agent::Claude) {
+        for (file, command) in other_bash_output_hooks(&workspace.root) {
+            eprintln!(
+                "{file} also runs a PostToolUse hook on Bash results: {command}. Claude Code runs these hooks in parallel on the original output and keeps the last rewrite, so the after-bash hook can replace that hook's rewrite, such as a redaction. If that hook rewrites output, remove one of the two."
+            );
+        }
+    }
     Ok(())
+}
+
+/// Other PostToolUse hooks that Claude Code runs on Bash results, from the project
+/// settings, as (file, command). Claude Code passes every such hook the original
+/// output in parallel and keeps the last rewrite (from the `updatedToolOutput`
+/// description in the Claude Code 2.1.327 binary: "hooks run in parallel on the
+/// ORIGINAL output, so an identity rewrite competes last-write-wins with sibling
+/// rewrites and can clobber a real redaction").
+fn other_bash_output_hooks(root: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for file in [".claude/settings.json", ".claude/settings.local.json"] {
+        let Ok(text) = fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        let Ok(config) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(entries) = config["hooks"]["PostToolUse"].as_array() else {
+            continue;
+        };
+        for entry in entries {
+            // An empty or missing matcher and `*` match every tool. A plain name
+            // matches exactly, and other matchers are regular expressions.
+            let matcher = entry["matcher"].as_str().unwrap_or("");
+            let bash = matcher.is_empty()
+                || matcher == "*"
+                || Regex::new(&format!("^(?:{matcher})$")).is_ok_and(|re| re.is_match("Bash"))
+                || !matcher
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && Regex::new(matcher).is_ok_and(|re| re.is_match("Bash"));
+            if !bash {
+                continue;
+            }
+            for handler in entry["hooks"].as_array().into_iter().flatten() {
+                let command = handler["command"]
+                    .as_str()
+                    .or_else(|| handler["type"].as_str())
+                    .unwrap_or("hook");
+                if command != Agent::Claude.command("after-bash") {
+                    found.push((file.to_owned(), command.to_owned()));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The file contents setup writes, keyed by path, and the instruction files it skips.

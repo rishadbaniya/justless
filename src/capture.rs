@@ -456,7 +456,10 @@ pub struct Recorded {
 /// Archive output that another program captured and compact it exactly as a
 /// hook-routed `execute` of `args` would, without rerun comparisons. `output` is
 /// stored as stdout within `max_run_bytes`, and `status` is the exit status
-/// reported with it.
+/// reported with it. The run is staged under `runs/.staged` and moved into place
+/// once its record is written, so a hook stopped at its timeout leaves nothing in
+/// `runs/`. Hooks finish within seconds, so a staged run older than a minute was
+/// left by one and is removed.
 pub fn record(
     workspace: &Workspace,
     args: &[OsString],
@@ -472,7 +475,22 @@ pub fn record(
     let redactor = crate::redact::for_run(workspace)?;
     let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
     let family = family_of(args, &selection);
-    let mut archive = Archive::create(workspace, &family, &origin.label, true)?;
+    workspace.prepare_state()?;
+    let runs = workspace.state.join("runs");
+    private_dir(&runs)?;
+    let staging = runs.join(".staged");
+    private_dir(&staging)?;
+    for entry in fs::read_dir(&staging)?.flatten() {
+        if entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|time| time.elapsed().is_ok_and(|age| age.as_secs() > 60))
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+    let mut archive = Archive::create_in(&staging, &family, &origin.label, true)?;
+    archive.destination = Some(runs);
     archive.store(output, settings.max_run_bytes)?;
     let capture = Capture {
         workspace,
@@ -490,12 +508,18 @@ pub fn record(
         retention: (settings.max_runs, settings.max_archive_bytes),
         origin: Some(origin),
     };
-    let (previews, footer, run) = capture.record(&mut archive, family, status, None)?;
-    Ok(Recorded {
-        run,
-        previews,
-        footer,
-    })
+    match capture.record(&mut archive, family, status, None) {
+        Ok((previews, footer, run)) => Ok(Recorded {
+            run,
+            previews,
+            footer,
+        }),
+        Err(error) => {
+            // A run that could not be recorded or moved into place is not kept.
+            let _ = fs::remove_dir_all(&archive.directory);
+            Err(error)
+        }
+    }
 }
 
 /// Run without recording, with the same exit statuses a shell reports.
@@ -567,6 +591,8 @@ struct Archive {
     late: bool,
     /// The locked `ACTIVE_LOCK`, held until Justless exits.
     active: Option<File>,
+    /// The runs directory a staged run moves into once its record is saved.
+    destination: Option<PathBuf>,
 }
 
 /// What the command wrote to one stream.
@@ -583,6 +609,11 @@ impl Archive {
         workspace.prepare_state()?;
         let runs = workspace.state.join("runs");
         private_dir(&runs)?;
+        Self::create_in(&runs, family, label, hook)
+    }
+
+    /// A new run directory under `runs`.
+    fn create_in(runs: &Path, family: &str, label: &str, hook: bool) -> Result<Self> {
         let temporary = Builder::new()
             .prefix("run-")
             .rand_bytes(12)
@@ -615,6 +646,7 @@ impl Archive {
             captured: vec![Captured::default(); 2],
             late: false,
             active,
+            destination: None,
         })
     }
 
@@ -631,6 +663,18 @@ impl Archive {
             archived: kept.len() as u64,
             produced: output.len() as u64,
         };
+        Ok(())
+    }
+
+    /// Move a staged run into the runs directory, once its record is saved.
+    fn publish(&mut self) -> Result<()> {
+        let Some(runs) = self.destination.take() else {
+            return Ok(());
+        };
+        let target = runs.join(self.id());
+        fs::rename(&self.directory, &target)
+            .with_context(|| format!("move the run into {}", runs.display()))?;
+        self.directory = target;
         Ok(())
     }
 
@@ -1509,6 +1553,7 @@ impl Capture<'_> {
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();
         archive.finish();
+        archive.publish()?;
         if let Some(prior) = previous.as_ref().filter(|_| run.unchanged) {
             archive.share(&workspace.state.join("runs").join(&prior.id), prior, &run);
         }

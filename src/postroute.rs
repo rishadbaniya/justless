@@ -49,8 +49,15 @@ use serde_json::{Value, json};
 use crate::capture::{self, Origin};
 use crate::workspace::{Workspace, write_json};
 
-/// Claude Code copies a large result to its session directory up to this size.
-const PERSISTED_LIMIT: u64 = 64 * 1024 * 1024;
+/// The largest output this hook archives, in lines and bytes. Grouping looks up a
+/// path for each line, and a review measured up to about 145 µs per line, so a
+/// larger result could outrun the hook's 10-second timeout. Claude Code shows such
+/// a result as the path of its saved copy and a short preview, so it passes through.
+const MAX_LINES: usize = 20_000;
+const MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Claude Code's preview of a result it saved to a file: up to the first 2,000
+/// characters. A report that replaces such a result must be no larger.
+const PREVIEW_CHARS: usize = 2_000;
 /// Lines of the original that the shown text left out and that report an error.
 const ERROR_LINES: usize = 8;
 const NOTE: &str = "Captured from a Claude Code Bash result after the command ran. The archive holds the output Claude Code recorded, with stdout and stderr interleaved, and Claude Code may have shortened it at its own output limits. The exit status is the whole command line's as Claude Code reported it: 0, or 1 where Claude Code read exit 1 as a valid result, so a pipe can hide its first command's failure.";
@@ -147,9 +154,25 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         Some(path) => read_persisted(path, response.get("persistedOutputSize")?, stdout)?,
         None => stdout.as_bytes().to_vec(),
     };
-    if output.len() <= threshold {
+    if output.len() <= threshold
+        || output.len() > MAX_BYTES
+        || output.iter().filter(|&&byte| byte == b'\n').count() > MAX_LINES
+    {
         return None;
     }
+    // For a result Claude Code saved to a file, the agent would have seen the first
+    // 2,000 characters. The report gets three quarters of that, so it fits with its
+    // error lines and marker.
+    let preview = persisted.map(|_| {
+        stdout
+            .chars()
+            .take(PREVIEW_CHARS)
+            .map(char::len_utf8)
+            .sum::<usize>()
+    });
+    let budget = preview.map_or(settings.max_output_bytes, |preview| {
+        settings.max_output_bytes.min(preview * 3 / 4)
+    });
     // Claude Code reports exit 1 as a valid result only with an interpretation,
     // such as "No matches found".
     let status = i32::from(
@@ -165,10 +188,17 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             || "terminal".to_owned(),
             |id| capture::source_digest(id.as_bytes())[..24].to_owned(),
         );
+    let mut note = NOTE.to_owned();
+    if let Some(preview) = preview {
+        note.push_str(&format!(
+            " Claude Code saved this {}-byte output to a file and would have shown its first {PREVIEW_CHARS} characters, so raw_bytes counts those {preview} bytes.",
+            output.len()
+        ));
+    }
     let origin = Origin {
         command: command.to_owned(),
         label: plan.label.clone(),
-        note: NOTE.to_owned(),
+        note,
     };
     let run_ws = Workspace {
         root: ws.root.clone(),
@@ -176,16 +206,8 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         state: ws.state.clone(),
     };
     let args: Vec<OsString> = plan.words.iter().map(OsString::from).collect();
-    let mut shown = capture::record(
-        &run_ws,
-        &args,
-        &output,
-        status,
-        settings.max_output_bytes,
-        &session,
-        &origin,
-    )
-    .ok()?;
+    let mut shown =
+        capture::record(&run_ws, &args, &output, status, budget, &session, &origin).ok()?;
     let archive = ws.state.join("runs").join(&shown.run.id);
     let mut text: String = shown
         .previews
@@ -201,27 +223,28 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     } else {
         let failures =
             summary.kind.is_empty() || summary.kind == "tests" && summary.items.is_empty();
-        unshown_errors(
-            &output,
-            &text,
-            &plan.program,
-            failures,
-            settings.max_output_bytes / 4,
-        )
+        unshown_errors(&output, &text, &plan.program, failures, budget / 4)
     };
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     text.push_str(&errors);
     text.push_str(shown.footer.trim_start_matches('\n'));
-    let saved = output.len().saturating_sub(text.len());
-    if shown.footer.is_empty() || saved < (output.len() / 4).max(512) {
+    let small = match preview {
+        Some(preview) => text.len() > preview,
+        None => output.len().saturating_sub(text.len()) < (output.len() / 4).max(512),
+    };
+    if shown.footer.is_empty() || small {
         // The agent keeps the original, so the archive adds nothing.
         let _ = fs::remove_dir_all(&archive);
         return None;
     }
-    if !errors.is_empty() {
+    if !errors.is_empty() || preview.is_some() {
         shown.run.footer_bytes += errors.len();
+        // Savings count against what Claude Code would have shown.
+        if let Some(preview) = preview {
+            shown.run.raw_bytes = preview as u64;
+        }
         let _ = write_json(&archive.join("record.json"), &shown.run);
     }
     let mut updated = input["tool_response"].clone();
@@ -241,9 +264,25 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }}))
 }
 
+/// How `history` and `resume` show a run's exit status. A run this hook recorded
+/// from a pipe or a list holds the whole line's status, which can hide a failure of
+/// the command it names, so the status says whose it is.
+pub fn exit_status(run: &crate::capture::Run) -> String {
+    if run.note.is_empty() {
+        run.status.to_string()
+    } else if run.label.contains(" | ") {
+        format!("{} (pipe)", run.status)
+    } else if run.label.ends_with("; …") {
+        format!("{} (last command)", run.status)
+    } else {
+        run.status.to_string()
+    }
+}
+
 /// The full output Claude Code saved for a large result. The inline `stdout` is
-/// only its start, so a file that is missing, cut at Claude Code's limit or not
-/// this result's leaves the result unchanged.
+/// only its start, so a file that is missing, larger than this hook archives or not
+/// this result's leaves the result unchanged. Claude Code cuts its copy at 64 MiB,
+/// far above that size.
 fn read_persisted(path: &str, size: &Value, stdout: &str) -> Option<Vec<u8>> {
     let path = Path::new(path);
     if !path.is_absolute()
@@ -256,13 +295,13 @@ fn read_persisted(path: &str, size: &Value, stdout: &str) -> Option<Vec<u8>> {
     }
     let size = size.as_u64()?;
     let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || size >= PERSISTED_LIMIT || metadata.len() < size {
+    if !metadata.is_file() || size > MAX_BYTES as u64 || metadata.len() < size {
         return None;
     }
     let mut bytes = Vec::new();
     File::open(path)
         .ok()?
-        .take(PERSISTED_LIMIT)
+        .take(MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .ok()?;
     let start = stdout.trim_start();
@@ -355,10 +394,10 @@ struct Plan {
 
 /// Find the one kind of supported command a command line runs. Its output may pass
 /// through filters that keep whole lines, such as `head`, `tail` or `grep`. Other
-/// commands in a list may only change directory or print a short note, such as
-/// `echo`. Several supported commands must select the same compaction, such as two
-/// searches. Anything else, including a command already routed through Justless,
-/// returns `None`.
+/// commands in a list may only change directory, change a setting, or print a short
+/// note such as `echo` before it. Several supported commands must select the same
+/// compaction, such as two searches. Anything else, including a command already
+/// routed through Justless, returns `None`.
 fn plan(command: &str) -> Option<Plan> {
     let segments = parse(command)?;
     let mut cd = PathBuf::new();
@@ -388,6 +427,11 @@ fn plan(command: &str) -> Option<Plan> {
                     after |= found.is_some();
                     continue;
                 }
+                // A line printed after the command, such as `echo "exit=$?"` or
+                // `&& echo OK || echo FAIL`, often reports how it ended, and a
+                // report of the command's own lines would leave it out.
+                Some(Quiet::Print) if found.is_some() => return None,
+                Some(Quiet::Print) => continue,
                 None => {}
             }
         }
@@ -409,6 +453,24 @@ fn plan(command: &str) -> Option<Plan> {
             crate::filters::profile(&refs),
             crate::summary::family(&args),
         );
+        // A search that prints lines around its matches or every line, such as
+        // `grep -n -A20 fn` or `grep -rn "" file`, is how an agent reads code, and a
+        // report grouped by file would show only the matching lines. A listing
+        // filtered by `grep` names the paths the agent asked for, which a listing
+        // report can collapse into one directory count.
+        let tool = crate::filters::unwrap_tool(&refs);
+        if crate::search::prints_more_than_matches(tool)
+            || kind.0 == Some(crate::filters::Profile::Listing)
+                && filters.iter().any(|filter| {
+                    strip(&filter.words)
+                        .and_then(|words| words.first())
+                        .is_some_and(|program| {
+                            matches!(basename(program), "grep" | "egrep" | "fgrep" | "rg")
+                        })
+                })
+        {
+            return None;
+        }
         match &found {
             Some((_, first_kind)) if *first_kind != kind => return None,
             Some(_) => after = true,
@@ -420,7 +482,6 @@ fn plan(command: &str) -> Option<Plan> {
                         label.push_str(basename(program));
                     }
                 }
-                let tool = crate::filters::unwrap_tool(&refs);
                 let plan = Plan {
                     words: words.to_vec(),
                     program: basename(tool.first().copied().unwrap_or("")).to_owned(),
@@ -449,8 +510,10 @@ fn basename(program: &str) -> &str {
 enum Quiet {
     /// A plain `cd DIR`.
     Enter(String),
-    /// A short note or a setting, such as `echo` or `set -e`.
+    /// A command that prints nothing, such as `set -e` or `true`.
     Note,
+    /// A short note, such as `echo` or `pwd`.
+    Print,
     /// A change of directory this line does not name, such as a bare `cd` or `cd -`.
     Elsewhere,
 }
@@ -470,9 +533,8 @@ fn quiet(words: &[String]) -> Option<Quiet> {
             }
             _ => Quiet::Elsewhere,
         }),
-        "echo" | "printf" | "true" | ":" | "set" | "export" | "unset" | "pwd" | "sleep" => {
-            Some(Quiet::Note)
-        }
+        "echo" | "printf" | "pwd" => Some(Quiet::Print),
+        "true" | ":" | "set" | "export" | "unset" | "sleep" => Some(Quiet::Note),
         _ => None,
     }
 }

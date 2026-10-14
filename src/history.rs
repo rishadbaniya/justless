@@ -733,7 +733,9 @@ fn outcome(run: &Run) -> String {
     if run.unfinished {
         "unfinished, output so far in justless log".into()
     } else {
-        format!("exit {}", run.status)
+        // A run the Bash post-command hook recorded from a pipe or a list holds the
+        // whole line's status, and says so.
+        format!("exit {}", crate::postroute::exit_status(run))
     }
 }
 

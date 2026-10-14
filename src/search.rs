@@ -252,6 +252,51 @@ pub fn select(words: &[&str]) -> Option<Profile> {
     })
 }
 
+/// Whether a search prints lines besides its matches, such as `grep -A5`, or a
+/// pattern that matches every line, such as `grep -rn "" file`. The agent asked for
+/// those lines, and a report grouped by file would show only a few matches.
+pub(crate) fn prints_more_than_matches(words: &[&str]) -> bool {
+    const CONTEXT: &[&str] = &[
+        "-A",
+        "-B",
+        "-C",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--after",
+        "--before",
+    ];
+    const EVERY_LINE: &[&str] = &["", "^", "$", ".", ".*", "^.*", ".*$", "^.*$"];
+    let Some((&program, args)) = words.split_first() else {
+        return false;
+    };
+    let (spec, args) = match (basename(program), args) {
+        ("rg", _) => (&RG, args),
+        ("grep" | "egrep" | "fgrep", _) => (&GREP, args),
+        ("git", ["grep", rest @ ..]) => (&GIT_GREP, rest),
+        ("ag", _) => (&AG, args),
+        ("ack" | "ack-grep", _) => (&ACK, args),
+        _ => return false,
+    };
+    // A list of file names, such as `rg --files .`, prints no lines and may have no
+    // pattern, so its first operand can be a path.
+    let Some(parsed) = parse(args, spec).filter(|parsed| !parsed.has_any(spec.lists)) else {
+        return false;
+    };
+    let explicit: Vec<&str> = parsed
+        .seen
+        .iter()
+        .filter(|(flag, _)| matches!(*flag, "-e" | "--regexp"))
+        .filter_map(|(_, value)| *value)
+        .collect();
+    let patterns = if explicit.is_empty() && !parsed.has(&["-f", "--file"]) {
+        parsed.positional.first().copied().into_iter().collect()
+    } else {
+        explicit
+    };
+    parsed.has(CONTEXT) || patterns.iter().any(|pattern| EVERY_LINE.contains(pattern))
+}
+
 // `find` options are single-dash words, so it has its own allow list. Actions such
 // as -exec and -delete and formats such as -print0, -printf and -ls select nothing.
 fn find_display(args: &[&str]) -> bool {

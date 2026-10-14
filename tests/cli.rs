@@ -12810,3 +12810,413 @@ fn claude_setup_adds_the_bash_output_hook_to_existing_installs() {
     let again = success(root, &["init", "--hooks", "--agent", "claude"]);
     assert!(!again.contains("settings.json"), "{again}");
 }
+
+#[cfg(unix)]
+#[test]
+fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
+    use serde_json::json;
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let content = stdout(
+        &Command::new("grep")
+            .args(["-rn", "needle", "src"])
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    let runs = || {
+        fs::read_dir(root.join(".justless/runs"))
+            .map(|dir| {
+                dir.filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("run-")
+                })
+                .count()
+            })
+            .unwrap_or(0)
+    };
+
+    // A note printed before the command is fine, and the search is grouped.
+    let noted = format!("== needle uses\n{content}");
+    let text = shown_stdout(&after_bash(
+        &root,
+        &root,
+        "echo \"== needle uses\"; grep -rn needle src",
+        bash_result(&noted),
+    ));
+    assert!(text.contains("src/big.rs ×150 [stdout:"), "{text}");
+    assert_eq!(runs(), 1);
+
+    // A line printed after the command often reports how it ended, which a report
+    // of the command's own lines would leave out, so the result stays whole.
+    let tests: String = (0..300)
+        .map(|i| format!("test pricing::case_{i} ... ok\n"))
+        .collect();
+    let build: String = (0..300)
+        .map(|i| format!("   Compiling crate_{i} v0.1.0\n"))
+        .collect();
+    for (command, output) in [
+        (
+            "cargo test 2>&1 | tail -400; echo \"EXIT_STATUS=${PIPESTATUS[0]}\"",
+            format!("{tests}EXIT_STATUS=101\n"),
+        ),
+        (
+            "set -o pipefail; cargo build 2>&1 | head -2000 && echo BUILD_OK || echo BUILD_FAILED",
+            format!("{build}BUILD_FAILED\n"),
+        ),
+        (
+            "echo \"== needle\"; grep -rn needle src; echo \"== call\"; grep -rn call src",
+            format!("== needle\n{content}== call\n{content}"),
+        ),
+        (
+            "grep -rn needle src; pwd",
+            format!("{content}{}\n", root.display()),
+        ),
+        (
+            "grep -rn needle src && printf done",
+            format!("{content}done"),
+        ),
+    ] {
+        assert_eq!(
+            after_bash(&root, &root, command, bash_result(&output)),
+            json!({}),
+            "{command}"
+        );
+    }
+
+    // Searches that print lines around their matches, or every line, are how an
+    // agent reads code, so they pass through, while the same searches without
+    // context are grouped.
+    let vcs = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+    };
+    vcs(&["init", "-q"]);
+    vcs(&["add", "src"]);
+    for command in ["rg -n needle src", "git grep -n needle -- src"] {
+        let text = shown_stdout(&after_bash(&root, &root, command, bash_result(&content)));
+        assert!(
+            text.contains("src/big.rs ×150 [stdout:"),
+            "{command}: {text}"
+        );
+    }
+    assert_eq!(runs(), 3);
+    for command in [
+        "grep -rn -A5 needle src",
+        "grep -rnA5 needle src",
+        "grep -rn -B 2 needle src",
+        "grep -rn --context=3 needle src",
+        "grep -rn --after-context 3 needle src",
+        "grep -rn --before-context=1 needle src",
+        "rg -n -C2 needle src",
+        "git grep -n -B2 needle -- src",
+        "grep -rn \"\" src",
+        "grep -rn -e '' src",
+        "grep -rn '^' src",
+        "rg -n '.*' src",
+    ] {
+        assert_eq!(
+            after_bash(&root, &root, command, bash_result(&content)),
+            json!({}),
+            "{command}"
+        );
+    }
+
+    // A listing filtered by grep names the paths the agent asked for, which a
+    // listing report could collapse into a directory count.
+    let found = stdout(
+        &Command::new("find")
+            .arg(".")
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    let filtered: String = found
+        .lines()
+        .filter(|line| line.contains("debug") || line.contains("node_modules"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(filtered.len() > 4096, "{}", filtered.len());
+    for command in [
+        "find . | grep debug",
+        "find . -type f | grep -v src",
+        "git ls-files --others | rg modules",
+    ] {
+        assert_eq!(
+            after_bash(&root, &root, command, bash_result(&filtered)),
+            json!({}),
+            "{command}"
+        );
+    }
+    let text = shown_stdout(&after_bash(
+        &root,
+        &root,
+        "find . | head -1000",
+        bash_result(&found),
+    ));
+    assert!(text.starts_with("find: "), "{text}");
+    // A list of file names has no pattern, so `.` there is a path.
+    let files: String = found
+        .lines()
+        .filter(|line| root.join(line).is_file())
+        .map(|line| format!("{line}\n"))
+        .collect();
+    for command in ["rg --files . | head -1000", "ag -g . ."] {
+        let text = shown_stdout(&after_bash(&root, &root, command, bash_result(&files)));
+        assert!(text.contains(" entries"), "{command}: {text}");
+    }
+    // Nothing that passed through was archived.
+    assert_eq!(runs(), 6);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_bash_piped_test_failure_shows_in_history_and_resume() {
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    // `| tail` cut the names of the failing tests but kept the summary line.
+    let mut log: String = (0..300)
+        .map(|i| format!("billing-trace step={i} state=ready\n"))
+        .collect();
+    log.push_str(
+        "\nthread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:\n\
+         assertion `left == right` failed\n  left: 106\n right: 105\n\n\
+         test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+         finished in 0.00s\n",
+    );
+    let text = shown_stdout(&after_bash(
+        &root,
+        &root,
+        "cargo test 2>&1 | tail -320",
+        bash_result(&log),
+    ));
+    assert!(
+        text.starts_with(
+            "failing test names not in the captured output\ntest result: FAILED. 0 passed; 1 failed"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "stdout:302: thread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:"
+        ),
+        "{text}"
+    );
+    let failed = marker_run(&text);
+
+    // The status belongs to `tail` or `true`, so lists say so, and resume shows
+    // the failing summary line.
+    let passing: String = (0..400)
+        .map(|i| format!("test pricing::case_{i} ... ok\n"))
+        .chain(std::iter::once(
+            "\ntest result: ok. 400 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s\n".to_owned(),
+        ))
+        .collect();
+    let text = shown_stdout(&after_bash(
+        &root,
+        &root,
+        "RUST_BACKTRACE=1 cargo test || true",
+        bash_result(&passing),
+    ));
+    assert!(
+        text.starts_with("0 reported failing test(s)\ntest result: ok."),
+        "{text}"
+    );
+    let passed = marker_run(&text);
+    let content = stdout(
+        &Command::new("grep")
+            .args(["-rn", "needle", "src"])
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    let plain = marker_run(&shown_stdout(&after_bash(
+        &root,
+        &root,
+        "grep -rn needle src",
+        bash_result(&content),
+    )));
+
+    let history = success(&root, &["history"]);
+    for expected in [
+        format!("{failed} · cargo test | tail · exit 0 (pipe) · "),
+        format!("{passed} · cargo test; … · exit 0 (last command) · "),
+        format!("{plain} · grep · exit 0 · "),
+    ] {
+        assert!(history.contains(&expected), "{expected}: {history}");
+    }
+    let resume = success(&root, &["resume"]);
+    let line = |id: &str| {
+        resume
+            .lines()
+            .find(|line| line.starts_with(id))
+            .unwrap_or_else(|| panic!("{id}: {resume}"))
+            .to_owned()
+    };
+    assert_eq!(
+        line(&failed),
+        format!(
+            "{failed} · cargo test | tail · exit 0 (pipe) · test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        )
+    );
+    // `0 failed` is not a failure.
+    assert_eq!(
+        line(&passed),
+        format!("{passed} · cargo test; … · exit 0 (last command)")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_bash_large_results_stay_within_the_hook_timeout_and_preview() {
+    use serde_json::json;
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let content = stdout(
+        &Command::new("grep")
+            .args(["-rn", "needle", "src"])
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    let runs = root.join(".justless/runs");
+
+    // Grouping looks up a path per line, so a result over 20,000 lines passes
+    // through untouched and unarchived, inline or saved by Claude Code.
+    let line = "src/big.rs:1:let needle_0 = load(needle, 0);\n";
+    let huge = line.repeat(20_001);
+    assert_eq!(
+        after_bash(&root, &root, "grep -rn needle src", bash_result(&huge)),
+        json!({})
+    );
+    let session = TempDir::new().unwrap();
+    let results = session.path().join("tool-results");
+    fs::create_dir(&results).unwrap();
+    let saved = results.join("huge.txt");
+    fs::write(&saved, &huge).unwrap();
+    let mut response = bash_result(&huge[..30000]);
+    response["persistedOutputPath"] = json!(saved);
+    response["persistedOutputSize"] = json!(huge.len());
+    assert_eq!(
+        after_bash(&root, &root, "grep -rn needle src", response),
+        json!({})
+    );
+    assert!(!runs.exists());
+
+    // A result Claude Code saved to a file would reach the agent as its first
+    // 2,000 characters, so the report is no larger, and stats count those bytes.
+    let full = content.repeat(4);
+    let saved = results.join("full.txt");
+    fs::write(&saved, &full).unwrap();
+    let mut response = bash_result(&full[..30000]);
+    response["persistedOutputPath"] = json!(saved);
+    response["persistedOutputSize"] = json!(full.len());
+    let text = shown_stdout(&after_bash(&root, &root, "grep -rn needle src", response));
+    let preview = full.chars().take(2000).map(char::len_utf8).sum::<usize>();
+    assert!(text.len() <= preview, "{} > {preview}: {text}", text.len());
+    assert!(text.contains("src/big.rs ×600"), "{text}");
+    let id = marker_run(&text);
+    assert_eq!(success(&root, &["log", &id, "--stream", "stdout"]), full);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(runs.join(&id).join("record.json")).unwrap()).unwrap();
+    assert_eq!(record["raw_bytes"], json!(preview), "{record}");
+    assert!(
+        record["note"].as_str().unwrap().contains(&format!(
+            "would have shown its first 2000 characters, so raw_bytes counts those {preview} bytes"
+        )),
+        "{record}"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&success(&root, &["stats", "--json"])).unwrap();
+    assert_eq!(stats["raw_bytes"], json!(preview), "{stats}");
+
+    // A hook stopped at its timeout leaves its staged run apart from the runs.
+    // The next archive removes it once it is a minute old, and leaves a run still
+    // being captured, which has no record yet, and a fresh staged run alone.
+    let abandoned = runs.join(".staged/run-AbandonedRun1");
+    let fresh = runs.join(".staged/run-FreshStaged1");
+    let capturing = runs.join("run-InProgress01");
+    for dir in [&abandoned, &fresh, &capturing] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("stdout"), "partial").unwrap();
+    }
+    for dir in [&abandoned, &capturing] {
+        assert!(
+            Command::new("touch")
+                .args(["-t", "202001010000"])
+                .arg(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let text = shown_stdout(&after_bash(
+        &root,
+        &root,
+        "grep -rn needle src",
+        bash_result(&content),
+    ));
+    assert!(!abandoned.exists());
+    assert!(fresh.join("stdout").exists());
+    assert!(capturing.join("stdout").exists());
+    let id = marker_run(&text);
+    assert!(runs.join(&id).join("record.json").exists());
+    assert!(!runs.join(".staged").join(&id).exists());
+    let history = success(&root, &["history"]);
+    assert!(history.contains(&id), "{history}");
+    assert!(
+        !history.contains("Staged") && !history.contains("InProgress"),
+        "{history}"
+    );
+}
+
+#[test]
+fn claude_setup_warns_about_other_hooks_on_bash_results() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::create_dir(root.join(".claude")).unwrap();
+    let shared = serde_json::json!({"hooks":{"PostToolUse":[
+        {"matcher":"Bash|Edit","hooks":[{"type":"command","command":"./scripts/redact.sh"}]},
+        {"matcher":"^Read$","hooks":[{"type":"command","command":"./scripts/read.sh"}]},
+        {"matcher":"Bas","hooks":[{"type":"command","command":"./scripts/exact.sh"}]}
+    ]}});
+    fs::write(root.join(".claude/settings.json"), shared.to_string()).unwrap();
+    let local = serde_json::json!({"hooks":{"PostToolUse":[
+        {"hooks":[{"type":"command","command":"./scripts/log.sh"}]}
+    ]}});
+    fs::write(root.join(".claude/settings.local.json"), local.to_string()).unwrap();
+    let output = cli(root, &["init", "--hooks", "--agent", "claude"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let warnings = stderr(&output);
+    for expected in [
+        ".claude/settings.json also runs a PostToolUse hook on Bash results: ./scripts/redact.sh.",
+        ".claude/settings.local.json also runs a PostToolUse hook on Bash results: ./scripts/log.sh.",
+        "keeps the last rewrite",
+    ] {
+        assert!(warnings.contains(expected), "{expected}: {warnings}");
+    }
+    for unexpected in ["read.sh", "exact.sh", "hook-claude"] {
+        assert!(!warnings.contains(unexpected), "{unexpected}: {warnings}");
+    }
+
+    // A project whose only Bash hooks are Justless's gets no warning.
+    let plain = TempDir::new().unwrap();
+    let output = cli(plain.path(), &["init", "--hooks", "--agent", "claude"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let again = cli(plain.path(), &["init", "--hooks", "--agent", "claude"]);
+    for output in [output, again] {
+        assert!(
+            !stderr(&output).contains("PostToolUse"),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
