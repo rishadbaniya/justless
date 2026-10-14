@@ -72,6 +72,19 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(cc_tools.benign_exit1("echo x >> f && git diff --exit-code"))
         self.assertFalse(cc_tools.benign_exit1("cargo test"))
         self.assertFalse(cc_tools.benign_exit1("justless run --hook -- cargo test"))
+        # Each case below was checked against real Claude Code 2.1.327 and its local fake API.
+        for command in ["rg 'a|b' src", "cat f | rg x", "cd src && rg x", "rg x # look", "rg x;",
+                        "git -C src diff --exit-code", "git --no-pager diff --exit-code",
+                        "git -c core.pager=cat diff --exit-code", "false && test 1",
+                        "justless run --hook --merge -- rg x 2>&1 && test 1", "rg x &>/dev/null",
+                        "for f in a; do if rg x; then echo done; fi; done; rg x",
+                        "case a in a) echo;; esac; rg x"]:
+            self.assertTrue(cc_tools.benign_exit1(command), command)
+        for command in ["LC_ALL=C rg x", "/opt/homebrew/bin/rg x", "'rg' x", "timeout 5 rg x",
+                        "{ rg x; }", "(cd src && rg x)", "if rg x; then echo y; fi",
+                        "for f in a; do rg x $f; done", "echo $(rg x; true)", "justless run --hook -- rg x",
+                        "while true; do if a; then rg x; fi; rg y; done"]:
+            self.assertFalse(cc_tools.benign_exit1(command), command)
         text, error, _ = self.bash("false")
         self.assertEqual((text, error), ("Exit code 1", True))
 

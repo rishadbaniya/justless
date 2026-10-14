@@ -141,11 +141,128 @@ def last_segment_program(command):
     return "", ""
 
 
+STATEMENT_OPENERS = {"if", "case", "for", "while", "until", "select"}
+STATEMENT_CLOSERS = {"fi", "esac", "done"}
+STATEMENT_PREFIXES = {"if", "then", "else", "elif", "while", "until", "do", "time"}
+
+
+def last_statement(command):
+    """The text of the last statement Claude Code 2.1.327 finds in a command line.
+
+    Claude Code parses the command with tree-sitter-bash and flattens program, list and
+    pipeline nodes: `&&`, `||`, `|`, `|&`, `;`, `&` and newlines separate statements and
+    comments are skipped. Any other node, such as a `{ ... }` group, a subshell, a loop, a
+    conditional or a function definition, is one statement. A command over 10,000
+    characters is one statement. This splitter follows quotes, escapes and that nesting;
+    here-documents are not modelled.
+    """
+    if len(command) > 10000:
+        return command
+    statements = []
+    start = 0
+    stack = []
+    quote = None
+    at_word_start = True
+    at_statement_start = True
+    i = 0
+    n = len(command)
+
+    def close(end):
+        text = command[start:end].strip()
+        if text:
+            statements.append(text)
+
+    while i < n:
+        c = command[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            at_word_start = at_statement_start = False
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            at_word_start = at_statement_start = False
+            continue
+        if c == "#" and at_word_start:
+            end = command.find("\n", i)
+            if not stack:
+                close(i)
+                start = n if end < 0 else end
+            i = n if end < 0 else end
+            continue
+        if at_word_start and c.isalpha():
+            j = i
+            while j < n and (command[j].isalnum() or command[j] == "_"):
+                j += 1
+            word = command[i:j]
+            boundary = j == n or command[j] in " \t\n;&|()<>"
+            if boundary and at_statement_start and word in STATEMENT_OPENERS:
+                stack.append("kw")
+            elif boundary and at_statement_start and word in STATEMENT_CLOSERS and stack and stack[-1] == "kw":
+                stack.pop()
+            i = j
+            at_word_start = False
+            at_statement_start = boundary and word in STATEMENT_PREFIXES
+            continue
+        if c == "(":
+            stack.append("(")
+        elif c == ")":
+            if stack and stack[-1] == "(":
+                stack.pop()
+        elif c == "{" and (i > 0 and command[i - 1] == "$" or
+                           at_word_start and (i + 1 == n or command[i + 1] in " \t\n")):
+            stack.append("{")
+        elif c == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        if c in ";&|\n":
+            previous = command[i - 1] if i > 0 else ""
+            following = command[i + 1] if i + 1 < n else ""
+            # A redirection such as `2>&1`, `<&3`, `&>file` or `>|file`.
+            if c == "&" and (previous in ("<", ">") or following == ">") or c == "|" and previous == ">":
+                i += 1
+                at_word_start = False
+                continue
+            if not stack:
+                close(i)
+            i += 2 if command[i:i + 2] in ("&&", "||", "|&", ";;") else 1
+            if not stack:
+                start = i
+            at_word_start = at_statement_start = True
+            continue
+        at_word_start = c in " \t\n" or (at_word_start and c in "({")
+        at_statement_start = at_statement_start and c in " \t\n(){!"
+        i += 1
+    close(n)
+    return statements[-1] if statements else command
+
+
 def benign_exit1(command):
-    program, first = last_segment_program(command)
-    if program in BENIGN_EXIT1:
-        return True
-    return program == "git" and first in BENIGN_GIT
+    """Whether Claude Code 2.1.327 reads exit status 1 of `command` as a valid result.
+
+    It takes the first whitespace-separated word of the last statement as written, so an
+    assignment, a wrapper such as `timeout`, a path or quotes make it another program.
+    For `git` it takes the first word that is not an option, and `-C` and `-c` take the
+    word after them. Only background tasks also check what precedes the last statement.
+    """
+    words = last_statement(command).split()
+    if not words:
+        return False
+    if words[0] == "git":
+        i = 1
+        while i < len(words):
+            if not words[i].startswith("-"):
+                return words[i] in BENIGN_GIT
+            i += 2 if words[i] in ("-C", "-c") else 1
+        return False
+    return words[0] in BENIGN_EXIT1
 
 
 def kb(size):

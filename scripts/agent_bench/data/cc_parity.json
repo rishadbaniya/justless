@@ -27,7 +27,7 @@
     "bash_failure_prefix": {"value": "Exit code {n}\n", "provenance": "cc-capture"},
     "bash_failure_read_window": {"value": 30000, "provenance": "cc-capture (40,000-byte output shows rows to 30,000)"},
     "bash_failure_excerpt": {"value": "if len('Exit code N\\n' + output) > 10000: head 5000 + '\\n\\n... [{n} characters truncated] ...\\n\\n' + tail 5000", "provenance": "cc-capture"},
-    "bash_benign_exit1": {"value": ["grep", "rg", "egrep", "fgrep", "find", "diff", "test", "[", "git diff", "git grep"], "provenance": "docs + cc-capture (grep, git diff --exit-code)"},
+    "bash_benign_exit1": {"value": ["grep", "rg", "egrep", "fgrep", "find", "diff", "test", "[", "git diff", "git grep"], "rule": "first whitespace-separated word of the last tree-sitter-bash statement, as written (no assignment, wrapper or path stripping); for git the first non-option word, with -C and -c taking the next word", "provenance": "docs + binary (KPi/Hy) + cc-capture and fake-API probes (env prefix, path, quotes, git -C/-c/--no-pager, cd &&, pipe, group)"},
     "bash_timeout": {"value": "Exit code 143\\nCommand timed out after {s}s, is_error", "provenance": "cc-capture"},
     "bash_cwd": {"value": "cd persists when the command succeeds and ends inside the project; outside, output gets '\\nShell cwd was reset to {root}'; a failed command keeps the previous cwd", "provenance": "cc-capture"},
     "bash_cwd_system_note": {"value": "# Environment update\n - Primary working directory: {new} (was {old})", "provenance": "cc-capture"},
