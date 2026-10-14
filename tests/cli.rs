@@ -772,6 +772,24 @@ fn agent_hook(
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+/// What the Claude Code hook appends after a routed command that starts with one of
+/// the programs whose exit status 1 Claude Code reads as valid, such as `rg`, `find`,
+/// `git diff` or `git grep`. `claude_hook_keeps_how_claude_code_reads_exit_1` checks
+/// the rule itself.
+fn claude_tail(agent: &str, command: &str) -> &'static str {
+    let mut words = command.split_whitespace();
+    let valid = match words.next() {
+        Some("git") => matches!(words.next(), Some("diff" | "grep")),
+        Some(program) => matches!(program, "rg" | "find" | "grep" | "diff"),
+        None => false,
+    };
+    if agent == "hook-claude" && valid {
+        " && test 1"
+    } else {
+        ""
+    }
+}
+
 #[test]
 fn codex_hooks_merge_and_use_the_documented_tool_contract() {
     let repo = mixed_fixture();
@@ -956,7 +974,7 @@ fn install_and_run_claude_and_agy_hooks() {
     let hook = &output["hookSpecificOutput"];
     assert_eq!(
         hook["updatedInput"],
-        json!({"command":"justless run --hook -- git diff","description":"show changes"})
+        json!({"command":"justless run --hook -- git diff && test 1","description":"show changes"})
     );
     assert!(hook.get("permissionDecision").is_none());
     let mut plan = claude_input;
@@ -1624,27 +1642,32 @@ fn compound_commands_wrap_each_supported_segment_in_place() {
             .as_str()
             .map(str::to_owned)
     };
-    for (command, expected) in [
+    // Claude Code reads exit 1 of a list ending in `git diff` as valid, so its hook
+    // ends such a list with `&& test 1`, which Claude Code reads the same way.
+    for (command, expected, claude_tail) in [
         (
             "git status; git diff",
             "justless run --hook -- git status; justless run --hook -- git diff",
+            true,
         ),
         (
             "cd web && npm test",
             "cd web && justless run --hook -- npm test",
+            false,
         ),
         (
             "git log --oneline -5  &&  git diff --stat",
             "justless run --hook -- git log --oneline -5  &&  justless run --hook -- git diff --stat",
+            true,
         ),
     ] {
-        for agent in ["hook-claude", "hook-codex"] {
-            assert_eq!(
-                rewrite(agent, command).as_deref(),
-                Some(expected),
-                "{agent} {command}"
-            );
-        }
+        let claude = format!("{expected}{}", if claude_tail { " && test 1" } else { "" });
+        assert_eq!(rewrite("hook-claude", command), Some(claude), "{command}");
+        assert_eq!(
+            rewrite("hook-codex", command).as_deref(),
+            Some(expected),
+            "{command}"
+        );
     }
     // Claude Code checks permissions for each rewritten segment. Codex auto-approves
     // a rewrite, so it only rewrites chains made entirely of supported commands.
@@ -1680,6 +1703,140 @@ fn compound_commands_wrap_each_supported_segment_in_place() {
     ] {
         assert_eq!(rewrite("hook-claude", command), None, "{command:?}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_hook_keeps_how_claude_code_reads_exit_1() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    fs::create_dir(root.join("src")).unwrap();
+    let nested = root.join("vendor_lib");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let rewrite = |agent: &str, command: &str| {
+        let output = agent_hook(&root, agent, "before-command", call(command));
+        let hook = &output["hookSpecificOutput"];
+        let command = hook["updatedInput"]["command"]
+            .as_str()
+            .or_else(|| hook["tool_input"]["command"].as_str())
+            .or_else(|| output["updated_input"]["command"].as_str())
+            .or_else(|| output["modifiedArgs"]["command"].as_str());
+        command.map(str::to_owned)
+    };
+    // Claude Code reads exit 1 as a valid result when the command's last statement
+    // starts with grep, rg, egrep, fgrep, find, diff, test or `[`, or is `git diff` or
+    // `git grep`. `test 1` keeps that reading and the command's own exit status.
+    let root_option = format!("--root {}", root.display());
+    for (command, expected) in [
+        (
+            "rg foo",
+            "justless run --hook -- rg foo && test 1".to_owned(),
+        ),
+        (
+            "git diff --exit-code",
+            "justless run --hook -- git diff --exit-code && test 1".to_owned(),
+        ),
+        (
+            "rg -n foo src 2>&1",
+            "justless run --hook --merge -- rg -n foo src 2>&1 && test 1".to_owned(),
+        ),
+        (
+            "cd src && rg foo",
+            "cd src && justless run --hook -- rg foo && test 1".to_owned(),
+        ),
+        (
+            "cd vendor_lib && git diff --exit-code",
+            format!(
+                "cd vendor_lib && justless {root_option} run --hook -- git diff --exit-code && test 1"
+            ),
+        ),
+        (
+            "git status; git diff --stat",
+            "justless run --hook -- git status; justless run --hook -- git diff --stat && test 1"
+                .to_owned(),
+        ),
+        (
+            "cargo build || rg foo;",
+            "justless run --hook -- cargo build || justless run --hook -- rg foo && test 1;"
+                .to_owned(),
+        ),
+        (
+            "rg foo\t",
+            "justless run --hook -- rg foo && test 1\t".to_owned(),
+        ),
+        // Claude Code reads exit 1 of these as an error with or without Justless: the
+        // last statement starts with another program or an assignment.
+        ("cargo test", "justless run --hook -- cargo test".to_owned()),
+        (
+            "rg foo; cargo build",
+            "justless run --hook -- rg foo; justless run --hook -- cargo build".to_owned(),
+        ),
+        (
+            "LC_ALL=C rg foo",
+            "LC_ALL=C justless run --hook -- rg foo".to_owned(),
+        ),
+        (
+            "git log --oneline -3",
+            "justless run --hook -- git log --oneline -3".to_owned(),
+        ),
+        // The last statement is not routed, so it is unchanged.
+        (
+            "rg foo; git push",
+            "justless run --hook -- rg foo; git push".to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            rewrite("hook-claude", command).as_deref(),
+            Some(expected.as_str()),
+            "{command}"
+        );
+    }
+    // Other clients show the exit status as it is, so they keep the plain rewrite.
+    for agent in ["hook-codex", "hook-gemini", "hook-cursor", "hook-copilot"] {
+        let call = match agent {
+            "hook-gemini" => serde_json::json!({"hook_event_name":"BeforeTool",
+                "tool_name":"run_shell_command","cwd":root,"tool_input":{"command":"rg foo"}}),
+            "hook-cursor" => serde_json::json!({"tool_name":"Shell","cwd":root,
+                "tool_input":{"command":"rg foo"}}),
+            "hook-copilot" => serde_json::json!({"cwd":root,"toolName":"bash",
+                "toolArgs":{"command":"rg foo"}}),
+            _ => call("rg foo"),
+        };
+        let output = agent_hook(&root, agent, "before-command", call);
+        assert!(
+            output
+                .to_string()
+                .contains("\"justless run --hook -- rg foo\""),
+            "{agent}: {output}"
+        );
+    }
+    // A command that already ends with the tail, as when Copilot or Cursor also runs
+    // the Claude Code hook, is left as it is by every handler.
+    let routed = "justless run --hook -- rg foo && test 1";
+    for agent in ["hook-claude", "hook-codex", "hook-cursor", "hook-copilot"] {
+        assert_eq!(rewrite(agent, routed), None, "{agent}");
+    }
+
+    // The tail keeps every exit status and the output.
+    fake_program(
+        &root,
+        "rg",
+        "[ \"$1\" = hit ] && { echo src/a.rs:1:hit; exit 0; }\n[ \"$1\" = miss ] && exit 1\necho 'rg: bad: No such file or directory' >&2\nexit 2\n",
+    );
+    let shell = merge_shell(&root);
+    for (pattern, code) in [("hit", 0), ("miss", 1), ("bad", 2)] {
+        let rewritten = rewrite("hook-claude", &format!("rg {pattern}")).unwrap();
+        let output = shell(&rewritten, &[]);
+        assert_eq!(output.status.code(), Some(code), "{rewritten}");
+        if code == 0 {
+            assert!(stdout(&output).starts_with("src/a.rs:1:hit"), "{rewritten}");
+        }
+    }
+    let skipped = shell("false || rg miss && test 1", &[]);
+    assert_eq!(skipped.status.code(), Some(1));
 }
 
 #[cfg(unix)]
@@ -2807,7 +2964,10 @@ fn hooks_route_searches_and_listings_but_not_machine_output() {
             let output = agent_hook(root, agent, "before-command", call(command));
             assert_eq!(
                 output["hookSpecificOutput"]["updatedInput"]["command"],
-                format!("justless run --hook -- {command}"),
+                format!(
+                    "justless run --hook -- {command}{}",
+                    claude_tail(agent, command)
+                ),
                 "{agent} {command}"
             );
         }
@@ -2962,7 +3122,10 @@ fn claude_code_keeps_its_own_grep_and_destructive_finds_pass_through() {
     ] {
         assert_eq!(
             rewrite("hook-claude", command),
-            Some(format!("justless run --hook -- {command}")),
+            Some(format!(
+                "justless run --hook -- {command}{}",
+                claude_tail("hook-claude", command)
+            )),
             "{command}"
         );
     }
@@ -3260,7 +3423,10 @@ fn revisions_with_a_tilde_are_routed_but_home_paths_are_not() {
         let output = agent_hook(root, "hook-claude", "before-command", call(command));
         assert_eq!(
             output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!("justless run --hook -- {command}"),
+            format!(
+                "justless run --hook -- {command}{}",
+                claude_tail("hook-claude", command)
+            ),
             "{command}"
         );
     }
@@ -5301,7 +5467,7 @@ fn rewritten_commands_keep_unicode_spaces_that_belong_to_a_word() {
         (
             "hook-claude",
             " git diff\t",
-            " justless run --hook -- git diff\t",
+            " justless run --hook -- git diff && test 1\t",
         ),
     ] {
         let output = agent_hook(&root, agent, "before-command", call(command));
@@ -12265,7 +12431,10 @@ exit 2
     );
     let shell = merge_shell(&root);
     let rewritten = rewrites(&root, "rg needle 2>&1")[0].1.clone().unwrap();
-    assert_eq!(rewritten, "justless run --hook --merge -- rg needle 2>&1");
+    assert_eq!(
+        rewritten,
+        "justless run --hook --merge -- rg needle 2>&1 && test 1"
+    );
     let small = shell(&rewritten, &[("COUNT", "3")]);
     assert_eq!(small.status.code(), Some(2));
     let text = stdout(&small);
@@ -12704,6 +12873,7 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     for command in [
         "justless run --hook -- grep -rn needle src",
         "cargo fmt && justless run --hook -- cargo test",
+        "cd src && justless run --hook -- rg needle && test 1",
         "cd src && justless log run-abc | head -400",
         "/opt/bin/justless recall abc",
         "cat src/big.rs",

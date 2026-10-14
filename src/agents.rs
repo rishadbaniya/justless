@@ -636,6 +636,7 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         mixed: agent == Agent::Gemini,
         client_grep: false,
         approves: agent == Agent::Cursor,
+        last_program: false,
     };
     let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
     args["command"] = Value::String(rewritten);
@@ -868,6 +869,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
             mixed: false,
             client_grep: false,
             approves: false,
+            last_program: false,
         },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
@@ -904,6 +906,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
             mixed: agent != Agent::Codex,
             client_grep: agent == Agent::Claude,
             approves: agent == Agent::Codex,
+            last_program: agent == Agent::Claude,
         },
     )?);
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
@@ -931,6 +934,63 @@ struct Rules {
     /// The client runs a rewritten command without asking, so each command must
     /// also pass `filters::approvable`.
     approves: bool,
+    /// The client judges exit status 1 by the program that starts the command's
+    /// last statement, as Claude Code does. See `EXIT_TAIL`.
+    last_program: bool,
+}
+
+/// What the Claude Code hook appends after a routed last command whose exit status
+/// 1 Claude Code reads as a valid result, such as `rg` that finds nothing or
+/// `git diff --exit-code` that finds a change. `&&` keeps the command's own exit
+/// status: `test 1` runs only after a success, and succeeds.
+///
+/// Claude Code 2.1.327 (`~/.local/share/claude/versions/2.1.327`, read-only) judges
+/// a foreground Bash result by the command text alone (`aUt` → `KPi` in its bundle).
+/// It parses the command with tree-sitter-bash, flattens `program`, `list` and
+/// `pipeline` nodes, skips the operators `&&`, `||`, `|`, `;`, `&`, `|&` and newline
+/// and comments, and keeps a `redirected_statement` without its redirections (`Hy`).
+/// Any other node, such as a function definition, `{ … }` group or subshell, is one
+/// statement. The program is the first whitespace-separated word of the last
+/// statement's text, as written (`YPi`): no assignment, wrapper or directory is
+/// stripped, so `LC_ALL=C rg x`, `timeout 5 rg x` and `/usr/bin/rg x` are read like
+/// any other program. Exit 1 is then valid for `grep`, `rg`, `egrep`, `fgrep`,
+/// `find`, `diff`, `test` and `[`, and for `git` when its first word that is not an
+/// option, after the word that `-C` or `-c` takes, is `diff` or `grep` (`VPi`,
+/// `iUt`). Exit 2 and above is an error for each of them, and any other nonzero
+/// status is an error for every other program. Only Claude Code's own background
+/// tasks also treat a last statement after `&&` as failed (`f0o`, `nJs`).
+///
+/// `justless run … -- rg x` starts with `justless`, so exit 1 became an error that
+/// plain `rg x` is not. Claude Code reads `test` exactly as it reads these programs,
+/// so the tail restores that reading, and its permission check allows the builtin
+/// `test` with no rule, so a rewrite asks for no more approval than before. Shell
+/// functions, aliases and `PATH` or `hash` changes that would keep the program's own
+/// name each need approval in Claude Code's default and auto modes, even with
+/// `Bash(justless:*)` allowed.
+const EXIT_TAIL: &str = " && test 1";
+
+/// Whether Claude Code reads exit status 1 of a command list whose last statement
+/// is `statement`, without redirections, as a valid result. See `EXIT_TAIL`.
+fn exit1_valid(statement: &str) -> bool {
+    let mut words = statement.split_whitespace();
+    match words.next() {
+        Some("git") => {
+            while let Some(word) = words.next() {
+                if !word.starts_with('-') {
+                    return matches!(word, "diff" | "grep");
+                }
+                if matches!(word, "-C" | "-c") {
+                    words.next();
+                }
+            }
+            false
+        }
+        Some(program) => matches!(
+            program,
+            "grep" | "rg" | "egrep" | "fgrep" | "find" | "diff" | "test" | "["
+        ),
+        None => false,
+    }
 }
 
 fn wrap_event(
@@ -980,6 +1040,19 @@ fn wrap_event(
     if plan.wrap.is_empty() {
         return None;
     }
+    // Where `EXIT_TAIL` goes: after the last command, when it is wrapped and the
+    // client reads its exit status 1 as valid. Its assignments count as written.
+    let tail = plan
+        .last
+        .filter(|last| {
+            rules.last_program
+                && plan.wrap.last().is_some_and(|(words, _)| {
+                    last.start <= words.start
+                        && words.end <= last.end
+                        && exit1_valid(&command[last.start..words.end])
+                })
+        })
+        .map(|last| last.end);
     // Rewrite each supported command in place and keep every other byte, so the
     // shell still sees the original operators, spacing and unsupported commands.
     let mut rewritten = String::with_capacity(command.len() + 64);
@@ -1002,6 +1075,11 @@ fn wrap_event(
             &command[range.clone()]
         ));
         copied = range.end;
+    }
+    if let Some(end) = tail {
+        rewritten.push_str(&command[copied..end]);
+        rewritten.push_str(EXIT_TAIL);
+        copied = end;
     }
     rewritten.push_str(&command[copied..]);
     Some(rewritten)
@@ -1281,6 +1359,8 @@ struct Plan {
     /// Each command to wrap, with the number of `cd` commands accepted before it.
     wrap: Vec<(Range<usize>, usize)>,
     other: Vec<Range<usize>>,
+    /// The last command of the line, with its assignments and any final `2>&1`.
+    last: Option<Range<usize>>,
 }
 
 /// Decide which commands of a list to rewrite. A list that changes directory in any
@@ -1313,12 +1393,14 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
     let Some(segments) = split_compound(command).filter(|s| s.len() > 1) else {
         let start = command.len() - command.trim_start_matches(SHELL_BLANKS).len();
         let range = start..command.trim_end_matches(SHELL_BLANKS).len().max(start);
+        plan.last = Some(range.clone());
         match supported(&command[range.clone()]) {
             Some(words) => plan.wrap.push((within(&range, words), 0)),
             None => plan.other.push(range),
         }
         return plan;
     };
+    plan.last = segments.last().cloned();
     let mut entered = 0;
     for range in &segments {
         let segment = &command[range.clone()];
@@ -1344,6 +1426,7 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
                         .filter(|range| directory_change(&command[(*range).clone()]).is_none())
                         .cloned()
                         .collect(),
+                    last: None,
                 };
             }
         }
@@ -1490,6 +1573,7 @@ pub fn would_route(command: &str) -> bool {
         mixed: true,
         client_grep: true,
         approves: false,
+        last_program: true,
     };
     !plan(command, rules, |_| true).wrap.is_empty()
 }
@@ -1757,4 +1841,48 @@ pub(crate) fn setup_error(
     hooks: bool,
 ) -> Option<anyhow::Error> {
     planned_changes(workspace, agents, hooks).err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit1_valid;
+
+    /// The rule described at `EXIT_TAIL`. The cases with an assignment, a path,
+    /// quotes, a wrapper, a group or Git options were also run through Claude Code
+    /// 2.1.327 against the benchmark's local fake API.
+    #[test]
+    fn exit_1_is_valid_by_the_first_word_of_the_last_statement() {
+        for statement in [
+            "rg foo src",
+            "grep -rn foo .",
+            "egrep foo",
+            "fgrep foo",
+            "find . -name x",
+            "diff a b",
+            "test -f x",
+            "[ -f x ]",
+            "rg 'a|b' src",
+            "git diff --exit-code",
+            "git grep -n foo",
+            "git -C src diff",
+            "git -c core.pager=cat diff",
+            "git --no-pager diff",
+        ] {
+            assert!(exit1_valid(statement), "{statement}");
+        }
+        for statement in [
+            "LC_ALL=C rg foo",
+            "/usr/bin/rg foo",
+            "'rg' foo",
+            "timeout 5 rg foo",
+            "{ rg foo; }",
+            "git log",
+            "git -C diff log",
+            "git",
+            "cargo test",
+            "",
+        ] {
+            assert!(!exit1_valid(statement), "{statement}");
+        }
+    }
 }
