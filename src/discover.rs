@@ -43,10 +43,11 @@ impl Route {
 /// The footer `justless run` prints on its own line after a captured command:
 /// `[justless run-ID] exit N · …` when a person runs it, and the bracketed
 /// `[justless run-ID · exit N]`, `[justless run-ID · 2.0 KB of 9.1 KB shown]` or
-/// `[justless run-ID · stderr after stdout]` markers of a hook-routed run.
+/// `[justless run-ID · stderr after stdout]` markers of a hook-routed run, which
+/// can also count redacted secrets, as in `[justless run-ID · 1 secret redacted]`.
 static FOOTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^\[justless run-[A-Za-z0-9]+(?:\] exit -?[0-9]+| · (?:exit -?[0-9]+|(?:[^\]\n]+ shown|stderr after stdout)(?: · exit -?[0-9]+)?)\]$)",
+        r"(?m)^\[justless run-[A-Za-z0-9]+(?:\] exit -?[0-9]+| · (?:[^\]\n]+ shown|[0-9]+ secrets? redacted|stderr after stdout|exit -?[0-9]+)(?: · (?:[0-9]+ secrets? redacted|stderr after stdout|exit -?[0-9]+))*\]$)",
     )
     .unwrap()
 });
@@ -308,4 +309,33 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FOOTER;
+
+    #[test]
+    fn footers_with_secret_counts_and_split_streams_count_as_routed() {
+        for line in [
+            "[justless run-Ab1] exit 0 · 10 of 20 output bytes · justless log run-Ab1",
+            "[justless run-Ab1 · exit 2]",
+            "[justless run-Ab1 · 2.0 KB of 9.1 KB shown]",
+            "[justless run-Ab1 · 2.0 KB of 9.1 KB shown · exit 101]",
+            "[justless run-Ab1 · 1 secret redacted]",
+            "[justless run-Ab1 · 2 secrets redacted · exit 1]",
+            "[justless run-Ab1 · 2.0 KB of 9.1 KB shown · 1 secret redacted · exit 2]",
+            "[justless run-Ab1 · stderr after stdout]",
+            "[justless run-Ab1 · 1 secret redacted · stderr after stdout · exit 2]",
+        ] {
+            assert!(FOOTER.is_match(&format!("output\n{line}")), "{line}");
+        }
+        for line in [
+            "[justless run-Ab1 · stderr after stdout here]",
+            "[justless run-Ab1 · secrets redacted]",
+            "see [justless run-Ab1 · exit 2]",
+        ] {
+            assert!(!FOOTER.is_match(&format!("output\n{line}")), "{line}");
+        }
+    }
 }

@@ -12342,3 +12342,98 @@ fn discover_counts_a_merged_search_footer_as_routed() {
     assert_eq!(labels("through_justless"), ["cargo test", "rg"]);
     assert_eq!(labels("supported_not_routed"), ["git diff"]);
 }
+
+/// An access key the redaction rules catch, built at runtime so no scanner-flagged
+/// literal lives in the repository.
+#[cfg(unix)]
+fn access_key() -> String {
+    format!("{}{}{}", "AK", "IA", "Q7ZK3M2R5T6V4WXY")
+}
+
+#[cfg(unix)]
+#[test]
+fn a_merged_run_archives_one_capped_pipe_and_redacts_what_it_shows() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let key = access_key();
+    let script = format!(
+        "echo 'out 1'; echo 'err 1 {key}' >&2; echo 'out 2 {key}'; echo 'err 2' >&2; exit 3"
+    );
+    let original = format!("out 1\nerr 1 {key}\nout 2 {key}\nerr 2\n");
+    let output = cli(
+        &root,
+        &["run", "--hook", "--merge", "--", "sh", "-c", &script],
+    );
+    // The exit status is the command's, and the preview keeps the order of both
+    // streams with the secrets replaced.
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let shown = stdout(&output);
+    assert!(!shown.contains(&key), "{shown}");
+    let lines: Vec<&str> = shown.lines().collect();
+    assert_eq!(lines.len(), 4, "{shown}");
+    assert_eq!((lines[0], lines[3]), ("out 1", "err 2"));
+    assert!(
+        lines[1].starts_with("err 1 [redacted:aws-access-key:"),
+        "{shown}"
+    );
+    assert!(
+        lines[2].starts_with("out 2 [redacted:aws-access-key:"),
+        "{shown}"
+    );
+    let id = footer_id(&output);
+    assert_eq!(
+        stderr(&output),
+        format!("[justless {id} · 2 secrets redacted · exit 3]\n")
+    );
+    // One pipe filled the stdout archive, nothing waited on it after the command
+    // exited, and the stderr archive is empty.
+    let archive = root.join(".justless/runs").join(&id);
+    assert_eq!(
+        fs::read(archive.join("stdout")).unwrap(),
+        original.as_bytes()
+    );
+    assert_eq!(fs::metadata(archive.join("stderr")).unwrap().len(), 0);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
+    assert_eq!(
+        record["stream_bytes"],
+        serde_json::json!([original.len(), 0])
+    );
+    assert!(record.get("drained").is_none(), "{record}");
+    assert!(record.get("produced_bytes").is_none(), "{record}");
+    assert_eq!(record["redaction"]["count"], 2);
+    // `log` replays the merged order redacted, and `--unredacted` the exact bytes.
+    assert_eq!(success(&root, &["log", &id]), shown);
+    assert_eq!(
+        cli(&root, &["log", &id, "--unredacted", "--stream", "stdout"]).stdout,
+        original.as_bytes()
+    );
+    let replay = cli(&root, &["log", &id, "--unredacted", "--stream", "stderr"]);
+    assert_eq!(
+        (stdout(&replay), stderr(&replay)),
+        (String::new(), String::new())
+    );
+
+    // The shared pipe is archived within `max_run_bytes`, and the command still
+    // runs to completion with its own status.
+    fs::write(root.join(".justless.toml"), "max_run_bytes = 1024\n").unwrap();
+    let script = "printf '%01000d\\n' 0; printf '%01000d\\n' 1 >&2; printf '%01000d\\n' 2; \
+                  printf '%01000d\\n' 3 >&2; exit 4";
+    let output = cli(
+        &root,
+        &["run", "--hook", "--merge", "--", "sh", "-c", script],
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).ends_with("\n[stdout archive truncated at 1.0 KB of 3.9 KB]\n"),
+        "{}",
+        stderr(&output)
+    );
+    let archive = root.join(".justless/runs").join(footer_id(&output));
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
+    assert_eq!(record["stream_bytes"], serde_json::json!([1024, 0]));
+    assert_eq!(record["produced_bytes"], serde_json::json!([4004, 0]));
+    assert_eq!(fs::metadata(archive.join("stdout")).unwrap().len(), 1024);
+    assert_eq!(fs::metadata(archive.join("stderr")).unwrap().len(), 0);
+}

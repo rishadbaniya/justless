@@ -1028,7 +1028,7 @@ fn strip_run_flags(mut words: &[String]) -> Option<&[String]> {
         let word = words.first()?.as_str();
         words = match word {
             "--" => return Some(&words[1..]),
-            "--hook" | "--fresh" | "--raw" => &words[1..],
+            "--hook" | "--merge" | "--fresh" | "--raw" => &words[1..],
             "--session" | "--max-bytes" => words.get(2..)?,
             _ if word.starts_with("--session=") || word.starts_with("--max-bytes=") => &words[1..],
             _ => return None,
@@ -1204,6 +1204,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!((cmd.dir.as_str(), argv(&cmd)), ("api", vec!["npm", "test"]));
+        // A hook keeps assignments and a final `2>&1` around the words it wraps.
+        let cmd = simple(
+            "",
+            "RUST_BACKTRACE=1 justless run --hook --merge --session abc -- cargo test 2>&1",
+        )
+        .unwrap();
+        assert_eq!((cmd.dir.as_str(), argv(&cmd)), ("", vec!["cargo", "test"]));
         let cmd = simple(
             "",
             "cargo test --manifest-path core/Cargo.toml -p x || true",
