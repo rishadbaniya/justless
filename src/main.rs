@@ -3,6 +3,7 @@ mod agents;
 mod capture;
 mod context;
 mod discover;
+mod doctests;
 mod doctor;
 mod exec;
 mod filters;

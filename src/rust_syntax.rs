@@ -71,7 +71,7 @@ const MAX_NESTING: usize = 1024;
 
 /// `syn::parse_file`, with a nesting check on the tokens before syn recurses
 /// through them.
-fn parse_file(text: &str) -> syn::Result<syn::File> {
+pub(crate) fn parse_file(text: &str) -> syn::Result<syn::File> {
     use proc_macro2::TokenTree;
     let mut content = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut shebang = None;

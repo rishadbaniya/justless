@@ -710,6 +710,47 @@ fn widening(runner: &RunnerPlan, step: &Step, outcome: &Outcome) -> Option<(usiz
     Some((count, selection::cargo_argv(&runner.base, &flags, &[])))
 }
 
+/// Filters of a passing doctest step that matched no doctest it reported.
+/// rustdoc can name an item otherwise than the index does, as for one a macro
+/// generates; such a step reruns its crates' doctests whole.
+fn doc_misses(step: &Step, outcome: &Outcome) -> Vec<String> {
+    if step.kind != StepKind::Doctests
+        || step.filters.is_empty()
+        || outcome.status != 0
+        || !outcome.tally.known
+    {
+        return Vec::new();
+    }
+    let doc = |key: &String| key.starts_with("doc:") || key == "*";
+    let reported: Vec<&String> = outcome
+        .tally
+        .names
+        .iter()
+        .filter(|(key, _)| doc(key))
+        .flat_map(|(_, names)| names)
+        .collect();
+    if reported.is_empty() {
+        // Quiet output names no test, so only the count can be checked.
+        let counted: usize = outcome
+            .tally
+            .counts
+            .iter()
+            .filter(|(key, _)| doc(key))
+            .map(|(_, count)| count)
+            .sum();
+        return if counted >= step.filters.len() {
+            Vec::new()
+        } else {
+            step.filters.clone()
+        };
+    }
+    step.filters
+        .iter()
+        .filter(|filter| !reported.iter().any(|name| name.contains(filter.as_str())))
+        .cloned()
+        .collect()
+}
+
 fn echoed(argv: &[String]) -> String {
     argv.iter()
         .map(|word| quote(word))
@@ -743,6 +784,7 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
             // package. Only a passing step is checked: after a failure cargo stops
             // at the failing binary, and the step has already failed the subset.
             let widen = widening(runner, step, &outcome);
+            let missed = doc_misses(step, &outcome);
             // pytest: unknown node IDs (exit 4) widen to their files, and an empty
             // collection (exit 5) means the selection did not match what pytest
             // collects, so the full suite runs. Either way the wider run's status
@@ -763,6 +805,25 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
                     } else {
                         "targets"
                     }
+                ));
+                let outcome = run_step(
+                    workspace,
+                    runner,
+                    result.mode,
+                    &argv,
+                    &echoed(&argv),
+                    options,
+                )?;
+                result.record(outcome, "widened", &argv, true);
+            }
+            if !missed.is_empty()
+                && let Some(flags) = step.widen.get("--doc")
+            {
+                let argv = selection::cargo_argv(&runner.base, flags, &[]);
+                let filters: Vec<String> = missed.iter().map(|filter| quote(filter)).collect();
+                result.note(format!(
+                    "widened: no doctest matched {}; running the crates' doctests in full",
+                    filters.join(", ")
                 ));
                 let outcome = run_step(
                     workspace,
@@ -1222,6 +1283,7 @@ mod tests {
                 .collect(),
             widen: BTreeMap::new(),
             built: Vec::new(),
+            filters: Vec::new(),
         }
     }
 
@@ -1289,5 +1351,35 @@ mod tests {
             echo(&step),
             "cargo test -p api --lib -- <2 test names> --exact"
         );
+    }
+
+    #[test]
+    fn a_doctest_filter_that_matched_nothing_is_a_miss() {
+        let step = Step {
+            kind: StepKind::Doctests,
+            argv: Vec::new(),
+            names: BTreeMap::new(),
+            widen: BTreeMap::new(),
+            built: Vec::new(),
+            filters: vec!["::total (line ".to_owned(), "price".to_owned()],
+        };
+        let outcome = |stdout: &str| Outcome {
+            status: 0,
+            run: None,
+            tally: runners::tally(Kind::Cargo, stdout, "   Doc-tests probe\n"),
+            elapsed_ms: 0,
+            shown: 0,
+            raw: 0,
+            unavailable: None,
+        };
+        let both = "\nrunning 2 tests\ntest src/lib.rs - Shop<T>::total (line 4) ... ok\ntest src/lib.rs - price (line 9) ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n";
+        assert!(doc_misses(&step, &outcome(both)).is_empty());
+        let one = "\nrunning 1 test\ntest src/lib.rs - price (line 9) ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out\n";
+        assert_eq!(doc_misses(&step, &outcome(one)), ["::total (line "]);
+        // Quiet output only counts: fewer doctests than filters is a miss.
+        let quiet = "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out\n";
+        assert_eq!(doc_misses(&step, &outcome(quiet)).len(), 2);
+        let none = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out\n";
+        assert_eq!(doc_misses(&step, &outcome(none)).len(), 2);
     }
 }

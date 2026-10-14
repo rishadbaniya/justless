@@ -7,11 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{Change, changes, relationship};
+use crate::doctests::{Docs, Group, markdown_examples};
 use crate::impact::{Dependent, Walk, walk};
 use crate::index::{Definition, Fingerprint, Index};
 use crate::map::{is_test_file, language, name};
@@ -170,6 +172,9 @@ pub(crate) struct Step {
     /// The targets a build-only step compiles, as `reports --example weekly`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub built: Vec<String>,
+    /// A doctest step's name filters, each of which must match a doctest.
+    #[serde(skip)]
+    pub filters: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -245,10 +250,11 @@ struct Seed {
     rules: bool,
 }
 
-/// Text of indexed files, read once.
+/// Text of indexed files, and the documentation of Rust files, read once.
 struct Texts<'a> {
     workspace: &'a Workspace,
     cache: BTreeMap<String, Option<String>>,
+    docs: BTreeMap<String, Option<Rc<Docs>>>,
 }
 
 impl<'a> Texts<'a> {
@@ -256,7 +262,23 @@ impl<'a> Texts<'a> {
         Self {
             workspace,
             cache: BTreeMap::new(),
+            docs: BTreeMap::new(),
         }
+    }
+
+    fn docs(&mut self, file: &str) -> Option<Rc<Docs>> {
+        if !self.docs.contains_key(file) {
+            let docs = self.get(file).map(|text| Rc::new(Docs::read(text)));
+            self.docs.insert(file.to_owned(), docs);
+        }
+        self.docs[file].clone()
+    }
+
+    fn line(&mut self, file: &str, line: usize) -> Option<String> {
+        self.get(file)?
+            .lines()
+            .nth(line.checked_sub(1)?)
+            .map(str::to_owned)
     }
 
     fn get(&mut self, file: &str) -> Option<&str> {
@@ -622,23 +644,90 @@ fn documented_item(index: &Index, file: &str, line: usize) -> Option<usize> {
         .filter(|&id| !matches!(index.definitions[id].kind.as_str(), "file" | "module"))
 }
 
-/// Whether a line lies inside a fenced code block: of the documentation
-/// comment around it in Rust, or of the whole file elsewhere.
-fn in_fence(text: &str, line: usize, rust: bool) -> bool {
-    let before: Vec<&str> = text.lines().take(line.saturating_sub(1)).collect();
-    let fences = before
-        .iter()
-        .rev()
-        .take_while(|text| !rust || doc_line(text))
-        .filter(|text| text.contains("```"))
-        .count();
-    fences % 2 == 1
+/// Rust documentation examples a change reaches.
+#[derive(Default)]
+struct DocHits {
+    /// The file and the item whose own docs hold the examples, or `None`
+    /// for every example in the file, with why.
+    examples: BTreeMap<(String, Option<usize>), String>,
+    /// Files with documentation Justless cannot read: their crate's doctests
+    /// run unfiltered, with why.
+    crates: BTreeMap<String, String>,
+}
+
+impl DocHits {
+    fn example(&mut self, file: &str, item: Option<usize>, why: &str) {
+        self.examples
+            .entry((file.to_owned(), item))
+            .or_insert_with(|| why.to_owned());
+    }
+
+    fn crate_of(&mut self, file: &str, why: &str) {
+        self.crates
+            .entry(file.to_owned())
+            .or_insert_with(|| why.to_owned());
+    }
+}
+
+/// What one item's documentation runs: examples rustdoc finds in it, or the
+/// whole crate's doctests when its text cannot be read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocRun {
+    Examples,
+    Crate,
+}
+
+/// Whether documentation holds an example rustdoc runs, `ignore`d ones
+/// included with `ignored`. Included files count; one that cannot be read
+/// runs the crate's doctests.
+fn doc_run(texts: &mut Texts, file: &str, group: &Group, ignored: bool) -> Option<DocRun> {
+    if group.unknown {
+        return Some(DocRun::Crate);
+    }
+    if group.runs(ignored) {
+        return Some(DocRun::Examples);
+    }
+    for include in &group.includes {
+        let Some(text) = resolve(file, include).and_then(|path| texts.get(&path)) else {
+            return Some(DocRun::Crate);
+        };
+        if markdown_examples(text)
+            .iter()
+            .any(|example| ignored || !example.ignored)
+        {
+            return Some(DocRun::Examples);
+        }
+    }
+    None
+}
+
+/// The item whose own outer docs `group` is, or `None` when rustdoc names
+/// the examples otherwise, as for a file's docs or an enum variant's.
+fn documented_by(index: &Index, file: &str, group: &Group) -> Option<usize> {
+    if group.inner {
+        return None;
+    }
+    let first = group.first();
+    let id = documented_item(index, file, first)?;
+    let definition = &index.definitions[id];
+    (definition.location.start <= first && first < definition.declaration).then_some(id)
+}
+
+/// The test filter that selects an item's doctests. rustdoc names a method
+/// after its type with any generics, as in `Shop<T>::total (line 4)`, so a
+/// method matches on `::total (line ` instead of its indexed name.
+fn doc_filter(definition: &Definition) -> String {
+    if definition.kind == "method" {
+        format!("::{} (line ", short(definition))
+    } else {
+        name(definition).to_owned()
+    }
 }
 
 /// Records the Rust documentation examples on `path:line` when that line is
 /// documentation, or lies in a file documentation includes. With `fenced`, the
-/// line must sit in a code block, as the examples rustdoc runs do. Returns
-/// whether it was documentation.
+/// line must sit in a code block rustdoc runs. Returns whether it was
+/// documentation.
 #[allow(clippy::too_many_arguments)]
 fn doc_example(
     index: &Index,
@@ -647,19 +736,19 @@ fn doc_example(
     path: &str,
     line: usize,
     fenced: bool,
+    ignored: bool,
     why: &str,
-    examples: &mut BTreeMap<(String, Option<usize>), String>,
+    hits: &mut DocHits,
 ) -> bool {
     if let Some(includers) = includes.get(path) {
-        if !fenced
-            || texts
-                .get(path)
-                .is_some_and(|text| in_fence(text, line, false))
-        {
+        let inside = texts.get(path).is_some_and(|text| {
+            markdown_examples(text).iter().any(|example| {
+                (ignored || !example.ignored) && example.start <= line && line <= example.end
+            })
+        });
+        if !fenced || inside {
             for (file, item) in includers {
-                examples
-                    .entry((file.clone(), *item))
-                    .or_insert_with(|| why.to_owned());
+                hits.example(file, *item, why);
             }
         }
         return true;
@@ -667,30 +756,65 @@ fn doc_example(
     if !path.ends_with(".rs") {
         return false;
     }
-    let Some(whole) = texts.get(path) else {
+    let (Some(docs), Some(text)) = (texts.docs(path), texts.line(path, line)) else {
         return false;
     };
-    let Some(text) = whole.lines().nth(line - 1) else {
-        return false;
-    };
-    if !doc_line(text) {
-        return false;
-    }
-    if fenced && !in_fence(whole, line, true) {
+    if docs.opaque(line, &text) {
+        hits.crate_of(path, why);
         return true;
     }
-    let trimmed = text.trim_start();
-    let item = if trimmed.starts_with("//!") || trimmed.starts_with("#![doc") {
-        None
-    } else if trimmed.starts_with("///") || trimmed.starts_with("#[doc") {
-        documented_item(index, path, line)
-    } else {
+    let Some(group) = docs.at(line) else {
         return false;
     };
-    examples
-        .entry((path.to_owned(), item))
-        .or_insert_with(|| why.to_owned());
+    if group.unknown {
+        hits.crate_of(path, why);
+    } else if !fenced || group.in_example(line, ignored) {
+        hits.example(path, documented_by(index, path, group), why);
+    }
     true
+}
+
+/// Records the examples that changed documentation in a Rust file runs: every
+/// example in the file when a changed line is documentation holding one, and
+/// the crate's when the documentation cannot be read.
+fn changed_docs(
+    texts: &mut Texts,
+    file: &str,
+    text: &[String],
+    changed: &BTreeSet<usize>,
+    ignored: bool,
+    hits: &mut DocHits,
+) {
+    let Some(docs) = texts.docs(file) else {
+        return;
+    };
+    let mut groups = BTreeSet::new();
+    for &line in changed {
+        let Some(text) = line.checked_sub(1).and_then(|at| text.get(at)) else {
+            continue;
+        };
+        if docs.opaque(line, text) {
+            hits.crate_of(
+                file,
+                &format!("changed documentation at {file}:{line} that Justless cannot read"),
+            );
+        } else if let Some(at) = docs.groups.iter().position(|g| g.covers(line))
+            && groups.insert(at)
+        {
+            match doc_run(texts, file, &docs.groups[at], ignored) {
+                Some(DocRun::Crate) => hits.crate_of(
+                    file,
+                    &format!("changed documentation at {file}:{line} that Justless cannot read"),
+                ),
+                Some(DocRun::Examples) => hits.example(
+                    file,
+                    None,
+                    &format!("changed documentation with an example at {file}:{line}"),
+                ),
+                None => {}
+            }
+        }
+    }
 }
 
 /// Which runners a dependency or configuration file belongs to.
@@ -806,9 +930,10 @@ struct Analysis {
     macros: Vec<(String, usize, String)>,
     /// Files deleted outright.
     deleted: BTreeSet<String>,
-    /// Rust documentation examples a change reaches: the file and documented
-    /// item, or `None` for the file's own docs, with why.
-    doc_examples: BTreeMap<(String, Option<usize>), String>,
+    /// Rust documentation examples a change reaches.
+    docs: DocHits,
+    /// Whether the base command runs `ignore`d tests, so `ignore`d examples count.
+    run_ignored: bool,
     /// Changed code files that nothing names by path.
     unmentioned_code: BTreeSet<String>,
 }
@@ -868,7 +993,15 @@ pub(crate) fn plan(
     let base = git_text(workspace, &["rev-parse", "--short", "HEAD"])
         .map_or_else(|| "no commits yet".to_owned(), |rev| format!("HEAD {rev}"));
     let changes = changes(workspace, index, false)?;
-    let mut analysis = analyze(workspace, index, &changes, settings)?;
+    // `cargo test -- --ignored` runs examples marked `ignore` too.
+    let run_ignored = runners.iter().any(|runner| {
+        runner.kind == Kind::Cargo
+            && runner
+                .base
+                .iter()
+                .any(|word| word == "--ignored" || word == "--include-ignored")
+    });
+    let mut analysis = analyze(workspace, index, &changes, settings, run_ignored)?;
     // Code in a language no runner here runs, such as SQL or shell, reaches
     // tests only through what names it or links to it; otherwise it is data.
     for file in std::mem::take(&mut analysis.unmentioned_code) {
@@ -949,6 +1082,7 @@ fn analyze(
     index: &Index,
     changes: &[(String, Change)],
     settings: &TestSettings,
+    run_ignored: bool,
 ) -> Result<Analysis> {
     let definitions = &index.definitions;
     let mut texts = Texts::new(workspace);
@@ -964,7 +1098,8 @@ fn analyze(
         mentioned_files: BTreeMap::new(),
         macros: Vec::new(),
         deleted: BTreeSet::new(),
-        doc_examples: BTreeMap::new(),
+        docs: DocHits::default(),
+        run_ignored,
         unmentioned_code: BTreeSet::new(),
     };
     let doc_includes = doc_includes(index, &mut texts);
@@ -1185,6 +1320,33 @@ fn analyze(
                         .push(((*file).to_owned(), start, macro_name));
                 }
             }
+            // Changed documentation runs the examples in it, wherever the item
+            // it documents leads. Lines removed count by their neighbors.
+            let mut changed = BTreeSet::new();
+            for change in list {
+                match change {
+                    Change::Ranges(ranges) => {
+                        for &(start, end) in ranges {
+                            changed.extend(start..=end);
+                        }
+                    }
+                    Change::Deleted(deletions) => {
+                        for deletion in deletions {
+                            changed.insert(deletion.after.max(1));
+                            changed.insert(deletion.after + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            changed_docs(
+                &mut texts,
+                file,
+                &lines,
+                &changed,
+                run_ignored,
+                &mut analysis.docs,
+            );
         }
     }
     analysis.files.sort();
@@ -1266,8 +1428,9 @@ fn analyze(
                 &path,
                 line,
                 false,
+                run_ignored,
                 &format!("its documentation includes {file} at {path}:{line}"),
-                &mut analysis.doc_examples,
+                &mut analysis.docs,
             ) {
                 mentioned = true;
                 continue;
@@ -1426,8 +1589,9 @@ fn analyze(
                                 &path,
                                 line,
                                 true,
+                                run_ignored,
                                 &format!("its example names {word} at {path}:{line}"),
-                                &mut analysis.doc_examples,
+                                &mut analysis.docs,
                             )
                         {
                             continue;
@@ -1751,6 +1915,7 @@ fn full_plan(runner: &Runner, reasons: Vec<Reason>) -> RunnerPlan {
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
             built: Vec::new(),
+            filters: Vec::new(),
         }],
         tests: Vec::new(),
         skipped: Vec::new(),
@@ -2712,6 +2877,7 @@ fn cargo_plan(
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
             built: Vec::new(),
+            filters: Vec::new(),
         });
     }
     // Compile coverage rides along with the filtered step.
@@ -2750,6 +2916,7 @@ fn cargo_plan(
             names: step_names,
             widen,
             built: Vec::new(),
+            filters: Vec::new(),
         });
     }
     if !unfiltered.is_empty() {
@@ -2759,11 +2926,32 @@ fn cargo_plan(
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
             built: Vec::new(),
+            filters: Vec::new(),
         });
     }
-    // Doctests of reached library items that carry an example.
+    // Doctests: the examples in reached library items' docs, and examples a
+    // change reaches elsewhere, such as changed docs or an included README.
+    // Documentation that cannot be read runs its crate's doctests unfiltered.
     let mut doc_packages = BTreeSet::new();
-    let mut doc_paths = BTreeMap::<String, (&'static str, String)>::new();
+    // Test name filter → (shown id, confidence, why).
+    let mut doc_paths = BTreeMap::<String, (String, &'static str, String)>::new();
+    let mut doc_crates = BTreeMap::<String, String>::new();
+    let runs_doctests = |package: &Package, target: &Target| {
+        target.is_lib()
+            && target.doctest
+            && cargo.scope.contains(&package.name)
+            && !packages.contains(&package.name)
+    };
+    let lib_of = |file: &str| {
+        definitions
+            .iter()
+            .filter(|d| d.location.file == file)
+            .find_map(|d| target_of(cargo, d))
+            .or_else(|| {
+                let package = cargo.owner(file)?;
+                Some((package, package.targets.iter().find(|t| t.is_lib())?))
+            })
+    };
     let mut reached_ids: BTreeSet<usize> = BTreeSet::new();
     for seed in &analysis.seeds {
         reached_ids.insert(seed.id);
@@ -2771,85 +2959,98 @@ fn cargo_plan(
     }
     for id in reached_ids {
         let definition = &definitions[id];
-        if definition.test || !in_scope(runner, &definition.location.file) {
+        let file = &definition.location.file;
+        if definition.test || !in_scope(runner, file) {
             continue;
         }
         let Some((package, target)) = target_of(cargo, definition) else {
             continue;
         };
-        if !target.is_lib() || !target.doctest || packages.contains(&package.name) {
+        if !runs_doctests(package, target) {
             continue;
         }
-        let documented = texts
-            .get(&definition.location.file)
-            .map(|text| {
-                text.lines()
-                    .skip(definition.location.start.saturating_sub(1))
-                    .take(
-                        definition
-                            .declaration
-                            .saturating_sub(definition.location.start),
+        let Some(docs) = texts.docs(file) else {
+            continue;
+        };
+        let mut run = None;
+        for group in docs.outer(definition.location.start, definition.declaration) {
+            match doc_run(&mut texts, file, group, analysis.run_ignored) {
+                Some(DocRun::Crate) => run = Some(DocRun::Crate),
+                Some(DocRun::Examples) if run.is_none() => run = Some(DocRun::Examples),
+                _ => {}
+            }
+        }
+        match run {
+            Some(DocRun::Crate) => {
+                doc_crates.entry(package.name.clone()).or_insert_with(|| {
+                    format!(
+                        "documentation Justless cannot read on reached item {}",
+                        name(definition)
                     )
-                    .any(|line| {
-                        let line = line.trim_start();
-                        (line.starts_with("///")
-                            || line.starts_with("//!")
-                            || line.starts_with("#[doc"))
-                            && line.contains("```")
-                    })
-            })
-            .unwrap_or(false);
-        if documented {
-            doc_packages.insert(package.name.clone());
-            doc_paths.insert(
-                name(definition).to_owned(),
-                (
-                    "exact",
-                    "documentation example on a reached item".to_owned(),
-                ),
-            );
+                });
+            }
+            Some(DocRun::Examples) => {
+                doc_packages.insert(package.name.clone());
+                doc_paths.insert(
+                    doc_filter(definition),
+                    (
+                        name(definition).to_owned(),
+                        "exact",
+                        "documentation example on a reached item".to_owned(),
+                    ),
+                );
+            }
+            None => {}
         }
     }
-    // Examples elsewhere that name a change, such as crate docs or an included README.
-    for ((file, item), why) in &analysis.doc_examples {
+    // Examples elsewhere that a change reaches.
+    for ((file, item), why) in &analysis.docs.examples {
         if !in_scope(runner, file) {
             continue;
         }
         let owner = match item {
             Some(id) => target_of(cargo, &definitions[*id]),
-            None => definitions
-                .iter()
-                .filter(|d| &d.location.file == file)
-                .find_map(|d| target_of(cargo, d))
-                .or_else(|| {
-                    let package = cargo.owner(file)?;
-                    Some((package, package.targets.iter().find(|t| t.is_lib())?))
-                }),
+            None => lib_of(file),
         };
         let Some((package, target)) = owner else {
             continue;
         };
-        if !target.is_lib()
-            || !target.doctest
-            || !cargo.scope.contains(&package.name)
-            || packages.contains(&package.name)
-        {
+        if !runs_doctests(package, target) {
             continue;
         }
         // Doctests are named `reports/src/lib.rs - stats::peak (line 3)`, or
         // without an item for a file's own docs.
-        let filter = match item {
-            Some(id) => name(&definitions[*id]).to_owned(),
+        let (filter, id) = match item {
+            Some(id) => (
+                doc_filter(&definitions[*id]),
+                name(&definitions[*id]).to_owned(),
+            ),
             None => {
                 let within = file
                     .strip_prefix(&package.dir)
                     .map_or(file.as_str(), |rest| rest.trim_start_matches('/'));
-                format!("{within} - ")
+                (format!("{within} - "), within.to_owned())
             }
         };
         doc_packages.insert(package.name.clone());
-        doc_paths.entry(filter).or_insert(("mention", why.clone()));
+        doc_paths
+            .entry(filter)
+            .or_insert((id, "mention", why.clone()));
     }
+    for (file, why) in &analysis.docs.crates {
+        if !in_scope(runner, file) {
+            continue;
+        }
+        if let Some((package, target)) = lib_of(file)
+            && runs_doctests(package, target)
+        {
+            doc_crates
+                .entry(package.name.clone())
+                .or_insert_with(|| why.clone());
+        }
+    }
+    // A crate whose doctests all run needs no filtered step of its own.
+    doc_packages.retain(|package| !doc_crates.contains_key(package));
     if !doc_packages.is_empty() {
         let mut flags = Vec::new();
         for package in &doc_packages {
@@ -2857,21 +3058,46 @@ fn cargo_plan(
             flags.push(package.clone());
         }
         flags.push("--doc".into());
-        let paths: Vec<String> = doc_paths.keys().cloned().collect();
-        for (path, (confidence, why)) in &doc_paths {
+        let filters: Vec<String> = doc_paths.keys().cloned().collect();
+        for (id, confidence, why) in doc_paths.values() {
             selected.push(Selected {
-                id: format!("{} (doctest)", path.trim_end_matches(" - ")),
+                id: format!("{id} (doctest)"),
                 target: "--doc".into(),
                 confidence,
                 why: why.clone(),
             });
         }
+        // Run a filter that matches no doctest as the crates' whole doctests.
+        let widen = BTreeMap::from([("--doc".to_owned(), flags.clone())]);
         plan.steps.push(Step {
             kind: StepKind::Doctests,
-            argv: cargo_argv(&runner.base, &flags, &paths),
+            argv: cargo_argv(&runner.base, &flags, &filters),
+            names: BTreeMap::new(),
+            widen,
+            built: Vec::new(),
+            filters,
+        });
+    }
+    if !doc_crates.is_empty() {
+        let mut flags = Vec::new();
+        for (package, why) in &doc_crates {
+            flags.push("-p".into());
+            flags.push(package.clone());
+            selected.push(Selected {
+                id: format!("{package} (all doctests)"),
+                target: "--doc".into(),
+                confidence: "possible",
+                why: why.clone(),
+            });
+        }
+        flags.push("--doc".into());
+        plan.steps.push(Step {
+            kind: StepKind::Doctests,
+            argv: cargo_argv(&runner.base, &flags, &[]),
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
             built: Vec::new(),
+            filters: Vec::new(),
         });
     }
     // Changed targets with no test step still build, as the full suite would.
@@ -2900,6 +3126,7 @@ fn cargo_plan(
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
             built,
+            filters: Vec::new(),
         });
         if only {
             plan.mode = Mode::BuildOnly;
@@ -3178,6 +3405,7 @@ fn file_plan(
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
             built: Vec::new(),
+            filters: Vec::new(),
         });
     } else {
         plan.mode = Mode::Nothing;
@@ -3319,6 +3547,7 @@ fn go_plan(
                 .map(|(package, names)| (package, names.into_iter().collect()))
                 .collect(),
             built: Vec::new(),
+            filters: Vec::new(),
         });
     }
     if !whole.is_empty() {
@@ -3329,6 +3558,7 @@ fn go_plan(
             names: BTreeMap::new(),
             widen: BTreeMap::new(),
             built: Vec::new(),
+            filters: Vec::new(),
         });
     }
     if plan.steps.is_empty() {
@@ -3475,13 +3705,31 @@ mod tests {
     }
 
     #[test]
-    fn doc_examples_are_the_fenced_lines() {
-        let rust = "//! Helpers.\n//!\n//! ```\n//! assert_eq!(peak(&[1]), 1);\n//! ```\n/// Uses peak.\nfn a() {}\n";
-        assert!(in_fence(rust, 4, true));
-        assert!(!in_fence(rust, 6, true));
-        let markdown = "# x\n\n```\nassert_eq!(mean(&[2]), 2);\n```\nmean is the average.\n";
-        assert!(in_fence(markdown, 4, false));
-        assert!(!in_fence(markdown, 6, false));
+    fn doc_examples_are_the_code_blocks() {
+        let rust = Docs::read(
+            "//! Helpers.\n//!\n//! ```\n//! assert_eq!(peak(&[1]), 1);\n//! ```\n/// Uses peak.\nfn a() {}\n",
+        );
+        assert!(rust.at(4).is_some_and(|docs| docs.in_example(4, false)));
+        assert!(rust.at(6).is_some_and(|docs| !docs.in_example(6, false)));
+        let markdown = markdown_examples(
+            "# x\n\n```\nassert_eq!(mean(&[2]), 2);\n```\nmean is the average.\n",
+        );
+        assert!(markdown.iter().any(|e| e.start <= 4 && 4 <= e.end));
+        assert!(!markdown.iter().any(|e| e.start <= 6 && 6 <= e.end));
+        // Methods match whatever generics rustdoc prints with their type.
+        let method = |kind: &str| Definition {
+            qualified: "probe::Shop::total".into(),
+            kind: kind.into(),
+            location: Location {
+                file: "src/lib.rs".into(),
+                start: 1,
+                end: 3,
+            },
+            declaration: 2,
+            test: false,
+        };
+        assert_eq!(doc_filter(&method("method")), "::total (line ");
+        assert_eq!(doc_filter(&method("function")), "Shop::total");
     }
 
     #[test]

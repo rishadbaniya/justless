@@ -13669,3 +13669,232 @@ fn claude_bash_replacements_use_the_preview_budget_run_would_give() {
     .unwrap();
     assert_eq!(replace(), serde_json::json!({}));
 }
+
+/// A one-crate repository committed on `main`, with `lib` and enough other
+/// tests that a small selection stays a subset.
+fn probe_crate(lib: &str) -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".gitignore"),
+        "/target/\n/Cargo.lock\n/.justless/\n",
+    )
+    .unwrap();
+    let others: String = (0..12)
+        .map(|n| format!("    #[test]\n    fn other_{n}() {{}}\n"))
+        .collect();
+    fs::write(
+        root.join("src/lib.rs"),
+        format!("{lib}\n#[cfg(test)]\nmod others {{\n{others}}}\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    git(root, &["branch", "-M", "main"]);
+    repo
+}
+
+const EXAMPLES: &str = r##"//! Crate docs.
+//!
+//! ~~~
+//! assert_eq!(probe::price(), 7);
+//! ~~~
+
+/// An indented example.
+///
+///     assert_eq!(probe::price(), 7);
+pub fn price() -> u8 {
+    7
+}
+
+/// A tilde fence.
+///
+/// ~~~
+/// assert_eq!(probe::fee(), 2);
+/// ~~~
+pub fn fee() -> u8 {
+    2
+}
+
+/**
+ * A block comment.
+ *
+ * ```
+ * assert_eq!(probe::tax(), 3);
+ * ```
+ */
+pub fn tax() -> u8 {
+    3
+}
+
+#[doc = "An attribute."]
+#[doc = ""]
+#[doc = "    assert_eq!(probe::levy(), 4);"]
+pub fn levy() -> u8 {
+    4
+}
+
+#[doc = concat!("Built by a macro.\n\n", "    assert_eq!(probe::duty(), 6);")]
+pub fn duty() -> u8 {
+    6
+}
+
+/// A shell example, which rustdoc does not run.
+///
+/// ```sh
+/// probe --price 7
+/// ```
+pub fn shown() -> u8 {
+    5
+}
+
+pub struct Shop<T>(pub T);
+
+impl<T> Shop<T> {
+    /// A method of a generic type.
+    ///
+    /// ```
+    /// assert_eq!(probe::Shop(()).total(), 1);
+    /// ```
+    pub fn total(&self) -> u8 {
+        1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prices() {
+        assert_eq!(price() + fee() + tax() + levy() + duty() + shown(), 27);
+    }
+
+    #[test]
+    fn totals() {
+        assert!(Shop::total(&Shop(())) > 0);
+    }
+}
+"##;
+
+#[test]
+fn affected_tests_run_every_example_rustdoc_runs() {
+    let repo = probe_crate(EXAMPLES);
+    let root = repo.path();
+    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
+    let plan = || {
+        success(
+            root,
+            &[
+                "test",
+                "--affected",
+                "--dry-run",
+                "--budget",
+                "8000",
+                "--",
+                "cargo",
+                "test",
+                "--offline",
+            ],
+        )
+    };
+    let reset = || git(root, &["checkout", "-q", "--", "."]);
+
+    // A broken example fails the subset wherever rustdoc finds it: an indented
+    // block, a tilde fence, crate docs, a block comment, a doc attribute and
+    // documentation a macro builds.
+    for (from, to, failure) in [
+        (
+            "///     assert_eq!(probe::price(), 7);",
+            "///     assert_eq!(probe::price(), 8);",
+            "  src/lib.rs - price (line ",
+        ),
+        (
+            "/// assert_eq!(probe::fee(), 2);",
+            "/// assert_eq!(probe::fee(), 3);",
+            "  src/lib.rs - fee (line ",
+        ),
+        (
+            "//! assert_eq!(probe::price(), 7);",
+            "//! assert_eq!(probe::price(), 9);",
+            "  src/lib.rs - (line ",
+        ),
+        (
+            " * assert_eq!(probe::tax(), 3);",
+            " * assert_eq!(probe::tax(), 4);",
+            "  src/lib.rs - tax (line ",
+        ),
+        (
+            "#[doc = \"    assert_eq!(probe::levy(), 4);\"]",
+            "#[doc = \"    assert_eq!(probe::levy(), 5);\"]",
+            "  src/lib.rs - levy (line ",
+        ),
+        (
+            "assert_eq!(probe::duty(), 6);\")]",
+            "assert_eq!(probe::duty(), 7);\")]",
+            "  src/lib.rs - duty (line ",
+        ),
+    ] {
+        replace_in(root, "src/lib.rs", from, to);
+        let failing = cli(root, &affected);
+        let err = stderr(&failing);
+        assert_eq!(
+            failing.status.code(),
+            Some(101),
+            "{to}\n{}{err}",
+            stdout(&failing)
+        );
+        assert!(err.contains("Subset failed (cargo)"), "{to}\n{err}");
+        assert!(err.contains(failure), "{failure:?} in\n{err}");
+        assert_no_suite_claim(&failing);
+        reset();
+    }
+
+    // Documentation Justless cannot read runs the crate's doctests unfiltered.
+    replace_in(
+        root,
+        "src/lib.rs",
+        "Built by a macro.",
+        "Built by the concat macro.",
+    );
+    has_line(
+        &plan(),
+        "  Run (doctests): cargo test --offline -p probe --doc",
+    );
+    reset();
+
+    // rustdoc names a method of a generic type `Shop<T>::total`; its example
+    // still runs when the method's body changes.
+    replace_in(root, "src/lib.rs", "        1\n", "        2\n");
+    let failing = cli(root, &affected);
+    let err = stderr(&failing);
+    assert_eq!(failing.status.code(), Some(101), "{err}");
+    assert!(err.contains("Subset failed (cargo)"), "{err}");
+    assert!(
+        err.contains("  src/lib.rs - Shop<T>::total (line "),
+        "{err}"
+    );
+    reset();
+
+    // A shell example is not a doctest, so changing it runs none.
+    replace_in(
+        root,
+        "src/lib.rs",
+        "/// probe --price 7",
+        "/// probe --price 8",
+    );
+    let text = plan();
+    assert!(!text.contains("--doc"), "{text}");
+    has_line(
+        &text,
+        "cargo · subset · 1 of 14 indexed tests in 1 of 1 test targets",
+    );
+    reset();
+}
