@@ -159,8 +159,22 @@ fn skip_trivia(mut s: &str) -> &str {
 }
 
 pub fn parse(text: &str) -> syn::Result<Syntax> {
+    extract(text, false)
+}
+
+/// [`parse`], also reading the body of every macro call that parses as
+/// comma-separated expressions, such as `ensure!(cond, "{}", detail())`. The
+/// index does not, because a macro may give those tokens another meaning.
+pub fn parse_macros(text: &str) -> syn::Result<Syntax> {
+    extract(text, true)
+}
+
+fn extract(text: &str, every_macro: bool) -> syn::Result<Syntax> {
     let file = parse_file(text)?;
-    let mut visitor = Extractor::default();
+    let mut visitor = Extractor {
+        every_macro,
+        ..Extractor::default()
+    };
     visitor.visit_file(&file);
     let offset = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8()
         + file.shebang.as_ref().map_or(0, String::len);
@@ -185,6 +199,8 @@ struct Extractor {
     symbol: Option<usize>,
     owner: Option<Vec<String>>,
     locals: Vec<BTreeMap<String, Option<Vec<String>>>>,
+    /// Whether to read the body of any macro call, not only the standard ones.
+    every_macro: bool,
 }
 
 impl Extractor {
@@ -558,33 +574,41 @@ impl<'ast> Visit<'ast> for Extractor {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        if mac.path.segments.last().is_some_and(|segment| {
-            matches!(
-                segment.ident.to_string().as_str(),
-                "assert"
-                    | "assert_eq"
-                    | "assert_ne"
-                    | "debug_assert"
-                    | "debug_assert_eq"
-                    | "debug_assert_ne"
-                    | "format"
-                    | "format_args"
-                    | "write"
-                    | "writeln"
-                    | "unreachable"
-                    | "todo"
-                    | "unimplemented"
-                    | "print"
-                    | "println"
-                    | "eprint"
-                    | "eprintln"
-                    | "panic"
-                    | "dbg"
-                    | "vec"
-                    | "matches"
-            )
-        }) && let Ok(expressions) =
-            mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_default();
+        let standard = matches!(
+            name.as_str(),
+            "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "debug_assert"
+                | "debug_assert_eq"
+                | "debug_assert_ne"
+                | "format"
+                | "format_args"
+                | "write"
+                | "writeln"
+                | "unreachable"
+                | "todo"
+                | "unimplemented"
+                | "print"
+                | "println"
+                | "eprint"
+                | "eprintln"
+                | "panic"
+                | "dbg"
+                | "vec"
+                | "matches"
+        );
+        // `stringify!` turns its tokens into text, and a `macro_rules!` body is patterns.
+        let other = self.every_macro && !matches!(name.as_str(), "stringify" | "macro_rules");
+        if (standard || other)
+            && let Ok(expressions) =
+                mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
         {
             for expression in &expressions {
                 self.visit_expr(expression);

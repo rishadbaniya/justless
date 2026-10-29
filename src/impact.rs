@@ -2,6 +2,7 @@
 //! changes to the code that depends on it, followed by the tests that reach it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Result, bail, ensure};
@@ -9,8 +10,9 @@ use clap::{Arg, ArgGroup, ArgMatches, Command};
 use serde_json::{Map, json};
 
 use crate::context::{Change, Deletion, Since, changes, relationship};
-use crate::index::{Definition, Edge, Index, Removed};
+use crate::index::{Definition, Edge, Index};
 use crate::map::{Fill, Section, emit, is_test_file, label, name, node, plural};
+use crate::rust_syntax::Kind;
 use crate::workspace::{Location, Workspace};
 
 /// New dependents followed from any one symbol. Certain links sort first.
@@ -334,18 +336,79 @@ impl Seeds {
     }
 }
 
-/// The index rebuilt with removed definitions restored, and the ids that each
-/// definition of one deletion took there.
-type Restored<'a> = Option<(&'a Index, &'a [Vec<usize>])>;
+/// What the symbols removed by a set of changes are followed with.
+struct Removals {
+    /// The index rebuilt with every removed definition restored, and the ids
+    /// each took there, in the order the deletions list them.
+    rebuilt: Option<(Index, Vec<Vec<usize>>)>,
+    /// The remaining mentions of each removed name.
+    searches: BTreeMap<String, Mentions>,
+}
+
+/// The name code uses for a symbol listed as `Type::name` or `name`.
+fn short_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+/// Searches for each removed name, then restores every removed definition at
+/// once in a rebuilt index, so the references that remain resolve as if each
+/// still existed. The Rust files that name one are parsed again with their
+/// macro bodies there, so a call such as `ensure!(check(x))` resolves too.
+fn removals(workspace: &Workspace, index: &Index, changes: &[(String, Change)]) -> Removals {
+    let mut removed = Vec::new();
+    let mut searches = BTreeMap::new();
+    for (file, change) in changes {
+        let Change::Deleted(deletions) = change else {
+            continue;
+        };
+        for deletion in deletions {
+            removed.extend(
+                deletion
+                    .removed
+                    .iter()
+                    .map(|(_, definition)| (file.as_str(), definition)),
+            );
+            for (name, kind) in &deletion.symbols {
+                let short = short_name(name);
+                if kind != "import" && !searches.contains_key(short) {
+                    searches.insert(short.to_owned(), mentions(workspace, index, short));
+                }
+            }
+        }
+    }
+    let rust: BTreeSet<&String> = searches
+        .values()
+        .flat_map(|search: &Mentions| &search.lines)
+        .map(|mention| &mention.file)
+        .filter(|file| file.ends_with(".rs"))
+        .collect();
+    let texts: Vec<(&str, String)> = rust
+        .into_iter()
+        .filter_map(|file| {
+            let text = fs::read_to_string(workspace.source_path(file).ok()?).ok()?;
+            Some((file.as_str(), text))
+        })
+        .collect();
+    let wider: Vec<(&str, &str)> = texts
+        .iter()
+        .map(|(file, text)| (*file, text.as_str()))
+        .collect();
+    let rebuilt = if removed.is_empty() && wider.is_empty() {
+        None
+    } else {
+        index.with_removed(&removed, &wider)
+    };
+    Removals { rebuilt, searches }
+}
 
 /// Seed the walk for lines removed without a replacement. A removed symbol no
 /// longer exists, so its impact starts at the code that still references it.
-/// Lines removed inside a surviving symbol change that symbol. Anything else is
-/// reported as unknown rather than pinned on a neighbor.
+/// Lines removed inside a surviving symbol change that symbol. Anything else,
+/// such as an import, is reported as unknown rather than pinned on a neighbor.
 fn deleted(
-    workspace: &Workspace,
     index: &Index,
-    restored: Restored,
+    removals: &Removals,
+    restored: &[Vec<usize>],
     file: &str,
     deletion: &Deletion,
     seeds: &mut Seeds,
@@ -353,7 +416,8 @@ fn deleted(
 ) {
     let definitions = &index.definitions;
     let (first, last) = deletion.old;
-    if deletion.symbols.is_empty() {
+    // An import is not a definition, so removing only imports removes lines.
+    if deletion.symbols.iter().all(|(_, kind)| kind == "import") {
         // The lines on both sides of the removal belong to one symbol: it changed.
         let around = index
             .at(&Location {
@@ -393,37 +457,45 @@ fn deleted(
         }
         return;
     }
+    let mut imports = false;
     for (position, (name, kind)) in deletion.symbols.iter().enumerate() {
+        if kind == "import" {
+            imports = true;
+            continue;
+        }
         section.push(
             format!("  {name} [{kind}] · deleted from {file} (committed lines {first}-{last})"),
             json!({"file": file, "deleted": name, "kind": kind, "removed": [first, last]}),
         );
-        if kind == "import" {
-            // An import is not a definition, and its text names no symbol.
-            section.push(
-                "  code that used the names it imported is not traced".into(),
-                json!({"file": file, "deleted": name, "note": "import not traced"}),
-            );
-            continue;
-        }
         // The removed definition and its members, as restored in the rebuilt index.
-        let restored = restored.and_then(|(rebuilt, ids)| {
-            let ids: Vec<usize> = deletion
-                .removed
-                .iter()
-                .zip(ids)
-                .filter(|((owner, _), _)| *owner == position)
-                .flat_map(|(_, ids)| ids.iter().copied())
-                .collect();
-            (!ids.is_empty()).then_some((rebuilt, ids))
-        });
-        let member = kind == "method" || kind.starts_with("associated");
-        let removed = Removal {
+        let ids: Vec<usize> = deletion
+            .removed
+            .iter()
+            .zip(restored)
+            .filter(|((owner, _), _)| *owner == position)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let short = short_name(name);
+        let removal = Removal {
             name,
-            short: name.rsplit("::").next().unwrap_or(name),
-            member,
+            short,
+            member: kind == "method" || kind.starts_with("associated"),
         };
-        follow(workspace, index, restored, &removed, seeds, section);
+        follow(
+            index,
+            removals.rebuilt.as_ref().map(|(rebuilt, _)| rebuilt),
+            &ids,
+            &removals.searches[short],
+            &removal,
+            seeds,
+            section,
+        );
+    }
+    if imports {
+        section.push(
+            format!("  {file} · code that used the imports removed with them is not traced"),
+            json!({"file": file, "removed": [first, last], "note": "imports not traced"}),
+        );
     }
 }
 
@@ -445,16 +517,17 @@ enum Doubt {
     NameOnly,
 }
 
-/// Seeds the code that still references a removed symbol. With the symbol
-/// restored in a rebuilt index, a link that resolves to it is certain, and an
+/// Seeds the code that still references a removed symbol, restored as `ids`
+/// in the `rebuilt` index. A link that resolves to it is certain, and an
 /// ambiguous one is possible. A remaining mention of its name does not count
 /// when it resolves to or declares another definition, or when, in Rust, it is
 /// plainly a field, binding, comment or other path. Any other mention is a
 /// possible reference, because the index cannot place it.
 fn follow(
-    workspace: &Workspace,
     index: &Index,
-    restored: Option<(&Index, Vec<usize>)>,
+    rebuilt: Option<&Index>,
+    ids: &[usize],
+    search: &Mentions,
     removed: &Removal,
     seeds: &mut Seeds,
     section: &mut Section,
@@ -465,13 +538,7 @@ fn follow(
         short,
         member,
     } = *removed;
-    let short_name = |definition: &Definition| -> bool {
-        crate::map::name(definition).rsplit("::").next() == Some(short)
-    };
-    let (rebuilt, ids) = match &restored {
-        Some((rebuilt, ids)) => (Some(*rebuilt), ids.as_slice()),
-        None => (None, &[][..]),
-    };
+    let named = |definition: &Definition| short_name(crate::map::name(definition)) == short;
     let shown = match rebuilt.zip(ids.first()) {
         Some((rebuilt, &id)) => {
             let definition = &rebuilt.definitions[id];
@@ -504,7 +571,6 @@ fn follow(
     }
 
     // The remaining mentions of its name.
-    let search = mentions(workspace, index, short);
     let resolving = rebuilt.unwrap_or(index);
     let lines: BTreeSet<(&str, usize)> = search
         .lines
@@ -518,7 +584,7 @@ fn follow(
         if !edge.inferred
             && !ids.contains(&edge.to)
             && lines.contains(&at)
-            && short_name(&resolving.definitions[edge.to])
+            && named(&resolving.definitions[edge.to])
         {
             other
                 .entry(at)
@@ -542,22 +608,27 @@ fn follow(
                 end: mention.line,
             })
             .into_iter()
-            .find(|&id| {
-                definitions[id].declaration == mention.line && short_name(&definitions[id])
-            });
+            .find(|&id| definitions[id].declaration == mention.line && named(&definitions[id]));
         if let Some(id) = declared {
             elsewhere.push(label(&definitions[id]));
             continue;
         }
-        if mention.file.ends_with(".rs")
-            && plainly_not_a_reference(
-                &mention.text,
-                short,
-                member,
-                &index.rust_paths_at(&mention.file, mention.line),
-            )
-        {
-            continue;
+        if mention.file.ends_with(".rs") {
+            // The paths parsed on the line, macro bodies included where the
+            // rebuilt index read them. A `use` resolves without following
+            // re-exports, so it never shows a path to be another item.
+            let paths = rebuilt
+                .and_then(|rebuilt| rebuilt.rust_paths_at(&mention.file, mention.line))
+                .or_else(|| index.rust_paths_at(&mention.file, mention.line))
+                .unwrap_or_default();
+            let paths: Vec<&[String]> = paths
+                .into_iter()
+                .filter(|(kind, _)| *kind != Kind::Import)
+                .map(|(_, path)| path)
+                .collect();
+            if plainly_not_a_reference(&mention.text, short, member, &paths) {
+                continue;
+            }
         }
         found.insert((mention.file.clone(), mention.line), Doubt::NameOnly);
     }
@@ -780,28 +851,7 @@ fn seeded(workspace: &Workspace, index: &Index, changes: &[(String, Change)]) ->
     let definitions = &index.definitions;
     let mut seeds = Seeds::default();
     let mut section = Section::new("changed", String::new(), 4);
-    // Restore every removed definition at once, so the references that remain
-    // resolve as if each still existed.
-    let removed: Vec<(&str, &Removed)> = changes
-        .iter()
-        .flat_map(|(file, change)| {
-            let deletions = match change {
-                Change::Deleted(deletions) => deletions.as_slice(),
-                _ => &[],
-            };
-            deletions.iter().flat_map(move |deletion| {
-                deletion
-                    .removed
-                    .iter()
-                    .map(move |(_, definition)| (file.as_str(), definition))
-            })
-        })
-        .collect();
-    let rebuilt = if removed.is_empty() {
-        None
-    } else {
-        index.with_removed(&removed)
-    };
+    let removals = removals(workspace, index, changes);
     let mut next = 0;
     for (file, change) in changes {
         let ranges = match change {
@@ -809,13 +859,14 @@ fn seeded(workspace: &Workspace, index: &Index, changes: &[(String, Change)]) ->
             Change::Deleted(deletions) => {
                 for deletion in deletions {
                     let count = deletion.removed.len();
-                    let restored = rebuilt
+                    let restored = removals
+                        .rebuilt
                         .as_ref()
-                        .map(|(rebuilt, ids)| (rebuilt, &ids[next..next + count]));
+                        .map_or(&[][..], |(_, ids)| &ids[next..next + count]);
                     next += count;
                     deleted(
-                        workspace,
                         index,
+                        &removals,
                         restored,
                         file,
                         deletion,

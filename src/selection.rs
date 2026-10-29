@@ -1418,7 +1418,8 @@ fn analyze(
             if let Change::Deleted(deletions) = change {
                 for deletion in deletions {
                     let removed: Vec<&str> = deletion.lines.iter().map(String::as_str).collect();
-                    if deletion.symbols.is_empty() {
+                    // An import removes no definition, only the names it bound.
+                    if deletion.symbols.iter().all(|(_, kind)| kind == "import") {
                         words.extend(tokens(&removed));
                     }
                 }

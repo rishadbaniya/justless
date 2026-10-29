@@ -14423,6 +14423,8 @@ fn deleting_python_and_typescript_functions_resolves_twins_and_marks_guesses() {
         // `current` is a plain module import, so the call is only a name match.
         "test_module [test] test_modules.py:4-5 · possibly references deleted value at test_modules.py:5 (name match only)",
         "test_module [test] test_modules.py:4-5 · possible · target itself",
+        // An import is not a definition, so the word `import` is not searched for.
+        "app.py · lines 1-1 removed between symbols · impact unknown",
     ] {
         assert!(impact.contains(expected), "{expected}\n{impact}");
     }
@@ -14492,5 +14494,75 @@ fn deleted_symbol_search_says_where_it_stopped() {
             && impact.contains("name search stopped after 256 matches")
             && impact.contains("outside indexed definitions, such as NOTES.md:1"),
         "{impact}"
+    );
+}
+
+#[test]
+fn deleted_function_calls_inside_macros_and_through_reexports_still_count() {
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    let lib = "macro_rules! check {\n    ($e:expr) => {\n        assert!($e)\n    };\n}\n\
+pub mod legacy;\npub mod current;\npub use legacy::value;\n\
+pub fn uses_current() {\n    check!(current::value() > 1);\n}\n\
+mod user {\n    use crate::value;\n    pub fn u() -> u8 {\n        value()\n    }\n}\n";
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            ("src/lib.rs", lib),
+            (
+                "src/legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() {\n    check!(value() > 1);\n}\n",
+            ),
+            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
+        ],
+        "src/legacy.rs",
+        "pub fn untouched() {\n    check!(value() > 1);\n}\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        // A call inside a macro the index does not read resolves like any other.
+        "legacy::untouched [function] src/legacy.rs:1-3 · still references deleted value at src/legacy.rs:2",
+        "src/lib.rs:8 · file scope still references deleted value",
+        // A named import ends a resolution chain, so code that reaches it only
+        // through the re-export cannot be linked, and stays possible.
+        "user [module] src/lib.rs:12-17 · possibly references deleted value at src/lib.rs:13 (name match only)",
+        "user::u [function] src/lib.rs:14-16 · possibly references deleted value at src/lib.rs:15 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    assert!(!impact.contains("uses_current"), "{impact}");
+}
+
+#[test]
+fn removing_a_rust_import_selects_the_code_that_used_it() {
+    let repo = deletion_repo(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "use std::env;\n\npub fn cwd() -> bool { env::current_dir().is_ok() }\n\
+#[test]\nfn test_cwd() { assert!(cwd()); }\n#[test]\nfn test_other() { assert!(true); }\n",
+            ),
+        ],
+        "src/lib.rs",
+        "\npub fn cwd() -> bool { env::current_dir().is_ok() }\n\
+#[test]\nfn test_cwd() { assert!(cwd()); }\n#[test]\nfn test_other() { assert!(true); }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains("src/lib.rs · lines 1-1 removed between symbols · impact unknown")
+            && !impact.contains("references deleted import"),
+        "{impact}"
+    );
+    let plan = success(
+        repo.path(),
+        &["test", "--affected", "--dry-run", "--", "cargo", "test"],
+    );
+    assert!(
+        plan.contains("Start cwd [function] src/lib.rs:2 · uses env")
+            && plan.contains("-- test_cwd --exact"),
+        "{plan}"
     );
 }

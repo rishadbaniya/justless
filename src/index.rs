@@ -312,24 +312,38 @@ impl Index {
     /// so references resolve as if it still existed, and the ids each one took
     /// there (several when its file belongs to several targets, none when it
     /// could not be restored). Lines of surviving code keep their numbers.
+    /// The Rust files in `wider`, given with their current text, also yield the
+    /// references inside every macro call that parses as expressions.
     pub(crate) fn with_removed(
         &self,
         removed: &[(&str, &Removed)],
+        wider: &[(&str, &str)],
     ) -> Option<(Index, Vec<Vec<usize>>)> {
         let source = self.source.as_ref()?;
         let mut overlay = Overlay::default();
+        for &(file, text) in wider {
+            if let Some(cached) = source.cache.files.get(file)
+                && cached.error.is_none()
+                && is_rust(file)
+                && let Ok(syntax) = rust_syntax::parse_macros(text)
+            {
+                let mut parsed = cached.clone();
+                parsed.syntax = syntax;
+                overlay.files.insert(file.to_owned(), parsed);
+            }
+        }
         for (entry, &(file, definition)) in removed.iter().enumerate() {
             let Some(cached) = source.cache.files.get(file) else {
                 continue;
-            };
-            let own = match &cached.foreign {
-                Some(facts) => facts.definitions.len(),
-                None => cached.syntax.symbols.len(),
             };
             let parsed = overlay
                 .files
                 .entry(file.to_owned())
                 .or_insert_with(|| cached.clone());
+            let own = match &parsed.foreign {
+                Some(facts) => facts.definitions.len(),
+                None => parsed.syntax.symbols.len(),
+            };
             match (definition, &mut parsed.foreign) {
                 (Removed::Rust(symbol), None) if is_rust(file) => {
                     parsed.syntax.symbols.push(symbol.clone())
@@ -344,7 +358,7 @@ impl Index {
                 .1
                 .push(entry);
         }
-        let (index, ids) = Self::assemble(
+        let (mut index, ids) = Self::assemble(
             &source.cache,
             &source.manifests,
             Refresh::default(),
@@ -354,25 +368,30 @@ impl Index {
         for (entry, id) in ids {
             restored[entry].push(id);
         }
+        // Keep the files parsed for this index, for `rust_paths_at`.
+        index.source = Some(Box::new(Source {
+            cache: Cache {
+                version: VERSION,
+                files: overlay.files,
+            },
+            manifests: BTreeMap::new(),
+        }));
         Some((index, restored))
     }
 
-    /// The paths the Rust parser recorded on `line` of `file`.
-    pub(crate) fn rust_paths_at(&self, file: &str, line: usize) -> Vec<&[String]> {
-        let Some(parsed) = self
-            .source
-            .as_ref()
-            .and_then(|source| source.cache.files.get(file))
-        else {
-            return Vec::new();
-        };
-        parsed
-            .syntax
-            .references
-            .iter()
-            .filter(|reference| reference.line == line)
-            .map(|reference| reference.path.as_slice())
-            .collect()
+    /// The paths the Rust parser recorded on `line` of `file`, with their
+    /// kind, or `None` when this index did not parse `file` itself.
+    pub(crate) fn rust_paths_at(&self, file: &str, line: usize) -> Option<Vec<(Kind, &[String])>> {
+        let parsed = self.source.as_ref()?.cache.files.get(file)?;
+        Some(
+            parsed
+                .syntax
+                .references
+                .iter()
+                .filter(|reference| reference.line == line)
+                .map(|reference| (reference.kind, reference.path.as_slice()))
+                .collect(),
+        )
     }
 
     /// Builds the index from parsed files, with `overlay` in place of the
