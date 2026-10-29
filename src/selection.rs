@@ -361,6 +361,41 @@ fn has_word(line: &str, word: &str) -> bool {
     })
 }
 
+/// Names a line gives `word` with `as`, such as `cost` in
+/// `pub use inner::price as cost;`. Casts to primitive types and `_` are not
+/// names.
+fn aliases(line: &str, word: &str) -> Vec<String> {
+    const PRIMITIVE: &[&str] = &[
+        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        "f32", "f64", "bool", "char", "str", "_",
+    ];
+    let mut found = Vec::new();
+    for (at, _) in line.match_indices(word) {
+        let end = at + word.len();
+        // `<T as Trait>` names a trait, not another name for `T`.
+        if line[..at].chars().next_back().is_some_and(identifier)
+            || line[end..].chars().next().is_some_and(identifier)
+            || line[..at].trim_end().ends_with('<')
+        {
+            continue;
+        }
+        let rest = line[end..].trim_start();
+        let Some(rest) = rest.strip_prefix("as") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("r#").unwrap_or(rest);
+        let name: String = rest.chars().take_while(|&c| identifier(c)).collect();
+        if !name.is_empty() && !PRIMITIVE.contains(&name.as_str()) && name != word {
+            found.push(name);
+        }
+    }
+    found
+}
+
 /// Lines of indexed files that contain `needle`, as a whole identifier when
 /// `word`. Returns `None` past the cap.
 fn find(
@@ -1828,7 +1863,8 @@ fn analyze(
                 .or_insert_with(|| file.clone());
         }
     }
-    for (word, file) in doc_words {
+    let mut searched: BTreeSet<String> = doc_words.keys().cloned().collect();
+    while let Some((word, file)) = doc_words.pop_first() {
         let lines = name_cache
             .entry(word.clone())
             .or_insert_with(|| find(index, &mut texts, &word, true))
@@ -1841,9 +1877,20 @@ fn analyze(
             continue;
         };
         for (path, line) in lines {
-            // Parsing a file for its examples costs more than the search.
-            if path.ends_with(".rs") && !texts.may_hold_examples(&path) {
-                continue;
+            if !path.ends_with(".rs") {
+                // An included file, such as a README.
+            } else if let Some(text) = texts.line(&path, line) {
+                // Examples call a re-export by its own name, as `cost` for
+                // `pub use inner::price as cost;`.
+                for alias in aliases(&text, &word) {
+                    if searched.insert(alias.clone()) {
+                        doc_words.insert(alias, file.clone());
+                    }
+                }
+                // Parsing a file for its examples costs more than the search.
+                if !texts.may_hold_examples(&path) {
+                    continue;
+                }
             }
             doc_example(
                 index,
@@ -3936,5 +3983,24 @@ mod tests {
             dotted("src/billing/__init__.py").as_deref(),
             Some("billing")
         );
+    }
+
+    #[test]
+    fn a_rename_is_an_alias() {
+        assert_eq!(aliases("pub use inner::price as cost;", "price"), ["cost"]);
+        assert_eq!(
+            aliases("    price as cost, other as r#type,", "other"),
+            ["type"]
+        );
+        assert_eq!(aliases("extern crate price as cost;", "price"), ["cost"]);
+        for (line, word) in [
+            ("let x = price as u8;", "price"),
+            ("<Shop as Display>::fmt(&shop, f)", "Shop"),
+            ("use inner::prices as cost;", "price"),
+            ("use inner::price as _;", "price"),
+            ("use inner::price;", "price"),
+        ] {
+            assert!(aliases(line, word).is_empty(), "{line}");
+        }
     }
 }

@@ -14164,3 +14164,27 @@ fn a_clean_branch_suggests_a_base_that_exists() {
         "{text}"
     );
 }
+
+#[test]
+fn affected_tests_run_examples_that_call_a_renamed_export() {
+    let repo = probe_crate(
+        "mod inner {\n    pub fn price() -> u8 {\n        7\n    }\n}\n\npub use inner::price as cost;\n\n/// A shop.\n///\n/// ```\n/// assert_eq!(probe::cost(), 7);\n/// ```\npub struct Shop;\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn prices() {\n        let _ = super::inner::price();\n    }\n}\n",
+    );
+    let root = repo.path();
+    // The example calls the changed function only by the name it is
+    // exported under.
+    replace_in(root, "src/lib.rs", "        7\n", "        8\n");
+    let failing = cli(
+        root,
+        &["test", "--affected", "--", "cargo", "test", "--offline"],
+    );
+    let err = stderr(&failing);
+    assert_eq!(
+        failing.status.code(),
+        Some(101),
+        "{}{err}",
+        stdout(&failing)
+    );
+    assert!(err.contains("Subset failed (cargo)"), "{err}");
+    assert!(err.contains("  src/lib.rs - Shop (line "), "{err}");
+}
