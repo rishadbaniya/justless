@@ -601,10 +601,15 @@ fn follow(
         }
         let rust = mention.file.ends_with(".rs");
         let occurrences: Vec<usize> = whole_words(&mention.text, short).collect();
-        // Outside Rust, the index links only the bare name, so a link says
-        // nothing about `module.name` on the same line.
+        // Links carry a line, not a column, so a link to another definition
+        // explains a line only where the name appears once. Outside Rust, the
+        // index links only the bare name, so a link says nothing about
+        // `module.name` on the same line.
         let attribute = !rust && occurrences.iter().any(|&at| after_dot(&mention.text[..at]));
-        if !attribute && let Some(target) = other.get(&at) {
+        if occurrences.len() == 1
+            && !attribute
+            && let Some(target) = other.get(&at)
+        {
             elsewhere.push(target.clone());
             continue;
         }

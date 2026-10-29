@@ -14683,3 +14683,53 @@ pub fn home() -> bool {\n    std::env::var(\"HOME\").is_ok() && ::std::env::var(
     }
     assert!(!impact.contains("  home [function]"), "{impact}");
 }
+
+#[test]
+fn a_twin_on_the_same_line_does_not_hide_another_mention_of_a_deleted_symbol() {
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    // `value()` reaches the removed function through a re-export the index
+    // does not follow, beside a call that resolves to the twin.
+    let lib = "pub mod legacy;\npub mod current;\npub use legacy::value;\n\
+mod user {\n    use crate::value;\n    pub fn u() -> u8 {\n        crate::current::value() + value()\n    }\n}\n\
+pub fn twin() -> u8 {\n    current::value()\n}\n";
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            ("src/lib.rs", lib),
+            (
+                "src/legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
+            ),
+            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
+        ],
+        "src/legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains(
+            "user::u [function] src/lib.rs:6-8 · possibly references deleted value at src/lib.rs:7 (name match only)"
+        ) && !impact.contains("  twin [function]"),
+        "{impact}"
+    );
+
+    // A method call on a typed twin beside one on a value of unknown type.
+    let lib = "pub struct Old;\nimpl Old {\n    pub fn value(&self) -> u8 { 2 }\n}\n\
+pub struct New;\nimpl New {\n    pub fn value(&self) -> u8 { 7 }\n}\n\
+pub fn mix(n: &New, a: &dyn std::any::Any) -> u8 {\n    let o = a.downcast_ref::<Old>().unwrap();\n    n.value() + o.value()\n}\n\
+pub fn typed(n: &New) -> u8 {\n    n.value()\n}\n";
+    let repo = deletion_repo(
+        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
+        "src/lib.rs",
+        &lib.replace("    pub fn value(&self) -> u8 { 2 }\n", ""),
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains(
+            "mix [function] src/lib.rs:8-11 · possibly references deleted value at src/lib.rs:10 (name match only)"
+        ) && !impact.contains("no remaining references")
+            && !impact.contains("  typed [function]")
+            && !impact.contains("New::value [method] src/lib.rs:6 ·"),
+        "{impact}"
+    );
+}
