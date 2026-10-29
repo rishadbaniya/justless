@@ -727,14 +727,15 @@ fn follow(
 /// Whether no whole-word `name` on a line of Rust can be a path to a removed
 /// item. Each must be a field or method after `.` (unless the item was a
 /// member), a field, parameter or binding name before a single `:`, a `let`
-/// binding, part of a `//` comment that is not documentation, or a qualified
-/// path the parser recorded on the line, which resolution with the item
-/// restored did not link to it.
+/// binding, part of a `//` comment that is not documentation, or the end of a
+/// path into the standard library that the parser recorded on the line. Any
+/// other qualified path stays, because resolution can miss one that reaches
+/// the item, such as `T::name` or a path through a type alias.
 fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[String]]) -> bool {
     let comment = plain_comment(text);
-    let qualified = paths
-        .iter()
-        .any(|path| path.len() > 1 && path.last().is_some_and(|last| last == name));
+    let standard = paths.iter().any(|path| {
+        path.len() > 1 && path.last().is_some_and(|last| last == name) && standard_root(&path[0])
+    });
     whole_words(text, name).all(|at| {
         if comment.is_some_and(|start| at > start) {
             return true;
@@ -744,8 +745,28 @@ fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[Stri
         (after_dot(before) && !member)
             || (after.starts_with(':') && !after.starts_with("::"))
             || binding(before)
-            || (before.ends_with("::") && qualified)
+            || (standard && in_standard_path(before))
     })
+}
+
+/// Whether a path segment names a standard library crate.
+fn standard_root(segment: &str) -> bool {
+    matches!(segment, "std" | "core" | "alloc")
+}
+
+/// Whether the text before a name ends with a path into the standard
+/// library, such as `std::env::` or `::core::mem::`.
+fn in_standard_path(before: &str) -> bool {
+    let start = before
+        .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+        .len();
+    let path = &before[start..];
+    path.ends_with("::")
+        && path
+            .trim_start_matches("::")
+            .split("::")
+            .next()
+            .is_some_and(standard_root)
 }
 
 /// Whether the text before a name ends with a single `.`, as in `value.name`.

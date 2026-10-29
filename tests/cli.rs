@@ -14629,3 +14629,57 @@ pub fn log() {\n    info!(value = 3, \"done\");\n}\n";
         "{impact}"
     );
 }
+
+#[test]
+fn deleted_symbols_keep_qualified_paths_the_index_cannot_resolve() {
+    // Without a manifest, `legacy::value` from main.rs is not linked, but it
+    // still names the removed function.
+    let repo = deletion_repo(
+        &[
+            (
+                "legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
+            ),
+            (
+                "main.rs",
+                "mod legacy;\nfn main() {\n    legacy::value();\n}\n",
+            ),
+        ],
+        "legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains(
+            "main::main [function] main.rs:2-4 · possibly references deleted value at main.rs:3 (name match only)"
+        ) && !impact.contains("no remaining references"),
+        "{impact}"
+    );
+
+    // A trait method called through a type parameter, an associated function
+    // called through a type alias, and a standard library path that shares a name.
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    let lib = "pub trait Get {\n    fn value(&self) -> u8;\n    fn other(&self) -> u8;\n}\n\
+pub fn through_parameter<T: Get>(t: &T) -> u8 {\n    T::value(t)\n}\n\
+pub struct S;\nimpl S {\n    pub fn var() -> u8 { 2 }\n}\npub type A = S;\n\
+pub fn through_alias() -> u8 {\n    A::var()\n}\n\
+pub fn home() -> bool {\n    std::env::var(\"HOME\").is_ok() && ::std::env::var(\"PATH\").is_ok()\n}\n";
+    let after = lib
+        .replace("    fn value(&self) -> u8;\n", "")
+        .replace("    pub fn var() -> u8 { 2 }\n", "");
+    let repo = deletion_repo(
+        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
+        "src/lib.rs",
+        &after,
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "Get::value [method] · deleted from src/lib.rs (committed lines 2-2)",
+        "S::var [method] · deleted from src/lib.rs (committed lines 10-10)",
+        "through_parameter [function] src/lib.rs:4-6 · possibly references deleted value at src/lib.rs:5 (name match only)",
+        "through_alias [function] src/lib.rs:11-13 · possibly references deleted var at src/lib.rs:12 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    assert!(!impact.contains("  home [function]"), "{impact}");
+}
