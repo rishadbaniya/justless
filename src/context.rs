@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use regex::Regex;
 
 use crate::capture;
-use crate::index::{Definition, Fingerprint, Index, is_call, nul_paths};
+use crate::index::{Definition, Fingerprint, Index, Removed, is_call, nul_paths};
 use crate::rust_syntax::Kind;
 use crate::workspace::{Location, Workspace, display_path};
 
@@ -778,6 +778,10 @@ pub(crate) struct Deletion {
     pub symbols: Vec<(String, String)>,
     /// The text of the removed lines, as the diff showed them.
     pub lines: Vec<String>,
+    /// The definitions removed with `symbols`, nested ones included, as the
+    /// committed version declared them, each with the position in `symbols`
+    /// of the outermost symbol that held it.
+    pub removed: Vec<(usize, crate::index::Removed)>,
 }
 
 /// Name the symbols each deletion removed, from the committed version of `file`
@@ -797,9 +801,11 @@ fn deleted_symbols(workspace: &Workspace, file: &str, rev: &str, deletions: &mut
         return;
     }
     let symbols = snapshot.symbols();
-    for deletion in deletions {
+    let mut spans = Vec::new();
+    for deletion in deletions.iter_mut() {
         let (first, last) = deletion.old;
         let inside = |start: usize, end: usize| first <= start && end <= last;
+        let mut outermost = Vec::new();
         for (name, kind, start, end) in &symbols {
             // Keep the outermost removed symbol; its members went with it.
             let nested = symbols.iter().any(|(_, _, s, e)| {
@@ -807,7 +813,51 @@ fn deleted_symbols(workspace: &Workspace, file: &str, rev: &str, deletions: &mut
             });
             if inside(*start, *end) && !nested {
                 deletion.symbols.push((name.clone(), kind.clone()));
+                outermost.push((*start, *end));
             }
+        }
+        spans.push(outermost);
+    }
+    // The same definitions as the index parses them, to restore while resolving
+    // the references that remain.
+    let removed: Vec<(usize, usize, Removed)> = if file.ends_with(".rs") {
+        crate::rust_syntax::parse(&snapshot.text)
+            .map(|syntax| {
+                syntax
+                    .symbols
+                    .into_iter()
+                    .map(|symbol| (symbol.start, symbol.end, Removed::Rust(symbol)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else if let Some(grammar) = crate::polyglot::Grammar::for_file(file) {
+        crate::polyglot::Parsers::default()
+            .parse(grammar, &snapshot.text)
+            .map(|facts| {
+                facts
+                    .definitions
+                    .into_iter()
+                    .map(|tag| (tag.start, tag.end, Removed::Foreign(tag)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for (start, end, definition) in removed {
+        let holder = deletions
+            .iter_mut()
+            .zip(&spans)
+            .find_map(|(deletion, spans)| {
+                let (first, last) = deletion.old;
+                if start < first || last < end {
+                    return None;
+                }
+                let owner = spans.iter().position(|&(s, e)| s <= start && end <= e)?;
+                Some((deletion, owner))
+            });
+        if let Some((deletion, owner)) = holder {
+            deletion.removed.push((owner, definition));
         }
     }
 }
@@ -1071,6 +1121,7 @@ pub(crate) fn changes(
                         old: (old_start, old_start + old_count.saturating_sub(1)),
                         symbols: Vec::new(),
                         lines: Vec::new(),
+                        removed: Vec::new(),
                     });
                     continue;
                 }

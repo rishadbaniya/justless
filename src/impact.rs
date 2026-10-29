@@ -8,8 +8,8 @@ use anyhow::{Result, bail, ensure};
 use clap::{Arg, ArgGroup, ArgMatches, Command};
 use serde_json::{Map, json};
 
-use crate::context::{Change, Since, changes, relationship};
-use crate::index::{Edge, Index};
+use crate::context::{Change, Deletion, Since, changes, relationship};
+use crate::index::{Definition, Edge, Index, Removed};
 use crate::map::{Fill, Section, emit, is_test_file, label, name, node, plural};
 use crate::workspace::{Location, Workspace};
 
@@ -68,7 +68,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         summary.insert(key.into(), json!([]));
     }
     let mut sections = Vec::new();
-    let (subject, seeds) = match matches.value_of("target") {
+    let (subject, seeds, possible) = match matches.value_of("target") {
         Some(target) => {
             let (subject, seeds) = resolve(&index, target)?;
             summary.insert(
@@ -81,6 +81,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
             (
                 subject.unwrap_or_else(|| label(&definitions[seeds[0]])),
                 seeds,
+                BTreeSet::new(),
             )
         }
         None => {
@@ -90,6 +91,11 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
                 matches.value_of("base"),
             )?;
             let (seeds, section) = changed(workspace, &index, &since)?;
+            let Seeds {
+                all: seeds,
+                possible,
+            } = seeds;
+            let seeds: Vec<usize> = seeds.into_iter().collect();
             if section.lines.is_empty() {
                 if matches.is_present("json") {
                     summary.insert("changed".into(), json!([]));
@@ -104,11 +110,12 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
             (
                 format!("changes ({})", plural(seeds.len(), "changed symbol")),
                 seeds,
+                possible,
             )
         }
     };
 
-    let walk = walk(&index, &seeds, depth);
+    let walk = walk_from(&index, &seeds, &possible, depth);
     let reached: usize = walk.levels.iter().map(Vec::len).sum();
     let header = vec![format!(
         "Affected by {subject} · {} within {}",
@@ -117,7 +124,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     )];
     let first_distance = sections.len();
     sections.extend(distance_sections(&index, &walk, seeds.len() > 1));
-    let (tests, files) = tests(&index, &seeds, &walk);
+    let (tests, files) = tests(&index, &seeds, &possible, &walk);
     let tests_at = sections.len();
     sections.push(test_section(&index, &tests, &files));
     sections.extend(command_section(&index, &tests));
@@ -305,16 +312,43 @@ fn resolve(index: &Index, target: &str) -> Result<(Option<String>, Vec<usize>)> 
     }
 }
 
+/// Symbols the walk starts from, and those among them only possibly affected.
+#[derive(Default)]
+struct Seeds {
+    all: BTreeSet<usize>,
+    possible: BTreeSet<usize>,
+}
+
+impl Seeds {
+    /// Adds a seed. Says whether that is worth a line: a new seed, or a certain
+    /// reason for one that was only possible.
+    fn add(&mut self, id: usize, possible: bool) -> bool {
+        if self.all.insert(id) {
+            if possible {
+                self.possible.insert(id);
+            }
+            true
+        } else {
+            !possible && self.possible.remove(&id)
+        }
+    }
+}
+
+/// The index rebuilt with removed definitions restored, and the ids that each
+/// definition of one deletion took there.
+type Restored<'a> = Option<(&'a Index, &'a [Vec<usize>])>;
+
 /// Seed the walk for lines removed without a replacement. A removed symbol no
-/// longer exists, so its impact starts at the code that still names it. Lines
-/// removed inside a surviving symbol change that symbol. Anything else is reported
-/// as unknown rather than pinned on a neighbor.
-pub(crate) fn deleted(
+/// longer exists, so its impact starts at the code that still references it.
+/// Lines removed inside a surviving symbol change that symbol. Anything else is
+/// reported as unknown rather than pinned on a neighbor.
+fn deleted(
     workspace: &Workspace,
     index: &Index,
+    restored: Restored,
     file: &str,
-    deletion: &crate::context::Deletion,
-    seeds: &mut BTreeSet<usize>,
+    deletion: &Deletion,
+    seeds: &mut Seeds,
     section: &mut Section,
 ) {
     let definitions = &index.definitions;
@@ -338,7 +372,7 @@ pub(crate) fn deleted(
             });
         match around {
             Some(id) => {
-                if seeds.insert(id) {
+                if seeds.add(id, false) {
                     let mut value = node(&definitions[id]);
                     value["changed"] =
                         json!(format!("{file}: lines removed after {}", deletion.after));
@@ -359,55 +393,336 @@ pub(crate) fn deleted(
         }
         return;
     }
-    for (name, kind) in &deletion.symbols {
+    for (position, (name, kind)) in deletion.symbols.iter().enumerate() {
         section.push(
             format!("  {name} [{kind}] · deleted from {file} (committed lines {first}-{last})"),
             json!({"file": file, "deleted": name, "kind": kind, "removed": [first, last]}),
         );
-        let short = name.rsplit("::").next().unwrap_or(name);
-        let mut referenced = false;
-        for (path, line) in mentions(workspace, index, short) {
-            let enclosing = index
-                .at(&Location {
-                    file: path.clone(),
-                    start: line,
-                    end: line,
-                })
-                .into_iter()
-                .min_by_key(|&id| {
-                    let span = &definitions[id].location;
-                    span.end - span.start
-                });
-            let Some(id) = enclosing else { continue };
-            referenced = true;
-            if seeds.insert(id) {
-                let mut value = node(&definitions[id]);
-                value["references_deleted"] = json!(name);
-                value["changed"] = json!(format!("{path}:{line}"));
-                section.push(
-                    format!(
-                        "  {} · still references deleted {short} at {path}:{line}",
-                        label(&definitions[id])
-                    ),
-                    value,
-                );
-            }
-        }
-        if !referenced {
+        if kind == "import" {
+            // An import is not a definition, and its text names no symbol.
             section.push(
-                format!("  no remaining references to {short} found in indexed text"),
-                json!({"deleted": name, "note": "no remaining references"}),
+                "  code that used the names it imported is not traced".into(),
+                json!({"file": file, "deleted": name, "note": "import not traced"}),
             );
+            continue;
         }
+        // The removed definition and its members, as restored in the rebuilt index.
+        let restored = restored.and_then(|(rebuilt, ids)| {
+            let ids: Vec<usize> = deletion
+                .removed
+                .iter()
+                .zip(ids)
+                .filter(|((owner, _), _)| *owner == position)
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .collect();
+            (!ids.is_empty()).then_some((rebuilt, ids))
+        });
+        let member = kind == "method" || kind.starts_with("associated");
+        let removed = Removal {
+            name,
+            short: name.rsplit("::").next().unwrap_or(name),
+            member,
+        };
+        follow(workspace, index, restored, &removed, seeds, section);
     }
 }
 
-/// Lines in indexed files that mention `name` as a whole identifier.
-pub(crate) fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Vec<(String, usize)> {
-    const LIMIT: usize = 256;
+/// A symbol a change removed, as `affected` follows it.
+struct Removal<'a> {
+    /// Its name within its file, as the deletion lists it.
+    name: &'a str,
+    /// The name code uses for it.
+    short: &'a str,
+    /// Whether it was a method or other member, which a value can reach with `.`.
+    member: bool,
+}
+
+/// How surely a remaining line references a removed symbol.
+#[derive(Clone, Copy, PartialEq)]
+enum Doubt {
+    Certain,
+    Ambiguous,
+    NameOnly,
+}
+
+/// Seeds the code that still references a removed symbol. With the symbol
+/// restored in a rebuilt index, a link that resolves to it is certain, and an
+/// ambiguous one is possible. A remaining mention of its name does not count
+/// when it resolves to or declares another definition, or when, in Rust, it is
+/// plainly a field, binding, comment or other path. Any other mention is a
+/// possible reference, because the index cannot place it.
+fn follow(
+    workspace: &Workspace,
+    index: &Index,
+    restored: Option<(&Index, Vec<usize>)>,
+    removed: &Removal,
+    seeds: &mut Seeds,
+    section: &mut Section,
+) {
+    let definitions = &index.definitions;
+    let Removal {
+        name,
+        short,
+        member,
+    } = *removed;
+    let short_name = |definition: &Definition| -> bool {
+        crate::map::name(definition).rsplit("::").next() == Some(short)
+    };
+    let (rebuilt, ids) = match &restored {
+        Some((rebuilt, ids)) => (Some(*rebuilt), ids.as_slice()),
+        None => (None, &[][..]),
+    };
+    let shown = match rebuilt.zip(ids.first()) {
+        Some((rebuilt, &id)) => {
+            let definition = &rebuilt.definitions[id];
+            if definition.qualified.starts_with(&definition.location.file) {
+                definition.qualified.clone()
+            } else {
+                crate::map::name(definition).to_owned()
+            }
+        }
+        None => name.to_owned(),
+    };
+
+    // Lines that link to the restored symbol: certain unless every link is ambiguous.
+    let mut found = BTreeMap::<(String, usize), Doubt>::new();
+    for edge in rebuilt
+        .into_iter()
+        .flat_map(|rebuilt| ids.iter().flat_map(|&id| rebuilt.incoming(id)))
+    {
+        let doubt = if edge.inferred {
+            Doubt::Ambiguous
+        } else {
+            Doubt::Certain
+        };
+        let entry = found
+            .entry((edge.location.file.clone(), edge.location.start))
+            .or_insert(doubt);
+        if doubt == Doubt::Certain {
+            *entry = doubt;
+        }
+    }
+
+    // The remaining mentions of its name.
+    let search = mentions(workspace, index, short);
+    let resolving = rebuilt.unwrap_or(index);
+    let lines: BTreeSet<(&str, usize)> = search
+        .lines
+        .iter()
+        .map(|mention| (mention.file.as_str(), mention.line))
+        .collect();
+    // A certain link from a mention line to another definition of that name.
+    let mut other = BTreeMap::<(&str, usize), String>::new();
+    for edge in &resolving.edges {
+        let at = (edge.location.file.as_str(), edge.location.start);
+        if !edge.inferred
+            && !ids.contains(&edge.to)
+            && lines.contains(&at)
+            && short_name(&resolving.definitions[edge.to])
+        {
+            other
+                .entry(at)
+                .or_insert_with(|| label(&resolving.definitions[edge.to]));
+        }
+    }
+    let mut elsewhere = Vec::new();
+    for mention in &search.lines {
+        let at = (mention.file.as_str(), mention.line);
+        if found.contains_key(&(mention.file.clone(), mention.line)) {
+            continue;
+        }
+        if let Some(target) = other.get(&at) {
+            elsewhere.push(target.clone());
+            continue;
+        }
+        let declared = index
+            .at(&Location {
+                file: mention.file.clone(),
+                start: mention.line,
+                end: mention.line,
+            })
+            .into_iter()
+            .find(|&id| {
+                definitions[id].declaration == mention.line && short_name(&definitions[id])
+            });
+        if let Some(id) = declared {
+            elsewhere.push(label(&definitions[id]));
+            continue;
+        }
+        if mention.file.ends_with(".rs")
+            && plainly_not_a_reference(
+                &mention.text,
+                short,
+                member,
+                &index.rust_paths_at(&mention.file, mention.line),
+            )
+        {
+            continue;
+        }
+        found.insert((mention.file.clone(), mention.line), Doubt::NameOnly);
+    }
+
+    let mut referenced = false;
+    let mut outside = Vec::new();
+    for ((path, line), doubt) in found {
+        let enclosing = index
+            .at(&Location {
+                file: path.clone(),
+                start: line,
+                end: line,
+            })
+            .into_iter()
+            .min_by_key(|&id| {
+                let span = &definitions[id].location;
+                span.end - span.start
+            });
+        let possible = doubt != Doubt::Certain;
+        let (verb, reason) = match doubt {
+            Doubt::Certain => ("still references", ""),
+            Doubt::Ambiguous => ("possibly references", " (ambiguous link)"),
+            Doubt::NameOnly => ("possibly references", " (name match only)"),
+        };
+        let Some(id) = enclosing else {
+            // Text outside every definition, such as documentation, is listed
+            // in one line. A link from file scope, such as a `use`, is a reference.
+            if doubt == Doubt::NameOnly {
+                outside.push(format!("{path}:{line}"));
+            } else {
+                referenced = true;
+                section.push(
+                    format!("  {path}:{line} · file scope {verb} deleted {short}{reason}"),
+                    json!({"file": path, "line": line, "references_deleted": name, "possible": possible, "note": "file scope"}),
+                );
+            }
+            continue;
+        };
+        referenced = true;
+        if seeds.add(id, possible) {
+            let mut value = node(&definitions[id]);
+            value["references_deleted"] = json!(name);
+            value["changed"] = json!(format!("{path}:{line}"));
+            value["possible"] = json!(possible);
+            section.push(
+                format!(
+                    "  {} · {verb} deleted {short} at {path}:{line}{reason}",
+                    label(&definitions[id])
+                ),
+                value,
+            );
+        }
+    }
+    if let Some(first) = outside.first() {
+        section.push(
+            format!(
+                "  {} of {short} outside indexed definitions, such as {first} · not followed",
+                plural(outside.len(), "mention")
+            ),
+            json!({"deleted": name, "note": "mentions outside definitions", "count": outside.len(), "first": first}),
+        );
+    }
+    if !referenced {
+        let mut text = format!("  no remaining references to {shown} found");
+        if let Some(first) = elsewhere.first() {
+            text.push_str(&format!(
+                " · {} resolve to other definitions, such as {first}",
+                plural(elsewhere.len(), "mention")
+            ));
+        }
+        section.push(
+            text,
+            json!({"deleted": name, "note": "no remaining references", "elsewhere": elsewhere.len()}),
+        );
+    }
+    if search.capped {
+        section.push(
+            format!(
+                "  name search stopped after {MENTIONS} matches; later mentions of {short} were not checked"
+            ),
+            json!({"deleted": name, "note": "name search capped", "limit": MENTIONS}),
+        );
+    }
+}
+
+/// Whether no whole-word `name` on a line of Rust can be a path to a removed
+/// item. Each must be a field or method after `.` (unless the item was a
+/// member), a field, parameter or binding name before a single `:`, a `let`
+/// binding, part of a `//` comment that is not documentation, or a qualified
+/// path the parser recorded on the line, which resolution with the item
+/// restored did not link to it.
+fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[String]]) -> bool {
+    let comment = plain_comment(text);
+    let qualified = paths
+        .iter()
+        .any(|path| path.len() > 1 && path.last().is_some_and(|last| last == name));
+    whole_words(text, name).all(|at| {
+        if comment.is_some_and(|start| at > start) {
+            return true;
+        }
+        let before = text[..at].trim_end();
+        let after = text[at + name.len()..].trim_start();
+        (before.ends_with('.') && !before.ends_with("..") && !member)
+            || (after.starts_with(':') && !after.starts_with("::"))
+            || binding(before)
+            || (before.ends_with("::") && qualified)
+    })
+}
+
+/// Where a `//` comment starts on a line of Rust, unless it is documentation,
+/// which can hold a compiled example, or a quote before it could make it part
+/// of a string.
+fn plain_comment(text: &str) -> Option<usize> {
+    let start = text.find("//")?;
+    if text[..start].contains(['"', '\'']) {
+        return None;
+    }
+    let rest = &text[start..];
+    let documentation =
+        (rest.starts_with("///") && !rest.starts_with("////")) || rest.starts_with("//!");
+    (!documentation).then_some(start)
+}
+
+/// Whether the text before a name ends with `let` or `let mut`, so the name is bound there.
+fn binding(before: &str) -> bool {
+    let before = before.strip_suffix("mut").map_or(before, str::trim_end);
+    before
+        .strip_suffix("let")
+        .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
+/// Byte offsets where `name` appears in `line` as a whole identifier.
+fn whole_words<'a>(line: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
     let identifier = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(name)
+        .map(|(at, _)| at)
+        .filter(move |&at| {
+            !line[..at].chars().next_back().is_some_and(identifier)
+                && !line[at + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(identifier)
+        })
+}
+
+/// Lines a name search stops at.
+const MENTIONS: usize = 256;
+
+/// Lines of indexed text that name a removed symbol.
+struct Mentions {
+    lines: Vec<Mention>,
+    /// Whether the search stopped at `MENTIONS` lines.
+    capped: bool,
+}
+
+struct Mention {
+    file: String,
+    line: usize,
+    text: String,
+}
+
+/// Lines in indexed files that mention `name` as a whole identifier.
+fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Mentions {
     let fingerprint = crate::index::Fingerprint::new(name);
-    let mut found = Vec::new();
+    let mut lines = Vec::new();
     for (file, candidate) in &index.fingerprints {
         if !candidate.includes(fingerprint) {
             continue;
@@ -419,28 +734,31 @@ pub(crate) fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Vec<
             continue;
         };
         for (offset, line) in text.lines().enumerate() {
-            let whole = line.match_indices(name).any(|(at, _)| {
-                !line[..at].chars().next_back().is_some_and(identifier)
-                    && !line[at + name.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(identifier)
-            });
-            if whole {
-                found.push((file.clone(), offset + 1));
-                if found.len() == LIMIT {
-                    return found;
+            if whole_words(line, name).next().is_some() {
+                if lines.len() == MENTIONS {
+                    return Mentions {
+                        lines,
+                        capped: true,
+                    };
                 }
+                lines.push(Mention {
+                    file: file.clone(),
+                    line: offset + 1,
+                    text: line.to_owned(),
+                });
             }
         }
     }
-    found
+    Mentions {
+        lines,
+        capped: false,
+    }
 }
 
 /// Symbols touched by the current changes: the innermost definition around each
 /// changed range, and any definition whose declaration line changed.
-fn changed(workspace: &Workspace, index: &Index, since: &Since) -> Result<(Vec<usize>, Section)> {
-    Ok(changed_in(
+fn changed(workspace: &Workspace, index: &Index, since: &Since) -> Result<(Seeds, Section)> {
+    Ok(seeded(
         workspace,
         index,
         &changes(workspace, index, since)?,
@@ -453,15 +771,57 @@ pub(crate) fn changed_in(
     index: &Index,
     changes: &[(String, Change)],
 ) -> (Vec<usize>, Section) {
+    let (seeds, section) = seeded(workspace, index, changes);
+    (seeds.all.into_iter().collect(), section)
+}
+
+/// [`changed_in`], keeping which seeds are only possibly affected.
+fn seeded(workspace: &Workspace, index: &Index, changes: &[(String, Change)]) -> (Seeds, Section) {
     let definitions = &index.definitions;
-    let mut seeds = BTreeSet::new();
+    let mut seeds = Seeds::default();
     let mut section = Section::new("changed", String::new(), 4);
+    // Restore every removed definition at once, so the references that remain
+    // resolve as if each still existed.
+    let removed: Vec<(&str, &Removed)> = changes
+        .iter()
+        .flat_map(|(file, change)| {
+            let deletions = match change {
+                Change::Deleted(deletions) => deletions.as_slice(),
+                _ => &[],
+            };
+            deletions.iter().flat_map(move |deletion| {
+                deletion
+                    .removed
+                    .iter()
+                    .map(move |(_, definition)| (file.as_str(), definition))
+            })
+        })
+        .collect();
+    let rebuilt = if removed.is_empty() {
+        None
+    } else {
+        index.with_removed(&removed)
+    };
+    let mut next = 0;
     for (file, change) in changes {
         let ranges = match change {
             Change::Ranges(ranges) => ranges,
             Change::Deleted(deletions) => {
                 for deletion in deletions {
-                    deleted(workspace, index, file, deletion, &mut seeds, &mut section);
+                    let count = deletion.removed.len();
+                    let restored = rebuilt
+                        .as_ref()
+                        .map(|(rebuilt, ids)| (rebuilt, &ids[next..next + count]));
+                    next += count;
+                    deleted(
+                        workspace,
+                        index,
+                        restored,
+                        file,
+                        deletion,
+                        &mut seeds,
+                        &mut section,
+                    );
                 }
                 continue;
             }
@@ -504,7 +864,7 @@ pub(crate) fn changed_in(
                 );
             }
             for id in picked {
-                if seeds.insert(id) {
+                if seeds.add(id, false) {
                     let mut value = node(&definitions[id]);
                     value["changed"] = json!(format!("{file}:{start}-{end}"));
                     section.push(
@@ -518,8 +878,8 @@ pub(crate) fn changed_in(
             }
         }
     }
-    section.title = format!("Changed · {}", plural(seeds.len(), "symbol"));
-    (seeds.into_iter().collect(), section)
+    section.title = format!("Changed · {}", plural(seeds.all.len(), "symbol"));
+    (seeds, section)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -561,13 +921,26 @@ fn links_into(index: &Index, id: usize) -> impl Iterator<Item = &Edge> {
 /// Breadth-first over incoming links. Each dependent appears once, at its
 /// shortest distance, through its most certain link, so cycles terminate.
 pub(crate) fn walk<'a>(index: &'a Index, seeds: &[usize], depth: usize) -> Walk<'a> {
+    walk_from(index, seeds, &BTreeSet::new(), depth)
+}
+
+/// [`walk`], where whatever a `possible` seed reaches is possible too.
+fn walk_from<'a>(
+    index: &'a Index,
+    seeds: &[usize],
+    possible: &BTreeSet<usize>,
+    depth: usize,
+) -> Walk<'a> {
     let definitions = &index.definitions;
     let dependent = |edge: &'a Edge| match edge.from {
         Some(from) => Dependent::Symbol(from),
         None => Dependent::Scope(&edge.location.file),
     };
     let mut seen: BTreeSet<Dependent> = seeds.iter().map(|&id| Dependent::Symbol(id)).collect();
-    let mut frontier: Vec<(usize, bool)> = seeds.iter().map(|&id| (id, false)).collect();
+    let mut frontier: Vec<(usize, bool)> = seeds
+        .iter()
+        .map(|&id| (id, possible.contains(&id)))
+        .collect();
     let mut levels = Vec::new();
     let mut fanned = Vec::new();
     let mut full = false;
@@ -660,10 +1033,12 @@ type TestFiles<'a> = BTreeMap<&'a str, (usize, bool, &'a Location)>;
 
 /// Test definitions that reach a seed, from the walk and from call chains up to
 /// eight hops regardless of `--depth`, and test-convention files reached without
-/// a detected test definition, such as JavaScript suites.
+/// a detected test definition, such as JavaScript suites. A test that only a
+/// `possible` seed leads to is possible.
 fn tests<'a>(
     index: &'a Index,
     seeds: &[usize],
+    possible: &BTreeSet<usize>,
     walk: &Walk<'a>,
 ) -> (Vec<(usize, usize, bool)>, TestFiles<'a>) {
     let definitions = &index.definitions;
@@ -673,11 +1048,12 @@ fn tests<'a>(
         *entry = (*entry).min((possible, hops));
     };
     for &seed in seeds {
+        let doubtful = possible.contains(&seed);
         if definitions[seed].test {
-            keep(seed, 0, false);
+            keep(seed, 0, doubtful);
         }
         for (id, hops, inferred) in index.related_tests(seed, 32) {
-            keep(id, hops, inferred);
+            keep(id, hops, inferred || doubtful);
         }
     }
     for (offset, level) in walk.levels.iter().enumerate() {
@@ -701,7 +1077,7 @@ fn tests<'a>(
     let mut files = TestFiles::new();
     let seed_files = seeds
         .iter()
-        .map(|&id| (&definitions[id].location, 0, false));
+        .map(|&id| (&definitions[id].location, 0, possible.contains(&id)));
     let reached = walk.levels.iter().enumerate().flat_map(|(offset, level)| {
         level
             .iter()

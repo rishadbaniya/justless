@@ -14274,3 +14274,223 @@ fn affected_tests_run_the_crate_doctests_for_a_name_too_common_to_search() {
     assert!(err.contains("Subset failed (cargo)"), "{err}");
     assert!(err.contains("  b/src/lib.rs - Ids (line "), "{err}");
 }
+
+/// A committed repository whose `file` then loses some lines, as `after`.
+fn deletion_repo(files: &[(&str, &str)], file: &str, after: &str) -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    write_files(root, &[(".gitignore", ".justless/\ntarget/\n")]);
+    write_files(root, files);
+    git(root, &["add", "."]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "fixture"],
+    );
+    fs::write(root.join(file), after).unwrap();
+    repo
+}
+
+#[test]
+fn deleting_a_function_is_not_referenced_by_a_same_named_function_elsewhere() {
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    // Nothing names legacy::value. The test calls current::value.
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            (
+                "src/lib.rs",
+                "pub mod legacy;\npub mod current;\n#[test]\nfn uses_current() { assert_eq!(current::value(), 7); }\n",
+            ),
+            (
+                "src/legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
+            ),
+            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
+        ],
+        "src/legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains("value [function] · deleted from src/legacy.rs (committed lines 1-1)")
+            && impact.contains("no remaining references to legacy::value found · 2 mentions resolve to other definitions, such as current::value [function] src/current.rs:1")
+            && !impact.contains("current::value [function] src/current.rs:1 ·")
+            && !impact.contains("uses_current")
+            && !impact.contains("references deleted"),
+        "{impact}"
+    );
+
+    // Each way a surviving reference still reaches it, beside twins that cannot.
+    let lib = "pub mod legacy;\npub mod current;\n\
+use legacy::value as old_value;\n\
+pub fn a() -> u8 { legacy::value() }\n\
+pub fn b() -> u8 { crate::legacy::value() }\n\
+pub fn c() -> u8 { old_value() }\n\
+pub fn d() -> u8 { current::value() }\n\
+mod inner {\n    use super::legacy::*;\n    pub fn e() -> u8 { value() }\n}\n\
+mod other {\n    use crate::current::value;\n    pub fn f() -> u8 { value() }\n}\n\
+mod third {\n    pub fn g() -> u8 { super::legacy::value() + super::current::value() }\n}\n\
+pub struct Item {\n    pub value: u8,\n}\n\
+pub fn h(item: &Item) -> u8 {\n    // value is read from the item\n    item.value\n}\n";
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            ("src/lib.rs", lib),
+            (
+                "src/legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 + value() }\n",
+            ),
+            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
+        ],
+        "src/legacy.rs",
+        "pub fn untouched() -> u8 { 5 + value() }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "a [function] src/lib.rs:4 · still references deleted value at src/lib.rs:4",
+        "b [function] src/lib.rs:5 · still references deleted value at src/lib.rs:5",
+        "c [function] src/lib.rs:6 · still references deleted value at src/lib.rs:6",
+        "inner::e [function] src/lib.rs:10 · still references deleted value at src/lib.rs:10",
+        "third::g [function] src/lib.rs:17 · still references deleted value at src/lib.rs:17",
+        "legacy::untouched [function] src/legacy.rs:1 · still references deleted value at src/legacy.rs:1",
+        "src/lib.rs:3 · file scope still references deleted value",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    for unexpected in [
+        "  d [function]",
+        "other::f",
+        "current::value [function] src/current.rs:1 ·",
+        "Item [struct]",
+        "  h [function]",
+        "possibl",
+        "no remaining references",
+    ] {
+        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&success(repo.path(), &["affected", "--changes", "--json"])).unwrap();
+    let changed = json["changed"].as_array().unwrap();
+    assert!(
+        changed.iter().any(|item| item["name"] == "a"
+            && item["references_deleted"] == "value"
+            && item["possible"] == false),
+        "{json}"
+    );
+}
+
+#[test]
+fn deleting_python_and_typescript_functions_resolves_twins_and_marks_guesses() {
+    let repo = deletion_repo(
+        &[
+            (
+                "legacy.py",
+                "def value():\n    return 2\n\n\ndef untouched():\n    return 5\n",
+            ),
+            ("current.py", "def value():\n    return 7\n"),
+            (
+                "test_current.py",
+                "from current import value\n\n\ndef test_current():\n    assert value() == 7\n",
+            ),
+            (
+                "test_modules.py",
+                "import current\n\n\ndef test_module():\n    assert current.value() == 7\n",
+            ),
+            (
+                "uses_legacy.py",
+                "from legacy import value\n\n\ndef old():\n    return value()\n",
+            ),
+            (
+                "app.py",
+                "import os\nimport sys\n\n\ndef main():\n    return sys.argv\n",
+            ),
+        ],
+        "legacy.py",
+        "def untouched():\n    return 5\n",
+    );
+    let root = repo.path();
+    fs::write(
+        root.join("app.py"),
+        "import sys\n\n\ndef main():\n    return sys.argv\n",
+    )
+    .unwrap();
+    let impact = success(root, &["affected", "--changes"]);
+    for expected in [
+        "value [function] · deleted from legacy.py (committed lines 1-4)",
+        "uses_legacy.py:1-5 [file] · still references deleted value at uses_legacy.py:1",
+        "old [function] uses_legacy.py:4-5 · still references deleted value at uses_legacy.py:5",
+        // `current` is a plain module import, so the call is only a name match.
+        "test_module [test] test_modules.py:4-5 · possibly references deleted value at test_modules.py:5 (name match only)",
+        "test_module [test] test_modules.py:4-5 · possible · target itself",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    for unexpected in [
+        "current.py:1-2",
+        "test_current",
+        "references deleted import",
+    ] {
+        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
+    }
+
+    let repo = deletion_repo(
+        &[
+            (
+                "src/legacy.ts",
+                "export function value(): number {\n  return 2;\n}\n\nexport function untouched(): number {\n  return 5;\n}\n",
+            ),
+            (
+                "src/current.ts",
+                "export function value(): number {\n  return 7;\n}\n",
+            ),
+            (
+                "src/current.test.ts",
+                "import { value } from './current';\n\ntest('current', () => {\n  expect(value()).toBe(7);\n});\n",
+            ),
+            (
+                "src/old.ts",
+                "import { value as legacyValue } from './legacy';\n\nexport function old(): number {\n  return legacyValue();\n}\n",
+            ),
+        ],
+        "src/legacy.ts",
+        "export function untouched(): number {\n  return 5;\n}\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "value [function] · deleted from src/legacy.ts (committed lines 1-4)",
+        "src/old.ts:1-5 [file] · still references deleted value at src/old.ts:1",
+        "old [function] src/old.ts:3-5 · still references deleted value at src/old.ts:4",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    for unexpected in ["current.test.ts", "src/current.ts", "possibl"] {
+        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
+    }
+}
+
+#[test]
+fn deleted_symbol_search_says_where_it_stopped() {
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    let notes: String = (0..300).map(|i| format!("value note {i}\n")).collect();
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            ("NOTES.md", &notes),
+            ("src/lib.rs", "pub mod legacy;\n"),
+            (
+                "src/legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
+            ),
+        ],
+        "src/legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains("no remaining references to legacy::value")
+            && impact.contains("name search stopped after 256 matches")
+            && impact.contains("outside indexed definitions, such as NOTES.md:1"),
+        "{impact}"
+    );
+}

@@ -19,7 +19,7 @@ struct Cache {
     files: BTreeMap<String, Parsed>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Parsed {
     digest: String,
     syntax: Syntax,
@@ -119,6 +119,43 @@ pub struct Index {
     by_name: BTreeMap<String, Vec<usize>>,
     incoming: Vec<Vec<usize>>,
     outgoing: Vec<Vec<usize>>,
+    /// The parsed files behind the index, kept to rebuild it with removed
+    /// definitions restored. An index built that way has none.
+    source: Option<Box<Source>>,
+}
+
+struct Source {
+    cache: Cache,
+    manifests: BTreeMap<String, toml_edit::DocumentMut>,
+}
+
+/// A definition that a change removed, as the committed version of its file
+/// declared it.
+pub(crate) enum Removed {
+    Rust(rust_syntax::Symbol),
+    Foreign(polyglot::Definition),
+}
+
+/// Parsed files that replace their cached versions while an index is built,
+/// with removed definitions appended after the file's own.
+#[derive(Default)]
+struct Overlay {
+    files: BTreeMap<String, Parsed>,
+    /// Per file, how many definitions it has of its own, and which removed
+    /// definition each appended one restores.
+    appended: BTreeMap<String, (usize, Vec<usize>)>,
+}
+
+impl Overlay {
+    fn parsed<'a>(&'a self, cache: &'a Cache, file: &str) -> &'a Parsed {
+        self.files.get(file).unwrap_or(&cache.files[file])
+    }
+
+    /// The removed definition behind the definition at `position` in `file`.
+    fn restores(&self, file: &str, position: usize) -> Option<usize> {
+        let (own, entries) = self.appended.get(file)?;
+        entries.get(position.checked_sub(*own)?).copied()
+    }
 }
 
 impl Index {
@@ -266,14 +303,88 @@ impl Index {
                 Err(error) => eprintln!("justless: index cache not saved: {error:#}"),
             }
         }
-        Ok(Self::assemble(cache, &manifests, refresh))
+        let (mut index, _) = Self::assemble(&cache, &manifests, refresh, &Overlay::default());
+        index.source = Some(Box::new(Source { cache, manifests }));
+        Ok(index)
     }
 
+    /// This index rebuilt with each removed definition restored to its file,
+    /// so references resolve as if it still existed, and the ids each one took
+    /// there (several when its file belongs to several targets, none when it
+    /// could not be restored). Lines of surviving code keep their numbers.
+    pub(crate) fn with_removed(
+        &self,
+        removed: &[(&str, &Removed)],
+    ) -> Option<(Index, Vec<Vec<usize>>)> {
+        let source = self.source.as_ref()?;
+        let mut overlay = Overlay::default();
+        for (entry, &(file, definition)) in removed.iter().enumerate() {
+            let Some(cached) = source.cache.files.get(file) else {
+                continue;
+            };
+            let own = match &cached.foreign {
+                Some(facts) => facts.definitions.len(),
+                None => cached.syntax.symbols.len(),
+            };
+            let parsed = overlay
+                .files
+                .entry(file.to_owned())
+                .or_insert_with(|| cached.clone());
+            match (definition, &mut parsed.foreign) {
+                (Removed::Rust(symbol), None) if is_rust(file) => {
+                    parsed.syntax.symbols.push(symbol.clone())
+                }
+                (Removed::Foreign(tag), Some(facts)) => facts.definitions.push(tag.clone()),
+                _ => continue,
+            }
+            overlay
+                .appended
+                .entry(file.to_owned())
+                .or_insert((own, Vec::new()))
+                .1
+                .push(entry);
+        }
+        let (index, ids) = Self::assemble(
+            &source.cache,
+            &source.manifests,
+            Refresh::default(),
+            &overlay,
+        );
+        let mut restored = vec![Vec::new(); removed.len()];
+        for (entry, id) in ids {
+            restored[entry].push(id);
+        }
+        Some((index, restored))
+    }
+
+    /// The paths the Rust parser recorded on `line` of `file`.
+    pub(crate) fn rust_paths_at(&self, file: &str, line: usize) -> Vec<&[String]> {
+        let Some(parsed) = self
+            .source
+            .as_ref()
+            .and_then(|source| source.cache.files.get(file))
+        else {
+            return Vec::new();
+        };
+        parsed
+            .syntax
+            .references
+            .iter()
+            .filter(|reference| reference.line == line)
+            .map(|reference| reference.path.as_slice())
+            .collect()
+    }
+
+    /// Builds the index from parsed files, with `overlay` in place of the
+    /// cached files it replaces. Returns each definition the overlay restored,
+    /// as (removed entry, id).
     fn assemble(
-        cache: Cache,
+        cache: &Cache,
         manifests: &BTreeMap<String, toml_edit::DocumentMut>,
         refresh: Refresh,
-    ) -> Self {
+        overlay: &Overlay,
+    ) -> (Self, Vec<(usize, usize)>) {
+        let mut restored = Vec::new();
         let targets = targets(&cache.files, manifests);
         let libraries = libraries(&targets);
         let units = source_units(&cache.files, &targets);
@@ -305,15 +416,19 @@ impl Index {
             by_name: BTreeMap::new(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
+            source: None,
         };
+        let parsed = |file: &str| overlay.parsed(cache, file);
         let mut precise = HashMap::<(usize, Vec<String>), Vec<usize>>::new();
         let mut origins = Vec::new();
         let mut owners = Vec::new();
         for unit in &units {
-            let parsed = &cache.files[&unit.file];
             origins.push(index.definitions.len());
-            for symbol in &parsed.syntax.symbols {
+            for (position, symbol) in parsed(&unit.file).syntax.symbols.iter().enumerate() {
                 let id = index.definitions.len();
+                if let Some(entry) = overlay.restores(&unit.file, position) {
+                    restored.push((entry, id));
+                }
                 owners.push(unit.target);
                 let mut path = unit.module.clone();
                 path.extend_from_slice(&symbol.path);
@@ -347,7 +462,7 @@ impl Index {
 
         let mut imports = HashMap::<(usize, Vec<String>), Vec<Binding>>::new();
         for (unit, origin) in units.iter().zip(&origins) {
-            for import in &cache.files[&unit.file].syntax.imports {
+            for import in &parsed(&unit.file).syntax.imports {
                 let module = joined(&unit.module, &import.module);
                 imports
                     .entry((unit.namespace(), module))
@@ -379,7 +494,7 @@ impl Index {
         let mut seen = BTreeSet::new();
         let mut resolved = Vec::new();
         for (unit, origin) in units.iter().zip(&origins) {
-            for reference in &cache.files[&unit.file].syntax.references {
+            for reference in &parsed(&unit.file).syntax.references {
                 let from = reference.from.map(|id| origin + id);
                 resolver.resolve(unit, from, reference, &mut resolved);
                 for &(to, kind, inferred) in &resolved {
@@ -399,7 +514,7 @@ impl Index {
                 }
             }
         }
-        index.add_foreign(&cache.files);
+        index.add_foreign(cache, overlay, &mut restored);
         index.incoming = vec![Vec::new(); index.definitions.len()];
         index.outgoing = vec![Vec::new(); index.definitions.len()];
         for (id, edge) in index.edges.iter().enumerate() {
@@ -408,17 +523,22 @@ impl Index {
                 index.outgoing[from].push(id);
             }
         }
-        index
+        (index, restored)
     }
 
-    fn add_foreign(&mut self, files: &BTreeMap<String, Parsed>) {
+    fn add_foreign(
+        &mut self,
+        cache: &Cache,
+        overlay: &Overlay,
+        restored: &mut Vec<(usize, usize)>,
+    ) {
         let mut units = BTreeMap::new();
         let mut routes = BTreeMap::<&str, Vec<usize>>::new();
         let mut tables = BTreeMap::<&str, Vec<usize>>::new();
         let mut families = BTreeMap::<(Grammar, &str), Vec<usize>>::new();
         let mut units_by_family = BTreeMap::<Grammar, Vec<&str>>::new();
-        for (file, parsed) in files {
-            let Some(facts) = &parsed.foreign else {
+        for file in cache.files.keys() {
+            let Some(facts) = &overlay.parsed(cache, file).foreign else {
                 continue;
             };
             let module = self.add_definition(
@@ -439,7 +559,10 @@ impl Index {
             let family = facts.grammar.family();
             units.insert(file.as_str(), (module, origin, facts));
             units_by_family.entry(family).or_default().push(file);
-            for tag in &facts.definitions {
+            for (position, tag) in facts.definitions.iter().enumerate() {
+                if let Some(entry) = overlay.restores(file, position) {
+                    restored.push((entry, self.definitions.len()));
+                }
                 let id = self.add_definition(
                     &tag.name,
                     Definition {

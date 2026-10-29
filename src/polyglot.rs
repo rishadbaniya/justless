@@ -342,7 +342,7 @@ impl Grammar {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Definition {
     #[serde(skip)]
     pub bytes: std::ops::Range<usize>,
@@ -361,7 +361,7 @@ pub struct Definition {
     pub test: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reference {
     pub name: String,
     pub from: Option<usize>,
@@ -369,14 +369,14 @@ pub struct Reference {
     pub kind: Kind,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Import {
     pub path: String,
     pub line: usize,
     pub bindings: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Facts {
     #[serde(skip)]
     pub import_ranges: Vec<std::ops::Range<usize>>,
