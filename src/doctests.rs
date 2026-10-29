@@ -575,6 +575,10 @@ fn code_blocks(lines: &[(usize, String)]) -> Vec<Example> {
                 rust: rust(c, info),
             });
             paragraph = false;
+        } else if thematic_break(rest) {
+            // A rule, or a setext underline of dashes, before a list marker
+            // that looks the same, such as `* * *`.
+            paragraph = false;
         } else if let Some(column) = list_item(indent, rest) {
             list = Some(column);
             let content = rest.get(column - indent..).unwrap_or("").trim_start();
@@ -590,8 +594,10 @@ fn code_blocks(lines: &[(usize, String)]) -> Vec<Example> {
                 paragraph = !content.is_empty();
             }
         } else {
-            // A heading or a rule is a block of one line; text continues.
-            paragraph = !(heading(rest) || thematic_break(rest));
+            // A heading, or a `===` underline that makes the text above one,
+            // is a block of its own; other text continues a paragraph.
+            let underline = paragraph && rest.trim_end().chars().all(|c| c == '=');
+            paragraph = !(heading(rest) || underline);
         }
     }
     close_indented(&mut indented, &mut found);
@@ -822,6 +828,15 @@ mod tests {
             examples("/// # Examples\n///     assert!(true);\nfn a() {}\n"),
             [(2, 2)]
         );
+        // Rules and setext underlines end the text above, as rustdoc reads them.
+        for text in [
+            "/// * * *\n///\n///     assert!(true);\nfn a() {}\n",
+            "/// - - -\n///\n///     assert!(true);\nfn a() {}\n",
+            "/// Title\n/// =====\n///     assert!(true);\nfn a() {}\n",
+            "/// Title\n/// -----\n///     assert!(true);\nfn a() {}\n",
+        ] {
+            assert_eq!(examples(text).len(), 1, "{text}");
+        }
         assert_eq!(
             examples(&format!(
                 "/// Text\n///\n/// {fence}\n/// assert!(true);\nfn a() {{}}\n"

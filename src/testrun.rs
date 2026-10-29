@@ -733,7 +733,8 @@ fn doc_misses(step: &Step, outcome: &Outcome) -> Vec<String> {
         .flat_map(|(_, names)| names)
         .collect();
     if reported.is_empty() {
-        // Quiet output names no test, so only the count can be checked.
+        // Quiet output names no test, and filters may match the same one,
+        // so only a step that ran no doctest at all is known to have missed.
         let counted: usize = outcome
             .tally
             .counts
@@ -741,7 +742,7 @@ fn doc_misses(step: &Step, outcome: &Outcome) -> Vec<String> {
             .filter(|(key, _)| doc(key))
             .map(|(_, count)| count)
             .sum();
-        return if counted >= step.filters.len() {
+        return if counted > 0 {
             Vec::new()
         } else {
             step.filters.clone()
@@ -1382,9 +1383,10 @@ mod tests {
         assert!(doc_misses(&step, &outcome(both)).is_empty());
         let one = "\nrunning 1 test\ntest src/lib.rs - price (line 9) ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out\n";
         assert_eq!(doc_misses(&step, &outcome(one)), ["::total (line "]);
-        // Quiet output only counts: fewer doctests than filters is a miss.
+        // Quiet output only counts, and two filters can match one doctest:
+        // only a step that ran none is a miss.
         let quiet = "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out\n";
-        assert_eq!(doc_misses(&step, &outcome(quiet)).len(), 2);
+        assert!(doc_misses(&step, &outcome(quiet)).is_empty());
         let none = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out\n";
         assert_eq!(doc_misses(&step, &outcome(none)).len(), 2);
     }
