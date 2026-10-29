@@ -611,7 +611,11 @@ impl<'ast> Visit<'ast> for Extractor {
                 mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
         {
             for expression in &expressions {
-                self.visit_expr(expression);
+                match expression {
+                    // A field such as `info!(value = 3)` names no item.
+                    Expr::Assign(field) if !standard => self.visit_expr(&field.right),
+                    _ => self.visit_expr(expression),
+                }
             }
         }
     }

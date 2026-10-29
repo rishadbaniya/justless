@@ -14566,3 +14566,66 @@ fn removing_a_rust_import_selects_the_code_that_used_it() {
         "{plan}"
     );
 }
+
+#[test]
+fn same_named_wrappers_of_a_deleted_function_are_not_cleared() {
+    // A wrapper that shares the name still calls the removed function. The
+    // index links the bare name to the wrapper itself, so that link proves nothing.
+    let repo = deletion_repo(
+        &[
+            (
+                "legacy.py",
+                "def value():\n    return 2\n\n\ndef untouched():\n    return 5\n",
+            ),
+            (
+                "current.py",
+                "import legacy\n\n\ndef value():\n    return legacy.value()\n",
+            ),
+            (
+                "oneline.py",
+                "import legacy\n\n\ndef value(): return legacy.value()\n",
+            ),
+        ],
+        "legacy.py",
+        "def untouched():\n    return 5\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "value [function] current.py:4-5 · possibly references deleted value at current.py:5 (name match only)",
+        "value [function] oneline.py:4 · possibly references deleted value at oneline.py:4 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    assert!(!impact.contains("no remaining references"), "{impact}");
+
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    let wrapper = "pub struct Wrapper;\nimpl Wrapper {\n    pub fn value(&self) -> u8 {\n        value()\n    }\n}\n\
+pub fn log() {\n    info!(value = 3, \"done\");\n}\n";
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            (
+                "src/lib.rs",
+                "macro_rules! info {\n    ($($t:tt)*) => {};\n}\npub mod legacy;\n",
+            ),
+            (
+                "src/legacy.rs",
+                &format!("pub fn value() -> u8 {{ 2 }}\n{wrapper}"),
+            ),
+        ],
+        "src/legacy.rs",
+        wrapper,
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "legacy::Wrapper::value [method] src/legacy.rs:3-5 · possibly references deleted value at src/legacy.rs:4 (name match only)",
+        // A macro field named like it is not a call, but the macro may use it.
+        "legacy::log [function] src/legacy.rs:7-9 · possibly references deleted value at src/legacy.rs:8 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    assert!(
+        !impact.contains("no remaining references") && !impact.contains("still references"),
+        "{impact}"
+    );
+}

@@ -578,17 +578,19 @@ fn follow(
         .map(|mention| (mention.file.as_str(), mention.line))
         .collect();
     // A certain link from a mention line to another definition of that name.
+    // The index can bind a bare name inside a method to that method, which Rust
+    // does not, so a link to a method only counts for a removed member.
     let mut other = BTreeMap::<(&str, usize), String>::new();
     for edge in &resolving.edges {
         let at = (edge.location.file.as_str(), edge.location.start);
+        let target = &resolving.definitions[edge.to];
         if !edge.inferred
             && !ids.contains(&edge.to)
             && lines.contains(&at)
-            && named(&resolving.definitions[edge.to])
+            && named(target)
+            && (member || target.kind != "method")
         {
-            other
-                .entry(at)
-                .or_insert_with(|| label(&resolving.definitions[edge.to]));
+            other.entry(at).or_insert_with(|| label(target));
         }
     }
     let mut elsewhere = Vec::new();
@@ -597,10 +599,16 @@ fn follow(
         if found.contains_key(&(mention.file.clone(), mention.line)) {
             continue;
         }
-        if let Some(target) = other.get(&at) {
+        let rust = mention.file.ends_with(".rs");
+        let occurrences: Vec<usize> = whole_words(&mention.text, short).collect();
+        // Outside Rust, the index links only the bare name, so a link says
+        // nothing about `module.name` on the same line.
+        let attribute = !rust && occurrences.iter().any(|&at| after_dot(&mention.text[..at]));
+        if !attribute && let Some(target) = other.get(&at) {
             elsewhere.push(target.clone());
             continue;
         }
+        // A declaration of another definition explains its own name only.
         let declared = index
             .at(&Location {
                 file: mention.file.clone(),
@@ -609,11 +617,13 @@ fn follow(
             })
             .into_iter()
             .find(|&id| definitions[id].declaration == mention.line && named(&definitions[id]));
-        if let Some(id) = declared {
+        if occurrences.len() == 1
+            && let Some(id) = declared
+        {
             elsewhere.push(label(&definitions[id]));
             continue;
         }
-        if mention.file.ends_with(".rs") {
+        if rust {
             // The paths parsed on the line, macro bodies included where the
             // rebuilt index read them. A `use` resolves without following
             // re-exports, so it never shows a path to be another item.
@@ -731,11 +741,17 @@ fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[Stri
         }
         let before = text[..at].trim_end();
         let after = text[at + name.len()..].trim_start();
-        (before.ends_with('.') && !before.ends_with("..") && !member)
+        (after_dot(before) && !member)
             || (after.starts_with(':') && !after.starts_with("::"))
             || binding(before)
             || (before.ends_with("::") && qualified)
     })
+}
+
+/// Whether the text before a name ends with a single `.`, as in `value.name`.
+fn after_dot(before: &str) -> bool {
+    let before = before.trim_end();
+    before.ends_with('.') && !before.ends_with("..")
 }
 
 /// Where a `//` comment starts on a line of Rust, unless it is documentation,
