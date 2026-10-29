@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{Change, Since, changes, relationship};
-use crate::doctests::{Docs, Group, markdown_examples};
+use crate::doctests::{Docs, Group, doc_like, markdown_examples, spans_lines};
 use crate::impact::{Dependent, Walk, walk};
 use crate::index::{Definition, Fingerprint, Index};
 use crate::map::{is_test_file, language, name};
@@ -760,7 +760,14 @@ fn doc_example(
     if !path.ends_with(".rs") {
         return false;
     }
-    let (Some(docs), Some(text)) = (texts.docs(path), texts.line(path, line)) else {
+    let Some(text) = texts.line(path, line) else {
+        return false;
+    };
+    // Most lines that name a symbol are code; only parse for one that may be docs.
+    if !doc_like(&text) && !texts.get(path).is_some_and(spans_lines) {
+        return false;
+    }
+    let Some(docs) = texts.docs(path) else {
         return false;
     };
     if docs.opaque(line, &text) {
@@ -789,6 +796,14 @@ fn changed_docs(
     ignored: bool,
     hits: &mut DocHits,
 ) {
+    let doc_line_changed = changed.iter().any(|&line| {
+        line.checked_sub(1)
+            .and_then(|at| text.get(at))
+            .is_some_and(|line| doc_like(line))
+    });
+    if !doc_line_changed && !texts.get(file).is_some_and(spans_lines) {
+        return;
+    }
     let Some(docs) = texts.docs(file) else {
         return;
     };
@@ -2997,7 +3012,18 @@ fn cargo_plan(
         if !runs_doctests(package, target) {
             continue;
         }
-        let Some(docs) = texts.docs(file) else {
+        // An item's docs start its span, so an undocumented item needs no parse.
+        let documented = texts.get(file).is_some_and(|text| {
+            text.lines()
+                .skip(definition.location.start.saturating_sub(1))
+                .take(
+                    definition
+                        .declaration
+                        .saturating_sub(definition.location.start),
+                )
+                .any(doc_like)
+        });
+        let Some(docs) = texts.docs(file).filter(|_| documented) else {
             continue;
         };
         let mut run = None;

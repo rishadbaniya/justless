@@ -175,6 +175,14 @@ pub(crate) fn doc_like(line: &str) -> bool {
         || (line.contains("cfg_attr") && line.contains("doc"))
 }
 
+/// Whether a file may hold documentation lines that do not look like
+/// documentation on their own: inside a `/** */` block or a `#[doc]` string
+/// that spans lines. Without that, [`doc_like`] finds every doc line, and the
+/// file need not be parsed for a line that is not one.
+pub(crate) fn spans_lines(text: &str) -> bool {
+    text.contains("/**") || text.contains("/*!") || text.contains("doc =") || text.contains("doc=")
+}
+
 /// Code blocks in a Markdown file that documentation includes, with 1-based lines.
 pub(crate) fn markdown_examples(text: &str) -> Vec<Example> {
     let lines: Vec<(usize, String)> = text
@@ -271,10 +279,15 @@ impl<'ast> Visit<'ast> for Attributes {
     }
 }
 
-/// Whether a `cfg_attr` names `doc` anywhere in its arguments.
+/// Whether a `cfg_attr` sets documentation text with `doc = ...` anywhere in
+/// its arguments. `doc(cfg(...))` and other `doc(...)` lists add none.
 fn names_doc(tokens: &TokenStream) -> bool {
-    tokens.clone().into_iter().any(|token| match token {
-        TokenTree::Ident(ident) => ident == "doc",
+    let tokens: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    tokens.iter().enumerate().any(|(at, token)| match token {
+        TokenTree::Ident(ident) => {
+            ident == "doc"
+                && matches!(tokens.get(at + 1), Some(TokenTree::Punct(punct)) if punct.as_char() == '=')
+        }
         TokenTree::Group(group) => names_doc(&group.stream()),
         _ => false,
     })
@@ -838,6 +851,9 @@ mod tests {
         );
         assert!(docs.groups.iter().all(|group| group.unknown));
         assert_eq!(docs.groups.len(), 2);
+        // `doc(cfg(...))` adds no text, so it neither documents nor widens.
+        let docs = Docs::read("#[cfg_attr(docsrs, doc(cfg(feature = \"x\")))]\nfn a() {}\n");
+        assert!(docs.groups.is_empty());
         let docs = Docs::read(
             "macro_rules! make {\n    () => {\n        /// ```\n        /// assert!(true);\n        /// ```\n        pub fn made() {}\n    };\n}\n",
         );
