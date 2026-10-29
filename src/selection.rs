@@ -1073,8 +1073,10 @@ pub(crate) fn plan(
     let changes = changes(workspace, index, &since)?;
     // A clean tree on a branch is no reason to test nothing silently.
     let note = (changes.is_empty() && head.is_some() && matches!(since, Since::Head)).then(|| {
-        "No changes against HEAD. To test a branch's commits, add --base REF, such as --base main."
-            .to_owned()
+        format!(
+            "No changes against HEAD. {}",
+            crate::context::base_hint(workspace, "test")
+        )
     });
     // `cargo test -- --ignored` runs examples marked `ignore` too.
     let run_ignored = runners.iter().any(|runner| {

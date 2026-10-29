@@ -96,7 +96,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
                     summary.insert("reached".into(), json!(0));
                     println!("{}", serde_json::to_string(&summary)?);
                 } else {
-                    println!("{}", since.nothing_changed());
+                    println!("{}", since.nothing_changed(workspace));
                 }
                 return Ok(());
             }

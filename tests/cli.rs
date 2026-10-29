@@ -2692,7 +2692,7 @@ fn affected_changes_start_from_the_changed_symbols() {
     ]);
     assert_eq!(
         success(path, &["affected", "--changes"]),
-        "No changed files. To review a branch's commits, add --base REF, such as --base main.\n"
+        "No changed files. To review a branch's commits, add --base REF.\n"
     );
     let clean: serde_json::Value =
         serde_json::from_str(&success(path, &["affected", "--changes", "--json"])).unwrap();
@@ -14115,4 +14115,52 @@ fn affected_tests_run_examples_that_call_what_a_change_reaches() {
         assert_no_suite_claim(&failing);
         git(root, &["checkout", "-q", "--", "."]);
     }
+}
+
+#[test]
+fn a_clean_branch_suggests_a_base_that_exists() {
+    let repo = probe_crate(
+        "pub fn rate() -> u8 {\n    5\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn rate_matches() {\n        assert_eq!(super::rate(), 5);\n    }\n}\n",
+    );
+    let root = repo.path();
+    // `git init` names the first branch `master` unless configured otherwise.
+    git(root, &["branch", "-M", "master"]);
+    let plan = |base: &[&str]| {
+        let mut args = vec!["test", "--affected", "--dry-run"];
+        args.extend(base);
+        args.extend(["--", "cargo", "test", "--offline"]);
+        success(root, &args)
+    };
+
+    // On the only branch there is nothing to compare with, so no ref is named.
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "No changes against HEAD. To test a branch's commits, add --base REF.",
+    );
+
+    // On a branch, the hint names the branch it started from, never a `main`
+    // this repository does not have, and following it finds the commit.
+    git(root, &["checkout", "-qb", "review"]);
+    replace_in(root, "src/lib.rs", "    5\n", "    8\n");
+    git(root, &["commit", "-qam", "raise the rate"]);
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "No changes against HEAD. To test a branch's commits, add --base REF, such as --base master.",
+    );
+    for command in [&["affected", "--changes"][..], &["context", "--changes"]] {
+        let text = success(root, command);
+        assert!(
+            text.contains(
+                "No changed files. To review a branch's commits, add --base REF, such as --base master."
+            ),
+            "{text}"
+        );
+    }
+    let text = plan(&["--base", "master"]);
+    assert!(
+        text.contains("  tests::rate_matches · probe --lib · exact"),
+        "{text}"
+    );
 }

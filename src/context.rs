@@ -704,15 +704,59 @@ impl Since {
     }
 
     /// What a clean comparison says, with how to review a branch's commits.
-    pub(crate) fn nothing_changed(&self) -> String {
+    pub(crate) fn nothing_changed(&self, workspace: &Workspace) -> String {
         match self {
-            Since::Head => "No changed files. To review a branch's commits, add --base REF, such as --base main.".into(),
+            Since::Head => format!("No changed files. {}", base_hint(workspace, "review")),
             Since::Staged => "No changed files.".into(),
             Since::Base { name, short, .. } => {
                 format!("No changed files against {name} (merge-base {short}).")
             }
         }
     }
+}
+
+/// How to `verb` a branch's commits when nothing changed against `HEAD`,
+/// naming a ref to pass when one fits: never one that names no commit here.
+pub(crate) fn base_hint(workspace: &Workspace, verb: &str) -> String {
+    match suggested_base(workspace) {
+        Some(name) => {
+            format!("To {verb} a branch's commits, add --base REF, such as --base {name}.")
+        }
+        None => format!("To {verb} a branch's commits, add --base REF."),
+    }
+}
+
+/// The remote's default branch, or a usual local one, that names a commit
+/// other than `HEAD`.
+fn suggested_base(workspace: &Workspace) -> Option<String> {
+    let commit = |name: &str| {
+        let output = workspace
+            .git(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{name}^{{commit}}"),
+            ])
+            .ok()?;
+        output.status.success().then(|| first_line(&output.stdout))
+    };
+    let head = commit("HEAD")?;
+    let remote = workspace
+        .git(&[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| first_line(&output.stdout))
+        .filter(|name| !name.is_empty());
+    remote
+        .into_iter()
+        .chain(["main", "master", "trunk", "develop"].map(str::to_owned))
+        .find(|name| commit(name).is_some_and(|at| at != head))
 }
 
 pub(crate) enum Change {
@@ -813,7 +857,7 @@ pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) 
         }
     }
     if changes.is_empty() {
-        report.line(since.nothing_changed());
+        report.line(since.nothing_changed(workspace));
     }
     report.finish()
 }
