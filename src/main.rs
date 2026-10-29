@@ -58,6 +58,14 @@ fn number(name: &'static str, value: &'static str, help: &'static str) -> Arg<'s
         .help(help)
 }
 
+/// `--base REF`: compare with the merge base of a ref and `HEAD`, as for a
+/// branch review, instead of with `HEAD` alone.
+fn base_arg() -> Arg<'static> {
+    Arg::new("base").long("base").value_name("REF").help(
+        "Compare with the merge base of REF and HEAD: the branch's commits and the working tree",
+    )
+}
+
 fn budget() -> Arg<'static> {
     Arg::new("budget")
         .long("budget")
@@ -249,6 +257,7 @@ fn cli() -> Command<'static> {
                         .requires("changes")
                         .help("Use staged changes"),
                 )
+                .arg(base_arg().requires("changes").conflicts_with("staged"))
                 .arg(Arg::new("at").long("at").value_name("PATH:LINE[-LINE]"))
                 .arg(Arg::new("symbol").long("symbol").value_name("SYMBOL"))
                 .group(
@@ -564,7 +573,12 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             } else if let Some(name) = sub.value_of("symbol") {
                 context::symbol(&workspace, &index, name, limit)?;
             } else {
-                context::changed(&workspace, &index, sub.is_present("staged"), limit)?;
+                let since = context::Since::resolve(
+                    &workspace,
+                    sub.is_present("staged"),
+                    sub.value_of("base"),
+                )?;
+                context::changed(&workspace, &index, &since, limit)?;
             }
         }
         ("code", sub) => context::code(

@@ -53,6 +53,7 @@ pub fn command() -> Command<'static> {
                 .requires("affected")
                 .help("Keep the subset when confidence is low instead of running the full suite"),
         )
+        .arg(crate::base_arg().requires("affected"))
         .arg(
             Arg::new("why")
                 .long("why")
@@ -128,6 +129,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             runners,
             &settings.test,
             matches.is_present("no-fallback"),
+            matches.value_of("base"),
         )?
     } else {
         selection::full_suite(&runners)
@@ -302,6 +304,7 @@ fn header(plan: &Plan, affected: bool) -> String {
 /// The `--dry-run` text, bounded by the budget.
 fn render(plan: &Plan, affected: bool, budget: usize) -> String {
     let mut lines = vec![header(plan, affected)];
+    lines.extend(plan.note.clone());
     let mut details = Vec::new();
     for note in &plan.changes {
         details.push(format!("Changed {} · {}", note.subject, note.detail));
@@ -760,6 +763,9 @@ fn echoed(argv: &[String]) -> String {
 
 fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32> {
     println!("{}", header(plan, options.affected));
+    if let Some(note) = &plan.note {
+        println!("{note}");
+    }
     let mut status = 0;
     let mut verdicts = Vec::new();
     let mut first_run = None;

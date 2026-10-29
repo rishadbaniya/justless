@@ -625,6 +625,96 @@ fn detail(
     Ok(())
 }
 
+/// What `--changes` compares the working tree with.
+#[derive(Clone, Debug)]
+pub(crate) enum Since {
+    /// `HEAD`, untracked files included.
+    Head,
+    /// The index against `HEAD`.
+    Staged,
+    /// The merge base of a ref and `HEAD`: a branch's commits and the
+    /// working tree on top of them, untracked files included.
+    Base {
+        name: String,
+        commit: String,
+        short: String,
+    },
+}
+
+impl Since {
+    /// Resolves `--staged` or `--base REF`. A ref that names no commit, or
+    /// shares no history with `HEAD`, is an error rather than an empty diff.
+    pub(crate) fn resolve(
+        workspace: &Workspace,
+        staged: bool,
+        base: Option<&str>,
+    ) -> Result<Since> {
+        let Some(name) = base else {
+            return Ok(if staged { Since::Staged } else { Since::Head });
+        };
+        let inside = workspace.git(&["rev-parse", "--is-inside-work-tree"])?;
+        ensure!(
+            inside.status.success() && inside.stdout.starts_with(b"true"),
+            "--base needs a Git repository: {}",
+            first_line(&inside.stderr)
+        );
+        let target = workspace.git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{name}^{{commit}}"),
+        ])?;
+        ensure!(
+            target.status.success(),
+            "--base {name}: no such commit in this repository"
+        );
+        let target = first_line(&target.stdout);
+        let merge_base = workspace.git(&["merge-base", &target, "HEAD"])?;
+        ensure!(
+            merge_base.status.success(),
+            "--base {name}: no common history with HEAD{}",
+            if workspace
+                .git(&["rev-parse", "--is-shallow-repository"])
+                .is_ok_and(|output| output.stdout.starts_with(b"true"))
+            {
+                " in this shallow clone; fetch more history"
+            } else {
+                ""
+            }
+        );
+        let commit = first_line(&merge_base.stdout);
+        let short = workspace
+            .git(&["rev-parse", "--short", &commit])
+            .map(|output| first_line(&output.stdout))
+            .unwrap_or_else(|_| commit.chars().take(7).collect());
+        Ok(Since::Base {
+            name: name.to_owned(),
+            commit,
+            short,
+        })
+    }
+
+    /// The commit whose files are the version before the change.
+    pub(crate) fn rev(&self) -> &str {
+        match self {
+            Since::Base { commit, .. } => commit,
+            _ => "HEAD",
+        }
+    }
+
+    /// What a clean comparison says, with how to review a branch's commits.
+    pub(crate) fn nothing_changed(&self) -> String {
+        match self {
+            Since::Head => "No changed files. To review a branch's commits, add --base REF, such as --base main.".into(),
+            Since::Staged => "No changed files.".into(),
+            Since::Base { name, short, .. } => {
+                format!("No changed files against {name} (merge-base {short}).")
+            }
+        }
+    }
+}
+
 pub(crate) enum Change {
     Unindexed,
     StagedDiffers,
@@ -646,10 +736,10 @@ pub(crate) struct Deletion {
     pub lines: Vec<String>,
 }
 
-/// Name the symbols each deletion removed, from the committed version of `file`.
-/// Leaves the list empty when that version cannot be read or parsed.
-fn deleted_symbols(workspace: &Workspace, file: &str, deletions: &mut [Deletion]) {
-    let Ok(output) = workspace.git(&["show", &format!("HEAD:./{file}")]) else {
+/// Name the symbols each deletion removed, from the committed version of `file`
+/// at `rev`. Leaves the list empty when that version cannot be read or parsed.
+fn deleted_symbols(workspace: &Workspace, file: &str, rev: &str, deletions: &mut [Deletion]) {
+    let Ok(output) = workspace.git(&["show", &format!("{rev}:./{file}")]) else {
         return;
     };
     if !output.status.success() {
@@ -678,9 +768,9 @@ fn deleted_symbols(workspace: &Workspace, file: &str, deletions: &mut [Deletion]
     }
 }
 
-pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -> Result<()> {
+pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) -> Result<()> {
     let mut report = Report::new(cap);
-    let changes = changes(workspace, index, staged)?;
+    let changes = changes(workspace, index, since)?;
     for (file, change) in &changes {
         let name = display_path(file);
         match change {
@@ -723,7 +813,7 @@ pub fn changed(workspace: &Workspace, index: &Index, staged: bool, cap: usize) -
         }
     }
     if changes.is_empty() {
-        report.line("No changed files.");
+        report.line(since.nothing_changed());
     }
     report.finish()
 }
@@ -812,14 +902,16 @@ fn first_line(bytes: &[u8]) -> String {
         .to_owned()
 }
 
-/// Changed line ranges per file against `HEAD`, or the index with `staged`.
-/// Untracked files count as changed throughout. Lines removed without a
-/// replacement are reported apart, as deletions.
+/// Changed line ranges per file against `HEAD`, the index with
+/// [`Since::Staged`], or a merge base with [`Since::Base`]. Untracked files
+/// count as changed throughout. Lines removed without a replacement are
+/// reported apart, as deletions.
 pub(crate) fn changes(
     workspace: &Workspace,
     index: &Index,
-    staged: bool,
+    since: &Since,
 ) -> Result<Vec<(String, Change)>> {
+    let staged = matches!(since, Since::Staged);
     let inside = workspace.git(&["rev-parse", "--is-inside-work-tree"])?;
     ensure!(
         inside.status.success() && inside.stdout.starts_with(b"true"),
@@ -834,10 +926,13 @@ pub(crate) fn changes(
         "--no-renames",
     ];
     let head = workspace.git(&["rev-parse", "--verify", "HEAD"])?;
-    if staged {
-        args.push("--cached");
-    } else if head.status.success() {
-        args.push("HEAD");
+    match since {
+        Since::Staged => args.push("--cached"),
+        // One commit and no dots: its tree against the working tree, so a
+        // branch's commits and uncommitted edits both count.
+        Since::Base { commit, .. } => args.push(commit),
+        Since::Head if head.status.success() => args.push("HEAD"),
+        Since::Head => {}
     }
     let mut names = args.clone();
     names.extend(["--name-only", "-z", "--", "."]);
@@ -946,7 +1041,7 @@ pub(crate) fn changes(
             ranges
         };
         if !deletions.is_empty() {
-            deleted_symbols(workspace, file, &mut deletions);
+            deleted_symbols(workspace, file, since.rev(), &mut deletions);
             changes.push((
                 file.clone(),
                 Change::Deleted(std::mem::take(&mut deletions)),

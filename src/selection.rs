@@ -12,7 +12,7 @@ use std::rc::Rc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::context::{Change, changes, relationship};
+use crate::context::{Change, Since, changes, relationship};
 use crate::doctests::{Docs, Group, markdown_examples};
 use crate::impact::{Dependent, Walk, walk};
 use crate::index::{Definition, Fingerprint, Index};
@@ -208,8 +208,12 @@ pub(crate) struct RunnerPlan {
 #[derive(Serialize)]
 pub(crate) struct Plan {
     pub version: u32,
-    /// `HEAD 3f2c1ab`, or why there is no base.
+    /// `HEAD 3f2c1ab`, `main (merge-base 3f2c1ab)` with `--base`, or why
+    /// there is no base.
     pub base: String,
+    /// What a clean tree means and how to test a branch instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub changes: Vec<Note>,
     pub seeds: Vec<Note>,
     pub ignored: Vec<Note>,
@@ -959,16 +963,19 @@ impl Analysis {
     }
 }
 
-/// Builds the plan for every runner from the current Git changes.
+/// Builds the plan for every runner from the current Git changes, against
+/// `HEAD` or, with `base`, the merge base of that ref and `HEAD`.
 pub(crate) fn plan(
     workspace: &Workspace,
     index: &Index,
     runners: Vec<Runner>,
     settings: &TestSettings,
     no_fallback: bool,
+    base: Option<&str>,
 ) -> Result<Plan> {
     let inside = git_text(workspace, &["rev-parse", "--is-inside-work-tree"]);
     if inside.as_deref() != Some("true") {
+        anyhow::ensure!(base.is_none(), "--base needs a Git repository");
         let runners = runners
             .into_iter()
             .map(|runner| {
@@ -984,15 +991,27 @@ pub(crate) fn plan(
         return Ok(Plan {
             version: 1,
             base: "no Git checkout".into(),
+            note: None,
             changes: Vec::new(),
             seeds: Vec::new(),
             ignored: Vec::new(),
             runners,
         });
     }
-    let base = git_text(workspace, &["rev-parse", "--short", "HEAD"])
-        .map_or_else(|| "no commits yet".to_owned(), |rev| format!("HEAD {rev}"));
-    let changes = changes(workspace, index, false)?;
+    let since = Since::resolve(workspace, false, base)?;
+    let head = git_text(workspace, &["rev-parse", "--short", "HEAD"]);
+    let base = match &since {
+        Since::Base { name, short, .. } => format!("{name} (merge-base {short})"),
+        _ => head
+            .as_ref()
+            .map_or_else(|| "no commits yet".to_owned(), |rev| format!("HEAD {rev}")),
+    };
+    let changes = changes(workspace, index, &since)?;
+    // A clean tree on a branch is no reason to test nothing silently.
+    let note = (changes.is_empty() && head.is_some() && matches!(since, Since::Head)).then(|| {
+        "No changes against HEAD. To test a branch's commits, add --base REF, such as --base main."
+            .to_owned()
+    });
     // `cargo test -- --ignored` runs examples marked `ignore` too.
     let run_ignored = runners.iter().any(|runner| {
         runner.kind == Kind::Cargo
@@ -1001,7 +1020,14 @@ pub(crate) fn plan(
                 .iter()
                 .any(|word| word == "--ignored" || word == "--include-ignored")
     });
-    let mut analysis = analyze(workspace, index, &changes, settings, run_ignored)?;
+    let mut analysis = analyze(
+        workspace,
+        index,
+        &changes,
+        settings,
+        run_ignored,
+        since.rev(),
+    )?;
     // Code in a language no runner here runs, such as SQL or shell, reaches
     // tests only through what names it or links to it; otherwise it is data.
     for file in std::mem::take(&mut analysis.unmentioned_code) {
@@ -1070,6 +1096,7 @@ pub(crate) fn plan(
     Ok(Plan {
         version: 1,
         base,
+        note,
         changes: changes_notes,
         seeds: analysis.seed_notes,
         ignored: analysis.ignored,
@@ -1083,6 +1110,7 @@ fn analyze(
     changes: &[(String, Change)],
     settings: &TestSettings,
     run_ignored: bool,
+    rev: &str,
 ) -> Result<Analysis> {
     let definitions = &index.definitions;
     let mut texts = Texts::new(workspace);
@@ -1173,7 +1201,7 @@ fn analyze(
         by_file.entry(file.as_str()).or_default().push(change);
     }
     let head_has =
-        |file: &str| git_text(workspace, &["cat-file", "-e", &format!("HEAD:./{file}")]).is_some();
+        |file: &str| git_text(workspace, &["cat-file", "-e", &format!("{rev}:./{file}")]).is_some();
     for (file, list) in &by_file {
         let exists = fs::symlink_metadata(workspace.root.join(file)).is_ok();
         let tracked = head_has(file);
@@ -1196,9 +1224,9 @@ fn analyze(
         if language(file).is_none() {
             continue;
         }
-        // Definitions present at HEAD and gone now, renamed ones included.
+        // Definitions present at the base and gone now, renamed ones included.
         if tracked {
-            let before = git_text_raw(workspace, &["show", &format!("HEAD:./{file}")])
+            let before = git_text_raw(workspace, &["show", &format!("{rev}:./{file}")])
                 .and_then(|text| symbols(file, text));
             let now = if exists {
                 texts
@@ -1690,7 +1718,7 @@ fn analyze(
         target.capped = seed.capped;
     }
 
-    // A seed that did not exist at HEAD and nothing reaches cannot change a test.
+    // A seed that did not exist at the base and nothing reaches cannot change a test.
     let mut committed = BTreeMap::<String, Option<String>>::new();
     for seed in &mut analysis.seeds {
         let definition = &definitions[seed.id];
@@ -1701,7 +1729,7 @@ fn analyze(
         let word = short(definition);
         let before = committed
             .entry(file.clone())
-            .or_insert_with(|| git_text_raw(workspace, &["show", &format!("HEAD:./{file}")]));
+            .or_insert_with(|| git_text_raw(workspace, &["show", &format!("{rev}:./{file}")]));
         seed.new = before
             .as_deref()
             .is_none_or(|text| !text.lines().any(|line| has_word(line, word)));
@@ -3573,6 +3601,7 @@ pub(crate) fn full_suite(runners: &[Runner]) -> Plan {
     Plan {
         version: 1,
         base: "full suite".into(),
+        note: None,
         changes: Vec::new(),
         seeds: Vec::new(),
         ignored: Vec::new(),

@@ -8,7 +8,7 @@ use anyhow::{Result, bail, ensure};
 use clap::{Arg, ArgGroup, ArgMatches, Command};
 use serde_json::{Map, json};
 
-use crate::context::{Change, changes, relationship};
+use crate::context::{Change, Since, changes, relationship};
 use crate::index::{Edge, Index};
 use crate::map::{Fill, Section, emit, is_test_file, label, name, node, plural};
 use crate::workspace::{Location, Workspace};
@@ -38,6 +38,11 @@ pub fn command() -> Command<'static> {
                 .long("staged")
                 .requires("changes")
                 .help("Use staged changes"),
+        )
+        .arg(
+            crate::base_arg()
+                .requires("changes")
+                .conflicts_with("staged"),
         )
         .group(
             ArgGroup::new("input")
@@ -79,14 +84,19 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
             )
         }
         None => {
-            let (seeds, section) = changed(workspace, &index, matches.is_present("staged"))?;
+            let since = Since::resolve(
+                workspace,
+                matches.is_present("staged"),
+                matches.value_of("base"),
+            )?;
+            let (seeds, section) = changed(workspace, &index, &since)?;
             if section.lines.is_empty() {
                 if matches.is_present("json") {
                     summary.insert("changed".into(), json!([]));
                     summary.insert("reached".into(), json!(0));
                     println!("{}", serde_json::to_string(&summary)?);
                 } else {
-                    println!("No changed files.");
+                    println!("{}", since.nothing_changed());
                 }
                 return Ok(());
             }
@@ -429,11 +439,11 @@ pub(crate) fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Vec<
 
 /// Symbols touched by the current changes: the innermost definition around each
 /// changed range, and any definition whose declaration line changed.
-fn changed(workspace: &Workspace, index: &Index, staged: bool) -> Result<(Vec<usize>, Section)> {
+fn changed(workspace: &Workspace, index: &Index, since: &Since) -> Result<(Vec<usize>, Section)> {
     Ok(changed_in(
         workspace,
         index,
-        &changes(workspace, index, staged)?,
+        &changes(workspace, index, since)?,
     ))
 }
 

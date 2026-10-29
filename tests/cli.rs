@@ -2692,7 +2692,7 @@ fn affected_changes_start_from_the_changed_symbols() {
     ]);
     assert_eq!(
         success(path, &["affected", "--changes"]),
-        "No changed files.\n"
+        "No changed files. To review a branch's commits, add --base REF, such as --base main.\n"
     );
     let clean: serde_json::Value =
         serde_json::from_str(&success(path, &["affected", "--changes", "--json"])).unwrap();
@@ -13897,4 +13897,106 @@ fn affected_tests_run_every_example_rustdoc_runs() {
         "cargo · subset · 1 of 14 indexed tests in 1 of 1 test targets",
     );
     reset();
+}
+
+#[test]
+fn affected_tests_with_a_base_ref_cover_the_branch_commits() {
+    let repo = probe_crate(
+        "pub fn rate() -> u8 {\n    5\n}\n\npub fn legacy() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn rate_matches() {\n        assert_eq!(super::rate(), 5);\n    }\n\n    #[test]\n    fn legacy_is_one() {\n        assert_eq!(super::legacy(), 1);\n    }\n}\n",
+    );
+    let root = repo.path();
+    let merge_base = git(root, &["rev-parse", "--short", "HEAD"])
+        .trim()
+        .to_owned();
+    git(root, &["checkout", "-qb", "review"]);
+    replace_in(root, "src/lib.rs", "    5\n", "    8\n");
+    git(root, &["commit", "-qam", "raise the rate"]);
+    let plan = |base: &[&str]| {
+        let mut args = vec!["test", "--affected", "--dry-run"];
+        args.extend(base);
+        args.extend(["--", "cargo", "test", "--offline"]);
+        success(root, &args)
+    };
+
+    // A clean tree says what it compared and how to review a branch.
+    let text = plan(&[]);
+    assert!(
+        text.contains(
+            "No changes against HEAD. To test a branch's commits, add --base REF, such as --base main."
+        ),
+        "{text}"
+    );
+    let context = success(root, &["context", "--changes"]);
+    assert!(context.contains("No changed files."), "{context}");
+    assert!(context.contains("add --base REF"), "{context}");
+
+    // Against main, the branch's commit is the change, and the header names
+    // the ref and its merge base.
+    let text = plan(&["--base", "main"]);
+    has_line(
+        &text,
+        &format!(
+            "Affected tests · working tree vs main (merge-base {merge_base}) · 1 changed file · 1 starting symbol"
+        ),
+    );
+    assert!(
+        text.contains("  tests::rate_matches · probe --lib · exact"),
+        "{text}"
+    );
+    let failing = cli(
+        root,
+        &[
+            "test",
+            "--affected",
+            "--base",
+            "main",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+        ],
+    );
+    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
+    assert!(
+        stderr(&failing).contains("Subset failed (cargo)"),
+        "{}",
+        stderr(&failing)
+    );
+
+    // `affected` and `context` read the same change set.
+    let impact = success(root, &["affected", "--changes", "--base", "main"]);
+    assert!(
+        impact.contains("rate [function] src/lib.rs:1-3 · changed src/lib.rs:2-2"),
+        "{impact}"
+    );
+    let context = success(root, &["context", "--changes", "--base", "main"]);
+    assert!(context.contains("Changed src/lib.rs:2-2"), "{context}");
+
+    // A function removed in a commit seeds the code that still names it, and
+    // uncommitted edits count on top of the commits.
+    replace_in(
+        root,
+        "src/lib.rs",
+        "pub fn legacy() -> u8 {\n    1\n}\n\n",
+        "",
+    );
+    git(root, &["commit", "-qam", "drop legacy"]);
+    replace_in(
+        root,
+        "src/lib.rs",
+        "assert_eq!(super::rate(), 5)",
+        "assert_eq!(super::rate(), 8)",
+    );
+    let text = plan(&["--base", "main"]);
+    has_line(&text, "Start legacy · removed from src/lib.rs");
+    assert!(
+        text.contains("Start tests::legacy_is_one [test] src/lib.rs:"),
+        "{text}"
+    );
+    assert!(text.contains("Start tests::rate_matches [test]"), "{text}");
+
+    // An unknown ref is an error, never an empty plan.
+    let unknown = cli(root, &["test", "--affected", "--base", "nope", "--dry-run"]);
+    assert!(!unknown.status.success(), "{}", stdout(&unknown));
+    assert!(stderr(&unknown).contains("nope"), "{}", stderr(&unknown));
 }
