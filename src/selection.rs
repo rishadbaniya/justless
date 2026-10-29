@@ -1304,10 +1304,10 @@ fn analyze(
     let head_has =
         |file: &str| git_text(workspace, &["cat-file", "-e", &format!("{rev}:./{file}")]).is_some();
     // Names a documentation example may use to exercise a change, each with
-    // the Rust file whose crate's doctests run when the name is too common to
+    // the Rust files whose crates' doctests run when the name is too common to
     // search: names removed or written outside any definition here, and below
     // everything the change reaches.
-    let mut doc_words = BTreeMap::<String, String>::new();
+    let mut doc_words = BTreeMap::<String, BTreeSet<String>>::new();
     for (file, list) in &by_file {
         let exists = fs::symlink_metadata(workspace.root.join(file)).is_ok();
         let tracked = head_has(file);
@@ -1357,7 +1357,8 @@ fn analyze(
                     if file.ends_with(".rs") {
                         doc_words
                             .entry(removed_name.to_owned())
-                            .or_insert_with(|| (*file).to_owned());
+                            .or_default()
+                            .insert((*file).to_owned());
                     }
                     if removed_name.len() < 3 || UBIQUITOUS.contains(&removed_name) {
                         continue;
@@ -1428,7 +1429,8 @@ fn analyze(
             for word in &words {
                 doc_words
                     .entry(word.clone())
-                    .or_insert_with(|| (*file).to_owned());
+                    .or_default()
+                    .insert((*file).to_owned());
             }
         }
         for word in words {
@@ -1860,20 +1862,23 @@ fn analyze(
             }
             doc_words
                 .entry(word.to_owned())
-                .or_insert_with(|| file.clone());
+                .or_default()
+                .insert(file.clone());
         }
     }
     let mut searched: BTreeSet<String> = doc_words.keys().cloned().collect();
-    while let Some((word, file)) = doc_words.pop_first() {
+    while let Some((word, files)) = doc_words.pop_first() {
         let lines = name_cache
             .entry(word.clone())
             .or_insert_with(|| find(index, &mut texts, &word, true))
             .clone();
         let Some(lines) = lines else {
-            analysis.docs.crate_of(
-                &file,
-                &format!("{word} is named too often to find the examples that use it"),
-            );
+            for file in &files {
+                analysis.docs.crate_of(
+                    file,
+                    &format!("{word} is named too often to find the examples that use it"),
+                );
+            }
             continue;
         };
         for (path, line) in lines {
@@ -1884,7 +1889,7 @@ fn analyze(
                 // `pub use inner::price as cost;`.
                 for alias in aliases(&text, &word) {
                     if searched.insert(alias.clone()) {
-                        doc_words.insert(alias, file.clone());
+                        doc_words.insert(alias, files.clone());
                     }
                 }
                 // Parsing a file for its examples costs more than the search.

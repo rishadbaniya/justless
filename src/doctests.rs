@@ -910,6 +910,20 @@ mod tests {
     }
 
     #[test]
+    fn included_markdown_has_its_own_examples() {
+        let found =
+            markdown_examples("# Title\n\nExample:\n\n    assert!(true);\n\n```text\nx\n```\n");
+        assert_eq!(
+            found,
+            [Example {
+                start: 5,
+                end: 5,
+                ignored: false
+            }]
+        );
+    }
+
+    #[test]
     fn a_file_with_an_example_may_hold_examples() {
         let fence = "```";
         for text in [
@@ -928,19 +942,5 @@ mod tests {
         assert!(!may_hold_examples(
             "/// A price.\n///\n/// See `a`.\nfn a() {}\n"
         ));
-    }
-
-    #[test]
-    fn included_markdown_has_its_own_examples() {
-        let found =
-            markdown_examples("# Title\n\nExample:\n\n    assert!(true);\n\n```text\nx\n```\n");
-        assert_eq!(
-            found,
-            [Example {
-                start: 5,
-                end: 5,
-                ignored: false
-            }]
-        );
     }
 }

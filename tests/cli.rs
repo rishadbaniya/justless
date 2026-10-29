@@ -14188,3 +14188,89 @@ fn affected_tests_run_examples_that_call_a_renamed_export() {
     assert!(err.contains("Subset failed (cargo)"), "{err}");
     assert!(err.contains("  src/lib.rs - Shop (line "), "{err}");
 }
+
+#[test]
+fn affected_tests_run_the_crate_doctests_for_a_name_too_common_to_search() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let others: String = (0..12)
+        .map(|n| format!("    #[test]\n    fn other_{n}() {{}}\n"))
+        .collect();
+    let package = |name: &str, dependencies: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}"
+        )
+    };
+    for (path, text) in [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n".to_owned(),
+        ),
+        (
+            ".gitignore",
+            "/target/\n/Cargo.lock\n/.justless/\n".to_owned(),
+        ),
+        ("a/Cargo.toml", package("a", "")),
+        (
+            "a/src/lib.rs",
+            format!(
+                "pub fn id() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn ids() {{\n        let _ = super::id();\n    }}\n{others}}}\n"
+            ),
+        ),
+        // More mentions of `id` than the search follows.
+        ("a/src/noise.rs", "// id\n".repeat(4100)),
+        (
+            "b/Cargo.toml",
+            package("b", "[dependencies]\na = { path = \"../a\" }\n"),
+        ),
+        (
+            "b/src/lib.rs",
+            format!(
+                "/// Identifiers.\n///\n/// ```\n/// assert_eq!(b::id(), 1);\n/// ```\npub struct Ids;\n\npub fn id() -> u8 {{\n    a::id()\n}}\n\n#[cfg(test)]\nmod tests {{\n{others}}}\n"
+            ),
+        ),
+    ] {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), text).unwrap();
+    }
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    // `id` changes in `a` and is reached in `b`, whose example calls it.
+    replace_in(root, "a/src/lib.rs", "    1\n", "    2\n");
+    let plan = success(
+        root,
+        &[
+            "test",
+            "--affected",
+            "--dry-run",
+            "--budget",
+            "8000",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+        ],
+    );
+    has_line(
+        &plan,
+        "  Run (doctests): cargo test --offline -p a -p b --doc",
+    );
+    assert!(
+        plan.contains("id is named too often to find the examples that use it"),
+        "{plan}"
+    );
+    let failing = cli(
+        root,
+        &["test", "--affected", "--", "cargo", "test", "--offline"],
+    );
+    let err = stderr(&failing);
+    assert_eq!(
+        failing.status.code(),
+        Some(101),
+        "{}{err}",
+        stdout(&failing)
+    );
+    assert!(err.contains("Subset failed (cargo)"), "{err}");
+    assert!(err.contains("  b/src/lib.rs - Ids (line "), "{err}");
+}
