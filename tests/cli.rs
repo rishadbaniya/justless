@@ -14123,7 +14123,7 @@ fn a_clean_branch_suggests_a_base_that_exists() {
         "pub fn rate() -> u8 {\n    5\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn rate_matches() {\n        assert_eq!(super::rate(), 5);\n    }\n}\n",
     );
     let root = repo.path();
-    // `git init` names the first branch `master` unless configured otherwise.
+    // Older Git, and Git configured so, names the first branch `master`.
     git(root, &["branch", "-M", "master"]);
     let plan = |base: &[&str]| {
         let mut args = vec!["test", "--affected", "--dry-run"];
