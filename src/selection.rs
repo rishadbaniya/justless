@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{Change, Since, changes, relationship};
-use crate::doctests::{Docs, Group, doc_like, markdown_examples, spans_lines};
+use crate::doctests::{Docs, Group, doc_like, markdown_examples, may_hold_examples, spans_lines};
 use crate::impact::{Dependent, Walk, walk};
 use crate::index::{Definition, Fingerprint, Index};
 use crate::map::{is_test_file, language, name};
@@ -259,6 +259,12 @@ struct Texts<'a> {
     workspace: &'a Workspace,
     cache: BTreeMap<String, Option<String>>,
     docs: BTreeMap<String, Option<Rc<Docs>>>,
+    /// Byte offsets where each line of a file starts.
+    starts: BTreeMap<String, Option<Vec<usize>>>,
+    /// Whether a file may hold doc lines that do not look like docs.
+    spans: BTreeMap<String, bool>,
+    /// Whether a file may hold an example rustdoc runs.
+    examples: BTreeMap<String, bool>,
 }
 
 impl<'a> Texts<'a> {
@@ -267,7 +273,30 @@ impl<'a> Texts<'a> {
             workspace,
             cache: BTreeMap::new(),
             docs: BTreeMap::new(),
+            starts: BTreeMap::new(),
+            spans: BTreeMap::new(),
+            examples: BTreeMap::new(),
         }
+    }
+
+    /// [`may_hold_examples`] of a file, read once.
+    fn may_hold_examples(&mut self, file: &str) -> bool {
+        if let Some(&examples) = self.examples.get(file) {
+            return examples;
+        }
+        let examples = self.get(file).is_some_and(may_hold_examples);
+        self.examples.insert(file.to_owned(), examples);
+        examples
+    }
+
+    /// [`spans_lines`] of a file, read once.
+    fn spans_lines(&mut self, file: &str) -> bool {
+        if let Some(&spans) = self.spans.get(file) {
+            return spans;
+        }
+        let spans = self.get(file).is_some_and(spans_lines);
+        self.spans.insert(file.to_owned(), spans);
+        spans
     }
 
     fn docs(&mut self, file: &str) -> Option<Rc<Docs>> {
@@ -278,11 +307,31 @@ impl<'a> Texts<'a> {
         self.docs[file].clone()
     }
 
+    /// Line `line` of `file`, as `str::lines` numbers it. Where each line
+    /// starts is found once per file, since the name nets ask for thousands.
     fn line(&mut self, file: &str, line: usize) -> Option<String> {
-        self.get(file)?
-            .lines()
-            .nth(line.checked_sub(1)?)
-            .map(str::to_owned)
+        let at = line.checked_sub(1)?;
+        if !self.starts.contains_key(file) {
+            let starts = self.get(file).map(|text| {
+                std::iter::once(0)
+                    .chain(
+                        text.match_indices('\n')
+                            .map(|(at, _)| at + 1)
+                            .filter(|&start| start < text.len()),
+                    )
+                    .collect()
+            });
+            self.starts.insert(file.to_owned(), starts);
+        }
+        let start = *self.starts[file].as_ref()?.get(at)?;
+        let text = self.cache[file].as_deref()?;
+        let rest = &text[start..];
+        let end = rest.find('\n');
+        let mut line = &rest[..end.unwrap_or(rest.len())];
+        if end.is_some() {
+            line = line.strip_suffix('\r').unwrap_or(line);
+        }
+        Some(line.to_owned())
     }
 
     fn get(&mut self, file: &str) -> Option<&str> {
@@ -764,7 +813,7 @@ fn doc_example(
         return false;
     };
     // Most lines that name a symbol are code; only parse for one that may be docs.
-    if !doc_like(&text) && !texts.get(path).is_some_and(spans_lines) {
+    if !doc_like(&text) && !texts.spans_lines(path) {
         return false;
     }
     let Some(docs) = texts.docs(path) else {
@@ -801,7 +850,7 @@ fn changed_docs(
             .and_then(|at| text.get(at))
             .is_some_and(|line| doc_like(line))
     });
-    if !doc_line_changed && !texts.get(file).is_some_and(spans_lines) {
+    if !doc_line_changed && !texts.spans_lines(file) {
         return;
     }
     let Some(docs) = texts.docs(file) else {
@@ -1217,6 +1266,11 @@ fn analyze(
     }
     let head_has =
         |file: &str| git_text(workspace, &["cat-file", "-e", &format!("{rev}:./{file}")]).is_some();
+    // Names a documentation example may use to exercise a change, each with
+    // the Rust file whose crate's doctests run when the name is too common to
+    // search: names removed or written outside any definition here, and below
+    // everything the change reaches.
+    let mut doc_words = BTreeMap::<String, String>::new();
     for (file, list) in &by_file {
         let exists = fs::symlink_metadata(workspace.root.join(file)).is_ok();
         let tracked = head_has(file);
@@ -1263,6 +1317,11 @@ fn analyze(
                         subject: removed_name.to_owned(),
                         detail: format!("removed from {file}"),
                     });
+                    if file.ends_with(".rs") {
+                        doc_words
+                            .entry(removed_name.to_owned())
+                            .or_insert_with(|| (*file).to_owned());
+                    }
                     if removed_name.len() < 3 || UBIQUITOUS.contains(&removed_name) {
                         continue;
                     }
@@ -1326,6 +1385,13 @@ fn analyze(
                     }
                 }
                 analysis.compile_files.insert((*file).to_owned());
+            }
+        }
+        if file.ends_with(".rs") {
+            for word in &words {
+                doc_words
+                    .entry(word.clone())
+                    .or_insert_with(|| (*file).to_owned());
             }
         }
         for word in words {
@@ -1731,6 +1797,64 @@ fn analyze(
         target.files = seed.files;
         target.dependents = seed.dependents;
         target.capped = seed.capped;
+    }
+
+    // An example exercises a change only through a name on the way to it, such
+    // as the public function it calls, so the examples that name anything the
+    // change reaches run too. A method too common to search by name, such as
+    // `new`, is found by its type, and a name too common to search at all runs
+    // its crate's doctests.
+    for seed in &analysis.seeds {
+        for id in std::iter::once(seed.id).chain(seed.dependents.keys().copied()) {
+            let definition = &definitions[id];
+            let file = &definition.location.file;
+            if definition.test
+                || !file.ends_with(".rs")
+                || matches!(definition.kind.as_str(), "file" | "module" | "import")
+            {
+                continue;
+            }
+            let mut word = short(definition);
+            if (word.len() < 3 || UBIQUITOUS.contains(&word))
+                && definition.kind == "method"
+                && let Some((parent, _)) = definition.qualified.rsplit_once("::")
+            {
+                word = parent.rsplit("::").next().unwrap_or(parent);
+            }
+            doc_words
+                .entry(word.to_owned())
+                .or_insert_with(|| file.clone());
+        }
+    }
+    for (word, file) in doc_words {
+        let lines = name_cache
+            .entry(word.clone())
+            .or_insert_with(|| find(index, &mut texts, &word, true))
+            .clone();
+        let Some(lines) = lines else {
+            analysis.docs.crate_of(
+                &file,
+                &format!("{word} is named too often to find the examples that use it"),
+            );
+            continue;
+        };
+        for (path, line) in lines {
+            // Parsing a file for its examples costs more than the search.
+            if path.ends_with(".rs") && !texts.may_hold_examples(&path) {
+                continue;
+            }
+            doc_example(
+                index,
+                &mut texts,
+                &doc_includes,
+                &path,
+                line,
+                true,
+                run_ignored,
+                &format!("its example names {word} at {path}:{line}"),
+                &mut analysis.docs,
+            );
+        }
     }
 
     // A seed that did not exist at the base and nothing reaches cannot change a test.

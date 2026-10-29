@@ -14000,3 +14000,119 @@ fn affected_tests_with_a_base_ref_cover_the_branch_commits() {
     assert!(!unknown.status.success(), "{}", stdout(&unknown));
     assert!(stderr(&unknown).contains("nope"), "{}", stderr(&unknown));
 }
+
+const CALLING_EXAMPLES: &str = r##"//! Crate docs.
+//!
+//! ```
+//! assert_eq!(probe::price(), 7);
+//! ```
+
+/// A shop.
+///
+/// ```
+/// assert_eq!(probe::Shop::new().0, 3);
+/// ```
+pub struct Shop(pub u8);
+
+impl Shop {
+    pub fn new() -> Shop {
+        Shop(3)
+    }
+}
+
+/// Identifiers.
+///
+/// ```
+/// assert_eq!(probe::id(), 1);
+/// ```
+pub struct Ids;
+
+pub fn id() -> u8 {
+    1
+}
+
+pub fn price() -> u8 {
+    base()
+}
+
+fn base() -> u8 {
+    7
+}
+
+pub struct Rates<T>(pub T);
+
+impl<T> Rates<T> {
+    /// ```
+    /// assert_eq!(probe::Rates::<u8>::RATE, 5);
+    /// ```
+    pub const RATE: u8 = 5;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn makes() {
+        let _ = Shop::new();
+    }
+
+    #[test]
+    fn ids() {
+        let _ = id();
+    }
+
+    #[test]
+    fn bases() {
+        let _ = base();
+    }
+
+    #[test]
+    fn rates() {
+        let _ = Rates::<u8>::RATE;
+    }
+}
+"##;
+
+#[test]
+fn affected_tests_run_examples_that_call_what_a_change_reaches() {
+    let repo = probe_crate(CALLING_EXAMPLES);
+    let root = repo.path();
+    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
+    // Each example exercises the change without naming the changed symbol:
+    // through its type for a name as common as `new`, by a name too short for
+    // the name net, through the public function that calls it, and through an
+    // associated constant the index does not hold as a definition.
+    for (from, to, failure) in [
+        (
+            "        Shop(3)\n",
+            "        Shop(4)\n",
+            "  src/lib.rs - Shop (line ",
+        ),
+        (
+            "    1\n}\n\npub fn price",
+            "    2\n}\n\npub fn price",
+            "  src/lib.rs - Ids (line ",
+        ),
+        ("    7\n}\n", "    8\n}\n", "  src/lib.rs - (line "),
+        (
+            "pub const RATE: u8 = 5;",
+            "pub const RATE: u8 = 6;",
+            "  src/lib.rs - Rates<T>::RATE (line ",
+        ),
+    ] {
+        replace_in(root, "src/lib.rs", from, to);
+        let failing = cli(root, &affected);
+        let err = stderr(&failing);
+        assert_eq!(
+            failing.status.code(),
+            Some(101),
+            "{to}\n{}{err}",
+            stdout(&failing)
+        );
+        assert!(err.contains("Subset failed (cargo)"), "{to}\n{err}");
+        assert!(err.contains(failure), "{failure:?} in\n{err}");
+        assert_no_suite_claim(&failing);
+        git(root, &["checkout", "-q", "--", "."]);
+    }
+}

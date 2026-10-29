@@ -183,6 +183,21 @@ pub(crate) fn spans_lines(text: &str) -> bool {
     text.contains("/**") || text.contains("/*!") || text.contains("doc =") || text.contains("doc=")
 }
 
+/// Whether a Rust file may hold an example rustdoc runs, judged from its text
+/// without parsing it: a fence, documentation that [`spans_lines`], or a doc
+/// comment with four columns of whitespace, which an indented block needs.
+/// A file without any of these has no example to find.
+pub(crate) fn may_hold_examples(text: &str) -> bool {
+    text.contains("```")
+        || text.contains("~~~")
+        || spans_lines(text)
+        || text.lines().any(|line| {
+            let line = line.trim_start();
+            (line.starts_with("///") || line.starts_with("//!"))
+                && (line[3..].contains("    ") || line[3..].contains('\t'))
+        })
+}
+
 /// Code blocks in a Markdown file that documentation includes, with 1-based lines.
 pub(crate) fn markdown_examples(text: &str) -> Vec<Example> {
     let lines: Vec<(usize, String)> = text
@@ -892,6 +907,27 @@ mod tests {
         assert!(docs.at(5).is_some_and(|group| group.examples.is_empty()));
         assert!(docs.at(9).is_some_and(|group| group.in_example(9, false)));
         assert_eq!(docs.outer(1, 4).count(), 1);
+    }
+
+    #[test]
+    fn a_file_with_an_example_may_hold_examples() {
+        let fence = "```";
+        for text in [
+            format!("/// {fence}\n/// a();\n/// {fence}\nfn a() {{}}\n"),
+            "/// ~~~\n/// a();\n/// ~~~\nfn a() {}\n".to_owned(),
+            "/// A.\n///\n///     a();\nfn a() {}\n".to_owned(),
+            "///A.\n///\n///\t\ta();\nfn a() {}\n".to_owned(),
+            "/// >     a();\nfn a() {}\n".to_owned(),
+            "/// - item\n///\n///       a();\nfn a() {}\n".to_owned(),
+            "/**\nA.\n\n    a();\n*/\nfn a() {}\n".to_owned(),
+            "#[doc = \"A.\"]\n#[doc = \"\"]\n#[doc = \"    a();\"]\nfn a() {}\n".to_owned(),
+        ] {
+            assert!(!examples(&text).is_empty(), "{text}");
+            assert!(may_hold_examples(&text), "{text}");
+        }
+        assert!(!may_hold_examples(
+            "/// A price.\n///\n/// See `a`.\nfn a() {}\n"
+        ));
     }
 
     #[test]
