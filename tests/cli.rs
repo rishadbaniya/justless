@@ -14733,3 +14733,33 @@ pub fn typed(n: &New) -> u8 {\n    n.value()\n}\n";
         "{impact}"
     );
 }
+
+#[test]
+fn format_strings_that_capture_a_deleted_constant_still_count() {
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    let lib = "pub mod legacy;\nuse legacy::*;\n\
+pub fn debug() -> String {\n    format!(\"{LIMIT:?}\")\n}\n\
+pub fn precision() -> String {\n    format!(\"{:.LIMIT$}\", 1.0)\n}\n\
+pub fn aligned() -> String {\n    format!(\"{LIMIT:>4}\")\n}\n";
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            ("src/lib.rs", lib),
+            (
+                "src/legacy.rs",
+                "pub const LIMIT: usize = 2;\npub fn untouched() -> u8 { 5 }\n",
+            ),
+        ],
+        "src/legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "debug [function] src/lib.rs:3-5 · possibly references deleted LIMIT at src/lib.rs:4 (name match only)",
+        "precision [function] src/lib.rs:6-8 · possibly references deleted LIMIT at src/lib.rs:7 (name match only)",
+        "aligned [function] src/lib.rs:9-11 · possibly references deleted LIMIT at src/lib.rs:10 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    assert!(!impact.contains("no remaining references"), "{impact}");
+}

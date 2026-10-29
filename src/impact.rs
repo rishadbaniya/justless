@@ -735,7 +735,8 @@ fn follow(
 /// binding, part of a `//` comment that is not documentation, or the end of a
 /// path into the standard library that the parser recorded on the line. Any
 /// other qualified path stays, because resolution can miss one that reaches
-/// the item, such as `T::name` or a path through a type alias.
+/// the item, such as `T::name` or a path through a type alias. So does a name
+/// inside a string, which a format string such as `"{name:?}"` can capture.
 fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[String]]) -> bool {
     let comment = plain_comment(text);
     let standard = paths.iter().any(|path| {
@@ -745,6 +746,9 @@ fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[Stri
         if comment.is_some_and(|start| at > start) {
             return true;
         }
+        if in_string(text, at) {
+            return false;
+        }
         let before = text[..at].trim_end();
         let after = text[at + name.len()..].trim_start();
         (after_dot(before) && !member)
@@ -752,6 +756,33 @@ fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[Stri
             || binding(before)
             || (standard && in_standard_path(before))
     })
+}
+
+/// Whether byte `at` of a line of Rust falls inside a string literal that
+/// opens on that line.
+fn in_string(text: &str, at: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut inside = false;
+    let mut index = 0;
+    while index < at {
+        match bytes[index] {
+            b'\\' if inside => index += 1,
+            b'"' => inside = !inside,
+            // A character literal such as '"' or '\"' does not open a string.
+            b'\'' if !inside => {
+                if bytes.get(index + 2) == Some(&b'\'') {
+                    index += 2;
+                } else if bytes.get(index + 1) == Some(&b'\\')
+                    && bytes.get(index + 3) == Some(&b'\'')
+                {
+                    index += 3;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    inside
 }
 
 /// Whether a path segment names a standard library crate.
