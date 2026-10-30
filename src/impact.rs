@@ -479,7 +479,7 @@ fn deleted(
         let removal = Removal {
             name,
             short,
-            member: kind == "method" || kind.starts_with("associated"),
+            member: is_member(kind),
         };
         follow(
             index,
@@ -507,6 +507,12 @@ struct Removal<'a> {
     short: &'a str,
     /// Whether it was a method or other member, which a value can reach with `.`.
     member: bool,
+}
+
+/// Whether a definition of this kind is a member, which a value or type can
+/// reach with `.` or `::`.
+fn is_member(kind: &str) -> bool {
+    kind == "method" || kind.starts_with("associated")
 }
 
 /// How surely a remaining line references a removed symbol.
@@ -577,6 +583,29 @@ fn follow(
         .iter()
         .map(|mention| (mention.file.as_str(), mention.line))
         .collect();
+    // Members of the same name are tied through a trait, as an implementation
+    // is to the trait item it implements, so for a removed member a link to or
+    // declaration of one proves nothing when either belongs to a trait. A
+    // removed member that could not be restored may belong to one.
+    let traits: BTreeSet<&str> = resolving
+        .definitions
+        .iter()
+        .filter(|definition| definition.kind == "trait")
+        .map(|definition| definition.qualified.as_str())
+        .collect();
+    let in_trait = |definition: &Definition| {
+        definition
+            .qualified
+            .rsplit_once("::")
+            .is_some_and(|(owner, _)| traits.contains(owner))
+    };
+    let trait_member = member
+        && rebuilt.is_none_or(|rebuilt| {
+            ids.is_empty() || ids.iter().any(|&id| in_trait(&rebuilt.definitions[id]))
+        });
+    let tied = |definition: &Definition| {
+        member && is_member(&definition.kind) && (trait_member || in_trait(definition))
+    };
     // A certain link from a mention line to another definition of that name.
     // The index can bind a bare name inside a method to that method, which Rust
     // does not, so a link to a method only counts for a removed member.
@@ -589,6 +618,7 @@ fn follow(
             && lines.contains(&at)
             && named(target)
             && (member || target.kind != "method")
+            && !tied(target)
         {
             other.entry(at).or_insert_with(|| label(target));
         }
@@ -624,6 +654,7 @@ fn follow(
             .find(|&id| definitions[id].declaration == mention.line && named(&definitions[id]));
         if occurrences.len() == 1
             && let Some(id) = declared
+            && !tied(&definitions[id])
         {
             elsewhere.push(label(&definitions[id]));
             continue;

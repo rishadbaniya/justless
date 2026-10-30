@@ -14763,3 +14763,50 @@ pub fn aligned() -> String {\n    format!(\"{LIMIT:>4}\")\n}\n";
     }
     assert!(!impact.contains("no remaining references"), "{impact}");
 }
+
+#[test]
+fn deleted_trait_members_keep_the_same_named_members_tied_to_them() {
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    // Removing a trait method breaks the implementation that still defines it
+    // and the calls that went through the trait.
+    let lib = "pub trait Get {\n    fn value(&self) -> u8;\n    fn other(&self) -> u8;\n}\n\
+pub struct X;\nimpl Get for X {\n    fn value(&self) -> u8 { 1 }\n    fn other(&self) -> u8 { 2 }\n}\n\
+pub fn typed(x: &X) -> u8 {\n    x.value()\n}\n";
+    let repo = deletion_repo(
+        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
+        "src/lib.rs",
+        &lib.replace("    fn value(&self) -> u8;\n", ""),
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "X::value [method] src/lib.rs:6 · possibly references deleted value at src/lib.rs:6 (name match only)",
+        "typed [function] src/lib.rs:9-11 · possibly references deleted value at src/lib.rs:10 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    assert!(!impact.contains("no remaining references"), "{impact}");
+
+    // Removing an override falls back to the trait's default, while an
+    // inherent method of another type that shares the name is unrelated.
+    let lib = "pub trait Get {\n    fn value(&self) -> u8 {\n        0\n    }\n}\n\
+pub struct X;\nimpl Get for X {\n    fn value(&self) -> u8 { 1 }\n}\n\
+pub struct Y;\nimpl Y {\n    pub fn value(&self) -> u8 { 3 }\n}\n\
+pub fn generic<T: Get>(t: &T) -> u8 {\n    t.value()\n}\n\
+pub fn inherent(v: &Y) -> u8 {\n    v.value()\n}\n";
+    let repo = deletion_repo(
+        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
+        "src/lib.rs",
+        &lib.replace("    fn value(&self) -> u8 { 1 }\n", ""),
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "X::value [method] · deleted from src/lib.rs (committed lines 8-8)",
+        "Get::value [method] src/lib.rs:2-4 · possibly references deleted value at src/lib.rs:2 (name match only)",
+        "generic [function] src/lib.rs:13-15 · possibly references deleted value at src/lib.rs:14 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+    for unexpected in ["Y::value [method] src/lib.rs:11 ·", "  inherent [function]"] {
+        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
+    }
+}
