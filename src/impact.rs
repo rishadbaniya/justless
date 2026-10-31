@@ -739,6 +739,10 @@ fn follow(
     }
     if !referenced {
         let mut text = format!("  no remaining references to {shown} found");
+        // Mentions outside definitions, such as a `macro_rules!` body, were not read.
+        if !outside.is_empty() {
+            text.push_str(" inside indexed definitions");
+        }
         if let Some(first) = elsewhere.first() {
             text.push_str(&format!(
                 " · {} resolve to other definitions, such as {first}",
@@ -747,7 +751,7 @@ fn follow(
         }
         section.push(
             text,
-            json!({"deleted": name, "note": "no remaining references", "elsewhere": elsewhere.len()}),
+            json!({"deleted": name, "note": "no remaining references", "elsewhere": elsewhere.len(), "outside": outside.len()}),
         );
     }
     if search.capped {

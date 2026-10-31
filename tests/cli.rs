@@ -14810,3 +14810,31 @@ pub fn inherent(v: &Y) -> u8 {\n    v.value()\n}\n";
         assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
     }
 }
+
+#[test]
+fn no_remaining_references_says_mentions_outside_definitions_were_not_read() {
+    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    // The only call is in a `macro_rules!` body, which is outside every definition.
+    let lib = "pub mod legacy;\nmacro_rules! old {\n    () => {\n        $crate::legacy::value()\n    };\n}\n\
+pub fn a() -> u8 {\n    old!()\n}\n";
+    let repo = deletion_repo(
+        &[
+            ("Cargo.toml", cargo),
+            ("src/lib.rs", lib),
+            (
+                "src/legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
+            ),
+        ],
+        "src/legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains(
+            "1 mention of value outside indexed definitions, such as src/lib.rs:4 · not followed"
+        ) && impact
+            .contains("no remaining references to legacy::value found inside indexed definitions"),
+        "{impact}"
+    );
+}
