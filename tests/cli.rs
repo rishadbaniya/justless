@@ -14838,3 +14838,52 @@ pub fn a() -> u8 {\n    old!()\n}\n";
         "{impact}"
     );
 }
+
+#[test]
+fn let_patterns_that_name_a_deleted_type_are_not_bindings() {
+    // Without a manifest the patterns are not linked, so only the text says
+    // they name the removed types.
+    let legacy = "pub enum Mode {\n    Fast,\n    Slow,\n}\npub struct Config {\n    pub host: u8,\n}\n\
+pub struct Wrapper(pub u8);\npub struct Marker;\npub fn untouched() -> u8 { 5 }\n";
+    let main = "mod legacy;\nmod make;\nuse legacy::*;\n\
+fn fast() -> u8 {\n    let Mode::Fast = make::mode() else { return 0 };\n    1\n}\n\
+fn host() -> u8 {\n    let Config { host } = make::config();\n    host\n}\n\
+fn inner() -> u8 {\n    let Wrapper(n) = make::wrapper();\n    n\n}\n\
+fn marked() -> u8 {\n    let Marker = make::marker();\n    1\n}\n\
+fn local() -> u8 {\n    let value = make::number();\n    1\n}\n\
+fn main() {}\n";
+    let make = "pub fn mode() -> crate::legacy::Mode { todo!() }\n\
+pub fn config() -> crate::legacy::Config { todo!() }\n\
+pub fn wrapper() -> crate::legacy::Wrapper { todo!() }\n\
+pub fn marker() -> crate::legacy::Marker { todo!() }\npub fn number() -> u8 { 1 }\n";
+    let repo = deletion_repo(
+        &[("legacy.rs", legacy), ("main.rs", main), ("make.rs", make)],
+        "legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    for expected in [
+        "main::fast [function] main.rs:4-7 · possibly references deleted Mode at main.rs:5 (name match only)",
+        "main::host [function] main.rs:8-11 · possibly references deleted Config at main.rs:9 (name match only)",
+        "main::inner [function] main.rs:12-15 · possibly references deleted Wrapper at main.rs:13 (name match only)",
+        "main::marked [function] main.rs:16-19 · possibly references deleted Marker at main.rs:17 (name match only)",
+    ] {
+        assert!(impact.contains(expected), "{expected}\n{impact}");
+    }
+
+    // A lowercase name after `let` is a variable, not the removed function.
+    let repo = deletion_repo(
+        &[
+            (
+                "legacy.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
+            ),
+            ("main.rs", main.replace("use legacy::*;", "").as_str()),
+            ("make.rs", "pub fn number() -> u8 { 1 }\n"),
+        ],
+        "legacy.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(!impact.contains("main::local"), "{impact}");
+}

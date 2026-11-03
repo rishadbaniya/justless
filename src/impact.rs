@@ -788,7 +788,7 @@ fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[Stri
         let after = text[at + name.len()..].trim_start();
         (after_dot(before) && !member)
             || (after.starts_with(':') && !after.starts_with("::"))
-            || binding(before)
+            || binding(before, name, after)
             || (standard && in_standard_path(before))
     })
 }
@@ -860,12 +860,18 @@ fn plain_comment(text: &str) -> Option<usize> {
     (!documentation).then_some(start)
 }
 
-/// Whether the text before a name ends with `let` or `let mut`, so the name is bound there.
-fn binding(before: &str) -> bool {
+/// Whether a name follows `let` or `let mut` as a variable it binds. A name
+/// that opens a path, tuple struct or struct pattern, as in `let Config { host }
+/// = c;`, names a type, and so may a capitalized one, such as a unit struct
+/// or constant matched by `let Marker = marker;`.
+fn binding(before: &str, name: &str, after: &str) -> bool {
     let before = before.strip_suffix("mut").map_or(before, str::trim_end);
     before
         .strip_suffix("let")
         .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+        && name.starts_with(|c: char| c.is_lowercase() || c == '_')
+        && !after.starts_with(['(', '{'])
+        && !after.starts_with("::")
 }
 
 /// Byte offsets where `name` appears in `line` as a whole identifier.
