@@ -583,6 +583,20 @@ fn follow(
         .iter()
         .map(|mention| (mention.file.as_str(), mention.line))
         .collect();
+    // A path into the standard library names none of the workspace's items,
+    // unless the workspace defines a module or crate of that name, such as `mod core;`.
+    let standard: Vec<&str> = STANDARD
+        .into_iter()
+        .filter(|root| {
+            !resolving.definitions.iter().any(|definition| {
+                short_name(crate::map::name(definition)) == *root
+                    || definition
+                        .qualified
+                        .strip_prefix(root)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+            })
+        })
+        .collect();
     // Members of the same name are tied through a trait, as an implementation
     // is to the trait item it implements, so for a removed member a link to or
     // declaration of one proves nothing when either belongs to a trait. A
@@ -672,7 +686,7 @@ fn follow(
                 .filter(|(kind, _)| *kind != Kind::Import)
                 .map(|(_, path)| path)
                 .collect();
-            if plainly_not_a_reference(&mention.text, short, member, &paths) {
+            if plainly_not_a_reference(&mention.text, short, member, &paths, &standard) {
                 continue;
             }
         }
@@ -768,12 +782,20 @@ fn follow(
 /// item. Each must be a field or method after `.` (unless the item was a
 /// member), a field, parameter or binding name before a single `:`, a `let`
 /// binding, part of a `//` comment that is not documentation, or the end of a
-/// path into the standard library that the parser recorded on the line. Any
-/// other qualified path stays, because resolution can miss one that reaches
-/// the item, such as `T::name` or a path through a type alias. So does a name
-/// inside a string, which a format string such as `"{name:?}"` can capture.
-fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[String]]) -> bool {
+/// path the parser recorded on the line that starts at one of the `standard`
+/// library crates. Any other qualified path stays, because resolution can miss
+/// one that reaches the item, such as `T::name` or a path through a type alias.
+/// So does a name inside a string, which a format string such as `"{name:?}"`
+/// can capture.
+fn plainly_not_a_reference(
+    text: &str,
+    name: &str,
+    member: bool,
+    paths: &[&[String]],
+    standard: &[&str],
+) -> bool {
     let comment = plain_comment(text);
+    let standard_root = |segment: &str| standard.contains(&segment);
     let standard = paths.iter().any(|path| {
         path.len() > 1 && path.last().is_some_and(|last| last == name) && standard_root(&path[0])
     });
@@ -789,7 +811,7 @@ fn plainly_not_a_reference(text: &str, name: &str, member: bool, paths: &[&[Stri
         (after_dot(before) && !member)
             || (after.starts_with(':') && !after.starts_with("::"))
             || binding(before, name, after)
-            || (standard && in_standard_path(before))
+            || (standard && path_root(before).is_some_and(standard_root))
     })
 }
 
@@ -820,24 +842,19 @@ fn in_string(text: &str, at: usize) -> bool {
     inside
 }
 
-/// Whether a path segment names a standard library crate.
-fn standard_root(segment: &str) -> bool {
-    matches!(segment, "std" | "core" | "alloc")
-}
+/// The standard library crates.
+const STANDARD: [&str; 3] = ["std", "core", "alloc"];
 
-/// Whether the text before a name ends with a path into the standard
-/// library, such as `std::env::` or `::core::mem::`.
-fn in_standard_path(before: &str) -> bool {
+/// The first segment of the path that the text before a name ends with, such
+/// as `std` for `std::env::` or `::std::env::`.
+fn path_root(before: &str) -> Option<&str> {
     let start = before
         .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
         .len();
     let path = &before[start..];
     path.ends_with("::")
-        && path
-            .trim_start_matches("::")
-            .split("::")
-            .next()
-            .is_some_and(standard_root)
+        .then(|| path.trim_start_matches("::").split("::").next())
+        .flatten()
 }
 
 /// Whether the text before a name ends with a single `.`, as in `value.name`.

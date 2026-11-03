@@ -14887,3 +14887,27 @@ pub fn marker() -> crate::legacy::Marker { todo!() }\npub fn number() -> u8 { 1 
     let impact = success(repo.path(), &["affected", "--changes"]);
     assert!(!impact.contains("main::local"), "{impact}");
 }
+
+#[test]
+fn a_local_module_named_like_the_standard_library_keeps_its_paths() {
+    // `core::value` names the local module, which the index does not link
+    // without a manifest, not the standard library.
+    let repo = deletion_repo(
+        &[
+            (
+                "core.rs",
+                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
+            ),
+            ("main.rs", "mod core;\nfn main() {\n    core::value();\n}\n"),
+        ],
+        "core.rs",
+        "pub fn untouched() -> u8 { 5 }\n",
+    );
+    let impact = success(repo.path(), &["affected", "--changes"]);
+    assert!(
+        impact.contains(
+            "main::main [function] main.rs:2-4 · possibly references deleted value at main.rs:3 (name match only)"
+        ) && !impact.contains("no remaining references"),
+        "{impact}"
+    );
+}
