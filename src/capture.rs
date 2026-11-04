@@ -1525,11 +1525,26 @@ impl Capture<'_> {
                 Err(error) => eprintln!("justless: {error:#}"),
             }
         }
+        let justless = workspace.justless();
         if let Some(redactor) = redactor {
             // Reports can quote an earlier record, such as a rerun's previous failures.
             for (_, preview) in &mut previews {
                 if let Cow::Owned(redacted) = redactor.bytes(preview) {
                     *preview = redacted;
+                }
+            }
+            // A shaped preview's pointers start with `justless --root ROOT`. A root
+            // named like a secret is no secret of the command's output, and the
+            // footer prints it as it is, so restore it where it was hidden and the
+            // pointer still runs.
+            if let Cow::Owned(hidden) = redactor.text(&justless) {
+                let hidden = regex::bytes::Regex::new(&regex::escape(&hidden))?;
+                for (_, preview) in &mut previews {
+                    if let Cow::Owned(restored) =
+                        hidden.replace_all(preview, regex::bytes::NoExpand(justless.as_bytes()))
+                    {
+                        *preview = restored;
+                    }
                 }
             }
         }
@@ -1547,7 +1562,7 @@ impl Capture<'_> {
                 redactor,
                 notice,
                 split,
-                justless: &workspace.justless(),
+                justless: &justless,
             },
         )?;
         run.footer_bytes = footer.len();

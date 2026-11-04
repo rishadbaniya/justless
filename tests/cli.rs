@@ -15464,3 +15464,49 @@ fn commands_in_mcp_results_reach_the_server_root_from_the_agents_shell() {
     let opened = follow(&sub, next);
     assert_eq!(stdout(&opened), settlement, "{next}: {}", stderr(&opened));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_printed_root_named_like_a_secret_survives_output_redaction() {
+    let repo = TempDir::new().unwrap();
+    let top = repo.path().canonicalize().unwrap();
+    // The redactor hides a GitHub token, and this directory is named like one.
+    let name = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    fs::create_dir(top.join(&name)).unwrap();
+    git(&top, &["init", "-q"]);
+    let output = cli(
+        &top,
+        &["--root", &name, "exec", "--lang", "sh", "seq 1 3000"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let (range, pointer) = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("[justless] stdout lines ")?
+                .split_once(" left out · ")
+        })
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(pointer.contains(&name), "{pointer}");
+    let (from, to) = range.split_once('-').unwrap();
+    let lines: String = (from.parse::<usize>().unwrap()..=to.parse().unwrap())
+        .map(|n| format!("{n}\n"))
+        .collect();
+    let replay = follow(&top, pointer);
+    assert_eq!(stdout(&replay), lines, "{pointer}: {}", stderr(&replay));
+
+    // A token the command printed is still hidden.
+    let output = cli(
+        &top,
+        &[
+            "--root",
+            &name,
+            "exec",
+            "--lang",
+            "sh",
+            &format!("echo token={name}; seq 1 3000"),
+        ],
+    );
+    let text = stdout(&output);
+    assert!(text.contains("token=[redacted:github-token:"), "{text}");
+}
