@@ -40,9 +40,14 @@ pub struct Workspace {
     pub cwd: PathBuf,
     pub state: PathBuf,
     /// The directory the command started in, which can lie outside `root`. A
-    /// command printed for the agent to run next is run from here.
+    /// command printed for the agent to run next is run from here. Empty when
+    /// that directory is unknown, as for the MCP server's commands.
     pub origin: PathBuf,
 }
+
+/// Set for a command whose output reaches an agent whose shell may work anywhere,
+/// such as the MCP server's child: every command it prints names `--root`.
+pub const ORIGIN_UNKNOWN: &str = "JUSTLESS_ORIGIN_UNKNOWN";
 
 /// How a `justless` command printed for the agent to run next starts, so that
 /// run from the directory the printing command started in it reaches the same
@@ -187,7 +192,11 @@ impl Workspace {
             None => found_root(&start).to_path_buf(),
         };
         ensure!(root.is_dir(), "{} is not a directory", root.display());
-        let origin = cwd.clone();
+        let origin = if std::env::var_os(ORIGIN_UNKNOWN).is_some() {
+            PathBuf::new()
+        } else {
+            cwd.clone()
+        };
         let cwd = if cwd.starts_with(&root) {
             cwd
         } else {

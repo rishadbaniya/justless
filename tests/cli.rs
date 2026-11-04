@@ -15359,3 +15359,108 @@ fn a_grouped_search_names_the_root_to_recall_from_a_nested_repository() {
         stderr(&recalled)
     );
 }
+
+/// The text of each `tools/call` result from a `justless mcp` server started in
+/// `cwd` with `args` before `mcp` and `project` as Claude Code's launch directory.
+fn mcp_results(
+    cwd: &Path,
+    args: &[&str],
+    project: Option<&Path>,
+    calls: &[serde_json::Value],
+) -> Vec<String> {
+    use serde_json::json;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+    command
+        .args(args)
+        .arg("mcp")
+        .current_dir(cwd)
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(project) = project {
+        command.env("CLAUDE_PROJECT_DIR", project);
+    }
+    let mut child = command.spawn().unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let mut lines = vec![
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        ];
+        for (id, call) in calls.iter().enumerate() {
+            lines.push(json!({"jsonrpc":"2.0","id":id + 1,"method":"tools/call","params":call}));
+        }
+        for line in lines {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|message| message["id"].as_u64().is_some_and(|id| id > 0))
+        .map(|message| {
+            message["result"]["content"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{message}"))
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
+}
+
+#[test]
+fn commands_in_mcp_results_reach_the_server_root_from_the_agents_shell() {
+    use serde_json::json;
+    let dir = TempDir::new().unwrap();
+    let top = dir.path().canonicalize().unwrap();
+    let settlement = "# Settlement controls\nThe settlement_cutoff is 19:00.\n";
+    let unrelated = "# General controls\nThe unrelated value is 05:00.\n";
+    // The server serves `a`, configured with `--root`, while the agent's shell works
+    // in `b`, another repository with a file of the same name.
+    write_files(
+        &top,
+        &[("a/settings.md", settlement), ("b/settings.md", unrelated)],
+    );
+    let (a, b) = (top.join("a"), top.join("b"));
+    git(&a, &["init", "-q"]);
+    git(&b, &["init", "-q"]);
+    let lookup = json!({"name":"lookup","arguments":{"question":"settlement_cutoff"}});
+    let map = json!({"name":"map","arguments":{}});
+    let results = mcp_results(
+        &b,
+        &["--root", a.to_str().unwrap()],
+        None,
+        &[lookup.clone(), map],
+    );
+    let next = results[0]
+        .lines()
+        .find_map(|line| line.strip_prefix("Next: "))
+        .unwrap_or_else(|| panic!("{}", results[0]));
+    let opened = follow(&b, next);
+    assert_eq!(stdout(&opened), settlement, "{next}: {}", stderr(&opened));
+    assert!(
+        results[1].contains(&format!(
+            "Next: justless --root {} expand FILE",
+            a.display()
+        )),
+        "{}",
+        results[1]
+    );
+
+    // Claude Code launched in a subdirectory: the server finds the repository
+    // root, and a bare path from the agent's shell would mean the subdirectory's file.
+    write_files(&top, &[("a/sub/settings.md", unrelated)]);
+    let sub = a.join("sub");
+    let results = mcp_results(&sub, &[], Some(&sub), &[lookup]);
+    let next = results[0]
+        .lines()
+        .find_map(|line| line.strip_prefix("Next: "))
+        .unwrap_or_else(|| panic!("{}", results[0]));
+    let opened = follow(&sub, next);
+    assert_eq!(stdout(&opened), settlement, "{next}: {}", stderr(&opened));
+}

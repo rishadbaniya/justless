@@ -360,11 +360,14 @@ impl Server {
 
     /// Runs one command. `log` passes its arguments so a long replay is paged.
     fn execute(&self, argv: &[String], log: Option<&Map<String, Value>>) -> Value {
+        // The agent's shell may start anywhere, so a command a result prints for it,
+        // such as lookup's `Next:` line, names this root.
         let output = Process::new(&self.exe)
             .arg("--root")
             .arg(&self.root)
             .args(argv)
             .current_dir(&self.root)
+            .env(crate::workspace::ORIGIN_UNKNOWN, "1")
             .stdin(Stdio::null())
             .output();
         let output = match output {
