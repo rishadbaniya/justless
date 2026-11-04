@@ -15003,6 +15003,32 @@ fn commands_printed_under_a_scoped_root_reach_the_same_files_and_runs() {
         "scoped-output\n",
         "{context}"
     );
+    write_files(
+        &root,
+        &[("billing/src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
+    );
+    let failed = scoped(&[
+        "run",
+        "--",
+        "sh",
+        "-c",
+        "echo 'src/main.rs:2:9: error: boom' >&2; exit 1",
+    ]);
+    let located = stdout(&scoped(&[
+        "context",
+        "--run",
+        &marked_run(&stderr(&failed)),
+    ]));
+    let replay = located
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("Replay: "))
+        .unwrap_or_else(|| panic!("{located}"));
+    // `log` replays stderr to stderr.
+    assert_eq!(
+        stderr(&follow(&root, replay)),
+        "src/main.rs:2:9: error: boom\n",
+        "{located}"
+    );
 
     // An agent may add `--root` to a command that already has it.
     let repeated = cli(
@@ -15248,7 +15274,7 @@ fn exec_line_pointers_under_a_scoped_root_replay_those_lines() {
 }
 
 #[test]
-fn a_replaced_read_names_the_file_and_root_to_expand_from_the_agents_directory() {
+fn a_replaced_read_names_the_root_to_expand_from_the_agents_directory() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
@@ -15286,6 +15312,7 @@ fn a_replaced_read_names_the_file_and_root_to_expand_from_the_agents_directory()
         .nth(1)
         .and_then(|rest| rest.split(", or use Read").next())
         .unwrap()
+        .replace("FILE", "module.py")
         .replace("'REV#ID'", &format!("'{revision}#1'"));
     // The row's exact bytes from the root's file, not docs/module.py.
     let expanded = follow(&docs, &expand);
@@ -15293,5 +15320,42 @@ fn a_replaced_read_names_the_file_and_root_to_expand_from_the_agents_directory()
         stdout(&expanded) == source.trim_end_matches('\n'),
         "{expand}: {}",
         stderr(&expanded)
+    );
+}
+
+#[test]
+fn a_grouped_search_names_the_root_to_recall_from_a_nested_repository() {
+    use serde_json::json;
+    let repo = search_repo();
+    let root = repo.path().canonicalize().unwrap();
+    // The hook starts in the project, and the agent's session works in src/, a
+    // nested repository.
+    let nested = root.join("src");
+    git(&root, &["init", "-q"]);
+    git(&nested, &["init", "-q"]);
+    let raw = Command::new("grep")
+        .args(["-rn", "needle", "big.rs", "api", "core", "db"])
+        .current_dir(&nested)
+        .output()
+        .unwrap();
+    let content = stdout(&raw).trim_end().to_owned();
+    let grep = json!({"hook_event_name":"PostToolUse","tool_name":"Grep","cwd":nested,
+        "tool_input":{"pattern":"needle","output_mode":"content","-n":true},
+        "tool_response":{"mode":"content","numFiles":0,"filenames":[],"content":content,
+            "numLines":content.lines().count(),"appliedLimit":250}});
+    let output = agent_hook(&root, "hook-claude", "after-search", grep);
+    let hint = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{output}"));
+    let recall = hint
+        .split("Recover the exact original with ")
+        .nth(1)
+        .and_then(|rest| rest.split(", or narrow").next())
+        .unwrap();
+    let recalled = follow(&nested, recall);
+    assert!(
+        stdout(&recalled) == content,
+        "{recall}: {}",
+        stderr(&recalled)
     );
 }

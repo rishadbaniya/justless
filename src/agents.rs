@@ -794,19 +794,17 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
         outline.push_str(&code);
         context = "Justless outline. L ranges are source line numbers, and code that no row covers follows the rows verbatim.";
     }
-    if outline.len() + 160 >= native.len() {
+    // With `--root`, a bare FILE is taken from the root and an absolute one works
+    // anywhere. The hint grows by the option, so the outline must save that too.
+    let justless = ws.invocation().files;
+    if outline.len() + 160 + (justless.len() - "justless".len()) >= native.len() {
         return None;
     }
     result["numLines"] = json!(outline.lines().count());
     result["content"] = json!(outline.trim_end_matches('\n'));
-    let expand = format!(
-        "{} expand {}",
-        ws.invocation().files,
-        crate::workspace::shell_quote(Path::new(&file))
-    );
     Some(
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
-        "additionalContext":format!("{context} Expand a row with {expand} 'REV#ID', or use Read with offset and limit for original lines.")}}),
+        "additionalContext":format!("{context} Expand a row with {justless} expand FILE 'REV#ID', or use Read with offset and limit for original lines.")}}),
     )
 }
 

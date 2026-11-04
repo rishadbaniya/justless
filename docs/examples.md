@@ -395,7 +395,7 @@ Subset failed (cargo): 3 of 3 tests that ran failed, exit 101 (7 of 20 indexed t
   ledger/src/tax.rs - tax::vat (line 3) · exact · documentation example on a reached item
   tests::invoice_total_adds_vat · possible · call at api/src/lib.rs:18 → invoice_total
   prints_the_total
-Full suite: justless test · Why: justless test --why run-ewOytdva2e6P
+Full suite: justless test -- cargo test --offline · Why: justless test --why run-ewOytdva2e6P
 ```
 
 The exit status is Cargo's 101. Cargo stops at the first failing test binary in each step, as `cargo test` does, so `ledger-core`'s own unit tests did not get to run; add `--no-fail-fast` to the command to see every failure. `justless test --why` shows why a test was chosen, from the record archived with the run:
@@ -429,7 +429,7 @@ Compared with run-ewOytdva2e6P:
 - tests::invoice_total_adds_vat api/src/lib.rs:18:9: assertion `left == right` failed left: "12.01" right: "12.00" [prior stdout:9-12]
 …
 Subset passed (cargo): ran 8 tests reachable from your changes (7 of 20 indexed tests selected, 13 not run); the full suite was not run (3.5 s).
-Full suite: justless test · Why: justless test --why run-EXOQcFyIjl9N
+Full suite: justless test -- cargo test --offline · Why: justless test --why run-EXOQcFyIjl9N
 ```
 
 Before saying the tests pass, run the full suite:

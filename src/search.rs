@@ -912,7 +912,9 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
         text.push_str(&truncation_note(&response, shown));
         response["truncated"] = json!(false);
     }
-    if text.len() + 160 >= original.len() {
+    // The hint grows by any `--root`, so the report must save that too.
+    let justless = ws.justless();
+    if text.len() + 160 + (justless.len() - "justless".len()) >= original.len() {
         return None;
     }
     let text = text.trim_end_matches('\n');
@@ -925,7 +927,7 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
     Some(json!({"hookSpecificOutput":{
         "hookEventName":"PostToolUse",
         "updatedToolOutput":response,
-        "additionalContext":format!("Justless grouped this {tool} result. Recover the exact original with {} recall {id}, or narrow the path or pattern.", ws.justless())
+        "additionalContext":format!("Justless grouped this {tool} result. Recover the exact original with {justless} recall {id}, or narrow the path or pattern.")
     }}))
 }
 
