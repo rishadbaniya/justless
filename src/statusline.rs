@@ -912,7 +912,8 @@ pub fn install(workspace: &Workspace) -> Result<()> {
     }
     if !hooks_installed(workspace) {
         println!(
-            "Savings appear once the hooks route commands and reads: run `justless init --hooks --agent claude`."
+            "Savings appear once the hooks route commands and reads: run `{} init --hooks --agent claude`.",
+            workspace.justless()
         );
     }
     Ok(())
@@ -939,7 +940,8 @@ pub fn hint(workspace: &Workspace, before: Option<Vec<u8>>) {
     });
     if !configured {
         println!(
-            "Optional: `justless init --statusline` shows this session's savings in Claude Code's status line."
+            "Optional: `{} init --statusline` shows this session's savings in Claude Code's status line.",
+            workspace.justless()
         );
     }
 }

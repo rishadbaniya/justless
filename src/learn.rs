@@ -392,6 +392,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         targets: &targets,
         outcome: &outcome,
         applied: apply,
+        justless: &workspace.justless(),
     };
     if as_json {
         println!("{}", serde_json::to_string_pretty(&report.json())?);
@@ -464,6 +465,8 @@ struct Report<'a> {
     /// The merge `--apply` made, or a preview planned.
     outcome: &'a block::Outcome,
     applied: bool,
+    /// How a printed command starts. See [`Workspace::justless`].
+    justless: &'a str,
 }
 
 impl Report<'_> {
@@ -662,7 +665,8 @@ impl Report<'_> {
                     .or(evidence.first())
                 {
                     Some(Pointer::Run { id, stream }) => out.push_str(&format!(
-                        "   evidence: justless log {id} --stream {stream}\n"
+                        "   evidence: {} log {id} --stream {stream}\n",
+                        self.justless
                     )),
                     Some(Pointer::Transcript { file, line }) => {
                         let path = t.directory.as_ref().map_or_else(
@@ -723,7 +727,8 @@ impl Report<'_> {
                 .collect();
             if !changed.is_empty() {
                 out.push_str(&format!(
-                    "Preview only. `justless learn --apply` writes these rules to {}.\n",
+                    "Preview only. `{} learn --apply` writes these rules to {}.\n",
+                    self.justless,
                     changed.join(" and ")
                 ));
             } else if !self.outcome.changes.is_empty() {

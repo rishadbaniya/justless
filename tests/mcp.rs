@@ -849,9 +849,12 @@ fn log_replays_are_paged_on_line_boundaries() {
     let cut = page(5);
     assert_eq!(cut.len(), 1);
     assert!(cut[0].starts_with(&"x".repeat(32_768)));
+    // The shell the agent runs it in may start anywhere, so the command names the root.
+    let server_root = root.canonicalize().unwrap();
     assert!(
         cut[0].contains(&format!(
-            "line 1 is longer than 32768 bytes and was cut. Run `justless log {long} --stream stdout --from 1 --to 1` in a shell"
+            "line 1 is longer than 32768 bytes and was cut. Run `justless --root {} log {long} --stream stdout --from 1 --to 1` in a shell",
+            server_root.display()
         )) && cut[0].contains("from=2 to continue"),
         "{}",
         &cut[0][32_768..]

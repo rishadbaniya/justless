@@ -148,7 +148,18 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
         settings.max_output_bytes
     };
     let default_session = std::env::var("JUSTLESS_SESSION").unwrap_or_else(|_| "terminal".into());
+    // The command that runs the full suite of the same runners in the same workspace.
+    let mut full_suite = format!("{} test", workspace.justless());
+    if let Some(command) = &command {
+        full_suite.push_str(" --");
+        for word in command {
+            full_suite.push(' ');
+            full_suite.push_str(&quote(word));
+        }
+    }
     let options = Options {
+        justless: workspace.justless(),
+        full_suite,
         max_bytes,
         session: matches
             .value_of("session")
@@ -161,6 +172,10 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
 }
 
 struct Options {
+    /// How a printed command starts. See [`Workspace::justless`].
+    justless: String,
+    /// The printed command for the full suite.
+    full_suite: String,
     max_bytes: usize,
     session: String,
     fresh: bool,
@@ -433,6 +448,7 @@ fn step_workspace(workspace: &Workspace, cwd: &str) -> Workspace {
         root: workspace.root.clone(),
         cwd: selection::runner_dir(workspace, cwd),
         state: workspace.state.clone(),
+        origin: workspace.origin.clone(),
     }
 }
 
@@ -919,13 +935,13 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
         .iter()
         .any(|mode| matches!(mode, Mode::Subset | Mode::LowConfidence | Mode::BuildOnly));
     if subset {
-        text.push_str("Full suite: justless test");
+        text.push_str(&format!("Full suite: {}", options.full_suite));
         if let Some(id) = &first_run {
-            text.push_str(&format!(" · Why: justless test --why {id}"));
+            text.push_str(&format!(" · Why: {} test --why {id}", options.justless));
         }
         text.push('\n');
     } else if modes.iter().all(|mode| *mode == Mode::Nothing) {
-        text.push_str("Full suite: justless test\n");
+        text.push_str(&format!("Full suite: {}\n", options.full_suite));
     }
     eprint!("{text}");
     Ok(status)

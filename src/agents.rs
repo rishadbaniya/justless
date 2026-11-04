@@ -509,7 +509,7 @@ pub fn run_client_hook(root: Option<&Path>, agent: Agent, mode: &str) {
     let input: Value =
         serde_json::from_reader(io::stdin().take(8 * 1024 * 1024)).unwrap_or(Value::Null);
     let output = std::panic::catch_unwind(|| {
-        let workspace = Workspace::discover(root).ok()?;
+        let workspace = agent_workspace(&Workspace::discover(root).ok()?, &input);
         match mode {
             "session-start" => client_start(&workspace, agent, &input),
             "before-command" => client_command(&workspace, agent, &input),
@@ -652,6 +652,7 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
 pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
     let input: Value =
         serde_json::from_reader(io::stdin().take(8 * 1024 * 1024)).unwrap_or(Value::Null);
+    let workspace = &agent_workspace(workspace, &input);
     let output = if agent == Agent::Agy {
         agy_hook(workspace, mode, &input).unwrap_or_else(|| {
             if mode == "before-command" {
@@ -677,7 +678,7 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
             .as_str()
             .is_none_or(|source| source == "compact")
     {
-        compact_state(workspace, AFTER_COMPACT)
+        compact_state(workspace, &after_compact(&workspace.justless()))
             .map(|context| {
                 json!({"hookSpecificOutput":{
                     "hookEventName":"SessionStart",
@@ -716,6 +717,16 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
     }
     println!("{output}");
     Ok(())
+}
+
+/// The workspace a hook answers for, with the directory the agent works in, which
+/// most clients report as `cwd`, so a command the answer prints reaches it from
+/// there. See [`Workspace::justless`].
+fn agent_workspace(workspace: &Workspace, input: &Value) -> Workspace {
+    let cwd = input["cwd"]
+        .as_str()
+        .map(|cwd| Path::new(cwd.strip_prefix("file://").unwrap_or(cwd)));
+    workspace.working_in(cwd.unwrap_or(&workspace.origin))
 }
 
 fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
@@ -788,24 +799,36 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     result["numLines"] = json!(outline.lines().count());
     result["content"] = json!(outline.trim_end_matches('\n'));
+    let expand = format!(
+        "{} expand {}",
+        ws.invocation().files,
+        crate::workspace::shell_quote(Path::new(&file))
+    );
     Some(
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
-        "additionalContext":format!("{context} Expand a row with justless expand FILE 'REV#ID', or use Read with offset and limit for original lines.")}}),
+        "additionalContext":format!("{context} Expand a row with {expand} 'REV#ID', or use Read with offset and limit for original lines.")}}),
     )
 }
 
 /// The documented bound on a compaction handoff, including its introduction.
 const HANDOFF_BYTES: usize = 1800;
-const AFTER_COMPACT: &str = "Justless activity from before compaction. Inspect a run with `justless context --run RUN_ID` or `justless search RUN_ID TEXT`, or replay an `S:A` line with `justless log RUN_ID --stream S --from A --to B`. Rerun only to test a change. `justless history TEXT` searches all earlier logs. [source changed] marks ranges edited since they were read.\n";
+/// The handoff after compaction, whose commands `justless` starts.
+fn after_compact(justless: &str) -> String {
+    format!(
+        "Justless activity from before compaction. Inspect a run with `{justless} context --run RUN_ID` or `{justless} search RUN_ID TEXT`, or replay an `S:A` line with `{justless} log RUN_ID --stream S --from A --to B`. Rerun only to test a change. `{justless} history TEXT` searches all earlier logs. [source changed] marks ranges edited since they were read.\n"
+    )
+}
 const BEFORE_COMPACT: &str = "Keep these Justless references verbatim in the summary. They recover exact logs and source without rerunning commands. Keep each run ID with its command and exit status, each file range with any [source changed] marker, and any `justless recall` IDs the task still needs. For runs the current task depends on, also note what they showed, such as the failure being fixed.\n";
 
 /// `intro` followed by recent Justless activity, within `HANDOFF_BYTES`, or
-/// `None` when there is no activity.
+/// `None` when there is no activity or an intro with a very long `--root` leaves
+/// no room for it.
 fn compact_state(workspace: &Workspace, intro: &str) -> Option<String> {
     if !workspace.state.is_dir() {
         return None;
     }
-    let state = crate::history::resume_text(workspace, HANDOFF_BYTES - intro.len()).ok()?;
+    let room = HANDOFF_BYTES.checked_sub(intro.len())?;
+    let state = crate::history::resume_text(workspace, room).ok()?;
     (!state.trim().is_empty() && !state.starts_with("No recorded project activity"))
         .then(|| format!("{intro}{state}"))
 }
@@ -819,7 +842,8 @@ fn startup(workspace: &Workspace) -> Option<String> {
         " Hooks here route builds, tests, lints, diffs and searches through Justless, so run them plainly."
     };
     Some(format!(
-        "Justless indexed {count} text files.{hooks} `justless resume` lists earlier runs and reads."
+        "Justless indexed {count} text files.{hooks} `{} resume` lists earlier runs and reads.",
+        workspace.justless()
     ))
 }
 
@@ -914,9 +938,10 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         hook["permissionDecision"] = json!("allow");
     }
     if command.trim_start().starts_with("rg ") {
-        hook["additionalContext"] = json!(
-            "To trace a symbol, `justless query NAME` lists its definition, callers and tests."
-        );
+        hook["additionalContext"] = json!(format!(
+            "To trace a symbol, `{} query NAME` lists its definition, callers and tests.",
+            workspace.working_in(&cwd).justless()
+        ));
     }
     Some(json!({"hookSpecificOutput":hook}))
 }
@@ -1825,6 +1850,7 @@ pub(crate) fn fresh_hooks(agent: Agent) -> Result<String> {
     );
     let workspace = Workspace {
         cwd: root.clone(),
+        origin: root.clone(),
         state: root.join(".justless"),
         root,
     };

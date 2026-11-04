@@ -258,7 +258,10 @@ fn recall_tool_use(ws: &Workspace, id: &str, as_json: bool, selection: &Selectio
     let entry: ToolUse = match fs::read(tool_use_path(ws, id)) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("read tool result index")?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            bail!("no archived tool result for {id}; try `justless recall --list TEXT`")
+            bail!(
+                "no archived tool result for {id}; try `{} recall --list TEXT`",
+                ws.justless()
+            )
         }
         Err(error) => return Err(error.into()),
     };
@@ -302,8 +305,9 @@ fn block_text(block: &Value) -> String {
 fn list_tool_uses(ws: &Workspace, text: Option<&str>, limit: usize) -> Result<()> {
     let entries = tool_uses(ws)?;
     if entries.is_empty() {
+        let justless = ws.justless();
         println!(
-            "No archived tool results yet. `justless wrap claude` and `justless proxy` archive them."
+            "No archived tool results yet. `{justless} wrap claude` and `{justless} proxy` archive them."
         );
         return Ok(());
     }
@@ -347,7 +351,10 @@ fn list_tool_uses(ws: &Workspace, text: Option<&str>, limit: usize) -> Result<()
     } else {
         String::new()
     };
-    println!("{summary}{newest}. Print one with `justless recall --tool-use ID`.");
+    println!(
+        "{summary}{newest}. Print one with `{} recall --tool-use ID`.",
+        ws.justless()
+    );
     Ok(())
 }
 

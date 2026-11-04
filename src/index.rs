@@ -115,6 +115,9 @@ pub struct Index {
     pub refresh: Refresh,
     pub files: BTreeMap<String, String>,
     pub fingerprints: BTreeMap<String, Fingerprint>,
+    /// How a command printed beside these results starts, so it reaches the same
+    /// workspace. See [`Workspace::justless`].
+    pub justless: String,
     by_file: BTreeMap<String, Vec<usize>>,
     by_name: BTreeMap<String, Vec<usize>>,
     incoming: Vec<Vec<usize>>,
@@ -305,6 +308,7 @@ impl Index {
         }
         let (mut index, _) = Self::assemble(&cache, &manifests, refresh, &Overlay::default());
         index.source = Some(Box::new(Source { cache, manifests }));
+        index.justless = workspace.justless();
         Ok(index)
     }
 
@@ -431,6 +435,7 @@ impl Index {
                 .map(|(file, parsed)| (file.clone(), parsed.fingerprint))
                 .collect(),
             refresh,
+            justless: "justless".into(),
             by_file: BTreeMap::new(),
             by_name: BTreeMap::new(),
             incoming: Vec::new(),
@@ -773,7 +778,8 @@ impl Index {
             count => format!(" and {} more", count - 1),
         };
         Some(format!(
-            "Not indexed: {file} ({reason}){more}. Run justless index to list them."
+            "Not indexed: {file} ({reason}){more}. Run {} index to list them.",
+            self.justless
         ))
     }
 

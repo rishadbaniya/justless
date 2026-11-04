@@ -305,7 +305,8 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     }
     if groups.contains_key(&Route::SupportedNotRouted) {
         println!(
-            "\nSupported commands reached the agent unfiltered. Install or refresh hooks with `justless init --hooks --agent claude`, then start a new session."
+            "\nSupported commands reached the agent unfiltered. Install or refresh hooks with `{} init --hooks --agent claude`, then start a new session.",
+            workspace.justless()
         );
     }
     Ok(())

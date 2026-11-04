@@ -43,6 +43,8 @@
 | `justless doctor --json` | Whether this project's setup works: the `justless` on `PATH`, each agent's CLI, hooks and instructions compared with what `init` writes, MCP entries and `.justless/`, with a fix for each problem. Exits 1 when something needs fixing. [Details](#check-the-setup) |
 | `justless init --remove --dry-run` | Each file that removing Justless from the project would change, and how. Drop `--dry-run` to make the changes. `--agent NAME` limits them to some clients, and `--purge` also deletes `.justless/`. |
 
+Commands that Justless prints for the agent to run next, such as a `Next:` line, a `justless log RUN_ID` pointer, the `Full suite:` and `Why:` lines or the commands in hook context, reach the same workspace when run as printed from the directory the first command started in. They start with `justless --root ROOT`, with the absolute root, when a plain `justless` started there would find another root, such as after `--root billing` or in a nested repository. `read`, `expand` and `edit` commands also add it whenever that directory is not the root, because they resolve a bare path from the current directory first. Otherwise they start with plain `justless`. A hook-routed run whose marker would need `--root` adds a line such as `[reopen with justless --root /work/app log run-ID]`. The MCP server cannot know where the agent's shell starts, so the shell command in its `log` paging note always names the root. `--root` may be repeated before the subcommand when every copy names the same directory.
+
 ## Indexing and languages
 
 Queries refresh the index automatically. Justless compares file identity and high-resolution timestamps where available, hashes files that need closer inspection, reuses parsed facts for unchanged content, and removes deleted files. In a Git checkout it uses tracked and unignored files. Files under version-control and dependency directories such as `node_modules`, `.venv` and `__pycache__` are left out, as are untracked files under `target`. Add patterns to `.justlessignore` for repo-specific exclusions. Files larger than `max_file_bytes` and files or directories Justless cannot read are skipped without stopping the index. `justless index` lists them on stderr, except binary files. A `find` that finds nothing names them, and a `query` that finds nothing names the skipped source files and unreadable paths. A file name that contains a control character, such as a newline, is printed as a quoted string with escapes.
@@ -173,8 +175,10 @@ The first lines name the base revision, then one line per runner: `cargo · subs
 
 ```text
 Subset passed (cargo): ran 8 tests reachable from your changes (7 of 20 indexed tests selected, 13 not run); the full suite was not run (1.3 s).
-Full suite: justless test · Why: justless test --why run-k2P9xq
+Full suite: justless test -- cargo test --offline · Why: justless test --why run-k2P9xq
 ```
+
+The `Full suite:` command repeats the runner given after `--`, if any.
 
 A failing subset adds up to three failing tests with the first link of their evidence. Build-only and nothing-ran results say `this is not a test result`, and a build-only result names the targets it built, as in `Build only (cargo): reports --example weekly, reports --lib compiled`. A fallback says `Full suite (fallback from --affected: CODES)`. Go output without `-v` is counted in packages. The exit status is the runner's, or with several steps or runners the first nonzero status in the order they ran; later steps still run, and a step replaced by a wider rerun does not count. A runner that cannot start, such as a missing program (exit 127) or a Python without pytest, keeps its status and is reported as `Runner not available (pytest): No module named pytest; exit 1. Its tests did not run; this is not a test result.` Nothing to run exits 0. Errors before any step runs, such as an unknown run ID or no detected runner, exit 2.
 

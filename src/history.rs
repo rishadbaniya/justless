@@ -449,8 +449,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         return Ok(());
     }
     if count == 0 {
+        let justless = workspace.justless();
         println!(
-            "No captured runs yet. Run a command with `justless run -- COMMAND` or install hooks with `justless init --hooks`."
+            "No captured runs yet. Run a command with `{justless} run -- COMMAND` or install hooks with `{justless} init --hooks`."
         );
     } else {
         println!(
@@ -545,12 +546,13 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             .map(|(family, n)| format!("{family} ×{n}"))
             .collect();
         println!(
-            "Hooks passed through: {}. Run `justless discover` to see what agents ran without Justless.",
-            passed.join(", ")
+            "Hooks passed through: {}. Run `{} discover` to see what agents ran without Justless.",
+            passed.join(", "),
+            workspace.justless()
         );
     }
     if let Some(proxy) = &proxy {
-        proxy.print(days);
+        proxy.print(days, &workspace.justless());
     }
     Ok(())
 }
@@ -564,6 +566,7 @@ pub fn history(
 ) -> Result<()> {
     let runs = records(workspace, oldest)?;
     let mut report = Report::new(cap);
+    let justless = workspace.justless();
     let mut count = 0;
     for run in runs {
         let run = run?;
@@ -593,7 +596,7 @@ pub fn history(
                 "{} · {} · {} · {} (epoch ms {})",
                 run.id,
                 command(&run),
-                outcome(&run),
+                outcome(&run, &justless),
                 age(run.completed_ms),
                 run.completed_ms
             ));
@@ -632,6 +635,7 @@ pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
 pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
     let mut report = Report::new(cap);
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
+    let justless = workspace.justless();
     let mut has_runs = false;
     for run in records(workspace, false)?.take(5) {
         let run = run?;
@@ -640,7 +644,7 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
             "{} · {} · {}{}{}",
             run.id,
             command(&run),
-            outcome(&run),
+            outcome(&run, &justless),
             if run.unchanged {
                 " · unchanged output"
             } else {
@@ -729,9 +733,10 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
     Ok(report.into_string())
 }
 
-fn outcome(run: &Run) -> String {
+/// `justless` starts the command that replays an unfinished run.
+fn outcome(run: &Run, justless: &str) -> String {
     if run.unfinished {
-        "unfinished, output so far in justless log".into()
+        format!("unfinished, output so far in {justless} log")
     } else {
         // A run the Bash post-command hook recorded from a pipe or a list holds the
         // whole line's status, and says so.

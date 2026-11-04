@@ -1547,6 +1547,7 @@ impl Capture<'_> {
                 redactor,
                 notice,
                 split,
+                justless: &workspace.justless(),
             },
         )?;
         run.footer_bytes = footer.len();
@@ -1600,6 +1601,8 @@ struct Shown<'a> {
     notice: bool,
     /// Both streams have output that a `--merge` run kept apart.
     split: bool,
+    /// How a command that reopens the run starts. See [`Workspace::justless`].
+    justless: &'a str,
 }
 
 /// The line printed after the preview. A command typed by a person keeps the full
@@ -1627,8 +1630,8 @@ fn footer(
     let truncation = run.truncation();
     if !shown.agent {
         return Ok(format!(
-            "\n[justless {id}] exit {} · {} of {} output bytes{redacted} · justless log {id}\n{truncation}",
-            run.status, run.preview_bytes, run.raw_bytes
+            "\n[justless {id}] exit {} · {} of {} output bytes{redacted} · {} log {id}\n{truncation}",
+            run.status, run.preview_bytes, run.raw_bytes, shown.justless
         ));
     }
     // Compare the printed bytes with what the command wrote before it exited: equal
@@ -1707,7 +1710,15 @@ fn footer(
             history::human_bytes(run.raw_bytes)
         )
     };
-    Ok(line + &truncation)
+    // The marker names the run, and `log`, `search` and `context --run` look for it
+    // in the workspace found from where the agent works. When that is another one,
+    // as for a hook-routed command inside a nested repository, say how to reach it.
+    let reopen = if line.is_empty() || shown.justless == "justless" {
+        String::new()
+    } else {
+        format!("[reopen with {} log {id}]\n", shown.justless)
+    };
+    Ok(line + &reopen + &truncation)
 }
 
 fn fit(mut report: String, max_bytes: usize) -> String {

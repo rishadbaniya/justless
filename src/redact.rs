@@ -1709,6 +1709,7 @@ fn lenient(root: &Path, state: &Path) -> Option<&'static Redactor> {
                 root: root.to_path_buf(),
                 cwd: root.to_path_buf(),
                 state: state.to_path_buf(),
+                origin: root.to_path_buf(),
             };
             let key = || KeySource::File(state.join("redact.key"));
             let configured = workspace.settings().and_then(|settings| {

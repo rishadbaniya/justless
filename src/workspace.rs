@@ -39,6 +39,39 @@ pub struct Workspace {
     pub root: PathBuf,
     pub cwd: PathBuf,
     pub state: PathBuf,
+    /// The directory the command started in, which can lie outside `root`. A
+    /// command printed for the agent to run next is run from here.
+    pub origin: PathBuf,
+}
+
+/// How a `justless` command printed for the agent to run next starts, so that
+/// run from the directory the printing command started in it reaches the same
+/// workspace. Each is `justless`, or `justless --root ROOT` with the absolute root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    /// For commands that name runs, recall IDs, symbols or workspace-relative
+    /// paths: `--root` when a plain `justless` started there finds another root.
+    pub command: String,
+    /// For `read`, `expand` and `edit`, whose bare paths resolve from the current
+    /// directory first unless `--root` is given: `--root` also whenever that
+    /// directory is not the root.
+    pub files: String,
+}
+
+#[cfg(test)]
+impl Invocation {
+    pub fn plain() -> Self {
+        Self {
+            command: "justless".into(),
+            files: "justless".into(),
+        }
+    }
+}
+
+/// A path quoted for a POSIX shell when it needs quoting.
+pub fn shell_quote(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    shlex::try_quote(&text).map_or_else(|_| text.to_string(), |quoted| quoted.into_owned())
 }
 
 pub(crate) const PROJECT_MARKERS: &[&str] = &[
@@ -122,6 +155,12 @@ pub fn marked_root(cwd: &Path) -> Option<&Path> {
         })
 }
 
+/// The root a plain `justless` started in `start` takes: its marked root, or
+/// `start` itself.
+pub fn found_root(start: &Path) -> &Path {
+    marked_root(start).unwrap_or(start)
+}
+
 impl Workspace {
     pub fn discover(root: Option<&Path>) -> Result<Self> {
         Self::locate(root, None)
@@ -145,16 +184,55 @@ impl Workspace {
             Some(root) => root
                 .canonicalize()
                 .with_context(|| format!("open {}", root.display()))?,
-            None => marked_root(&start).unwrap_or(&start).to_path_buf(),
+            None => found_root(&start).to_path_buf(),
         };
         ensure!(root.is_dir(), "{} is not a directory", root.display());
+        let origin = cwd.clone();
         let cwd = if cwd.starts_with(&root) {
             cwd
         } else {
             root.clone()
         };
         let state = root.join(".justless");
-        Ok(Self { root, cwd, state })
+        Ok(Self {
+            root,
+            cwd,
+            state,
+            origin,
+        })
+    }
+
+    /// The same workspace for a command printed for an agent working in `dir`,
+    /// such as the directory a hook reports. A relative `dir` starts at `origin`.
+    pub fn working_in(&self, dir: &Path) -> Self {
+        Self {
+            root: self.root.clone(),
+            cwd: self.cwd.clone(),
+            state: self.state.clone(),
+            origin: self.origin.join(dir),
+        }
+    }
+
+    /// How a printed command starts, for an agent working where this one started.
+    pub fn invocation(&self) -> Invocation {
+        // A directory that cannot be resolved gets `--root`, which works from anywhere.
+        let origin = self.origin.canonicalize().ok();
+        let found = origin
+            .as_deref()
+            .is_some_and(|origin| found_root(origin) == self.root);
+        let at_root = origin.as_deref() == Some(self.root.as_path());
+        let rooted = || format!("justless --root {}", shell_quote(&self.root));
+        let plain = || "justless".to_owned();
+        Invocation {
+            command: if found { plain() } else { rooted() },
+            files: if found && at_root { plain() } else { rooted() },
+        }
+    }
+
+    /// The start of a printed command that names runs, recall IDs, symbols or
+    /// workspace-relative paths. See [`Invocation::command`].
+    pub fn justless(&self) -> String {
+        self.invocation().command
     }
 
     pub fn git(&self, args: &[&str]) -> Result<Output> {
@@ -368,5 +446,79 @@ pub fn lock_state(path: &Path) -> Result<File> {
             announced = true;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace(root: &Path, origin: &Path) -> Workspace {
+        Workspace {
+            root: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            state: root.join(".justless"),
+            origin: origin.to_path_buf(),
+        }
+    }
+
+    fn rooted(root: &Path) -> String {
+        format!("justless --root {}", shell_quote(root))
+    }
+
+    #[test]
+    fn printed_commands_name_the_root_only_where_a_plain_one_would_miss_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().canonicalize().unwrap();
+        for sub in [
+            ".git",
+            "billing",
+            "docs",
+            "vendor/lib/src",
+            "vendor/lib/.git",
+        ] {
+            fs::create_dir_all(top.join(sub)).unwrap();
+        }
+        let plain = || "justless".to_owned();
+
+        // Started at the root: nothing to add.
+        let at_root = workspace(&top, &top).invocation();
+        assert_eq!(at_root.command, plain());
+        assert_eq!(at_root.files, plain());
+        // A subdirectory finds the same root, but bare paths for `read`, `expand`
+        // and `edit` would start there.
+        let below = workspace(&top, &top.join("docs")).invocation();
+        assert_eq!(below.command, plain());
+        assert_eq!(below.files, rooted(&top));
+        // `--root billing` from the top, or from inside billing, which has no marker.
+        let billing = top.join("billing");
+        for origin in [&top, &billing] {
+            let scoped = workspace(&billing, origin).invocation();
+            assert_eq!(scoped.command, rooted(&billing), "{}", origin.display());
+            assert_eq!(scoped.files, rooted(&billing), "{}", origin.display());
+        }
+        // A hook-routed run inside a nested repository records in the outer one.
+        let nested = workspace(&top, &top.join("vendor/lib/src")).invocation();
+        assert_eq!(nested.command, rooted(&top));
+        assert_eq!(nested.files, rooted(&top));
+        // A directory that no longer exists cannot be checked, so the root is named.
+        let gone = workspace(&top, &top.join("removed")).invocation();
+        assert_eq!(gone.command, rooted(&top));
+        // A hook's reported directory replaces where the hook itself started.
+        let hook = workspace(&top, &top).working_in(Path::new("vendor/lib"));
+        assert_eq!(hook.justless(), rooted(&top));
+    }
+
+    #[test]
+    fn a_printed_root_is_quoted_for_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().canonicalize().unwrap();
+        let spaced = top.join("my project");
+        fs::create_dir(&spaced).unwrap();
+        let command = workspace(&spaced, &top).justless();
+        assert_eq!(
+            shlex::split(&command).unwrap(),
+            ["justless", "--root", spaced.to_str().unwrap()]
+        );
     }
 }

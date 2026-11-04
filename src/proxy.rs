@@ -318,6 +318,7 @@ impl Proxy {
                 root: ws.root.clone(),
                 cwd: ws.cwd.clone(),
                 state: ws.state.clone(),
+                origin: ws.origin.clone(),
             },
             archive,
             log.clone(),

@@ -646,7 +646,14 @@ impl Trailer<'_> {
 
 /// Replaces a long stdout preview with the lines most relevant to `intent`, in log
 /// order, within `max_bytes`. The output is UTF-8 and the same for the same input.
-pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> Result<Vec<u8>> {
+/// `justless` starts the commands it names, so they reach run `run_id`.
+pub fn preview(
+    stdout: &Path,
+    intent: &str,
+    max_bytes: usize,
+    justless: &str,
+    run_id: &str,
+) -> Result<Vec<u8>> {
     let terms = terms(intent);
     ensure!(!terms.is_empty(), "the intent has no search terms");
     let mut analysis = Analysis::new(&terms);
@@ -666,7 +673,7 @@ pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> R
     })?;
     let shown_intent = show_intent(intent);
     if frequency.iter().all(|&count| count == 0) {
-        let cut = cut.then_some(run_id);
+        let cut = cut.then_some((justless, run_id));
         return fallback(stdout, &shown_intent, lines, max_bytes, cut);
     }
 
@@ -778,7 +785,7 @@ pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> R
     // at most `lines`, so the widest form bounds it.
     let widest = "9".repeat(lines.to_string().len());
     let widest_runs = format!(" ({widest}-{widest}, {widest}-{widest}, {widest}-{widest}, …)");
-    let widest_log = log_clause(run_id, (lines, lines));
+    let widest_log = log_clause(justless, run_id, (lines, lines));
     let reserve = |runs: &str, log: &str| {
         [(every, some), (0, 0)]
             .into_iter()
@@ -938,7 +945,7 @@ pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> R
     };
     let log = next
         .first()
-        .map(|&range| log_clause(run_id, range))
+        .map(|&range| log_clause(justless, run_id, range))
         .unwrap_or_default();
 
     let mut output = header;
@@ -965,15 +972,20 @@ pub fn preview(stdout: &Path, intent: &str, max_bytes: usize, run_id: &str) -> R
 }
 
 /// ` · justless log RUN --stream stdout --from A --to B`.
-fn log_clause(run_id: &str, (first, last): (usize, usize)) -> String {
-    format!(" · justless log {run_id} --stream stdout --from {first} --to {last}")
+fn log_clause(justless: &str, run_id: &str, (first, last): (usize, usize)) -> String {
+    format!(" · {justless} log {run_id} --stream stdout --from {first} --to {last}")
 }
 
 /// A long stdout without an intent: whole lines from its start and its end within
 /// `max_bytes`, around one line that names the lines left out and the command that
 /// replays them. A line too long for its half is cut and marked with an ellipsis, and
 /// counts as left out. Returns `None` when the usual preview should stay.
-pub fn outline(stdout: &Path, max_bytes: usize, run_id: &str) -> Result<Option<Vec<u8>>> {
+pub fn outline(
+    stdout: &Path,
+    max_bytes: usize,
+    justless: &str,
+    run_id: &str,
+) -> Result<Option<Vec<u8>>> {
     let mut file = File::open(stdout)?;
     let size = file.metadata()?.len();
     let mut newlines = 0;
@@ -999,7 +1011,7 @@ pub fn outline(stdout: &Path, max_bytes: usize, run_id: &str) -> Result<Option<V
         let what = if cut { "not shown in full" } else { "left out" };
         format!(
             "[justless] stdout {range} {what}{}\n",
-            log_clause(run_id, (from, to))
+            log_clause(justless, run_id, (from, to))
         )
     };
     // Room for the widest marker and two ellipses with their newline.
@@ -1098,18 +1110,18 @@ fn fallback(
     intent: &str,
     lines: usize,
     max_bytes: usize,
-    cut: Option<&str>,
+    cut: Option<(&str, &str)>,
 ) -> Result<Vec<u8>> {
     let (header, trailer) = match cut {
         None => (
             format!("[focus] no line matches {intent}; first and last of {lines} lines:\n"),
             String::new(),
         ),
-        Some(run_id) => (
+        Some((justless, run_id)) => (
             format!(
                 "[focus] no line matches {intent} in its first {LINE_LIMIT_SHOWN}; first and last of {lines} lines:\n"
             ),
-            format!("[focus] justless search {run_id} TEXT reads whole lines\n"),
+            format!("[focus] {justless} search {run_id} TEXT reads whole lines\n"),
         ),
     };
     let body = max_bytes.saturating_sub(header.len() + trailer.len());
@@ -1374,7 +1386,7 @@ mod tests {
     }
 
     fn focused(file: &tempfile::NamedTempFile, intent: &str, budget: usize) -> String {
-        let preview = preview(file.path(), intent, budget, "run-Ab12Cd34Ef56").unwrap();
+        let preview = preview(file.path(), intent, budget, "justless", "run-Ab12Cd34Ef56").unwrap();
         assert!(preview.len() <= budget, "{budget}: {}", preview.len());
         String::from_utf8(preview).unwrap()
     }
@@ -1560,7 +1572,7 @@ mod tests {
     fn outlined(bytes: &[u8], budget: usize) -> String {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut file, bytes).unwrap();
-        let shown = outline(file.path(), budget, "run-Ab12Cd34Ef56")
+        let shown = outline(file.path(), budget, "justless", "run-Ab12Cd34Ef56")
             .unwrap()
             .expect("an outline");
         assert!(shown.len() <= budget, "{budget}: {}", shown.len());

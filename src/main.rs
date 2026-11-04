@@ -96,6 +96,7 @@ fn cli() -> Command<'static> {
                 .long("root")
                 .value_name("DIR")
                 .global(true)
+                .multiple_occurrences(true)
                 .allow_invalid_utf8(true)
                 .help("Override repository root"),
         )
@@ -378,6 +379,32 @@ fn context_budget(workspace: &Workspace, matches: &ArgMatches) -> Result<usize> 
     }
 }
 
+/// `--root` may be repeated when every copy names the same directory, as when an
+/// agent adds one to a printed command that already carries it.
+fn check_root(matches: &ArgMatches) -> Result<()> {
+    let mut roots = matches
+        .values_of_os("root")
+        .into_iter()
+        .flatten()
+        .map(Path::new);
+    let Some(first) = roots.next() else {
+        return Ok(());
+    };
+    for other in roots {
+        let same = match (first.canonicalize(), other.canonicalize()) {
+            (Ok(first), Ok(other)) => first == other,
+            _ => first == other,
+        };
+        ensure!(
+            same,
+            "--root names two different directories: {} and {}",
+            first.display(),
+            other.display()
+        );
+    }
+    Ok(())
+}
+
 fn dispatch(matches: &ArgMatches) -> Result<i32> {
     let root = matches.value_of_os("root").map(Path::new);
     // A drainer started by `run` stores a background process's late output. It
@@ -399,6 +426,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         statusline::run(root);
         return Ok(0);
     }
+    check_root(matches)?;
     // Claude Code starts MCP servers with CLAUDE_PROJECT_DIR set to its launch
     // directory. Without an explicit root the server searches upward from there, as
     // hooks and commands do from theirs. `--install` writes to the current project.

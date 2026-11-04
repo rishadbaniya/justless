@@ -376,7 +376,7 @@ impl Server {
         let failed = !output.status.success();
         let mut texts = Vec::new();
         if let Some(arguments) = log.filter(|_| !failed) {
-            texts = log_pages(&output, arguments);
+            texts = log_pages(&output, arguments, &self.root);
         } else {
             for stream in [&output.stdout, &output.stderr] {
                 if !stream.is_empty() {
@@ -401,8 +401,15 @@ const LOG_PAGE: usize = 32 * 1024;
 
 /// A successful `log` replay as one text per stream. A replay that exceeds
 /// `LOG_PAGE` ends on a line boundary with the arguments for the next page.
-fn log_pages(output: &std::process::Output, arguments: &Map<String, Value>) -> Vec<String> {
+/// `root` is the server's: the shell the agent runs a printed command in may start
+/// anywhere, so that command always names it.
+fn log_pages(
+    output: &std::process::Output,
+    arguments: &Map<String, Value>,
+    root: &std::path::Path,
+) -> Vec<String> {
     let run = arguments["run_id"].as_str().unwrap_or_default();
+    let root = crate::workspace::shell_quote(root);
     let from = arguments
         .get("from")
         .and_then(Value::as_u64)
@@ -438,7 +445,7 @@ fn log_pages(output: &std::process::Output, arguments: &Map<String, Value>) -> V
             // One line is longer than a page.
             format!(
                 "\n[justless: {stream} line {from} is longer than {LOG_PAGE} bytes and was cut. \
-                 Run `justless log {run} --stream {stream} --from {from} --to {from}` in a shell \
+                 Run `justless --root {root} log {run} --stream {stream} --from {from} --to {from}` in a shell \
                  for the whole line, or call log with stream=\"{stream}\", from={}{to_hint} to continue.]",
                 from + 1
             )

@@ -228,9 +228,10 @@ fn test_section(index: &Index, tests: &[(usize, usize, bool)], files: &TestFiles
         );
     }
     if section.lines.is_empty() {
-        section.title =
-            "Tests · none reach the target through indexed links. Search with justless find."
-                .into();
+        section.title = format!(
+            "Tests · none reach the target through indexed links. Search with {} find.",
+            index.justless
+        );
     }
     section
 }
@@ -299,7 +300,8 @@ fn resolve(index: &Index, target: &str) -> Result<(Option<String>, Vec<usize>)> 
         });
         ensure!(
             !seeds.is_empty(),
-            "{file} has no indexed symbols. Use justless find for its text."
+            "{file} has no indexed symbols. Use {} find for its text.",
+            index.justless
         );
         seeds.sort_by_key(|&id| (&index.definitions[id].location, id));
         let subject = format!("{file} ({})", plural(seeds.len(), "symbol"));

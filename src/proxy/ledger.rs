@@ -405,7 +405,8 @@ impl Report {
         serde_json::to_value(self).unwrap_or_else(|_| json!(null))
     }
 
-    pub fn print(&self, days: u64) {
+    /// `justless` starts the commands it names. See [`Workspace::justless`].
+    pub fn print(&self, days: u64, justless: &str) {
         let plural = |n: u64, one: &str, many: &str| {
             format!("{} {}", thousands(n), if n == 1 { one } else { many })
         };
@@ -484,7 +485,7 @@ impl Report {
             );
         }
         println!(
-            "  {} ({}). `justless recall --list TEXT` finds one.",
+            "  {} ({}). `{justless} recall --list TEXT` finds one.",
             plural(
                 self.archived_results,
                 "tool result archived",
@@ -566,6 +567,7 @@ mod tests {
             root: dir.path().to_owned(),
             cwd: dir.path().to_owned(),
             state: dir.path().join(".justless"),
+            origin: dir.path().to_owned(),
         };
         let proxy = ledger_dir(&ws);
         fs::create_dir_all(&proxy).unwrap();

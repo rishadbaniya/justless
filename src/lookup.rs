@@ -22,7 +22,7 @@ use clap::{Arg, ArgMatches, Command};
 use serde_json::{Value, json};
 
 use crate::capture::{self, Stream};
-use crate::workspace::{Location, Workspace};
+use crate::workspace::{Invocation, Location, Workspace};
 use chunks::Class;
 use score::{Part, Scores};
 use tokens::Question;
@@ -120,6 +120,8 @@ pub(crate) struct Ranking {
     pub unmatched: Vec<String>,
     /// The question had more terms than are used.
     pub truncated: bool,
+    /// How the printed commands start, so they reach this workspace.
+    pub justless: Invocation,
 }
 
 const SOURCE: usize = 0;
@@ -270,6 +272,7 @@ fn rank_in(
         matched,
         unmatched,
         truncated: question.truncated,
+        justless: workspace.invocation(),
     })
 }
 
@@ -380,8 +383,8 @@ fn quoted(file: &str) -> String {
 /// The command that opens the top result: its exact bytes when the whole
 /// result fits `budget`, because `expand` and `log` have no budget of their
 /// own. Otherwise a budgeted excerpt around its best lines, or for a log just
-/// the lines shown.
-fn next(hit: &Hit, budget: usize) -> String {
+/// the lines shown. `justless` starts it, so it reaches the same workspace.
+fn next(hit: &Hit, budget: usize, justless: &Invocation) -> String {
     let Location { file, start, end } = &hit.location;
     let fits = hit.bytes.is_some_and(|bytes| bytes <= budget);
     if let Some((run, stream)) = &hit.run {
@@ -390,17 +393,22 @@ fn next(hit: &Hit, budget: usize) -> String {
             _ => (*start, *end),
         };
         return format!(
-            "justless log {run} --stream {} --from {from} --to {to}",
+            "{} log {run} --stream {} --from {from} --to {to}",
+            justless.command,
             stream.name()
         );
     }
     if fits {
-        return format!("justless expand {} L{start}-{end}", quoted(file));
+        return format!("{} expand {} L{start}-{end}", justless.files, quoted(file));
     }
     let first = hit.lines.first().map_or(*start, |(line, _)| *line);
     let from = (*start).max(first.saturating_sub(3));
     let to = (*end).min(from + EXCERPT_LINES - 1);
-    format!("justless code {} --from {from} --to {to}", quoted(file))
+    format!(
+        "{} code {} --from {from} --to {to}",
+        justless.command,
+        quoted(file)
+    )
 }
 
 fn block(hit: &Hit) -> String {
@@ -457,8 +465,9 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
         let mut limit = MAX_WORDS;
         loop {
             let line = format!(
-                "No ranked matches for: {}. Use justless find TEXT for exact text.\n",
-                words(&ranking.unmatched, limit)
+                "No ranked matches for: {}. Use {} find TEXT for exact text.\n",
+                words(&ranking.unmatched, limit),
+                ranking.justless.command
             );
             if line.len() <= budget || limit <= 8 {
                 return line;
@@ -467,7 +476,10 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
         }
     }
     let blocks = ranking.hits.iter().map(block).collect::<Vec<_>>();
-    let next = format!("Next: {}\n", next(&ranking.hits[0], budget));
+    let next = format!(
+        "Next: {}\n",
+        next(&ranking.hits[0], budget, &ranking.justless)
+    );
     let all = counts(ranking, blocks.len(), Some(MAX_WORDS));
     if blocks.iter().map(String::len).sum::<usize>() + all.len() + next.len() <= budget {
         return blocks.concat() + &all + &next;
@@ -599,13 +611,11 @@ fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<Strin
         }
         value["total"] = json!(ranking.total);
         value["omitted"] = json!(ranking.hits.len() - kept);
-        value["next"] = json!(
-            ranking
-                .hits
-                .first()
-                .filter(|_| kept > 0)
-                .map(|hit| next(hit, budget))
-        );
+        value["next"] = json!(ranking.hits.first().filter(|_| kept > 0).map(|hit| next(
+            hit,
+            budget,
+            &ranking.justless
+        )));
         value["results"] = json!([]);
         value.to_string()
     };
@@ -696,37 +706,48 @@ mod tests {
             matched: vec!["retries".into()],
             unmatched: vec!["configured".into()],
             truncated: false,
+            justless: Invocation::plain(),
         }
     }
 
     #[test]
     fn next_offers_expand_only_when_the_whole_result_fits() {
         assert_eq!(
-            next(&hit("src/a b.rs", 5, 84, &[]), 2400),
+            next(&hit("src/a b.rs", 5, 84, &[]), 2400, &Invocation::plain()),
             "justless expand 'src/a b.rs' L5-84"
         );
         // A few long lines are too large for the budget.
         let mut long = hit("src/a.rs", 5, 15, &[(10, "x")]);
         long.bytes = Some(3659);
-        assert_eq!(next(&long, 2400), "justless code src/a.rs --from 7 --to 15");
-        assert_eq!(next(&long, 4000), "justless expand src/a.rs L5-15");
-        long.bytes = None;
         assert_eq!(
-            next(&long, 100_000),
+            next(&long, 2400, &Invocation::plain()),
             "justless code src/a.rs --from 7 --to 15"
         );
         assert_eq!(
-            next(&hit("src/a.rs", 5, 300, &[(6, "x")]), 2400),
+            next(&long, 4000, &Invocation::plain()),
+            "justless expand src/a.rs L5-15"
+        );
+        long.bytes = None;
+        assert_eq!(
+            next(&long, 100_000, &Invocation::plain()),
+            "justless code src/a.rs --from 7 --to 15"
+        );
+        assert_eq!(
+            next(
+                &hit("src/a.rs", 5, 300, &[(6, "x")]),
+                2400,
+                &Invocation::plain()
+            ),
             "justless code src/a.rs --from 5 --to 44"
         );
         let mut log = hit("run-1", 1, 40, &[(7, "x"), (9, "y")]);
         log.run = Some(("run-1".into(), Stream::Stderr));
         assert_eq!(
-            next(&log, 2400),
+            next(&log, 2400, &Invocation::plain()),
             "justless log run-1 --stream stderr --from 1 --to 40"
         );
         assert_eq!(
-            next(&log, 500),
+            next(&log, 500, &Invocation::plain()),
             "justless log run-1 --stream stderr --from 7 --to 9"
         );
     }
@@ -866,11 +887,50 @@ mod tests {
             matched: Vec::new(),
             unmatched: (0..40).map(|index| format!("missing{index}")).collect(),
             truncated: false,
+            justless: Invocation::plain(),
         };
         let output = render_text(&empty, 128);
         assert!(output.len() <= 128, "{output}");
         assert!(
             output.starts_with("No ranked matches for: missing0, "),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn next_starts_with_the_workspace_invocation() {
+        let justless = Invocation {
+            command: "justless --root /w".into(),
+            files: "justless --root /w".into(),
+        };
+        assert_eq!(
+            next(&hit("src/a.rs", 5, 15, &[]), 2400, &justless),
+            "justless --root /w expand src/a.rs L5-15"
+        );
+        // From a subdirectory only `expand` needs the root.
+        let below = Invocation {
+            command: "justless".into(),
+            files: "justless --root /w".into(),
+        };
+        assert_eq!(
+            next(&hit("src/a.rs", 5, 300, &[(6, "x")]), 2400, &below),
+            "justless code src/a.rs --from 5 --to 44"
+        );
+        assert_eq!(
+            next(&hit("src/a.rs", 5, 15, &[]), 2400, &below),
+            "justless --root /w expand src/a.rs L5-15"
+        );
+        let mut log = hit("run-1", 1, 40, &[(7, "x")]);
+        log.run = Some(("run-1".into(), Stream::Stdout));
+        assert_eq!(
+            next(&log, 2400, &justless),
+            "justless --root /w log run-1 --stream stdout --from 1 --to 40"
+        );
+        let mut empty = ranking(Vec::new());
+        empty.justless = justless;
+        let output = render_text(&empty, 2400);
+        assert!(
+            output.contains("Use justless --root /w find TEXT"),
             "{output}"
         );
     }

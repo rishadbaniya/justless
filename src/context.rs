@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
@@ -362,12 +363,13 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
     let (directory, run) = capture::load(workspace, id)?;
     crate::history::recall(&directory, "context");
     let mut report = Report::new(cap);
+    let justless = workspace.justless();
     report.line(format!(
         "Run {id} · {} source locations",
         run.diagnostics.len()
     ));
     if run.diagnostics.is_empty() {
-        report.line(format!("No indexed source location found. Inspect justless search {id} <text> or justless log {id}."));
+        report.line(format!("No indexed source location found. Inspect {justless} search {id} <text> or {justless} log {id}."));
     }
     // Group by source location but keep every distinct log line: progress output and
     // the real error often name the same line, and the error must survive.
@@ -404,7 +406,7 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
                 diagnostic.log_line
             ));
             report.line(format!(
-                "  Replay: justless log {id} --stream {} --from {} --to {}",
+                "  Replay: {justless} log {id} --stream {} --from {} --to {}",
                 diagnostic.stream.name(),
                 diagnostic.log_line.saturating_sub(2).max(1),
                 diagnostic.log_line.saturating_add(2)
@@ -415,9 +417,9 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
         }
         if diagnostics.len() > shown {
             report.line(format!(
-                "  +{} more log line(s) at this location. justless search {id} {}",
+                "  +{} more log line(s) at this location. {justless} search {id} {}",
                 diagnostics.len() - shown,
-                location.file
+                crate::workspace::shell_quote(Path::new(&location.file))
             ));
         }
         if let Some(digest) = run.source_digests.get(&location.file)
@@ -872,7 +874,7 @@ pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) 
                 report.line(format!("{name} · deleted"))
             }
             Change::Unindexed => report.line(format!("{name} · no current indexed source")),
-            Change::StagedDiffers => report.line(format!("{name} · working tree differs from staged source. Use justless context --changes to inspect the current file.")),
+            Change::StagedDiffers => report.line(format!("{name} · working tree differs from staged source. Use {} context --changes to inspect the current file.", workspace.justless())),
             Change::Empty => report.line(format!("{name} · empty after changes")),
             Change::Deleted(deletions) => {
                 for deletion in deletions {

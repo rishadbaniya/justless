@@ -1003,6 +1003,7 @@ mod tests {
             root: root.clone(),
             cwd: root.clone(),
             state: root.join(".justless"),
+            origin: root.clone(),
         };
         let single = cold_bytes(&workspace, 1);
         assert_eq!(single, cold_bytes(&workspace, 4));

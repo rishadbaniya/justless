@@ -155,6 +155,8 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         root: ws.root.clone(),
         cwd: directory,
         state: ws.state.clone(),
+        // The agent's shell runs a printed command from where this line started.
+        origin: cwd.clone(),
     };
     let args: Vec<OsString> = plan.words.iter().map(OsString::from).collect();
     // The preview budget `justless run` would give these words, which adapts to

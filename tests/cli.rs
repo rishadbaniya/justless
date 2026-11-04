@@ -9975,7 +9975,10 @@ fn affected_tests_run_a_labeled_subset_with_the_runners_own_status() {
         "{}",
         stderr(&passing)
     );
-    assert!(stderr(&passing).contains("Full suite: justless test · Why: justless test --why run-"));
+    // The full suite line repeats the runner given after `--`.
+    assert!(stderr(&passing).contains(
+        "Full suite: justless test -- cargo test --offline · Why: justless test --why run-"
+    ));
     assert_no_suite_claim(&passing);
 
     // The full suite is one command away and labeled as such.
@@ -14909,5 +14912,386 @@ fn a_local_module_named_like_the_standard_library_keeps_its_paths() {
             "main::main [function] main.rs:2-4 · possibly references deleted value at main.rs:3 (name match only)"
         ) && !impact.contains("no remaining references"),
         "{impact}"
+    );
+}
+/// Runs a command Justless printed for the agent the way the agent would: as
+/// printed, from `cwd`, with this build standing in for `justless`.
+fn follow(cwd: &Path, printed: &str) -> Output {
+    let words = shlex::split(printed).unwrap_or_else(|| panic!("not a shell command: {printed}"));
+    assert_eq!(words[0], "justless", "{printed}");
+    Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(&words[1..])
+        .current_dir(cwd)
+        .env("CARGO_TARGET_DIR", cwd.join("target"))
+        .output()
+        .unwrap()
+}
+
+/// The ID in the first `[justless run-…` marker, whether a person's footer or an
+/// agent's bracketed marker.
+fn marked_run(text: &str) -> String {
+    text.split("[justless ").nth(1).unwrap()[..]
+        .split([' ', ']'])
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn commands_printed_under_a_scoped_root_reach_the_same_files_and_runs() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let billing = root.join("billing");
+    write_files(
+        &root,
+        &[
+            (
+                "settings.md",
+                "# General controls\nThe unrelated value is 05:00.\n",
+            ),
+            (
+                "billing/settings.md",
+                "# Settlement controls\nThe settlement_cutoff is 19:00.\n",
+            ),
+        ],
+    );
+    git(&root, &["init", "-q"]);
+    let scoped = |args: &[&str]| cli(&root, &[&["--root", "billing"][..], args].concat());
+    let settlement = "# Settlement controls\nThe settlement_cutoff is 19:00.\n";
+
+    // lookup's closing command, as text and as JSON, opens billing's file.
+    let text = stdout(&scoped(&["lookup", "settlement_cutoff"]));
+    let next = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Next: "))
+        .unwrap();
+    let opened = follow(&root, next);
+    assert_eq!(stdout(&opened), settlement, "{next}: {}", stderr(&opened));
+    assert!(
+        next.starts_with(&format!("justless --root {} expand ", billing.display())),
+        "{text}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout(&scoped(&["lookup", "--json", "settlement_cutoff"]))).unwrap();
+    assert_eq!(
+        stdout(&follow(&root, json["next"].as_str().unwrap())),
+        settlement
+    );
+
+    // The run footer and the pointers `context --run` prints reopen the run.
+    let run = scoped(&["run", "--", "sh", "-c", "echo scoped-output; exit 3"]);
+    assert_eq!(run.status.code(), Some(3), "{}", stderr(&run));
+    let id = marked_run(&stderr(&run));
+    let footer = stderr(&run);
+    let reopen = footer
+        .lines()
+        .find_map(|line| line.split(" output bytes · ").nth(1))
+        .unwrap();
+    assert_eq!(
+        stdout(&follow(&root, reopen)),
+        "scoped-output\n",
+        "{footer}"
+    );
+    let context = stdout(&scoped(&["context", "--run", &id]));
+    let replay = context
+        .lines()
+        .find_map(|line| line.strip_prefix("No indexed source location found. Inspect "))
+        .and_then(|line| line.split(" or ").nth(1)?.strip_suffix('.'))
+        .unwrap();
+    assert_eq!(
+        stdout(&follow(&root, replay)),
+        "scoped-output\n",
+        "{context}"
+    );
+
+    // An agent may add `--root` to a command that already has it.
+    let repeated = cli(
+        &root,
+        &[
+            "--root",
+            "billing",
+            "--root",
+            billing.to_str().unwrap(),
+            "expand",
+            "settings.md",
+            "L1-2",
+        ],
+    );
+    assert_eq!(stdout(&repeated), settlement, "{}", stderr(&repeated));
+    let conflicting = cli(
+        &root,
+        &[
+            "--root",
+            ".",
+            "--root",
+            "billing",
+            "expand",
+            "settings.md",
+            "L1-2",
+        ],
+    );
+    assert_eq!(conflicting.status.code(), Some(2));
+    assert!(
+        stderr(&conflicting).contains("--root names two different directories"),
+        "{}",
+        stderr(&conflicting)
+    );
+
+    // Where a plain `justless` finds the same root, the commands stay as they were.
+    let plain = success(&root, &["lookup", "unrelated", "value"]);
+    assert!(
+        plain.ends_with("\nNext: justless expand settings.md L1-2\n"),
+        "{plain}"
+    );
+    let unscoped = cli(&root, &["run", "--", "sh", "-c", "echo plain; exit 1"]);
+    assert!(
+        stderr(&unscoped).contains(&format!(
+            " output bytes · justless log {}\n",
+            marked_run(&stderr(&unscoped))
+        )),
+        "{}",
+        stderr(&unscoped)
+    );
+}
+
+#[test]
+fn an_expand_printed_in_a_subdirectory_opens_the_root_file_it_names() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let billing = root.join("billing");
+    write_files(
+        &root,
+        &[
+            (
+                "settings.md",
+                "# Settlement controls\nThe settlement_cutoff is 19:00.\n",
+            ),
+            (
+                "billing/settings.md",
+                "# General controls\nThe unrelated value is 05:00.\n",
+            ),
+        ],
+    );
+    git(&root, &["init", "-q"]);
+    // From billing/, a bare `settings.md` would mean billing's own file.
+    let text = success(&billing, &["lookup", "settlement_cutoff"]);
+    let next = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Next: "))
+        .unwrap();
+    let opened = follow(&billing, next);
+    assert_eq!(
+        stdout(&opened),
+        "# Settlement controls\nThe settlement_cutoff is 19:00.\n",
+        "{next}: {}",
+        stderr(&opened)
+    );
+    // A command without bare paths finds the run from there unchanged.
+    let run = cli(&billing, &["run", "--", "sh", "-c", "echo below; exit 1"]);
+    assert!(
+        stderr(&run).contains(&format!(
+            " output bytes · justless log {}\n",
+            marked_run(&stderr(&run))
+        )),
+        "{}",
+        stderr(&run)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runs_recorded_from_a_nested_repository_can_be_reopened_from_there() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let vendor = root.join("vendor/lib");
+    fs::create_dir_all(&vendor).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&vendor, &["init", "-q"]);
+    // The command hook's rewrite inside the nested repository records here.
+    let run = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["--root", root.to_str().unwrap(), "run", "--hook", "--"])
+        .args(["sh", "-c", "seq 1 3000; exit 2"])
+        .current_dir(&vendor)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(2), "{}", stderr(&run));
+    let id = marked_run(&stderr(&run));
+    let reopen = stderr(&run)
+        .lines()
+        .find_map(|line| line.strip_prefix("[reopen with ")?.strip_suffix(']'))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("{}", stderr(&run)));
+    let replay = follow(&vendor, &reopen);
+    let lines: String = (1..=3000).map(|n| format!("{n}\n")).collect();
+    assert_eq!(stdout(&replay), lines, "{reopen}: {}", stderr(&replay));
+
+    // The compaction handoff and session context the agent reads there too.
+    let context = |mode: &str, source: &str| {
+        let input = json!({"hook_event_name":"SessionStart","source":source,"cwd":vendor});
+        agent_hook(&root, "hook-claude", mode, input)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let handoff = context("after-compact", "compact");
+    assert!(handoff.contains(&id), "{handoff}");
+    let inspect = handoff
+        .split('`')
+        .find(|part| part.ends_with(" context --run RUN_ID"))
+        .unwrap()
+        .replace("RUN_ID", &id);
+    let inspected = follow(&vendor, &inspect);
+    assert!(
+        stdout(&inspected).starts_with(&format!("Run {id} · ")),
+        "{inspect}: {}",
+        stderr(&inspected)
+    );
+    let started = context("session-start", "startup");
+    let resume = started
+        .split('`')
+        .find(|part| part.ends_with(" resume"))
+        .unwrap();
+    assert!(stdout(&follow(&vendor, resume)).contains(&id), "{started}");
+}
+
+#[test]
+fn test_follow_ups_keep_the_scoped_root_and_the_runner() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let app = root.join("app");
+    write_files(
+        &root,
+        &[
+            (".gitignore", "target/\n.justless/\n"),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "app/src/lib.rs",
+                "pub fn rate() -> u8 {\n    5\n}\n\npub fn other() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn rate_matches() {\n        assert_eq!(super::rate(), 5);\n    }\n\n    #[test]\n    fn other_matches() {\n        assert_eq!(super::other(), 1);\n    }\n}\n",
+            ),
+        ],
+    );
+    git(&root, &["init", "-q"]);
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "fixture"]);
+    replace_in(&root, "app/src/lib.rs", "    5\n", "    6\n");
+    let subset = cli(
+        &root,
+        &[
+            "--root",
+            "app",
+            "test",
+            "--affected",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+        ],
+    );
+    assert_eq!(subset.status.code(), Some(101), "{}", stderr(&subset));
+    let err = stderr(&subset);
+    let (full, why) = err
+        .lines()
+        .find_map(|line| line.strip_prefix("Full suite: ")?.split_once(" · Why: "))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert_eq!(
+        full,
+        format!(
+            "justless --root {} test -- cargo test --offline",
+            app.display()
+        )
+    );
+    let reasons = follow(&root, why);
+    assert!(
+        reasons.status.success() && stdout(&reasons).contains("rate_matches"),
+        "{why}: {}{}",
+        stdout(&reasons),
+        stderr(&reasons)
+    );
+    let suite = follow(&root, full);
+    assert_eq!(suite.status.code(), Some(101), "{}", stderr(&suite));
+    assert!(
+        stderr(&suite).contains("Full suite (cargo): exit 101"),
+        "{}",
+        stderr(&suite)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_line_pointers_under_a_scoped_root_replay_those_lines() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::create_dir(root.join("sub")).unwrap();
+    git(&root, &["init", "-q"]);
+    let output = cli(
+        &root,
+        &["--root", "sub", "exec", "--lang", "sh", "seq 1 3000"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let (range, pointer) = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("[justless] stdout lines ")?
+                .split_once(" left out · ")
+        })
+        .unwrap_or_else(|| panic!("{text}"));
+    let (from, to) = range.split_once('-').unwrap();
+    let lines: String = (from.parse::<usize>().unwrap()..=to.parse().unwrap())
+        .map(|n| format!("{n}\n"))
+        .collect();
+    assert_eq!(stdout(&follow(&root, pointer)), lines, "{pointer}");
+}
+
+#[test]
+fn a_replaced_read_names_the_file_and_root_to_expand_from_the_agents_directory() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let docs = root.join("docs");
+    let source = format!(
+        "def calculate():\n{}    return 42\n",
+        "    # detail\n".repeat(400)
+    );
+    write_files(
+        &root,
+        &[
+            ("module.py", &source),
+            ("docs/module.py", "def other():\n    return 1\n"),
+        ],
+    );
+    git(&root, &["init", "-q"]);
+    let path = root.join("module.py");
+    let read = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse","cwd":docs,
+        "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
+        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+    let output = agent_hook(&root, "hook-claude", "after-read", read);
+    let replaced = &output["hookSpecificOutput"];
+    let outline = replaced["updatedToolOutput"]["file"]["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{output}"));
+    let revision = outline
+        .strip_prefix("revision ")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    let hint = replaced["additionalContext"].as_str().unwrap();
+    let expand = hint
+        .split("Expand a row with ")
+        .nth(1)
+        .and_then(|rest| rest.split(", or use Read").next())
+        .unwrap()
+        .replace("'REV#ID'", &format!("'{revision}#1'"));
+    // The row's exact bytes from the root's file, not docs/module.py.
+    let expanded = follow(&docs, &expand);
+    assert!(
+        stdout(&expanded) == source.trim_end_matches('\n'),
+        "{expand}: {}",
+        stderr(&expanded)
     );
 }

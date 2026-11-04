@@ -37,11 +37,15 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let json = matches.is_present("json");
     let (header, sections, summary) = build(&index);
     let order: Vec<_> = (0..sections.len()).collect();
-    let footer = ["Next: justless expand FILE NAME, query NAME or affected NAME"];
+    // `--root` for `expand` also serves `query` and `affected`.
+    let footer = [format!(
+        "Next: {} expand FILE NAME, query NAME or affected NAME",
+        workspace.invocation().files
+    )];
     emit(
         &header,
         &sections,
-        &footer.map(str::to_owned),
+        &footer,
         &order,
         Fill::RoundRobin,
         budget,
@@ -712,8 +716,9 @@ fn build(index: &Index) -> (Vec<String>, Vec<Section>, Map<String, Value>) {
     )];
     if !index.errors.is_empty() {
         header.push(format!(
-            "{} could not be parsed. justless index lists them.",
-            plural(index.errors.len(), "file")
+            "{} could not be parsed. {} index lists them.",
+            plural(index.errors.len(), "file"),
+            index.justless
         ));
     }
     let mut summary = Map::new();

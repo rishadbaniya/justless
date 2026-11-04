@@ -271,8 +271,9 @@ pub fn run(ws: &Workspace, args: &ArgMatches, settings: Settings) -> Result<i32>
         "archive off".to_owned()
     };
     eprintln!(
-        "justless: Claude Code → {addr} → {} · {clearing} · {archive} · justless stats shows what changed",
-        proxy.upstream()
+        "justless: Claude Code → {addr} → {} · {clearing} · {archive} · {} stats shows what changed",
+        proxy.upstream(),
+        ws.justless()
     );
     let mut command = Command::new(&claude);
     command

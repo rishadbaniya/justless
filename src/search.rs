@@ -925,7 +925,7 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
     Some(json!({"hookSpecificOutput":{
         "hookEventName":"PostToolUse",
         "updatedToolOutput":response,
-        "additionalContext":format!("Justless grouped this {tool} result. Recover the exact original with justless recall {id}, or narrow the path or pattern.")
+        "additionalContext":format!("Justless grouped this {tool} result. Recover the exact original with {} recall {id}, or narrow the path or pattern.", ws.justless())
     }}))
 }
 

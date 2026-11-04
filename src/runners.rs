@@ -851,7 +851,8 @@ pub(crate) fn detect(
         let vitest = listed("vitest") || configured("vitest.config.");
         let kind = match (jest, vitest) {
             (true, true) => bail!(
-                "{file} lists both jest and vitest; pass the runner after --, e.g. justless test --affected -- npx vitest run"
+                "{file} lists both jest and vitest; pass the runner after --, e.g. {} test --affected -- npx vitest run",
+                workspace.justless()
             ),
             (true, false) => Kind::Jest,
             (false, true) => Kind::Vitest,
@@ -893,7 +894,8 @@ pub(crate) fn detect(
     // A Go module directory may hold no indexed go.mod if it is ignored; nothing to do.
     if runners.is_empty() {
         bail!(
-            "no test runner detected; pass one after --, e.g. justless test --affected -- cargo test"
+            "no test runner detected; pass one after --, e.g. {} test --affected -- cargo test",
+            workspace.justless()
         );
     }
     runners.sort_by(|a, b| (a.kind, &a.root).cmp(&(b.kind, &b.root)));
