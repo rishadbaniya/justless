@@ -511,7 +511,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             }
         }
         ("search", sub) => {
-            let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
+            let (directory, run) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
             if sub.is_present("unredacted") {
                 redact::bypass();
                 history::recall(&directory, "unredacted");
@@ -521,6 +521,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 Stream::select(sub.value_of("stream").unwrap()),
                 sub.value_of("text").unwrap(),
                 read_num(sub, "limit", 1)?,
+                run.may_have_failed(),
             )?;
             history::recall(&directory, "search");
         }

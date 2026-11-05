@@ -200,6 +200,13 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl Run {
+    /// Whether the run failed or may have. A pipe or a list that the Bash
+    /// post-command hook recorded keeps the whole line's status, which can hide
+    /// a failure.
+    pub(crate) fn may_have_failed(&self) -> bool {
+        self.status != 0 || crate::postroute::exit_status(self) != self.status.to_string()
+    }
+
     fn unfinished(id: String, family: &str, label: &str, hook: bool) -> Self {
         Self {
             id,
@@ -2638,13 +2645,247 @@ fn separator(last: Option<u8>) -> &'static str {
     }
 }
 
-pub fn search(directory: &Path, streams: &[Stream], needle: &str, limit: usize) -> Result<()> {
-    let mut remaining = limit;
-    matches(directory, streams, needle, |stream, n, line| {
-        println!("{}:{n}: {line}", stream.name());
-        remaining -= 1;
-        remaining > 0
-    })
+/// Lists the lines of a run that contain `needle`, up to `limit`, and ends with a
+/// count of the matches it left out. `failed` is whether the run failed.
+pub fn search(
+    directory: &Path,
+    streams: &[Stream],
+    needle: &str,
+    limit: usize,
+    failed: bool,
+) -> Result<()> {
+    let found = Found::scan(directory, streams, needle, failed, limit)?;
+    let chosen = found.choose(limit);
+    let mut tally = found.tally();
+    let mut out = io::stdout().lock();
+    for &(stream, line, text) in &chosen {
+        writeln!(out, "{}:{line}: {text}", stream.name())?;
+        tally.show(stream);
+    }
+    if tally.shown() < tally.total() {
+        writeln!(
+            out,
+            "[{} of {} matches shown ({tally}); --limit {} shows all]",
+            tally.shown(),
+            tally.total(),
+            tally.total()
+        )?;
+    }
+    Ok(())
+}
+
+/// A word that marks a matching line as a failure wherever it appears, such as
+/// `FAILED`, `TimeoutError` or `panicked`. Matching too much only changes which
+/// lines a cut keeps first.
+static FAILURE_WORD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:errors?|exceptions?)\b|\b(?:fail(?:s|ed|ure|ures)?|panic(?:s|ked)?|traceback|fatal)\b",
+    )
+    .expect("failure word pattern")
+});
+
+/// The kinds of matching line, in the order a cut gives them places. Only a
+/// failed run has failure and stderr lines; every match of a run that passed
+/// is `PLAIN`.
+const FAILURE: usize = 0;
+const STDERR: usize = 1;
+const PLAIN: usize = 2;
+const KINDS: usize = 3;
+
+fn kind_of(failed: bool, stream: Stream, text: &str) -> usize {
+    if !failed {
+        PLAIN
+    } else if FAILURE_WORD.is_match(text) || failure_tier(text).is_some() {
+        FAILURE
+    } else if stream == Stream::Stderr {
+        STDERR
+    } else {
+        PLAIN
+    }
+}
+
+/// Matching lines shown and found per stream, for the notice that counts what a
+/// listing left out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    shown: [usize; 2],
+    total: [usize; 2],
+}
+
+impl Tally {
+    pub(crate) fn found(&mut self, stream: Stream, count: usize) {
+        self.total[stream.index()] += count;
+    }
+
+    pub(crate) fn show(&mut self, stream: Stream) {
+        self.shown[stream.index()] += 1;
+    }
+
+    pub(crate) fn add(&mut self, other: &Self) {
+        for index in 0..2 {
+            self.shown[index] += other.shown[index];
+            self.total[index] += other.total[index];
+        }
+    }
+
+    /// The same counts with every match shown.
+    pub(crate) fn every_shown(&self) -> Self {
+        Self {
+            shown: self.total,
+            total: self.total,
+        }
+    }
+
+    pub(crate) fn shown(&self) -> usize {
+        self.shown.iter().sum()
+    }
+
+    pub(crate) fn total(&self) -> usize {
+        self.total.iter().sum()
+    }
+
+    /// Shown and found for one stream.
+    pub(crate) fn of(&self, stream: Stream) -> (usize, usize) {
+        (self.shown[stream.index()], self.total[stream.index()])
+    }
+}
+
+/// `stdout 19 of 25, stderr 1 of 1`, leaving out a stream without matches.
+impl std::fmt::Display for Tally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for stream in Stream::BOTH {
+            let (shown, total) = self.of(stream);
+            if total == 0 {
+                continue;
+            }
+            if !first {
+                f.write_str(", ")?;
+            }
+            first = false;
+            write!(f, "{} {shown} of {total}", stream.name())?;
+        }
+        Ok(())
+    }
+}
+
+/// The lines of a run's streams that contain a text. Every match is counted,
+/// and the first `keep` of each kind are kept in line order, enough to choose
+/// the lines for any limit up to `keep`.
+pub(crate) struct Found {
+    failed: bool,
+    streams: Vec<Stream>,
+    counts: Vec<[usize; KINDS]>,
+    kept: Vec<[Vec<(usize, String)>; KINDS]>,
+}
+
+impl Found {
+    /// Reads `streams` to the end. `failed` is whether the run failed.
+    pub(crate) fn scan(
+        directory: &Path,
+        streams: &[Stream],
+        needle: &str,
+        failed: bool,
+        keep: usize,
+    ) -> Result<Self> {
+        let mut found = Self {
+            failed,
+            streams: streams.to_vec(),
+            counts: vec![[0; KINDS]; streams.len()],
+            kept: streams.iter().map(|_| Default::default()).collect(),
+        };
+        matches(directory, streams, needle, |stream, line, text| {
+            let index = found
+                .streams
+                .iter()
+                .position(|&searched| searched == stream)
+                .unwrap_or_default();
+            let kind = kind_of(failed, stream, text);
+            found.counts[index][kind] += 1;
+            let kept = &mut found.kept[index][kind];
+            if kept.len() < keep {
+                kept.push((line, text.to_owned()));
+            }
+            true
+        })?;
+        Ok(found)
+    }
+
+    pub(crate) fn total(&self) -> usize {
+        self.counts.iter().flatten().sum()
+    }
+
+    /// Every match counted, none shown yet.
+    pub(crate) fn tally(&self) -> Tally {
+        let mut tally = Tally::default();
+        for (&stream, counts) in self.streams.iter().zip(&self.counts) {
+            tally.found(stream, counts.iter().sum());
+        }
+        tally
+    }
+
+    /// The line of `stream` a cut shows first: on a failed run its first
+    /// failure line, otherwise its first match.
+    pub(crate) fn first(&self, stream: Stream) -> Option<(Stream, usize, &str)> {
+        let index = self
+            .streams
+            .iter()
+            .position(|&searched| searched == stream)?;
+        let (line, text) = self.kept[index].iter().find_map(|kept| kept.first())?;
+        Some((stream, *line, text.as_str()))
+    }
+
+    /// The lines to show within `limit`, at most the `keep` it was scanned
+    /// with, as stream, line number and text. When every match fits, they come
+    /// stream by stream in line order. Otherwise each stream with a match keeps
+    /// a place. On a failed run, failure lines take the places first, then
+    /// stderr lines, and the streams holding them come first. Lines stay in
+    /// order within a stream.
+    pub(crate) fn choose(&self, limit: usize) -> Vec<(Stream, usize, &str)> {
+        let cut = self.total() > limit;
+        let mut quota = vec![[0usize; KINDS]; self.streams.len()];
+        if cut {
+            let best = |counts: &[usize; KINDS]| (0..KINDS).find(|&kind| counts[kind] > 0);
+            let mut reserved = self
+                .counts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, counts)| Some((best(counts)?, index)))
+                .collect::<Vec<_>>();
+            reserved.sort_unstable();
+            let mut left = limit;
+            for (kind, index) in reserved.into_iter().take(limit) {
+                quota[index][kind] += 1;
+                left -= 1;
+            }
+            for kind in 0..KINDS {
+                for (index, counts) in self.counts.iter().enumerate() {
+                    let take = (counts[kind] - quota[index][kind]).min(left);
+                    quota[index][kind] += take;
+                    left -= take;
+                }
+            }
+        } else {
+            quota.clone_from(&self.counts);
+        }
+        let mut order = (0..self.streams.len()).collect::<Vec<_>>();
+        if cut && self.failed {
+            order.sort_by_key(|&index| {
+                let first = (0..KINDS).find(|&kind| quota[index][kind] > 0);
+                (first.unwrap_or(KINDS), index)
+            });
+        }
+        let mut chosen = Vec::new();
+        for index in order {
+            let mut lines = (0..KINDS)
+                .flat_map(|kind| self.kept[index][kind].iter().take(quota[index][kind]))
+                .map(|(line, text)| (self.streams[index], *line, text.as_str()))
+                .collect::<Vec<_>>();
+            lines.sort_by_key(|&(_, line, _)| line);
+            chosen.extend(lines);
+        }
+        chosen
+    }
 }
 
 /// Keep one overlapping window so even a single enormous log line is searchable.
@@ -2698,4 +2939,104 @@ pub fn matches(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Stream::{Stderr, Stdout};
+
+    fn found(failed: bool, lines: &[(Stream, usize, &str)]) -> Found {
+        let mut found = Found {
+            failed,
+            streams: Stream::BOTH.to_vec(),
+            counts: vec![[0; KINDS]; 2],
+            kept: vec![Default::default(), Default::default()],
+        };
+        for &(stream, line, text) in lines {
+            let kind = kind_of(failed, stream, text);
+            found.counts[stream.index()][kind] += 1;
+            found.kept[stream.index()][kind].push((line, text.to_owned()));
+        }
+        found
+    }
+
+    #[test]
+    fn a_cut_keeps_a_place_for_each_stream_and_lines_in_order() {
+        let lines = [
+            (Stdout, 1, "a"),
+            (Stdout, 2, "b"),
+            (Stdout, 3, "c"),
+            (Stderr, 1, "warning d"),
+        ];
+        // Within the limit, streams and lines keep their order.
+        assert_eq!(found(true, &lines).choose(4), lines);
+        // A run that passed keeps stdout first.
+        assert_eq!(
+            found(false, &lines).choose(2),
+            [(Stdout, 1, "a"), (Stderr, 1, "warning d")]
+        );
+        assert_eq!(found(false, &lines).choose(1), [(Stdout, 1, "a")]);
+        // A failed run gives stderr the first place.
+        assert_eq!(
+            found(true, &lines).choose(3),
+            [(Stderr, 1, "warning d"), (Stdout, 1, "a"), (Stdout, 2, "b")]
+        );
+        assert_eq!(found(true, &lines).choose(1), [(Stderr, 1, "warning d")]);
+        // A failure line outranks stderr, and stays in line order.
+        let lines = [
+            (Stdout, 1, "a"),
+            (Stdout, 2, "b"),
+            (Stdout, 3, "test result: FAILED. 1 failed"),
+            (Stderr, 1, "warning d"),
+        ];
+        assert_eq!(
+            found(true, &lines).choose(2),
+            [
+                (Stdout, 3, "test result: FAILED. 1 failed"),
+                (Stderr, 1, "warning d")
+            ]
+        );
+        assert_eq!(
+            found(true, &lines).choose(3),
+            [
+                (Stdout, 1, "a"),
+                (Stdout, 3, "test result: FAILED. 1 failed"),
+                (Stderr, 1, "warning d")
+            ]
+        );
+    }
+
+    #[test]
+    fn failure_words_count_anywhere_in_a_failed_runs_line() {
+        for text in [
+            "order-42 FAILED at settlement",
+            "raised TimeoutError: slow",
+            "thread 'main' panicked at src/lib.rs:3:5",
+            "found 2 errors",
+            "Traceback (most recent call last):",
+            "fatal: not a repository",
+        ] {
+            assert_eq!(kind_of(true, Stdout, text), FAILURE, "{text}");
+        }
+        for text in ["order-42 progress 3", "fail_fast = true", "passed"] {
+            assert_eq!(kind_of(true, Stdout, text), PLAIN, "{text}");
+        }
+        assert_eq!(kind_of(true, Stderr, "Compiling demo"), STDERR);
+        assert_eq!(kind_of(false, Stderr, "error: demo"), PLAIN);
+    }
+
+    #[test]
+    fn a_tally_names_only_streams_with_matches() {
+        let mut tally = Tally::default();
+        tally.found(Stdout, 25);
+        assert_eq!(tally.to_string(), "stdout 0 of 25");
+        tally.found(Stderr, 1);
+        tally.show(Stderr);
+        assert_eq!(tally.to_string(), "stdout 0 of 25, stderr 1 of 1");
+        assert_eq!(
+            tally.every_shown().to_string(),
+            "stdout 25 of 25, stderr 1 of 1"
+        );
+    }
 }

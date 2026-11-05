@@ -122,6 +122,8 @@ pub(crate) struct Ranking {
     pub truncated: bool,
     /// How the printed commands start, so they reach this workspace.
     pub justless: Invocation,
+    /// With `--logs`, the matching log windows per stream.
+    pub logs: Option<capture::Tally>,
 }
 
 const SOURCE: usize = 0;
@@ -216,6 +218,7 @@ fn rank_in(
     };
     let mut total = 0;
     let mut chosen = Vec::new();
+    let mut logs = None;
     // Log scores use their own statistics, so logs are not ranked against
     // source. The few best log windows come first, because they were asked
     // for, and take no places from source results.
@@ -231,12 +234,42 @@ fn rank_in(
             })
             .collect::<Vec<_>>();
         total += candidates.len();
-        let limit = if group == LOGS {
-            LOG_RESULTS.min(options.limit)
-        } else {
-            options.limit
-        };
-        chosen.extend(score::select(candidates, limit, compare, contents, copy));
+        if group != LOGS {
+            chosen.extend(score::select(
+                candidates,
+                options.limit,
+                compare,
+                contents,
+                copy,
+            ));
+            continue;
+        }
+        let stream = |candidate: &Candidate| logs::parse_key(file(candidate).0).map(|key| key.1);
+        let mut found = capture::Tally::default();
+        for candidate in &candidates {
+            found.found(stream(candidate).unwrap_or(Stream::Stdout), 1);
+        }
+        logs = Some(found);
+        let limit = LOG_RESULTS.min(options.limit);
+        let mut picked = score::select(candidates.clone(), limit, compare, contents, copy);
+        // A stream whose windows all rank below the other stream's still keeps
+        // a place, such as the one stderr line that explains a failure under
+        // pages of progress. It takes the place of the other stream's last.
+        for missing in [Stream::Stderr, Stream::Stdout] {
+            if picked.len() < 2 || picked.iter().any(|(pick, _)| stream(pick) == Some(missing)) {
+                continue;
+            }
+            let Some(best) = candidates
+                .iter()
+                .filter(|candidate| stream(candidate) == Some(missing))
+                .min_by(|left, right| compare(left, right))
+            else {
+                continue;
+            };
+            picked.pop();
+            picked.push((*best, Vec::new()));
+        }
+        chosen.extend(picked);
     }
     let hits = chosen
         .iter()
@@ -273,6 +306,7 @@ fn rank_in(
         unmatched,
         truncated: question.truncated,
         justless: workspace.invocation(),
+        logs,
     })
 }
 
@@ -445,6 +479,18 @@ fn words(words: &[String], limit: usize) -> String {
     chunks::clip(&words.join(", "), limit)
 }
 
+/// The matching log windows per stream, with those among the first `shown`
+/// results counted as shown.
+fn log_windows(ranking: &Ranking, shown: usize) -> Option<capture::Tally> {
+    let mut tally = ranking.logs?;
+    for hit in &ranking.hits[..shown.min(ranking.hits.len())] {
+        if let Some((_, stream)) = &hit.run {
+            tally.show(*stream);
+        }
+    }
+    Some(tally)
+}
+
 fn counts(ranking: &Ranking, shown: usize, limit: Option<usize>) -> String {
     let mut line = format!("{shown} of {} ranked", ranking.total);
     if let Some(limit) = limit {
@@ -455,6 +501,17 @@ fn counts(ranking: &Ranking, shown: usize, limit: Option<usize>) -> String {
     }
     if ranking.truncated {
         line.push_str(&format!(" · first {} terms used", tokens::MAX_TERMS));
+    }
+    // Log windows the three places left out are counted per stream. The clause
+    // is there whatever the budget shows, so the footer it reserves fits. More
+    // `--limit` adds no log windows, so the full form names the search that
+    // lists every matching line.
+    let ranked = ranking.hits.iter().filter(|hit| hit.run.is_some()).count();
+    if let Some(windows) = log_windows(ranking, shown).filter(|tally| tally.total() > ranked) {
+        line.push_str(&format!(" · log windows {windows}"));
+        if limit.is_some() {
+            line.push_str(" (justless history TEXT lists every matching line)");
+        }
     }
     line.push('\n');
     line
@@ -611,11 +668,25 @@ fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<Strin
         }
         value["total"] = json!(ranking.total);
         value["omitted"] = json!(ranking.hits.len() - kept);
-        value["next"] = json!(ranking.hits.first().filter(|_| kept > 0).map(|hit| next(
-            hit,
-            budget,
-            &ranking.justless
-        )));
+        if let Some(windows) = log_windows(ranking, kept) {
+            let stream = |stream: Stream| {
+                let (shown, total) = windows.of(stream);
+                json!({"total": total, "shown": shown})
+            };
+            value["logs"] = json!({
+                "total": windows.total(),
+                "omitted": windows.total() - windows.shown(),
+                "stdout": stream(Stream::Stdout),
+                "stderr": stream(Stream::Stderr),
+            });
+        }
+        value["next"] = json!(
+            ranking
+                .hits
+                .first()
+                .filter(|_| kept > 0)
+                .map(|hit| next(hit, budget, &ranking.justless))
+        );
         value["results"] = json!([]);
         value.to_string()
     };
@@ -707,6 +778,7 @@ mod tests {
             unmatched: vec!["configured".into()],
             truncated: false,
             justless: Invocation::plain(),
+            logs: None,
         }
     }
 
@@ -888,6 +960,7 @@ mod tests {
             unmatched: (0..40).map(|index| format!("missing{index}")).collect(),
             truncated: false,
             justless: Invocation::plain(),
+            logs: None,
         };
         let output = render_text(&empty, 128);
         assert!(output.len() <= 128, "{output}");
@@ -933,5 +1006,54 @@ mod tests {
             output.contains("Use justless --root /w find TEXT"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn log_windows_left_out_are_counted_per_stream_within_the_budget() {
+        let log = |stream: Stream, start: usize| {
+            let mut hit = hit(
+                "run-Ab12",
+                start,
+                start + 39,
+                &[(start, "order-42 progress")],
+            );
+            hit.source = Source::Log;
+            hit.run = Some(("run-Ab12".into(), stream));
+            hit
+        };
+        let mut found = capture::Tally::default();
+        found.found(Stream::Stdout, 4);
+        found.found(Stream::Stderr, 1);
+        let mut ranking = ranking(vec![
+            log(Stream::Stdout, 1),
+            log(Stream::Stdout, 41),
+            log(Stream::Stderr, 1),
+            hit("src/a.rs", 5, 9, &[(6, "x")]),
+        ]);
+        ranking.logs = Some(found);
+        let full = render_text(&ranking, 100_000);
+        assert!(
+            full.contains(
+                " · log windows stdout 2 of 4, stderr 1 of 1 (justless history TEXT lists every matching line)\n"
+            ),
+            "{full}"
+        );
+        for budget in (128..full.len()).step_by(3) {
+            let output = render_text(&ranking, budget);
+            assert!(output.len() <= budget, "{budget}: {output}");
+            assert!(output.contains(" · log windows stdout "), "{output}");
+        }
+        let value: Value =
+            serde_json::from_str(&render_json("order-42", &ranking, 100_000).unwrap()).unwrap();
+        assert_eq!(
+            value["logs"],
+            json!({"total": 5, "omitted": 2, "stdout": {"total": 4, "shown": 2}, "stderr": {"total": 1, "shown": 1}})
+        );
+        // When every window is shown, the text adds nothing.
+        found = capture::Tally::default();
+        found.found(Stream::Stdout, 2);
+        found.found(Stream::Stderr, 1);
+        ranking.logs = Some(found);
+        assert!(!render_text(&ranking, 100_000).contains("log windows"));
     }
 }

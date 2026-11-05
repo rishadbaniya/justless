@@ -15510,3 +15510,373 @@ fn a_printed_root_named_like_a_secret_survives_output_redaction() {
     let text = stdout(&output);
     assert!(text.contains("token=[redacted:github-token:"), "{text}");
 }
+/// Archives a finished run directly, as `run` leaves it, with its stdout and
+/// stderr.
+fn archived_run(root: &Path, id: &str, status: i32, completed_ms: u64, streams: [&str; 2]) {
+    let run = root.join(".justless/runs").join(id);
+    fs::create_dir_all(&run).unwrap();
+    let record = serde_json::json!({
+        "id": id,
+        "status": status,
+        "raw_bytes": streams[0].len() + streams[1].len(),
+        "preview_bytes": 0,
+        "completed_ms": completed_ms,
+        "family": "other",
+        "diagnostics": [],
+        "source_digests": {},
+    });
+    fs::write(run.join("record.json"), record.to_string()).unwrap();
+    fs::write(run.join("stdout"), streams[0]).unwrap();
+    fs::write(run.join("stderr"), streams[1]).unwrap();
+}
+
+fn order_progress(count: usize) -> String {
+    (0..count)
+        .map(|i| format!("order-42 progress {i}\n"))
+        .collect()
+}
+
+/// `search` lines for progress lines `range` of `order_progress`.
+fn progress_matches(range: std::ops::Range<usize>) -> String {
+    range
+        .map(|i| format!("stdout:{}: order-42 progress {i}\n", i + 1))
+        .collect()
+}
+
+/// `history` lines without their age, which depends on the clock.
+fn history_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(|line| match line.split_once("] ") {
+            Some((age, rest)) if age.ends_with(" ago") => rest.to_owned(),
+            _ => line.to_owned(),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn search_keeps_a_place_for_each_stream_and_counts_what_its_limit_leaves_out() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    let script = "i=0; while [ $i -lt 25 ]; do echo \"order-42 progress $i\"; i=$((i+1)); done; \
+                  echo 'order-42 FAILED at settlement' >&2; exit 1";
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let id = run_id(&output);
+    let id = id.split(' ').next().unwrap();
+    let failure = "stderr:1: order-42 FAILED at settlement\n";
+    // Within the limit, matches are listed stream by stream in line order, and
+    // nothing says more exist.
+    assert_eq!(
+        success(root, &["search", id, "order-42", "--limit", "26"]),
+        progress_matches(0..25) + failure
+    );
+    // The default limit of 20 no longer fills with stdout progress: the failed
+    // run's stderr failure keeps a place and comes first, and the last line
+    // counts what each stream left out.
+    assert_eq!(
+        success(root, &["search", id, "order-42"]),
+        format!(
+            "{failure}{}[20 of 26 matches shown (stdout 19 of 25, stderr 1 of 1); --limit 26 shows all]\n",
+            progress_matches(0..19)
+        )
+    );
+    assert_eq!(
+        success(root, &["search", id, "order-42", "--limit", "1"]),
+        format!(
+            "{failure}[1 of 26 matches shown (stdout 0 of 25, stderr 1 of 1); --limit 26 shows all]\n"
+        )
+    );
+    assert_eq!(
+        success(
+            root,
+            &[
+                "search", id, "order-42", "--stream", "stdout", "--limit", "3"
+            ]
+        ),
+        progress_matches(0..3) + "[3 of 25 matches shown (stdout 3 of 25); --limit 25 shows all]\n"
+    );
+    assert_eq!(
+        success(root, &["search", id, "order-42", "--stream", "stderr"]),
+        failure
+    );
+}
+
+#[test]
+fn search_puts_failure_lines_first_only_for_a_failed_run() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    // A merged `2>&1` run archives its failure on stdout, after the progress.
+    let log = order_progress(25) + "order-42 FAILED at settlement\n";
+    archived_run(root, "run-Failed1", 1, 2_000, [&log, ""]);
+    archived_run(root, "run-Passed1", 0, 1_000, [&log, ""]);
+    assert_eq!(
+        success(root, &["search", "run-Failed1", "order-42", "--limit", "5"]),
+        format!(
+            "{}stdout:26: order-42 FAILED at settlement\n[5 of 26 matches shown (stdout 5 of 26); --limit 26 shows all]\n",
+            progress_matches(0..4)
+        )
+    );
+    // A run that passed keeps plain line order.
+    assert_eq!(
+        success(root, &["search", "run-Passed1", "order-42", "--limit", "5"]),
+        format!(
+            "{}[5 of 26 matches shown (stdout 5 of 26); --limit 26 shows all]\n",
+            progress_matches(0..5)
+        )
+    );
+    // `history` chooses within each run the same way, newest run first.
+    assert_eq!(
+        history_lines(&success(root, &["history", "order-42", "--limit", "3"])),
+        [
+            "run-Failed1 other stdout:1: order-42 progress 0",
+            "run-Failed1 other stdout:2: order-42 progress 1",
+            "run-Failed1 other stdout:26: order-42 FAILED at settlement",
+            "[3 of 52 matches shown from 1 of 2 matching runs (stdout 3 of 52); --limit 52 shows all]",
+        ]
+    );
+}
+
+#[test]
+fn history_counts_matches_past_its_limit_and_keeps_runs_in_order() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    archived_run(root, "run-Old1", 0, 1_000, ["order-42 shipped\n", ""]);
+    let failure = "order-42 FAILED at settlement\n";
+    archived_run(root, "run-New2", 1, 2_000, [&order_progress(25), failure]);
+    let progress = |range: std::ops::Range<usize>| {
+        range
+            .map(|i| format!("run-New2 other stdout:{}: order-42 progress {i}", i + 1))
+            .collect::<Vec<_>>()
+    };
+    let mut expected = vec!["run-New2 other stderr:1: order-42 FAILED at settlement".to_owned()];
+    expected.extend(progress(0..11));
+    expected.push(
+        "[12 of 27 matches shown from 1 of 2 matching runs (stdout 11 of 26, stderr 1 of 1); --limit 27 shows all]"
+            .to_owned(),
+    );
+    assert_eq!(
+        history_lines(&success(root, &["history", "order-42"])),
+        expected
+    );
+    // The earliest run still comes first with --oldest.
+    assert_eq!(
+        history_lines(&success(
+            root,
+            &["history", "order-42", "--oldest", "--limit", "1"]
+        )),
+        [
+            "run-Old1 other stdout:1: order-42 shipped",
+            "[1 of 27 matches shown from 1 of 2 matching runs (stdout 1 of 26, stderr 0 of 1); --limit 27 shows all]",
+        ]
+    );
+    // Everything within the limit is listed as before, without a notice.
+    let mut all = progress(0..25);
+    all.push("run-New2 other stderr:1: order-42 FAILED at settlement".to_owned());
+    all.push("run-Old1 other stdout:1: order-42 shipped".to_owned());
+    assert_eq!(
+        history_lines(&success(root, &["history", "order-42", "--limit", "27"])),
+        all
+    );
+    // A budget that cuts the list keeps the failure and says what it left out.
+    let cut = success(
+        root,
+        &["history", "order-42", "--limit", "27", "--budget", "400"],
+    );
+    assert!(cut.len() <= 400, "{} bytes: {cut}", cut.len());
+    let lines = history_lines(&cut);
+    assert_eq!(
+        lines[0], "run-New2 other stderr:1: order-42 FAILED at settlement",
+        "{cut}"
+    );
+    let notice = lines.last().unwrap();
+    assert!(
+        notice.contains(" of 27 matches shown from 1 of 2 matching runs (stdout ")
+            && notice.ends_with(", stderr 1 of 1); a larger --budget shows all]"),
+        "{cut}"
+    );
+    assert!(cut.contains("[context budget reached]\n"), "{cut}");
+}
+
+#[test]
+fn lookup_logs_keep_a_window_for_each_stream_and_count_the_rest() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    // Two runs of dense progress outrank the one stderr line that explains the
+    // failure.
+    let busy: String = (0..80)
+        .map(|i| format!("order-42 order-42 progress {i}\n"))
+        .collect();
+    archived_run(root, "run-Busy1", 0, 1_000, [&busy, ""]);
+    archived_run(
+        root,
+        "run-Fail2",
+        1,
+        2_000,
+        [&busy, "order-42 FAILED at settlement\n"],
+    );
+    let output = success(root, &["lookup", "order-42", "--logs"]);
+    assert!(
+        output.contains(
+            "run-Fail2 stderr:1-1 log other · exit 1\n  1 | order-42 FAILED at settlement\n"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains(" · log windows stdout 2 of 4, stderr 1 of 1"),
+        "{output}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&success(root, &["lookup", "order-42", "--logs", "--json"])).unwrap();
+    assert_eq!(
+        value["logs"],
+        serde_json::json!({
+            "total": 5,
+            "omitted": 2,
+            "stdout": {"total": 4, "shown": 2},
+            "stderr": {"total": 1, "shown": 1},
+        }),
+        "{value:#}"
+    );
+}
+
+#[test]
+fn mcp_search_and_history_count_the_matches_they_leave_out() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    archived_run(
+        root,
+        "run-New2",
+        1,
+        2_000,
+        [&order_progress(25), "order-42 FAILED at settlement\n"],
+    );
+    let request = |id: u64, method: &str, params: serde_json::Value| {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+            .to_string()
+    };
+    let lines = [
+        request(
+            0,
+            "initialize",
+            serde_json::json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}),
+        ),
+        request(
+            1,
+            "tools/call",
+            serde_json::json!({"name": "search", "arguments": {"run_id": "run-New2", "text": "order-42"}}),
+        ),
+        request(
+            2,
+            "tools/call",
+            serde_json::json!({"name": "history", "arguments": {"text": "order-42"}}),
+        ),
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["mcp", "--root"])
+        .arg(root)
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for line in &lines {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = |id: u64| {
+        stdout(&output)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|message| message["id"] == id)
+            .unwrap()["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["text"].as_str().unwrap().to_owned())
+            .collect::<String>()
+    };
+    let search = text(1);
+    assert!(
+        search.starts_with("stderr:1: order-42 FAILED at settlement\n")
+            && search.ends_with(
+                "[20 of 26 matches shown (stdout 19 of 25, stderr 1 of 1); --limit 26 shows all]\n"
+            ),
+        "{search}"
+    );
+    let history = text(2);
+    assert!(
+        history.contains("run-New2 other stderr:1: order-42 FAILED at settlement\n")
+            && history.ends_with(
+                "[12 of 26 matches shown from 1 of 1 matching runs (stdout 11 of 25, stderr 1 of 1); --limit 26 shows all]\n"
+            ),
+        "{history}"
+    );
+}
+
+#[test]
+fn history_keeps_a_place_for_a_stream_whose_matches_are_all_in_older_runs() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    archived_run(
+        root,
+        "run-Old1",
+        1,
+        1_000,
+        ["", "order-42 FAILED at settlement\n"],
+    );
+    archived_run(root, "run-New2", 0, 2_000, [&order_progress(25), ""]);
+    let mut expected = (0..11)
+        .map(|i| format!("run-New2 other stdout:{}: order-42 progress {i}", i + 1))
+        .collect::<Vec<_>>();
+    expected.push("run-Old1 other stderr:1: order-42 FAILED at settlement".to_owned());
+    expected.push(
+        "[12 of 26 matches shown from 2 of 2 matching runs (stdout 11 of 25, stderr 1 of 1); --limit 26 shows all]"
+            .to_owned(),
+    );
+    assert_eq!(
+        history_lines(&success(root, &["history", "order-42"])),
+        expected
+    );
+    // A single place goes to the newest match, and the notice counts the rest.
+    assert_eq!(
+        history_lines(&success(root, &["history", "order-42", "--limit", "1"])),
+        [
+            "run-New2 other stdout:1: order-42 progress 0",
+            "[1 of 26 matches shown from 1 of 2 matching runs (stdout 1 of 25, stderr 0 of 1); --limit 26 shows all]",
+        ]
+    );
+}
+
+#[test]
+fn search_treats_a_pipe_recorded_as_passing_as_a_possible_failure() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    let log = order_progress(25) + "order-42 FAILED at settlement\n";
+    archived_run(root, "run-Piped1", 0, 1_000, [&log, ""]);
+    // The Bash post-command hook records a pipe with the whole line's status.
+    let record = root.join(".justless/runs/run-Piped1/record.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    value["label"] = "cargo test | tail".into();
+    value["note"] = "captured after the command ran".into();
+    fs::write(&record, value.to_string()).unwrap();
+    assert_eq!(
+        success(root, &["search", "run-Piped1", "order-42", "--limit", "2"]),
+        "stdout:1: order-42 progress 0\nstdout:26: order-42 FAILED at settlement\n\
+         [2 of 26 matches shown (stdout 2 of 26); --limit 26 shows all]\n"
+    );
+}

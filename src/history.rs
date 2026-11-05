@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -565,51 +565,182 @@ pub fn history(
     cap: usize,
 ) -> Result<()> {
     let runs = records(workspace, oldest)?;
+    if let Some(needle) = needle {
+        return search_runs(workspace, runs, needle, limit, cap);
+    }
     let mut report = Report::new(cap);
     let justless = workspace.justless();
     let mut count = 0;
     for run in runs {
         let run = run?;
-        if let Some(needle) = needle {
-            let directory = workspace.state.join("runs").join(&run.id);
-            capture::matches(
-                &directory,
-                Stream::select("both"),
-                needle,
-                |stream, n, excerpt| {
-                    report.line(format!(
-                        "[{}] {} {} {}:{n}: {excerpt}",
-                        age(run.completed_ms),
-                        run.id,
-                        run.family,
-                        stream.name()
-                    ));
-                    count += 1;
-                    count < limit && !report.clipped
-                },
-            )?;
-            if count >= limit || report.clipped {
-                break;
-            }
-        } else {
-            report.line(format!(
-                "{} · {} · {} · {} (epoch ms {})",
-                run.id,
-                command(&run),
-                outcome(&run, &justless),
-                age(run.completed_ms),
-                run.completed_ms
-            ));
-            count += 1;
-            if count >= limit || report.clipped {
-                break;
-            }
+        report.line(format!(
+            "{} · {} · {} · {} (epoch ms {})",
+            run.id,
+            command(&run),
+            outcome(&run, &justless),
+            age(run.completed_ms),
+            run.completed_ms
+        ));
+        count += 1;
+        if count >= limit || report.clipped {
+            break;
         }
     }
     if count == 0 {
         report.line("No matching captured runs.");
     }
     report.finish()
+}
+
+/// Lists the lines that contain `needle` in `runs`, in their order, up to
+/// `limit` and within `cap` bytes. Every run is searched to the end, so a last
+/// line can count the matches left out. Within a run that the limit cuts,
+/// each stream keeps a place and a failed run's failure lines come first, as
+/// in `search`. A stream whose matches all lie past the cut keeps a place too.
+fn search_runs(
+    workspace: &Workspace,
+    runs: impl Iterator<Item = Result<Run>>,
+    needle: &str,
+    limit: usize,
+    cap: usize,
+) -> Result<()> {
+    let mut found = Vec::new();
+    let mut earlier = 0;
+    for run in runs {
+        let run = run?;
+        let directory = workspace.state.join("runs").join(&run.id);
+        // A run past the limit keeps only the first line of each kind, which
+        // a stream left out may need.
+        let keep = limit.saturating_sub(earlier).max(1);
+        match capture::Found::scan(
+            &directory,
+            Stream::select("both"),
+            needle,
+            run.may_have_failed(),
+            keep,
+        ) {
+            Ok(matches) if matches.total() > 0 => {
+                earlier += matches.total();
+                found.push((run, matches));
+            }
+            Ok(_) => {}
+            Err(error) => skipped(&run.id, &error),
+        }
+    }
+    let mut all = capture::Tally::default();
+    for (_, matches) in &found {
+        all.add(&matches.tally());
+    }
+    let total = all.total();
+    if total == 0 {
+        let mut report = Report::new(cap);
+        report.line("No matching captured runs.");
+        return report.finish();
+    }
+    // The lines for `want` places. Each run gets the places the runs before it
+    // left. When that leaves out every match of a stream, such as an older
+    // failed run's stderr under a newer run's stdout, the first run with one
+    // shows it in the place of the last line listed.
+    let lines = |want: usize| {
+        let mut places = Vec::with_capacity(found.len());
+        let mut left = want;
+        for (_, matches) in &found {
+            let take = left.min(matches.total());
+            places.push(take);
+            left -= take;
+        }
+        let mut pinned = Vec::new();
+        if want < total && want >= 2 {
+            for stream in [Stream::Stdout, Stream::Stderr] {
+                let listed = found.iter().zip(&places).any(|((_, matches), &take)| {
+                    matches.choose(take).iter().any(|line| line.0 == stream)
+                });
+                let first = found
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, (_, matches))| Some((index, matches.first(stream)?)));
+                let last = places.iter().rposition(|&take| take > 0);
+                if let (false, Some(first), Some(last)) = (listed, first, last) {
+                    places[last] -= 1;
+                    pinned.push(first);
+                }
+            }
+        }
+        let mut lines = Vec::new();
+        for (index, ((run, matches), &take)) in found.iter().zip(&places).enumerate() {
+            let mut chosen = matches.choose(take);
+            for (_, line) in pinned.iter().filter(|(pinned, _)| *pinned == index) {
+                if !chosen.contains(line) {
+                    chosen.push(*line);
+                }
+            }
+            for (stream, n, excerpt) in chosen {
+                let line = format!(
+                    "[{}] {} {} {}:{n}: {excerpt}",
+                    age(run.completed_ms),
+                    run.id,
+                    run.family,
+                    stream.name()
+                );
+                lines.push((index, stream, line));
+            }
+        }
+        lines
+    };
+    let notice = |tally: &capture::Tally, runs: usize, budget: bool| {
+        let hint = match (total > limit, budget) {
+            (true, true) => format!("--limit {total} and a larger --budget show all"),
+            (true, false) => format!("--limit {total} shows all"),
+            _ => "a larger --budget shows all".to_owned(),
+        };
+        format!(
+            "[{} of {total} matches shown from {runs} of {} matching runs ({tally}); {hint}]\n",
+            tally.shown(),
+            found.len()
+        )
+    };
+    // Room for the notice, set aside once matches are left out. Every number in
+    // it is at most the one in this form.
+    let widest = notice(&all.every_shown(), found.len(), true).len();
+    let mut want = limit.min(total);
+    let mut room = if want < total { widest } else { 0 };
+    loop {
+        let mut report = Report::new(cap.saturating_sub(room));
+        let mut tally = all;
+        let mut listed = Vec::new();
+        let mut shown = 0;
+        for (index, stream, line) in lines(want) {
+            report.line(line);
+            if report.clipped {
+                break;
+            }
+            tally.show(stream);
+            if listed.last() != Some(&index) {
+                listed.push(index);
+            }
+            shown += 1;
+        }
+        // When the budget leaves out lines the limit allowed, the lines that
+        // fit are chosen again, so that cut also keeps each stream's place and
+        // puts a failure first.
+        if report.clipped && room == 0 {
+            room = widest;
+            continue;
+        }
+        if report.clipped && shown > 0 && shown < want {
+            want = shown;
+            continue;
+        }
+        let budget = shown < limit.min(total);
+        // Lines chosen again to fit still mark the budget as reached.
+        report.clipped |= budget;
+        let mut output = report.into_string();
+        if tally.shown() < total {
+            output.push_str(&notice(&tally, listed.len(), budget));
+        }
+        io::stdout().lock().write_all(output.as_bytes())?;
+        return Ok(());
+    }
 }
 
 /// How lists name a run: its command label, or the output family when that is
