@@ -15942,3 +15942,46 @@ fn history_keeps_a_match_and_its_notice_within_small_budgets() {
         "{output}"
     );
 }
+
+#[test]
+fn lookup_logs_keep_both_streams_when_the_budget_fits_two_windows() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    let busy: String = (0..80)
+        .map(|i| format!("order-42 order-42 progress {i}\n"))
+        .collect();
+    archived_run(root, "run-Busy1", 0, 1_000, [&busy, ""]);
+    archived_run(
+        root,
+        "run-Fail2",
+        1,
+        2_000,
+        [&busy, "order-42 FAILED at settlement\n"],
+    );
+    let mut two = 0;
+    for budget in (128..800).step_by(8) {
+        let output = success(
+            root,
+            &[
+                "lookup",
+                "order-42",
+                "--logs",
+                "--budget",
+                &budget.to_string(),
+            ],
+        );
+        let windows = output
+            .lines()
+            .filter(|line| line.starts_with("run-") && line.contains(" log other"))
+            .collect::<Vec<_>>();
+        if windows.len() >= 2 {
+            two += 1;
+            assert!(
+                windows.iter().any(|line| line.contains(" stderr:")),
+                "{budget}: {output}"
+            );
+        }
+    }
+    assert!(two > 0);
+}

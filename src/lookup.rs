@@ -254,7 +254,9 @@ fn rank_in(
         let mut picked = score::select(candidates.clone(), limit, compare, contents, copy);
         // A stream whose windows all rank below the other stream's still keeps
         // a place, such as the one stderr line that explains a failure under
-        // pages of progress. It takes the place of the other stream's last.
+        // pages of progress. It takes the place of the other stream's last and
+        // is listed second, so a budget that leaves out the last windows still
+        // shows both streams.
         for missing in [Stream::Stderr, Stream::Stdout] {
             if picked.len() < 2 || picked.iter().any(|(pick, _)| stream(pick) == Some(missing)) {
                 continue;
@@ -267,7 +269,7 @@ fn rank_in(
                 continue;
             };
             picked.pop();
-            picked.push((*best, Vec::new()));
+            picked.insert(1, (*best, Vec::new()));
         }
         chosen.extend(picked);
     }
