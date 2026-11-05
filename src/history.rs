@@ -687,60 +687,81 @@ fn search_runs(
         }
         lines
     };
-    let notice = |tally: &capture::Tally, runs: usize, budget: bool| {
+    // The notice in its fullest form first. When that leaves no room for a
+    // match, as under a small --budget, the run count and the hint are dropped,
+    // and then the counts per stream.
+    let notice = |form: usize, tally: &capture::Tally, runs: usize, budget: bool| {
+        let shown = tally.shown();
+        if form == 2 {
+            return format!("[{shown} of {total} matches shown]\n");
+        }
+        if form == 1 {
+            return format!("[{shown} of {total} matches shown ({tally})]\n");
+        }
         let hint = match (total > limit, budget) {
             (true, true) => format!("--limit {total} and a larger --budget show all"),
             (true, false) => format!("--limit {total} shows all"),
             _ => "a larger --budget shows all".to_owned(),
         };
         format!(
-            "[{} of {total} matches shown from {runs} of {} matching runs ({tally}); {hint}]\n",
-            tally.shown(),
+            "[{shown} of {total} matches shown from {runs} of {} matching runs ({tally}); {hint}]\n",
             found.len()
         )
     };
-    // Room for the notice, set aside once matches are left out. Every number in
-    // it is at most the one in this form.
-    let widest = notice(&all.every_shown(), found.len(), true).len();
-    let mut want = limit.min(total);
-    let mut room = if want < total { widest } else { 0 };
-    loop {
-        let mut report = Report::new(cap.saturating_sub(room));
-        let mut tally = all;
-        let mut listed = Vec::new();
-        let mut shown = 0;
-        for (index, stream, line) in lines(want) {
-            report.line(line);
-            if report.clipped {
-                break;
+    // The output with one form of the notice, and how many matches it shows.
+    let attempt = |form: usize| {
+        // Room for the notice, set aside once matches are left out. Every
+        // number in it is at most the one in this form.
+        let widest = notice(form, &all.every_shown(), found.len(), true).len();
+        let mut want = limit.min(total);
+        let mut room = if want < total { widest } else { 0 };
+        loop {
+            let mut report = Report::new(cap.saturating_sub(room));
+            let mut tally = all;
+            let mut listed = Vec::new();
+            let mut shown = 0;
+            for (index, stream, line) in lines(want) {
+                report.line(line);
+                if report.clipped {
+                    break;
+                }
+                tally.show(stream);
+                if listed.last() != Some(&index) {
+                    listed.push(index);
+                }
+                shown += 1;
             }
-            tally.show(stream);
-            if listed.last() != Some(&index) {
-                listed.push(index);
+            // When the budget leaves out lines the limit allowed, the lines
+            // that fit are chosen again, so that cut also keeps each stream's
+            // place and puts a failure first.
+            if report.clipped && room == 0 {
+                room = widest;
+                continue;
             }
-            shown += 1;
+            if report.clipped && shown > 0 && shown < want {
+                want = shown;
+                continue;
+            }
+            let budget = shown < limit.min(total);
+            // Lines chosen again to fit still mark the budget as reached.
+            report.clipped |= budget;
+            let mut output = report.into_string();
+            if tally.shown() < total {
+                output.push_str(&notice(form, &tally, listed.len(), budget));
+            }
+            return (output, shown);
         }
-        // When the budget leaves out lines the limit allowed, the lines that
-        // fit are chosen again, so that cut also keeps each stream's place and
-        // puts a failure first.
-        if report.clipped && room == 0 {
-            room = widest;
-            continue;
+    };
+    let mut form = 0;
+    let output = loop {
+        let (output, shown) = attempt(form);
+        if shown > 0 || form == 2 {
+            break output;
         }
-        if report.clipped && shown > 0 && shown < want {
-            want = shown;
-            continue;
-        }
-        let budget = shown < limit.min(total);
-        // Lines chosen again to fit still mark the budget as reached.
-        report.clipped |= budget;
-        let mut output = report.into_string();
-        if tally.shown() < total {
-            output.push_str(&notice(&tally, listed.len(), budget));
-        }
-        io::stdout().lock().write_all(output.as_bytes())?;
-        return Ok(());
-    }
+        form += 1;
+    };
+    io::stdout().lock().write_all(output.as_bytes())?;
+    Ok(())
 }
 
 /// How lists name a run: its command label, or the output family when that is

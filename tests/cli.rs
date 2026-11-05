@@ -15907,3 +15907,38 @@ fn search_reads_a_failure_word_anywhere_in_the_line_not_only_near_the_match() {
     let output = success(root, &["history", "order-42", "--limit", "2"]);
     assert!(output.contains(" stdout:26: "), "{output}");
 }
+
+#[test]
+fn history_keeps_a_match_and_its_notice_within_small_budgets() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    archived_run(root, "run-A1", 1, 1_000, ["", "order-42 panicked\n"]);
+    archived_run(root, "run-B2", 0, 2_000, [&order_progress(30), ""]);
+    for budget in (128..700).step_by(9) {
+        let output = success(
+            root,
+            &["history", "order-42", "--budget", &budget.to_string()],
+        );
+        assert!(output.len() <= budget, "{budget}: {output}");
+        let notice = output.lines().last().unwrap();
+        assert!(
+            notice.starts_with('[') && notice.contains(" of 31 matches shown"),
+            "{budget}: {output}"
+        );
+        // At least one match line is shown whole.
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains(" other stdout:1: order-42 progress 0")),
+            "{budget}: {output}"
+        );
+    }
+    // The fullest notice is kept whenever it leaves room for a match.
+    let output = success(root, &["history", "order-42", "--budget", "1000"]);
+    assert!(
+        output.ends_with("; --limit 31 and a larger --budget show all]\n")
+            || output.ends_with("; --limit 31 shows all]\n"),
+        "{output}"
+    );
+}
