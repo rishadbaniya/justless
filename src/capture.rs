@@ -2794,13 +2794,15 @@ impl Found {
             counts: vec![[0; KINDS]; streams.len()],
             kept: streams.iter().map(|_| Default::default()).collect(),
         };
-        matches(directory, streams, needle, |stream, line, text| {
+        matches(directory, streams, needle, |stream, line, text, whole| {
             let index = found
                 .streams
                 .iter()
                 .position(|&searched| searched == stream)
                 .unwrap_or_default();
-            let kind = kind_of(failed, stream, text);
+            // A failure word can lie outside the excerpt, as `FAILED` does
+            // before a long test ID.
+            let kind = kind_of(failed, stream, whole);
             found.counts[index][kind] += 1;
             let kept = &mut found.kept[index][kind];
             if kept.len() < keep {
@@ -2888,12 +2890,15 @@ impl Found {
     }
 }
 
-/// Keep one overlapping window so even a single enormous log line is searchable.
+/// Calls `emit` with the stream, line number, excerpt around the match and the
+/// whole line of each line that contains `needle`. Keep one overlapping window so
+/// even a single enormous log line is searchable; for such a line, the whole line
+/// is the window read so far.
 pub fn matches(
     directory: &Path,
     streams: &[Stream],
     needle: &str,
-    mut emit: impl FnMut(Stream, usize, &str) -> bool,
+    mut emit: impl FnMut(Stream, usize, &str, &str) -> bool,
 ) -> Result<()> {
     for &stream in streams {
         let mut file = crate::redact::Reader::new(
@@ -2918,7 +2923,7 @@ pub fn matches(
                 if let Some(pos) = text.find(needle) {
                     let start = text.ceil_char_boundary(pos.saturating_sub(100));
                     let end = text.floor_char_boundary((start + 400).min(text.len()));
-                    if !emit(stream, line_number, text[start..end].trim_end()) {
+                    if !emit(stream, line_number, text[start..end].trim_end(), &text) {
                         return Ok(());
                     }
                     matched = true;

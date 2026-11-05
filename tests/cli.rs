@@ -15880,3 +15880,30 @@ fn search_treats_a_pipe_recorded_as_passing_as_a_possible_failure() {
          [2 of 26 matches shown (stdout 2 of 26); --limit 26 shows all]\n"
     );
 }
+
+#[test]
+fn search_reads_a_failure_word_anywhere_in_the_line_not_only_near_the_match() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    // A long test ID puts the searched text far from the `FAILED` that opens
+    // the line, beyond the excerpt printed around the match.
+    let id = format!("tests/test_billing.py::test_cutoff[{}]", "x".repeat(150));
+    let log = order_progress(25) + &format!("FAILED {id} order-42 cutoff\n");
+    archived_run(root, "run-Long1", 1, 1_000, [&log, ""]);
+    let output = success(root, &["search", "run-Long1", "order-42", "--limit", "2"]);
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{output}");
+    assert_eq!(lines[0], "stdout:1: order-42 progress 0", "{output}");
+    assert!(
+        lines[1].starts_with("stdout:26: ") && lines[1].ends_with(" order-42 cutoff"),
+        "{output}"
+    );
+    assert_eq!(
+        lines[2],
+        "[2 of 26 matches shown (stdout 2 of 26); --limit 26 shows all]"
+    );
+    // `history` chooses within the run the same way.
+    let output = success(root, &["history", "order-42", "--limit", "2"]);
+    assert!(output.contains(" stdout:26: "), "{output}");
+}
