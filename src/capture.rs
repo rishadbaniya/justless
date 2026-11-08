@@ -2675,11 +2675,12 @@ pub fn search(
 }
 
 /// A word that marks a matching line as a failure wherever it appears, such as
-/// `FAILED`, `TimeoutError` or `panicked`. Matching too much only changes which
-/// lines a cut keeps first.
+/// `FAILED`, `TimeoutError`, `panicked`, mocha's `2 failing`, a signal such as
+/// `Segmentation fault` or `Killed`, or TAP's `not ok`. Matching too much only
+/// changes which lines a cut keeps first.
 static FAILURE_WORD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(?:errors?|exceptions?)\b|\b(?:fail(?:s|ed|ure|ures)?|panic(?:s|ked)?|traceback|fatal)\b",
+        r"(?i)(?:errors?|exceptions?)\b|\b(?:fail(?:s|ed|ing|ure|ures)?|panic(?:s|ked)?|traceback|fatal|segfault|segmentation fault|abort(?:s|ed)?|killed|timed out|not ok)\b",
     )
     .expect("failure word pattern")
 });
@@ -3043,5 +3044,28 @@ mod tests {
             tally.every_shown().to_string(),
             "stdout 25 of 25, stderr 1 of 1"
         );
+    }
+
+    #[test]
+    fn summaries_signals_and_timeouts_count_as_failures() {
+        for text in [
+            "  2 failing",
+            "Segmentation fault (core dumped)",
+            "segfault at 0 ip 0000",
+            "Aborted (core dumped)",
+            "process killed by signal 9",
+            "Killed",
+            "request timed out after 30s",
+            "not ok 3 - settles order",
+        ] {
+            assert_eq!(kind_of(true, Stdout, text), FAILURE, "{text}");
+        }
+        for text in [
+            "fail_fast = true",
+            "killed_count = 0",
+            "nothing failing_here",
+        ] {
+            assert_eq!(kind_of(true, Stdout, text), PLAIN, "{text}");
+        }
     }
 }
