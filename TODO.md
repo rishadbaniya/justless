@@ -1,33 +1,38 @@
 # TODO
 
-Work parked on 2026-11-19 to save usage. Each item says what is wrong or missing, the evidence, the plan, how far the work got and the next step. Byte figures come from the owner's real Claude Code and Codex transcripts, measured locally (labels and sizes only). Token figures elsewhere in the project are bytes ÷ 4 estimates.
+All work was stopped on 2026-11-19 to save usage; nothing is running. Each item says what is wrong or missing, the evidence, the plan, how far the work got and the next step. Byte figures come from the owner's real Claude Code and Codex transcripts, measured locally (labels and sizes only). Token figures elsewhere in the project are bytes ÷ 4 estimates.
 
 **Progress scale:** *not started* · *designed* (approach decided, no code) · *partial* (code exists, unfinished or untested) · *built* (complete with tests, not independently reviewed) · *reviewed* (an independent reviewer tried to break it and its findings were fixed) · *on main*.
 
 ---
 
-## 1. In progress
+## 1. Stopped bug fixes (highest priority)
+
+These three were the last work running. All are on the current history, so they can be rebased onto `main` directly. None has been through the independent reviewer.
 
 ### 1.1 Changes with no line diff are missed — high
 - **Problem.** `context --changes` and `test --affected` build the change set from line hunks only. Removing a script's executable bit (Git shows `100755 → 100644`) or changing a fixture marked `-diff` in `.gitattributes` produced "No changed files"; `test --affected` ran nothing and exited 0 while full `cargo test` failed with Permission denied. A wrong "nothing to test" is worse than running everything.
 - **Plan.** Build the change set from Git's file-level listing (`git diff --raw -z` with rename detection, plus untracked files): mode changes, binary and `-diff` files, symlink and submodule changes, renames, type changes and deletions all stay in. `context --changes` says what changed ("mode 100755 → 100644", "no line diff"); `test --affected` falls back to broader testing with a stated reason whenever a changed file has no line diff. Same for `--staged` and `--base`.
 - **Where.** `src/context.rs` (change detection, around the `changes()` reader), `src/selection.rs`.
-- **Progress.** *partial*: a builder is running in workflow `wf_25a301f5-fae`, followed by an independent reviewer-fixer. No commits yet.
-- **Next.** Integrate when the workflow finishes: rebuild on `main`, run the full checks and the reviewer's repro.
+- **Branch.** `wip/no-line-diff-changes` (1 wip commit on `334db3d`, 7 files, +694 −24).
+- **Progress.** *partial, most of the way*: `src/context.rs` +345 (file-level change listing), `src/selection.rs` +61 (broader fallback with a reason), `testrun.rs`, `impact.rs`, 298 lines of tests, docs and changelog. Stopped before the builder's own checks finished; not reviewed.
+- **Next.** Compile and run the full checks; reproduce with a mode-only change and a `-diff` fixture (both must no longer exit 0 with nothing run); review; integrate.
 
 ### 1.2 Editing one Markdown section can delete the next — high
 - **Problem.** A level-1 heading written as a setext heading (`Usage` underlined with `=====`) is not recognized. With `# Install` before it, the outline listed only Install, `expand` of Install included all of Usage, and replacing Install deleted both (the dry run showed it). This destroys user text.
 - **Plan.** One shared CommonMark heading scanner used everywhere Markdown is split (outline/expand/edit in `src/source.rs`, the index's Markdown sections, `lookup` chunks, `pack`): `=`/`-` underlines under a paragraph line, `---` after a blank line as a thematic break, front matter skipped, ATX headings with 1–6 `#`, optional closing `#`s, up to 3 spaces of indent and a required space, nothing inside fenced, indented or HTML blocks. A test edits each section of a mixed document and checks every other byte is unchanged.
 - **Where.** `src/source.rs` (around line 324), `src/lookup/chunks.rs`, the index.
-- **Progress.** *partial*: builder running in the same workflow, then a reviewer-fixer.
-- **Next.** Integrate with 1.1.
+- **Branch.** `worktree-wf_25a301f5-fae-2` (commit `e9e8d7c fix(source): end Markdown sections at setext headings` + 1 wip, 8 files, +1,106 −100).
+- **Progress.** *partial, close to built*: the core fix is committed; the wip holds follow-ups. Not reviewed.
+- **Next.** Finish the wip, run the byte-preservation test over every section of a mixed ATX/setext document, review, integrate.
 
 ### 1.3 Savings ignore bytes replayed later — medium
 - **Problem.** A command printed 19,000 bytes; Justless showed 364 and reported 18,636 saved. After `justless log` returned all 19,000 bytes, the full-read counter went from 0 to 1 but savings stayed at 18,636, though across both responses Justless sent 364 bytes more than the plain command.
 - **Plan.** Record the bytes each later retrieval returns (`log`, `search`, `context --run`, MCP log tools, `lookup --logs`) and report initial savings and net savings after replays side by side in `stats`, `stats --json` and the status line; apply the same to the proxy's retire-and-recall numbers.
 - **Where.** `src/history.rs` (around line 390), `recalls.json` per run, `src/statusline.rs`.
-- **Progress.** *partial*: builder running in the same workflow.
-- **Next.** Integrate with 1.1.
+- **Branch.** `worktree-wf_25a301f5-fae-3` (1 commit `dfd096e fix(stats): report savings net of later replays and recalls`, 14 files, +1,103 −160).
+- **Progress.** *built*: complete commit with tests; not reviewed.
+- **Next.** Review (old `recalls.json` records, MCP and `lookup --logs` replays, status line wording), then integrate.
 
 ---
 
