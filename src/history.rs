@@ -708,7 +708,7 @@ fn search_runs(
             found.len()
         )
     };
-    // The output with one form of the notice, and how many matches it shows.
+    // The output with one form of the notice, and the matches it shows.
     let attempt = |form: usize| {
         // Room for the notice, set aside once matches are left out. Every
         // number in it is at most the one in this form.
@@ -749,16 +749,30 @@ fn search_runs(
             if tally.shown() < total {
                 output.push_str(&notice(form, &tally, listed.len(), budget));
             }
-            return (output, shown);
+            return (output, tally);
         }
     };
-    let mut form = 0;
-    let output = loop {
-        let (output, shown) = attempt(form);
-        if shown > 0 || form == 2 {
-            break output;
-        }
-        form += 1;
+    // The fullest notice that leaves room for matches of as many streams as
+    // any form does, so a larger budget never shows fewer streams. With no
+    // room for any match, the shortest.
+    let covered = |tally: &capture::Tally| {
+        [Stream::Stdout, Stream::Stderr]
+            .into_iter()
+            .filter(|&stream| tally.of(stream).0 > 0)
+            .count()
+    };
+    let mut attempts = (0..3).map(attempt).collect::<Vec<_>>();
+    let most = attempts
+        .iter()
+        .map(|(_, tally)| covered(tally))
+        .max()
+        .unwrap_or_default();
+    let output = match attempts
+        .iter()
+        .position(|(_, tally)| most > 0 && covered(tally) == most)
+    {
+        Some(form) => attempts.swap_remove(form).0,
+        None => attempts.pop().unwrap_or_default().0,
     };
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())

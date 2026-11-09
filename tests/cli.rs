@@ -15985,3 +15985,27 @@ fn lookup_logs_keep_both_streams_when_the_budget_fits_two_windows() {
     }
     assert!(two > 0);
 }
+
+#[test]
+fn history_never_drops_a_stream_as_its_budget_grows() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    archived_run(root, "run-A1", 1, 1_000, ["", "order-42 panicked\n"]);
+    archived_run(root, "run-B2", 0, 2_000, [&order_progress(30), ""]);
+    let failure = " run-A1 other stderr:1: order-42 panicked\n";
+    let mut since = None;
+    for budget in (128..420).step_by(3) {
+        let output = success(
+            root,
+            &["history", "order-42", "--budget", &budget.to_string()],
+        );
+        assert!(output.len() <= budget, "{budget}: {output}");
+        if output.contains(failure) {
+            since.get_or_insert(budget);
+        } else if let Some(since) = since {
+            panic!("shown at a budget of {since}, missing at {budget}: {output}");
+        }
+    }
+    assert!(since.is_some());
+}
