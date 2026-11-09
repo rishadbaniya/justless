@@ -1,56 +1,160 @@
 # TODO
 
-Work parked on 2026-11-19 to save usage. Items are ranked within each section. Byte figures come from the owner's real Claude Code and Codex transcripts (measured locally, labels and sizes only).
+Work parked on 2026-11-19 to save usage. Each item says what is wrong or missing, the evidence, the plan, how far the work got and the next step. Byte figures come from the owner's real Claude Code and Codex transcripts, measured locally (labels and sizes only). Token figures elsewhere in the project are bytes ÷ 4 estimates.
 
-## In progress
+**Progress scale:** *not started* · *designed* (approach decided, no code) · *partial* (code exists, unfinished or untested) · *built* (complete with tests, not independently reviewed) · *reviewed* (an independent reviewer tried to break it and its findings were fixed) · *on main*.
 
-- Fix three reported problems (one workflow, still running): `context --changes` and `test --affected` miss changes that have no line diff (executable bit, `-diff` files), Markdown sections with `=====`/`-----` underlined headings (an edit of one section deleted the next), and savings that ignore bytes later replayed with `log` (report initial and net savings).
+---
 
-## Parked work on local branches
+## 1. In progress
 
-Unreviewed. Each was stopped mid-build; the last commit on each is a `wip:` snapshot. The first three sit on the pre-redate history (old `53a53ff`), so cherry-pick their own commits onto `main` rather than merging.
+### 1.1 Changes with no line diff are missed — high
+- **Problem.** `context --changes` and `test --affected` build the change set from line hunks only. Removing a script's executable bit (Git shows `100755 → 100644`) or changing a fixture marked `-diff` in `.gitattributes` produced "No changed files"; `test --affected` ran nothing and exited 0 while full `cargo test` failed with Permission denied. A wrong "nothing to test" is worse than running everything.
+- **Plan.** Build the change set from Git's file-level listing (`git diff --raw -z` with rename detection, plus untracked files): mode changes, binary and `-diff` files, symlink and submodule changes, renames, type changes and deletions all stay in. `context --changes` says what changed ("mode 100755 → 100644", "no line diff"); `test --affected` falls back to broader testing with a stated reason whenever a changed file has no line diff. Same for `--staged` and `--base`.
+- **Where.** `src/context.rs` (change detection, around the `changes()` reader), `src/selection.rs`.
+- **Progress.** *partial*: a builder is running in workflow `wf_25a301f5-fae`, followed by an independent reviewer-fixer. No commits yet.
+- **Next.** Integrate when the workflow finishes: rebuild on `main`, run the full checks and the reviewer's repro.
 
-| Branch | What it was building |
-| --- | --- |
-| `worktree-wf_7175cb10-fff-1` | Route and outline shell range reads: `sed -n 'A,Bp' f`, `nl -ba f \| sed -n`, `head`/`tail`/`awk` ranges, `cat f [\| head]`, `git show REV:path`. Small reads byte-exact, wide reads outlined with a one-command exact escape. Measured untouched: 20.8 MB of 93.6 MB Claude Code tool output (`sed -n` alone 11.6 MB), plus ~80 MB in older Codex sessions. |
-| `worktree-wf_7175cb10-fff-2` | Outline wide ranged `Read` calls (offset/limit) in the Claude Code post-read hook, with an exact path that cannot loop. Measured untouched: 1,234 reads, 8.5 MB. Has one real commit before the wip. |
-| `worktree-wf_7175cb10-fff-3` | Parse check after edits: reject a `justless edit` that leaves the file unparseable (`--allow-parse-errors` to force), and a PostToolUse note when Claude Code's own Edit/Write introduces a parse error. |
-| `worktree-wf_c5c37048-0d9-1` | `justless find --path/--glob`, a `--after CURSOR` next page when `--limit`/`--budget` cuts results, and one instruction line saying which search to use (`find` literals, `query` symbols and callers, `lookup` questions, `rg` regexes). |
-| `fix/resume-whole-file-reads` | `resume` and the compaction handoff record whole-file `read`s and outlines, not only `expand`. One commit on the current history. |
+### 1.2 Editing one Markdown section can delete the next — high
+- **Problem.** A level-1 heading written as a setext heading (`Usage` underlined with `=====`) is not recognized. With `# Install` before it, the outline listed only Install, `expand` of Install included all of Usage, and replacing Install deleted both (the dry run showed it). This destroys user text.
+- **Plan.** One shared CommonMark heading scanner used everywhere Markdown is split (outline/expand/edit in `src/source.rs`, the index's Markdown sections, `lookup` chunks, `pack`): `=`/`-` underlines under a paragraph line, `---` after a blank line as a thematic break, front matter skipped, ATX headings with 1–6 `#`, optional closing `#`s, up to 3 spaces of indent and a required space, nothing inside fenced, indented or HTML blocks. A test edits each section of a mixed document and checks every other byte is unchanged.
+- **Where.** `src/source.rs` (around line 324), `src/lookup/chunks.rs`, the index.
+- **Progress.** *partial*: builder running in the same workflow, then a reviewer-fixer.
+- **Next.** Integrate with 1.1.
 
-## Next features
+### 1.3 Savings ignore bytes replayed later — medium
+- **Problem.** A command printed 19,000 bytes; Justless showed 364 and reported 18,636 saved. After `justless log` returned all 19,000 bytes, the full-read counter went from 0 to 1 but savings stayed at 18,636, though across both responses Justless sent 364 bytes more than the plain command.
+- **Plan.** Record the bytes each later retrieval returns (`log`, `search`, `context --run`, MCP log tools, `lookup --logs`) and report initial savings and net savings after replays side by side in `stats`, `stats --json` and the status line; apply the same to the proxy's retire-and-recall numbers.
+- **Where.** `src/history.rs` (around line 390), `recalls.json` per run, `src/statusline.rs`.
+- **Progress.** *partial*: builder running in the same workflow.
+- **Next.** Integrate with 1.1.
 
-1. **Changed since the last read.** `context` and `pack` remember the revision of each symbol shown in this session; the next read of a changed symbol shows the changed lines with context and an expand command; after compaction or a new session, full context again. A reviewer re-inspecting a test after a one-line change got 2,342 bytes for 46 lines. Judge it by total input tokens and task success over whole tasks.
-2. **`justless test --compare REF`.** Run tests at the merge base and in the working tree; group failures as newly failing, already failing (same test and assertion) and fixed. Start with Cargo; rerun only the failing test IDs against the base.
-3. **Codex code mode.** Check whether the Codex hook fires for commands inside code-mode `exec` (our matcher is `^Bash$`). 68% of the owner's Codex output since late August ran in code mode, and Codex is `init`'s default client. Then a Codex PostToolUse compactor for piped `rg` and failing output.
-4. **Permission parity.** Claude Code checks allow rules against the rewritten `justless run …`, so rules such as `Bash(cargo test:*)` may stop matching and prompt more. Test once by hand, then honor or document.
-5. **Generic compaction floor** for unknown commands: collapse `\r` progress frames, elide long base64, fold repeated lines.
-6. **`init --global`**: user-level hooks that find the project root per call, with a per-project opt-out. 12.5 MB was lost in sessions whose project had no hooks.
-7. **Hook kill switches**: `exclude_commands` in `.justless.toml`, an environment variable to disable routing, and `justless rewrite "<cmd>"` to show what a hook would do.
+---
 
-## Later
+## 2. Parked work on local branches
 
-- OpenCode: route commands with `tool.execute.before`, compact with `tool.execute.after`.
-- Command parity with RTK: `terraform`/`tofu plan`, `gh pr/run view`, `docker compose logs`, Maven/Gradle, `dotnet test`, `swift test`, `rspec`, `phpunit` grouped failures.
-- Post-run compaction for Copilot CLI and Gemini CLI; read Codex rollouts in `discover`, `learn` and `stats`.
-- Vue, Svelte and Astro components in the index; shebang detection for extensionless scripts.
-- Outlines for large reads outside the workspace; compaction and recall IDs for large MCP and WebFetch results.
-- Richer `[[filters]]` (keep, max_lines, replace) and user-global filters.
-- Structural search, graph analytics (dead code, cycles), more languages (Elixir, Objective-C, PowerShell, Julia, Groovy).
+Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot that may not compile. None has been reviewed. The first three branches sit on the pre-redate history (old `53a53ff`, identical in content to current `main` before `0d190cf`), so cherry-pick their commits onto `main` rather than merging. Their measured targets and acceptance rules are in the workflow brief `justless-reads-and-edit-check` (session scripts).
 
-## Known limits from reviews
+### 2.1 Shell range reads — biggest measured token win
+- **Branch.** `worktree-wf_7175cb10-fff-1` (1 wip commit, 11 files, +1,534 −15).
+- **Problem.** Agents read files through the shell, and hooks pass these through by design. Untouched in Claude Code (Nov 7–18): 4,079 reads, **20.8 MB of 93.6 MB** tool output. `sed -n` ranges alone were 1,754 results / 11.6 MB (ranges over 150 lines: 384 results / 3.9 MB); piped `cat FILE | …` 241 / 2.2 MB; `git show REV:path` 341 / 2.6 MB. In older Codex sessions: `sed -n` 48 MB, `nl -ba | sed -n` 25 MB, `tail FILE` 7 MB, `awk` 3 MB.
+- **Plan.** Recognize single-file read shapes inside the workspace (`sed -n 'A,Bp'`, `nl -ba | sed -n`, `head`/`tail -n`, `awk 'NR>=A && NR<=B'`, `cat FILE [| head|tail|sed -n]`, `git show REV:path`, with `cd DIR &&`). Small reads return exactly what the original prints and are recorded for `resume`; wide reads in a supported language return an outline of that range plus a one-command exact escape (`expand`/`code`) that is never compacted again. Errors such as a missing file surface exactly as before. Rewrite in PreToolUse for all clients, so Codex benefits.
+- **Progress.** *partial, about half*: a new `src/shellread.rs` (1,149 lines) with the shape parser and output, wiring in `agents.rs`, `postroute.rs`, `history.rs`, `source.rs`, `statusline.rs`, `discover.rs`, and 237 lines of tests. Not yet compiled clean, measured against the transcripts, checked with the real Claude Code binary, or reviewed.
+- **Next.** Finish and compile; byte-exactness tests (trailing newline, CRLF, ranges past EOF, `tail -n +N`, nl formatting); transcript replay for before/after bytes; adversarial review.
 
-- `test --affected`: a quiet doctest step is trusted when any doctest ran; MCP tools cannot pass `--base`; several shapes (generic or trait-impl methods, inline-module docs) fall back to the full suite.
-- `affected --changes` after a deletion: unlinked paths into external crates other than std/core/alloc show as possible; callers of a `macro_rules!` that names the deleted symbol are not seeded.
-- `history TEXT` ranks newest runs first, so an older run's failure line can sit behind newer matches (it is counted in the notice). The MCP search tools cap `limit` at 1000 while the notice can suggest more.
+### 2.2 Outline wide ranged `Read` calls
+- **Branch.** `worktree-wf_7175cb10-fff-2` (1 real commit + 1 wip, 6 files, +656 −9).
+- **Problem.** The Claude Code post-read hook returns early whenever `offset`, `limit` or `pages` is set, so 1,234 ranged workspace Reads (8.5 MB) were never outlined; windows of 151–300 lines were 211 reads / 2.1 MB and windows over 300 lines 186 reads / 4.0 MB. The current outline hint tells agents to use Read with offset/limit, so a naive change would loop.
+- **Plan.** Above a line/byte threshold and in a supported language, replace a ranged Read with an outline of that window plus an exact path that cannot be outlined again (a smaller window, or `expand`/`code`). Keep `allow_large`, small windows, PDFs, images and files outside the workspace untouched. Validate the replacement and read-before-edit with the real Claude Code binary.
+- **Progress.** *partial, most of the way*: commit `a9ae072 feat(hooks): outline wide ranged Claude Code Reads` (agents.rs +132, source.rs +86, 428 lines of tests, a benchmarks note), plus uncommitted follow-ups in the wip. Not reviewed or probed against the real binary.
+- **Next.** Finish the wip, run the real-binary probe (`scratchpad/probe/cc_probe.py` pattern), review.
+
+### 2.3 Parse check after edits
+- **Branch.** `worktree-wf_7175cb10-fff-3` (1 wip commit, 10 files, +1,211 −22).
+- **Problem.** `justless edit` writes a replacement that leaves the file unparseable (reproduced with Rust `pub fn a() -> u32 {\n 1 +\n`), prints success and exits 0; the next outline silently loses functions. Python edits that leave a bracket open do the same. Claude Code's own Edit/Write get no syntax feedback without an LSP plugin.
+- **Plan.** Parse before and after each `justless edit` batch (syn for Rust, Tree-sitter ERROR/MISSING nodes elsewhere); reject a batch that introduces a parse error, leaving the file unchanged, with line/column and context, unless `--allow-parse-errors`. Files already broken are not blocked. A PostToolUse hook for Claude Code Edit/MultiEdit/Write adds a one-line note only when the edit introduced a parse error.
+- **Progress.** *partial, past half*: new `src/syntax_check.rs` (594 lines), `source.rs` +156, `rust_syntax.rs` +33, the Claude Code hook in `agents.rs` +66, 337 lines of CLI tests and progressive-test updates. Not compiled clean, probed or reviewed.
+- **Next.** Finish; test for false rejections across all 21 languages (macros, decorators, templates); measure parse cost on large files; review.
+
+### 2.4 `find` scoping, paging and search guidance
+- **Branch.** `worktree-wf_c5c37048-0d9-1` (1 wip commit, tests only: `tests/cli.rs` +487, `tests/mcp.rs` +91).
+- **Problem.** Reviewers asked for `--path`/`--glob` on `find`; with 60 matching files and `--budget 512` only five matches appeared, and raising `--limit` changed nothing, with no way to get the next page. The installed instructions do not say which search to use.
+- **Plan.** `--path` and `--glob` (rg -g semantics, `!` negation) on CLI and MCP; an empty scope says so; a cut notice naming which limit bound ("budget reached after 5 of 60 files") and a ready `--after CURSOR` next-page command, also in JSON and MCP; one compact instruction line: `find` for literals, `query` for symbols and callers, `lookup` for questions, `rg` for regular expressions.
+- **Progress.** *partial, tests first*: the failing tests are written; no implementation yet.
+- **Next.** Implement against those tests; measure the instruction block (now about 882 bytes, budget +120).
+
+### 2.5 `resume` misses whole-file reads
+- **Branch.** `fix/resume-whole-file-reads` (1 commit `5faf9dd`, on the current history, 6 files, +298 −21).
+- **Problem.** `justless read worker.py` printed the whole small file, but `resume` reported no activity, even after the file changed; `expand` on the same file was recorded.
+- **Plan.** Every path that shows source records the inspected range the way `expand` does: `read` verbatim files, outlines, `code`, `context --at`, `pack` excerpts and the Read hook's pass-through.
+- **Progress.** *built*: complete with tests; the reviewer-fixer never ran.
+- **Next.** Review (double counting, changed-file notices, bounded activity) and integrate. Coordinate with 2.1, which records shell reads through the same function.
+
+---
+
+## 3. Next features (not started unless noted)
+
+### 3.1 Show what changed since the agent last read a symbol — top token idea from a reviewer
+- **Problem.** The read → edit → test → inspect loop resends whole functions. A reviewer inspected a real test with `context --symbol`, changed one line, inspected again, and got 2,342 bytes for 46 lines.
+- **Plan.** `context` and `pack` remember the revision of each symbol actually shown in the current session; the next read of a changed symbol shows the changed lines with surrounding context and a command to expand the whole function; after compaction or in a new session, full context again.
+- **Progress.** *not started*. The pieces exist: revision-bound outlines, the session ID on hook runs, and the activity file that 2.5 extends.
+- **Measure.** Total input tokens and task success over complete tasks, not bytes per call (use the benchmark in 5.1).
+
+### 3.2 `justless test --compare REF` — top debugging idea from a reviewer
+- **Problem.** An agent cannot tell which failures its change introduced and which already failed on the base branch.
+- **Plan.** Run the tests at the merge base and in the working tree; group failures as newly failing, already failing (same test and same assertion) and fixed. Start with Cargo; rerun only the failing test IDs against the base, in a temporary worktree.
+- **Progress.** *designed*. Builds on `test --affected --base` (on main) and the grouped test summaries.
+
+### 3.3 Codex code mode
+- **Problem.** Since late August, 68% of the owner's Codex output (503 MB of 734 MB overall) ran inside code-mode `exec`, and the Codex hook matches only `^Bash$`. If nested calls bypass the hook, Justless does nothing for current Codex sessions. Codex is `init`'s default client.
+- **Evidence so far.** Codex's hooks docs say hook decisions apply to tools called from code mode, but that is untested here.
+- **Plan.** Verify with one real Codex session; then route or post-compact nested commands; then a Codex PostToolUse compactor (`decision: "block"` with the compact text) for piped `rg` and failing output, which a replay put at 15.3 MB → 1.2 MB in older sessions.
+- **Progress.** *not started* (research done).
+
+### 3.4 Permission parity for rewritten commands
+- **Problem.** Claude Code checks permission rules against the rewritten `justless run --hook -- …`, so allow rules such as `Bash(cargo test:*)` may stop matching and users get extra prompts; deny rules may also stop matching. Likely adoption friction.
+- **Plan.** Test once in a live session; then either evaluate the user's allow/ask/deny rules against the original command in the hook (as RTK does) or document the `Bash(justless:*)` rule clearly.
+- **Progress.** *not started*.
+
+### 3.5 Generic compaction floor
+- **Problem.** Ad-hoc scripts are the largest untouched family by count; unknown commands get only a head/tail preview.
+- **Plan.** In every preview, collapse `\r` progress frames, elide long base64 runs and fold repeated lines; let the post-run hook apply this floor to unknown commands above a high threshold.
+- **Progress.** *not started*.
+
+### 3.6 `init --global`
+- **Problem.** Hooks are per project; 12.5 MB was lost in sessions whose project had no hooks. RTK offers `init -g` for 13 agents.
+- **Plan.** Opt-in user-level hooks that resolve the project root per call, with a per-project opt-out, and `doctor`/`init --remove` support.
+- **Progress.** *not started*.
+
+### 3.7 Hook kill switches and diagnostics
+- **Plan.** `exclude_commands` (prefix or regex) in `.justless.toml`, an environment variable that disables routing, and `justless rewrite "<cmd>"` that prints what a hook would do.
+- **Progress.** *not started*.
+
+---
+
+## 4. Later
+
+| Item | Why | Progress |
+| --- | --- | --- |
+| OpenCode routing via `tool.execute.before/after` | OpenCode is advertised, but on current Claude models its integration does almost nothing | not started |
+| Command parity: `terraform`/`tofu plan`, `gh pr/run view`, `docker compose logs`, Maven/Gradle, `dotnet test`, `swift test`, `rspec`, `phpunit` | users compare on coverage (RTK lists 100+ commands); few bytes locally | not started |
+| Post-run compaction for Copilot CLI and Gemini CLI | their hooks rewrite only lists of supported commands, so pipes arrive raw | not started |
+| Codex rollouts in `discover`, `learn`, `stats` | cannot see what Justless misses in Codex | not started |
+| Vue, Svelte, Astro components; shebang detection | most of that code is invisible to the index | not started |
+| Outlines for large reads outside the workspace; compaction for large MCP and WebFetch results | bypass Justless today; MCP bytes unmeasured locally | not started |
+| Richer `[[filters]]` and user-global filters | in-house tools need compaction without code changes | not started |
+| Structural search, graph analytics (dead code, cycles), more languages (Elixir, Objective-C, PowerShell, Julia, Groovy) | parity with graphify and code-graph MCPs | not started |
+| Read deduplication | demoted: redundant re-reads were only 1.2% of read bytes here | not started |
+
+---
+
+## 5. Benchmark, docs and release
+
+### 5.1 Paid benchmark pilot
+- **Goal.** A defensible end-to-end number: cost per successful task, justless vs plain Claude Code vs Anthropic's server-side context editing, at equal or better success.
+- **Progress.** The four-arm harness is *on main* (`scripts/agent_bench`, 118 tests): Claude Code 2.1.327 parity (65 of 68 tool results byte-identical), 32 frozen tasks from the owner's repos, sandboxed runs, a $90 hard cap enforced per request, pre-registered analysis. Offline validation passed (dry runs with 0 mismatches). The task store (about 60 GB) is in the session scratchpad. Spent so far on paid runs: about $1.10 (the earlier repair benchmark).
+- **Next.** Move the store to a durable private directory; redo `run.py cc-capture` and `parity-diff` with the current binary (hooks changed since the capture); re-run `prepare --generate` for the one lint task that exposes a source file; `validate-tasks`; `review-tasks --approve`; then the pilot (estimate $2.53, cap $3). Scale up only if the pilot is sane.
+
+### 5.2 README
+- **Problem.** The README does not mention `lookup`, `exec`, `learn`, secret redaction, `test --affected`, `doctor`, `init --remove` or the status line, and its numbers predate them.
+- **Progress.** *not started*.
+
+### 5.3 First release
+- **Problem.** No tagged release, so every install compiles from source and needs Rust.
+- **Progress.** `release.yml` and the checksum-verified installer are *on main*; no tag yet. Tag `v0.1.0` after the in-progress fixes land.
+
+---
+
+## 6. Known limits found in reviews (on main, documented, low severity)
+
+- `test --affected`: a quiet (`-q`) doctest step is trusted when any doctest ran; MCP tools cannot pass `--base`; generic or trait-impl methods, inline-module docs and some other shapes fall back to the full suite (safe, slower).
+- `affected --changes` after a deletion: unlinked paths into external crates other than std/core/alloc are reported as possible; callers of a `macro_rules!` that names the deleted symbol are not followed.
+- `history TEXT` ranks newest runs first, so an older failed run's line can sit behind newer matches (it is counted in the cut notice). MCP search tools cap `limit` at 1000 while the notice can suggest more.
 - `--root` given both before and after the subcommand silently uses the second.
+- Routed searches with ` && test 1`: Claude Code's UI label reads "Condition is false" instead of "No matches found" (the model never sees it); a routed search moved to the background still reads exit 1 as failed.
 
-## Benchmark and release
+---
 
-- Run the paid pilot (estimate $2.53, hard cap $3): redo `run.py cc-capture` and `parity-diff` with the current binary, `prepare --generate`, `validate-tasks`, `review-tasks --approve`, then `pilot`. The task store lives in the session scratchpad (about 60 GB) and should move to a durable private directory first. See docs/benchmarks.md.
-- README does not yet mention `lookup`, `exec`, `learn`, redaction, `test --affected`, `doctor` or the status line.
-- Tag `v0.1.0` so installs use prebuilt binaries.
+## 7. Do not build
 
-## Do not build
-
-LLM summarization or retrieval, telemetry, client-side rewriting of earlier requests (it invalidates thinking on current Claude models), networked graph databases, bundled embedding models, and fetching filters from the network. Each breaks the local, deterministic, zero-network promise.
+LLM summarization or retrieval, telemetry, client-side rewriting of earlier requests (it invalidates thinking on current Claude models; the opt-in proxy uses server-side context editing instead), networked graph databases, bundled embedding models, and fetching filters from the network. Each breaks the local, deterministic, zero-network promise in the README.
