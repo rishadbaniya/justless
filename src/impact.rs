@@ -962,11 +962,7 @@ fn mentions(workspace: &Workspace, index: &Index, name: &str) -> Mentions {
 /// Symbols touched by the current changes: the innermost definition around each
 /// changed range, and any definition whose declaration line changed.
 fn changed(workspace: &Workspace, index: &Index, since: &Since) -> Result<(Seeds, Section)> {
-    Ok(seeded(
-        workspace,
-        index,
-        &changes(workspace, index, since)?,
-    ))
+    Ok(seeded(workspace, index, &changes(workspace, index, since)?))
 }
 
 /// [`changed`] over a change set the caller already collected.

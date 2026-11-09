@@ -682,13 +682,11 @@ fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<Strin
                 "stderr": stream(Stream::Stderr),
             });
         }
-        value["next"] = json!(
-            ranking
-                .hits
-                .first()
-                .filter(|_| kept > 0)
-                .map(|hit| next(hit, budget, &ranking.justless))
-        );
+        value["next"] = json!(ranking.hits.first().filter(|_| kept > 0).map(|hit| next(
+            hit,
+            budget,
+            &ranking.justless
+        )));
         value["results"] = json!([]);
         value.to_string()
     };
