@@ -106,12 +106,21 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Plan.** In every preview, collapse `\r` progress frames, elide long base64 runs and fold repeated lines; let the post-run hook apply this floor to unknown commands above a high threshold.
 - **Progress.** *not started*.
 
-### 3.6 `init --global`
+### 3.6 Lossless compaction for JSON and JSONL output — next new token-saving feature after 2.1
+- **Problem.** JSON arrays and JSONL records pay tokens for the same keys on every row, even when every value differs. §3.5 does not cover this.
+- **Evidence (external reviewer).** 38 real Cargo targets from `utils` (fields package, kind, name), o200k_base tokenizer, replay pointer included in each: compact JSON 627 tokens, column names printed once 360 (−43%), grouped by package and kind 245 (−61%). All 38 records were rebuilt in order from the grouped output.
+- **Plan.** Detect JSON arrays of objects and JSONL streams with shared fields; build a table view (column names once, constant columns lifted to one line) and optionally a grouped view, before clipping; emit it only when it is smaller than the original, otherwise keep the original. Apply only when the output reaches the agent directly: pipes and redirects stay untouched (a documented exception to "machine formats pass through"). Footer with the run ID; `justless log` returns the original bytes.
+- **Lossless rules.** Before emitting, decode the view and check it equals the parsed original; on any mismatch show the original. Keep `null` and a missing field distinct, `"1"` and `1` distinct, key order, nested values (as inline compact JSON) and escapes. Irregular or deeply nested data stays as is.
+- **Open questions.** Justless has no tokenizer (zero dependencies), so "fewer tokens" means fewer bytes unless one is bundled. Grouping saves more but is harder for a model to read when it must count, filter or quote one record: make the table form the default and enable grouping only if the benchmark (5.1) shows answers stay correct.
+- **Measure.** Bytes on real sessions' JSON outputs (`gh api`, `kubectl -o json`, `cargo metadata`, `npm ls --json`, cloud CLIs), then task success, before building more command-specific formatters.
+- **Progress.** *designed*.
+
+### 3.7 `init --global`
 - **Problem.** Hooks are per project; 12.5 MB was lost in sessions whose project had no hooks. RTK offers `init -g` for 13 agents.
 - **Plan.** Opt-in user-level hooks that resolve the project root per call, with a per-project opt-out, and `doctor`/`init --remove` support.
 - **Progress.** *not started*.
 
-### 3.7 Hook kill switches and diagnostics
+### 3.8 Hook kill switches and diagnostics
 - **Plan.** `exclude_commands` (prefix or regex) in `.justless.toml`, an environment variable that disables routing, and `justless rewrite "<cmd>"` that prints what a hook would do.
 - **Progress.** *not started*.
 
