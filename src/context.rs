@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
@@ -419,7 +418,7 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
             report.line(format!(
                 "  +{} more log line(s) at this location. {justless} search {id} {}",
                 diagnostics.len() - shown,
-                crate::workspace::shell_quote(Path::new(&location.file))
+                crate::workspace::shell_text(&location.file)
             ));
         }
         if let Some(digest) = run.source_digests.get(&location.file)

@@ -16009,3 +16009,33 @@ fn history_never_drops_a_stream_as_its_budget_grows() {
     }
     assert!(since.is_some());
 }
+
+#[test]
+fn lookup_next_command_opens_a_file_whose_name_starts_with_a_dash() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(
+        root.join("-release.md"),
+        "# Release\nThe release_window is Friday.\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    let output = cli(root, &["lookup", "release_window"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let next = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Next: "))
+        .unwrap_or_else(|| panic!("no Next line: {text}"));
+    assert!(next.contains("./-release.md"), "{next}");
+    let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let shell = Command::new("sh")
+        .args(["-c", next])
+        .current_dir(root)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(shell.status.success(), "{next}: {}", stderr(&shell));
+    assert!(stdout(&shell).contains("release_window is Friday"));
+}

@@ -413,7 +413,7 @@ fn hit(
 }
 
 fn quoted(file: &str) -> String {
-    shlex::try_quote(file).map_or_else(|_| file.to_owned(), |quoted| quoted.into_owned())
+    crate::workspace::shell_path(file)
 }
 
 /// The command that opens the top result: its exact bytes when the whole

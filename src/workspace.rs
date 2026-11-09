@@ -79,6 +79,28 @@ pub fn shell_quote(path: &Path) -> String {
     shlex::try_quote(&text).map_or_else(|_| text.to_string(), |quoted| quoted.into_owned())
 }
 
+/// A relative file path as a printed command's argument: quoted for a POSIX
+/// shell, and starting with `./` when it would otherwise start with `-`, so the
+/// command reads it as a path rather than an option (`-release.md`).
+pub fn shell_path(file: &str) -> String {
+    if file.starts_with('-') {
+        shell_quote(Path::new(&format!("./{file}")))
+    } else {
+        shell_quote(Path::new(file))
+    }
+}
+
+/// Text as a printed command's last positional argument: quoted, and after
+/// `--` when it starts with `-`, so the command reads it as text, not an option.
+pub fn shell_text(text: &str) -> String {
+    let quoted = shell_quote(Path::new(text));
+    if text.starts_with('-') {
+        format!("-- {quoted}")
+    } else {
+        quoted
+    }
+}
+
 pub(crate) const PROJECT_MARKERS: &[&str] = &[
     ".justless.toml",
     "Cargo.toml",
@@ -461,6 +483,16 @@ pub fn lock_state(path: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printed_arguments_never_read_as_options() {
+        assert_eq!(shell_path("-release.md"), "./-release.md");
+        assert_eq!(shell_path("docs/-v.md"), "docs/-v.md");
+        assert_eq!(shell_path("my notes.md"), "'my notes.md'");
+        assert_eq!(shell_path("-a b.md"), "'./-a b.md'");
+        assert_eq!(shell_text("-release.md"), "-- -release.md");
+        assert_eq!(shell_text("src/a.rs"), "src/a.rs");
+    }
 
     fn workspace(root: &Path, origin: &Path) -> Workspace {
         Workspace {

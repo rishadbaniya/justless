@@ -45,6 +45,7 @@ User-visible changes to Justless are recorded here. No release has been publishe
 
 ### Reads and edits
 
+- Commands Justless prints for the agent to run next name a file that starts with `-` as `./-name.md`, and put search text that starts with `-` after `--`, so they no longer fail as unknown options.
 - `read FILE --outline` returns a revision and numbered signatures with line ranges. `expand` returns the exact bytes of a symbol, Markdown section or line range.
 - `edit` replaces or inserts at a symbol or line range only when the file still matches the revision the agent read. A batch of same-file edits is checked as a whole, and a stale, ambiguous or overlapping edit rejects the batch. `--dry-run` shows a diff.
 - Without `--root`, `read`, `expand` and `edit` resolve a relative path from the current directory, falling back to the project root. `edit` refuses files the user cannot write and keeps hard links and extended attributes.
