@@ -127,7 +127,10 @@ impl<'a> Selection<'a> {
     /// Prints the selected part of `text`: every byte, the exact bytes of a line
     /// range, or numbered matching lines for `--grep`.
     fn print(&self, text: &[u8]) -> Result<()> {
-        let mut out = io::stdout().lock();
+        self.write(&mut io::stdout().lock(), text)
+    }
+
+    fn write(&self, out: &mut impl Write, text: &[u8]) -> Result<()> {
         if self.whole() {
             return Ok(out.write_all(text)?);
         }
@@ -143,24 +146,32 @@ impl<'a> Selection<'a> {
             }
             return Ok(());
         };
+        // Every match is counted, so a last line can say what the limit left out.
         let mut shown = 0;
+        let mut found = 0;
         for (number, line) in lines {
             let line = String::from_utf8_lossy(line);
             let line = line.trim_end_matches(['\r', '\n']);
             let Some(at) = line.find(needle) else {
                 continue;
             };
+            found += 1;
+            if shown == self.limit {
+                continue;
+            }
             // Long lines are cut around the match, as `justless search` does.
             let start = line.floor_char_boundary(at.saturating_sub(100));
             let end = line.floor_char_boundary((start + 400).min(line.len()));
             writeln!(out, "{number}: {}", &line[start..end])?;
             shown += 1;
-            if shown == self.limit {
-                break;
-            }
         }
-        if shown == 0 {
+        if found == 0 {
             writeln!(out, "No line matches {needle:?}.")?;
+        } else if shown < found {
+            writeln!(
+                out,
+                "[{shown} of {found} matching lines shown; --limit {found} shows all]"
+            )?;
         }
         Ok(())
     }
@@ -914,5 +925,32 @@ mod tests {
         for bad in ["", "../x", "a/b", "a b", &"x".repeat(201)] {
             assert!(!valid_tool_use_id(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn grep_counts_the_matching_lines_its_limit_leaves_out() {
+        let text = (1..=30)
+            .map(|i| format!("order-42 progress {i}\n"))
+            .collect::<String>()
+            + "order-42 FAILED\n";
+        let grep = |limit: usize| {
+            let selection = Selection {
+                from: 1,
+                to: usize::MAX,
+                grep: Some("order-42"),
+                limit,
+            };
+            let mut out = Vec::new();
+            selection.write(&mut out, text.as_bytes()).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            grep(2),
+            "1: order-42 progress 1\n2: order-42 progress 2\n\
+             [2 of 31 matching lines shown; --limit 31 shows all]\n"
+        );
+        let all = grep(31);
+        assert_eq!(all.lines().count(), 31, "{all}");
+        assert!(all.ends_with("31: order-42 FAILED\n"), "{all}");
     }
 }

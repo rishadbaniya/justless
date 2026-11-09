@@ -1485,7 +1485,8 @@ fn archives_only_accepted_requests_and_recalls_exactly() {
     );
     assert_eq!(
         String::from_utf8(grep.stdout).unwrap(),
-        "2:   with spacing\n4:   with spacing\n"
+        "2:   with spacing\n4:   with spacing\n\
+         [2 of 50 matching lines shown; --limit 50 shows all]\n"
     );
     let none = justless(dir.path(), &["recall", "toolu_01Bash", "--grep", "absent"]);
     assert_eq!(none.stdout, b"No line matches \"absent\".\n");
