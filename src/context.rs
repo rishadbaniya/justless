@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::sync::LazyLock;
@@ -767,6 +767,13 @@ pub(crate) enum Change {
     Ranges(Vec<(usize, usize)>),
     /// Lines removed without a replacement.
     Deleted(Vec<Deletion>),
+    /// A change to the file as a whole that no line range shows, such as
+    /// `mode 100755 -> 100644`, a binary body, a symlink target or a
+    /// submodule commit. Nothing can trace what depends on it.
+    FileLevel(String),
+    /// Where an added file came from: `renamed from …` or `copied from …`.
+    /// The change itself is still the deleted and the added path.
+    Origin(String),
 }
 
 /// Lines a change removed from a file without adding any in their place.
@@ -875,6 +882,9 @@ pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) 
             Change::Unindexed => report.line(format!("{name} · no current indexed source")),
             Change::StagedDiffers => report.line(format!("{name} · working tree differs from staged source. Use {} context --changes to inspect the current file.", workspace.justless())),
             Change::Empty => report.line(format!("{name} · empty after changes")),
+            Change::FileLevel(what) | Change::Origin(what) => {
+                report.line(format!("{name} · {what}"))
+            }
             Change::Deleted(deletions) => {
                 for deletion in deletions {
                     deleted(workspace, index, file, deletion, &mut report)?;
@@ -1000,7 +1010,9 @@ fn first_line(bytes: &[u8]) -> String {
 /// Changed line ranges per file against `HEAD`, the index with
 /// [`Since::Staged`], or a merge base with [`Since::Base`]. Untracked files
 /// count as changed throughout. Lines removed without a replacement are
-/// reported apart, as deletions.
+/// reported apart, as deletions. Every path Git lists is kept: a change no
+/// line range shows, such as a mode, a binary body, a symlink or a
+/// submodule, is a [`Change::FileLevel`].
 pub(crate) fn changes(
     workspace: &Workspace,
     index: &Index,
@@ -1018,6 +1030,8 @@ pub(crate) fn changes(
         "--relative",
         "--no-ext-diff",
         "--no-textconv",
+        // A submodule's own settings must not hide a changed pointer.
+        "--ignore-submodules=none",
         "--no-renames",
     ];
     let head = workspace.git(&["rev-parse", "--verify", "HEAD"])?;
@@ -1029,15 +1043,19 @@ pub(crate) fn changes(
         Since::Head if head.status.success() => args.push("HEAD"),
         Since::Head => {}
     }
-    let mut names = args.clone();
-    names.extend(["--name-only", "-z", "--", "."]);
-    let output = workspace.git(&names)?;
+    // Git's file-level listing, not the line hunks, decides what changed.
+    let mut listing = args.clone();
+    listing.extend(["--raw", "-z", "--no-abbrev", "--", "."]);
+    let output = workspace.git(&listing)?;
     ensure!(
         output.status.success(),
         "git diff failed: {}",
         first_line(&output.stderr)
     );
-    let mut tracked: BTreeSet<_> = nul_paths(&output.stdout).map(str::to_owned).collect();
+    let mut tracked: BTreeMap<String, Raw> = raw_entries(&output.stdout)
+        .into_iter()
+        .filter_map(|(raw, mut paths)| Some((paths.pop()?, raw)))
+        .collect();
     let mut new_files = BTreeSet::new();
     if !staged {
         let output = workspace.git(&[
@@ -1059,16 +1077,44 @@ pub(crate) fn changes(
             ensure!(output.status.success(), "could not list staged changes");
             new_files.extend(nul_paths(&output.stdout).map(str::to_owned));
         }
-        tracked.retain(|file| !new_files.contains(file));
+        tracked.retain(|file, _| !new_files.contains(file));
     }
+    let origins = origins(workspace, &args, &tracked);
     let mut changes = Vec::new();
-    for (file, untracked) in tracked
+    for (file, raw) in tracked
         .iter()
-        .map(|file| (file, false))
-        .chain(new_files.iter().map(|file| (file, true)))
+        .map(|(file, raw)| (file, Some(raw)))
+        .chain(new_files.iter().map(|file| (file, None)))
     {
+        let untracked = raw.is_none();
+        if let Some(origin) = origins.get(file) {
+            changes.push((file.clone(), Change::Origin(origin.clone())));
+        }
+        let level = match raw {
+            Some(raw) => raw.file_level(workspace, file),
+            None => untracked_level(workspace, file),
+        };
+        if let Some((what, lines)) = &level {
+            changes.push((file.clone(), Change::FileLevel(what.clone())));
+            if !lines {
+                continue;
+            }
+        }
         if !index.files.contains_key(file) {
-            changes.push((file.clone(), Change::Unindexed));
+            // The index skips binaries, so a tracked file's own patch says
+            // whether its body changed, and whether in lines.
+            let body = match raw {
+                Some(raw) if raw.new_mode != ABSENT => body(&patch(workspace, &args, file)?),
+                _ => Body::Lines,
+            };
+            match (body, raw) {
+                (Body::Opaque, Some(raw)) => {
+                    changes.push((file.clone(), Change::FileLevel(raw.opaque())))
+                }
+                // Only the mode changed, and that is listed above.
+                (Body::Unchanged, _) if level.is_some() => {}
+                _ => changes.push((file.clone(), Change::Unindexed)),
+            }
             continue;
         }
         if staged {
@@ -1085,17 +1131,16 @@ pub(crate) fn changes(
             continue;
         }
         let mut deletions = Vec::new();
+        let mut opaque = false;
         let locations = if untracked {
             vec![(1, file_lines)]
         } else {
-            let mut hunk = args.clone();
-            hunk.extend(["--unified=0", "--", file]);
-            let output = workspace.git(&hunk)?;
-            ensure!(output.status.success(), "could not read diff for {file}");
+            let output = patch(workspace, &args, file)?;
+            opaque = body(&output) == Body::Opaque;
             let mut ranges = Vec::new();
             // Whether the removed lines that follow belong to the last deletion.
             let mut removing = false;
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
+            for line in output.lines() {
                 let Some(matches) = HUNK.captures(line) else {
                     if removing && let Some(text) = line.strip_prefix('-') {
                         let deletion: &mut Deletion =
@@ -1136,6 +1181,7 @@ pub(crate) fn changes(
             }
             ranges
         };
+        let lined = !locations.is_empty() || !deletions.is_empty();
         if !deletions.is_empty() {
             deleted_symbols(workspace, file, since.rev(), &mut deletions);
             changes.push((
@@ -1146,6 +1192,273 @@ pub(crate) fn changes(
         if !locations.is_empty() || untracked {
             changes.push((file.clone(), Change::Ranges(locations)));
         }
+        // Git lists the file, but no line shows the change: a binary body, a
+        // file marked `-diff`, or anything else without a line diff.
+        if let Some(raw) = raw
+            && !lined
+            && (opaque || level.is_none())
+        {
+            changes.push((file.clone(), Change::FileLevel(raw.opaque())));
+        }
     }
     Ok(changes)
+}
+
+/// Git's mode for a path that does not exist on that side.
+const ABSENT: &str = "000000";
+const SYMLINK: &str = "120000";
+const SUBMODULE: &str = "160000";
+
+/// One path in `git diff --raw`: its modes before and after, its object id
+/// after, and Git's status letter, with a score for a rename or copy.
+struct Raw {
+    old_mode: String,
+    new_mode: String,
+    new_id: String,
+    status: String,
+}
+
+impl Raw {
+    /// A change to the path as a whole, if any, and whether its lines can
+    /// still be read, as a file's can after its mode changed. A symlink, a
+    /// submodule or a change of type has no lines of its own.
+    fn file_level(&self, workspace: &Workspace, file: &str) -> Option<(String, bool)> {
+        let (old, new) = (self.old_mode.as_str(), self.new_mode.as_str());
+        let what = if self.status.starts_with('T') {
+            format!("type changed from {} to {}", kind(old), kind(new))
+        } else if old == SUBMODULE || new == SUBMODULE {
+            match (old, new) {
+                (ABSENT, _) => "new submodule",
+                (_, ABSENT) => "submodule removed",
+                _ => "submodule changed",
+            }
+            .to_owned()
+        } else if old == SYMLINK || new == SYMLINK {
+            match (old, new) {
+                (_, ABSENT) => "symlink deleted".to_owned(),
+                (ABSENT, _) => format!("new symlink{}", self.target(workspace, file)),
+                _ => format!("symlink target changed{}", self.target(workspace, file)),
+            }
+        } else if old != new && old != ABSENT && new != ABSENT {
+            return Some((format!("mode {old} -> {new}"), true));
+        } else {
+            return None;
+        };
+        Some((what, false))
+    }
+
+    /// ` to TARGET` for a symlink: the staged blob, or the link on disk when
+    /// Git compared the working tree.
+    fn target(&self, workspace: &Workspace, file: &str) -> String {
+        let target = if self.new_id.bytes().all(|byte| byte == b'0') {
+            fs::read_link(workspace.root.join(file))
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+        } else {
+            workspace
+                .git(&["cat-file", "blob", &self.new_id])
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        target.map_or_else(String::new, |target| format!(" to {target}"))
+    }
+
+    /// A body Git shows without a line diff.
+    fn opaque(&self) -> String {
+        if self.status.starts_with('A') {
+            "added, binary or no line diff".into()
+        } else {
+            "binary or no line diff".into()
+        }
+    }
+}
+
+/// What a mode in `git diff --raw` holds.
+fn kind(mode: &str) -> String {
+    match mode {
+        "100644" => "file".into(),
+        "100755" => "executable file".into(),
+        SYMLINK => "symlink".into(),
+        SUBMODULE => "submodule".into(),
+        _ => format!("mode {mode}"),
+    }
+}
+
+/// An untracked path with no lines of its own: a symlink, or a nested
+/// repository, which `git ls-files` lists as `DIR/`.
+fn untracked_level(workspace: &Workspace, file: &str) -> Option<(String, bool)> {
+    if file.ends_with('/') {
+        return Some(("new nested Git repository".into(), false));
+    }
+    let path = workspace.root.join(file);
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let target = fs::read_link(&path)
+        .map(|target| format!(" to {}", target.to_string_lossy()))
+        .unwrap_or_default();
+    Some((format!("new symlink{target}"), false))
+}
+
+/// Parses `git diff --raw -z`: a status record, then one path, or two for a
+/// rename or copy. Paths that are not UTF-8 are skipped, as elsewhere.
+fn raw_entries(bytes: &[u8]) -> Vec<(Raw, Vec<String>)> {
+    let mut fields = bytes.split(|&byte| byte == 0);
+    let mut entries = Vec::new();
+    while let Some(record) = fields.next() {
+        let Some(record) = std::str::from_utf8(record)
+            .ok()
+            .and_then(|record| record.strip_prefix(':'))
+        else {
+            continue;
+        };
+        let [old_mode, new_mode, _, new_id, status] = record.split(' ').collect::<Vec<_>>()[..]
+        else {
+            continue;
+        };
+        let count = if status.starts_with(['R', 'C']) { 2 } else { 1 };
+        let paths: Vec<String> = fields
+            .by_ref()
+            .take(count)
+            .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_owned))
+            .collect();
+        if paths.len() == count {
+            entries.push((
+                Raw {
+                    old_mode: old_mode.to_owned(),
+                    new_mode: new_mode.to_owned(),
+                    new_id: new_id.to_owned(),
+                    status: status.to_owned(),
+                },
+                paths,
+            ));
+        }
+    }
+    entries
+}
+
+/// Where each added path came from, by Git's rename and copy detection. The
+/// change set itself keeps the deleted path and the added one apart, so a
+/// rename reaches the users of both.
+fn origins(
+    workspace: &Workspace,
+    args: &[&str],
+    tracked: &BTreeMap<String, Raw>,
+) -> BTreeMap<String, String> {
+    let mut origins = BTreeMap::new();
+    if !tracked.values().any(|raw| raw.status.starts_with('A')) {
+        return origins;
+    }
+    let mut detect: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|arg| *arg != "--no-renames")
+        .collect();
+    detect.extend(["-M", "-C", "--raw", "-z", "--no-abbrev", "--", "."]);
+    let Ok(output) = workspace.git(&detect) else {
+        return origins;
+    };
+    if !output.status.success() {
+        return origins;
+    }
+    for (raw, paths) in raw_entries(&output.stdout) {
+        let how = match raw.status.chars().next() {
+            Some('R') => "renamed",
+            Some('C') => "copied",
+            _ => continue,
+        };
+        let [from, to] = &paths[..] else {
+            continue;
+        };
+        let similar = raw.status[1..]
+            .parse::<u32>()
+            .ok()
+            .filter(|score| *score < 100)
+            .map(|score| format!(", {score}% similar"))
+            .unwrap_or_default();
+        origins.insert(
+            to.clone(),
+            format!("{how} from {}{similar}", display_path(from)),
+        );
+    }
+    origins
+}
+
+/// What a file's patch shows of its body.
+#[derive(PartialEq)]
+enum Body {
+    Lines,
+    /// Git said `Binary files … differ`: a binary, or a file marked `-diff`.
+    Opaque,
+    /// No hunk at all, as when only the mode changed.
+    Unchanged,
+}
+
+fn body(patch: &str) -> Body {
+    for line in patch.lines() {
+        if HUNK.is_match(line) {
+            return Body::Lines;
+        }
+        if (line.starts_with("Binary files ") && line.ends_with(" differ"))
+            || line == "GIT binary patch"
+        {
+            return Body::Opaque;
+        }
+    }
+    Body::Unchanged
+}
+
+/// `git diff` for one file with no context lines.
+fn patch(workspace: &Workspace, args: &[&str], file: &str) -> Result<String> {
+    let mut hunk = args.to_vec();
+    hunk.extend(["--unified=0", "--", file]);
+    let output = workspace.git(&hunk)?;
+    ensure!(output.status.success(), "could not read diff for {file}");
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_listing_keeps_modes_and_both_paths_of_a_rename() {
+        let zero = "0".repeat(40);
+        let id = "a".repeat(40);
+        let listing = format!(
+            ":100755 100644 {id} {zero} M\0run.sh\0:100644 100644 {id} {id} R096\0old.rs\0new.rs\0:160000 160000 {id} {zero} M\0sub\0"
+        );
+        let entries = raw_entries(listing.as_bytes());
+        let summary: Vec<(&str, &str, &str, Vec<&str>)> = entries
+            .iter()
+            .map(|(raw, paths)| {
+                (
+                    raw.old_mode.as_str(),
+                    raw.new_mode.as_str(),
+                    raw.status.as_str(),
+                    paths.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("100755", "100644", "M", vec!["run.sh"]),
+                ("100644", "100644", "R096", vec!["old.rs", "new.rs"]),
+                ("160000", "160000", "M", vec!["sub"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_patch_without_hunks_is_binary_or_only_a_mode() {
+        assert!(body("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n") == Body::Lines);
+        assert!(
+            body("diff --git a/g b/g\nindex 1..2 100644\nBinary files a/g and b/g differ\n")
+                == Body::Opaque
+        );
+        assert!(body("diff --git a/x b/x\nold mode 100755\nnew mode 100644\n") == Body::Unchanged);
+        assert!(body("") == Body::Unchanged);
+    }
 }

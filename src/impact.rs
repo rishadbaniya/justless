@@ -1009,7 +1009,8 @@ fn seeded(workspace: &Workspace, index: &Index, changes: &[(String, Change)]) ->
                 let reason = match other {
                     Change::Unindexed => "not indexed",
                     Change::StagedDiffers => "working tree differs from staged source",
-                    _ => "empty after changes",
+                    Change::FileLevel(what) | Change::Origin(what) => what,
+                    Change::Empty | Change::Ranges(_) | Change::Deleted(_) => "empty after changes",
                 };
                 section.push(
                     format!("  {file} · {reason}"),

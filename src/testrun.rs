@@ -238,6 +238,11 @@ fn runner_line(plan: &RunnerPlan, affected: bool) -> String {
             codes(plan)
         ),
         Mode::BuildOnly => format!("{who} · build only · no test reaches the changed code"),
+        // Kept by --no-fallback: the change could not be traced, not ruled out.
+        Mode::Nothing if !plan.reasons.is_empty() => format!(
+            "{who} · nothing to run, low confidence ({}) · no test is known to reach the change",
+            codes(plan)
+        ),
         Mode::Nothing => format!("{who} · nothing to run · no change reaches its tests"),
         Mode::Command => format!("{who} · command as given · {}", first_reason()),
         Mode::Full if affected && !plan.reasons.is_empty() => {

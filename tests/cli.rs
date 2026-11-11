@@ -16257,3 +16257,302 @@ fn claude_reads_record_the_lines_or_outline_the_agent_was_shown() {
         before
     );
 }
+
+/// A committed Cargo package whose integration tests run a tracked script and
+/// read a fixture that `.gitattributes` keeps out of line diffs.
+#[cfg(unix)]
+fn file_level_fixture() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let write = |file: &str, text: &str| {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(".gitignore", "/target/\n/Cargo.lock\n");
+    write(".gitattributes", "fixtures/golden.txt -diff\n");
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        "src/lib.rs",
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n",
+    );
+    write("README.md", "# Demo\n");
+    write("scripts/check.sh", "#!/bin/sh\necho ok\n");
+    set_mode(&root.join("scripts/check.sh"), 0o755);
+    write("fixtures/golden.txt", "expected output\n");
+    fs::write(root.join("fixtures/blob.bin"), [0u8, 159, 146, 150]).unwrap();
+    std::os::unix::fs::symlink("golden.txt", root.join("fixtures/current")).unwrap();
+    write(
+        "tests/files.rs",
+        concat!(
+            "#[test]\nfn script_runs() {\n",
+            "    let script = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/scripts/check.sh\");\n",
+            "    assert!(std::process::Command::new(script).status().unwrap().success());\n}\n\n",
+            "#[test]\nfn golden_matches() {\n",
+            "    let path = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/fixtures/golden.txt\");\n",
+            "    assert_eq!(std::fs::read_to_string(path).unwrap(), \"expected output\\n\");\n}\n",
+        ),
+    );
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    repo
+}
+
+#[cfg(unix)]
+#[test]
+fn changes_git_shows_without_a_line_diff_stay_in_the_change_set() {
+    let repo = file_level_fixture();
+    let root = repo.path();
+    let cargo = ["--", "cargo", "test", "--offline"];
+    let plan = |extra: &[&str]| {
+        success(
+            root,
+            &[&["test", "--affected", "--dry-run"][..], extra, &cargo].concat(),
+        )
+    };
+    let clean = |root: &Path| {
+        let text = success(root, &["context", "--changes"]);
+        assert!(text.starts_with("No changed files."), "{text}");
+    };
+    clean(root);
+
+    // The executable bit alone: Git shows 100755 -> 100644 and no line. The
+    // test that names the script would pass, so only the full suite is safe.
+    set_mode(&root.join("scripts/check.sh"), 0o644);
+    let what = "scripts/check.sh · mode 100755 -> 100644";
+    has_line(&success(root, &["context", "--changes"]), what);
+    has_line(
+        &success(root, &["affected", "--changes"]),
+        &format!("  {what}"),
+    );
+    let text = plan(&[]);
+    has_line(&text, &format!("Changed {what}"));
+    let reason = "scripts/check.sh changed without a line diff (mode 100755 -> 100644)";
+    assert!(
+        text.contains(&format!("cargo · full suite · {reason}")),
+        "{text}"
+    );
+    has_line(&text, &format!("  no-line-diff: {reason}"));
+    has_line(&text, "  Run (full suite): cargo test --offline");
+    let kept = plan(&["--no-fallback"]);
+    assert!(
+        kept.contains("cargo · low-confidence subset (no-line-diff)"),
+        "{kept}"
+    );
+    // Staged, it reads the same.
+    git(root, &["add", "scripts/check.sh"]);
+    has_line(&success(root, &["context", "--changes", "--staged"]), what);
+    has_line(
+        &success(root, &["affected", "--changes", "--staged"]),
+        &format!("  {what}"),
+    );
+    // Committed on a branch, `--base` reads it the same.
+    git(root, &["tag", "base"]);
+    git(root, &["commit", "-qm", "drop the executable bit"]);
+    clean(root);
+    has_line(
+        &success(root, &["context", "--changes", "--base", "base"]),
+        what,
+    );
+    has_line(
+        &success(root, &["affected", "--changes", "--base", "base"]),
+        &format!("  {what}"),
+    );
+    let text = plan(&["--base", "base"]);
+    has_line(&text, &format!("  no-line-diff: {reason}"));
+    has_line(&text, "  Run (full suite): cargo test --offline");
+    git(root, &["reset", "-q", "--hard", "base"]);
+    clean(root);
+
+    // A binary fixture, staged too, and a symlink that points elsewhere.
+    fs::write(root.join("fixtures/blob.bin"), [0u8, 1, 2, 3]).unwrap();
+    let what = "fixtures/blob.bin · binary or no line diff";
+    has_line(&success(root, &["context", "--changes"]), what);
+    let text = plan(&[]);
+    has_line(&text, &format!("Changed {what}"));
+    has_line(
+        &text,
+        "  no-line-diff: fixtures/blob.bin changed without a line diff (binary or no line diff)",
+    );
+    git(root, &["add", "fixtures/blob.bin"]);
+    has_line(&success(root, &["context", "--changes", "--staged"]), what);
+    git(root, &["reset", "-q", "--hard"]);
+    fs::remove_file(root.join("fixtures/current")).unwrap();
+    std::os::unix::fs::symlink("blob.bin", root.join("fixtures/current")).unwrap();
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "Changed fixtures/current · symlink target changed to blob.bin",
+    );
+    has_line(
+        &text,
+        "  no-line-diff: fixtures/current changed without a line diff (symlink target changed to blob.bin)",
+    );
+    has_line(&text, "  Run (full suite): cargo test --offline");
+    // Kept as a subset, an untraceable change never reads as reaching nothing.
+    let kept = plan(&["--no-fallback"]);
+    assert!(
+        kept.lines().any(
+            |line| line.starts_with("cargo · nothing to run, low confidence (")
+                && line.contains("no-line-diff")
+        ),
+        "{kept}"
+    );
+    assert!(!kept.contains("no change reaches its tests"), "{kept}");
+    git(root, &["reset", "-q", "--hard"]);
+    clean(root);
+
+    // A fixture marked `-diff`: Git reports it like a binary file.
+    replace_in(root, "fixtures/golden.txt", "expected", "changed");
+    has_line(
+        &success(root, &["context", "--changes"]),
+        "fixtures/golden.txt · binary or no line diff",
+    );
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "Changed fixtures/golden.txt · binary or no line diff",
+    );
+    assert!(
+        text.contains("cargo · full suite · fixtures/golden.txt changed without a line diff (binary or no line diff)"),
+        "{text}"
+    );
+    git(root, &["reset", "-q", "--hard"]);
+
+    // A mode change beside edited lines keeps both.
+    set_mode(&root.join("src/lib.rs"), 0o755);
+    replace_in(root, "src/lib.rs", "a + b", "b + a");
+    let context = success(root, &["context", "--changes"]);
+    has_line(&context, "src/lib.rs · mode 100644 -> 100755");
+    has_line(&context, "Changed src/lib.rs:2-2");
+    let text = plan(&[]);
+    has_line(
+        &text,
+        "Changed src/lib.rs · modified, mode 100644 -> 100755",
+    );
+    assert!(
+        text.contains(
+            "  no-line-diff: src/lib.rs changed without a line diff (mode 100644 -> 100755)"
+        ),
+        "{text}"
+    );
+    has_line(&text, "  Run (full suite): cargo test --offline");
+    git(root, &["reset", "-q", "--hard"]);
+
+    // Documentation stays inert, and still says what changed.
+    set_mode(&root.join("README.md"), 0o755);
+    let text = plan(&[]);
+    has_line(&text, "Changed README.md · mode 100644 -> 100755");
+    has_line(
+        &text,
+        "README.md · no test impact (documentation or repository metadata)",
+    );
+    has_line(
+        &text,
+        "cargo · nothing to run · no change reaches its tests",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changes_name_symlinks_submodules_renames_and_type_changes() {
+    use std::os::unix::fs::symlink;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join("text.txt"), "a\nb\n").unwrap();
+    fs::write(root.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    fs::write(root.join("becomes-link"), "plain\n").unwrap();
+    fs::write(root.join("before.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    symlink("text.txt", root.join("link")).unwrap();
+    symlink("text.txt", root.join("gone-link")).unwrap();
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    git(&sub, &["init", "-q"]);
+    fs::write(sub.join("a"), "a\n").unwrap();
+    git(&sub, &["add", "a"]);
+    git(&sub, &["commit", "-qm", "a"]);
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+
+    fs::remove_file(root.join("link")).unwrap();
+    symlink("run.sh", root.join("link")).unwrap();
+    fs::remove_file(root.join("becomes-link")).unwrap();
+    symlink("text.txt", root.join("becomes-link")).unwrap();
+    fs::remove_file(root.join("gone-link")).unwrap();
+    git(root, &["mv", "before.txt", "after.txt"]);
+    fs::write(sub.join("b"), "b\n").unwrap();
+    git(&sub, &["add", "b"]);
+    git(&sub, &["commit", "-qm", "b"]);
+    symlink("nowhere", root.join("new-link")).unwrap();
+    let described = [
+        "link · symlink target changed to run.sh",
+        "becomes-link · type changed from file to symlink",
+        "gone-link · symlink deleted",
+        "after.txt · renamed from before.txt",
+        "sub · submodule changed",
+        "new-link · new symlink to nowhere",
+    ];
+    let context = success(root, &["context", "--changes"]);
+    for line in described {
+        has_line(&context, line);
+    }
+    has_line(&context, "before.txt · deleted");
+    let affected = success(root, &["affected", "--changes"]);
+    for line in described {
+        has_line(&affected, &format!("  {line}"));
+    }
+
+    // Staged, the index side names the same changes.
+    git(root, &["add", "-A"]);
+    let staged = success(root, &["context", "--changes", "--staged"]);
+    for line in described {
+        has_line(&staged, line);
+    }
+
+    // A nested repository Git cannot list file by file is kept too.
+    let nested = root.join("nested");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    has_line(
+        &success(root, &["context", "--changes"]),
+        "nested/ · new nested Git repository",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn affected_tests_widen_for_a_file_level_change_outside_the_runner_root() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let write = |file: &str, text: &str| {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(".gitignore", "target/\nCargo.lock\n");
+    write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write("app/src/lib.rs", "pub fn one() -> i32 {\n    1\n}\n");
+    write(
+        "app/tests/script.rs",
+        "#[test]\nfn script_runs() {\n    let script = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../scripts/check.sh\");\n    assert!(std::process::Command::new(script).status().unwrap().success());\n}\n",
+    );
+    write("scripts/check.sh", "#!/bin/sh\necho ok\n");
+    set_mode(&root.join("scripts/check.sh"), 0o755);
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    set_mode(&root.join("scripts/check.sh"), 0o644);
+    let text = success(root, &["test", "--affected", "--dry-run"]);
+    assert!(
+        text.contains("cargo (app) · full suite · scripts/check.sh changed without a line diff (mode 100755 -> 100644)"),
+        "{text}"
+    );
+}

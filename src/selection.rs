@@ -574,6 +574,27 @@ fn inert(file: &str) -> bool {
         || file.starts_with(".justless/")
 }
 
+/// How a changed file reads in the plan: its status, followed by what Git
+/// showed of the file as a whole, or only that when nothing else changed,
+/// such as `mode 100755 -> 100644` or `symlink deleted`.
+fn file_status(status: &str, list: &[&Change]) -> String {
+    let whole: Vec<&str> = list
+        .iter()
+        .filter_map(|change| match change {
+            Change::FileLevel(what) | Change::Origin(what) => Some(what.as_str()),
+            _ => None,
+        })
+        .collect();
+    let lines = list
+        .iter()
+        .any(|change| !matches!(change, Change::FileLevel(_) | Change::Origin(_)));
+    match (whole.is_empty(), lines) {
+        (true, _) => status.to_owned(),
+        (false, true) => format!("{status}, {}", whole.join(", ")),
+        (false, false) => whole.join(", "),
+    }
+}
+
 /// Whether a line holds only a comment, which names things without using them.
 fn comment_only(line: &str) -> bool {
     let line = line.trim_start();
@@ -1024,6 +1045,9 @@ struct Analysis {
     compile_files: BTreeSet<String>,
     /// Files whose changes could not be pinned to any test or symbol.
     unlinked: BTreeMap<String, Reason>,
+    /// Files changed as a whole, with no line range to trace, such as a mode
+    /// change or a binary body. Every runner falls back for them.
+    file_level: BTreeMap<String, Reason>,
     /// Files with no test impact, and why.
     ignored: Vec<Note>,
     /// Tests or test files selected directly by a mention, by runner-independent key.
@@ -1222,6 +1246,7 @@ fn analyze(
         seed_notes: Vec::new(),
         compile_files: BTreeSet::new(),
         unlinked: BTreeMap::new(),
+        file_level: BTreeMap::new(),
         ignored: Vec::new(),
         mentioned_tests: BTreeMap::new(),
         mentioned_files: BTreeMap::new(),
@@ -1323,7 +1348,31 @@ fn analyze(
         } else {
             "modified"
         };
-        analysis.files.push(((*file).to_owned(), status.to_owned()));
+        analysis
+            .files
+            .push(((*file).to_owned(), file_status(status, list)));
+        // A change no line range shows cannot be traced to what depends on
+        // it, even when tests name the file: every runner falls back.
+        let opaque: Vec<&str> = list
+            .iter()
+            .filter_map(|change| match change {
+                Change::FileLevel(what) => Some(what.as_str()),
+                _ => None,
+            })
+            .collect();
+        let exempt = inert(file)
+            || ignore_globs
+                .as_ref()
+                .is_some_and(|globs| globs.matched_path_or_any_parents(file, false).is_ignore());
+        if !opaque.is_empty() && !exempt {
+            analysis.file_level.insert(
+                (*file).to_owned(),
+                Reason {
+                    code: "no-line-diff",
+                    message: format!("{file} changed without a line diff ({})", opaque.join(", ")),
+                },
+            );
+        }
         if !exists {
             analysis.deleted.insert((*file).to_owned());
         }
@@ -2259,10 +2308,12 @@ fn plan_runner(
         plan.steps.clear();
         return plan;
     }
-    let mut reasons = Vec::new();
+    // A change with no line range can reach tests anywhere, whatever their root.
+    let mut reasons: Vec<Reason> = analysis.file_level.values().cloned().collect();
     let mut package_scope = BTreeMap::<String, Reason>::new();
     // File-level triggers for files under this runner.
-    for (file, status) in &analysis.files {
+    for (file, _) in &analysis.files {
+        let deleted = analysis.deleted.contains(file);
         let mine = runner.contains(file) || !file.contains('/');
         if !mine {
             continue;
@@ -2331,7 +2382,7 @@ fn plan_runner(
                 });
                 continue;
             }
-            if status != "deleted" && !index.files.contains_key(file.as_str()) {
+            if !deleted && !index.files.contains_key(file.as_str()) {
                 let why = index
                     .refresh
                     .skipped
@@ -2344,7 +2395,7 @@ fn plan_runner(
                 });
                 continue;
             }
-            if status == "deleted" {
+            if deleted {
                 // A deleted Rust file can leave a stale `mod` behind that only a
                 // build of its package finds; elsewhere importers cannot be traced.
                 if let Some(cargo) = &runner.cargo
