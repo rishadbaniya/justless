@@ -679,8 +679,15 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
         let outline = ["outline", "json", "match", "after", "limit"]
             .iter()
             .any(|id| args.occurrences_of(id) > 0);
+        let digest = crate::capture::source_digest(source.text.as_bytes());
         if !outline && source.text.len() <= budget {
-            return Ok(io::stdout().lock().write_all(source.text.as_bytes())?);
+            io::stdout().lock().write_all(source.text.as_bytes())?;
+            // The whole file, recorded as `expand FILE L1-N` would record it.
+            let lines = source.text.lines().count();
+            if lines > 0 {
+                crate::history::saw_source(ws, file, 1, lines, digest);
+            }
+            return Ok(());
         }
         source.index(file)?;
         let page = source.page(
@@ -694,6 +701,7 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
         } else {
             print!("{}", page.display());
         }
+        crate::history::saw_outline(ws, file, digest);
     } else {
         if name == "edit" {
             return edit(ws, file, source, args);

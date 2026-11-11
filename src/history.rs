@@ -219,6 +219,9 @@ struct Read {
     digest: String,
     from: usize,
     to: usize,
+    /// The file's outline rather than its lines, with `from` and `to` 0.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    outline: bool,
 }
 
 fn get<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
@@ -260,20 +263,34 @@ pub fn recall(directory: &Path, operation: &str) {
     );
 }
 
+/// Records that the agent was shown lines `from..=to` of the workspace file
+/// `file`, whose bytes have `digest` ([`capture::source_digest`]), for `resume`,
+/// the compaction handoff and their `[source changed]` notices. Each command
+/// that prints source lines calls it once per range it printed. The same range
+/// of unchanged source shown again counts as a repeated read in `stats`.
 pub fn saw_source(workspace: &Workspace, file: &str, from: usize, to: usize, digest: String) {
+    saw(workspace, file, from, to, digest, false);
+}
+
+/// Records that the agent was shown `file`'s outline: its revision, rows and
+/// line ranges, but not its lines. A file keeps one outline entry whatever the
+/// page, and it never counts as a repeated read.
+pub fn saw_outline(workspace: &Workspace, file: &str, digest: String) {
+    saw(workspace, file, 0, 0, digest, true);
+}
+
+fn saw(workspace: &Workspace, file: &str, from: usize, to: usize, digest: String, outline: bool) {
     if workspace.prepare_state().is_err() {
         return;
     }
     let _ = update(
         &workspace.state.join("activity.json"),
         |a: &mut Activity| {
-            if let Some(i) = a
-                .reads
-                .iter()
-                .position(|r| r.file == file && r.from == from && r.to == to)
-            {
+            if let Some(i) = a.reads.iter().position(|r| {
+                r.file == file && r.from == from && r.to == to && r.outline == outline
+            }) {
                 let old = a.reads.remove(i);
-                if old.digest == digest {
+                if old.digest == digest && !outline {
                     a.repeat_reads += 1;
                 }
             }
@@ -284,6 +301,7 @@ pub fn saw_source(workspace: &Workspace, file: &str, from: usize, to: usize, dig
                     digest,
                     from,
                     to,
+                    outline,
                 },
             );
             a.reads.truncate(32);
@@ -863,22 +881,21 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
     }
     let reserve = pack_bytes.min(room / 2);
     let mut dropped = pack.len() < activity.last_pack.len();
-    // Activity keeps the 32 most recent ranges, newest first.
+    // Activity keeps the 32 most recent ranges and outlines, newest first.
     for read in activity.reads.iter().take(32) {
         if report.clipped {
             break;
         }
-        let line = format!(
-            "Read {}:{}-{}{}",
-            read.file,
-            read.from,
-            read.to,
-            if current(workspace, &read.file, &read.digest) {
-                ""
-            } else {
-                " [source changed]"
-            }
-        );
+        let stale = if current(workspace, &read.file, &read.digest) {
+            ""
+        } else {
+            " [source changed]"
+        };
+        let line = if read.outline {
+            format!("Outline {}{stale}", read.file)
+        } else {
+            format!("Read {}:{}-{}{stale}", read.file, read.from, read.to)
+        };
         if line.len() + 1 + reserve > report.left() {
             dropped = true;
             break;

@@ -662,7 +662,9 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
             }
         })
     } else if agent == Agent::Claude && mode == "after-read" {
-        claude_read(workspace, &input).unwrap_or_else(|| json!({}))
+        let outline = claude_read(workspace, &input);
+        saw_claude_read(workspace, &input, outline.is_some());
+        outline.unwrap_or_else(|| json!({}))
     } else if agent == Agent::Claude && mode == "after-search" {
         crate::search::claude_tool_output(workspace, &input).unwrap_or_else(|| json!({}))
     } else if agent == Agent::Claude && mode == "after-bash" {
@@ -808,6 +810,35 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     )
 }
 
+/// Records what a Claude Code Read of a workspace text file showed the agent,
+/// for `resume` and `[source changed]`: the outline that replaced it, or the
+/// lines Claude Code returned. Like hook pass-through counts, it is kept only in
+/// a project that already has a state directory.
+fn saw_claude_read(ws: &Workspace, input: &Value, outlined: bool) -> Option<()> {
+    if input["hook_event_name"] != "PostToolUse"
+        || input["tool_name"] != "Read"
+        || input["tool_response"]["type"] != "text"
+        || !ws.state.is_dir()
+    {
+        return None;
+    }
+    let result = &input["tool_response"]["file"];
+    let file = ws.relative_file(Path::new(result["filePath"].as_str()?))?;
+    let digest = crate::capture::source_digest(&fs::read(ws.source_path(&file).ok()?).ok()?);
+    if outlined {
+        crate::history::saw_outline(ws, &file, digest);
+    } else {
+        let from = usize::try_from(result["startLine"].as_u64()?).ok()?;
+        let lines = usize::try_from(result["numLines"].as_u64()?).ok()?;
+        if from == 0 || lines == 0 {
+            return None;
+        }
+        let to = from.checked_add(lines - 1)?;
+        crate::history::saw_source(ws, &file, from, to, digest);
+    }
+    Some(())
+}
+
 /// The documented bound on a compaction handoff, including its introduction.
 const HANDOFF_BYTES: usize = 1800;
 /// The handoff after compaction, whose commands `justless` starts.
@@ -816,7 +847,7 @@ fn after_compact(justless: &str) -> String {
         "Justless activity from before compaction. Inspect a run with `{justless} context --run RUN_ID` or `{justless} search RUN_ID TEXT`, or replay an `S:A` line with `{justless} log RUN_ID --stream S --from A --to B`. Rerun only to test a change. `{justless} history TEXT` searches all earlier logs. [source changed] marks ranges edited since they were read.\n"
     )
 }
-const BEFORE_COMPACT: &str = "Keep these Justless references verbatim in the summary. They recover exact logs and source without rerunning commands. Keep each run ID with its command and exit status, each file range with any [source changed] marker, and any `justless recall` IDs the task still needs. For runs the current task depends on, also note what they showed, such as the failure being fixed.\n";
+const BEFORE_COMPACT: &str = "Keep these Justless references verbatim in the summary. They recover exact logs and source without rerunning commands. Keep each run ID with its command and exit status, each file range or outline with any [source changed] marker, and any `justless recall` IDs the task still needs. For runs the current task depends on, also note what they showed, such as the failure being fixed.\n";
 
 /// `intro` followed by recent Justless activity, within `HANDOFF_BYTES`, or
 /// `None` when there is no activity or an intro with a very long `--root` leaves

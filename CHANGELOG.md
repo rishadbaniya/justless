@@ -56,6 +56,7 @@ User-visible changes to Justless are recorded here. No release has been publishe
 
 - `mask` retires older tool results in an outbound request to `[justless recall ID]` references, and `recall` restores the original value. The OpenCode v1 plugin applies this automatically before each model request.
 - Claude Code and Codex hooks carry recent run IDs, outcomes and inspected file ranges across compaction, within 1,800 bytes. `resume` shows the same handoff from the terminal. Runs are named by their command, such as `git status` or `cargo test`.
+- `read` of a small file, which prints it whole, is recorded in `resume` and the handoff as `Read FILE:1-N`, like `expand` of the same lines, and marked `[source changed]` once the file changes. An outline from `read` or the Claude Code Read hook is listed as `Outline FILE`, and the Read hook records the lines of each Read it passes through.
 
 ### Agent setup
 

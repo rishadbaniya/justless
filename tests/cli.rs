@@ -16039,3 +16039,221 @@ fn lookup_next_command_opens_a_file_whose_name_starts_with_a_dash() {
     assert!(shell.status.success(), "{next}: {}", stderr(&shell));
     assert!(stdout(&shell).contains("release_window is Friday"));
 }
+
+/// The `Read` and `Outline` lines `resume` lists for one file.
+fn resume_reads(root: &Path, file: &str) -> Vec<String> {
+    success(root, &["resume", "--budget", "100000"])
+        .lines()
+        .filter(|line| {
+            line.strip_prefix("Read ")
+                .and_then(|rest| rest.strip_prefix(file))
+                .is_some_and(|rest| rest.starts_with(':'))
+                || line
+                    .strip_prefix("Outline ")
+                    .and_then(|rest| rest.strip_prefix(file))
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn whole_file_reads_and_outlines_are_recorded_for_resume() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("worker.py"), "def work():\n    return 1\n").unwrap();
+
+    // A small file comes back verbatim and is recorded like `expand L1-2`.
+    assert_eq!(
+        success(&root, &["read", "worker.py"]),
+        "def work():\n    return 1\n"
+    );
+    assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
+    fs::write(root.join("worker.py"), "def work():\n    return 2\n").unwrap();
+    assert_eq!(
+        resume_reads(&root, "worker.py"),
+        ["Read worker.py:1-2 [source changed]"]
+    );
+    // The compaction handoff carries the same notice.
+    let handoff = agent_hook(
+        &root,
+        "hook-claude",
+        "after-compact",
+        serde_json::json!({"hook_event_name":"SessionStart","source":"compact"}),
+    );
+    let context = handoff["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        context.contains("Read worker.py:1-2 [source changed]\n"),
+        "{handoff}"
+    );
+    // Reading it again replaces the entry. Reading unchanged source again, by
+    // `read` or by `expand` of the same lines, counts as a repeated read.
+    success(&root, &["read", "worker.py"]);
+    success(&root, &["read", "worker.py"]);
+    success(&root, &["expand", "worker.py", "L1-2"]);
+    assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
+    assert!(success(&root, &["stats"]).contains(" 2 repeated source-range read(s)"));
+    // From a subdirectory, the entry still names the workspace-relative file.
+    fs::create_dir(root.join("jobs")).unwrap();
+    fs::write(root.join("jobs/queue.py"), "QUEUE = []\n").unwrap();
+    success(&root.join("jobs"), &["read", "queue.py"]);
+    assert_eq!(
+        resume_reads(&root, "jobs/queue.py"),
+        ["Read jobs/queue.py:1-1"]
+    );
+    // An empty file shows no lines, so nothing is recorded.
+    fs::write(root.join("empty.py"), "").unwrap();
+    assert_eq!(success(&root, &["read", "empty.py"]), "");
+    assert!(resume_reads(&root, "empty.py").is_empty());
+
+    // An outline is recorded as an outline, once per file whatever the page,
+    // and not as the file's lines or a repeated read.
+    let big: String = (0..60)
+        .map(|n| format!("def f{n}(x):\n    y = x + {n}\n    return y * 2\n\n"))
+        .collect();
+    fs::write(root.join("big.py"), &big).unwrap();
+    let outline = success(&root, &["read", "big.py", "--budget", "400"]);
+    assert!(
+        outline.starts_with("revision ") && outline.contains("next --after "),
+        "{outline}"
+    );
+    assert_eq!(resume_reads(&root, "big.py"), ["Outline big.py"]);
+    success(&root, &["read", "big.py", "--outline", "--match", "f7"]);
+    success(&root, &["read", "big.py", "--json"]);
+    success(&root, &["read", "worker.py", "--outline"]);
+    assert_eq!(resume_reads(&root, "big.py"), ["Outline big.py"]);
+    assert_eq!(
+        resume_reads(&root, "worker.py"),
+        ["Outline worker.py", "Read worker.py:1-2"]
+    );
+    assert!(success(&root, &["stats"]).contains(" 2 repeated source-range read(s)"));
+    fs::write(root.join("big.py"), big.replace("x + 7\n", "x + 70\n")).unwrap();
+    assert_eq!(
+        resume_reads(&root, "big.py"),
+        ["Outline big.py [source changed]"]
+    );
+
+    // A pack lists its files once, as before, and adds no ranges of its own.
+    success(&root, &["pack", "where is f3 defined"]);
+    let resume = success(&root, &["resume", "--budget", "100000"]);
+    assert!(resume.contains("Last pack: big.py"), "{resume}");
+    assert_eq!(
+        resume_reads(&root, "big.py"),
+        ["Outline big.py [source changed]"]
+    );
+}
+
+#[test]
+fn reads_recorded_before_outlines_existed_still_load() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("worker.py"), "def work():\n    return 1\n").unwrap();
+    fs::create_dir(root.join(".justless")).unwrap();
+    // activity.json as an earlier Justless wrote it.
+    fs::write(
+        root.join(".justless/activity.json"),
+        r#"{"bypasses":{"cat":1},"reads":[{"file":"worker.py","digest":"0","from":1,"to":1}],"repeat_reads":3,"last_pack":{}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        resume_reads(&root, "worker.py"),
+        ["Read worker.py:1-1 [source changed]"]
+    );
+    success(&root, &["read", "worker.py"]);
+    assert_eq!(
+        resume_reads(&root, "worker.py"),
+        ["Read worker.py:1-2", "Read worker.py:1-1 [source changed]"]
+    );
+    assert!(success(&root, &["stats"]).contains(" 3 repeated source-range read(s)"));
+}
+
+#[test]
+fn claude_reads_record_the_lines_or_outline_the_agent_was_shown() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    let small = root.join("worker.py");
+    fs::write(&small, "def work():\n    return 1\n").unwrap();
+    let large = root.join("module.py");
+    let source = format!(
+        "def calculate():\n{}    return 42\n",
+        "    # detail\n".repeat(400)
+    );
+    fs::write(&large, &source).unwrap();
+    let read = |path: &Path, content: &str, start: u64, lines: u64, total: u64| {
+        json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+            "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
+            "content":content,"startLine":start,"numLines":lines,"totalLines":total}}})
+    };
+    let small_read = read(&small, "def work():\n    return 1", 1, 2, 2);
+
+    // A project without a state directory is left without one.
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-read", small_read.clone()),
+        json!({})
+    );
+    assert!(!root.join(".justless").exists());
+
+    success(&root, &["index"]);
+    // A small whole read passes through and records the whole file.
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-read", small_read.clone()),
+        json!({})
+    );
+    assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
+    // A ranged read records the lines Claude Code returned.
+    let mut ranged = read(&large, "    # detail\n    # detail", 3, 2, 402);
+    ranged["tool_input"]["offset"] = json!(3);
+    ranged["tool_input"]["limit"] = json!(2);
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-read", ranged),
+        json!({})
+    );
+    assert_eq!(resume_reads(&root, "module.py"), ["Read module.py:3-4"]);
+    // A whole read replaced by an outline records the outline only.
+    let whole = read(&large, source.trim_end_matches('\n'), 1, 402, 402);
+    let replaced = agent_hook(&root, "hook-claude", "after-read", whole);
+    assert!(
+        replaced["hookSpecificOutput"]["updatedToolOutput"].is_object(),
+        "{replaced}"
+    );
+    assert_eq!(
+        resume_reads(&root, "module.py"),
+        ["Outline module.py", "Read module.py:3-4"]
+    );
+    // The same whole read, unchanged, counts as a repeated read.
+    agent_hook(&root, "hook-claude", "after-read", small_read);
+    assert!(success(&root, &["stats"]).contains(" 1 repeated source-range read(s)"));
+    fs::write(&small, "def work():\n    return 2\n").unwrap();
+    assert_eq!(
+        resume_reads(&root, "worker.py"),
+        ["Read worker.py:1-2 [source changed]"]
+    );
+
+    // Images, and files outside the project, are not recorded.
+    let before = fs::read_to_string(root.join(".justless/activity.json")).unwrap();
+    let image = root.join("logo.png");
+    fs::write(&image, b"\x89PNG\r\n").unwrap();
+    let picture = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+        "tool_input":{"file_path":image},"tool_response":{"type":"image","file":{"base64":"",
+        "type":"image/png","originalSize":6}}});
+    agent_hook(&root, "hook-claude", "after-read", picture);
+    let elsewhere = TempDir::new().unwrap();
+    let outside = elsewhere.path().canonicalize().unwrap().join("notes.txt");
+    fs::write(&outside, "note\n").unwrap();
+    agent_hook(
+        &root,
+        "hook-claude",
+        "after-read",
+        read(&outside, "note", 1, 1, 1),
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(".justless/activity.json")).unwrap(),
+        before
+    );
+}
