@@ -10,13 +10,12 @@ All work was stopped on 2026-11-19 to save usage; nothing is running. Each item 
 
 These three were the last work running. All are on the current history, so they can be rebased onto `main` directly. None has been through the independent reviewer.
 
-### 1.1 Changes with no line diff are missed — high
+### 1.1 Changes with no line diff are missed — high — done
 - **Problem.** `context --changes` and `test --affected` build the change set from line hunks only. Removing a script's executable bit (Git shows `100755 → 100644`) or changing a fixture marked `-diff` in `.gitattributes` produced "No changed files"; `test --affected` ran nothing and exited 0 while full `cargo test` failed with Permission denied. A wrong "nothing to test" is worse than running everything.
 - **Plan.** Build the change set from Git's file-level listing (`git diff --raw -z` with rename detection, plus untracked files): mode changes, binary and `-diff` files, symlink and submodule changes, renames, type changes and deletions all stay in. `context --changes` says what changed ("mode 100755 → 100644", "no line diff"); `test --affected` falls back to broader testing with a stated reason whenever a changed file has no line diff. Same for `--staged` and `--base`.
 - **Where.** `src/context.rs` (change detection, around the `changes()` reader), `src/selection.rs`.
-- **Branch.** `wip/no-line-diff-changes` (1 wip commit on `334db3d`, 7 files, +694 −24).
-- **Progress.** *partial, most of the way*: `src/context.rs` +345 (file-level change listing), `src/selection.rs` +61 (broader fallback with a reason), `testrun.rs`, `impact.rs`, 298 lines of tests, docs and changelog. Stopped before the builder's own checks finished; not reviewed.
-- **Next.** Compile and run the full checks; reproduce with a mode-only change and a `-diff` fixture (both must no longer exit 0 with nothing run); review; integrate.
+- **Progress.** *on main* (2026-11-19). The change set comes from `git diff --raw` plus untracked files; `context --changes` names each file-level change, and `test --affected` falls back to the full suite with reason `no-line-diff`. Checked end to end: a test script that lost its executable bit now gives the full suite and exit 101, matching `cargo test` (before: nothing run, exit 0). Reviewed by hand, not by an independent reviewer.
+- **Note.** The branch's three new tests had failed only because a shared Cargo target directory reused a binary built from another worktree; after forcing a rebuild they pass. When building several worktrees with one `CARGO_TARGET_DIR`, touch `src/` and `tests/` first.
 
 ### 1.2 Editing one Markdown section can delete the next — high
 - **Problem.** A level-1 heading written as a setext heading (`Usage` underlined with `=====`) is not recognized. With `# Install` before it, the outline listed only Install, `expand` of Install included all of Usage, and replacing Install deleted both (the dry run showed it). This destroys user text.
