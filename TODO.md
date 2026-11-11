@@ -68,12 +68,12 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Progress.** *partial, tests first*: the failing tests are written; no implementation yet.
 - **Next.** Implement against those tests; measure the instruction block (now about 882 bytes, budget +120).
 
-### 2.5 `resume` misses whole-file reads
+### 2.5 `resume` misses whole-file reads — done
 - **Branch.** `fix/resume-whole-file-reads` (1 commit `5faf9dd`, on the current history, 6 files, +298 −21).
 - **Problem.** `justless read worker.py` printed the whole small file, but `resume` reported no activity, even after the file changed; `expand` on the same file was recorded.
 - **Plan.** Every path that shows source records the inspected range the way `expand` does: `read` verbatim files, outlines, `code`, `context --at`, `pack` excerpts and the Read hook's pass-through.
-- **Progress.** *built*: complete with tests; the reviewer-fixer never ran.
-- **Next.** Review (double counting, changed-file notices, bounded activity) and integrate. Coordinate with 2.1, which records shell reads through the same function.
+- **Progress.** *on main* (2026-11-19): `read`, outlines and Claude Code Read pass-throughs are recorded; `resume` lists `Read FILE:A-B` or `Outline FILE` with `[source changed]` after an edit. Reviewed by hand, not by an independent reviewer.
+- **Next.** When 2.1 lands, record shell reads through the same `history::saw_source` / `saw_outline` functions.
 
 ---
 
