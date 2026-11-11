@@ -115,12 +115,19 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Measure.** Bytes on real sessions' JSON outputs (`gh api`, `kubectl -o json`, `cargo metadata`, `npm ls --json`, cloud CLIs), then task success, before building more command-specific formatters.
 - **Progress.** *designed*.
 
-### 3.7 `init --global`
+### 3.7 Dependency-aware diffs for lockfiles, starting with Cargo.lock
+- **Problem.** A `git diff` that touches a lockfile is summarized by hunk location, which can cost more than saying which dependencies changed, and still does not answer the review question.
+- **Evidence (external reviewer).** Nine real commits from `utils` and `justless`, o200k_base tokenizer, same replay pointer in both formats: the dependency summary was smaller on 7 of 9; choosing the smaller preview per commit cut the total from 2,937 to 2,219 tokens (−24%). On one `utils` commit the current preview spent 282 tokens listing nine hunk locations, while a 147-token summary named all nine added packages and showed that `tokio` gained `signal-hook-registry`.
+- **Plan.** For a diff that touches `Cargo.lock`, parse both revisions (`git show REV:Cargo.lock` and the working or target version) and show package additions, removals, version changes and changed dependency links. Always flag a `source` or `checksum` change on an existing version (a supply-chain signal), even when the rest is clipped. Use the summary when it is smaller than the hunk preview; keep the exact patch one command away through the run's `justless log`.
+- **Measure.** How often agents reopen the full patch after a summary (`stats` already counts full reopenings per family) before adding `package-lock.json`, `pnpm-lock.yaml`, `uv.lock`, `poetry.lock`, `go.sum` and others.
+- **Progress.** *designed*.
+
+### 3.8 `init --global`
 - **Problem.** Hooks are per project; 12.5 MB was lost in sessions whose project had no hooks. RTK offers `init -g` for 13 agents.
 - **Plan.** Opt-in user-level hooks that resolve the project root per call, with a per-project opt-out, and `doctor`/`init --remove` support.
 - **Progress.** *not started*.
 
-### 3.8 Hook kill switches and diagnostics
+### 3.9 Hook kill switches and diagnostics
 - **Plan.** `exclude_commands` (prefix or regex) in `.justless.toml`, an environment variable that disables routing, and `justless rewrite "<cmd>"` that prints what a hook would do.
 - **Progress.** *not started*.
 
