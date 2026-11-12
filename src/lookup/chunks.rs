@@ -510,51 +510,16 @@ fn code<'a>(
     Some(Some(chunks))
 }
 
-/// Markdown headings as `source` finds them: (line, level, title).
-fn headings(lines: &[&str]) -> Vec<(usize, usize, String)> {
-    let mut headings = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
-    for (index, line) in lines.iter().enumerate() {
-        let raw = line.trim_end();
-        let content = raw.trim_start_matches(' ');
-        if raw.len() - content.len() > 3 {
-            continue;
-        }
-        if let Some(delimiter @ ('`' | '~')) = content.chars().next() {
-            let width = content.chars().take_while(|&c| c == delimiter).count();
-            if width >= 3 {
-                match fence {
-                    None => fence = Some((delimiter, width)),
-                    Some((d, w))
-                        if d == delimiter && width >= w && content[width..].trim().is_empty() =>
-                    {
-                        fence = None
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-        }
-        if fence.is_some() {
-            continue;
-        }
-        let level = content.bytes().take_while(|&c| c == b'#').count();
-        if !(1..=6).contains(&level) || !content[level..].starts_with([' ', '\t']) {
-            continue;
-        }
-        headings.push((index + 1, level, content[level..].trim().to_owned()));
-    }
-    headings
-}
-
+/// One chunk per heading, as `read` outlines Markdown, running to the next
+/// heading of any level. Lines before the first heading form a preamble.
 fn markdown<'a>(file: &str, lines: &[&'a str]) -> Vec<Chunk<'a>> {
-    let headings = headings(lines);
+    let headings = crate::markdown::headings(lines);
     let name = file_name(file);
     let stem = file_stem(file);
     let mut chunks = Vec::new();
     let preamble = headings
         .first()
-        .map_or(lines.len(), |(line, _, _)| line - 1);
+        .map_or(lines.len(), |heading| heading.first);
     if lines[..preamble]
         .iter()
         .filter(|line| !is_blank(line))
@@ -570,25 +535,30 @@ fn markdown<'a>(file: &str, lines: &[&'a str]) -> Vec<Chunk<'a>> {
         chunks.push(chunk);
     }
     let mut ancestors = Vec::<(usize, &str)>::new();
-    for (index, (start, level, title)) in headings.iter().enumerate() {
+    for (index, heading) in headings.iter().enumerate() {
+        // `end` is the 1-based last line of the chunk and the 0-based line after it.
         let end = headings
             .get(index + 1)
-            .map_or(lines.len(), |(next, _, _)| next - 1);
-        while ancestors.last().is_some_and(|(depth, _)| depth >= level) {
+            .map_or(lines.len(), |next| next.first);
+        while ancestors
+            .last()
+            .is_some_and(|(depth, _)| *depth >= heading.level)
+        {
             ancestors.pop();
         }
+        let title = heading.title.as_str();
         let display = if title.is_empty() { name } else { title };
-        let mut chunk = Chunk::new(*start, end, display, "section", Class::Doc);
-        chunk.add(NAME, title.clone());
+        let mut chunk = Chunk::new(heading.first + 1, end, display, "section", Class::Doc);
+        chunk.add(NAME, title.to_owned());
         for (_, ancestor) in &ancestors {
             chunk.add(DOC, ancestor.to_string());
         }
         chunk.add(DOC, stem.to_owned());
-        for line in &lines[*start..end] {
+        for line in &lines[heading.last + 1..end] {
             chunk.add(BODY, *line);
         }
         chunks.push(chunk);
-        ancestors.push((*level, title));
+        ancestors.push((heading.level, title));
     }
     chunks
 }
@@ -827,6 +797,41 @@ Downloads are retried.
         );
         assert_eq!(field(&chunks[4], DOC), ["Operations", "operations"]);
         assert_eq!(field(&chunks[1], BODY), ["```sh", "# not a heading", "```"]);
+    }
+
+    #[test]
+    fn markdown_sections_start_at_setext_headings() {
+        let source = "\
+# Install
+
+Run the installer.
+
+Usage
+=====
+
+Call the tool.
+
+<div>
+# not a heading
+</div>
+
+Flags across
+two lines
+---------
+Pass --help.
+";
+        let chunks = chunk("README.md", source, &mut Parsers::default());
+        assert_eq!(
+            summary(&chunks),
+            [
+                "1-4 section Install",
+                "5-13 section Usage",
+                "14-17 section Flags across two lines"
+            ]
+        );
+        assert_eq!(field(&chunks[1], BODY)[..2], ["", "Call the tool."]);
+        assert_eq!(field(&chunks[2], DOC), ["Usage", "README"]);
+        assert_eq!(field(&chunks[2], BODY), ["Pass --help."]);
     }
 
     #[test]

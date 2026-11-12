@@ -52,6 +52,7 @@ User-visible changes to Justless are recorded here. No release has been publishe
 - Without `--root`, `read`, `expand` and `edit` resolve a relative path from the current directory, falling back to the project root. `edit` refuses files the user cannot write and keeps hard links and extended attributes.
 - A command Justless prints for the agent to run next, such as lookup's `Next:` line, a run footer, `test --affected`'s `Full suite:` and `Why:` lines or hook context, reaches the same workspace from the directory the agent works in. It adds `--root` with the absolute root when a plain `justless` there would find another one, as after `--root billing`, and for `read`, `expand` and `edit` also from a subdirectory. Before, `justless --root billing lookup` could suggest an `expand` that opened the repository root's file of the same name. MCP tool results always add `--root`, since the server cannot know where the agent's shell works. The `Full suite:` line repeats the runner given after `--`.
 - An outline of Rust source with a syntax error names the error and its line.
+- Markdown outlines and `lookup` sections follow the CommonMark heading rules. A heading underlined with `=` or `-` starts its own section, so expanding or editing the section above it no longer takes it along. `#tag` lines and lines in code, HTML blocks, front matter, block quotes and list items are not headings.
 
 ### Tool history and sessions
 

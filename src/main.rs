@@ -18,6 +18,7 @@ mod lint;
 mod listing;
 mod lookup;
 mod map;
+mod markdown;
 mod mcp;
 mod merge;
 mod observations;

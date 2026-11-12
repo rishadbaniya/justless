@@ -16556,3 +16556,174 @@ fn affected_tests_widen_for_a_file_level_change_outside_the_runner_root() {
         "{text}"
     );
 }
+
+/// The outline rows of a Markdown file as (name, first line, last line).
+fn markdown_rows(root: &Path, file: &str) -> (String, Vec<(String, u64, u64)>) {
+    let outline: serde_json::Value =
+        serde_json::from_str(&success(root, &["read", file, "--outline", "--json"])).unwrap();
+    let rows = outline["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap().to_owned(),
+                entry["first"].as_u64().unwrap(),
+                entry["last"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    (outline["revision"].as_str().unwrap().to_owned(), rows)
+}
+
+#[test]
+fn markdown_setext_heading_ends_the_section_before_it() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let text = "# Install\n\nRun the installer.\n\nUsage\n=====\n\nCall the tool.\n\n## Flags\n\nPass --help.\n";
+    fs::write(root.join("README.md"), text).unwrap();
+    let (revision, rows) = markdown_rows(root, "README.md");
+    let expected = [("Install", 1, 4), ("Usage", 5, 12), ("Flags", 10, 12)]
+        .map(|(name, first, last)| (name.to_owned(), first, last));
+    assert_eq!(rows, expected);
+    assert_eq!(
+        success(root, &["expand", "README.md", "Install"]),
+        "# Install\n\nRun the installer.\n\n"
+    );
+    // Replacing Install leaves the Usage section and its subsection alone.
+    let input = TempDir::new().unwrap();
+    let replacement = input.path().join("install.md");
+    fs::write(&replacement, "# Install\n\nUse brew.\n\n").unwrap();
+    let selector = format!("{revision}#1");
+    let edit = [
+        "edit",
+        "README.md",
+        &selector,
+        "--replacement-file",
+        replacement.to_str().unwrap(),
+    ];
+    let diff = success(root, &[&edit[..], &["--dry-run"]].concat());
+    assert!(
+        diff.contains("+Use brew.") && !diff.contains("-Usage") && !diff.contains("-Call"),
+        "{diff}"
+    );
+    success(root, &edit);
+    assert_eq!(
+        fs::read_to_string(root.join("README.md")).unwrap(),
+        text.replace("Run the installer.", "Use brew.")
+    );
+    // lookup ranks the Usage section as its own place, from its first line.
+    let found = success(root, &["lookup", "call the tool"]);
+    assert!(found.contains("README.md:5-9 section Usage"), "{found}");
+}
+
+#[test]
+fn markdown_section_edits_touch_only_their_own_bytes() {
+    let lines = [
+        "---",
+        "title: Guide",
+        "# not a heading: front matter",
+        "---",
+        "Intro paragraph.",
+        "",
+        "Guide",
+        "=====",
+        "",
+        "#tag is not a heading.",
+        "",
+        "```sh title=\"x\"",
+        "# fenced comment",
+        "Fake",
+        "===",
+        "```",
+        "",
+        "Install",
+        "-------",
+        "Run `make`.",
+        "",
+        "~~~~",
+        "## inside a tilde fence",
+        "~~~",
+        "still fenced",
+        "~~~~",
+        "",
+        "    # indented code",
+        "",
+        "- item",
+        "---",
+        "",
+        "<div>",
+        "# inside an HTML block",
+        "</div>",
+        "",
+        "### Linux ###",
+        "apt install",
+        "",
+        "---",
+        "",
+        "Usage across",
+        "several lines",
+        "==",
+        "Body.",
+        "",
+        "> # quoted",
+        "> Quote",
+        "> ---",
+        "",
+        "   ## Flags",
+        "Pass --help.",
+    ];
+    // Each heading's name and section lines, written out rather than read back.
+    let expected: [(&str, usize, usize); 5] = [
+        ("Guide", 7, 41),
+        ("Install", 18, 41),
+        ("Linux", 37, 41),
+        ("Usage across several lines", 42, 52),
+        ("Flags", 51, 52),
+    ];
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let input = TempDir::new().unwrap();
+    let replacement = input.path().join("replacement.md");
+    let marker = "replaced section\n";
+    fs::write(&replacement, marker).unwrap();
+    for ending in ["\n", "\r\n"] {
+        let text = lines.map(|line| format!("{line}{ending}")).concat();
+        // Byte offsets of each line start, then the end of the file.
+        let mut starts = vec![0];
+        starts.extend(text.match_indices(ending).map(|(at, _)| at + ending.len()));
+        fs::write(root.join("guide.md"), &text).unwrap();
+        let (revision, rows) = markdown_rows(root, "guide.md");
+        assert_eq!(
+            rows,
+            expected.map(|(name, first, last)| (name.to_owned(), first as u64, last as u64)),
+            "{ending:?}"
+        );
+        for (row, (name, first, last)) in expected.iter().enumerate() {
+            let span = starts[first - 1]..starts[*last];
+            let selector = format!("{revision}#{}", row + 1);
+            fs::write(root.join("guide.md"), &text).unwrap();
+            assert_eq!(
+                success(root, &["expand", "guide.md", &selector]),
+                text[span.clone()],
+                "{name} {ending:?}"
+            );
+            success(
+                root,
+                &[
+                    "edit",
+                    "guide.md",
+                    &selector,
+                    "--replacement-file",
+                    replacement.to_str().unwrap(),
+                ],
+            );
+            let edited = fs::read_to_string(root.join("guide.md")).unwrap();
+            assert_eq!(
+                edited,
+                format!("{}{marker}{}", &text[..span.start], &text[span.end..]),
+                "{name} {ending:?}"
+            );
+        }
+    }
+}

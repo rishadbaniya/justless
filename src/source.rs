@@ -294,58 +294,25 @@ impl Snapshot {
         if !markdown {
             return;
         }
-        let mut open = Vec::<(usize, usize)>::new();
-        let mut fence: Option<(char, usize)> = None;
-        for (line, &start) in self.lines.iter().enumerate() {
-            let end = self.lines.get(line + 1).copied().unwrap_or(self.text.len());
-            let raw = self.text[start..end].trim_end();
-            let content = raw.trim_start_matches(' ');
-            if raw.len() - content.len() > 3 {
-                continue;
-            }
-            if let Some(delimiter @ ('`' | '~')) = content.chars().next() {
-                let width = content.chars().take_while(|&c| c == delimiter).count();
-                if width >= 3 {
-                    match fence {
-                        None => fence = Some((delimiter, width)),
-                        Some((d, w))
-                            if d == delimiter
-                                && width >= w
-                                && content[width..].trim().is_empty() =>
-                        {
-                            fence = None
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-            }
-            if fence.is_some() {
-                continue;
-            }
-            let level = content.bytes().take_while(|&c| c == b'#').count();
-            if !(1..=6).contains(&level) || !content[level..].starts_with([' ', '\t']) {
-                continue;
-            }
-            let mut title = content[level..].trim();
-            // A closing run of #s after a space is not part of the heading text.
-            let unclosed = title.trim_end_matches('#');
-            if unclosed.is_empty() || unclosed.ends_with([' ', '\t']) {
-                title = unclosed.trim_end();
-            }
-            while open.last().is_some_and(|(depth, _)| *depth >= level) {
-                let (_, id) = open.pop().unwrap();
-                self.entries[id].bytes.end = start;
-            }
-            open.push((level, self.entries.len()));
-            self.entries.push(Entry {
-                name: title.into(),
+        // Where a 0-based line starts, or the end of the text past the last line.
+        let offset = |line: usize| self.lines.get(line).copied().unwrap_or(self.text.len());
+        let lines: Vec<&str> = (0..self.lines.len())
+            .map(|line| {
+                let text = &self.text[offset(line)..offset(line + 1)];
+                text.strip_suffix('\n').unwrap_or(text)
+            })
+            .collect();
+        let entries: Vec<Entry> = crate::markdown::sections(&lines)
+            .into_iter()
+            .map(|section| Entry {
+                name: section.heading.title,
                 kind: "heading".into(),
-                signature_start: start,
-                bytes: start..self.text.len(),
-                header_end: end,
-            });
-        }
+                signature_start: offset(section.heading.first),
+                bytes: offset(section.heading.first)..offset(section.end),
+                header_end: offset(section.heading.last + 1),
+            })
+            .collect();
+        self.entries.extend(entries);
     }
 
     fn reference(&self, index: usize) -> String {
