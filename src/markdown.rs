@@ -73,18 +73,24 @@ pub fn sections<S: AsRef<str>>(lines: &[S]) -> Vec<Section> {
 }
 
 /// The lines a YAML front matter block takes at the top of a file: `---`
-/// through a closing `---` or `...`. Without a closing line there is none.
+/// directly followed by YAML, through a closing `---` or `...`. Without a
+/// closing line, or with a blank line after the opening one, the `---` is a
+/// thematic break, so a file that opens with a rule keeps its headings.
 fn front_matter<S: AsRef<str>>(lines: &[S]) -> usize {
     fn trimmed(line: &impl AsRef<str>) -> &str {
         line.as_ref().trim_end_matches([' ', '\t', '\r'])
     }
-    match lines.first() {
-        Some(first) if trimmed(first).trim_start_matches('\u{feff}') == "---" => lines[1..]
-            .iter()
-            .position(|line| matches!(trimmed(line), "---" | "..."))
-            .map_or(0, |closing| closing + 2),
-        _ => 0,
+    let opens = lines
+        .first()
+        .is_some_and(|first| trimmed(first).trim_start_matches('\u{feff}') == "---")
+        && lines.get(1).is_some_and(|next| !trimmed(next).is_empty());
+    if !opens {
+        return 0;
     }
+    lines[1..]
+        .iter()
+        .position(|line| matches!(trimmed(line), "---" | "..."))
+        .map_or(0, |closing| closing + 2)
 }
 
 #[derive(Default)]
@@ -802,6 +808,12 @@ mod tests {
         assert_eq!(titles("# before\n```\n# a\n"), ["before"]);
         // Without a closing line, `---` at the top is a thematic break.
         assert_eq!(titles("---\n# first\nText\n"), ["first"]);
+        // So is one followed by a blank line, as front matter starts with YAML.
+        assert_eq!(
+            titles("---\n\n# Project\n\nIntro\n\n---\n\n## Install\n"),
+            ["Project", "Install"]
+        );
+        assert_eq!(titles("---\n---\n# after\n"), ["after"]);
         // A lone tag cannot interrupt a paragraph.
         assert_eq!(titles("Para\n<span>\n===\n"), ["Para <span>"]);
     }
