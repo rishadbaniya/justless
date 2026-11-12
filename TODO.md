@@ -126,7 +126,14 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Plan.** Opt-in user-level hooks that resolve the project root per call, with a per-project opt-out, and `doctor`/`init --remove` support.
 - **Progress.** *not started*.
 
-### 3.9 Hook kill switches and diagnostics
+### 3.9 Global project registry — machine-wide stats and run lookup
+- **Problem.** All state lives in each project's `.justless/`, so nothing sees across projects: `stats` covers one checkout, runs made in a git worktree or nested repository count only there, and `justless log RUN` from another directory answers "unknown run ID". On 2026-11-19 this repo's `stats` showed 5 runs because a session's other work ran in worktrees and scratch folders.
+- **Plan.** Keep every project's data where it is (archives can hold secrets; deleting `.justless/` must still remove them; index, `resume` and `[source changed]` are per checkout). Add one small local registry, for example `~/.local/state/justless/projects.json` (honouring `XDG_STATE_HOME`), listing each project root, its repository identity (`git rev-parse --git-common-dir`) and when it was last used. Use it for: `justless stats --all` (one total, worktrees of one repository grouped together); `justless log`/`search`/`context --run RUN` falling back to the registry when the run is not in the current project (run IDs are already unique); `doctor` listing projects with hooks. Exclude temporary folders (`$TMPDIR`, test and benchmark roots) from totals by default, with a flag to include them. `init --remove --purge` drops the project's entry.
+- **Constraints.** Local only (no network), private file permissions, never stores run output or command lines (paths and counts only), and safe to delete (it is rebuilt as projects are used).
+- **Relation.** Shares the user-level home that `init --global` (3.8) needs; build them together if both are taken up.
+- **Progress.** *designed*.
+
+### 3.10 Hook kill switches and diagnostics
 - **Plan.** `exclude_commands` (prefix or regex) in `.justless.toml`, an environment variable that disables routing, and `justless rewrite "<cmd>"` that prints what a hook would do.
 - **Progress.** *not started*.
 
