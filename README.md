@@ -26,8 +26,10 @@
 - **⚡ Compact Output.** `justless run` parses each tool's output: test failures grouped by diagnostic (cargo, pytest, Go, Jest/Vitest), lint findings grouped by rule ID with `file:line` (rustc, Clippy, Ruff, mypy, ESLint, tsc and more), searches grouped by file, listings by directory. Anything else becomes a 4 KB head, tail and error-line preview.
 - **🎯 Exact Recall.** Every stream is archived byte for byte, up to 256 MiB, in `.justless/runs/<id>` with a SHA-256 digest. `justless log ID --from N --to M` replays exact lines, with secrets masked unless you add `--unredacted`; an identical rerun collapses to one line.
 - **🔬 Surgical Reads.** syn and Tree-sitter outlines across 21 languages with revision-bound row IDs. `expand` returns one symbol's exact bytes; `edit` writes only the replacement after checking the revision.
-- **🗺️ Code Map and Impact.** An incremental graph of symbols, calls, imports, HTTP routes and SQL relations. `pack` answers a question in one call; `affected` walks back to the tests that reach a change.
+- **🗺️ Code Map and Impact.** An incremental graph of symbols, calls, imports, HTTP routes and SQL relations. `pack` answers a question in one call, `lookup` ranks the few places that answer "where is X configured?", and `affected` walks back to the tests that reach a change.
 - **🧪 Affected Tests.** `justless test --affected` runs only the tests that reach your Git changes, labels the result as a subset, and runs the full suite instead when the selection can't be trusted.
+- **🔐 Secret Redaction.** Cloud keys, tokens and private keys in command output are masked everywhere the agent sees output: previews, footers, `log`, `search` and MCP results. The archive keeps the exact bytes for `log --unredacted`.
+- **🧰 Scripts and Lessons.** `justless exec` runs a script the agent writes over large data, with whole head and tail lines and `--intent` ranking the lines that matter. `justless learn` proposes project rules from command mistakes agents keep repeating, and `--apply` adds them to the instructions.
 - **🧹 Context Hygiene.** A footer only when output was cut, failed or had a secret masked, compaction hooks that carry run IDs and inspected ranges into the next turn, and an opt-in `justless wrap claude` that has the API clear old tool results server-side, with every original archived.
 
 
