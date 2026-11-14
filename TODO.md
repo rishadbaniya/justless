@@ -160,9 +160,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Progress.** The four-arm harness is *on main* (`scripts/agent_bench`, 118 tests): Claude Code 2.1.327 parity (65 of 68 tool results byte-identical), 32 frozen tasks from the owner's repos, sandboxed runs, a $90 hard cap enforced per request, pre-registered analysis. Offline validation passed (dry runs with 0 mismatches). The task store (about 60 GB) is in the session scratchpad. Spent so far on paid runs: about $1.10 (the earlier repair benchmark).
 - **Next.** Move the store to a durable private directory; redo `run.py cc-capture` and `parity-diff` with the current binary (hooks changed since the capture); re-run `prepare --generate` for the one lint task that exposes a source file; `validate-tasks`; `review-tasks --approve`; then the pilot (estimate $2.53, cap $3). Scale up only if the pilot is sane.
 
-### 5.2 README
-- **Problem.** The README does not mention `lookup`, `exec`, `learn`, secret redaction, `test --affected`, `doctor`, `init --remove` or the status line, and its numbers predate them.
-- **Progress.** *not started*.
+### 5.2 README — done
+- **Progress.** *on main* (2026-11-19): the README now names `lookup`, secret redaction, `exec` and `learn`, next to the existing `test --affected`, `doctor`, `init --remove` and status-line mentions. Its measured table still holds: a re-run of the repair benchmark on 2026-11-19 gave 87.2–87.5% fewer input tokens across the four models, within run-to-run noise of the published 87.3–87.5%.
 
 ### 5.3 First release
 - **Problem.** No tagged release, so every install compiles from source and needs Rust.
