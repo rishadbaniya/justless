@@ -380,14 +380,40 @@ fn context_budget(workspace: &Workspace, matches: &ArgMatches) -> Result<usize> 
     }
 }
 
+/// The `--root` values given before the subcommand. Clap copies a global
+/// argument given after the subcommand over the one given before it, so
+/// `justless --root A query X --root B` would otherwise run in B without a word.
+/// The scan stops at the subcommand, so arguments for a command `run` or `wrap`
+/// starts are never read as Justless's own.
+fn leading_roots(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut roots = Vec::new();
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--root" {
+            match args.next() {
+                Some(value) => roots.push(value),
+                None => break,
+            }
+        } else if let Some(value) = arg.to_str().and_then(|text| text.strip_prefix("--root=")) {
+            roots.push(OsString::from(value));
+        } else {
+            break;
+        }
+    }
+    roots
+}
+
 /// `--root` may be repeated when every copy names the same directory, as when an
 /// agent adds one to a printed command that already carries it.
 fn check_root(matches: &ArgMatches) -> Result<()> {
-    let mut roots = matches
-        .values_of_os("root")
-        .into_iter()
-        .flatten()
-        .map(Path::new);
+    let leading = leading_roots(std::env::args_os());
+    let mut roots = leading.iter().map(Path::new).chain(
+        matches
+            .values_of_os("root")
+            .into_iter()
+            .flatten()
+            .map(Path::new),
+    );
     let Some(first) = roots.next() else {
         return Ok(());
     };

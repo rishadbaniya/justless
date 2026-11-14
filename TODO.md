@@ -174,7 +174,6 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - `test --affected`: a quiet (`-q`) doctest step is trusted when any doctest ran; MCP tools cannot pass `--base`; generic or trait-impl methods, inline-module docs and some other shapes fall back to the full suite (safe, slower).
 - `affected --changes` after a deletion: unlinked paths into external crates other than std/core/alloc are reported as possible; callers of a `macro_rules!` that names the deleted symbol are not followed.
 - `history TEXT` ranks newest runs first, so an older failed run's line can sit behind newer matches (it is counted in the cut notice). MCP search tools cap `limit` at 1000 while the notice can suggest more.
-- `--root` given both before and after the subcommand silently uses the second.
 - Routed searches with ` && test 1`: Claude Code's UI label reads "Condition is false" instead of "No matches found" (the model never sees it); a routed search moved to the background still reads exit 1 as failed.
 
 ---

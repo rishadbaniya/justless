@@ -34,6 +34,7 @@ User-visible changes to Justless are recorded here. No release has been publishe
 
 ### Code navigation
 
+- `--root` given once before the subcommand and once after it with different directories is now an error. Before, the second silently won, so a command could run in the wrong project.
 - A local index covers Rust, JavaScript, TypeScript and TSX, Python, Go, Java, Kotlin, Scala, C, C++, C#, Swift, Dart, Ruby, PHP, Lua, Zig, Bash, SQL and HCL, including Terraform. It refreshes on every query and reuses unchanged files.
 - `query`, `path`, `find`, `context` and `code` answer definition, reference, caller, test and dependency questions with a file and line for each result. Links inferred across languages, such as an HTTP route or a SQL table name, are marked as possible.
 - `pack` gathers definitions, graph links, source lines, working-tree changes and recent failures for a task within a byte budget.

@@ -16727,3 +16727,37 @@ fn markdown_section_edits_touch_only_their_own_bytes() {
         }
     }
 }
+
+#[test]
+fn root_given_before_and_after_the_subcommand_must_agree() {
+    let temp = TempDir::new().unwrap();
+    let (a, b) = (temp.path().join("a"), temp.path().join("b"));
+    for dir in [&a, &b] {
+        fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+    }
+    fs::write(a.join("lib.rs"), "fn alpha() {}\n").unwrap();
+    fs::write(b.join("lib.rs"), "fn beta() {}\n").unwrap();
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+    // Clap copies the later value over the earlier one, so this ran in b.
+    let split = cli(temp.path(), &["--root", a, "find", "fn", "--root", b]);
+    assert!(!split.status.success(), "{}", stdout(&split));
+    assert!(
+        stderr(&split).contains("--root names two different directories"),
+        "{}",
+        stderr(&split)
+    );
+    let joined = format!("--root={a}");
+    let split = cli(temp.path(), &[&joined, "find", "fn", "--root", b]);
+    assert!(!split.status.success(), "{}", stdout(&split));
+    // The same directory twice still works.
+    let same = cli(temp.path(), &["--root", a, "find", "fn", "--root", a]);
+    assert!(same.status.success(), "{}", stderr(&same));
+    assert!(stdout(&same).contains("alpha"));
+    // Arguments after `run --` belong to the command it starts.
+    let run = cli(
+        temp.path(),
+        &["--root", a, "run", "--", "echo", "--root", b],
+    );
+    assert!(run.status.success(), "{}", stderr(&run));
+}
