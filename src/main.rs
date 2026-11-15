@@ -534,16 +534,14 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             let full = to == usize::MAX && sub.value_of("from") == Some("1");
             // The MCP server shows a long replay one page at a time and records
             // the size of the page itself.
-            let measured = std::env::var_os(mcp::PAGED_REPLAY).is_none();
-            history::recall(
-                &directory,
-                if full {
+            if std::env::var_os(mcp::PAGED_REPLAY).is_none() {
+                let retrieval = if full {
                     history::Retrieval::Full
                 } else {
                     history::Retrieval::Range
-                },
-                measured.then_some(printed),
-            );
+                };
+                history::recall(&directory, retrieval, Some(printed));
+            }
             if full {
                 adaptive::note_replay(&directory, sub.value_of("stream").unwrap());
             }

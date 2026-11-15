@@ -750,22 +750,37 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
 /// `stats` subtracts them from the runs' savings. A window cut down to its
 /// header counts as the header.
 fn note_log_windows(workspace: &Workspace, ranking: &Ranking, output: &str, json: bool) {
+    if !ranking.hits.iter().any(|hit| hit.run.is_some()) {
+        return;
+    }
     let mut printed = std::collections::BTreeMap::<String, u64>::new();
-    for hit in &ranking.hits {
-        let Some((run, _)) = &hit.run else {
-            continue;
-        };
-        let shown = if json {
-            serde_json::to_string(&result_json(hit)).ok()
-        } else {
-            let block = block(hit);
-            let header = block[..block.find('\n').map_or(block.len(), |at| at + 1)].to_owned();
-            [block, header]
-                .into_iter()
-                .find(|text| output.contains(text.as_str()))
-        };
-        if let Some(text) = shown.filter(|text| output.contains(text.as_str())) {
-            *printed.entry(run.clone()).or_default() += text.len() as u64;
+    let mut charge = |hit: &Hit, bytes: usize| {
+        if let Some((run, _)) = &hit.run {
+            *printed.entry(run.clone()).or_default() += bytes as u64;
+        }
+    };
+    if json {
+        if let Ok(value) = serde_json::from_str::<Value>(output)
+            && let Some(results) = value["results"].as_array()
+        {
+            for (hit, result) in ranking.hits.iter().zip(results) {
+                charge(hit, result.to_string().len());
+            }
+        }
+    } else {
+        let mut rest = output;
+        for hit in &ranking.hits {
+            let full = block(hit);
+            let header = full.split_inclusive('\n').next().unwrap_or_default();
+            if let Some(next) = rest.strip_prefix(&full) {
+                charge(hit, full.len());
+                rest = next;
+            } else {
+                if rest.starts_with(header) {
+                    charge(hit, header.len());
+                }
+                break;
+            }
         }
     }
     crate::history::excerpts(workspace, &printed);

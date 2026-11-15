@@ -400,22 +400,13 @@ fn update<T: serde::de::DeserializeOwned + Serialize + Default>(
 }
 
 /// Records a retrieval of the run in `directory` and the bytes it printed.
-/// `bytes` is `None` when the caller that shows the result records its size
-/// with [`measured`], as the MCP server does for a `log` page. Until then the
-/// retrieval counts as unmeasured, and a whole replay is estimated.
+/// Unredacted reads also increment a separate counter without adding bytes twice.
 pub fn recall(directory: &Path, retrieval: Retrieval, bytes: Option<u64>) {
     let _ = update(&directory.join("recalls.json"), |r: &mut Recalls| {
         r.count(retrieval);
         if let Some(bytes) = bytes {
             r.measure(retrieval, bytes);
         }
-    });
-}
-
-/// Records the bytes of a retrieval that [`recall`] counted without them.
-pub fn measured(directory: &Path, retrieval: Retrieval, bytes: u64) {
-    let _ = update(&directory.join("recalls.json"), |r: &mut Recalls| {
-        r.measure(retrieval, bytes);
     });
 }
 
@@ -437,16 +428,19 @@ const ARCHIVE_RECALLS: &str = "archive-recalls.jsonl";
 struct ArchiveRecall {
     ms: u64,
     bytes: u64,
+    #[serde(default)]
+    proxy: bool,
 }
 
 /// Records that `justless recall` printed `bytes` of an archived tool result.
-pub fn recalled_archive(workspace: &Workspace, bytes: u64) {
+pub fn recalled_archive(workspace: &Workspace, bytes: u64, proxy: bool) {
     if workspace.prepare_state().is_err() {
         return;
     }
     let Ok(mut line) = serde_json::to_vec(&ArchiveRecall {
         ms: now_ms(),
         bytes,
+        proxy,
     }) else {
         return;
     };
@@ -454,17 +448,29 @@ pub fn recalled_archive(workspace: &Workspace, bytes: u64) {
     crate::statusline::append(&workspace.state.join(ARCHIVE_RECALLS), &line);
 }
 
+#[derive(Default)]
+pub(crate) struct ArchiveRecalls {
+    count: u64,
+    pub(crate) bytes: u64,
+    pub(crate) proxy_bytes: u64,
+}
+
 /// How many archived tool results `justless recall` printed since `since_ms`,
 /// and their bytes.
-pub fn archive_recalls(state: &Path, since_ms: u64) -> (u64, u64) {
+pub(crate) fn archive_recalls(state: &Path, since_ms: u64) -> ArchiveRecalls {
     let Ok(text) = fs::read_to_string(state.join(ARCHIVE_RECALLS)) else {
-        return (0, 0);
+        return ArchiveRecalls::default();
     };
     text.lines()
         .filter_map(|line| serde_json::from_str::<ArchiveRecall>(line).ok())
         .filter(|recall| recall.ms >= since_ms)
-        .fold((0, 0), |(count, bytes), recall| {
-            (count + 1, bytes + recall.bytes)
+        .fold(ArchiveRecalls::default(), |mut total, recall| {
+            total.count += 1;
+            total.bytes += recall.bytes;
+            if recall.proxy {
+                total.proxy_bytes += recall.bytes;
+            }
+            total
         })
 }
 
@@ -610,7 +616,7 @@ fn estimated_tokens_signed(bytes: i64) -> i64 {
 }
 
 /// [`human_bytes`] for net savings, which can be negative.
-fn signed_bytes(bytes: i64) -> String {
+pub(crate) fn signed_bytes(bytes: i64) -> String {
     let size = human_bytes(bytes.unsigned_abs());
     if bytes < 0 { format!("-{size}") } else { size }
 }
@@ -698,14 +704,14 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         }
     }
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
-    let proxy = crate::proxy::report(workspace, since)?;
+    let recalls = archive_recalls(&workspace.state, since);
+    let proxy = crate::proxy::report(workspace, since, recalls.proxy_bytes)?;
     let (raw, preview, saved, net) = (
         totals.raw_bytes,
         totals.preview_bytes,
         totals.initial(),
         totals.net_saved_bytes,
     );
-    let (recalls, recalled_bytes) = archive_recalls(&workspace.state, since);
     let mut commands: Vec<_> = families.into_values().collect();
     commands.sort_by(|a, b| {
         b.totals
@@ -738,7 +744,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "unredacted_replays": unredacted,
             "hook_pass_through": activity.bypasses,
             "proxy": proxy.as_ref().map(|p| p.json()),
-            "archive_recalls": {"recalls": recalls, "bytes": recalled_bytes},
+            "archive_recalls": {"recalls": recalls.count, "bytes": recalls.bytes},
             "preview_budgets": crate::adaptive::stats_json(workspace),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -905,10 +911,11 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     if let Some(proxy) = &proxy {
         proxy.print(days, &workspace.justless());
     }
-    if recalls > 0 {
+    if recalls.count > 0 {
         println!(
-            "\nArchived tool results printed by `justless recall`, last {days} day(s): {recalls}, {} back in context. Request-boundary and mask savings do not subtract them.",
-            human_bytes(recalled_bytes)
+            "\nArchived tool results printed by `justless recall`, last {days} day(s): {}, {} back in context.",
+            recalls.count,
+            human_bytes(recalls.bytes)
         );
     }
     Ok(())

@@ -23,13 +23,11 @@ These three were the last work running. All are on the current history, so they 
 - **Where.** `src/source.rs` (around line 324), `src/lookup/chunks.rs`, the index.
 - **Progress.** *on main* (2026-11-19). One shared CommonMark heading scanner (`src/markdown.rs`) now splits Markdown for outlines, `expand`, `edit` and `lookup`: setext `=`/`-` underlines, ATX headings, nothing inside code fences, front matter or HTML blocks, and a top `---` followed by a blank line read as a rule. Checked end to end: with `# Install` followed by an underlined `Usage`, the outline lists both, `expand` of Install stops before Usage, and replacing Install leaves Usage intact. Reviewed by hand, not by an independent reviewer.
 
-### 1.3 Savings ignore bytes replayed later — medium
+### 1.3 Savings ignore bytes replayed later — medium — done
 - **Problem.** A command printed 19,000 bytes; Justless showed 364 and reported 18,636 saved. After `justless log` returned all 19,000 bytes, the full-read counter went from 0 to 1 but savings stayed at 18,636, though across both responses Justless sent 364 bytes more than the plain command.
 - **Plan.** Record the bytes each later retrieval returns (`log`, `search`, `context --run`, MCP log tools, `lookup --logs`) and report initial savings and net savings after replays side by side in `stats`, `stats --json` and the status line; apply the same to the proxy's retire-and-recall numbers.
 - **Where.** `src/history.rs` (around line 390), `recalls.json` per run, `src/statusline.rs`.
-- **Branch.** `worktree-wf_25a301f5-fae-3` (1 commit `dfd096e fix(stats): report savings net of later replays and recalls`, 14 files, +1,103 −160).
-- **Progress.** *built*: complete commit with tests; not reviewed.
-- **Next.** Review (old `recalls.json` records, MCP and `lookup --logs` replays, status line wording), then integrate.
+- **Progress.** Implemented and verified on 2026-11-19. Run stats report initial savings, bytes returned, and signed net savings. MCP charges the delivered log page. Proxy stats subtract recalls from the bytes marked for clearing and keep API-reported token counts separate. Regression tests cover full and partial reads, mixed source and log output, and older records.
 
 ---
 

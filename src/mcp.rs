@@ -87,8 +87,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Protocol loop
 
-/// Set for a `log` child, whose output the server pages: the child counts the
-/// replay, and the server records the bytes of the page it returns.
+/// A paged log is accounted for by the server once it knows the delivered size.
 pub(crate) const PAGED_REPLAY: &str = "JUSTLESS_PAGED_REPLAY";
 
 struct Server {
@@ -391,7 +390,6 @@ impl Server {
         let mut texts = Vec::new();
         if let Some(arguments) = log.filter(|_| !failed) {
             texts = log_pages(&output, arguments, &self.root);
-            self.measure_page(arguments, texts.iter().map(String::len).sum());
         } else {
             for stream in [&output.stdout, &output.stderr] {
                 if !stream.is_empty() {
@@ -406,11 +404,13 @@ impl Server {
                 "(no output)".into()
             });
         }
+        if let Some(arguments) = log.filter(|_| !failed) {
+            self.measure_page(arguments, texts.iter().map(String::len).sum());
+        }
         tool_result(texts, failed)
     }
 
-    /// Records the bytes of a `log` page against its run. The child counted the
-    /// replay as `log` does, as whole when it has no line range.
+    /// Records the page and its delivered byte count together after pagination.
     fn measure_page(&self, arguments: &Map<String, Value>, bytes: usize) {
         let Some(Ok(run)) = arguments
             .get("run_id")
@@ -429,7 +429,7 @@ impl Server {
         } else {
             crate::history::Retrieval::Range
         };
-        crate::history::measured(&directory, retrieval, bytes as u64);
+        crate::history::recall(&directory, retrieval, Some(bytes as u64));
     }
 }
 

@@ -125,7 +125,8 @@ fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> O
     if let Some(start) = session_start(input, now) {
         for workspace in &workspaces {
             tally.add_runs(workspace, start);
-            tally.recalled += crate::history::archive_recalls(&workspace.state, start).1;
+            let recalls = crate::history::archive_recalls(&workspace.state, start);
+            tally.recalled += recalls.bytes - recalls.proxy_bytes;
         }
     }
     if let Some(digest) = &digest {
@@ -436,6 +437,20 @@ fn render(tally: &Tally, width: Option<usize>) -> String {
         counts.push(count(tally.searches, "search", "searches"));
     }
     let mut variants = Vec::new();
+    if tally.run_replayed > 0 || tally.recalled > 0 {
+        let initial = net_bytes(tally.run_raw, tally.run_shown, 0).saturating_add(net_bytes(
+            tally.tool_raw,
+            tally.tool_shown,
+            0,
+        ));
+        let tokens = short_number(estimated_tokens(initial.unsigned_abs()));
+        let direction = if initial < 0 { "extra" } else { "saved" };
+        let both = format!("justless · initially ≈{tokens} tokens {direction} · {saved}");
+        let mut full = vec![format!("{both} this session")];
+        full.extend(counts.iter().cloned());
+        variants.push(full.join(" · "));
+        variants.push(both);
+    }
     for kept in (0..=counts.len()).rev() {
         let mut parts = vec!["justless".to_owned(), format!("{saved} this session")];
         parts.extend(counts[..kept].iter().cloned());
@@ -1037,7 +1052,7 @@ mod tests {
         assert_eq!(replayed.net_bytes(), -364);
         assert_eq!(
             render(&replayed, None),
-            "justless · net ≈91 extra tokens this session · 1 run"
+            "justless · initially ≈4.7k tokens saved · net ≈91 extra tokens this session · 1 run"
         );
         // A grouped Grep result recalled in part keeps the rest of its saving.
         let recalled = Tally {
@@ -1050,7 +1065,7 @@ mod tests {
         assert_eq!(recalled.net_bytes(), 5_000);
         assert_eq!(
             render(&recalled, None),
-            "justless · net ≈1.2k tokens saved this session · 1 search"
+            "justless · initially ≈2.2k tokens saved · net ≈1.2k tokens saved this session · 1 search"
         );
     }
 }

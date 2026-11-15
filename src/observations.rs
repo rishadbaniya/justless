@@ -1,4 +1,3 @@
-use crate::capture::Counted;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -10,7 +9,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::capture::source_digest;
+use crate::capture::{Counted, source_digest};
 use crate::history::{age, human_bytes, now_ms};
 use crate::workspace::{Workspace, private_dir, write_json};
 
@@ -622,10 +621,10 @@ fn marker(value: &Value) -> Option<&str> {
 
 /// Prints one archived result, by recall ID or tool_use ID. Returns the bytes
 /// printed.
-fn recall(ws: &Workspace, args: &ArgMatches, selection: &Selection) -> Result<u64> {
+fn recall(ws: &Workspace, args: &ArgMatches, selection: &Selection) -> Result<(u64, bool)> {
     let as_json = args.is_present("json");
     if let Some(id) = args.value_of("tool-use") {
-        return recall_tool_use(ws, id, as_json, selection);
+        return Ok((recall_tool_use(ws, id, as_json, selection)?, true));
     }
     let id = args.value_of("id").unwrap();
     // A tool_use ID reaches the proxy's archive, so `justless recall ID`
@@ -635,7 +634,7 @@ fn recall(ws: &Workspace, args: &ArgMatches, selection: &Selection) -> Result<u6
             valid_tool_use_id(id),
             "invalid ID: expected a 64-character recall ID or a tool_use ID"
         );
-        return recall_tool_use(ws, id, as_json, selection);
+        return Ok((recall_tool_use(ws, id, as_json, selection)?, true));
     }
     let value = recover(ws, id)?;
     // Plain recall prints text: a string, or the parts of an all-text array
@@ -648,13 +647,13 @@ fn recall(ws: &Workspace, args: &ArgMatches, selection: &Selection) -> Result<u6
                 .collect::<String>(),
             None => value.as_str().unwrap_or_default().to_owned(),
         };
-        return selection.print(text.as_bytes());
+        return Ok((selection.print(text.as_bytes())?, false));
     }
     ensure!(
         selection.whole(),
         "--from, --to and --grep need a text result; use --json for this one"
     );
-    print_json(&value)
+    Ok((print_json(&value)?, false))
 }
 
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
@@ -669,8 +668,8 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
         }
         // What a recall prints comes back into context, so `stats` and the status
         // line report it beside the savings it reverses.
-        let printed = recall(ws, args, &selection)?;
-        crate::history::recalled_archive(ws, printed);
+        let (printed, proxy) = recall(ws, args, &selection)?;
+        crate::history::recalled_archive(ws, printed, proxy);
         return Ok(());
     }
     let mut input = Vec::new();

@@ -1629,6 +1629,14 @@ fn records_stats_from_api_usage() {
     assert_eq!(records[1]["mismatch"], true);
     assert_eq!(records[1]["repeats"], 1);
     assert_eq!(records[2]["observed"], false);
+    let full = justless(dir.path(), &["recall", "--tool-use", "toolu_00"]);
+    let part = justless(
+        dir.path(),
+        &["recall", "toolu_01", "--from", "1", "--to", "1"],
+    );
+    assert!(full.status.success() && part.status.success());
+    let recalled = (full.stdout.len() + part.stdout.len()) as u64;
+    assert!(recalled > 0);
     let stats: Value =
         serde_json::from_slice(&justless(dir.path(), &["stats", "--json"]).stdout).unwrap();
     let proxy_stats = &stats["proxy"];
@@ -1643,6 +1651,11 @@ fn records_stats_from_api_usage() {
     assert_eq!(
         proxy_stats["newly_cleared"]["est_tokens"],
         4 * result_bytes(2000).div_ceil(4)
+    );
+    assert_eq!(proxy_stats["recalled_bytes"], recalled);
+    assert_eq!(
+        proxy_stats["net_cleared_bytes"],
+        (4 * result_bytes(2000)) as i64 - recalled as i64
     );
     assert_eq!(proxy_stats["warm_rewrite_tokens"], 1500);
     assert_eq!(proxy_stats["tokens_not_sent"], 2010 + 1500);

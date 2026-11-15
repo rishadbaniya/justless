@@ -292,6 +292,8 @@ pub struct Report {
     fallbacks: u64,
     moves: Moves,
     newly_cleared: Cleared,
+    recalled_bytes: u64,
+    net_cleared_bytes: i64,
     warm_rewrite_tokens: u64,
     tokens_not_sent: u64,
     mismatches: u64,
@@ -340,7 +342,7 @@ fn ledger_files(dir: &Path) -> Result<Option<Vec<PathBuf>>> {
 }
 
 /// `None` when the proxy never ran in this project.
-pub fn report(ws: &Workspace, since_ms: u64) -> Result<Option<Report>> {
+pub fn report(ws: &Workspace, since_ms: u64, recalled_bytes: u64) -> Result<Option<Report>> {
     let Some(files) = ledger_files(&ledger_dir(ws))? else {
         return Ok(None);
     };
@@ -368,6 +370,9 @@ pub fn report(ws: &Workspace, since_ms: u64) -> Result<Option<Report>> {
             report.add(&record);
         }
     }
+    report.recalled_bytes = recalled_bytes;
+    report.net_cleared_bytes =
+        crate::history::net_bytes(report.newly_cleared.bytes, 0, recalled_bytes);
     Ok(Some(report))
 }
 
@@ -458,6 +463,12 @@ impl Report {
                 kinds.join(", ")
             );
         }
+        println!(
+            "  {} initially marked for clearing · {} returned by proxy archive recalls · {} net",
+            human_bytes(self.newly_cleared.bytes),
+            human_bytes(self.recalled_bytes),
+            crate::history::signed_bytes(self.net_cleared_bytes)
+        );
         println!(
             "  {} input tokens not sent to the model, summed over requests as reported by the API",
             short(self.tokens_not_sent)
@@ -585,8 +596,8 @@ mod tests {
         // An unreadable older month is never opened.
         fs::write(proxy.join("requests-2025-12.jsonl"), b"\xff not json").unwrap();
         fs::write(proxy.join("requests-2026-11.jsonl"), line(november)).unwrap();
-        assert_eq!(report(&ws, november - 1).unwrap().unwrap().requests, 1);
-        assert_eq!(report(&ws, january - 1).unwrap().unwrap().requests, 2);
+        assert_eq!(report(&ws, november - 1, 0).unwrap().unwrap().requests, 1);
+        assert_eq!(report(&ws, january - 1, 0).unwrap().unwrap().requests, 2);
     }
 
     #[test]

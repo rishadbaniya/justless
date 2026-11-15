@@ -17031,7 +17031,7 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
     assert_eq!(printed_bytes(&cli(&root, &["log", "run-replayed"])), 19_000);
     assert_eq!(
         line(),
-        "justless · net ≈91 extra tokens this session · 1 run"
+        "justless · initially ≈4.7k tokens saved · net ≈91 extra tokens this session · 1 run"
     );
 
     // An archived tool result printed by `recall` comes back into context too.
@@ -17069,7 +17069,7 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
     // (19,000 - 364 - 19,000) - 6,000 recalled = -6,364 bytes ≈ 1,591 tokens.
     assert_eq!(
         line(),
-        "justless · net ≈1.6k extra tokens this session · 1 run"
+        "justless · initially ≈4.7k tokens saved · net ≈1.6k extra tokens this session · 1 run"
     );
     let report = savings(&root);
     assert_eq!(
