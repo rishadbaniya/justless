@@ -234,7 +234,10 @@ pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
     let words = shlex::split(command)?;
     let refs: Vec<&str> = words.iter().map(String::as_str).collect();
     let effective = crate::wrappers::effective(&refs)?;
-    if effective.len() == refs.len() && effective.iter().zip(&refs).all(|(a, b)| a == b) {
+    let differs =
+        effective.len() != refs.len() || effective.iter().zip(&refs).any(|(a, b)| a.as_str() != *b);
+    let program = effective.first().map(String::as_str);
+    if !differs && !matches!(program, Some("cat")) {
         return None;
     }
     piece(command, &[command], Join::Always).map(|piece| vec![piece])
@@ -326,5 +329,5 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
     } else if !stages.is_empty() || join != Join::Always {
         return None;
     }
-    (2..=32).contains(&pieces.len()).then_some(pieces)
+    (1..=32).contains(&pieces.len()).then_some(pieces)
 }

@@ -300,6 +300,8 @@ fn wrappers_are_looked_through_before_compacting() {
         "env -u HOME sed -n '1,300p' big.rs",
         "nice -n 5 sed -n '1,300p' big.rs",
         "bash -c \"sed -n '1,300p' big.rs\"",
+        "cat big.rs",
+        "sed -n '1,300p' big.rs | head -200",
     ] {
         let raw = native(dir, command);
         let out = hook(dir, command, Some(response(&raw)));
