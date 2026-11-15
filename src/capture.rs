@@ -450,6 +450,16 @@ pub struct Origin {
     pub label: String,
     /// Stored in the run record: how the output was captured and what it may lack.
     pub note: String,
+    /// A verified source-range outline and the bytes the client would have received.
+    pub outline: Option<SourceOutline>,
+}
+
+pub struct SourceOutline {
+    pub text: String,
+    /// Bytes the shell client showed before compaction, including any client-side trim.
+    pub baseline: usize,
+    /// Claude trims the trailing newline from Bash results sent to the model.
+    pub trim_footer: bool,
 }
 
 /// What a recorded run shows the agent: each stream's preview, with secrets
@@ -481,7 +491,11 @@ pub fn record(
     let selection = crate::filters::Selection::for_run(args, &settings.filters)?;
     let redactor = crate::redact::for_run(workspace)?;
     let words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
-    let family = family_of(args, &selection);
+    let family = if origin.outline.is_some() {
+        origin.label.clone()
+    } else {
+        family_of(args, &selection)
+    };
     workspace.prepare_state()?;
     let runs = workspace.state.join("runs");
     private_dir(&runs)?;
@@ -1533,6 +1547,11 @@ impl Capture<'_> {
             }
         }
         let justless = workspace.justless();
+        let source_outline = origin.and_then(|o| o.outline.as_ref());
+        if let Some(outline) = source_outline {
+            previews[0].1 =
+                format!("{}Exact: {justless} log {}\n", outline.text, run.id).into_bytes();
+        }
         if let Some(redactor) = redactor {
             // Reports can quote an earlier record, such as a rerun's previous failures.
             for (_, preview) in &mut previews {
@@ -1559,7 +1578,7 @@ impl Capture<'_> {
         // A `--merge` search or listing kept its streams apart, so its stderr follows
         // stdout rather than interleaving with it.
         let split = merge && !merged && previews.iter().all(|(_, bytes)| !bytes.is_empty());
-        let footer = footer(
+        let mut footer = footer(
             &run,
             &previews,
             &archive.readers,
@@ -1572,6 +1591,12 @@ impl Capture<'_> {
                 justless: &justless,
             },
         )?;
+        if let Some(outline) = source_outline {
+            run.raw_bytes = outline.baseline as u64;
+            if outline.trim_footer && footer.ends_with('\n') {
+                footer.pop();
+            }
+        }
         run.footer_bytes = footer.len();
         write_json(&directory.join("record.json"), &run).context("save run record")?;
         archive.keep();

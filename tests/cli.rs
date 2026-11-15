@@ -17085,3 +17085,160 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
     success(&root, &["recall", "--list"]);
     assert_eq!(savings(&root)["archive_recalls"]["recalls"], 2);
 }
+
+#[cfg(unix)]
+#[test]
+fn sed_ranges_keep_native_bytes_and_only_charge_the_delivered_outline_and_replay() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let filename = "price list.py";
+    let mut data = String::new();
+    for i in 0..60 {
+        data.push_str(&format!(
+            "def price_{i}(x):\r\n    initial = x + {i}\r\n    return initial * 2\r\n\r\n"
+        ));
+    }
+    data.push_str("# no final newline");
+    fs::write(root.join(filename), data).unwrap();
+    let pre = |handler: &str, command: &str| {
+        agent_hook(
+            &root,
+            handler,
+            "before-command",
+            json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}}),
+        )
+    };
+    let exec = |rewritten: &str| {
+        let argv = shlex::split(rewritten).unwrap();
+        assert_eq!(argv[0], "justless");
+        cli(
+            &root,
+            &argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
+        )
+    };
+    let native = |script: &str| {
+        Command::new("sed")
+            .args(["-n", script, filename])
+            .current_dir(&root)
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let command = "sed -n '2,200p' 'price list.py'";
+    let first = pre("hook-codex", "sed -n '2,4p' 'price list.py'");
+    let short = exec(
+        first["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(short.stdout, native("2,4p"));
+    assert!(short.stderr.is_empty());
+    assert!(success(&root, &["resume"]).contains("Read price list.py:2-4"));
+    for other in [
+        "sed -n '240,999p' 'price list.py'",
+        "sed -n '999,1000p' 'price list.py'",
+        "sed -n '1,200p' missing.py",
+        "sed -n '1,200p' 'price list.py' | wc -c",
+        "sed -n '1,200p' 'price list.py' > copy",
+        "sed -n '1,200p' 'price list.py' other",
+        "sed -n '1,200p;201p' 'price list.py'",
+    ] {
+        assert!(
+            pre("hook-codex", other)["hookSpecificOutput"]["updatedInput"].is_null(),
+            "{other}"
+        );
+    }
+    assert!(pre("hook-claude", command)["hookSpecificOutput"]["updatedInput"].is_null());
+    let real = native("2,200p");
+    let text = std::str::from_utf8(&real).unwrap();
+    for response in [
+        json!({"stdout":"different","stderr":"","interrupted":false}),
+        json!({"stdout":text,"stderr":"error","interrupted":false}),
+        json!({"stdout":text,"stderr":"","interrupted":true}),
+    ] {
+        assert_eq!(after_bash(&root, &root, command, response), json!({}));
+    }
+    let codex = pre("hook-codex", command);
+    let output = exec(
+        codex["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(output.status.success() && output.stderr.is_empty());
+    let claude = after_bash(
+        &root,
+        &root,
+        command,
+        json!({"stdout":text,"stderr":"","interrupted":false}),
+    );
+    let outputs = [stdout(&output), shown_stdout(&claude)];
+    assert!(success(&root, &["resume"]).contains("Outline price list.py:2-200"));
+    fs::write(root.join(filename), "changed since the outline\n").unwrap();
+    for view in &outputs {
+        assert!(
+            view.contains("price_1")
+                && !view.contains("price_55")
+                && !view.contains("return initial"),
+            "{view}"
+        );
+        assert!(view.len() * 2 < real.len(), "{view}");
+        let exact = view
+            .lines()
+            .find_map(|line| line.strip_prefix("Exact: "))
+            .unwrap();
+        assert_eq!(exec(exact).stdout, real);
+    }
+    let stats = savings(&root);
+    let shown: usize = outputs.iter().map(String::len).sum();
+    assert_eq!(stats["runs"], 2);
+    assert_eq!(stats["commands"][0]["family"], "sed");
+    assert_eq!(stats["replayed_bytes"], real.len() * 2);
+    assert_eq!(stats["net_saved_bytes"], -(shown as i64));
+}
+
+#[cfg(unix)]
+#[test]
+fn sed_range_persisted_and_trimmed_outputs_use_the_visible_baseline() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let raw: String = (0..150)
+        .map(|i| format!("def compute_{i}(amount):\n    return amount + {i}\n\n"))
+        .collect();
+    fs::write(root.join("calc.py"), &raw).unwrap();
+    let command = "sed -n '1,500p' calc.py";
+    let trimmed = raw.trim_end_matches('\n');
+    let inline = shown_stdout(&after_bash(
+        &root,
+        &root,
+        command,
+        json!({
+            "stdout":trimmed, "stderr":"", "interrupted":false
+        }),
+    ));
+    let dir = root.join("tool-results");
+    fs::create_dir(&dir).unwrap();
+    let saved = dir.join("result.txt");
+    fs::write(&saved, &raw).unwrap();
+    let response = json!({"stdout": &raw[..2000], "stderr":"", "interrupted":false,
+        "persistedOutputPath":saved,"persistedOutputSize":raw.len()});
+    let answer = after_bash(&root, &root, command, response);
+    assert!(
+        answer["hookSpecificOutput"]["updatedToolOutput"]
+            .get("persistedOutputPath")
+            .is_none()
+    );
+    let page = shown_stdout(&answer);
+    assert!(page.contains("Exact:") && page.len() < 2000);
+    let stats = savings(&root);
+    assert_eq!(stats["raw_bytes"], trimmed.len() + 2000);
+    assert_eq!(
+        stats["net_saved_bytes"],
+        (trimmed.len() + 2000 - inline.len() - page.len()) as i64
+    );
+    let id = marker_run(&page);
+    assert_eq!(cli(&root, &["log", &id]).stdout, raw.as_bytes());
+}

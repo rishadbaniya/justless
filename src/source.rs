@@ -30,9 +30,23 @@ pub fn commands() -> Vec<Cli<'static>> {
             .arg(file())
             .arg(Arg::new("outline").long("outline"))
             .arg(
+                Arg::new("shell-range")
+                    .long("shell-range")
+                    .value_name("A-B")
+                    .hidden(true)
+                    .conflicts_with_all(&["outline", "json", "match", "after"]),
+            )
+            .arg(
                 Arg::new("json")
                     .long("json")
                     .help("Return a structured outline"),
+            )
+            .arg(
+                Arg::new("shell-session")
+                    .long("shell-session")
+                    .value_name("ID")
+                    .hidden(true)
+                    .requires("shell-range"),
             )
             .arg(Arg::new("match").long("match").value_name("TEXT"))
             .arg(
@@ -176,6 +190,13 @@ impl Snapshot {
                 )
             })
             .collect()
+    }
+
+    pub(crate) fn line_window(&self, first: usize, last: usize) -> Option<(usize, Range<usize>)> {
+        let start = *self.lines.get(first.checked_sub(1)?)?;
+        let last = last.min(self.lines.len());
+        let end = self.lines.get(last).copied().unwrap_or(self.text.len());
+        (start < end).then_some((last, start..end))
     }
 
     fn line(&self, offset: usize) -> usize {
@@ -639,7 +660,20 @@ fn workspace_file(ws: &Workspace, file: &str, root_given: bool) -> Result<String
 }
 
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> Result<()> {
-    let file = &workspace_file(ws, args.value_of("file").unwrap(), root_given)?;
+    let argument = args.value_of("file").unwrap();
+    if name == "read"
+        && let Some(range) = args.value_of("shell-range")
+    {
+        // The hook passes the already resolved, workspace-relative file.
+        return crate::shellread::read(
+            ws,
+            Snapshot::open(ws, argument)?,
+            argument,
+            range,
+            args.value_of("shell-session").unwrap_or("terminal"),
+        );
+    }
+    let file = &workspace_file(ws, argument, root_given)?;
     let mut source = Snapshot::open(ws, file)?;
     if name == "read" {
         let budget = crate::context_budget(ws, args)?;

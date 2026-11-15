@@ -60,7 +60,7 @@ const MAX_LINES: usize = 20_000;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 /// Claude Code's preview of a result it saved to a file: up to the first 2,000
 /// characters. A report that replaces such a result must be no larger.
-const PREVIEW_CHARS: usize = 2_000;
+pub(crate) const PREVIEW_CHARS: usize = 2_000;
 /// Lines of the original that the shown text left out and that report an error.
 const ERROR_LINES: usize = 8;
 const NOTE: &str = "Captured from a Claude Code Bash result after the command ran. The archive holds the output Claude Code recorded, with stdout and stderr interleaved, and Claude Code may have shortened it at its own output limits. The exit status is the whole command line's as Claude Code reported it: 0, or 1 where Claude Code read exit 1 as a valid result, so a pipe can hide its first command's failure.";
@@ -135,6 +135,12 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         || RUN_MARKER.is_match(stdout)
     {
         return None;
+    }
+    if !cfg!(windows)
+        && let Some(words) = crate::agents::literal_command(command)
+        && let Some((file, a, b)) = crate::shellread::command(&words)
+    {
+        return crate::shellread::claude(ws, input, file, a, b);
     }
     let settings = ws.settings().ok()?;
     let persisted = response.get("persistedOutputPath").and_then(Value::as_str);
@@ -211,6 +217,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         command: command.to_owned(),
         label: plan.label.clone(),
         note,
+        outline: None,
     };
     // The same redactor the capture uses for the previews and footer. A
     // configuration it cannot read stops the capture too.
@@ -331,7 +338,7 @@ pub fn exit_status(run: &crate::capture::Run) -> String {
 /// only its start, so a file that is missing, larger than this hook archives or not
 /// this result's leaves the result unchanged. Claude Code cuts its copy at 64 MiB,
 /// far above that size.
-fn read_persisted(path: &str, size: &Value, stdout: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_persisted(path: &str, size: &Value, stdout: &str) -> Option<Vec<u8>> {
     let path = Path::new(path);
     if !path.is_absolute()
         || path

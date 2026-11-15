@@ -634,9 +634,8 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
     // Cursor answers a rewrite with `permission: "allow"`, like Codex.
     let rules = Rules {
         mixed: agent == Agent::Gemini,
-        client_grep: false,
+        claude: false,
         approves: agent == Agent::Cursor,
-        last_program: false,
     };
     let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
     args["command"] = Value::String(rewritten);
@@ -920,9 +919,8 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         input["conversationId"].as_str(),
         Rules {
             mixed: false,
-            client_grep: false,
+            claude: false,
             approves: false,
-            last_program: false,
         },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
@@ -957,9 +955,8 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         input["session_id"].as_str(),
         Rules {
             mixed: agent != Agent::Codex,
-            client_grep: agent == Agent::Claude,
+            claude: agent == Agent::Claude,
             approves: agent == Agent::Codex,
-            last_program: agent == Agent::Claude,
         },
     )?);
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
@@ -981,16 +978,12 @@ struct Rules {
     /// The client checks the rewritten command, so a list may mix supported
     /// commands with others that stay as they are.
     mixed: bool,
-    /// Claude Code's shell replaces `grep` with a bundled ugrep that honors
-    /// .gitignore and skips binary files. Running the system grep instead would
-    /// search ignored build and dependency trees, so leave grep to that shell.
-    client_grep: bool,
+    /// Claude handles range reads after Bash completes, supplies its own grep,
+    /// and interprets exit status 1 according to the last program (see `EXIT_TAIL`).
+    claude: bool,
     /// The client runs a rewritten command without asking, so each command must
     /// also pass `filters::approvable`.
     approves: bool,
-    /// The client judges exit status 1 by the program that starts the command's
-    /// last statement, as Claude Code does. See `EXIT_TAIL`.
-    last_program: bool,
 }
 
 /// What the Claude Code hook appends after a routed last command whose exit status
@@ -1056,15 +1049,23 @@ fn wrap_event(
 ) -> Option<String> {
     if !cfg!(windows)
         && let Some(words) = literal_command(command)
-        && let [program, file] = words.as_slice()
-        && program == "cat"
-        && !file.starts_with('-')
     {
-        let rewritten = read_instead(workspace, cwd, file);
-        if rewritten.is_none() {
-            crate::history::bypass(workspace, command);
+        if let Some((file, first, last)) = crate::shellread::command(&words) {
+            if rules.claude {
+                return None;
+            }
+            return crate::shellread::rewrite(workspace, cwd, file, first, last, session);
         }
-        return rewritten;
+        if let [program, file] = words.as_slice()
+            && program == "cat"
+            && !file.starts_with('-')
+        {
+            let rewritten = read_instead(workspace, cwd, file);
+            if rewritten.is_none() {
+                crate::history::bypass(workspace, command);
+            }
+            return rewritten;
+        }
     }
     let session = session
         .filter(|id| !id.is_empty())
@@ -1099,7 +1100,7 @@ fn wrap_event(
     let tail = plan
         .last
         .filter(|last| {
-            rules.last_program
+            rules.claude
                 && plan.wrap.last().is_some_and(|(words, _)| {
                     last.start <= words.start
                         && words.end <= last.end
@@ -1204,7 +1205,7 @@ fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String>
 /// not count. Neither do statements that only bind modules or names: JavaScript and
 /// TypeScript `require` bindings, export lists, re-exports and `module.exports`
 /// set to names, and Python's `from __future__` imports and `if TYPE_CHECKING:`.
-fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Option<Vec<usize>> {
+pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Option<Vec<usize>> {
     let extension = Path::new(file)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1432,7 +1433,7 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
             && (rules.mixed && !rules.approves || form.approvable(segment));
         (env && literal_command(&segment[..form.command.end]).is_some()
             && supported_command(words)
-            && !(rules.client_grep && runs_grep(words))
+            && !(rules.claude && runs_grep(words))
             && (!rules.approves
                 || literal_command(words).is_some_and(|words| {
                     let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -1625,9 +1626,8 @@ fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
 pub fn would_route(command: &str) -> bool {
     let rules = Rules {
         mixed: true,
-        client_grep: true,
+        claude: true,
         approves: false,
-        last_program: true,
     };
     !plan(command, rules, |_| true).wrap.is_empty()
 }
@@ -1755,7 +1755,7 @@ pub(crate) fn supported_words(words: &[&str]) -> bool {
     shlex::try_join(words.iter().map(String::as_str)).is_ok_and(|line| supported_command(&line))
 }
 
-fn literal_command(command: &str) -> Option<Vec<String>> {
+pub(crate) fn literal_command(command: &str) -> Option<Vec<String>> {
     let mut quote = None;
     let mut previous = None;
     for character in command.chars() {

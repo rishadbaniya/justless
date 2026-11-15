@@ -6,6 +6,8 @@ User-visible changes to Justless are recorded here. No release has been publishe
 
 ### Command output
 
+- Wide single-file `sed -n 'A,Bp' FILE` hook reads can show a range outline and a command to replay the original bytes. Replays count toward net savings in `stats`.
+
 - `justless run -- COMMAND` runs a noninteractive command and keeps its exit status. It shows a bounded preview of stdout and stderr and archives both streams under `.justless/runs/`, up to `max_run_bytes` each. `log` replays any line range byte for byte, `search` finds text in one run, and `history` searches every run in the project.
 - `search` and `history` no longer cut off matches silently. When `--limit` or the budget leaves matches out, each stream with a match keeps a place, a failed run's failure lines and stderr come first, and a last line counts the matches shown and found per stream, such as `[20 of 26 matches shown (stdout 19 of 25, stderr 1 of 1); --limit 26 shows all]`. Under a very small `--budget`, `history` shortens that line to the totals so a match of each stream still fits. Earlier, 20 stdout progress lines could hide the stderr line that explained the failure. `lookup --logs` keeps a window for each stream with matches, counts the windows it leaves out per stream, and reports them as `logs` in `--json`. The MCP `search` and `history` tools return the same notice, and `recall ID --grep TEXT` counts the matching lines its `--limit` leaves out.
 - Test failures from `cargo test`, `go test` and `pytest` are grouped by their reported diagnostic. Each group links to its lines in the archived log. The JavaScript runners `npm`, `pnpm`, `yarn` and `bun test`, `jest`, `vitest run` and `node --test` drop passing-file lines and keep failures.

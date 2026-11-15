@@ -32,6 +32,7 @@ mod rust_syntax;
 mod search;
 mod selection;
 mod shell_form;
+mod shellread;
 mod source;
 mod statusline;
 mod summary;

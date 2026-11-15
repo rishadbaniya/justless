@@ -480,17 +480,24 @@ pub(crate) fn archive_recalls(state: &Path, since_ms: u64) -> ArchiveRecalls {
 /// that prints source lines calls it once per range it printed. The same range
 /// of unchanged source shown again counts as a repeated read in `stats`.
 pub fn saw_source(workspace: &Workspace, file: &str, from: usize, to: usize, digest: String) {
-    saw(workspace, file, from, to, digest, false);
+    saw_range(workspace, file, from, to, digest, false);
 }
 
 /// Records that the agent was shown `file`'s outline: its revision, rows and
 /// line ranges, but not its lines. A file keeps one outline entry whatever the
 /// page, and it never counts as a repeated read.
 pub fn saw_outline(workspace: &Workspace, file: &str, digest: String) {
-    saw(workspace, file, 0, 0, digest, true);
+    saw_range(workspace, file, 0, 0, digest, true);
 }
 
-fn saw(workspace: &Workspace, file: &str, from: usize, to: usize, digest: String, outline: bool) {
+pub(crate) fn saw_range(
+    workspace: &Workspace,
+    file: &str,
+    from: usize,
+    to: usize,
+    digest: String,
+    outline: bool,
+) {
     if workspace.prepare_state().is_err() {
         return;
     }
@@ -1244,7 +1251,9 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
         } else {
             " [source changed]"
         };
-        let line = if read.outline {
+        let line = if read.outline && read.from > 0 {
+            format!("Outline {}:{}-{}{stale}", read.file, read.from, read.to)
+        } else if read.outline {
             format!("Outline {}{stale}", read.file)
         } else {
             format!("Read {}:{}-{}{stale}", read.file, read.from, read.to)
