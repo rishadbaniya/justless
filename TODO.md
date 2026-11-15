@@ -274,3 +274,13 @@ Two branches carry this work; neither is merged into `main`.
   - OpenCode post-command compaction: works end to end; a wrapped `sed` result measured 10,470 bytes before and 1,327 after, and an exit-1 result stayed untouched.
   - Transcript replay: `scripts/replay.py` replayed 1,867 stored results, 164 eligible, 26 compacted, and saved 278,084 of 314,460 bytes (88.4%). The rest were under 4 KiB, pass-throughs, already compacted, or a directory that no longer existed.
 - Not merged. To use the plugin: `cargo install --path . --locked --force`, refresh `init --hooks --agent opencode`, restart OpenCode.
+
+---
+
+## 10. Coverage branch (`feat/coverage`, merged)
+
+- `20dbad2` **Single-piece pipelines and `cat` singles.** The batch parser now accepts a single-piece command list, so `sed … | head` and similar pipelines compact after verification. A plain `cat FILE` single is handled by the same path; plain `sed`/`head`/`tail` singles stay on the existing plan path so their preview and replay tests keep their exact behavior.
+- `74929a3` **OpenCode read-only tool.** The plugin registers `justless` again for `pack`, `map`, `lookup`, `query`, `path`, `read`/`expand`/`code`, archived runs, `recall`, `affected`, `stats` and `discover`, and refuses every other command. The after-tool compaction from `feat/top5` stays.
+- Tests: 248 CLI, 8 batch and 211 binary tests; `cargo fmt` and `clippy -D warnings` clean.
+- Still open from the ten-item plan: rerun delta for batch archives, fixed per-request overhead, watch/incremental index/daemon, `explain` and graph exports, and the session ledger.
+

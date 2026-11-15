@@ -40,6 +40,7 @@ mod summary;
 mod testrun;
 mod uninstall;
 mod workspace;
+mod wrappers;
 
 use std::ffi::OsString;
 use std::io::ErrorKind;

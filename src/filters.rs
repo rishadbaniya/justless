@@ -1,4 +1,5 @@
 //! Command selection and line filters shared by explicit runs and agent hooks.
+use crate::wrappers::effective;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -113,7 +114,12 @@ pub fn tool_label(args: &[OsString]) -> String {
 }
 
 pub fn tool_label_words(words: &[&str]) -> String {
-    let words = unwrap_tool(words);
+    let owned = effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(words) => words.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let words = unwrap_tool(&refs);
     let Some((program, rest)) = words.split_first() else {
         return "other".into();
     };

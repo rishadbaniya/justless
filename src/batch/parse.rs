@@ -144,6 +144,10 @@ pub(super) fn search_paths(words: &[String]) -> Option<&[String]> {
 fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> {
     let mut stages = stages.iter().map(|s| shlex::split(s));
     let words = stages.next()??;
+    let words = {
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        crate::wrappers::effective(&refs)?
+    };
     let (program, args) = words.split_first()?;
     let source = match program.as_str() {
         "git" if super::git::supported(args) => Source::Git(words),
@@ -189,6 +193,54 @@ fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> 
         source,
         filters,
     })
+}
+
+fn literal(command: &str) -> bool {
+    let mut quote = None;
+    let mut chars = command.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if q == '"' && c == '\\' {
+                match chars.next() {
+                    Some((_, next)) if !next.is_control() => {}
+                    _ => return false,
+                }
+            } else if q == '"' && matches!(c, '$' | '`') || c.is_control() {
+                return false;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => match chars.next() {
+                Some((_, next)) if !next.is_control() => {}
+                _ => return false,
+            },
+            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '<' | '>' | '{' | '}' | '[' | ']' | '*'
+            | '?' | '#' | '~' | '!' => return false,
+            c if c.is_control() && c != '\t' => return false,
+            _ => {}
+        }
+    }
+    quote.is_none()
+}
+
+pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
+    if command.len() > 16 * 1024 || !literal(command) {
+        return None;
+    }
+    let words = shlex::split(command)?;
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    let effective = crate::wrappers::effective(&refs)?;
+    let differs =
+        effective.len() != refs.len() || effective.iter().zip(&refs).any(|(a, b)| a.as_str() != *b);
+    let program = effective.first().map(String::as_str);
+    if !differs && !matches!(program, Some("cat")) {
+        return None;
+    }
+    piece(command, &[command], Join::Always).map(|piece| vec![piece])
 }
 
 pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
@@ -277,5 +329,5 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
     } else if !stages.is_empty() || join != Join::Always {
         return None;
     }
-    (2..=32).contains(&pieces.len()).then_some(pieces)
+    (1..=32).contains(&pieces.len()).then_some(pieces)
 }

@@ -287,3 +287,27 @@ fn recheck_skips_external_git_diff_and_ambiguous_pipe_status() {
     );
     assert!(!dir.join(".justless/runs").exists());
 }
+
+#[test]
+fn wrappers_are_looked_through_before_compacting() {
+    let temp = fixture();
+    let dir = temp.path();
+    for command in [
+        "timeout 5 sed -n '1,150p' big.rs && sed -n '150,300p' big.rs",
+        "env -u HOME sed -n '1,150p' big.rs && sed -n '150,300p' big.rs",
+        "env FOO=1 sed -n '1,150p' big.rs && sed -n '150,300p' big.rs",
+        "timeout 5 sed -n '1,300p' big.rs",
+        "env -u HOME sed -n '1,300p' big.rs",
+        "nice -n 5 sed -n '1,300p' big.rs",
+        "bash -c \"sed -n '1,300p' big.rs\"",
+        "cat big.rs",
+        "sed -n '1,300p' big.rs | head -200",
+    ] {
+        let raw = native(dir, command);
+        let out = hook(dir, command, Some(response(&raw)));
+        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap_or("");
+        assert!(shown.contains("big.rs"), "{command}: {out}");
+    }
+}
