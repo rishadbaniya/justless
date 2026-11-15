@@ -192,6 +192,11 @@ impl Snapshot {
             .collect()
     }
 
+    /// The number of lines, counting a final line without a newline.
+    pub(crate) fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
     pub(crate) fn line_window(&self, first: usize, last: usize) -> Option<(usize, Range<usize>)> {
         let start = *self.lines.get(first.checked_sub(1)?)?;
         let last = last.min(self.lines.len());

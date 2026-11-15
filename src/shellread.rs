@@ -12,11 +12,20 @@ use crate::history;
 use crate::source::Snapshot;
 use crate::workspace::{Workspace, shell_quote};
 
-/// An inclusive sed range or a tail read starting at a positive line number.
+/// One window a read prints: lines `first..=last`, or `first` to the end of
+/// the file. With `from_end`, `first` counts lines back from the end, as
+/// `tail -n N` does.
 #[derive(Clone, Copy)]
-pub(crate) struct LineRange {
+struct Span {
     first: usize,
     last: Option<usize>,
+    from_end: bool,
+}
+
+/// The windows of a recognized read, in the order the command prints them.
+#[derive(Clone)]
+pub(crate) struct LineRange {
+    spans: Vec<Span>,
 }
 
 fn decimal(text: &str) -> Option<usize> {
@@ -26,13 +35,14 @@ fn decimal(text: &str) -> Option<usize> {
     text.parse().ok()
 }
 
-impl LineRange {
+impl Span {
     fn closed(text: &str, separator: char) -> Option<Self> {
         let (first, last) = text.split_once(separator)?;
         let (first, last) = (decimal(first)?, decimal(last)?);
         (first <= last).then_some(Self {
             first,
             last: Some(last),
+            from_end: false,
         })
     }
 
@@ -40,17 +50,38 @@ impl LineRange {
         Some(Self {
             first: decimal(text.strip_prefix('+')?)?,
             last: None,
+            from_end: false,
         })
-    }
-
-    fn argument(self) -> String {
-        match self.last {
-            Some(last) => format!("{}-{last}", self.first),
-            None => format!("+{}", self.first),
-        }
     }
 }
 
+impl LineRange {
+    fn one(span: Span) -> Self {
+        Self { spans: vec![span] }
+    }
+
+    /// A `sed -n` script of `A,Bp` addresses, one or several joined by `;`,
+    /// such as `12,107p;209,260p`.
+    fn sed(script: &str) -> Option<Self> {
+        let spans = script
+            .split(';')
+            .map(|part| Span::closed(part.strip_suffix('p')?, ','))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { spans })
+    }
+
+    /// The `read --shell-range` argument: `A-B` and `+N` windows joined by commas.
+    fn parse(text: &str) -> Option<Self> {
+        let spans = text
+            .split(',')
+            .map(|part| Span::tail(part).or_else(|| Span::closed(part, '-')))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { spans })
+    }
+}
+
+/// A standalone single-file read: `sed -n 'A,Bp[;C,Dp…]' FILE`,
+/// `head -n N FILE`, `tail -n N FILE` or `tail -n +N FILE`.
 pub(crate) fn command(words: &[String]) -> Option<(&str, LineRange)> {
     let [program, flag, address, file] = words else {
         return None;
@@ -63,34 +94,92 @@ pub(crate) fn command(words: &[String]) -> Option<(&str, LineRange)> {
         return None;
     }
     let range = match program.as_str() {
-        "sed" => LineRange::closed(address.strip_suffix('p')?, ',')?,
-        "tail" => LineRange::tail(address)?,
+        "sed" => LineRange::sed(address)?,
+        "head" => LineRange::one(Span {
+            first: 1,
+            last: Some(decimal(address)?),
+            from_end: false,
+        }),
+        "tail" => LineRange::one(Span::tail(address).or_else(|| {
+            Some(Span {
+                first: decimal(address)?,
+                last: None,
+                from_end: true,
+            })
+        })?),
         _ => return None,
     };
     Some((file, range))
 }
 
-struct Selection {
-    source: Snapshot,
-    file: String,
-    range: LineRange,
+/// One printed window, resolved against the file.
+struct Window {
+    first: usize,
     last: usize,
     bytes: Range<usize>,
 }
 
+struct Selection {
+    source: Snapshot,
+    file: String,
+    windows: Vec<Window>,
+    text: String,
+    /// The last window stops at a requested line rather than at the end of
+    /// the file, where sed and head implementations differ on a missing
+    /// final newline.
+    closed: bool,
+}
+
 impl Selection {
-    fn new(source: Snapshot, file: &str, range: LineRange) -> Option<Self> {
-        let (last, bytes) = source.line_window(range.first, range.last.unwrap_or(usize::MAX))?;
+    fn new(source: Snapshot, file: &str, range: &LineRange) -> Option<Self> {
+        let total = source.line_count();
+        let mut windows: Vec<Window> = Vec::new();
+        for span in &range.spans {
+            let first = if span.from_end {
+                total.checked_sub(span.first).map_or(1, |rest| rest + 1)
+            } else {
+                span.first
+            };
+            // sed prints overlapping or out-of-order addresses line by line,
+            // repeating lines, so only ascending, disjoint windows are exact.
+            if windows.last().is_some_and(|window| first <= window.last) {
+                return None;
+            }
+            let (last, bytes) = source.line_window(first, span.last.unwrap_or(usize::MAX))?;
+            windows.push(Window { first, last, bytes });
+        }
+        let text = windows
+            .iter()
+            .map(|window| &source.text[window.bytes.clone()])
+            .collect();
+        let closed = range.spans.last()?.last.is_some();
         Some(Self {
             source,
             file: file.to_owned(),
-            range,
-            last,
-            bytes,
+            windows,
+            text,
+            closed,
         })
     }
 
-    fn open(ws: &Workspace, cwd: &Path, file: &str, range: LineRange) -> Option<Self> {
+    /// The windows as `read --shell-range` and the outline header name them.
+    fn ranges(&self, separator: &str) -> String {
+        let last = self.windows.len() - 1;
+        self.windows
+            .iter()
+            .enumerate()
+            .map(|(i, window)| {
+                if i == last && !self.closed {
+                    format!("+{}", window.first)
+                } else {
+                    format!("{}-{}", window.first, window.last)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(separator)
+    }
+
+    fn open(ws: &Workspace, cwd: &Path, file: &str, range: &LineRange) -> Option<Self> {
         let path = cwd.join(file);
         let relative = path.strip_prefix(&ws.root).ok()?;
         if relative.components().any(|c| c == Component::ParentDir) {
@@ -102,20 +191,35 @@ impl Selection {
     }
 
     fn text(&self) -> &str {
-        &self.source.text[self.bytes.clone()]
+        &self.text
     }
 
     fn observe(&self, ws: &Workspace, outline: bool) {
         let digest = capture::source_digest(self.source.text.as_bytes());
-        history::saw_range(ws, &self.file, self.range.first, self.last, digest, outline);
+        for window in &self.windows {
+            history::saw_range(
+                ws,
+                &self.file,
+                window.first,
+                window.last,
+                digest.clone(),
+                outline,
+            );
+        }
     }
 
     fn outline(&mut self, ws: &Workspace, baseline: usize) -> Option<String> {
         let settings = ws.settings().ok()?;
-        if (self.last - self.range.first < 150 && self.bytes.len() <= 6144)
-            || self.bytes.len() as u64 > settings.max_run_bytes
+        let lines: usize = self
+            .windows
+            .iter()
+            .map(|window| window.last + 1 - window.first)
+            .sum();
+        let bytes = self.text.len() as u64;
+        if (lines <= 150 && bytes <= 6144)
+            || bytes > settings.max_run_bytes
             || settings.max_runs == 0
-            || self.bytes.len() as u64 > settings.max_archive_bytes
+            || bytes > settings.max_archive_bytes
         {
             return None;
         }
@@ -128,22 +232,33 @@ impl Selection {
         self.source.index(&self.file).ok()?;
         if crate::agents::uncovered_code(&self.file, &self.source)?
             .iter()
-            .any(|&i| (self.range.first - 1..self.last).contains(&i))
+            .any(|&i| {
+                self.windows
+                    .iter()
+                    .any(|window| (window.first - 1..window.last).contains(&i))
+            })
         {
             return None;
         }
-        let mut outline = format!("{} lines {}-{}\n", self.file, self.range.first, self.last);
+        let shown = self
+            .windows
+            .iter()
+            .map(|window| format!("{}-{}", window.first, window.last))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut outline = format!("{} lines {shown}\n", self.file);
         let mut count = 0;
         let mut shown = 0;
         for (name, kind, a, b) in self.source.symbols() {
             if kind == "text" {
                 return None;
             }
-            if kind == "import"
-                || a > self.last
-                || b < self.range.first
-                || (a <= self.range.first && b >= self.last)
-            {
+            // A row for each symbol a window shows part of, not one that only
+            // encloses a whole window, such as the impl around a method.
+            let listed = self.windows.iter().any(|window| {
+                a <= window.last && b >= window.first && !(a <= window.first && b >= window.last)
+            });
+            if kind == "import" || !listed {
                 continue;
             }
             let row = format!("  L{a}-{b} {kind} {name}\n");
@@ -176,9 +291,24 @@ impl Selection {
         claude: bool,
     ) -> Option<String> {
         let outline = self.outline(ws, baseline)?;
-        let (program, address) = match self.range.last {
-            Some(_) => ("sed", format!("{},{}p", self.range.first, self.last)),
-            None => ("tail", self.range.argument()),
+        let (program, address) = match (&self.windows[..], self.closed) {
+            ([window], false) => ("tail", format!("+{}", window.first)),
+            (windows, closed) => {
+                let last = windows.len() - 1;
+                let script = windows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, window)| {
+                        if i == last && !closed {
+                            format!("{},$p", window.first)
+                        } else {
+                            format!("{},{}p", window.first, window.last)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                ("sed", script)
+            }
         };
         let words = [program, "-n", &address, &self.file];
         let args: Vec<_> = words.iter().map(OsString::from).collect();
@@ -221,8 +351,14 @@ pub(crate) fn rewrite(
     range: LineRange,
     session: Option<&str>,
 ) -> Option<String> {
-    let read = Selection::open(ws, cwd, file, range)?;
-    if range.last.is_some() && !read.text().ends_with('\n') {
+    // A count from the end is resolved here, before the command runs, so a file
+    // that grows in between would print other lines. Only the post-run hook,
+    // which checks the bytes the command printed, takes `tail -n N`.
+    if range.spans.iter().any(|span| span.from_end) {
+        return None;
+    }
+    let read = Selection::open(ws, cwd, file, &range)?;
+    if read.closed && !read.text().ends_with('\n') {
         return None;
     }
     let session = session
@@ -237,7 +373,7 @@ pub(crate) fn rewrite(
     Some(format!(
         "justless --root {} read --shell-range {}{session} -- {}",
         shell_quote(&ws.root),
-        range.argument(),
+        read.ranges(","),
         shell_quote(Path::new(&read.file))
     ))
 }
@@ -249,14 +385,13 @@ pub(crate) fn read(
     range: &str,
     session: &str,
 ) -> Result<()> {
-    let range = LineRange::tail(range)
-        .or_else(|| LineRange::closed(range, '-'))
-        .context("expected a positive line range A-B or +N")?;
-    let Some(mut read) = Selection::new(source, file, range) else {
+    let range = LineRange::parse(range)
+        .context("expected positive line ranges A-B or +N, joined by commas")?;
+    let Some(mut read) = Selection::new(source, file, &range) else {
         return Ok(());
     };
     let mut out = io::stdout().lock();
-    if let Some(text) = read.compact(ws, read.bytes.len(), session, false) {
+    if let Some(text) = read.compact(ws, read.text.len(), session, false) {
         out.write_all(text.as_bytes())?;
     } else {
         out.write_all(read.text().as_bytes())?;
@@ -282,7 +417,7 @@ pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange
         .unwrap_or(&ws.cwd)
         .canonicalize()
         .ok()?;
-    let mut read = Selection::open(ws, &cwd, file, range)?;
+    let mut read = Selection::open(ws, &cwd, file, &range)?;
     let stdout = response["stdout"].as_str()?;
     let persisted = response["persistedOutputPath"].as_str();
     let stored;
@@ -305,7 +440,7 @@ pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange
     }
     // BSD and GNU sed differ at an unterminated EOF. A post hook can keep
     // either client's original result without reconstructing that final byte.
-    if range.last.is_some() && !selected.ends_with('\n') {
+    if read.closed && !selected.ends_with('\n') {
         return None;
     }
     let session = input["session_id"]

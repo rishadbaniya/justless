@@ -17340,3 +17340,95 @@ fn tail_from_line_uses_the_current_eof_and_archives_the_exact_suffix() {
     assert_eq!(stats["replayed_bytes"], raw.len() * 2);
     assert_eq!(stats["net_saved_bytes"], -(shown as i64));
 }
+
+#[test]
+fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let mut data = String::new();
+    for i in 0..120 {
+        data.push_str(&format!(
+            "def price_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    rounded = round(taxed, 2)\n    discounted = rounded - {i} * 0.01\n    capped = min(discounted, 1000)\n    return capped * 2\n\n"
+        ));
+    }
+    fs::write(root.join("prices.py"), &data).unwrap();
+    let native = |command: &str| {
+        Command::new("sh")
+            .args(["-c", command])
+            .current_dir(&root)
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let pre = |command: &str| {
+        agent_hook(
+            &root,
+            "hook-codex",
+            "before-command",
+            json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}}),
+        )
+    };
+    // Codex runs a workspace read in their place, which prints the native bytes.
+    for command in [
+        "head -n 3 prices.py",
+        "tail -n +950 prices.py",
+        "sed -n '2,4p;9,12p' prices.py",
+    ] {
+        let rewritten = pre(command)["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("not rewritten: {command}"))
+            .to_owned();
+        let argv = shlex::split(&rewritten).unwrap();
+        let output = cli(
+            &root,
+            &argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
+        );
+        assert_eq!(output.stdout, native(command), "{command}");
+    }
+    // sed prints overlapping or out-of-order addresses line by line, and a zero or
+    // negative count means something else, so these keep the native command.
+    for command in [
+        "sed -n '10,20p;15,30p' prices.py",
+        "sed -n '30,40p;1,5p' prices.py",
+        "head -n -5 prices.py",
+        "tail -n 0 prices.py",
+        // Counted from the end before the command runs, so a growing file
+        // could print other lines; only the post-run hook takes it.
+        "tail -n 5 prices.py",
+    ] {
+        assert!(
+            pre(command)["hookSpecificOutput"]["updatedInput"].is_null(),
+            "{command}"
+        );
+    }
+    // In Claude Code a wide read becomes an outline whose replay is the native bytes.
+    for command in [
+        "head -n 400 prices.py",
+        "tail -n 300 prices.py",
+        "sed -n '1,120p;200,420p' prices.py",
+    ] {
+        let real = native(command);
+        let text = std::str::from_utf8(&real).unwrap();
+        let replaced = after_bash(
+            &root,
+            &root,
+            command,
+            json!({"stdout":text,"stderr":"","interrupted":false}),
+        );
+        let shown = replaced["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{command}: {replaced}"));
+        assert!(shown.len() * 4 < real.len(), "{command}: {shown}");
+        let id = shown
+            .split_whitespace()
+            .find(|word| word.starts_with("run-"))
+            .unwrap();
+        assert_eq!(
+            cli(&root, &["log", id, "--unredacted"]).stdout,
+            real,
+            "{command}"
+        );
+    }
+}
