@@ -32,7 +32,7 @@ pub fn commands() -> Vec<Cli<'static>> {
             .arg(
                 Arg::new("shell-range")
                     .long("shell-range")
-                    .value_name("A-B")
+                    .value_name("A-B|+N")
                     .hidden(true)
                     .conflicts_with_all(&["outline", "json", "match", "after"]),
             )

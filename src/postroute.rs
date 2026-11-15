@@ -138,9 +138,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     if !cfg!(windows)
         && let Some(words) = crate::agents::literal_command(command)
-        && let Some((file, a, b)) = crate::shellread::command(&words)
+        && let Some((file, range)) = crate::shellread::command(&words)
     {
-        return crate::shellread::claude(ws, input, file, a, b);
+        return crate::shellread::claude(ws, input, file, range);
     }
     let settings = ws.settings().ok()?;
     let persisted = response.get("persistedOutputPath").and_then(Value::as_str);

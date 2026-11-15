@@ -1,4 +1,4 @@
-//! Single-file, numeric sed ranges that request source for display.
+//! Single-file shell commands that read an inclusive source range.
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::ops::Range;
@@ -12,55 +12,85 @@ use crate::history;
 use crate::source::Snapshot;
 use crate::workspace::{Workspace, shell_quote};
 
-/// Positive decimal addresses only. Other sed address syntax stays native.
-fn bounds(text: &str, separator: char) -> Option<(usize, usize)> {
-    let (a, b) = text.split_once(separator)?;
-    let decimal = |s: &str| {
-        (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse::<usize>().ok())
-            .flatten()
-    };
-    let (a, b) = (decimal(a)?, decimal(b)?);
-    (a <= b).then_some((a, b))
+/// An inclusive sed range or a tail read starting at a positive line number.
+#[derive(Clone, Copy)]
+pub(crate) struct LineRange {
+    first: usize,
+    last: Option<usize>,
 }
 
-pub(crate) fn command(words: &[String]) -> Option<(&str, usize, usize)> {
-    let [sed, flag, script, file] = words else {
+fn decimal(text: &str) -> Option<usize> {
+    if text.is_empty() || text.starts_with('0') || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+impl LineRange {
+    fn closed(text: &str, separator: char) -> Option<Self> {
+        let (first, last) = text.split_once(separator)?;
+        let (first, last) = (decimal(first)?, decimal(last)?);
+        (first <= last).then_some(Self {
+            first,
+            last: Some(last),
+        })
+    }
+
+    fn tail(text: &str) -> Option<Self> {
+        Some(Self {
+            first: decimal(text.strip_prefix('+')?)?,
+            last: None,
+        })
+    }
+
+    fn argument(self) -> String {
+        match self.last {
+            Some(last) => format!("{}-{last}", self.first),
+            None => format!("+{}", self.first),
+        }
+    }
+}
+
+pub(crate) fn command(words: &[String]) -> Option<(&str, LineRange)> {
+    let [program, flag, address, file] = words else {
         return None;
     };
-    if sed != "sed"
-        || flag != "-n"
+    if flag != "-n"
         || file.is_empty()
         || file.starts_with(['-', '='])
         || file.chars().any(char::is_control)
     {
         return None;
     }
-    let (a, b) = bounds(script.strip_suffix('p')?, ',')?;
-    Some((file, a, b))
+    let range = match program.as_str() {
+        "sed" => LineRange::closed(address.strip_suffix('p')?, ',')?,
+        "tail" => LineRange::tail(address)?,
+        _ => return None,
+    };
+    Some((file, range))
 }
 
 struct Selection {
     source: Snapshot,
     file: String,
-    first: usize,
+    range: LineRange,
     last: usize,
     bytes: Range<usize>,
 }
 
 impl Selection {
-    fn new(source: Snapshot, file: &str, first: usize, last: usize) -> Option<Self> {
-        let (last, bytes) = source.line_window(first, last)?;
+    fn new(source: Snapshot, file: &str, range: LineRange) -> Option<Self> {
+        let (last, bytes) = source.line_window(range.first, range.last.unwrap_or(usize::MAX))?;
         Some(Self {
             source,
             file: file.to_owned(),
-            first,
+            range,
             last,
             bytes,
         })
     }
 
-    fn open(ws: &Workspace, cwd: &Path, file: &str, first: usize, last: usize) -> Option<Self> {
+    fn open(ws: &Workspace, cwd: &Path, file: &str, range: LineRange) -> Option<Self> {
         let path = cwd.join(file);
         let relative = path.strip_prefix(&ws.root).ok()?;
         if relative.components().any(|c| c == Component::ParentDir) {
@@ -68,7 +98,7 @@ impl Selection {
         }
         let relative: std::path::PathBuf = relative.components().collect();
         let file = relative.to_str()?;
-        Self::new(Snapshot::open(ws, file).ok()?, file, first, last)
+        Self::new(Snapshot::open(ws, file).ok()?, file, range)
     }
 
     fn text(&self) -> &str {
@@ -77,12 +107,12 @@ impl Selection {
 
     fn observe(&self, ws: &Workspace, outline: bool) {
         let digest = capture::source_digest(self.source.text.as_bytes());
-        history::saw_range(ws, &self.file, self.first, self.last, digest, outline);
+        history::saw_range(ws, &self.file, self.range.first, self.last, digest, outline);
     }
 
     fn outline(&mut self, ws: &Workspace, baseline: usize) -> Option<String> {
         let settings = ws.settings().ok()?;
-        if (self.last - self.first < 150 && self.bytes.len() <= 6144)
+        if (self.last - self.range.first < 150 && self.bytes.len() <= 6144)
             || self.bytes.len() as u64 > settings.max_run_bytes
             || settings.max_runs == 0
             || self.bytes.len() as u64 > settings.max_archive_bytes
@@ -98,11 +128,11 @@ impl Selection {
         self.source.index(&self.file).ok()?;
         if crate::agents::uncovered_code(&self.file, &self.source)?
             .iter()
-            .any(|&i| (self.first - 1..self.last).contains(&i))
+            .any(|&i| (self.range.first - 1..self.last).contains(&i))
         {
             return None;
         }
-        let mut outline = format!("{} lines {}-{}\n", self.file, self.first, self.last);
+        let mut outline = format!("{} lines {}-{}\n", self.file, self.range.first, self.last);
         let mut count = 0;
         let mut shown = 0;
         for (name, kind, a, b) in self.source.symbols() {
@@ -111,8 +141,8 @@ impl Selection {
             }
             if kind == "import"
                 || a > self.last
-                || b < self.first
-                || (a <= self.first && b >= self.last)
+                || b < self.range.first
+                || (a <= self.range.first && b >= self.last)
             {
                 continue;
             }
@@ -146,12 +176,15 @@ impl Selection {
         claude: bool,
     ) -> Option<String> {
         let outline = self.outline(ws, baseline)?;
-        let script = format!("{},{}p", self.first, self.last);
-        let words = ["sed", "-n", &script, &self.file];
+        let (program, address) = match self.range.last {
+            Some(_) => ("sed", format!("{},{}p", self.range.first, self.last)),
+            None => ("tail", self.range.argument()),
+        };
+        let words = [program, "-n", &address, &self.file];
         let args: Vec<_> = words.iter().map(OsString::from).collect();
         let origin = Origin {
             command: shlex::try_join(words).ok()?,
-            label: "sed".into(),
+            label: program.into(),
             note: String::new(),
             outline: Some(SourceOutline {
                 text: outline,
@@ -185,12 +218,11 @@ pub(crate) fn rewrite(
     ws: &Workspace,
     cwd: &Path,
     file: &str,
-    a: usize,
-    b: usize,
+    range: LineRange,
     session: Option<&str>,
 ) -> Option<String> {
-    let read = Selection::open(ws, cwd, file, a, b)?;
-    if !read.text().ends_with('\n') {
+    let read = Selection::open(ws, cwd, file, range)?;
+    if range.last.is_some() && !read.text().ends_with('\n') {
         return None;
     }
     let session = session
@@ -203,8 +235,9 @@ pub(crate) fn rewrite(
         })
         .unwrap_or_default();
     Some(format!(
-        "justless --root {} read --shell-range {a}-{b}{session} -- {}",
+        "justless --root {} read --shell-range {}{session} -- {}",
         shell_quote(&ws.root),
+        range.argument(),
         shell_quote(Path::new(&read.file))
     ))
 }
@@ -216,8 +249,10 @@ pub(crate) fn read(
     range: &str,
     session: &str,
 ) -> Result<()> {
-    let (a, b) = bounds(range, '-').context("expected a positive inclusive line range A-B")?;
-    let Some(mut read) = Selection::new(source, file, a, b) else {
+    let range = LineRange::tail(range)
+        .or_else(|| LineRange::closed(range, '-'))
+        .context("expected a positive line range A-B or +N")?;
+    let Some(mut read) = Selection::new(source, file, range) else {
         return Ok(());
     };
     let mut out = io::stdout().lock();
@@ -230,15 +265,9 @@ pub(crate) fn read(
     Ok(())
 }
 
-/// Claude executes sed itself and checks permissions on the original command.
+/// Claude executes the original command itself and checks permissions on the original command.
 /// Accept the result only if it matches the selected source bytes.
-pub(crate) fn claude(
-    ws: &Workspace,
-    input: &Value,
-    file: &str,
-    a: usize,
-    b: usize,
-) -> Option<Value> {
+pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange) -> Option<Value> {
     let response = &input["tool_response"];
     if !response["stderr"].as_str()?.is_empty()
         || response["returnCodeInterpretation"]
@@ -253,7 +282,7 @@ pub(crate) fn claude(
         .unwrap_or(&ws.cwd)
         .canonicalize()
         .ok()?;
-    let mut read = Selection::open(ws, &cwd, file, a, b)?;
+    let mut read = Selection::open(ws, &cwd, file, range)?;
     let stdout = response["stdout"].as_str()?;
     let persisted = response["persistedOutputPath"].as_str();
     let stored;
@@ -276,7 +305,7 @@ pub(crate) fn claude(
     }
     // BSD and GNU sed differ at an unterminated EOF. A post hook can keep
     // either client's original result without reconstructing that final byte.
-    if !selected.ends_with('\n') {
+    if range.last.is_some() && !selected.ends_with('\n') {
         return None;
     }
     let session = input["session_id"]

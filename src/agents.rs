@@ -1050,11 +1050,11 @@ fn wrap_event(
     if !cfg!(windows)
         && let Some(words) = literal_command(command)
     {
-        if let Some((file, first, last)) = crate::shellread::command(&words) {
+        if let Some((file, range)) = crate::shellread::command(&words) {
             if rules.claude {
                 return None;
             }
-            return crate::shellread::rewrite(workspace, cwd, file, first, last, session);
+            return crate::shellread::rewrite(workspace, cwd, file, range, session);
         }
         if let [program, file] = words.as_slice()
             && program == "cat"

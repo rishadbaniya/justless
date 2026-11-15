@@ -17242,3 +17242,101 @@ fn sed_range_persisted_and_trimmed_outputs_use_the_visible_baseline() {
     let id = marker_run(&page);
     assert_eq!(cli(&root, &["log", &id]).stdout, raw.as_bytes());
 }
+
+#[cfg(unix)]
+#[test]
+fn tail_from_line_uses_the_current_eof_and_archives_the_exact_suffix() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let file = "fees today.py";
+    let mut source = (0..80)
+        .map(|i| format!("def fee_{i}(x):\r\n    return x + {i}\r\n\r\n"))
+        .collect::<String>();
+    source.push_str("# last line");
+    fs::write(root.join(file), &source).unwrap();
+    let before = |agent: &str, command: &str| {
+        agent_hook(
+            &root,
+            agent,
+            "before-command",
+            json!({
+                "hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
+                "tool_input":{"command":command}
+            }),
+        )["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    let run = |rewritten: &str| {
+        let args = shlex::split(rewritten).unwrap();
+        assert_eq!(args[0], "justless");
+        let out = cli(
+            &root,
+            &args.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
+        );
+        assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+        out.stdout
+    };
+    let native = |first: &str| {
+        let out = Command::new("tail")
+            .args(["-n", first, file])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out.stdout
+    };
+    for first in ["+240", "+241"] {
+        let cmd = format!("tail -n {first} 'fees today.py'");
+        assert_eq!(run(&before("hook-codex", &cmd).unwrap()), native(first));
+    }
+    for cmd in [
+        "tail -n 3 'fees today.py'",
+        "tail -f 'fees today.py'",
+        "tail -c +7 'fees today.py'",
+        "tail -n +400 'fees today.py'",
+        "tail -n +7 missing",
+        "tail -n +7 'fees today.py' | wc -c",
+        "tail -n +7 'fees today.py' > saved",
+        "tail -n +7 'fees today.py' other",
+    ] {
+        assert!(before("hook-codex", cmd).is_none(), "{cmd}");
+    }
+
+    let cmd = "tail -n +7 'fees today.py'";
+    assert!(before("hook-claude", cmd).is_none());
+    let rewritten = before("hook-codex", cmd).unwrap();
+    // A growing file is read through the EOF at execution, after the pre-hook.
+    source.push_str("\r\n# appended");
+    fs::write(root.join(file), &source).unwrap();
+    let raw = native("+7");
+    let codex = String::from_utf8(run(&rewritten)).unwrap();
+    let claude = shown_stdout(&after_bash(
+        &root,
+        &root,
+        cmd,
+        json!({
+            "stdout":std::str::from_utf8(&raw).unwrap(),"stderr":"","interrupted":false
+        }),
+    ));
+    let short = before("hook-codex", "tail -n +241 'fees today.py'").unwrap();
+    fs::write(root.join(file), "changed\n").unwrap();
+    assert!(run(&short).is_empty());
+    let mut shown = 0;
+    for text in [codex, claude] {
+        assert!(text.contains("fee_2") && !text.contains("fee_0(") && text.len() < raw.len());
+        shown += text.len();
+        let exact = text
+            .lines()
+            .find_map(|s| s.strip_prefix("Exact: "))
+            .unwrap();
+        assert_eq!(run(exact), raw);
+    }
+    let stats = savings(&root);
+    assert_eq!(stats["commands"][0]["family"], "tail");
+    assert_eq!(stats["runs"], 2);
+    assert_eq!(stats["replayed_bytes"], raw.len() * 2);
+    assert_eq!(stats["net_saved_bytes"], -(shown as i64));
+}
