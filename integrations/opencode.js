@@ -5,6 +5,47 @@ function binary() {
   return process.env.JUSTLESS_BIN || "justless";
 }
 
+const readonly = [
+  "affected", "code", "context", "discover", "expand", "find", "history", "log",
+  "lookup", "map", "pack", "path", "query", "read", "recall", "resume", "search",
+  "stats",
+];
+
+async function queryTool(directory) {
+  try {
+    const { tool } = await import("@opencode-ai/plugin");
+    return tool({
+      description:
+        "Read this repository through Justless before reading files blindly. Pack builds " +
+        "task context, map lists areas, hubs, communities and entry points, lookup ranks " +
+        "code, docs and config for a question, query finds a symbol, its callers, references " +
+        "or tests, path traces a relationship between two names, read with --outline shows " +
+        "a file's structure, expand prints an exact span, code prints a source range, log " +
+        "and search read an archived command run, recall restores a retired tool result, " +
+        "affected lists dependents, stats and discover report measured savings.",
+      args: {
+        command: tool.schema.enum(readonly),
+        args: tool.schema.array(tool.schema.string()).optional(),
+      },
+      async execute({ command, args }) {
+        if (!readonly.includes(command)) {
+          throw new Error(`justless: ${command} is not a read-only command`);
+        }
+        return new Promise((resolve, reject) => {
+          execFile(binary(), ["--root", directory, command, ...(args ?? [])], {
+            timeout: 30_000, maxBuffer: 64 * 1024 * 1024, encoding: "utf8",
+          }, (error, stdout, stderr) => {
+            if (error) return reject(new Error((stderr || error.message).trim() || "justless failed"));
+            resolve(stdout);
+          });
+        });
+      },
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 function mask(directory, model, parts) {
   return new Promise((resolve, reject) => {
     const child = execFile(binary(), ["--root", directory, "mask", "--model", model], {
@@ -57,7 +98,8 @@ function selectedModel(messages) {
   }
 }
 
-export const Justless = async ({ directory }) => ({
+export const Justless = async ({ directory }) => {
+  const hooks = {
   "tool.execute.after": async (input, output) => {
     if (input?.tool !== "bash" && input?.tool !== "Bash") return;
     const command = input?.args?.command;
@@ -102,4 +144,9 @@ export const Justless = async ({ directory }) => ({
       // The host can send the original request if the CLI or its archive is unavailable.
     }
   },
-});
+  };
+
+  const tool = await queryTool(directory);
+  if (tool) hooks.tool = { justless: tool };
+  return hooks;
+};
