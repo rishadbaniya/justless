@@ -197,12 +197,10 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                     return None;
                 }
                 let inner = shlex::split(refs[i])?;
-                if inner.iter().any(|w| {
-                    matches!(
-                        w.as_str(),
-                        ";" | "|" | "&" | ">" | ">>" | "<" | "<<" | "(" | ")"
-                    )
-                }) {
+                if inner
+                    .iter()
+                    .any(|w| w.contains([';', '|', '&', '>', '<', '(', ')']))
+                {
                     return None;
                 }
                 let inner_refs: Vec<&str> = inner.iter().map(String::as_str).collect();
@@ -1025,5 +1023,36 @@ fn append(out: &mut String, text: &str, budget: usize) {
     } else if available >= 20 {
         out.push_str(&fit[..fit.floor_char_boundary(available - "…\n".len())]);
         out.push_str("…\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective;
+
+    fn effective_words(command: &str) -> Option<Vec<String>> {
+        let words = shlex::split(command)?;
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        effective(&refs)
+    }
+
+    #[test]
+    fn wrappers_are_looked_through() {
+        assert_eq!(
+            effective_words("timeout 5 sed -n 1,2p f").unwrap(),
+            ["sed", "-n", "1,2p", "f"]
+        );
+        assert_eq!(effective_words("env -u HOME cat f").unwrap(), ["cat", "f"]);
+        assert_eq!(effective_words("nice -n 5 cat f").unwrap(), ["cat", "f"]);
+        assert_eq!(
+            effective_words("bash -c 'sed -n 1,2p f'").unwrap(),
+            ["sed", "-n", "1,2p", "f"]
+        );
+        assert_eq!(effective_words("git -C . diff").unwrap(), ["git", "diff"]);
+    }
+
+    #[test]
+    fn compound_shell_strings_are_not_unwrapped() {
+        assert_eq!(effective_words("bash -c 'cargo test; rm -rf /'"), None);
     }
 }

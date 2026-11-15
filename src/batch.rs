@@ -102,8 +102,12 @@ struct Verified<'a> {
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn parse(command: &'a str) -> Option<Self> {
+    pub(crate) fn parse_list(command: &'a str) -> Option<Self> {
         parse::list(command).map(Self)
+    }
+
+    pub(crate) fn parse(command: &'a str) -> Option<Self> {
+        Self::parse_list(command).or_else(|| parse::single(command).map(Self))
     }
 
     pub(crate) fn compact(&self, ws: &Workspace, input: &Value) -> Option<Value> {
@@ -397,4 +401,16 @@ fn render(
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Batch;
+
+    #[test]
+    fn a_wrapped_single_command_parses() {
+        assert!(Batch::parse("timeout 5 sed -n 1,2p Cargo.toml").is_some());
+        assert!(Batch::parse("env -u HOME cat Cargo.toml").is_some());
+        assert!(Batch::parse("sed -n 1,2p Cargo.toml").is_none());
+    }
 }

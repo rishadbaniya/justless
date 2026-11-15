@@ -1047,7 +1047,7 @@ fn wrap_event(
     session: Option<&str>,
     rules: Rules,
 ) -> Option<String> {
-    if !cfg!(windows) && rules.claude && crate::batch::Batch::parse(command).is_some() {
+    if !cfg!(windows) && rules.claude && crate::batch::Batch::parse_list(command).is_some() {
         return None;
     }
     if !cfg!(windows)

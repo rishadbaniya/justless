@@ -195,6 +195,16 @@ fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> 
     })
 }
 
+pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
+    let words = shlex::split(command)?;
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    let effective = crate::filters::effective(&refs)?;
+    if effective.len() == refs.len() && effective.iter().zip(&refs).all(|(a, b)| a == b) {
+        return None;
+    }
+    piece(command, &[command], Join::Always).map(|piece| vec![piece])
+}
+
 pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
     if command.len() > 16 * 1024 || !command.contains([';', '\n', '&', '|']) {
         return None;

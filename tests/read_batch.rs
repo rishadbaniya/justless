@@ -296,6 +296,10 @@ fn wrappers_are_looked_through_before_compacting() {
         "timeout 5 sed -n '1,150p' big.rs && sed -n '150,300p' big.rs",
         "env -u HOME sed -n '1,150p' big.rs && sed -n '150,300p' big.rs",
         "env FOO=1 sed -n '1,150p' big.rs && sed -n '150,300p' big.rs",
+        "timeout 5 sed -n '1,300p' big.rs",
+        "env -u HOME sed -n '1,300p' big.rs",
+        "nice -n 5 sed -n '1,300p' big.rs",
+        "bash -c \"sed -n '1,300p' big.rs\"",
     ] {
         let raw = native(dir, command);
         let out = hook(dir, command, Some(response(&raw)));
