@@ -28,7 +28,7 @@ pub struct Item {
 
 pub fn family(args: &[OsString]) -> String {
     let all: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
-    let owned = crate::filters::effective(&all);
+    let owned = crate::wrappers::effective(&all);
     let refs: Vec<&str> = match &owned {
         Some(words) => words.iter().map(String::as_str).collect(),
         None => all.clone(),

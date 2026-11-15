@@ -411,6 +411,9 @@ mod tests {
     fn a_wrapped_single_command_parses() {
         assert!(Batch::parse("timeout 5 sed -n 1,2p Cargo.toml").is_some());
         assert!(Batch::parse("env -u HOME cat Cargo.toml").is_some());
+        assert!(Batch::parse("bash -c 'sed -n 1,2p Cargo.toml'").is_some());
         assert!(Batch::parse("sed -n 1,2p Cargo.toml").is_none());
+        assert!(Batch::parse("env FOO=$(cat Cargo.toml) cat Cargo.toml").is_none());
+        assert!(Batch::parse("env FOO=1 cat *").is_none());
     }
 }

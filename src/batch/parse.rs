@@ -146,7 +146,7 @@ fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> 
     let words = stages.next()??;
     let words = {
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-        crate::filters::effective(&refs)?
+        crate::wrappers::effective(&refs)?
     };
     let (program, args) = words.split_first()?;
     let source = match program.as_str() {
@@ -195,10 +195,45 @@ fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> 
     })
 }
 
+fn literal(command: &str) -> bool {
+    let mut quote = None;
+    let mut chars = command.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if q == '"' && c == '\\' {
+                match chars.next() {
+                    Some((_, next)) if !next.is_control() => {}
+                    _ => return false,
+                }
+            } else if q == '"' && matches!(c, '$' | '`') || c.is_control() {
+                return false;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => match chars.next() {
+                Some((_, next)) if !next.is_control() => {}
+                _ => return false,
+            },
+            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '<' | '>' | '{' | '}' | '[' | ']' | '*'
+            | '?' | '#' | '~' | '!' => return false,
+            c if c.is_control() && c != '\t' => return false,
+            _ => {}
+        }
+    }
+    quote.is_none()
+}
+
 pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
+    if command.len() > 16 * 1024 || !literal(command) {
+        return None;
+    }
     let words = shlex::split(command)?;
     let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-    let effective = crate::filters::effective(&refs)?;
+    let effective = crate::wrappers::effective(&refs)?;
     if effective.len() == refs.len() && effective.iter().zip(&refs).all(|(a, b)| a == b) {
         return None;
     }
