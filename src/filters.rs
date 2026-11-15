@@ -71,6 +71,183 @@ fn display_options(mut args: &[&str], flags: &[&str], valued: &[&str], names: bo
 
 /// Skip package-runner prefixes such as `npx`, `uv run` and `bundle exec` so the
 /// tool they launch selects the profile.
+fn assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn tail(words: &[&str], n: usize) -> Option<Vec<String>> {
+    (words.len() > n).then(|| words[n..].iter().map(|w| (*w).to_owned()).collect())
+}
+
+fn env_rest(words: &[&str]) -> Option<Vec<String>> {
+    let mut i = 1;
+    while let Some(word) = words.get(i) {
+        match *word {
+            "-i" | "--ignore-environment" | "-0" | "--null" => i += 1,
+            "-u" | "--unset" => i += 2,
+            "--" => {
+                i += 1;
+                break;
+            }
+            word if word.starts_with("--unset=") => i += 1,
+            word if assignment(word) => i += 1,
+            _ => break,
+        }
+    }
+    tail(words, i)
+}
+
+/// The command a wrapper actually runs. Assignments, `env`, `time`, `nohup`,
+/// `command`, `nice`, `timeout`, `stdbuf`, `bash -c` and git's global options
+/// are removed so output can be classified. Never used to replay the command:
+/// the recorded words keep the wrappers.
+pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
+    let mut words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+    loop {
+        while words.first().is_some_and(|w| assignment(w)) {
+            words.remove(0);
+        }
+        let first = words.first()?.clone();
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let rest = match first.as_str() {
+            "env" => env_rest(&refs)?,
+            "time" | "nohup" => match refs.get(1).copied() {
+                Some("-p") | Some("--") => tail(&refs, 2)?,
+                Some(word) if word.starts_with('-') => return None,
+                _ => tail(&refs, 1)?,
+            },
+            "command" => match refs.get(1).copied() {
+                Some("-p") | Some("--") => tail(&refs, 2)?,
+                Some(word) if word.starts_with('-') => return None,
+                _ => tail(&refs, 1)?,
+            },
+            "nice" => match refs.get(1).copied() {
+                Some("-n") | Some("--adjustment") => tail(&refs, 3)?,
+                Some(word) if word.starts_with("--adjustment=") => tail(&refs, 2)?,
+                Some(word) if word.starts_with('-') => tail(&refs, 2)?,
+                _ => tail(&refs, 1)?,
+            },
+            "timeout" => {
+                let mut i = 1;
+                while let Some(word) = refs.get(i) {
+                    if *word == "-s"
+                        || *word == "--signal"
+                        || *word == "-k"
+                        || *word == "--kill-after"
+                    {
+                        i += 2;
+                    } else if word.starts_with("--signal=")
+                        || word.starts_with("--kill-after=")
+                        || (word.starts_with('-') && word.len() > 1)
+                    {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let duration = refs.get(i)?;
+                if !duration.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                tail(&refs, i + 1)?
+            }
+            "stdbuf" => {
+                let mut i = 1;
+                while refs
+                    .get(i)
+                    .is_some_and(|w| w.starts_with('-') && *w != "--")
+                {
+                    i += 1;
+                }
+                if refs.get(i) == Some(&"--") {
+                    i += 1;
+                }
+                tail(&refs, i)?
+            }
+            "bash" | "sh" | "zsh" | "dash" => {
+                let mut i = 1;
+                let mut found = false;
+                while let Some(word) = refs.get(i) {
+                    if *word == "-c" {
+                        found = true;
+                        i += 1;
+                        break;
+                    }
+                    if word
+                        .strip_prefix('-')
+                        .is_some_and(|flags| !word.starts_with("--") && flags.contains('c'))
+                    {
+                        found = true;
+                        i += 1;
+                        break;
+                    }
+                    if word.starts_with("--") {
+                        return None;
+                    }
+                    i += 1;
+                }
+                if !found || refs.len() != i + 1 {
+                    return None;
+                }
+                let inner = shlex::split(refs[i])?;
+                if inner.iter().any(|w| {
+                    matches!(
+                        w.as_str(),
+                        ";" | "|" | "&" | ">" | ">>" | "<" | "<<" | "(" | ")"
+                    )
+                }) {
+                    return None;
+                }
+                let inner_refs: Vec<&str> = inner.iter().map(String::as_str).collect();
+                effective(&inner_refs)?
+            }
+            "git" => {
+                let mut i = 1;
+                while let Some(word) = refs.get(i) {
+                    match *word {
+                        "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+                        | "--exec-path" | "--config-env" => i += 2,
+                        "--no-pager"
+                        | "-P"
+                        | "--paginate"
+                        | "-p"
+                        | "--bare"
+                        | "--literal-pathspecs"
+                        | "--glob-pathspecs"
+                        | "--noglob-pathspecs"
+                        | "--icase-pathspecs"
+                        | "--no-replace-objects" => i += 1,
+                        word if word.starts_with("--git-dir=")
+                            || word.starts_with("--work-tree=")
+                            || word.starts_with("--namespace=")
+                            || word.starts_with("--exec-path=")
+                            || word.starts_with("--config-env=") =>
+                        {
+                            i += 1;
+                        }
+                        word if word.starts_with("-C") && word.len() > 2 => i += 1,
+                        word if word.starts_with('-') => return None,
+                        _ => break,
+                    }
+                }
+                let mut out = vec!["git".to_owned()];
+                out.extend(refs[i..].iter().map(|w| (*w).to_owned()));
+                return Some(out);
+            }
+            _ => break,
+        };
+        words = rest;
+    }
+    Some(words)
+}
+
 pub fn unwrap_tool<'a, 'b>(words: &'a [&'b str]) -> &'a [&'b str] {
     runners(words).0
 }
@@ -113,7 +290,12 @@ pub fn tool_label(args: &[OsString]) -> String {
 }
 
 pub fn tool_label_words(words: &[&str]) -> String {
-    let words = unwrap_tool(words);
+    let owned = effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(words) => words.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let words = unwrap_tool(&refs);
     let Some((program, rest)) = words.split_first() else {
         return "other".into();
     };

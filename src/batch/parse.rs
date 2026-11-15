@@ -144,6 +144,10 @@ pub(super) fn search_paths(words: &[String]) -> Option<&[String]> {
 fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> {
     let mut stages = stages.iter().map(|s| shlex::split(s));
     let words = stages.next()??;
+    let words = {
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        crate::filters::effective(&refs)?
+    };
     let (program, args) = words.split_first()?;
     let source = match program.as_str() {
         "git" if super::git::supported(args) => Source::Git(words),

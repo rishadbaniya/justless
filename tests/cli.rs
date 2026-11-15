@@ -12200,6 +12200,10 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         "cd 2>&1 && cargo test",
         // Assignments the shell would expand, and words that are not assignments.
         "env RUST_BACKTRACE=1 cargo test",
+        "env PATH=/tmp/bin cargo test",
+        "env -u PATH cargo test",
+        "env -i cargo test",
+        "bash -c 'cargo test; rm -rf /'",
         "RUST_BACKTRACE=$LEVEL cargo test",
         "FOO=`id` cargo test",
         "FOO=~/x cargo test",
