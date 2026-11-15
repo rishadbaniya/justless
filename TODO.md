@@ -1,8 +1,23 @@
 # TODO
 
-All work was stopped on 2026-11-19 to save usage; nothing is running. Each item says what is wrong or missing, the evidence, the plan, how far the work got and the next step. Byte figures come from the owner's real Claude Code and Codex transcripts, measured locally (labels and sizes only). Token figures elsewhere in the project are bytes ÷ 4 estimates.
+All work was stopped on 2026-11-19; it resumed the same day for the wrapper, OpenCode and coverage work recorded below. Each item says what is wrong or missing, the evidence, the plan, how far the work got and the next step. Byte figures come from the owner's real Claude Code and Codex transcripts, measured locally (labels and sizes only). Token figures elsewhere in the project are bytes ÷ 4 estimates.
 
 **Progress scale:** *not started* · *designed* (approach decided, no code) · *partial* (code exists, unfinished or untested) · *built* (complete with tests, not independently reviewed) · *reviewed* (an independent reviewer tried to break it and its findings were fixed) · *on main*.
+
+## Today — 2026-11-19
+
+`main` is at `24a8984`, nine commits ahead of `origin/main`. Three stacked branches are merged into it: `feat/wrapper-coverage`, `feat/top5` and `feat/coverage`.
+
+**Shipped.** Wrapper-aware post-command compaction for lists and single commands; `src/wrappers.rs`; the metacharacter and 16 KiB guard; single-piece pipelines and `cat` singles; OpenCode `tool.execute.after` and the read-only `justless` tool; `scripts/replay.py` (1,867 results, 278,084 of 314,460 bytes saved, 88.4%).
+
+**Decisions.**
+- Pre-command rewriting never unwraps a wrapper. Doing so would hide the original command from clients that auto-approve, so `env RUST_BACKTRACE=1 cargo test` and `git -C . diff` stay as written.
+- Failure-aware Claude is blocked: PostToolUse carries no exit status and failed results are not rewritten. OpenCode compacts only results whose `metadata.exit` is 0.
+- Batch rerun comparisons stay off: a truncated archive cannot prove full equality. Routed runs still print `Output unchanged since`.
+- Polyglot affected tests and the HTTP/SQL cross-language links already existed; `fixtures/mixed` proves both, so no code was added for them.
+- Of the ten-item plan, #1, #2, #4 (partial) and #10 shipped. #3, #5, #6, #7 and #8 remain open.
+
+**Why this file is long.** §8 is the 50-idea token backlog; §9 and §10 are branch logs kept for provenance.
 
 ---
 
@@ -252,9 +267,9 @@ None of these is planned in the sections above. Order is expected bytes kept out
 
 ---
 
-## 9. Top-five work, branch status
+## 9. Top-five work (merged into main)
 
-Two branches carry this work; neither is merged into `main`.
+`feat/wrapper-coverage` and `feat/top5` are merged into `main` at `24a8984`.
 
 ### `feat/wrapper-coverage` (4 commits ahead)
 
