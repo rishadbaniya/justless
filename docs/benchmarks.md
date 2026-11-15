@@ -208,6 +208,8 @@ python3 scripts/benchmark.py --mode codex
 
 The CLI tests cover Rust and Python diagnostics, archive replay, multi-language source links, exact text search, source edits and deletion, Git changes, and Codex hook installation and command rewriting. The local benchmark replays the diagnosis on disposable copies of the synthetic fixture. It measures bytes and elapsed time and estimates tool output tokens as bytes divided by four, rounded up per result. The Codex benchmark runs the same task in two fresh sessions, one using Cargo and direct source reads and one using Justless. It records token usage from completed turns.
 
+`scripts/replay.py` replays stored Claude Code Bash results through `justless hook-claude after-bash` and reports measured bytes. On the local transcripts it replayed 1,867 results, 164 eligible, 26 compacted, and saved 278,084 of 314,460 bytes (88.4%). The 1,593 results under 4 KiB, 138 pass-through results and 86 results whose directory no longer existed were left alone.
+
 The original single-task benchmark on macOS arm64 with Rust 1.93.0 produced these medians over three local replays per variant. Cargo compilation was warmed before the timed commands.
 
 | Local replay | Successful runs | Tool output | Estimated output tokens | Elapsed |

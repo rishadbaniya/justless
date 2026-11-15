@@ -1,9 +1,13 @@
 // Managed by Justless. OpenCode v1 project plugin.
 import { execFile } from "node:child_process";
 
+function binary() {
+  return process.env.JUSTLESS_BIN || "justless";
+}
+
 function mask(directory, model, parts) {
   return new Promise((resolve, reject) => {
-    const child = execFile("justless", ["--root", directory, "mask", "--model", model], {
+    const child = execFile(binary(), ["--root", directory, "mask", "--model", model], {
       timeout: 5000, maxBuffer: 16 * 1024 * 1024, encoding: "utf8",
     }, (error, stdout) => {
       if (error) return reject(error);
@@ -12,6 +16,29 @@ function mask(directory, model, parts) {
     });
     child.stdin.on("error", reject);
     child.stdin.end(JSON.stringify({ messages: [{ info: { role: "assistant" }, parts }] }));
+  });
+}
+
+
+function afterBash(directory, command, stdout) {
+  return new Promise((resolve) => {
+    const child = execFile(binary(), ["hook-claude", "after-bash"], {
+      cwd: directory, timeout: 10_000, maxBuffer: 64 * 1024 * 1024, encoding: "utf8",
+    }, (error, output) => {
+      if (error) return resolve();
+      try {
+        const next = JSON.parse(output).hookSpecificOutput?.updatedToolOutput?.stdout;
+        resolve(typeof next === "string" && next !== stdout ? next : undefined);
+      } catch { resolve(); }
+    });
+    child.stdin.on("error", () => resolve());
+    child.stdin.end(JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command },
+      tool_response: { stdout, stderr: "", interrupted: false, isImage: false },
+      cwd: directory,
+    }));
   });
 }
 
@@ -31,6 +58,14 @@ function selectedModel(messages) {
 }
 
 export const Justless = async ({ directory }) => ({
+  "tool.execute.after": async (input, output) => {
+    if (input?.tool !== "bash" && input?.tool !== "Bash") return;
+    const command = input?.args?.command;
+    if (typeof command !== "string" || typeof output?.output !== "string") return;
+    if (typeof output.metadata?.exit === "number" && output.metadata.exit !== 0) return;
+    const next = await afterBash(directory, command, output.output);
+    if (next !== undefined) output.output = next;
+  },
   "experimental.chat.messages.transform": async (_input, { messages }) => {
     const model = selectedModel(messages);
     if (!model) return;
