@@ -190,3 +190,87 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 ## 7. Do not build
 
 LLM summarization or retrieval, telemetry, client-side rewriting of earlier requests (it invalidates thinking on current Claude models; the opt-in proxy uses server-side context editing instead), networked graph databases, bundled embedding models, and fetching filters from the network. Each breaks the local, deterministic, zero-network promise in the README.
+
+---
+
+## 8. Token-usage ideas only (unplanned, ranked)
+
+None of these is planned in the sections above. Order is expected bytes kept out of context, not measured savings; size each with transcript replay before building. Effort: S (small), M (medium), L (large).
+
+1. **Failed and stderr-bearing command compaction.** A non-empty stderr skips compaction today, yet failing builds and tests are usually the largest results. Compact stdout and stderr separately after verifying each, keep the exit status, and archive one exact replay. (M)
+    - **Status.** OpenCode's after-tool hook now compacts a successful Bash result and skips one whose `metadata.exit` is nonzero. Claude Code's PostToolUse carries no exit status and does not rewrite a failed result, so the Claude half stays open.
+2. **Rerun delta.** When a command reruns, compare against its previous run in the same directory and session: show only what changed, or a pointer when the output is identical. Test and build loops rerun dozens of times. Routed runs already print `Output unchanged since`; after-bash batch archives skip rerun comparisons because a truncated record cannot prove equality. (M)
+3. **Session excerpt dedupe in `pack`, `lookup` and `context`.** Do not resend a file chunk or section already shown this session; point to the earlier run or range. This is excerpt-level, not the demoted Read dedupe. (M)
+4. **pytest, `go test`, jest/vitest and `cargo nextest` summaries.** The §4 parity list names rspec, phpunit, Maven, Gradle, dotnet and swift but not these, which dominate polyglot repositories. Group by test file, keep failures and counts. (L)
+5. **Lint and typecheck formatters.** ruff, mypy/pyright, eslint/tsc/biome and golangci-lint: deduplicate by rule and location, show counts per rule, keep the first occurrence with code. (L)
+6. **Parameterized failure dedupe.** Two hundred cases failing the same assertion become one representative failure, a count and the case IDs. (M)
+7. **Language-aware exception folding.** Collapse Python chained exceptions, Rust backtraces and JS stacks to the inj! point plus frames grouped by file/crate. §3.5 only folds identical lines. (M)
+8. **Severity sampling for CI logs.** Keep errors and warnings with N context lines, elide info noise with a count. Samples by severity rather than folding repeated bytes. (M)
+9. **`git blame` compaction.** Group consecutive lines by commit, one header per commit, total counts. Currently unsupported and often the largest git output. (S)
+10. **Wrapper coverage.** `git -C DIR`, `bash -c '…'`, `env VAR=1 …`, `timeout 60 …`, `nice`, `command` and `time` prefixes currently stop routing, so large git and test outputs arrive raw. Unwrap them for the same filters. (S)
+    - **Branch `feat/wrapper-coverage`.** Post-command compaction now looks through `env` (including `-u` and `-i`), `time`, `nohup`, `command`, `nice`, `timeout`, `stdbuf`, `bash -c` and git's global options, for a single command as a one-piece list and for each piece of a mixed read list. The recorded command keeps the original words for replay. Wrapper parsing lives in `src/wrappers.rs`; the single-piece path now applies the same metacharacter and 16 KiB guard as multi-piece lists, so substitutions, globs and redirections stay unparsed. Pre-command rewriting stays strict: a rewrite would hide the original command from clients that auto-approve, so `env RUST_BACKTRACE=1 cargo test` and `git -C . diff` remain unwrapped. Tests cover `timeout`, `env -u`, `env FOO=1`, `nice`, `bash -c`, wrapper options, unsafe wrappers and both list and single forms; unit tests cover the unwrap itself. (M)
+11. **Tabular text compaction.** psql, sqlite3, csv/tsv, aws and gcloud tables: column names once, constant columns lifted, aligned columns dropped. Lossless sibling of §3.6. (M)
+12. **Multi-commit history views.** `git log -p`, `git show --stat`, `git range-diff`: summarize per commit, keep patches one command away. (M)
+13. **Tree and listing compaction.** `find`, `ls -R`, `tree` and `rg --files`: group by directory with counts, keep only interesting entries. (M)
+14. **Log prefix and timestamp normalization.** kubectl, journalctl and systemd logs repeat timestamp, pod and level on every line; strip to a header and deduplicate. (S)
+15. **Non-CR progress folding.** pip/npm/docker dots, percentages and spinner lines that never use `\r`. §3.5 covers only carriage-return frames. (S)
+16. **HTML to text for `curl`, `wget` and `gh`.** TODO covers WebFetch, not shell HTTP fetches, which often dump whole pages. (M)
+17. **Non-git diff compaction.** `diff -u`, `patch` output and `gh pr diff`: file-level summary plus hunks. (M)
+18. **Dependency-tree folding.** `cargo tree`, `npm ls` and `pnpm list` in text mode: one line per repeated subtree, counts. JSON is §3.6. (S)
+19. **Duplicate content inside one result.** The same file printed twice in a batched command becomes a pointer on the second copy. (S)
+20. **Per-result overhead.** Shorter replay footers, run IDs and cut notices; at thousands of results the fixed text is a measurable share. (S)
+21. **Per-request overhead.** Deduplicate the instruction block across AGENTS.md and CLAUDE.md, and shorten MCP and plugin tool descriptions. Paid on every request, not per result. (S)
+22. **Scoped maps.** `map --changed`, `--since REV` and `--path DIR`, with top hubs as the default; a monorepo map is otherwise 10–20 KB per call. (S)
+23. **Adaptive budgets for `pack`, `context` and `lookup`.** Reuse the run-budget learning: same reopen signal, one step at a time. (M)
+24. **`rg`/`grep` context grouping.** With `-A`, `-B` or `-C`, show a range outline per file instead of every line the pattern touched. (S)
+25. **`discover --plan`.** Rank unsupported command families by measured bytes and print the build order, turning telemetry into a deterministic roadmap. (S)
+26. **Post-run JSON compaction for piped JSON.** §3.6 intentionally excludes pipes; the post-run hook can still verify and compact the captured bytes losslessly. (M)
+27. **YAML and TOML structural compaction.** Helm, kubectl and compose config: lift keys, fold lists, omit defaults, verify by re-parse. (M)
+28. **XML, SOAP and HAR summaries.** Structure, counts and repeated nodes; rarely worth full bytes. (M)
+29. **Generated, minified and vendored files.** Detect `*.pb.go`, `*.min.js`, source maps, `dist/`, `vendor/` and minified single-line content in previews and the index; show shape and count. §3.5 only elides base64 runs. (M)
+30. **Moved-block detection in diffs.** Git renders a move as delete plus add; detect identical blocks and emit "moved from A to B". (M)
+31. **Task-aware diff clipping.** Keep hunks that touch task terms and paths, summarize the rest by file. (M)
+32. **Search cap per file.** For a match-heavy `rg`, show first and last N per file plus a count and a ready range command instead of every match. (S)
+33. **Test collection output.** `cargo test -- --list` and `pytest --collect-only`: counts by module, not one line per test. (S)
+34. **Build progress and timing lines.** Compiling/Fetching/Downloading/Finished lines and per-step timings are unique, so folding identical lines does not help; summarize by crate and keep only failures. (S)
+35. **Compiler warning dedupe.** Group warnings by lint code and target, keep one full example and a count. (M)
+36. **Package-manager resolution logs.** npm/pnpm/yarn/uv/pip resolution trees and "already satisfied" lines become counts and only conflicts. (M)
+37. **Docker build step folding.** Keep the failing step and warnings, fold successful layer logs by step. (M)
+38. **`kubectl describe` field elision.** Keep status, conditions, containers and events; drop managed fields, annotations and default env. (S)
+39. **File-level-only diffs.** Binary, mode, symlink and submodule changes: one line each with hashes instead of a patch attempt. Complements 1.1, which is change detection. (S)
+40. **OpenCode native read-only tool.** Register `pack`, `map`, `lookup`, `query` and `path` as a plugin tool so the agent gets compact answers without shelling out for whole files. Distinct from the §4 routing item. (M)
+41. **OpenCode retirement tuning.** The plugin keeps the last three results and ignores under 256 bytes; size the window and threshold from real sessions. (S)
+42. **Proxy clear-threshold tuning.** Set `clear_at_least` and the minimum token count from measured sessions so clearing maximises removed bytes without dropping cache hits. (S)
+43. **Antigravity read-outline parity.** §4 covers Copilot and Gemini post-run compaction but not Antigravity's separate hook contract. (M)
+44. **Binary-output detection.** NUL or high-byte-ratio output shows type, size and first/last bytes instead of dumping binary into context. (S)
+45. **Pointer summaries.** A retired result could carry a one-line summary in its placeholder; it costs bytes per request but may avoid a recall. Measure before adopting. (S)
+46. **Range navigation in footers.** Offer `--from/--to` in the footer so a model asking for more does not replay the whole log. (S)
+47. **Paged recall.** `recall --outline` or a range so only the needed part of an archived result returns. (S)
+48. **Formatter-level adaptive widening.** If a family's output is reopened, switch that formatter to a fuller preview automatically; today only the byte budget adapts. (M)
+49. **Empirical cut thresholds per family.** Choose preview sizes from transcript replay instead of one global default. (M)
+50. **Transcript replay harness for sizing.** A repeatable script that puts every new formatter against the stored transcripts before it is built, so this list can be ranked by bytes rather than intuition. (M)
+
+---
+
+## 9. Top-five work, branch status
+
+Two branches carry this work; neither is merged into `main`.
+
+### `feat/wrapper-coverage` (4 commits ahead)
+
+- `2afa5ea` **Post-command wrapper coverage.** A read list looks through `env` (including `-u`/`-i`/`VAR=1`), `time`, `nohup`, `command`, `nice`, `timeout`, `stdbuf`, `bash -c` and git's global options per piece. The recorded command keeps the original words for replay. Pre-command rewriting stays strict, so `env RUST_BACKTRACE=1 cargo test` and `git -C . diff` are not rewritten for clients that auto-approve.
+- `d3727fe` Correct the coverage claim in the docs.
+- `5c267f1` A wrapped single command is now classified as a one-piece list and compacted after verification.
+- `8e07e1b` Wrapper parsing moved to `src/wrappers.rs`; the single-piece path now applies the same metacharacter and 16 KiB guard as multi-piece lists, so substitutions, globs and redirections stay unparsed.
+- Tests: wrapper options, unsafe wrappers, list and single forms. Verified: `cargo fmt`, `clippy -D warnings`, 248 CLI tests, 8 batch tests, plus 211 binary tests; `scripts/context_benchmark.py` passes.
+
+### `feat/top5` (stacked on `feat/wrapper-coverage`, one commit on top)
+
+- `5477565` connects the OpenCode plugin to the post-command hook: `tool.execute.after` compacts a successful Bash result and leaves a result whose `metadata.exit` is nonzero alone. It also adds `scripts/replay.py`, the measured transcript replay harness, and updates the reference.
+- **Top five status**
+  - Failure-aware compaction: OpenCode successful results covered; nonzero exits skipped. Claude Code's PostToolUse has no exit status and failed results are not rewritten, so the Claude side remains open.
+  - Rerun delta: routed runs already print `Output unchanged since`; after-bash batch archives deliberately skip rerun comparisons, because a truncated archive cannot prove equality of full output.
+  - Polyglot affected tests: already built; pytest, jest/vitest and `go test` selection are covered by existing tests.
+  - OpenCode post-command compaction: works end to end; a wrapped `sed` result measured 10,470 bytes before and 1,327 after, and an exit-1 result stayed untouched.
+  - Transcript replay: `scripts/replay.py` replayed 1,867 stored results, 164 eligible, 26 compacted, and saved 278,084 of 314,460 bytes (88.4%). The rest were under 4 KiB, pass-throughs, already compacted, or a directory that no longer existed.
+- Not merged. To use the plugin: `cargo install --path . --locked --force`, refresh `init --hooks --agent opencode`, restart OpenCode.
