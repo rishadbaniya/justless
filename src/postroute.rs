@@ -56,8 +56,8 @@ use crate::workspace::{Workspace, write_json};
 /// path for each line, and a review measured up to about 145 µs per line, so a
 /// larger result could outrun the hook's 10-second timeout. Claude Code shows such
 /// a result as the path of its saved copy and a short preview, so it passes through.
-const MAX_LINES: usize = 20_000;
-const MAX_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_LINES: usize = 20_000;
+pub(crate) const MAX_BYTES: usize = 2 * 1024 * 1024;
 /// Claude Code's preview of a result it saved to a file: up to the first 2,000
 /// characters. A report that replaces such a result must be no larger.
 pub(crate) const PREVIEW_CHARS: usize = 2_000;
@@ -135,6 +135,11 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         || RUN_MARKER.is_match(stdout)
     {
         return None;
+    }
+    if !cfg!(windows)
+        && let Some(batch) = crate::batch::Batch::parse(command)
+    {
+        return batch.compact(ws, input);
     }
     if !cfg!(windows)
         && let Some(words) = crate::agents::literal_command(command)
@@ -327,7 +332,7 @@ pub fn exit_status(run: &crate::capture::Run) -> String {
         run.status.to_string()
     } else if run.label.contains(" | ") {
         format!("{} (pipe)", run.status)
-    } else if run.label.ends_with("; …") {
+    } else if !run.pieces.is_empty() || run.label.ends_with("; …") {
         format!("{} (last command)", run.status)
     } else {
         run.status.to_string()

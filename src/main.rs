@@ -1,5 +1,6 @@
 mod adaptive;
 mod agents;
+mod batch;
 mod capture;
 mod context;
 mod discover;

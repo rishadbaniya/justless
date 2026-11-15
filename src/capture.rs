@@ -129,8 +129,21 @@ pub struct Diagnostic {
     pub stream: Stream,
 }
 
+/// A verified command's portion of archived stdout. Byte offsets are half-open;
+/// line pointers are one-based and inclusive. Empty pieces have no line pointer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunPiece {
+    pub command_index: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub first_line: Option<usize>,
+    pub last_line: Option<usize>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Run {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pieces: Vec<RunPiece>,
     pub id: String,
     pub status: i32,
     pub raw_bytes: u64,
@@ -210,6 +223,7 @@ impl Run {
     fn unfinished(id: String, family: &str, label: &str, hook: bool) -> Self {
         Self {
             id,
+            pieces: Vec::new(),
             status: -1,
             raw_bytes: 0,
             preview_bytes: 0,
@@ -396,6 +410,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         redactor,
         retention: (settings.max_runs, settings.max_archive_bytes),
         origin: None,
+        pieces: &[],
     };
     match capture.record(&mut archive, family, status, stdout_preview) {
         Ok((previews, footer, _)) => {
@@ -486,6 +501,26 @@ pub fn record(
     session: &str,
     origin: &Origin,
 ) -> Result<Recorded> {
+    record_with_pieces(
+        workspace,
+        args,
+        output,
+        status,
+        max_bytes,
+        session,
+        (origin, &[]),
+    )
+}
+
+pub(crate) fn record_with_pieces(
+    workspace: &Workspace,
+    args: &[OsString],
+    output: &[u8],
+    status: i32,
+    max_bytes: usize,
+    session: &str,
+    (origin, pieces): (&Origin, &[RunPiece]),
+) -> Result<Recorded> {
     ensure!(!args.is_empty(), "no command to record");
     let settings = workspace.settings()?;
     let selection = crate::filters::Selection::for_run(args, &settings.filters)?;
@@ -528,6 +563,7 @@ pub fn record(
         redactor,
         retention: (settings.max_runs, settings.max_archive_bytes),
         origin: Some(origin),
+        pieces,
     };
     match capture.record(&mut archive, family, status, None) {
         Ok((previews, footer, run)) => Ok(Recorded {
@@ -1321,6 +1357,7 @@ struct Capture<'a> {
     retention: (usize, u64),
     /// Output another program captured, recorded after its command ran.
     origin: Option<&'a Origin>,
+    pieces: &'a [RunPiece],
 }
 
 impl Capture<'_> {
@@ -1348,6 +1385,7 @@ impl Capture<'_> {
             redactor,
             retention,
             origin,
+            pieces,
         } = *self;
         let directory = archive.directory.clone();
         let lengths = archive.lengths();
@@ -1357,6 +1395,7 @@ impl Capture<'_> {
             .collect();
         let argv_withheld = crate::learn::withhold_command(&argv);
         let mut run = Run {
+            pieces: pieces.to_vec(),
             status,
             raw_bytes: lengths.iter().sum(),
             stream_bytes: lengths.clone(),

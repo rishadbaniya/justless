@@ -6,6 +6,8 @@ User-visible changes to Justless are recorded here. No release has been publishe
 
 ### Command output
 
+- Claude Code can compact mixed Bash read lists after execution. Each verified command gets its own preview and line range, and one `justless log` replays the combined output.
+
 - Wide single-file `sed -n 'A,Bp' FILE` (with one or several ascending ranges), `head -n N FILE`, `tail -n +N FILE` and, in Claude Code, `tail -n N FILE` hook reads can show a range outline and a command to replay the original bytes. Replays count toward net savings in `stats`.
 
 - `justless run -- COMMAND` runs a noninteractive command and keeps its exit status. It shows a bounded preview of stdout and stderr and archives both streams under `.justless/runs/`, up to `max_run_bytes` each. `log` replays any line range byte for byte, `search` finds text in one run, and `history` searches every run in the project.
