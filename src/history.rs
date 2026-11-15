@@ -193,15 +193,164 @@ pub fn records(
         }))
 }
 
+/// A later request that printed part of a run's output again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retrieval {
+    /// `log` replaying whole streams.
+    Full,
+    /// `log` with a line range.
+    Range,
+    /// `search` within the run.
+    Search,
+    /// `context --run`.
+    Context,
+    /// Lines of the run that `history TEXT`, `lookup --logs` or `pack` printed.
+    Excerpt,
+    /// A replay with `--unredacted`, counted on top of its full, range or search
+    /// request, which carries the bytes.
+    Unredacted,
+}
+
+/// How often a run's output was retrieved after its preview, in `recalls.json`
+/// beside the run. Records written before bytes were counted hold only the counts.
 #[derive(Default, Serialize, Deserialize)]
 struct Recalls {
+    #[serde(default)]
     full: u64,
+    #[serde(default)]
     range: u64,
+    #[serde(default)]
     search: u64,
+    #[serde(default)]
     context: u64,
     /// Replays with `--unredacted`, counted on top of the full, range or search call.
     #[serde(default)]
     unredacted: u64,
+    #[serde(default)]
+    excerpts: u64,
+    /// The bytes printed by the retrievals that `measured` counts.
+    #[serde(default)]
+    bytes: u64,
+    /// Retrievals whose bytes are in `bytes`. The rest of each count was made
+    /// before bytes were counted, or by a caller that failed to record them.
+    #[serde(default)]
+    measured: Measured,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Measured {
+    #[serde(default)]
+    full: u64,
+    #[serde(default)]
+    range: u64,
+    #[serde(default)]
+    search: u64,
+    #[serde(default)]
+    context: u64,
+    #[serde(default)]
+    excerpts: u64,
+}
+
+impl Recalls {
+    fn count(&mut self, retrieval: Retrieval) {
+        match retrieval {
+            Retrieval::Full => self.full += 1,
+            Retrieval::Range => self.range += 1,
+            Retrieval::Search => self.search += 1,
+            Retrieval::Context => self.context += 1,
+            Retrieval::Excerpt => self.excerpts += 1,
+            Retrieval::Unredacted => self.unredacted += 1,
+        }
+    }
+
+    fn measure(&mut self, retrieval: Retrieval, bytes: u64) {
+        let measured = &mut self.measured;
+        match retrieval {
+            Retrieval::Full => measured.full += 1,
+            Retrieval::Range => measured.range += 1,
+            Retrieval::Search => measured.search += 1,
+            Retrieval::Context => measured.context += 1,
+            Retrieval::Excerpt => measured.excerpts += 1,
+            Retrieval::Unredacted => return,
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn replayed(&self, directory: &Path) -> Replayed {
+        let measured = &self.measured;
+        let full = self.full.saturating_sub(measured.full);
+        // A whole replay prints both archived streams, so their size bounds it.
+        let archive = || {
+            ["stdout", "stderr"]
+                .iter()
+                .filter_map(|stream| fs::metadata(directory.join(stream)).ok())
+                .map(|meta| meta.len())
+                .sum::<u64>()
+        };
+        Replayed {
+            measured: self.bytes,
+            estimated: if full > 0 {
+                full.saturating_mul(archive())
+            } else {
+                0
+            },
+            estimated_replays: full,
+            unmeasured: self.range.saturating_sub(measured.range)
+                + self.search.saturating_sub(measured.search)
+                + self.context.saturating_sub(measured.context)
+                + self.excerpts.saturating_sub(measured.excerpts),
+        }
+    }
+}
+
+/// What later retrievals of a run printed after its preview.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Replayed {
+    /// Bytes measured as they were printed.
+    pub measured: u64,
+    /// Whole replays recorded without their size, each estimated as the size of
+    /// the run's archived streams.
+    pub estimated: u64,
+    pub estimated_replays: u64,
+    /// Range, search, context and excerpt requests recorded without their size.
+    /// Nothing bounds them, so they are counted but not subtracted.
+    pub unmeasured: u64,
+}
+
+impl Replayed {
+    /// Every byte subtracted from the run's savings: measured and estimated.
+    pub fn bytes(&self) -> u64 {
+        self.measured.saturating_add(self.estimated)
+    }
+
+    fn add(&mut self, other: Replayed) {
+        self.measured += other.measured;
+        self.estimated += other.estimated;
+        self.estimated_replays += other.estimated_replays;
+        self.unmeasured += other.unmeasured;
+    }
+}
+
+/// What later retrievals of the run in `directory` printed. A damaged
+/// `recalls.json` counts as no retrieval, with a warning unless `quiet`.
+pub fn replayed(directory: &Path, quiet: bool) -> Replayed {
+    let path = directory.join("recalls.json");
+    let recalls: Recalls = if quiet {
+        get(&path).unwrap_or_default()
+    } else {
+        get_or_warn(&path)
+    };
+    recalls.replayed(directory)
+}
+
+/// Savings net of later retrievals: raw output minus what the agent received at
+/// first and every byte it retrieved afterwards. Negative when the retrievals
+/// cost more than the preview saved.
+pub fn net_bytes(raw: u64, shown: u64, replayed: u64) -> i64 {
+    let signed = |bytes: u64| i64::try_from(bytes).unwrap_or(i64::MAX);
+    signed(raw)
+        .saturating_sub(signed(shown))
+        .saturating_sub(signed(replayed))
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -250,17 +399,73 @@ fn update<T: serde::de::DeserializeOwned + Serialize + Default>(
     write_json(path, &value)
 }
 
-pub fn recall(directory: &Path, operation: &str) {
-    let _ = update(
-        &directory.join("recalls.json"),
-        |r: &mut Recalls| match operation {
-            "full" => r.full += 1,
-            "range" => r.range += 1,
-            "search" => r.search += 1,
-            "unredacted" => r.unredacted += 1,
-            _ => r.context += 1,
-        },
-    );
+/// Records a retrieval of the run in `directory` and the bytes it printed.
+/// `bytes` is `None` when the caller that shows the result records its size
+/// with [`measured`], as the MCP server does for a `log` page. Until then the
+/// retrieval counts as unmeasured, and a whole replay is estimated.
+pub fn recall(directory: &Path, retrieval: Retrieval, bytes: Option<u64>) {
+    let _ = update(&directory.join("recalls.json"), |r: &mut Recalls| {
+        r.count(retrieval);
+        if let Some(bytes) = bytes {
+            r.measure(retrieval, bytes);
+        }
+    });
+}
+
+/// Records the bytes of a retrieval that [`recall`] counted without them.
+pub fn measured(directory: &Path, retrieval: Retrieval, bytes: u64) {
+    let _ = update(&directory.join("recalls.json"), |r: &mut Recalls| {
+        r.measure(retrieval, bytes);
+    });
+}
+
+/// Records the bytes that excerpts of several runs printed, such as the
+/// matching lines of `history TEXT`, as one retrieval of each run.
+pub fn excerpts(workspace: &Workspace, printed: &BTreeMap<String, u64>) {
+    for (id, &bytes) in printed {
+        if let Ok((directory, _)) = capture::load(workspace, id) {
+            recall(&directory, Retrieval::Excerpt, Some(bytes));
+        }
+    }
+}
+
+/// The archived tool results that `justless recall` printed, one JSON line each
+/// with its time and size. They came from the agent's client, not from a run.
+const ARCHIVE_RECALLS: &str = "archive-recalls.jsonl";
+
+#[derive(Serialize, Deserialize)]
+struct ArchiveRecall {
+    ms: u64,
+    bytes: u64,
+}
+
+/// Records that `justless recall` printed `bytes` of an archived tool result.
+pub fn recalled_archive(workspace: &Workspace, bytes: u64) {
+    if workspace.prepare_state().is_err() {
+        return;
+    }
+    let Ok(mut line) = serde_json::to_vec(&ArchiveRecall {
+        ms: now_ms(),
+        bytes,
+    }) else {
+        return;
+    };
+    line.push(b'\n');
+    crate::statusline::append(&workspace.state.join(ARCHIVE_RECALLS), &line);
+}
+
+/// How many archived tool results `justless recall` printed since `since_ms`,
+/// and their bytes.
+pub fn archive_recalls(state: &Path, since_ms: u64) -> (u64, u64) {
+    let Ok(text) = fs::read_to_string(state.join(ARCHIVE_RECALLS)) else {
+        return (0, 0);
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<ArchiveRecall>(line).ok())
+        .filter(|recall| recall.ms >= since_ms)
+        .fold((0, 0), |(count, bytes), recall| {
+            (count + 1, bytes + recall.bytes)
+        })
 }
 
 /// Records that the agent was shown lines `from..=to` of the workspace file
@@ -337,15 +542,48 @@ pub fn bypass(workspace: &Workspace, command: &str) {
     );
 }
 
+/// Byte totals for a group of runs. `preview_bytes` is what the agent received
+/// at first, footers included. Later retrievals are kept apart from it.
+#[derive(Default, Serialize)]
+struct Totals {
+    raw_bytes: u64,
+    preview_bytes: u64,
+    /// Bytes that later retrievals printed, as measured.
+    replayed_bytes: u64,
+    /// Whole replays recorded without their size, estimated from the archive.
+    estimated_replay_bytes: u64,
+    /// Raw output minus the preview and every measured or estimated retrieval.
+    net_saved_bytes: i64,
+}
+
+impl Totals {
+    fn add(&mut self, raw: u64, shown: u64, replayed: Replayed) {
+        self.raw_bytes += raw;
+        self.preview_bytes += shown;
+        self.replayed_bytes += replayed.measured;
+        self.estimated_replay_bytes += replayed.estimated;
+        self.net_saved_bytes =
+            self.net_saved_bytes
+                .saturating_add(net_bytes(raw, shown, replayed.bytes()));
+    }
+
+    /// Savings at first preview, before any retrieval.
+    fn initial(&self) -> u64 {
+        self.raw_bytes.saturating_sub(self.preview_bytes)
+    }
+}
+
 #[derive(Default, Serialize)]
 struct FamilyStats {
     family: String,
     runs: u64,
-    raw_bytes: u64,
-    preview_bytes: u64,
+    #[serde(flatten)]
+    totals: Totals,
     reopened_runs: u64,
     full_reads: u64,
     targeted_lookups: u64,
+    /// Lines of these runs that `history TEXT`, `lookup --logs` or `pack` printed.
+    excerpts: u64,
     unchanged_runs: u64,
     /// Runs whose printed preview and footer were larger than the raw output.
     grown_runs: u64,
@@ -355,14 +593,38 @@ struct FamilyStats {
 struct DayStats {
     date: String,
     runs: u64,
-    raw_bytes: u64,
-    preview_bytes: u64,
+    #[serde(flatten)]
+    totals: Totals,
 }
 
 /// Agents and providers tokenize differently. Like the benchmarks, the report
 /// estimates tokens as UTF-8 bytes divided by four and labels the figure as such.
 pub fn estimated_tokens(bytes: u64) -> u64 {
     bytes.div_ceil(4)
+}
+
+/// [`estimated_tokens`] for net savings, which can be negative.
+fn estimated_tokens_signed(bytes: i64) -> i64 {
+    let tokens = i64::try_from(estimated_tokens(bytes.unsigned_abs())).unwrap_or(i64::MAX);
+    if bytes < 0 { -tokens } else { tokens }
+}
+
+/// [`human_bytes`] for net savings, which can be negative.
+fn signed_bytes(bytes: i64) -> String {
+    let size = human_bytes(bytes.unsigned_abs());
+    if bytes < 0 { format!("-{size}") } else { size }
+}
+
+fn signed_percent(part: i64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / whole as f64
+    }
+}
+
+fn rounded(percent: f64) -> f64 {
+    (percent * 10.0).round() / 10.0
 }
 
 pub fn human_bytes(bytes: u64) -> String {
@@ -398,7 +660,9 @@ pub fn utc_date(ms: u64) -> String {
 
 pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
-    let (mut count, mut raw, mut preview) = (0u64, 0u64, 0u64);
+    let mut count = 0u64;
+    let mut totals = Totals::default();
+    let mut replayed = Replayed::default();
     let (mut secrets, mut unredacted) = (0u64, 0u64);
     let mut families: BTreeMap<String, FamilyStats> = BTreeMap::new();
     let mut timeline: BTreeMap<String, DayStats> = BTreeMap::new();
@@ -407,52 +671,65 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         // Count everything the agent received, including the footer.
         let shown = (run.preview_bytes + run.footer_bytes) as u64;
         count += 1;
-        raw += run.raw_bytes;
-        preview += shown;
         secrets += run.redaction.as_ref().map_or(0, |found| found.count);
-        let c: Recalls = get_or_warn(
-            &workspace
-                .state
-                .join("runs")
-                .join(&run.id)
-                .join("recalls.json"),
-        );
+        let directory = workspace.state.join("runs").join(&run.id);
+        let c: Recalls = get_or_warn(&directory.join("recalls.json"));
+        let later = c.replayed(&directory);
+        totals.add(run.raw_bytes, shown, later);
+        replayed.add(later);
         unredacted += c.unredacted;
         let f = families.entry(run.family.clone()).or_default();
         f.family = run.family;
         f.runs += 1;
-        f.raw_bytes += run.raw_bytes;
-        f.preview_bytes += shown;
+        f.totals.add(run.raw_bytes, shown, later);
         f.reopened_runs += u64::from(c.full > 0);
         f.full_reads += c.full;
         f.targeted_lookups += c.range + c.search + c.context;
+        f.excerpts += c.excerpts;
         f.unchanged_runs += u64::from(run.unchanged);
         f.grown_runs += u64::from(shown > run.raw_bytes);
+        // Retrievals are not timed, so they count on the day their run completed.
         if run.completed_ms >= since && run.completed_ms > 0 {
             let date = utc_date(run.completed_ms);
             let d = timeline.entry(date.clone()).or_default();
             d.date = date;
             d.runs += 1;
-            d.raw_bytes += run.raw_bytes;
-            d.preview_bytes += shown;
+            d.totals.add(run.raw_bytes, shown, later);
         }
     }
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
     let proxy = crate::proxy::report(workspace, since)?;
-    let saved = raw.saturating_sub(preview);
+    let (raw, preview, saved, net) = (
+        totals.raw_bytes,
+        totals.preview_bytes,
+        totals.initial(),
+        totals.net_saved_bytes,
+    );
+    let (recalls, recalled_bytes) = archive_recalls(&workspace.state, since);
     let mut commands: Vec<_> = families.into_values().collect();
     commands.sort_by(|a, b| {
-        let saved = |f: &FamilyStats| f.raw_bytes.saturating_sub(f.preview_bytes);
-        saved(b).cmp(&saved(a)).then(a.family.cmp(&b.family))
+        b.totals
+            .net_saved_bytes
+            .cmp(&a.totals.net_saved_bytes)
+            .then(a.family.cmp(&b.family))
     });
     if as_json {
+        // The keys from before retrievals were measured keep their meaning:
+        // `saved_*` and `estimated_tokens_saved` are savings at first preview.
         let report = serde_json::json!({
             "runs": count,
             "raw_bytes": raw,
             "preview_bytes": preview,
             "saved_bytes": saved,
-            "saved_percent": (percent(saved, raw) * 10.0).round() / 10.0,
+            "saved_percent": rounded(percent(saved, raw)),
             "estimated_tokens_saved": estimated_tokens(saved),
+            "replayed_bytes": replayed.measured,
+            "estimated_replay_bytes": replayed.estimated,
+            "estimated_replays": replayed.estimated_replays,
+            "unmeasured_retrievals": replayed.unmeasured,
+            "net_saved_bytes": net,
+            "net_saved_percent": rounded(signed_percent(net, raw)),
+            "estimated_tokens_net_saved": estimated_tokens_signed(net),
             "token_estimate": "UTF-8 bytes / 4",
             "days": timeline.into_values().collect::<Vec<_>>(),
             "commands": commands,
@@ -461,6 +738,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "unredacted_replays": unredacted,
             "hook_pass_through": activity.bypasses,
             "proxy": proxy.as_ref().map(|p| p.json()),
+            "archive_recalls": {"recalls": recalls, "bytes": recalled_bytes},
             "preview_budgets": crate::adaptive::stats_json(workspace),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -473,41 +751,73 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         );
     } else {
         println!(
-            "Kept {} of {} command output out of context ({:.1}%) across {count} run(s)",
+            "Kept {} of {} command output out of context at first preview ({:.1}%) across {count} run(s)",
             human_bytes(saved),
             human_bytes(raw),
             percent(saved, raw)
         );
+        let net_saved = format!(
+            "net saved: {} ({:.1}%)",
+            signed_bytes(net),
+            signed_percent(net, raw)
+        );
+        if replayed.bytes() == 0 && replayed.unmeasured == 0 {
+            println!("No run output was retrieved again, so {net_saved}");
+        } else {
+            let estimate = if replayed.estimated_replays > 0 {
+                format!(
+                    " and about {} estimated for {} whole replay(s) recorded without their size",
+                    human_bytes(replayed.estimated),
+                    replayed.estimated_replays
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "Later replays and lookups printed {} of run output again{estimate}, so {net_saved}",
+                human_bytes(replayed.measured)
+            );
+        }
+        if replayed.unmeasured > 0 {
+            println!(
+                "{} earlier range, search or context request(s) were recorded without their size and are not subtracted",
+                replayed.unmeasured
+            );
+        }
         println!(
-            "≈{} tokens saved (estimated as bytes ÷ 4)",
-            estimated_tokens(saved)
+            "≈{} tokens saved at first preview, ≈{} net (estimated as bytes ÷ 4)",
+            estimated_tokens(saved),
+            estimated_tokens_signed(net)
         );
         if secrets > 0 {
             println!("Redacted {secrets} secret(s) in captured output");
         }
         if !timeline.is_empty() {
-            println!("\nLast {days} day(s), UTC");
+            println!("\nLast {days} day(s), UTC, with retrievals on the day their run completed");
             let peak = timeline
                 .values()
-                .map(|d| d.raw_bytes.saturating_sub(d.preview_bytes))
+                .map(|d| d.totals.net_saved_bytes)
                 .max()
                 .unwrap_or(0)
-                .max(1);
+                .max(1) as u64;
             for d in timeline.values() {
-                let day_saved = d.raw_bytes.saturating_sub(d.preview_bytes);
-                let width = (day_saved * 20).div_ceil(peak) as usize;
-                println!(
-                    "  {}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%  {}",
+                let t = &d.totals;
+                let bar = t.net_saved_bytes.max(0) as u64;
+                let width = (bar * 20).div_ceil(peak) as usize;
+                let row = format!(
+                    "  {}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%  net {:>6.1}%  {}",
                     d.date,
                     d.runs,
-                    human_bytes(d.raw_bytes),
-                    human_bytes(d.preview_bytes),
-                    percent(day_saved, d.raw_bytes),
+                    human_bytes(t.raw_bytes),
+                    human_bytes(t.preview_bytes),
+                    percent(t.initial(), t.raw_bytes),
+                    signed_percent(t.net_saved_bytes, t.raw_bytes),
                     "█".repeat(width)
                 );
+                println!("{}", row.trim_end());
             }
         }
-        println!("\nBy command, most saved first");
+        println!("\nBy command, most net savings first");
         let wide = commands
             .iter()
             .map(|f| f.family.chars().count())
@@ -515,12 +825,28 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             .unwrap_or(0)
             .min(28);
         for f in &commands {
+            let t = &f.totals;
             let mut notes = Vec::new();
             if f.reopened_runs > 0 {
                 notes.push(format!("{}/{} reopened in full", f.reopened_runs, f.runs));
             }
             if f.targeted_lookups > 0 {
                 notes.push(format!("{} targeted lookup(s)", f.targeted_lookups));
+            }
+            if f.excerpts > 0 {
+                notes.push(format!("{} log excerpt(s)", f.excerpts));
+            }
+            let later = t.replayed_bytes + t.estimated_replay_bytes;
+            if later > 0 {
+                notes.push(format!(
+                    "{}{} retrieved later",
+                    if t.estimated_replay_bytes > 0 {
+                        "about "
+                    } else {
+                        ""
+                    },
+                    human_bytes(later)
+                ));
             }
             if f.unchanged_runs > 0 {
                 notes.push(format!("{} unchanged", f.unchanged_runs));
@@ -530,11 +856,12 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             }
             let family = crate::summary::short(&f.family, 28);
             println!(
-                "  {family:<wide$}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%{}",
+                "  {family:<wide$}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%  net {:>6.1}%{}",
                 f.runs,
-                human_bytes(f.raw_bytes),
-                human_bytes(f.preview_bytes),
-                percent(f.raw_bytes.saturating_sub(f.preview_bytes), f.raw_bytes),
+                human_bytes(t.raw_bytes),
+                human_bytes(t.preview_bytes),
+                percent(t.initial(), t.raw_bytes),
+                signed_percent(t.net_saved_bytes, t.raw_bytes),
                 if notes.is_empty() {
                     String::new()
                 } else {
@@ -546,9 +873,15 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     }
     let reopened: u64 = commands.iter().map(|f| f.reopened_runs).sum();
     let targeted: u64 = commands.iter().map(|f| f.targeted_lookups).sum();
+    let excerpts: u64 = commands.iter().map(|f| f.excerpts).sum();
     if count > 0 || activity.repeat_reads > 0 {
         println!(
-            "\nRecovery: {reopened} run(s) reopened in full · {targeted} targeted lookup(s) · {} repeated source-range read(s){}",
+            "\nRecovery: {reopened} run(s) reopened in full · {targeted} targeted lookup(s){} · {} repeated source-range read(s){}",
+            if excerpts > 0 {
+                format!(" · {excerpts} log excerpt(s)")
+            } else {
+                String::new()
+            },
             activity.repeat_reads,
             if unredacted > 0 {
                 format!(" · {unredacted} unredacted replay(s)")
@@ -571,6 +904,12 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     }
     if let Some(proxy) = &proxy {
         proxy.print(days, &workspace.justless());
+    }
+    if recalls > 0 {
+        println!(
+            "\nArchived tool results printed by `justless recall`, last {days} day(s): {recalls}, {} back in context. Request-boundary and mask savings do not subtract them.",
+            human_bytes(recalled_bytes)
+        );
     }
     Ok(())
 }
@@ -738,8 +1077,14 @@ fn search_runs(
             let mut tally = all;
             let mut listed = Vec::new();
             let mut shown = 0;
+            let mut printed = BTreeMap::new();
             for (index, stream, line) in lines(want) {
+                let before = report.left();
                 report.line(line);
+                let bytes = before - report.left();
+                if bytes > 0 {
+                    *printed.entry(found[index].0.id.clone()).or_insert(0u64) += bytes as u64;
+                }
                 if report.clipped {
                     break;
                 }
@@ -767,7 +1112,7 @@ fn search_runs(
             if tally.shown() < total {
                 output.push_str(&notice(form, &tally, listed.len(), budget));
             }
-            return (output, tally);
+            return (output, tally, printed);
         }
     };
     // The fullest notice that leaves room for matches of as many streams as
@@ -782,17 +1127,18 @@ fn search_runs(
     let mut attempts = (0..3).map(attempt).collect::<Vec<_>>();
     let most = attempts
         .iter()
-        .map(|(_, tally)| covered(tally))
+        .map(|(_, tally, _)| covered(tally))
         .max()
         .unwrap_or_default();
-    let output = match attempts
+    let (output, _, printed) = match attempts
         .iter()
-        .position(|(_, tally)| most > 0 && covered(tally) == most)
+        .position(|(_, tally, _)| most > 0 && covered(tally) == most)
     {
-        Some(form) => attempts.swap_remove(form).0,
-        None => attempts.pop().unwrap_or_default().0,
+        Some(form) => attempts.swap_remove(form),
+        None => attempts.pop().unwrap_or_default(),
     };
     io::stdout().lock().write_all(output.as_bytes())?;
+    excerpts(workspace, &printed);
     Ok(())
 }
 

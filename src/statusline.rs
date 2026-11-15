@@ -37,7 +37,7 @@ use clap::Command;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::history::{estimated_tokens, now_ms};
+use crate::history::{estimated_tokens, net_bytes, now_ms};
 use crate::workspace::{Workspace, lock_state, private_dir, write_text};
 
 /// The command `init --statusline` installs. Other setup code matches it to tell
@@ -94,16 +94,22 @@ fn read_input() -> Value {
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
-/// What this session's hooks kept out of context.
+/// What this session's hooks kept out of context, and what came back later.
 #[derive(Default)]
 struct Tally {
     runs: u64,
     run_raw: u64,
     run_shown: u64,
+    /// Bytes that later `log`, `search`, `context --run` and excerpt requests
+    /// printed from the counted runs, measured or estimated as in `stats`.
+    run_replayed: u64,
     reads: u64,
     searches: u64,
     tool_raw: u64,
     tool_shown: u64,
+    /// Bytes of archived tool results that `justless recall` printed during the
+    /// session, such as the original of a grouped Grep result.
+    recalled: u64,
 }
 
 fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> Option<String> {
@@ -119,6 +125,7 @@ fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> O
     if let Some(start) = session_start(input, now) {
         for workspace in &workspaces {
             tally.add_runs(workspace, start);
+            tally.recalled += crate::history::archive_recalls(&workspace.state, start).1;
         }
     }
     if let Some(digest) = &digest {
@@ -350,6 +357,7 @@ impl Tally {
                 self.runs += 1;
                 self.run_raw += cost.raw_bytes;
                 self.run_shown += cost.preview_bytes + cost.footer_bytes;
+                self.run_replayed += crate::history::replayed(&entry.path(), true).bytes();
             }
         }
     }
@@ -376,9 +384,13 @@ impl Tally {
         }
     }
 
-    fn saved_bytes(&self) -> u64 {
-        // Like `stats`, count everything the agent received, footers included.
-        self.run_raw.saturating_sub(self.run_shown) + self.tool_raw.saturating_sub(self.tool_shown)
+    /// Savings net of what came back later, as in `stats`: everything the agent
+    /// received counts, footers, replays and recalls included. Negative when the
+    /// replays cost more than the previews saved.
+    fn net_bytes(&self) -> i64 {
+        let runs = net_bytes(self.run_raw, self.run_shown, self.run_replayed);
+        let tools = net_bytes(self.tool_raw, self.tool_shown, self.recalled);
+        runs.saturating_add(tools)
     }
 }
 
@@ -406,10 +418,13 @@ fn render(tally: &Tally, width: Option<usize>) -> String {
         return "justless · ready".into();
     }
     // Tokens are estimated as UTF-8 bytes divided by four, as in `stats`.
-    let saved = format!(
-        "≈{} tokens saved",
-        short_number(estimated_tokens(tally.saved_bytes()))
-    );
+    let net = tally.net_bytes();
+    let tokens = short_number(estimated_tokens(net.unsigned_abs()));
+    let saved = if net < 0 {
+        format!("net ≈{tokens} extra tokens")
+    } else {
+        format!("net ≈{tokens} tokens saved")
+    };
     let mut counts = Vec::new();
     if tally.runs > 0 {
         counts.push(count(tally.runs, "run", "runs"));
@@ -461,7 +476,7 @@ fn roots_file(state: &Path, digest: &str) -> PathBuf {
 /// Appends `bytes` to a file in a state directory, creating it but never
 /// following a link. One short write per call, so concurrent writers do not
 /// interleave lines.
-fn append(path: &Path, bytes: &[u8]) -> Option<()> {
+pub(crate) fn append(path: &Path, bytes: &[u8]) -> Option<()> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -983,26 +998,59 @@ mod tests {
             run_shown: 35_200,
             reads: 1,
             searches: 2,
-            tool_raw: 0,
-            tool_shown: 0,
+            ..Tally::default()
         };
         assert_eq!(
             render(&tally, None),
-            "justless · ≈41.2k tokens saved this session · 23 runs · 1 read · 2 searches"
+            "justless · net ≈41.2k tokens saved this session · 23 runs · 1 read · 2 searches"
         );
         assert_eq!(
-            render(&tally, Some(62)),
-            "justless · ≈41.2k tokens saved this session · 23 runs · 1 read"
+            render(&tally, Some(66)),
+            "justless · net ≈41.2k tokens saved this session · 23 runs · 1 read"
         );
         assert_eq!(
-            render(&tally, Some(61)),
-            "justless · ≈41.2k tokens saved this session · 23 runs"
+            render(&tally, Some(65)),
+            "justless · net ≈41.2k tokens saved this session · 23 runs"
         );
-        assert_eq!(render(&tally, Some(30)), "justless · ≈41.2k tokens saved");
+        assert_eq!(
+            render(&tally, Some(30)),
+            "justless · net ≈41.2k tokens saved"
+        );
         assert_eq!(render(&Tally::default(), Some(5)), "justless · ready");
         assert_eq!(short_number(999), "999");
         assert_eq!(short_number(3_000), "3k");
         assert_eq!(short_number(999_949), "999.9k");
         assert_eq!(short_number(1_260_000), "1.3M");
+    }
+
+    #[test]
+    fn replays_and_recalls_come_off_the_session_savings() {
+        // A 19,000-byte output shown in 364 bytes, then replayed whole: the
+        // session received 364 bytes more than running the command directly.
+        let replayed = Tally {
+            runs: 1,
+            run_raw: 19_000,
+            run_shown: 364,
+            run_replayed: 19_000,
+            ..Tally::default()
+        };
+        assert_eq!(replayed.net_bytes(), -364);
+        assert_eq!(
+            render(&replayed, None),
+            "justless · net ≈91 extra tokens this session · 1 run"
+        );
+        // A grouped Grep result recalled in part keeps the rest of its saving.
+        let recalled = Tally {
+            searches: 1,
+            tool_raw: 10_000,
+            tool_shown: 1_000,
+            recalled: 4_000,
+            ..Tally::default()
+        };
+        assert_eq!(recalled.net_bytes(), 5_000);
+        assert_eq!(
+            render(&recalled, None),
+            "justless · net ≈1.2k tokens saved this session · 1 search"
+        );
     }
 }

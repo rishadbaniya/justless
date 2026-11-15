@@ -87,8 +87,14 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Protocol loop
 
+/// Set for a `log` child, whose output the server pages: the child counts the
+/// replay, and the server records the bytes of the page it returns.
+pub(crate) const PAGED_REPLAY: &str = "JUSTLESS_PAGED_REPLAY";
+
 struct Server {
     root: PathBuf,
+    /// The project's `.justless/`, where a `log` page is recorded against its run.
+    state: PathBuf,
     exe: PathBuf,
     initialized: bool,
     /// The revision negotiated through `initialize`.
@@ -118,6 +124,7 @@ impl RpcError {
 fn serve(workspace: &Workspace) -> Result<()> {
     let mut server = Server {
         root: workspace.root.clone(),
+        state: workspace.state.clone(),
         exe: std::env::current_exe().context("locate the justless executable")?,
         initialized: false,
         version: None,
@@ -362,7 +369,11 @@ impl Server {
     fn execute(&self, argv: &[String], log: Option<&Map<String, Value>>) -> Value {
         // The agent's shell may start anywhere, so a command a result prints for it,
         // such as lookup's `Next:` line, names this root.
-        let output = Process::new(&self.exe)
+        let mut command = Process::new(&self.exe);
+        if log.is_some() {
+            command.env(PAGED_REPLAY, "1");
+        }
+        let output = command
             .arg("--root")
             .arg(&self.root)
             .args(argv)
@@ -380,6 +391,7 @@ impl Server {
         let mut texts = Vec::new();
         if let Some(arguments) = log.filter(|_| !failed) {
             texts = log_pages(&output, arguments, &self.root);
+            self.measure_page(arguments, texts.iter().map(String::len).sum());
         } else {
             for stream in [&output.stdout, &output.stderr] {
                 if !stream.is_empty() {
@@ -395,6 +407,29 @@ impl Server {
             });
         }
         tool_result(texts, failed)
+    }
+
+    /// Records the bytes of a `log` page against its run. The child counted the
+    /// replay as `log` does, as whole when it has no line range.
+    fn measure_page(&self, arguments: &Map<String, Value>, bytes: usize) {
+        let Some(Ok(run)) = arguments
+            .get("run_id")
+            .map(|value| validate(&RUN_ID, value))
+        else {
+            return;
+        };
+        let directory = self.state.join("runs").join(run);
+        if !directory.is_dir() {
+            return;
+        }
+        let whole = arguments.get("from").and_then(Value::as_u64).unwrap_or(1) == 1
+            && arguments.get("to").is_none_or(Value::is_null);
+        let retrieval = if whole {
+            crate::history::Retrieval::Full
+        } else {
+            crate::history::Retrieval::Range
+        };
+        crate::history::measured(&directory, retrieval, bytes as u64);
     }
 }
 

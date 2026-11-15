@@ -2166,8 +2166,9 @@ fn stats_report_savings_by_command_with_token_estimates() {
     assert_eq!(report["days"].as_array().unwrap().len(), 1);
     let text = success(root, &["stats"]);
     assert!(
-        text.contains("tokens saved (estimated as bytes ÷ 4)")
-            && text.contains("By command, most saved first\n  mypy"),
+        text.contains("tokens saved at first preview, ≈")
+            && text.contains(" net (estimated as bytes ÷ 4)")
+            && text.contains("By command, most net savings first\n  mypy"),
         "{text}"
     );
 }
@@ -7115,11 +7116,11 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     // (40,000 + 952) - (2,048 + 1,000) bytes kept out = 37,904 bytes ≈ 9,476 tokens.
     assert_eq!(
         line("s1"),
-        "justless · ≈9.5k tokens saved this session · 2 runs"
+        "justless · net ≈9.5k tokens saved this session · 2 runs"
     );
     assert_eq!(
         status_line(&root, &[], event("s1").as_bytes(), Some("40")),
-        "justless · ≈9.5k tokens saved"
+        "justless · net ≈9.5k tokens saved"
     );
 
     // A whole-file Read that the hook replaces with an outline counts for its session.
@@ -7169,12 +7170,12 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     let expected = format!("≈{}k", tokens.strip_suffix(".0").unwrap_or(&tokens));
     assert_eq!(
         line("s1"),
-        format!("justless · {expected} tokens saved this session · 2 runs · 1 read · 1 search")
+        format!("justless · net {expected} tokens saved this session · 2 runs · 1 read · 1 search")
     );
     // Another session sees the shared project runs, but not this session's reads.
     assert_eq!(
         line("s2"),
-        "justless · ≈9.5k tokens saved this session · 2 runs"
+        "justless · net ≈9.5k tokens saved this session · 2 runs"
     );
     // A Read the hook leaves alone, such as an explicit range, is not counted.
     let mut ranged = read;
@@ -7718,7 +7719,7 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
     // session), not the nested run or the read.
     assert_eq!(
         line(&outer, "s2"),
-        "justless · ≈0 tokens saved this session · 1 run"
+        "justless · net ≈0 tokens saved this session · 1 run"
     );
     // The session's roots are kept in the project it started in.
     let listed = fs::read_to_string(
@@ -13578,7 +13579,7 @@ fn statusline_counts_replaced_bash_results_as_hook_runs_of_the_session() {
     assert_eq!(saved, (content.len() - text.len()) as u64);
     let tokens = format!("{:.1}", saved.div_ceil(4) as f64 / 1000.0);
     let expected = format!(
-        "justless · ≈{}k tokens saved this session · 1 run",
+        "justless · net ≈{}k tokens saved this session · 1 run",
         tokens.strip_suffix(".0").unwrap_or(&tokens)
     );
     // It counts while the session is inside the nested repository and after the
@@ -16760,4 +16761,327 @@ fn root_given_before_and_after_the_subcommand_must_agree() {
         &["--root", a, "run", "--", "echo", "--root", b],
     );
     assert!(run.status.success(), "{}", stderr(&run));
+}
+
+/// Every byte a command printed, on both streams.
+fn printed_bytes(output: &Output) -> u64 {
+    (output.stdout.len() + output.stderr.len()) as u64
+}
+
+/// `stats --json`, which must not warn about any record.
+fn savings(root: &Path) -> serde_json::Value {
+    let output = cli(root, &["stats", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Writes 19,000 bytes of output, more than a preview shows, to `output.txt`.
+fn nineteen_thousand_bytes(root: &Path) {
+    let text: String = (0..500)
+        .map(|i| format!("line {i:04} {}\n", "x".repeat(27)))
+        .collect();
+    assert_eq!(text.len(), 19_000);
+    fs::write(root.join("output.txt"), &text).unwrap();
+}
+
+#[test]
+fn stats_subtract_a_full_replay_from_the_savings_it_reverses() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    nineteen_thousand_bytes(root);
+    let run = cli(root, &["run", "--", "cat", "output.txt"]);
+    assert!(run.status.success(), "{}", stderr(&run));
+    let id = run_id(&run);
+    let shown = printed_bytes(&run);
+    assert!(shown < 19_000 / 2, "{shown}");
+    let before = savings(root);
+    assert_eq!(before["raw_bytes"], 19_000);
+    assert_eq!(before["preview_bytes"], shown);
+    assert_eq!(before["saved_bytes"], 19_000 - shown);
+    assert_eq!(before["replayed_bytes"], 0);
+    assert_eq!(before["net_saved_bytes"], 19_000 - shown);
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains("No run output was retrieved again, so net saved: "),
+        "{text}"
+    );
+
+    // The agent reads the whole log back.
+    let replay = cli(root, &["log", &id]);
+    assert!(replay.status.success(), "{}", stderr(&replay));
+    assert_eq!(printed_bytes(&replay), 19_000);
+    let after = savings(root);
+    // Savings at first preview keep their keys and meaning.
+    for key in [
+        "raw_bytes",
+        "preview_bytes",
+        "saved_bytes",
+        "saved_percent",
+        "estimated_tokens_saved",
+    ] {
+        assert_eq!(after[key], before[key], "{key}");
+    }
+    // Across both responses the agent received `shown` bytes more than the
+    // command printed, and the net figures say so.
+    let net = -(shown as i64);
+    let net_tokens = -(shown.div_ceil(4) as i64);
+    assert_eq!(after["replayed_bytes"], 19_000);
+    assert_eq!(after["estimated_replay_bytes"], 0);
+    assert_eq!(after["unmeasured_retrievals"], 0);
+    assert_eq!(after["net_saved_bytes"], net);
+    assert_eq!(after["estimated_tokens_net_saved"], net_tokens);
+    assert!(after["net_saved_percent"].as_f64().unwrap() < 0.0);
+    for group in [&after["commands"][0], &after["days"][0]] {
+        assert_eq!(group["replayed_bytes"], 19_000, "{group}");
+        assert_eq!(group["net_saved_bytes"], net, "{group}");
+    }
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains(
+            "Later replays and lookups printed 18.6 KB of run output again, so net saved: -"
+        ) && text.contains(&format!(
+            "tokens saved at first preview, ≈{net_tokens} net (estimated as bytes ÷ 4)"
+        )) && text.contains("1/1 reopened in full · 18.6 KB retrieved later"),
+        "{text}"
+    );
+}
+
+#[test]
+fn each_retrieval_of_a_run_adds_exactly_what_it_printed() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let text: String = (0..400)
+        .map(|i| {
+            format!(
+                "entry {i:03} {}\n",
+                if i % 50 == 7 { "needle" } else { "hay" }
+            )
+        })
+        .collect();
+    fs::write(root.join("output.txt"), &text).unwrap();
+    let run = cli(root, &["run", "--", "cat", "output.txt"]);
+    let id = run_id(&run);
+    let initial = text.len() as i64 - printed_bytes(&run) as i64;
+    assert!(initial > 0, "{initial}");
+    let mut expected = 0;
+    for args in [
+        vec!["log", &id, "--from", "5", "--to", "9"],
+        vec!["search", &id, "needle"],
+        vec!["context", "--run", &id],
+        vec!["history", "needle"],
+    ] {
+        let output = cli(root, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert!(!output.stdout.is_empty(), "{args:?}");
+        assert_eq!(stderr(&output), "", "{args:?}");
+        expected += output.stdout.len() as u64;
+        assert_eq!(savings(root)["replayed_bytes"], expected, "{args:?}");
+    }
+    let report = savings(root);
+    assert_eq!(report["commands"][0]["targeted_lookups"], 3);
+    assert_eq!(report["commands"][0]["excerpts"], 1);
+    assert_eq!(report["commands"][0]["reopened_runs"], 0);
+    assert_eq!(report["net_saved_bytes"], initial - expected as i64);
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains(" · 3 targeted lookup(s) · 1 log excerpt(s) · "),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn log_lines_shown_beside_source_count_and_the_source_does_not() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let source: String = (1..=20)
+        .map(|i| format!("def f{i}():\n    return {i}\n"))
+        .collect();
+    fs::write(root.join("app.py"), source).unwrap();
+    fs::write(root.join("output.txt"), lint_fixture("mypy.txt")).unwrap();
+    let mypy = fake_program(root, "mypy", "cat output.txt\nexit 1\n");
+    let id = run_id(&cli(root, &["run", "--", mypy.to_str().unwrap(), "app.py"]));
+    let replayed = || savings(root)["replayed_bytes"].as_u64().unwrap();
+
+    // `context --run` counts its log lines and replay commands, not the source.
+    let context = success(root, &["context", "--run", &id]);
+    let source_lines: u64 = context
+        .lines()
+        .filter(|line| line.starts_with("app.py::") || line.contains(" | "))
+        .map(|line| line.len() as u64 + 1)
+        .sum();
+    assert!(source_lines > 0, "{context}");
+    assert_eq!(replayed(), context.len() as u64 - source_lines, "{context}");
+
+    // A task pack's recorded failure counts, its source excerpts do not.
+    let before = replayed();
+    let pack = success(root, &["pack", "fix the mypy error"]);
+    assert!(
+        pack.starts_with(&format!("Recorded mypy failure: {id}")),
+        "{pack}"
+    );
+    let failure: u64 = pack
+        .lines()
+        .take_while(|line| !line.starts_with("app.py ["))
+        .filter(|line| !line.contains(" | "))
+        .map(|line| line.len() as u64 + 1)
+        .sum();
+    assert_eq!(replayed() - before, failure, "{pack}");
+
+    // A ranked log window counts as the lines lookup printed from it.
+    let before = replayed();
+    let lookup = success(root, &["lookup", "--logs", "Incompatible return value"]);
+    let window: u64 = lookup
+        .split_inclusive('\n')
+        .skip_while(|line| !line.starts_with(&id))
+        .take_while(|line| line.starts_with(&id) || line.starts_with("  "))
+        .map(|line| line.len() as u64)
+        .sum();
+    assert!(window > 0, "{lookup}");
+    assert_eq!(replayed() - before, window, "{lookup}");
+    assert_eq!(savings(root)["commands"][0]["excerpts"], 2);
+}
+
+#[test]
+fn stats_estimate_replays_recorded_before_bytes_were_counted() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    nineteen_thousand_bytes(root);
+    let run = cli(root, &["run", "--", "cat", "output.txt"]);
+    let id = run_id(&run);
+    let saved = 19_000 - printed_bytes(&run) as i64;
+    let recalls = root.join(".justless/runs").join(&id).join("recalls.json");
+    let write = |value: serde_json::Value| fs::write(&recalls, value.to_string()).unwrap();
+
+    // An old record with no retrievals changes nothing, and says nothing.
+    write(serde_json::json!({"full": 0, "range": 0, "search": 0, "context": 0}));
+    let report = savings(root);
+    assert_eq!(report["net_saved_bytes"], saved);
+    assert_eq!(report["unmeasured_retrievals"], 0);
+    let text = success(root, &["stats"]);
+    assert!(!text.contains("without their size"), "{text}");
+
+    // An old whole replay is estimated at the archive's size, and labelled so.
+    write(serde_json::json!({"full": 1, "range": 0, "search": 0, "context": 0}));
+    let report = savings(root);
+    assert_eq!(report["replayed_bytes"], 0);
+    assert_eq!(report["estimated_replays"], 1);
+    assert_eq!(report["estimated_replay_bytes"], 19_000);
+    assert_eq!(report["net_saved_bytes"], saved - 19_000);
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains(
+            "and about 18.6 KB estimated for 1 whole replay(s) recorded without their size"
+        ),
+        "{text}"
+    );
+
+    // A replay measured after the upgrade is not counted twice.
+    success(root, &["log", &id]);
+    let report = savings(root);
+    assert_eq!(report["replayed_bytes"], 19_000);
+    assert_eq!(report["estimated_replays"], 1);
+    assert_eq!(report["estimated_replay_bytes"], 19_000);
+    assert_eq!(report["net_saved_bytes"], saved - 38_000);
+
+    // Old range, search and context requests cannot be sized, so they are
+    // counted and named but not subtracted.
+    write(serde_json::json!({"full": 0, "range": 2, "search": 1, "context": 0}));
+    let report = savings(root);
+    assert_eq!(report["unmeasured_retrievals"], 3);
+    assert_eq!(report["net_saved_bytes"], saved);
+    let text = success(root, &["stats"]);
+    assert!(
+        text.contains("3 earlier range, search or context request(s) were recorded without their size and are not subtracted"),
+        "{text}"
+    );
+}
+
+#[test]
+fn statusline_shows_savings_net_of_replays_and_recalls() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let start: u64 = 1_767_323_045_678;
+    let transcript = root.join("transcript.jsonl");
+    fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"timestamp\":\"2026-01-02T03:04:05.678Z\",\"sessionId\":\"s1\"}\n",
+    )
+    .unwrap();
+    let event = json!({"session_id":"s1","transcript_path":transcript,"cwd":root,
+        "workspace":{"current_dir":root,"project_dir":root}})
+    .to_string();
+    let line = || status_line(&root, &[], event.as_bytes(), None);
+    // A hook-routed run printed 19,000 bytes and showed 364, footer included.
+    synthetic_run(&root, "run-replayed", start + 1_000, 19_000, 364 - 48, true);
+    fs::write(
+        root.join(".justless/runs/run-replayed/stdout"),
+        "y".repeat(19_000),
+    )
+    .unwrap();
+    assert_eq!(
+        line(),
+        "justless · net ≈4.7k tokens saved this session · 1 run"
+    );
+    // Replaying it whole leaves the session 364 bytes worse off than running
+    // the command directly.
+    assert_eq!(printed_bytes(&cli(&root, &["log", "run-replayed"])), 19_000);
+    assert_eq!(
+        line(),
+        "justless · net ≈91 extra tokens this session · 1 run"
+    );
+
+    // An archived tool result printed by `recall` comes back into context too.
+    let result = "z".repeat(3_000);
+    let request = json!({"messages": [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "old", "name": "bash", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "old", "content": result}]},
+    ]});
+    let mut mask = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["mask", "--keep", "0"])
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    mask.stdin
+        .take()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let masked: serde_json::Value =
+        serde_json::from_slice(&mask.wait_with_output().unwrap().stdout).unwrap();
+    let id = masked["messages"][1]["content"][0]["content"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("[justless recall ")
+        .and_then(|stub| stub.strip_suffix(']'))
+        .unwrap()
+        .to_owned();
+    assert_eq!(success(&root, &["recall", &id]), result);
+    assert_eq!(
+        success(&root, &["recall", &id, "--from", "1", "--to", "1"]),
+        result
+    );
+    // (19,000 - 364 - 19,000) - 6,000 recalled = -6,364 bytes ≈ 1,591 tokens.
+    assert_eq!(
+        line(),
+        "justless · net ≈1.6k extra tokens this session · 1 run"
+    );
+    let report = savings(&root);
+    assert_eq!(
+        report["archive_recalls"],
+        json!({"recalls": 2, "bytes": 6_000})
+    );
+    let text = success(&root, &["stats"]);
+    assert!(
+        text.contains("Archived tool results printed by `justless recall`, last 7 day(s): 2, 5.9 KB back in context."),
+        "{text}"
+    );
+    // A listing prints no archived result and is not counted.
+    success(&root, &["recall", "--list"]);
+    assert_eq!(savings(&root)["archive_recalls"]["recalls"], 2);
 }

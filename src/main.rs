@@ -518,21 +518,32 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
             if sub.is_present("unredacted") {
                 redact::bypass();
-                history::recall(&directory, "unredacted");
+                history::recall(&directory, history::Retrieval::Unredacted, None);
             }
             let to = if sub.is_present("to") {
                 read_num(sub, "to", 1)?
             } else {
                 usize::MAX
             };
-            capture::log(
+            let printed = capture::log(
                 &directory,
                 Stream::select(sub.value_of("stream").unwrap()),
                 read_num(sub, "from", 1)?,
                 to,
             )?;
             let full = to == usize::MAX && sub.value_of("from") == Some("1");
-            history::recall(&directory, if full { "full" } else { "range" });
+            // The MCP server shows a long replay one page at a time and records
+            // the size of the page itself.
+            let measured = std::env::var_os(mcp::PAGED_REPLAY).is_none();
+            history::recall(
+                &directory,
+                if full {
+                    history::Retrieval::Full
+                } else {
+                    history::Retrieval::Range
+                },
+                measured.then_some(printed),
+            );
             if full {
                 adaptive::note_replay(&directory, sub.value_of("stream").unwrap());
             }
@@ -541,16 +552,16 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             let (directory, run) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
             if sub.is_present("unredacted") {
                 redact::bypass();
-                history::recall(&directory, "unredacted");
+                history::recall(&directory, history::Retrieval::Unredacted, None);
             }
-            capture::search(
+            let printed = capture::search(
                 &directory,
                 Stream::select(sub.value_of("stream").unwrap()),
                 sub.value_of("text").unwrap(),
                 read_num(sub, "limit", 1)?,
                 run.may_have_failed(),
             )?;
-            history::recall(&directory, "search");
+            history::recall(&directory, history::Retrieval::Search, Some(printed));
         }
         ("pack", sub) => pack::pack(
             &workspace,

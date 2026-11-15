@@ -707,6 +707,8 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
     let mut report = Report::new(cap);
     let mut diagnosed = BTreeSet::new();
     let mut found_run = false;
+    // The recorded failure shown, and the bytes printed about it.
+    let mut failure = None;
     let mut latest = BTreeSet::new();
     let mut sources = BTreeMap::new();
     for run in history::records(workspace, false)?.take(25) {
@@ -727,6 +729,8 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
         if !failure_task && !relevant {
             continue;
         }
+        // The lines about the run retrieve its output again; the source does not.
+        let (room, mut source) = (report.left(), 0);
         report.line(format!(
             "Recorded {} failure: {} (exit {})",
             run.family, run.id, run.status
@@ -749,6 +753,7 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
                 }
             }
             if !stale {
+                let before = report.left();
                 excerpt(
                     workspace,
                     &mut sources,
@@ -757,12 +762,15 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
                     d.location.start,
                     &mut report,
                 );
+                source += before.saturating_sub(report.left());
                 for id in index.at(&d.location) {
                     *ranks.entry(id).or_default() += 90;
                     diagnosed.insert(id);
                 }
             }
         }
+        let shown = room.saturating_sub(report.left()).saturating_sub(source);
+        failure = Some((run.id.clone(), shown as u64));
         found_run = true;
         break;
     }
@@ -919,5 +927,9 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
         report.line("No matching source or recorded failure. Try a symbol, file name, or an error from the log.");
     }
     history::saw_pack(workspace, inspected);
-    report.finish()
+    report.finish()?;
+    if let Some((id, bytes)) = failure.filter(|(_, bytes)| *bytes > 0) {
+        history::excerpts(workspace, &BTreeMap::from([(id, bytes)]));
+    }
+    Ok(())
 }

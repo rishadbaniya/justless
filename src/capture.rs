@@ -870,7 +870,7 @@ impl Archive {
                 .seek(SeekFrom::Start(0))
                 .and_then(|_| copy_out(&mut crate::redact::Reader::new(file, redactor), stream))
             {
-                Ok(byte) => last = byte.or(last),
+                Ok((byte, _)) => last = byte.or(last),
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
                 Err(error) => eprintln!("justless: could not replay {}: {error}", stream.name()),
             }
@@ -2529,7 +2529,9 @@ fn read_record(directory: &Path, id: &str) -> Result<Run> {
     }
 }
 
-pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Result<()> {
+/// Replays a run's streams, or a range of their lines, with any notes on stderr.
+/// Returns the bytes printed, notes included, which is what the agent receives.
+pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Result<u64> {
     ensure!(
         from > 0 && from <= to,
         "expected a positive, ordered line range"
@@ -2548,9 +2550,11 @@ pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Resu
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Lengths>(&bytes).ok())
         .unwrap_or_default();
+    let mut printed = 0;
     for &stream in streams {
         let path = directory.join(stream.name());
-        let last = replay_file(&path, stream, from, to)?;
+        let (last, bytes) = replay_file(&path, stream, from, to)?;
+        printed += bytes;
         let mut notes = String::new();
         if let (Some(&kept), Some(&total)) =
             (recorded.get(stream.index()), produced.get(stream.index()))
@@ -2578,15 +2582,17 @@ pub fn log(directory: &Path, streams: &[Stream], from: usize, to: usize) -> Resu
             ));
         }
         if !notes.is_empty() {
-            eprint!("{}{notes}", separator(last));
+            let separator = separator(last);
+            eprint!("{separator}{notes}");
+            printed += (separator.len() + notes.len()) as u64;
         }
     }
-    Ok(())
+    Ok(printed)
 }
 
 /// Replay a stream file, or a range of its lines, and flush it. Returns the last
-/// byte printed.
-fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<Option<u8>> {
+/// byte printed and how many bytes were printed.
+fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<(Option<u8>, u64)> {
     let redactor = path.parent().and_then(crate::redact::for_archive);
     let mut file = crate::redact::Reader::new(File::open(path)?, redactor);
     if from == 1 && to == usize::MAX {
@@ -2594,12 +2600,14 @@ fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<Op
     }
     let mut line = Vec::new();
     let mut last = None;
+    let mut printed = 0;
     for number in 1..=to {
         if file.read_until(b'\n', &mut line)? == 0 {
             break;
         }
         if number >= from {
             stream.print(&line)?;
+            printed += line.len() as u64;
             last = line.last().copied().or(last);
         }
         line.clear();
@@ -2607,16 +2615,17 @@ fn replay_file(path: &Path, stream: Stream, from: usize, to: usize) -> Result<Op
     if stream == Stream::Stdout {
         io::stdout().flush()?;
     }
-    Ok(last)
+    Ok((last, printed))
 }
 
 /// Copy a stream to Justless's own stdout or stderr and flush it, so a note that
 /// follows on stderr comes after it even when both go to one file. Returns the
-/// last byte copied.
-fn copy_out(reader: &mut impl Read, stream: Stream) -> io::Result<Option<u8>> {
-    fn copy(reader: &mut impl Read, mut output: impl Write) -> io::Result<Option<u8>> {
+/// last byte copied and how many bytes were copied.
+fn copy_out(reader: &mut impl Read, stream: Stream) -> io::Result<(Option<u8>, u64)> {
+    fn copy(reader: &mut impl Read, mut output: impl Write) -> io::Result<(Option<u8>, u64)> {
         let mut buffer = vec![0; 64 * 1024];
         let mut last = None;
+        let mut copied = 0;
         loop {
             let read = match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -2625,10 +2634,11 @@ fn copy_out(reader: &mut impl Read, stream: Stream) -> io::Result<Option<u8>> {
                 Err(error) => return Err(error),
             };
             output.write_all(&buffer[..read])?;
+            copied += read as u64;
             last = Some(buffer[read - 1]);
         }
         output.flush()?;
-        Ok(last)
+        Ok((last, copied))
     }
     match stream {
         Stream::Stdout => copy(reader, io::stdout().lock()),
@@ -2645,6 +2655,30 @@ fn separator(last: Option<u8>) -> &'static str {
     }
 }
 
+/// A writer that counts the bytes written through it.
+pub(crate) struct Counted<W> {
+    inner: W,
+    pub(crate) written: u64,
+}
+
+impl<W: Write> Counted<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self { inner, written: 0 }
+    }
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Lists the lines of a run that contain `needle`, up to `limit`, and ends with a
 /// count of the matches it left out. `failed` is whether the run failed.
 pub fn search(
@@ -2653,11 +2687,11 @@ pub fn search(
     needle: &str,
     limit: usize,
     failed: bool,
-) -> Result<()> {
+) -> Result<u64> {
     let found = Found::scan(directory, streams, needle, failed, limit)?;
     let chosen = found.choose(limit);
     let mut tally = found.tally();
-    let mut out = io::stdout().lock();
+    let mut out = Counted::new(io::stdout().lock());
     for &(stream, line, text) in &chosen {
         writeln!(out, "{}:{line}: {text}", stream.name())?;
         tally.show(stream);
@@ -2671,7 +2705,7 @@ pub fn search(
             tally.total()
         )?;
     }
-    Ok(())
+    Ok(out.written)
 }
 
 /// A word that marks a matching line as a failure wherever it appears, such as

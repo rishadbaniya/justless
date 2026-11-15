@@ -146,20 +146,23 @@ stdout:189: billing-trace probe=only-in-the-full-log
 billing-trace probe=only-in-the-full-log
 ```
 
-`justless history TEXT` searches every archived run in the project, and `justless stats` adds up what stayed out of context:
+`justless history TEXT` searches every archived run in the project, and `justless stats` adds up what stayed out of context. The first figure is what the previews kept out. The net figure also subtracts the 492 bytes that `context --run`, `search` and `log` printed from the first run afterwards:
 
 ```text
-Kept 16.7 KB of 18.4 KB command output out of context (90.9%) across 2 run(s)
-≈4279 tokens saved (estimated as bytes ÷ 4)
+Kept 16.7 KB of 18.4 KB command output out of context at first preview (90.9%) across 2 run(s)
+Later replays and lookups printed 492 B of run output again, so net saved: 16.2 KB (88.2%)
+≈4279 tokens saved at first preview, ≈4156 net (estimated as bytes ÷ 4)
 
-Last 7 day(s), UTC
-  2026-11-18     2 run(s)    18.4 KB → 1.7 KB     90.9%  ████████████████████
+Last 7 day(s), UTC, with retrievals on the day their run completed
+  2026-11-18     2 run(s)    18.4 KB → 1.7 KB     90.9%  net   88.2%  ████████████████████
 
-By command, most saved first
-  cargo test     2 run(s)    18.4 KB → 1.7 KB     90.9%  · 3 targeted lookup(s) · 1 grew
+By command, most net savings first
+  cargo test     2 run(s)    18.4 KB → 1.7 KB     90.9%  net   88.2%  · 3 targeted lookup(s) · 492 B retrieved later · 1 grew
 
 Recovery: 0 run(s) reopened in full · 3 targeted lookup(s) · 0 repeated source-range read(s)
 ```
+
+Replaying the whole first log with `justless log run-yKGf8E4eZx1V` would print its 18,038 bytes again and take the net figure below zero: the preview, the lookups and the replay together would put more of that run in context than running `cargo test` directly.
 
 ## What a hook-routed command prints
 

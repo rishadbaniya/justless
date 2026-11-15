@@ -862,3 +862,60 @@ fn log_replays_are_paged_on_line_boundaries() {
     // A replay that fits is returned exactly. stderr has no line 19,999.
     assert_eq!(page(6), vec!["row 19999\nrow 20000\n".to_owned()]);
 }
+
+/// `justless stats --json` for the project at `root`.
+fn stats(root: &Path) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["--root"])
+        .arg(root)
+        .args(["stats", "--json"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn a_log_page_counts_the_bytes_it_returned_not_the_whole_replay() {
+    let fixture = mixed_fixture();
+    let root = fixture.path();
+    // 200,000 bytes of output, far more than one 32 KiB page.
+    let rows = captured(
+        root,
+        "awk 'BEGIN{for(i=1;i<=20000;i++) printf \"row %05d\\n\", i}'",
+    );
+    let lines = raw_exchange(
+        root,
+        &[
+            legacy_initialize(),
+            call(1, "log", json!({"run_id": rows})),
+            call(2, "log", json!({"run_id": rows, "from": 3277, "to": 3286})),
+        ],
+    );
+    let returned = |id: i64| -> u64 {
+        let response = by_id(&lines, id);
+        assert_eq!(response["result"]["isError"], false, "{response:#}");
+        response["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["text"].as_str().unwrap().len() as u64)
+            .sum()
+    };
+    let (page, range) = (returned(1), returned(2));
+    assert!((32_768..33_000).contains(&page), "{page}");
+    assert_eq!(range, 100);
+    let report = stats(root);
+    assert_eq!(report["raw_bytes"], 200_000);
+    assert_eq!(report["replayed_bytes"], page + range);
+    assert_eq!(report["estimated_replay_bytes"], 0);
+    assert_eq!(report["unmeasured_retrievals"], 0);
+    assert_eq!(report["commands"][0]["reopened_runs"], 1);
+    assert_eq!(report["commands"][0]["targeted_lookups"], 1);
+    assert_eq!(
+        report["net_saved_bytes"],
+        200_000 - report["preview_bytes"].as_i64().unwrap() - (page + range) as i64
+    );
+}

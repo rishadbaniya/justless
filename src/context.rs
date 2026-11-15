@@ -360,9 +360,10 @@ const MAX_DIAGNOSTICS_PER_LOCATION: usize = 4;
 
 pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> Result<()> {
     let (directory, run) = capture::load(workspace, id)?;
-    crate::history::recall(&directory, "context");
     let mut report = Report::new(cap);
     let justless = workspace.justless();
+    // Bytes of source shown around the locations.
+    let mut source = 0;
     report.line(format!(
         "Run {id} · {} source locations",
         run.diagnostics.len()
@@ -426,13 +427,24 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
         {
             report.line("  Source changed or disappeared after this run. Re-run the command for current locations.");
         } else {
+            let room = report.left();
             at_location(workspace, index, location, &mut report)?;
+            source += room.saturating_sub(report.left());
         }
         if report.clipped {
             break;
         }
     }
-    report.finish()
+    let text = report.into_string();
+    io::stdout().lock().write_all(text.as_bytes())?;
+    // The log lines and notes retrieve the run's output again. The source shown
+    // beside them does not.
+    crate::history::recall(
+        &directory,
+        crate::history::Retrieval::Context,
+        Some(text.len().saturating_sub(source) as u64),
+    );
+    Ok(())
 }
 
 fn at_location(

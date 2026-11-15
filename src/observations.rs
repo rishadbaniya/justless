@@ -1,3 +1,4 @@
+use crate::capture::Counted;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -125,14 +126,17 @@ impl<'a> Selection<'a> {
     }
 
     /// Prints the selected part of `text`: every byte, the exact bytes of a line
-    /// range, or numbered matching lines for `--grep`.
-    fn print(&self, text: &[u8]) -> Result<()> {
-        self.write(&mut io::stdout().lock(), text)
+    /// range, or numbered matching lines for `--grep`. Returns the bytes printed.
+    fn print(&self, text: &[u8]) -> Result<u64> {
+        let mut out = Counted::new(io::stdout().lock());
+        self.write(&mut out, text)?;
+        Ok(out.written)
     }
 
     fn write(&self, out: &mut impl Write, text: &[u8]) -> Result<()> {
         if self.whole() {
-            return Ok(out.write_all(text)?);
+            out.write_all(text)?;
+            return Ok(());
         }
         let lines = text
             .split_inclusive(|&byte| byte == b'\n')
@@ -175,6 +179,13 @@ impl<'a> Selection<'a> {
         }
         Ok(())
     }
+}
+
+/// Writes the typed JSON value of an archived result. Returns the bytes printed.
+fn print_json(value: &Value) -> Result<u64> {
+    let mut out = Counted::new(io::stdout().lock());
+    serde_json::to_writer(&mut out, value)?;
+    Ok(out.written)
 }
 
 pub(crate) fn valid_tool_use_id(id: &str) -> bool {
@@ -264,7 +275,8 @@ fn tool_uses(ws: &Workspace) -> Result<Vec<ToolUse>> {
     Ok(entries)
 }
 
-fn recall_tool_use(ws: &Workspace, id: &str, as_json: bool, selection: &Selection) -> Result<()> {
+/// Prints an archived result by its tool_use ID. Returns the bytes printed.
+fn recall_tool_use(ws: &Workspace, id: &str, as_json: bool, selection: &Selection) -> Result<u64> {
     ensure!(valid_tool_use_id(id), "invalid tool_use ID");
     let entry: ToolUse = match fs::read(tool_use_path(ws, id)) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("read tool result index")?,
@@ -279,10 +291,10 @@ fn recall_tool_use(ws: &Workspace, id: &str, as_json: bool, selection: &Selectio
     ensure!(entry.id == id, "tool result index mismatch for {id}");
     let value = recover(ws, &entry.observation)?;
     if as_json {
-        return Ok(serde_json::to_writer(io::stdout().lock(), &value)?);
+        return print_json(&value);
     }
     match &value {
-        Value::Null => Ok(()),
+        Value::Null => Ok(0),
         Value::String(text) => selection.print(text.as_bytes()),
         Value::Array(blocks) => {
             let parts: Vec<String> = blocks.iter().map(block_text).collect();
@@ -608,13 +620,46 @@ fn marker(value: &Value) -> Option<&str> {
         .filter(|id| valid_id(id))
 }
 
+/// Prints one archived result, by recall ID or tool_use ID. Returns the bytes
+/// printed.
+fn recall(ws: &Workspace, args: &ArgMatches, selection: &Selection) -> Result<u64> {
+    let as_json = args.is_present("json");
+    if let Some(id) = args.value_of("tool-use") {
+        return recall_tool_use(ws, id, as_json, selection);
+    }
+    let id = args.value_of("id").unwrap();
+    // A tool_use ID reaches the proxy's archive, so `justless recall ID`
+    // works for a recall placeholder and for a cleared tool result alike.
+    if !valid_id(id) {
+        ensure!(
+            valid_tool_use_id(id),
+            "invalid ID: expected a 64-character recall ID or a tool_use ID"
+        );
+        return recall_tool_use(ws, id, as_json, selection);
+    }
+    let value = recover(ws, id)?;
+    // Plain recall prints text: a string, or the parts of an all-text array
+    // joined without a separator. `--json` prints the typed value.
+    if !as_json && text_kind(&value).is_some() {
+        let text = match value.as_array() {
+            Some(parts) => parts
+                .iter()
+                .map(|part| part["text"].as_str().unwrap_or_default())
+                .collect::<String>(),
+            None => value.as_str().unwrap_or_default().to_owned(),
+        };
+        return selection.print(text.as_bytes());
+    }
+    ensure!(
+        selection.whole(),
+        "--from, --to and --grep need a text result; use --json for this one"
+    );
+    print_json(&value)
+}
+
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     if name == "recall" {
         let selection = Selection::of(args)?;
-        let as_json = args.is_present("json");
-        if let Some(id) = args.value_of("tool-use") {
-            return recall_tool_use(ws, id, as_json, &selection);
-        }
         if args.is_present("list") {
             ensure!(
                 selection.whole(),
@@ -622,34 +667,11 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
             );
             return list_tool_uses(ws, args.value_of("list"), selection.limit);
         }
-        let id = args.value_of("id").unwrap();
-        // A tool_use ID reaches the proxy's archive, so `justless recall ID`
-        // works for a recall placeholder and for a cleared tool result alike.
-        if !valid_id(id) {
-            ensure!(
-                valid_tool_use_id(id),
-                "invalid ID: expected a 64-character recall ID or a tool_use ID"
-            );
-            return recall_tool_use(ws, id, as_json, &selection);
-        }
-        let value = recover(ws, id)?;
-        // Plain recall prints text: a string, or the parts of an all-text array
-        // joined without a separator. `--json` prints the typed value.
-        if !as_json && text_kind(&value).is_some() {
-            let text = match value.as_array() {
-                Some(parts) => parts
-                    .iter()
-                    .map(|part| part["text"].as_str().unwrap_or_default())
-                    .collect::<String>(),
-                None => value.as_str().unwrap_or_default().to_owned(),
-            };
-            return selection.print(text.as_bytes());
-        }
-        ensure!(
-            selection.whole(),
-            "--from, --to and --grep need a text result; use --json for this one"
-        );
-        return Ok(serde_json::to_writer(io::stdout().lock(), &value)?);
+        // What a recall prints comes back into context, so `stats` and the status
+        // line report it beside the savings it reverses.
+        let printed = recall(ws, args, &selection)?;
+        crate::history::recalled_archive(ws, printed);
+        return Ok(());
     }
     let mut input = Vec::new();
     io::stdin().lock().read_to_end(&mut input)?;

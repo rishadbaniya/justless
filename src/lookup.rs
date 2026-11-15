@@ -735,13 +735,40 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         logs: matches.is_present("logs"),
     };
     let ranking = rank(workspace, &question, &options)?;
-    let output = if matches.is_present("json") {
+    let json = matches.is_present("json");
+    let output = if json {
         render_json(&question, &ranking, budget)?
     } else {
         render_text(&ranking, budget)
     };
     io::stdout().lock().write_all(output.as_bytes())?;
+    note_log_windows(workspace, &ranking, &output, json);
     Ok(())
+}
+
+/// Records the log windows that `output` shows as retrievals of their runs, so
+/// `stats` subtracts them from the runs' savings. A window cut down to its
+/// header counts as the header.
+fn note_log_windows(workspace: &Workspace, ranking: &Ranking, output: &str, json: bool) {
+    let mut printed = std::collections::BTreeMap::<String, u64>::new();
+    for hit in &ranking.hits {
+        let Some((run, _)) = &hit.run else {
+            continue;
+        };
+        let shown = if json {
+            serde_json::to_string(&result_json(hit)).ok()
+        } else {
+            let block = block(hit);
+            let header = block[..block.find('\n').map_or(block.len(), |at| at + 1)].to_owned();
+            [block, header]
+                .into_iter()
+                .find(|text| output.contains(text.as_str()))
+        };
+        if let Some(text) = shown.filter(|text| output.contains(text.as_str())) {
+            *printed.entry(run.clone()).or_default() += text.len() as u64;
+        }
+    }
+    crate::history::excerpts(workspace, &printed);
 }
 
 #[cfg(test)]
