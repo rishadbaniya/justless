@@ -6,16 +6,18 @@ All work was stopped on 2026-11-19; it resumed the same day for the wrapper, Ope
 
 ## Today — 2026-11-19
 
-`main` is at `3d68e4b`, ten commits ahead of `origin/main`. Three stacked branches are merged into it: `feat/wrapper-coverage`, `feat/top5` and `feat/coverage`.
+`main` is at `7a96af7` plus the `discover --plan` commit below, twelve commits ahead of `origin/main`. Three stacked branches are merged into it: `feat/wrapper-coverage`, `feat/top5` and `feat/coverage`.
 
-**Shipped.** Wrapper-aware post-command compaction for lists and single commands; `src/wrappers.rs`; the metacharacter and 16 KiB guard; single-piece pipelines and `cat` singles; OpenCode `tool.execute.after` and the read-only `justless` tool; `scripts/replay.py` (1,867 results, 278,084 of 314,460 bytes saved, 88.4%).
+**Shipped.** Wrapper-aware post-command compaction for lists and single commands; `src/wrappers.rs`; the metacharacter and 16 KiB guard; single-piece pipelines and `cat` singles; OpenCode `tool.execute.after` and the read-only `justless` tool; `scripts/replay.py` (1,867 results, 278,084 of 314,460 bytes saved, 88.4%); `cd DIR && …` list prefixes as a piece base directory (`7a96af7`); `discover --plan` to rank unrouted families by output and mark what compacts now.
 
 **Decisions.**
 - Pre-command rewriting never unwraps a wrapper. Doing so would hide the original command from clients that auto-approve, so `env RUST_BACKTRACE=1 cargo test` and `git -C . diff` stay as written.
 - Failure-aware Claude is blocked: PostToolUse carries no exit status and failed results are not rewritten. OpenCode compacts only results whose `metadata.exit` is 0.
 - Batch rerun comparisons stay off: a truncated archive cannot prove full equality. Routed runs still print `Output unchanged since`.
 - Polyglot affected tests and the HTTP/SQL cross-language links already existed; `fixtures/mixed` proves both, so no code was added for them.
-- Of the ten-item plan, #1, #2, #4 (partial) and #10 shipped. #3, #5, #6, #7 and #8 remain open.
+- Of the ten-item plan, #1, #2, #4 (partial) and #10 shipped, and #10 now includes `cd DIR && …` prefixes. #3, #5, #6, #7 and #8 remain open.
+- The `cd` fix was worth more than a new formatter: the 4.28 MB `cd` pool was unreachable because `list` rejected the `cd` piece. `discover --plan` on this checkout now marks 3.8 MB of sed-family output and 1.5 MB of grep-family output as compactable with a hook or `run --`.
+- Rerun delta stays unbuilt: measured 60 repeated calls / 0.11 MB out of 14.6 MB, so #3 is no longer a top-five item.
 
 **Why this file is long.** §8 is the 50-idea token backlog; §9 and §10 are branch logs kept for provenance.
 

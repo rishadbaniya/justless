@@ -2232,6 +2232,18 @@ fn discover_classifies_claude_code_shell_commands() {
     assert_eq!(route("supported_not_routed")["output_bytes"], 4000);
     assert_eq!(route("supported_not_routed")["estimated_tokens"], 1000);
     assert_eq!(route("not_supported")["labels"][0]["label"], "ls");
+    let plan: serde_json::Value = serde_json::from_str(&discover(&["--json", "--plan"])).unwrap();
+    let rows = plan["plan"].as_array().unwrap();
+    assert_eq!(rows[0]["label"], "cargo test");
+    assert_eq!(rows[0]["output_bytes"], 4000);
+    assert_eq!(rows[0]["compactable_now_bytes"], 0);
+    assert_eq!(rows[1]["label"], "ls");
+    let text = discover(&["--plan"]);
+    assert!(
+        text.contains("Unrouted output by command family, largest first")
+            && text.contains("cargo test ×1 (3.9 KB)"),
+        "{text}"
+    );
     let text = discover(&[]);
     assert!(
         text.starts_with("Claude Code ran 3 shell command(s) here in the last 30 day(s), across 1 session(s)")

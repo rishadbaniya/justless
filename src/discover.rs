@@ -138,7 +138,15 @@ fn routed(command: &str, label: &str, content: &Value) -> bool {
     invokes_justless || bare_cat && first.is_some_and(|text| OUTLINE.is_match(text))
 }
 
-pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
+#[derive(Default)]
+struct PlanEntry {
+    commands: u64,
+    bytes: u64,
+    now_commands: u64,
+    now_bytes: u64,
+}
+
+pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> Result<()> {
     let window = Duration::from_secs(days.saturating_mul(86_400));
     let since = SystemTime::now()
         .checked_sub(window)
@@ -155,6 +163,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
 
     let root = workspace.root.to_string_lossy().into_owned();
     let mut groups: BTreeMap<Route, Group> = BTreeMap::new();
+    let mut unrouted: BTreeMap<String, PlanEntry> = BTreeMap::new();
     let mut sessions = BTreeSet::new();
     for file in &files {
         // <session>.jsonl and everything under <session>/ belong to one session.
@@ -234,6 +243,15 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
                             Route::NotSupported
                         };
                         let bytes = text_bytes(content);
+                        if plan && route != Route::ThroughJustless {
+                            let entry = unrouted.entry(label.clone()).or_default();
+                            entry.commands += 1;
+                            entry.bytes += bytes;
+                            if crate::batch::Batch::parse(&call.command).is_some() {
+                                entry.now_commands += 1;
+                                entry.now_bytes += bytes;
+                            }
+                        }
                         let group = groups.entry(route).or_default();
                         group.commands += 1;
                         group.output_bytes += bytes;
@@ -258,6 +276,17 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "commands": total,
             "output_bytes": output,
             "token_estimate": "UTF-8 bytes / 4",
+            "plan": plan.then(|| {
+                let mut entries: Vec<_> = unrouted.iter().collect();
+                entries.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.0.cmp(b.0)));
+                entries.into_iter().map(|(label, e)| serde_json::json!({
+                    "label": label,
+                    "commands": e.commands,
+                    "output_bytes": e.bytes,
+                    "compactable_now_commands": e.now_commands,
+                    "compactable_now_bytes": e.now_bytes,
+                })).collect::<Vec<_>>()
+            }),
             "groups": groups.iter().map(|(route, g)| serde_json::json!({
                 "route": route,
                 "commands": g.commands,
@@ -301,6 +330,26 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         println!("  {}", shown.join(" · "));
         if labels.len() > 8 {
             println!("  +{} more command type(s)", labels.len() - 8);
+        }
+    }
+    if plan {
+        let mut entries: Vec<_> = unrouted.iter().collect();
+        entries.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.0.cmp(b.0)));
+        println!("\nUnrouted output by command family, largest first (labels only, no commands):");
+        for (label, entry) in entries.iter().take(12) {
+            let now = if entry.now_bytes > 0 {
+                format!(
+                    " · {} would compact now with a hook or `run --`",
+                    human_bytes(entry.now_bytes)
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "  {label} ×{} ({}){now}",
+                entry.commands,
+                human_bytes(entry.bytes)
+            );
         }
     }
     if groups.contains_key(&Route::SupportedNotRouted) {

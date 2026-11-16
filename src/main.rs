@@ -202,7 +202,12 @@ fn cli() -> Command<'static> {
             Command::new("discover")
                 .about("Find shell commands agents ran here without Justless, from Claude Code transcripts")
                 .arg(number("days", "30", "Days of transcripts to scan"))
-                .arg(Arg::new("json").long("json").help("Print a JSON report")),
+                .arg(Arg::new("json").long("json").help("Print a JSON report"))
+                .arg(
+                    Arg::new("plan")
+                        .long("plan")
+                        .help("Rank unrouted command families by output and mark what compacts now"),
+                ),
         )
         .subcommand(learn::command())
         .subcommand(Command::new("index").about("Refresh the incremental repository index"))
@@ -582,6 +587,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             &workspace,
             read_num(sub, "days", 1)? as u64,
             sub.is_present("json"),
+            sub.is_present("plan"),
         )?,
         ("learn", sub) => learn::run(&workspace, sub)?,
         ("stats", sub) => history::stats(
