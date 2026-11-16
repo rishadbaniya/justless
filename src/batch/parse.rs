@@ -11,6 +11,7 @@ pub(super) enum Join {
 pub(super) struct Piece<'a> {
     pub header: &'a str,
     pub join: Join,
+    pub dir: Option<String>,
     pub source: Source,
     pub filters: Vec<Filter>,
 }
@@ -141,7 +142,12 @@ pub(super) fn search_paths(words: &[String]) -> Option<&[String]> {
     .then(|| &words[i + 1..])
 }
 
-fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> {
+fn piece<'a>(
+    header: &'a str,
+    stages: &[&str],
+    join: Join,
+    dir: Option<String>,
+) -> Option<Piece<'a>> {
     let mut stages = stages.iter().map(|s| shlex::split(s));
     let words = stages.next()??;
     let words = {
@@ -190,9 +196,37 @@ fn piece<'a>(header: &'a str, stages: &[&str], join: Join) -> Option<Piece<'a>> 
     Some(Piece {
         header,
         join,
+        dir,
         source,
         filters,
     })
+}
+
+fn change(stage: &str) -> Option<Option<String>> {
+    let words = shlex::split(stage)?;
+    match words.as_slice() {
+        [word] if assignment(word) => Some(None),
+        [word, dir] if word == "cd" => local(dir).then(|| Some(dir.clone())),
+        _ => None,
+    }
+}
+
+fn assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn enter(base: &mut Option<String>, dir: &str) {
+    let joined = match (base.as_deref(), Path::new(dir).is_absolute()) {
+        (_, true) => dir.to_owned(),
+        (Some(base), false) => Path::new(base).join(dir).to_string_lossy().into_owned(),
+        (None, false) => dir.to_owned(),
+    };
+    *base = Some(joined);
 }
 
 fn literal(command: &str) -> bool {
@@ -240,7 +274,7 @@ pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
     if !differs && !matches!(program, Some("cat")) {
         return None;
     }
-    piece(command, &[command], Join::Always).map(|piece| vec![piece])
+    piece(command, &[command], Join::Always, None).map(|piece| vec![piece])
 }
 
 pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
@@ -252,6 +286,7 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
     let (mut start, mut segment) = (0, 0);
     let mut quote = None;
     let mut join = Join::Always;
+    let mut base = None;
     let mut chars = command.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         if let Some(q) = quote {
@@ -298,17 +333,34 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
                 if c == '&' && !paired {
                     return None;
                 }
-                pieces.push(piece(command[segment..i].trim(), &stages, join)?);
-                if pieces.len() > 32 {
-                    return None;
-                }
-                stages.clear();
-                segment = start;
-                join = match c {
+                let next = match c {
                     '&' => Join::Success,
                     '|' => Join::Failure,
                     _ => Join::Always,
                 };
+                match (stages.len() == 1).then(|| change(stages[0])).flatten() {
+                    Some(Some(dir)) => {
+                        if next == Join::Failure {
+                            return None;
+                        }
+                        enter(&mut base, &dir);
+                    }
+                    Some(None) => {}
+                    None => {
+                        pieces.push(piece(
+                            command[segment..i].trim(),
+                            &stages,
+                            join,
+                            base.clone(),
+                        )?);
+                        if pieces.len() > 32 {
+                            return None;
+                        }
+                    }
+                }
+                stages.clear();
+                segment = start;
+                join = next;
             }
             '$' | '`' | '(' | ')' | '<' | '>' | '{' | '}' | '[' | ']' | '*' | '?' | '#' | '~'
             | '!' => return None,
@@ -325,7 +377,14 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
         if stages.len() > 8 {
             return None;
         }
-        pieces.push(piece(command[segment..].trim(), &stages, join)?);
+        if stages.len() != 1 || change(stages[0]).is_none() {
+            pieces.push(piece(
+                command[segment..].trim(),
+                &stages,
+                join,
+                base.clone(),
+            )?);
+        }
     } else if !stages.is_empty() || join != Join::Always {
         return None;
     }

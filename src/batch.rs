@@ -6,7 +6,7 @@ mod reads;
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,7 @@ struct Verified<'a> {
     piece: &'a Piece<'a>,
     range: RunPiece,
     source: Option<reads::SourceLines>,
+    dir: PathBuf,
 }
 
 impl<'a> Batch<'a> {
@@ -156,7 +157,8 @@ impl<'a> Batch<'a> {
             .checked_sub(192 + 2 * run_ws.justless().len())?;
         let deadline = Instant::now() + Duration::from_secs(4);
         let mut files = reads::Files::new();
-        let mut repo = None;
+        let mut repo: Option<(PathBuf, git::Repository)> = None;
+        let root = ws.root.canonicalize().ok()?;
         let mut status = 0;
         let mut may_have_closed_pipe = false;
         let mut output = String::new();
@@ -180,6 +182,13 @@ impl<'a> Batch<'a> {
                 .filters
                 .iter()
                 .any(|f| matches!(f, parse::Filter::First(_)));
+            let dir = cwd
+                .join(piece.dir.as_deref().unwrap_or(""))
+                .canonicalize()
+                .ok()?;
+            if !dir.is_dir() || !dir.starts_with(&root) {
+                return None;
+            }
             let (text, source) = match &piece.source {
                 Source::File {
                     file,
@@ -187,25 +196,25 @@ impl<'a> Batch<'a> {
                     numbered,
                 } => {
                     let (text, source) =
-                        files.read(ws, &cwd, file, select, *numbered, &piece.filters)?;
+                        files.read(ws, &dir, file, select, *numbered, &piece.filters)?;
                     status = 0;
                     (text, Some(source))
                 }
                 Source::Git(words) => {
-                    if repo.is_none() {
-                        repo = Some(git::Repository::open(ws, &cwd, deadline)?);
+                    if repo.as_ref().is_none_or(|(repo_dir, _)| repo_dir != &dir) {
+                        repo = Some((dir.clone(), git::Repository::open(ws, &dir, deadline)?));
                     }
                     status = 0;
                     (
                         reads::filter(
-                            repo.as_ref()?.output(&cwd, &words[1..], deadline)?,
+                            repo.as_ref()?.1.output(&dir, &words[1..], deadline)?,
                             &piece.filters,
                         )?,
                         None,
                     )
                 }
                 Source::Search(words) => {
-                    let (code, text) = search(ws, &cwd, words, deadline)?;
+                    let (code, text) = search(ws, &dir, words, deadline)?;
                     // With pipefail set a successful tail can still report the search's failure.
                     if !piece.filters.is_empty() && code != 0 {
                         return None;
@@ -233,6 +242,7 @@ impl<'a> Batch<'a> {
                 piece,
                 range,
                 source,
+                dir,
             });
         }
         let expected_status = i32::from(
@@ -270,7 +280,7 @@ impl<'a> Batch<'a> {
                 }
             }
         }
-        let text = render(&mut files, &verified, &cwd, actual, budget)?;
+        let text = render(&mut files, &verified, actual, budget)?;
         if Instant::now() >= deadline {
             return None;
         }
@@ -336,7 +346,6 @@ fn excerpt(text: &str, limit: usize) -> String {
 fn render(
     files: &mut reads::Files,
     items: &[Verified<'_>],
-    cwd: &Path,
     output: &str,
     budget: usize,
 ) -> Option<String> {
@@ -368,7 +377,7 @@ fn render(
                 Source::File { .. } => files.outline(item.source.as_ref()?, text, limit),
                 Source::Search(words) => {
                     let args = words.iter().map(String::as_str).collect::<Vec<_>>();
-                    let mut engine = crate::search::Search::new(cwd, &args);
+                    let mut engine = crate::search::Search::new(&item.dir, &args);
                     for (n, line) in text.lines().enumerate() {
                         engine.observe(line, item.range.first_line? + n);
                     }
@@ -415,5 +424,33 @@ mod tests {
         assert!(Batch::parse("sed -n 1,2p Cargo.toml").is_none());
         assert!(Batch::parse("env FOO=$(cat Cargo.toml) cat Cargo.toml").is_none());
         assert!(Batch::parse("env FOO=1 cat *").is_none());
+    }
+
+    #[test]
+    fn a_cd_prefixed_list_parses_in_that_directory() {
+        let batch = Batch::parse_list("cd fixtures/mixed && git diff && sed -n 1,2p db/schema.sql")
+            .unwrap();
+        assert_eq!(batch.0.len(), 2);
+        assert!(
+            batch
+                .0
+                .iter()
+                .all(|p| p.dir.as_deref() == Some("fixtures/mixed"))
+        );
+        assert_eq!(batch.0[1].header, "sed -n 1,2p db/schema.sql");
+
+        let batch = Batch::parse_list("cd /repo && cd sub && git diff").unwrap();
+        assert_eq!(batch.0.len(), 1);
+        assert_eq!(batch.0[0].dir.as_deref(), Some("/repo/sub"));
+        assert_eq!(batch.0[0].header, "git diff");
+
+        let batch = Batch::parse_list("cd fixtures/mixed && FOO=1 && git diff").unwrap();
+        assert_eq!(batch.0.len(), 1);
+        assert_eq!(batch.0[0].dir.as_deref(), Some("fixtures/mixed"));
+
+        assert!(Batch::parse_list("cd ../elsewhere && git diff").is_none());
+        assert!(Batch::parse_list("cd .git && git diff").is_none());
+        assert!(Batch::parse_list("cd /repo || git diff").is_none());
+        assert!(Batch::parse_list("cd /repo && rm -rf x && git diff").is_none());
     }
 }

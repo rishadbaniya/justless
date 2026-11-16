@@ -1744,16 +1744,6 @@ fn claude_hook_keeps_how_claude_code_reads_exit_1() {
             "justless run --hook --merge -- rg -n foo src 2>&1 && test 1".to_owned(),
         ),
         (
-            "cd src && rg foo",
-            "cd src && justless run --hook -- rg foo && test 1".to_owned(),
-        ),
-        (
-            "cd vendor_lib && git diff --exit-code",
-            format!(
-                "cd vendor_lib && justless {root_option} run --hook -- git diff --exit-code && test 1"
-            ),
-        ),
-        (
             "git status; git diff --stat",
             "justless run --hook -- git status; justless run --hook -- git diff --stat && test 1"
                 .to_owned(),
@@ -1782,6 +1772,12 @@ fn claude_hook_keeps_how_claude_code_reads_exit_1() {
             "git log --oneline -3",
             "justless run --hook -- git log --oneline -3".to_owned(),
         ),
+        (
+            "cd vendor_lib && git diff --exit-code",
+            format!(
+                "cd vendor_lib && justless {root_option} run --hook -- git diff --exit-code && test 1"
+            ),
+        ),
         // The last statement is not routed, so it is unchanged.
         (
             "rg foo; git push",
@@ -1794,6 +1790,9 @@ fn claude_hook_keeps_how_claude_code_reads_exit_1() {
             "{command}"
         );
     }
+    // A cd-prefixed list that the after-run compactor accepts keeps the command
+    // Claude Code wrote instead of being routed through a rewrite.
+    assert_eq!(rewrite("hook-claude", "cd src && rg foo"), None);
     // Other clients show the exit status as it is, so they keep the plain rewrite.
     for agent in ["hook-codex", "hook-gemini", "hook-cursor", "hook-copilot"] {
         let call = match agent {

@@ -311,3 +311,61 @@ fn wrappers_are_looked_through_before_compacting() {
         assert!(shown.contains("big.rs"), "{command}: {out}");
     }
 }
+
+#[test]
+fn cd_lists_compact_in_their_directory() {
+    let temp = fixture();
+    let dir = temp.path();
+    fs::create_dir(dir.join("sub")).unwrap();
+    fs::copy(dir.join("big.rs"), dir.join("sub/big.rs")).unwrap();
+    for args in [
+        vec!["add", "sub/big.rs"],
+        vec![
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=x",
+            "commit",
+            "-qm",
+            "sub",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let list = "cd sub && sed -n '1,600p' big.rs";
+    let raw = native(dir, list);
+    let (view, record) = verified(dir, list, response(&raw), &raw);
+    assert!(view.contains("function add_"), "{view}");
+    assert_eq!(record["pieces"][0]["command_index"], 1);
+
+    let list = "cd sub; sed -n '1,600p' big.rs";
+    let raw = native(dir, list);
+    let (view, _) = verified(dir, list, response(&raw), &raw);
+    assert!(view.contains("function add_"), "{view}");
+}
+
+#[test]
+fn a_cd_outside_the_workspace_or_backtracking_stays_raw() {
+    let temp = fixture();
+    let dir = temp.path();
+    let raw = native(dir, "cd / && sed -n '1,3p' etc/hosts");
+    assert_eq!(
+        hook(dir, "cd / && sed -n '1,3p' etc/hosts", Some(response(&raw))),
+        json!({})
+    );
+    assert_eq!(
+        hook(
+            dir,
+            "cd ../.. && sed -n '1,3p' big.rs",
+            Some(response(&raw))
+        ),
+        json!({})
+    );
+}
