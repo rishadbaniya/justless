@@ -6,7 +6,9 @@ All work was stopped on 2026-11-19; it resumed the same day for the wrapper, Ope
 
 ## Today — 2026-11-19
 
-`main` is at `d01440e`, thirteen commits ahead of `origin/main`. Three stacked branches are merged into it: `feat/wrapper-coverage`, `feat/top5` and `feat/coverage`.
+`main` is at `d01440e` plus this pass's setup commit, fourteen commits ahead of `origin/main`. Three stacked branches are merged into it: `feat/wrapper-coverage`, `feat/top5` and `feat/coverage`.
+
+**What this pass was trying to do.** Reduce what coding agents spend on shell output by fixing reach and measurement rather than adding formatters: let the parsers see `cd DIR && …` lists, rank the remaining backlog by measured bytes (`discover --plan`), and stop paying fixed per-request overhead. The first two shipped (`7a96af7`, `d01440e`); the third measured under 1% of routed output, so it was closed without a change. Replay saves 287,973 of 329,112 eligible bytes (87.5%), which is 7.1% of all Bash output in this project's corpus and 29 of 1,867 results. Honest overall rating: 7/10. The engineering and safety model are strong; end-to-end agent savings are not yet proven, because the provider benchmarks are n=1 on a synthetic task and the installed binary can lag the source.
 
 **Shipped.** Wrapper-aware post-command compaction for lists and single commands; `src/wrappers.rs`; the metacharacter and 16 KiB guard; single-piece pipelines and `cat` singles; OpenCode `tool.execute.after` and the read-only `justless` tool; `scripts/replay.py` (1,867 results; after the `cd` fix, 29 compacted results save 287,973 of 329,112 eligible bytes, 87.5%); `cd DIR && …` list prefixes as a piece base directory (`7a96af7`); `discover --plan` to rank unrouted families by output and mark what compacts now.
 

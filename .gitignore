@@ -3,3 +3,4 @@
 **/target/
 **/.justless/
 __pycache__/
+/.claude/settings.local.json

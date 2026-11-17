@@ -1,0 +1,83 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^(startup|resume)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 60,
+            "command": "justless hook-claude session-start",
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "^compact$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "justless hook-claude after-compact"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "justless hook-claude before-command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Read$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "justless hook-claude after-read"
+          }
+        ]
+      },
+      {
+        "matcher": "^(Grep|Glob)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "justless hook-claude after-search"
+          }
+        ]
+      },
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "justless hook-claude after-bash"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "^(manual|auto)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "justless hook-claude before-compact"
+          }
+        ]
+      }
+    ]
+  }
+}
