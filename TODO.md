@@ -196,6 +196,11 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 
 ---
 
+### 3.11 Better token figures without a bundled tokenizer
+- **Why not a tokenizer.** Claude's tokenizer is not public; exact counts need Anthropic's token-counting API (network, against the zero-network promise), and a public tokenizer such as `o200k_base` is a different model's and adds megabytes. Every compaction decision already uses exact bytes; tokens appear only in reports.
+- **Plan.** (1) Calibrate bytes-per-token per content type (code, JSON, prose, logs) once, offline, with the benchmark harness and the API, and ship the constants; code runs about 3-3.5 bytes per token, so today's flat bytes ÷ 4 undercounts savings on code. (2) Read the provider-reported usage Claude Code already stores in its local session files (input, cache reads, cache writes) to show real per-session totals in `stats`, offline. Keep the API benchmarks as the only source of measured before-and-after savings.
+- **Progress.** *designed*.
+
 ## 4. Later
 
 | Item | Why | Progress |
