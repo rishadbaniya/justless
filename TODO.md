@@ -6,9 +6,9 @@ All work was stopped on 2026-11-19; it resumed the same day for the wrapper, Ope
 
 ## Today — 2026-11-19
 
-`main` is at `7a96af7` plus the `discover --plan` commit below, twelve commits ahead of `origin/main`. Three stacked branches are merged into it: `feat/wrapper-coverage`, `feat/top5` and `feat/coverage`.
+`main` is at `d01440e`, thirteen commits ahead of `origin/main`. Three stacked branches are merged into it: `feat/wrapper-coverage`, `feat/top5` and `feat/coverage`.
 
-**Shipped.** Wrapper-aware post-command compaction for lists and single commands; `src/wrappers.rs`; the metacharacter and 16 KiB guard; single-piece pipelines and `cat` singles; OpenCode `tool.execute.after` and the read-only `justless` tool; `scripts/replay.py` (1,867 results, 278,084 of 314,460 bytes saved, 88.4%); `cd DIR && …` list prefixes as a piece base directory (`7a96af7`); `discover --plan` to rank unrouted families by output and mark what compacts now.
+**Shipped.** Wrapper-aware post-command compaction for lists and single commands; `src/wrappers.rs`; the metacharacter and 16 KiB guard; single-piece pipelines and `cat` singles; OpenCode `tool.execute.after` and the read-only `justless` tool; `scripts/replay.py` (1,867 results; after the `cd` fix, 29 compacted results save 287,973 of 329,112 eligible bytes, 87.5%); `cd DIR && …` list prefixes as a piece base directory (`7a96af7`); `discover --plan` to rank unrouted families by output and mark what compacts now.
 
 **Decisions.**
 - Pre-command rewriting never unwraps a wrapper. Doing so would hide the original command from clients that auto-approve, so `env RUST_BACKTRACE=1 cargo test` and `git -C . diff` stay as written.
@@ -18,12 +18,14 @@ All work was stopped on 2026-11-19; it resumed the same day for the wrapper, Ope
 - Of the ten-item plan, #1, #2, #4 (partial) and #10 shipped, and #10 now includes `cd DIR && …` prefixes. #3, #5, #6, #7 and #8 remain open.
 - The `cd` fix was worth more than a new formatter: the 4.28 MB `cd` pool was unreachable because `list` rejected the `cd` piece. `discover --plan` on this checkout now marks 3.8 MB of sed-family output and 1.5 MB of grep-family output as compactable with a hook or `run --`.
 - Rerun delta stays unbuilt: measured 60 repeated calls / 0.11 MB out of 14.6 MB, so #3 is no longer a top-five item.
+- Fixed per-request overhead (#5) is closed without a change: a navigation footer is about 78 B and a recall placeholder 82 B, which is under 1% of routed output, and the footer carries the only retrieval hint. Trimming it would trade navigation for tens of kilobytes.
+- The before-run hook now leaves a `cd`-prefixed list alone instead of routing it, because the after-run compactor accepts it. `tests/cli.rs` records that for `cd src && rg foo`; unsupported forms such as `git diff --exit-code` still route.
 
 **Why this file is long.** §8 is the 50-idea token backlog; §9 and §10 are branch logs kept for provenance.
 
 ## Review queue for Claude Code — 2026-11-19
 
-Everything below is committed on `main`; the merge is `24a8984`, the last docs log is `3d68e4b`. Review the code, not just this summary.
+Everything below is committed on `main`; the merge is `24a8984`, and the two newest commits are `7a96af7` and `d01440e`. Review the code, not just this summary.
 
 - `2afa5ea` wrapper lookup for read lists — `src/wrappers.rs`, `src/batch/parse.rs::piece`, `src/filters.rs`; check the pre-command permission contract (no wrapper rewriting, no PATH/LD stripping for auto-approve clients).
 - `d3727fe` docs correction for wrapper coverage.
@@ -34,10 +36,12 @@ Everything below is committed on `main`; the merge is `24a8984`, the last docs l
 - `20dbad2` one-piece pipelines and `cat` singles — `list` now accepts one piece, `single` allows `cat`; confirm `sed`/`head`/`tail` singles still use the plan path.
 - `74929a3` OpenCode read-only tool — review the `readonly` list and the in-`execute` command guard.
 - `24a8984` merge — the only conflict was `TODO.md`; the main branch log was kept and §10 added.
+- `7a96af7` `cd DIR && …` list prefixes — `src/batch/parse.rs::change`/`enter`, `src/batch.rs` resolves each piece's directory inside the workspace and reopens Git per directory; `tests/read_batch.rs` and `tests/cli.rs`. Check that backtracking, `.git`, outside-root and `||` lists stay raw, and that the canonical root check does not read through a symlinked temp path.
+- `d01440e` `discover --plan` — `src/discover.rs::PlanEntry`, `src/main.rs`; verify the output has labels and byte counts only, never command text.
 
-Verification already run on the merged tree: `cargo fmt --check`, `clippy -D warnings`, 248 CLI tests, 8 batch tests, 211 binary tests, and `scripts/context_benchmark.py`. Replay: `python3 scripts/replay.py --limit 40`.
+Verification already run on the merged tree: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, 248 CLI tests, 10 batch tests, 212 binary tests, and `scripts/context_benchmark.py`. Replay: `python3 scripts/replay.py --binary ./target/debug/justless`.
 
-Known open after this queue: #3 batch rerun delta, #5 fixed per-request overhead, #6 watch/incremental index/daemon, #7 `explain` and graph exports, #8 session ledger. An uncommitted `src/setup.rs` draft was removed; no `setup` command shipped.
+Known open after this queue: #3 batch rerun delta (measured small), #6 watch/incremental index/daemon, #7 `explain` and graph exports, #8 session ledger. #5 fixed per-request overhead is measured and closed without a change. An uncommitted `src/setup.rs` draft was removed; no `setup` command shipped.
 
 ---
 
