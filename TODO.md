@@ -23,11 +23,19 @@ All work was stopped on 2026-11-19; it resumed the same day for the wrapper, Ope
 - Fixed per-request overhead (#5) is closed without a change: a navigation footer is about 78 B and a recall placeholder 82 B, which is under 1% of routed output, and the footer carries the only retrieval hint. Trimming it would trade navigation for tens of kilobytes.
 - The before-run hook now leaves a `cd`-prefixed list alone instead of routing it, because the after-run compactor accepts it. `tests/cli.rs` records that for `cd src && rg foo`; unsupported forms such as `git diff --exit-code` still route.
 
+**Hook deployment audit (2026-11-19, after the commits).** The hook definitions are correct; the deployment is not, and it explains most of the small measured win.
+- Codex has no Justless hooks: `~/.codex/hooks.json` holds only graphify's `PreToolUse`, and `doctor` reports "Codex is on PATH but not set up here".
+- Claude hooks exist only in this repository's `.claude/settings.json`; user-level `~/.claude/settings.json` has none, so other repositories get nothing.
+- Clients read hooks at session start. The 7-day transcript holds 13,900 Claude Code commands but only 620 routed (4.5%) and 63 recorded runs; that session began before the hooks were installed.
+- The hooks invoke `~/.cargo/bin/justless`, built at 02:32 today rather than from `d01440e`, so the `cd` fix, `discover --plan`, read tool and retirement were not running. Nothing checks the binary's revision.
+- Even where hooks were installed, `discover` reports 2,295 supported commands (3.6 MB) passed through (`git diff` 1.3 MB, `git show` 863 KB, `git log` 492 KB, `cargo test` 234 KB) plus 451 supported commands (1.6 MB) not routed.
+- **Next:** install at user level and for Codex (`init --hooks` merges), reinstall the binary from `main`, add a stale-binary check to `doctor`, restart the client, then inspect the passed-through `git`/`cargo` forms. Do not quote the 87.5% replay figure as a session-wide win until a hooked session is measured.
+
 **Why this file is long.** §8 is the 50-idea token backlog; §9 and §10 are branch logs kept for provenance.
 
 ## Review queue for Claude Code — 2026-11-19
 
-Everything below is committed on `main`; the merge is `24a8984`, and the two newest commits are `7a96af7` and `d01440e`. Review the code, not just this summary.
+Everything below is committed on `main`; the merge is `24a8984`, the follow-ups are `7a96af7`, `d01440e` and `616f0c7`, and the hook audit above is documentation only. Review the code, not just this summary.
 
 - `2afa5ea` wrapper lookup for read lists — `src/wrappers.rs`, `src/batch/parse.rs::piece`, `src/filters.rs`; check the pre-command permission contract (no wrapper rewriting, no PATH/LD stripping for auto-approve clients).
 - `d3727fe` docs correction for wrapper coverage.
@@ -40,6 +48,7 @@ Everything below is committed on `main`; the merge is `24a8984`, and the two new
 - `24a8984` merge — the only conflict was `TODO.md`; the main branch log was kept and §10 added.
 - `7a96af7` `cd DIR && …` list prefixes — `src/batch/parse.rs::change`/`enter`, `src/batch.rs` resolves each piece's directory inside the workspace and reopens Git per directory; `tests/read_batch.rs` and `tests/cli.rs`. Check that backtracking, `.git`, outside-root and `||` lists stay raw, and that the canonical root check does not read through a symlinked temp path.
 - `d01440e` `discover --plan` — `src/discover.rs::PlanEntry`, `src/main.rs`; verify the output has labels and byte counts only, never command text.
+- `616f0c7` setup — `AGENTS.md`/`CLAUDE.md` instruction block, `.claude/settings.json`, `.gitignore`; confirm the hooks call a binary that exists and that `settings.local.json` stays untracked.
 
 Verification already run on the merged tree: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, 248 CLI tests, 10 batch tests, 212 binary tests, and `scripts/context_benchmark.py`. Replay: `python3 scripts/replay.py --binary ./target/debug/justless`.
 
