@@ -1457,6 +1457,17 @@ impl Capture<'_> {
                 },
             )
             .with_context(|| format!("read {}", stream.name()))?;
+            // A stream shown whole gets the floor too when it reaches the agent
+            // directly, since a typed run may feed a pipe, and when that saves more
+            // than the footer that then names the run.
+            let preview = match std::str::from_utf8(&preview)
+                .ok()
+                .filter(|_| hook && fits)
+                .and_then(crate::floor::compact)
+            {
+                Some(compact) if compact.len() + 64 < preview.len() => compact.into_bytes(),
+                _ => preview,
+            };
             fit_whole[index] = fits;
             secrets[index] = run.redaction.as_ref().map_or(0, |found| found.count) - before;
             previews.push((stream, preview));
@@ -2030,6 +2041,9 @@ fn scan(
     let mut tail_bytes = 0;
     let mut line_no = 0;
     let mut filter = crate::filters::LineFilter::new(selection, max_bytes);
+    // Display-only compaction of the head and tail; see `floor`.
+    let mut floor = crate::floor::Floor::default();
+    let mut floored = Vec::new();
 
     // A stream that fits is shown whole, including lines that markers made longer.
     let line_limit = if truncated {
@@ -2114,25 +2128,25 @@ fn scan(
             if !failure && !patch && (has_location || trimmed.starts_with("warning")) {
                 section.add(Block::new(Tier::Note, line, shown), payload / 2);
             }
-            head.push(shown);
-            // The tail ends where the stream ends, even inside an enormous line.
-            let mut excerpt = Excerpt::new(tail_limit);
             if cut {
-                // Only the start of an enormous line was scanned. Show its real end.
+                floor.flush(&mut floored);
+            } else {
+                floor.push(shown, &mut floored);
+            }
+            for line in floored.drain(..) {
+                head.push(&line);
+                keep_tail(&mut tail, &mut tail_bytes, tail_limit, &line, false);
+            }
+            if cut {
+                // Only the start of an enormous line was scanned. Show its real end;
+                // the tail ends where the stream ends, even inside such a line.
+                head.push(shown);
                 let wanted = tail_limit.saturating_sub(end.len());
                 let mut suffix = raw[raw.len().saturating_sub(wanted)..].to_vec();
                 suffix.extend_from_slice(&end);
                 let suffix = String::from_utf8_lossy(&suffix);
-                excerpt.push_end(&ANSI.replace_all(&suffix, ""), true);
-            } else {
-                excerpt.push_end(shown, false);
-            }
-            if !excerpt.text.is_empty() {
-                tail_bytes += excerpt.text.len();
-                tail.push_back(excerpt.text);
-                while tail_bytes > tail_limit {
-                    tail_bytes -= tail.pop_front().unwrap().len();
-                }
+                let suffix = ANSI.replace_all(&suffix, "");
+                keep_tail(&mut tail, &mut tail_bytes, tail_limit, &suffix, true);
             }
         }
         raw.clear();
@@ -2140,6 +2154,11 @@ fn scan(
     }
     if let Some(open) = block.take() {
         section.add(open, payload / 2);
+    }
+    floor.flush(&mut floored);
+    for line in floored.drain(..) {
+        head.push(&line);
+        keep_tail(&mut tail, &mut tail_bytes, tail_limit, &line, false);
     }
 
     if let Some(buffer) = whole {
@@ -2167,6 +2186,19 @@ fn scan(
         return Ok((filtered, !truncated));
     }
     Ok((preview, !truncated))
+}
+
+/// Add a line to the tail excerpt, dropping its oldest lines past `limit`.
+fn keep_tail(tail: &mut VecDeque<String>, bytes: &mut usize, limit: usize, line: &str, cut: bool) {
+    let mut excerpt = Excerpt::new(limit);
+    excerpt.push_end(line, cut);
+    if !excerpt.text.is_empty() {
+        *bytes += excerpt.text.len();
+        tail.push_back(excerpt.text);
+        while *bytes > limit {
+            *bytes -= tail.pop_front().unwrap().len();
+        }
+    }
 }
 
 /// Read one line. A line longer than `limit` keeps its first `limit` bytes in

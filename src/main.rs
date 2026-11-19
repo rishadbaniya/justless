@@ -11,6 +11,7 @@ mod doctor;
 mod exec;
 mod filters;
 mod find;
+mod floor;
 mod focus;
 mod history;
 mod impact;

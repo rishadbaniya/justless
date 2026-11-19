@@ -814,7 +814,7 @@ impl<'a> LineFilter<'a> {
     }
 }
 
-fn diagnostic(line: &str) -> bool {
+pub(crate) fn diagnostic(line: &str) -> bool {
     let text = line.to_ascii_lowercase();
     [
         "fail",

@@ -77,6 +77,56 @@ fn json_output_is_shown_as_tables_that_log_reverses() {
     }
 }
 
+#[test]
+fn previews_collapse_progress_encoded_runs_and_repeats() {
+    let dir = workspace("");
+    let root = dir.path();
+    let frames: String = (0..=100).map(|i| format!("\r{i:>3}%")).collect();
+    let blob: String = (0..400).map(|i| ["Qm", "x9", "aZ", "k+"][i % 4]).collect();
+    let noisy = format!(
+        "fetch{frames}\n{}error: kept\nerror: kept\nkey {blob}\n",
+        "waiting\n".repeat(200)
+    );
+    fs::write(root.join("noisy.txt"), &noisy).unwrap();
+    let floored = format!(
+        "100% [101 earlier progress frame(s) cut]\nwaiting\n[last line repeated 199 more time(s)]\n\
+         error: kept\nerror: kept\nkey {}[… 776 base64 characters cut …]{}\n",
+        &blob[..12],
+        &blob[788..]
+    );
+    let output = justless(root, &["run", "--hook", "--", "cat", "noisy.txt"]);
+    assert_eq!(text(&output.stdout), floored);
+    let log = justless(root, &["log", &run_id(&output)]);
+    assert_eq!(text(&log.stdout), noisy);
+    // A typed run that fits could feed a pipe, so it stays verbatim, but a clipped
+    // one folds its head and tail.
+    let typed = justless(root, &["run", "--fresh", "--", "cat", "noisy.txt"]);
+    assert_eq!(text(&typed.stdout), noisy);
+    let clipped = justless(
+        root,
+        &[
+            "run",
+            "--fresh",
+            "--max-bytes",
+            "1024",
+            "--",
+            "cat",
+            "noisy.txt",
+        ],
+    );
+    let shown = text(&clipped.stdout);
+    assert!(
+        shown.starts_with(
+            "100% [101 earlier progress frame(s) cut]\nwaiting\n[last line repeated 199"
+        ),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("error: kept\nerror: kept\nkey Qmx9"),
+        "{shown}"
+    );
+}
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
