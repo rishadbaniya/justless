@@ -1202,7 +1202,7 @@ fn claude_edit(ws: &Workspace, input: &Value) -> Option<Value> {
         parsed_before,
         certain,
         ..
-    } = crate::syntax_check::judge(&file, before, &after, &[change], false)?
+    } = crate::syntax_check::judge(&ws.root, &file, before, &after, &[change], false)?
     else {
         return None;
     };

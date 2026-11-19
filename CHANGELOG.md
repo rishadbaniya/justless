@@ -40,7 +40,7 @@ Details: [Indexing and languages](docs/reference.md#indexing-and-languages) · [
 
 - `read FILE --outline` returns a revision and numbered signatures, and `expand` returns the exact bytes of a symbol, Markdown section or line range.
 - `edit` writes a symbol or line range only if the file still matches the revision the agent read; a stale or overlapping edit rejects the whole batch.
-- `edit` rejects a batch that would leave a parsing file unparseable, with the parser's line and message; `--allow-parse-errors` writes it anyway.
+- `edit` rejects a batch that would leave a parsing file unparseable, with the parser's line and message; `--allow-parse-errors` writes it anyway. In a crate with `#![feature(…)]`, Rust errors other than unpaired delimiters are reported, not rejected.
 - Claude Code's Read hook outlines large whole-file Reads and ranged Reads of more than 150 lines: 167 such ranged Reads went from 2,803,765 bytes to 304,590.
 - Shell reads of a wide file with `cat`, `sed -n`, `head`, `tail` or `git show REV:path` show an outline and a command that replays the exact bytes.
 - Outlines list up to 20 lines of top-level code that no row covers, in scripts named by their `#!` line, Elixir, PowerShell, Julia and Groovy files and Vue, Svelte and Astro components too; a file with more keeps its full read.

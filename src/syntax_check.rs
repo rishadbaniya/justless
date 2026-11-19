@@ -3,14 +3,20 @@
 //! with their Tree-sitter grammar, whose ERROR and MISSING nodes mark the text
 //! it could not fit.
 //!
-//! syn follows stable Rust, so any error it finds is certain. A bundled
-//! Tree-sitter grammar can lag behind its language, such as TypeScript variance
-//! annotations or Kotlin context parameters, and reports an ERROR node for valid
-//! newer syntax. An error is certain there only when a token is missing or the
-//! edit leaves brackets that no longer pair up, which no version of the language
+//! syn follows stable Rust, so an error it finds is certain, unless the crate
+//! enables unstable features with `#![feature(…)]` and may use syntax syn does
+//! not know, such as `super let` or `gen` blocks. There only an unclosed or
+//! unmatched delimiter is certain, since no Rust accepts one. syn reads the
+//! arguments of a macro call as tokens, so it finds no error in them, such as
+//! `vec![1,, 2]`, as long as their delimiters pair up. A bundled Tree-sitter
+//! grammar can lag behind its language, such as TypeScript variance annotations
+//! or Kotlin context parameters, and reports an ERROR node for valid newer
+//! syntax. An error is certain there only when a token is missing or the edit
+//! leaves brackets that no longer pair up, which no version of the language
 //! accepts. Other errors are reported, and the edit is not blocked.
 
 use std::ops::{ControlFlow, Range};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tree_sitter::{ParseOptions, ParseState, Parser, Tree};
@@ -100,8 +106,9 @@ pub enum Verdict {
         problem: Problem,
         parsed_before: bool,
         /// The file parsed before, and the problem is one that no version of the
-        /// language accepts: any syn error, a missing token, or brackets the edit
-        /// left unpaired. Only a certain problem blocks an edit.
+        /// language accepts: a syn error outside a crate that enables unstable
+        /// features, an unpaired Rust delimiter, a missing token, or brackets the
+        /// edit left unpaired. Only a certain problem blocks an edit.
         certain: bool,
         /// The edit changed how the file's brackets pair up.
         unbalanced: bool,
@@ -402,11 +409,13 @@ fn mapped(position: usize, changes: &[Change]) -> Option<usize> {
     position.checked_add_signed(shift)
 }
 
-/// Judges an edit of `file` from `before`, or from no file, to `after`. Returns
-/// `None` when the file's kind is not checked. With `need_before` false, a file
-/// that parses after the edit is `Clean` without parsing the text before it.
-/// With it true, both texts are parsed at once.
+/// Judges an edit of `file`, a path within the workspace at `root`, from
+/// `before`, or from no file, to `after`. Returns `None` when the file's kind is
+/// not checked. With `need_before` false, a file that parses after the edit is
+/// `Clean` without parsing the text before it. With it true, both texts are
+/// parsed at once.
 pub fn judge(
+    root: &Path,
     file: &str,
     before: Option<&str>,
     after: &str,
@@ -459,7 +468,12 @@ pub fn judge(
             .find(|problem| problem.missing || unbalanced && problem.bracket)
             .unwrap_or(first)
             .clone();
-        let certain = blocks(file) && (file.ends_with(".rs") || problem.missing || unbalanced);
+        let certain = blocks(file)
+            && if file.ends_with(".rs") {
+                problem.bracket || !unstable_rust(root, file, after)
+            } else {
+                problem.missing || unbalanced
+            };
         return Some(Verdict::Introduced {
             problem,
             parsed_before: true,
@@ -508,6 +522,46 @@ pub fn judge(
     })
 }
 
+/// Whether the Rust file `file` is in a crate that enables unstable features:
+/// its text `after`, or a `lib.rs` or `main.rs` in a directory above it within
+/// its package, such as the crate root `src/lib.rs` of `src/net/tcp.rs`, holds
+/// `#![feature(…)]`. syn parses stable Rust, so such a crate may use syntax it
+/// rejects. Guard patterns, for one, need `#![feature(guard_patterns)]`, and
+/// stable rustc rejects them as experimental, so outside such a crate a syn
+/// error stays certain.
+fn unstable_rust(root: &Path, file: &str, after: &str) -> bool {
+    if enables_features(after) {
+        return true;
+    }
+    let path = Path::new(file);
+    for directory in path.ancestors().skip(1) {
+        let unstable = ["lib.rs", "main.rs"].iter().any(|name| {
+            let root_file = directory.join(name);
+            root_file != path
+                && std::fs::read_to_string(root.join(&root_file))
+                    .is_ok_and(|text| enables_features(&text))
+        });
+        if unstable {
+            return true;
+        }
+        if root.join(directory).join("Cargo.toml").is_file() {
+            break;
+        }
+    }
+    false
+}
+
+/// Whether `text` holds an inner attribute `#![feature(…)]`.
+fn enables_features(text: &str) -> bool {
+    text.match_indices("#!").any(|(at, _)| {
+        text[at + 2..]
+            .trim_start()
+            .strip_prefix('[')
+            .and_then(|rest| rest.trim_start().strip_prefix("feature"))
+            .is_some_and(|rest| rest.trim_start().starts_with('('))
+    })
+}
+
 /// The parses after and before an edit, run on two threads so that the check
 /// takes about as long as one parse, or `None` when either gave up. The second
 /// thread gets the main thread's stack, which deeply nested source needs.
@@ -552,6 +606,27 @@ pub fn located(file: &str, text: &str, problem: &Problem) -> String {
 mod tests {
     use super::*;
 
+    /// A workspace root that holds no crate root for `judge` to read.
+    const NO_ROOT: &str = "/nonexistent-justless-workspace";
+
+    #[test]
+    fn inner_feature_attributes_mark_unstable_rust() {
+        for text in [
+            "#![feature(super_let)]\nfn a() {}\n",
+            "//! Docs.\n#! [ feature (gen_blocks, yeet_expr) ]\n",
+        ] {
+            assert!(enables_features(text), "{text}");
+        }
+        for text in [
+            "#![cfg_attr(docsrs, feature(doc_cfg))]\n",
+            "#[feature(x)]\nfn a() {}\n",
+            "#![features(x)]\n",
+            "#!/usr/bin/env run\nfn a() {}\n",
+        ] {
+            assert!(!enables_features(text), "{text}");
+        }
+    }
+
     /// The first problem as `LINE:COLUMN message`.
     fn first(file: &str, text: &str) -> Option<String> {
         let found = problems(file, text).expect("a checked language");
@@ -569,7 +644,14 @@ mod tests {
             before: start..start + old.len(),
             after: start..start + new.len(),
         };
-        let verdict = judge(file, Some(before), &after, &[change], true);
+        let verdict = judge(
+            Path::new(NO_ROOT),
+            file,
+            Some(before),
+            &after,
+            &[change],
+            true,
+        );
         (after, verdict)
     }
 
@@ -670,14 +752,14 @@ mod tests {
         assert_eq!(edit("a.txt", "a\n", "a", "(").1, None);
         // A new file counts as parsing before.
         assert!(matches!(
-            judge("new.py", None, "def f(:\n", &[], false),
+            judge(Path::new(NO_ROOT), "new.py", None, "def f(:\n", &[], false),
             Some(Verdict::Introduced {
                 parsed_before: true,
                 ..
             })
         ));
         assert_eq!(
-            judge("new.py", None, "x = 1\n", &[], false),
+            judge(Path::new(NO_ROOT), "new.py", None, "x = 1\n", &[], false),
             Some(Verdict::Clean)
         );
     }
@@ -732,7 +814,14 @@ mod tests {
     /// problem that blocks it, "reported" for one that does not.
     fn judged(file: &str, before: &str, after: &str) -> &'static str {
         let change = Change::between(before, after);
-        match judge(file, Some(before), after, &[change], true) {
+        match judge(
+            Path::new(NO_ROOT),
+            file,
+            Some(before),
+            after,
+            &[change],
+            true,
+        ) {
             Some(Verdict::Clean) => "clean",
             Some(Verdict::Introduced { certain: true, .. }) => "certain",
             Some(Verdict::Introduced { certain: false, .. }) => "reported",
@@ -897,7 +986,14 @@ mod tests {
         let matlab = "function y = f(x)\n  y = x * 2;\nend\n";
         let change = Change::between(matlab, "function y = f(x\n");
         assert_eq!(
-            judge("f.m", Some(matlab), "function y = f(x\n", &[change], true),
+            judge(
+                Path::new(NO_ROOT),
+                "f.m",
+                Some(matlab),
+                "function y = f(x\n",
+                &[change],
+                true
+            ),
             None
         );
     }

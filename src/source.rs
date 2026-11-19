@@ -942,7 +942,7 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
     let verdict = if edited == source.text {
         None
     } else {
-        syntax_check::judge(file, Some(&source.text), &edited, &changes, true)
+        syntax_check::judge(&ws.root, file, Some(&source.text), &edited, &changes, true)
     };
     // Only a certain problem in a file that parsed blocks the edit. Others are
     // reported on stderr after it is written.

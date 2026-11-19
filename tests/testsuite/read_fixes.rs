@@ -66,6 +66,20 @@ impl Project {
         text(&output.stdout)
     }
 
+    /// `justless edit` with `input` on stdin.
+    fn edit(&self, args: &[&str], input: &str) -> Output {
+        let mut command = self.command(&self.root());
+        command.arg("edit").args(args);
+        piped(&mut command, input.as_bytes())
+    }
+
+    fn revision(&self, file: &str) -> String {
+        let outline: Value =
+            serde_json::from_str(&self.ok(&self.root(), &["read", file, "--outline", "--json"]))
+                .unwrap();
+        outline["revision"].as_str().unwrap().to_owned()
+    }
+
     /// The answer of `justless HANDLER MODE` run in `cwd` to `input`.
     fn hook(&self, cwd: &Path, handler: &str, mode: &str, input: &Value) -> String {
         let mut command = self.command(cwd);
@@ -408,4 +422,127 @@ fn compaction_forgets_the_session_in_nested_projects() {
     project.hook(&empty, "hook-claude", "after-compact", &start);
     assert!(!empty.join(".justless").exists());
     lacks(&view(&inner, &inner_view), "since you read it");
+}
+
+/// Edits of a crate that enables unstable features with `#![feature(…)]`, whose
+/// syntax syn does not parse.
+const NIGHTLY: [(&str, &str); 7] = [
+    (
+        "super_let",
+        "fn a() -> u32 {\n    let r = { super let x = 1; &x };\n    *r\n}",
+    ),
+    (
+        "gen_blocks",
+        "fn a() -> impl Iterator<Item = u32> {\n    gen { yield 1; yield 2; }\n}",
+    ),
+    ("yeet_expr", "fn a() -> Option<u32> {\n    do yeet;\n}"),
+    ("pin_ergonomics", "fn a(x: &pin mut u32) -> u32 {\n    1\n}"),
+    (
+        "unsafe_binders",
+        "fn a(_x: unsafe<'a> &'a u32) -> u32 {\n    1\n}",
+    ),
+    (
+        "ergonomic_clones",
+        "fn a() {\n    let s = String::new();\n    let f = use || s.len();\n    let _ = f;\n}",
+    ),
+    (
+        "guard_patterns",
+        "fn a(x: Option<u32>) -> u32 {\n    match x {\n        (Some(v) if v > 0) | None => 1,\n        _ => 0,\n    }\n}",
+    ),
+];
+
+#[test]
+fn feature_gated_crates_get_syn_errors_reported_not_rejected() {
+    let project = Project::new();
+    let root = project.root();
+    git(&root, &["init", "-q"]);
+    project.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    let stable = "fn a() -> u32 {\n    1\n}\n";
+    for (feature, body) in NIGHTLY {
+        // The same edit of a crate on stable Rust is rejected.
+        project.write("src/lib.rs", stable);
+        let rejected = project.edit(
+            &[
+                "src/lib.rs",
+                "a",
+                "--revision",
+                &project.revision("src/lib.rs"),
+            ],
+            body,
+        );
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{feature}: {}",
+            text(&rejected.stderr)
+        );
+        assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), stable);
+
+        let before = format!("#![feature({feature})]\n{stable}");
+        project.write("src/lib.rs", &before);
+        let written = project.edit(
+            &[
+                "src/lib.rs",
+                "a",
+                "--revision",
+                &project.revision("src/lib.rs"),
+            ],
+            body,
+        );
+        assert!(
+            written.status.success(),
+            "{feature}: {}",
+            text(&written.stderr)
+        );
+        has(
+            &text(&written.stderr),
+            "warning: src/lib.rs may no longer parse",
+        );
+        has(&fs::read_to_string(root.join("src/lib.rs")).unwrap(), body);
+    }
+
+    // A module of a crate whose root enables a feature.
+    project.write("src/lib.rs", "#![feature(super_let)]\nmod m;\n");
+    project.write("src/m.rs", stable);
+    let (_, body) = NIGHTLY[0];
+    let written = project.edit(
+        &["src/m.rs", "a", "--revision", &project.revision("src/m.rs")],
+        body,
+    );
+    assert!(written.status.success(), "{}", text(&written.stderr));
+    has(
+        &text(&written.stderr),
+        "warning: src/m.rs may no longer parse",
+    );
+
+    // Claude Code's Edit gets the note for a lagging parser.
+    let path = project.write("src/m.rs", stable);
+    let after = format!("{body}\n");
+    fs::write(&path, &after).unwrap();
+    let event = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Edit","cwd":root,
+        "tool_input":{"file_path":path},"tool_response":{"originalFile":stable}});
+    let note = project.json_hook(&root, "hook-claude", "after-edit", &event);
+    has(
+        note["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default(),
+        "The parser may not know newer syntax",
+    );
+
+    // Brackets that no longer pair up are wrong in any Rust.
+    project.write("src/m.rs", stable);
+    let rejected = project.edit(
+        &["src/m.rs", "a", "--revision", &project.revision("src/m.rs")],
+        "fn a() -> u32 {\n    1 +",
+    );
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "{}",
+        text(&rejected.stderr)
+    );
+    has(&text(&rejected.stderr), "unclosed `{`");
 }
