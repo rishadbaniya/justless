@@ -2996,22 +2996,26 @@ mod tests {
 
         // Every fresh hook file is understood and current, as it is or with
         // justless called by path.
-        for (_, agent) in AGENTS {
+        for (name, agent) in AGENTS {
             if agent == Agent::OpenCode {
                 continue;
             }
             let fresh = agents::fresh_hooks(agent).unwrap();
             let (group, expected) = expected_hooks(&serde_json::from_str(&fresh).unwrap()).unwrap();
-            assert!(!expected.is_empty());
+            assert!(!expected.is_empty(), "{name}");
             let by_path = fresh.replace("\"justless hook-", "\"/opt/bin/justless hook-");
             for (text, paths) in [(&fresh, &[][..]), (&by_path, &["/opt/bin/justless"])] {
+                let case = format!("{name} {paths:?}");
                 let config: Value = serde_json::from_str(text).unwrap();
                 let audit = audit_config(agent, &config, &group, &expected);
-                assert_eq!(audit.found, expected.len());
-                assert!(audit.missing.is_empty() && audit.unexpected.is_empty());
-                assert!(audit.drift.is_empty(), "{}", audit.drift[0].key);
-                assert!(audit.shape.is_none());
-                assert_eq!(audit.paths, paths);
+                assert_eq!(audit.found, expected.len(), "{case}");
+                assert!(
+                    audit.missing.is_empty() && audit.unexpected.is_empty(),
+                    "{case}"
+                );
+                assert!(audit.drift.is_empty(), "{case}: {}", audit.drift[0].key);
+                assert!(audit.shape.is_none(), "{case}");
+                assert_eq!(audit.paths, paths, "{case}");
             }
         }
     }

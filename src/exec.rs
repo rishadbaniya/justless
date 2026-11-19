@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(prefix(Lang::Bun, ""), "run");
         assert_eq!(prefix(Lang::Bun, "--smol"), "run --smol");
         assert_eq!(prefix(Lang::Sh, "-e"), "-e");
-        assert_eq!(prefix(Lang::Python3, ""), "");
+        assert!(Lang::Python3.prefix(&[]).is_empty());
     }
 
     #[test]
