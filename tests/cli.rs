@@ -4943,10 +4943,7 @@ fn warm_index_reads_its_cache_in_bulk() {
     let warm = success(path, &["index"]);
     let elapsed = started.elapsed();
     assert!(warm.contains("0 parsed · 4 reused"), "{warm}");
-    assert!(
-        elapsed < std::time::Duration::from_secs(4),
-        "warm index took {elapsed:?}"
-    );
+    assert!(elapsed.as_secs() < 4, "warm index took {elapsed:?}");
 }
 
 #[test]
@@ -4965,50 +4962,40 @@ fn state_locks_time_out_with_a_message_and_reads_do_not_wait() {
         file.lock().unwrap();
         file
     };
-    let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_justless"))
-            .args(args)
+    // Every run must succeed; it returns its stdout and stderr.
+    let run = |args: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(argv(args))
             .current_dir(path)
             .env("JUSTLESS_LOCK_TIMEOUT", "1.5")
             .output()
-            .unwrap()
+            .unwrap();
+        assert!(output.status.success(), "{args}: {}", stderr(&output));
+        (stdout(&output), stderr(&output))
     };
     let index_lock = hold("index.lock");
     // A writer that cannot take the lock still answers from what it parsed.
     let started = std::time::Instant::now();
-    let cold = run(&["query", "apply_fee", "--view", "definition"]);
-    assert!(cold.status.success(), "{}", stderr(&cold));
-    assert!(
-        stdout(&cold).contains("src/pricing.rs:5-7"),
-        "{}",
-        stdout(&cold)
-    );
-    let message = stderr(&cold);
-    assert!(
-        message.contains("waiting for")
-            && message.contains("index.lock")
-            && message.contains("index cache not saved: timed out after"),
-        "{message}"
-    );
+    let (cold, message) = run("query apply_fee --view definition");
+    assert!(cold.contains("src/pricing.rs:5-7"), "{cold}");
+    let waited = [
+        "waiting for",
+        "index.lock",
+        "index cache not saved: timed out after",
+    ];
+    assert_all_in(&message, &waited);
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     drop(index_lock);
     assert!(success(path, &["index"]).contains("4 parsed"));
     // Unchanged sources need no lock at all: no wait message, no timeout.
     let index_lock = hold("index.lock");
-    let warm = run(&["query", "apply_fee", "--view", "definition"]);
-    assert!(warm.status.success(), "{}", stderr(&warm));
-    assert_eq!(stderr(&warm), "");
+    assert_eq!(run("query apply_fee --view definition").1, "");
     drop(index_lock);
     // A held capture lock degrades to a run without a baseline instead of hanging.
     let capture_lock = hold("capture.lock");
-    let captured = run(&["run", "--", "echo", "hello"]);
-    assert!(captured.status.success(), "{}", stderr(&captured));
-    assert!(stdout(&captured).contains("hello"));
-    assert!(
-        stderr(&captured).contains("timed out after"),
-        "{}",
-        stderr(&captured)
-    );
+    let (captured, message) = run("run -- echo hello");
+    assert!(captured.contains("hello"));
+    assert!(message.contains("timed out after"), "{message}");
     drop(capture_lock);
 }
 
@@ -5020,6 +5007,11 @@ fn write_files(root: &Path, files: &[(&str, &str)]) {
     }
 }
 
+/// The Cargo.toml of an edition 2021 package called `name`.
+fn edition_2021_manifest(name: &str) -> String {
+    format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+}
+
 #[test]
 fn rust_references_follow_globs_variants_trait_uses_and_twins() {
     let repo = TempDir::new().unwrap();
@@ -5027,10 +5019,7 @@ fn rust_references_follow_globs_variants_trait_uses_and_twins() {
     write_files(
         root,
         &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("Cargo.toml", &edition_2021_manifest("demo")),
             ("src/lib.rs", "pub mod a;\npub mod b;\npub mod twins;\n"),
             (
                 "src/a.rs",
@@ -5047,15 +5036,15 @@ fn rust_references_follow_globs_variants_trait_uses_and_twins() {
         ],
     );
     // `use super::*` reaches the item the parent module imported.
-    let callers = success(root, &["query", "Widget::new", "--view", "callers"]);
+    let callers = success(root, &argv("query Widget::new --view callers"));
     assert!(
         callers.contains("call from demo::b::tests::makes_widget at src/b.rs:38"),
         "{callers}"
     );
-    let tests = success(root, &["query", "Widget::new", "--view", "tests"]);
+    let tests = success(root, &argv("query Widget::new --view tests"));
     assert!(tests.contains("demo::b::tests::makes_widget"), "{tests}");
     // Variant uses and patterns count as references to their enum.
-    let status = success(root, &["query", "Status", "--view", "references"]);
+    let status = success(root, &argv("query Status --view references"));
     for line in ["src/b.rs:9", "src/b.rs:10", "src/b.rs:15"] {
         assert!(status.contains(line), "{line}: {status}");
     }
@@ -5085,15 +5074,8 @@ fn rust_references_follow_globs_variants_trait_uses_and_twins() {
             && message.contains("(select demo::twins::tune@src/twins.rs:6)"),
         "{message}"
     );
-    let second = success(
-        root,
-        &[
-            "query",
-            "demo::twins::tune@src/twins.rs:6",
-            "--view",
-            "callers",
-        ],
-    );
+    let selected = "query demo::twins::tune@src/twins.rs:6 --view callers";
+    let second = success(root, &argv(selected));
     assert!(
         second.starts_with("demo::twins::tune [function] at src/twins.rs:6-9\n")
             && second.contains("possible call from demo::twins::run at src/twins.rs:12"),
@@ -5105,11 +5087,10 @@ fn rust_references_follow_globs_variants_trait_uses_and_twins() {
             && run.contains("possible call → demo::twins::tune [function] at src/twins.rs:6-9"),
         "{run}"
     );
-    let missing = cli(root, &["query", "demo::twins::tune@src/twins.rs:11"]);
+    let missing = stderr(&cli(root, &["query", "demo::twins::tune@src/twins.rs:11"]));
     assert!(
-        stderr(&missing).contains("symbol not found: demo::twins::tune at src/twins.rs:11"),
-        "{}",
-        stderr(&missing)
+        missing.contains("symbol not found: demo::twins::tune at src/twins.rs:11"),
+        "{missing}"
     );
 }
 
@@ -5117,29 +5098,15 @@ fn rust_references_follow_globs_variants_trait_uses_and_twins() {
 fn ambiguity_lists_say_how_many_candidates_they_leave_out() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let mut files = vec![(
-        "Cargo.toml".to_owned(),
-        "[package]\nname = \"many\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_owned(),
-    )];
-    let mut lib = String::new();
-    for module in 0..15 {
-        lib.push_str(&format!("pub mod m{module};\n"));
-        files.push((format!("src/m{module}.rs"), "pub struct Args;\n".to_owned()));
+    let manifest = edition_2021_manifest("many");
+    let lib: String = (0..15).map(|id| format!("pub mod m{id};\n")).collect();
+    write_files(root, &[("Cargo.toml", &manifest), ("src/lib.rs", &lib)]);
+    for id in 0..15 {
+        fs::write(root.join(format!("src/m{id}.rs")), "pub struct Args;\n").unwrap();
     }
-    files.push(("src/lib.rs".to_owned(), lib));
-    let files: Vec<_> = files
-        .iter()
-        .map(|(file, text)| (file.as_str(), text.as_str()))
-        .collect();
-    write_files(root, &files);
     let message = stderr(&cli(root, &["query", "Args"]));
-    assert_eq!(
-        message
-            .lines()
-            .filter(|line| line.contains(" at src/"))
-            .count(),
-        12
-    );
+    let listed = message.lines().filter(|line| line.contains(" at src/"));
+    assert_eq!(listed.count(), 12, "{message}");
     assert!(message.ends_with("  … and 3 more\n"), "{message}");
 }
 
@@ -5178,10 +5145,8 @@ fn sql_writes_and_schema_qualified_tables_link_by_short_name() {
             && log.contains("possible SQL relation from app.py::save at app.py:3"),
         "{log}"
     );
-    write_files(
-        root,
-        &[("billing.sql", "CREATE TABLE billing.event_log (id INT);\n")],
-    );
+    let billing = "CREATE TABLE billing.event_log (id INT);\n";
+    write_files(root, &[("billing.sql", billing)]);
     let ambiguous = stderr(&cli(root, &["query", "event_log"]));
     assert!(
         ambiguous.contains("ambiguous symbol event_log")
@@ -5248,7 +5213,7 @@ fn unreadable_files_and_directories_are_skipped_and_reported() {
         let found = cli(root, &["find", "VISIBLE_NEEDLE"]);
         let query = cli(root, &["query", "visible_fn"]);
         let index = cli(root, &["index"]);
-        let missing = cli(root, &["query", "locked"]);
+        let missing = stderr(&cli(root, &["query", "locked"]));
         set_mode(&root.join("secret"), 0o755);
         set_mode(&root.join("locked.rs"), 0o644);
         if !enforced {
@@ -5263,16 +5228,13 @@ fn unreadable_files_and_directories_are_skipped_and_reported() {
             skipped.contains("locked.rs: not indexed, unreadable: Permission denied"),
             "{git}: {skipped}"
         );
-        if !git {
-            assert!(
-                skipped.contains("secret: not indexed, unreadable: Permission denied"),
-                "{skipped}"
-            );
-        }
         assert!(
-            stderr(&missing).contains("symbol not found: locked\nNot indexed: "),
-            "{git}: {}",
-            stderr(&missing)
+            git || skipped.contains("secret: not indexed, unreadable: Permission denied"),
+            "{skipped}"
+        );
+        assert!(
+            missing.contains("symbol not found: locked\nNot indexed: "),
+            "{git}: {missing}"
         );
     }
 }
@@ -5288,10 +5250,7 @@ fn tracked_target_modules_are_indexed_and_oversized_files_are_reported() {
     write_files(
         root,
         &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"skip\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("Cargo.toml", &edition_2021_manifest("skip")),
             (
                 "src/lib.rs",
                 "pub mod target;\npub mod big;\npub fn top() { target::aim(); }\n",
@@ -5314,12 +5273,10 @@ fn tracked_target_modules_are_indexed_and_oversized_files_are_reported() {
     );
     assert!(success(root, &["find", "pub fn aim"]).contains("src/target/mod.rs:1: pub fn aim"));
     assert!(stderr(&cli(root, &["query", "generated"])).contains("symbol not found"));
-    let index = cli(root, &["index"]);
+    let index = stderr(&cli(root, &["index"]));
     assert!(
-        stderr(&index)
-            .contains("src/big.rs: not indexed, 2720020 bytes, over max_file_bytes (2097152)"),
-        "{}",
-        stderr(&index)
+        index.contains("src/big.rs: not indexed, 2720020 bytes, over max_file_bytes (2097152)"),
+        "{index}"
     );
     let missing = stderr(&cli(root, &["query", "huge_fn"]));
     assert!(
@@ -5356,11 +5313,10 @@ fn unusual_file_names_stay_searchable_and_on_one_line() {
     assert!(found.contains(":1: pub fn token_nfd()"), "{found}");
     assert!(success(root, &["query", "token_nfd"]).contains(&listed));
     assert!(success(root, &["read", &listed]).contains("NEEDLE_NFD"));
-    fs::write(
-        root.join("src/a\nb.rs"),
-        "pub fn nl_fn() {}\n// NEEDLE_NL\n",
-    )
-    .unwrap();
+    write_files(
+        root,
+        &[("src/a\nb.rs", "pub fn nl_fn() {}\n// NEEDLE_NL\n")],
+    );
     assert_eq!(
         success(root, &["find", "NEEDLE_NL"]),
         "\"src/a\\nb.rs\":2: // NEEDLE_NL\n"
@@ -5378,10 +5334,7 @@ fn changes_show_every_symbol_of_a_new_file_and_name_deletions() {
     write_files(
         root,
         &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"multi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("Cargo.toml", &edition_2021_manifest("multi")),
             ("src/lib.rs", "pub mod engine;\n"),
             (".gitignore", "/.justless/\n"),
             (
@@ -5453,10 +5406,8 @@ fn context_and_find_state_their_limits() {
         success(root, &["query", "pricing.py::fee", "--view", "definition"]),
         "pricing.py::fee [function] at pricing.py:4-6\n"
     );
-    assert!(
-        success(root, &["context", "--symbol", "pricing.py::fee"])
-            .contains("  4 | @functools.lru_cache(maxsize=8)\n")
-    );
+    let fee = success(root, &argv("context --symbol pricing.py::fee"));
+    assert!(fee.contains("  4 | @functools.lru_cache(maxsize=8)\n"));
     let limited = success(root, &["find", "marker", "--limit", "3"]);
     assert_eq!(limited.lines().count(), 5, "{limited}");
     assert!(
@@ -5469,16 +5420,13 @@ fn context_and_find_state_their_limits() {
         "{all}"
     );
     for args in [
-        &["code", "main.py", "--from", "400", "--to", "410"][..],
-        &["context", "--at", "main.py:5000"],
+        "code main.py --from 400 --to 410",
+        "context --at main.py:5000",
     ] {
-        let output = cli(root, args);
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(
-            stderr(&output).contains("main.py has 2 lines; line"),
-            "{}",
-            stderr(&output)
-        );
+        let output = cli(root, &argv(args));
+        assert_eq!(output.status.code(), Some(2), "{args}");
+        let message = stderr(&output);
+        assert!(message.contains("main.py has 2 lines; line"), "{message}");
     }
     assert_eq!(
         success(root, &["code", "main.py", "--from", "1", "--to", "40"]),
@@ -5502,10 +5450,7 @@ fn packs_rank_names_that_cover_the_question_above_single_word_matches() {
     write_files(
         root,
         &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"market\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("Cargo.toml", &edition_2021_manifest("market")),
             ("src/lib.rs", "pub mod book;\npub mod signing;\n"),
             (
                 "src/book.rs",
@@ -5582,10 +5527,7 @@ fn wide_ranges_name_class_members_and_hints_skip_binaries() {
         ],
     );
     fs::write(root.join("clip.wav"), media).unwrap();
-    let wide = success(
-        root,
-        &["context", "--at", "engine.py:1-22", "--budget", "4000"],
-    );
+    let wide = success(root, &argv("context --at engine.py:1-22 --budget 4000"));
     assert!(
         wide.starts_with("engine.py:1-22 · 2 symbols: Engine, drive\n")
             && wide.contains("  overlaps engine.py::Engine::m0 [function] at engine.py:2-3\n")
@@ -5609,12 +5551,8 @@ fn claude_background_commands_pass_through() {
     let root = repo.path().canonicalize().unwrap();
     fs::create_dir(root.join(".justless")).unwrap();
     let call = |input: serde_json::Value| {
-        agent_hook(
-            &root,
-            "hook-claude",
-            "before-command",
-            serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":input}),
-        )
+        let event = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":input});
+        agent_hook(&root, "hook-claude", "before-command", event)
     };
     // A background command returns at once and streams later. Wrapped, it would
     // show nothing until it exits.
@@ -5676,26 +5614,15 @@ fn directory_changes_that_can_leave_the_workspace_pass_through() {
             assert_eq!(rewrite(agent, command), None, "{agent} {command}");
         }
     }
-    for (command, expected) in [
-        (
-            "cd sub && git status",
-            "cd sub && justless run --hook -- git status",
-        ),
-        (
-            "cd ./sub/ && cd deeper && git status",
-            "cd ./sub/ && cd deeper && justless run --hook -- git status",
-        ),
-        (
-            "cd inner && git status",
-            "cd inner && justless run --hook -- git status",
-        ),
+    // Changes that stay inside the workspace still route the command after them.
+    for command in [
+        "cd sub && git status",
+        "cd ./sub/ && cd deeper && git status",
+        "cd inner && git status",
     ] {
+        let wrapped = Some(command.replace("git status", "justless run --hook -- git status"));
         for agent in ["hook-claude", "hook-codex"] {
-            assert_eq!(
-                rewrite(agent, command).as_deref(),
-                Some(expected),
-                "{agent} {command}"
-            );
+            assert_eq!(rewrite(agent, command), wrapped, "{agent} {command}");
         }
     }
 }
@@ -5707,19 +5634,14 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
     fs::create_dir_all(root.join(".justless")).unwrap();
     let root = root.canonicalize().unwrap();
     let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let claude = |command: &str| agent_hook(&root, "hook-claude", "before-command", call(command));
     let absolute = format!("cd {} && cargo test", root.display());
     for command in [absolute.as_str(), "ls && cd /tmp && git status"] {
-        assert_eq!(
-            agent_hook(&root, "hook-claude", "before-command", call(command)),
-            serde_json::json!({}),
-            "{command}"
-        );
+        assert_eq!(claude(command), serde_json::json!({}), "{command}");
     }
     // Codex declines a list with an unsupported command and counts each command once.
-    assert_eq!(
-        hook(&root, "before-command", call("cargo test && git push")),
-        serde_json::json!({})
-    );
+    let codex = hook(&root, "before-command", call("cargo test && git push"));
+    assert_eq!(codex, serde_json::json!({}));
     let stats: serde_json::Value =
         serde_json::from_str(&success(&root, &["stats", "--json"])).unwrap();
     assert_eq!(
@@ -5731,40 +5653,15 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
     // `discover` applies the hook's own rules, so a list the hook passes through
     // is not reported as a missing hook.
     let config = repo.path().join("claude");
-    let slug: String = root
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let transcripts = config.join("projects").join(slug);
-    fs::create_dir_all(&transcripts).unwrap();
-    let mut lines = Vec::new();
     // Claude Code's command hook leaves a read list to the post-command hook,
     // which keeps a small result as it is.
     let reads = "git diff --stat; git diff";
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "before-command", call(reads)),
-        serde_json::json!({})
-    );
-    for (id, command) in [
-        ("t1", absolute.as_str()),
-        ("t2", "grep -rn x src"),
-        ("t3", reads),
-    ] {
-        lines.push(serde_json::json!({"type":"assistant","cwd":root,"timestamp":"2999-01-01T00:00:00Z",
-            "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}}).to_string());
-        lines.push(serde_json::json!({"type":"user","cwd":root,"timestamp":"2999-01-01T00:00:01Z",
-            "message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"x".repeat(900)}]}}).to_string());
-    }
-    fs::write(transcripts.join("session.jsonl"), lines.join("\n")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["discover", "--json"])
-        .current_dir(&root)
-        .env("CLAUDE_CONFIG_DIR", &config)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(claude(reads), serde_json::json!({}));
+    let output = "x".repeat(900);
+    let calls = [absolute.as_str(), "grep -rn x src", reads].map(|c| (c, output.as_str()));
+    write_transcripts(&root, &config, &[("session.jsonl", &calls)]);
+    let report = claude_config_success(&root, &config, &["discover", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
     let groups = report["groups"].as_array().unwrap();
     assert_eq!(report["commands"], 3, "{report}");
     // A list the hook declines on purpose must never read as a missing hook.
@@ -5782,18 +5679,10 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
                     .iter()
                     .any(|l| l["label"] == label)
             })
-            .map(|g| g["route"].clone())
+            .and_then(|g| g["route"].as_str())
     };
-    assert_eq!(
-        route("cargo test"),
-        Some(serde_json::json!("passed_through")),
-        "{report}"
-    );
-    assert_eq!(
-        route("grep"),
-        Some(serde_json::json!("not_supported")),
-        "{report}"
-    );
+    assert_eq!(route("cargo test"), Some("passed_through"), "{report}");
+    assert_eq!(route("grep"), Some("not_supported"), "{report}");
 }
 
 #[test]
@@ -5801,14 +5690,9 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
-    let cursor = |command: &str| {
-        agent_hook(
-            &root,
-            "hook-cursor",
-            "before-command",
-            serde_json::json!({"tool_name":"Shell","cwd":root,"tool_input":{"command":command}}),
-        )
-    };
+    let codex = |command: &str| hook(&root, "before-command", call(command));
+    let shell = |command: &str| serde_json::json!({"tool_name":"Shell","cwd":root,"tool_input":{"command":command}});
+    let cursor = |command: &str| agent_hook(&root, "hook-cursor", "before-command", shell(command));
     for command in [
         "make install",
         "make deploy",
@@ -5860,11 +5744,7 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "gradle test -Pci",
         "dotnet test -p:CI=true",
     ] {
-        assert_eq!(
-            hook(&root, "before-command", call(command)),
-            serde_json::json!({}),
-            "{command}"
-        );
+        assert_eq!(codex(command), serde_json::json!({}), "{command}");
         assert_eq!(cursor(command), serde_json::json!({}), "{command}");
     }
     // Claude Code checks the rewritten command itself, so its hook still routes them.
@@ -5906,15 +5786,10 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "python -m poetry run pytest",
         "pytest -o cache_dir=.cache/pytest tests",
     ] {
-        let output = hook(&root, "before-command", call(command));
-        assert_eq!(
-            output["hookSpecificOutput"]["permissionDecision"], "allow",
-            "{command}"
-        );
-        assert_eq!(
-            output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!("justless run --hook -- {command}")
-        );
+        let decision = codex(command)["hookSpecificOutput"].clone();
+        assert_eq!(decision["permissionDecision"], "allow", "{command}");
+        let wrapped = format!("justless run --hook -- {command}");
+        assert_eq!(decision["updatedInput"]["command"], wrapped, "{command}");
         assert_eq!(cursor(command)["permission"], "allow", "{command}");
     }
     // `python -m RUNNER` decides exactly as `RUNNER` does.
@@ -5937,16 +5812,8 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "pipenv run",
         "bundle exec",
     ] {
-        let direct = hook(
-            &root,
-            "before-command",
-            call(&format!("{runner} pytest -q")),
-        );
-        let module = hook(
-            &root,
-            "before-command",
-            call(&format!("python -m {runner} pytest -q")),
-        );
+        let direct = codex(&format!("{runner} pytest -q"));
+        let module = codex(&format!("python -m {runner} pytest -q"));
         assert_eq!(
             direct["hookSpecificOutput"]["permissionDecision"],
             module["hookSpecificOutput"]["permissionDecision"],
@@ -6014,26 +5881,21 @@ fn init_edits_a_linked_instructions_file_once_and_keeps_the_link() {
     // A link that leaves the project is skipped, and hooks are still installed.
     let other = repo.path().join("other");
     fs::create_dir(&other).unwrap();
-    fs::write(repo.path().join("shared.md"), "# Shared\n").unwrap();
+    let shared = repo.path().join("shared.md");
+    fs::write(&shared, "# Shared\n").unwrap();
     std::os::unix::fs::symlink("../shared.md", other.join("CLAUDE.md")).unwrap();
     let output = cli(&other, &["init", "--hooks", "--agent", "claude"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).contains("Skipped CLAUDE.md"));
-    assert_eq!(
-        fs::read_to_string(repo.path().join("shared.md")).unwrap(),
-        "# Shared\n"
-    );
+    assert_eq!(fs::read_to_string(&shared).unwrap(), "# Shared\n");
     assert!(other.join(".claude/settings.json").is_file());
 
     // A setup that fails leaves no state directory behind.
     let broken = repo.path().join("broken");
     fs::create_dir_all(broken.join(".claude")).unwrap();
     fs::write(broken.join(".claude/settings.json"), "[]").unwrap();
-    assert!(
-        !cli(&broken, &["init", "--hooks", "--agent", "claude"])
-            .status
-            .success()
-    );
+    let failed = cli(&broken, &["init", "--hooks", "--agent", "claude"]);
+    assert!(!failed.status.success(), "{}", stdout(&failed));
     assert!(!broken.join(".justless").exists());
     assert!(!broken.join("CLAUDE.md").exists());
 }
