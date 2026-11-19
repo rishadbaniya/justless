@@ -188,6 +188,7 @@ impl Inventory {
             kind: "inventory".into(),
             outcomes,
             items: self.issues,
+            ..Summary::default()
         }
     }
 }

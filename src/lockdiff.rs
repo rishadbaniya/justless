@@ -571,6 +571,7 @@ mod tests {
                 item("src/lib.rs", 50),
             ],
             outcomes: Vec::new(),
+            ..Summary::default()
         };
         let section = |head: &str| Section {
             path: "Cargo.lock".into(),

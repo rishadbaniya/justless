@@ -104,7 +104,7 @@ static TOTAL: LazyLock<Regex> = LazyLock::new(|| {
 // The package and, in recent Cargo, the target, such as `(lib test)` or `(bin "x")`.
 static UNCOMPILED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^error: could not compile `([^`]+)`(?: \(([^)]+)\))?").unwrap());
-static CARGO_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static CARGO_STATUS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^ +(?:Compiling|Checking|Finished|Building|Blocking|Fresh|Documenting|Downloaded|Downloading|Updating|Locking|Adding|Running|Packaging|Verifying) \S",
     )
@@ -274,6 +274,10 @@ pub struct Lint {
     uncompiled_at: String,
     unlocated_errors: usize,
     other: [Other; 2],
+    /// Cargo's status lines among `other`, per stream: count, first and last line.
+    status: [(usize, usize, usize); 2],
+    /// The last `Finished` status line.
+    finished: String,
     overflow: bool,
 }
 
@@ -297,6 +301,8 @@ impl Lint {
             uncompiled_at: String::new(),
             unlocated_errors: 0,
             other: Default::default(),
+            status: [(0, 0, 0); 2],
+            finished: String::new(),
             overflow: false,
         }
     }
@@ -312,7 +318,47 @@ impl Lint {
         let line = text.trim_end_matches(['\n', '\r']);
         if !self.classify(line, n, stream) && !line.trim().is_empty() {
             self.other[stream as usize].note(n, line);
+            if CARGO_STATUS.is_match(line) {
+                let status = &mut self.status[stream as usize];
+                *status = (status.0 + 1, if status.0 == 0 { n } else { status.1 }, n);
+                if line.trim_start().starts_with("Finished ") {
+                    self.finished = short(line.trim(), 200);
+                }
+            }
         }
+    }
+
+    /// One line for a run that printed only Cargo's status lines, such as a clean
+    /// `cargo clippy`, with the range of those lines on each stream and the last
+    /// `Finished` line. `None` when the run printed anything else.
+    pub fn clean(&self, label: &str) -> Option<String> {
+        let only_status = (0..2).all(|i| self.other[i].count == self.status[i].0);
+        if self.overflow
+            || !only_status
+            || self.block.is_some()
+            || !self.findings.is_empty()
+            || !self.outcomes.is_empty()
+            || !self.uncompiled.is_empty()
+            || self.hidden_outcomes > 0
+            || self.status.iter().all(|status| status.0 == 0)
+        {
+            return None;
+        }
+        let mut line = format!("{label}: 0 findings");
+        for stream in [Stream::Stdout, Stream::Stderr] {
+            let (count, first, last) = self.status[stream as usize];
+            if count > 0 {
+                let name = stream.name();
+                line.push_str(&format!(
+                    " · {count} cargo status line(s) [{name}:{first}-{last}]"
+                ));
+            }
+        }
+        if !self.finished.is_empty() {
+            line.push_str(&format!(" · {}", self.finished));
+        }
+        line.push('\n');
+        Some(line)
     }
 
     /// Record a line and return whether it belonged to a recognized shape.
@@ -587,8 +633,7 @@ impl Lint {
 
         let mut summary = Summary {
             kind: "lint".into(),
-            items: Vec::new(),
-            outcomes: Vec::new(),
+            ..Summary::default()
         };
         let mut header = format!(
             "{label}: {total} finding(s), {errors} error(s), {} warning(s) · {} rule(s) · {} file(s)",

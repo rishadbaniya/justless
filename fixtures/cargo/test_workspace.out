@@ -1,0 +1,76 @@
+
+running 2 tests
+test tests::greeting_names_the_customer ... ok
+test tests::invoice_total_adds_vat ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test prints_the_total ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+
+running 5 tests
+test money::tests::adds_vat ... ok
+test tax::tests::net_removes_tax ... ok
+test tax::tests::vat_is_a_fifth ... ok
+test tax::tests::vat_rounds_down ... ok
+test money::tests::displays_cents ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test rates_file_lists_the_standard_rate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test invoice_includes_vat ... ok
+test zero_has_no_vat ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+test stats::tests::mean_of_nothing_is_zero ... ok
+test stats::tests::mean_rounds_down ... ok
+test stats::tests::median_of_nothing_is_zero ... ok
+test stats::tests::median_sorts_first ... ok
+test stats::tests::peak_finds_the_largest ... ok
+test tests::table_has_one_line_per_row ... ok
+test tests::table_starts_with_the_title ... ok
+test tests::row_pads_both_columns ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test summary_table_lists_mean_and_peak ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test ledger/src/tax.rs - tax::vat (line 3) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

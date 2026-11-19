@@ -1,0 +1,5 @@
+   Compiling checkout-fixture v0.1.0 (/work/failing)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.85s
+     Running unittests src/lib.rs (/work/target/debug/deps/checkout_fixture-4b58a8d3c9315df3)
+     Running tests/checkout.rs (/work/target/debug/deps/checkout-08b118bf0c4a4cc2)
+error: test failed, to rerun pass `--test checkout`

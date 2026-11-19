@@ -9,6 +9,7 @@ Notable changes to Justless, newest release first, in the style of [Keep a Chang
 - `justless run -- COMMAND` keeps the exit status, shows a bounded preview and archives both streams; `log` replays any line range byte for byte.
 - `search RUN TEXT` finds text in one run and `history TEXT` in every run, failures first, and both count the matches they leave out.
 - Test failures from `cargo test`, `go test` and `pytest` are grouped by diagnostic, each linked to its log lines; JavaScript runners drop passing files.
+- `cargo test` reports its totals with one line per test binary, also after `2>&1`, and a clean `cargo build` or `clippy` is one line: this repository's 58.7 KB test run shows as 0.7 KB.
 - Compiler and linter findings are grouped by rule with a count and up to four locations, for rustc, Clippy, Ruff, mypy, ESLint, `tsc`, ShellCheck and more.
 - Searches are grouped by file and listings by directory, and searches with context lines report blocks: seven such searches went from 54,940 bytes to 16,045.
 - Git diffs, `git show` and `git log -p` are summarized by commit and hunk, and a `Cargo.lock` change names the packages added, removed and updated.

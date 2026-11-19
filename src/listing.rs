@@ -362,6 +362,7 @@ impl Listing {
                     item
                 })
                 .collect(),
+            ..Summary::default()
         };
         if self.total == 0 {
             return Some((String::new(), summary));

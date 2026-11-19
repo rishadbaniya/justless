@@ -15,6 +15,10 @@ pub struct Summary {
     pub kind: String,
     pub items: Vec<Item>,
     pub outcomes: Vec<String>,
+    /// `cargo test` totals per test binary, when they account for every line of
+    /// both streams. The report then stands in for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo: Option<crate::cargo_tests::Totals>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +71,7 @@ const LIMIT: usize = 2048;
 
 pub struct Parser {
     inventory: Option<crate::inventory::Inventory>,
+    cargo: Option<crate::cargo_tests::Scan>,
     summary: Summary,
     hash: Sha256,
     file: String,
@@ -119,6 +124,8 @@ impl Parser {
             inventory: profile
                 .filter(|p| p.inventory())
                 .map(crate::inventory::Inventory::new),
+            cargo: (family == "cargo test" && profile.is_none())
+                .then(crate::cargo_tests::Scan::default),
             summary: Summary {
                 kind: kind.into(),
                 ..Default::default()
@@ -196,7 +203,17 @@ impl Parser {
         if self.summary.kind == "diff" {
             self.diff(line, number);
         } else {
+            if let Some(cargo) = &mut self.cargo {
+                cargo.observe(line, number, crate::capture::Stream::Stdout);
+            }
             self.test(line, number);
+        }
+    }
+
+    /// Read a line of stderr, where `cargo test` names each test binary it runs.
+    pub fn observe_stderr(&mut self, text: &str, number: usize) {
+        if let Some(cargo) = &mut self.cargo {
+            cargo.observe(text, number, crate::capture::Stream::Stderr);
         }
     }
 
@@ -432,6 +449,7 @@ impl Parser {
         }
         self.flush();
         self.summary.items.extend(self.failures.into_values());
+        self.summary.cargo = self.cargo.and_then(crate::cargo_tests::Scan::finish);
         self.summary
     }
 }
@@ -599,10 +617,13 @@ impl Summary {
             if status != 0 && self.items.is_empty() {
                 return None;
             }
-            if self.items.is_empty() && self.failing_outcome().is_some() {
-                report.push_str("failing test names not in the captured output\n");
-            } else {
-                report.push_str(&format!("{} reported failing test(s)\n", self.items.len()));
+            // With no failing test, cargo's totals line comes first.
+            if !self.items.is_empty() || self.cargo.is_none() {
+                if self.items.is_empty() && self.failing_outcome().is_some() {
+                    report.push_str("failing test names not in the captured output\n");
+                } else {
+                    report.push_str(&format!("{} reported failing test(s)\n", self.items.len()));
+                }
             }
         }
         let previous = previous.filter(|(_, s)| s.kind == self.kind);
@@ -667,6 +688,10 @@ impl Summary {
             for item in &self.items {
                 report.push_str(&format!("{}\n", item.display()));
             }
+        }
+        if let Some(totals) = self.cargo.as_ref().filter(|_| self.kind == "tests") {
+            report.push_str(&totals.render());
+            return Some(report);
         }
         for line in self
             .outcomes

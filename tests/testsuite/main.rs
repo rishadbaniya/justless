@@ -1,6 +1,7 @@
 //! Integration suites for single features, built as one test binary so they link
 //! once and their tests run in parallel. `cargo test --test testsuite mcp::` runs one.
 
+mod cargo_reports;
 mod codex;
 mod codex_lists;
 mod common;

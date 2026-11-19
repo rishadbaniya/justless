@@ -1,0 +1,15 @@
+   Compiling ledger-core v0.1.0 (/work/affected/ledger)
+   Compiling reports v0.1.0 (/work/affected/reports)
+   Compiling api v0.1.0 (/work/affected/api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.70s
+     Running unittests src/lib.rs (/work/target/debug/deps/api-aca6214acba402d6)
+     Running unittests src/main.rs (/work/target/debug/deps/api-7f1c774c0611f1a9)
+     Running tests/cli.rs (/work/target/debug/deps/cli-054fc7bfd59f996f)
+     Running unittests src/lib.rs (/work/target/debug/deps/ledger_core-4910ccbcae0378e3)
+     Running tests/data.rs (/work/target/debug/deps/data-e275242b3355e08f)
+     Running tests/totals.rs (/work/target/debug/deps/totals-351b5586d12d3701)
+     Running unittests src/lib.rs (/work/target/debug/deps/reports-77da06e7782b37d7)
+     Running tests/summary.rs (/work/target/debug/deps/summary-cc789b3445dd2ae2)
+   Doc-tests api
+   Doc-tests ledger_core
+   Doc-tests reports

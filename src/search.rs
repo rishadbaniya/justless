@@ -1046,6 +1046,7 @@ impl Search {
                     item
                 })
                 .collect(),
+            ..Summary::default()
         };
         header.push('\n');
         let current = self.groups.iter().map(|g| (g.path.as_str(), g.matches));

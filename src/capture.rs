@@ -55,7 +55,7 @@ pub enum Stream {
 }
 
 impl Stream {
-    const BOTH: [Self; 2] = [Self::Stdout, Self::Stderr];
+    pub(crate) const BOTH: [Self; 2] = [Self::Stdout, Self::Stderr];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -1624,6 +1624,12 @@ impl Capture<'_> {
             && previous.as_ref().is_some_and(|p| {
                 p.produced_bytes.is_empty() && p.digests == run.digests && p.status == run.status
             });
+        // A clean build or lint run, in one line, when every line it printed is
+        // Cargo's status.
+        let clean = lint
+            .as_ref()
+            .filter(|_| status == 0)
+            .and_then(|lint| lint.clean(&crate::filters::tool_label(args)));
         let lint = lint.and_then(|lint| {
             lint.finish(
                 &crate::filters::tool_label(args),
@@ -1647,6 +1653,8 @@ impl Capture<'_> {
             run.summary = summary.clone();
         }
         let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
+        // A report that accounts for every line of both streams replaces both.
+        let whole = run.summary.cargo.is_some();
         // The Cargo.lock sections of a patch, described by their dependency changes.
         let locks = (!merged && run.produced_bytes.is_empty() && crate::lockdiff::applies(words))
             .then(|| read_text(&archive.readers[0], lengths[0], crate::lockdiff::LIMIT))
@@ -1689,6 +1697,12 @@ impl Capture<'_> {
                 previews[1].1.clear();
                 report = true;
             }
+        } else if let Some(line) = clean.filter(|line| line.len() + 64 < shown) {
+            // Like findings, the line covers both streams. It saves more than the
+            // footer that then names the run, as for the floor.
+            previews[0].1 = line.into_bytes();
+            previews[1].1.clear();
+            report = true;
         } else if let Some((groups, _)) = grouped {
             // Search and listing groups replace a large stdout only. Smaller output stays
             // verbatim, and stderr keeps messages such as unreadable directories.
@@ -1696,15 +1710,19 @@ impl Capture<'_> {
                 previews[0].1 = fit(groups, max_bytes).into_bytes();
                 report = true;
             }
-        } else if !merged
+        } else if (!merged || whole)
             && let Some(summary) = run.summary.render(
                 previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
                 run.status,
             )
-            && (!stdout_fits || previous.is_some() || summary.len() < previews[0].1.len())
+            && (whole && fit_whole.contains(&false)
+                || !stdout_fits
+                || previous.is_some()
+                || summary.len() < if whole { shown } else { previews[0].1.len() })
         {
             // A merged stdout also holds the command's stderr, which a test, diff or
-            // inventory summary of stdout would drop, so that run keeps its preview.
+            // inventory summary of stdout would drop, so that run keeps its preview,
+            // unless the summary accounts for every line, as `cargo test` totals do.
             let summary = match &locks {
                 Some((_, sections)) if previous.is_none() && run.summary.kind == "diff" => {
                     flags_shown = true;
@@ -1713,6 +1731,9 @@ impl Capture<'_> {
                 _ => summary,
             };
             previews[0].1 = fit(summary, max_bytes).into_bytes();
+            if whole {
+                previews[1].1.clear();
+            }
             report = true;
         } else if !merged
             && selection.profile.is_none()
@@ -2224,6 +2245,8 @@ fn scan(
                 Some(Grouping::Listing(listing)) => listing.observe(&text, line_no),
                 None => {}
             }
+        } else {
+            parser.observe_stderr(&text, line_no);
         }
         let structured = cargo_message(&text);
         let rendered = structured.as_ref().and_then(rendered_message);

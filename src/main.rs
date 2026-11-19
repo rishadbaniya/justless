@@ -2,6 +2,7 @@ mod adaptive;
 mod agents;
 mod batch;
 mod capture;
+mod cargo_tests;
 mod claude_permissions;
 mod components;
 mod context;
