@@ -60,7 +60,7 @@ Details: [Recoverable tool history](docs/reference.md#recoverable-tool-history) 
 
 - `install.sh` builds Justless from source with Cargo and, run in a project, sets up every agent it finds on `PATH`.
 - `justless init --hooks` sets up Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, Antigravity CLI and OpenCode with a short instruction block, and is safe to rerun.
-- Hooks route supported commands in `&&`, `||` and `;` lists, after `NAME=value` and before a final `2>&1`; Codex and Cursor, which skip approval, route only local tools.
+- Hooks route supported commands in `&&`, `||` and `;` lists, after `NAME=value` and before a final `2>&1`; Codex, Cursor and Antigravity CLI, whose hooks approve the rewrite, route only local tools.
 - The Claude Code hook keeps your permission rules in force by judging the original command, and `doctor` warns about rules such as `Bash(justless run *)`.
 - While a `Read`, `Edit` or `Write` deny or ask rule exists, the Claude Code hook leaves file-reading commands such as `rg SECRET .env` as written in every permission mode.
 - Hooks that approve rewrites, Codex, Cursor and Antigravity, leave commands with options that run other programs or code, such as `rg --pre`, `rg --hostname-bin` or `go vet -vettool`.

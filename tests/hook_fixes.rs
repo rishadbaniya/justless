@@ -237,6 +237,9 @@ fn approving_hooks_leave_options_that_run_other_programs() {
         "swift test --toolchain ./tc",
         "cargo clippy -- -C linker=./x",
         "cargo clippy -- --extern x=./x.so",
+        "jest --setupFiles=./x.js",
+        "npm test -- --globalSetup ./x.js",
+        "eslint --init",
     ];
     for handler in ["hook-codex", "hook-cursor"] {
         for command in left {
@@ -486,6 +489,24 @@ fn removing_global_hooks_keeps_the_users_own_empty_hook_arrays() {
         expected["model"] = json!("sonnet");
         assert_eq!(left, expected);
     }
+    // Setup run again after an edit that dropped one of its hooks records the file
+    // as it was from the first record, so the user's empty array still comes back.
+    let before = json!({"model":"opus","hooks":{"SessionStart":[]}});
+    fs::write(&settings, serde_json::to_string_pretty(&before).unwrap()).unwrap();
+    project.success(&["init", "--global", "--agent", "claude"]);
+    let mut edited: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    edited["model"] = json!("sonnet");
+    edited["hooks"]
+        .as_object_mut()
+        .unwrap()
+        .remove("PostToolUse")
+        .unwrap();
+    fs::write(&settings, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+    let output = project.success(&["init", "--global", "--agent", "claude"]);
+    assert!(output.starts_with("Updated "), "{output}");
+    project.success(&["init", "--remove", "--global", "--agent", "claude"]);
+    let left: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(left, json!({"model":"sonnet","hooks":{"SessionStart":[]}}));
     // A file setup created holds nothing of the user's, so it goes.
     fs::remove_file(&settings).unwrap();
     project.success(&["init", "--global", "--agent", "claude"]);

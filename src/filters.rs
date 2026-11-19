@@ -854,7 +854,12 @@ pub fn approvable(words: &[&str]) -> bool {
 ///   or run a script;
 /// - Swift `-X…` options passed to the compilers and linker, `--toolchain`,
 ///   `--toolset`, `--destination` and `--swift-sdks-path`, which choose them,
-///   and `--disable-sandbox`, which runs package plugins unsandboxed.
+///   and `--disable-sandbox`, which runs package plugins unsandboxed;
+/// - ESLint `--init` and `--inspect-config`, which run npm or npx, and
+///   `--plugin`, `--rulesdir`, `--parser` and `--resolve-plugins-relative-to`;
+/// - the module and setup options of the JavaScript test runners that `jest`,
+///   `vitest`, `bun test` and a package manager's `test` script may start (see
+///   `JS_LOADERS`), and an inline JSON `--config`, which can name them.
 fn runs_code(program: &str, args: &[&str]) -> bool {
     let program = Path::new(program)
         .file_name()
@@ -865,7 +870,20 @@ fn runs_code(program: &str, args: &[&str]) -> bool {
             .take_while(|arg| **arg != "--")
             .any(|arg| names.iter().any(|name| names_option(arg, name)))
     };
+    if matches!(program, "jest" | "vitest" | "npm" | "pnpm" | "yarn" | "bun")
+        && js_runner_loads_code(args)
+    {
+        return true;
+    }
     match program {
+        "eslint" => named(&[
+            "--init",
+            "--inspect-config",
+            "--plugin",
+            "--rulesdir",
+            "--parser",
+            "--resolve-plugins-relative-to",
+        ]),
         "pytest" | "py.test" => pytest_loads_code(args),
         "python" | "python3" => {
             matches!(args, ["-m", "pytest", ..]) && pytest_loads_code(&args[2..])
@@ -907,6 +925,56 @@ fn runs_code(program: &str, args: &[&str]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Options of Jest, Vitest and Bun's test runner that load a module they name or
+/// start a browser or server, in lowercase without `-` or `_`, so Jest's
+/// `--setupFiles` and `--setup-files` both match. A test environment such as
+/// `--env=jsdom` stays allowed: tests routinely need one, and it names a
+/// package the project installed.
+const JS_LOADERS: &[&str] = &[
+    "testrunner",
+    "runner",
+    "globalsetup",
+    "globalteardown",
+    "setupfiles",
+    "setupfilesafterenv",
+    "transform",
+    "resolver",
+    "testsequencer",
+    "snapshotresolver",
+    "testresultsprocessor",
+    "preset",
+    "watchplugins",
+    "preload",
+    "browser",
+    "api",
+    "open",
+];
+
+/// Whether JavaScript test runner arguments, including those a package manager
+/// passes to its `test` script after `--`, load code as `JS_LOADERS` lists, or
+/// give `--config` as inline JSON, which can name such modules.
+fn js_runner_loads_code(args: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        let Some(option) = arg.strip_prefix("--") else {
+            return false;
+        };
+        let (key, value) = option
+            .split_once('=')
+            .map_or((option, None), |(key, value)| (key, Some(value)));
+        // Vitest reads dotted names such as `--browser.enabled`.
+        let key = key.split('.').next().unwrap_or(key);
+        let key: String = key
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_'))
+            .flat_map(char::to_lowercase)
+            .collect();
+        JS_LOADERS.contains(&key.as_str())
+            || key == "config" && value.is_some_and(|value| value.trim_start().starts_with('{'))
+    }) || args
+        .windows(2)
+        .any(|pair| matches!(pair[0], "--config" | "-c") && pair[1].trim_start().starts_with('{'))
 }
 
 /// Whether `arg` gives the option `name`. A long option matches with or without
@@ -1344,6 +1412,17 @@ mod tests {
             ("cargo clippy -- -D -C", false),
             ("cargo clippy -- -Clinker=x", false),
             ("cargo test -- --nocapture", true),
+            // JavaScript test runners, also behind a package manager's script.
+            ("jest --setupFiles=./x.js", false),
+            ("jest --setup-files ./x.js", false),
+            ("jest --config {\"globalSetup\":\"./x.js\"}", false),
+            ("jest --env=jsdom", true),
+            ("npm test -- --globalSetup ./x.js", false),
+            ("vitest run --browser.enabled", false),
+            ("bun test --preload ./x.ts", false),
+            ("eslint --init", false),
+            ("eslint --plugin x src", false),
+            ("eslint src", true),
         ] {
             let words: Vec<&str> = command.split(' ').collect();
             assert_eq!(approvable(&words), approved, "{command}");
