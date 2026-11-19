@@ -117,7 +117,9 @@ fn windows_of_supported_output_get_the_family_report() {
         "1".repeat(40),
         "    waiting for the build\n".repeat(600)
     );
-    let cases: [(&str, &str, &[&str], &[&str]); 6] = [
+    let listed = format!("{full}{cut}");
+    let last: String = search.split_inclusive('\n').skip(40).collect();
+    let cases: [(&str, &str, &[&str], &[&str]); 9] = [
         // A whole patch within the window: one report line per hunk, no note.
         (
             "git diff | sed -n 1,2000p",
@@ -167,6 +169,33 @@ fn windows_of_supported_output_get_the_family_report() {
             &["    waiting for the build\n[last line repeated 599 more time(s)]\n    done\n"],
             &["clipped", "Covers only"],
         ),
+        // In a list, a window of the last command cut the end of its patch.
+        (
+            "git diff src; git diff tests | head -n 300",
+            &listed,
+            &[
+                "Covers only the lines `head -n 300` passed on",
+                "56 diff section(s)\n",
+                "src/f15.rs @@ -1,8 +1,8 @@ fn f15() { (cut off) [stdout:1050-1060]\n",
+            ],
+            &[],
+        ),
+        // `tail` kept the last lines.
+        (
+            "rg -n needle src | tail -200",
+            &last,
+            &[
+                "Covers only the lines `tail -200` passed on",
+                "rg: 200 matches in 25 files\n",
+            ],
+            &[],
+        ),
+        (
+            "cd src && git diff | sed -n 1,2000p",
+            &full,
+            &["40 diff section(s)\n"],
+            &["Covers only"],
+        ),
     ];
     for (command, stdout, has_all, lacks_all) in cases {
         let (dir, home) = workspace();
@@ -208,6 +237,37 @@ fn windows_of_supported_output_get_the_family_report() {
             );
         }
     }
+
+    // A secret in a window is redacted in the report and kept in the archive.
+    let (dir, home) = workspace();
+    let root = dir.path().canonicalize().unwrap();
+    let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4).get(..36).unwrap());
+    let secret = full.replacen("+1,8 @@ fn f0()", &format!("+1,8 @@ fn f0(\"{token}\")"), 1);
+    let replaced = after_bash(
+        &root,
+        home.path(),
+        "git diff | sed -n 1,2000p",
+        response(shown(&secret)),
+    );
+    let replaced = replaced.expect("a report");
+    has(
+        &replaced,
+        "40 diff section(s)\nsrc/f0.rs @@ -1,8 +1,8 @@ fn f0(\"",
+    );
+    lacks(&replaced, &token);
+    let id = replaced
+        .rsplit("[justless ")
+        .next()
+        .unwrap()
+        .split([' ', ']'])
+        .next()
+        .unwrap();
+    let exact = justless(&root, home.path(), &["log", id, "--unredacted"], b"");
+    assert_eq!(text(&exact), shown(&secret));
+    lacks(
+        &text(&justless(&root, home.path(), &["log", id], b"")),
+        &token,
+    );
 }
 
 #[cfg(unix)]

@@ -252,7 +252,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     {
         return None;
     }
-    let (start_cut, end_cut) = plan.cut(shown_text.lines().count());
+    let (start_cut, end_cut, ends_early) = plan.cut(shown_text.lines().count());
     // For a result Claude Code saved to a file, the agent would have seen the first
     // 2,000 characters. The report gets three quarters of that, so it fits with its
     // error lines and marker.
@@ -303,7 +303,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             status,
             budget,
             &session,
-            (&origin, &[], end_cut),
+            (&origin, &[], ends_early),
         )
         .ok()
     };
@@ -366,20 +366,13 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     // A report of what a `head`, `tail` or `sed -n` window kept says so, since the
     // command may have printed more.
-    if start_cut || end_cut {
-        let chain: Vec<&str> = plan
-            .filters
-            .iter()
-            .map(|(_, words)| words.as_str())
-            .collect();
-        let chain = crate::summary::short(&chain.join(" | "), 160);
-        text.insert_str(
-            0,
-            &format!(
-                "Covers only the lines `{chain}` passed on, not the command's whole output.\n"
-            ),
-        );
-    }
+    let note = if start_cut || end_cut {
+        let chain = crate::summary::short(&plan.chains(), 160);
+        format!("Covers only the lines `{chain}` passed on, not the command's whole output.\n")
+    } else {
+        String::new()
+    };
+    text.insert_str(0, &note);
     text.push_str(&errors);
     text.push_str(shown.footer.trim_start_matches('\n'));
     // Previews go through the redactor once more before they are printed, so the
@@ -402,8 +395,8 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         let _ = fs::remove_dir_all(&archive);
         return None;
     }
-    if !errors.is_empty() || preview.is_some() {
-        shown.run.footer_bytes += errors.len();
+    if !errors.is_empty() || !note.is_empty() || preview.is_some() {
+        shown.run.footer_bytes += errors.len() + note.len();
         // Savings count against what Claude Code would have shown.
         if let Some(preview) = preview {
             shown.run.raw_bytes = preview as u64;
@@ -667,6 +660,8 @@ struct Plan {
     cd: PathBuf,
     /// The filters its output passed through, with their words.
     filters: Vec<(Filter, String)>,
+    /// The filters of each later command of the same kind in a list.
+    later: Vec<Vec<(Filter, String)>>,
     /// The display profile that compacts its output.
     profile: Option<crate::filters::Profile>,
 }
@@ -693,29 +688,61 @@ impl Plan {
     }
 
     /// Whether the filters may have dropped lines from the start and from the end
-    /// of the command's output, given the `lines` they passed on. A window filter
-    /// that passed on fewer lines than its limit dropped none, when only filters that
-    /// keep every line follow it. Claude Code drops trailing blank lines, so a
-    /// window within a few lines of its limit counts as full.
-    fn cut(&self, lines: usize) -> (bool, bool) {
-        let (mut start, mut end) = (false, false);
-        for (index, (filter, _)) in self.filters.iter().enumerate() {
-            let counted = self.filters[index + 1..]
-                .iter()
-                .all(|(filter, _)| matches!(filter, Filter::Pass | Filter::Columns(_)));
-            let reached = |limit: usize| !counted || lines + TRIMMED >= limit;
-            match *filter {
-                Filter::Pass | Filter::Lines | Filter::Columns(_) => {}
-                Filter::Head(limit) => end |= limit.is_none_or(reached),
-                Filter::Tail(limit) => start |= limit.is_none_or(reached),
-                Filter::Range(first, last_line) => {
-                    start |= first > 1;
-                    end |= last_line.is_some_and(|last_line| reached(last_line + 1 - first));
-                }
+    /// of the output, given the `lines` shown, and whether the last command's
+    /// output may end early. In a list, whose lines several commands printed, any
+    /// window may have cut.
+    fn cut(&self, lines: usize) -> (bool, bool, bool) {
+        let Some(last) = self.later.last() else {
+            let (start, end) = window(&self.filters, Some(lines));
+            return (start, end, end);
+        };
+        let (start, end) = self
+            .later
+            .iter()
+            .map(|chain| window(chain, None))
+            .fold(window(&self.filters, None), |(a, b), (c, d)| {
+                (a || c, b || d)
+            });
+        (start, end, window(last, None).1)
+    }
+
+    /// The filters of every command, as `head -n 40 | cat; head -5`.
+    fn chains(&self) -> String {
+        std::iter::once(&self.filters)
+            .chain(&self.later)
+            .filter(|chain| !chain.is_empty())
+            .map(|chain| {
+                let words: Vec<&str> = chain.iter().map(|(_, words)| words.as_str()).collect();
+                words.join(" | ")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Whether `chain` may have dropped lines from the start and from the end of its
+/// input, given the `lines` it passed on when known. A window filter that passed on
+/// fewer lines than its limit dropped none, when only filters that keep every line
+/// follow it. Claude Code drops trailing blank lines, so a window within a few lines
+/// of its limit counts as full.
+fn window(chain: &[(Filter, String)], lines: Option<usize>) -> (bool, bool) {
+    let (mut start, mut end) = (false, false);
+    for (index, (filter, _)) in chain.iter().enumerate() {
+        let counted = chain[index + 1..]
+            .iter()
+            .all(|(filter, _)| matches!(filter, Filter::Pass | Filter::Columns(_)));
+        let reached = |limit: usize| !counted || lines.is_none_or(|lines| lines + TRIMMED >= limit);
+        match *filter {
+            Filter::Pass | Filter::Lines | Filter::Columns(_) => {}
+            Filter::Head(limit) => end |= limit.is_none_or(reached),
+            Filter::Tail(limit) => start |= limit.is_none_or(reached),
+            Filter::Range(first, last_line) => {
+                start |= first > 1;
+                end |= last_line.is_some_and(|last_line| reached(last_line + 1 - first));
             }
         }
-        (start, end)
     }
+    (start, end)
 }
 
 /// Trailing blank lines Claude Code may have dropped from a window's last lines.
@@ -829,7 +856,7 @@ fn plan(command: &str) -> Option<Plan> {
         {
             return None;
         }
-        match &found {
+        match &mut found {
             Some((plan, first_kind)) if *first_kind != kind || plan.strict() => return None,
             Some(_)
                 if kept
@@ -838,7 +865,10 @@ fn plan(command: &str) -> Option<Plan> {
             {
                 return None;
             }
-            Some(_) => after = true,
+            Some((plan, _)) => {
+                after = true;
+                plan.later.push(kept);
+            }
             None => {
                 let mut label = crate::history::label(&refs);
                 for filter in filters {
@@ -853,6 +883,7 @@ fn plan(command: &str) -> Option<Plan> {
                     label,
                     cd: cd.clone(),
                     filters: kept,
+                    later: Vec::new(),
                     profile: kind.0,
                 };
                 found = Some((plan, kind));
@@ -898,6 +929,7 @@ fn unknown_plan(command: &str) -> Option<Plan> {
         label: crate::history::label(&refs),
         cd: PathBuf::new(),
         filters: Vec::new(),
+        later: Vec::new(),
         profile: None,
     })
 }
@@ -1586,9 +1618,14 @@ mod tests {
                     .into_iter()
                     .map(|filter| (filter, String::new()))
                     .collect(),
+                later: Vec::new(),
                 profile: None,
             };
-            assert_eq!(plan.cut(lines), cut, "{command} with {lines} lines");
+            assert_eq!(
+                plan.cut(lines),
+                (cut.0, cut.1, cut.1),
+                "{command} with {lines} lines"
+            );
         }
     }
 }
