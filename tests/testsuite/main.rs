@@ -12,6 +12,7 @@ mod lookup;
 mod mcp;
 mod output_fixes;
 mod read_batch;
+mod read_fixes;
 mod redact;
 mod report_fixes;
 mod retirement;

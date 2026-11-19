@@ -1675,52 +1675,124 @@ pub(crate) fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Opt
     ))
 }
 
+/// How a language that runs statements at the top level writes lines that run
+/// nothing there. Rust, Go, Java and the other compiled languages, Objective-C
+/// included, hold only declarations at the top level, and so do Python stubs and
+/// Kotlin and Scala sources outside scripts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TopLevel {
+    Shell,
+    Python,
+    /// JavaScript and TypeScript, also in Vue, Svelte and Astro components.
+    JavaScript,
+    Ruby,
+    Php,
+    /// Lua and SQL, whose comments start with `--`.
+    Dashes,
+    /// Groovy, Gradle and `Jenkinsfile`, and Kotlin and Scala scripts.
+    Jvm,
+    Elixir,
+    PowerShell,
+    Julia,
+}
+
+impl TopLevel {
+    /// The language of `file`, which its parser reads as `grammar`, if it runs
+    /// statements at the top level.
+    fn of(file: &str, grammar: crate::polyglot::Grammar) -> Option<Self> {
+        use crate::polyglot::Grammar;
+        let extension = Path::new(file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let extension = extension.as_deref();
+        Some(match grammar {
+            Grammar::Bash => Self::Shell,
+            Grammar::Python if extension != Some("pyi") => Self::Python,
+            Grammar::JavaScript
+            | Grammar::TypeScript
+            | Grammar::Tsx
+            | Grammar::Vue
+            | Grammar::Svelte
+            | Grammar::Astro => Self::JavaScript,
+            Grammar::Ruby => Self::Ruby,
+            Grammar::Php => Self::Php,
+            Grammar::Lua | Grammar::Sql => Self::Dashes,
+            Grammar::Kotlin if extension == Some("kts") => Self::Jvm,
+            Grammar::Scala if matches!(extension, Some("sc" | "sbt")) => Self::Jvm,
+            Grammar::Groovy => Self::Jvm,
+            Grammar::Elixir => Self::Elixir,
+            Grammar::PowerShell => Self::PowerShell,
+            Grammar::Julia => Self::Julia,
+            _ => return None,
+        })
+    }
+
+    /// The starts of lines that run nothing, besides `#` and blank lines.
+    fn inert(self) -> &'static [&'static str] {
+        match self {
+            Self::Php => &["//", "/*", "*", "<?", "?>", "<!--", "declare("],
+            Self::Ruby => &["require ", "require(", "require_relative "],
+            Self::Dashes => &["--"],
+            Self::JavaScript => &["//", "/*", "*"],
+            Self::Jvm => &["//", "/*", "*", "package ", "import "],
+            Self::Shell | Self::Python | Self::Elixir | Self::PowerShell | Self::Julia => &[],
+        }
+    }
+
+    /// The marks that open and close a block comment whose inner lines need not
+    /// start with a comment mark.
+    fn block_comment(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::PowerShell => Some(("<#", "#>")),
+            Self::Julia => Some(("#=", "=#")),
+            _ => None,
+        }
+    }
+}
+
 /// The zero-based lines of top-level code that no outline row covers, such as the
 /// commands of a shell script between its functions or a Python `__main__` block.
-/// Only languages that run statements at the top level are checked. Rust, Go, Java
-/// and other compiled languages hold only declarations there. Blank lines, the
-/// language's comments, a Python module docstring or a lone string literal such as
-/// `'use strict'` before the first statement outside shell, docstrings inside rows,
-/// PHP tags and `declare`, Ruby's `require`, closing
-/// brackets and a wrapper whose members are outlined, such as `class Name {`, do
-/// not count. Neither do statements that only bind modules or names: JavaScript and
-/// TypeScript `require` bindings, export lists, re-exports and `module.exports`
-/// set to names, and Python's `from __future__` imports and `if TYPE_CHECKING:`.
+/// The language comes from the file's name and text, as the index reads it, so a
+/// script named by its `#!` line counts as one named by its extension. Only
+/// languages that run statements at the top level are checked (see [`TopLevel`]).
+/// In a Vue, Svelte or Astro component, every line of markup, styles and script
+/// tags counts, and the code in its scripts is checked as JavaScript. Blank lines,
+/// the language's comments, including PowerShell `<# #>` and Julia `#= =#` blocks,
+/// a Python module docstring or a lone string literal such as `'use strict'`
+/// before the first statement outside shell and PowerShell, docstrings inside
+/// rows, PHP tags and `declare`, Ruby's `require`, closing brackets and a wrapper
+/// whose members are outlined, such as `class Name {`, do not count. Neither do
+/// statements that only bind modules or names: JavaScript and TypeScript `require`
+/// bindings, export lists, re-exports and `module.exports` set to names, Python's
+/// `from __future__` imports and `if TYPE_CHECKING:`, and the `package` and
+/// `import` lines of Groovy and Kotlin and Scala scripts.
 pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Option<Vec<usize>> {
-    let extension = Path::new(file)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase);
-    let language = extension.as_deref().unwrap_or_default();
-    if !matches!(
-        extension.as_deref(),
-        Some(
-            "sh" | "bash"
-                | "py"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "ts"
-                | "mts"
-                | "cts"
-                | "tsx"
-                | "rb"
-                | "rake"
-                | "php"
-                | "phtml"
-                | "lua"
-                | "sql"
-                | "kts"
-                | "sc"
-                | "sbt"
-        )
-    ) {
+    use crate::polyglot::Grammar;
+    let Some(grammar) = Grammar::detect(file, &source.text) else {
         return Some(Vec::new());
+    };
+    let Some(language) = TopLevel::of(file, grammar) else {
+        return Some(Vec::new());
+    };
+    // Markup is blanked out of a component, line for line.
+    let component = matches!(grammar, Grammar::Vue | Grammar::Svelte | Grammar::Astro);
+    let code = if component {
+        crate::components::scripts(&source.text, grammar == Grammar::Astro).0
+    } else {
+        String::new()
+    };
+    let original: Vec<&str> = source.text.lines().collect();
+    let lines: Vec<&str> = if component {
+        code.lines().collect()
+    } else {
+        original.clone()
+    };
+    if lines.len() != original.len() {
+        return None;
     }
     let page = source.page("", None, usize::MAX, usize::MAX).ok()?;
     let page = serde_json::to_value(page).ok()?;
-    let lines: Vec<&str> = source.text.lines().collect();
     let mut covered = vec![false; lines.len()];
     for entry in page["entries"].as_array()? {
         let first = usize::try_from(entry["first"].as_u64()?).ok()?;
@@ -1730,7 +1802,8 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
         }
     }
     let mut uncovered = Vec::new();
-    let mut docstring = None;
+    // The mark that ends the docstring or block comment the line is in.
+    let mut closing = None;
     // Directives and module docstrings come before the first statement. A string
     // after it can be part of a statement, such as the last operand of a `+`.
     let mut prologue = true;
@@ -1743,30 +1816,52 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
             continue;
         }
         let text = lines[index].trim();
-        if let Some(quote) = docstring {
-            if text.contains(quote) {
-                docstring = None;
+        if let Some(mark) = closing {
+            if text.contains(mark) {
+                closing = None;
             }
             continue;
         }
+        if component && text.is_empty() {
+            if !original[index].trim().is_empty() {
+                uncovered.push(index);
+            }
+            continue;
+        }
+        if let Some((open, close)) = language.block_comment()
+            && let Some(rest) = text.strip_prefix(open)
+        {
+            match rest.find(close) {
+                None => closing = Some(close),
+                // Code after the comment on its line runs.
+                Some(end) if !rest[end + close.len()..].trim().is_empty() => {
+                    prologue = false;
+                    uncovered.push(index);
+                }
+                Some(_) => {}
+            }
+            continue;
+        }
+        // A Julia docstring documents the definition on the line after it.
+        if language == TopLevel::Julia
+            && let Some(end) = julia_docstring(&lines, index)
+            && covered.get(end + 1) == Some(&true)
+        {
+            next = end + 1;
+            continue;
+        }
         let literal = text.trim_end_matches(';');
-        let prefixes: &[&str] = match language {
-            "php" | "phtml" => &["//", "/*", "*", "<?", "?>", "<!--", "declare("],
-            "rb" | "rake" => &["require ", "require(", "require_relative "],
-            "lua" | "sql" => &["--"],
-            "sh" | "bash" | "py" => &[],
-            _ => &["//", "/*", "*"],
-        };
         if text.is_empty()
             || text.starts_with('#')
-            || prefixes.iter().any(|prefix| text.starts_with(prefix))
+            || language.inert().iter().any(|prefix| text.starts_with(prefix))
             || text
                 .chars()
                 .all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
             // A lone string literal, such as `'use strict'`, has no effect. In a
-            // shell script it is a command, such as the dispatcher `"$@"`.
+            // shell or PowerShell script it is a command, such as the dispatcher
+            // `"$@"`, or output.
             || prologue
-                && !matches!(language, "sh" | "bash")
+                && !matches!(language, TopLevel::Shell | TopLevel::PowerShell)
                 && ['\'', '"'].into_iter().any(|quote| {
                     literal.len() > 1
                         && literal.starts_with(quote)
@@ -1778,10 +1873,10 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
         }
         if let Some(quote) = ["\"\"\"", "'''"]
             .into_iter()
-            .find(|quote| prologue && language == "py" && text.starts_with(quote))
+            .find(|quote| prologue && language == TopLevel::Python && text.starts_with(quote))
         {
             if !text[3..].contains(quote) {
-                docstring = Some(quote);
+                closing = Some(quote);
             }
             continue;
         }
@@ -1803,6 +1898,24 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
     Some(uncovered)
 }
 
+/// The last line of the string literal that starts line `start`, when the line
+/// starts with one and nothing follows it: a `"""` block or a one-line `"…"`.
+fn julia_docstring(lines: &[&str], start: usize) -> Option<usize> {
+    let first = lines[start].trim();
+    if let Some(rest) = first.strip_prefix("\"\"\"") {
+        if rest.contains("\"\"\"") {
+            return rest.ends_with("\"\"\"").then_some(start);
+        }
+        let closing = lines[start + 1..]
+            .iter()
+            .position(|line| line.contains("\"\"\""))?;
+        let end = start + 1 + closing;
+        return lines[end].trim_end().ends_with("\"\"\"").then_some(end);
+    }
+    let inner = first.strip_prefix('"')?.strip_suffix('"')?;
+    (!inner.replace("\\\\", "").replace("\\\"", "").contains('"')).then_some(start)
+}
+
 /// A JavaScript or TypeScript statement that only binds modules or names.
 static JS_BINDING: LazyLock<Regex> = LazyLock::new(|| {
     let module = r#"(?:'[^']*'|"[^"]*")"#;
@@ -1817,9 +1930,9 @@ static JS_BINDING: LazyLock<Regex> = LazyLock::new(|| {
 /// The line after a statement that starts at `start` and only binds modules or
 /// names, such as `const fs = require('fs')` or `export { a, b } from './x'`, even
 /// when it spans several lines. A call, function or nested object is code.
-fn module_binding(language: &str, lines: &[&str], start: usize) -> Option<usize> {
+fn module_binding(language: TopLevel, lines: &[&str], start: usize) -> Option<usize> {
     let first = lines[start].trim();
-    if language == "py" {
+    if language == TopLevel::Python {
         let typing = first.strip_prefix("if ").is_some_and(|condition| {
             matches!(
                 condition.strip_suffix(':').map(str::trim),
@@ -1841,21 +1954,19 @@ fn module_binding(language: &str, lines: &[&str], start: usize) -> Option<usize>
             .take(64)
             .position(|line| line.contains(')'))
             .map(|offset| start + offset + 2);
-    } else if !matches!(
-        language,
-        "js" | "jsx" | "mjs" | "cjs" | "ts" | "mts" | "cts" | "tsx"
-    ) || ![
-        "const ",
-        "let ",
-        "var ",
-        "import ",
-        "export ",
-        "module.exports",
-        "exports.",
-        "exports ",
-    ]
-    .iter()
-    .any(|prefix| first.starts_with(prefix))
+    } else if language != TopLevel::JavaScript
+        || ![
+            "const ",
+            "let ",
+            "var ",
+            "import ",
+            "export ",
+            "module.exports",
+            "exports.",
+            "exports ",
+        ]
+        .iter()
+        .any(|prefix| first.starts_with(prefix))
     {
         return None;
     }

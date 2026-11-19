@@ -43,6 +43,7 @@ Details: [Indexing and languages](docs/reference.md#indexing-and-languages) · [
 - `edit` rejects a batch that would leave a parsing file unparseable, with the parser's line and message; `--allow-parse-errors` writes it anyway.
 - Claude Code's Read hook outlines large whole-file Reads and ranged Reads of more than 150 lines: 167 such ranged Reads went from 2,803,765 bytes to 304,590.
 - Shell reads of a wide file with `cat`, `sed -n`, `head`, `tail` or `git show REV:path` show an outline and a command that replays the exact bytes.
+- Outlines list up to 20 lines of top-level code that no row covers, in scripts named by their `#!` line, Elixir, PowerShell, Julia and Groovy files and Vue, Svelte and Astro components too; a file with more keeps its full read.
 - Claude Code's post-edit hook tells the model when a native Edit or Write leaves a file that parsed before unparseable.
 
 Details: [Progressive reads and verified edits](docs/reference.md#progressive-reads-and-verified-edits) · [Shell and Read hooks](docs/reference.md#install-and-configure-agents)
