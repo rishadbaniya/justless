@@ -143,6 +143,9 @@ pub struct Settings {
     /// Show JSON tables with consecutive rows that share a field's value under
     /// one `@ VALUE` line. Off by default: plain rows are easier to count and quote.
     pub json_grouping: bool,
+    /// Commands every hook leaves alone: the first words of a command, or a
+    /// regular expression when the entry starts with `^`. See `crate::rewrite`.
+    pub exclude_commands: Vec<String>,
 }
 
 impl Default for Settings {
@@ -162,6 +165,7 @@ impl Default for Settings {
             adaptive_cap_bytes: None,
             adaptive_floor_bytes: None,
             json_grouping: false,
+            exclude_commands: Vec::new(),
         }
     }
 }
@@ -388,6 +392,9 @@ impl Workspace {
                 .is_none_or(|floor| (512..=settings.max_output_bytes).contains(&floor)),
             "adaptive_floor_bytes must be at least 512 and at most max_output_bytes"
         );
+        for entry in &settings.exclude_commands {
+            crate::rewrite::check_exclusion(entry)?;
+        }
         Ok(settings)
     }
 }

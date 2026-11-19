@@ -34,6 +34,7 @@ mod polyglot;
 mod postroute;
 mod proxy;
 mod redact;
+mod rewrite;
 mod rollouts;
 mod runners;
 mod rust_syntax;
@@ -377,6 +378,7 @@ fn cli() -> Command<'static> {
         .subcommand(testrun::command())
         .subcommand(mcp::command())
         .subcommand(doctor::command())
+        .subcommand(rewrite::command())
         .subcommands(source::commands())
         .subcommands(observations::commands())
         .subcommands(proxy::commands())
@@ -482,6 +484,17 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
     if let Some(("drain", sub)) = matches.subcommand() {
         return capture::drain(sub.value_of_t("room")?);
     }
+    // `JUSTLESS_DISABLE` turns every hook into its client's no-op.
+    if let Some((name, sub)) = matches.subcommand()
+        && let Some(client) = name.strip_prefix("hook-")
+        && rewrite::disabled()
+    {
+        rewrite::pass(
+            agents::Agent::parse(client)?,
+            sub.value_of("mode").unwrap_or_default(),
+        );
+        return Ok(0);
+    }
     // Cursor, Gemini CLI and Copilot block a tool call when its hook fails, so these
     // handlers answer every error, including a missing workspace, with a no-op.
     if let Some((name, sub)) = matches.subcommand()
@@ -518,6 +531,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         ("mcp", sub) => mcp::run(&workspace, sub)?,
         ("doctor", sub) => return doctor::run(&workspace, sub, matches.is_present("root")),
         ("exec", sub) => return exec::run(&workspace, sub),
+        ("rewrite", sub) => rewrite::run(&workspace, sub)?,
         ("map", sub) => map::run(&workspace, sub)?,
         ("affected", sub) => impact::run(&workspace, sub)?,
         ("lookup", sub) => lookup::run(&workspace, sub)?,

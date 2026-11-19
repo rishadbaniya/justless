@@ -1,0 +1,6 @@
+# Tests and `cargo run` never read or write the user's own agent settings or
+# Justless's machine-wide project registry: these point at a folder under target/.
+[env]
+XDG_STATE_HOME = { value = "target/test-home/state", relative = true, force = true }
+CLAUDE_CONFIG_DIR = { value = "target/test-home/claude", relative = true, force = true }
+CODEX_HOME = { value = "target/test-home/codex", relative = true, force = true }

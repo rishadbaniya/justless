@@ -567,7 +567,7 @@ pub fn saw_pack(workspace: &Workspace, files: BTreeMap<String, String>) {
 }
 
 pub fn bypass(workspace: &Workspace, command: &str) {
-    if !workspace.state.is_dir() {
+    if !workspace.state.is_dir() || crate::rewrite::previewing() {
         return;
     }
     let Some(word) = command.split_whitespace().next() else {

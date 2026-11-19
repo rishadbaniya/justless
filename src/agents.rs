@@ -757,6 +757,20 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the command hook answers for a shell call, as `run_hook` and
+/// `run_client_hook` would, for `justless rewrite`.
+pub(crate) fn preview_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value> {
+    let workspace = &agent_workspace(workspace, input);
+    match agent {
+        Agent::Claude | Agent::Codex if input["permission_mode"] != "plan" => {
+            bash_hook(workspace, agent, input)
+        }
+        Agent::Agy => agy_hook(workspace, "before-command", input),
+        Agent::Cursor | Agent::Gemini | Agent::Copilot => client_command(workspace, agent, input),
+        _ => None,
+    }
+}
+
 /// The workspace a hook answers for, with the directory the agent works in, which
 /// most clients report as `cwd`, so a command the answer prints reaches it from
 /// there. See [`Workspace::justless`].
@@ -1318,7 +1332,10 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
         // Only with a reported mode, so the rules below always judge it.
         None if agent == Agent::Claude
             && !cfg!(windows)
-            && crate::claude_permissions::mode(input).is_some() =>
+            && crate::claude_permissions::mode(input).is_some()
+            && crate::rewrite::Exclusions::of(workspace)
+                .line(command)
+                .is_none() =>
         {
             with_seen_session(command, input)?
         }
@@ -1481,6 +1498,12 @@ fn wrap_event(
     session: Option<&str>,
     rules: Rules,
 ) -> Option<String> {
+    // Commands `exclude_commands` names are left as written. A list keeps its
+    // other commands, which are judged below.
+    let exclusions = crate::rewrite::Exclusions::of(workspace);
+    if exclusions.line(command).is_some() {
+        return None;
+    }
     if !cfg!(windows) && rules.claude && crate::batch::Batch::parse_list(command).is_some() {
         return None;
     }
@@ -1521,7 +1544,7 @@ fn wrap_event(
     // Follow each `cd` so a later one is checked from the directory it starts in,
     // and each wrapped command knows where it runs.
     let mut directories = vec![cwd.to_path_buf()];
-    let plan = plan(command, rules, |entered| {
+    let mut plan = plan(command, rules, |entered| {
         let current = directories.last().map_or(cwd, PathBuf::as_path);
         match current.join(entered).canonicalize() {
             Ok(next) if next.is_dir() && next.starts_with(&workspace.root) => {
@@ -1533,6 +1556,14 @@ fn wrap_event(
     });
     for range in plan.other {
         crate::history::bypass(workspace, &command[range]);
+    }
+    // A client that may mix commands keeps the others; one that runs a rewritten
+    // list without asking gets the list as written, as for any unsupported command.
+    let excluded = |(words, _): &(Range<usize>, usize)| exclusions.within(command, words).is_some();
+    if rules.mixed {
+        plan.wrap.retain(|wrap| !excluded(wrap));
+    } else if plan.wrap.iter().any(excluded) {
+        plan.wrap.clear();
     }
     if plan.wrap.is_empty() {
         return None;
@@ -2004,7 +2035,7 @@ fn descends(directory: &str) -> bool {
 /// range of each command. Expansions, pipes, redirections other than `2>&1`,
 /// grouping, background jobs and comments return `None` so the whole command passes
 /// through unchanged.
-fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
+pub(crate) fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;

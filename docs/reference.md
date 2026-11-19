@@ -44,6 +44,7 @@
 | `justless learn --days 30 --json` | Command mistakes agents corrected or keep repeating, as proposed rules with failure, session and thread counts, the failed output they cost, the last date seen, a check against the current tree and the run behind each rule. `--apply` writes them to a managed block in the project instructions. |
 | `justless mcp` | A stdio MCP server for the read-only commands. `--install CLIENT` adds it to a client's project config. |
 | `justless doctor --json` | Whether this project's setup works: the `justless` on `PATH`, each agent's CLI, hooks and instructions compared with what `init` writes, MCP entries and `.justless/`, with a fix for each problem. Exits 1 when something needs fixing. [Details](#check-the-setup) |
+| `justless rewrite "COMMAND" --agent claude --mode default` | What that client's command hook would do with a shell command run here, without running it: the rewritten command and why, or why it stays as written, such as an `exclude_commands` entry or `JUSTLESS_DISABLE`. For Claude Code it also gives the permission verdict for `--mode`. Nothing is recorded |
 | `justless init --remove --dry-run` | Each file that removing Justless from the project would change, and how. Drop `--dry-run` to make the changes. `--agent NAME` limits them to some clients, and `--purge` also deletes `.justless/`. |
 
 Commands that Justless prints for the agent to run next, such as a `Next:` line, a `justless log RUN_ID` pointer, the `Full suite:` and `Why:` lines or the commands in hook context, reach the same workspace when run as printed from the directory the first command started in. They start with `justless --root ROOT`, with the absolute root, when a plain `justless` started there would find another root, such as after `--root billing` or in a nested repository. `read`, `expand` and `edit` commands also add it whenever that directory is not the root, because they resolve a bare path from the current directory first. Otherwise they start with plain `justless`. A hook-routed run whose marker would need `--root` adds a line such as `[reopen with justless --root /work/app log run-ID]`. The MCP server cannot know where the agent's shell starts, so every command in its tool results, such as lookup's `Next:` line or the `log` paging note, names the root. `--root` may be repeated before the subcommand when every copy names the same directory.
@@ -382,6 +383,7 @@ adaptive_previews = true
 adaptive_cap_bytes = 16384
 adaptive_floor_bytes = 2048
 json_grouping = false
+exclude_commands = []
 ```
 
 The cap must be at least `max_output_bytes`, and the floor between 512 and `max_output_bytes`.
@@ -395,6 +397,12 @@ omit = '^make\[\d+\]: (Entering|Leaving) directory'
 ```
 
 An empty prefix, an invalid expression or one that matches empty text stops the run with an error.
+
+`exclude_commands` lists commands that every client's command hook and Claude Code's post-command hook leave as written. An entry matches a command that starts with its words, before or after any `NAME=value` assignments, so `"cargo bench"` matches `cargo bench --all` and `RUST_LOG=1 cargo bench` but not `cargo benchmark`. An entry that starts with `^` is a regular expression instead. In a `&&`, `||` or `;` list, Claude Code and Gemini CLI still route the other commands, while Codex, Cursor, Copilot and Antigravity CLI, whose hooks rewrite a list only when every command in it is supported, leave the whole list as written. An empty entry or an invalid expression is a settings error.
+
+```toml
+exclude_commands = ["cargo bench", "npm run dev", "^git (log|show)"]
+```
 
 `[test]` tunes `justless test --affected`. Both lists take gitignore-style patterns and are empty by default. `full_suite_on` names files whose change runs every runner's full suite. `ignore` names changed files that have no test impact, which otherwise count as unlinked data and run the full suite.
 
@@ -546,6 +554,20 @@ Cursor, Gemini CLI and Copilot can block a tool call when its hook fails or exit
 `justless init` defaults to Codex. Omit `--hooks` to install only the selected client's project instructions and add `.justless/` to `.gitignore`. The `init-codex` alias is also supported. When an instructions file is a symlink to a file inside the project, such as `CLAUDE.md -> AGENTS.md`, setup edits that file once and keeps the link. When `CLAUDE.md` has a line that is exactly `@AGENTS.md`, outside fenced code, and `AGENTS.md` holds the block or this run writes it there, Claude Code reads the block through the import, so setup writes it into `AGENTS.md` only and removes a copy from `CLAUDE.md`, which Claude Code would otherwise load twice per request. A link that leaves the project is skipped with a warning, and the hooks are still installed. Setup checks every file before it creates `.justless/`, so a failed setup leaves the project unchanged.
 
 Run `justless run -- cargo test`, `justless run -- git diff`, or `justless run -- rg -n pattern src`. For interactive commands, live streaming, or pipelines that consume raw machine-readable output, use `justless run --raw -- …` or call the command directly. For shell expressions, pass the shell explicitly, as in `justless run -- sh -c 'cargo test && git diff'`.
+
+### Turn the hooks off
+
+Set `JUSTLESS_DISABLE=1` in the agent's environment to make every Justless hook answer with its client's no-op, as if none were installed, without removing them: commands run as written, and reads, searches and session starts get nothing added. Any value other than empty or `0` counts. To keep only some commands away from the hooks, list them in `exclude_commands` (see [Configuration](#configuration)). `justless rewrite "COMMAND"` shows what a client's hook would do with a command run in the current directory, using the same code as the hook, and records nothing:
+
+```sh
+$ justless rewrite "cargo test" --agent codex
+Codex hook: rewritten
+  justless run --hook -- cargo test
+Why: it runs a supported command through `justless run`, which archives the full output and prints a compact preview.
+Permission: the hook allows the rewrite, and Codex runs it without asking.
+```
+
+For Claude Code, `--mode` takes the permission mode the hook would see (`default`, `acceptEdits`, `plan`, `auto`, `dontAsk` or `bypassPermissions`), and the last line gives the verdict of the permission rules that apply here and what the hook does with it.
 
 ### Claude Code status line
 

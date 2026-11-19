@@ -122,7 +122,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     let call = &input["tool_input"];
     let command = call["command"].as_str()?;
-    if call["run_in_background"] == true {
+    if call["run_in_background"] == true
+        || crate::rewrite::Exclusions::of(ws).any(command).is_some()
+    {
         return None;
     }
     let response = input["tool_response"].as_object()?;

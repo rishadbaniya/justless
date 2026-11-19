@@ -46,6 +46,8 @@ cargo test --locked
 
 For an installer change, also run `sh scripts/test_install.sh` (and `sh scripts/test_install.sh dash` where available). It installs from local fake releases with a stub Cargo.
 
+`.cargo/config.toml` points `XDG_STATE_HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` at `target/test-home/` for `cargo test` and `cargo run`, so tests never read or write your own agent settings or project registry. A test that needs one of them sets it, or `HOME`, to its own folder.
+
 `tests/cli.rs` exercises the binary, including command capture, navigation and hooks. `tests/progressive.rs` covers exact spans, stale and concurrent edits, and observation recovery. `fixtures/failing` is deliberately broken so the tests can diagnose and repair disposable copies. `fixtures/mixed` exercises links across TypeScript, Python and SQL. `fixtures/affected` is a three-package Cargo workspace for `test --affected`: a required-features target, a black-box CLI test, a test macro, an embedded data file and untested code.
 
 For a test-selection change, run `python3 scripts/affected_benchmark.py --binary ./target/debug/justless`. It mutates a disposable copy of `fixtures/affected`, runs each mutant as a subset and as the full suite, and exits nonzero on any missed failure.

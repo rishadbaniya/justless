@@ -151,6 +151,8 @@ impl Lab {
             .env("PATH", &self.bin)
             .env("SHELL", &self.shell)
             .env("HOME", self.base.join("home"))
+            // Codex rollouts are read from the lab's home directory.
+            .env_remove("CODEX_HOME")
             .env_remove("JUSTLESS_SESSION")
             .env_remove("CLAUDE_PROJECT_DIR");
         command
