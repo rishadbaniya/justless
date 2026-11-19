@@ -1209,7 +1209,17 @@ impl Doctor<'_> {
             }
         };
         let state = block_state(&text);
+        // Claude Code reads the block of the `AGENTS.md` that `CLAUDE.md` imports.
+        let imported =
+            profile.agent == Agent::Claude && agents::imported_instructions(root, false).is_some();
         let check = match state {
+            Block::Current | Block::Stale if imported => Check::new(
+                Status::Fail,
+                format!(
+                    "Instructions: {name} has its own Justless block and imports AGENTS.md, which has one too, so Claude Code loads it twice"
+                ),
+            )
+            .fix(rewrite()),
             Block::Current => Check::new(
                 Status::Ok,
                 format!("Instructions: {name} has the current Justless block"),
@@ -1238,7 +1248,7 @@ impl Doctor<'_> {
                 .fix(rewrite()),
             },
         };
-        (state != Block::Absent, vec![check])
+        (state != Block::Absent || imported, vec![check])
     }
 
     /// The check for a Justless section that `CLAUDE.md` brings in with an

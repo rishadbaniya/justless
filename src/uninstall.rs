@@ -375,14 +375,19 @@ fn try_remember(workspace: &Workspace, path: &Path, contents: &str) -> Result<()
 
 /// Note the instructions file each client `init` set up reads, so removing another
 /// client that shares the file keeps the section while this one is still set up.
+/// Claude Code reads the `AGENTS.md` that `CLAUDE.md` imports.
 pub fn remember_readers(workspace: &Workspace, clients: &[Agent]) {
     let root = &workspace.root;
     let mut record = load(workspace);
     let mut changed = false;
+    let imported = agents::imported_instructions(root, false).map(|(_, target)| target);
     for &agent in clients {
-        let Ok(Some(path)) = agents::instructions_file(root, &root.join(agent.instructions()))
-        else {
-            continue;
+        let path = match &imported {
+            Some(target) if agent == Agent::Claude => target.clone(),
+            _ => match agents::instructions_file(root, &root.join(agent.instructions())) {
+                Ok(Some(path)) => path,
+                _ => continue,
+            },
         };
         if let Ok(file) = key(root, &path) {
             changed |= record
@@ -691,8 +696,12 @@ fn plan(workspace: &Workspace, chosen: &[Agent], purge: bool, record: &Record) -
     };
 
     // Instruction files, grouped by the file each client reads, so a link such as
-    // `CLAUDE.md -> AGENTS.md` is handled once, as setup does.
+    // `CLAUDE.md -> AGENTS.md` is handled once, as setup does. Claude Code also
+    // reads the `AGENTS.md` that `CLAUDE.md` imports.
     let mut readers: Vec<(PathBuf, Vec<Agent>)> = Vec::new();
+    if let Some((_, target)) = agents::imported_instructions(root, false) {
+        readers.push((target, vec![Agent::Claude]));
+    }
     for agent in all_agents() {
         let filename = agent.instructions();
         let file = root.join(filename);
@@ -1020,7 +1029,7 @@ fn strip(key: &str, kind: Kind, text: &str) -> Result<Scan> {
 }
 
 /// The text without its Justless section, checked the way setup checks it.
-fn strip_section(key: &str, text: &str) -> Result<Option<String>> {
+pub(crate) fn strip_section(key: &str, text: &str) -> Result<Option<String>> {
     let Some(start) = text.find(START) else {
         ensure!(
             !text.contains(END),

@@ -182,9 +182,32 @@ type Changes = (BTreeMap<PathBuf, String>, Vec<&'static str>);
 fn planned_changes(workspace: &Workspace, agents: &[Agent], hooks: bool) -> Result<Changes> {
     let mut changes = BTreeMap::new();
     let mut skipped = Vec::new();
+    let root = &workspace.root;
+    // Claude Code reads an `AGENTS.md` that `CLAUDE.md` imports, so its block goes
+    // there, once, and a copy in `CLAUDE.md` is removed.
+    let shared = agents
+        .iter()
+        .any(|agent| agent.instructions() == "AGENTS.md");
+    let imported = agents
+        .contains(&Agent::Claude)
+        .then(|| imported_instructions(root, shared))
+        .flatten();
     for &agent in agents {
         let filename = agent.instructions();
-        let Some(path) = instructions_file(&workspace.root, &workspace.root.join(filename))? else {
+        let target = match &imported {
+            Some((own, target)) if agent == Agent::Claude => {
+                let original = match changes.get(own) {
+                    Some(planned) => String::clone(planned),
+                    None => read_regular(own)?,
+                };
+                if let Some(text) = crate::uninstall::strip_section(filename, &original)? {
+                    changes.insert(own.clone(), text);
+                }
+                Some(target.clone())
+            }
+            _ => instructions_file(root, &root.join(filename))?,
+        };
+        let Some(path) = target else {
             if !skipped.contains(&filename) {
                 skipped.push(filename);
             }
@@ -2289,6 +2312,26 @@ pub(crate) fn instruction_block() -> (&'static str, &'static str, &'static str) 
 /// leaves the project, which `init` skips.
 pub(crate) fn instructions_target(root: &Path, path: &Path) -> Result<Option<PathBuf>> {
     instructions_file(root, path)
+}
+
+/// `CLAUDE.md` and the `AGENTS.md` it imports, as the files `init` edits, when
+/// Claude Code reads the Justless block through that import: `CLAUDE.md` has a
+/// line that is exactly `@AGENTS.md`, outside fenced code, and `AGENTS.md` holds a
+/// block or `shared` says setup is writing one there. Claude Code expands the
+/// import in place, so a block in `CLAUDE.md` as well loads twice per request.
+pub(crate) fn imported_instructions(root: &Path, shared: bool) -> Option<(PathBuf, PathBuf)> {
+    let claude = instructions_file(root, &root.join("CLAUDE.md")).ok()??;
+    let agents = instructions_file(root, &root.join("AGENTS.md")).ok()??;
+    let mut fenced = false;
+    let imports = fs::read_to_string(&claude).ok()?.lines().any(|line| {
+        let line = line.trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        !fenced && line == "@AGENTS.md"
+    });
+    let holds = || fs::read_to_string(&agents).is_ok_and(|text| text.contains(START));
+    (claude != agents && imports && (shared || holds())).then_some((claude, agents))
 }
 
 /// What `init --hooks` would write to `agent`'s hook file in this project, or

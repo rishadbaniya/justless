@@ -7730,6 +7730,55 @@ fn init_remove_keeps_a_section_an_instructions_only_setup_still_reads() {
 
 #[cfg(unix)]
 #[test]
+fn claude_md_that_imports_agents_md_gets_no_second_block() {
+    let tools = doctor_tools(&["claude", "codex"]);
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    let read = |file: &str| fs::read_to_string(root.join(file)).unwrap();
+    // Claude Code does not expand an import in code.
+    for (claude, copy) in [
+        ("@AGENTS.md\n", false),
+        ("# Rules\n\n  @AGENTS.md \n", false),
+        ("See `@AGENTS.md`.\n", true),
+        ("```\n@AGENTS.md\n```\n", true),
+    ] {
+        fs::write(root.join("AGENTS.md"), "# Agents\n").unwrap();
+        fs::write(root.join("CLAUDE.md"), claude).unwrap();
+        success(&root, &["init", "--agent", "claude", "--agent", "codex"]);
+        assert_eq!(
+            read("CLAUDE.md").contains("justless:begin"),
+            copy,
+            "{claude}"
+        );
+        assert!(read("AGENTS.md").contains("justless:begin"));
+    }
+    // A copy from an earlier setup is reported, and doctor's fix removes it.
+    let agents = read("AGENTS.md");
+    let block = agents[agents.find("<!-- justless:begin").unwrap()..].trim_end();
+    fs::write(root.join("CLAUDE.md"), format!("@AGENTS.md\n\n{block}\n")).unwrap();
+    let (_, text) = doctor_text(&root, tools.path());
+    assert!(text.contains("✗ Instructions: CLAUDE.md has its own Justless block and imports AGENTS.md, which has one too"), "{text}");
+    doctor_apply(&root, tools.path(), &text);
+    assert_eq!(read("CLAUDE.md"), "@AGENTS.md\n");
+    let (_, text) = doctor_text(&root, tools.path());
+    assert!(
+        text.contains("✓ Instructions: CLAUDE.md imports AGENTS.md, which has the current"),
+        "{text}"
+    );
+    // Removing Codex keeps the block that Claude Code reads through the import.
+    let output = success(&root, &["init", "--remove", "--agent", "codex"]);
+    assert!(
+        output.contains("Kept the Justless section in AGENTS.md, which claude also reads."),
+        "{output}"
+    );
+    success(&root, &["init", "--remove", "--agent", "claude"]);
+    assert_eq!(read("AGENTS.md"), "# Agents\n");
+    assert_eq!(read("CLAUDE.md"), "@AGENTS.md\n");
+}
+
+#[cfg(unix)]
+#[test]
 fn init_remove_reads_only_the_links_it_needs() {
     let project = TempDir::new().unwrap();
     let outside = TempDir::new().unwrap();
