@@ -3376,7 +3376,7 @@ fn search_output_groups_matches_by_file_with_exact_lines() {
     let small = cli(root, &["run", "--", "grep", "-rn", "rare_token", "."]);
     let expected = direct(&["-rn", "--exclude-dir=.justless", "rare_token", "."]);
     assert_eq!(stdout(&small), expected);
-    // Context lines extend each file's range but are not counted as matches.
+    // Context lines are counted apart from matches.
     let context = stdout(&cli(
         root,
         &["run", "--", "grep", "-rn", "-A", "1", "needle", "src"],
@@ -3839,6 +3839,7 @@ fn context_searches_show_blocks_that_log_returns_exactly() {
             .unwrap();
     }
     let rg = Command::new("rg").arg("--version").output().is_ok();
+    let tags = regex::Regex::new(r"(\S+) \[stdout:(\d+)(?:-(\d+))?\]").unwrap();
     for args in [
         &["grep", "-rn", "-C2", "needle", "src"][..],
         &["grep", "-n", "-C2", "needle", "src/x-1.rs"],
@@ -3875,20 +3876,53 @@ fn context_searches_show_blocks_that_log_returns_exactly() {
                 && !report.contains(&token),
             "{args:?}: {report}"
         );
-        // Every tag names lines that `log` returns exactly.
-        let lines: Vec<&str> = raw.lines().collect();
+        // The archive is exact, and a range that names one block holds exactly that
+        // block: one file's consecutive lines, from its first to its last number,
+        // with no line of the same block just outside.
         let id = run_id(&output);
-        for tag in report.split("[stdout:").skip(1).take(6) {
-            let range = tag.split(']').next().unwrap();
-            let (from, to) = range.split_once('-').unwrap_or((range, range));
-            let (a, b): (usize, usize) = (from.parse().unwrap(), to.parse().unwrap());
-            let log = ["log", &id, "--unredacted", "--from", from, "--to", to];
-            assert_eq!(
-                success(root, &log),
-                format!("{}\n", lines[a - 1..b].join("\n")),
-                "{args:?} {range}"
+        let log = ["log", &id, "--unredacted", "--stream", "stdout"];
+        assert_eq!(success(root, &log), raw, "{args:?}");
+        let lines: Vec<&str> = raw.lines().collect();
+        let line = |n: usize| {
+            let line = *lines.get(n.checked_sub(1)?)?;
+            let file = ["src/x-1.rs", "src/y:2.rs"]
+                .into_iter()
+                .find(|f| line.starts_with(f));
+            let rest = file.map_or(line, |f| line.get(f.len() + 1..).unwrap_or(""));
+            let number = rest.split([':', '-']).next()?.parse::<usize>().ok();
+            (line != "--" && !line.is_empty()).then_some((file, number))
+        };
+        let joins = |a: Option<(Option<&str>, Option<usize>)>, b: (Option<&str>, Option<usize>)| {
+            a.is_some_and(|a| {
+                a.0 == b.0 && a.0.is_some() && a.1.zip(b.1).is_none_or(|(x, y)| x + 1 == y)
+            })
+        };
+        let mut checked = 0;
+        for found in tags.captures_iter(&report) {
+            let (a, b) = (
+                found[2].parse().unwrap(),
+                found.get(3).map_or(&found[2], |m| m.as_str()),
             );
+            let b: usize = b.parse().unwrap();
+            if found[1] == *"blocks" {
+                continue;
+            }
+            let first = line(a).unwrap();
+            assert!(
+                (a..=b).all(|n| line(n).is_some_and(
+                    |l| l.0 == first.0 && l.1.zip(first.1).is_none_or(|(x, y)| x == y + n - a)
+                )) && !joins(line(a - 1), first)
+                    && !joins(Some(line(b).unwrap()), line(b + 1).unwrap_or((None, None)))
+                    && found[1].strip_prefix('L').is_none_or(|range| {
+                        *range == *format!("{}-{}", first.1.unwrap(), line(b).unwrap().1.unwrap())
+                            || a == b && *range == *first.1.unwrap().to_string()
+                    }),
+                "{args:?} {}",
+                &found[0]
+            );
+            checked += 1;
         }
+        assert!(checked >= 20, "{args:?}: {report}");
     }
 }
 

@@ -1,10 +1,14 @@
 //! Group search output by file and select the search and listing profiles.
 //!
 //! `rg`, `grep -r`, `git grep`, `ag` and `ack` print one record per line as
-//! `path:line:text` or `path:text`. Context lines use `path-line-text` and context
-//! groups are separated by `--`. A path is accepted only when it names an existing
+//! `path:line:text` or `path:text`. A path is accepted only when it names an existing
 //! file, so output without paths, such as a single-file grep, keeps the ordinary
 //! preview. Shown lines keep the exact text after the path.
+//!
+//! With context options, matches use `path:line:text`, context lines
+//! `path-line-text`, and blocks of them are separated by `--`. Block mode reads
+//! those, the numbered lines of one file without its name and `rg --heading`, and
+//! reports blocks instead of matching lines.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -250,8 +254,10 @@ pub fn select(words: &[&str]) -> Option<Profile> {
             return None;
         }
     }
-    // rg prints file names as headings only on request, and only blocks read them.
-    if parsed.has(&["--heading"]) && !parsed.has(CONTEXT) {
+    // rg prints file names as headings only on request, and only numbered blocks
+    // read them.
+    if parsed.has(&["--heading"]) && !(parsed.has(CONTEXT) && parsed.has(&["-n", "--line-number"]))
+    {
         return None;
     }
     Some(if parsed.has_any(spec.lists) {
@@ -838,7 +844,16 @@ impl Search {
         let Some((first, line)) = pending.first() else {
             return;
         };
-        let Some(end) = self.path_end(line, '-', numbered) else {
+        // A name that a longer real name also fits, such as `a` and `a-1` before
+        // `a-1-2-text`, leaves the file unknown.
+        let end = self.path_end(line, '-', numbered).filter(|&end| {
+            !line[end + 1..].match_indices('-').take(16).any(|(i, _)| {
+                let longer = end + 1 + i;
+                (!numbered || number(&line[longer + 1..]).is_some_and(|(_, sep)| sep == '-'))
+                    && self.known(&line[..longer])
+            })
+        });
+        let Some(end) = end else {
             self.mode().failed = true;
             return;
         };
@@ -869,6 +884,10 @@ impl Search {
             }
         }
         let open = *mode.open.get_or_insert_with(|| {
+            // A file's lines start at its first block, after any heading.
+            if self.groups[c].blocks.is_empty() {
+                self.groups[c].first = n;
+            }
             mode.list.push(Block {
                 group: c,
                 start: n,
@@ -1421,11 +1440,11 @@ mod tests {
     #[test]
     fn blocks_account_for_every_line_or_fall_back() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["a", "a-b", "x-1.rs"] {
+        for name in ["a", "a-b", "a-1", "x-1.rs"] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
         let grep = ["grep", "-rn", "-C1", "x", "."];
-        let cases: [(&[&str], &[&str], Option<&str>); 7] = [
+        let cases: [(&[&str], &[&str], Option<&str>); 10] = [
             // ugrep prints no `--` between files.
             (
                 &grep,
@@ -1452,6 +1471,19 @@ mod tests {
                     "a ×3 in 2 blocks [stdout:1-3]\n  2:x\n  3:x\n  +1 more block [stdout:3]: L5 [stdout:3]\n",
                 ),
             ),
+            // rg --heading names each file once, before a blank line ends it.
+            (
+                &["rg", "-n", "-C1", "--heading", "x", "."],
+                &["a", "1-p", "2:x", "", "x-1.rs", "4:x", "--", "9:x"],
+                Some("x-1.rs ×2 in 2 blocks [stdout:6-8]\n  4:x\n  +1 more block [stdout:8]: L9"),
+            ),
+            (
+                &grep,
+                &["a:2:x", "--", "Binary file x-1.rs matches"],
+                Some("x-1.rs ×1 in 1 block [stdout:3]\n  (binary file matches)\n"),
+            ),
+            // Both `a` and `a-1` fit a cut block's `a-1-2-q`.
+            (&grep, &["a:2:x", "--", "a-1-2-q"], None),
             (&grep, &["a:2:x", "stray"], None),
             // One file's lines without numbers cannot tell matches from context.
             (&["grep", "-C1", "x", "a"], &["p", "x"], None),
