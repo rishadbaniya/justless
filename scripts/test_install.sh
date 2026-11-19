@@ -23,6 +23,7 @@ mkdir "$work/stub" "$work/empty"
 cat > "$work/stub/cargo" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$CARGO_LOG"
+echo "${CARGO_NET_GIT_FETCH_WITH_CLI-unset}" >> "$CARGO_LOG.cli"
 root=
 while [ "$#" -gt 0 ]; do
     if [ "$1" = --root ]; then root=$2; fi
@@ -68,6 +69,8 @@ cargo_ran() {
 run git "" --cli-only
 check git '[ "$status" -eq 0 ]'
 check git 'cargo_ran git "$git_install justless"'
+# A git fetch goes through the git command, so url.insteadOf rewrites to SSH work.
+check git '[ "$(cat "$work/git/cargo.log.cli")" = true ]'
 check git 'grep -qxF "$building" "$work/git/out"'
 check git '[ -x "$work/git/root/bin/justless" ] && [ ! -e "$work/git/fake.log" ]'
 check git 'grep -qF "Justless CLI installed." "$work/git/out"'

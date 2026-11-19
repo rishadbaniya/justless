@@ -15,6 +15,12 @@ install_from_source() {
         exit 1
     fi
     echo "Building Justless from source with Cargo. The first build takes a few minutes."
+    # Cargo's built-in Git follows url.insteadOf rewrites (https to ssh, for example)
+    # but cannot use the SSH agent or keys the git command can, so fetch with git.
+    if [ -z "$source_dir" ] && [ -z "${CARGO_NET_GIT_FETCH_WITH_CLI-}" ] && command -v git >/dev/null 2>&1; then
+        CARGO_NET_GIT_FETCH_WITH_CLI=true
+        export CARGO_NET_GIT_FETCH_WITH_CLI
+    fi
     if [ -n "$source_dir" ]; then
         cargo install --locked --root "$prefix" --path "$source_dir"
     elif [ -n "$version" ]; then
