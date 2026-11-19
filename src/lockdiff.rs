@@ -368,7 +368,7 @@ pub fn view(patch: &str, sections: &[Section]) -> String {
 /// A patch summary whose `Cargo.lock` hunks are replaced by their description when
 /// that is shorter, with every flag right after the first line.
 pub fn summarize(summary: &Summary, sections: &[Section]) -> String {
-    let mut out = format!("{} diff section(s)\n", summary.items.len());
+    let mut out = format!("{}\n", summary.patch_heading());
     for section in sections {
         out.push_str(&section.flag_lines());
     }

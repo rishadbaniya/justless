@@ -1,0 +1,65 @@
+commit 0940ff5cd49d5b8fc541e004d5dd8e69e793adad
+Author: Justless Devs <dev@example.invalid>
+Date:   Sun Sep 27 19:56:50 2026 +0545
+
+    build(deps): depend on libc on Unix for signal forwarding
+    
+    libc 0.2.191 was already in the lock file as a transitive dependency.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 0b8f06f..765b560 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -274,6 +274,7 @@ dependencies = [
+  "anyhow",
+  "clap",
+  "ignore",
++ "libc",
+  "proc-macro2",
+  "regex",
+  "rustix",
+diff --git a/Cargo.toml b/Cargo.toml
+index 6c72e57..dd2fa82 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -41,3 +41,6 @@ tree-sitter-zig = "1.1"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+ rustix = { version = "1", features = ["fs"] }
++
++[target.'cfg(unix)'.dependencies]
++libc = "0.2"
+
+commit 4e5ef6a7fe67670e254948c47dc37a6e16cf7d78
+Author: Justless Devs <dev@example.invalid>
+Date:   Sun Sep 6 18:56:47 2026 +0545
+
+    docs(readme): add the logo and tagline
+
+diff --git a/README.md b/README.md
+index dde33b9..bc613d7 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,17 @@
+-# Justless
++<p align="center">
++  <img src="assets/logo.png" alt="Justless logo" width="140">
++</p>
++
++<h1 align="center">justless</h1>
++
++<p align="center">
++  <strong>Your agent reads less. It knows more.</strong><br>
++  Compact by default. Exact on demand.
++</p>
++
++<p align="center">
++  <a href="#install">Install</a> · <a href="docs/reference.md">Reference</a> · <a href="docs/examples.md">Examples</a> · <a href="docs/benchmarks.md">Benchmarks</a>
++</p>
+ 
+ Justless is a local CLI that helps coding agents use fewer tokens when running commands and exploring a codebase.
+ 
+diff --git a/assets/logo.png b/assets/logo.png
+new file mode 100644
+index 0000000..b92ab02
+Binary files /dev/null and b/assets/logo.png differ

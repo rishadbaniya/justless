@@ -33,19 +33,26 @@ pub fn family(args: &[OsString]) -> String {
         Some(words) => words.iter().map(String::as_str).collect(),
         None => all.clone(),
     };
-    let mut words: Vec<_> = crate::filters::unwrap_tool(&refs)
-        .iter()
-        .take(3)
-        .copied()
-        .collect();
+    let tool = crate::filters::unwrap_tool(&refs);
+    let mut words: Vec<_> = tool.iter().take(3).copied().collect();
     if let Some(command) = words.first_mut() {
         *command = std::path::Path::new(*command)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
     }
+    // `git log` prints patches only when asked; other logs stay in `git`.
+    let patch = || {
+        tool.iter().skip(2).take_while(|w| **w != "--").any(|w| {
+            matches!(*w, "-p" | "-u" | "--patch")
+                || w.starts_with("-U")
+                || w.starts_with("--unified=")
+        })
+    };
     match words.as_slice() {
         ["git", "diff", ..] => "git diff",
+        ["git", "show", ..] => "git show",
+        ["git", "log", ..] if patch() => "git log",
         ["cargo", "test", ..] => "cargo test",
         ["go", "test", ..] => "go test",
         ["npm", "test", ..] => "npm test",
@@ -68,14 +75,35 @@ pub struct Parser {
     current_test: String,
     /// Message lines still expected after `panicked at path:line:col:`.
     panic_lines: usize,
+    /// `git show` and `git log -p` output: a commit header before each patch.
+    commits: bool,
+    place: Place,
+    /// Whether that output reached a file's patch, which a plain log never does.
+    patched: bool,
     discarded: bool,
+}
+
+/// Where a line of `git show` or `git log -p` output falls.
+#[derive(Clone, Copy, PartialEq)]
+enum Place {
+    /// Before the first commit, or after the blank line that ends one.
+    Between,
+    /// `Author:`, `Date:` and the other fields after `commit SHA`.
+    Fields,
+    /// The indented message, after the blank line that ends the fields.
+    Message,
+    /// A file's extended header lines, from `diff --git` to its first hunk.
+    File,
+    Hunk,
 }
 
 impl Parser {
     pub fn new(family: &str, profile: Option<crate::filters::Profile>) -> Self {
+        let commits = profile.is_none() && matches!(family, "git show" | "git log");
         let kind = match family {
             _ if profile.is_some() => "",
             "git diff" => "diff",
+            _ if commits => "diff",
             "pytest" | "cargo test" | "go test" | "npm test" => "tests",
             _ => "",
         };
@@ -93,6 +121,9 @@ impl Parser {
             failures: BTreeMap::new(),
             current_test: String::new(),
             panic_lines: 0,
+            commits,
+            place: Place::Between,
+            patched: false,
             discarded: false,
         }
     }
@@ -114,6 +145,10 @@ impl Parser {
             return;
         }
         let line = text.trim_end_matches('\n');
+        if self.commits {
+            self.discarded = !self.commit(line, number);
+            return;
+        }
         if self.summary.kind == "diff"
             && self.file.is_empty()
             && !line.is_empty()
@@ -134,6 +169,80 @@ impl Parser {
             item.digest = format!("{:x}", self.hash.finalize_reset());
             self.summary.items.push(item);
         }
+    }
+
+    /// Read one line of `git show` or `git log -p` output. Each commit header, from
+    /// `commit SHA` through its message, is an item before the commit's file and
+    /// hunk items. A line out of place, such as a `--stat` line, a combined
+    /// `diff --cc` or a custom `--format`, returns false.
+    fn commit(&mut self, line: &str, n: usize) -> bool {
+        const FIELDS: [&str; 6] = [
+            "Merge: ",
+            "Author: ",
+            "AuthorDate: ",
+            "Commit: ",
+            "CommitDate: ",
+            "Date: ",
+        ];
+        const HEADERS: [&str; 14] = [
+            "index ",
+            "--- ",
+            "+++ ",
+            "old mode ",
+            "new mode ",
+            "deleted file mode ",
+            "new file mode ",
+            "similarity index ",
+            "dissimilarity index ",
+            "rename from ",
+            "rename to ",
+            "copy from ",
+            "copy to ",
+            "Binary files ",
+        ];
+        let place = self.place;
+        if let Some(id) = commit_id(line)
+            && place != Place::Fields
+        {
+            self.flush();
+            self.file.clear();
+            let name = format!("commit {}", short(id, 12));
+            self.pending = Some(Item::new(&name, NO_MESSAGE, n));
+            self.place = Place::Fields;
+        } else if line.is_empty() {
+            // A blank line ends the fields, and the patch before the next commit.
+            // It belongs to no item.
+            self.place = match place {
+                Place::Fields | Place::Message => Place::Message,
+                _ => Place::Between,
+            };
+            return true;
+        } else if line.starts_with("diff --git ") && place != Place::Between {
+            self.patched = true;
+            self.place = Place::File;
+        } else if line.starts_with("@@ ") && matches!(place, Place::File | Place::Hunk) {
+            self.place = Place::Hunk;
+        } else {
+            let fits = match place {
+                Place::Between => false,
+                Place::Fields => FIELDS.iter().any(|field| line.starts_with(field)),
+                Place::Message => line.starts_with("    "),
+                Place::File => HEADERS.iter().any(|header| line.starts_with(header)),
+                Place::Hunk => line.starts_with([' ', '+', '-', '\\']),
+            };
+            if !fits {
+                return false;
+            }
+            if place == Place::Message
+                && let Some(item) = &mut self.pending
+                && item.detail == NO_MESSAGE
+                && !line.trim().is_empty()
+            {
+                item.detail = short(line.trim(), 240);
+            }
+        }
+        self.diff(line, n);
+        true
     }
 
     fn diff(&mut self, line: &str, n: usize) {
@@ -267,7 +376,9 @@ impl Parser {
     }
 
     pub fn finish(mut self) -> Summary {
-        if self.discarded {
+        // Commit headers with no patch, as a plain log or `git show -s` prints,
+        // keep the ordinary preview.
+        if self.discarded || (self.commits && !self.patched) {
             return Summary::default();
         }
         if let Some(inventory) = self.inventory {
@@ -279,7 +390,27 @@ impl Parser {
     }
 }
 
+/// The detail of a commit header whose message is empty.
+const NO_MESSAGE: &str = "(no message)";
+
+/// The commit id on a `commit SHA` or `commit SHA (decorations)` line.
+fn commit_id(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("commit ")?;
+    let (id, decorations) = rest.split_once(' ').unwrap_or((rest, ""));
+    (id.len() >= 7
+        && id.bytes().all(|b| b.is_ascii_hexdigit())
+        && (decorations.is_empty() || decorations.starts_with('(')))
+    .then_some(id)
+}
+
 impl Item {
+    /// Whether this is a commit header from `git show` or `git log -p`.
+    fn is_commit(&self) -> bool {
+        self.name
+            .strip_prefix("commit ")
+            .is_some_and(|id| id.len() >= 7 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
     pub(crate) fn new(name: &str, detail: &str, n: usize) -> Self {
         Self {
             name: short(name, 320),
@@ -335,6 +466,17 @@ impl Summary {
             .map(String::as_str)
     }
 
+    /// The first line of a patch summary, such as `1 commit(s), 3 diff section(s)`.
+    pub(crate) fn patch_heading(&self) -> String {
+        let commits = self.items.iter().filter(|item| item.is_commit()).count();
+        let sections = format!("{} diff section(s)", self.items.len() - commits);
+        if commits == 0 {
+            sections
+        } else {
+            format!("{commits} commit(s), {sections}")
+        }
+    }
+
     /// A one-line outcome for handoffs, such as a failing test count or top lint rule.
     pub fn headline(&self) -> Option<String> {
         match self.kind.as_str() {
@@ -358,9 +500,7 @@ impl Summary {
                     top.digest
                 ))
             }
-            "diff" if !self.items.is_empty() => {
-                Some(format!("{} diff section(s)", self.items.len()))
-            }
+            "diff" if !self.items.is_empty() => Some(self.patch_heading()),
             "inventory" | "search" | "listing" => self.outcomes.first().cloned(),
             _ => None,
         }
@@ -448,7 +588,8 @@ impl Summary {
             }
         } else {
             if self.kind == "diff" {
-                report.push_str(&format!("{} diff section(s)\n", self.items.len()));
+                report.push_str(&self.patch_heading());
+                report.push('\n');
             }
             for item in &self.items {
                 report.push_str(&format!("{}\n", item.display()));
@@ -463,5 +604,82 @@ impl Summary {
             report.push('\n');
         }
         Some(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real `git show 0940ff5 4e5ef6a` output from this repository.
+    const SHOW: &str = include_str!("../fixtures/patches/git_show.txt");
+
+    fn parse(family: &str, text: &str) -> Summary {
+        let mut parser = Parser::new(family, None);
+        for (index, line) in text.split_inclusive('\n').enumerate() {
+            parser.observe(line, index + 1);
+        }
+        parser.finish()
+    }
+
+    #[test]
+    fn commit_patches_list_each_header_then_its_hunks() {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        for (line, expected) in [
+            ("git show HEAD~3", "git show"),
+            ("git log -p -2", "git log"),
+            ("git log -U1", "git log"),
+            ("git log --oneline -5", "git"),
+            ("git log -- -p", "git"),
+        ] {
+            assert_eq!(family(&args(line)), expected, "{line}");
+        }
+        let summary = parse("git show", SHOW);
+        assert_eq!(
+            summary.render(None, 0).unwrap(),
+            "2 commit(s), 4 diff section(s)\n\
+             commit 0940ff5cd49d build(deps): depend on libc on Unix for signal forwarding [stdout:1-7]\n\
+             Cargo.lock @@ -274,6 +274,7 @@ dependencies = [ [stdout:13-20]\n\
+             Cargo.toml @@ -41,3 +41,6 @@ tree-sitter-zig = \"1.1\" [stdout:25-31]\n\
+             commit 4e5ef6a7fe67 docs(readme): add the logo and tagline [stdout:33-37]\n\
+             README.md @@ -1,4 +1,17 @@ [stdout:43-61]\n\
+             assets/logo.png new file mode 100644 [stdout:62-65]\n"
+        );
+        assert_eq!(
+            summary.headline().as_deref(),
+            Some("2 commit(s), 4 diff section(s)")
+        );
+        // A rerun with a changed message reports that header only.
+        let reworded = parse("git log", &SHOW.replace("add the logo", "add a logo"));
+        let delta = reworded.render(Some(("run-1", &summary)), 0).unwrap();
+        assert_eq!(
+            delta,
+            "Compared with run-1:\n\
+             + commit 4e5ef6a7fe67 docs(readme): add a logo and tagline [stdout:33-37]\n\
+             - commit 4e5ef6a7fe67 docs(readme): add the logo and tagline [prior stdout:33-37]\n"
+        );
+    }
+
+    #[test]
+    fn commit_output_without_a_plain_patch_keeps_the_preview() {
+        let header = SHOW.split("diff --git").next().unwrap();
+        for text in [
+            // `--stat`, a combined diff, `--oneline`, a blank inside a hunk,
+            // `git show -s` and `git show REV:path`.
+            SHOW.replacen("\ndiff --git", "\n Cargo.lock | 1 +\n\ndiff --git", 1),
+            SHOW.replace("diff --git a/README.md b/README.md", "diff --cc README.md"),
+            SHOW.replacen(
+                "commit 0940ff5cd49d5b8fc541e004d5dd8e69e793adad",
+                "0940ff5 build(deps)",
+                1,
+            ),
+            SHOW.replacen("  \"clap\",\n", "\n", 1),
+            header.to_owned(),
+            "[package]\nname = \"justless\"\n".to_owned(),
+        ] {
+            assert!(parse("git show", &text).items.is_empty(), "{text}");
+        }
+        // `git diff` output still needs `diff --git` first.
+        assert!(parse("git diff", SHOW).items.is_empty());
     }
 }

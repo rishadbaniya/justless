@@ -311,8 +311,34 @@ fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
         shown.contains(summary) && !shown.contains("Cargo.lock @@"),
         "{shown}"
     );
+    // A commit too large to show whole lists its header, then the description with
+    // the flag on top, and each `[stdout:A-B]` replays exactly those lines.
+    let commit = ["run", "--max-bytes", "1024", "--", "git", "show", "HEAD"];
+    let output = justless(root, &commit);
+    let shown = text(&output.stdout);
+    assert!(
+        shown.starts_with(&format!(
+            "1 commit(s), 9 diff section(s)\n! Cargo.lock: {flag}\ncommit "
+        )) && shown.contains(" bump [stdout:1-5]\n")
+            && shown.contains(summary)
+            && !shown.contains("Cargo.lock @@"),
+        "{shown}"
+    );
+    let patch: Vec<String> = git(root, &["show", "HEAD"])
+        .split_inclusive('\n')
+        .map(str::to_owned)
+        .collect();
+    for tag in shown.split("[stdout:").skip(1) {
+        let (from, to) = tag.split_once(']').unwrap().0.split_once('-').unwrap();
+        let log = ["log", &run_id(&output), "--from", from, "--to", to];
+        let (from, to): (usize, usize) = (from.parse().unwrap(), to.parse().unwrap());
+        assert_eq!(
+            text(&justless(root, &log).stdout),
+            patch[from - 1..to].concat()
+        );
+    }
     // Any other preview still names the flag: a rerun's unchanged notice and a
-    // clipped commit.
+    // clipped commit whose `--stat` the summary does not read.
     let clipped = [
         "run",
         "--hook",
@@ -321,6 +347,8 @@ fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
         "--",
         "git",
         "show",
+        "--stat",
+        "--patch",
         "HEAD",
     ];
     for (args, start) in [(&diff[..], "Output unchanged"), (&clipped[..], "commit ")] {
