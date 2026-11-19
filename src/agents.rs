@@ -891,7 +891,7 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     result["content"] = json!(outline.trim_end_matches('\n'));
     Some(
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
-        "additionalContext":format!("{context} Expand a row with {justless} expand FILE 'REV#ID', or Read original lines with offset and a limit of at most {READ_WINDOW_LINES}.")}}),
+        "additionalContext":format!("{context} Exact lines: `{justless} expand FILE 'REV#ID'` for a row, or a Read with offset and a limit of at most {READ_WINDOW_LINES} lines.")}}),
     )
 }
 
@@ -922,7 +922,8 @@ fn read_file(ws: &Workspace, path: &Path) -> Option<(Workspace, String)> {
 /// line names `justless recall ID`, which prints it exactly. Only files with
 /// parser rows qualify, under the rules of the outline of a workspace file.
 /// `expand` and `edit` take workspace files only, so the hint names Read's own
-/// ways back, which pass through here: any ranged Read, and `allow_large`.
+/// ways back, which pass through here: any ranged Read first, then `allow_large`
+/// and `recall`, which both cost the whole result, priced in the hint.
 fn outside_read(ws: &Workspace, path: &Path, mut response: Value) -> Option<Value> {
     if !outside_file(ws, path) {
         return None;
@@ -985,8 +986,9 @@ fn outside_read(ws: &Workspace, path: &Path, mut response: Value) -> Option<Valu
         covered = ", and code that no row covers follows the rows verbatim";
     }
     let first = |id: &str| format!("[justless recall {id}] exact original Read result · {lines}\n");
+    let size = crate::history::human_bytes(native.len() as u64);
     let context = format!(
-        "Justless outline of a file outside the workspace. L ranges are source line numbers{covered}. A Read with offset and a limit of at most {READ_WINDOW_LINES} lines, or with allow_large: true, returns lines as they are, and `{} recall ID` with the first line's ID prints this Read's original result.",
+        "Justless outline of a file outside the workspace. L ranges are source line numbers{covered}. Exact lines: a Read with offset and a limit of at most {READ_WINDOW_LINES} lines. A Read with allow_large: true, or `{} recall ID` with the first line's ID, returns all {lines} ({size}) as they are.",
         ws.justless()
     );
     // A recall ID is 64 hex digits.
@@ -1118,14 +1120,18 @@ fn claude_read_window(ws: &Workspace, args: &Value, response: &Value) -> Option<
         }
         covered = ", and code that no row covers follows the rows verbatim";
     }
-    // The same Read with `allow_large` passes through, so it returns the window as
-    // Read did, whatever its size. Claude Code 2.1.327 saves a Bash result over about
-    // 30,000 characters to a file and shows a preview, so `expand` of a large window
-    // would not reach the agent whole.
+    // The cheap exact paths come first: `expand` of one row, or a Read of at most
+    // `READ_WINDOW_LINES` lines. The same Read with `allow_large` passes through, so
+    // it returns the window as Read did, whatever its size, and the hint prices it.
+    // Claude Code 2.1.327 saves a Bash result over about 30,000 characters to a file
+    // and shows a preview, so `expand` of a large window would not reach the agent
+    // whole.
     let quoted = shlex::try_quote(&file).ok()?;
     let justless = ws.invocation().files;
     let context = format!(
-        "Justless outline of lines {first}-{last}, the lines this Read returned. L ranges are source line numbers{covered}. The same Read with allow_large: true returns those lines as they are, a Read of at most {READ_WINDOW_LINES} lines is never outlined, and `{justless} expand {quoted} 'REV#ID'` prints one row."
+        "Justless outline of lines {first}-{last}, the lines this Read returned. L ranges are source line numbers{covered}. Exact lines: `{justless} expand {quoted} 'REV#ID'` for a row, or a Read of at most {READ_WINDOW_LINES} lines, which is never outlined. The same Read with allow_large: true returns all {} lines ({}) as they are.",
+        last + 1 - first,
+        crate::history::human_bytes(native.len() as u64)
     );
     // Rows drop their signatures when that is what fits the context budget.
     let content = [true, false]

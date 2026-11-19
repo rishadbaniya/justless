@@ -14046,9 +14046,9 @@ fn a_replaced_read_names_the_root_to_expand_from_the_agents_directory() {
     assert!(outline.starts_with("revision "), "{outline}");
     let hint = replaced["additionalContext"].as_str().unwrap();
     let expand = hint
-        .split("Expand a row with ")
+        .split("Exact lines: `")
         .nth(1)
-        .and_then(|rest| rest.split(", or Read").next())
+        .and_then(|rest| rest.split("` for a row").next())
         .unwrap()
         .replace("FILE", "module.py")
         .replace("'REV#ID'", &format!("'{revision}#1'"));
@@ -14898,6 +14898,16 @@ fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
     assert!(!content.contains("next --after") && content.len() * 2 < native.len());
     let context = output["additionalContext"].as_str().unwrap();
     assert!(context.contains("allow_large: true") && !context.contains("expand"));
+    // The ranged Read comes first, and the whole-result routes state their cost.
+    let size = format!("{:.1} KB", native.len() as f64 / 1024.0);
+    assert!(
+        context.find("a limit of at most 150 lines").unwrap()
+            < context.find("allow_large").unwrap()
+            && context.ends_with(&format!(
+                "recall ID` with the first line's ID, returns all 298 lines ({size}) as they are."
+            )),
+        "{context}"
+    );
     assert_eq!(success(&root, &["recall", id]), native);
     text_lacks(&success(&root, &["resume"]), &["pipeline.py"]);
 
@@ -16642,7 +16652,7 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
     assert_eq!(file["totalLines"], 601);
     assert_eq!(
         hook_output["additionalContext"],
-        "Justless outline of lines 110-409, the lines this Read returned. L ranges are source line numbers. The same Read with allow_large: true returns those lines as they are, a Read of at most 150 lines is never outlined, and `justless expand src/lib.rs 'REV#ID'` prints one row."
+        "Justless outline of lines 110-409, the lines this Read returned. L ranges are source line numbers. Exact lines: `justless expand src/lib.rs 'REV#ID'` for a row, or a Read of at most 150 lines, which is never outlined. The same Read with allow_large: true returns all 300 lines (11.0 KB) as they are."
     );
     // `resume` lists the window as an outline of those lines, beside the whole
     // outline `read` showed.
@@ -16700,7 +16710,7 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
     assert!(
         context
             .unwrap()
-            .ends_with("or Read original lines with offset and a limit of at most 150."),
+            .ends_with("or a Read with offset and a limit of at most 150 lines."),
         "{whole}"
     );
 }
