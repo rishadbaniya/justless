@@ -1743,15 +1743,20 @@ fn retention(settings: &Settings) -> Option<(usize, u64)> {
 
 /// The note for a configured client when no hook has routed a command yet. Runs
 /// do not record which client routed them, so any hook-routed run, or a command a
-/// hook passed through, counts for every client. For Claude Code, `rules` are its
-/// permission rules, which can make the command hook leave commands as written.
+/// hook passed through or left, counts for every client. For Claude Code, `rules`
+/// are its permission rules, which can make the command hook leave commands as
+/// written, and the commands the hook left show the modes its sessions reported.
 fn routing_note(
     profile: &Profile,
     facts: &Facts,
     rules: Option<&claude_permissions::Rules>,
 ) -> Option<Check> {
     use claude_permissions::{Answer, Verdict, answer};
-    if profile.agent == Agent::OpenCode || facts.hook_runs > 0 || facts.passed_through > 0 {
+    let left = profile.agent == Agent::Claude && !facts.left.is_empty();
+    if profile.agent == Agent::OpenCode
+        || facts.hook_runs > 0
+        || !left && (facts.passed_through > 0 || !facts.left.is_empty())
+    {
         return None;
     }
     let scope = if facts.scanned < facts.runs {
@@ -1762,6 +1767,7 @@ fn routing_note(
     let label = profile.label;
     let advice = match rules.map(|rules| (rules.broken().is_empty(), rules.default_mode())) {
         Some((false, _)) => "While a Claude Code settings file cannot be used, the command hook leaves every command as written; see Permissions below.".to_owned(),
+        _ if left => left_advice(&facts.left, label),
         Some((true, mode)) if answer(mode, Verdict::Allow) == Answer::Leave => format!(
             "Your settings start sessions in `{mode}` permission mode, where the command hook leaves every command as written. Start a session in another mode, then run a build or test."
         ),
@@ -1777,6 +1783,45 @@ fn routing_note(
             profile.trust
         ),
     ))
+}
+
+/// What the commands the Claude Code command hook left say: how many, by the
+/// permission mode their sessions reported, and what to do about the most common
+/// mode, judged as the hook judges it.
+fn left_advice(left: &BTreeMap<String, u64>, label: &str) -> String {
+    use claude_permissions::{Answer, Verdict, answer};
+    let mut modes: Vec<(&str, u64)> = left.iter().map(|(mode, &n)| (mode.as_str(), n)).collect();
+    modes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let name = |mode: &str| match mode {
+        "other" => "a mode Justless does not know".to_owned(),
+        mode => format!("`{mode}` mode"),
+    };
+    let counts: Vec<String> = modes
+        .iter()
+        .map(|&(mode, n)| format!("{n} in {}", name(mode)))
+        .collect();
+    let mode = modes[0].0;
+    let what = if answer(mode, Verdict::Allow) == Answer::Leave {
+        format!(
+            "In {} the hook leaves every command; start a session in another mode, then run a build or test.",
+            name(mode)
+        )
+    } else if answer(mode, Verdict::Unknown) == Answer::Leave {
+        format!(
+            "In {} the hook routes only commands that allow rules cover. Allow the builds and tests you run, such as Bash(cargo test *), or answer \"Yes, and don't ask again\" when {label} asks, then run one.",
+            name(mode)
+        )
+    } else {
+        format!(
+            "In {} the hook leaves only commands that a deny or ask rule might match.",
+            name(mode)
+        )
+    };
+    format!(
+        "Its command hook left {} as written for the permission rules: {}. {what} `justless discover` counts the commands the hook left.",
+        plural(left.values().sum::<u64>() as usize, "command"),
+        counts.join(", ")
+    )
 }
 
 /// The `--agent` names of the clients found on PATH, in setup order. OpenCode is
@@ -2236,6 +2281,9 @@ struct Facts {
     index_saved: Option<u64>,
     /// Commands the hooks saw and passed through unchanged.
     passed_through: u64,
+    /// Commands the Claude Code command hook left as written for the permission
+    /// rules, by the permission mode the session reported.
+    left: BTreeMap<String, u64>,
 }
 
 #[derive(Deserialize)]
@@ -2254,6 +2302,8 @@ struct RunFacts {
 struct Activity {
     #[serde(default)]
     bypasses: BTreeMap<String, u64>,
+    #[serde(default)]
+    permission_leaves: BTreeMap<String, u64>,
 }
 
 impl Facts {
@@ -2340,10 +2390,12 @@ impl Facts {
             facts.index_bytes = Some(metadata.len());
             facts.index_saved = metadata.modified().ok().map(millis);
         }
-        facts.passed_through = fs::read(state.join("activity.json"))
+        let activity = fs::read(state.join("activity.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Activity>(&bytes).ok())
-            .map_or(0, |activity| activity.bypasses.values().sum());
+            .unwrap_or_default();
+        facts.passed_through = activity.bypasses.values().sum();
+        facts.left = activity.permission_leaves;
         facts
     }
 
@@ -2441,6 +2493,7 @@ impl Facts {
             "last_hook_routed_run_ms": self.last_hook_run.as_ref().map(|(when, _)| when),
             "last_hook_routed_label": self.last_hook_run.as_ref().map(|(_, label)| label),
             "hook_pass_through": self.passed_through,
+            "hook_left_by_permissions": self.left,
             "run_bytes": self.run_bytes,
             "runs_measured": self.measured,
             "observations": self.observations,

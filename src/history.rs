@@ -365,6 +365,10 @@ struct Activity {
     /// `crate::seen`.
     #[serde(default)]
     deltas: Deltas,
+    /// Commands the Claude Code command hook left as written for the permission
+    /// rules, by the permission mode the session reported. See `left_by_permissions`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    permission_leaves: BTreeMap<String, u64>,
 }
 
 /// How many views printed changes since an earlier read instead of the whole
@@ -582,6 +586,26 @@ pub fn bypass(workspace: &Workspace, command: &str) {
     let _ = update(
         &workspace.state.join("activity.json"),
         |a: &mut Activity| *a.bypasses.entry(family.to_owned()).or_default() += 1,
+    );
+}
+
+/// Counts a command the Claude Code command hook left as written because of the
+/// permission rules in the permission mode `mode` that the session reported, so
+/// `doctor` sees a mode no settings file shows, such as one from
+/// `--permission-mode`, `--settings` or a switch during the session. Only a count
+/// per mode is kept, never the command: a mode Claude Code documents by name, and
+/// any other as `other`.
+pub fn left_by_permissions(workspace: &Workspace, mode: &str) {
+    if !workspace.state.is_dir() {
+        return;
+    }
+    let mode = match mode {
+        "default" | "acceptEdits" | "dontAsk" | "bypassPermissions" | "auto" | "plan" => mode,
+        _ => "other",
+    };
+    let _ = update(
+        &workspace.state.join("activity.json"),
+        |a: &mut Activity| *a.permission_leaves.entry(mode.to_owned()).or_default() += 1,
     );
 }
 

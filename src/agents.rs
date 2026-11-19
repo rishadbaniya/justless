@@ -1374,7 +1374,10 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
             .map(|range| &command[range])
             .collect();
         match crate::claude_permissions::decide(&workspace.root, mode, &segments) {
-            crate::claude_permissions::Answer::Leave => return None,
+            crate::claude_permissions::Answer::Leave => {
+                crate::history::left_by_permissions(workspace, mode);
+                return None;
+            }
             crate::claude_permissions::Answer::Rewrite => {}
             crate::claude_permissions::Answer::Approve => approve = true,
         }

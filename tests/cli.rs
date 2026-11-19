@@ -6726,6 +6726,22 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
     ), "{text}");
     assert!(text.contains("In Codex, review and trust the project hooks with /hooks first."));
     assert!(text.contains("CLI not found on PATH (looked for cursor, cursor-agent)"));
+    // The Claude Code hook counts what it leaves by the mode the session reported,
+    // such as one from `--permission-mode`, which no settings file shows.
+    for mode in ["acceptEdits", "dontAsk", "dontAsk"] {
+        let call = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+            "cwd":root,"permission_mode":mode,"tool_input":{"command":"cargo test"}});
+        assert_eq!(
+            agent_hook(root, "hook-claude", "before-command", call),
+            serde_json::json!({})
+        );
+    }
+    let (_, text) = doctor_text(root, tools.path());
+    assert!(text.contains(
+        "! Claude Code has not routed a command through Justless here yet. Its command hook left 3 commands as written for the permission rules: 2 in `dontAsk` mode, 1 in `acceptEdits` mode. In `dontAsk` mode the hook routes only commands that allow rules cover."
+    ), "{text}");
+    // Any hook that ran counts for every client.
+    assert!(!text.contains("In Codex, review and trust"), "{text}");
 
     success(root, &["run", "--hook", "--", "ls", "-la"]);
     let bin = tools.path().join("bin");
@@ -6742,6 +6758,10 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
     assert_eq!(report["project"], true);
     assert_eq!(report["state"]["hook_routed_runs"], 1);
     assert_eq!(report["state"]["last_hook_routed_label"], "ls");
+    assert_eq!(
+        report["state"]["hook_left_by_permissions"],
+        serde_json::json!({"acceptEdits": 1, "dontAsk": 2})
+    );
     let agents = report["agents"].as_array().unwrap();
     assert_eq!(agents.len(), 7);
     assert!(agents.iter().all(|agent| agent["set_up"] == true));
