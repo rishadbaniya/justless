@@ -76,43 +76,52 @@ fn run_id(output: &Output) -> String {
         .to_owned()
 }
 
+/// Asserts that `text` contains each of `needles`, naming the first one missing.
+#[track_caller]
+fn assert_all_in(text: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+    }
+}
+
+/// Asserts that `text` contains none of `needles`.
+#[track_caller]
+fn assert_none_in(text: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(!text.contains(needle), "unexpected {needle:?} in:\n{text}");
+    }
+}
+
+/// Splits a command line without quoting into its arguments.
+fn argv(line: &str) -> Vec<&str> {
+    line.split_whitespace().collect()
+}
+
 #[test]
 fn failing_cargo_test_leads_to_source_and_exact_log_slice() {
     let root = fixture();
     let path = root.path();
-    let output = cli(
-        path,
-        &[
-            "run",
-            "--max-bytes",
-            "512",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-        ],
-    );
+    let output = cli(path, &argv("run --max-bytes 512 -- cargo test --offline"));
     assert_eq!(output.status.code(), Some(101), "{:?}", output);
     let preview = stdout(&output);
     assert!(preview.len() <= 512, "{preview}");
-    assert!(preview.contains("total_includes_fee"), "{preview}");
-    assert!(preview.contains("tests/checkout.rs:11"), "{preview}");
-    assert!(preview.contains("assertion"), "{preview}");
-    assert!(!preview.contains("only-in-the-full-log"), "{preview}");
+    assert_all_in(
+        &preview,
+        &["total_includes_fee", "tests/checkout.rs:11", "assertion"],
+    );
+    assert_none_in(&preview, &["only-in-the-full-log"]);
     let id = run_id(&output);
     let context = success(path, &["context", "--run", &id]);
-    assert!(context.contains("tests/checkout.rs:11"), "{context}");
-    assert!(
-        context.contains("assert_eq!(total(100, 5), 105);"),
-        "{context}"
-    );
-    assert!(
-        context.contains("checkout_fixture::pricing::checkout_total"),
-        "{context}"
+    assert_all_in(
+        &context,
+        &[
+            "tests/checkout.rs:11",
+            "assert_eq!(total(100, 5), 105);",
+            "checkout_fixture::pricing::checkout_total",
+        ],
     );
     let code = success(path, &["context", "--symbol", "checkout_total"]);
-    assert!(code.contains("src/pricing.rs:1-3"), "{code}");
-    assert!(code.contains("apply_fee(subtotal, fee)"), "{code}");
+    assert_all_in(&code, &["src/pricing.rs:1-3", "apply_fee(subtotal, fee)"]);
     let full = success(path, &["log", &id, "--stream", "stdout"]);
     assert!(full.len() > 15_000, "{}", full.len());
     let matches = success(path, &["search", &id, "only-in-the-full-log"]);
@@ -133,10 +142,7 @@ fn failing_cargo_test_leads_to_source_and_exact_log_slice() {
     assert!(bounded.contains("[context budget reached]"), "{bounded}");
     fs::write(path.join("tests/checkout.rs"), "fn new_source() {}\n").unwrap();
     let historical = success(path, &["context", "--run", &id]);
-    assert!(
-        historical.contains("Source changed or disappeared"),
-        "{historical}"
-    );
+    assert!(historical.contains("Source changed or disappeared"));
 }
 
 #[test]
@@ -145,44 +151,34 @@ fn index_tracks_relationships_and_reuses_unchanged_files() {
     let path = root.path();
     assert!(success(path, &["index"]).contains("4 parsed"));
     assert!(success(path, &["index"]).contains("0 parsed · 4 reused"));
-    let tests = success(path, &["query", "apply_fee", "--view", "tests"]);
-    assert!(tests.contains("related test (2 call hops)"), "{tests}");
-    assert!(tests.contains("total_includes_fee"), "{tests}");
-    let callers = success(path, &["query", "checkout_total", "--view", "callers"]);
-    assert!(
-        callers.contains(
-            "call from checkout_fixture_test_checkout::total_includes_fee at tests/checkout.rs:11"
-        ),
-        "{callers}"
+    let tests = success(path, &argv("query apply_fee --view tests"));
+    assert_all_in(
+        &tests,
+        &["related test (2 call hops)", "total_includes_fee"],
     );
-    let references = success(path, &["query", "checkout_total", "--view", "references"]);
-    assert!(
-        references.contains("import from file scope at tests/checkout.rs:1"),
-        "{references}"
+    let callers = success(path, &argv("query checkout_total --view callers"));
+    assert_all_in(
+        &callers,
+        &["call from checkout_fixture_test_checkout::total_includes_fee at tests/checkout.rs:11"],
     );
-    fs::write(
-        path.join("src/pricing.rs"),
-        "pub fn replacement_total() -> u32 { 105 }\n",
-    )
-    .unwrap();
+    let references = success(path, &argv("query checkout_total --view references"));
+    assert_all_in(
+        &references,
+        &["import from file scope at tests/checkout.rs:1"],
+    );
+    let pricing = "pub fn replacement_total() -> u32 { 105 }\n";
+    fs::write(path.join("src/pricing.rs"), pricing).unwrap();
     fs::remove_file(path.join("src/obsolete.rs")).unwrap();
     let changed = success(path, &["index"]);
     assert!(
         changed.contains("1 parsed · 2 reused · 1 removed"),
         "{changed}"
     );
-    assert!(
-        success(
-            path,
-            &["query", "replacement_total", "--view", "definition"]
-        )
-        .contains("src/pricing.rs:1")
-    );
+    let definition = success(path, &argv("query replacement_total --view definition"));
+    assert!(definition.contains("src/pricing.rs:1"));
     for stale in ["checkout_total", "apply_fee", "obsolete_helper"] {
-        assert!(
-            stderr(&cli(path, &["query", stale])).contains("symbol not found"),
-            "{stale}"
-        );
+        let message = stderr(&cli(path, &["query", stale]));
+        assert!(message.contains("symbol not found"), "{stale}");
     }
 }
 
@@ -190,48 +186,32 @@ fn index_tracks_relationships_and_reuses_unchanged_files() {
 fn git_changes_and_codex_setup_work_in_a_repository() {
     let root = fixture();
     let path = root.path();
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .current_dir(path)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{args:?} {}", stderr(&output));
-    };
-    git(&["init", "-q"]);
     fs::write(path.join("AGENTS.md"), "# Existing instructions\n").unwrap();
-    git(&["add", "."]);
-    git(&[
-        "-c",
-        "user.name=Justless Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-qm",
-        "fixture",
-    ]);
+    git_repository(path);
     success(path, &["init-codex"]);
     success(path, &["init-codex"]);
     let agents = fs::read_to_string(path.join("AGENTS.md")).unwrap();
     assert!(agents.starts_with("# Existing instructions\n"));
     assert_eq!(agents.matches("<!-- justless:begin -->").count(), 1);
-    git(&["check-ignore", ".justless/index.json"]);
+    git(path, &["check-ignore", ".justless/index.json"]);
     let pricing = path.join("src/pricing.rs");
     let previous = fs::read_to_string(&pricing).unwrap();
     fs::write(&pricing, previous.replace("fee + 1", "fee + 2")).unwrap();
     let changes = success(path, &["context", "--changes"]);
-    assert!(changes.contains("Changed src/pricing.rs:6-6"), "{changes}");
-    assert!(changes.contains("apply_fee [function]"), "{changes}");
-    assert!(changes.contains("total_includes_fee"), "{changes}");
-    git(&["add", "src/pricing.rs"]);
+    assert_all_in(
+        &changes,
+        &[
+            "Changed src/pricing.rs:6-6",
+            "apply_fee [function]",
+            "total_includes_fee",
+        ],
+    );
+    git(path, &["add", "src/pricing.rs"]);
     assert!(success(path, &["context", "--changes", "--staged"]).contains("apply_fee"));
     fs::write(&pricing, &previous).unwrap();
     let staged = success(path, &["context", "--changes", "--staged"]);
-    assert!(
-        staged.contains("working tree differs from staged source"),
-        "{staged}"
-    );
-    let output = cli(path, &["run", "--", "git", "diff", "--", "src/pricing.rs"]);
+    assert!(staged.contains("working tree differs from staged source"));
+    let output = cli(path, &argv("run -- git diff -- src/pricing.rs"));
     assert!(output.status.success(), "{}", stderr(&output));
     let id = run_id(&output);
     assert!(success(path, &["log", &id, "--stream", "stdout"]).contains("fee + 1"));
@@ -241,21 +221,14 @@ fn git_changes_and_codex_setup_work_in_a_repository() {
 fn log_replay_preserves_binary_streams_and_command_status() {
     let root = fixture();
     let path = root.path();
-    let command = [
-        "sh",
-        "-c",
-        "printf '\\001\\000hello\\377'; printf 'oops\\n' >&2; exit 23",
-    ];
-    let output = cli(path, &["run", "--", command[0], command[1], command[2]]);
+    let script = "printf '\\001\\000hello\\377'; printf 'oops\\n' >&2; exit 23";
+    let output = cli(path, &["run", "--", "sh", "-c", script]);
     assert_eq!(output.status.code(), Some(23));
     let id = run_id(&output);
     let log = cli(path, &["log", &id]);
     assert_eq!(log.stdout, b"\x01\x00hello\xff");
     assert_eq!(log.stderr, b"oops\n");
-    let raw = cli(
-        path,
-        &["run", "--raw", "--", command[0], command[1], command[2]],
-    );
+    let raw = cli(path, &["run", "--raw", "--", "sh", "-c", script]);
     assert_eq!(raw.status.code(), Some(23));
     assert_eq!(raw.stdout, log.stdout);
     assert_eq!(raw.stderr, log.stderr);
@@ -273,27 +246,13 @@ fn compiler_json_errors_link_to_source_and_the_original_message() {
         path.join("src/pricing.rs"),
         "pub fn checkout_total(subtotal: u32, fee: u32) -> u32 {\n    subtotal + fee + \"wrong\"\n}\n",
     ).unwrap();
-    let output = cli(
-        path,
-        &[
-            "run",
-            "--max-bytes",
-            "512",
-            "--",
-            "cargo",
-            "check",
-            "--offline",
-            "--message-format=json",
-        ],
-    );
+    let command = "run --max-bytes 512 -- cargo check --offline --message-format=json";
+    let output = cli(path, &argv(command));
     assert_eq!(output.status.code(), Some(101), "{}", stderr(&output));
-    let preview = stdout(&output);
-    assert!(preview.contains("error[E0277]"), "{preview}");
-    assert!(preview.contains("src/pricing.rs:2"), "{preview}");
+    assert_all_in(&stdout(&output), &["error[E0277]", "src/pricing.rs:2"]);
     let id = run_id(&output);
     let source = success(path, &["context", "--run", &id]);
-    assert!(source.contains("src/pricing.rs:2"), "{source}");
-    assert!(source.contains("subtotal + fee + \"wrong\""), "{source}");
+    assert_all_in(&source, &["src/pricing.rs:2", "subtotal + fee + \"wrong\""]);
     let full = success(path, &["log", &id, "--stream", "stdout"]);
     assert!(full.lines().any(|line| {
         serde_json::from_str::<serde_json::Value>(line)
@@ -309,18 +268,18 @@ fn ambiguous_names_and_invalid_edits_cannot_return_stale_definitions() {
     fs::write(&source, "pub fn apply_fee() {}\n").unwrap();
     let ambiguous = cli(path, &["query", "apply_fee"]);
     assert_ne!(ambiguous.status.code(), Some(0));
-    let message = stderr(&ambiguous);
-    assert!(message.contains("ambiguous symbol"), "{message}");
-    assert!(message.contains("src/obsolete.rs:1"), "{message}");
-    assert!(message.contains("src/pricing.rs:5-7"), "{message}");
+    assert_all_in(
+        &stderr(&ambiguous),
+        &[
+            "ambiguous symbol",
+            "src/obsolete.rs:1",
+            "src/pricing.rs:5-7",
+        ],
+    );
     assert!(success(path, &["query", "pricing::apply_fee"]).contains("src/pricing.rs:5-7"));
     fs::write(&source, "pub fn apply_fee(\n").unwrap();
-    let errors = cli(path, &["index"]);
-    assert!(
-        stderr(&errors).contains("src/obsolete.rs: line"),
-        "{}",
-        stderr(&errors)
-    );
+    let errors = stderr(&cli(path, &["index"]));
+    assert!(errors.contains("src/obsolete.rs: line"), "{errors}");
     assert!(success(path, &["query", "apply_fee"]).contains("src/pricing.rs:5-7"));
 }
 
@@ -331,58 +290,36 @@ fn mixed_repo_paths_and_exact_text_refresh_after_edits() {
     let index = cli(root, &["index"]);
     assert!(index.status.success(), "{}", stderr(&index));
     assert!(index.stderr.is_empty(), "{}", stderr(&index));
-    assert!(
-        stdout(&index).contains("6 text files"),
-        "{}",
-        stdout(&index)
+    assert!(stdout(&index).contains("6 text files"), "{index:?}");
+    assert_all_in(
+        &success(root, &["path", "fetchOrders", "purchase_orders"]),
+        &[
+            "HTTP route at frontend/orders.ts:4",
+            "list_orders [function] at backend/orders.py:6-8",
+            "SQL relation at backend/orders.py:8",
+            "purchase_orders [table] at db/schema.sql:1-3",
+        ],
     );
-    let route = success(root, &["path", "fetchOrders", "purchase_orders"]);
-    assert!(
-        route.contains("HTTP route at frontend/orders.ts:4"),
-        "{route}"
-    );
-    assert!(
-        route.contains("list_orders [function] at backend/orders.py:6-8"),
-        "{route}"
-    );
-    assert!(
-        route.contains("SQL relation at backend/orders.py:8"),
-        "{route}"
-    );
-    assert!(
-        route.contains("purchase_orders [table] at db/schema.sql:1-3"),
-        "{route}"
-    );
-    let imports = success(
-        root,
-        &["query", "frontend/orders.ts", "--view", "dependencies"],
-    );
-    assert!(
-        imports.contains("formatOrder [function] at frontend/format.ts:1-3"),
-        "{imports}"
-    );
+    let imports = success(root, &argv("query frontend/orders.ts --view dependencies"));
+    assert!(imports.contains("formatOrder [function] at frontend/format.ts:1-3"));
     let hits = success(root, &["find", "-i", "CANARY-CHECKOUT"]);
-    assert!(hits.contains("docs/operations.md:3"), "{hits}");
-    assert!(hits.contains("backend/settings.custom:1"), "{hits}");
+    assert_all_in(
+        &hits,
+        &["docs/operations.md:3", "backend/settings.custom:1"],
+    );
     fs::write(root.join(".justlessignore"), "*.custom\n").unwrap();
     let hits = success(root, &["find", "canary-checkout"]);
-    assert!(!hits.contains("settings.custom"), "{hits}");
-    fs::write(
-        root.join("frontend/orders.ts"),
-        "export function replacementOrder() {}\n",
-    )
-    .unwrap();
+    assert_all_in(&hits, &["docs/operations.md:3"]);
+    assert_none_in(&hits, &["settings.custom"]);
+    let orders = "export function replacementOrder() {}\n";
+    fs::write(root.join("frontend/orders.ts"), orders).unwrap();
     fs::remove_file(root.join("db/schema.sql")).unwrap();
     for symbol in ["fetchOrders", "purchase_orders"] {
-        assert!(
-            stderr(&cli(root, &["query", symbol])).contains("symbol not found"),
-            "{symbol}"
-        );
+        let message = stderr(&cli(root, &["query", symbol]));
+        assert!(message.contains("symbol not found"), "{symbol}");
     }
-    assert!(
-        success(root, &["query", "replacementOrder", "--view", "definition"])
-            .contains("frontend/orders.ts:1")
-    );
+    let definition = success(root, &argv("query replacementOrder --view definition"));
+    assert!(definition.contains("frontend/orders.ts:1"));
 }
 
 #[test]
@@ -390,48 +327,24 @@ fn structural_parsers_cover_common_non_rust_languages() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     for (file, source, name) in [
-        (
-            "program.js",
-            "export function jsThing() { return 1; }\n",
-            "jsThing",
-        ),
-        (
-            "view.tsx",
-            "export function TsView() { return <div />; }\n",
-            "TsView",
-        ),
-        (
-            "main.go",
-            "package main\nfunc GoThing() int { return 1 }\n",
-            "GoThing",
-        ),
-        (
-            "Demo.java",
-            "class JavaThing { int javaMethod() { return 1; } }\n",
-            "JavaThing",
-        ),
+        ("a.js", "export function jsThing() {}\n", "jsThing"),
+        ("v.tsx", "function TsView() { return <a />; }\n", "TsView"),
+        ("a.go", "package a\nfunc GoThing() {}\n", "GoThing"),
+        ("A.java", "class JavaThing { void m() {} }\n", "JavaThing"),
         ("main.c", "int c_thing(void) { return 1; }\n", "c_thing"),
         ("main.cpp", "int cpp_thing() { return 1; }\n", "cpp_thing"),
         (
-            "Demo.cs",
-            "class CSharpThing { int Run() { return 1; } }\n",
+            "A.cs",
+            "class CSharpThing { void Run() {} }\n",
             "CSharpThing",
         ),
         (
-            "demo.rb",
-            "class RubyThing\n  def run\n    1\n  end\nend\n",
+            "a.rb",
+            "class RubyThing\n  def run\n  end\nend\n",
             "RubyThing",
         ),
-        (
-            "demo.php",
-            "<?php function php_thing() { return 1; }\n",
-            "php_thing",
-        ),
-        (
-            "demo.sh",
-            "bash_thing() { printf 'hello\\n'; }\n",
-            "bash_thing",
-        ),
+        ("a.php", "<?php function php_thing() {}\n", "php_thing"),
+        ("a.sh", "bash_thing() { printf 'hi\\n'; }\n", "bash_thing"),
     ] {
         fs::write(root.join(file), source).unwrap();
         let output = success(root, &["query", name, "--view", "definition"]);
@@ -458,9 +371,13 @@ struct LanguageCase<'a> {
     expand: (&'a str, &'a str),
     caller: (&'a str, &'a str),
     test: (&'a str, &'a str),
+    /// More outline rows, by file.
+    outlines: &'a [(&'a str, &'a str)],
+    /// A symbol and its whole `definition` answer.
+    definition: Option<(&'a str, &'a str)>,
 }
 
-fn check_language(case: LanguageCase<'_>) -> TempDir {
+fn check_language(case: &LanguageCase<'_>) -> TempDir {
     let repo = language_fixture(case.language);
     let root = repo.path();
     let outline = success(root, &["read", case.file, "--outline"]);
@@ -477,236 +394,393 @@ fn check_language(case: LanguageCase<'_>) -> TempDir {
     let (symbol, test) = case.test;
     let tests = success(root, &["query", symbol, "--view", "tests"]);
     assert!(tests.contains(test), "{tests}");
+    for (file, row) in case.outlines {
+        let text = success(root, &["read", file, "--outline"]);
+        assert!(text.contains(row), "{row}{text}");
+    }
+    if let Some((symbol, expected)) = case.definition {
+        let definition = success(root, &["query", symbol, "--view", "definition"]);
+        assert_eq!(definition, expected);
+    }
     repo
 }
 
+/// Kotlin, Swift, Scala, Dart, Lua, Zig, Elixir, Objective-C, PowerShell, Julia
+/// and Groovy outline, expand, link calls and find tests.
 #[test]
-fn kotlin_outlines_calls_and_junit_tests_share_the_jvm_index() {
-    let repo = check_language(LanguageCase {
-        language: "kotlin",
-        file: "Billing.kt",
-        rows: &[
-            "#3 L7-9 interface Ledger  interface Ledger",
-            "#5 L11-23 class InvoiceService  class InvoiceService(private val ledger: Ledger) : Ledger by ledger",
-            "#6 L12-12 property InvoiceService::currency  val currency = \"EUR\"",
-            "#7 L14-18 method InvoiceService::total  fun total(items: List<Cents>): Cents",
-            "#8 L21-21 method InvoiceService::create  fun create(ledger: Ledger): InvoiceService",
-            "#9 L25-25 function applyTax  fun applyTax(amount: Cents): Cents",
-        ],
-        expand: (
-            "applyTax",
-            "fun applyTax(amount: Cents): Cents = amount * 2",
-        ),
-        caller: (
-            "applyTax",
-            "call from Billing.kt::InvoiceService::total at Billing.kt:17",
-        ),
-        test: (
-            "total",
-            "related test (1 call hops): BillingTest.kt::BillingTest::totalsItems [test]",
-        ),
-    });
-    let root = repo.path();
-    // Kotlin and Java resolve calls to each other, and JUnit marks Java tests too.
-    fs::write(
-        root.join("TaxTest.java"),
-        "class TaxTest {\n  @org.junit.Test\n  void doubles() { BillingKt.applyTax(2); }\n}\n",
-    )
-    .unwrap();
-    let tests = success(root, &["query", "applyTax", "--view", "tests"]);
-    assert!(
-        tests.contains("related test (1 call hops): TaxTest.java::TaxTest::doubles [test]"),
-        "{tests}"
-    );
-}
-
-#[test]
-fn swift_extensions_extend_their_type_and_xctest_methods_are_tests() {
-    let repo = check_language(LanguageCase {
-        language: "swift",
-        file: "Billing.swift",
-        rows: &[
-            "#3 L5-7 protocol Ledger  protocol Ledger",
-            "#5 L9-12 struct Invoice  struct Invoice",
-            "#8 L14-26 class InvoiceService  final class InvoiceService",
-            "#10 L17-19 constructor InvoiceService::init  init(ledger: Ledger)",
-            "#11 L21-25 method InvoiceService::total  func total(_ items: [Cents]) -> Cents",
-            "#12 L29-29 method InvoiceService::reset  func reset()",
-            "#13 L32-34 function applyTax  func applyTax(_ amount: Cents) -> Cents",
-        ],
-        expand: ("InvoiceService::reset", "func reset() {}"),
-        caller: (
-            "applyTax",
-            "call from Billing.swift::InvoiceService::total at Billing.swift:24",
-        ),
-        test: (
-            "total",
-            "related test (1 call hops): BillingTests.swift::BillingTests::testTotalsItems [test]",
-        ),
-    });
-    let definition = success(
-        repo.path(),
-        &["query", "InvoiceService", "--view", "definition"],
-    );
-    assert_eq!(
-        definition,
-        "Billing.swift::InvoiceService [class] at Billing.swift:14-26\n"
-    );
-}
-
-#[test]
-fn scala_companions_and_test_dsl_calls_are_indexed() {
-    let repo = check_language(LanguageCase {
-        language: "scala",
-        file: "Billing.scala",
-        rows: &[
-            "#3 L7-9 trait Ledger  trait Ledger",
-            "#5 L11-11 class Invoice  case class Invoice(id: String, total: Cents)",
-            "#6 L13-21 class InvoiceService  class InvoiceService(ledger: Ledger)",
-            "#8 L16-20 method InvoiceService::total  def total(items: List[Cents]): Cents =",
-            "#9 L24-24 method InvoiceService::create  def create(ledger: Ledger): InvoiceService =",
-            "#10 L27-27 function applyTax  def applyTax(amount: Cents): Cents =",
-        ],
-        expand: (
-            "InvoiceService::create",
-            "def create(ledger: Ledger): InvoiceService = new InvoiceService(ledger)",
-        ),
-        caller: (
-            "applyTax",
-            "call from Billing.scala::InvoiceService::total at Billing.scala:19",
-        ),
-        test: (
-            "create",
-            "related test (1 call hops): BillingSuite.scala::BillingSuite::\"totals items\" [test]",
-        ),
-    });
-    let suite = success(repo.path(), &["read", "BillingSuite.scala", "--outline"]);
-    assert!(
-        suite.contains("#3 L6-9 test BillingSuite::\"totals items\"  test(\"totals items\") {\n"),
-        "{suite}"
-    );
-}
-
-#[test]
-fn dart_constructors_and_test_calls_are_indexed() {
-    let repo = check_language(LanguageCase {
-        language: "dart",
-        file: "billing.dart",
-        rows: &[
-            "#3 L5-7 class Ledger  abstract class Ledger",
-            "#4 L6-6 method Ledger::record  void record(Cents amount);",
-            "#6 L10-10 field InvoiceService::ledger  final Ledger ledger;",
-            "#7 L12-12 constructor InvoiceService::new  InvoiceService(this.ledger);",
-            "#9 L16-20 method InvoiceService::total  Cents total(List<Cents> items)",
-            "#10 L23-25 function applyTax  Cents applyTax(Cents amount)",
-        ],
-        expand: (
-            "InvoiceService::standard",
-            "InvoiceService.standard() : ledger = MemoryLedger();",
-        ),
-        caller: (
-            "applyTax",
-            "call from billing.dart::InvoiceService::total at billing.dart:19",
-        ),
-        test: (
-            "total",
-            "related test (1 call hops): billing_test.dart::main::\"totals items\" [test]",
-        ),
-    });
-    let definition = success(
-        repo.path(),
-        &["query", "InvoiceService", "--view", "definition"],
-    );
-    assert_eq!(
-        definition,
-        "billing.dart::InvoiceService [class] at billing.dart:9-21\n"
-    );
-    // A test described by a function name stays distinct from that function.
-    let tests = success(repo.path(), &["query", "applyTax", "--view", "tests"]);
-    assert!(
-        tests.starts_with("billing.dart::applyTax [function]")
-            && tests.contains(
-                "related test (1 call hops): billing_test.dart::main::\"applyTax\" [test]"
+fn language_outlines_link_calls_and_tests() {
+    let cases = [
+        LanguageCase {
+            language: "kotlin",
+            file: "Billing.kt",
+            rows: &[
+                "#3 L7-9 interface Ledger  interface Ledger",
+                "#5 L11-23 class InvoiceService  class InvoiceService(private val ledger: Ledger) : Ledger by ledger",
+                "#6 L12-12 property InvoiceService::currency  val currency = \"EUR\"",
+                "#7 L14-18 method InvoiceService::total  fun total(items: List<Cents>): Cents",
+                "#8 L21-21 method InvoiceService::create  fun create(ledger: Ledger): InvoiceService",
+                "#9 L25-25 function applyTax  fun applyTax(amount: Cents): Cents",
+            ],
+            expand: (
+                "applyTax",
+                "fun applyTax(amount: Cents): Cents = amount * 2",
             ),
-        "{tests}"
-    );
-}
-
-#[test]
-fn lua_and_zig_outlines_link_calls_and_tests() {
-    check_language(LanguageCase {
-        language: "lua",
-        file: "billing.lua",
-        rows: &[
-            "#1 L3-5 function apply_tax  local function apply_tax(amount)",
-            "#2 L7-13 function total  function M.total(items)",
-            "#3 L15-17 function format_total  local format_total = function(amount)",
-            "#4 L19-21 method describe  function M:describe()",
-        ],
-        expand: (
-            "format_total",
-            "local format_total = function(amount)\n  return string.format(\"%d\", amount)\nend",
-        ),
-        caller: (
-            "apply_tax",
-            "call from billing.lua::total at billing.lua:12",
-        ),
-        test: (
-            "total",
-            "related test (1 call hops): billing_spec.lua::\"totals items\" [test]",
-        ),
-    });
-    let repo = check_language(LanguageCase {
-        language: "zig",
-        file: "billing.zig",
-        rows: &[
-            "#2 L3-9 struct Invoice  pub const Invoice = struct",
-            "#3 L6-8 function Invoice::add  pub fn add(self: *Invoice, amount: u64) void",
-            "#4 L11-13 function applyTax  fn applyTax(amount: u64) u64",
-            "#5 L15-19 test \"adds tax\"  test \"adds tax\"",
-            "#6 L21-23 test \"applyTax\"  test applyTax",
-        ],
-        expand: (
-            "Invoice::add",
-            "pub fn add(self: *Invoice, amount: u64) void {\n        self.total += applyTax(amount);\n    }",
-        ),
-        caller: (
-            "applyTax",
-            "call from billing.zig::Invoice::add at billing.zig:7",
-        ),
-        test: (
-            "add",
-            "related test (1 call hops): billing.zig::\"adds tax\" [test]",
-        ),
-    });
-    // `test applyTax` documents the function without shadowing it.
-    let callers = success(repo.path(), &["query", "applyTax", "--view", "callers"]);
-    assert!(
-        callers.contains("call from billing.zig::\"applyTax\" at billing.zig:22"),
-        "{callers}"
-    );
+            caller: (
+                "applyTax",
+                "call from Billing.kt::InvoiceService::total at Billing.kt:17",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): BillingTest.kt::BillingTest::totalsItems [test]",
+            ),
+            outlines: &[],
+            definition: None,
+        },
+        // Swift extensions extend their type and XCTest methods are tests.
+        LanguageCase {
+            language: "swift",
+            file: "Billing.swift",
+            rows: &[
+                "#3 L5-7 protocol Ledger  protocol Ledger",
+                "#5 L9-12 struct Invoice  struct Invoice",
+                "#8 L14-26 class InvoiceService  final class InvoiceService",
+                "#10 L17-19 constructor InvoiceService::init  init(ledger: Ledger)",
+                "#11 L21-25 method InvoiceService::total  func total(_ items: [Cents]) -> Cents",
+                "#12 L29-29 method InvoiceService::reset  func reset()",
+                "#13 L32-34 function applyTax  func applyTax(_ amount: Cents) -> Cents",
+            ],
+            expand: ("InvoiceService::reset", "func reset() {}"),
+            caller: (
+                "applyTax",
+                "call from Billing.swift::InvoiceService::total at Billing.swift:24",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): BillingTests.swift::BillingTests::testTotalsItems [test]",
+            ),
+            outlines: &[],
+            definition: Some((
+                "InvoiceService",
+                "Billing.swift::InvoiceService [class] at Billing.swift:14-26\n",
+            )),
+        },
+        // Scala companions and test DSL calls are indexed.
+        LanguageCase {
+            language: "scala",
+            file: "Billing.scala",
+            rows: &[
+                "#3 L7-9 trait Ledger  trait Ledger",
+                "#5 L11-11 class Invoice  case class Invoice(id: String, total: Cents)",
+                "#6 L13-21 class InvoiceService  class InvoiceService(ledger: Ledger)",
+                "#8 L16-20 method InvoiceService::total  def total(items: List[Cents]): Cents =",
+                "#9 L24-24 method InvoiceService::create  def create(ledger: Ledger): InvoiceService =",
+                "#10 L27-27 function applyTax  def applyTax(amount: Cents): Cents =",
+            ],
+            expand: (
+                "InvoiceService::create",
+                "def create(ledger: Ledger): InvoiceService = new InvoiceService(ledger)",
+            ),
+            caller: (
+                "applyTax",
+                "call from Billing.scala::InvoiceService::total at Billing.scala:19",
+            ),
+            test: (
+                "create",
+                "related test (1 call hops): BillingSuite.scala::BillingSuite::\"totals items\" [test]",
+            ),
+            outlines: &[(
+                "BillingSuite.scala",
+                "#3 L6-9 test BillingSuite::\"totals items\"  test(\"totals items\") {\n",
+            )],
+            definition: None,
+        },
+        // Dart constructors and test calls are indexed.
+        LanguageCase {
+            language: "dart",
+            file: "billing.dart",
+            rows: &[
+                "#3 L5-7 class Ledger  abstract class Ledger",
+                "#4 L6-6 method Ledger::record  void record(Cents amount);",
+                "#6 L10-10 field InvoiceService::ledger  final Ledger ledger;",
+                "#7 L12-12 constructor InvoiceService::new  InvoiceService(this.ledger);",
+                "#9 L16-20 method InvoiceService::total  Cents total(List<Cents> items)",
+                "#10 L23-25 function applyTax  Cents applyTax(Cents amount)",
+            ],
+            expand: (
+                "InvoiceService::standard",
+                "InvoiceService.standard() : ledger = MemoryLedger();",
+            ),
+            caller: (
+                "applyTax",
+                "call from billing.dart::InvoiceService::total at billing.dart:19",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): billing_test.dart::main::\"totals items\" [test]",
+            ),
+            outlines: &[],
+            definition: Some((
+                "InvoiceService",
+                "billing.dart::InvoiceService [class] at billing.dart:9-21\n",
+            )),
+        },
+        LanguageCase {
+            language: "lua",
+            file: "billing.lua",
+            rows: &[
+                "#1 L3-5 function apply_tax  local function apply_tax(amount)",
+                "#2 L7-13 function total  function M.total(items)",
+                "#3 L15-17 function format_total  local format_total = function(amount)",
+                "#4 L19-21 method describe  function M:describe()",
+            ],
+            expand: (
+                "format_total",
+                "local format_total = function(amount)\n  return string.format(\"%d\", amount)\nend",
+            ),
+            caller: (
+                "apply_tax",
+                "call from billing.lua::total at billing.lua:12",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): billing_spec.lua::\"totals items\" [test]",
+            ),
+            outlines: &[],
+            definition: None,
+        },
+        LanguageCase {
+            language: "zig",
+            file: "billing.zig",
+            rows: &[
+                "#2 L3-9 struct Invoice  pub const Invoice = struct",
+                "#3 L6-8 function Invoice::add  pub fn add(self: *Invoice, amount: u64) void",
+                "#4 L11-13 function applyTax  fn applyTax(amount: u64) u64",
+                "#5 L15-19 test \"adds tax\"  test \"adds tax\"",
+                "#6 L21-23 test \"applyTax\"  test applyTax",
+            ],
+            expand: (
+                "Invoice::add",
+                "pub fn add(self: *Invoice, amount: u64) void {\n        self.total += applyTax(amount);\n    }",
+            ),
+            caller: (
+                "applyTax",
+                "call from billing.zig::Invoice::add at billing.zig:7",
+            ),
+            test: (
+                "add",
+                "related test (1 call hops): billing.zig::\"adds tax\" [test]",
+            ),
+            outlines: &[],
+            definition: None,
+        },
+        LanguageCase {
+            language: "elixir",
+            file: "billing.ex",
+            rows: &[
+                "#1 L1-26 module Shop.Billing  defmodule Shop.Billing",
+                "#2 L4-4 import import  alias Shop.Ledger",
+                "#4 L9-9 type Shop.Billing::cents  @type cents :: non_neg_integer()",
+                "#5 L12-17 function Shop.Billing::total  def total(%__MODULE__{items: items})",
+                "#7 L23-23 function Shop.Billing::apply_tax  defp apply_tax(amount) when is_integer(amount), do: amount * 2",
+                "#8 L25-25 macro Shop.Billing::cents  defmacro cents(value), do: value",
+                "#10 L29-29 function Shop.Printable::print  def print(document)",
+            ],
+            expand: (
+                "Shop.Billing::apply_tax",
+                "defp apply_tax(amount) when is_integer(amount), do: amount * 2",
+            ),
+            // A module's own functions resolve by name across the project.
+            caller: (
+                "apply_tax",
+                "possible call from billing.ex::Shop.Billing::total at billing.ex:15",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): billing_test.exs::Shop.BillingTest::\"totals items\" [test]",
+            ),
+            outlines: &[],
+            definition: None,
+        },
+        LanguageCase {
+            language: "objc",
+            file: "SHPBilling.m",
+            rows: &[
+                "#1 L1-1 import import  #import \"SHPBilling.h\"",
+                "#3 L4-6 function SHPApplyTax  static NSInteger SHPApplyTax(NSInteger amount)",
+                "#4 L9-9 property SHPInvoiceService::ledger  @property (nonatomic, strong) id<SHPLedger> ledger;",
+                "#6 L22-29 method SHPInvoiceService::totalOfItems  - (NSInteger)totalOfItems:(NSArray<NSNumber *> *)items",
+                "#7 L31-33 method SHPInvoiceService::serviceWithLedger  + (instancetype)serviceWithLedger:(id<SHPLedger>)ledger",
+            ],
+            expand: (
+                "SHPApplyTax",
+                "static NSInteger SHPApplyTax(NSInteger amount) {\n    return amount * 2;\n}",
+            ),
+            caller: (
+                "SHPApplyTax",
+                "call from SHPBilling.m::SHPInvoiceService::totalOfItems at SHPBilling.m:28",
+            ),
+            test: (
+                "totalOfItems",
+                "related test (1 call hops): SHPBillingTests.m::SHPBillingTests::testTotalsItems [test]",
+            ),
+            // Header macros and protocols parse, and a class extension is no
+            // second class.
+            outlines: &[
+                (
+                    "SHPBilling.h",
+                    "#3 L6-6 method SHPLedger::recordAmount  - (void)recordAmount:(NSInteger)amount;\n",
+                ),
+                (
+                    "SHPBilling.h",
+                    "#4 L9-14 class SHPInvoiceService  @interface SHPInvoiceService : NSObject\n",
+                ),
+            ],
+            definition: Some((
+                "SHPInvoiceService",
+                "SHPBilling.h::SHPInvoiceService [class] at SHPBilling.h:9-14\n",
+            )),
+        },
+        LanguageCase {
+            language: "powershell",
+            file: "Billing.psm1",
+            rows: &[
+                "#1 L1-1 import import  using namespace System.Collections.Generic",
+                "#3 L4-11 class InvoiceService  class InvoiceService",
+                "#4 L5-5 property InvoiceService::Currency  [string] $Currency = 'EUR'",
+                "#5 L7-10 method InvoiceService::Total  [int] Total([int[]] $Items)",
+                "#7 L22-25 function Get-InvoiceTotal  function Get-InvoiceTotal([int[]] $Items)",
+            ],
+            expand: (
+                "Invoke-ApplyTax",
+                "function Invoke-ApplyTax {\n    [CmdletBinding()]\n    param(\n        [Parameter(Mandatory)]\n        [int] $Amount\n    )\n    return $Amount * 2\n}",
+            ),
+            caller: (
+                "Invoke-ApplyTax",
+                "call from Billing.psm1::InvoiceService::Total at Billing.psm1:9",
+            ),
+            test: (
+                "Get-InvoiceTotal",
+                "related test (1 call hops): Billing.Tests.ps1::\"totals items\" [test]",
+            ),
+            outlines: &[(
+                "Billing.Tests.ps1",
+                "#1 L6-8 test \"totals items\"  It 'totals items' {\n",
+            )],
+            definition: None,
+        },
+        LanguageCase {
+            language: "julia",
+            file: "Billing.jl",
+            rows: &[
+                "#1 L1-33 module Billing  module Billing",
+                "#5 L10-13 struct Billing::Invoice  struct Invoice",
+                "#6 L15-15 constant Billing::CURRENCY  const CURRENCY = \"EUR\"",
+                "#7 L17-17 function Billing::apply_tax  apply_tax(amount::Integer) = amount * 2",
+                "#8 L19-25 function Billing::total  function total(invoice::Invoice)",
+                "#9 L27-29 macro Billing::cents  macro cents(value)",
+            ],
+            expand: (
+                "Billing::apply_tax",
+                "apply_tax(amount::Integer) = amount * 2",
+            ),
+            caller: (
+                "apply_tax",
+                "possible call from Billing.jl::Billing::total at Billing.jl:24",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): runtests.jl::\"totals items\" [test]",
+            ),
+            outlines: &[],
+            definition: None,
+        },
+        LanguageCase {
+            language: "groovy",
+            file: "Billing.groovy",
+            rows: &[
+                "#3 L6-8 interface Ledger  interface Ledger",
+                "#5 L10-28 class InvoiceService  @CompileStatic class InvoiceService",
+                "#8 L15-17 constructor InvoiceService::new  InvoiceService(Ledger ledger)",
+                "#9 L19-23 method InvoiceService::total  long total(List<Long> items)",
+                "#12 L31-33 method Taxes::applyTax  static long applyTax(long amount)",
+            ],
+            expand: (
+                "Taxes::applyTax",
+                "static long applyTax(long amount) {\n        amount * 2\n    }",
+            ),
+            caller: (
+                "applyTax",
+                "possible call from Billing.groovy::Taxes::describe at Billing.groovy:36",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): BillingSpec.groovy::BillingSpec::\"totals items\" [test]",
+            ),
+            outlines: &[(
+                "build.gradle",
+                "#2 L18-22 task printVersion  tasks.register('printVersion')\n",
+            )],
+            definition: None,
+        },
+    ];
+    for case in &cases {
+        let repo = check_language(case);
+        let root = repo.path();
+        match case.language {
+            // Kotlin and Java resolve calls to each other, and JUnit marks Java
+            // tests too.
+            "kotlin" => {
+                let test = "class TaxTest {\n  @org.junit.Test\n  void doubles() { BillingKt.applyTax(2); }\n}\n";
+                fs::write(root.join("TaxTest.java"), test).unwrap();
+                let tests = success(root, &["query", "applyTax", "--view", "tests"]);
+                assert!(
+                    tests.contains(
+                        "related test (1 call hops): TaxTest.java::TaxTest::doubles [test]"
+                    ),
+                    "{tests}"
+                );
+            }
+            // A test described by a function name stays distinct from that function.
+            "dart" => {
+                let tests = success(root, &["query", "applyTax", "--view", "tests"]);
+                assert!(
+                    tests.starts_with("billing.dart::applyTax [function]")
+                        && tests.contains(
+                            "related test (1 call hops): billing_test.dart::main::\"applyTax\" [test]"
+                        ),
+                    "{tests}"
+                );
+            }
+            // `test applyTax` documents the function without shadowing it.
+            "zig" => {
+                let callers = success(root, &["query", "applyTax", "--view", "callers"]);
+                assert!(
+                    callers.contains("call from billing.zig::\"applyTax\" at billing.zig:22"),
+                    "{callers}"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]
 fn terraform_blocks_use_addresses_and_link_references() {
     let repo = language_fixture("terraform");
     let root = repo.path();
-    let outline = success(root, &["read", "main.tf", "--outline"]);
-    for row in [
-        "#1 L1-3 terraform terraform  terraform\n",
-        "#2 L5-7 provider provider.aws  provider \"aws\"\n",
-        "#3 L10-10 local local.bucket_name  bucket_name = \"${var.prefix}-logs\"\n",
-        "#4 L13-15 resource aws_s3_bucket.logs  resource \"aws_s3_bucket\" \"logs\"\n",
-        "#5 L17-21 data data.aws_iam_policy_document.read  data \"aws_iam_policy_document\" \"read\"\n",
-        "#6 L23-26 module module.vpc  module \"vpc\"\n",
-    ] {
-        assert!(outline.contains(row), "{row}{outline}");
-    }
-    let variables = success(root, &["read", "variables.tf", "--outline"]);
-    assert!(
-        variables.contains("#1 L1-4 variable var.region  variable \"region\"\n"),
-        "{variables}"
+    assert_all_in(
+        &success(root, &["read", "main.tf", "--outline"]),
+        &[
+            "#1 L1-3 terraform terraform  terraform\n",
+            "#2 L5-7 provider provider.aws  provider \"aws\"\n",
+            "#3 L10-10 local local.bucket_name  bucket_name = \"${var.prefix}-logs\"\n",
+            "#4 L13-15 resource aws_s3_bucket.logs  resource \"aws_s3_bucket\" \"logs\"\n",
+            "#5 L17-21 data data.aws_iam_policy_document.read  data \"aws_iam_policy_document\" \"read\"\n",
+            "#6 L23-26 module module.vpc  module \"vpc\"\n",
+        ],
     );
+    let variables = success(root, &["read", "variables.tf", "--outline"]);
+    assert!(variables.contains("#1 L1-4 variable var.region  variable \"region\"\n"));
     assert_eq!(
         success(root, &["expand", "main.tf", "aws_s3_bucket.logs"]),
         "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = local.bucket_name\n}"
@@ -745,173 +819,6 @@ fn terraform_blocks_use_addresses_and_link_references() {
 }
 
 #[test]
-fn elixir_objective_c_powershell_julia_and_groovy_link_calls_and_tests() {
-    for case in [
-        LanguageCase {
-            language: "elixir",
-            file: "billing.ex",
-            rows: &[
-                "#1 L1-26 module Shop.Billing  defmodule Shop.Billing",
-                "#2 L4-4 import import  alias Shop.Ledger",
-                "#4 L9-9 type Shop.Billing::cents  @type cents :: non_neg_integer()",
-                "#5 L12-17 function Shop.Billing::total  def total(%__MODULE__{items: items})",
-                "#7 L23-23 function Shop.Billing::apply_tax  defp apply_tax(amount) when is_integer(amount), do: amount * 2",
-                "#8 L25-25 macro Shop.Billing::cents  defmacro cents(value), do: value",
-                "#10 L29-29 function Shop.Printable::print  def print(document)",
-            ],
-            expand: (
-                "Shop.Billing::apply_tax",
-                "defp apply_tax(amount) when is_integer(amount), do: amount * 2",
-            ),
-            // A module's own functions resolve by name across the project.
-            caller: (
-                "apply_tax",
-                "possible call from billing.ex::Shop.Billing::total at billing.ex:15",
-            ),
-            test: (
-                "total",
-                "related test (1 call hops): billing_test.exs::Shop.BillingTest::\"totals items\" [test]",
-            ),
-        },
-        LanguageCase {
-            language: "objc",
-            file: "SHPBilling.m",
-            rows: &[
-                "#1 L1-1 import import  #import \"SHPBilling.h\"",
-                "#3 L4-6 function SHPApplyTax  static NSInteger SHPApplyTax(NSInteger amount)",
-                "#4 L9-9 property SHPInvoiceService::ledger  @property (nonatomic, strong) id<SHPLedger> ledger;",
-                "#6 L22-29 method SHPInvoiceService::totalOfItems  - (NSInteger)totalOfItems:(NSArray<NSNumber *> *)items",
-                "#7 L31-33 method SHPInvoiceService::serviceWithLedger  + (instancetype)serviceWithLedger:(id<SHPLedger>)ledger",
-            ],
-            expand: (
-                "SHPApplyTax",
-                "static NSInteger SHPApplyTax(NSInteger amount) {\n    return amount * 2;\n}",
-            ),
-            caller: (
-                "SHPApplyTax",
-                "call from SHPBilling.m::SHPInvoiceService::totalOfItems at SHPBilling.m:28",
-            ),
-            test: (
-                "totalOfItems",
-                "related test (1 call hops): SHPBillingTests.m::SHPBillingTests::testTotalsItems [test]",
-            ),
-        },
-        LanguageCase {
-            language: "powershell",
-            file: "Billing.psm1",
-            rows: &[
-                "#1 L1-1 import import  using namespace System.Collections.Generic",
-                "#3 L4-11 class InvoiceService  class InvoiceService",
-                "#4 L5-5 property InvoiceService::Currency  [string] $Currency = 'EUR'",
-                "#5 L7-10 method InvoiceService::Total  [int] Total([int[]] $Items)",
-                "#7 L22-25 function Get-InvoiceTotal  function Get-InvoiceTotal([int[]] $Items)",
-            ],
-            expand: (
-                "Invoke-ApplyTax",
-                "function Invoke-ApplyTax {\n    [CmdletBinding()]\n    param(\n        [Parameter(Mandatory)]\n        [int] $Amount\n    )\n    return $Amount * 2\n}",
-            ),
-            caller: (
-                "Invoke-ApplyTax",
-                "call from Billing.psm1::InvoiceService::Total at Billing.psm1:9",
-            ),
-            test: (
-                "Get-InvoiceTotal",
-                "related test (1 call hops): Billing.Tests.ps1::\"totals items\" [test]",
-            ),
-        },
-        LanguageCase {
-            language: "julia",
-            file: "Billing.jl",
-            rows: &[
-                "#1 L1-33 module Billing  module Billing",
-                "#5 L10-13 struct Billing::Invoice  struct Invoice",
-                "#6 L15-15 constant Billing::CURRENCY  const CURRENCY = \"EUR\"",
-                "#7 L17-17 function Billing::apply_tax  apply_tax(amount::Integer) = amount * 2",
-                "#8 L19-25 function Billing::total  function total(invoice::Invoice)",
-                "#9 L27-29 macro Billing::cents  macro cents(value)",
-            ],
-            expand: (
-                "Billing::apply_tax",
-                "apply_tax(amount::Integer) = amount * 2",
-            ),
-            caller: (
-                "apply_tax",
-                "possible call from Billing.jl::Billing::total at Billing.jl:24",
-            ),
-            test: (
-                "total",
-                "related test (1 call hops): runtests.jl::\"totals items\" [test]",
-            ),
-        },
-        LanguageCase {
-            language: "groovy",
-            file: "Billing.groovy",
-            rows: &[
-                "#3 L6-8 interface Ledger  interface Ledger",
-                "#5 L10-28 class InvoiceService  @CompileStatic class InvoiceService",
-                "#8 L15-17 constructor InvoiceService::new  InvoiceService(Ledger ledger)",
-                "#9 L19-23 method InvoiceService::total  long total(List<Long> items)",
-                "#12 L31-33 method Taxes::applyTax  static long applyTax(long amount)",
-            ],
-            expand: (
-                "Taxes::applyTax",
-                "static long applyTax(long amount) {\n        amount * 2\n    }",
-            ),
-            caller: (
-                "applyTax",
-                "possible call from Billing.groovy::Taxes::describe at Billing.groovy:36",
-            ),
-            test: (
-                "total",
-                "related test (1 call hops): BillingSpec.groovy::BillingSpec::\"totals items\" [test]",
-            ),
-        },
-    ] {
-        let language = case.language;
-        let repo = check_language(case);
-        let root = repo.path();
-        let outline = |file| success(root, &["read", file, "--outline"]);
-        let expected: &[(&str, &str)] = match language {
-            // Header macros and protocols parse, and a class extension is no
-            // second class.
-            "objc" => &[
-                (
-                    "SHPBilling.h",
-                    "#3 L6-6 method SHPLedger::recordAmount  - (void)recordAmount:(NSInteger)amount;\n",
-                ),
-                (
-                    "SHPBilling.h",
-                    "#4 L9-14 class SHPInvoiceService  @interface SHPInvoiceService : NSObject\n",
-                ),
-            ],
-            "powershell" => &[(
-                "Billing.Tests.ps1",
-                "#1 L6-8 test \"totals items\"  It 'totals items' {\n",
-            )],
-            "groovy" => &[(
-                "build.gradle",
-                "#2 L18-22 task printVersion  tasks.register('printVersion')\n",
-            )],
-            _ => &[],
-        };
-        for (file, row) in expected {
-            let text = outline(file);
-            assert!(text.contains(row), "{row}{text}");
-        }
-        if language == "objc" {
-            let definition = success(
-                root,
-                &["query", "SHPInvoiceService", "--view", "definition"],
-            );
-            assert_eq!(
-                definition,
-                "SHPBilling.h::SHPInvoiceService [class] at SHPBilling.h:9-14\n"
-            );
-        }
-    }
-}
-
-#[test]
 fn vue_svelte_and_astro_scripts_are_indexed_at_their_own_lines() {
     let repo = language_fixture("components");
     let root = repo.path();
@@ -938,27 +845,22 @@ fn vue_svelte_and_astro_scripts_are_indexed_at_their_own_lines() {
         ),
     ] {
         let outline = success(root, &["read", file, "--outline"]);
-        for row in rows {
-            assert!(outline.contains(row), "{row}{outline}");
-        }
+        assert_all_in(&outline, rows);
         // Markup and styles stay out of the outline.
-        assert!(
-            !outline.contains("invoice") && !outline.contains("text-align"),
-            "{outline}"
-        );
+        assert_none_in(&outline, &["invoice", "text-align"]);
     }
     assert_eq!(
         success(root, &["expand", "InvoiceRow.svelte", "taxed"]),
         "function taxed(value: number): string {\n    return `${applyTax(value)} ${currency}`;\n  }"
     );
-    let callers = success(root, &["query", "applyTax", "--view", "callers"]);
-    for caller in [
-        "call from Invoice.astro::grandTotal at Invoice.astro:12",
-        "call from InvoiceRow.svelte::taxed at InvoiceRow.svelte:11",
-        "call from InvoiceTotal.vue::total at InvoiceTotal.vue:17",
-    ] {
-        assert!(callers.contains(caller), "{callers}");
-    }
+    assert_all_in(
+        &success(root, &["query", "applyTax", "--view", "callers"]),
+        &[
+            "call from Invoice.astro::grandTotal at Invoice.astro:12",
+            "call from InvoiceRow.svelte::taxed at InvoiceRow.svelte:11",
+            "call from InvoiceTotal.vue::total at InvoiceTotal.vue:17",
+        ],
+    );
     let affected = success(root, &["affected", "billing.ts"]);
     assert!(
         affected
@@ -1013,10 +915,7 @@ fn extensionless_scripts_take_the_language_of_their_shebang() {
         );
     }
     let outline = success(root, &["read", "bin/deploy", "--outline"]);
-    assert!(
-        outline.contains("#1 L2-3 function deploy_release  def deploy_release(tag):\n"),
-        "{outline}"
-    );
+    assert!(outline.contains("#1 L2-3 function deploy_release  def deploy_release(tag):\n"));
     let map = success(root, &["map"]);
     assert!(
         map.contains("Bash 1 · JavaScript 1 · Python 1 · Ruby 1"),
@@ -1126,20 +1025,14 @@ fn claude_hook_keeps_the_permission_rules_of_the_original_command() {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
     };
-    write(
-        &config.join("settings.json"),
-        r#"{"permissions":{"allow":["Bash(git status:*)","Bash(git log *)","Bash(rg:*)"]}}"#,
-    );
-    write(
-        &root.join(".claude/settings.json"),
-        r#"{"permissions":{"ask":["Bash(git log:*)"]}}"#,
-    );
+    let user = r#"{"permissions":{"allow":["Bash(git status:*)","Bash(git log *)","Bash(rg:*)"]}}"#;
+    write(&config.join("settings.json"), user);
+    let ask = r#"{"permissions":{"ask":["Bash(git log:*)"]}}"#;
+    write(&root.join(".claude/settings.json"), ask);
     let local = root.join(".claude/settings.local.json");
     write(&local, r#"{"permissions":{"allow":["Bash(echo *)"]}}"#);
-    write(
-        &managed.join("managed-settings.json"),
-        r#"{"permissions":{"deny":["Bash(rg fetch*)"]}}"#,
-    );
+    let deny = r#"{"permissions":{"deny":["Bash(rg fetch*)"]}}"#;
+    write(&managed.join("managed-settings.json"), deny);
     let run = |command: &str, mode: Option<&str>, user: Option<&Path>| -> Value {
         let mut input = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
             "tool_input":{"command":command,"description":"check"}});
@@ -1159,12 +1052,9 @@ fn claude_hook_keeps_the_permission_rules_of_the_original_command() {
             None => hook.env_remove("CLAUDE_CONFIG_DIR"),
         };
         let mut child = hook.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.to_string().as_bytes())
-            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+        drop(stdin);
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         serde_json::from_slice(&output.stdout).unwrap()
@@ -1211,11 +1101,8 @@ fn claude_hook_keeps_the_permission_rules_of_the_original_command() {
     ] {
         for (mode, expected) in modes.iter().zip(answers) {
             let output = run(command, *mode, Some(&config));
-            assert_eq!(
-                claude_answer(&output),
-                expected,
-                "{command} {mode:?}: {output}"
-            );
+            let answer = claude_answer(&output);
+            assert_eq!(answer, expected, "{command} {mode:?}: {output}");
         }
     }
     let approved = run("git status", Some("default"), Some(&config));
@@ -1226,29 +1113,17 @@ fn claude_hook_keeps_the_permission_rules_of_the_original_command() {
 
     // A settings file that cannot be parsed might deny anything.
     write(&local, "{");
-    assert_eq!(
-        run("git status", Some("bypassPermissions"), Some(&config)),
-        json!({})
-    );
+    let output = run("git status", Some("bypassPermissions"), Some(&config));
+    assert_eq!(output, json!({}));
     write(&local, r#"{"permissions":{"allow":["Bash(echo *)"]}}"#);
 
     // Without CLAUDE_CONFIG_DIR, the user settings come from the home directory.
-    assert_eq!(
-        claude_answer(&run("git diff", Some("default"), None)),
-        "leave"
-    );
-    write(
-        &home.join(".claude/settings.json"),
-        r#"{"permissions":{"allow":["Bash(git diff)"]}}"#,
-    );
-    assert_eq!(
-        claude_answer(&run("git diff", Some("default"), None)),
-        "approve"
-    );
-    assert_eq!(
-        claude_answer(&run("git status", Some("default"), None)),
-        "leave"
-    );
+    let answer = |command| claude_answer(&run(command, Some("default"), None));
+    assert_eq!(answer("git diff"), "leave");
+    let diff = r#"{"permissions":{"allow":["Bash(git diff)"]}}"#;
+    write(&home.join(".claude/settings.json"), diff);
+    assert_eq!(answer("git diff"), "approve");
+    assert_eq!(answer("git status"), "leave");
 }
 
 /// Claude Code keeps "don't ask again" rules in the local settings file at the
@@ -1270,17 +1145,11 @@ fn claude_hook_reads_allow_rules_from_the_repository_local_file() {
         &["worktree", "add", "-q", worktree.to_str().unwrap()],
     );
     fs::create_dir(main.join(".claude")).unwrap();
-    fs::write(
-        main.join(".claude/settings.local.json"),
-        r#"{"permissions":{"allow":["Bash(git status:*)"]}}"#,
-    )
-    .unwrap();
+    let local = r#"{"permissions":{"allow":["Bash(git status:*)"]}}"#;
+    fs::write(main.join(".claude/settings.local.json"), local).unwrap();
     // Claude Code reads the shared file only where the session started.
-    fs::write(
-        main.join(".claude/settings.json"),
-        r#"{"permissions":{"allow":["Bash(git log:*)"]}}"#,
-    )
-    .unwrap();
+    let shared = r#"{"permissions":{"allow":["Bash(git log:*)"]}}"#;
+    fs::write(main.join(".claude/settings.json"), shared).unwrap();
     let answer = |project: &Path, command: &str, home: &Path| {
         let input = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
             "cwd":project,"permission_mode":"default","tool_input":{"command":command}});
@@ -1302,16 +1171,8 @@ fn claude_hook_reads_allow_rules_from_the_repository_local_file() {
     };
     let home = base.join("home");
     for project in [main.join("sub"), worktree] {
-        assert_eq!(
-            answer(&project, "git status", &home),
-            "approve",
-            "{project:?}"
-        );
-        assert_eq!(
-            answer(&project, "git log -1", &home),
-            "leave",
-            "{project:?}"
-        );
+        assert_eq!(answer(&project, "git status", &home), "approve");
+        assert_eq!(answer(&project, "git log -1", &home), "leave");
     }
     // When the repository root is the home directory, Claude Code keeps the file
     // where the session started.
@@ -1327,7 +1188,8 @@ fn doctor_warns_about_allow_rules_that_let_justless_run_anything() {
     git(root, &["init", "-q"]);
     success(root, &["init", "--hooks", "--agent", "claude"]);
     let (_, text) = doctor_text(root, tools.path());
-    assert!(!text.contains("Permissions:"), "{text}");
+    assert_all_in(&text, &["Claude Code"]);
+    assert_none_in(&text, &["Permissions:"]);
     fs::write(
         root.join(".claude/settings.local.json"),
         r#"{"permissions":{"allow":["Bash(justless run *)","Bash(justless query:*)","Bash(cargo test *)"]}}"#,
@@ -1338,53 +1200,41 @@ fn doctor_warns_about_allow_rules_that_let_justless_run_anything() {
     fs::write(&user, r#"{"permissions":{"allow":["Bash(justless:*)"]}}"#).unwrap();
     let (status, text) = doctor_text(root, tools.path());
     assert_eq!(status, Some(0), "{text}");
-    assert!(
-        text.contains("! Permissions: Bash(justless run *) in .claude/settings.local.json lets the agent run any command without asking"),
-        "{text}"
+    assert_all_in(
+        &text,
+        &[
+            "! Permissions: Bash(justless run *) in .claude/settings.local.json lets the agent run any command without asking",
+            &format!("! Permissions: Bash(justless:*) in {} lets", user.display()),
+            "Remove Bash(justless run *) from .claude/settings.local.json",
+            "routes only commands that allow rules cover",
+        ],
     );
-    assert!(
-        text.contains(&format!(
-            "! Permissions: Bash(justless:*) in {} lets",
-            user.display()
-        )),
-        "{text}"
-    );
-    assert!(
-        text.contains("Remove Bash(justless run *) from .claude/settings.local.json"),
-        "{text}"
-    );
-    assert!(!text.contains("justless query"), "{text}");
-    assert!(
-        text.contains("routes only commands that allow rules cover"),
-        "{text}"
-    );
+    assert_none_in(&text, &["justless query"]);
 
     // In bypassPermissions mode the hook routes what no rule covers.
-    fs::write(
-        &user,
-        r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
-    )
-    .unwrap();
+    let bypass = r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#;
+    fs::write(&user, bypass).unwrap();
     let (_, text) = doctor_text(root, tools.path());
-    assert!(
-        text.contains("here yet. Start a new Claude Code session"),
-        "{text}"
-    );
+    assert_all_in(&text, &["here yet. Start a new Claude Code session"]);
     // A settings file the hook cannot use stops it from routing in every mode.
     fs::write(&user, "{").unwrap();
     let (_, text) = doctor_text(root, tools.path());
-    assert!(
-        text.contains(&format!(
-            "! Permissions: cannot use Claude Code settings {} (not valid JSON: EOF while parsing an object at line 1 column 1), so the command hook leaves every command as written, in every permission mode",
-            user.display()
-        )) && text.contains(&format!("by hand: Fix {} so that", user.display()))
-            && text.contains("here yet. While a Claude Code settings file cannot be used"),
-        "{text}"
+    assert_all_in(
+        &text,
+        &[
+            &format!(
+                "! Permissions: cannot use Claude Code settings {} (not valid JSON: EOF while parsing an object at line 1 column 1), so the command hook leaves every command as written, in every permission mode",
+                user.display()
+            ),
+            &format!("by hand: Fix {} so that", user.display()),
+            "here yet. While a Claude Code settings file cannot be used",
+        ],
     );
 }
 
 #[test]
 fn codex_hooks_merge_and_use_the_documented_tool_contract() {
+    use serde_json::json;
     let repo = mixed_fixture();
     let root = repo.path();
     fs::create_dir(root.join(".codex")).unwrap();
@@ -1395,31 +1245,23 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
     success(root, &["init-codex", "--hooks"]);
     assert_eq!(installed, fs::read_to_string(&config).unwrap());
     let parsed: serde_json::Value = serde_json::from_str(&installed).unwrap();
+    let hooks = &parsed["hooks"];
     assert_eq!(parsed["description"], "preserve");
-    assert_eq!(parsed["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        parsed["hooks"]["SessionStart"][0]["hooks"][0]["async"],
-        true
-    );
-    assert_eq!(
-        parsed["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
-        "justless hook-codex before-command"
-    );
+    assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 2);
+    assert_eq!(hooks["SessionStart"][0]["hooks"][0]["async"], true);
+    let command = &hooks["PreToolUse"][1]["hooks"][0]["command"];
+    assert_eq!(command, "justless hook-codex before-command");
 
     let start = hook(
         root,
         "session-start",
-        serde_json::json!({"hook_event_name":"SessionStart"}),
+        json!({"hook_event_name":"SessionStart"}),
     );
-    assert!(
-        start["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("Justless indexed")
-    );
+    let context = start["hookSpecificOutput"]["additionalContext"].as_str();
+    assert!(context.unwrap().contains("Justless indexed"));
     assert!(root.join(".justless/index.json").is_file());
     let call = |command: &str| {
-        serde_json::json!({
+        json!({
             "hook_event_name":"PreToolUse", "tool_name":"Bash", "tool_cwd": root,
             "tool_input":{"command":command,"workdir":root}
         })
@@ -1429,24 +1271,15 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
         "before-command",
         call("rg 'fetch|list_orders' frontend"),
     );
+    let output = &rewritten["hookSpecificOutput"];
+    assert_eq!(output["permissionDecision"], "allow");
     assert_eq!(
-        rewritten["hookSpecificOutput"]["permissionDecision"],
-        "allow"
-    );
-    assert_eq!(
-        rewritten["hookSpecificOutput"]["updatedInput"]["command"],
+        output["updatedInput"]["command"],
         "justless run --hook -- rg 'fetch|list_orders' frontend"
     );
-    assert_eq!(
-        rewritten["hookSpecificOutput"]["updatedInput"]["workdir"],
-        root.to_str().unwrap()
-    );
-    assert!(
-        rewritten["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("justless query")
-    );
+    assert_eq!(output["updatedInput"]["workdir"], root.to_str().unwrap());
+    let context = output["additionalContext"].as_str().unwrap();
+    assert!(context.contains("justless query"));
     for command in [
         "cargo test && git push",
         "git push origin main",
@@ -1458,18 +1291,10 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
         "justless run --hook -- rg fetch",
         "rg fetch frontend/*.ts",
     ] {
-        assert_eq!(
-            hook(root, "before-command", call(command)),
-            serde_json::json!({}),
-            "{command}"
-        );
+        let output = hook(root, "before-command", call(command));
+        assert_eq!(output, json!({}), "{command}");
     }
-    let git = Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(git.status.success(), "{}", stderr(&git));
+    git(root, &["init", "-q"]);
     let rewritten = hook(root, "before-command", call("git status --short"));
     let command = rewritten["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
@@ -1491,11 +1316,7 @@ fn codex_hooks_merge_and_use_the_documented_tool_contract() {
     assert!(stdout(&output).contains("frontend/"), "{}", stdout(&output));
     // A hook-routed run that reached the agent verbatim prints no footer, but it is
     // still archived and listed.
-    assert!(
-        !stderr(&output).contains("[justless"),
-        "{}",
-        stderr(&output)
-    );
+    assert_none_in(&stderr(&output), &["[justless"]);
     let latest = success(root, &["history"]);
     let id = latest.split_whitespace().next().unwrap();
     assert!(
@@ -1515,28 +1336,17 @@ fn install_and_run_claude_and_agy_hooks() {
     let claude = root.join(".claude/settings.json");
     let agy = root.join(".agents/hooks.json");
     fs::create_dir(root.join(".agents")).unwrap();
-    fs::write(
-        &claude,
-        r#"{"permissions":{"defaultMode":"default"},"hooks":{"SessionStart":[]}}"#,
-    )
-    .unwrap();
-    fs::write(
-        &agy,
-        r#"{"other":{"enabled":false},"justless":{"PreToolUse":"invalid"}}"#,
-    )
-    .unwrap();
+    let settings = r#"{"permissions":{"defaultMode":"default"},"hooks":{"SessionStart":[]}}"#;
+    fs::write(&claude, settings).unwrap();
+    let invalid = r#"{"other":{"enabled":false},"justless":{"PreToolUse":"invalid"}}"#;
+    fs::write(&agy, invalid).unwrap();
     let setup = ["init", "--hooks", "--agent", "claude", "--agent", "agy"];
     assert!(!cli(&root, &setup).status.success());
     assert!(!root.join("CLAUDE.md").exists());
     fs::write(&agy, r#"{"other":{"enabled":false}}"#).unwrap();
     fs::write(root.join("CLAUDE.md"), "# Team rules\n").unwrap();
     success(&root, &setup);
-    let configs = || {
-        [
-            fs::read_to_string(&claude).unwrap(),
-            fs::read_to_string(&agy).unwrap(),
-        ]
-    };
+    let configs = || [&claude, &agy].map(|path| fs::read_to_string(path).unwrap());
     let installed = configs();
     success(&root, &setup);
     assert_eq!(installed, configs());
@@ -1549,18 +1359,14 @@ fn install_and_run_claude_and_agy_hooks() {
     let block = &instructions[instructions.find("<!-- justless:begin -->").unwrap()
         ..instructions.find("<!-- justless:end -->").unwrap()];
     assert!(block.len() <= 1024, "{} bytes", block.len());
-    assert!(block.contains("justless run -- CMD") && block.contains("justless recall ID"));
+    assert_all_in(block, &["justless run -- CMD", "justless recall ID"]);
     let [claude, agy] = installed.map(|s| serde_json::from_str::<Value>(&s).unwrap());
     assert_eq!(claude["permissions"]["defaultMode"], "default");
-    assert_eq!(
-        claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-        "justless hook-claude before-command"
-    );
+    let command = &claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"];
+    assert_eq!(command, "justless hook-claude before-command");
     assert_eq!(agy["other"]["enabled"], false);
-    assert_eq!(
-        agy["justless"]["SessionStart"][0]["command"],
-        "justless hook-agy session-start"
-    );
+    let command = &agy["justless"]["SessionStart"][0]["command"];
+    assert_eq!(command, "justless hook-agy session-start");
     assert_eq!(agy["justless"]["PreToolUse"][0]["matcher"], "^run_command$");
     let claude_input = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":"git diff","description":"show changes"}});
     let output = agent_hook(&root, "hook-claude", "before-command", claude_input.clone());
@@ -1572,61 +1378,32 @@ fn install_and_run_claude_and_agy_hooks() {
     assert!(hook.get("permissionDecision").is_none());
     let mut plan = claude_input;
     plan["permission_mode"] = json!("plan");
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "before-command", plan),
-        json!({})
-    );
+    let output = agent_hook(&root, "hook-claude", "before-command", plan);
+    assert_eq!(output, json!({}));
     let elsewhere = TempDir::new().unwrap();
     let agy_input = |command: &str, cwd: &Path| json!({"workspacePaths":[root],"toolCall":{"name":"run_command","args":{"CommandLine":command,"Cwd":cwd,"WaitMsBeforeAsync":10}}});
+    let agy_hook = |dir: &Path, mode: &str, input| agent_hook(dir, "hook-agy", mode, input);
     let dispatch = |command: &str, cwd: &Path| {
-        agent_hook(
-            elsewhere.path(),
-            "hook-agy",
-            "before-command",
-            agy_input(command, cwd),
-        )
+        agy_hook(elsewhere.path(), "before-command", agy_input(command, cwd))
     };
     assert_eq!(
         dispatch("git diff", &root),
         json!({"decision":"allow","overwrite":{"CommandLine":"justless run --hook -- git diff"}})
     );
-    assert_eq!(
-        dispatch("git diff", elsewhere.path()),
-        json!({"decision":"allow"})
-    );
-    assert_eq!(
-        dispatch("git diff | cat", &root),
-        json!({"decision":"allow"})
-    );
+    let allow = json!({"decision":"allow"});
+    assert_eq!(dispatch("git diff", elsewhere.path()), allow);
+    assert_eq!(dispatch("git diff | cat", &root), allow);
     let mut multiple = agy_input("git diff", &root);
     multiple["workspacePaths"] = json!([elsewhere.path(), root]);
-    let result = agent_hook(
-        elsewhere.path(),
-        "hook-agy",
-        "before-command",
-        multiple.clone(),
-    );
-    assert_eq!(
-        result["overwrite"]["CommandLine"],
-        "justless run --hook -- git diff"
-    );
+    let result = agy_hook(elsewhere.path(), "before-command", multiple.clone());
+    let command = &result["overwrite"]["CommandLine"];
+    assert_eq!(command, "justless run --hook -- git diff");
     multiple["toolCall"]["args"]["RunPersistent"] = json!(true);
-    assert_eq!(
-        agent_hook(&root, "hook-agy", "before-command", multiple),
-        json!({"decision":"allow"})
-    );
-    let startup = agent_hook(
-        elsewhere.path(),
-        "hook-agy",
-        "session-start",
-        json!({"workspacePaths":[root]}),
-    );
-    assert!(
-        startup["injectSteps"][0]["ephemeralMessage"]
-            .as_str()
-            .unwrap()
-            .contains("Justless indexed")
-    );
+    assert_eq!(agy_hook(&root, "before-command", multiple), allow);
+    let startup = json!({"workspacePaths":[root]});
+    let startup = agy_hook(elsewhere.path(), "session-start", startup);
+    let message = startup["injectSteps"][0]["ephemeralMessage"].as_str();
+    assert!(message.unwrap().contains("Justless indexed"));
     assert!(root.join(".justless/index.json").is_file());
     assert!(!elsewhere.path().join(".justless").exists());
 }
