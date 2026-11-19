@@ -270,8 +270,12 @@ impl Hooks {
 struct AgentAudit<'p> {
     profile: &'p Profile,
     cli: Option<PathBuf>,
-    /// The hook file has Justless entries, or a problem doctor reports.
+    /// The hook file has Justless entries, or a problem doctor reports, or the
+    /// global hooks serve this project.
     hooked: bool,
+    /// The user-level file whose global hooks serve this project, when the
+    /// project's own hook file has none.
+    global: Option<PathBuf>,
     /// The agent's own instructions file has a Justless section.
     instructed: bool,
     checks: Vec<Check>,
@@ -304,10 +308,11 @@ impl Doctor<'_> {
         if at_home {
             return self.outside(sections, &profiles, &clis, true);
         }
+        let installed = crate::global::installed();
         let mut audits: Vec<AgentAudit> = profiles
             .iter()
             .zip(&clis)
-            .map(|(profile, cli)| self.audit_agent(profile, cli.clone()))
+            .map(|(profile, cli)| self.audit_agent(profile, cli.clone(), &installed))
             .collect();
         // `AGENTS.md` serves several clients. Count it as Codex setup, the `init`
         // default, only when no other client that reads it has hooks.
@@ -432,6 +437,7 @@ impl Doctor<'_> {
                 "set_up": set,
                 "hooks": audit.hooked,
                 "hook_file": profile.agent.hook_file().display().to_string(),
+                "global_hook_file": audit.global.as_ref().map(|file| file.display().to_string()),
                 "instructions_file": profile.agent.instructions_name(),
                 "status": status.map(Status::name),
             }));
@@ -901,25 +907,56 @@ impl Doctor<'_> {
         })
     }
 
-    fn audit_agent<'p>(&self, profile: &'p Profile, cli: Option<PathBuf>) -> AgentAudit<'p> {
+    fn audit_agent<'p>(
+        &self,
+        profile: &'p Profile,
+        cli: Option<PathBuf>,
+        installed: &[crate::global::Installed],
+    ) -> AgentAudit<'p> {
         let hooks = self.audit_hooks(profile);
+        // Global hooks count as this client's hooks where they serve the project,
+        // judged as they judge each call. They write no instructions.
+        let workspace = self.workspace;
+        let global = installed
+            .iter()
+            .find(|global| global.agent == profile.agent && global.global > 0)
+            .filter(|_| {
+                !hooks.hooked
+                    && crate::global::skip(profile.agent, None, &workspace.cwd, workspace).is_none()
+            })
+            .map(|global| global.file.clone());
         // Offer `init --hooks` for the instructions only where it runs and adds no
-        // second copy of hooks that call justless by path.
+        // second copy of hooks that call justless by path. Where only the global
+        // hooks serve the project, plain `init` adds the instructions, and the
+        // global hooks go on serving it.
         let rerun =
             hooks.hooked && !hooks.by_path && self.setup_error(&[profile.name], true).is_none();
         let (block, instructions) = self.audit_instructions(profile, rerun);
+        let hooked = hooks.hooked || global.is_some();
         // Without hooks, a section in a file only this client reads still shows setup.
-        let instructed = !hooks.hooked
+        let instructed = !hooked
             && block
             && matches!(profile.agent, Agent::Claude | Agent::Gemini | Agent::Codex);
         let mut checks = hooks.checks;
-        if hooks.hooked || instructed {
+        if let Some(file) = &global {
+            checks.push(Check::new(
+                Status::Ok,
+                format!(
+                    "Hooks: the global {} hooks in {} serve this project. They come from the user-level settings, so {} has none",
+                    profile.label,
+                    file.display(),
+                    profile.agent.hook_file().display()
+                ),
+            ));
+        }
+        if hooked || instructed {
             checks.extend(instructions);
         }
         AgentAudit {
             profile,
             cli,
-            hooked: hooks.hooked,
+            hooked,
+            global,
             instructed,
             checks,
         }
@@ -2815,24 +2852,23 @@ fn global_checks(project: Option<&Workspace>) -> Vec<Check> {
         let Some(workspace) = project.filter(|_| hooks.global > 0) else {
             continue;
         };
-        let opted_out = workspace
-            .settings()
-            .is_ok_and(|settings| !settings.global_hooks);
-        let here = &workspace.cwd;
+        use crate::global::Skip;
         checks.push(Check::new(
             Status::Info,
-            if opted_out {
-                format!(
+            match crate::global::skip(hooks.agent, None, &workspace.cwd, workspace) {
+                Some(Skip::OptedOut) => format!(
                     "This project sets global_hooks = false, so the global {} hooks leave it alone",
                     hooks.label
-                )
-            } else if crate::global::project_hooks(hooks.agent, None, here, &workspace.root) {
-                format!(
+                ),
+                Some(Skip::ProjectHooks) => format!(
                     "This project's own {} hooks take precedence, so the global ones leave it alone",
                     hooks.label
-                )
-            } else {
-                format!("The global {} hooks serve this project", hooks.label)
+                ),
+                Some(Skip::Outside) => format!(
+                    "The global {} hooks leave this folder alone: it is the home directory, the filesystem root or a client's config directory",
+                    hooks.label
+                ),
+                None => format!("The global {} hooks serve this project", hooks.label),
             },
         ));
     }

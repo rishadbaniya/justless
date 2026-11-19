@@ -441,21 +441,23 @@ impl Coverage {
 
 /// Classify each Codex shell command by whether it went through Justless, with the
 /// Codex hook's rules: a list is routed only when every command in it is supported.
-pub(crate) fn coverage(root: &Path, since_ms: u64) -> Coverage {
+pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -> Coverage {
     let mut groups: BTreeMap<Route, Group> = BTreeMap::new();
     let (mut nested, mut nested_bytes) = (0, 0);
-    let scan = scan(root, since_ms, |shell| {
+    let exclusions = crate::rewrite::Exclusions::of(workspace);
+    let scan = scan(&workspace.root, since_ms, |shell| {
         let words = crate::agents::command_label(&shell.command);
         let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
         let content = Value::String(shell.output);
         let route = if crate::discover::routed(&shell.command, &label, &content) {
             Route::ThroughJustless
-        } else if crate::agents::codex_would_route(&shell.command) {
-            Route::SupportedNotRouted
-        } else if crate::agents::codex_would_route(&label) {
-            Route::PassedThrough
         } else {
-            Route::NotSupported
+            Route::unrouted(
+                &shell.command,
+                &label,
+                &exclusions,
+                crate::agents::codex_would_route,
+            )
         };
         if shell.nested {
             nested += 1;
@@ -484,7 +486,7 @@ pub(crate) struct Stats {
 }
 
 pub(crate) fn stats(workspace: &crate::workspace::Workspace, since_ms: u64) -> Option<Stats> {
-    let codex = coverage(&workspace.root, since_ms);
+    let codex = coverage(workspace, since_ms);
     let (commands, bytes) = (codex.commands(), codex.bytes());
     if commands == 0 {
         return None;

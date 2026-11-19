@@ -745,11 +745,15 @@ impl Summary {
     }
 }
 
-/// The totals of every run in a project's archive, quietly skipping unreadable runs.
-pub(crate) fn summary(workspace: &Workspace) -> Summary {
+/// The totals of the runs in a project's archive that finished at or after
+/// `since_ms`, as the `stats` timeline counts them, quietly skipping unreadable runs.
+pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
     let mut totals = Totals::default();
     let mut runs = 0;
     for run in records(workspace, false).into_iter().flatten().flatten() {
+        if run.completed_ms < since_ms || run.completed_ms == 0 {
+            continue;
+        }
         let directory = workspace.state.join("runs").join(&run.id);
         let recalls: Recalls = get(&directory.join("recalls.json")).unwrap_or_default();
         let shown = (run.preview_bytes + run.footer_bytes) as u64;

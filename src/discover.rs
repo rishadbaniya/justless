@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::history::{estimated_tokens, human_bytes, now_ms, utc_date};
+use crate::rewrite::Exclusions;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -28,6 +29,9 @@ pub(crate) enum Route {
     /// A supported command that the Claude Code hook leaves as written under the
     /// current permission rules and the session's mode.
     LeftByPermissions,
+    /// A supported command, or supported tool in a form the hooks pass through,
+    /// that the project's `exclude_commands` keeps from the hooks.
+    Excluded,
     /// A supported tool in a form the hooks pass through whole, such as a pipe.
     PassedThrough,
     NotSupported,
@@ -39,8 +43,34 @@ impl Route {
             Self::ThroughJustless => "Through Justless",
             Self::SupportedNotRouted => "Supported, not routed",
             Self::LeftByPermissions => "Supported, left to Claude Code's permission rules",
+            Self::Excluded => "Supported, excluded by exclude_commands",
             Self::PassedThrough => "Supported tool, passed through",
             Self::NotSupported => "Not supported yet",
+        }
+    }
+
+    /// How a hook that routes a command when `routes` says so treats a command
+    /// that did not go through Justless, under the project's `exclude_commands`:
+    /// `SupportedNotRouted` when it would route it now.
+    pub(crate) fn unrouted(
+        command: &str,
+        label: &str,
+        exclusions: &Exclusions,
+        routes: impl Fn(&str, &Exclusions) -> bool,
+    ) -> Self {
+        let none = Exclusions::default();
+        if routes(command, exclusions) {
+            Self::SupportedNotRouted
+        } else if routes(command, &none) {
+            Self::Excluded
+        } else if routes(label, &none) {
+            if exclusions.any(command).is_some() {
+                Self::Excluded
+            } else {
+                Self::PassedThrough
+            }
+        } else {
+            Self::NotSupported
         }
     }
 }
@@ -165,7 +195,8 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
         anyhow::bail!("cannot locate the Claude Code configuration directory");
     };
     let since_ms = now_ms().saturating_sub(days.saturating_mul(86_400_000));
-    let codex = crate::rollouts::coverage(&workspace.root, since_ms);
+    let codex = crate::rollouts::coverage(workspace, since_ms);
+    let exclusions = Exclusions::of(workspace);
     // Sessions keep subagent transcripts under <session>/subagents/, and workflow
     // subagents one level deeper under subagents/workflows/<run>/.
     let mut files = Vec::new();
@@ -272,30 +303,34 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                         let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
                         let route = if routed(&call.command, &label, content) {
                             Route::ThroughJustless
-                        } else if crate::agents::would_route(&call.command) {
+                        } else {
+                            let route = Route::unrouted(
+                                &call.command,
+                                &label,
+                                &exclusions,
+                                crate::agents::would_route,
+                            );
                             // Without a recorded mode the hook rewrites as it
                             // always has.
-                            let left = call.mode.as_deref().is_some_and(|mode| {
-                                let rules = rules.get_or_insert_with(|| {
-                                    let root = &workspace.root;
-                                    crate::claude_permissions::load(
-                                        &crate::claude_permissions::Sources::locate(root, root),
-                                    )
+                            let left = route == Route::SupportedNotRouted
+                                && call.mode.as_deref().is_some_and(|mode| {
+                                    let rules = rules.get_or_insert_with(|| {
+                                        let root = &workspace.root;
+                                        crate::claude_permissions::load(
+                                            &crate::claude_permissions::Sources::locate(root, root),
+                                        )
+                                    });
+                                    crate::agents::left_by_permissions(&call.command, mode, rules)
                                 });
-                                crate::agents::left_by_permissions(&call.command, mode, rules)
-                            });
                             if left {
                                 Route::LeftByPermissions
                             } else {
-                                Route::SupportedNotRouted
+                                route
                             }
-                        } else if crate::agents::would_route(&label) {
-                            Route::PassedThrough
-                        } else {
-                            Route::NotSupported
                         };
                         let bytes = text_bytes(content);
-                        if plan && route != Route::ThroughJustless {
+                        // Excluded commands stay as written by choice.
+                        if plan && !matches!(route, Route::ThroughJustless | Route::Excluded) {
                             let entry = unrouted.entry(label.clone()).or_default();
                             entry.commands += 1;
                             entry.bytes += bytes;

@@ -340,26 +340,50 @@ fn project(agent: Agent, mode: &str, input: &Value) -> Option<Workspace> {
         return None;
     }
     let cwd = cwd.canonicalize().ok()?;
-    let root = crate::workspace::marked_root(&cwd)?.to_path_buf();
+    let root = crate::workspace::marked_root(&cwd)?;
+    let workspace = Workspace::discover(Some(root)).ok()?;
+    skip(agent, Some(mode), &cwd, &workspace)
+        .is_none()
+        .then_some(workspace)
+}
+
+/// Why the global hooks leave a project alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Skip {
+    /// The root is the filesystem root, the home directory or a client's config
+    /// directory, whose settings are the user's own.
+    Outside,
+    /// Its `.justless.toml` sets `global_hooks = false`.
+    OptedOut,
+    /// Its own settings run Justless's hook for the same client, which wins.
+    ProjectHooks,
+}
+
+fn outside(root: &Path) -> bool {
     let canonical = |path: Option<PathBuf>| path.and_then(|path| path.canonicalize().ok());
-    if root.parent().is_none()
-        || canonical(home()).as_ref() == Some(&root)
+    root.parent().is_none()
+        || canonical(home()).as_deref() == Some(root)
         || CLIENTS
             .into_iter()
             .filter_map(|client| canonical(config_dir(client)))
             .any(|directory| root.starts_with(directory))
-    {
-        return None;
-    }
-    let workspace = Workspace::discover(Some(&root)).ok()?;
-    if workspace
+}
+
+/// Whether the global hooks for `agent` leave the project of a call made in
+/// `cwd` alone, and why, for `mode` or any mode; `None` when they serve it.
+pub fn skip(agent: Agent, mode: Option<&str>, cwd: &Path, workspace: &Workspace) -> Option<Skip> {
+    if outside(&workspace.root) {
+        Some(Skip::Outside)
+    } else if workspace
         .settings()
         .is_ok_and(|settings| !settings.global_hooks)
-        || project_hooks(agent, Some(mode), &cwd, &root)
     {
-        return None;
+        Some(Skip::OptedOut)
+    } else if project_hooks(agent, mode, cwd, &workspace.root) {
+        Some(Skip::ProjectHooks)
+    } else {
+        None
     }
-    Some(workspace)
 }
 
 /// Whether a project's own settings run Justless's hook for `agent`, for `mode`

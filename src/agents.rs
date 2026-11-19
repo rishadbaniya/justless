@@ -1568,17 +1568,10 @@ fn wrap_event(
             _ => false,
         }
     });
-    for range in plan.other {
+    for range in std::mem::take(&mut plan.other) {
         crate::history::bypass(workspace, &command[range]);
     }
-    // A client that may mix commands keeps the others; one that runs a rewritten
-    // list without asking gets the list as written, as for any unsupported command.
-    let excluded = |(words, _): &(Range<usize>, usize)| exclusions.within(command, words).is_some();
-    if rules.mixed {
-        plan.wrap.retain(|wrap| !excluded(wrap));
-    } else if plan.wrap.iter().any(excluded) {
-        plan.wrap.clear();
-    }
+    plan.exclude(command, rules, &exclusions);
     if plan.wrap.is_empty() {
         return None;
     }
@@ -1905,6 +1898,21 @@ struct Plan {
     last: Option<Range<usize>>,
 }
 
+impl Plan {
+    /// Leave the commands `exclude_commands` names as written. A client that may
+    /// mix commands keeps the others; one that runs a rewritten list without asking
+    /// gets the list as written, as for any unsupported command.
+    fn exclude(&mut self, command: &str, rules: Rules, exclusions: &crate::rewrite::Exclusions) {
+        let excluded =
+            |(words, _): &(Range<usize>, usize)| exclusions.within(command, words).is_some();
+        if rules.mixed {
+            self.wrap.retain(|wrap| !excluded(wrap));
+        } else if self.wrap.iter().any(excluded) {
+            self.wrap.clear();
+        }
+    }
+}
+
 /// Decide which commands of a list to rewrite. A list that changes directory in any
 /// way other than a plain `cd DIR` into the workspace, accepted by `enter`, passes
 /// through whole, so a wrapped command never runs from outside the workspace.
@@ -2108,11 +2116,14 @@ pub(crate) fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
 }
 
 /// Whether the Claude Code command hook would route all or part of this command
-/// through Justless. Each `cd` is checked by its words alone, so a link that leaves
-/// the workspace is not detected here.
-pub fn would_route(command: &str) -> bool {
-    // `wrap_event` leaves a read list to the post-command hook.
-    if !cfg!(windows) && crate::batch::Batch::parse_list(command).is_some() {
+/// through Justless in a project with these `exclude_commands`. Each `cd` is
+/// checked by its words alone, so a link that leaves the workspace is not
+/// detected here.
+pub fn would_route(command: &str, exclusions: &crate::rewrite::Exclusions) -> bool {
+    // `wrap_event` leaves an excluded line, and a read list to the post-command hook.
+    if exclusions.line(command).is_some()
+        || !cfg!(windows) && crate::batch::Batch::parse_list(command).is_some()
+    {
         return false;
     }
     let rules = Rules {
@@ -2120,7 +2131,9 @@ pub fn would_route(command: &str) -> bool {
         claude: true,
         approves: false,
     };
-    !plan(command, rules, |_| true).wrap.is_empty()
+    let mut plan = plan(command, rules, |_| true);
+    plan.exclude(command, rules, exclusions);
+    !plan.wrap.is_empty()
 }
 
 /// Whether the Claude Code command hook, given a command it would route (see
@@ -2141,8 +2154,12 @@ pub fn left_by_permissions(
 
 /// Whether the Codex hook would route `command`, as `wrap_event` does: a range read
 /// or `cat FILE` becomes a `justless read`, and because Codex runs a rewritten command
-/// without asking, a list is routed only when every command in it is supported.
-pub(crate) fn codex_would_route(command: &str) -> bool {
+/// without asking, a list is routed only when every command in it is supported
+/// and none is excluded.
+pub(crate) fn codex_would_route(command: &str, exclusions: &crate::rewrite::Exclusions) -> bool {
+    if exclusions.line(command).is_some() {
+        return false;
+    }
     if !cfg!(windows) && crate::shellread::parse(command).is_some() {
         return true;
     }
@@ -2151,7 +2168,9 @@ pub(crate) fn codex_would_route(command: &str) -> bool {
         claude: false,
         approves: true,
     };
-    !plan(command, rules, |_| true).wrap.is_empty()
+    let mut plan = plan(command, rules, |_| true);
+    plan.exclude(command, rules, exclusions);
+    !plan.wrap.is_empty()
 }
 
 /// The program and subcommand that start a shell command, such as `cargo test`.

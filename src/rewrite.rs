@@ -73,6 +73,7 @@ pub fn check_exclusion(entry: &str) -> Result<()> {
 
 /// The project's `exclude_commands`. Settings that cannot be read exclude
 /// nothing, so the hooks behave as they did before the setting existed.
+#[derive(Default)]
 pub struct Exclusions(Vec<String>);
 
 impl Exclusions {

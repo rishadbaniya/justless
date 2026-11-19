@@ -239,7 +239,7 @@ fn cli() -> Command<'static> {
         .subcommand(
             Command::new("stats")
                 .about("Show output savings by day and command, recoveries and hook coverage")
-                .arg(number("days", "7", "Days in the timeline"))
+                .arg(number("days", "7", "Days in the timeline; with --all, count runs that finished in them"))
                 .arg(Arg::new("json").long("json").help("Print a JSON report"))
                 .arg(Arg::new("sessions").long("sessions").help(
                     "Add the token usage Claude Code recorded for this workspace's sessions",
@@ -682,7 +682,9 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             sub.is_present("plan"),
         )?,
         ("learn", sub) => learn::run(&workspace, sub)?,
-        ("stats", sub) if sub.is_present("all") => registry::stats(sub, &workspace)?,
+        ("stats", sub) if sub.is_present("all") => {
+            registry::stats(sub, &workspace, read_num(sub, "days", 1)? as u64)?
+        }
         ("stats", sub) => history::stats(
             &workspace,
             read_num(sub, "days", 1)? as u64,

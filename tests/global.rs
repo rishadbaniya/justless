@@ -297,6 +297,105 @@ fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
     assert!(error.contains("invalid exclude_commands regex"), "{error}");
 }
 
+#[test]
+fn discover_reports_excluded_commands_in_their_own_group() {
+    let lab = Lab::new();
+    let root = lab.project(
+        "work",
+        "exclude_commands = [\"cargo build\", \"^git log\"]\n",
+    );
+    let commands = [
+        "cargo build",
+        "git log -3",
+        "cargo build | tail",
+        "cargo test | tail",
+        "cargo build && cargo test",
+        "cargo test",
+    ];
+    // Claude Code transcripts, and a Codex rollout with the same commands.
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = lab.home.join(".claude/projects").join(slug);
+    let rollouts = lab.home.join(".codex/sessions/2026/11/19");
+    fs::create_dir_all(&transcripts).unwrap();
+    fs::create_dir_all(&rollouts).unwrap();
+    let (mut claude, mut codex) = (
+        Vec::new(),
+        vec![json!({"type": "session_meta",
+        "timestamp": "2099-01-01T00:00:00.000Z",
+        "payload": {"id": "t", "session_id": "t", "cwd": root, "source": "cli"}})],
+    );
+    for (id, command) in commands.iter().enumerate() {
+        let (id, output) = (format!("c{id}"), "x".repeat(1000));
+        claude.push(
+            json!({"cwd": root, "timestamp": "2999-01-01T00:00:00Z", "message": {"content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}]}}),
+        );
+        claude.push(
+            json!({"cwd": root, "timestamp": "2999-01-01T00:00:01Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "content": output}]}}),
+        );
+        codex.push(
+            json!({"timestamp": "2099-01-01T00:00:00.000Z", "type": "event_msg",
+            "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": id,
+            "command": ["/bin/zsh", "-lc", command], "cwd": format!("file://{}", root.display()),
+            "exit_code": 0, "aggregated_output": output, "source": "unified_exec_startup"}}}),
+        );
+    }
+    let lines = |records: Vec<Value>| records.iter().map(|r| format!("{r}\n")).collect::<String>();
+    fs::write(transcripts.join("s.jsonl"), lines(claude)).unwrap();
+    fs::write(
+        rollouts.join("rollout-2026-11-19T10-00-00-t.jsonl"),
+        lines(codex),
+    )
+    .unwrap();
+
+    let report: Value =
+        serde_json::from_str(&lab.run(&root, &["discover", "--json", "--plan"])).unwrap();
+    let labels = |groups: &Value, route: &str| -> Vec<String> {
+        let groups = groups.as_array().unwrap();
+        let group = groups.iter().find(|group| group["route"] == route);
+        let labels = group.map_or(&[][..], |group| group["labels"].as_array().unwrap());
+        labels
+            .iter()
+            .map(|l| format!("{} ×{}", l["label"].as_str().unwrap(), l["commands"]))
+            .collect()
+    };
+    // Claude Code checks a rewrite, so the rest of a list with an excluded command
+    // is still routed; Codex keeps such a list as written.
+    assert_eq!(
+        labels(&report["groups"], "excluded"),
+        ["cargo build ×2", "git log ×1"]
+    );
+    assert_eq!(
+        labels(&report["groups"], "supported_not_routed"),
+        ["cargo build ×1", "cargo test ×1"]
+    );
+    assert_eq!(
+        labels(&report["groups"], "passed_through"),
+        ["cargo test ×1"]
+    );
+    assert_eq!(
+        labels(&report["codex"]["groups"], "excluded"),
+        ["cargo build ×3", "git log ×1"]
+    );
+    assert_eq!(
+        labels(&report["codex"]["groups"], "supported_not_routed"),
+        ["cargo test ×1"]
+    );
+    let plan = report["plan"].as_array().unwrap();
+    assert!(plan.iter().all(|row| row["label"] != "git log"), "{plan:?}");
+    let text = lab.run(&root, &["discover"]);
+    assert!(
+        text.contains("Supported, excluded by exclude_commands: 3 command(s)")
+            && !text.contains("xxxx"),
+        "{text}"
+    );
+}
+
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(["-c", "user.name=Lab", "-c", "user.email=lab@example.com"])
@@ -377,6 +476,19 @@ fn the_registry_totals_projects_by_repository_and_finds_their_runs() {
     let output = lab.output(&main, &["stats", "--all"], None, &temp);
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("main (2 checkouts)  2 run(s)"), "{text}");
+    assert!(text.starts_with("In the last 7 day(s), kept "), "{text}");
+    // `--days` counts the runs that finished in the window.
+    let old = run_id(&lab, &main, "seq 1 3000");
+    let record = main.join(".justless/runs").join(&old).join("record.json");
+    let mut run: Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    run["completed_ms"] = json!(1_000);
+    fs::write(&record, run.to_string()).unwrap();
+    let all = stats(&["stats", "--all", "--days", "30", "--json"]);
+    assert_eq!(
+        (&all["days"], &all["runs"]),
+        (&json!(30), &json!(2)),
+        "{all}"
+    );
     assert!(
         text.contains("Left out 1 project(s) in temporary folders"),
         "{text}"
@@ -496,6 +608,31 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
     );
     assert!(doctor(&own).contains("own Claude Code hooks take precedence"));
     assert!(doctor(&opted).contains("sets global_hooks = false"));
+    // The global hooks count as each client's hooks where they serve the project.
+    // They write no instructions, and plain `init` adds those without hooks.
+    assert!(
+        report.contains("✓ Hooks: the global Claude Code hooks in ")
+            && report.contains("✗ Instructions: CLAUDE.md does not exist")
+            && report.contains("\n  justless init --agent claude --agent codex\n")
+            && !report.contains("not set up in this project")
+            && !report.contains("Hooks: none"),
+        "{report}"
+    );
+    assert!(doctor(&opted).contains("not set up in this project"));
+    lab.run(&plain, &["init", "--agent", "claude", "--agent", "codex"]);
+    let report = doctor(&plain);
+    assert!(
+        report.contains("Instructions: CLAUDE.md has the current Justless block")
+            && report.contains("✓ Hooks: the global Codex hooks in ")
+            && !report.contains("Instructions: AGENTS.md has no")
+            && !plain.join(".claude").exists(),
+        "{report}"
+    );
+    let json = lab.output(&plain, &["doctor", "--json"], None, &[]).stdout;
+    let json: Value = serde_json::from_slice(&json).unwrap();
+    let agents = json["agents"].as_array().unwrap();
+    assert_eq!(agents[0]["hooks"], true, "{json}");
+    assert_eq!(agents[0]["global_hook_file"], json!(claude));
 
     // A file nobody edited since is restored byte for byte, and the directory
     // setup created for Codex goes with its file.

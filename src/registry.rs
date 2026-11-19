@@ -213,8 +213,10 @@ pub fn locate(workspace: &Workspace, id: &str) -> Result<(Option<Workspace>, Pat
     Err(local)
 }
 
-/// `stats --all`: one total across the registered projects, by repository.
-pub fn stats(matches: &ArgMatches, workspace: &Workspace) -> Result<()> {
+/// `stats --all`: one total across the registered projects, by repository, of
+/// the runs that finished in the last `days` days.
+pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<()> {
+    let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
     let include_temp = matches.is_present("include-temp");
     let temporary = temporary_folders();
     let mut groups: Vec<(PathBuf, Vec<PathBuf>, Summary)> = Vec::new();
@@ -245,7 +247,10 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace) -> Result<()> {
         let Ok(project) = Workspace::discover(Some(&entry.root)) else {
             continue;
         };
-        let summary = crate::history::summary(&project);
+        let summary = crate::history::summary(&project, since);
+        if summary.runs == 0 {
+            continue;
+        }
         let key = entry
             .repository
             .clone()
@@ -296,6 +301,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace) -> Result<()> {
             })
             .collect();
         let report = json!({
+            "days": days,
             "projects": groups.iter().map(|(_, roots, _)| roots.len()).sum::<usize>(),
             "runs": total.runs,
             "raw_bytes": total.raw_bytes,
@@ -312,11 +318,11 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace) -> Result<()> {
         return Ok(());
     }
     if groups.is_empty() {
-        println!("No captured runs in any registered project yet.");
+        println!("No captured runs in any registered project in the last {days} day(s).");
     } else {
         let projects: usize = groups.iter().map(|(_, roots, _)| roots.len()).sum();
         println!(
-            "Kept {} of {} command output out of context at first preview ({:.1}%) across {} run(s) in {projects} project(s), net saved {} (≈{} tokens at first preview, bytes ÷ 4)",
+            "In the last {days} day(s), kept {} of {} command output out of context at first preview ({:.1}%) across {} run(s) in {projects} project(s), net saved {} (≈{} tokens at first preview, bytes ÷ 4)",
             human_bytes(total.saved_bytes()),
             human_bytes(total.raw_bytes),
             percent(total.saved_bytes(), total.raw_bytes),
