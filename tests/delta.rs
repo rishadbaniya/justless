@@ -9,12 +9,7 @@ use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
-const SESSION_VARIABLES: [&str; 4] = [
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "JUSTLESS_ORIGIN_UNKNOWN",
-    "JUSTLESS_SESSION",
-];
+const SESSION_VARIABLES: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "JUSTLESS_SESSION"];
 
 fn cli(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
@@ -355,21 +350,11 @@ fn new_sessions_and_compaction_print_whole_again() {
     // Without a session nothing changes.
     assert_eq!(ok(root, &["context", "--symbol", "long_function"]), plain);
 
-    // Claude Code's session ID, except in a subagent or the MCP server.
+    // The shell's Claude Code session ID is no session: subagents share it.
     let claude = [("CLAUDE_CODE_SESSION_ID", "8d1c")];
     let symbol = ["context", "--symbol", "long_function"];
     assert_eq!(ok_with(root, &symbol, &claude), plain);
-    assert!(ok_with(root, &symbol, &claude).contains("unchanged since you read it"));
-    let child = [
-        ("CLAUDE_CODE_SESSION_ID", "8d1c"),
-        ("CLAUDE_CODE_CHILD_SESSION", "1"),
-    ];
-    assert_eq!(ok_with(root, &symbol, &child), plain);
-    let mcp = [
-        ("CLAUDE_CODE_SESSION_ID", "8d1c"),
-        ("JUSTLESS_ORIGIN_UNKNOWN", "1"),
-    ];
-    assert!(!ok_with(root, &symbol, &mcp).contains("since you read"));
+    assert_eq!(ok_with(root, &symbol, &claude), plain);
 
     // `resume` keeps the views; the compaction handoff forgets them all.
     ok(root, &["resume"]);
@@ -380,7 +365,7 @@ fn new_sessions_and_compaction_print_whole_again() {
         serde_json::json!({"hook_event_name":"PreCompact","trigger":"auto","cwd":root}),
     );
     assert_eq!(ok(root, &SYMBOL), plain);
-    assert_eq!(ok_with(root, &symbol, &claude), plain);
+    assert_eq!(ok(root, &other), plain);
     assert!(ok(root, &SYMBOL).contains("unchanged since you read it"));
     hook(
         root,
@@ -605,4 +590,149 @@ fn twins_that_share_a_name_are_remembered_apart() {
     assert!(second.starts_with("src/lib.rs:22-28\n"), "{second}");
     assert!(!second.contains("since you read"), "{second}");
     assert!(view(selectors[0]).contains("unchanged since you read it"));
+}
+
+/// The Claude Code command hook's answer for `command`, with only `settings`
+/// as the project's permission settings.
+fn claude_command_hook(
+    root: &Path,
+    command: &str,
+    extra: serde_json::Value,
+    settings: Option<&str>,
+) -> serde_json::Value {
+    let home = TempDir::new().unwrap();
+    let claude = root.join(".claude/settings.json");
+    match settings {
+        Some(settings) => {
+            fs::create_dir_all(claude.parent().unwrap()).unwrap();
+            fs::write(&claude, settings).unwrap();
+        }
+        None => {
+            let _ = fs::remove_file(&claude);
+        }
+    }
+    let mut input = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+        "cwd":root,"session_id":"0f3a-session","tool_input":{"command":command}});
+    for (key, value) in extra.as_object().unwrap() {
+        input[key] = value.clone();
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["hook-claude", "before-command"])
+        .current_dir(root)
+        .env("CLAUDE_PROJECT_DIR", root)
+        .env(
+            "JUSTLESS_TEST_CLAUDE_MANAGED_DIR",
+            home.path().join("managed"),
+        )
+        .env("HOME", home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn the_claude_hook_names_the_session_and_subagent() {
+    use serde_json::json;
+    let dir = project(10);
+    let root = dir.path();
+    let read = "justless context --symbol long_function";
+    let rewritten = |answer: &serde_json::Value| {
+        answer["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{answer}"))
+            .to_owned()
+    };
+    let auto = json!({"permission_mode":"auto"});
+    let parent = rewritten(&claude_command_hook(root, read, auto.clone(), None));
+    let digest = parent.rsplit(' ').next().unwrap().to_owned();
+    assert_eq!(parent, format!("{read} --session {digest}"));
+    let subagent = json!({"permission_mode":"auto","agent_id":"a41c","agent_type":"Explore"});
+    let child = rewritten(&claude_command_hook(root, read, subagent.clone(), None));
+    assert_ne!(child, parent, "a subagent gets its own session");
+    assert_eq!(
+        rewritten(&claude_command_hook(
+            root,
+            "justless --root . pack \"what is long_function\" 2>&1",
+            auto.clone(),
+            None
+        )),
+        format!("justless --root . pack \"what is long_function\" --session {digest} 2>&1")
+    );
+    // The parent's read does not stand for the subagent's, nor the reverse.
+    let run = |line: &str| {
+        let words: Vec<&str> = line.split(' ').skip(1).collect();
+        ok(root, &words)
+    };
+    let plain = ok(root, &["context", "--symbol", "long_function"]);
+    assert_eq!(run(&parent), plain);
+    assert_eq!(run(&child), plain);
+    assert!(run(&parent).contains("unchanged since you read it"));
+    assert!(run(&child).contains("unchanged since you read it"));
+
+    // Without a reported mode the rules are not read, so nothing changes.
+    assert_eq!(claude_command_hook(root, read, json!({}), None), json!({}));
+    // Other commands, compound lines and named sessions stay as they are.
+    for command in [
+        "justless query long_function",
+        "justless context --symbol long_function --session mine",
+        "cd src && justless context --symbol long_function",
+        "justless pack -- what",
+        "cargo-justless context --symbol long_function",
+    ] {
+        assert_eq!(
+            claude_command_hook(root, command, auto.clone(), None),
+            json!({}),
+            "{command}"
+        );
+    }
+    // The original command is judged against the permission rules first.
+    let default = json!({"permission_mode":"default"});
+    assert_eq!(
+        claude_command_hook(root, read, default.clone(), None),
+        json!({})
+    );
+    let allow = r#"{"permissions":{"allow":["Bash(justless context:*)"]}}"#;
+    let allowed = claude_command_hook(root, read, default, Some(allow));
+    assert_eq!(rewritten(&allowed), parent);
+    assert_eq!(allowed["hookSpecificOutput"]["permissionDecision"], "allow");
+    let deny = r#"{"permissions":{"deny":["Bash(justless context:*)"]}}"#;
+    assert_eq!(claude_command_hook(root, read, auto, Some(deny)), json!({}));
+}
+
+#[test]
+fn stats_count_the_bytes_deltas_kept_out() {
+    let dir = project(30);
+    let root = dir.path();
+    let plain = ok(root, &["context", "--symbol", "long_function"]);
+    ok(root, &SYMBOL);
+    let unchanged = ok(root, &SYMBOL);
+    edit(root, "helper(12);", "helper(120);");
+    let delta = ok(root, &SYMBOL);
+    let stats: serde_json::Value = serde_json::from_str(&ok(root, &["stats", "--json"])).unwrap();
+    let counted = &stats["changed_since_read"];
+    assert_eq!(counted["views"], 2, "{counted}");
+    assert_eq!(
+        counted["shown_bytes"],
+        (unchanged.len() + delta.len()) as u64,
+        "{counted}"
+    );
+    // What the views without a session print.
+    let edited = ok(root, &["context", "--symbol", "long_function"]);
+    assert_eq!(
+        counted["whole_bytes"],
+        (plain.len() + edited.len()) as u64,
+        "{counted}"
+    );
+    assert!(ok(root, &["stats"]).contains("Changed since read: 2 view(s) printed "));
 }

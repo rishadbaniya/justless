@@ -87,7 +87,7 @@ fn budget() -> Arg<'static> {
 }
 
 /// The session whose earlier views `context --symbol`, `context --at` and
-/// `pack` compare with. Claude Code's session ID is the default.
+/// `pack` compare with. The Claude Code hook adds it.
 fn seen_session() -> Arg<'static> {
     Arg::new("session")
         .long("session")

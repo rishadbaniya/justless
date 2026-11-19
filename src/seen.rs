@@ -19,9 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::source_digest;
 use crate::context::Report;
-use crate::workspace::{
-    ORIGIN_UNKNOWN, Workspace, display_path, lock_state, shell_text, write_json,
-};
+use crate::workspace::{Workspace, display_path, lock_state, shell_text, write_json};
 
 /// Session files under `.justless/`, one per session.
 const DIRECTORY: &str = "seen";
@@ -42,22 +40,13 @@ const AROUND: usize = 2;
 /// end. A larger middle counts as replaced whole, which is still exact.
 const DIFF_CELLS: usize = 4 << 20;
 
-/// The session a view belongs to: `--session`, else Claude Code's session ID
-/// in the agent's shell, digested as hooks digest it for `run --session`. An
-/// agent that Claude Code starts as a child session can share its parent's ID
-/// but not its context, and an MCP server keeps the ID it started with after
-/// `/clear`, so neither uses it.
+/// The session a view belongs to: `--session`, which the Claude Code hook adds
+/// to `context` and `pack` commands from the hook's session and subagent IDs.
+/// `CLAUDE_CODE_SESSION_ID` in the agent's shell is not used: a subagent has
+/// the same one but a context of its own, and Claude Code marks top-level
+/// shells as child sessions too, so the shell cannot tell them apart.
 fn session(explicit: Option<&str>) -> Option<String> {
-    if let Some(name) = explicit.filter(|name| !name.is_empty()) {
-        return Some(name.to_owned());
-    }
-    let child = std::env::var_os("CLAUDE_CODE_CHILD_SESSION")
-        .is_some_and(|value| !value.is_empty() && value != "0");
-    if child || std::env::var_os(ORIGIN_UNKNOWN).is_some() {
-        return None;
-    }
-    let id = std::env::var("CLAUDE_CODE_SESSION_ID").ok()?;
-    (!id.is_empty()).then(|| source_digest(id.as_bytes())[..24].to_owned())
+    explicit.filter(|name| !name.is_empty()).map(str::to_owned)
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -113,6 +102,9 @@ pub(crate) struct Memory {
     changes: Vec<(String, String, Option<View>)>,
     /// Excerpts to add, or a file's list to start again at a new revision.
     pack: Vec<PackFile>,
+    /// Views printed as changes, with the bytes their whole views would have
+    /// printed and the bytes they did, for `stats`.
+    saved: (u64, u64, u64),
 }
 
 /// A symbol `context` shows, with its current span, lines from 1.
@@ -152,6 +144,7 @@ impl Memory {
             fresh,
             changes: Vec::new(),
             pack: Vec::new(),
+            saved: (0, 0, 0),
         })
     }
 
@@ -256,6 +249,15 @@ impl Memory {
                 .map(|since| format!("changed since you read it at {since}"))
                 .as_deref(),
         );
+        // What the view prints without a session, for `stats`.
+        let whole_bytes: usize = whole_view
+            .iter()
+            .map(|row| match row {
+                Row::Text(_) => location.len() + 1,
+                Row::Line(i) => format!("  {} | {}\n", number(*i), shown(lines[*i])).len(),
+                Row::Removed(_) => 0,
+            })
+            .sum();
         let shorter = match &since {
             Some(since) if !self.fresh && !changed => Some(vec![Row::Text(if header {
                 format!("{location} · unchanged since you read it at {since} · {whole_symbol}")
@@ -295,6 +297,7 @@ impl Memory {
             Some(rows) if bytes(&rows) < bytes(&whole_view) => (rows, true),
             _ => (whole_view, false),
         };
+        let room = report.left();
         // What the agent was shown completely.
         let mut printed = BTreeSet::new();
         let mut printed_removed = BTreeSet::new();
@@ -327,6 +330,9 @@ impl Memory {
                     }
                 }
             }
+        }
+        if delta {
+            self.count_saved(whole_bytes.min(room), room.saturating_sub(report.left()));
         }
         let known = |i: usize| status[i] == Line::Seen || printed.contains(&i);
         if let (Some(&first), Some(&last)) = (printed.first(), printed.last()) {
@@ -451,7 +457,19 @@ impl Memory {
 
     /// Writes the records this command changed back to the session's file,
     /// over what other commands wrote meanwhile, within the store's bounds.
+    /// Counts a view that printed `shown` bytes where the whole view would
+    /// have printed `whole`.
+    pub(crate) fn count_saved(&mut self, whole: usize, shown: usize) {
+        self.saved.0 += 1;
+        self.saved.1 += whole as u64;
+        self.saved.2 += shown as u64;
+    }
+
     pub(crate) fn save(self, workspace: &Workspace) {
+        let (views, whole, shown) = self.saved;
+        if views > 0 {
+            crate::history::saw_delta(workspace, views, whole, shown);
+        }
         if self.changes.is_empty() && self.pack.is_empty() {
             return;
         }

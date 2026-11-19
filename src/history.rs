@@ -360,6 +360,19 @@ struct Activity {
     repeat_reads: u64,
     #[serde(default)]
     last_pack: BTreeMap<String, String>,
+    /// Views of symbols read before that printed only what changed, see
+    /// `crate::seen`.
+    #[serde(default)]
+    deltas: Deltas,
+}
+
+/// How many views printed changes since an earlier read instead of the whole
+/// source, and the bytes of the whole views and of what they printed.
+#[derive(Default, Serialize, Deserialize)]
+struct Deltas {
+    views: u64,
+    whole_bytes: u64,
+    shown_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -523,6 +536,22 @@ pub(crate) fn saw_range(
                 },
             );
             a.reads.truncate(32);
+        },
+    );
+}
+
+/// Records that `views` views printed `shown` bytes of changes since an
+/// earlier read where their whole views would have printed `whole`.
+pub fn saw_delta(workspace: &Workspace, views: u64, whole: u64, shown: u64) {
+    if workspace.prepare_state().is_err() {
+        return;
+    }
+    let _ = update(
+        &workspace.state.join("activity.json"),
+        |a: &mut Activity| {
+            a.deltas.views += views;
+            a.deltas.whole_bytes += whole;
+            a.deltas.shown_bytes += shown;
         },
     );
 }
@@ -748,6 +777,13 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "days": timeline.into_values().collect::<Vec<_>>(),
             "commands": commands,
             "repeated_source_reads": activity.repeat_reads,
+            "changed_since_read": {
+                "views": activity.deltas.views,
+                "whole_bytes": activity.deltas.whole_bytes,
+                "shown_bytes": activity.deltas.shown_bytes,
+                "saved_bytes": activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes),
+                "estimated_tokens_saved": estimated_tokens(activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes)),
+            },
             "redacted_secrets": secrets,
             "unredacted_replays": unredacted,
             "hook_pass_through": activity.bypasses,
@@ -903,6 +939,18 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             } else {
                 String::new()
             }
+        );
+    }
+    let deltas = &activity.deltas;
+    if deltas.views > 0 {
+        let saved = deltas.whole_bytes.saturating_sub(deltas.shown_bytes);
+        println!(
+            "Changed since read: {} view(s) printed {} instead of {}, {} kept out (≈{} tokens, bytes ÷ 4)",
+            deltas.views,
+            human_bytes(deltas.shown_bytes),
+            human_bytes(deltas.whole_bytes),
+            human_bytes(saved),
+            estimated_tokens(saved)
         );
     }
     if !activity.bypasses.is_empty() {

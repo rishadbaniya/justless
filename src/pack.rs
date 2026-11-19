@@ -222,7 +222,9 @@ fn excerpt(
         && 2 * (note.len() + 1) <= bytes
         && memory.saw_excerpt(file, &revision, &lines)
     {
+        let room = report.left();
         report.line(note);
+        memory.count_saved(bytes.min(room), room.saturating_sub(report.left()));
         return;
     }
     let clipped = report.clipped;

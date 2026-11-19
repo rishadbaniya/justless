@@ -22,7 +22,6 @@ fn justless(cwd: &Path) -> Command {
     command
         .current_dir(cwd)
         .env_remove("JUSTLESS_SESSION")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("JUSTLESS_FILE")
         .env_remove("NO_COLOR");
     command
