@@ -370,3 +370,58 @@ fn opencode_plugin_passes_the_selected_model() {
         "{args}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn opencode_plugin_compacts_only_bash_results_that_exited_zero() {
+    use std::os::unix::fs::PermissionsExt;
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipped: node is not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    // Not on PATH: the plugin must find it through JUSTLESS_BIN.
+    let fake = dir.path().join("fake-justless");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncat > /dev/null\nprintf '%s' '{{\"hookSpecificOutput\":{{\"updatedToolOutput\":{{\"stdout\":\"compacted\"}}}}}}'\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/opencode.js");
+    // A killed command reports a null exit, and a result without metadata has no
+    // known status: both stay raw like a failure.
+    let script = r#"
+        const { Justless } = await import(process.env.PLUGIN);
+        const hooks = await Justless({ directory: process.env.PROJECT });
+        const seen = [];
+        for (const metadata of [{ exit: 1 }, { exit: null }, {}, undefined, { exit: 0 }]) {
+          const output = { output: "x".repeat(5000), metadata };
+          await hooks["tool.execute.after"]({ tool: "bash", args: { command: "cat big" } }, output);
+          seen.push(output.output.length === 5000 ? "raw" : output.output);
+        }
+        console.log(seen.join(" "));
+    "#;
+    let out = Command::new("node")
+        .args(["--input-type=module", "-e", script])
+        .env("JUSTLESS_BIN", &fake)
+        .env("PLUGIN", format!("file://{}", plugin.display()))
+        .env("PROJECT", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "raw raw raw raw compacted"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
+}

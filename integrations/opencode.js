@@ -104,7 +104,8 @@ export const Justless = async ({ directory }) => {
     if (input?.tool !== "bash" && input?.tool !== "Bash") return;
     const command = input?.args?.command;
     if (typeof command !== "string" || typeof output?.output !== "string") return;
-    if (typeof output.metadata?.exit === "number" && output.metadata.exit !== 0) return;
+    // A failed, killed or unreported exit keeps its whole result.
+    if (output.metadata?.exit !== 0) return;
     const next = await afterBash(directory, command, output.output);
     if (next !== undefined) output.output = next;
   },
