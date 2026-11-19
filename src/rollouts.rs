@@ -456,6 +456,7 @@ pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -
                 &shell.command,
                 &label,
                 &exclusions,
+                false,
                 crate::agents::codex_would_route,
             )
         };

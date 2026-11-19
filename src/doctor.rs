@@ -2864,6 +2864,10 @@ fn global_checks(project: Option<&Workspace>) -> Vec<Check> {
                     "This project's own {} hooks take precedence, so the global ones leave it alone",
                     hooks.label
                 ),
+                Some(Skip::Unmarked) => format!(
+                    "The global {} hooks leave this folder alone: neither it nor a parent has .git, .justless/, .justless.toml or a project file",
+                    hooks.label
+                ),
                 Some(Skip::Outside) => format!(
                     "The global {} hooks leave this folder alone: it is the home directory, the filesystem root or a client's config directory",
                     hooks.label

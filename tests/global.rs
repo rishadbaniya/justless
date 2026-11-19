@@ -308,6 +308,8 @@ fn discover_reports_excluded_commands_in_their_own_group() {
         "cargo build",
         "git log -3",
         "cargo build | tail",
+        "RUST_LOG=1 timeout 60 cargo build 2>&1 | tail",
+        "cd src && cargo build | tail",
         "cargo test | tail",
         "cargo build && cargo test",
         "cargo test",
@@ -365,10 +367,11 @@ fn discover_reports_excluded_commands_in_their_own_group() {
             .collect()
     };
     // Claude Code checks a rewrite, so the rest of a list with an excluded command
-    // is still routed; Codex keeps such a list as written.
+    // is still routed; Codex keeps such a list as written. Claude Code's post-run
+    // hook leaves an excluded pipe alone; Codex has none.
     assert_eq!(
         labels(&report["groups"], "excluded"),
-        ["cargo build ×2", "git log ×1"]
+        ["cargo build ×4", "git log ×1"]
     );
     assert_eq!(
         labels(&report["groups"], "supported_not_routed"),
@@ -380,7 +383,11 @@ fn discover_reports_excluded_commands_in_their_own_group() {
     );
     assert_eq!(
         labels(&report["codex"]["groups"], "excluded"),
-        ["cargo build ×3", "git log ×1"]
+        ["cargo build ×2", "git log ×1"]
+    );
+    assert_eq!(
+        labels(&report["codex"]["groups"], "passed_through"),
+        ["cargo build ×3", "cargo test ×1"]
     );
     assert_eq!(
         labels(&report["codex"]["groups"], "supported_not_routed"),
@@ -390,7 +397,7 @@ fn discover_reports_excluded_commands_in_their_own_group() {
     assert!(plan.iter().all(|row| row["label"] != "git log"), "{plan:?}");
     let text = lab.run(&root, &["discover"]);
     assert!(
-        text.contains("Supported, excluded by exclude_commands: 3 command(s)")
+        text.contains("Supported, excluded by exclude_commands: 5 command(s)")
             && !text.contains("xxxx"),
         "{text}"
     );
@@ -619,6 +626,12 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
         "{report}"
     );
     assert!(doctor(&opted).contains("not set up in this project"));
+    // A folder outside any project gets the outside report, as the hooks skip it.
+    let loose = doctor(&lab.base.join("loose"));
+    assert!(
+        loose.contains("has no Justless setup") && !loose.contains("serve this project"),
+        "{loose}"
+    );
     lab.run(&plain, &["init", "--agent", "claude", "--agent", "codex"]);
     let report = doctor(&plain);
     assert!(

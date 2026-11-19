@@ -350,6 +350,9 @@ fn project(agent: Agent, mode: &str, input: &Value) -> Option<Workspace> {
 /// Why the global hooks leave a project alone.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Skip {
+    /// Neither the directory nor a parent has `.git`, `.justless/`,
+    /// `.justless.toml` or a project file.
+    Unmarked,
     /// The root is the filesystem root, the home directory or a client's config
     /// directory, whose settings are the user's own.
     Outside,
@@ -372,7 +375,9 @@ fn outside(root: &Path) -> bool {
 /// Whether the global hooks for `agent` leave the project of a call made in
 /// `cwd` alone, and why, for `mode` or any mode; `None` when they serve it.
 pub fn skip(agent: Agent, mode: Option<&str>, cwd: &Path, workspace: &Workspace) -> Option<Skip> {
-    if outside(&workspace.root) {
+    if crate::workspace::marked_root(cwd).is_none() {
+        Some(Skip::Unmarked)
+    } else if outside(&workspace.root) {
         Some(Skip::Outside)
     } else if workspace
         .settings()

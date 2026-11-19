@@ -29,8 +29,9 @@ pub(crate) enum Route {
     /// A supported command that the Claude Code hook leaves as written under the
     /// current permission rules and the session's mode.
     LeftByPermissions,
-    /// A supported command, or supported tool in a form the hooks pass through,
-    /// that the project's `exclude_commands` keeps from the hooks.
+    /// A supported command that the project's `exclude_commands` keeps from the
+    /// hooks, or for Claude Code a supported tool in a pass-through form, which
+    /// it keeps from the post-run hook.
     Excluded,
     /// A supported tool in a form the hooks pass through whole, such as a pipe.
     PassedThrough,
@@ -51,11 +52,14 @@ impl Route {
 
     /// How a hook that routes a command when `routes` says so treats a command
     /// that did not go through Justless, under the project's `exclude_commands`:
-    /// `SupportedNotRouted` when it would route it now.
+    /// `SupportedNotRouted` when it would route it now. With `post_run`, the
+    /// client's post-run hook compacts the forms the command hook passes through,
+    /// unless an entry names them.
     pub(crate) fn unrouted(
         command: &str,
         label: &str,
         exclusions: &Exclusions,
+        post_run: bool,
         routes: impl Fn(&str, &Exclusions) -> bool,
     ) -> Self {
         let none = Exclusions::default();
@@ -63,16 +67,27 @@ impl Route {
             Self::SupportedNotRouted
         } else if routes(command, &none) {
             Self::Excluded
-        } else if routes(label, &none) {
-            if exclusions.any(command).is_some() {
-                Self::Excluded
-            } else {
-                Self::PassedThrough
-            }
-        } else {
+        } else if !routes(label, &none) {
             Self::NotSupported
+        } else if post_run && excluded_stage(exclusions, command) {
+            Self::Excluded
+        } else {
+            Self::PassedThrough
         }
     }
+}
+
+/// Whether an entry names the line, a command in it, or a command of a pipe
+/// after its assignments and wrappers such as `env` or `timeout`, as the post-run
+/// hook checks it.
+fn excluded_stage(exclusions: &Exclusions, command: &str) -> bool {
+    exclusions.any(command).is_some()
+        || command.split(['&', '|', ';', '\n']).any(|stage| {
+            let words = shlex::split(stage).unwrap_or_default();
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            crate::wrappers::effective(&words)
+                .is_some_and(|words| exclusions.matching(&words.join(" ")).is_some())
+        })
 }
 
 /// The footer `justless run` prints on its own line after a captured command:
@@ -308,6 +323,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                                 &call.command,
                                 &label,
                                 &exclusions,
+                                true,
                                 crate::agents::would_route,
                             );
                             // Without a recorded mode the hook rewrites as it
