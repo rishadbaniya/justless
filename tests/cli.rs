@@ -2895,22 +2895,16 @@ fn map_orients_with_located_areas_hubs_links_and_entry_points() {
     let json: serde_json::Value = serde_json::from_str(&success(root, &["map", "--json"])).unwrap();
     assert_eq!(json["symbols"], 5);
     assert_eq!(json["possible_links"], 2);
-    assert_eq!(
-        json["cross_area_links"][0]["example"]["at"],
-        "backend/orders.py:8"
-    );
-    assert_eq!(json["cross_area_links"][0]["example"]["possible"], true);
+    let link = &json["cross_area_links"][0]["example"];
+    assert_eq!(link["at"], "backend/orders.py:8");
+    assert_eq!(link["possible"], true);
     assert_eq!(json["entry_points"][0]["reason"], "HTTP route /api/orders");
     assert_eq!(json["capped"], false);
 
     let repo = fixture();
     let path = repo.path();
-    fs::create_dir_all(path.join("src/bin")).unwrap();
-    fs::write(
-        path.join("src/bin/quote.rs"),
-        "fn main() {\n    println!(\"{}\", checkout_fixture::checkout_total(1, 2));\n}\n",
-    )
-    .unwrap();
+    let quote = "fn main() {\n    println!(\"{}\", checkout_fixture::checkout_total(1, 2));\n}\n";
+    write_files(path, &[("src/bin/quote.rs", quote)]);
     let map = success(path, &["map"]);
     for expected in [
         "  pricing::checkout_total [function] src/pricing.rs:1-3 · in 4 · out 1",
@@ -2945,15 +2939,11 @@ fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
     let shallow = success(path, &["affected", "apply_fee", "--depth", "1"]);
     assert!(!shallow.contains("Distance 2"), "{shallow}");
     has_line(&shallow, "  cargo test --test checkout total_includes_fee");
-    has_line(
-        &shallow,
-        "Depth limit: 3 more dependents past 1 hop. Raise --depth to follow them.",
-    );
+    let limit = "Depth limit: 3 more dependents past 1 hop. Raise --depth to follow them.";
+    has_line(&shallow, limit);
     let file = success(path, &["affected", "src/pricing.rs"]);
-    has_line(
-        &file,
-        "Affected by src/pricing.rs (2 symbols) · 3 dependents within 3 hops",
-    );
+    let header = "Affected by src/pricing.rs (2 symbols) · 3 dependents within 3 hops";
+    has_line(&file, header);
     let small = success(path, &["affected", "apply_fee", "--budget", "300"]);
     assert!(small.len() <= 300, "{} bytes\n{small}", small.len());
     has_line(&small, "  cargo test --test checkout total_includes_fee");
@@ -2961,10 +2951,8 @@ fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
         serde_json::from_str(&success(path, &["affected", "apply_fee", "--json"])).unwrap();
     assert_eq!(json["reached"], 4);
     assert_eq!(json["dependents"].as_array().unwrap().len(), 4);
-    assert_eq!(
-        json["dependents"][0]["dependent"]["name"],
-        "pricing::checkout_total"
-    );
+    let nearest = &json["dependents"][0]["dependent"];
+    assert_eq!(nearest["name"], "pricing::checkout_total");
     assert_eq!(json["tests"][0]["hops"], 2);
     assert_eq!(
         json["commands"],
@@ -2980,35 +2968,22 @@ fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
     );
 
     // A cycle ends once every symbol on it has been reached.
-    fs::write(
-        path.join("src/cycle.rs"),
-        "pub fn ping(n: u32) -> u32 {\n    if n == 0 { 0 } else { pong(n - 1) }\n}\n\npub fn pong(n: u32) -> u32 {\n    ping(n)\n}\n",
-    )
-    .unwrap();
-    let mut lib = fs::OpenOptions::new()
-        .append(true)
-        .open(path.join("src/lib.rs"))
-        .unwrap();
-    writeln!(lib, "pub mod cycle;").unwrap();
+    let lib = fs::read_to_string(path.join("src/lib.rs")).unwrap() + "pub mod cycle;\n";
+    let ping = "pub fn ping(n: u32) -> u32 {\n    if n == 0 { 0 } else { pong(n - 1) }\n}\n\npub fn pong(n: u32) -> u32 {\n    ping(n)\n}\n";
+    write_files(path, &[("src/cycle.rs", ping), ("src/lib.rs", &lib)]);
     let cycle = success(path, &["affected", "ping", "--depth", "6"]);
-    has_line(
-        &cycle,
+    for expected in [
         "Affected by cycle::ping [function] src/cycle.rs:1-3 · 1 dependent within 6 hops",
-    );
-    has_line(
-        &cycle,
         "  cycle::pong [function] src/cycle.rs:5-7 · call at src/cycle.rs:6",
-    );
+    ] {
+        has_line(&cycle, expected);
+    }
 
     // TypeScript → Python → SQL, with pytest node IDs for the tests that reach it.
     let repo = mixed_fixture();
     let root = repo.path();
-    fs::create_dir(root.join("tests")).unwrap();
-    fs::write(
-        root.join("tests/test_orders.py"),
-        "from backend.orders import list_orders\n\n\ndef test_list_orders():\n    assert list_orders() is not None\n\n\nclass TestOrders:\n    def test_again(self):\n        list_orders()\n",
-    )
-    .unwrap();
+    let tests = "from backend.orders import list_orders\n\n\ndef test_list_orders():\n    assert list_orders() is not None\n\n\nclass TestOrders:\n    def test_again(self):\n        list_orders()\n";
+    write_files(root, &[("tests/test_orders.py", tests)]);
     let impact = success(root, &["affected", "purchase_orders"]);
     for expected in [
         "  list_orders [function] backend/orders.py:6-8 · possible SQL relation at backend/orders.py:8",
@@ -3024,28 +2999,21 @@ fn affected_walks_dependents_by_distance_to_the_tests_that_reach_them() {
 fn affected_caps_fan_out_deterministically() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let mut source = String::from("def hot():\n    return 1\n");
-    for number in 0..300 {
-        source.push_str(&format!(
-            "\n\ndef caller_{number:03}():\n    return hot()\n"
-        ));
-    }
+    let callers: String = (0..300)
+        .map(|n| format!("\n\ndef caller_{n:03}():\n    return hot()\n"))
+        .collect();
+    let source = format!("def hot():\n    return 1\n{callers}");
     fs::write(root.join("hot.py"), source).unwrap();
     let args = ["affected", "hot", "--budget", "100000"];
     let impact = success(root, &args);
     assert_eq!(impact, success(root, &args));
-    has_line(
-        &impact,
-        "Fan-out cap: followed 256 of 300 dependents of hot [function] hot.py:1-2.",
-    );
+    let cap = "Fan-out cap: followed 256 of 300 dependents of hot [function] hot.py:1-2.";
+    has_line(&impact, cap);
     has_line(&impact, "Distance 1 · 256");
     assert!(impact.contains("  caller_255 [function]"), "{impact}");
     assert!(!impact.contains("caller_256"), "{impact}");
-    let json: serde_json::Value = serde_json::from_str(&success(
-        root,
-        &["affected", "hot", "--budget", "100000", "--json"],
-    ))
-    .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&success(root, &argv("affected hot --budget 100000 --json"))).unwrap();
     assert_eq!(json["capped"], true);
     assert_eq!(json["dependents"].as_array().unwrap().len(), 256);
     assert_eq!(json["commands"], serde_json::json!([]));
@@ -3055,25 +3023,7 @@ fn affected_caps_fan_out_deterministically() {
 fn affected_changes_start_from_the_changed_symbols() {
     let repo = fixture();
     let path = repo.path();
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .current_dir(path)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{args:?} {}", stderr(&output));
-    };
-    git(&["init", "-q"]);
-    git(&["add", "."]);
-    git(&[
-        "-c",
-        "user.name=Justless Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-qm",
-        "fixture",
-    ]);
+    git_repository(path);
     assert_eq!(
         success(path, &["affected", "--changes"]),
         "No changed files. To review a branch's commits, add --base REF.\n"
@@ -3137,17 +3087,6 @@ fn search_repo() -> TempDir {
 }
 
 #[cfg(unix)]
-fn log_range(line: &str) -> (String, String) {
-    let range = line
-        .rsplit_once("[stdout:")
-        .unwrap()
-        .1
-        .trim_end_matches(']');
-    let (from, to) = range.split_once('-').unwrap_or((range, range));
-    (from.to_owned(), to.to_owned())
-}
-
-#[cfg(unix)]
 #[test]
 fn search_output_groups_matches_by_file_with_exact_lines() {
     let repo = search_repo();
@@ -3183,14 +3122,12 @@ fn search_output_groups_matches_by_file_with_exact_lines() {
     // The busiest file comes first and links to exactly its original lines.
     let group = report.lines().nth(1).unwrap();
     assert!(group.starts_with("./src/big.rs ×150 [stdout:"), "{report}");
-    let (from, to) = log_range(group);
+    let (_, range) = group.rsplit_once("[stdout:").unwrap();
+    let range = range.trim_end_matches(']');
+    let (from, to) = range.split_once('-').unwrap_or((range, range));
     let id = run_id(&output);
-    let slice = success(
-        root,
-        &[
-            "log", &id, "--stream", "stdout", "--from", &from, "--to", &to,
-        ],
-    );
+    let log = format!("log {id} --stream stdout --from {from} --to {to}");
+    let slice = success(root, &argv(&log));
     assert_eq!(slice.lines().count(), 150);
     assert!(slice.lines().all(|l| l.starts_with("./src/big.rs:")));
     let first = raw
@@ -3211,15 +3148,9 @@ fn search_output_groups_matches_by_file_with_exact_lines() {
     // Archived logs, including the stdout of the run itself, are never searched,
     // even when the pattern names the state directory.
     fs::write(root.join("docs/state.md"), "keep .justless/ out of Git\n").unwrap();
-    let state = cli(root, &["run", "--", "grep", "-rn", ".justless", "."]);
-    assert_eq!(
-        stdout(&state),
-        "./docs/state.md:1:keep .justless/ out of Git\n"
-    );
-    let again = cli(
-        root,
-        &["run", "--fresh", "--", "grep", "-rn", "needle", "."],
-    );
+    let state = stdout(&cli(root, &argv("run -- grep -rn .justless .")));
+    assert_eq!(state, "./docs/state.md:1:keep .justless/ out of Git\n");
+    let again = cli(root, &argv("run --fresh -- grep -rn needle ."));
     assert!(stdout(&again).starts_with(&format!("grep: {total} matches")));
     let source = fs::read_to_string(root.join("src/big.rs")).unwrap();
     fs::write(root.join("src/big.rs"), format!("{source}needle again\n")).unwrap();
@@ -3239,10 +3170,7 @@ fn search_output_groups_matches_by_file_with_exact_lines() {
     let expected = direct(&["-rn", "--exclude-dir=.justless", "rare_token", "."]);
     assert_eq!(stdout(&small), expected);
     // Context lines are counted apart from matches.
-    let context = stdout(&cli(
-        root,
-        &["run", "--", "grep", "-rn", "-A", "1", "needle", "src"],
-    ));
+    let context = stdout(&cli(root, &argv("run -- grep -rn -A 1 needle src")));
     let matches = direct(&["-rn", "needle", "src"]).lines().count();
     assert!(
         context.starts_with(&format!("grep: {matches} matches in "))
@@ -3315,15 +3243,41 @@ fn listings_group_by_directory_and_collapse_dependency_trees() {
     );
 }
 
+/// The Bash hooks write no state, so the cases share one root. Comments name the
+/// test each case came from.
 #[test]
-fn hooks_route_searches_and_listings_but_not_machine_output() {
+fn bash_hooks_route_searches_listings_and_revisions_but_leave_other_commands_alone() {
+    use serde_json::json;
     let repo = mixed_fixture();
     let root = repo.path();
-    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
-    for command in [
-        "grep -rn fetch .",
-        "grep -n fetch frontend/orders.ts frontend/format.ts",
-        "grep -rl fetch frontend",
+    fs::create_dir(root.join("src")).unwrap();
+    let hook = |agent: &str, command: &str| {
+        let call = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+        agent_hook(root, agent, "before-command", call)
+    };
+    let routes = |agents: &[&str], commands: &[&str]| {
+        for agent in agents {
+            for command in commands {
+                let tail = claude_tail(agent, command);
+                let output = hook(agent, command);
+                let rewritten = &output["hookSpecificOutput"]["updatedInput"]["command"];
+                let expected = format!("justless run --hook -- {command}{tail}");
+                assert_eq!(*rewritten, expected, "{agent} {command}");
+            }
+        }
+    };
+    let passes = |agents: &[&str], commands: &[&str]| {
+        for agent in agents {
+            for command in commands {
+                assert_eq!(hook(agent, command), json!({}), "{agent} {command}");
+            }
+        }
+    };
+    let both = ["hook-claude", "hook-codex"];
+    let (claude, codex) = (["hook-claude"], ["hook-codex"]);
+
+    // hooks_route: searches and listings for display are routed for every client.
+    let listings = [
         "git grep -n fetch",
         "rg -l fetch",
         "rg --files",
@@ -3337,26 +3291,41 @@ fn hooks_route_searches_and_listings_but_not_machine_output() {
         "tree -L 2",
         "fd orders",
         "git ls-files",
-    ] {
-        // Claude Code keeps its own grep (see claude_code_keeps_its_own_grep_...).
-        let agents: &[&str] = if command.starts_with("grep ") {
-            &["hook-codex"]
-        } else {
-            &["hook-claude", "hook-codex"]
-        };
-        for agent in agents {
-            let output = agent_hook(root, agent, "before-command", call(command));
-            assert_eq!(
-                output["hookSpecificOutput"]["updatedInput"]["command"],
-                format!(
-                    "justless run --hook -- {command}{}",
-                    claude_tail(agent, command)
-                ),
-                "{agent} {command}"
-            );
-        }
-    }
-    for command in [
+    ];
+    routes(&both, &listings);
+    // claude_code_keeps: Claude Code's shell replaces grep with a bundled ugrep that
+    // honors .gitignore, so its hook leaves grep alone. Other clients run the system
+    // grep either way.
+    let greps = [
+        "grep -rn fetch .",
+        "grep -n fetch frontend/orders.ts frontend/format.ts",
+        "grep -rl fetch frontend",
+        "grep -rn Workspace src",
+    ];
+    routes(&codex, &greps);
+    passes(&claude, &greps);
+    let cd = "cd src && grep -rn foo .";
+    passes(&claude, &[cd]);
+    let output = hook("hook-codex", cd);
+    let rewritten = &output["hookSpecificOutput"]["updatedInput"]["command"];
+    let expected = "cd src && justless run --hook -- grep -rn foo .";
+    assert_eq!(*rewritten, expected, "hook-codex {cd}");
+    // claude_code_keeps: other searches and listings are still routed for Claude Code.
+    let claude_routed = [
+        "find . -name '*.rs'",
+        "rg Workspace",
+        "git grep -n Workspace",
+        "ls -la src",
+        // revisions_with_a_tilde: `~` inside a word is literal to the shell, so these
+        // are ordinary Git revisions.
+        "git diff HEAD~3",
+        "git log main~5..HEAD",
+        "git show HEAD~1 --stat",
+    ];
+    routes(&claude, &claude_routed);
+
+    // hooks_route: machine output, pipes and redirects pass through.
+    let claude_passed = [
         "grep fetch frontend/orders.ts",
         "grep -rn fetch . | head",
         "grep -rc fetch .",
@@ -3372,13 +3341,22 @@ fn hooks_route_searches_and_listings_but_not_machine_output() {
         "tree -J",
         "fd -0 orders",
         "git ls-files -z",
-    ] {
-        assert_eq!(
-            agent_hook(root, "hook-claude", "before-command", call(command)),
-            serde_json::json!({}),
-            "{command}"
-        );
-    }
+        // revisions_with_a_tilde: at the start of a word, or after `=` or `:`, the
+        // shell expands `~`: pass through.
+        "ls ~/x",
+        "cat ~/.ssh/config",
+        "git diff --output=~/x",
+        "git log a:~b",
+    ];
+    passes(&claude, &claude_passed);
+    // claude_code_keeps: destructive finds pass through for every client.
+    let destructive = [
+        "find . -name '*.tmp' -delete",
+        "find . -exec rm {} +",
+        "find . -name x -execdir cat {} +",
+        "find . -ok rm {} +",
+    ];
+    passes(&both, &destructive);
 }
 
 #[test]
@@ -3393,6 +3371,10 @@ fn claude_grep_and_glob_results_are_grouped_and_recoverable() {
         .unwrap();
     let content = stdout(&raw).trim_end().to_owned();
     let lines = content.lines().count();
+    let recall_id = |text: &str| {
+        let rest = text.strip_prefix("[justless recall ").unwrap();
+        rest.split(']').next().unwrap().to_owned()
+    };
     let grep = |content: &str, mode: Value| {
         json!({"hook_event_name":"PostToolUse","tool_name":"Grep","cwd":root,
             "tool_input":{"pattern":"needle","output_mode":"content","-n":true},
@@ -3414,14 +3396,9 @@ fn claude_grep_and_glob_results_are_grouped_and_recoverable() {
     assert_eq!(updated["numLines"], text.lines().count());
     assert_eq!(updated["appliedLimit"], 250);
     assert_eq!(updated["mode"], "content");
-    let id = text
-        .strip_prefix("[justless recall ")
-        .unwrap()
-        .split(']')
-        .next()
-        .unwrap();
-    assert!(hook["additionalContext"].as_str().unwrap().contains(id));
-    assert_eq!(success(&root, &["recall", id]), content);
+    let id = recall_id(text);
+    assert!(hook["additionalContext"].as_str().unwrap().contains(&id));
+    assert_eq!(success(&root, &["recall", &id]), content);
 
     // Results without paths, counts and small results reach Claude unchanged.
     let single: String = (1..300)
@@ -3436,17 +3413,14 @@ fn claude_grep_and_glob_results_are_grouped_and_recoverable() {
         assert_eq!(output, json!({}));
     }
 
-    let mut files: Vec<String> = Vec::new();
-    for dir in ["api", "core", "db"] {
-        for f in 0..10 {
-            let path = root.join(format!("src/{dir}/f{f}.rs"));
-            files.push(path.display().to_string());
-        }
-    }
-    for p in 0..60 {
-        let path = root.join(format!("node_modules/pkg{p}/index.js"));
-        files.push(path.display().to_string());
-    }
+    let sources = ["api", "core", "db"]
+        .iter()
+        .flat_map(|d| (0..10).map(move |f| format!("src/{d}/f{f}.rs")));
+    let modules = (0..60).map(|p| format!("node_modules/pkg{p}/index.js"));
+    let files: Vec<String> = sources
+        .chain(modules)
+        .map(|p| root.join(p).display().to_string())
+        .collect();
     let glob = json!({"hook_event_name":"PostToolUse","tool_name":"Glob","cwd":root,
         "tool_input":{"pattern":"**/*.*"},
         "tool_response":{"durationMs":4,"numFiles":files.len(),"filenames":files,"truncated":true,
@@ -3471,58 +3445,8 @@ fn claude_grep_and_glob_results_are_grouped_and_recoverable() {
                 .starts_with("(Showing 90 of 250 matching files; 160 more"),
         "{names:?}"
     );
-    let id = names[0]
-        .strip_prefix("[justless recall ")
-        .unwrap()
-        .split(']')
-        .next()
-        .unwrap();
-    assert_eq!(success(&root, &["recall", id]), files.join("\n"));
-}
-
-#[test]
-fn claude_code_keeps_its_own_grep_and_destructive_finds_pass_through() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    fs::create_dir(root.join("src")).unwrap();
-    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
-    let rewrite = |agent: &str, command: &str| {
-        agent_hook(&root, agent, "before-command", call(command))["hookSpecificOutput"]
-            ["updatedInput"]["command"]
-            .as_str()
-            .map(str::to_owned)
-    };
-    // Claude Code's shell replaces grep with a bundled ugrep that honors .gitignore,
-    // so its hook leaves grep alone. Other clients run the system grep either way.
-    for command in ["grep -rn Workspace src", "cd src && grep -rn foo ."] {
-        assert_eq!(rewrite("hook-claude", command), None, "{command}");
-        assert!(rewrite("hook-codex", command).is_some(), "{command}");
-    }
-    for command in [
-        "find . -name '*.rs'",
-        "rg Workspace",
-        "git grep -n Workspace",
-        "ls -la src",
-    ] {
-        assert_eq!(
-            rewrite("hook-claude", command),
-            Some(format!(
-                "justless run --hook -- {command}{}",
-                claude_tail("hook-claude", command)
-            )),
-            "{command}"
-        );
-    }
-    for command in [
-        "find . -name '*.tmp' -delete",
-        "find . -exec rm {} +",
-        "find . -name x -execdir cat {} +",
-        "find . -ok rm {} +",
-    ] {
-        for agent in ["hook-claude", "hook-codex"] {
-            assert_eq!(rewrite(agent, command), None, "{agent} {command}");
-        }
-    }
+    let id = recall_id(names[0]);
+    assert_eq!(success(&root, &["recall", &id]), files.join("\n"));
 }
 
 #[test]
@@ -3569,12 +3493,7 @@ fn hook_routed_runs_print_a_footer_only_when_it_adds_information() {
         marker.contains(" of ") && marker.trim_end().ends_with(" shown]"),
         "{marker}"
     );
-    let id = marker
-        .trim()
-        .trim_start_matches('[')
-        .split(' ')
-        .nth(1)
-        .unwrap();
+    let id = marker.trim().split(' ').nth(1).unwrap();
     let replay = success(root, &["log", id, "--stream", "stdout"]);
     let expected: String = (1..=20000).map(|n| format!("{n}\n")).collect();
     assert_eq!(replay, expected);
@@ -3594,11 +3513,8 @@ fn hook_routed_runs_print_a_footer_only_when_it_adds_information() {
         (partial.status.code(), stdout(&partial)),
         (Some(4), "partial".into())
     );
-    assert!(
-        stderr(&partial).starts_with("\n[justless run-"),
-        "{:?}",
-        stderr(&partial)
-    );
+    let marker = stderr(&partial);
+    assert!(marker.starts_with("\n[justless run-"), "{marker:?}");
 
     // A command typed by a person keeps the full footer that scripts parse.
     let typed = cli(root, &["run", "--", "sh", "-c", "echo typed"]);
@@ -3621,26 +3537,12 @@ fn hook_routed_runs_print_a_footer_only_when_it_adds_information() {
 fn search_groups_files_whose_names_share_a_prefix() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
+    let text = "needle in this configuration value\n".repeat(100);
     for name in ["settings", "settings-prod"] {
-        fs::write(
-            root.join(name),
-            "needle in this configuration value\n".repeat(100),
-        )
-        .unwrap();
+        fs::write(root.join(name), &text).unwrap();
     }
     // `settings-prod:1:…` must not be read as a context line of `settings`.
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--",
-            "grep",
-            "-n",
-            "needle",
-            "settings",
-            "settings-prod",
-        ],
-    );
+    let output = cli(root, &argv("run -- grep -n needle settings settings-prod"));
     assert_eq!(output.status.code(), Some(0));
     let preview = stdout(&output);
     assert!(
@@ -3649,25 +3551,10 @@ fn search_groups_files_whose_names_share_a_prefix() {
     );
     // Real context lines (`settings-2-…`) are still recognized as context, and
     // the run shows blocks.
-    fs::write(
-        root.join("settings"),
-        "needle one\nplain line\n".repeat(300),
-    )
-    .unwrap();
-    let context = cli(
-        root,
-        &[
-            "run",
-            "--",
-            "grep",
-            "-n",
-            "-A",
-            "1",
-            "needle",
-            "settings",
-            "settings-prod",
-        ],
-    );
+    let text = "needle one\nplain line\n".repeat(300);
+    fs::write(root.join("settings"), text).unwrap();
+    let args = argv("run -- grep -n -A 1 needle settings settings-prod");
+    let context = cli(root, &args);
     let preview = stdout(&context);
     assert!(
         preview.starts_with("grep: 400 matches in 2 files, 2 blocks, 300 context lines")
@@ -3693,32 +3580,20 @@ fn context_searches_show_blocks_that_log_returns_exactly() {
     for name in ["x-1.rs", "y:2.rs"] {
         fs::write(root.join("src").join(name), &text).unwrap();
     }
-    for args in [&["init", "-q"][..], &["add", "src"]] {
-        Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap();
-    }
+    git(root, &["init", "-q"]);
+    git(root, &["add", "src"]);
     let rg = Command::new("rg").arg("--version").output().is_ok();
     let tags = regex::Regex::new(r"(\S+) \[stdout:(\d+)(?:-(\d+))?\]").unwrap();
-    for args in [
-        &["grep", "-rn", "-C2", "needle", "src"][..],
-        &["grep", "-n", "-C2", "needle", "src/x-1.rs"],
-        &["git", "grep", "-n", "-A2", "needle", "--", "src"],
-        &["rg", "--sort=path", "-n", "-C2", "needle", "src"],
-        &["rg", "--sort=path", "-C2", "needle", "src"],
-        &[
-            "rg",
-            "--sort=path",
-            "-n",
-            "-C2",
-            "--heading",
-            "needle",
-            "src",
-        ],
-        &["rg", "-n", "-C2", "needle", "src/y:2.rs"],
+    for line in [
+        "grep -rn -C2 needle src",
+        "grep -n -C2 needle src/x-1.rs",
+        "git grep -n -A2 needle -- src",
+        "rg --sort=path -n -C2 needle src",
+        "rg --sort=path -C2 needle src",
+        "rg --sort=path -n -C2 --heading needle src",
+        "rg -n -C2 needle src/y:2.rs",
     ] {
+        let args = argv(line);
         if args[0] == "rg" && !rg {
             continue;
         }
@@ -3729,7 +3604,7 @@ fn context_searches_show_blocks_that_log_returns_exactly() {
                 .output()
                 .unwrap(),
         );
-        let output = cli(root, &[&["run", "--"][..], args].concat());
+        let output = cli(root, &[&["run", "--"][..], &args].concat());
         let report = stdout(&output);
         assert!(
             report.len() < raw.len()
@@ -3794,16 +3669,9 @@ fn failed_run_context_keeps_every_diagnostic_at_a_shared_location() {
     let root = repo.path();
     fs::write(root.join("price.py"), "def price():\n    return 1\n").unwrap();
     // Progress on stdout and the real error on stderr both name price.py:2.
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "echo 'price.py:2: progress'; echo 'price.py:2: error: EXPECTED_FAILURE' >&2; exit 1",
-        ],
-    );
+    let script =
+        "echo 'price.py:2: progress'; echo 'price.py:2: error: EXPECTED_FAILURE' >&2; exit 1";
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
     assert_eq!(output.status.code(), Some(1));
     let id = run_id(&output);
     let context = success(root, &["context", "--run", &id, "--budget", "12000"]);
@@ -3841,11 +3709,8 @@ fn deleting_a_function_points_affected_at_its_callers_not_its_neighbor() {
     git(&["init", "-q"]);
     fs::write(root.join(".gitignore"), ".justless/\n").unwrap();
     fs::create_dir(root.join("src")).unwrap();
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-    )
-    .unwrap();
+    let manifest = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+    fs::write(root.join("Cargo.toml"), manifest).unwrap();
     let original = "pub fn kept() -> u8 { 1 }\npub fn removed() -> u8 { 2 }\npub fn consumer() -> u8 { removed() }\n\
 #[test]\nfn checks_removed() { assert_eq!(consumer(), 2); }\n#[test]\nfn checks_kept() { assert_eq!(kept(), 1); }\n\
 pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
@@ -3854,17 +3719,12 @@ pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
     git(&["add", "."]);
     git(&["commit", "-qm", "fixture"]);
 
-    fs::write(
-        &source,
-        original.replace("pub fn removed() -> u8 { 2 }\n", ""),
-    )
-    .unwrap();
+    let without = original.replace("pub fn removed() -> u8 { 2 }\n", "");
+    fs::write(&source, without).unwrap();
     for staged in [false, true] {
-        if staged {
-            git(&["add", "src/lib.rs"]);
-        }
         let mut args = vec!["affected", "--changes"];
         if staged {
+            git(&["add", "src/lib.rs"]);
             args.push("--staged");
         }
         let impact = success(root, &args);
@@ -3905,42 +3765,6 @@ pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
             && !context.contains("· removed"),
         "{context}"
     );
-}
-
-#[test]
-fn revisions_with_a_tilde_are_routed_but_home_paths_are_not() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
-    // `~` inside a word is literal to the shell, so these are ordinary Git revisions.
-    for command in [
-        "git diff HEAD~3",
-        "git log main~5..HEAD",
-        "git show HEAD~1 --stat",
-    ] {
-        let output = agent_hook(root, "hook-claude", "before-command", call(command));
-        assert_eq!(
-            output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!(
-                "justless run --hook -- {command}{}",
-                claude_tail("hook-claude", command)
-            ),
-            "{command}"
-        );
-    }
-    // At the start of a word, or after `=` or `:`, the shell expands it: pass through.
-    for command in [
-        "ls ~/x",
-        "cat ~/.ssh/config",
-        "git diff --output=~/x",
-        "git log a:~b",
-    ] {
-        assert_eq!(
-            agent_hook(root, "hook-claude", "before-command", call(command)),
-            serde_json::json!({}),
-            "{command}"
-        );
-    }
 }
 
 /// Run a fake linter that prints `out` on stdout and `err` on stderr, and return the
