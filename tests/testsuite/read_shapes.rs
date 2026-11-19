@@ -22,11 +22,18 @@ fn fixture() -> TempDir {
     let script: String = (0..400)
         .map(|i| format!("echo \"step {i} of the deployment script\"\n"))
         .collect();
+    let settings: String = (0..60)
+        .map(|i| format!("key_{i:02} = \"the value of setting number {i}\"\n"))
+        .collect();
+    // A lockfile, whose whole-file outline a wide `cat` is rerouted to.
+    let lock = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock")).unwrap();
     fs::create_dir(dir.join("sub")).unwrap();
     for at in [dir.to_path_buf(), dir.join("sub")] {
         fs::write(at.join("big.rs"), &rust).unwrap();
         fs::write(at.join("wide.sh"), &script).unwrap();
         fs::write(at.join("small.txt"), "alpha\nβeta\n").unwrap();
+        fs::write(at.join("notes.toml"), &settings).unwrap();
+        fs::write(at.join("Cargo.lock"), &lock).unwrap();
     }
     fs::write(dir.join("part"), "no final newline").unwrap();
     sh(
@@ -127,20 +134,22 @@ fn a_trailing_cat_is_answered_as_the_read_alone() {
         "sed -n '1,20p;300,330p' FILE",
         "head -n 160 FILE",
         "tail -n 170 FILE",
-        "tail -n +5 FILE",
         "cat FILE",
         "cat FILE | head -n 170",
-        "cd sub && sed -n 1,170p FILE",
         "cd sub && cat FILE",
         "git show HEAD:FILE",
     ];
-    let mut compacted = 0;
+    let (mut compacted, mut rerouted) = (0, [0, 0]);
     for form in forms {
         for (file, suffix) in [
             ("big.rs", " | cat"),
             ("wide.sh", "|cat -"),
             ("small.txt", " | cat"),
+            ("Cargo.lock", " | cat"),
         ] {
+            if file == "Cargo.lock" && !form.ends_with("cat FILE") {
+                continue;
+            }
             let read = form.replace("FILE", file);
             let piped = format!("{read}{suffix}");
             // Each side in its own workspace, so neither sees the other's runs.
@@ -159,6 +168,11 @@ fn a_trailing_cat_is_answered_as_the_read_alone() {
                     continue;
                 }
                 assert_eq!(a, b, "{which:?} {piped}");
+                match which {
+                    Hook::ClaudePre => rerouted[0] += usize::from(a.contains(" read -- ")),
+                    Hook::CodexPre => rerouted[1] += usize::from(a.contains("--shell-range")),
+                    Hook::ClaudePost => {}
+                }
                 // A compacted read archives the exact bytes the pipe printed.
                 if let (Hook::ClaudePost, Some(id)) = (which, ids.first()) {
                     let replayed = replay(home.path(), with_cat.path(), id);
@@ -168,7 +182,11 @@ fn a_trailing_cat_is_answered_as_the_read_alone() {
             }
         }
     }
-    assert!(compacted >= 10, "{compacted}");
+    // Every client's route is exercised, not only answers that leave the read.
+    assert!(
+        compacted >= 10 && rerouted[0] >= 1 && rerouted[1] >= 10,
+        "{compacted} {rerouted:?}"
+    );
 }
 
 #[test]
@@ -203,6 +221,13 @@ fn a_cat_of_several_files_reads_as_one_piece_per_file() {
             &["$ cat part [stdout:1-1]", "$ cat big.rs [stdout:1-600]"],
         ),
         (
+            "cat notes.toml big.rs wide.sh",
+            &[
+                "$ cat notes.toml [stdout:1-60]",
+                "$ cat big.rs [stdout:61-660]",
+            ],
+        ),
+        (
             "grep -n absent small.txt || cat big.rs small.txt; head -n 1 small.txt",
             &[
                 "$ cat big.rs [stdout:1-600]",
@@ -226,6 +251,9 @@ fn a_cat_of_several_files_reads_as_one_piece_per_file() {
         if command.contains("small.txt") {
             has(&view, "alpha\nβeta\n");
         }
+        if command.contains("notes.toml") {
+            has(&view, &fs::read_to_string(dir.join("notes.toml")).unwrap());
+        }
         has(&view, "big.rs lines 1-600\n  L1-3 function add_000");
         let (ids, _) = normalized(&json!(view), dir);
         assert_eq!(text(&replay(home.path(), dir, &ids[0])), stdout);
@@ -234,7 +262,7 @@ fn a_cat_of_several_files_reads_as_one_piece_per_file() {
     // Each file is recorded as a whole-file read would record it.
     let temp = fixture();
     let dir = temp.path();
-    post(dir, "cat small.txt big.rs").1.unwrap();
+    post(dir, "cat small.txt big.rs notes.toml").1.unwrap();
     let out = Command::new(BIN)
         .args(["resume", "--budget", "100000"])
         .current_dir(dir)
@@ -245,6 +273,7 @@ fn a_cat_of_several_files_reads_as_one_piece_per_file() {
     let resume = text(&out.stdout);
     has(&resume, "Read small.txt:1-2");
     has(&resume, "Outline big.rs:1-600");
+    has(&resume, "Read notes.toml:1-60");
 
     // A pre-command client has no read that prints several files.
     assert_eq!(

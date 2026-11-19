@@ -186,10 +186,8 @@ impl<'a> Batch<'a> {
                 }
             }
         }
-        let budget = settings
-            .context_budget
-            .min(baseline * 3 / 4)
-            .checked_sub(192 + 2 * run_ws.justless().len())?;
+        let ceiling = (baseline * 3 / 4).checked_sub(192 + 2 * run_ws.justless().len())?;
+        let budget = settings.context_budget.min(ceiling);
         let deadline = Instant::now() + Duration::from_secs(4);
         let mut files = reads::Files::new();
         let mut repo: Option<(PathBuf, git::Repository)> = None;
@@ -329,7 +327,20 @@ impl<'a> Batch<'a> {
                 }
             }
         }
-        let (text, verbatim) = render(&mut files, &verified, actual, budget)?;
+        // A small file of a `cat A B …` is shown whole, as its own `cat` would
+        // be, outside the budget for the other pieces but within the ceiling.
+        let small: Vec<bool> = verified
+            .iter()
+            .map(|item| {
+                let text = &actual[item.range.start_byte..item.range.end_byte];
+                matches!(item.piece.source, Source::Files(_))
+                    && text.len() <= 6144
+                    && text.bytes().filter(|&b| b == b'\n').count() <= 150
+            })
+            .collect();
+        let (text, verbatim) = render(&mut files, &verified, actual, budget, &small)
+            .filter(|(text, _)| text.len() <= ceiling)
+            .or_else(|| render(&mut files, &verified, actual, budget, &[]))?;
         if Instant::now() >= deadline {
             return None;
         }
@@ -411,7 +422,9 @@ fn render(
     items: &[Verified<'_>],
     output: &str,
     budget: usize,
+    whole: &[bool],
 ) -> Option<(String, Vec<bool>)> {
+    let whole = |i: usize| whole.get(i).copied().unwrap_or(false);
     let headers: Vec<_> = items
         .iter()
         .map(|item| {
@@ -429,10 +442,17 @@ fn render(
     let mut bodies = vec![String::new(); items.len()];
     // Whether each piece's bytes are shown as they are.
     let mut verbatim = vec![false; items.len()];
-    for (pos, i) in order.into_iter().enumerate() {
+    let mut left = (0..items.len()).filter(|&i| !whole(i)).count();
+    for i in order {
         let item = &items[i];
-        let limit = remaining / (items.len() - pos);
         let text = &output[item.range.start_byte..item.range.end_byte];
+        if whole(i) {
+            bodies[i] = text.to_owned();
+            verbatim[i] = true;
+            continue;
+        }
+        let limit = remaining / left;
+        left -= 1;
         if !text.is_empty() && limit < 32 && text.len() > limit {
             return None;
         }
