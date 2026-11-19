@@ -146,6 +146,10 @@ Hooks route commands through `justless run`, a local index answers code question
 
 [Command reference](docs/reference.md) · [Worked examples](docs/examples.md) · [Benchmarks](docs/benchmarks.md) · [How it compares](docs/comparison.md) · [FAQ](docs/faq.md)
 
+## How do you make money from this?
+
+I don't. justless is for people who want to spend less on tokens, not a funnel into spending more somewhere else. There's no paid edition, no cloud version, no account, no telemetry and no "Pro" features held back: everything on this page is in the one free binary, and it never phones home. If it saves you money, a ⭐ helps the next person find it.
+
 ## Contributing
 
 Build, test and commit conventions are in [CONTRIBUTING.md](CONTRIBUTING.md), maintainer notes in [AGENTS.md](AGENTS.md), and changes in the [changelog](CHANGELOG.md).
