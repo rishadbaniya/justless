@@ -7,13 +7,14 @@
 //! makes the line diff exact. A record advances only when the agent was shown
 //! every line it had seen that is gone now, so a later view never leans on a
 //! line the agent still believes is there. Without a session the views print
-//! whole, as before. The compaction handoff forgets every record, because the
+//! whole, as before. The compaction handoff forgets the session's records in
+//! every project, and every record in the project its hook runs in, because the
 //! agent's context no longer holds what it was shown.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -136,8 +137,7 @@ impl Memory {
     /// leaves every view as it was.
     pub(crate) fn open(workspace: &Workspace, explicit: Option<&str>, fresh: bool) -> Option<Self> {
         let key = session(explicit)?;
-        let name = format!("{}.json", &source_digest(key.as_bytes())[..24]);
-        let path = workspace.state.join(DIRECTORY).join(name);
+        let path = workspace.state.join(DIRECTORY).join(file_name(&key));
         Some(Self {
             store: load(&path),
             path,
@@ -541,15 +541,47 @@ impl Memory {
     }
 }
 
-/// Forgets what every session was shown. The compaction handoff calls it: after
+/// The file under [`DIRECTORY`] that holds session `key`'s records.
+fn file_name(key: &str) -> String {
+    format!("{}.json", &source_digest(key.as_bytes())[..24])
+}
+
+/// Forgets what the agent was shown. The compaction handoff calls it: after
 /// compaction the agent no longer holds the source, so views print whole again.
-pub(crate) fn forget(workspace: &Workspace) {
-    let directory = workspace.state.join(DIRECTORY);
-    if !directory.is_dir() {
+/// Every session's records in `workspace`, where the hook runs, are forgotten,
+/// and with `session`, the `--session` value the hook gives the compacted
+/// session's commands, its records in every other project the registry lists,
+/// such as a nested repository or another `--root` its commands read. Other
+/// sessions' records there stay, since their agents still hold what they read.
+pub(crate) fn forget(workspace: &Workspace, session: Option<&str>) {
+    clear(&workspace.state, None);
+    let Some(session) = session.filter(|session| !session.is_empty()) else {
+        return;
+    };
+    let name = file_name(session);
+    for project in crate::registry::projects() {
+        if project.root != workspace.root {
+            clear(&project.root.join(".justless"), Some(&name));
+        }
+    }
+}
+
+/// Removes session file `name` from the records under `state`, or all of them.
+/// The lock is taken only when there is something to remove.
+fn clear(state: &Path, name: Option<&str>) {
+    let directory = state.join(DIRECTORY);
+    let target = match name {
+        Some(name) => directory.join(name),
+        None => directory,
+    };
+    if fs::symlink_metadata(&target).is_err() {
         return;
     }
-    let _guard = lock_state(&workspace.state.join("seen.lock"));
-    let _ = fs::remove_dir_all(directory);
+    let _guard = lock_state(&state.join("seen.lock"));
+    let _ = match name {
+        Some(_) => fs::remove_file(&target),
+        None => fs::remove_dir_all(&target),
+    };
 }
 
 fn load(path: &std::path::Path) -> Store {

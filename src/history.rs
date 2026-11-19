@@ -1354,11 +1354,10 @@ pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
 }
 
 /// The compaction handoff: [`activity_text`] for the summary or the restarted
-/// session. Compaction drops the source the agent was shown, so this also
-/// forgets the symbols `context` and `pack` remember for each session, and
-/// their next views print whole.
+/// session. The hook also forgets the symbols `context` and `pack` remember for
+/// the session (see `crate::seen::forget`), since compaction drops the source the
+/// agent was shown.
 pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
-    crate::seen::forget(workspace);
     activity_text(workspace, cap)
 }
 

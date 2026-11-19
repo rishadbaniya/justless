@@ -32,7 +32,7 @@ Details: [Run output](docs/reference.md#task-packs-and-run-history) · [Affected
 - `find --path` and `--glob` narrow a literal search, and a cut page names what cut it and prints the command for the next page.
 - `pack "TASK"` gathers the definitions, links, source lines, changes and failures a task needs within a byte budget, and `map` summarizes a repository.
 - `affected` lists what depends on a symbol, a file or the current changes, hop by hop, with the tests that reach it; `context --run RUN_ID` ties a failure to its code.
-- In a session, `context` and `pack` re-read a symbol as only its changed lines, 512 bytes instead of 2,039 for one changed line; `--fresh` shows it whole.
+- In a session, `context` and `pack` re-read a symbol as only its changed lines, 512 bytes instead of 2,039 for one changed line; `--fresh` shows it whole, and so does compaction, in every project the session read.
 
 Details: [Indexing and languages](docs/reference.md#indexing-and-languages) · [Map and change impact](docs/reference.md#repository-map-and-change-impact) · [Ranked lookup](docs/reference.md#ranked-lookup)
 

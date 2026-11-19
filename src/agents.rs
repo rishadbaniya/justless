@@ -737,7 +737,7 @@ pub(crate) fn answer_hook(
             .as_str()
             .is_none_or(|source| source == "compact")
     {
-        compact_state(workspace, &after_compact(&workspace.justless()))
+        compact_state(workspace, input, &after_compact(&workspace.justless()))
             .map(|context| {
                 json!({"hookSpecificOutput":{
                     "hookEventName":"SessionStart",
@@ -749,7 +749,7 @@ pub(crate) fn answer_hook(
         // Claude Code uses PreCompact stdout as instructions for the summary, so this
         // mode prints plain text rather than a JSON decision.
         if input["hook_event_name"] == "PreCompact"
-            && let Some(context) = compact_state(workspace, BEFORE_COMPACT)
+            && let Some(context) = compact_state(workspace, input, BEFORE_COMPACT)
         {
             print!("{context}");
         }
@@ -1239,8 +1239,11 @@ const BEFORE_COMPACT: &str = "Keep these Justless references verbatim in the sum
 
 /// `intro` followed by recent Justless activity, within `HANDOFF_BYTES`, or
 /// `None` when there is no activity or an intro with a very long `--root` leaves
-/// no room for it.
-fn compact_state(workspace: &Workspace, intro: &str) -> Option<String> {
+/// no room for it. Compaction drops the source the agent was shown, so the
+/// symbols `context` and `pack` remember for the session that `input` names are
+/// forgotten first, in every project, including one with no state of its own.
+fn compact_state(workspace: &Workspace, input: &Value, intro: &str) -> Option<String> {
+    crate::seen::forget(workspace, seen_session(input).as_deref());
     if !workspace.state.is_dir() {
         return None;
     }
@@ -1413,7 +1416,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -
 /// the original command against the permission rules first. Command hooks
 /// pass everything through on Windows, and so does this.
 fn with_seen_session(command: &str, input: &Value) -> Option<String> {
-    let session = input["session_id"].as_str().filter(|id| !id.is_empty())?;
+    let digest = seen_session(input)?;
     let line = command.trim_end();
     let (line, tail) = match line.strip_suffix(" 2>&1") {
         Some(line) => (line.trim_end(), " 2>&1"),
@@ -1442,12 +1445,18 @@ fn with_seen_session(command: &str, input: &Value) -> Option<String> {
     if words.any(|word| word == "--" || word == "--session" || word.starts_with("--session=")) {
         return None;
     }
+    Some(format!("{line} --session {digest}{tail}"))
+}
+
+/// The `--session` value for the agent whose hook sent `input`: a digest of
+/// Claude Code's `session_id` with, inside a subagent, its `agent_id`.
+fn seen_session(input: &Value) -> Option<String> {
+    let session = input["session_id"].as_str().filter(|id| !id.is_empty())?;
     let key = match input["agent_id"].as_str().filter(|id| !id.is_empty()) {
         Some(agent) => format!("{session}\0{agent}"),
         None => session.to_owned(),
     };
-    let digest = &crate::capture::source_digest(key.as_bytes())[..24];
-    Some(format!("{line} --session {digest}{tail}"))
+    Some(crate::capture::source_digest(key.as_bytes())[..24].to_owned())
 }
 
 /// What a client's command hook may rewrite.

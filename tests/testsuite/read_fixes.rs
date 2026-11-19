@@ -333,3 +333,79 @@ fn shell_reads_of_an_extensionless_script_keep_its_commands() {
         );
     }
 }
+
+/// Twelve-line functions named `prefix0` to `prefix5`, as a Rust library.
+fn library(prefix: &str) -> String {
+    repeat(
+        6,
+        &format!(
+            "pub fn {prefix}{{i}}(x: u32) -> u32 {{\n{}    v0\n}}\n\n",
+            (0..12)
+                .map(|k| format!("    let v{k} = x + {{i}} + {k} * 1000;\n"))
+                .collect::<String>()
+        ),
+    )
+}
+
+#[test]
+fn compaction_forgets_the_session_in_nested_projects() {
+    let project = Project::new();
+    let outer = project.root();
+    let inner = outer.join("svc");
+    project.write("src/lib.rs", &library("outer"));
+    project.write("svc/src/lib.rs", &library("inner"));
+    git(&outer, &["init", "-q"]);
+    git(&inner, &["init", "-q"]);
+    // The command the Claude Code hook routes for the agent's session.
+    let routed = |cwd: &Path, symbol: &str| -> Vec<String> {
+        let event = json!({"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
+            "cwd":cwd,"permission_mode":"bypassPermissions",
+            "tool_input":{"command":format!("justless context --symbol {symbol}")}});
+        let answer = project.json_hook(cwd, "hook-claude", "before-command", &event);
+        let command = answer["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{answer}"));
+        has(command, " --session ");
+        let words = shlex::split(command).unwrap();
+        assert_eq!(words[0], "justless", "{command}");
+        words[1..].to_vec()
+    };
+    let view = |cwd: &Path, args: &[String]| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        project.ok(cwd, &args)
+    };
+    let inner_view = routed(&inner, "inner3");
+    let outer_view = routed(&outer, "outer3");
+    let other: Vec<String> = ["context", "--symbol", "inner3", "--session", "other"]
+        .map(String::from)
+        .to_vec();
+    for (cwd, args) in [
+        (&inner, &inner_view),
+        (&outer, &outer_view),
+        (&inner, &other),
+    ] {
+        lacks(&view(cwd, args), "since you read it");
+        has(&view(cwd, args), "unchanged since you read it");
+    }
+    assert!(inner.join(".justless/seen").is_dir());
+
+    // The hook runs in the outer project, and the session's views print whole in
+    // both. Another session's views in the nested project are its own.
+    let compact =
+        json!({"session_id":"s1","hook_event_name":"PreCompact","trigger":"auto","cwd":outer});
+    project.hook(&outer, "hook-claude", "before-compact", &compact);
+    lacks(&view(&inner, &inner_view), "since you read it");
+    lacks(&view(&outer, &outer_view), "since you read it");
+    has(&view(&inner, &other), "unchanged since you read it");
+
+    // The same after compaction, from a project without state of its own.
+    has(&view(&inner, &inner_view), "unchanged since you read it");
+    let empty = outer.join("empty");
+    fs::create_dir(&empty).unwrap();
+    git(&empty, &["init", "-q"]);
+    let start =
+        json!({"session_id":"s1","hook_event_name":"SessionStart","source":"compact","cwd":empty});
+    project.hook(&empty, "hook-claude", "after-compact", &start);
+    assert!(!empty.join(".justless").exists());
+    lacks(&view(&inner, &inner_view), "since you read it");
+}
