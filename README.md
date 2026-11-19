@@ -17,9 +17,9 @@
   <strong>148×</strong> smaller answer to a code question · <strong>85×</strong> smaller reads of old revisions · <strong>28×</strong> smaller <code>find .</code> · <strong>10×</strong> less command output · <strong>8×</strong> fewer input tokens on a repair task · <strong>0</strong> network calls
 </p>
 
-**justless** is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
+**justless** sits between your coding agent and its tools. It turns command output into compact reports, answers code questions from a local **code graph** so the agent stops reading whole files, and keeps every byte it cuts one command away.
 
-> **🔒 100% local. Zero network calls.** justless runs entirely on your machine, between your agent and your shell. It sends nothing anywhere: no telemetry, no analytics, no cloud service, no LLM, no account. Your code and command output never leave your computer. The one exception is opt-in: `justless wrap claude` relays Claude Code's own API requests to Anthropic and adds no requests of its own.
+> **🔒 100% local. Zero network calls.** No telemetry, no cloud, no LLM, no account: your code and command output never leave your machine. The one opt-in exception, `justless wrap claude`, only relays Claude Code's own API requests.
 
 ## How much it saves
 
@@ -79,15 +79,17 @@ Token-saving tools each take one slice of the context window. RTK compresses com
 
 ## How it cuts tokens
 
-- **⚡ Compact Output.** `justless run` parses each tool's output: test failures grouped by diagnostic (cargo, pytest, Go, Jest/Vitest), lint findings grouped by rule ID with `file:line` (rustc, Clippy, Ruff, mypy, ESLint, tsc and more), searches grouped by file, listings by directory. Anything else becomes a 4 KB head, tail and error-line preview.
-- **🎯 Exact Recall.** Every stream is archived byte for byte, up to 256 MiB, in `.justless/runs/<id>` with a SHA-256 digest. `justless log ID --from N --to M` replays exact lines, with secrets masked unless you add `--unredacted`; an identical rerun collapses to one line.
-- **🔬 Surgical Reads.** syn and Tree-sitter outlines across 26 languages with revision-bound row IDs. `expand` returns one symbol's exact bytes; `edit` writes only the replacement after checking the revision.
-- **🗺️ Code Map and Impact.** An incremental graph of symbols, calls, imports, HTTP routes and SQL relations. `pack` answers a question in one call, `lookup` ranks the few places that answer "where is X configured?", and `affected` walks back to the tests that reach a change.
-- **🧪 Affected Tests.** `justless test --affected` runs only the tests that reach your Git changes, labels the result as a subset, and runs the full suite instead when the selection can't be trusted.
-- **🔐 Secret Redaction.** Cloud keys, tokens and private keys in command output are masked everywhere the agent sees output: previews, footers, `log`, `search` and MCP results. The archive keeps the exact bytes for `log --unredacted`.
-- **🧰 Scripts and Lessons.** `justless exec` runs a script the agent writes over large data, with whole head and tail lines and `--intent` ranking the lines that matter. `justless learn` proposes project rules from command mistakes agents keep repeating, and `--apply` adds them to the instructions.
-- **🧹 Context Hygiene.** A footer only when output was cut, failed or had a secret masked, compaction hooks that carry run IDs and inspected ranges into the next turn, and an opt-in `justless wrap claude` that has the API clear old tool results server-side, with every original archived.
-
+| | What it does |
+| --- | --- |
+| ⚡ **Compact output** | Test failures, lint findings, searches, diffs, listings and JSON become grouped reports. Anything else gets a 4 KB head, tail and error-line preview. |
+| 🎯 **Exact recall** | Every byte is archived with a SHA-256 digest. `justless log RUN --from A --to B` replays the exact lines. |
+| 🔬 **Surgical reads** | Outlines in 26 languages. `expand` returns one symbol's exact bytes, and `edit` writes it back only if the file has not changed. |
+| 🗺️ **Code graph** | Symbols, calls, imports, HTTP routes and SQL tables. `query`, `path`, `pack`, `lookup` and `affected` answer in one call. |
+| 🧪 **Affected tests** | `justless test --affected` runs only the tests a change reaches, and the full suite when it can't be sure. |
+| 🔁 **Changed since last read** | Re-reading code with `context` or `pack` shows only what changed since the agent last saw it. |
+| 🔐 **Secret redaction** | Keys, tokens and private keys are masked everywhere the agent sees output. |
+| 🧹 **Context hygiene** | Run IDs survive compaction, and opt-in `justless wrap claude` clears old tool results server-side. |
+| 🧰 **Scripts and lessons** | `exec` runs a script over big data; `learn` turns mistakes agents repeat into project rules. |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/demo-dark.svg">
@@ -109,8 +111,8 @@ The exit status is still 101, and `justless log RUN_ID --stream stdout --from 36
 
 ### What it does not do
 
-- **No changed commands.** Same command, directory and exit code. Pipes, redirections other than a final `2>&1`, interactive commands and output another program reads pass through; JSON a person or agent reads directly is shown as a table only when the table decodes back to the same JSON.
-- **No network, no LLM, no telemetry.** Parsing is local and deterministic; everything stays in `.justless/`. Only the installer goes online, plus the opt-in `wrap` proxy, which relays your agent's own API requests.
+- **No changed commands.** Same command, directory and exit code. Pipes, redirections, interactive commands and output another program reads pass through untouched.
+- **No network, no LLM, no telemetry.** Parsing is local and deterministic, and everything stays in `.justless/`.
 - **No hidden failures.** Anything cut is marked and one command away.
 
 ## Install
