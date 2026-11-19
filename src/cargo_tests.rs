@@ -27,9 +27,9 @@ static DOC_TESTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^ +Doc-tests (\S+)$").expect("doc-tests pattern"));
 
 /// Lines of other stream text kept in a report: the first ones and the
-/// diagnostics, besides the last.
+/// diagnostics with their locations, besides the last.
 const KEPT_LINES: usize = 2;
-const KEPT_DIAGNOSTICS: usize = 6;
+const KEPT_DIAGNOSTICS: usize = 8;
 /// Binaries that ran no test, named in one line.
 const NAMED_IDLE: usize = 4;
 
@@ -38,6 +38,11 @@ pub struct Totals {
     pub binaries: Vec<Binary>,
     /// Cargo's status lines and any other lines, per stream, as report lines.
     pub notes: Vec<String>,
+    /// Whether the notes show every other line of stderr, so the report stands
+    /// in for stderr too. Otherwise stderr keeps its own preview, which shows
+    /// a compiler warning's location lines, and has no notes.
+    #[serde(default)]
+    pub stderr: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -195,7 +200,11 @@ impl Scan {
         let ordinal = other.range.count;
         other.range.add(n);
         let text = short(line.trim_end(), 200);
-        let diagnostic = crate::filters::diagnostic(line);
+        // A warning or error and the `-->` line that locates it, not the `= note:`
+        // and source lines that quote a lint's name.
+        let trimmed = line.trim_start();
+        let diagnostic = trimmed.starts_with("--> ")
+            || crate::filters::diagnostic(line) && !trimmed.starts_with(['=', '|']);
         if other.kept.len() < KEPT_LINES && other.diagnostics == 0
             || diagnostic && other.diagnostics < KEPT_DIAGNOSTICS
         {
@@ -229,7 +238,12 @@ impl Scan {
             binaries.push(binary);
         }
         let mut notes = Vec::new();
+        let other = &self.other[Stream::Stderr as usize];
+        let stderr = other.kept.len() + usize::from(other.last.is_some()) == other.range.count;
         for stream in Stream::BOTH {
+            if stream == Stream::Stderr && !stderr {
+                continue;
+            }
             let name = stream.name();
             let status = &self.status[stream as usize];
             if status.count > 0 {
@@ -259,7 +273,11 @@ impl Scan {
                 notes.push("  …".into());
             }
         }
-        Some(Totals { binaries, notes })
+        Some(Totals {
+            binaries,
+            notes,
+            stderr,
+        })
     }
 }
 
@@ -443,21 +461,38 @@ mod tests {
     #[test]
     fn other_lines_keep_their_diagnostics_and_mark_what_they_left_out() {
         let noise: String = (0..10).map(|i| format!("trace {i}\n")).collect();
-        let err = format!("{ERR}{noise}warning: unused import: `Path`\ntrace end\n");
-        let notes = totals(&[(OUT, Stream::Stdout), (&err, Stream::Stderr)])
-            .unwrap()
-            .notes;
+        let warning = "warning: unused import: `Path`\n --> src/lib.rs:1:5\n  |\n";
+        let tail = format!("{noise}{warning}trace end\n");
+        let joined = merged(OUT, ERR) + &tail;
+        let notes = totals(&[(&joined, Stream::Stdout)]).unwrap().notes;
         assert_eq!(
             notes,
             [
-                "stderr: 15 cargo status line(s) [stderr:1-15]",
-                "stderr: 12 other line(s) [stderr:16-27]",
+                "stdout: 15 cargo status line(s) [stdout:2-87]",
+                "stdout: 14 other line(s) [stdout:92-105]",
                 "  trace 0",
                 "  trace 1",
                 "  …",
                 "  warning: unused import: `Path`",
+                "   --> src/lib.rs:1:5",
+                "  …",
                 "  trace end",
             ]
         );
+        // Apart, stderr whose other lines do not all show keeps its own preview,
+        // and three or fewer show whole.
+        for (err, whole) in [
+            (format!("{ERR}{tail}"), false),
+            (format!("{ERR}a\nb\nc\n"), true),
+        ] {
+            let totals = totals(&[(OUT, Stream::Stdout), (&err, Stream::Stderr)]).unwrap();
+            assert_eq!(totals.stderr, whole);
+            assert_eq!(
+                totals.notes.len(),
+                if whole { 5 } else { 0 },
+                "{:?}",
+                totals.notes
+            );
+        }
     }
 }

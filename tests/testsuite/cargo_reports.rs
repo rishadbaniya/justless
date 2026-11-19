@@ -211,6 +211,10 @@ fn a_clean_build_is_one_line_and_anything_else_keeps_its_lines() {
     for (stderr, code) in [
         (err.clone(), 1),
         (format!("{err}build script says hello\n"), 0),
+        (
+            format!("warning: unused manifest key: package.foo\n{err}"),
+            0,
+        ),
         (finished.clone(), 0),
     ] {
         let err_file = sandbox.file("err", &stderr);

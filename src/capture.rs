@@ -1589,6 +1589,11 @@ impl Capture<'_> {
         let stdout_fits = fit_whole[0];
 
         run.summary = parser.finish();
+        // A truncated archive holds only a prefix, whose totals can add up and still
+        // leave out what came after it.
+        if !run.produced_bytes.is_empty() {
+            run.summary.cargo = None;
+        }
         let mut key = Sha256::new();
         for field in std::iter::once(workspace.cwd.as_os_str().as_encoded_bytes())
             .chain(args.iter().map(|arg| arg.as_encoded_bytes()))
@@ -1628,7 +1633,7 @@ impl Capture<'_> {
         // Cargo's status.
         let clean = lint
             .as_ref()
-            .filter(|_| status == 0)
+            .filter(|_| status == 0 && run.produced_bytes.is_empty())
             .and_then(|lint| lint.clean(&crate::filters::tool_label(args)));
         let lint = lint.and_then(|lint| {
             lint.finish(
@@ -1653,8 +1658,20 @@ impl Capture<'_> {
             run.summary = summary.clone();
         }
         let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
-        // A report that accounts for every line of both streams replaces both.
+        // `cargo test` totals account for every line of stdout, and of stderr when
+        // they show all its other lines, so they replace what they cover.
         let whole = run.summary.cargo.is_some();
+        let covers_stderr = run
+            .summary
+            .cargo
+            .as_ref()
+            .is_some_and(|totals| totals.stderr);
+        let covered = previews[0].1.len()
+            + if covers_stderr {
+                previews[1].1.len()
+            } else {
+                0
+            };
         // The Cargo.lock sections of a patch, described by their dependency changes.
         let locks = (!merged && run.produced_bytes.is_empty() && crate::lockdiff::applies(words))
             .then(|| read_text(&archive.readers[0], lengths[0], crate::lockdiff::LIMIT))
@@ -1715,10 +1732,10 @@ impl Capture<'_> {
                 previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
                 run.status,
             )
-            && (whole && fit_whole.contains(&false)
+            && (covers_stderr && !fit_whole[1]
                 || !stdout_fits
                 || previous.is_some()
-                || summary.len() < if whole { shown } else { previews[0].1.len() })
+                || summary.len() < covered)
         {
             // A merged stdout also holds the command's stderr, which a test, diff or
             // inventory summary of stdout would drop, so that run keeps its preview,
@@ -1731,7 +1748,7 @@ impl Capture<'_> {
                 _ => summary,
             };
             previews[0].1 = fit(summary, max_bytes).into_bytes();
-            if whole {
+            if covers_stderr {
                 previews[1].1.clear();
             }
             report = true;

@@ -276,6 +276,8 @@ pub struct Lint {
     other: [Other; 2],
     /// Cargo's status lines among `other`, per stream: count, first and last line.
     status: [(usize, usize, usize); 2],
+    /// Non-blank lines per stream, whatever shape read them.
+    lines: [usize; 2],
     /// The last `Finished` status line.
     finished: String,
     overflow: bool,
@@ -302,6 +304,7 @@ impl Lint {
             unlocated_errors: 0,
             other: Default::default(),
             status: [(0, 0, 0); 2],
+            lines: [0; 2],
             finished: String::new(),
             overflow: false,
         }
@@ -316,6 +319,9 @@ impl Lint {
             return;
         }
         let line = text.trim_end_matches(['\n', '\r']);
+        if !line.trim().is_empty() {
+            self.lines[stream as usize] += 1;
+        }
         if !self.classify(line, n, stream) && !line.trim().is_empty() {
             self.other[stream as usize].note(n, line);
             if CARGO_STATUS.is_match(line) {
@@ -332,7 +338,9 @@ impl Lint {
     /// `cargo clippy`, with the range of those lines on each stream and the last
     /// `Finished` line. `None` when the run printed anything else.
     pub fn clean(&self, label: &str) -> Option<String> {
-        let only_status = (0..2).all(|i| self.other[i].count == self.status[i].0);
+        // A shape can take a line without a finding, as a warning without a
+        // location, so every line counts.
+        let only_status = (0..2).all(|i| self.lines[i] == self.status[i].0);
         if self.overflow
             || !only_status
             || self.block.is_some()
