@@ -33,7 +33,7 @@ Ideas and limits that were considered and closed, with the reason. Each reason c
 | Severity sampling for CI logs | 34 results, 0.08 MB; the logs profile keeps errors with context and folds repeats. |
 | `git blame` | 4 results, 0.01 MB. |
 | Tabular text from database and cloud CLIs | 8 results, under 0.01 MB. |
-| `git log -p`, `--stat` and `range-diff` views | 35 results, 0.05 MB; `--stat` is already a summary. The `git show` patch form is planned instead. |
+| `git log --stat` and `range-diff` views | 35 results with `git log -p`, 0.05 MB; `--stat` is already a summary. `git show` and `git log -p` patches now get the commit summary. |
 | Log prefix and timestamp normalization | 34 results, 0.08 MB. |
 | Non-CR progress folding | 14 results, 0.03 MB. |
 | HTML to text for curl, wget and gh | None of 471 results contained an HTML page. |
@@ -75,3 +75,5 @@ Ideas and limits that were considered and closed, with the reason. Each reason c
 | `.mm` files as Objective-C | 209 of 357 real Objective-C++ files (59%) parse with errors in the Objective-C grammar; on average 6.4% of a file's bytes sit in error nodes. |
 | `nl -ba FILE \| sed -n` reads | 0 results in 472 transcripts. |
 | `awk 'NR>=A && NR<=B'` range reads | 42 results, 0.10 MB. |
+| Cargo.lock descriptions inside `git log -p` | Two git lookups per lockfile section per commit; `git log -p` is 0.05 MB in total. |
+| Compacting lists that mix `git show` with other git commands after they run | 29 results, 0.11 MB; `git diff` lists already pass through the same way. |

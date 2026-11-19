@@ -158,10 +158,8 @@ Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). Th
 ### 4.A Reads outside the workspace, and the duplicate instruction block — done
 - **Progress.** *on main* (2026-11-19). A whole Claude Code Read of a parser-supported file outside the workspace is outlined from the returned content and the original archived with `justless recall ID` (e.g. 35,392 → 2,764 bytes); dotfiles, `$HOME/.*` and tool-results files are skipped. When `CLAUDE.md` imports `@AGENTS.md`, `init` keeps one block in AGENTS.md (this repo's CLAUDE.md went from 941 to 11 bytes), and `doctor` flags a duplicate copy.
 
-### 4.B Commit-aware diff summary for `git show` patches
-- Map the patch forms of `git show` (and `git log -p`) to the diff summary, reading each commit header as an item before the per-file and per-hunk items; anything unrecognized still falls back to the preview. Measured: 138 results over 4 KB, 1.53 MB, clipped today because the diff parser requires `diff --git` first.
-- **Starts after:** the compaction-formats branch (§3.5–§3.7) merges.
-- **Progress.** *designed*.
+### 4.B Commit-aware diff summary for `git show` patches — done
+- **Progress.** *on main* (2026-11-19). `git show` and `git log -p` get the diff summary: one item per commit header, then file and hunk items with exact `[stdout:A-B]` ranges; the Cargo.lock description and its flags work inside it; reruns compare only when they share a commit. `git show c5f088d` 11,462 → 1,008 bytes (2,046 clipped before). On commits over about 25 KB the summary is larger than the old head/tail clip (e.g. 34,734 → 2,802 vs 2,043) but names every hunk, as `git diff` already does. Remaining edges are closed in docs/decisions.md.
 
 ### 4.C Grouped context searches — done
 - **Progress.** *on main* (2026-11-19). rg/grep/git grep output with `-A/-B/-C` is parsed strictly into blocks and grouped by file with exact `[stdout:A-B]` ranges, in `run` previews and the Claude Code post-run hook; anything the parse cannot account for falls back. Seven real 5–12 KB searches: 54,940 → 16,045 bytes. Open: ag/ack layouts unverified (not installed); Claude Code's own Grep tool with context options keeps the matches-only grouping.
