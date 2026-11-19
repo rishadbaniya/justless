@@ -160,6 +160,14 @@ def spaced(chosen, candidate, gap=SPACING):
     return all(c["file"] != candidate["file"] or abs(c["offset"] - candidate["offset"]) >= gap for c in chosen)
 
 
+def test_module_files(pristine):
+    """Files that a `#[cfg(test)] mod name;` declares: the oracle treats edits there as test edits."""
+    out = set()
+    for rel in gen_tasks.files(pristine, [".rs"]):
+        out.update(oracles.external_test_modules(rel, (Path(pristine) / rel).read_text(errors="replace")))
+    return out
+
+
 def rewrite_candidates(pristine, exposed, avoid, lints):
     """Behavior-preserving rewrites outside tests, as dicts with lint, file, offset, old, new and package."""
     out = []
@@ -356,6 +364,7 @@ def gen_lint(repo, seed, avoid, n=1, label=""):
         raise RuntimeError("baseline clippy does not compile for %s" % repo)
     base_counts = oracles.lint_counts(base_msgs)
     rng = random.Random("%d|large-lint|%s%s" % (seed, repo, label))
+    test_files = test_module_files(pristine)
     exposed = gen_tasks.exposed_files(repo, pristine, gen_tasks.files(pristine, [".rs"]))
     cands = rewrite_candidates(pristine, exposed, avoid, SAFE_LINTS)
     by_lint = collections.defaultdict(list)
@@ -380,6 +389,10 @@ def gen_lint(repo, seed, avoid, n=1, label=""):
         if len(kept_rule) < RULE_SITES - 1 or len({e["file"] for e in kept_rule}) < RULE_FILES_MIN \
                 or len(kept_noise) < NOISE_SITES * 2 // 3:
             log("large lint", repo, rule, "too few kept", len(kept_rule), len(kept_noise))
+            continue
+        if any(e["file"] in test_files for e in kept_rule):
+            # Fixing the rule there would count as editing tests.
+            log("large lint", repo, rule, "a rule site is in a test module")
             continue
         try:
             edits, messages = verify_injection(work, target, json_cmd, base_msgs,
@@ -522,6 +535,9 @@ def gen_regression(repo, seed, avoid, n=1, label=""):
     flaky = set(baseline.get("flaky") or [])
     rng = random.Random("%d|large-regression|%s%s" % (seed, repo, label))
     exposed = gen_tasks.exposed_files(repo, pristine, gen_tasks.files(pristine, [".rs"]))
+    # Neither the cleanup nor the bug may sit in a test module: reverting the commit must not count as a
+    # test edit, so that the reverted cleanup is what fails.
+    avoid = set(avoid) | test_module_files(pristine)
     cands = rewrite_candidates(pristine, exposed, avoid, SAFE_LINTS)
     per_file = collections.Counter(c["file"] for c in cands)
     accepted, pool, attempts = find_bugs(repo, base, work, target, baseline, 1, rng,

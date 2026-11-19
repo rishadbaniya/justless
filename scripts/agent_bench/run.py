@@ -886,7 +886,9 @@ def estimate_large(args):
     source = "pre-measurement assumption"
     paths = {t["id"]: accounting.LARGE_PREPILOT_PATH for t in task_list}
     if getattr(args, "from_dry", None):
-        measured = accounting.dry_run_paths(Path(args.home) / "campaigns" / args.from_dry)
+        measured = {}
+        for name in args.from_dry.split(","):
+            measured.update(accounting.dry_run_paths(Path(args.home) / "campaigns" / name))
         missing = sorted(set(paths) - set(measured))
         if missing:
             raise SystemExit("no successful dry-run measurement for %s in %s" % (", ".join(missing), args.from_dry))
@@ -1088,7 +1090,8 @@ def parser():
     common(sub.add_parser("pilot"))
     common(sub.add_parser("estimate")).add_argument("--assume", default="pilot", choices=["pilot", "prepilot"])
     sub.choices["estimate"].add_argument("--from-dry", help="large task set: the dry-run campaign directory "
-                                         "holding the correct variant, such as dry-large-correct")
+                                         "holding the correct variant, such as dry-large-correct; several "
+                                         "may be given, separated by commas")
     common(sub.add_parser("run"))
     common(sub.add_parser("anchor")).add_argument("--dry-anchor", action="store_true",
                                                     help="upstream is the fake API with a scripted agent (free)")
