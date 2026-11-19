@@ -18,7 +18,7 @@ use crate::history;
 use crate::summary::{Parser, Summary};
 use crate::workspace::{Location, Workspace, lock_state, private_dir, write_json};
 
-static ANSI: LazyLock<Regex> =
+pub(crate) static ANSI: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("ANSI pattern"));
 static SOURCE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:(?:-->|:::|at)\s+)?([^\r\n]+?):(\d+)(?::\d+)?")
@@ -2089,8 +2089,7 @@ fn scan(
     let mut preview = Vec::new();
     let mut head = Excerpt::new(payload / 6);
     let mut section = Section::default();
-    let mut block: Option<Block> = None;
-    let mut patch = false;
+    let mut failures = Failures::default();
     let tail_limit = payload / 3;
     let mut tail = VecDeque::new();
     let mut tail_bytes = 0;
@@ -2129,32 +2128,8 @@ fn scan(
         let rendered = structured.as_ref().and_then(rendered_message);
         let shown = rendered.as_deref().unwrap_or(&text);
         let line = shown.trim_end_matches(['\n', '\r']);
-        // Lines inside a patch hunk are file content, not diagnostics.
-        patch = line.starts_with("@@ ")
-            || patch && (line.is_empty() || line.starts_with([' ', '+', '-', '\\']));
-
-        // A failure keeps the lines that explain it: a traceback through its
-        // exception line, a panic's message, or a compiler error's location.
-        let mut failure = false;
-        if let Some(open) = block.as_mut() {
-            match open.extend(line, shown) {
-                Extend::More => failure = true,
-                Extend::Last => {
-                    failure = true;
-                    section.add(block.take().unwrap(), payload / 2);
-                }
-                Extend::Stop => section.add(block.take().unwrap(), payload / 2),
-            }
-        }
-        if !failure
-            && !patch
-            && let Some(tier) = failure_tier(line)
-        {
-            failure = true;
-            if let Some(earlier) = block.replace(Block::new(tier, line, shown)) {
-                section.add(earlier, payload / 2);
-            }
-        }
+        let failure = failures.observe(line, shown, |block| section.add(block, payload / 2));
+        let patch = failures.patch;
         let found = if patch {
             Vec::new()
         } else if let Some(message) = &structured {
@@ -2186,11 +2161,18 @@ fn scan(
             if cut {
                 floor.flush(&mut floored);
             } else {
-                floor.push(shown, &mut floored);
+                floor.push(shown, failure, &mut floored);
             }
-            for line in floored.drain(..) {
+            for (line, repeats) in floored.drain(..) {
                 head.push(&line);
-                keep_tail(&mut tail, &mut tail_bytes, tail_limit, &line, false);
+                keep_tail(
+                    &mut tail,
+                    &mut tail_bytes,
+                    tail_limit,
+                    &line,
+                    false,
+                    repeats,
+                );
             }
             if cut {
                 // Only the start of an enormous line was scanned. Show its real end;
@@ -2201,19 +2183,26 @@ fn scan(
                 suffix.extend_from_slice(&end);
                 let suffix = String::from_utf8_lossy(&suffix);
                 let suffix = ANSI.replace_all(&suffix, "");
-                keep_tail(&mut tail, &mut tail_bytes, tail_limit, &suffix, true);
+                keep_tail(&mut tail, &mut tail_bytes, tail_limit, &suffix, true, false);
             }
         }
         raw.clear();
         end.clear();
     }
-    if let Some(open) = block.take() {
+    if let Some(open) = failures.block.take() {
         section.add(open, payload / 2);
     }
     floor.flush(&mut floored);
-    for line in floored.drain(..) {
+    for (line, repeats) in floored.drain(..) {
         head.push(&line);
-        keep_tail(&mut tail, &mut tail_bytes, tail_limit, &line, false);
+        keep_tail(
+            &mut tail,
+            &mut tail_bytes,
+            tail_limit,
+            &line,
+            false,
+            repeats,
+        );
     }
 
     if let Some(buffer) = whole {
@@ -2243,13 +2232,25 @@ fn scan(
     Ok((preview, !truncated))
 }
 
-/// Add a line to the tail excerpt, dropping its oldest lines past `limit`.
-fn keep_tail(tail: &mut VecDeque<String>, bytes: &mut usize, limit: usize, line: &str, cut: bool) {
+/// Add a line to the tail excerpt, dropping its oldest lines past `limit`. `cut`
+/// marks a line whose start was left out, and `repeats` the floor's count of
+/// repeats of the line before, which leaves the tail with that line.
+fn keep_tail(
+    tail: &mut VecDeque<String>,
+    bytes: &mut usize,
+    limit: usize,
+    line: &str,
+    cut: bool,
+    repeats: bool,
+) {
     let mut excerpt = Excerpt::new(limit);
     excerpt.push_end(line, cut);
     if !excerpt.text.is_empty() {
         *bytes += excerpt.text.len();
-        tail.push_back(excerpt.text);
+        match tail.back_mut() {
+            Some(last) if repeats => last.push_str(&excerpt.text),
+            _ => tail.push_back(excerpt.text),
+        }
         while *bytes > limit {
             *bytes -= tail.pop_front().unwrap().len();
         }
@@ -2468,6 +2469,59 @@ impl Block {
             self.text.push_str(&frame);
         }
     }
+}
+
+/// Follows the failure blocks of a stream line by line, as the `[diagnostics]`
+/// section reads them, and whether a line is inside a patch hunk.
+#[derive(Default)]
+struct Failures {
+    block: Option<Block>,
+    patch: bool,
+}
+
+impl Failures {
+    /// Whether `line`, without its line break, starts or continues a failure block. A
+    /// block that ends goes to `done`.
+    fn observe(&mut self, line: &str, shown: &str, mut done: impl FnMut(Block)) -> bool {
+        // Lines inside a patch hunk are file content, not diagnostics.
+        self.patch = crate::floor::in_hunk(self.patch, line);
+        // A failure keeps the lines that explain it: a traceback through its
+        // exception line, a panic's message, or a compiler error's location.
+        let mut failure = false;
+        if let Some(open) = self.block.as_mut() {
+            match open.extend(line, shown) {
+                Extend::More => failure = true,
+                Extend::Last => {
+                    failure = true;
+                    done(self.block.take().unwrap());
+                }
+                Extend::Stop => done(self.block.take().unwrap()),
+            }
+        }
+        if !failure
+            && !self.patch
+            && let Some(tier) = failure_tier(line)
+        {
+            failure = true;
+            if let Some(earlier) = self.block.replace(Block::new(tier, line, shown)) {
+                done(earlier);
+            }
+        }
+        failure
+    }
+}
+
+/// Whether each line of `text` belongs to a failure block, as a clipped preview's
+/// scan reads it, so the floor leaves it whole.
+pub(crate) fn failure_lines(text: &str) -> Vec<bool> {
+    let mut failures = Failures::default();
+    text.split_inclusive('\n')
+        .map(|raw| {
+            let shown = ANSI.replace_all(raw, "");
+            let line = shown.trim_end_matches(['\n', '\r']);
+            failures.observe(line, &shown, drop)
+        })
+        .collect()
 }
 
 fn with_newline(text: &str) -> String {

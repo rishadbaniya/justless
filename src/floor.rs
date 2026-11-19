@@ -4,8 +4,10 @@
 //!
 //! It changes only what is displayed. Each elision says what was cut, and is used
 //! only where it is shorter than the text it replaces. Lines that look like a
-//! failure, warning or assertion, and lines inside a patch hunk, are never changed,
-//! folded or dropped.
+//! failure, warning or assertion, the lines that explain a failure as the
+//! `[diagnostics]` scan reads them, such as a panic's message or a traceback's
+//! frames, pytest's `E` lines, and lines inside a patch hunk, also a combined or
+//! coloured one, are never changed, folded or dropped.
 use std::borrow::Cow;
 
 /// A hex run longer than a SHA-512 digest.
@@ -22,6 +24,18 @@ fn kept(line: &str) -> bool {
         || ["Traceback", "thread '", "left:", "right:"]
             .iter()
             .any(|prefix| trimmed.starts_with(prefix))
+        // pytest explains a failed assertion on lines that start with `E`.
+        || line == "E"
+        || line.starts_with("E ")
+}
+
+/// Whether `line`, without its line break and colours, is inside a patch hunk, given
+/// whether the line before it was: a `@@ ` hunk header, a combined diff's `@@@`
+/// one, and the context, added, removed and no-newline lines after it.
+pub(crate) fn in_hunk(before: bool, line: &str) -> bool {
+    line.starts_with("@@ ")
+        || line.starts_with("@@@")
+        || before && (line.is_empty() || line.starts_with([' ', '+', '-', '\\']))
 }
 
 /// One line, without its line break, with progress frames collapsed and long
@@ -128,6 +142,10 @@ pub fn prints_file(words: &[&str]) -> bool {
     }
 }
 
+/// A line the floor shows, with its line break, and whether it is the
+/// `[last line repeated N more time(s)]` marker that counts the line before it.
+pub type Shown = (String, bool);
+
 /// Applies the floor to a stream line by line, folding repeated lines.
 #[derive(Default)]
 pub struct Floor {
@@ -139,30 +157,32 @@ pub struct Floor {
 
 impl Floor {
     /// The lines to show for one line of the stream, which keeps its line break:
-    /// none while it repeats the line before.
-    pub fn push(&mut self, text: &str, out: &mut Vec<String>) {
+    /// none while it repeats the line before. A `marked` line belongs to a failure
+    /// block and is shown as it is.
+    pub fn push(&mut self, text: &str, marked: bool, out: &mut Vec<Shown>) {
         let line = text.strip_suffix('\n').unwrap_or(text);
-        let trimmed = line.trim_end_matches('\r');
-        self.patch = trimmed.starts_with("@@ ")
-            || self.patch && (trimmed.is_empty() || trimmed.starts_with([' ', '+', '-', '\\']));
-        let shown = if self.patch {
+        // Colours, as `git diff --color` prints them, do not hide a hunk.
+        let plain = crate::capture::ANSI.replace_all(line, "");
+        let plain = plain.trim_end_matches('\r');
+        self.patch = in_hunk(self.patch, plain);
+        let keep = marked || self.patch || kept(plain);
+        let shown = if keep {
             Cow::Borrowed(line)
         } else {
             self::line(line)
         };
-        let foldable = !self.patch && !kept(line);
-        if foldable && self.last.as_deref() == Some(&shown) {
+        if !keep && self.last.as_deref() == Some(&shown) {
             self.repeats += 1;
             return;
         }
         self.flush(out);
         let newline = if text.ends_with('\n') { "\n" } else { "" };
-        out.push(format!("{shown}{newline}"));
-        self.last = foldable.then(|| shown.into_owned());
+        out.push((format!("{shown}{newline}"), false));
+        self.last = (!keep).then(|| shown.into_owned());
     }
 
     /// Show what folding still holds back, as at the end of the stream.
-    pub fn flush(&mut self, out: &mut Vec<String>) {
+    pub fn flush(&mut self, out: &mut Vec<Shown>) {
         let repeats = std::mem::take(&mut self.repeats);
         let Some(last) = self.last.take() else {
             return;
@@ -172,22 +192,23 @@ impl Floor {
         }
         let marker = format!("[last line repeated {repeats} more time(s)]\n");
         if marker.len() < repeats * (last.len() + 1) {
-            out.push(marker);
+            out.push((marker, true));
         } else {
-            out.extend(std::iter::repeat_n(format!("{last}\n"), repeats));
+            out.extend(std::iter::repeat_n((format!("{last}\n"), false), repeats));
         }
     }
 }
 
 /// The floor applied to a whole text, when it changed anything.
 pub fn compact(text: &str) -> Option<String> {
+    let marks = crate::capture::failure_lines(text);
     let mut floor = Floor::default();
     let mut lines = Vec::new();
-    for line in text.split_inclusive('\n') {
-        floor.push(line, &mut lines);
+    for (line, marked) in text.split_inclusive('\n').zip(marks) {
+        floor.push(line, marked, &mut lines);
     }
     floor.flush(&mut lines);
-    let out = lines.concat();
+    let out: String = lines.into_iter().map(|(line, _)| line).collect();
     (out != text).then_some(out)
 }
 
@@ -265,6 +286,44 @@ mod tests {
                 expected,
                 "{input:?}"
             );
+        }
+    }
+
+    #[test]
+    fn failure_blocks_and_every_patch_stay_whole() {
+        let base64: String = (0..150)
+            .map(|i| ["Qm", "x9", "aZ", "k+", "P0"][i % 5])
+            .collect();
+        let hex: String = (0..200)
+            .map(|i| char::from(b"0123456789abcdef"[i * 7 % 16]))
+            .collect();
+        let e = "\u{1b}";
+        for input in [
+            // A panic's message.
+            format!(
+                "thread 'tests::digest' panicked at src/lib.rs:10:5:\nunexpected digest {hex}\n"
+            ),
+            // A traceback's frames, one of them repeated.
+            format!(
+                "Traceback (most recent call last):\n  File \"a.py\", line 3, in <module>\n    load('{base64}')\n    load('{base64}')\nValueError: bad\n"
+            ),
+            // pytest's explanation of a failed assertion.
+            format!(
+                "E       AssertionError: assert left == right\nE         + {base64}\n{}",
+                "E\n".repeat(30)
+            ),
+            // A combined diff's hunk.
+            format!(
+                "@@@ -1,3 -1,3 +1,30 @@@\n+ {base64}\n{}",
+                "+ same line\n".repeat(25)
+            ),
+            // A coloured hunk.
+            format!(
+                "{e}[36m@@ -1,3 +1,12 @@{e}[m\n{e}[32m+{base64}{e}[m\n{}",
+                format!("{e}[32m+same line{e}[m\n").repeat(10)
+            ),
+        ] {
+            assert_eq!(compact(&input), None, "{input:?}");
         }
     }
 }

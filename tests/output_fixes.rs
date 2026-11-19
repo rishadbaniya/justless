@@ -211,3 +211,35 @@ fn json_that_fits_takes_a_view_only_when_it_saves_more_than_a_footer() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_clipped_preview_keeps_failure_lines_and_each_repeat_count_with_its_line() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root();
+    sandbox.stub("emit", "cat \"$1\"\n");
+    let hex: String = (0..200)
+        .map(|i| char::from(b"0123456789abcdef"[i * 7 % 16]))
+        .collect();
+    let panic =
+        format!("thread 'tests::digest' panicked at src/lib.rs:10:5:\nunexpected digest {hex}\n\n");
+    let filler: String = (0..100)
+        .map(|i| format!("filler line {i:03} {}\n", ".".repeat(30)))
+        .collect();
+    // With a 4096-byte budget the tail keeps about 1347 bytes: room for the last
+    // line and the repeat count, but not for the repeated line as well.
+    let repeated = format!("repeated line {}\n", "r".repeat(46)).repeat(3);
+    let last = format!("end {}\n", "z".repeat(1276));
+    let output_text = format!("{panic}{filler}{repeated}{last}");
+    fs::write(root.join("out.txt"), &output_text).unwrap();
+    let output = sandbox.justless(&["run", "--max-bytes", "4096", "--", "emit", "out.txt"]);
+    assert!(output.status.success(), "{output:?}");
+    let shown = text(&output.stdout);
+    assert!(shown.len() <= 4096, "{shown}");
+    let (head, tail) = shown
+        .split_once("[output clipped. Full log retained.]\n")
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert!(head.starts_with(&panic), "{head}");
+    assert!(!tail.starts_with("[last line repeated"), "{tail}");
+    assert!(tail.ends_with(&last), "{tail}");
+}
