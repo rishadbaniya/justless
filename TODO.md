@@ -140,10 +140,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Progress.** *not started*. The pieces exist: revision-bound outlines, the session ID on hook runs, and the activity file that 2.5 extends.
 - **Measure.** Total input tokens and task success over complete tasks, not bytes per call (use the benchmark in 5.1).
 
-### 3.2 `justless test --compare REF` — top debugging idea from a reviewer
-- **Problem.** An agent cannot tell which failures its change introduced and which already failed on the base branch.
-- **Plan.** Run the tests at the merge base and in the working tree; group failures as newly failing, already failing (same test and same assertion) and fixed. Start with Cargo; rerun only the failing test IDs against the base, in a temporary worktree.
-- **Progress.** *designed*. Builds on `test --affected --base` (on main) and the grouped test summaries.
+### 3.2 `justless test --compare REF` — done
+- **Progress.** *on main* (2026-11-19). Runs the tests in the working tree, reruns only the failing ones at the merge base in a temporary worktree (base builds in `.justless/compare/cargo-target`), and groups them as new failures, changed failures and already failing with the same normalized message. Cargo and pytest (pytest only tested against a stand-in; real pytest still to confirm); other runners say "not supported". Works with `--affected` and `--base`. Exit status is the working tree's.
 
 ### 3.3 Codex code mode
 - **Problem.** Since late August, 68% of the owner's Codex output (503 MB of 734 MB overall) ran inside code-mode `exec`, and the Codex hook matches only `^Bash$`. If nested calls bypass the hook, Justless does nothing for current Codex sessions. Codex is `init`'s default client.
