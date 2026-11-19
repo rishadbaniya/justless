@@ -44,6 +44,7 @@ Details: [Indexing and languages](docs/reference.md#indexing-and-languages) · [
 - Claude Code's Read hook outlines large whole-file Reads and ranged Reads of more than 150 lines: 167 such ranged Reads went from 2,803,765 bytes to 304,590.
 - Shell reads of a wide file with `cat`, `sed -n`, `head`, `tail` or `git show REV:path` show an outline and a command that replays the exact bytes.
 - A shell read followed by `| cat` is handled as the read alone, and in Claude Code `cat A B …` of several workspace files shows one section per file, small files whole and wide ones outlined.
+- Claude Code read lists may also mix in `cat -n`, literal `echo` and `printf`, `pwd`, `true`, `ls`, `wc`, `git status --short` and `git log`, each reproduced and checked byte for byte: in a week of this project's transcripts, 107 large list results (1.2 MB) that passed through whole now qualify.
 - Outlines list up to 20 lines of top-level code that no row covers, in scripts named by their `#!` line, Elixir, PowerShell, Julia and Groovy files and Vue, Svelte and Astro components too; a file with more keeps its full read.
 - Claude Code's post-edit hook tells the model when a native Edit or Write leaves a file that parsed before unparseable.
 

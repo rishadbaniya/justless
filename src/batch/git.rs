@@ -18,42 +18,103 @@ fn revision(arg: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-/~^:".contains(&b))
 }
 
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn pathspec(arg: &str) -> bool {
+    local(arg) && !Path::new(arg).is_absolute() && !arg.starts_with(':')
+}
+
+fn diff_option(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--stat"
+            | "--shortstat"
+            | "--numstat"
+            | "--name-only"
+            | "--name-status"
+            | "-p"
+            | "--patch"
+            | "--no-color"
+            | "--no-ext-diff"
+            | "--no-textconv"
+            | "--no-patch"
+            | "--oneline"
+    ) || arg.strip_prefix("-U").is_some_and(digits)
+}
+
+/// A `git log` option that limits or formats the commits without running
+/// anything else: a format that checks signatures runs GnuPG, so it is refused.
+fn log_option(arg: &str) -> bool {
+    diff_option(arg)
+        || matches!(
+            arg,
+            "--no-merges" | "--merges" | "--first-parent" | "--reverse" | "--no-decorate"
+        )
+        || arg.strip_prefix('-').is_some_and(digits)
+        || arg.strip_prefix("-n").is_some_and(digits)
+        || arg.strip_prefix("--max-count=").is_some_and(digits)
+        || (arg.starts_with("--format=") || arg.starts_with("--pretty="))
+            && !arg
+                .split('%')
+                .skip(1)
+                .any(|s| s.trim_start_matches(['+', '-', ' ']).starts_with('G'))
+}
+
+/// `git status` in its short or porcelain form. The long form and `--branch`
+/// name the branch, which the isolated repository does not have.
+fn status(rest: &[String]) -> bool {
+    let mut short = false;
+    let mut paths = false;
+    for arg in rest {
+        if paths || !arg.starts_with('-') {
+            if !pathspec(arg) {
+                return false;
+            }
+        } else if arg == "--" {
+            paths = true;
+        } else if matches!(
+            arg.as_str(),
+            "-s" | "--short" | "--porcelain" | "--porcelain=v1"
+        ) {
+            short = true;
+        } else if !matches!(
+            arg.as_str(),
+            "-uno"
+                | "-unormal"
+                | "-uall"
+                | "-u"
+                | "--untracked-files=no"
+                | "--untracked-files=normal"
+                | "--untracked-files=all"
+        ) {
+            return false;
+        }
+    }
+    short
+}
+
 pub(super) fn supported(args: &[String]) -> bool {
     let Some((op, rest)) = args.split_first() else {
         return false;
     };
-    if !matches!(op.as_str(), "show" | "diff") {
-        return false;
-    }
+    let option: fn(&str) -> bool = match op.as_str() {
+        "show" | "diff" => |arg| diff_option(arg) || matches!(arg, "--cached" | "--staged"),
+        "log" => log_option,
+        "status" => return status(rest),
+        _ => return false,
+    };
     let mut paths = false;
     for arg in rest {
         if paths {
-            if !local(arg) || Path::new(arg).is_absolute() || arg.starts_with(':') {
+            if !pathspec(arg) {
                 return false;
             }
         } else if arg == "--" {
             paths = true;
         } else if arg.starts_with('-') {
-            if !matches!(
-                arg.as_str(),
-                "--stat"
-                    | "--shortstat"
-                    | "--numstat"
-                    | "--name-only"
-                    | "--name-status"
-                    | "--cached"
-                    | "--staged"
-                    | "-p"
-                    | "--patch"
-                    | "--no-color"
-                    | "--no-ext-diff"
-                    | "--no-textconv"
-                    | "--no-patch"
-                    | "--oneline"
-            ) && !arg
-                .strip_prefix("-U")
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-            {
+            if !option(arg) {
                 return false;
             }
         } else if !revision(arg) {
@@ -148,6 +209,12 @@ impl Repository {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             _ => return None,
         }
+        // `git status` lists untracked files past the repository's own excludes.
+        let exclude = common.join("info/exclude");
+        if fs::symlink_metadata(&exclude).is_ok_and(|m| m.is_file() && m.len() <= 1024 * 1024) {
+            fs::create_dir_all(temp.join("info")).ok()?;
+            fs::copy(exclude, temp.join("info/exclude")).ok()?;
+        }
         Some(Self { dir, root })
     }
 
@@ -163,13 +230,30 @@ impl Repository {
                 "-c",
                 "core.attributesFile=/dev/null",
             ])
-            .arg(&args[0])
-            .args([
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=all",
-            ]);
+            .arg(&args[0]);
+        if args[0] == "status" {
+            // The default excludes file sits under the home directory, and
+            // submodules are never entered.
+            for key in ["HOME", "XDG_CONFIG_HOME"] {
+                if let Some(value) = std::env::var_os(key) {
+                    cmd.env(key, value);
+                }
+            }
+            cmd.arg("--ignore-submodules=all");
+            let (options, paths): (Vec<_>, Vec<_>) = args[1..]
+                .iter()
+                .filter(|arg| *arg != "--")
+                .partition(|arg| arg.starts_with('-'));
+            cmd.args(options).arg("--").args(paths);
+            let (code, text) = bounded(&mut cmd, super::MAX_BYTES, deadline)?;
+            return (code == 0).then_some(text);
+        }
+        cmd.args([
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=all",
+        ]);
         let mut paths = false;
         for arg in &args[1..] {
             if paths || arg.starts_with('-') {
@@ -187,7 +271,10 @@ impl Repository {
                 cmd.arg(format!("{}{dots}{}", resolve(left)?, resolve(right)?));
             } else if let Some(id) = oid(cwd, arg, deadline) {
                 cmd.arg(id);
-            } else if args[0] == "diff" && local(arg) && cwd.join(arg).is_file() {
+            } else if matches!(args[0].as_str(), "diff" | "log")
+                && local(arg)
+                && cwd.join(arg).is_file()
+            {
                 cmd.arg("--").arg(arg);
                 paths = true;
             } else {

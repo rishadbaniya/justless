@@ -20,7 +20,7 @@ pub(super) enum Source {
     File {
         file: String,
         select: Filter,
-        numbered: bool,
+        numbered: Numbers,
     },
     /// `cat A B …`: each whole file in turn.
     Files(Vec<String>),
@@ -28,6 +28,110 @@ pub(super) enum Source {
     Object(String),
     Git(Vec<String>),
     Search(Vec<String>),
+    /// What the shell prints itself: a literal `echo` or `printf`, or `true`.
+    Literal(String),
+    /// `pwd`: the directory the shell is in, as it names it.
+    Pwd,
+    /// `ls` or `wc` of workspace paths, rerun with the same words.
+    Listing(Vec<String>),
+}
+
+/// How a file read numbers its lines.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Numbers {
+    None,
+    /// `nl -ba`, which always ends a numbered line with a newline.
+    Nl,
+    /// `cat -n`, which keeps each line's own ending.
+    Cat,
+}
+
+impl Source {
+    /// The reads a list has to include before it runs as written.
+    fn read(&self) -> bool {
+        match self {
+            Self::File { .. } | Self::Files(_) | Self::Object(_) | Self::Search(_) => true,
+            Self::Git(words) => matches!(words[1].as_str(), "show" | "diff"),
+            Self::Literal(_) | Self::Pwd | Self::Listing(_) => false,
+        }
+    }
+}
+
+/// Whether every piece is a read the command hook has always left to the
+/// post-run hook. A list that mixes in other pieces keeps the command hook's
+/// route, such as a `git log` it runs through Justless, so the post-run hook
+/// compacts it only when the command hook left it as written.
+pub(super) fn reads_only(pieces: &[Piece<'_>]) -> bool {
+    pieces.iter().all(|piece| {
+        piece.source.read()
+            && !matches!(
+                piece.source,
+                Source::File {
+                    numbered: Numbers::Cat,
+                    ..
+                }
+            )
+    })
+}
+
+/// The text `echo` prints, when the shells agree on it: bash and zsh both
+/// print words without a backslash or a leading option as they are, except
+/// that zsh ends its options at a lone `-` and expands a leading `=`.
+fn echo(args: &[String]) -> Option<String> {
+    let option = |w: &str| {
+        w.strip_prefix('-')
+            .is_some_and(|f| f.is_empty() || f.bytes().all(|b| b"neE".contains(&b)))
+    };
+    if args.first().is_some_and(|w| option(w))
+        || args.iter().any(|w| w.contains('\\') || w.starts_with('='))
+    {
+        return None;
+    }
+    Some(args.join(" ") + "\n")
+}
+
+/// The text `printf FORMAT` prints for a format of plain text, `%%` and the
+/// common escapes, without further arguments.
+fn printf(args: &[String]) -> Option<String> {
+    let [format] = args else { return None };
+    if format.starts_with('-') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        out.push(match c {
+            '%' => chars.next().filter(|&c| c == '%')?,
+            '\\' => match chars.next()? {
+                'n' => '\n',
+                't' => '\t',
+                '\\' => '\\',
+                _ => return None,
+            },
+            c => c,
+        });
+    }
+    Some(out)
+}
+
+/// Whether `ls` or `wc` lists the operands of `args` in a form the recheck
+/// reproduces: names alone, or counts of lines, words and bytes of files.
+fn listing(program: &str, args: &[String]) -> bool {
+    let (flags, operands): (Vec<_>, Vec<_>) = args.iter().partition(|a| a.starts_with('-'));
+    let allowed: &[u8] = if program == "ls" { b"1aA" } else { b"lwc" };
+    flags
+        .iter()
+        .all(|f| f.len() > 1 && f[1..].bytes().all(|b| allowed.contains(&b)))
+        && operands.iter().all(|p| local(p))
+        // BSD tools take every word after the first operand as an operand.
+        && args.iter().skip_while(|a| a.starts_with('-')).all(|a| !a.starts_with('-'))
+        && (program == "ls" || !operands.is_empty())
+        && operands.len() <= 32
+}
+
+/// The operands of an `ls` or `wc`.
+pub(super) fn operands(words: &[String]) -> impl Iterator<Item = &String> {
+    words[1..].iter().filter(|a| !a.starts_with('-'))
 }
 
 #[derive(Clone)]
@@ -165,6 +269,16 @@ fn piece<'a>(
         "git" if object.is_some() => Source::Object(object?),
         "git" if super::git::supported(args) => Source::Git(words),
         "rg" | "grep" if search_paths(&words).is_some() => Source::Search(words),
+        "echo" => Source::Literal(echo(args)?),
+        "printf" => Source::Literal(printf(args)?),
+        "true" | ":" if args.is_empty() => Source::Literal(String::new()),
+        "pwd" if args.is_empty() || args == ["-L"] => Source::Pwd,
+        "ls" | "wc" if listing(program, args) => Source::Listing(words),
+        "cat" if args.len() == 2 && args[0] == "-n" && local(&args[1]) => Source::File {
+            file: args[1].clone(),
+            select: Filter::All,
+            numbered: Numbers::Cat,
+        },
         "cat" if args.len() > 1 => {
             if !args.iter().all(|file| local(file)) {
                 return None;
@@ -186,7 +300,11 @@ fn piece<'a>(
             Source::File {
                 file: file.clone(),
                 select,
-                numbered: program == "nl",
+                numbered: if program == "nl" {
+                    Numbers::Nl
+                } else {
+                    Numbers::None
+                },
             }
         }
         _ => return None,
@@ -203,12 +321,13 @@ fn piece<'a>(
                 if filters.is_empty()
                     && matches!(
                         source,
-                        Source::File { numbered: true, .. }
-                            | Source::File {
-                                select: Filter::All,
-                                ..
-                            }
-                            | Source::Object(_)
+                        Source::File {
+                            numbered: Numbers::Nl | Numbers::Cat,
+                            ..
+                        } | Source::File {
+                            select: Filter::All,
+                            ..
+                        } | Source::Object(_)
                     ) =>
             {
                 sed(args)?
@@ -304,9 +423,10 @@ pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
     if !differs && !matches!(program, Some("cat")) {
         return None;
     }
+    // Only a list mixes in other pieces.
     piece(command, &[command], Join::Always, None)
         .map(|piece| vec![piece])
-        .filter(|pieces| outputs(pieces) <= 32)
+        .filter(|pieces| reads_only(pieces) && outputs(pieces) <= 32)
 }
 
 /// How many outputs the pieces print: one for each file of a `cat A B …`.
@@ -384,7 +504,8 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
                 match (stages.len() == 1).then(|| change(stages[0])).flatten() {
                     Some(Some(dir)) => {
                         // Later reads start in `dir` only if the shell surely
-                        // entered it. Among the pieces only a search can fail.
+                        // entered it. Among the pieces only a search can fail:
+                        // the recheck rejects any other piece that fails.
                         let skippable = match join {
                             Join::Always => false,
                             Join::Success => pieces
@@ -441,11 +562,106 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
     } else if !stages.is_empty() || join != Join::Always {
         return None;
     }
-    (1..=32).contains(&outputs(&pieces)).then_some(pieces)
+    // Output the shell prints itself, a listing, `git log` or `git status`
+    // joins a list of reads; alone it keeps the command hook's route.
+    (pieces.iter().any(|piece| piece.source.read()) && (1..=32).contains(&outputs(&pieces)))
+        .then_some(pieces)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::Source;
+
+    /// What a list's second piece is when the list parses.
+    fn joined(piece: &str) -> Option<String> {
+        let list = format!("cat a; {piece}");
+        let pieces = super::list(&list)?;
+        Some(match &pieces[1].source {
+            Source::Literal(text) => format!("literal {text:?}"),
+            Source::Pwd => "pwd".into(),
+            Source::Listing(words) => format!("listing {}", words.join(" ")),
+            Source::Git(words) => format!("git {}", words[1]),
+            Source::File { .. } => "file".into(),
+            _ => "other".into(),
+        })
+    }
+
+    #[test]
+    fn output_the_shell_prints_and_listings_join_reads() {
+        for (piece, expected) in [
+            ("echo ----", Some(r#"literal "----\n""#)),
+            ("echo", Some(r#"literal "\n""#)),
+            ("echo 'a  b' c", Some(r#"literal "a  b c\n""#)),
+            ("echo --", Some(r#"literal "--\n""#)),
+            ("printf '%%\\t\\n'", Some(r#"literal "%\t\n""#)),
+            ("true", Some(r#"literal """#)),
+            (":", Some(r#"literal """#)),
+            ("pwd", Some("pwd")),
+            ("ls", Some("listing ls")),
+            ("ls -A -1 src docs", Some("listing ls -A -1 src docs")),
+            ("wc -l a b", Some("listing wc -l a b")),
+            ("cat -n b", Some("file")),
+            ("git status --short", Some("git status")),
+            ("git status --porcelain -uno -- src", Some("git status")),
+            ("git log --oneline -3 main -- src", Some("git log")),
+            ("git log --format='%h %s%n%b' -n2", Some("git log")),
+            ("git log --oneline main..HEAD | head -5", Some("git log")),
+            // Shells disagree, or the text is not literal.
+            ("echo -n x", None),
+            ("echo -", None),
+            ("echo -e x", None),
+            ("echo 'a\\nb'", None),
+            ("echo =x", None),
+            ("printf '%s' x", None),
+            ("printf '%d'", None),
+            ("printf '\\x41'", None),
+            ("true x", None),
+            ("pwd -P", None),
+            // Listings that change with time, leave the workspace or read stdin.
+            ("ls -l", None),
+            ("ls -la src", None),
+            ("ls ../x", None),
+            ("ls .git", None),
+            ("ls src -a", None),
+            ("wc", None),
+            ("wc -m a", None),
+            ("cat -n a b", None),
+            ("cat -n ../a", None),
+            // Git forms the isolated repository cannot reproduce or that run more.
+            ("git status", None),
+            ("git status -sb", None),
+            ("git status --short --branch", None),
+            ("git log --show-signature -1", None),
+            ("git log --format=%G? -1", None),
+            ("git log --pretty='%+GS' -1", None),
+            ("git log -n 3", None),
+            ("git log --oneline -3 -- ../x", None),
+        ] {
+            assert_eq!(joined(piece).as_deref(), expected, "{piece}");
+        }
+    }
+
+    #[test]
+    fn a_list_needs_a_read_and_a_single_command_stays_a_read() {
+        for list in [
+            "echo a; pwd",
+            "git status --short && git log --oneline -5",
+            "ls src; wc -l a",
+            "true; echo done",
+        ] {
+            assert!(super::list(list).is_none(), "{list}");
+        }
+        assert!(super::list("git diff; echo ---; git log -1 --oneline").is_some());
+        for single in [
+            "timeout 5 ls",
+            "timeout 5 echo x",
+            "env A=1 pwd",
+            "cat -n a",
+        ] {
+            assert!(super::single(single).is_none(), "{single}");
+        }
+    }
+
     #[test]
     fn only_a_tilde_inside_a_word_is_literal() {
         assert!(super::list("git show HEAD~1:a.rs; sed -n 1,2p b").is_some());

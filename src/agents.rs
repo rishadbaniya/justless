@@ -1546,7 +1546,10 @@ fn wrap_event(
         .flatten();
     // A read that ends in `| cat` is judged as the read alone.
     let listed = read.as_ref().map_or(command, |read| read.unpiped(command));
-    if !cfg!(windows) && rules.claude && crate::batch::Batch::parse_list(listed).is_some() {
+    if !cfg!(windows)
+        && rules.claude
+        && crate::batch::Batch::parse_list(listed).is_some_and(|batch| batch.reads_only())
+    {
         return None;
     }
     if let Some(read) = read {
@@ -2259,7 +2262,8 @@ pub(crate) fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
 pub fn would_route(command: &str, exclusions: &crate::rewrite::Exclusions) -> bool {
     // `wrap_event` leaves an excluded line, and a read list to the post-command hook.
     if exclusions.line(command).is_some()
-        || !cfg!(windows) && crate::batch::Batch::parse_list(command).is_some()
+        || !cfg!(windows)
+            && crate::batch::Batch::parse_list(command).is_some_and(|batch| batch.reads_only())
     {
         return false;
     }

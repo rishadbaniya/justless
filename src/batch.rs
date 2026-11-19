@@ -99,6 +99,35 @@ fn search(
     matches!(code, 0 | 1).then_some((code, text))
 }
 
+/// Rerun an `ls` or `wc` of workspace paths. Neither writes anything; both
+/// sort and count in the locale the shell had.
+fn listing(ws: &Workspace, cwd: &Path, words: &[String], deadline: Instant) -> Option<String> {
+    let ls = words[0] == "ls";
+    for operand in parse::operands(words) {
+        let path = cwd.join(operand).canonicalize().ok()?;
+        if !path.starts_with(&ws.root) || !(path.is_file() || ls && path.is_dir()) {
+            return None;
+        }
+    }
+    let candidates: &[&str] = if ls {
+        &["/bin/ls", "/usr/bin/ls"]
+    } else {
+        &["/usr/bin/wc", "/bin/wc"]
+    };
+    let binary = candidates.iter().find(|p| Path::new(p).is_file())?;
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(cwd)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    for key in ["LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE"] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    let (code, text) = bounded(cmd.args(&words[1..]), MAX_BYTES, deadline)?;
+    (code == 0).then_some(text)
+}
+
 struct Verified<'a> {
     piece: &'a Piece<'a>,
     /// For one file of a `cat A B …`, the `cat` of that file alone.
@@ -117,16 +146,22 @@ impl<'a> Batch<'a> {
         Self::parse_list(command).or_else(|| parse::single(command).map(Self))
     }
 
+    /// Whether the command hook leaves the list as written for the post-run
+    /// hook: every piece is a read. Other lists keep the command hook's route.
+    pub(crate) fn reads_only(&self) -> bool {
+        parse::reads_only(&self.0)
+    }
+
     /// Whether every piece runs in `root` when the list starts from `cwd`, judged
     /// from the command alone, for a list recorded in a transcript.
     pub(crate) fn inside(&self, root: &Path, cwd: &Path) -> bool {
         self.0.iter().all(|piece| {
             let dir = crate::find::lexical(&cwd.join(piece.dir.as_deref().unwrap_or("")));
+            let within = |file: &String| crate::find::lexical(&dir.join(file)).starts_with(root);
             dir.starts_with(root)
                 && match &piece.source {
-                    Source::File { file, .. } => {
-                        crate::find::lexical(&dir.join(file)).starts_with(root)
-                    }
+                    Source::File { file, .. } => within(file),
+                    Source::Listing(words) => parse::operands(words).all(within),
                     _ => true,
                 }
         })
@@ -175,6 +210,9 @@ impl<'a> Batch<'a> {
         // Claude Code's main session keeps a `cd`, so its cwd can already be the
         // directory the list entered, while a subagent's is where the list started.
         let mut start = cwd.clone();
+        // `pwd` prints the directory as the shell names it, before links resolve.
+        let mut logical =
+            crate::find::lexical(input["cwd"].as_str().map(Path::new).unwrap_or(&ws.cwd));
         if let Some(dir) = self.0.last().and_then(|piece| piece.dir.as_deref()) {
             let entered: PathBuf = Path::new(dir)
                 .components()
@@ -183,6 +221,7 @@ impl<'a> Batch<'a> {
             if entered.is_relative() && !cwd.join(&entered).is_dir() && cwd.ends_with(&entered) {
                 for _ in entered.components() {
                     start.pop();
+                    logical.pop();
                 }
             }
         }
@@ -237,8 +276,14 @@ impl<'a> Batch<'a> {
                 // `cat` prints each file in turn, so each is its own piece.
                 Source::Files(names) => {
                     for name in names {
-                        let (text, source) =
-                            files.read(ws, &dir, name, &parse::Filter::All, false, &[])?;
+                        let (text, source) = files.read(
+                            ws,
+                            &dir,
+                            name,
+                            &parse::Filter::All,
+                            parse::Numbers::None,
+                            &[],
+                        )?;
                         let header = format!("cat {}", shlex::try_quote(name).ok()?);
                         outputs.push((Some(header), text, Some(source)));
                     }
@@ -264,6 +309,22 @@ impl<'a> Batch<'a> {
                         return None;
                     }
                     status = code;
+                    outputs.push((None, reads::filter(text, &piece.filters)?, None));
+                }
+                Source::Literal(text) => {
+                    status = 0;
+                    outputs.push((None, reads::filter(text.clone(), &piece.filters)?, None));
+                }
+                Source::Pwd => {
+                    let path =
+                        crate::find::lexical(&logical.join(piece.dir.as_deref().unwrap_or("")));
+                    let text = format!("{}\n", path.to_str()?);
+                    status = 0;
+                    outputs.push((None, reads::filter(text, &piece.filters)?, None));
+                }
+                Source::Listing(words) => {
+                    let text = listing(ws, &dir, words, deadline)?;
+                    status = 0;
                     outputs.push((None, reads::filter(text, &piece.filters)?, None));
                 }
             }
@@ -471,7 +532,7 @@ fn render(
                     }
                     engine.finish(&words[0], limit, None, true).map(|(s, _)| s)
                 }
-                Source::Git(_) => {
+                Source::Git(words) if matches!(words[1].as_str(), "show" | "diff") => {
                     let mut engine = crate::summary::Parser::new("git diff", None);
                     for (n, line) in text.lines().enumerate() {
                         engine.observe(line, item.range.first_line? + n);
@@ -481,6 +542,7 @@ fn render(
                         .render(None, 0)
                         .map(|report| excerpt(&report, limit))
                 }
+                Source::Git(_) | Source::Literal(_) | Source::Pwd | Source::Listing(_) => None,
             }
         };
         let body = shaped

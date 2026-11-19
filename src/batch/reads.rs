@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 
-use super::{MAX_BYTES, parse::Filter};
+use super::{
+    MAX_BYTES,
+    parse::{Filter, Numbers},
+};
 use crate::{source::Snapshot, workspace::Workspace};
 
 pub(super) struct Files {
@@ -43,7 +46,7 @@ impl Files {
         cwd: &Path,
         file: &str,
         select: &Filter,
-        numbered: bool,
+        numbered: Numbers,
         filters: &[Filter],
     ) -> Option<(String, SourceLines)> {
         let path = cwd.join(file);
@@ -87,7 +90,8 @@ impl Files {
             self.files
                 .insert(key.clone(), Snapshot::from_text(path, text));
         }
-        let (text, mut source) = self.select(&key, spec, path, &Filter::All, false, filters)?;
+        let (text, mut source) =
+            self.select(&key, spec, path, &Filter::All, Numbers::None, filters)?;
         source.object = true;
         Some((text, source))
     }
@@ -98,7 +102,7 @@ impl Files {
         name: &str,
         path: &str,
         select: &Filter,
-        numbered: bool,
+        numbered: Numbers,
         filters: &[Filter],
     ) -> Option<(String, SourceLines)> {
         let snap = self.files.get(key)?;
@@ -107,17 +111,16 @@ impl Files {
             if i >= 100_000 {
                 return None;
             }
-            if numbered && line.starts_with("\\:") {
-                return None;
-            }
-            let text = if numbered {
-                format!(
+            let text = match numbered {
+                // `nl` treats these lines as section delimiters.
+                Numbers::Nl if line.starts_with("\\:") => return None,
+                Numbers::Nl => format!(
                     "{:>6}\t{}\n",
                     i + 1,
                     line.strip_suffix('\n').unwrap_or(line)
-                )
-            } else {
-                line.to_owned()
+                ),
+                Numbers::Cat => format!("{:>6}\t{line}", i + 1),
+                Numbers::None => line.to_owned(),
             };
             rows.push(Row {
                 source_line: i + 1,

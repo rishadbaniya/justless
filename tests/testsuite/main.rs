@@ -11,6 +11,7 @@ mod global;
 mod hook_fixes;
 mod lookup;
 mod mcp;
+mod mixed_lists;
 mod output_fixes;
 mod piped;
 mod read_batch;

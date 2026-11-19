@@ -412,7 +412,7 @@ fn left_alone(
     }
     let read = crate::shellread::parse(command);
     let listed = read.as_ref().map_or(command, |read| read.unpiped(command));
-    if claude && crate::batch::Batch::parse_list(listed).is_some() {
+    if claude && crate::batch::Batch::parse_list(listed).is_some_and(|batch| batch.reads_only()) {
         return (
             "a list of reads runs as written, and the after-bash hook compacts its output.".into(),
             false,
@@ -476,10 +476,13 @@ fn left_alone(
             false,
         );
     }
-    let after = if claude {
-        " The after-bash hook may still compact its output after it runs."
-    } else {
-        ""
+    let after = match claude {
+        // A list of reads that mixes in other pieces, such as `echo ----`.
+        true if crate::batch::Batch::parse_list(listed).is_some() => {
+            " As a list of reads, it runs as written, and the after-bash hook compacts its output."
+        }
+        true => " The after-bash hook may still compact its output after it runs.",
+        false => "",
     };
     (
         format!(
