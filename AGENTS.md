@@ -33,7 +33,7 @@ On a returning checkout, `./target/debug/justless resume` shows recent runs and 
 | User-level hooks, project registry, kill switches | `src/global.rs`, `src/registry.rs`, `src/rewrite.rs` | `init --global` writes only the user hook files it records, and its hooks answer with the client's no-op wherever a project's own hooks, `global_hooks = false` or no project applies. The registry holds paths and times only, never waits on a lock, and is safe to delete. `JUSTLESS_DISABLE` and `exclude_commands` leave commands as written for every client. |
 | Setup checks | `src/doctor.rs`, the accessors at the end of `src/agents.rs` | `doctor` only reads: no index refresh, lock or `.justless/`. It judges hooks and instruction blocks against `init`'s own output with `init`'s matching, and each fix it prints must clear its problem, so anything `init` leaves alone gets a fix by hand. |
 | Claude Code status line | `src/statusline.rs` | Exit 0 with one line for any input and write nothing. `init --statusline` writes only the local settings file, and its `.gitignore` entry, and never replaces a status line from local, project or user settings. Hooks and routed runs list nested projects for their session in the launch project. |
-| Prebuilt binaries and releases | `install.sh`, `.github/workflows/`, `packaging/homebrew/` | Install an archive only when its SHA-256 matches `SHA256SUMS`, and abort on a mismatch. Fall back to Cargo when no prebuilt binary fits. Keep the crate compiling on Windows by gating Unix-only APIs with `cfg(unix)`. |
+| Installer | `install.sh` | Build from source with Cargo and never download binaries. Keep the script POSIX sh compatible, dash included. Keep the crate compiling on Windows by gating Unix-only APIs with `cfg(unix)`. |
 
 The instruction template in `src/agents.rs` is installed into **consumer repositories**. Edit that template to change what their agents see. Edit this file for guidance about developing Justless itself.
 
@@ -45,7 +45,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-For an installer change, also run `sh scripts/test_install.sh` (and `sh scripts/test_install.sh dash` where available). It installs from local fake releases with a stub Cargo.
+For an installer change, also run `sh scripts/test_install.sh` (and `sh scripts/test_install.sh dash` where available). It runs the installer with a stub Cargo, so it needs no network and builds nothing.
 
 `.cargo/config.toml` points `XDG_STATE_HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` at `target/test-home/` for `cargo test` and `cargo run`, so tests never read or write your own agent settings or project registry. A test that needs one of them sets it, or `HOME`, to its own folder.
 
@@ -57,12 +57,9 @@ For a context-size change, run `python3 scripts/context_benchmark.py --binary ./
 
 Use Conventional Commits such as `feat(source): support section edits`. Keep the README focused on the goal, architecture and quick start. Put detailed flags and examples in `docs/`, and describe features in Justless’s own terms.
 
-## Cut a release
+## Tag a version
 
-1. On an up-to-date `main` where `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked` pass locally, set `version` in `Cargo.toml` to `X.Y.Z`, run `cargo build` (without `--locked`) to refresh `Cargo.lock`, and commit `chore(release): X.Y.Z`.
-2. Tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
-3. `.github/workflows/release.yml` checks that the tag matches `Cargo.toml`, builds the five targets, and publishes a GitHub release with the archives and `SHA256SUMS`. A version with a hyphen, such as `0.3.0-rc.1`, becomes a prerelease, which the installer's latest download skips.
-4. For Homebrew, update `url` and `sha256` in `packaging/homebrew/justless.rb` as its header describes and push it to the tap.
+There are no release binaries: every install builds from source. To tag a version, on an up-to-date `main` where the three checks above pass, set `version` in `Cargo.toml` to `X.Y.Z`, run `cargo build` (without `--locked`) to refresh `Cargo.lock`, commit `chore(release): X.Y.Z`, and push it with the tag: `git tag vX.Y.Z && git push origin main vX.Y.Z`. `JUSTLESS_VERSION=X.Y.Z` then makes the installer build that tag.
 
 <!-- justless:begin -->
 ## Justless

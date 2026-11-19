@@ -16,7 +16,7 @@ Run the binary from `target/debug` so you test the code you are changing, not an
 
 ## Check a change
 
-Run these before every commit. There is no CI workflow for pushes or pull requests, so these local checks are the gate. The release workflow runs only when a version tag is pushed.
+Run these before every commit. There is no CI workflow, so these local checks are the gate.
 
 ```sh
 cargo fmt --all -- --check
@@ -28,7 +28,7 @@ Run the tests on Linux or macOS. Hooks are disabled on Windows and several suite
 
 | If you change | Also run |
 | --- | --- |
-| `install.sh` | `sh scripts/test_install.sh`, and `sh scripts/test_install.sh dash` if `dash` is installed. It installs from local fake releases with a stub Cargo and needs no network. |
+| `install.sh` | `sh scripts/test_install.sh`, and `sh scripts/test_install.sh dash` if `dash` is installed. It runs the installer with a stub Cargo, so it needs no network and builds nothing. |
 | How much output or source reaches the agent | `python3 scripts/context_benchmark.py --binary ./target/debug/justless` after building. Report the results as bytes. |
 | The repair or replay benchmarks | See [Benchmarks](docs/benchmarks.md). The `--api` modes make paid API calls and are optional. |
 

@@ -146,7 +146,7 @@ The exit status is still 101, and `justless log RUN_ID --stream stdout --from 36
 curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- claude
 ```
 
-Swap `claude` for your agent. The script installs justless (a prebuilt binary when a release exists, otherwise built with [Rust](https://rustup.rs)) and turns it on for this project.
+Swap `claude` for your agent. The script builds justless from source with Cargo and turns it on for this project. It needs [Rust](https://rustup.rs) 1.91 or newer and a C compiler, and the first build takes a few minutes.
 
 | Your agent | Use | Then |
 | --- | --- | --- |

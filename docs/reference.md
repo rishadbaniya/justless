@@ -479,17 +479,14 @@ curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.
 curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- --cli-only
 ```
 
-The installer prefers a prebuilt binary. Each [release](https://github.com/rishadbaniya/justless/releases) publishes `justless-VERSION-TARGET.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, a `.zip` for `x86_64-pc-windows-msvc`, and a `SHA256SUMS` file. The installer downloads `SHA256SUMS` and the archive for your system with `curl` or `wget`. It checks the archive with `sha256sum`, `shasum` or `openssl`, and confirms that the binary runs before it installs it. If the checksum does not match, it stops without installing anything. The Linux binaries need glibc 2.35 or newer.
-
-The installer builds with Cargo instead when no archive matches the system, the download fails, no checksum tool is available, or the binary does not run here, as on musl-based Linux. Building needs Rust 1.91 or newer and a C compiler. Pass `--from-source` to always build, as in `sh -s -- --from-source claude`. Running `install.sh` from a Justless checkout builds that checkout.
+Justless publishes no prebuilt binaries. The installer builds it from source with `cargo install --locked`, which needs Rust 1.91 or newer ([rustup](https://rustup.rs)) and a C compiler for the Tree-sitter grammars. The first build takes a few minutes. Without `cargo` on `PATH`, the installer names what to install and stops. Running `install.sh` from a Justless checkout builds that checkout. Otherwise Cargo fetches the `main` branch from GitHub.
 
 | Variable | Effect |
 | --- | --- |
-| `JUSTLESS_VERSION` | Install release `X.Y.Z` instead of the latest. A source build uses tag `vX.Y.Z`. |
-| `JUSTLESS_RELEASE_BASE_URL` | Download `SHA256SUMS` and archives from this URL instead of the GitHub release, for a mirror or a local `file://` directory. |
-| `CARGO_INSTALL_ROOT`, `CARGO_HOME` | Choose the install prefix for both prebuilt and source installs. |
+| `JUSTLESS_VERSION` | Build tag `vX.Y.Z` instead of the `main` branch. |
+| `CARGO_INSTALL_ROOT`, `CARGO_HOME` | Choose the install prefix. |
 
-The binary goes in `$CARGO_INSTALL_ROOT/bin`, defaulting to `$CARGO_HOME/bin` or `~/.cargo/bin`. Put that directory on the agent's `PATH`. On Windows, extract `justless.exe` from the release zip to a directory on `PATH`. There the command hooks pass every shell command through unchanged. Once the binary is installed, configure another project from its root with `justless init --hooks --agent codex --agent claude --agent agy`. Select only the clients you use. Running setup again preserves existing instructions, settings, and hooks.
+The binary goes in `$CARGO_INSTALL_ROOT/bin`, defaulting to `$CARGO_HOME/bin` or `~/.cargo/bin`. Put that directory on the agent's `PATH`. The installer is a POSIX shell script, so on Windows build with `cargo install --locked --git https://github.com/rishadbaniya/justless.git justless` instead. There the command hooks pass every shell command through unchanged. Once the binary is installed, configure another project from its root with `justless init --hooks --agent codex --agent claude --agent agy`. Select only the clients you use. Running setup again preserves existing instructions, settings, and hooks.
 
 | Client | Instructions | Project hooks |
 | --- | --- | --- |
