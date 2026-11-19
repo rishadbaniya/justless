@@ -22,7 +22,7 @@ Notable changes to Justless, newest release first, in the style of [Keep a Chang
 - `justless test --affected` runs only the tests the current changes reach, with Cargo, pytest, Jest, Vitest or Go, labeled as a subset, or the full suite with a reason.
 - `test --compare REF` separates new failures from those already failing at the merge base, and `--base REF` reviews a branch in `test --affected`, `affected` and `context`.
 
-Details: [Run output](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#task-packs-and-run-history) · [Affected tests](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#affected-tests) · [Script runner](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#script-runner) · [Secret redaction](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#secret-redaction)
+Details: [Run output](docs/reference.md#task-packs-and-run-history) · [Affected tests](docs/reference.md#affected-tests) · [Script runner](docs/reference.md#script-runner) · [Secret redaction](docs/reference.md#secret-redaction)
 
 ### Code navigation
 
@@ -34,7 +34,7 @@ Details: [Run output](https://github.com/rishadbaniya/justless/blob/main/docs/re
 - `affected` lists what depends on a symbol, a file or the current changes, hop by hop, with the tests that reach it; `context --run RUN_ID` ties a failure to its code.
 - In a session, `context` and `pack` re-read a symbol as only its changed lines, 512 bytes instead of 2,039 for one changed line; `--fresh` shows it whole.
 
-Details: [Indexing and languages](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#indexing-and-languages) · [Map and change impact](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#repository-map-and-change-impact) · [Ranked lookup](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#ranked-lookup)
+Details: [Indexing and languages](docs/reference.md#indexing-and-languages) · [Map and change impact](docs/reference.md#repository-map-and-change-impact) · [Ranked lookup](docs/reference.md#ranked-lookup)
 
 ### Reads and edits
 
@@ -45,7 +45,7 @@ Details: [Indexing and languages](https://github.com/rishadbaniya/justless/blob/
 - Shell reads of a wide file with `cat`, `sed -n`, `head`, `tail` or `git show REV:path` show an outline and a command that replays the exact bytes.
 - Claude Code's post-edit hook tells the model when a native Edit or Write leaves a file that parsed before unparseable.
 
-Details: [Progressive reads and verified edits](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#progressive-reads-and-verified-edits) · [Shell and Read hooks](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#install-and-configure-agents)
+Details: [Progressive reads and verified edits](docs/reference.md#progressive-reads-and-verified-edits) · [Shell and Read hooks](docs/reference.md#install-and-configure-agents)
 
 ### Tool history and sessions
 
@@ -54,11 +54,11 @@ Details: [Progressive reads and verified edits](https://github.com/rishadbaniya/
 - Claude Code and Codex hooks carry recent run IDs, outcomes and inspected file ranges across compaction within 1,800 bytes, and `resume` prints the same handoff.
 - `resume` lists the files the agent read or outlined, through Justless, the Read hook or shell reads, and marks them `[source changed]` after an edit.
 
-Details: [Recoverable tool history](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#recoverable-tool-history) · [Request-boundary context management](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#request-boundary-context-management)
+Details: [Recoverable tool history](docs/reference.md#recoverable-tool-history) · [Request-boundary context management](docs/reference.md#request-boundary-context-management)
 
 ### Agent setup
 
-- `install.sh` installs a checksum-verified prebuilt binary, or builds from source, and from a project sets up every agent it finds on `PATH`.
+- `install.sh` builds Justless from source with Cargo and, run in a project, sets up every agent it finds on `PATH`.
 - `justless init --hooks` sets up Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, Antigravity CLI and OpenCode with a short instruction block, and is safe to rerun.
 - Hooks route supported commands in `&&`, `||` and `;` lists, after `NAME=value` and before a final `2>&1`; Codex and Cursor, which skip approval, route only local tools.
 - The Claude Code hook keeps your permission rules in force by judging the original command, and `doctor` warns about rules such as `Bash(justless run *)`.
@@ -71,7 +71,7 @@ Details: [Recoverable tool history](https://github.com/rishadbaniya/justless/blo
 - `justless init --remove` undoes setup and restores untouched files byte for byte; `--dry-run` shows each change and `--purge` also deletes `.justless/`.
 - `justless learn` turns command mistakes agents corrected or repeated into project rules, and `--apply` writes them to `AGENTS.md` or `CLAUDE.md`.
 
-Details: [Install and configure agents](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#install-and-configure-agents) · [MCP server](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#mcp-server) · [Check the setup](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#check-the-setup) · [Learned command rules](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#learned-command-rules)
+Details: [Install and configure agents](docs/reference.md#install-and-configure-agents) · [MCP server](docs/reference.md#mcp-server) · [Check the setup](docs/reference.md#check-the-setup) · [Learned command rules](docs/reference.md#learned-command-rules)
 
 ### Reporting
 
@@ -81,4 +81,4 @@ Details: [Install and configure agents](https://github.com/rishadbaniya/justless
 - `justless statusline` shows the session's savings in Claude Code's status line; `init --statusline` adds it without replacing an existing one.
 - `discover` lists commands Claude Code and Codex ran outside Justless, as labels and byte counts only, and says when permission rules kept them out.
 
-Details: [Run history and stats](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#task-packs-and-run-history) · [Status line](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#claude-code-status-line) · [Projects on this machine](https://github.com/rishadbaniya/justless/blob/main/docs/reference.md#projects-on-this-machine)
+Details: [Run history and stats](docs/reference.md#task-packs-and-run-history) · [Status line](docs/reference.md#claude-code-status-line) · [Projects on this machine](docs/reference.md#projects-on-this-machine)

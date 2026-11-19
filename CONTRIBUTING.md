@@ -49,7 +49,7 @@ If you change the facts the index extracts, make sure existing caches are rebuil
 - **Agent instructions.** The text in `src/agents.rs` between `<!-- justless:begin -->` and `<!-- justless:end -->` is installed into other people's repositories, and their agents load it with every model request. Edit it there to change what their agents see, and keep it short: a test in `tests/cli.rs` fails once it passes 1,024 bytes. Edit `AGENTS.md` for guidance about developing Justless itself.
 - **Existing setup.** `justless init` and `install.sh` must keep a project's existing instructions and settings, and running them twice must be safe.
 - **Documentation.** Keep the README to the goal, the architecture and the quick start. Put flags and details in [docs/reference.md](docs/reference.md) and walkthroughs in [docs/examples.md](docs/examples.md). Describe features in Justless's own terms. Every number in the docs should come from a measurement described next to it, or from [docs/benchmarks.md](docs/benchmarks.md).
-- **Changelog.** Add user-visible changes to the Unreleased section of [CHANGELOG.md](CHANGELOG.md).
+- **Changelog.** Add each user-visible change to the top section of [CHANGELOG.md](CHANGELOG.md) as one line in the group it belongs to, with details in `docs/reference.md`.
 
 ## Report a problem
 
