@@ -172,6 +172,12 @@ fn the_command_hook_keeps_its_route_for_a_mixed_list() {
     ] {
         assert_eq!(fixture.hook(list, None), json!({}), "{list}");
     }
+    // A note before one supported command keeps that command's report.
+    let changed = fs::read_to_string(fixture.dir().join("big.rs")).unwrap();
+    fs::write(fixture.dir().join("big.rs"), changed.replace('+', "-")).unwrap();
+    let noted = "echo note; git diff";
+    let view = fixture.view(noted, &fixture.sh(noted)).unwrap();
+    assert!(!view.contains("$ echo note"), "{view}");
     // A command the hook routes on its own is still routed in the list.
     let routed = fixture.hook("sed -n 1,600p big.rs; git status --short", None);
     let command = routed["hookSpecificOutput"]["updatedInput"]["command"].as_str();

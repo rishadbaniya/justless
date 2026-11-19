@@ -478,7 +478,7 @@ fn left_alone(
     }
     let after = match claude {
         // A list of reads that mixes in other pieces, such as `echo ----`.
-        true if crate::batch::Batch::parse_list(listed).is_some() => {
+        true if crate::postroute::read_list(listed).is_some() => {
             " As a list of reads, it runs as written, and the after-bash hook compacts its output."
         }
         true => " The after-bash hook may still compact its output after it runs.",

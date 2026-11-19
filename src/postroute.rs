@@ -163,7 +163,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         // A wide read the range outline cannot show, such as a shell script,
         // keeps the read list's excerpt.
         let compacted = crate::shellread::claude(ws, input, &read, || {
-            crate::batch::Batch::parse(command)
+            read_list(command)
                 .filter(|_| !object)
                 .and_then(|batch| batch.compact(ws, input))
         });
@@ -175,8 +175,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // settings, still gets the report for its one kind of command below.
     if !cfg!(windows)
         && !routed
-        && let Some(compacted) =
-            crate::batch::Batch::parse(command).and_then(|batch| batch.compact(ws, input))
+        && let Some(compacted) = read_list(command).and_then(|batch| batch.compact(ws, input))
     {
         return Some(compacted);
     }
@@ -617,7 +616,7 @@ pub(crate) fn after_run(
             }
             handled = true;
         }
-        if crate::batch::Batch::parse(command).is_some_and(|batch| batch.inside(root, cwd)) {
+        if read_list(command).is_some_and(|batch| batch.inside(root, cwd)) {
             if !fits(crate::batch::FLOOR) {
                 return verdict(true);
             }
@@ -764,6 +763,14 @@ enum Filter {
     Range(usize, Option<usize>),
     /// `cut -c1-N`: the first N characters of each line.
     Columns(usize),
+}
+
+/// The read list this hook compacts: one of reads alone, or one that mixes in
+/// other pieces when no single-command report below takes the line, so
+/// `echo NOTE; git diff` keeps the diff report.
+pub(crate) fn read_list(command: &str) -> Option<crate::batch::Batch<'_>> {
+    crate::batch::Batch::parse(command)
+        .filter(|batch| batch.reads_only() || plan(command).is_none())
 }
 
 /// Find the one kind of supported command a command line runs. Its output may pass
