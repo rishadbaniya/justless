@@ -1412,33 +1412,18 @@ fn install_and_run_claude_and_agy_hooks() {
 fn non_rust_diagnostics_and_project_budgets_work() {
     let repo = mixed_fixture();
     let root = repo.path();
-    fs::write(
-        root.join(".justless.toml"),
-        "context_budget = 320\nmax_output_bytes = 512\nmax_file_bytes = 1000\n",
-    )
-    .unwrap();
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            r#"printf 'Traceback (most recent call last):\n  File "backend/orders.py", line 8, in list_orders\nRuntimeError: synthetic\n' >&2; exit 7"#,
-        ],
-    );
+    let settings = "context_budget = 320\nmax_output_bytes = 512\nmax_file_bytes = 1000\n";
+    fs::write(root.join(".justless.toml"), settings).unwrap();
+    let script = r#"printf 'Traceback (most recent call last):\n  File "backend/orders.py", line 8, in list_orders\nRuntimeError: synthetic\n' >&2; exit 7"#;
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
     assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
     let id = run_id(&output);
     let compact = success(root, &["context", "--run", &id]);
     assert!(compact.len() <= 320, "{compact}");
     let full_context = success(root, &["context", "--run", &id, "--budget", "2000"]);
-    assert!(
-        full_context.contains("backend/orders.py:8"),
-        "{full_context}"
-    );
-    assert!(
-        full_context.contains("purchase_orders [table]"),
-        "{full_context}"
+    assert_all_in(
+        &full_context,
+        &["backend/orders.py:8", "purchase_orders [table]"],
     );
     let docs = root.join("docs/operations.md");
     fs::write(&docs, "old marker").unwrap();
@@ -1448,94 +1433,43 @@ fn non_rust_diagnostics_and_project_budgets_work() {
     assert!(!success(root, &["find", "old marker"]).contains("docs/operations.md"));
     fs::write(&docs, "new marker".repeat(120)).unwrap();
     let oversized = success(root, &["find", "new marker"]);
-    assert!(
-        !oversized.contains("docs/operations.md:1:")
-            && oversized.contains("Not indexed: docs/operations.md (1200 bytes"),
-        "{oversized}"
-    );
+    assert_all_in(&oversized, &["Not indexed: docs/operations.md (1200 bytes"]);
+    assert_none_in(&oversized, &["docs/operations.md:1:"]);
 }
 
 #[test]
 fn diff_sections_delta_sessions_and_exact_recall() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let git = |args: &[&str]| {
-        let result = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap();
-        assert!(result.status.success(), "{}", stderr(&result));
-        result
-    };
-    git(&["init", "-q"]);
+    git(root, &["init", "-q"]);
     for file in ["first.txt", "second.txt"] {
         fs::write(root.join(file), "old\n").unwrap();
-        git(&["add", file]);
+        git(root, &["add", file]);
         fs::write(root.join(file), "a long new line of evidence\n".repeat(90)).unwrap();
     }
-    let args = [
-        "run",
-        "--session",
-        "one",
-        "--max-bytes",
-        "512",
-        "--",
-        "git",
-        "diff",
-    ];
+    let args = argv("run --session one --max-bytes 512 -- git diff");
     let first = cli(root, &args);
     let id = run_id(&first);
-    assert!(stdout(&first).contains("first.txt") && stdout(&first).contains("second.txt"));
+    assert_all_in(&stdout(&first), &["first.txt", "second.txt"]);
     let same = success(root, &args);
     assert!(same.contains(&format!("unchanged since {id}")));
-    let another = success(
-        root,
-        &[
-            "run",
-            "--session",
-            "two",
-            "--max-bytes",
-            "512",
-            "--",
-            "git",
-            "diff",
-        ],
-    );
+    let another = success(root, &argv("run --session two --max-bytes 512 -- git diff"));
     assert!(another.contains("second.txt") && !another.contains("since"));
     fs::write(root.join("first.txt"), "different hunk\n".repeat(93)).unwrap();
     let delta = cli(root, &args);
     assert!(stdout(&delta).contains("+ first.txt") && !stdout(&delta).contains("second.txt"));
     let changed = run_id(&delta);
     let exact = cli(root, &["log", &changed, "--stream", "stdout"]);
-    assert_eq!(exact.stdout, git(&["diff"]).stdout);
+    assert_eq!(exact.stdout, git(root, &["diff"]).into_bytes());
     let oldest = success(
         root,
         &["history", "a long new line", "--oldest", "--limit", "1"],
     );
     assert!(oldest.contains(&id) && oldest.contains("stdout:"));
     let stats = success(root, &["stats"]);
-    assert!(
-        stats.contains("1/4 reopened in full") && stats.contains("1 unchanged"),
-        "{stats}"
-    );
-    assert!(
-        success(
-            root,
-            &[
-                "run",
-                "--session",
-                "one",
-                "--fresh",
-                "--max-bytes",
-                "512",
-                "--",
-                "git",
-                "diff"
-            ]
-        )
-        .contains("second.txt")
-    );
+    assert_all_in(&stats, &["1/4 reopened in full", "1 unchanged"]);
+    let fresh = argv("run --session one --fresh --max-bytes 512 -- git diff");
+    assert!(success(root, &fresh).contains("second.txt"));
     fs::write(root.join("first.txt"), "old\n").unwrap();
     fs::write(root.join("second.txt"), "old\n").unwrap();
     let removed = success(root, &args);
@@ -1545,75 +1479,49 @@ fn diff_sections_delta_sessions_and_exact_recall() {
 #[test]
 fn task_packs_and_handoffs_link_live_and_historical_evidence() {
     let mixed = mixed_fixture();
-    let two_seeds = success(
-        mixed.path(),
-        &["pack", "trace fetchOrders to purchase_orders"],
+    let pack = |question: &str| success(mixed.path(), &["pack", question]);
+    let two_seeds = pack("trace fetchOrders to purchase_orders");
+    assert_all_in(&two_seeds, &["HTTP route", "SQL relation"]);
+    assert_all_in(
+        &pack("What breaks if I rename purchase_orders?"),
+        &[
+            "schema.sql",
+            "list_orders",
+            "fetchOrders",
+            "possible HTTP",
+            "SELECT order_id",
+        ],
     );
-    assert!(
-        two_seeds.contains("HTTP route") && two_seeds.contains("SQL relation"),
-        "{two_seeds}"
-    );
-    let pack = success(
-        mixed.path(),
-        &["pack", "What breaks if I rename purchase_orders?"],
-    );
-    for term in [
-        "schema.sql",
-        "list_orders",
-        "fetchOrders",
-        "possible HTTP",
-        "SELECT order_id",
-    ] {
-        assert!(pack.contains(term), "{pack}");
-    }
-    assert!(
-        success(
-            mixed.path(),
-            &["pack", "purchase_orders", "--budget", "128"]
-        )
-        .len()
-            <= 128
-    );
-    assert!(success(mixed.path(), &["pack", "canary-checkout"]).contains("docs/operations.md"));
+    let budget = ["pack", "purchase_orders", "--budget", "128"];
+    assert!(success(mixed.path(), &budget).len() <= 128);
+    assert!(pack("canary-checkout").contains("docs/operations.md"));
     // A passage is headed by its best line, not its first.
-    let route = success(mixed.path(), &["pack", "where is the api route for orders"]);
-    assert!(
-        route.contains("Text backend/orders.py:6 @router.get(\"/api/orders\")\n    1 | "),
-        "{route}"
+    assert_all_in(
+        &pack("where is the api route for orders"),
+        &["Text backend/orders.py:6 @router.get(\"/api/orders\")\n    1 | "],
     );
     let repo = fixture();
     let root = repo.path();
-    let args = [
-        "run",
-        "--max-bytes",
-        "512",
-        "--",
-        "cargo",
-        "test",
-        "--offline",
-    ];
+    let args = argv("run --max-bytes 512 -- cargo test --offline");
     let failed = cli(root, &args);
     assert_eq!(failed.status.code(), Some(101));
     let id = run_id(&failed);
     // A workflow that repeats `checkout` does not displace the code the
     // recorded failure points at.
     let step = "    steps:\n      - uses: actions/checkout@v4\n      - run: cargo test\n";
-    write_files(
-        root,
-        &[(
-            ".github/workflows/ci.yml",
-            &format!("name: CI\non: [push]\njobs:\n  test:\n{step}  lint:\n{step}  docs:\n{step}"),
-        )],
-    );
+    let workflow =
+        format!("name: CI\non: [push]\njobs:\n  test:\n{step}  lint:\n{step}  docs:\n{step}");
+    write_files(root, &[(".github/workflows/ci.yml", &workflow)]);
     let evidence = success(root, &["pack", "diagnose the failing checkout test"]);
-    for term in [
-        &id,
-        "tests/checkout.rs:11",
-        "apply_fee",
-        "subtotal + fee + 1",
-    ] {
-        assert!(evidence.contains(term), "{evidence}");
-    }
+    assert_all_in(
+        &evidence,
+        &[
+            &id,
+            "tests/checkout.rs:11",
+            "apply_fee",
+            "subtotal + fee + 1",
+        ],
+    );
     let lead = evidence.find("::total_includes_fee [function]").unwrap();
     assert!(
         evidence.find("ci.yml").is_none_or(|text| lead < text),
@@ -1626,20 +1534,12 @@ fn task_packs_and_handoffs_link_live_and_historical_evidence() {
     let text = fs::read_to_string(&source).unwrap();
     fs::write(source, text.replace("subtotal + fee + 1", "subtotal + fee")).unwrap();
     let handoff = success(root, &["resume"]);
-    assert!(
-        handoff.contains(&id) && handoff.contains("src/pricing.rs:5-7 [source changed]"),
-        "{handoff}"
-    );
+    assert_all_in(&handoff, &[&id, "src/pricing.rs:5-7 [source changed]"]);
     let fixed = cli(root, &args);
     assert_eq!(fixed.status.code(), Some(0));
-    assert!(
-        stdout(&fixed).contains("- total_includes_fee"),
-        "{}",
-        stdout(&fixed)
-    );
-    assert!(
-        !success(root, &["pack", "why did checkout fail"]).contains("Recorded cargo test failure")
-    );
+    assert_all_in(&stdout(&fixed), &["- total_includes_fee"]);
+    let why = success(root, &["pack", "why did checkout fail"]);
+    assert_none_in(&why, &["Recorded cargo test failure"]);
     assert!(success(root, &["history", "assertion", "--oldest", "--limit", "1"]).contains(&id));
     assert!(success(root, &["stats"]).contains("1 repeated source-range read(s)"));
 }
@@ -1671,43 +1571,28 @@ fn older_runs_are_searchable_and_hook_statistics_do_not_capture_arguments() {
             && !wrapped.contains("odd")
     );
     assert!(success(root, &["stats"]).contains("Hooks passed through: git ×1."));
-    assert!(
-        !fs::read_to_string(root.join(".justless/activity.json"))
-            .unwrap()
-            .contains("secret-value")
-    );
+    let activity = fs::read_to_string(root.join(".justless/activity.json")).unwrap();
+    assert_none_in(&activity, &["secret-value"]);
 }
 
 #[cfg(unix)]
 #[test]
 fn pytest_summaries_group_shared_diagnostics_and_preserve_failure_exit() {
-    use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let exe = root.join("pytest");
-    fs::write(&exe, "#!/bin/sh\ncat results\nexit 1\n").unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+    let exe = fake_program(root, "pytest", "cat results\nexit 1\n");
     let filler = "progress\n".repeat(100);
     fs::write(root.join("results"), format!("{filler}FAILED orders.py::one - TimeoutError\nFAILED orders.py::two - TimeoutError\nFAILED orders.py::three - ValueError\n3 failed in 0.1s\n")).unwrap();
     let args = ["run", "--max-bytes", "512", "--", exe.to_str().unwrap()];
     let failed = cli(root, &args);
     let preview = stdout(&failed);
     assert_eq!(failed.status.code(), Some(1));
-    assert!(
-        preview.contains("3 reported failing")
-            && preview.contains("2 test(s)")
-            && preview.matches("TimeoutError").count() == 1,
-        "{preview}"
-    );
-    fs::write(
-        root.join("results"),
-        format!("{filler}FAILED orders.py::two - TimeoutError\n1 failed in 0.1s\n"),
-    )
-    .unwrap();
-    let next = cli(root, &args);
-    assert!(
-        stdout(&next).contains("- orders.py::one") && !stdout(&next).contains("- orders.py::two")
-    );
+    assert_all_in(&preview, &["3 reported failing", "2 test(s)"]);
+    assert_eq!(preview.matches("TimeoutError").count(), 1, "{preview}");
+    let results = format!("{filler}FAILED orders.py::two - TimeoutError\n1 failed in 0.1s\n");
+    fs::write(root.join("results"), results).unwrap();
+    let next = stdout(&cli(root, &args));
+    assert!(next.contains("- orders.py::one") && !next.contains("- orders.py::two"));
     fs::write(root.join("results"), "unrecognized fatal runner output\n").unwrap();
     let unknown = cli(root, &args);
     assert_eq!(unknown.status.code(), Some(1));
@@ -1718,11 +1603,8 @@ fn pytest_summaries_group_shared_diagnostics_and_preserve_failure_exit() {
 fn history_finds_an_exact_match_across_large_line_windows() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let text = format!(
-        "{}split-match{}\nnext\n",
-        "x".repeat(256 * 1024 - 3),
-        "y".repeat(500_000)
-    );
+    let x = "x".repeat(256 * 1024 - 3);
+    let text = format!("{x}split-match{}\nnext\n", "y".repeat(500_000));
     fs::write(root.join("big.txt"), text).unwrap();
     let run = cli(root, &["run", "--", "cat", "big.txt"]);
     let id = run_id(&run);
@@ -1735,19 +1617,13 @@ fn history_finds_an_exact_match_across_large_line_windows() {
 fn concurrent_runs_publish_complete_archives_and_keep_workdirs_separate() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    assert!(
-        Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success()
-    );
+    git(root, &["init", "-q"]);
     let a = root.join("a");
     let b = root.join("b");
+    let report = "evidence\n".repeat(80);
     for folder in [&a, &b] {
         fs::create_dir(folder).unwrap();
-        fs::write(folder.join("report"), "evidence\n".repeat(80)).unwrap();
+        fs::write(folder.join("report"), &report).unwrap();
     }
     let args = ["run", "--", "cat", "report"];
     let runs = std::thread::scope(|scope| {
@@ -1757,20 +1633,16 @@ fn concurrent_runs_publish_complete_archives_and_keep_workdirs_separate() {
             .map(|t| t.join().unwrap())
             .collect::<Vec<_>>()
     });
-    assert_eq!(
-        runs.iter()
-            .filter(|r| stdout(r).contains("Output unchanged"))
-            .count(),
-        3
-    );
+    let unchanged = runs
+        .iter()
+        .filter(|r| stdout(r).contains("Output unchanged"));
+    assert_eq!(unchanged.count(), 3);
     for run in &runs {
         assert!(run.status.success());
-        assert_eq!(
-            success(root, &["log", &run_id(run), "--stream", "stdout"]),
-            "evidence\n".repeat(80)
-        );
+        let log = success(root, &["log", &run_id(run), "--stream", "stdout"]);
+        assert_eq!(log, report);
     }
-    assert_eq!(success(&b, &args), "evidence\n".repeat(80));
+    assert_eq!(success(&b, &args), report);
     assert_eq!(success(root, &["history"]).lines().count(), 5);
 }
 
@@ -1790,65 +1662,52 @@ fn fake_program(dir: &Path, name: &str, script: &str) -> PathBuf {
 fn container_and_cluster_tables_list_only_rows_that_need_attention() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(
-        root.join("ps.txt"),
-        concat!(
-            "CONTAINER ID   IMAGE         COMMAND   CREATED       STATUS                       PORTS     NAMES\n",
-            "a1b2c3d4e5f6   nginx:1.27    \"nginx\"   2 hours ago   Up 2 hours (healthy)         80/tcp    web\n",
-            "b2c3d4e5f6a1   postgres:16   \"pg\"      2 hours ago   Up 2 hours (unhealthy)                 db\n",
-            "c3d4e5f6a1b2   redis:7       \"redis\"   3 hours ago   Exited (137) 5 minutes ago             cache\n",
-            "d4e5f6a1b2c3   busybox       \"sh\"      3 hours ago   Up 3 hours                             worker\n",
-        ),
-    )
-    .unwrap();
-    fs::write(
-        root.join("pods.txt"),
-        concat!(
-            "NAMESPACE   NAME          READY   STATUS             RESTARTS   AGE\n",
-            "prod        api-abcde     1/1     Running            0          3d\n",
-            "prod        api-fghij     0/1     CrashLoopBackOff   12         3d\n",
-            "jobs        migrate-xyz   0/1     Completed          0          1d\n",
-        ),
-    )
-    .unwrap();
+    let ps = concat!(
+        "CONTAINER ID   IMAGE         COMMAND   CREATED       STATUS                       PORTS     NAMES\n",
+        "a1b2c3d4e5f6   nginx:1.27    \"nginx\"   2 hours ago   Up 2 hours (healthy)         80/tcp    web\n",
+        "b2c3d4e5f6a1   postgres:16   \"pg\"      2 hours ago   Up 2 hours (unhealthy)                 db\n",
+        "c3d4e5f6a1b2   redis:7       \"redis\"   3 hours ago   Exited (137) 5 minutes ago             cache\n",
+        "d4e5f6a1b2c3   busybox       \"sh\"      3 hours ago   Up 3 hours                             worker\n",
+    );
+    let pods = concat!(
+        "NAMESPACE   NAME          READY   STATUS             RESTARTS   AGE\n",
+        "prod        api-abcde     1/1     Running            0          3d\n",
+        "prod        api-fghij     0/1     CrashLoopBackOff   12         3d\n",
+        "jobs        migrate-xyz   0/1     Completed          0          1d\n",
+    );
+    write_files(root, &[("ps.txt", ps), ("pods.txt", pods)]);
     let docker = fake_program(root, "docker", "cat ps.txt\n");
     let kubectl = fake_program(root, "kubectl", "cat pods.txt\nexit ${FAIL:-0}\n");
+    let (docker, kubectl) = (docker.to_str().unwrap(), kubectl.to_str().unwrap());
 
-    let ps = success(root, &["run", "--", docker.to_str().unwrap(), "ps", "-a"]);
-    assert!(
-        ps.starts_with("docker ps: 4 listed, 2 need attention\n")
-            && ps.contains("db unhealthy [stdout:3-3]")
-            && ps.contains("cache Exited (137) [stdout:4-4]")
-            && ps.contains("Other examples: web, worker")
-            && !ps.contains("nginx:1.27"),
-        "{ps}"
-    );
-    let again = success(root, &["run", "--", docker.to_str().unwrap(), "ps", "-a"]);
-    assert!(again.starts_with("Output unchanged since run-"), "{again}");
-
-    let get = ["run", "--", kubectl.to_str().unwrap(), "get", "pods", "-A"];
-    let pods = success(root, &get);
-    assert!(
-        pods.contains("kubectl get pods: 3 listed, 1 need attention")
-            && pods.contains("prod/api-fghij CrashLoopBackOff ready=0/1 restarts=12")
-            && !pods.contains("prod/api-abcde Running"),
-        "{pods}"
-    );
-
-    // Formats Justless does not understand keep the ordinary preview.
-    let wide = success(
-        root,
+    let listed = success(root, &["run", "--", docker, "ps", "-a"]);
+    assert!(listed.starts_with("docker ps: 4 listed, 2 need attention\n"));
+    assert_all_in(
+        &listed,
         &[
-            "run",
-            "--",
-            kubectl.to_str().unwrap(),
-            "get",
-            "pods",
-            "-o",
-            "wide",
+            "db unhealthy [stdout:3-3]",
+            "cache Exited (137) [stdout:4-4]",
+            "Other examples: web, worker",
         ],
     );
-    assert_eq!(wide, fs::read_to_string(root.join("pods.txt")).unwrap());
+    assert_none_in(&listed, &["nginx:1.27"]);
+    let again = success(root, &["run", "--", docker, "ps", "-a"]);
+    assert!(again.starts_with("Output unchanged since run-"), "{again}");
+
+    let get = ["run", "--", kubectl, "get", "pods", "-A"];
+    let listed = success(root, &get);
+    assert_all_in(
+        &listed,
+        &[
+            "kubectl get pods: 3 listed, 1 need attention",
+            "prod/api-fghij CrashLoopBackOff ready=0/1 restarts=12",
+        ],
+    );
+    assert_none_in(&listed, &["prod/api-abcde Running"]);
+
+    // Formats Justless does not understand keep the ordinary preview.
+    let wide = success(root, &["run", "--", kubectl, "get", "pods", "-o", "wide"]);
+    assert_eq!(wide, pods);
     let failed = Command::new(env!("CARGO_BIN_EXE_justless"))
         .args(get)
         .current_dir(root)
@@ -1856,10 +1715,7 @@ fn container_and_cluster_tables_list_only_rows_that_need_attention() {
         .output()
         .unwrap();
     assert_eq!(failed.status.code(), Some(1));
-    assert_eq!(
-        stdout(&failed),
-        fs::read_to_string(root.join("pods.txt")).unwrap()
-    );
+    assert_eq!(stdout(&failed), pods);
 }
 
 #[cfg(unix)]
@@ -1882,26 +1738,18 @@ fn js_tests_logs_and_project_filters_keep_failure_evidence() {
     let tests = cli(root, &["run", "--", npm.to_str().unwrap(), "test"]);
     let preview = stdout(&tests);
     assert_eq!(tests.status.code(), Some(1));
-    assert!(
-        preview.starts_with("[4 retained lines, 40 filtered, 0 repeats]\n")
-            && preview.contains("FAIL src/cart.test.js\n  Expected: 30\n  Received: 27\n")
-            && !preview.contains("PASS "),
-        "{preview}"
+    assert!(preview.starts_with("[4 retained lines, 40 filtered, 0 repeats]\n"));
+    assert_all_in(
+        &preview,
+        &["FAIL src/cart.test.js\n  Expected: 30\n  Received: 27\n"],
     );
+    assert_none_in(&preview, &["PASS "]);
     let id = run_id(&tests);
-    assert_eq!(
-        success(
-            root,
-            &["log", &id, "--stream", "stdout", "--from", "1", "--to", "1"]
-        ),
-        "PASS src/m0.test.js\n"
-    );
+    let first = ["log", &id, "--stream", "stdout", "--from", "1", "--to", "1"];
+    assert_eq!(success(root, &first), "PASS src/m0.test.js\n");
 
-    let docker = fake_program(
-        root,
-        "docker",
-        "for i in 1 2 3 4 5; do echo 'GET /health 200'; done\necho 'ERROR db refused'\n",
-    );
+    let script = "for i in 1 2 3 4 5; do echo 'GET /health 200'; done\necho 'ERROR db refused'\n";
+    let docker = fake_program(root, "docker", script);
     let logs = success(
         root,
         &["run", "--", docker.to_str().unwrap(), "logs", "api"],
@@ -1920,11 +1768,9 @@ fn js_tests_logs_and_project_filters_keep_failure_evidence() {
             "exit 2\n",
         ),
     );
-    fs::write(
-        root.join(".justless.toml"),
-        "[[filters]]\ncommand = [\"make\"]\nomit = '^make\\[\\d+\\]: Entering'\n",
-    )
-    .unwrap();
+    let settings = root.join(".justless.toml");
+    let filter = "[[filters]]\ncommand = [\"make\"]\nomit = '^make\\[\\d+\\]: Entering'\n";
+    fs::write(&settings, filter).unwrap();
     let built = cli(root, &["run", "--", make.to_str().unwrap()]);
     assert_eq!(built.status.code(), Some(2));
     assert_eq!(
@@ -1943,17 +1789,10 @@ fn js_tests_logs_and_project_filters_keep_failure_evidence() {
             "invalid filters.omit regex",
         ),
     ] {
-        fs::write(
-            root.join(".justless.toml"),
-            format!("[[filters]]\n{rule}\n"),
-        )
-        .unwrap();
+        fs::write(&settings, format!("[[filters]]\n{rule}\n")).unwrap();
         let rejected = cli(root, &["run", "--", make.to_str().unwrap()]);
-        assert!(
-            !rejected.status.success() && stderr(&rejected).contains(message),
-            "{rule}: {}",
-            stderr(&rejected)
-        );
+        assert!(!rejected.status.success(), "{rule}");
+        assert_all_in(&stderr(&rejected), &[message]);
     }
 }
 
@@ -1962,6 +1801,7 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
+    let claude = |command| agent_hook(root, "hook-claude", "before-command", call(command));
     for command in [
         "docker ps -a",
         "docker container ls --filter status=exited",
@@ -1973,13 +1813,28 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
         "pnpm run test",
         "vitest run",
         "node --test",
+        // Linters, build tools and package runners.
+        "cargo clippy --all-targets -- -D warnings",
+        "npx eslint src",
+        "npx -y tsc --noEmit",
+        "pnpm exec vue-tsc --noEmit",
+        "uv run ruff check .",
+        "poetry run mypy app",
+        "python -m mypy app",
+        "bundle exec rubocop",
+        "golangci-lint run ./...",
+        "shellcheck -f gcc install.sh",
+        "go vet ./...",
+        "uv run pytest -q",
+        "make",
+        "./gradlew build",
+        "mvn -q test",
+        "dotnet build",
+        "swift test",
+        "cmake --build build",
     ] {
-        let output = agent_hook(root, "hook-claude", "before-command", call(command));
-        assert_eq!(
-            output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!("justless run --hook -- {command}"),
-            "{command}"
-        );
+        let rewritten = &claude(command)["hookSpecificOutput"]["updatedInput"]["command"];
+        assert_eq!(rewritten, &format!("justless run --hook -- {command}"));
     }
     for command in [
         "docker ps --format json",
@@ -1988,15 +1843,19 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
         "kubectl get pods -o yaml",
         "kubectl logs -f api-1",
         "npm test -- --watch",
+        "eslint --format json src",
+        "ruff check --output-format=json .",
+        "npx tsc --watch",
+        "mypy --pretty app",
+        "shellcheck -f json install.sh",
+        "npx",
+        "uv run",
+        "cmake -S . -B build",
         "vitest",
         "jest --json",
         "docker ps | grep db",
     ] {
-        assert_eq!(
-            agent_hook(root, "hook-claude", "before-command", call(command)),
-            serde_json::json!({}),
-            "{command}"
-        );
+        assert_eq!(claude(command), serde_json::json!({}), "{command}");
     }
 }
 
@@ -2131,30 +1990,27 @@ fn compound_commands_wrap_each_supported_segment_in_place() {
     };
     // Claude Code reads exit 1 of a list ending in `git diff` as valid, so its hook
     // ends such a list with `&& test 1`, which Claude Code reads the same way.
-    for (command, expected, claude_tail) in [
+    for (command, expected, tail) in [
         (
             "git status; git diff",
             "justless run --hook -- git status; justless run --hook -- git diff",
-            true,
+            " && test 1",
         ),
         (
             "cd web && npm test",
             "cd web && justless run --hook -- npm test",
-            false,
+            "",
         ),
         (
             "git log --oneline -5  &&  git diff --stat",
             "justless run --hook -- git log --oneline -5  &&  justless run --hook -- git diff --stat",
-            true,
+            " && test 1",
         ),
     ] {
-        let claude = format!("{expected}{}", if claude_tail { " && test 1" } else { "" });
-        assert_eq!(rewrite("hook-claude", command), Some(claude), "{command}");
-        assert_eq!(
-            rewrite("hook-codex", command).as_deref(),
-            Some(expected),
-            "{command}"
-        );
+        let claude = rewrite("hook-claude", command);
+        assert_eq!(claude, Some(format!("{expected}{tail}")), "{command}");
+        let codex = rewrite("hook-codex", command);
+        assert_eq!(codex.as_deref(), Some(expected), "{command}");
     }
     // Claude Code checks permissions for each rewritten segment. Codex auto-approves
     // a rewrite, so it only rewrites chains made entirely of supported commands.
@@ -2217,65 +2073,49 @@ fn claude_hook_keeps_how_claude_code_reads_exit_1() {
     // starts with grep, rg, egrep, fgrep, find, diff, test or `[`, or is `git diff` or
     // `git grep`. `test 1` keeps that reading and the command's own exit status.
     let root_option = format!("--root {}", root.display());
+    let nested_diff = format!(
+        "cd vendor_lib && justless {root_option} run --hook -- git diff --exit-code && test 1"
+    );
     for (command, expected) in [
-        (
-            "rg foo",
-            "justless run --hook -- rg foo && test 1".to_owned(),
-        ),
+        ("rg foo", "justless run --hook -- rg foo && test 1"),
         (
             "git diff --exit-code",
-            "justless run --hook -- git diff --exit-code && test 1".to_owned(),
+            "justless run --hook -- git diff --exit-code && test 1",
         ),
         (
             "rg -n foo src 2>&1",
-            "justless run --hook --merge -- rg -n foo src 2>&1 && test 1".to_owned(),
+            "justless run --hook --merge -- rg -n foo src 2>&1 && test 1",
         ),
         (
             "git status; git diff --stat",
-            "justless run --hook -- git status; justless run --hook -- git diff --stat && test 1"
-                .to_owned(),
+            "justless run --hook -- git status; justless run --hook -- git diff --stat && test 1",
         ),
         (
             "cargo build || rg foo;",
-            "justless run --hook -- cargo build || justless run --hook -- rg foo && test 1;"
-                .to_owned(),
+            "justless run --hook -- cargo build || justless run --hook -- rg foo && test 1;",
         ),
-        (
-            "rg foo\t",
-            "justless run --hook -- rg foo && test 1\t".to_owned(),
-        ),
+        ("rg foo\t", "justless run --hook -- rg foo && test 1\t"),
         // Claude Code reads exit 1 of these as an error with or without Justless: the
         // last statement starts with another program or an assignment.
-        ("cargo test", "justless run --hook -- cargo test".to_owned()),
+        ("cargo test", "justless run --hook -- cargo test"),
         (
             "rg foo; cargo build",
-            "justless run --hook -- rg foo; justless run --hook -- cargo build".to_owned(),
+            "justless run --hook -- rg foo; justless run --hook -- cargo build",
         ),
-        (
-            "LC_ALL=C rg foo",
-            "LC_ALL=C justless run --hook -- rg foo".to_owned(),
-        ),
+        ("LC_ALL=C rg foo", "LC_ALL=C justless run --hook -- rg foo"),
         (
             "git log --oneline -3",
-            "justless run --hook -- git log --oneline -3".to_owned(),
+            "justless run --hook -- git log --oneline -3",
         ),
-        (
-            "cd vendor_lib && git diff --exit-code",
-            format!(
-                "cd vendor_lib && justless {root_option} run --hook -- git diff --exit-code && test 1"
-            ),
-        ),
+        ("cd vendor_lib && git diff --exit-code", &nested_diff),
         // The last statement is not routed, so it is unchanged.
         (
             "rg foo; git push",
-            "justless run --hook -- rg foo; git push".to_owned(),
+            "justless run --hook -- rg foo; git push",
         ),
     ] {
-        assert_eq!(
-            rewrite("hook-claude", command).as_deref(),
-            Some(expected.as_str()),
-            "{command}"
-        );
+        let rewritten = rewrite("hook-claude", command);
+        assert_eq!(rewritten.as_deref(), Some(expected), "{command}");
     }
     // A cd-prefixed list that the after-run compactor accepts keeps the command
     // Claude Code wrote instead of being routed through a rewrite.
@@ -2291,13 +2131,8 @@ fn claude_hook_keeps_how_claude_code_reads_exit_1() {
                 "toolArgs":{"command":"rg foo"}}),
             _ => call("rg foo"),
         };
-        let output = agent_hook(&root, agent, "before-command", call);
-        assert!(
-            output
-                .to_string()
-                .contains("\"justless run --hook -- rg foo\""),
-            "{agent}: {output}"
-        );
+        let output = agent_hook(&root, agent, "before-command", call).to_string();
+        assert_all_in(&output, &["\"justless run --hook -- rg foo\""]);
     }
     // A command that already ends with the tail, as when Copilot or Cursor also runs
     // the Claude Code hook, is left as it is by every handler.
@@ -2415,42 +2250,37 @@ fn linter_findings_group_by_rule_with_locations() {
     ] {
         fs::write(root.join("output.txt"), lint_fixture(fixture)).unwrap();
         let redirect = if stream == "2" { " >&2" } else { "" };
-        let exe = fake_program(
-            root,
-            program,
-            &format!("cat output.txt{redirect}\nexit 1\n"),
-        );
+        let script = format!("cat output.txt{redirect}\nexit 1\n");
+        let exe = fake_program(root, program, &script);
         let mut command = vec!["run", "--fresh", "--", exe.to_str().unwrap()];
         command.extend(args);
         let output = cli(root, &command);
         assert_eq!(output.status.code(), Some(1), "{fixture}");
-        let preview = stdout(&output);
-        for line in expected {
-            assert!(
-                preview.contains(line),
-                "{fixture}: missing {line:?}\n{preview}"
-            );
-        }
+        assert_all_in(&stdout(&output), expected);
+        let footer = stderr(&output);
         assert!(
-            stderr(&output).trim_start().starts_with("[justless run-"),
+            footer.trim_start().starts_with("[justless run-"),
             "{fixture}"
         );
     }
 
     // A repeated ESLint report collapses to one line per rule and one outcome line.
-    fs::write(
-        root.join("output.txt"),
-        lint_fixture("eslint.txt").repeat(4),
-    )
-    .unwrap();
+    let report = lint_fixture("eslint.txt").repeat(4);
+    fs::write(root.join("output.txt"), report).unwrap();
     let eslint = fake_program(root, "eslint", "cat output.txt\nexit 1\n");
     let report = stdout(&cli(root, &["run", "--", eslint.to_str().unwrap(), "."]));
     assert!(
-        report.starts_with("eslint: 20 finding(s), 16 error(s), 4 warning(s) · 3 rule(s) · 2 file(s)\n")
-            && report.contains("error no-undef ×12  'foo' is not defined\n  /work/web/b.js:3:15, 4:25, /work/web/c.js:1:1 [stdout:4-4]")
-            && report.matches("✖ 5 problems").count() == 1,
-        "{report}"
+        report.starts_with(
+            "eslint: 20 finding(s), 16 error(s), 4 warning(s) · 3 rule(s) · 2 file(s)\n"
+        )
     );
+    assert_all_in(
+        &report,
+        &[
+            "error no-undef ×12  'foo' is not defined\n  /work/web/b.js:3:15, 4:25, /work/web/c.js:1:1 [stdout:4-4]",
+        ],
+    );
+    assert_eq!(report.matches("✖ 5 problems").count(), 1, "{report}");
 
     // A rerun reports which rules appeared, changed or are no longer reported.
     fs::write(
@@ -2458,72 +2288,21 @@ fn linter_findings_group_by_rule_with_locations() {
         "/work/web/b.js\n  3:15  error  'foo' is not defined  no-undef\n  9:1  error  'x' is assigned a value but never used  no-unused-vars\n".repeat(3),
     )
     .unwrap();
-    let rerun = stdout(&cli(root, &["run", "--", eslint.to_str().unwrap(), "."]));
-    assert!(
-        rerun.contains("Compared with run-")
-            && rerun.contains("~ error no-undef ×12 → ×3")
-            && rerun.contains("~ error no-unused-vars ×4 → ×3")
-            && rerun.contains("- warning eqeqeq ×4 (no longer reported)"),
-        "{rerun}"
+    assert_all_in(
+        &stdout(&cli(root, &["run", "--", eslint.to_str().unwrap(), "."])),
+        &[
+            "Compared with run-",
+            "~ error no-undef ×12 → ×3",
+            "~ error no-unused-vars ×4 → ×3",
+            "- warning eqeqeq ×4 (no longer reported)",
+        ],
     );
 
     // Output with no recognized finding keeps the ordinary preview.
     fs::write(root.join("output.txt"), "All checks passed!\n").unwrap();
     let ruff = fake_program(root, "ruff", "cat output.txt\n");
-    assert_eq!(
-        success(root, &["run", "--", ruff.to_str().unwrap(), "check"]),
-        "All checks passed!\n"
-    );
-}
-
-#[test]
-fn hooks_route_linters_build_tools_and_package_runners() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
-    for command in [
-        "cargo clippy --all-targets -- -D warnings",
-        "npx eslint src",
-        "npx -y tsc --noEmit",
-        "pnpm exec vue-tsc --noEmit",
-        "uv run ruff check .",
-        "poetry run mypy app",
-        "python -m mypy app",
-        "bundle exec rubocop",
-        "golangci-lint run ./...",
-        "shellcheck -f gcc install.sh",
-        "go vet ./...",
-        "uv run pytest -q",
-        "make",
-        "./gradlew build",
-        "mvn -q test",
-        "dotnet build",
-        "swift test",
-        "cmake --build build",
-    ] {
-        let output = agent_hook(root, "hook-claude", "before-command", call(command));
-        assert_eq!(
-            output["hookSpecificOutput"]["updatedInput"]["command"],
-            format!("justless run --hook -- {command}"),
-            "{command}"
-        );
-    }
-    for command in [
-        "eslint --format json src",
-        "ruff check --output-format=json .",
-        "npx tsc --watch",
-        "mypy --pretty app",
-        "shellcheck -f json install.sh",
-        "npx",
-        "uv run",
-        "cmake -S . -B build",
-    ] {
-        assert_eq!(
-            agent_hook(root, "hook-claude", "before-command", call(command)),
-            serde_json::json!({}),
-            "{command}"
-        );
-    }
+    let plain = success(root, &["run", "--", ruff.to_str().unwrap(), "check"]);
+    assert_eq!(plain, "All checks passed!\n");
 }
 
 #[cfg(unix)]
@@ -2532,7 +2311,7 @@ fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
     use serde_json::{Value, json};
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
-    let raw_hook = |agent: &str, mode: &str, input: Value| {
+    let raw_hook = |agent: &str, mode: &str, input: &Value| {
         let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
             .args([agent, mode])
             .current_dir(&root)
@@ -2540,35 +2319,25 @@ fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.to_string().as_bytes())
-            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+        drop(stdin);
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         stdout(&output)
     };
+    let read = |file: &str| fs::read_to_string(root.join(file)).unwrap();
     let compact = json!({"hook_event_name":"SessionStart","source":"compact","cwd":root});
     let pre = json!({"hook_event_name":"PreCompact","trigger":"auto","cwd":root});
 
     // With no recorded activity both hooks stay silent.
-    success(
-        &root,
-        &[
-            "init", "--hooks", "--agent", "claude", "--agent", "codex", "--agent", "agy",
-        ],
-    );
-    assert_eq!(
-        raw_hook("hook-claude", "after-compact", compact.clone()).trim(),
-        "{}"
-    );
-    assert_eq!(raw_hook("hook-claude", "before-compact", pre.clone()), "");
+    let agents = "init --hooks --agent claude --agent codex --agent agy";
+    success(&root, &argv(agents));
+    let restored = raw_hook("hook-claude", "after-compact", &compact);
+    assert_eq!(restored.trim(), "{}");
+    assert_eq!(raw_hook("hook-claude", "before-compact", &pre), "");
 
-    let claude: Value =
-        serde_json::from_str(&fs::read_to_string(root.join(".claude/settings.json")).unwrap())
-            .unwrap();
+    let claude: Value = serde_json::from_str(&read(".claude/settings.json")).unwrap();
     let after = &claude["hooks"]["SessionStart"][1];
     assert_eq!(after["matcher"], "^compact$");
     assert_eq!(
@@ -2576,57 +2345,51 @@ fn compaction_hooks_restore_recent_runs_and_guide_the_summary() {
         "justless hook-claude after-compact"
     );
     assert!(after["hooks"][0].get("async").is_none());
-    assert_eq!(
-        claude["hooks"]["PreCompact"][0]["hooks"][0]["command"],
-        "justless hook-claude before-compact"
-    );
-    let codex: Value =
-        serde_json::from_str(&fs::read_to_string(root.join(".codex/hooks.json")).unwrap()).unwrap();
+    let before = &claude["hooks"]["PreCompact"][0]["hooks"][0]["command"];
+    assert_eq!(before, "justless hook-claude before-compact");
+    let codex: Value = serde_json::from_str(&read(".codex/hooks.json")).unwrap();
     assert_eq!(codex["hooks"]["SessionStart"][1]["matcher"], "^compact$");
     assert!(codex["hooks"].get("PreCompact").is_none());
-    assert!(
-        !fs::read_to_string(root.join(".agents/hooks.json"))
-            .unwrap()
-            .contains("compact")
-    );
+    let agy = read(".agents/hooks.json");
+    assert_all_in(&agy, &["justless hook-agy"]);
+    assert_none_in(&agy, &["compact"]);
 
     fs::write(root.join("output.txt"), lint_fixture("mypy.txt")).unwrap();
     let mypy = fake_program(&root, "mypy", "cat output.txt\nexit 1\n");
     let run = cli(&root, &["run", "--", mypy.to_str().unwrap(), "app.py"]);
     let id = run_id(&run);
 
-    let restored: Value =
-        serde_json::from_str(&raw_hook("hook-claude", "after-compact", compact.clone())).unwrap();
-    let context = restored["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
+    let restored = raw_hook("hook-claude", "after-compact", &compact);
+    let restored: Value = serde_json::from_str(&restored).unwrap();
+    let output = &restored["hookSpecificOutput"];
+    let context = output["additionalContext"].as_str().unwrap();
+    assert_eq!(output["hookEventName"], "SessionStart");
+    assert_all_in(
+        context,
+        &[
+            &format!("{id} · mypy · exit 1 · 3 finding(s) in 2 rule(s), first return-value ×2"),
+            "justless log RUN_ID",
+            "justless context --run RUN_ID",
+        ],
+    );
+    assert!(context.len() < 2400, "{context}");
+    let codex_output = raw_hook("hook-codex", "after-compact", &compact);
     assert_eq!(
-        restored["hookSpecificOutput"]["hookEventName"],
-        "SessionStart"
+        serde_json::from_str::<Value>(&codex_output).unwrap(),
+        restored
     );
-    assert!(
-        context.contains(&format!(
-            "{id} · mypy · exit 1 · 3 finding(s) in 2 rule(s), first return-value ×2"
-        )) && context.contains("justless log RUN_ID")
-            && context.contains("justless context --run RUN_ID")
-            && context.len() < 2400,
-        "{context}"
-    );
-    let codex_output: Value =
-        serde_json::from_str(&raw_hook("hook-codex", "after-compact", compact)).unwrap();
-    assert_eq!(codex_output, restored);
     let startup = json!({"hook_event_name":"SessionStart","source":"startup","cwd":root});
     assert_eq!(
-        raw_hook("hook-codex", "after-compact", startup).trim(),
+        raw_hook("hook-codex", "after-compact", &startup).trim(),
         "{}"
     );
 
-    let instructions = raw_hook("hook-claude", "before-compact", pre);
+    let instructions = raw_hook("hook-claude", "before-compact", &pre);
     assert!(
-        instructions.starts_with("Keep these Justless references verbatim in the summary.")
-            && instructions.contains(&id),
+        instructions.starts_with("Keep these Justless references verbatim in the summary."),
         "{instructions}"
     );
+    assert_all_in(&instructions, &[&id]);
 }
 
 #[cfg(unix)]
