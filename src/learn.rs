@@ -1,12 +1,13 @@
 //! `justless learn`: turn command mistakes that agents corrected or keep repeating into
 //! short project rules.
 //!
-//! Evidence comes from Claude Code transcripts and the run archive, both local. Only
+//! Evidence comes from Claude Code transcripts, Codex rollouts and the run archive, all
+//! local. Only
 //! a closed table of signatures counts, every rule is checked against the current
 //! tree, `PATH` or `$SHELL`, and rules are built from validated slots, never copied
 //! from commands. Without `--apply` nothing is written.
 mod block;
-mod events;
+pub(crate) mod events;
 mod patterns;
 mod privacy;
 
@@ -146,12 +147,19 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let now = now_ms();
     let since = now.saturating_sub(days.saturating_mul(DAY_MS));
     let mut transcript_stats = events::TranscriptStats::default();
-    let transcripts = events::transcripts(workspace, since, &mut transcript_stats);
+    let mut transcripts = events::transcripts(workspace, since, &mut transcript_stats);
+    let mut codex_stats = events::TranscriptStats::default();
+    events::rollouts(workspace, since, &mut codex_stats, &mut transcripts);
+    let sessions: BTreeSet<String> = transcript_stats
+        .sessions
+        .union(&codex_stats.sessions)
+        .cloned()
+        .collect();
     let mut run_stats = events::RunStats::default();
     let runs = events::runs(
         workspace,
         since,
-        &transcript_stats.sessions,
+        &sessions,
         &transcripts.linked,
         &mut run_stats,
     );
@@ -383,6 +391,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         days,
         min_sessions,
         transcripts: &transcript_stats,
+        codex: &codex_stats,
         runs: &run_stats,
         proposed: &proposed,
         held: &held,
@@ -455,6 +464,7 @@ struct Report<'a> {
     days: u64,
     min_sessions: u64,
     transcripts: &'a events::TranscriptStats,
+    codex: &'a events::TranscriptStats,
     runs: &'a events::RunStats,
     proposed: &'a [&'a Rule<'a>],
     held: &'a [(&'a Rule<'a>, Reason)],
@@ -571,6 +581,15 @@ impl Report<'_> {
                     "not_run": t.not_run,
                     "status_unknown": t.status_unknown,
                 },
+                "codex_rollouts": {
+                    "available": self.codex.available,
+                    "directory": self.codex.directory.as_ref().map(|dir| dir.to_string_lossy()),
+                    "files": self.codex.files,
+                    "sessions": self.codex.sessions.len(),
+                    "threads": self.codex.threads.len(),
+                    "results": self.codex.results,
+                    "not_run": self.codex.not_run,
+                },
                 "runs": {
                     "available": r.available,
                     "scanned": r.scanned,
@@ -623,6 +642,13 @@ impl Report<'_> {
                 "Read {sessions} Claude Code session(s) ({} agent thread(s), {results} shell results) and {runs} archived run(s) from the last {} day(s).\n",
                 thousands(t.threads.len() as u64),
                 self.days
+            ));
+        }
+        if self.codex.results > 0 {
+            out.push_str(&format!(
+                "Also read {} Codex session(s) ({} shell results).\n",
+                thousands(self.codex.sessions.len() as u64),
+                thousands(self.codex.results)
             ));
         }
         if !t.available {

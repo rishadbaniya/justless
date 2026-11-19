@@ -2373,3 +2373,42 @@ fn learn_skips_bash_results_recorded_after_the_command_ran() {
     let report = lab.json(&[]);
     assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
 }
+
+#[test]
+fn learn_reads_codex_rollouts() {
+    let lab = Lab::new();
+    lab.tool("python3", "exit 0");
+    // One Codex thread: a direct call fails, and a code-mode script's call corrects it.
+    let failed = "Chunk ID: a\nWall time: 0.1 seconds\nProcess exited with code 127\nOutput:\nzsh:1: command not found: python\n";
+    let records = [
+        json!({"type": "session_meta", "payload": {"id": "t1", "session_id": "r1", "cwd": lab.root}}),
+        json!({"type": "response_item", "payload": {"type": "function_call", "name": "exec_command",
+            "call_id": "call_1", "arguments": json!({"cmd": "python scripts/gen.py"}).to_string()}}),
+        json!({"type": "response_item", "payload": {"type": "function_call_output",
+            "call_id": "call_1", "output": failed}}),
+        json!({"type": "event_msg", "payload": {"type": "item_completed", "item": {
+            "type": "CommandExecution", "id": "exec-1", "exit_code": 0,
+            "command": ["/bin/zsh", "-lc", "python3 scripts/gen.py"],
+            "cwd": format!("file://{}", lab.root.display()), "aggregated_output": "generated\n"}}}),
+    ];
+    let at = timestamp(now_ms() - 30 * MINUTE);
+    let mut body = String::new();
+    for mut record in records {
+        record["timestamp"] = json!(at);
+        body.push_str(&format!("{record}\n"));
+    }
+    let dir = lab.base.join("home/.codex/sessions/2026/11/19");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("rollout-2026-11-19T10-00-00-t1.jsonl"), body).unwrap();
+    let report = lab.json(&[]);
+    let rules = report["rules"].as_array().unwrap();
+    let text = "Use `python3`, not `python`; `python` is not installed on this machine.";
+    assert_eq!(rule(rules, text)["corrections"], 1);
+    assert_eq!(report["sources"]["codex_rollouts"]["results"], 2);
+    // Codex reads AGENTS.md, so a rule from its rollouts does not create CLAUDE.md.
+    assert_eq!(report["apply"]["targets"], json!(["AGENTS.md"]));
+    assert!(
+        lab.text(&[])
+            .contains("Also read 1 Codex session(s) (2 shell results).")
+    );
+}

@@ -713,6 +713,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
     let recalls = archive_recalls(&workspace.state, since);
     let proxy = crate::proxy::report(workspace, since, recalls.proxy_bytes)?;
+    let codex = crate::rollouts::stats(workspace, since);
     let (raw, preview, saved, net) = (
         totals.raw_bytes,
         totals.preview_bytes,
@@ -753,6 +754,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "proxy": proxy.as_ref().map(|p| p.json()),
             "archive_recalls": {"recalls": recalls.count, "bytes": recalls.bytes},
             "preview_budgets": crate::adaptive::stats_json(workspace),
+            "codex": codex.as_ref().map(|codex| &codex.json),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -914,6 +916,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             passed.join(", "),
             workspace.justless()
         );
+    }
+    if let Some(codex) = &codex {
+        println!("{}", codex.line);
     }
     if let Some(proxy) = &proxy {
         proxy.print(days, &workspace.justless());

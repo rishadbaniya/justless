@@ -657,7 +657,7 @@ impl Candidate {
         self.failure_bytes += bytes;
         self.first_ms = self.first_ms.min(event.time_ms);
         self.last_ms = self.last_ms.max(event.time_ms);
-        self.transcript |= event.transcript;
+        self.transcript |= event.transcript && !event.codex;
         self.evidence.insert((event.time_ms, pointer));
     }
 

@@ -319,7 +319,11 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         ("PostToolUse", "after-read", "^Read$", 5),
         ("PostToolUse", "after-search", "^(Grep|Glob)$", 5),
         // Bash output the command hook left alone, such as a pipe or Claude Code's
-        // own grep, is archived and compacted after it ran.
+        // own grep, is archived and compacted after it ran. Codex gets no such hook:
+        // its PostToolUse replaces a result only by blocking it, which rejects the
+        // call inside a code-mode script, or with `continue: false`, which leaves a
+        // script's result as it was; its input carries no exit status, and nothing
+        // documented tells a script's call from a direct one. See docs/reference.md.
         ("PostToolUse", "after-bash", "^Bash$", 10),
         // An edit that leaves a file unparseable gets a note, and its result stays.
         // Claude Code 2.1.327 has no MultiEdit tool; earlier versions had one.
@@ -1859,6 +1863,25 @@ pub fn would_route(command: &str) -> bool {
         mixed: true,
         claude: true,
         approves: false,
+    };
+    !plan(command, rules, |_| true).wrap.is_empty()
+}
+
+/// Whether the Codex hook would route `command`, as `wrap_event` does: a range read
+/// or `cat FILE` becomes a `justless read`, and because Codex runs a rewritten command
+/// without asking, a list is routed only when every command in it is supported.
+pub(crate) fn codex_would_route(command: &str) -> bool {
+    if !cfg!(windows)
+        && let Some(words) = literal_command(command)
+        && (crate::shellread::command(&words).is_some()
+            || matches!(words.as_slice(), [program, file] if program == "cat" && !file.starts_with('-')))
+    {
+        return true;
+    }
+    let rules = Rules {
+        mixed: false,
+        claude: false,
+        approves: true,
     };
     !plan(command, rules, |_| true).wrap.is_empty()
 }

@@ -31,6 +31,7 @@ mod polyglot;
 mod postroute;
 mod proxy;
 mod redact;
+mod rollouts;
 mod runners;
 mod rust_syntax;
 mod search;
@@ -236,7 +237,7 @@ fn cli() -> Command<'static> {
         )
         .subcommand(
             Command::new("discover")
-                .about("Find shell commands agents ran here without Justless, from Claude Code transcripts")
+                .about("Find shell commands agents ran here without Justless, from Claude Code transcripts and Codex rollouts")
                 .arg(number("days", "30", "Days of transcripts to scan"))
                 .arg(Arg::new("json").long("json").help("Print a JSON report"))
                 .arg(

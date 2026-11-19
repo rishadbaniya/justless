@@ -1,4 +1,5 @@
-//! Shell commands an agent ran, read from Claude Code transcripts and the run archive.
+//! Shell commands an agent ran, read from Claude Code transcripts, Codex rollouts and
+//! the run archive.
 //!
 //! Each event is one command with its directory relative to the workspace root, its
 //! exit status and a bounded copy of its output. Commands are normalized without
@@ -135,7 +136,10 @@ impl Tests {
 pub struct Event {
     pub thread: String,
     pub session: String,
+    /// Read from an agent transcript or rollout, which holds the text the agent read.
     pub transcript: bool,
+    /// Read from a Codex rollout rather than a Claude Code transcript.
+    pub codex: bool,
     pub time_ms: u64,
     /// The command as the agent wrote it. Used for privacy and operand checks only.
     pub raw: String,
@@ -385,11 +389,87 @@ fn accept(
     } else {
         Status::Code(0)
     };
+    let event = event(
+        workspace, normalizer, &content, status, call, thread, stats, linked,
+    );
+    Some(Event {
+        pointer: Pointer::Transcript {
+            file: thread.to_owned(),
+            line,
+        },
+        ..event
+    })
+}
+
+/// Shell commands from Codex rollouts of threads that started in this workspace,
+/// read like transcript results. A rule they support goes to AGENTS.md, which
+/// Codex reads.
+pub fn rollouts(
+    workspace: &Workspace,
+    since_ms: u64,
+    stats: &mut TranscriptStats,
+    result: &mut Transcripts,
+) {
+    let mut normalizer = Normalizer::new(&workspace.root);
+    let scan = crate::rollouts::scan(&workspace.root, since_ms, |shell| {
+        // A call a hook or the sandbox refused never ran.
+        let Some(code) = shell.status else {
+            stats.not_run += 1;
+            return;
+        };
+        let cwd = Path::new(&shell.cwd)
+            .strip_prefix(&workspace.root)
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let file = shell.file.to_string_lossy().into_owned();
+        let call = Pending {
+            command: shell.command,
+            cwd,
+            time_ms: shell.time_ms,
+            session: session_key(&shell.session),
+        };
+        let event = event(
+            workspace,
+            &mut normalizer,
+            &shell.output,
+            Status::Code(code),
+            call,
+            &file,
+            stats,
+            &mut result.linked,
+        );
+        result.events.push(Event {
+            codex: true,
+            pointer: Pointer::Transcript {
+                file,
+                line: shell.line,
+            },
+            ..event
+        });
+    });
+    stats.directory = scan.home.map(|home| home.join("sessions"));
+    stats.available = stats.directory.as_ref().is_some_and(|dir| dir.is_dir());
+    stats.files = scan.files;
+}
+
+/// An event from the text an agent read and the exit status it was given. The
+/// caller sets the pointer.
+#[allow(clippy::too_many_arguments)]
+fn event(
+    workspace: &Workspace,
+    normalizer: &mut Normalizer,
+    content: &str,
+    status: Status,
+    call: Pending,
+    thread: &str,
+    stats: &mut TranscriptStats,
+    linked: &mut BTreeSet<String>,
+) -> Event {
     stats.results += 1;
     stats.sessions.insert(call.session.clone());
     stats.threads.insert(thread.to_owned());
 
-    let body = bounded(&content);
+    let body = bounded(content);
     let mut texts = Vec::new();
     let mut tests = None;
     for captures in LINK.captures_iter(&body) {
@@ -417,10 +497,11 @@ fn accept(
     });
     release(&mut texts, status);
     let (shape, env) = normalizer.shell(&call.cwd, &call.command);
-    Some(Event {
+    Event {
         thread: thread.to_owned(),
         session: call.session,
         transcript: true,
+        codex: false,
         time_ms: call.time_ms,
         raw: call.command,
         env,
@@ -430,10 +511,10 @@ fn accept(
         tests,
         failure_bytes: content.len() as u64,
         pointer: Pointer::Transcript {
-            file: thread.to_owned(),
-            line,
+            file: String::new(),
+            line: 0,
         },
-    })
+    }
 }
 
 /// Archived runs from every client whose hooks route commands through `justless run`,
@@ -529,6 +610,7 @@ pub fn runs(
             thread: format!("run:{}", run.session),
             session: run.session.clone(),
             transcript: false,
+            codex: false,
             time_ms: run.completed_ms,
             raw: shlex::try_join(run.argv.iter().map(String::as_str))
                 .unwrap_or_else(|_| run.argv.join(" ")),

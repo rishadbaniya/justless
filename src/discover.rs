@@ -4,6 +4,7 @@
 //! `~/.claude/projects/<workspace path with non-alphanumerics as dashes>/`. Each
 //! Bash `tool_use` carries the command and each `tool_result` carries the output the
 //! model read. Only command labels such as `cargo test` and byte counts are reported.
+//! Codex rollouts for the workspace are read too; see [`crate::rollouts`].
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -21,7 +22,7 @@ use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Route {
+pub(crate) enum Route {
     ThroughJustless,
     SupportedNotRouted,
     /// A supported tool in a form the hooks pass through whole, such as a pipe.
@@ -56,10 +57,10 @@ static OUTLINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\Arevision [0-9a-f]+ · [0-9]+ lines\n").unwrap());
 
 #[derive(Default, Serialize)]
-struct Group {
-    commands: u64,
-    output_bytes: u64,
-    labels: BTreeMap<String, (u64, u64)>,
+pub(crate) struct Group {
+    pub commands: u64,
+    pub output_bytes: u64,
+    pub labels: BTreeMap<String, (u64, u64)>,
 }
 
 struct Call {
@@ -123,7 +124,7 @@ fn text_matches(content: &Value, pattern: &Regex) -> bool {
 /// Whether a command ran through Justless: its output has a run footer, its
 /// labelled command is a `justless` binary at any path, or it is a bare
 /// `cat FILE` whose result is the outline the hooks substitute.
-fn routed(command: &str, label: &str, content: &Value) -> bool {
+pub(crate) fn routed(command: &str, label: &str, content: &Value) -> bool {
     if text_matches(content, &FOOTER) {
         return true;
     }
@@ -155,6 +156,8 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
     let Some(dir) = transcript_dir(&workspace.root) else {
         anyhow::bail!("cannot locate the Claude Code configuration directory");
     };
+    let since_ms = now_ms().saturating_sub(days.saturating_mul(86_400_000));
+    let codex = crate::rollouts::coverage(&workspace.root, since_ms);
     // Sessions keep subagent transcripts under <session>/subagents/, and workflow
     // subagents one level deeper under subagents/workflows/<run>/.
     let mut files = Vec::new();
@@ -294,15 +297,8 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                     "compactable_now_bytes": e.now_bytes,
                 })).collect::<Vec<_>>()
             }),
-            "groups": groups.iter().map(|(route, g)| serde_json::json!({
-                "route": route,
-                "commands": g.commands,
-                "output_bytes": g.output_bytes,
-                "estimated_tokens": estimated_tokens(g.output_bytes),
-                "labels": g.labels.iter().map(|(label, (n, b))| serde_json::json!({
-                    "label": label, "commands": n, "output_bytes": b
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
+            "groups": groups_json(&groups),
+            "codex": codex.json(),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -312,6 +308,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             "No Claude Code shell commands found for this workspace in the last {days} day(s) under {}.",
             dir.display()
         );
+        print_codex(workspace, &codex, days);
         return Ok(());
     }
     println!(
@@ -319,26 +316,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
         sessions.len(),
         human_bytes(output)
     );
-    for (route, group) in &groups {
-        println!(
-            "\n{}: {} command(s) · {} output · ≈{} tokens",
-            route.title(),
-            group.commands,
-            human_bytes(group.output_bytes),
-            estimated_tokens(group.output_bytes)
-        );
-        let mut labels: Vec<_> = group.labels.iter().collect();
-        labels.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
-        let shown: Vec<_> = labels
-            .iter()
-            .take(8)
-            .map(|(label, (n, bytes))| format!("{label} ×{n} ({})", human_bytes(*bytes)))
-            .collect();
-        println!("  {}", shown.join(" · "));
-        if labels.len() > 8 {
-            println!("  +{} more command type(s)", labels.len() - 8);
-        }
-    }
+    print_groups(&groups);
     if plan {
         let mut entries: Vec<_> = unrouted.iter().collect();
         entries.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.0.cmp(b.0)));
@@ -365,7 +343,88 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             workspace.justless()
         );
     }
+    print_codex(workspace, &codex, days);
     Ok(())
+}
+
+pub(crate) fn groups_json(groups: &BTreeMap<Route, Group>) -> Vec<Value> {
+    groups
+        .iter()
+        .map(|(route, g)| {
+            serde_json::json!({
+                "route": route,
+                "commands": g.commands,
+                "output_bytes": g.output_bytes,
+                "estimated_tokens": estimated_tokens(g.output_bytes),
+                "labels": g.labels.iter().map(|(label, (n, b))| serde_json::json!({
+                    "label": label, "commands": n, "output_bytes": b
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+fn print_groups(groups: &BTreeMap<Route, Group>) {
+    for (route, group) in groups {
+        println!(
+            "\n{}: {} command(s) · {} output · ≈{} tokens",
+            route.title(),
+            group.commands,
+            human_bytes(group.output_bytes),
+            estimated_tokens(group.output_bytes)
+        );
+        let mut labels: Vec<_> = group.labels.iter().collect();
+        labels.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
+        let shown: Vec<_> = labels
+            .iter()
+            .take(8)
+            .map(|(label, (n, bytes))| format!("{label} ×{n} ({})", human_bytes(*bytes)))
+            .collect();
+        println!("  {}", shown.join(" · "));
+        if labels.len() > 8 {
+            println!("  +{} more command type(s)", labels.len() - 8);
+        }
+    }
+}
+
+/// The Codex part of the report, when Codex threads started in this workspace.
+fn print_codex(workspace: &Workspace, codex: &crate::rollouts::Coverage, days: u64) {
+    let scan = &codex.scan;
+    if scan.files == 0 {
+        return;
+    }
+    let total = codex.commands();
+    println!(
+        "\nCodex ran {total} shell command(s) here in the last {days} day(s), across {} session(s), returning {} of output.",
+        scan.sessions.len(),
+        human_bytes(codex.bytes())
+    );
+    if codex.nested > 0 {
+        println!(
+            "{} of them ran inside code-mode scripts, which received {} of that output.",
+            codex.nested,
+            human_bytes(codex.nested_bytes)
+        );
+    }
+    if scan.scripts > 0 {
+        println!(
+            "Code-mode scripts returned {} to the model in {} result(s){}.",
+            human_bytes(scan.script_bytes),
+            scan.scripts,
+            if codex.nested == 0 {
+                "; this Codex did not record the commands they ran"
+            } else {
+                ""
+            }
+        );
+    }
+    print_groups(&codex.groups);
+    if codex.groups.contains_key(&Route::SupportedNotRouted) {
+        println!(
+            "\nSupported commands reached Codex unfiltered. Install or refresh hooks with `{} init --hooks --agent codex`, trust them with /hooks in Codex, then start a new session.",
+            workspace.justless()
+        );
+    }
 }
 
 #[cfg(test)]
