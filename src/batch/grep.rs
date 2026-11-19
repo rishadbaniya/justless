@@ -8,7 +8,8 @@
 //! system grep, which prints files in its own fixed order.
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use super::parse::{Filter, local, number};
 use super::reads;
@@ -211,16 +212,51 @@ impl Grep {
 
 /// The ugrep built into Claude Code, as its `grep` function finds it: the path
 /// Claude Code exports to its shell, or the launcher the native installer links.
-/// Only a binary the native installer keeps under `versions/` is run.
-fn ugrep() -> Option<PathBuf> {
+/// Only a binary the native installer keeps under `versions/`, and that says
+/// it is ugrep when asked, is run with grep arguments.
+fn ugrep(deadline: Instant) -> Option<PathBuf> {
     let candidates = [
         std::env::var_os("CLAUDE_CODE_EXECPATH").map(PathBuf::from),
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/claude")),
     ];
     candidates.into_iter().flatten().find_map(|path| {
         let path = path.canonicalize().ok()?;
-        (path.is_file() && path.parent()?.file_name()? == "versions").then_some(path)
+        (path.is_file() && path.parent()?.file_name()? == "versions" && answers(&path, deadline))
+            .then_some(path)
     })
+}
+
+/// Whether `binary`, named `ugrep`, prints ugrep's version and exits. A
+/// version that ignored the name would start Claude Code itself, which goes
+/// online, so it is never given grep arguments. The verdict is kept for the
+/// binary as last modified, for the rest of the hook.
+fn answers(binary: &Path, deadline: Instant) -> bool {
+    static VERDICTS: Mutex<Vec<(PathBuf, SystemTime, bool)>> = Mutex::new(Vec::new());
+    let Ok(modified) = std::fs::metadata(binary).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let Ok(mut verdicts) = VERDICTS.lock() else {
+        return false;
+    };
+    if let Some((_, _, verdict)) = verdicts
+        .iter()
+        .find(|(path, time, _)| path == binary && *time == modified)
+    {
+        return *verdict;
+    }
+    let mut cmd = Command::new(binary);
+    cmd.current_dir("/")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--version");
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::arg0(&mut cmd, "ugrep");
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+    let verdict = cfg!(unix)
+        && super::bounded(&mut cmd, 4096, deadline)
+            .is_some_and(|(code, text)| code == 0 && text.starts_with("ugrep "));
+    verdicts.push((binary.to_owned(), modified, verdict));
+    verdict
 }
 
 struct Run<'a> {
@@ -350,7 +386,10 @@ pub(super) fn reproduce(
     let args = &grep.words[1..];
     let several = walks || grep.paths.len() > 1;
     // Only a Unix process can name the program it runs `ugrep`.
-    if let Some(binary) = (cfg!(unix) && !grep.system).then(ugrep).flatten() {
+    if let Some(binary) = (cfg!(unix) && !grep.system)
+        .then(|| ugrep(deadline))
+        .flatten()
+    {
         let found = if !several {
             run.ugrep(&binary, args).and_then(|(code, text)| {
                 let text = reads::filter(text, filters)?;

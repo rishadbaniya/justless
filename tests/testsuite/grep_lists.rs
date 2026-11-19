@@ -93,15 +93,12 @@ impl Fixture {
             .map(str::to_owned)
     }
 
-    /// Stand in for the ugrep Claude Code's shell runs, where its installer
-    /// keeps it: drop the options its `grep` function adds, and run grep.
-    fn embedded(&self) {
+    /// Install `script` where Claude Code's native installer keeps its binary,
+    /// with the launcher link its `grep` function looks for.
+    fn embedded(&self, script: &str) {
         let versions = self.home.path().join(".local/share/claude/versions");
         fs::create_dir_all(&versions).unwrap();
-        executable(
-            &versions.join("1.0.0"),
-            "#!/bin/sh\nshift 11\nexec /usr/bin/grep \"$@\"\n",
-        );
+        executable(&versions.join("1.0.0"), script);
         fs::create_dir_all(self.home.path().join(".local/bin")).unwrap();
         symlink(
             versions.join("1.0.0"),
@@ -112,6 +109,11 @@ impl Fixture {
 }
 
 const READ: &str = "sed -n 1,600p big.rs";
+
+/// A stand-in for Claude Code's ugrep: it names itself when asked, then drops
+/// the options the `grep` function adds and runs grep.
+const UGREP: &str = "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'ugrep 7.8.4'; exit 0; }\n\
+    shift 11\nexec /usr/bin/grep \"$@\"\n";
 
 #[test]
 fn each_grep_shape_keeps_its_exact_range_and_replay() {
@@ -211,7 +213,7 @@ fn files_claude_codes_ugrep_printed_in_any_order_are_checked_one_by_one() {
     assert_eq!(cut.lines().count(), 3);
     // The system grep prints files in its own order only.
     assert_eq!(fixture.view(&list, &shuffled), None);
-    fixture.embedded();
+    fixture.embedded(UGREP);
     let view = fixture.view(&list, &shuffled).expect("compacted");
     has(&view, &format!("$ {piece} [stdout:"));
     assert!(fixture.view(&head, &format!("{read}{cut}")).is_some());
@@ -224,4 +226,43 @@ fn files_claude_codes_ugrep_printed_in_any_order_are_checked_one_by_one() {
     assert_eq!(fixture.view(&wrapped, &shuffled), None);
     let raw = fixture.sh(&wrapped);
     assert!(fixture.view(&wrapped, &raw).is_some());
+}
+
+#[test]
+fn a_binary_that_is_not_ugrep_is_never_given_grep_arguments() {
+    let piece = "grep -rn needle_2 src";
+    let list = format!("{READ}; {piece}");
+    for answer in [
+        // A Claude Code that ignores the name it was started as.
+        "echo '2.1.0 (Claude Code)'",
+        // One that fails, or never answers.
+        "exit 1",
+        "exec sleep 30",
+    ] {
+        let fixture = Fixture::new();
+        let calls = fixture.home.path().join("calls");
+        fixture.embedded(&format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n{answer}\n",
+            calls.display()
+        ));
+        let read = fixture.sh(READ);
+        let block = |file: &str| fixture.sh(&format!("grep -Hn needle_2 {file}"));
+        let (a, b) = (block("src/a.rs"), block("src/b.rs"));
+        let raw = fixture.sh(&list);
+        // The other order from the one the system grep prints.
+        let shuffled = if raw == format!("{read}{a}{b}") {
+            format!("{read}{b}{a}")
+        } else {
+            format!("{read}{a}{b}")
+        };
+        assert_ne!(raw, shuffled);
+        // The system grep takes over: its own order compacts, another does not.
+        assert!(fixture.view(&list, &raw).is_some(), "{answer}");
+        assert_eq!(fixture.view(&list, &shuffled), None, "{answer}");
+        let seen = fs::read_to_string(&calls).unwrap_or_default();
+        assert!(
+            !seen.is_empty() && seen.lines().all(|l| l == "--version"),
+            "{answer}: {seen}"
+        );
+    }
 }
