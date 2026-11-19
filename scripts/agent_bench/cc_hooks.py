@@ -20,6 +20,21 @@ import sandbox
 
 CONTEXT_FILE_LIMIT = 10000
 CONTEXT_PREVIEW = 2000
+# Justless's stand-in for the machine's managed settings directory.
+MANAGED_OVERRIDE = "JUSTLESS_TEST_CLAUDE_MANAGED_DIR"
+
+
+def pinned_settings(env, root):
+    """The hook environment with Claude Code's user and managed settings pinned under the run's home.
+
+    The command hook reads permission rules from those settings, so the machine's own files would
+    change what it routes. Both paths sit under HOME, which the run's sandbox lets the hook read.
+    """
+    env = dict(env)
+    home = Path(env.get("HOME") or Path(root).parent / "home")
+    env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
+    env[MANAGED_OVERRIDE] = str(home / ".claude-managed")
+    return env
 
 
 class HookEvent:
@@ -46,7 +61,7 @@ class HookRunner:
     def __init__(self, root, env, profile_path=None, session_id=None, transcript_path=None,
                  permission_mode="bypassPermissions", effort="medium", context_dir=None):
         self.root = Path(root)
-        self.env = dict(env)
+        self.env = pinned_settings(env, self.root)
         self.profile_path = profile_path
         self.session_id = session_id or str(uuid.uuid4())
         self.transcript_path = str(transcript_path or (self.root.parent / "home" / "transcript.jsonl"))

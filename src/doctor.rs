@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::agents::{self, AGENTS, Agent};
+use crate::claude_permissions;
 use crate::history::{human_bytes, now_ms};
 use crate::mcp::Client;
 use crate::workspace::{PROJECT_MARKERS, Settings, Workspace};
@@ -382,11 +383,18 @@ impl Doctor<'_> {
                     );
                 }
                 section.checks.extend(audit.checks);
+                // Claude Code's permission rules decide what its command hook routes.
+                let rules = (profile.agent == Agent::Claude).then(|| {
+                    let root = &self.workspace.root;
+                    claude_permissions::load(&claude_permissions::Sources::locate(root, root))
+                });
                 if audit.hooked {
-                    section.checks.extend(routing_note(profile, &facts));
+                    section
+                        .checks
+                        .extend(routing_note(profile, &facts, rules.as_ref()));
                 }
-                if profile.agent == Agent::Claude {
-                    section.checks.extend(self.claude_permission_checks());
+                if let Some(rules) = &rules {
+                    section.checks.extend(self.claude_permission_checks(rules));
                 }
                 status = section.worst();
                 sections.push(section);
@@ -915,28 +923,46 @@ impl Doctor<'_> {
         }
     }
 
-    /// Claude Code allow rules, such as `Bash(justless run *)` saved by "Yes, and
-    /// don't ask again" on a routed command, that let the agent run any command as
-    /// `justless run -- COMMAND` without asking. The command hook does not need
-    /// them: it approves a routed command when the rules allow the command itself.
-    fn claude_permission_checks(&self) -> Vec<Check> {
-        let sources =
-            crate::claude_permissions::Sources::locate(&self.workspace.root, &self.workspace.root);
-        crate::claude_permissions::broad_justless_rules(&sources)
-            .into_iter()
-            .map(|(file, rule)| {
-                let file = self.relative(&file.display().to_string());
-                Check::new(
-                    Status::Warn,
-                    format!(
-                        "Permissions: {rule} in {file} lets the agent run any command without asking, as `justless run -- COMMAND`"
-                    ),
+    /// Claude Code settings files the command hook cannot use, which stop it from
+    /// rewriting any command, and allow rules, such as `Bash(justless run *)` saved
+    /// by "Yes, and don't ask again" on a routed command, that let the agent run any
+    /// command as `justless run -- COMMAND` without asking. The command hook does
+    /// not need those: it approves a routed command when the rules allow the
+    /// command itself.
+    fn claude_permission_checks(&self, rules: &claude_permissions::Rules) -> Vec<Check> {
+        let unusable = rules.broken().iter().map(|broken| {
+            let file = self.relative(&broken.path.display().to_string());
+            Check::new(
+                Status::Warn,
+                format!(
+                    "Permissions: cannot use Claude Code settings {file} ({}), so the command hook leaves every command as written, in every permission mode",
+                    broken.problem
+                ),
+            )
+            .fix(Fix::Manual(if broken.path.is_dir() {
+                format!("Make {file} readable by this user")
+            } else if broken.path.is_relative() {
+                // No variable locates the user settings file.
+                "Set HOME, or CLAUDE_CONFIG_DIR, in the environment Claude Code and its hooks run in".into()
+            } else {
+                format!(
+                    "Fix {file} so that it reads as a JSON object whose `permissions` lists hold strings, or remove it; `claude doctor` also names what Claude Code rejects"
                 )
-                .fix(Fix::Manual(format!(
-                    "Remove {rule} from {file}, and allow the commands themselves instead, such as Bash(cargo test *); the command hook approves a routed command those rules allow"
-                )))
-            })
-            .collect()
+            }))
+        });
+        let broad = rules.broad_justless_rules().into_iter().map(|(file, rule)| {
+            let file = self.relative(&file.display().to_string());
+            Check::new(
+                Status::Warn,
+                format!(
+                    "Permissions: {rule} in {file} lets the agent run any command without asking, as `justless run -- COMMAND`"
+                ),
+            )
+            .fix(Fix::Manual(format!(
+                "Remove {rule} from {file}, and allow the commands themselves instead, such as Bash(cargo test *); the command hook approves a routed command those rules allow"
+            )))
+        });
+        unusable.chain(broad).collect()
     }
 
     /// The agent's hook file: whether it holds Justless entries, and its checks.
@@ -1715,8 +1741,14 @@ fn retention(settings: &Settings) -> Option<(usize, u64)> {
 
 /// The note for a configured client when no hook has routed a command yet. Runs
 /// do not record which client routed them, so any hook-routed run, or a command a
-/// hook passed through, counts for every client.
-fn routing_note(profile: &Profile, facts: &Facts) -> Option<Check> {
+/// hook passed through, counts for every client. For Claude Code, `rules` are its
+/// permission rules, which can make the command hook leave commands as written.
+fn routing_note(
+    profile: &Profile,
+    facts: &Facts,
+    rules: Option<&claude_permissions::Rules>,
+) -> Option<Check> {
+    use claude_permissions::{Answer, Verdict, answer};
     if profile.agent == Agent::OpenCode || facts.hook_runs > 0 || facts.passed_through > 0 {
         return None;
     }
@@ -1725,11 +1757,22 @@ fn routing_note(profile: &Profile, facts: &Facts) -> Option<Check> {
     } else {
         " here".into()
     };
+    let label = profile.label;
+    let advice = match rules.map(|rules| (rules.broken().is_empty(), rules.default_mode())) {
+        Some((false, _)) => "While a Claude Code settings file cannot be used, the command hook leaves every command as written; see Permissions below.".to_owned(),
+        Some((true, mode)) if answer(mode, Verdict::Allow) == Answer::Leave => format!(
+            "Your settings start sessions in `{mode}` permission mode, where the command hook leaves every command as written. Start a session in another mode, then run a build or test."
+        ),
+        Some((true, mode)) if answer(mode, Verdict::Unknown) == Answer::Leave => format!(
+            "Your settings start sessions in `{mode}` permission mode, where the command hook routes only commands that allow rules cover and leaves the rest for {label} to ask about. Allow the builds and tests you run, such as Bash(cargo test *), or answer \"Yes, and don't ask again\" when {label} asks, then run one; `justless discover` counts the commands the hook left."
+        ),
+        _ => format!("Start a new {label} session in this project and run a build or test."),
+    };
     Some(Check::new(
         Status::Warn,
         format!(
-            "{} has not routed a command through Justless{scope} yet. Start a new {} session in this project and run a build or test.{}",
-            profile.label, profile.label, profile.trust
+            "{label} has not routed a command through Justless{scope} yet. {advice}{}",
+            profile.trust
         ),
     ))
 }

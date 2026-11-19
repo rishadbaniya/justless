@@ -25,6 +25,9 @@ use crate::workspace::Workspace;
 pub(crate) enum Route {
     ThroughJustless,
     SupportedNotRouted,
+    /// A supported command that the Claude Code hook leaves as written under the
+    /// current permission rules and the session's mode.
+    LeftByPermissions,
     /// A supported tool in a form the hooks pass through whole, such as a pipe.
     PassedThrough,
     NotSupported,
@@ -35,6 +38,7 @@ impl Route {
         match self {
             Self::ThroughJustless => "Through Justless",
             Self::SupportedNotRouted => "Supported, not routed",
+            Self::LeftByPermissions => "Supported, left to Claude Code's permission rules",
             Self::PassedThrough => "Supported tool, passed through",
             Self::NotSupported => "Not supported yet",
         }
@@ -66,6 +70,8 @@ pub(crate) struct Group {
 struct Call {
     command: String,
     date: String,
+    /// The permission mode the transcript last recorded before the call.
+    mode: Option<String>,
 }
 
 pub(crate) fn transcript_dir(root: &Path) -> Option<PathBuf> {
@@ -145,6 +151,8 @@ struct PlanEntry {
     bytes: u64,
     now_commands: u64,
     now_bytes: u64,
+    left_commands: u64,
+    left_bytes: u64,
 }
 
 pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> Result<()> {
@@ -162,12 +170,18 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
     // subagents one level deeper under subagents/workflows/<run>/.
     let mut files = Vec::new();
     transcripts(&dir, since, 6, &mut files);
-    files.sort();
+    // Each session's own transcript first, so its subagents can take its mode.
+    files.sort_by_cached_key(|file| (file.parent() != Some(dir.as_path()), file.clone()));
 
     let root = workspace.root.to_string_lossy().into_owned();
     let mut groups: BTreeMap<Route, Group> = BTreeMap::new();
     let mut unrouted: BTreeMap<String, PlanEntry> = BTreeMap::new();
     let mut sessions = BTreeSet::new();
+    // Claude Code's permission rules, read once a transcript records a mode.
+    let mut rules: Option<crate::claude_permissions::Rules> = None;
+    // The modes each session's own transcript recorded, for its subagents'
+    // transcripts, which record none.
+    let mut session_modes: HashMap<String, BTreeSet<String>> = HashMap::new();
     for file in &files {
         // <session>.jsonl and everything under <session>/ belong to one session.
         let session = file
@@ -179,6 +193,12 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                 name.strip_suffix(".jsonl").unwrap_or(&name).to_owned()
             })
             .unwrap_or_default();
+        let own = file.parent() == Some(dir.as_path());
+        // A subagent takes its session's mode when the session recorded only one.
+        let mut mode = session_modes
+            .get(&session)
+            .filter(|modes| modes.len() == 1)
+            .and_then(|modes| modes.first().cloned());
         let mut calls: HashMap<String, Call> = HashMap::new();
         let Ok(handle) = File::open(file) else {
             continue;
@@ -187,13 +207,26 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             let Ok(line) = line else {
                 break;
             };
-            // Skip cheaply before parsing: only tool calls and results matter.
-            if !line.contains("\"tool_use\"") && !line.contains("\"tool_result\"") {
+            // Skip cheaply before parsing: only tool calls, results and the
+            // permission mode matter.
+            if !line.contains("\"tool_use\"")
+                && !line.contains("\"tool_result\"")
+                && !line.contains("\"permissionMode\"")
+            {
                 continue;
             }
             let Ok(entry) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if let Some(recorded) = entry["permissionMode"].as_str() {
+                mode = Some(recorded.to_owned());
+                if own {
+                    session_modes
+                        .entry(session.clone())
+                        .or_default()
+                        .insert(recorded.to_owned());
+                }
+            }
             if entry["cwd"]
                 .as_str()
                 .is_some_and(|cwd| cwd != root && !cwd.starts_with(&format!("{root}/")))
@@ -219,6 +252,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                                 Call {
                                     command: command.to_owned(),
                                     date: date.to_owned(),
+                                    mode: mode.clone(),
                                 },
                             );
                         }
@@ -239,7 +273,22 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                         let route = if routed(&call.command, &label, content) {
                             Route::ThroughJustless
                         } else if crate::agents::would_route(&call.command) {
-                            Route::SupportedNotRouted
+                            // Without a recorded mode the hook rewrites as it
+                            // always has.
+                            let left = call.mode.as_deref().is_some_and(|mode| {
+                                let rules = rules.get_or_insert_with(|| {
+                                    let root = &workspace.root;
+                                    crate::claude_permissions::load(
+                                        &crate::claude_permissions::Sources::locate(root, root),
+                                    )
+                                });
+                                crate::agents::left_by_permissions(&call.command, mode, rules)
+                            });
+                            if left {
+                                Route::LeftByPermissions
+                            } else {
+                                Route::SupportedNotRouted
+                            }
                         } else if crate::agents::would_route(&label) {
                             Route::PassedThrough
                         } else {
@@ -250,6 +299,10 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                             let entry = unrouted.entry(label.clone()).or_default();
                             entry.commands += 1;
                             entry.bytes += bytes;
+                            if route == Route::LeftByPermissions {
+                                entry.left_commands += 1;
+                                entry.left_bytes += bytes;
+                            }
                             // The command hook would route it, or the post-command
                             // hook would outline a range read or a read list.
                             if route == Route::SupportedNotRouted
@@ -295,6 +348,8 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                     "output_bytes": e.bytes,
                     "compactable_now_commands": e.now_commands,
                     "compactable_now_bytes": e.now_bytes,
+                    "left_by_permissions_commands": e.left_commands,
+                    "left_by_permissions_bytes": e.left_bytes,
                 })).collect::<Vec<_>>()
             }),
             "groups": groups_json(&groups),
@@ -330,8 +385,16 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             } else {
                 String::new()
             };
+            let left = if entry.left_bytes > 0 {
+                format!(
+                    " · {} left to permission rules",
+                    human_bytes(entry.left_bytes)
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "  {label} ×{} ({}){now}",
+                "  {label} ×{} ({}){now}{left}",
                 entry.commands,
                 human_bytes(entry.bytes)
             );
@@ -341,6 +404,19 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
         println!(
             "\nSupported commands reached the agent unfiltered. Install or refresh hooks with `{} init --hooks --agent claude`, then start a new session.",
             workspace.justless()
+        );
+    }
+    if groups.contains_key(&Route::LeftByPermissions) {
+        let unreadable = rules
+            .as_ref()
+            .is_some_and(|rules| !rules.broken().is_empty());
+        println!(
+            "\nThe command hook leaves a supported command for Claude Code to judge when an ask or deny rule might match it, and in default, acceptEdits and dontAsk modes when no allow rule covers it. Allow the commands you run, such as Bash(cargo test *), rather than Bash(justless …), to route them.{}",
+            if unreadable {
+                " A Claude Code settings file cannot be read, so the hook leaves every command; `justless doctor` names it."
+            } else {
+                ""
+            }
         );
     }
     print_codex(workspace, &codex, days);

@@ -44,6 +44,16 @@ class HookTests(unittest.TestCase):
         self.assertIn("justless run --hook", executed["command"])
         self.assertEqual(original["command"], "git diff")
 
+    def test_claude_settings_are_pinned_under_the_run_home(self):
+        home = self.run_dir / "home"
+        self.assertEqual(self.hooks.env["CLAUDE_CONFIG_DIR"], str(home / ".claude"))
+        managed = home / ".claude-managed"
+        self.assertEqual(self.hooks.env[cc_hooks.MANAGED_OVERRIDE], str(managed))
+        managed.mkdir(parents=True)
+        (managed / "managed-settings.json").write_text(json.dumps({"permissions": {"deny": ["Bash(git diff:*)"]}}))
+        executed, notes, blocked = self.hooks.pre_tool("Bash", {"command": "git diff"}, "t0")
+        self.assertEqual(executed, {"command": "git diff"})
+
     def test_read_outline_replaces_structured_output(self):
         outcome = self.ws.read({"file_path": str(self.root / "src" / "big.rs")})
         before = outcome.text()

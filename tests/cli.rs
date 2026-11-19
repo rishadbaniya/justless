@@ -1251,6 +1251,73 @@ fn claude_hook_keeps_the_permission_rules_of_the_original_command() {
     );
 }
 
+/// Claude Code keeps "don't ask again" rules in the local settings file at the
+/// repository root, resolved through a worktree to the main checkout.
+#[cfg(unix)]
+#[test]
+fn claude_hook_reads_allow_rules_from_the_repository_local_file() {
+    let temp = TempDir::new().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let main = base.join("main");
+    let worktree = base.join("wt");
+    fs::create_dir_all(main.join("sub")).unwrap();
+    fs::write(main.join("sub/a.txt"), "a\n").unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-qm", "init"]);
+    git(
+        &main,
+        &["worktree", "add", "-q", worktree.to_str().unwrap()],
+    );
+    fs::create_dir(main.join(".claude")).unwrap();
+    fs::write(
+        main.join(".claude/settings.local.json"),
+        r#"{"permissions":{"allow":["Bash(git status:*)"]}}"#,
+    )
+    .unwrap();
+    // Claude Code reads the shared file only where the session started.
+    fs::write(
+        main.join(".claude/settings.json"),
+        r#"{"permissions":{"allow":["Bash(git log:*)"]}}"#,
+    )
+    .unwrap();
+    let answer = |project: &Path, command: &str, home: &Path| {
+        let input = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+            "cwd":project,"permission_mode":"default","tool_input":{"command":command}});
+        let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(["hook-claude", "before-command"])
+            .current_dir(project)
+            .envs(no_claude_settings(&base))
+            .env("CLAUDE_PROJECT_DIR", project)
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        claude_answer(&serde_json::from_slice(&output.stdout).unwrap())
+    };
+    let home = base.join("home");
+    for project in [main.join("sub"), worktree] {
+        assert_eq!(
+            answer(&project, "git status", &home),
+            "approve",
+            "{project:?}"
+        );
+        assert_eq!(
+            answer(&project, "git log -1", &home),
+            "leave",
+            "{project:?}"
+        );
+    }
+    // When the repository root is the home directory, Claude Code keeps the file
+    // where the session started.
+    assert_eq!(answer(&main.join("sub"), "git status", &main), "leave");
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_warns_about_allow_rules_that_let_justless_run_anything() {
@@ -1287,6 +1354,33 @@ fn doctor_warns_about_allow_rules_that_let_justless_run_anything() {
         "{text}"
     );
     assert!(!text.contains("justless query"), "{text}");
+    assert!(
+        text.contains("routes only commands that allow rules cover"),
+        "{text}"
+    );
+
+    // In bypassPermissions mode the hook routes what no rule covers.
+    fs::write(
+        &user,
+        r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+    )
+    .unwrap();
+    let (_, text) = doctor_text(root, tools.path());
+    assert!(
+        text.contains("here yet. Start a new Claude Code session"),
+        "{text}"
+    );
+    // A settings file the hook cannot use stops it from routing in every mode.
+    fs::write(&user, "{").unwrap();
+    let (_, text) = doctor_text(root, tools.path());
+    assert!(
+        text.contains(&format!(
+            "! Permissions: cannot use Claude Code settings {} (not valid JSON: EOF while parsing an object at line 1 column 1), so the command hook leaves every command as written, in every permission mode",
+            user.display()
+        )) && text.contains(&format!("by hand: Fix {} so that", user.display()))
+            && text.contains("here yet. While a Claude Code settings file cannot be used"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -2758,6 +2852,90 @@ fn discover_classifies_claude_code_shell_commands() {
             && text.contains("Supported, not routed: 1 command(s) · 3.9 KB output · ≈1000 tokens\n  cargo test ×1 (3.9 KB)")
             && text.contains("justless init --hooks --agent claude")
             && !text.contains("x".repeat(20).as_str()),
+        "{text}"
+    );
+}
+
+/// A supported command that the Claude Code hook leaves as written under the
+/// permission rules and the recorded mode is counted apart from one no hook saw.
+#[test]
+fn discover_separates_commands_left_to_claude_code_permissions() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("work");
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    let root = root.canonicalize().unwrap();
+    fs::write(
+        root.join(".claude/settings.local.json"),
+        r#"{"permissions":{"allow":["Bash(git status:*)"]}}"#,
+    )
+    .unwrap();
+    let config = repo.path().join("claude");
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = config.join("projects").join(slug);
+    let transcript = |file: &str, mode: Option<&str>, calls: &[(&str, &str, usize)]| {
+        let mut lines: Vec<String> = mode
+            .map(|mode| {
+                serde_json::json!({"type":"permission-mode","permissionMode":mode}).to_string()
+            })
+            .into_iter()
+            .collect();
+        for (id, command, bytes) in calls {
+            lines.push(serde_json::json!({"type":"assistant","cwd":root,"timestamp":"2999-01-01T00:00:00Z",
+                "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}}).to_string());
+            lines.push(serde_json::json!({"type":"user","cwd":root,"timestamp":"2999-01-01T00:00:01Z",
+                "message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"x".repeat(*bytes)}]}}).to_string());
+        }
+        let path = transcripts.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, lines.join("\n")).unwrap();
+    };
+    // In default mode the hook leaves a command no allow rule covers, and a
+    // subagent takes its session's only mode. Without a mode it always rewrites.
+    transcript(
+        "s1.jsonl",
+        Some("default"),
+        &[("a", "cargo test", 1000), ("b", "git status", 10)],
+    );
+    transcript(
+        "s1/subagents/agent-1.jsonl",
+        None,
+        &[("c", "cargo build", 300)],
+    );
+    transcript("s2.jsonl", None, &[("d", "cargo test", 20)]);
+    let discover = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .arg("discover")
+            .args(args)
+            .current_dir(&root)
+            .env("CLAUDE_CONFIG_DIR", &config)
+            .env(
+                "JUSTLESS_TEST_CLAUDE_MANAGED_DIR",
+                repo.path().join("managed"),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    };
+    let report: serde_json::Value = serde_json::from_str(&discover(&["--json", "--plan"])).unwrap();
+    let groups = report["groups"].as_array().unwrap();
+    let route = |name: &str| groups.iter().find(|g| g["route"] == name).unwrap();
+    assert_eq!(route("left_by_permissions")["commands"], 2);
+    assert_eq!(route("left_by_permissions")["output_bytes"], 1300);
+    assert_eq!(route("supported_not_routed")["commands"], 2);
+    let rows = report["plan"].as_array().unwrap();
+    let row = rows.iter().find(|r| r["label"] == "cargo test").unwrap();
+    assert_eq!(row["left_by_permissions_bytes"], 1000);
+    assert_eq!(row["compactable_now_bytes"], 20);
+    let text = discover(&["--plan"]);
+    assert!(
+        text.contains("Supported, left to Claude Code's permission rules: 2 command(s)")
+            && text.contains("cargo test ×2 (1020 B) · 20 B would compact now with a hook or `run --` · 1000 B left to permission rules")
+            && text.contains("Allow the commands you run, such as Bash(cargo test *)"),
         "{text}"
     );
 }
@@ -6360,10 +6538,11 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
             "✓ Instructions: {file} has the current Justless block"
         )));
     }
-    // Configured clients that never routed a command say so, recognizably.
+    // Configured clients that never routed a command say so, recognizably. Claude
+    // Code starts in default mode, where the hook routes only allowed commands.
     assert!(text.contains(
-        "! Claude Code has not routed a command through Justless here yet. Start a new Claude Code session"
-    ));
+        "! Claude Code has not routed a command through Justless here yet. Your settings start sessions in `default` permission mode, where the command hook routes only commands that allow rules cover"
+    ), "{text}");
     assert!(text.contains("In Codex, review and trust the project hooks with /hooks first."));
     assert!(text.contains("CLI not found on PATH (looked for cursor, cursor-agent)"));
 

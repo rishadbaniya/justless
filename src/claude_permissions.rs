@@ -24,6 +24,17 @@
 //!   Support/ClaudeCode/` on macOS and `/etc/claude-code/` on Linux, as
 //!   `managed-settings.json` followed by `managed-settings.d/*.json` in alphabetical
 //!   order, without hidden files.
+//! - "If you start Claude Code in a subdirectory of a git repository, it reads and
+//!   writes [`.claude/settings.local.json`] at the repository root", and "In a
+//!   worktree, it uses the file at the main checkout's root". It keeps the file with
+//!   `.claude/settings.json` instead "outside a git repository, when the repository
+//!   root is your home directory, on Windows, or when the repository root or its
+//!   `.git` or `.claude` entry isn't owned by your user", and it "still reads a file
+//!   an earlier version left there [in the starting directory] alongside the root
+//!   file". Claude Code before v2.1.211 read only the starting directory's file.
+//! - `permissions.defaultMode` comes from the highest of managed, local, project and
+//!   user settings that sets it, and "values `auto` and `bypassPermissions` don't
+//!   take effect from project or local settings".
 //!
 //! The rules are read so that every mistake is safe: allow rules count only in a
 //! narrow form that Claude Code certainly honors, while ask and deny rules match
@@ -52,6 +63,10 @@ pub struct Sources {
     /// The directory whose `.claude/settings.json` and `.claude/settings.local.json`
     /// Claude Code reads for the session.
     project: PathBuf,
+    /// The root of the main checkout of the Git repository that holds `project`,
+    /// where Claude Code keeps the local settings file, with whether that place is
+    /// certain enough for the file's allow rules to count.
+    repository: Option<(PathBuf, bool)>,
     /// Other directories whose `.claude/` files may apply, such as the repository
     /// root that keeps the local file of a session started in a subdirectory. Only
     /// their ask and deny rules count.
@@ -69,13 +84,11 @@ impl Sources {
             .map(PathBuf::from)
             .or_else(|| variable(home).map(|home| PathBuf::from(home).join(".claude")))
             .map(|dir| dir.join("settings.json"));
-        let same = |a: &Path, b: &Path| {
-            a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
-        };
         Self {
             managed,
             user,
             project: project.to_path_buf(),
+            repository: repository(project).filter(|(dir, _)| !same(dir, project)),
             nearby: (!same(project, root))
                 .then(|| root.to_path_buf())
                 .into_iter()
@@ -91,6 +104,80 @@ impl Sources {
             .map_or_else(|| root.to_path_buf(), PathBuf::from);
         Self::locate(&project, root)
     }
+}
+
+/// The root of the Git repository that holds `dir`, resolved through a linked
+/// worktree to its main checkout, as Claude Code places the local settings file.
+/// The flag is false where Claude Code may keep the file elsewhere: beside a `.git`
+/// file that is not a linked worktree's, such as a submodule's, and in the cases
+/// [`owned`] checks.
+fn repository(dir: &Path) -> Option<(PathBuf, bool)> {
+    let mut top = None;
+    for ancestor in dir.ancestors() {
+        match fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(metadata) => {
+                top = Some((ancestor, metadata.is_dir()));
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    let (top, checkout) = top?;
+    // A linked worktree's `.git` file names its Git directory, whose `commondir`
+    // leads to the main checkout's `.git` directory.
+    let main = if checkout {
+        Some(top.to_path_buf())
+    } else {
+        fs::read_to_string(top.join(".git"))
+            .ok()
+            .and_then(|text| Some(top.join(text.trim().strip_prefix("gitdir:")?.trim())))
+            .and_then(|git| {
+                let common = fs::read_to_string(git.join("commondir")).ok()?;
+                git.join(common.trim()).canonicalize().ok()
+            })
+            .filter(|common| common.file_name() == Some(".git".as_ref()))
+            .and_then(|common| common.parent().map(Path::to_path_buf))
+    };
+    Some(match main {
+        Some(main) => {
+            let certain = owned(&main);
+            (main, certain)
+        }
+        None => (top.to_path_buf(), false),
+    })
+}
+
+/// Whether Claude Code keeps the local settings file at the repository root
+/// `root`: not on Windows, not in the home directory, and only when the effective
+/// user owns the root and its `.git` and `.claude` entries.
+#[cfg(unix)]
+fn owned(root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let user = unsafe { libc::geteuid() };
+    let mine = |metadata: io::Result<fs::Metadata>| metadata.is_ok_and(|m| m.uid() == user);
+    !same(root, Path::new(&home))
+        && mine(fs::metadata(root))
+        && mine(fs::symlink_metadata(root.join(".git")))
+        && mine(fs::symlink_metadata(root.join(".claude")))
+}
+
+#[cfg(not(unix))]
+fn owned(_: &Path) -> bool {
+    false
+}
+
+/// Whether two paths name the same file.
+fn same(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 fn system_managed() -> PathBuf {
@@ -110,8 +197,10 @@ pub struct Rules {
     allow: Vec<String>,
     ask: Vec<String>,
     deny: Vec<String>,
-    /// A file exists but could not be read or parsed, so it might deny anything.
-    broken: bool,
+    /// Files that exist but could not be read or used, so they might deny anything.
+    broken: Vec<Broken>,
+    /// The `permissions.defaultMode` that applies, with the scope of its file.
+    default_mode: Option<(Scope, String)>,
     /// A file sets `blockReadsOutsideWorkingDirectories` or
     /// `blockWritesOutsideWorkingDirectories`.
     blocks_paths: bool,
@@ -119,10 +208,19 @@ pub struct Rules {
     found: Vec<(PathBuf, String)>,
 }
 
+/// A settings file, or the managed drop-in directory, that exists but cannot be
+/// read or used.
+#[derive(Debug)]
+pub struct Broken {
+    pub path: PathBuf,
+    /// What is wrong, such as `expected value at line 1 column 1`.
+    pub problem: String,
+}
+
 /// One settings file as read.
 enum Loaded {
     Missing,
-    Broken,
+    Broken(String),
     Settings(Value),
 }
 
@@ -130,7 +228,8 @@ fn read(path: &Path) -> Loaded {
     match fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
             Ok(value) if value.is_object() => Loaded::Settings(value),
-            _ => Loaded::Broken,
+            Ok(_) => Loaded::Broken("not a JSON object".into()),
+            Err(error) => Loaded::Broken(format!("not valid JSON: {error}")),
         },
         Err(error)
             if matches!(
@@ -140,21 +239,29 @@ fn read(path: &Path) -> Loaded {
         {
             Loaded::Missing
         }
-        Err(_) => Loaded::Broken,
+        Err(error) => Loaded::Broken(error.to_string()),
     }
 }
 
-/// The managed files in the order Claude Code merges them, or `None` when the
-/// drop-in directory exists but cannot be listed.
-fn managed_files(dir: &Path) -> Option<Vec<PathBuf>> {
+/// The managed files in the order Claude Code merges them, or the problem when
+/// the drop-in directory exists but cannot be listed.
+fn managed_files(dir: &Path) -> Result<Vec<PathBuf>, Broken> {
     let mut files = vec![dir.join("managed-settings.json")];
     let drop_ins = dir.join("managed-settings.d");
+    let unlisted = |problem: String| Broken {
+        path: drop_ins.clone(),
+        problem,
+    };
     match fs::read_dir(&drop_ins) {
         Ok(entries) => {
             let mut names = BTreeSet::new();
             for entry in entries {
-                let name = entry.ok()?.file_name();
-                let name = name.to_str()?.to_owned();
+                let name = entry
+                    .map_err(|error| unlisted(error.to_string()))?
+                    .file_name();
+                let name = name
+                    .into_string()
+                    .map_err(|_| unlisted("a file name is not UTF-8".into()))?;
                 if !name.starts_with('.') && name.ends_with(".json") {
                     names.insert(name);
                 }
@@ -166,30 +273,36 @@ fn managed_files(dir: &Path) -> Option<Vec<PathBuf>> {
                 error.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
             ) => {}
-        Err(_) => return None,
+        Err(error) => return Err(unlisted(error.to_string())),
     }
-    Some(files)
+    Ok(files)
 }
 
-/// A rule list under `permissions`, or `None` when the file holds something
+/// A rule list under `permissions`, or the problem when the file holds something
 /// Claude Code would reject. Allow lists skip entries that are not strings, as
 /// Claude Code skips malformed entries; for ask and deny such an entry might deny.
-fn list(settings: &Value, name: &str) -> Option<Vec<String>> {
+fn list(settings: &Value, name: &str) -> Result<Vec<String>, String> {
     let permissions = match settings.get("permissions") {
-        None | Some(Value::Null) => return Some(Vec::new()),
+        None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Object(permissions)) => permissions,
-        Some(_) => return None,
+        Some(_) => return Err("`permissions` is not an object".into()),
     };
     match permissions.get(name) {
-        None | Some(Value::Null) => Some(Vec::new()),
+        None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => {
             let rules: Vec<String> = items
                 .iter()
                 .filter_map(|item| item.as_str().map(str::to_owned))
                 .collect();
-            (name == "allow" || rules.len() == items.len()).then_some(rules)
+            if name == "allow" || rules.len() == items.len() {
+                Ok(rules)
+            } else {
+                Err(format!(
+                    "`permissions.{name}` holds a rule that is not a string"
+                ))
+            }
         }
-        Some(_) => None,
+        Some(_) => Err(format!("`permissions.{name}` is not a list")),
     }
 }
 
@@ -205,49 +318,102 @@ fn managed_only(settings: &Value) -> bool {
     .any(|value| !matches!(value, Value::Null | Value::Bool(false)))
 }
 
+/// Where a settings file sits, from the lowest precedence to the highest.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Scope {
+    /// A file Claude Code may read for the session: only its ask and deny rules
+    /// count.
+    Nearby,
+    User,
+    Project,
+    /// The local file in the directory the session started in.
+    Local,
+    /// The local file at the repository root, whose values win over the other's.
+    RepositoryLocal,
+    Managed,
+}
+
 /// Read every settings file the sources name.
 pub fn load(sources: &Sources) -> Rules {
     let mut rules = Rules::default();
-    // Each file, with whether its allow rules count and whether it is managed.
-    let mut files: Vec<(PathBuf, bool, bool)> = Vec::new();
+    let mut files: Vec<(PathBuf, Scope)> = Vec::new();
     match managed_files(&sources.managed) {
-        Some(managed) => files.extend(managed.into_iter().map(|file| (file, true, true))),
-        None => rules.broken = true,
+        Ok(managed) => files.extend(managed.into_iter().map(|file| (file, Scope::Managed))),
+        Err(broken) => rules.broken.push(broken),
     }
     match &sources.user {
-        Some(user) => files.push((user.clone(), true, false)),
-        None => rules.broken = true,
+        Some(user) => files.push((user.clone(), Scope::User)),
+        None => rules.broken.push(Broken {
+            path: PathBuf::from("~/.claude/settings.json"),
+            problem: "neither CLAUDE_CONFIG_DIR nor HOME is set".into(),
+        }),
     }
-    for name in ["settings.json", "settings.local.json"] {
-        files.push((sources.project.join(".claude").join(name), true, false));
+    let claude = sources.project.join(".claude");
+    files.push((claude.join("settings.json"), Scope::Project));
+    files.push((claude.join("settings.local.json"), Scope::Local));
+    if let Some((dir, certain)) = &sources.repository {
+        let scope = if *certain {
+            Scope::RepositoryLocal
+        } else {
+            Scope::Nearby
+        };
+        files.push((dir.join(".claude").join("settings.local.json"), scope));
     }
     for dir in &sources.nearby {
         for name in ["settings.json", "settings.local.json"] {
-            files.push((dir.join(".claude").join(name), false, false));
+            files.push((dir.join(".claude").join(name), Scope::Nearby));
         }
     }
     let mut managed_allow = Vec::new();
     let mut only_managed = false;
-    for (file, allows, managed) in files {
+    // A file listed twice, such as the repository's local file as a nearby one,
+    // counts once, in the scope listed first.
+    let mut seen = Vec::new();
+    for (file, scope) in files {
+        let key = file.canonicalize().unwrap_or_else(|_| file.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
         let settings = match read(&file) {
             Loaded::Missing => continue,
-            Loaded::Broken => {
-                rules.broken = true;
+            Loaded::Broken(problem) => {
+                rules.broken.push(Broken {
+                    path: file,
+                    problem,
+                });
                 continue;
             }
             Loaded::Settings(settings) => settings,
         };
-        let (Some(allow), Some(ask), Some(deny)) = (
+        let (allow, ask, deny) = match (
             list(&settings, "allow"),
             list(&settings, "ask"),
             list(&settings, "deny"),
-        ) else {
-            rules.broken = true;
-            continue;
+        ) {
+            (Ok(allow), Ok(ask), Ok(deny)) => (allow, ask, deny),
+            (Err(problem), _, _) | (_, Err(problem), _) | (_, _, Err(problem)) => {
+                rules.broken.push(Broken {
+                    path: file,
+                    problem,
+                });
+                continue;
+            }
         };
-        if managed {
+        if scope == Scope::Managed {
             only_managed |= managed_only(&settings);
             managed_allow.extend(allow.iter().cloned());
+        }
+        if let Some(mode) = settings["permissions"]["defaultMode"].as_str()
+            && scope != Scope::Nearby
+            && (matches!(scope, Scope::User | Scope::Managed)
+                || !matches!(mode, "auto" | "bypassPermissions"))
+            && rules
+                .default_mode
+                .as_ref()
+                .is_none_or(|(rank, _)| scope > *rank)
+        {
+            rules.default_mode = Some((scope, mode.to_owned()));
         }
         rules.blocks_paths |= [
             "blockReadsOutsideWorkingDirectories",
@@ -259,7 +425,7 @@ pub fn load(sources: &Sources) -> Rules {
                 .get(key)
                 .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
         });
-        if allows {
+        if scope != Scope::Nearby {
             rules.allow.extend(allow.iter().cloned());
         }
         rules
@@ -289,7 +455,7 @@ pub enum Verdict {
 impl Rules {
     /// Judge a command line by its top-level commands, as split at `&&`, `||` and `;`.
     pub fn verdict(&self, segments: &[&str]) -> Verdict {
-        if self.broken {
+        if !self.broken.is_empty() {
             return Verdict::Deny;
         }
         let candidates: Vec<String> = segments.iter().flat_map(|s| candidates(s)).collect();
@@ -558,24 +724,45 @@ pub fn decide(root: &Path, mode: &str, segments: &[&str]) -> Answer {
     ) {
         return Answer::Leave;
     }
-    answer(mode, load(&Sources::for_hook(root)).verdict(segments))
+    load(&Sources::for_hook(root)).answer(mode, segments)
 }
 
-/// Allow rules that let the agent run any command as `justless run -- COMMAND`
-/// without asking, with the file each one is in.
-pub fn broad_justless_rules(sources: &Sources) -> Vec<(PathBuf, String)> {
-    let probes = [
-        "justless run -- sh -c anything",
-        "justless run --hook --session 0123456789abcdef01234567 -- sh -c anything",
-    ];
-    load(sources)
-        .found
-        .into_iter()
-        .filter(|(_, rule)| {
-            rule.trim_start().starts_with("Bash(justless")
-                && probes.iter().any(|probe| loosely(rule, probe))
-        })
-        .collect()
+impl Rules {
+    /// The hook's answer for a command line it can route, split into its
+    /// top-level commands, in a session that reports `mode`.
+    pub fn answer(&self, mode: &str, segments: &[&str]) -> Answer {
+        answer(mode, self.verdict(segments))
+    }
+
+    /// The permission mode sessions start in unless told otherwise.
+    pub fn default_mode(&self) -> &str {
+        self.default_mode
+            .as_ref()
+            .map_or("default", |(_, mode)| mode.as_str())
+    }
+
+    /// Settings files that exist but cannot be used, each of which keeps the
+    /// hook from rewriting any command.
+    pub fn broken(&self) -> &[Broken] {
+        &self.broken
+    }
+
+    /// Allow rules that let the agent run any command as `justless run -- COMMAND`
+    /// without asking, with the file each one is in.
+    pub fn broad_justless_rules(&self) -> Vec<(&Path, &str)> {
+        let probes = [
+            "justless run -- sh -c anything",
+            "justless run --hook --session 0123456789abcdef01234567 -- sh -c anything",
+        ];
+        self.found
+            .iter()
+            .filter(|(_, rule)| {
+                rule.trim_start().starts_with("Bash(justless")
+                    && probes.iter().any(|probe| loosely(rule, probe))
+            })
+            .map(|(file, rule)| (file.as_path(), rule.as_str()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -691,7 +878,10 @@ mod tests {
         }
         assert_eq!(blanket.verdict(&["cargo test"]), Verdict::Allow);
         let broken = Rules {
-            broken: true,
+            broken: vec![Broken {
+                path: PathBuf::from("settings.json"),
+                problem: "not a JSON object".into(),
+            }],
             ..rules(&["Bash"], &[], &[])
         };
         assert_eq!(broken.verdict(&["cargo test"]), Verdict::Deny);
@@ -772,6 +962,7 @@ mod tests {
             managed: dir.join("managed"),
             user: Some(dir.join("user/settings.json")),
             project: dir.join("project"),
+            repository: None,
             nearby: vec![dir.join("root")],
         }
     }
@@ -846,13 +1037,26 @@ mod tests {
         ] {
             let path = dir.join(file);
             write(&path, text);
+            let loaded = load(&sources);
             assert_eq!(
-                load(&sources).verdict(&["git status"]),
+                loaded.verdict(&["git status"]),
                 Verdict::Deny,
                 "{file}: {text}"
             );
+            // Each one is named, with its problem, for `doctor`.
+            assert!(
+                matches!(loaded.broken(), [broken] if broken.path == path && !broken.problem.is_empty()),
+                "{file}: {text}: {:?}",
+                loaded.broken()
+            );
             fs::remove_file(&path).unwrap();
         }
+        write(&dir.join("project/.claude/settings.json"), "{");
+        assert_eq!(
+            load(&sources).broken()[0].problem,
+            "not valid JSON: EOF while parsing an object at line 1 column 1"
+        );
+        fs::remove_file(dir.join("project/.claude/settings.json")).unwrap();
         assert_eq!(load(&sources).verdict(&["git status"]), Verdict::Allow);
         // Path limits in any file keep file commands from being approved.
         write(
@@ -869,6 +1073,46 @@ mod tests {
     }
 
     #[test]
+    fn the_repository_local_file_and_the_default_mode_follow_claude_code() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let mut sources = sources(dir);
+        let repository = dir.join("repo/.claude/settings.local.json");
+        write(
+            &repository,
+            r#"{"permissions":{"allow":["Bash(cargo test:*)"],"defaultMode":"acceptEdits"}}"#,
+        );
+        // Where Claude Code may keep the file elsewhere, only its ask and deny
+        // rules count, and it sets no mode.
+        sources.repository = Some((dir.join("repo"), false));
+        let loaded = load(&sources);
+        assert_eq!(loaded.verdict(&["cargo test"]), Verdict::Unknown);
+        assert_eq!(loaded.default_mode(), "default");
+        sources.repository = Some((dir.join("repo"), true));
+        let loaded = load(&sources);
+        assert_eq!(loaded.verdict(&["cargo test"]), Verdict::Allow);
+        assert_eq!(loaded.default_mode(), "acceptEdits");
+        // The highest file that sets a mode wins, and only user and managed
+        // settings set `auto` or `bypassPermissions`.
+        write(
+            &dir.join("user/settings.json"),
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+        );
+        write(
+            &dir.join("project/.claude/settings.local.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        );
+        assert_eq!(load(&sources).default_mode(), "acceptEdits");
+        fs::remove_file(&repository).unwrap();
+        assert_eq!(load(&sources).default_mode(), "auto");
+        write(
+            &dir.join("managed/managed-settings.json"),
+            r#"{"permissions":{"defaultMode":"dontAsk"}}"#,
+        );
+        assert_eq!(load(&sources).default_mode(), "dontAsk");
+    }
+
+    #[test]
     fn only_broad_justless_allow_rules_are_reported() {
         let temp = tempfile::TempDir::new().unwrap();
         let dir = temp.path();
@@ -880,8 +1124,9 @@ mod tests {
             &dir.join("user/settings.json"),
             r#"{"permissions":{"allow":["Bash(justless *)","Bash(justless run --hook *)"]}}"#,
         );
-        let found = broad_justless_rules(&sources(dir));
-        let rules: Vec<&str> = found.iter().map(|(_, rule)| rule.as_str()).collect();
+        let loaded = load(&sources(dir));
+        let found = loaded.broad_justless_rules();
+        let rules: Vec<&str> = found.iter().map(|(_, rule)| *rule).collect();
         assert_eq!(
             rules,
             [

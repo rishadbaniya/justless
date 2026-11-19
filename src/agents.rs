@@ -2078,6 +2078,22 @@ pub fn would_route(command: &str) -> bool {
     !plan(command, rules, |_| true).wrap.is_empty()
 }
 
+/// Whether the Claude Code command hook, given a command it would route (see
+/// `would_route`), leaves it as written in a session that reports `mode`, because
+/// the permission rules or the mode require it, as `bash_hook` judges it.
+pub fn left_by_permissions(
+    command: &str,
+    mode: &str,
+    rules: &crate::claude_permissions::Rules,
+) -> bool {
+    // The hook skips plan mode before it judges anything.
+    mode == "plan"
+        || split_compound(command).is_some_and(|ranges| {
+            let segments: Vec<&str> = ranges.into_iter().map(|range| &command[range]).collect();
+            rules.answer(mode, &segments) == crate::claude_permissions::Answer::Leave
+        })
+}
+
 /// Whether the Codex hook would route `command`, as `wrap_event` does: a range read
 /// or `cat FILE` becomes a `justless read`, and because Codex runs a rewritten command
 /// without asking, a list is routed only when every command in it is supported.
