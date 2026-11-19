@@ -2,12 +2,6 @@
 
 Open work only. Finished work is in [CHANGELOG.md](CHANGELOG.md) and the Git history; ideas that were measured and closed, and what not to build, are in [docs/decisions.md](docs/decisions.md).
 
-## In progress
-
-### Record read-list reads for `resume`
-- Reads served inside Claude Code read lists (`src/batch*`) never call `history::saw_source`/`saw_outline`, so `resume` and `[source changed]` miss them; single-file reads are recorded.
-- **Progress.** *designed*.
-
 ## Next
 
 ### Cut the test suite
