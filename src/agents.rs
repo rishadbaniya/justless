@@ -767,7 +767,7 @@ pub(crate) fn answer_hook(
         && input["tool_name"] == "Bash"
         && input["permission_mode"] != "plan"
     {
-        bash_hook(workspace, agent, input).unwrap_or_else(|| json!({}))
+        bash_hook(workspace, agent, input, true).unwrap_or_else(|| json!({}))
     } else {
         json!({})
     };
@@ -784,7 +784,7 @@ pub(crate) fn preview_command(workspace: &Workspace, agent: Agent, input: &Value
     let workspace = &agent_workspace(workspace, input);
     match agent {
         Agent::Claude | Agent::Codex if input["permission_mode"] != "plan" => {
-            bash_hook(workspace, agent, input)
+            bash_hook(workspace, agent, input, false)
         }
         Agent::Agy => agy_hook(workspace, "before-command", input),
         Agent::Cursor | Agent::Gemini | Agent::Copilot => client_command(workspace, agent, input),
@@ -1315,7 +1315,8 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
 }
 
-fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value> {
+/// `record` is false for `justless rewrite`, which previews the answer and writes nothing.
+fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -> Option<Value> {
     let args = &input["tool_input"];
     let cwd = input
         .get("tool_cwd")
@@ -1375,7 +1376,9 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
             .collect();
         match crate::claude_permissions::decide(&workspace.root, mode, &segments) {
             crate::claude_permissions::Answer::Leave => {
-                crate::history::left_by_permissions(workspace, mode);
+                if record {
+                    crate::history::left_by_permissions(workspace, mode);
+                }
                 return None;
             }
             crate::claude_permissions::Answer::Rewrite => {}
