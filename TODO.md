@@ -102,19 +102,11 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Next.** Use transcript replay to measure workload-wide savings. The parked branch also covers `nl`, `head`, last-N-line `tail`, `awk`, `cat`, `git show` and command lists. Bring those forms forward separately and check their native byte behavior.
 - **Command-list follow-up.** Test inspection batches that combine `git diff --stat`, a multi-range sed expression, and `rg` piped to `cut`. Both hooks currently pass the tested batch through. Compare automatic handling against `justless exec --lang sh -` on the same script. Preserve shell quoting, the status of the final pipeline, and measure bytes after the pipeline's own filters.
 
-### 2.2 Outline wide ranged `Read` calls
-- **Branch.** `worktree-wf_7175cb10-fff-2` (1 real commit + 1 wip, 6 files, +656 −9).
-- **Problem.** The Claude Code post-read hook returns early whenever `offset`, `limit` or `pages` is set, so 1,234 ranged workspace Reads (8.5 MB) were never outlined; windows of 151–300 lines were 211 reads / 2.1 MB and windows over 300 lines 186 reads / 4.0 MB. The current outline hint tells agents to use Read with offset/limit, so a naive change would loop.
-- **Plan.** Above a line/byte threshold and in a supported language, replace a ranged Read with an outline of that window plus an exact path that cannot be outlined again (a smaller window, or `expand`/`code`). Keep `allow_large`, small windows, PDFs, images and files outside the workspace untouched. Validate the replacement and read-before-edit with the real Claude Code binary.
-- **Progress.** *partial, most of the way*: commit `a9ae072 feat(hooks): outline wide ranged Claude Code Reads` (agents.rs +132, source.rs +86, 428 lines of tests, a benchmarks note), plus uncommitted follow-ups in the wip. Not reviewed or probed against the real binary.
-- **Next.** Finish the wip, run the real-binary probe (`scratchpad/probe/cc_probe.py` pattern), review.
+### 2.2 Outline wide ranged `Read` calls — done
+- **Progress.** *on main* (2026-11-19). A ranged Read returning more than 150 lines of a source or Markdown file becomes the outline rows of that window in Claude Code's Read shape; the way back (`allow_large`, any Read of at most 150 lines, or `expand`) is never outlined. Measured: a 300-line window of `src/agents.rs` 14,924 → 1,555 bytes; checked with the real Claude Code binary (outline, native escape, Edit inside the window).
 
-### 2.3 Parse check after edits
-- **Branch.** `worktree-wf_7175cb10-fff-3` (1 wip commit, 10 files, +1,211 −22).
-- **Problem.** `justless edit` writes a replacement that leaves the file unparseable (reproduced with Rust `pub fn a() -> u32 {\n 1 +\n`), prints success and exits 0; the next outline silently loses functions. Python edits that leave a bracket open do the same. Claude Code's own Edit/Write get no syntax feedback without an LSP plugin.
-- **Plan.** Parse before and after each `justless edit` batch (syn for Rust, Tree-sitter ERROR/MISSING nodes elsewhere); reject a batch that introduces a parse error, leaving the file unchanged, with line/column and context, unless `--allow-parse-errors`. Files already broken are not blocked. A PostToolUse hook for Claude Code Edit/MultiEdit/Write adds a one-line note only when the edit introduced a parse error.
-- **Progress.** *partial, past half*: new `src/syntax_check.rs` (594 lines), `source.rs` +156, `rust_syntax.rs` +33, the Claude Code hook in `agents.rs` +66, 337 lines of CLI tests and progressive-test updates. Not compiled clean, probed or reviewed.
-- **Next.** Finish; test for false rejections across all 21 languages (macros, decorators, templates); measure parse cost on large files; review.
+### 2.3 Parse check after edits — done
+- **Progress.** *on main* (2026-11-19). `justless edit` blocks (exit 2, file unchanged, unless `--allow-parse-errors`) a Rust syntax error, a missing token or brackets that no longer pair; other grammar errors only warn, because the bundled grammars reject some valid newer syntax. Already-broken files are never blocked. A Claude Code Edit/MultiEdit/Write hook adds a short note only when an edit introduced a parse error. Cost: 63 ms vs 26 ms on a 690 KB Rust file.
 
 ### 2.4 `find` scoping, paging and search guidance — done
 - **Progress.** *on main* (2026-11-19, `src/find.rs`). `--path` and `--glob` (rg -g semantics) on the CLI and MCP; an empty scope says so; a cut page names the bound that cut it and prints a `--after CURSOR` next page, rejected with a clear message when the search or the stop file changed. The instruction block gained one line on which search to use (882 → 995 bytes). The MCP tool list is 7,971 of its 8,000-byte cap, so the next MCP parameter must make room.
