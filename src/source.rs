@@ -126,7 +126,7 @@ pub struct Snapshot {
     parse_error: Option<String>,
 }
 
-fn revision_for(file: &str, bytes: &[u8]) -> String {
+pub(crate) fn revision_for(file: &str, bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"justless-source-v1\0");
     hash.update(file.as_bytes());

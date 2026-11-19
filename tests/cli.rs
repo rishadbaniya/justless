@@ -46,6 +46,8 @@ fn cli(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_justless"))
         .args(args)
         .current_dir(root)
+        // A session would print repeated `context` and `pack` views as deltas.
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("CARGO_TARGET_DIR", root.join("target"))
         .output()
         .unwrap()

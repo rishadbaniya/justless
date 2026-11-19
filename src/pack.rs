@@ -8,6 +8,7 @@ use anyhow::{Result, ensure};
 use crate::context::{Report, relationship};
 use crate::history;
 use crate::index::{Fingerprint, Index, nul_paths};
+use crate::seen::Memory;
 use crate::summary::short;
 use crate::workspace::{Location, Workspace, display_path};
 
@@ -173,13 +174,19 @@ fn changed_files(workspace: &Workspace) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Up to three lines of `file` from `from`. In a session, lines printed
+/// exactly the same way before become one line that says so, when that is at
+/// most half their size.
+#[allow(clippy::too_many_arguments)]
 fn excerpt(
     workspace: &Workspace,
+    index: &Index,
     cache: &mut BTreeMap<String, String>,
     file: &str,
     from: usize,
     to: usize,
     report: &mut Report,
+    memory: Option<&mut Memory>,
 ) {
     let text = cache.entry(file.to_owned()).or_insert_with(|| {
         workspace
@@ -188,14 +195,49 @@ fn excerpt(
             .and_then(|p| fs::read_to_string(p).ok())
             .unwrap_or_default()
     });
-    for (offset, line) in text
+    let lines: Vec<String> = text
         .lines()
         .enumerate()
         .skip(from.saturating_sub(1))
         .take(to.saturating_sub(from) + 1)
         .take(3)
+        .map(|(offset, line)| format!("    {} | {}", offset + 1, short(line.trim(), 150)))
+        .collect();
+    let Some(memory) = memory else {
+        for line in &lines {
+            report.line(line);
+        }
+        return;
+    };
+    let revision = crate::source::revision_for(file, text.as_bytes());
+    let last = from + lines.len().saturating_sub(1);
+    let note = if lines.len() > 1 {
+        format!("    {from}-{last} | unchanged since you read them")
+    } else {
+        format!("    {from} | unchanged since you read it")
+    };
+    // A short declaration says more than the note, so it stays.
+    let bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+    if !lines.is_empty()
+        && 2 * (note.len() + 1) <= bytes
+        && memory.saw_excerpt(file, &revision, &lines)
     {
-        report.line(format!("    {} | {}", offset + 1, short(line.trim(), 150)));
+        report.line(note);
+        return;
+    }
+    let clipped = report.clipped;
+    for line in &lines {
+        report.line(line);
+    }
+    if !clipped && !lines.is_empty() {
+        memory.showed(
+            file,
+            &revision,
+            &crate::context::seen_names(index, file, from, last),
+        );
+    }
+    if !report.clipped && !lines.is_empty() {
+        memory.remember_excerpt(file, &revision, &lines);
     }
 }
 
@@ -625,7 +667,13 @@ fn show_text(report: &mut Report, hit: &Passage) {
     }
 }
 
-pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Result<()> {
+pub fn pack(
+    workspace: &Workspace,
+    index: &Index,
+    task: &str,
+    cap: usize,
+    mut memory: Option<&mut Memory>,
+) -> Result<()> {
     ensure!(!task.trim().is_empty(), "provide a task or symbol");
     let words = terms(task);
     let question = task.to_lowercase();
@@ -756,11 +804,13 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
                 let before = report.left();
                 excerpt(
                     workspace,
+                    index,
                     &mut sources,
                     &d.location.file,
                     d.location.start,
                     d.location.start,
                     &mut report,
+                    memory.as_deref_mut(),
                 );
                 source += before.saturating_sub(report.left());
                 for id in index.at(&d.location) {
@@ -832,11 +882,13 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
         ));
         excerpt(
             workspace,
+            index,
             &mut sources,
             &def.location.file,
             def.declaration,
             def.declaration,
             &mut report,
+            memory.as_deref_mut(),
         );
         seen.insert(id);
         queue.push_back((id, 0));
@@ -885,11 +937,13 @@ pub fn pack(workspace: &Workspace, index: &Index, task: &str, cap: usize) -> Res
             if discovered {
                 excerpt(
                     workspace,
+                    index,
                     &mut sources,
                     &target.location.file,
                     target.declaration,
                     target.location.end.min(target.declaration + 2),
                     &mut report,
+                    memory.as_deref_mut(),
                 );
                 queue.push_back((other, depth + 1));
             }

@@ -34,6 +34,7 @@ mod redact;
 mod runners;
 mod rust_syntax;
 mod search;
+mod seen;
 mod selection;
 mod shell_form;
 mod shellread;
@@ -79,6 +80,22 @@ fn budget() -> Arg<'static> {
         .long("budget")
         .value_name("N")
         .help("Context token ceiling (default 2400, conservatively budgeted by UTF-8 byte)")
+}
+
+/// The session whose earlier views `context --symbol`, `context --at` and
+/// `pack` compare with. Claude Code's session ID is the default.
+fn seen_session() -> Arg<'static> {
+    Arg::new("session")
+        .long("session")
+        .takes_value(true)
+        .value_name("NAME")
+        .help("Print only what changed since this session saw a symbol")
+}
+
+fn seen_fresh() -> Arg<'static> {
+    Arg::new("fresh")
+        .long("fresh")
+        .help("Print whole symbols, even ones this session saw")
 }
 
 fn id() -> Arg<'static> {
@@ -181,6 +198,8 @@ fn cli() -> Command<'static> {
             Command::new("pack")
                 .about("Gather source, relationships and run evidence for a task")
                 .arg(Arg::new("task").required(true))
+                .arg(seen_session())
+                .arg(seen_fresh())
                 .arg(budget()),
         )
         .subcommand(
@@ -267,6 +286,8 @@ fn cli() -> Command<'static> {
                         .required(true)
                         .args(&["run", "changes", "at", "symbol"]),
                 )
+                .arg(seen_session())
+                .arg(seen_fresh())
                 .arg(budget()),
         )
         .subcommand(
@@ -562,12 +583,20 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             )?;
             history::recall(&directory, history::Retrieval::Search, Some(printed));
         }
-        ("pack", sub) => pack::pack(
-            &workspace,
-            &Index::open(&workspace)?,
-            sub.value_of("task").unwrap(),
-            context_budget(&workspace, sub)?,
-        )?,
+        ("pack", sub) => {
+            let mut memory =
+                seen::Memory::open(&workspace, sub.value_of("session"), sub.is_present("fresh"));
+            pack::pack(
+                &workspace,
+                &Index::open(&workspace)?,
+                sub.value_of("task").unwrap(),
+                context_budget(&workspace, sub)?,
+                memory.as_mut(),
+            )?;
+            if let Some(memory) = memory {
+                memory.save(&workspace);
+            }
+        }
         ("history", sub) => history::history(
             &workspace,
             sub.value_of("text"),
@@ -628,10 +657,20 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             let index = Index::open(&workspace)?;
             if let Some(id) = sub.value_of("run") {
                 context::from_run(&workspace, &index, id, limit)?;
-            } else if let Some(location) = sub.value_of("at") {
-                context::at(&workspace, &index, location, limit)?;
-            } else if let Some(name) = sub.value_of("symbol") {
-                context::symbol(&workspace, &index, name, limit)?;
+            } else if sub.is_present("at") || sub.is_present("symbol") {
+                let mut memory = seen::Memory::open(
+                    &workspace,
+                    sub.value_of("session"),
+                    sub.is_present("fresh"),
+                );
+                if let Some(location) = sub.value_of("at") {
+                    context::at(&workspace, &index, location, limit, memory.as_mut())?;
+                } else if let Some(name) = sub.value_of("symbol") {
+                    context::symbol(&workspace, &index, name, limit, memory.as_mut())?;
+                }
+                if let Some(memory) = memory {
+                    memory.save(&workspace);
+                }
             } else {
                 let since = context::Since::resolve(
                     &workspace,

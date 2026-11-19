@@ -9,6 +9,7 @@ use regex::Regex;
 use crate::capture;
 use crate::index::{Definition, Index, Removed, is_call, nul_paths};
 use crate::rust_syntax::Kind;
+use crate::seen::{Memory, Symbol};
 use crate::workspace::{Location, Workspace, display_path};
 
 static HUNK: LazyLock<Regex> = LazyLock::new(|| {
@@ -245,7 +246,13 @@ fn snippet(
     Ok(())
 }
 
-pub fn at(workspace: &Workspace, index: &Index, input: &str, cap: usize) -> Result<()> {
+pub fn at(
+    workspace: &Workspace,
+    index: &Index,
+    input: &str,
+    cap: usize,
+    memory: Option<&mut Memory>,
+) -> Result<()> {
     let (file, range) = input
         .rsplit_once(':')
         .context("use a workspace-relative path and line, e.g. src/lib.rs:10")?;
@@ -267,19 +274,90 @@ pub fn at(workspace: &Workspace, index: &Index, input: &str, cap: usize) -> Resu
             end: end.min(lines),
         },
         &mut report,
+        memory,
     )?;
     report.finish()
 }
 
-pub fn symbol(workspace: &Workspace, index: &Index, name: &str, cap: usize) -> Result<()> {
-    let symbol = &index.definitions[index.select(name)?];
-    code(
+/// The symbol's source. In a session, a symbol read before prints only the
+/// lines that changed since, or one line when none did.
+pub fn symbol(
+    workspace: &Workspace,
+    index: &Index,
+    name: &str,
+    cap: usize,
+    memory: Option<&mut Memory>,
+) -> Result<()> {
+    let id = index.select(name)?;
+    let definition = &index.definitions[id];
+    let location = &definition.location;
+    let Some(memory) = memory else {
+        return code(workspace, &location.file, location.start, location.end, cap);
+    };
+    let text = fs::read_to_string(workspace.source_path(&location.file)?)?;
+    if location.start == 0 || location.start > text.lines().count() {
+        return code(workspace, &location.file, location.start, location.end, cap);
+    }
+    let mut report = Report::new(cap);
+    memory.show(
         workspace,
-        &symbol.location.file,
-        symbol.location.start,
-        symbol.location.end,
-        cap,
-    )
+        &text,
+        &Symbol {
+            file: &location.file,
+            name: &seen_name(index, id),
+            start: location.start,
+            end: location.end,
+        },
+        &overlapping_names(index, id),
+        (location.start, location.end),
+        true,
+        &mut report,
+    );
+    report.finish()
+}
+
+/// The name a session remembers a definition by: its qualified name, numbered
+/// from the second definition of that name in the same file, such as a
+/// cfg-gated twin, so one twin's view is never compared with another's.
+fn seen_name(index: &Index, id: usize) -> String {
+    let definition = &index.definitions[id];
+    let earlier = index
+        .definitions
+        .iter()
+        .filter(|other| {
+            other.qualified == definition.qualified
+                && other.location.file == definition.location.file
+                && other.location.start < definition.location.start
+        })
+        .count();
+    if earlier == 0 {
+        definition.qualified.clone()
+    } else {
+        format!("{}#{}", definition.qualified, earlier + 1)
+    }
+}
+
+/// The names a session remembers the definitions of `file` by that share any
+/// of lines `from..=to`, such as a method and the block around it.
+pub(crate) fn seen_names(index: &Index, file: &str, from: usize, to: usize) -> Vec<String> {
+    index
+        .definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| {
+            other.location.file == file && other.location.start <= to && from <= other.location.end
+        })
+        .map(|(id, _)| seen_name(index, id))
+        .collect()
+}
+
+/// The other definitions that share lines with definition `id`.
+fn overlapping_names(index: &Index, id: usize) -> Vec<String> {
+    let location = &index.definitions[id].location;
+    let own = seen_name(index, id);
+    let mut names = seen_names(index, &location.file, location.start, location.end);
+    names.retain(|name| *name != own);
+    names
 }
 
 /// Distinct log lines listed for one source location in `context --run`.
@@ -355,7 +433,7 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
             report.line("  Source changed or disappeared after this run. Re-run the command for current locations.");
         } else {
             let room = report.left();
-            at_location(workspace, index, location, &mut report)?;
+            at_location(workspace, index, location, &mut report, None)?;
             source += room.saturating_sub(report.left());
         }
         if report.clipped {
@@ -379,6 +457,7 @@ fn at_location(
     index: &Index,
     location: &Location,
     report: &mut Report,
+    mut memory: Option<&mut Memory>,
 ) -> Result<()> {
     let definitions = index.at(location);
     // A file or module contains everything in it, so it only stands for a range
@@ -394,7 +473,7 @@ fn at_location(
         span.start <= location.start && location.end <= span.end
     });
     if let Some(best) = containing {
-        return detail(workspace, index, best, location, &members, report);
+        return detail(workspace, index, best, location, &members, report, memory);
     }
     if !members.is_empty() {
         let mut outermost: Vec<usize> = members
@@ -447,7 +526,15 @@ fn at_location(
                 })
                 .collect();
             inner.sort_by_key(|&other| (index.definitions[other].location.start, other));
-            detail(workspace, index, id, &part, &inner, report)?;
+            detail(
+                workspace,
+                index,
+                id,
+                &part,
+                &inner,
+                report,
+                memory.as_deref_mut(),
+            )?;
         }
         return Ok(());
     }
@@ -464,7 +551,15 @@ fn at_location(
             report,
         );
     };
-    detail(workspace, index, best, location, &definitions, report)
+    detail(
+        workspace,
+        index,
+        best,
+        location,
+        &definitions,
+        report,
+        memory,
+    )
 }
 
 /// One symbol around a location: its calls, related tests, the other symbols
@@ -476,6 +571,7 @@ fn detail(
     location: &Location,
     overlapping: &[usize],
     report: &mut Report,
+    memory: Option<&mut Memory>,
 ) -> Result<()> {
     let definition = &index.definitions[best];
     report.line(describe(definition));
@@ -554,7 +650,26 @@ fn detail(
         .max(location.start.saturating_add(3))
         .min(definition.location.end)
         .min(from.saturating_add(14));
-    snippet(workspace, &location.file, from, to.max(from), report)?;
+    match memory {
+        Some(memory) => {
+            let text = fs::read_to_string(workspace.source_path(&location.file)?)?;
+            memory.show(
+                workspace,
+                &text,
+                &Symbol {
+                    file: &location.file,
+                    name: &seen_name(index, best),
+                    start: definition.location.start,
+                    end: definition.location.end,
+                },
+                &overlapping_names(index, best),
+                (from, to.max(from)),
+                false,
+                report,
+            );
+        }
+        None => snippet(workspace, &location.file, from, to.max(from), report)?,
+    }
     if definition.declaration < from && !report.clipped {
         report.line(format!(
             "  Declaration starts at {}:{}",
@@ -845,6 +960,7 @@ pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) 
                             end,
                         },
                         &mut report,
+                        None,
                     )?;
                     if report.clipped {
                         break;
@@ -932,7 +1048,7 @@ fn deleted(
             span.end - span.start
         });
     if let Some(id) = around {
-        detail(workspace, index, id, &location, &[], report)?;
+        detail(workspace, index, id, &location, &[], report, None)?;
     }
     Ok(())
 }

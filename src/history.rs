@@ -1170,13 +1170,22 @@ fn command(run: &Run) -> String {
 }
 
 pub fn resume(workspace: &Workspace, cap: usize) -> Result<()> {
-    print!("{}", resume_text(workspace, cap)?);
+    print!("{}", activity_text(workspace, cap)?);
     Ok(())
+}
+
+/// The compaction handoff: [`activity_text`] for the summary or the restarted
+/// session. Compaction drops the source the agent was shown, so this also
+/// forgets the symbols `context` and `pack` remember for each session, and
+/// their next views print whole.
+pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
+    crate::seen::forget(workspace);
+    activity_text(workspace, cap)
 }
 
 /// Recent runs, inspected source and the last pack, with stale source marked.
 /// Returns `None` inside the text when the project has no recorded activity.
-pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
+fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
     let mut report = Report::new(cap);
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
     let justless = workspace.justless();

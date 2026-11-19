@@ -25,6 +25,7 @@
 | `justless context --changes --staged` | Staged ranges for files that currently match the staged source |
 | `justless context --changes --base main` | Changes against the merge base of `main` and `HEAD`: a branch's commits and the working tree on top of them. On a clean tree, plain `--changes` suggests it. |
 | `justless context --at src/lib.rs:8` | Enclosing symbol, relevant calls, and source around a line or range. A range across several symbols shows each of them. A line past the end of the file is an error. |
+| `justless context --symbol NAME` | The symbol's location and numbered source. In a session, a symbol read before prints only what changed since. [Details](#reading-a-symbol-again) |
 | `justless code src/lib.rs --from 1 --to 8` | A numbered excerpt of original source. A range that starts past the end of the file is an error, and one that runs past it ends at the last line with a note. |
 | `justless read FILE --outline` | Revision, signatures and line ranges. Small files are returned verbatim when called without outline options. |
 | `justless expand FILE SELECTOR` | Exact bytes for a symbol, entry, section or inclusive line range |
@@ -69,6 +70,30 @@ Rust references to a type include enum variant uses and patterns such as `Status
 SQL tables and views are linked from the statements that read or write them: `SELECT` and `JOIN` sources, `UPDATE`, `INSERT INTO`, `DELETE FROM`, `ALTER TABLE`, `DROP TABLE` and `CREATE INDEX … ON`. Queries in string literals of the other parsed languages are linked the same way. These links are possible relationships. A schema-qualified table such as `audit.event_log` can also be queried by its short name, `event_log`.
 
 HCL files index top-level blocks by their Terraform address, such as `aws_s3_bucket.logs`, `data.aws_iam_policy_document.read`, `var.region`, `module.vpc` and `output.bucket_arn`. Each `locals` entry is indexed as `local.NAME`. Expressions that use an address become references, so `justless query var.region --view references` lists its uses. References to a block in another file are possible links. An address defined in more than one indexed module is ambiguous, so its references stay unlinked.
+
+## Reading a symbol again
+
+In an agent session, `context --symbol`, `context --at` and `pack` remember the source of each symbol they printed. The next view of the same symbol in that session prints only what changed since:
+
+```text
+tests/cli.rs:142-187 · 45 of 46 lines unchanged since you read it at c9373236130b · whole symbol: justless expand tests/cli.rs '099c9336f89915e844d0861b#L142-187'
+  158 |     let references = success(path, &["query", "checkout_total", "--view", "references"]);
+  159 |     assert!(
+-     |         references.contains("import from file scope at tests/checkout.rs:1"),
++ 160 |         references.contains("import from file scope at tests/checkout.rs:1"), // edited
+  161 |         "{references}"
+  162 |     );
+```
+
+- Each changed or added line is marked `+` with its current number, and each line the agent saw that is gone is marked `-` without one. Up to two unchanged lines surround each change, and `…` marks the unchanged lines left out. `REV` is the file's revision at the earlier view, and the `expand` command prints the current symbol, bound to the current revision, so `edit` accepts the same selector.
+- A symbol that has not changed prints one line, such as `src/lib.rs:8-22 · unchanged since you read it at REV, then at lines 6-20 · whole symbol: …`. The `then at lines` part appears when the symbol moved.
+- `context --at` treats the lines it shows around a location the same way, after the symbol's calls and tests, with a line such as `  6 of 7 lines unchanged since you read them at REV`. Lines of the symbol that the agent was never shown print as plain lines.
+- The whole view replaces the delta or the one-line note when it would be no longer, as for a rewrite, a very short symbol or an `--at` window of a few lines. A whole `context --symbol` view of a changed symbol then starts with `changed since you read it at REV`.
+- `pack` replaces up to three excerpt lines it already printed in this session with one line such as `    1-3 | unchanged since you read them`, when the file has not changed since and that line is at most half their size.
+
+The comparison is exact. Justless stores each symbol's text as of its last view and which of its lines were printed, up to 64 KiB per symbol, 64 symbols and 512 KiB per session, and the 16 most recent sessions under `.justless/seen/`. Git cannot serve as the earlier version, because the loop runs on uncommitted edits. Line endings count, so a change from `\n` to `\r\n` shows as a changed line. When the budget cuts a view, the lines it did not print stay unread, and a line that is gone counts as shown only once the agent has been shown its removal. A view that prints a symbol's lines drops the records of symbols that share them, such as the block around a method, made at another revision of the file, and so does a `pack` excerpt; a view that cannot bring its own record up to date, such as a window that skipped a change, drops that record. So a line that changed and changed back always prints again. Reads through other commands, such as `expand` or the client's own Read tool, are not tracked, and the `REV` in each note names the version compared with. A symbol is the same when its file and qualified name match, with same-named twins such as cfg-gated definitions told apart by their order in the file, so a renamed symbol, one moved to another file or one too large to store prints whole.
+
+The session is `--session NAME`, or else Claude Code's session ID, which reaches commands the agent runs. A shell with `CLAUDE_CODE_CHILD_SESSION` set gets whole views, because an agent that Claude Code starts as a child session can share its parent's session ID but not its context. So do the MCP server's tools, whose server keeps the ID it started with after `/clear`. `--fresh` prints whole views and still remembers them. After compaction the agent no longer holds what it read, so the compaction hooks that `init --hooks` installs for Claude Code forget every session's views. Without those hooks, or after another client's compaction, use `--fresh`. Without a session, views print whole, as before.
 
 ## Repository map and change impact
 
