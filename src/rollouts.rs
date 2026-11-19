@@ -14,11 +14,13 @@
 //!   as words), answered by a `function_call_output` with the same `call_id`. That
 //!   output is what the model read. `exec_command` text starts with a header that
 //!   holds `Process exited with code N` and ends with `Output:`, and a command that
-//!   keeps running reports `Process running with session ID N` instead.
+//!   keeps running reports `Process running with session ID N` instead; the model
+//!   reads the rest of its output later, through `write_stdin`.
 //! - `event_msg` `item_completed` whose `item` is a `CommandExecution`, written
-//!   since late August 2026: `command` (`[shell, "-lc", text]`), `cwd`, `exit_code`
-//!   (a `file://` URI) and `aggregated_output`. Its `id` is `exec-…` for a call from a code-mode
-//!   script and the `call_id` for a direct call, which is therefore read once.
+//!   since late August 2026: `command` (`[shell, "-lc", text]`), `cwd` (a `file://`
+//!   URI), `exit_code` and `aggregated_output`. Its `id` is `exec-…` for a call from
+//!   a code-mode script and the `call_id` for a direct call, which is read once: with
+//!   its result, or from this item when the command kept running.
 //! - `response_item` `custom_tool_call` named `exec`, a code-mode script, answered
 //!   by a `custom_tool_call_output` that the model read. Before the
 //!   `CommandExecution` items, the commands a script ran were not recorded.
@@ -131,6 +133,9 @@ fn read(
     let mut session: Option<String> = None;
     let mut turn = String::new();
     let mut calls: HashMap<String, Call> = HashMap::new();
+    // Direct calls answered, and those whose command was still running then.
+    let mut answered: HashSet<String> = HashSet::new();
+    let mut running: HashMap<String, Call> = HashMap::new();
     let mut scripts: HashSet<String> = HashSet::new();
     for (index, line) in BufReader::new(handle).lines().enumerate() {
         let Ok(line) = line else {
@@ -251,11 +256,22 @@ fn read(
                     }
                     continue;
                 }
+                let direct = running.remove(id);
+                if direct.is_none() && answered.contains(id) {
+                    continue;
+                }
                 let cwd = match native(&item["cwd"]) {
                     "" => turn.clone(),
                     cwd => cwd.to_owned(),
                 };
-                let command = item["command"].as_array().and_then(|w| words_text(w));
+                let nested = direct.is_none();
+                let (command, time_ms) = match direct {
+                    Some(call) => (Some(call.command), call.time_ms),
+                    None => (
+                        item["command"].as_array().and_then(|w| words_text(w)),
+                        time_ms,
+                    ),
+                };
                 let (Some(command), true) = (command, time_ms >= since_ms && within(&cwd)) else {
                     continue;
                 };
@@ -277,7 +293,7 @@ fn read(
                     bytes: output.len() as u64,
                     output,
                     status,
-                    nested: true,
+                    nested,
                     file: file.to_path_buf(),
                     line: index + 1,
                 });
@@ -288,17 +304,19 @@ fn read(
                     continue;
                 };
                 let (id, call) = call;
+                answered.insert(id.clone());
                 if call.time_ms < since_ms || !within(&call.cwd) {
-                    continue;
-                }
-                if !seen.insert(id) {
-                    scan.repeated += 1;
                     continue;
                 }
                 let whole = text(&payload["output"]);
                 let Some((status, output)) = result(&whole) else {
+                    running.insert(id, call);
                     continue;
                 };
+                if !seen.insert(id) {
+                    scan.repeated += 1;
+                    continue;
+                }
                 let thread = session.clone().unwrap_or_default();
                 scan.sessions.insert(thread.clone());
                 each(Shell {

@@ -1,6 +1,8 @@
 //! Codex: the command hook for calls from code-mode scripts, and the rollouts that
 //! `discover` and `stats` read. Payloads follow Codex's hook schema and the rollout
-//! records described in `src/rollouts.rs`.
+//! records described in `src/rollouts.rs`. Command hooks pass every command through
+//! on Windows, so these run on Unix.
+#![cfg(unix)]
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -182,6 +184,8 @@ fn rollouts_feed_discover_and_stats() {
                 "call_3",
                 "Chunk ID: b\nWall time: 10.0 seconds\nProcess running with session ID 5\nOutput:\nCompiling\n",
             ),
+            // The command kept running; its item holds the whole output.
+            item("call_3", "cargo build", src, 0, "Compiling\nFinished\n"),
             exec_command("call_4", "git push"),
             output(
                 "call_4",
@@ -212,7 +216,7 @@ fn rollouts_feed_discover_and_stats() {
             "code_mode_commands",
             "code_mode_results"
         ]),
-        [json!(1), json!(4), json!(2), json!(1)],
+        [json!(1), json!(5), json!(2), json!(1)],
         "{codex:#}"
     );
     assert_eq!(
@@ -230,22 +234,25 @@ fn rollouts_feed_discover_and_stats() {
             .collect::<Vec<_>>()
     };
     assert_eq!(labels("through_justless"), ["justless run"]);
-    assert_eq!(labels("supported_not_routed"), ["cargo test", "rg"]);
+    assert_eq!(
+        labels("supported_not_routed"),
+        ["cargo build", "cargo test", "rg"]
+    );
     assert_eq!(labels("not_supported"), ["git push"]);
 
     let text = lab.run(&["discover"], None);
     assert!(
-        text.contains("Codex ran 4 shell command(s) here")
+        text.contains("Codex ran 5 shell command(s) here")
             && text.contains("2 of them ran inside code-mode scripts")
             && text.contains("init --hooks --agent codex")
             && !text.contains("needle"),
         "{text}"
     );
     let stats = lab.json(&["stats", "--json"], None);
-    assert_eq!(stats["codex"]["commands"], 4, "{stats:#}");
+    assert_eq!(stats["codex"]["commands"], 5, "{stats:#}");
     assert_eq!(stats["codex"]["through_justless_commands"], 1);
     assert!(
         lab.run(&["stats"], None)
-            .contains("Codex shell commands here: 4")
+            .contains("Codex shell commands here: 5")
     );
 }
