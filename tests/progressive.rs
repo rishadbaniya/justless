@@ -33,8 +33,55 @@ fn ok(out: Output) -> Vec<u8> {
     out.stdout
 }
 
+/// The stdout of a command, given no input, that must succeed.
+fn out(root: &Path, args: &[&str]) -> Vec<u8> {
+    ok(run(root, args, b""))
+}
+
+fn fails(root: &Path, args: &[&str], input: &[u8]) -> bool {
+    !run(root, args, input).status.success()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 fn json_output(root: &Path, args: &[&str], input: &Value) -> Value {
     serde_json::from_slice(&ok(run(root, args, &serde_json::to_vec(input).unwrap()))).unwrap()
+}
+
+fn json(root: &Path, args: &[&str]) -> Value {
+    json_output(root, args, &Value::Null)
+}
+
+fn outline(root: &Path, name: &str) -> Value {
+    json(root, &["read", name, "--json"])
+}
+
+fn revision(root: &Path, name: &str) -> String {
+    outline(root, name)["revision"].as_str().unwrap().to_owned()
+}
+
+/// One field of every row of an outline page.
+fn column<'a>(page: &'a Value, key: &str) -> Vec<&'a str> {
+    let entries = page["entries"].as_array().unwrap();
+    entries
+        .iter()
+        .map(|entry| entry[key].as_str().unwrap())
+        .collect()
+}
+
+fn read(root: &Path, name: &str) -> String {
+    fs::read_to_string(root.join(name)).unwrap()
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+#[track_caller]
+fn contains(text: &str, needle: &str) {
+    assert!(text.contains(needle), "{needle:?} not in:\n{text}");
 }
 
 #[test]
@@ -69,45 +116,24 @@ fn reads_and_edits_use_parser_extents_even_with_unicode_crlf_or_same_line_declar
     ];
     for (name, source, symbol, selected) in cases {
         fs::write(root.join(name), source).unwrap();
-        assert_eq!(ok(run(root, &["read", name], b"")), source.as_bytes());
-        let outline = json_output(root, &["read", name, "--json"], &Value::Null);
-        let revision = outline["revision"].as_str().unwrap();
-        assert_eq!(
-            ok(run(
-                root,
-                &["expand", name, symbol, "--revision", revision],
-                b""
-            )),
-            selected.as_bytes(),
-            "{name}"
-        );
-        assert!(!run(root, &["edit", name, symbol], b"oops").status.success());
+        assert_eq!(out(root, &["read", name]), source.as_bytes());
+        let revision = &revision(root, name);
+        let edit = ["edit", name, symbol, "--revision", revision];
+        let expanded = out(root, &["expand", name, symbol, "--revision", revision]);
+        assert_eq!(expanded, selected.as_bytes(), "{name}");
+        assert!(fails(root, &["edit", name, symbol], b"oops"));
         let edited = format!("{selected} /* updated */");
-        let preview = ok(run(
+        let dry_run = [&edit[..], &["--dry-run"]].concat();
+        let preview = ok(run(root, &dry_run, edited.as_bytes()));
+        contains(&String::from_utf8(preview).unwrap(), "/* updated */");
+        assert_eq!(read(root, name), source);
+        ok(run(root, &edit, edited.as_bytes()));
+        assert_eq!(read(root, name), source.replace(selected, &edited));
+        assert!(fails(
             root,
-            &["edit", name, symbol, "--revision", revision, "--dry-run"],
-            edited.as_bytes(),
+            &["edit", name, "L1", "--revision", revision],
+            b"oops"
         ));
-        assert!(
-            String::from_utf8(preview)
-                .unwrap()
-                .contains("/* updated */")
-        );
-        assert_eq!(fs::read_to_string(root.join(name)).unwrap(), source);
-        ok(run(
-            root,
-            &["edit", name, symbol, "--revision", revision],
-            edited.as_bytes(),
-        ));
-        assert_eq!(
-            fs::read_to_string(root.join(name)).unwrap(),
-            source.replace(selected, &edited)
-        );
-        assert!(
-            !run(root, &["edit", name, "L1", "--revision", revision], b"oops")
-                .status
-                .success()
-        );
     }
 }
 
@@ -118,78 +144,41 @@ fn pagination_and_batch_edits_are_revision_bound() {
     let text = "use std::fmt;\nmod a { pub fn same() {} }\nmod b { pub fn same() {} }\n";
     fs::write(root.join("lib.rs"), text).unwrap();
     fs::write(root.join("copy.rs"), text).unwrap();
-    let page = json_output(
-        root,
-        &[
-            "read", "lib.rs", "--json", "--match", "same", "--limit", "1",
-        ],
-        &Value::Null,
-    );
+    let page = json(root, &words("read lib.rs --json --match same --limit 1"));
     let cursor = page["next"].as_str().unwrap();
     assert_eq!(page["entries"][0]["name"], "a::same");
-    let next = json_output(
-        root,
-        &[
-            "read", "lib.rs", "--json", "--match", "same", "--after", cursor,
-        ],
-        &Value::Null,
-    );
+    let after = [
+        "read", "lib.rs", "--json", "--match", "same", "--after", cursor,
+    ];
+    let next = json(root, &after);
     assert_eq!(next["entries"][0]["name"], "b::same");
     assert!(next["next"].is_null());
-    assert!(
-        !run(root, &["expand", "lib.rs", "same"], b"")
-            .status
-            .success()
-    );
-    assert!(
-        !run(root, &["edit", "copy.rs", cursor], b"oops")
-            .status
-            .success()
-    );
-    let inspected = json_output(
-        root,
-        &["expand", "lib.rs", "a::same", "--json"],
-        &Value::Null,
-    );
+    assert!(fails(root, &["expand", "lib.rs", "same"], b""));
+    assert!(fails(root, &["edit", "copy.rs", cursor], b"oops"));
+    let inspected = json(root, &words("expand lib.rs a::same --json"));
     assert_eq!(inspected["content"], "pub fn same() {}");
     assert_eq!(inspected["first"], 2);
+    let selector = inspected["selector"].as_str().unwrap();
     assert_eq!(
-        ok(run(
-            root,
-            &["expand", "lib.rs", inspected["selector"].as_str().unwrap()],
-            b""
-        )),
+        out(root, &["expand", "lib.rs", selector]),
         b"pub fn same() {}"
     );
     let rev = page["revision"].as_str().unwrap();
     let batch = |data: Value| {
-        run(
-            root,
-            &["edit", "lib.rs", "--batch", "--revision", rev],
-            &serde_json::to_vec(&data).unwrap(),
-        )
+        let edit = ["edit", "lib.rs", "--batch", "--revision", rev];
+        run(root, &edit, &serde_json::to_vec(&data).unwrap())
     };
-    assert!(
-        !batch(json!([{"selector":"a","replacement":""},{"selector":"a::same","replacement":""}]))
-            .status
-            .success()
-    );
-    assert_eq!(fs::read_to_string(root.join("lib.rs")).unwrap(), text);
+    // Overlapping selectors reject the whole batch.
+    let overlapping =
+        json!([{"selector":"a","replacement":""},{"selector":"a::same","replacement":""}]);
+    assert!(!batch(overlapping).status.success());
+    assert_eq!(read(root, "lib.rs"), text);
     ok(batch(
         json!([{"selector":"L1","replacement":"// intro\n","mode":"before"},{"selector":cursor,"replacement":"pub fn fresh() {}"},{"selector":"L3","mode":"after","replacement":"// eof"}]),
     ));
-    assert_eq!(
-        fs::read_to_string(root.join("lib.rs")).unwrap(),
-        format!(
-            "// intro\n{}// eof",
-            text.replacen("fn same", "fn fresh", 1)
-        )
-    );
-    assert!(
-        !run(root, &["read", "lib.rs", "--after", cursor], b"")
-            .status
-            .success()
-    );
+    let fresh = text.replacen("fn same", "fn fresh", 1);
+    assert_eq!(read(root, "lib.rs"), format!("// intro\n{fresh}// eof"));
+    assert!(fails(root, &["read", "lib.rs", "--after", cursor], b""));
 }
 
 #[test]
@@ -197,34 +186,24 @@ fn text_fallback_handles_empty_files_and_verified_ranges() {
     let d = tempdir().unwrap();
     let root = d.path();
     fs::write(root.join("settings.custom"), "").unwrap();
-    let page = json_output(root, &["read", "settings.custom", "--json"], &Value::Null);
-    let rev = page["revision"].as_str().unwrap();
+    let rev = &revision(root, "settings.custom");
     let source = "é\r\n".repeat(80) + "last";
-    ok(run(
-        root,
-        &["edit", "settings.custom", "L1", "--revision", rev],
-        source.as_bytes(),
-    ));
-    assert_eq!(
-        ok(run(root, &["expand", "settings.custom", "L80-L81"], b"")),
-        "é\r\nlast".as_bytes()
-    );
-    let outline = ok(run(
-        root,
-        &["read", "settings.custom", "--budget", "128"],
-        b"",
-    ));
+    let edit = ["edit", "settings.custom", "L1", "--revision", rev];
+    ok(run(root, &edit, source.as_bytes()));
+    let range = out(root, &["expand", "settings.custom", "L80-L81"]);
+    assert_eq!(range, "é\r\nlast".as_bytes());
+    let outline = out(root, &["read", "settings.custom", "--budget", "128"]);
     assert!(outline.len() <= 128);
     fs::write(root.join("binary"), b"hello\0world").unwrap();
-    assert!(!run(root, &["read", "binary"], b"").status.success());
+    assert!(fails(root, &["read", "binary"], b""));
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(root.join("settings.custom"), root.join("alias")).unwrap();
-        assert!(
-            !run(root, &["edit", "alias", "L1", "--revision", rev], b"wrong")
-                .status
-                .success()
-        );
+        assert!(fails(
+            root,
+            &["edit", "alias", "L1", "--revision", rev],
+            b"wrong"
+        ));
     }
 }
 
@@ -233,26 +212,17 @@ fn concurrent_verified_edits_allow_one_writer() {
     let project = tempdir().unwrap();
     let root = project.path();
     fs::write(root.join("x.txt"), "before\n").unwrap();
-    let page = json_output(root, &["read", "x.txt", "--json"], &Value::Null);
-    let rev = page["revision"].as_str().unwrap();
+    let rev = &revision(root, "x.txt");
     std::thread::scope(|threads| {
         let handles: Vec<_> = [b"left".as_slice(), b"right"]
             .into_iter()
             .map(|text| {
-                threads.spawn(move || {
-                    run(root, &["edit", "x.txt", "L1", "--revision", rev], text)
-                        .status
-                        .success()
-                })
+                let edit = ["edit", "x.txt", "L1", "--revision", rev];
+                threads.spawn(move || run(root, &edit, text).status.success())
             })
             .collect();
-        assert_eq!(
-            handles
-                .into_iter()
-                .filter_map(|h| h.join().unwrap().then_some(()))
-                .count(),
-            1
-        );
+        let written = handles.into_iter().map(|h| h.join().unwrap());
+        assert_eq!(written.filter(|&success| success).count(), 1);
     });
 }
 
@@ -270,11 +240,16 @@ fn native_reads_preserve_explicit_windows_and_reject_mismatched_content() {
     fs::write(&path, &source).unwrap();
     let mut event = json!({"tool_name":"Read","hook_event_name":"PostToolUse","tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,"content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
     let post = |event: &Value| json_output(&root, &["hook-claude", "after-read"], event);
-    let result = post(&event);
-    let compact = &result["hookSpecificOutput"]["updatedToolOutput"]["file"];
-    assert!(compact["content"].as_str().unwrap().contains("calculate"));
-    assert!(!compact["content"].as_str().unwrap().contains("# detail"));
-    assert_eq!(compact["totalLines"], 402);
+    let compact = |event: &Value| {
+        let result = post(event);
+        let file = &result["hookSpecificOutput"]["updatedToolOutput"]["file"];
+        let content = file["content"].as_str().unwrap();
+        assert!(!content.contains("# detail"), "{content}");
+        file.clone()
+    };
+    let file = compact(&event);
+    contains(file["content"].as_str().unwrap(), "calculate");
+    assert_eq!(file["totalLines"], 402);
     event["tool_input"]["limit"] = json!(32);
     assert_eq!(post(&event), json!({}));
     event["tool_input"].as_object_mut().unwrap().remove("limit");
@@ -286,14 +261,10 @@ fn native_reads_preserve_explicit_windows_and_reject_mismatched_content() {
     }
     for flag in [json!(false), json!("false"), Value::Null] {
         event["tool_input"]["allow_large"] = flag;
-        let result = post(&event);
-        let compact = &result["hookSpecificOutput"]["updatedToolOutput"]["file"];
-        assert!(!compact["content"].as_str().unwrap().contains("# detail"));
+        compact(&event);
     }
-    event["tool_input"]
-        .as_object_mut()
-        .unwrap()
-        .remove("allow_large");
+    let input = event["tool_input"].as_object_mut().unwrap();
+    input.remove("allow_large");
     fs::write(&path, source.replace("42", "43")).unwrap();
     assert_eq!(post(&event), json!({}));
     let command = |cmd: &str| json!({"tool_name":"Bash","hook_event_name":"PreToolUse","tool_input":{"command":cmd,"workdir":subdir}});
@@ -308,6 +279,14 @@ fn native_reads_preserve_explicit_windows_and_reject_mismatched_content() {
     for cmd in ["cat a b", "cat ../outside", "cat a | head", "cat -n a"] {
         assert_eq!(shell(cmd), json!({}));
     }
+}
+
+fn recall_id(stub: &Value) -> String {
+    let text = stub.as_str().or_else(|| stub[0]["text"].as_str()).unwrap();
+    text.strip_prefix("[justless recall ")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -338,35 +317,23 @@ fn outbound_requests_restore_exact_values_and_protect_current_context() {
         ),
     ];
     for (original, pointer) in cases {
-        let masked = json_output(
-            root,
-            &["mask", "--keep", "1", "--model", "claude-sonnet-4-6"],
-            &original,
-        );
+        let keep = words("mask --keep 1 --model claude-sonnet-4-6");
+        let masked = json_output(root, &keep, &original);
         let mut expected = original.clone();
         let stub = masked.pointer(pointer).unwrap();
-        let text = stub.as_str().or_else(|| stub[0]["text"].as_str()).unwrap();
-        let id = text
-            .strip_prefix("[justless recall ")
-            .unwrap()
-            .strip_suffix(']')
-            .unwrap();
+        let id = recall_id(stub);
         *expected.pointer_mut(pointer).unwrap() = stub.clone();
         assert_eq!(masked, expected);
-        assert_eq!(
-            json_output(root, &["recall", id, "--json"], &Value::Null),
-            *original.pointer(pointer).unwrap()
-        );
+        let recalled = json(root, &["recall", &id, "--json"]);
+        assert_eq!(recalled, *original.pointer(pointer).unwrap());
         assert_eq!(json_output(root, &["mask", "--restore"], &masked), original);
         assert_eq!(json_output(root, &["mask", "--keep", "1"], &masked), masked);
-        for flag in [
-            ["--keep-tool", "read"],
-            ["--pin", "old"],
-            ["--trigger-bytes", "100000"],
-        ] {
+        for flags in ["--keep-tool read", "--pin old", "--trigger-bytes 100000"] {
+            let mask = format!("mask --keep 1 {flags}");
             assert_eq!(
-                json_output(root, &["mask", "--keep", "1", flag[0], flag[1]], &original),
-                original
+                json_output(root, &words(&mask), &original),
+                original,
+                "{flags}"
             );
         }
     }
@@ -384,12 +351,8 @@ fn multimodal_or_annotated_results_survive_and_corrupt_archives_fail_closed() {
     assert_eq!(json_output(root, &["mask", "--keep", "0"], &req), req);
     let req = json!({"messages":[{"role":"tool","tool_call_id":"1","content":data}]});
     let masked = json_output(root, &["mask", "--keep", "0"], &req);
-    let path = fs::read_dir(root.join(".justless/observations"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let mut archive = fs::read_dir(root.join(".justless/observations")).unwrap();
+    let path = archive.next().unwrap().unwrap().path();
     fs::write(path, b"\"corrupt\"").unwrap();
     for (args, input) in [
         (["mask", "--restore"].as_slice(), &masked),
@@ -402,53 +365,52 @@ fn multimodal_or_annotated_results_survive_and_corrupt_archives_fail_closed() {
 }
 
 #[test]
-fn markdown_sections_skip_fenced_headings_and_include_subsections() {
+fn markdown_sections_skip_fenced_headings_and_drop_closing_hashes() {
     let d = tempdir().unwrap();
     let root = d.path();
     let section = "# Install\nrun setup\n\n~~~sh\n# fake\n~~~\n## Linux\nread this\n";
     fs::write(root.join("guide.md"), format!("{section}# Use\ncommands")).unwrap();
-    let page = json_output(root, &["read", "guide.md", "--json"], &Value::Null);
-    assert_eq!(page["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(column(&outline(root, "guide.md"), "name").len(), 3);
     assert_eq!(
-        ok(run(root, &["expand", "guide.md", "Install"], b"")),
+        out(root, &["expand", "guide.md", "Install"]),
         section.as_bytes()
     );
-    assert_eq!(
-        ok(run(root, &["expand", "guide.md", "Linux"], b"")),
-        b"## Linux\nread this\n"
-    );
+    let linux = out(root, &["expand", "guide.md", "Linux"]);
+    assert_eq!(linux, b"## Linux\nread this\n");
+
+    let text = "# Guide #\n\n## Setup ##\nInstall steps.\n\n## C#\nRun it.\n\n### Setup\nPer-command setup.\n";
+    fs::write(root.join("doc.md"), text).unwrap();
+    let page = outline(root, "doc.md");
+    assert_eq!(column(&page, "name"), ["Guide", "Setup", "C#", "Setup"]);
+    assert_eq!(out(root, &["expand", "doc.md", "Guide"]), text.as_bytes());
+    let setup = run(root, &["expand", "doc.md", "Setup"], b"");
+    assert!(!setup.status.success());
+    contains(&stderr(&setup), "ambiguous symbol");
 }
 
 #[test]
 fn agent_setup_preserves_existing_plugin_and_registers_claude_read_once() {
     let d = tempdir().unwrap();
     let root = d.path();
-    let install = [
-        "init", "--hooks", "--agent", "opencode", "--agent", "claude",
-    ];
-    ok(run(root, &install, b""));
+    let install = words("init --hooks --agent opencode --agent claude");
+    out(root, &install);
     let plugin = root.join(".opencode/plugins/justless.js");
     let script = fs::read_to_string(&plugin).unwrap();
-    assert!(script.contains("experimental.chat.messages.transform"));
-    assert!(ok(run(root, &install, b"")).is_empty());
-    let settings: Value =
-        serde_json::from_slice(&fs::read(root.join(".claude/settings.json")).unwrap()).unwrap();
-    assert_eq!(
-        settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
-        4
-    );
-    assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "^Read$");
-    assert_eq!(
-        settings["hooks"]["PostToolUse"][1]["matcher"],
-        "^(Grep|Glob)$"
-    );
-    assert_eq!(settings["hooks"]["PostToolUse"][2]["matcher"], "^Bash$");
-    assert_eq!(
-        settings["hooks"]["PostToolUse"][3]["matcher"],
-        "^(Edit|MultiEdit|Write)$"
-    );
+    contains(&script, "experimental.chat.messages.transform");
+    assert!(out(root, &install).is_empty());
+    let settings = fs::read(root.join(".claude/settings.json")).unwrap();
+    let settings: Value = serde_json::from_slice(&settings).unwrap();
+    let hooks = settings["hooks"]["PostToolUse"].as_array().unwrap();
+    let matchers: Vec<Value> = hooks.iter().map(|hook| hook["matcher"].clone()).collect();
+    let expected = [
+        "^Read$",
+        "^(Grep|Glob)$",
+        "^Bash$",
+        "^(Edit|MultiEdit|Write)$",
+    ];
+    assert_eq!(matchers, expected);
     fs::write(&plugin, "// user plugin").unwrap();
-    assert!(!run(root, &install, b"").status.success());
+    assert!(fails(root, &install, b""));
     assert_eq!(fs::read_to_string(&plugin).unwrap(), "// user plugin");
 }
 
@@ -460,38 +422,11 @@ fn oversized_files_report_the_size_cap_even_when_it_splits_a_character() {
     // The cap's extra byte falls inside the two-byte é.
     fs::write(root.join("big.txt"), "aaaaaaaaé\n").unwrap();
     fs::write(root.join("bad.txt"), b"abc\xff\n").unwrap();
-    let out = run(root, &["read", "big.txt", "--outline"], b"");
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("file exceeds max_file_bytes"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let out = run(root, &["read", "bad.txt"], b"");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("expected UTF-8 source"));
-}
-
-#[test]
-fn markdown_heading_names_drop_closing_hashes() {
-    let d = tempdir().unwrap();
-    let root = d.path();
-    let text = "# Guide #\n\n## Setup ##\nInstall steps.\n\n## C#\nRun it.\n\n### Setup\nPer-command setup.\n";
-    fs::write(root.join("doc.md"), text).unwrap();
-    let page = json_output(root, &["read", "doc.md", "--json"], &Value::Null);
-    let names: Vec<_> = page["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(names, ["Guide", "Setup", "C#", "Setup"]);
-    assert_eq!(
-        ok(run(root, &["expand", "doc.md", "Guide"], b"")),
-        text.as_bytes()
-    );
-    let out = run(root, &["expand", "doc.md", "Setup"], b"");
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous symbol"));
+    let big = run(root, &["read", "big.txt", "--outline"], b"");
+    assert!(!big.status.success());
+    contains(&stderr(&big), "file exceeds max_file_bytes");
+    let bad = run(root, &["read", "bad.txt"], b"");
+    contains(&stderr(&bad), "expected UTF-8 source");
 }
 
 #[test]
@@ -503,40 +438,16 @@ fn rust_outline_signatures_skip_docs_and_attributes() {
         "{function}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]\n#[repr(i8)]\npub enum Side {{ Buy = 1 }}\n"
     );
     fs::write(root.join("lib.rs"), &text).unwrap();
-    let page = json_output(root, &["read", "lib.rs", "--json"], &Value::Null);
-    let signatures: Vec<_> = page["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry["signature"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        signatures,
-        [
-            "pub fn fair_value(spot: f64, vol: f64) -> f64",
-            "pub enum Side"
-        ]
-    );
+    let page = outline(root, "lib.rs");
+    let signatures = column(&page, "signature");
+    let fair_value = "pub fn fair_value(spot: f64, vol: f64) -> f64";
+    assert_eq!(signatures, [fair_value, "pub enum Side"]);
     assert_eq!(page["entries"][0]["first"], 1);
     // Doc text stays searchable and inside the editable span.
-    let found = json_output(
-        root,
-        &["read", "lib.rs", "--json", "--match", "smile-adjusted"],
-        &Value::Null,
-    );
+    let found = json(root, &words("read lib.rs --json --match smile-adjusted"));
     assert_eq!(found["entries"][0]["name"], "fair_value");
-    assert_eq!(
-        ok(run(root, &["expand", "lib.rs", "fair_value"], b"")),
-        function.as_bytes()
-    );
-}
-
-fn recall_id(stub: &Value) -> String {
-    let text = stub.as_str().or_else(|| stub[0]["text"].as_str()).unwrap();
-    text.strip_prefix("[justless recall ")
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap()
-        .to_owned()
+    let expanded = out(root, &["expand", "lib.rs", "fair_value"]);
+    assert_eq!(expanded, function.as_bytes());
 }
 
 #[test]
@@ -552,12 +463,10 @@ fn plain_recall_prints_the_text_of_retired_text_parts() {
         {"role":"tool","tool_call_id":"recent","content":"x"}]});
     let masked = json_output(root, &["mask", "--keep", "1"], &request);
     let id = recall_id(&masked["messages"][1]["content"]);
-    let plain = ok(run(root, &["recall", &id], b""));
+    let plain = out(root, &["recall", &id]);
     assert_eq!(String::from_utf8(plain).unwrap(), format!("{lines}end"));
-    assert_eq!(
-        json_output(root, &["recall", &id, "--json"], &Value::Null),
-        request["messages"][1]["content"]
-    );
+    let recalled = json(root, &["recall", &id, "--json"]);
+    assert_eq!(recalled, request["messages"][1]["content"]);
 }
 
 #[test]
@@ -568,35 +477,26 @@ fn rust_syntax_errors_are_reported_instead_of_hiding_symbols() {
         .map(|i| format!("pub fn f{i}() -> u8 {{ {i} }}\n"))
         .collect();
     fs::write(root.join("ok.rs"), &text).unwrap();
-    let healthy = json_output(root, &["read", "ok.rs", "--json"], &Value::Null);
-    assert!(healthy.get("parse_error").is_none());
+    assert!(outline(root, "ok.rs").get("parse_error").is_none());
     text.push_str("pub fn wip( {\n");
     fs::write(root.join("lib.rs"), &text).unwrap();
-    let outline = String::from_utf8(ok(run(root, &["read", "lib.rs", "--outline"], b""))).unwrap();
-    assert_eq!(
-        outline.lines().nth(1),
-        Some("Rust parse failed at line 101: cannot parse string into token stream")
-    );
-    let page = json_output(root, &["read", "lib.rs", "--json"], &Value::Null);
-    assert!(
-        page["parse_error"]
-            .as_str()
-            .unwrap()
-            .starts_with("Rust parse failed at line 101")
-    );
-    let small = ok(run(root, &["read", "lib.rs", "--budget", "128"], b""));
+    let outlined = String::from_utf8(out(root, &["read", "lib.rs", "--outline"])).unwrap();
+    let error = "Rust parse failed at line 101: cannot parse string into token stream";
+    assert_eq!(outlined.lines().nth(1), Some(error));
+    let page = outline(root, "lib.rs");
+    let parse_error = page["parse_error"].as_str().unwrap();
+    assert!(parse_error.starts_with("Rust parse failed at line 101"));
+    let small = out(root, &["read", "lib.rs", "--budget", "128"]);
     assert!(small.len() <= 128, "{}", String::from_utf8_lossy(&small));
-    let out = run(root, &["expand", "lib.rs", "f3"], b"");
-    assert!(!out.status.success());
-    let error = String::from_utf8_lossy(&out.stderr);
+    let expand = run(root, &["expand", "lib.rs", "f3"], b"");
+    assert!(!expand.status.success());
+    let error = stderr(&expand);
     assert!(
         error.contains("line 101") && error.contains("line range"),
         "{error}"
     );
-    assert_eq!(
-        ok(run(root, &["expand", "lib.rs", "L3"], b"")),
-        b"pub fn f3() -> u8 { 3 }\n"
-    );
+    let line = out(root, &["expand", "lib.rs", "L3"]);
+    assert_eq!(line, b"pub fn f3() -> u8 { 3 }\n");
 }
 
 #[test]
@@ -605,11 +505,8 @@ fn deeply_nested_rust_reports_an_error_instead_of_overflowing_the_stack() {
     let root = d.path();
     fs::write(root.join(".justless.toml"), "").unwrap();
     fs::write(root.join("ok.rs"), "pub fn hello() -> u8 { 1 }\n").unwrap();
-    let deep = format!(
-        "fn f() -> u8 {{ {}1{} }}\n",
-        "(".repeat(3000),
-        ")".repeat(3000)
-    );
+    let parens = ("(".repeat(3000), ")".repeat(3000));
+    let deep = format!("fn f() -> u8 {{ {}1{} }}\n", parens.0, parens.1);
     let unary = format!("const B: bool = {}true;\n", "!".repeat(3000));
     let chain = format!("const X: u64 = {}1;\n", "1 + ".repeat(20000));
     fs::write(root.join("deep.rs"), &deep).unwrap();
@@ -617,30 +514,23 @@ fn deeply_nested_rust_reports_an_error_instead_of_overflowing_the_stack() {
     fs::write(root.join("chain.rs"), &chain).unwrap();
     fs::write(root.join("late.rs"), "fn a() {}\n\nfn b( -> {}\n").unwrap();
     for (name, text) in [("deep.rs", &deep), ("unary.rs", &unary)] {
-        let page = json_output(root, &["read", name, "--json"], &Value::Null);
-        assert_eq!(
-            page["parse_error"],
-            "Rust parse failed at line 1: nesting deeper than 1024 levels"
-        );
+        let error = "Rust parse failed at line 1: nesting deeper than 1024 levels";
+        assert_eq!(outline(root, name)["parse_error"], error);
         // Line ranges never need the parser.
-        assert_eq!(ok(run(root, &["expand", name, "L1"], b"")), text.as_bytes());
+        assert_eq!(out(root, &["expand", name, "L1"]), text.as_bytes());
     }
-    let page = json_output(root, &["read", "chain.rs", "--json"], &Value::Null);
-    assert_eq!(page["entries"][0]["name"], "X");
-    let page = json_output(root, &["read", "late.rs", "--json"], &Value::Null);
-    assert!(
-        page["parse_error"]
-            .as_str()
-            .unwrap()
-            .starts_with("Rust parse failed at line 3: "),
-        "{page}"
-    );
-    let found = String::from_utf8(ok(run(root, &["query", "hello"], b""))).unwrap();
-    assert!(found.contains("hello [function] at ok.rs:1"), "{found}");
+    assert_eq!(outline(root, "chain.rs")["entries"][0]["name"], "X");
+    let page = outline(root, "late.rs");
+    let error = page["parse_error"].as_str().unwrap();
+    assert!(error.starts_with("Rust parse failed at line 3: "), "{page}");
+    let found = String::from_utf8(out(root, &["query", "hello"])).unwrap();
+    contains(&found, "hello [function] at ok.rs:1");
 }
 
+/// A member's decorators belong to its span, so they are read and edited with it,
+/// but its outline row shows only its own signature.
 #[test]
-fn typescript_method_spans_include_their_decorators() {
+fn typescript_member_decorators_stay_in_spans_and_out_of_signatures() {
     let d = tempdir().unwrap();
     let root = d.path();
     let method =
@@ -648,13 +538,17 @@ fn typescript_method_spans_include_their_decorators() {
     let text = format!(
         "class Ctl {{\n  /** Lists users. */\n  {method}\n\n  open() {{ return 2; }}\n}}\n"
     );
-    for name in ["ctl.ts", "ctl.tsx"] {
+    // More than the 160 bytes a row shows before its signature is clipped.
+    let decorators = "@ApiResponse({ status: 200, description: \"The list of users visible to the caller\" })\n  @ApiResponse({ status: 403, description: \"The caller lacks the users:read permission\" })\n  @Get(\"/users\")\n  ";
+    assert!(decorators.len() > 160);
+    let list = format!(
+        "{decorators}listUsers(page: number, size: number): Promise<User[]> {{ return []; }}"
+    );
+    let controller = format!("class UsersController {{\n  {list}\n}}\n");
+    for extension in ["ts", "tsx"] {
+        let name = &format!("ctl.{extension}");
         fs::write(root.join(name), &text).unwrap();
-        let found = json_output(
-            root,
-            &["expand", name, "Ctl::admin", "--json"],
-            &Value::Null,
-        );
+        let found = json(root, &["expand", name, "Ctl::admin", "--json"]);
         assert_eq!(found["content"], method, "{name}");
         assert_eq!(found["first"], 3);
         let revision = found["revision"].as_str().unwrap();
@@ -664,51 +558,23 @@ fn typescript_method_spans_include_their_decorators() {
             b"",
         ));
         // The decorators leave with the method instead of moving to open().
-        assert_eq!(
-            fs::read_to_string(root.join(name)).unwrap(),
-            "class Ctl {\n  /** Lists users. */\n  \n\n  open() { return 2; }\n}\n"
-        );
-    }
-}
+        let rest = "class Ctl {\n  /** Lists users. */\n  \n\n  open() { return 2; }\n}\n";
+        assert_eq!(read(root, name), rest);
 
-#[test]
-fn typescript_outline_signatures_skip_member_decorators() {
-    let d = tempdir().unwrap();
-    let root = d.path();
-    // More than the 160 bytes a row shows before its signature is clipped.
-    let decorators = "@ApiResponse({ status: 200, description: \"The list of users visible to the caller\" })\n  @ApiResponse({ status: 403, description: \"The caller lacks the users:read permission\" })\n  @Get(\"/users\")\n  ";
-    assert!(decorators.len() > 160);
-    let method = format!(
-        "{decorators}listUsers(page: number, size: number): Promise<User[]> {{ return []; }}"
-    );
-    let text = format!("class UsersController {{\n  {method}\n}}\n");
-    for name in ["u.ts", "u.tsx"] {
-        fs::write(root.join(name), &text).unwrap();
-        let page = json_output(root, &["read", name, "--json"], &Value::Null);
-        let row = &page["entries"][1];
-        assert_eq!(row["name"], "UsersController::listUsers", "{name}");
-        assert_eq!(
-            row["signature"], "listUsers(page: number, size: number): Promise<User[]>",
-            "{name}"
-        );
+        let name = &format!("u.{extension}");
+        let symbol = "UsersController::listUsers";
+        fs::write(root.join(name), &controller).unwrap();
+        let row = &outline(root, name)["entries"][1];
+        assert_eq!(row["name"], symbol, "{name}");
+        let signature = "listUsers(page: number, size: number): Promise<User[]>";
+        assert_eq!(row["signature"], signature, "{name}");
         // The line range and the editable span still cover the decorators.
         assert_eq!(row["first"], 2, "{name}");
-        let found = json_output(
-            root,
-            &["expand", name, "UsersController::listUsers", "--json"],
-            &Value::Null,
-        );
-        assert_eq!(found["content"], method.as_str(), "{name}");
+        let found = json(root, &["expand", name, symbol, "--json"]);
+        assert_eq!(found["content"], list.as_str(), "{name}");
         // Decorator text stays searchable.
-        let matched = json_output(
-            root,
-            &["read", name, "--json", "--match", "users:read"],
-            &Value::Null,
-        );
-        assert_eq!(
-            matched["entries"][0]["name"], "UsersController::listUsers",
-            "{name}"
-        );
+        let matched = json(root, &["read", name, "--json", "--match", "users:read"]);
+        assert_eq!(matched["entries"][0]["name"], symbol, "{name}");
     }
 }
 
@@ -716,63 +582,54 @@ fn typescript_outline_signatures_skip_member_decorators() {
 fn symbol_insertions_land_on_line_boundaries() {
     let d = tempdir().unwrap();
     let root = d.path();
-    let insert = |name: &str, text: &str, args: &[&str], replacement: &str| {
+    let insert = |name: &str, text: &str, args: &str, replacement: &str| {
         fs::write(root.join(name), text).unwrap();
-        let page = json_output(root, &["read", name, "--json"], &Value::Null);
-        let revision = page["revision"].as_str().unwrap();
+        let revision = revision(root, name);
         let mut command = vec!["edit", name];
-        command.extend_from_slice(args);
-        command.extend_from_slice(&["--revision", revision]);
+        command.extend(words(args));
+        command.extend(["--revision", revision.as_str()]);
         ok(run(root, &command, replacement.as_bytes()));
-        fs::read_to_string(root.join(name)).unwrap()
+        read(root, name)
     };
     assert_eq!(
         insert(
             "a.py",
             "class A:\n    def old(self):\n        return 1\n\n    def last(self):\n        return 2\n",
-            &["A::old", "--after"],
+            "A::old --after",
             "    def new(self):\n        return 0\n",
         ),
         "class A:\n    def old(self):\n        return 1\n    def new(self):\n        return 0\n\n    def last(self):\n        return 2\n"
     );
-    assert_eq!(
-        insert(
-            "x.rs",
-            "fn a() {}\r\nfn b() {}\r\n",
-            &["a", "--after"],
-            "fn n() {}\r\n"
-        ),
-        "fn a() {}\r\nfn n() {}\r\nfn b() {}\r\n"
+    let crlf = insert(
+        "x.rs",
+        "fn a() {}\r\nfn b() {}\r\n",
+        "a --after",
+        "fn n() {}\r\n",
     );
+    assert_eq!(crlf, "fn a() {}\r\nfn n() {}\r\nfn b() {}\r\n");
     assert_eq!(
         insert(
             "ctl.ts",
             "class Ctl {\n  @Get(\"/a\")\n  admin() {}\n}\n",
-            &["Ctl::admin", "--before"],
+            "Ctl::admin --before",
             "  fresh() {}\n",
         ),
         "class Ctl {\n  fresh() {}\n  @Get(\"/a\")\n  admin() {}\n}\n"
     );
     // A symbol that shares its line keeps its exact boundary.
-    assert_eq!(
-        insert(
-            "same.rs",
-            "fn one() {} fn two() {}\n",
-            &["two", "--before"],
-            "fn mid() {} "
-        ),
-        "fn one() {} fn mid() {} fn two() {}\n"
+    let same = insert(
+        "same.rs",
+        "fn one() {} fn two() {}\n",
+        "two --before",
+        "fn mid() {} ",
     );
+    assert_eq!(same, "fn one() {} fn mid() {} fn two() {}\n");
     // The last line has no line ending, so the insertion goes at the end.
-    assert_eq!(
-        insert("end.rs", "fn a() {}", &["a", "--after"], "\nfn z() {}"),
-        "fn a() {}\nfn z() {}"
-    );
+    let end = insert("end.rs", "fn a() {}", "a --after", "\nfn z() {}");
+    assert_eq!(end, "fn a() {}\nfn z() {}");
     // Line ranges already end at a line boundary and keep a blank next line.
-    assert_eq!(
-        insert("t.txt", "one\n\nthree\n", &["L1", "--after"], "two\n"),
-        "one\ntwo\n\nthree\n"
-    );
+    let lines = insert("t.txt", "one\n\nthree\n", "L1 --after", "two\n");
+    assert_eq!(lines, "one\ntwo\n\nthree\n");
 }
 
 #[test]
@@ -798,68 +655,51 @@ fn source_paths_resolve_from_the_current_directory_within_the_workspace() {
         child.stdin.take().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     };
-    let read = |file: &str| ok(from_crate(&["read", file], b""));
+    let read_from_crate = |file: &str| ok(from_crate(&["read", file], b""));
     // Without --root, a bare path resolves like a shell path and says so when
     // the root has a different file of that name.
     let shadowed = from_crate(&["read", "Cargo.toml"], b"");
-    assert!(
-        String::from_utf8_lossy(&shadowed.stderr)
-            .contains("use ../Cargo.toml for the workspace root's file")
+    contains(
+        &stderr(&shadowed),
+        "use ../Cargo.toml for the workspace root's file",
     );
     assert_eq!(ok(shadowed), b"[package]\n");
-    assert_eq!(read("./Cargo.toml"), b"[package]\n");
-    assert_eq!(read("../Cargo.toml"), b"[workspace]\n");
-    assert_eq!(read("only.txt"), b"only here\n");
-    // A workspace-relative path still works when the current directory lacks it.
-    assert_eq!(read("crate/only.txt"), b"only here\n");
-    assert_eq!(
-        read(crate_dir.join("Cargo.toml").to_str().unwrap()),
-        b"[package]\n"
-    );
-    assert!(
-        !from_crate(&["read", "../../outside.txt"], b"")
-            .status
-            .success()
-    );
+    let absolute = crate_dir.join("Cargo.toml");
+    for (path, expected) in [
+        ("./Cargo.toml", "[package]\n"),
+        ("../Cargo.toml", "[workspace]\n"),
+        ("only.txt", "only here\n"),
+        // A workspace-relative path still works when the current directory lacks it.
+        ("crate/only.txt", "only here\n"),
+        (absolute.to_str().unwrap(), "[package]\n"),
+    ] {
+        assert_eq!(read_from_crate(path), expected.as_bytes(), "{path}");
+    }
+    let outside = from_crate(&["read", "../../outside.txt"], b"");
+    assert!(!outside.status.success());
     // With --root, as hooks pass it, a bare path is root-relative first.
-    let hooked = from_crate(
-        &["--root", root.to_str().unwrap(), "read", "Cargo.toml"],
-        b"",
-    );
-    assert!(
-        String::from_utf8_lossy(&hooked.stderr).contains("use ./Cargo.toml for crate/Cargo.toml")
-    );
+    let rooted = ["--root", root.to_str().unwrap(), "read", "Cargo.toml"];
+    let hooked = from_crate(&rooted, b"");
+    contains(&stderr(&hooked), "use ./Cargo.toml for crate/Cargo.toml");
     assert_eq!(ok(hooked), b"[workspace]\n");
     // Every spelling of one file shares its name and revision.
     let local = from_crate(&["expand", "Cargo.toml", "L1", "--json"], b"");
     let local: Value = serde_json::from_slice(&ok(local)).unwrap();
-    let rooted = json_output(
-        &root,
-        &["expand", "crate/Cargo.toml", "L1", "--json"],
-        &Value::Null,
-    );
+    let rooted = json(&root, &words("expand crate/Cargo.toml L1 --json"));
     assert_eq!(local["file"], "crate/Cargo.toml");
     assert_eq!(local["revision"], rooted["revision"]);
     let revision = local["revision"].as_str().unwrap();
-    ok(from_crate(
-        &[
-            "edit",
-            "Cargo.toml",
-            "L1",
-            "--before",
-            "--revision",
-            revision,
-        ],
-        b"# added\n",
-    ));
-    assert_eq!(
-        fs::read_to_string(crate_dir.join("Cargo.toml")).unwrap(),
-        "# added\n[package]\n"
-    );
-    assert_eq!(
-        fs::read_to_string(root.join("Cargo.toml")).unwrap(),
-        "[workspace]\n"
-    );
+    let edit = [
+        "edit",
+        "Cargo.toml",
+        "L1",
+        "--before",
+        "--revision",
+        revision,
+    ];
+    ok(from_crate(&edit, b"# added\n"));
+    assert_eq!(read(&crate_dir, "Cargo.toml"), "# added\n[package]\n");
+    assert_eq!(read(&root, "Cargo.toml"), "[workspace]\n");
 }
 
 #[test]
@@ -873,14 +713,10 @@ fn dry_run_patches_name_the_workspace_file_and_apply_cleanly() {
         fs::create_dir_all(base.join("src/a b")).unwrap();
         fs::write(base.join(name), text).unwrap();
     }
-    let page = json_output(&root, &["read", name, "--json"], &Value::Null);
-    let revision = page["revision"].as_str().unwrap();
-    let edit = ["edit", name, "b", "--revision", revision];
-    let patch = ok(run(
-        &root,
-        &[&edit[..], &["--dry-run"]].concat(),
-        b"fn b2() {}",
-    ));
+    let revision = revision(&root, name);
+    let edit = ["edit", name, "b", "--revision", &revision];
+    let dry_run = [&edit[..], &["--dry-run"]].concat();
+    let patch = ok(run(&root, &dry_run, b"fn b2() {}"));
     let header = String::from_utf8_lossy(&patch);
     // Git may quote the non-ASCII name, depending on core.quotePath.
     let lines: Vec<_> = header.lines().collect();
@@ -888,7 +724,7 @@ fn dry_run_patches_name_the_workspace_file_and_apply_cleanly() {
     assert!(lines[2].starts_with("--- ") && lines[2].contains("a/src/a b/"));
     assert!(lines[3].starts_with("+++ ") && lines[3].contains("b/src/a b/"));
     assert!(!header.contains(root.to_str().unwrap()) && !header.contains(".tmp"));
-    assert_eq!(fs::read_to_string(root.join(name)).unwrap(), text);
+    assert_eq!(read(&root, name), text);
     let mut apply = Command::new("git")
         .args(["apply", "-"])
         .current_dir(copy.path())
@@ -898,10 +734,7 @@ fn dry_run_patches_name_the_workspace_file_and_apply_cleanly() {
     apply.stdin.take().unwrap().write_all(&patch).unwrap();
     assert!(apply.wait().unwrap().success());
     ok(run(&root, &edit, b"fn b2() {}"));
-    assert_eq!(
-        fs::read(copy.path().join(name)).unwrap(),
-        fs::read(root.join(name)).unwrap()
-    );
+    assert_eq!(read(copy.path(), name), read(&root, name));
 }
 
 #[cfg(unix)]
@@ -911,8 +744,7 @@ fn edits_refuse_read_only_files_and_keep_links_and_attributes() {
     let d = tempdir().unwrap();
     let root = d.path();
     let edit = |name: &str| {
-        let page = json_output(root, &["read", name, "--json"], &Value::Null);
-        let revision = page["revision"].as_str().unwrap().to_owned();
+        let revision = revision(root, name);
         run(
             root,
             &["edit", name, "L2", "--revision", &revision],
@@ -922,27 +754,18 @@ fn edits_refuse_read_only_files_and_keep_links_and_attributes() {
     fs::write(root.join("ro.txt"), "one\ntwo\n").unwrap();
     fs::set_permissions(root.join("ro.txt"), fs::Permissions::from_mode(0o444)).unwrap();
     // Root may write anyway, as a shell would let it.
-    if fs::File::options()
-        .write(true)
-        .open(root.join("ro.txt"))
-        .is_err()
-    {
-        let out = edit("ro.txt");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("ro.txt is not writable"));
-        assert_eq!(
-            fs::read_to_string(root.join("ro.txt")).unwrap(),
-            "one\ntwo\n"
-        );
+    let writable = fs::File::options().write(true).open(root.join("ro.txt"));
+    if writable.is_err() {
+        contains(&stderr(&edit("ro.txt")), "ro.txt is not writable");
+        assert_eq!(read(root, "ro.txt"), "one\ntwo\n");
     }
     fs::write(root.join("linked.txt"), "one\ntwo\n").unwrap();
     fs::hard_link(root.join("linked.txt"), root.join("link.txt")).unwrap();
-    let inode = fs::metadata(root.join("linked.txt")).unwrap().ino();
+    let inode = |name: &str| fs::metadata(root.join(name)).unwrap().ino();
+    let before = inode("linked.txt");
     ok(edit("linked.txt"));
-    assert_eq!(fs::metadata(root.join("linked.txt")).unwrap().ino(), inode);
-    assert_eq!(
-        fs::read_to_string(root.join("link.txt")).unwrap(),
-        "one\nTWO\n"
-    );
+    assert_eq!(inode("linked.txt"), before);
+    assert_eq!(read(root, "link.txt"), "one\nTWO\n");
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
         let tagged = root.join("tagged.txt");
@@ -954,7 +777,7 @@ fn edits_refuse_read_only_files_and_keep_links_and_attributes() {
             let mut value = [0; 8];
             let len = rustix::fs::getxattr(&tagged, "user.justless.test", &mut value[..]).unwrap();
             assert_eq!(&value[..len], b"kept");
-            assert_eq!(fs::read_to_string(&tagged).unwrap(), "one\nTWO\n");
+            assert_eq!(read(root, "tagged.txt"), "one\nTWO\n");
         }
     }
 }
@@ -986,86 +809,83 @@ fn mask_keeps_lone_surrogate_escapes_and_retires_other_results() {
 
     let masked = ok(run(root, &["mask", "--keep", "1"], request.as_bytes()));
     let masked_text = String::from_utf8(masked.clone()).unwrap();
-    assert!(
-        masked_text.contains(r#""file caf\udc80 and \\ud83d""#)
-            && masked_text.contains(r#"cut \uD83D""#),
-        "{masked_text}"
-    );
+    contains(&masked_text, r#""file caf\udc80 and \\ud83d""#);
+    contains(&masked_text, r#"cut \uD83D""#);
     let start = masked_text.find("[justless recall ").unwrap();
     let id = &masked_text[start + 17..start + 81];
-    assert_eq!(ok(run(root, &["recall", id], b"")), data.as_bytes());
+    assert_eq!(out(root, &["recall", id]), data.as_bytes());
     let restored = ok(run(root, &["mask", "--restore"], &masked));
     assert_eq!(String::from_utf8(restored).unwrap(), normalized);
+}
+
+/// `template` with each line that ends in ` detail` repeated 400 times, which makes
+/// the file long enough for a native read to become an outline.
+fn padded(template: &str) -> String {
+    let line = |line: &str| {
+        let line = format!("{line}\n");
+        if line.ends_with(" detail\n") {
+            line.repeat(400)
+        } else {
+            line
+        }
+    };
+    template.lines().map(line).collect()
 }
 
 #[test]
 fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
     let d = tempdir().unwrap();
     let root = d.path().canonicalize().unwrap();
-    let detail = |marker: &str| format!("{marker} detail\n").repeat(400);
+    let steps: String = (1..=21).map(|n| format!("step {n}\n")).collect();
     // `None` keeps the native read. Otherwise the outline lists these lines of code
     // that no row covers, and only a file with none has its `cat` rewritten.
     let files: [(&str, String, Option<&[&str]>); 17] = [
         // Commands between and after a shell script's functions.
         (
             "deploy.sh",
-            format!(
-                "#!/bin/sh\n# Deploy the service.\nset -eu\n\nrequire() {{\n{}  command -v \"$1\" >/dev/null\n}}\n\nrequire cargo\ncargo build --release\n",
-                detail("  #")
+            padded(
+                "#!/bin/sh\n# Deploy the service.\nset -eu\n\nrequire() {\n  # detail\n  command -v \"$1\" >/dev/null\n}\n\nrequire cargo\ncargo build --release\n",
             ),
             Some(&["set -eu", "require cargo", "cargo build --release"]),
         ),
         // In shell, a lone quoted word and `require NAME` are commands too.
         (
             "dispatch.sh",
-            format!(
-                "#!/bin/sh\nbuild() {{\n{}  :\n}}\n\n\"$@\"\n",
-                detail("  #")
-            ),
+            padded("#!/bin/sh\nbuild() {\n  # detail\n  :\n}\n\n\"$@\"\n"),
             Some(&["\"$@\""]),
         ),
         (
             "setup.sh",
-            format!(
-                "#!/bin/sh\nrequire() {{\n{}  command -v \"$1\"\n}}\n\nrequire cargo\n",
-                detail("  #")
-            ),
+            padded("#!/bin/sh\nrequire() {\n  # detail\n  command -v \"$1\"\n}\n\nrequire cargo\n"),
             Some(&["require cargo"]),
         ),
         // A script that is mostly top-level commands keeps its native read.
         (
             "release.sh",
-            format!(
-                "#!/bin/sh\nstep() {{\n{}  echo \"$1\"\n}}\n{}",
-                detail("  #"),
-                (1..=21).map(|n| format!("step {n}\n")).collect::<String>()
-            ),
+            padded("#!/bin/sh\nstep() {\n  # detail\n  echo \"$1\"\n}\n") + &steps,
             None,
         ),
         // A Python entry point.
         (
             "tool.py",
-            format!(
-                "import sys\n\n\ndef main():\n{}    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
-                detail("    #")
+            padded(
+                "import sys\n\n\ndef main():\n    # detail\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
             ),
             Some(&["if __name__ == \"__main__\":", "    sys.exit(main())"]),
         ),
         // Docstrings, comments and imports are not code the outline hides.
         (
             "module.py",
-            format!(
-                "\"\"\"Pricing rules.\n\nLong description.\n\"\"\"\n# Helpers follow.\nimport math\n\n\ndef price():\n{}    return math.pi\n",
-                detail("    #")
+            padded(
+                "\"\"\"Pricing rules.\n\nLong description.\n\"\"\"\n# Helpers follow.\nimport math\n\n\ndef price():\n    # detail\n    return math.pi\n",
             ),
             Some(&[]),
         ),
         // Neither are `__future__` imports and imports only for type checkers.
         (
             "typed.py",
-            format!(
-                "from __future__ import annotations\nfrom __future__ import (\n    division,\n)\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from collections.abc import Iterator\n\n\ndef main():\n{}    return 0\n",
-                detail("    #")
+            padded(
+                "from __future__ import annotations\nfrom __future__ import (\n    division,\n)\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from collections.abc import Iterator\n\n\ndef main():\n    # detail\n    return 0\n",
             ),
             Some(&[]),
         ),
@@ -1073,9 +893,8 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
         // name other modules.
         (
             "util.js",
-            format!(
-                "'use strict'\nconst fs = require('fs')\nconst {{ join }} = require('path')\nconst {{\n  a,\n  b,\n}} = require('./x')\nfunction read(p) {{\n{}  return fs.readFileSync(p, 'utf8')\n}}\nexport {{ read }}\nexport * from './other'\nexport default read\nmodule.exports = {{\n  read,\n  load: read,\n}}\nexports.read = read\n",
-                detail("  //")
+            padded(
+                "'use strict'\nconst fs = require('fs')\nconst { join } = require('path')\nconst {\n  a,\n  b,\n} = require('./x')\nfunction read(p) {\n  // detail\n  return fs.readFileSync(p, 'utf8')\n}\nexport { read }\nexport * from './other'\nexport default read\nmodule.exports = {\n  read,\n  load: read,\n}\nexports.read = read\n",
             ),
             Some(&[]),
         ),
@@ -1083,9 +902,8 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
         // code, so they follow the rows.
         (
             "server.js",
-            format!(
-                "const app = require('./app')(options)\nlet cache\nfunction handle(req, res) {{\n{}  res.end('ok')\n}}\napp.listen(8080)\n",
-                detail("  //")
+            padded(
+                "const app = require('./app')(options)\nlet cache\nfunction handle(req, res) {\n  // detail\n  res.end('ok')\n}\napp.listen(8080)\n",
             ),
             Some(&[
                 "const app = require('./app')(options)",
@@ -1095,9 +913,8 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
         ),
         (
             "config.js",
-            format!(
-                "module.exports = {{\n  name: 'thing',\n  run() {{\n{}    return 1\n  }},\n}}\n",
-                detail("    //")
+            padded(
+                "module.exports = {\n  name: 'thing',\n  run() {\n    // detail\n    return 1\n  },\n}\n",
             ),
             Some(&["module.exports = {", "  name: 'thing',"]),
         ),
@@ -1105,9 +922,8 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
         // shown with the rest of the statement.
         (
             "message.js",
-            format!(
-                "'use strict'\nconst MESSAGE = 'Refusing to delete. ' +\n  'It blocks republishing. ' +\n  'Run with --force.'\nfunction check() {{\n{}  return MESSAGE\n}}\n",
-                detail("  //")
+            padded(
+                "'use strict'\nconst MESSAGE = 'Refusing to delete. ' +\n  'It blocks republishing. ' +\n  'Run with --force.'\nfunction check() {\n  // detail\n  return MESSAGE\n}\n",
             ),
             Some(&[
                 "const MESSAGE = 'Refusing to delete. ' +",
@@ -1117,27 +933,24 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
         ),
         (
             "usage.py",
-            format!(
-                "import sys\n\n\ndef main():\n{}    return 0\n\n\nprint(\"\"\"\nusage: tool\n\"\"\")\nsys.exit(main())\n",
-                detail("    #")
+            padded(
+                "import sys\n\n\ndef main():\n    # detail\n    return 0\n\n\nprint(\"\"\"\nusage: tool\n\"\"\")\nsys.exit(main())\n",
             ),
             Some(&["print(\"\"\"", "usage: tool", "\"\"\")", "sys.exit(main())"]),
         ),
         // A function exported whole is a row of its own.
         (
             "factory.js",
-            format!(
-                "const fs = require('fs')\nmodule.exports = function make(options) {{\n{}  return fs\n}}\n",
-                detail("  //")
+            padded(
+                "const fs = require('fs')\nmodule.exports = function make(options) {\n  // detail\n  return fs\n}\n",
             ),
             Some(&[]),
         ),
         // PHP tags, `declare` and a lone directive string are not code either.
         (
             "Service.php",
-            format!(
-                "<?php\n'use strict';\ndeclare(strict_types=1);\n\nnamespace App;\n\nclass Service\n{{\n    public function total(): int\n    {{\n{}        return 1;\n    }}\n}}\n",
-                detail("        //")
+            padded(
+                "<?php\n'use strict';\ndeclare(strict_types=1);\n\nnamespace App;\n\nclass Service\n{\n    public function total(): int\n    {\n        // detail\n        return 1;\n    }\n}\n",
             ),
             Some(&[]),
         ),
@@ -1145,20 +958,16 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
         // associated constant do not stop the outline.
         (
             "lib.rs",
-            format!(
-                "pub struct Price(u32);\n\nimpl Price {{\n    const LIMIT: u32 = 10;\n\n    pub fn checked(&self) -> bool {{\n{}        self.0 < Self::LIMIT\n    }}\n}}\n",
-                detail("        //")
+            padded(
+                "pub struct Price(u32);\n\nimpl Price {\n    const LIMIT: u32 = 10;\n\n    pub fn checked(&self) -> bool {\n        // detail\n        self.0 < Self::LIMIT\n    }\n}\n",
             ),
             Some(&[]),
         ),
         // Code shown after the rows is bounded by the context budget too.
         (
             "wide.py",
-            format!(
-                "def main():\n{}    return 0\n\n\nprint('{}')\n",
-                detail("    #"),
-                "x".repeat(3000)
-            ),
+            padded("def main():\n    # detail\n    return 0\n\n\n")
+                + &format!("print('{}')\n", "x".repeat(3000)),
             None,
         ),
         // A small file stays native whatever it holds.
