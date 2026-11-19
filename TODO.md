@@ -119,26 +119,14 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 ### 3.4 Permission parity for rewritten commands — done
 - **Progress.** *on main* (2026-11-19, `src/claude_permissions.rs`). The Claude Code hook reads allow/ask/deny rules from managed, user, project and local settings and judges the original command: deny or ask leaves it alone in every mode; allow rewrites with `permissionDecision: allow` (not in `auto`, where the classifier reviews instead); no matching rule rewrites only in `bypassPermissions` and `auto`. `doctor` warns about `Bash(justless…)` allow rules that would let `justless run -- <anything>` through. Checked in an isolated project for each case.
 
-### 3.5 Generic compaction floor
-- **Problem.** Ad-hoc scripts are the largest untouched family by count; unknown commands get only a head/tail preview.
-- **Plan.** In every preview, collapse `\r` progress frames, elide long base64 runs and fold repeated lines; let the post-run hook apply this floor to unknown commands above a high threshold.
-- **Progress.** *not started*.
+### 3.5 Generic compaction floor — done
+- **Progress.** *on main* (2026-11-19, `src/floor.rs`). Progress frames collapse to the last one, long base64/hex runs keep 12 characters at each end with a marker, repeated lines fold; failure and patch lines are never touched. The Claude Code post-run hook applies the floor (and JSON tables) to a single unsupported command over 4× `context_budget` when that saves 25%. Synthetic progress log 20,446 → 465 bytes.
 
-### 3.6 Lossless compaction for JSON and JSONL output — next new token-saving feature after 2.1
-- **Problem.** JSON arrays and JSONL records pay tokens for the same keys on every row, even when every value differs. §3.5 does not cover this.
-- **Evidence (external reviewer).** 38 real Cargo targets from `utils` (fields package, kind, name), o200k_base tokenizer, replay pointer included in each: compact JSON 627 tokens, column names printed once 360 (−43%), grouped by package and kind 245 (−61%). All 38 records were rebuilt in order from the grouped output.
-- **Plan.** Detect JSON arrays of objects and JSONL streams with shared fields; build a table view (column names once, constant columns lifted to one line) and optionally a grouped view, before clipping; emit it only when it is smaller than the original, otherwise keep the original. Apply only when the output reaches the agent directly: pipes and redirects stay untouched (a documented exception to "machine formats pass through"). Footer with the run ID; `justless log` returns the original bytes.
-- **Lossless rules.** Before emitting, decode the view and check it equals the parsed original; on any mismatch show the original. Keep `null` and a missing field distinct, `"1"` and `1` distinct, key order, nested values (as inline compact JSON) and escapes. Irregular or deeply nested data stays as is.
-- **Open questions.** Justless has no tokenizer (zero dependencies), so "fewer tokens" means fewer bytes unless one is bundled. Grouping saves more but is harder for a model to read when it must count, filter or quote one record: make the table form the default and enable grouping only if the benchmark (5.1) shows answers stay correct.
-- **Measure.** Bytes on real sessions' JSON outputs (`gh api`, `kubectl -o json`, `cargo metadata`, `npm ls --json`, cloud CLIs), then task success, before building more command-specific formatters.
-- **Progress.** *designed*.
+### 3.6 Lossless compaction for JSON and JSONL output — next new token-saving feature after 2.1 — done
+- **Progress.** *on main* (2026-11-19, `src/jsonview.rs`). Arrays of objects and JSON lines become a verified table (fields named once, shared fields lifted); the view is decoded and compared with the original before it is shown. Grouping is behind `json_grouping`, off. Synthetic `gh api` issues 29,823 → 14,514, `kubectl` pods 25,493 → 9,307, `docker ps` JSONL 7,315 → 1,421 bytes; real `cargo metadata` −8% (nested arrays stay inline).
 
-### 3.7 Dependency-aware diffs for lockfiles, starting with Cargo.lock
-- **Problem.** A `git diff` that touches a lockfile is summarized by hunk location, which can cost more than saying which dependencies changed, and still does not answer the review question.
-- **Evidence (external reviewer).** Nine real commits from `utils` and `justless`, o200k_base tokenizer, same replay pointer in both formats: the dependency summary was smaller on 7 of 9; choosing the smaller preview per commit cut the total from 2,937 to 2,219 tokens (−24%). On one `utils` commit the current preview spent 282 tokens listing nine hunk locations, while a 147-token summary named all nine added packages and showed that `tokio` gained `signal-hook-registry`.
-- **Plan.** For a diff that touches `Cargo.lock`, parse both revisions (`git show REV:Cargo.lock` and the working or target version) and show package additions, removals, version changes and changed dependency links. Always flag a `source` or `checksum` change on an existing version (a supply-chain signal), even when the rest is clipped. Use the summary when it is smaller than the hunk preview; keep the exact patch one command away through the run's `justless log`.
-- **Measure.** How often agents reopen the full patch after a summary (`stats` already counts full reopenings per family) before adding `package-lock.json`, `pnpm-lock.yaml`, `uv.lock`, `poetry.lock`, `go.sum` and others.
-- **Progress.** *designed*.
+### 3.7 Dependency-aware diffs for lockfiles, starting with Cargo.lock — done
+- **Progress.** *on main* (2026-11-19, `src/lockdiff.rs`). Cargo.lock sections of `git diff`/`git show` are described by added, removed and updated packages and changed links when smaller; `source`/`checksum` changes on an existing version are always flagged. Real commit: 16.5 KB → 1.2 KB.
 
 ### 3.8 `init --global`
 - **Problem.** Hooks are per project; 12.5 MB was lost in sessions whose project had no hooks. RTK offers `init -g` for 13 agents.
@@ -197,6 +185,10 @@ Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). Th
 - Test selection treats `.vue`, `.svelte`, `.astro` and the five new languages as code but not as anything a runner tests, so a component change does not select its JS tests; a MATLAB `.m` file is still named Objective-C there because that check has no file text.
 - The five new grammars only report parse problems after edits; measure them on real code (as was done for the older grammars) before letting them block.
 - Not covered: `.mm` files, Perl (a `tree-sitter-perl` crate exists). Groovy uses the third-party `dekobon-tree-sitter-groovy` grammar (Apache-2.0 OR MIT), chosen because the `tree-sitter-groovy` crate misparsed Spock and Gradle code.
+- **Progress.** *designed*.
+
+### 4.I Route JSON-producing commands to the table view
+- The PreToolUse hook never routes JSON-producing commands (`supported_command` rejects `--json`, `--output`, `--message-format`; `kubectl -o json` fails the display check; `gh`, `cargo metadata` and `npm ls` are not supported commands), so JSON tables reach agents only through `justless run`, `exec` and the Claude Code post-run hook. Route unpiped JSON-producing commands for clients without a post-run hook, keeping pipes and redirections untouched, and consider whitespace-only compaction of pretty-printed non-tabular JSON (would cut `npm ls` by 62%).
 - **Progress.** *designed*.
 
 ### 4.E `git show REV:path` reads
