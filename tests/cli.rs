@@ -747,45 +747,53 @@ fn language_outlines_link_calls_and_tests() {
             definition: None,
         },
     ];
-    for case in &cases {
-        let repo = check_language(case);
-        let root = repo.path();
-        match case.language {
-            // Kotlin and Java resolve calls to each other, and JUnit marks Java
-            // tests too.
-            "kotlin" => {
-                let test = "class TaxTest {\n  @org.junit.Test\n  void doubles() { BillingKt.applyTax(2); }\n}\n";
-                fs::write(root.join("TaxTest.java"), test).unwrap();
-                let tests = success(root, &["query", "applyTax", "--view", "tests"]);
-                assert!(
-                    tests.contains(
-                        "related test (1 call hops): TaxTest.java::TaxTest::doubles [test]"
-                    ),
-                    "{tests}"
-                );
-            }
-            // A test described by a function name stays distinct from that function.
-            "dart" => {
-                let tests = success(root, &["query", "applyTax", "--view", "tests"]);
-                assert!(
+    // Each language runs on its own thread, named after it, as separate tests did.
+    std::thread::scope(|scope| {
+        for case in &cases {
+            let check = move || {
+                let repo = check_language(case);
+                let root = repo.path();
+                match case.language {
+                    // Kotlin and Java resolve calls to each other, and JUnit marks Java
+                    // tests too.
+                    "kotlin" => {
+                        let test = "class TaxTest {\n  @org.junit.Test\n  void doubles() { BillingKt.applyTax(2); }\n}\n";
+                        fs::write(root.join("TaxTest.java"), test).unwrap();
+                        let tests = success(root, &["query", "applyTax", "--view", "tests"]);
+                        assert!(
+                            tests.contains(
+                                "related test (1 call hops): TaxTest.java::TaxTest::doubles [test]"
+                            ),
+                            "{tests}"
+                        );
+                    }
+                    // A test described by a function name stays distinct from that function.
+                    "dart" => {
+                        let tests = success(root, &["query", "applyTax", "--view", "tests"]);
+                        assert!(
                     tests.starts_with("billing.dart::applyTax [function]")
                         && tests.contains(
                             "related test (1 call hops): billing_test.dart::main::\"applyTax\" [test]"
                         ),
                     "{tests}"
                 );
-            }
-            // `test applyTax` documents the function without shadowing it.
-            "zig" => {
-                let callers = success(root, &["query", "applyTax", "--view", "callers"]);
-                assert!(
-                    callers.contains("call from billing.zig::\"applyTax\" at billing.zig:22"),
-                    "{callers}"
-                );
-            }
-            _ => {}
+                    }
+                    // `test applyTax` documents the function without shadowing it.
+                    "zig" => {
+                        let callers = success(root, &["query", "applyTax", "--view", "callers"]);
+                        assert!(
+                            callers
+                                .contains("call from billing.zig::\"applyTax\" at billing.zig:22"),
+                            "{callers}"
+                        );
+                    }
+                    _ => {}
+                }
+            };
+            let thread = std::thread::Builder::new().name(case.language.to_owned());
+            thread.spawn_scoped(scope, check).unwrap();
         }
-    }
+    });
 }
 
 #[test]
