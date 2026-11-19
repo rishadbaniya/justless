@@ -697,10 +697,12 @@ fn plan(workspace: &Workspace, chosen: &[Agent], purge: bool, record: &Record) -
 
     // Instruction files, grouped by the file each client reads, so a link such as
     // `CLAUDE.md -> AGENTS.md` is handled once, as setup does. Claude Code also
-    // reads the `AGENTS.md` that `CLAUDE.md` imports.
+    // reads the `AGENTS.md` that `CLAUDE.md` imports, which keeps that section
+    // while Claude Code is not removed, as its own copy in `CLAUDE.md` once did.
     let mut readers: Vec<(PathBuf, Vec<Agent>)> = Vec::new();
-    if let Some((_, target)) = agents::imported_instructions(root, false) {
-        readers.push((target, vec![Agent::Claude]));
+    let imported = agents::imported_instructions(root, false).map(|(_, target)| target);
+    if let Some(target) = &imported {
+        readers.push((target.clone(), vec![Agent::Claude]));
     }
     for agent in all_agents() {
         let filename = agent.instructions();
@@ -750,7 +752,11 @@ fn plan(workspace: &Workspace, chosen: &[Agent], purge: bool, record: &Record) -
         let others: Vec<&str> = owners
             .iter()
             .copied()
-            .filter(|&owner| !chosen.contains(&owner) && configured(workspace, record, owner, &key))
+            .filter(|&owner| {
+                !chosen.contains(&owner)
+                    && (owner == Agent::Claude && imported.as_ref() == Some(&path)
+                        || configured(workspace, record, owner, &key))
+            })
             .map(name)
             .collect();
         if others.is_empty() {

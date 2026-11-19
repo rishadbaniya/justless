@@ -7766,12 +7766,14 @@ fn claude_md_that_imports_agents_md_gets_no_second_block() {
         text.contains("✓ Instructions: CLAUDE.md imports AGENTS.md, which has the current"),
         "{text}"
     );
-    // Removing Codex keeps the block that Claude Code reads through the import.
+    // Removing Codex keeps the block that Claude Code reads through the import,
+    // with or without the setup record.
+    let kept = "Kept the Justless section in AGENTS.md, which claude also reads.";
+    let dry_run = ["init", "--remove", "--agent", "codex", "--dry-run"];
+    assert!(success(&root, &dry_run).contains(kept));
+    fs::remove_file(root.join(".justless/setup.json")).unwrap();
     let output = success(&root, &["init", "--remove", "--agent", "codex"]);
-    assert!(
-        output.contains("Kept the Justless section in AGENTS.md, which claude also reads."),
-        "{output}"
-    );
+    assert!(output.contains(kept), "{output}");
     success(&root, &["init", "--remove", "--agent", "claude"]);
     assert_eq!(read("AGENTS.md"), "# Agents\n");
     assert_eq!(read("CLAUDE.md"), "@AGENTS.md\n");
@@ -17173,6 +17175,7 @@ fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
             .current_dir(&root)
             .envs(no_claude_settings(&root))
             .env("HOME", &home)
+            .env("USERPROFILE", &home)
             .env_remove("CLAUDE_PROJECT_DIR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
