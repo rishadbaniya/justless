@@ -699,7 +699,8 @@ impl Page<'_> {
     }
 
     fn json(&self, scope: Option<Value>, notes: &[String]) -> Result<String> {
-        let budget = self.request.budget;
+        // One byte stays free for the closing newline.
+        let budget = self.request.budget.saturating_sub(1);
         let base = |shown: usize| {
             let mut value = Map::new();
             value.insert("total".into(), json!(self.found.total));
