@@ -243,3 +243,52 @@ fn a_clipped_preview_keeps_failure_lines_and_each_repeat_count_with_its_line() {
     assert!(!tail.starts_with("[last line repeated"), "{tail}");
     assert!(tail.ends_with(&last), "{tail}");
 }
+
+#[test]
+fn a_file_read_from_a_revision_is_not_summarized_as_commits() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root();
+    let git = |args: &[&str]| {
+        let output = sandbox
+            .command("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    // Notes shaped like `git log -p` output.
+    let history: String = (0..6)
+        .map(|c| {
+            format!(
+                "commit {}\nAuthor: A U Thor <a@example.invalid>\nDate:   Mon Jan 1 00:00:00 2026 +0000\n\n    change {c}\n\n\
+                 diff --git a/src/f{c}.rs b/src/f{c}.rs\nindex 1111111..2222222 100644\n--- a/src/f{c}.rs\n+++ b/src/f{c}.rs\n\
+                 @@ -1,3 +1,3 @@\n fn a() {{}}\n-fn b() {{}}\n+fn c() {{}}\n fn d() {{}}\n",
+                format!("{c:02x}").repeat(20)
+            )
+        })
+        .collect();
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join("notes/history.txt"), &history).unwrap();
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "notes"]);
+    for hook in [&[][..], &["--hook"]] {
+        let args = [
+            &["run", "--fresh"][..],
+            hook,
+            &[
+                "--max-bytes",
+                "4096",
+                "--",
+                "git",
+                "show",
+                "HEAD:notes/history.txt",
+            ],
+        ]
+        .concat();
+        let output = sandbox.justless(&args);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(text(&output.stdout), history, "{args:?}");
+    }
+}

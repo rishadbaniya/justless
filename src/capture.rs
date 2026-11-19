@@ -1435,7 +1435,13 @@ impl Capture<'_> {
             redaction: redactor.map(|r| crate::redact::Found::new(r.fingerprint())),
             ..Run::unfinished(archive.id(), &family, "", hook)
         };
-        let mut parser = Parser::new(&run.family, selection.profile);
+        // A file's content, as `git show REV:PATH` prints it, is no patch or commit
+        // whatever it holds.
+        let prints_file = crate::floor::prints_file(words);
+        let mut parser = Parser::new(
+            if prints_file { "" } else { &run.family },
+            selection.profile,
+        );
         let mut lint = (selection.profile == Some(crate::filters::Profile::Lint))
             .then(|| crate::lint::Lint::new(&workspace.root));
         let mut grouping = match selection.profile {
@@ -1451,7 +1457,7 @@ impl Capture<'_> {
         let mut previews = Vec::new();
         // Output that reaches the agent directly, so a reformatted stream breaks no
         // program that parses it, and that is not a file's content.
-        let direct = hook && !crate::floor::prints_file(words);
+        let direct = hook && !prints_file;
         // The JSON that a hook-routed read such as `gh api` or `kubectl get -o json`
         // prints stays byte for byte when it is shown whole, unless a view that
         // decodes to the same data is smaller (see `json_view`), so the floor leaves

@@ -49,8 +49,12 @@ impl Section {
     }
 }
 
-/// Whether `words` run `git diff` or `git show`, whose output may hold a patch.
+/// Whether `words` run `git diff` or `git show`, whose output may hold a patch, and
+/// do not print a file's content, as `git show REV:PATH` does.
 pub fn applies(words: &[&str]) -> bool {
+    if crate::floor::prints_file(words) {
+        return false;
+    }
     // Options such as `-C DIR` or `--git-dir` read another repository, where these
     // blob ids would not resolve, and wrappers drop them.
     if words.iter().any(|word| {
@@ -599,6 +603,7 @@ mod tests {
             (&["git", "-c", "color.ui=never", "diff"][..], true),
             (&["git", "-C", "elsewhere", "diff"][..], false),
             (&["git", "log", "-p"][..], false),
+            (&["git", "show", "HEAD:Cargo.lock"][..], false),
             (&["cargo", "diff"][..], false),
         ] {
             assert_eq!(applies(words), applies_to, "{words:?}");
