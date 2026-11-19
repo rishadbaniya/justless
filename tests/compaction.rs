@@ -155,6 +155,7 @@ fn after_bash(root: &Path, command: &str, stdout: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(unix)]
 #[test]
 fn the_post_run_hook_floors_large_output_of_unknown_commands() {
     let dir = workspace("");
@@ -229,6 +230,7 @@ fn lockfile(packages: &[(&str, &str, &str, &str)]) -> String {
     text
 }
 
+#[cfg(unix)]
 #[test]
 fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
     let dir = workspace("");
@@ -309,4 +311,23 @@ fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
         shown.contains(summary) && !shown.contains("Cargo.lock @@"),
         "{shown}"
     );
+    // Any other preview still names the flag: a rerun's unchanged notice and a
+    // clipped commit.
+    let clipped = [
+        "run",
+        "--hook",
+        "--max-bytes",
+        "1024",
+        "--",
+        "git",
+        "show",
+        "HEAD",
+    ];
+    for (args, start) in [(&diff[..], "Output unchanged"), (&clipped[..], "commit ")] {
+        let shown = text(&justless(root, args).stdout);
+        assert!(
+            shown.starts_with(&format!("! Cargo.lock: {flag}\n{start}")),
+            "{shown}"
+        );
+    }
 }

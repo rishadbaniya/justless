@@ -111,6 +111,23 @@ fn kind(run: &str) -> Option<&'static str> {
         .then_some("base64")
 }
 
+/// Whether `words` print a file's content, as `git show REV:PATH` and `git cat-file`
+/// do. Such output shown whole stays byte for byte.
+pub fn prints_file(words: &[&str]) -> bool {
+    let owned = crate::wrappers::effective(words);
+    let words: Vec<&str> = match &owned {
+        Some(words) => words.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    match words.as_slice() {
+        [git, "show", rest @ ..] if git.ends_with("git") => rest
+            .iter()
+            .any(|arg| !arg.starts_with('-') && arg.contains(':')),
+        [git, "cat-file", ..] => git.ends_with("git"),
+        _ => false,
+    }
+}
+
 /// Applies the floor to a stream line by line, folding repeated lines.
 #[derive(Default)]
 pub struct Floor {
@@ -177,6 +194,18 @@ pub fn compact(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_reads_are_recognized() {
+        for (words, expected) in [
+            (&["git", "show", "HEAD:data.json"][..], true),
+            (&["git", "cat-file", "-p", "HEAD:x"][..], true),
+            (&["git", "show", "HEAD"][..], false),
+            (&["git", "show", "--format=%h:%s"][..], false),
+        ] {
+            assert_eq!(prints_file(words), expected, "{words:?}");
+        }
+    }
 
     #[test]
     fn floor_cuts_noise_and_says_what_it_cut() {

@@ -1434,6 +1434,9 @@ impl Capture<'_> {
         };
         let mut locations = Locations::default();
         let mut previews = Vec::new();
+        // Output that reaches the agent directly, so a reformatted stream breaks no
+        // program that parses it, and that is not a file's content.
+        let direct = hook && !crate::floor::prints_file(words);
         // Whether each stream, after redaction, fits the budget and is shown whole,
         // and how many secrets it held.
         let mut fit_whole = [true; 2];
@@ -1462,7 +1465,7 @@ impl Capture<'_> {
             // than the footer that then names the run.
             let preview = match std::str::from_utf8(&preview)
                 .ok()
-                .filter(|_| hook && fits)
+                .filter(|_| direct && fits)
                 .and_then(crate::floor::compact)
             {
                 Some(compact) if compact.len() + 64 < preview.len() => compact.into_bytes(),
@@ -1605,7 +1608,7 @@ impl Capture<'_> {
             // JSON reformatted for reading would break a program that parses it, so
             // only output that reaches the agent directly, or that is clipped anyway,
             // is shown as tables.
-            && (hook || !stdout_fits)
+            && (direct || !stdout_fits)
             && let Some(view) = json_view(
                 &archive.readers[0],
                 lengths[0],
@@ -1613,6 +1616,7 @@ impl Capture<'_> {
                 max_bytes,
                 json_grouping,
             )
+            && (!stdout_fits || view.len() < previews[0].1.len())
         {
             previews[0].1 = view;
         }
