@@ -343,3 +343,30 @@ Local Claude Code transcripts from 2026-11-07 to 2026-11-18 hold 1,234 Reads of 
 The 167 replaced windows went from 2,803,765 to 304,590 bytes, a median of 12% of their size. Of the 50 recovered wide windows that passed through, 45 sat mostly inside one definition and 5 had more rows than the context budget holds. Thresholds of 100, 200 and 300 lines would have replaced 207, 135 and 100 windows and saved 2,676,278, 2,307,513 and 1,987,217 bytes, against 2,499,175 at 150. These figures do not model what the agent read next, such as a narrower Read of the part it needed.
 
 Against Claude Code 2.1.327 and the harness's local fake API, a Read of lines 100-399 of a generated 482-line Rust file reached the model as the outline and the hint. The same Read again returned the outline again, a 150-line Read returned the native lines, and an Edit inside the outlined window succeeded, as it did in the same script without hooks. After an outlined 300-line window and an outlined 400-line window of 35,231 bytes, the same Read with `allow_large: true` returned exactly what Read returned without hooks. `justless expand` printed the 300-line window exactly, but Claude Code returned the larger window's 32.9 KB as a saved file and a preview, so the hint names the Read.
+
+## Token estimates
+
+`stats` converts bytes to tokens with one ratio per content type. `scripts/token_calibration.py` measured them on 2026-11-19 at commit e7d0926 with Anthropic's token-counting endpoint, `POST /v1/messages/count_tokens`, for `claude-sonnet-5-5`. The endpoint counts without generating. Only this repository's own text was sent:
+
+- code: tracked source files in every fixture language, the scripts, `src/` and `tests/`, and the patches of the last ten commits under `src/` and `tests/`;
+- JSON: tracked `.json` files, `cargo metadata`, and `cargo check --message-format=json` on a copy of `fixtures/failing`;
+- prose: tracked Markdown;
+- logs: the real tool output kept under `fixtures/` as `.txt`, and the output of `cargo test` and `cargo clippy` on a copy of `fixtures/failing`, the crate's unit tests, `git log --stat` without author lines, `cargo tree` and `ls -lRn`.
+
+Command output had the checkout, temporary and home directories replaced by placeholders. Each text was cut at line ends into samples of at most 24,000 bytes, at most four per source and 1.5 MB per type, every source's first sample before any source's second. The count for `.` minus one, 8 tokens, was subtracted from every sample as the request's overhead. Each ratio is pooled: the type's UTF-8 bytes over its tokens.
+
+| Type | Sources | Samples | Bytes | Tokens | Bytes per token | Per sample, min / median / max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| code | 152 | 152 | 1,499,977 | 584,751 | 2.57 | 1.74 / 2.45 / 3.13 |
+| JSON | 10 | 13 | 123,392 | 55,462 | 2.22 | 1.76 / 2.19 / 2.99 |
+| prose | 15 | 22 | 267,944 | 96,407 | 2.78 | 2.22 / 2.75 / 3.18 |
+| logs | 33 | 34 | 139,440 | 63,191 | 2.21 | 1.51 / 2.21 / 2.56 |
+| all | 210 | 221 | 2,030,753 | 799,811 | 2.54 | |
+
+`claude-opus-5-5` returned the same count as `claude-sonnet-5-5` for all 221 samples. Another tokenizer needs a new measurement. Bytes ÷ 4, the earlier estimate, counted 56% (logs, JSON) to 70% (prose) of these tokens. The JSON sample is thin: 96 KB of its 123 KB is `cargo metadata`.
+
+`stats` sorts each run's output by its first 8 KB of stdout, then stderr. On the first 8 KB of the same samples, the classifier put 99.3% of the code bytes, 99.8% of the log bytes and 90.3% of the prose bytes in their own type; `docs/examples.md`, mostly command transcripts, read as logs. Every JSON sample that opens a document read as JSON, while the three later pieces of `cargo metadata`, which start inside a value, read as logs; a run's output is always read from its start.
+
+On 73 runs archived in this repository's main checkout, 779,149 bytes were kept out at first preview: 495,743 of code, 241,321 of logs and 42,085 of prose. Bytes ÷ 4 estimated 194,788 tokens; the measured ratios estimate 317,766.
+
+To repeat the measurement, run `python3 scripts/token_calibration.py` with `ANTHROPIC_API_KEY` set, or `--collect samples.json` first to read every sample before anything is sent, and copy the printed bytes and tokens into `CALIBRATION` in `src/tokens.rs`.

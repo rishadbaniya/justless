@@ -151,7 +151,7 @@ billing-trace probe=only-in-the-full-log
 ```text
 Kept 16.7 KB of 18.4 KB command output out of context at first preview (90.9%) across 2 run(s)
 Later replays and lookups printed 492 B of run output again, so net saved: 16.2 KB (88.2%)
-≈4279 tokens saved at first preview, ≈4156 net (estimated as bytes ÷ 4)
+≈7757 tokens saved at first preview, ≈7534 net (estimated at 2.21 bytes per token for logs)
 
 Last 7 day(s), UTC, with retrievals on the day their run completed
   2026-11-18     2 run(s)    18.4 KB → 1.7 KB     90.9%  net   88.2%  ████████████████████

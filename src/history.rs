@@ -640,16 +640,11 @@ struct DayStats {
     totals: Totals,
 }
 
-/// Agents and providers tokenize differently. Like the benchmarks, the report
-/// estimates tokens as UTF-8 bytes divided by four and labels the figure as such.
+/// Tokens as UTF-8 bytes divided by four, the flat estimate that the status line,
+/// `discover` and the proxy label as such. `stats` uses the measured ratios in
+/// [`crate::tokens`].
 pub fn estimated_tokens(bytes: u64) -> u64 {
     bytes.div_ceil(4)
-}
-
-/// [`estimated_tokens`] for net savings, which can be negative.
-fn estimated_tokens_signed(bytes: i64) -> i64 {
-    let tokens = i64::try_from(estimated_tokens(bytes.unsigned_abs())).unwrap_or(i64::MAX);
-    if bytes < 0 { -tokens } else { tokens }
 }
 
 /// [`human_bytes`] for net savings, which can be negative.
@@ -701,10 +696,11 @@ pub fn utc_date(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
+pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) -> Result<()> {
     let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
     let mut count = 0u64;
     let mut totals = Totals::default();
+    let mut estimate = crate::tokens::Estimate::default();
     let mut replayed = Replayed::default();
     let (mut secrets, mut unredacted) = (0u64, 0u64);
     let mut families: BTreeMap<String, FamilyStats> = BTreeMap::new();
@@ -719,6 +715,11 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
         let c: Recalls = get_or_warn(&directory.join("recalls.json"));
         let later = c.replayed(&directory);
         totals.add(run.raw_bytes, shown, later);
+        estimate.add(
+            crate::tokens::run_content(&directory),
+            net_bytes(run.raw_bytes, shown, 0),
+            net_bytes(run.raw_bytes, shown, later.bytes()),
+        );
         replayed.add(later);
         unredacted += c.unredacted;
         let f = families.entry(run.family.clone()).or_default();
@@ -744,6 +745,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     let recalls = archive_recalls(&workspace.state, since);
     let proxy = crate::proxy::report(workspace, since, recalls.proxy_bytes)?;
     let codex = crate::rollouts::stats(workspace, since);
+    let usage = sessions
+        .then(|| crate::tokens::sessions(&workspace.root, since))
+        .flatten();
     let (raw, preview, saved, net) = (
         totals.raw_bytes,
         totals.preview_bytes,
@@ -760,21 +764,22 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     if as_json {
         // The keys from before retrievals were measured keep their meaning:
         // `saved_*` and `estimated_tokens_saved` are savings at first preview.
-        let report = serde_json::json!({
+        let mut report = serde_json::json!({
             "runs": count,
             "raw_bytes": raw,
             "preview_bytes": preview,
             "saved_bytes": saved,
             "saved_percent": rounded(percent(saved, raw)),
-            "estimated_tokens_saved": estimated_tokens(saved),
+            "estimated_tokens_saved": estimate.saved_tokens(),
             "replayed_bytes": replayed.measured,
             "estimated_replay_bytes": replayed.estimated,
             "estimated_replays": replayed.estimated_replays,
             "unmeasured_retrievals": replayed.unmeasured,
             "net_saved_bytes": net,
             "net_saved_percent": rounded(signed_percent(net, raw)),
-            "estimated_tokens_net_saved": estimated_tokens_signed(net),
-            "token_estimate": "UTF-8 bytes / 4",
+            "estimated_tokens_net_saved": estimate.net_tokens(),
+            "token_estimate": crate::tokens::method(),
+            "estimate_by_content": estimate.json(),
             "days": timeline.into_values().collect::<Vec<_>>(),
             "commands": commands,
             "repeated_source_reads": activity.repeat_reads,
@@ -783,7 +788,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
                 "whole_bytes": activity.deltas.whole_bytes,
                 "shown_bytes": activity.deltas.shown_bytes,
                 "saved_bytes": activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes),
-                "estimated_tokens_saved": estimated_tokens(activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes)),
+                "estimated_tokens_saved": crate::tokens::Content::Code.tokens(activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes)),
             },
             "redacted_secrets": secrets,
             "unredacted_replays": unredacted,
@@ -793,6 +798,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             "preview_budgets": crate::adaptive::stats_json(workspace),
             "codex": codex.as_ref().map(|codex| &codex.json),
         });
+        if sessions {
+            report["claude_code_sessions"] = crate::tokens::sessions_json(usage.as_ref(), days);
+        }
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -837,9 +845,10 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             );
         }
         println!(
-            "≈{} tokens saved at first preview, ≈{} net (estimated as bytes ÷ 4)",
-            estimated_tokens(saved),
-            estimated_tokens_signed(net)
+            "≈{} tokens saved at first preview, ≈{} net (estimated at {})",
+            estimate.saved_tokens(),
+            estimate.net_tokens(),
+            estimate.basis()
         );
         if secrets > 0 {
             println!("Redacted {secrets} secret(s) in captured output");
@@ -946,12 +955,13 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
     if deltas.views > 0 {
         let saved = deltas.whole_bytes.saturating_sub(deltas.shown_bytes);
         println!(
-            "Changed since read: {} view(s) printed {} instead of {}, {} kept out (≈{} tokens, bytes ÷ 4)",
+            "Changed since read: {} view(s) printed {} instead of {}, {} kept out (≈{} tokens, estimated at {:.2} bytes per token for code)",
             deltas.views,
             human_bytes(deltas.shown_bytes),
             human_bytes(deltas.whole_bytes),
             human_bytes(saved),
-            estimated_tokens(saved)
+            crate::tokens::Content::Code.tokens(saved),
+            crate::tokens::Content::Code.bytes_per_token()
         );
     }
     if !activity.bypasses.is_empty() {
@@ -978,6 +988,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool) -> Result<()> {
             recalls.count,
             human_bytes(recalls.bytes)
         );
+    }
+    if sessions {
+        crate::tokens::print_sessions(usage.as_ref(), days);
     }
     Ok(())
 }

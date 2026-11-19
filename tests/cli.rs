@@ -2752,15 +2752,80 @@ fn stats_report_savings_by_command_with_token_estimates() {
     let saved = report["saved_bytes"].as_u64().unwrap();
     assert_eq!(report["runs"], 2);
     assert_eq!(saved, raw - preview);
-    assert_eq!(report["estimated_tokens_saved"], saved.div_ceil(4));
-    assert_eq!(report["token_estimate"], "UTF-8 bytes / 4");
+    // Linter output is estimated at the ratio measured for logs.
+    let logs = &report["estimate_by_content"]["logs"];
+    assert_eq!(logs["saved_bytes"], saved);
+    assert_eq!(
+        report["estimated_tokens_saved"],
+        logs_tokens(&report, saved)
+    );
+    let ratio = format!("{:.2}", logs["bytes_per_token"].as_f64().unwrap());
+    let method = report["token_estimate"].as_str().unwrap();
+    assert!(method.contains(&format!("logs {ratio}")), "{method}");
     assert_eq!(report["commands"][0]["family"], "mypy");
     assert_eq!(report["days"].as_array().unwrap().len(), 1);
     let text = success(root, &["stats"]);
     assert!(
         text.contains("tokens saved at first preview, ≈")
-            && text.contains(" net (estimated as bytes ÷ 4)")
+            && text.contains(&format!(
+                " net (estimated at {ratio} bytes per token for logs)"
+            ))
             && text.contains("By command, most net savings first\n  mypy"),
+        "{text}"
+    );
+}
+
+#[test]
+fn stats_sessions_add_claude_code_usage_apart_from_savings() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().join("work");
+    fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let config = repo.path().join("claude");
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcripts = config.join("projects").join(slug);
+    fs::create_dir_all(&transcripts).unwrap();
+    let usage = serde_json::json!({"input_tokens": 3, "cache_creation_input_tokens": 2000,
+        "cache_read_input_tokens": 40000, "output_tokens": 500});
+    let line = serde_json::json!({"type": "assistant", "timestamp": "2999-01-01T00:00:00.000Z",
+        "requestId": "req_1", "message": {"id": "msg_1", "model": "claude-opus-5-5",
+        "usage": usage, "content": [{"type": "text", "text": "private words"}]}})
+    .to_string();
+    // Claude Code writes a response once per content block.
+    fs::write(transcripts.join("s.jsonl"), format!("{line}\n{line}\n")).unwrap();
+    let stats = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .arg("stats")
+            .args(args)
+            .current_dir(&root)
+            .env("CLAUDE_CONFIG_DIR", &config)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        stdout(&output)
+    };
+    let plain: serde_json::Value = serde_json::from_str(&stats(&["--json"])).unwrap();
+    assert!(plain.get("claude_code_sessions").is_none());
+    let report: serde_json::Value =
+        serde_json::from_str(&stats(&["--json", "--sessions"])).unwrap();
+    let sessions = &report["claude_code_sessions"];
+    assert_eq!(
+        (&sessions["sessions"], &sessions["requests"]),
+        (&1.into(), &1.into())
+    );
+    assert_eq!(sessions["cache_read_input_tokens"], 40000);
+    assert_eq!(sessions["models"][0]["model"], "claude-opus-5-5");
+    let text = stats(&["--sessions"]);
+    assert!(
+        text.contains("as the provider reported it. This is total usage, not savings.")
+            && text.contains("1 session(s) · 1 request(s), 0 from subagents")
+            && text.contains("claude-opus-5-5")
+            && text.contains("40.0k")
+            && !text.contains("private words"),
         "{text}"
     );
 }
@@ -18044,6 +18109,13 @@ fn printed_bytes(output: &Output) -> u64 {
     (output.stdout.len() + output.stderr.len()) as u64
 }
 
+/// The tokens `stats` estimates for `bytes` of logs, from the calibration it reports.
+fn logs_tokens(report: &serde_json::Value, bytes: u64) -> u64 {
+    let logs = &report["estimate_by_content"]["logs"];
+    let sample = |key: &str| logs[key].as_u64().unwrap();
+    (bytes * sample("sample_tokens")).div_ceil(sample("sample_bytes"))
+}
+
 /// `stats --json`, which must not warn about any record.
 fn savings(root: &Path) -> serde_json::Value {
     let output = cli(root, &["stats", "--json"]);
@@ -18101,7 +18173,7 @@ fn stats_subtract_a_full_replay_from_the_savings_it_reverses() {
     // Across both responses the agent received `shown` bytes more than the
     // command printed, and the net figures say so.
     let net = -(shown as i64);
-    let net_tokens = -(shown.div_ceil(4) as i64);
+    let net_tokens = -(logs_tokens(&after, shown) as i64);
     assert_eq!(after["replayed_bytes"], 19_000);
     assert_eq!(after["estimated_replay_bytes"], 0);
     assert_eq!(after["unmeasured_retrievals"], 0);
@@ -18117,7 +18189,7 @@ fn stats_subtract_a_full_replay_from_the_savings_it_reverses() {
         text.contains(
             "Later replays and lookups printed 18.6 KB of run output again, so net saved: -"
         ) && text.contains(&format!(
-            "tokens saved at first preview, ≈{net_tokens} net (estimated as bytes ÷ 4)"
+            "tokens saved at first preview, ≈{net_tokens} net (estimated at "
         )) && text.contains("1/1 reopened in full · 18.6 KB retrieved later"),
         "{text}"
     );

@@ -47,6 +47,7 @@ mod statusline;
 mod summary;
 mod syntax_check;
 mod testrun;
+mod tokens;
 mod uninstall;
 mod workspace;
 mod wrappers;
@@ -236,7 +237,10 @@ fn cli() -> Command<'static> {
             Command::new("stats")
                 .about("Show output savings by day and command, recoveries and hook coverage")
                 .arg(number("days", "7", "Days in the timeline"))
-                .arg(Arg::new("json").long("json").help("Print a JSON report")),
+                .arg(Arg::new("json").long("json").help("Print a JSON report"))
+                .arg(Arg::new("sessions").long("sessions").help(
+                    "Add the token usage Claude Code recorded for this workspace's sessions",
+                )),
         )
         .subcommand(
             Command::new("discover")
@@ -633,6 +637,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             &workspace,
             read_num(sub, "days", 1)? as u64,
             sub.is_present("json"),
+            sub.is_present("sessions"),
         )?,
         ("index", _) => {
             let index = Index::open(&workspace)?;
