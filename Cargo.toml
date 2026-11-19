@@ -3,7 +3,9 @@ name = "justless"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
-description = "Local command output and source context for coding agents"
+description = "Cuts coding agents' tokens: compact command output, a local code graph and exact recall, with zero network calls"
+keywords = ["claude-code", "llm", "tokens", "coding-agents", "context"]
+categories = ["command-line-utilities", "development-tools"]
 license = "Apache-2.0"
 repository = "https://github.com/rishadbaniya/justless"
 

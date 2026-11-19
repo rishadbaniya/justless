@@ -4,10 +4,6 @@ Open work only. Finished work is in [CHANGELOG.md](CHANGELOG.md) and the Git his
 
 ## In progress
 
-### Route JSON-producing commands to the table view
-- The PreToolUse hook never routes JSON-producing commands (`supported_command` rejects `--json`, `--output`, `--message-format`; `kubectl -o json` fails the display check; `gh`, `cargo metadata` and `npm ls` are not supported commands), so JSON tables reach agents only through `justless run`, `exec` and the Claude Code post-run hook. Route unpiped JSON-producing commands for clients without a post-run hook, keeping pipes and redirections untouched, and consider whitespace-only compaction of pretty-printed non-tabular JSON (would cut `npm ls` by 62%).
-- **Progress.** *designed*.
-
 ### Follow-ups from global setup
 - In a project served only by global hooks, `doctor` still fails with "not set up in this project" and "Hooks: none"; `discover` does not apply `exclude_commands`; `stats --all` ignores `--days`.
 - **Progress.** *designed*.

@@ -7,7 +7,7 @@
 #        brew install --build-from-source ./Formula/justless.rb && brew test justless && brew audit --strict justless
 #   3. Commit and push the tap. Users then run `brew install rishadbaniya/justless/justless`.
 class Justless < Formula
-  desc "Local command output and source context for coding agents"
+  desc "Cuts coding agent tokens with compact output and a local code graph"
   homepage "https://github.com/rishadbaniya/justless"
   license "Apache-2.0"
   url "https://github.com/rishadbaniya/justless/archive/refs/tags/v0.1.0.tar.gz"
