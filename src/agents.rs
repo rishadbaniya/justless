@@ -1913,7 +1913,7 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         let env = form.keeps_justless(segment)
             && (rules.mixed && !rules.approves || form.approvable(segment));
         (env && literal_command(&segment[..form.command.end]).is_some()
-            && supported_command(words)
+            && supported_command(words, !rules.claude)
             && !(rules.claude && runs_grep(words))
             && (!rules.approves
                 || literal_command(words).is_some_and(|words| {
@@ -2168,7 +2168,7 @@ pub fn command_label(command: &str) -> String {
         |s: &str| crate::shell_form::parse(s).map_or(s.to_owned(), |f| s[f.command].to_owned());
     let first = segments
         .iter()
-        .find(|s| !is_cd(s) && supported_command(&words_of(s)))
+        .find(|s| !is_cd(s) && supported_command(&words_of(s), false))
         .or_else(|| segments.iter().find(|s| !is_cd(s)))
         .or(segments.first())
         .copied()
@@ -2198,7 +2198,11 @@ fn runs_grep(command: &str) -> bool {
         })
 }
 
-fn supported_command(command: &str) -> bool {
+/// Whether a command hook routes this one command. `json` also takes the reads
+/// that print JSON (see `filters::json_output`), for clients without a post-run
+/// hook: Claude Code's post-run hook shows such output as JSON tables when it is
+/// large, and passes the rest through as written.
+fn supported_command(command: &str, json: bool) -> bool {
     if cfg!(windows) {
         return false;
     }
@@ -2209,6 +2213,10 @@ fn supported_command(command: &str) -> bool {
     // Searches and listings accept only display options, so they skip the list below.
     if let Some(route) = crate::search::route(&words) {
         return route;
+    }
+    // JSON reads accept only their documented read options, so they skip it too.
+    if crate::filters::json_output(&words) {
+        return json;
     }
     let supported =
         crate::filters::legacy_hook(&words) || crate::filters::profile(&words).is_some();
@@ -2268,7 +2276,8 @@ pub(crate) fn supported_words(words: &[&str]) -> bool {
                 .collect()
         })
         .collect();
-    shlex::try_join(words.iter().map(String::as_str)).is_ok_and(|line| supported_command(&line))
+    shlex::try_join(words.iter().map(String::as_str))
+        .is_ok_and(|line| supported_command(&line, false))
 }
 
 pub(crate) fn literal_command(command: &str) -> Option<Vec<String>> {

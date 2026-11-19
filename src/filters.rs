@@ -346,6 +346,256 @@ fn js_display(args: &[&str]) -> bool {
     })
 }
 
+/// Whether a command only reads and prints JSON for the agent to look at: `gh`
+/// list and view commands with `--json`, `gh api` GET requests, `kubectl get -o
+/// json`, `docker ps`, `images` and `inspect` in JSON, `cargo metadata` and `npm ls
+/// --json`. Its output is shown as JSON tables or compact JSON (see `jsonview`)
+/// when that is smaller. Every option must be one these tools document for such a
+/// read, so a request that writes, waits, filters the JSON or names a file
+/// elsewhere keeps its own form.
+pub fn json_output(words: &[&str]) -> bool {
+    let words = unwrap_tool(words);
+    let Some((&program, args)) = words.split_first() else {
+        return false;
+    };
+    match (program, args) {
+        ("gh", ["api", rest @ ..]) => gh_api(rest),
+        ("gh", ["search", kind, rest @ ..]) if !kind.starts_with('-') => gh_json(rest),
+        (
+            "gh",
+            [
+                "pr" | "issue" | "repo" | "run" | "release" | "workflow" | "label" | "cache"
+                | "secret" | "variable" | "codespace",
+                "list" | "ls" | "view" | "status" | "checks",
+                rest @ ..,
+            ],
+        ) => gh_json(rest),
+        ("kubectl", _) => kubectl_json(args),
+        ("docker", _) => docker_json(args),
+        ("cargo", ["metadata", rest @ ..]) => {
+            display_options(
+                rest,
+                &[
+                    "--no-deps",
+                    "--offline",
+                    "--frozen",
+                    "--locked",
+                    "--all-features",
+                    "--no-default-features",
+                    "-q",
+                    "--quiet",
+                ],
+                &[
+                    "--format-version",
+                    "--features",
+                    "-F",
+                    "--filter-platform",
+                    "--manifest-path",
+                ],
+                false,
+            ) && option_values(rest, &["--format-version"]).all(|version| version == "1")
+                && option_values(rest, &["--manifest-path"]).all(local_argument)
+        }
+        ("npm", ["ls" | "list" | "la" | "ll", rest @ ..]) => {
+            rest.contains(&"--json")
+                && display_options(
+                    rest,
+                    &[
+                        "--json",
+                        "--all",
+                        "-a",
+                        "--long",
+                        "-l",
+                        "--global",
+                        "-g",
+                        "--link",
+                        "--package-lock-only",
+                        "--workspaces",
+                        "--include-workspace-root",
+                    ],
+                    &["--depth", "--omit", "--include", "--workspace", "-w"],
+                    true,
+                )
+        }
+        _ => false,
+    }
+}
+
+/// The arguments that are neither an option nor the value of one in `valued`.
+fn operands<'a>(args: &[&'a str], valued: &[&str]) -> Vec<&'a str> {
+    let mut operands = Vec::new();
+    let mut words = args.iter();
+    while let Some(&arg) = words.next() {
+        if valued.contains(&arg) {
+            words.next();
+        } else if !arg.starts_with('-') {
+            operands.push(arg);
+        }
+    }
+    operands
+}
+
+/// The values given to any of `names`, as `NAME VALUE` or `NAME=VALUE`.
+fn option_values<'a>(args: &'a [&'a str], names: &'a [&str]) -> impl Iterator<Item = &'a str> {
+    args.iter()
+        .enumerate()
+        .filter_map(move |(index, arg)| match arg.split_once('=') {
+            Some((name, value)) if names.contains(&name) => Some(value),
+            None if names.contains(arg) => args.get(index + 1).copied(),
+            _ => None,
+        })
+}
+
+/// `gh api` options for a GET request whose response is printed as it came: no
+/// fields or input, which make it a POST, no other method, and no `--jq` or
+/// `--template`, which print something else.
+fn gh_api(args: &[&str]) -> bool {
+    const VALUED: &[&str] = &[
+        "-H",
+        "--header",
+        "-X",
+        "--method",
+        "--hostname",
+        "--cache",
+        "-p",
+        "--preview",
+    ];
+    matches!(operands(args, VALUED).as_slice(), [endpoint] if *endpoint != "graphql")
+        && display_options(
+            args,
+            &["--paginate", "--slurp", "-i", "--include"],
+            VALUED,
+            true,
+        )
+        && option_values(args, &["-X", "--method"]).all(|method| method.eq_ignore_ascii_case("GET"))
+        && option_values(args, &["-H", "--header"]).all(|header| {
+            header.split_once(':').is_some_and(|(name, _)| {
+                ["accept", "x-github-api-version"]
+                    .contains(&name.trim().to_ascii_lowercase().as_str())
+            })
+        })
+}
+
+/// Options of a `gh` list or view command that prints the `--json` fields as they
+/// are, without opening a browser or waiting.
+fn gh_json(args: &[&str]) -> bool {
+    let flags = || {
+        args.iter()
+            .map(|arg| arg.split_once('=').map_or(*arg, |(flag, _)| flag))
+    };
+    flags().any(|flag| flag == "--json")
+        && !flags().any(|flag| {
+            matches!(
+                flag,
+                "--web" | "-w" | "--watch" | "--jq" | "-q" | "--template" | "-t"
+            )
+        })
+}
+
+/// `kubectl get` with JSON output and only display options, after any namespace
+/// or context given before the verb.
+fn kubectl_json(mut args: &[&str]) -> bool {
+    while let Some((&arg, rest)) = args.split_first() {
+        if ["--namespace", "-n", "--context"].contains(&arg)
+            && rest.first().is_some_and(|v| !v.starts_with('-'))
+        {
+            args = &rest[1..];
+        } else if arg.starts_with("--namespace=") || arg.starts_with("--context=") {
+            args = rest;
+        } else {
+            break;
+        }
+    }
+    let ["get", rest @ ..] = args else {
+        return false;
+    };
+    let mut json = false;
+    let mut others = Vec::with_capacity(rest.len());
+    let mut words = rest.iter();
+    while let Some(&arg) = words.next() {
+        let value = match arg {
+            "-o" | "--output" => words.next().copied(),
+            _ => arg
+                .strip_prefix("--output=")
+                .or_else(|| arg.strip_prefix("-o="))
+                .or_else(|| arg.strip_prefix("-o")),
+        };
+        match value {
+            Some("json") => json = true,
+            Some(_) => return false,
+            None => others.push(arg),
+        }
+    }
+    const VALUED: &[&str] = &[
+        "-n",
+        "--namespace",
+        "--context",
+        "-l",
+        "--selector",
+        "--field-selector",
+        "--sort-by",
+    ];
+    json && !operands(&others, VALUED).is_empty()
+        && display_options(
+            &others,
+            &["-A", "--all-namespaces", "--ignore-not-found"],
+            VALUED,
+            true,
+        )
+}
+
+/// `docker ps` and `docker images` with `--format json`, and `docker inspect`,
+/// which prints JSON unless given another format.
+fn docker_json(args: &[&str]) -> bool {
+    let json = |args: &[&str], names: &[&str], default: bool| {
+        let mut formats = option_values(args, names).peekable();
+        match formats.peek() {
+            None => default,
+            Some(_) => formats.all(|format| matches!(format, "json" | "{{json .}}")),
+        }
+    };
+    match args {
+        ["ps", tail @ ..] | ["container", "ls" | "list" | "ps", tail @ ..] => {
+            json(tail, &["--format"], false)
+                && display_options(
+                    tail,
+                    &[
+                        "-a",
+                        "--all",
+                        "--no-trunc",
+                        "--latest",
+                        "-l",
+                        "-s",
+                        "--size",
+                    ],
+                    &["-f", "--filter", "-n", "--last", "--format"],
+                    false,
+                )
+        }
+        ["images", tail @ ..] | ["image", "ls" | "list", tail @ ..] => {
+            json(tail, &["--format"], false)
+                && display_options(
+                    tail,
+                    &["-a", "--all", "--digests", "--no-trunc"],
+                    &["-f", "--filter", "--format"],
+                    true,
+                )
+        }
+        ["inspect", tail @ ..]
+        | [
+            "container" | "image" | "volume" | "network",
+            "inspect",
+            tail @ ..,
+        ] => {
+            const VALUED: &[&str] = &["-f", "--format", "--type"];
+            json(tail, &["-f", "--format"], true)
+                && !operands(tail, VALUED).is_empty()
+                && display_options(tail, &["-s", "--size"], VALUED, true)
+        }
+        _ => false,
+    }
+}
+
 pub fn legacy_hook(words: &[&str]) -> bool {
     matches!(
         unwrap_tool(words),
@@ -380,9 +630,9 @@ pub fn approvable(words: &[&str]) -> bool {
     let Some((&program, args)) = tool.split_first() else {
         return false;
     };
-    // Searches and Git display commands only read, and their options are checked
-    // when they are routed.
-    if crate::search::select(tool).is_some() || program == "git" {
+    // Searches, Git display commands and JSON reads only read, and their options
+    // are checked when they are routed.
+    if crate::search::select(tool).is_some() || program == "git" || json_output(tool) {
         return true;
     }
     if !args.iter().all(|arg| local_argument(arg)) {

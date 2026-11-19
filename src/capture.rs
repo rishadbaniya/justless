@@ -1437,6 +1437,12 @@ impl Capture<'_> {
         // Output that reaches the agent directly, so a reformatted stream breaks no
         // program that parses it, and that is not a file's content.
         let direct = hook && !crate::floor::prints_file(words);
+        // The JSON that a hook-routed read such as `gh api` or `kubectl get -o json`
+        // prints stays byte for byte when it is shown whole, unless a view that
+        // decodes to the same data is smaller (see `json_view`), so the floor leaves
+        // its stdout. Claude Code's post-run hook, which records such a command after
+        // it ran (`origin`), keeps the floor.
+        let json = origin.is_none() && crate::filters::json_output(words);
         // Whether each stream, after redaction, fits the budget and is shown whole,
         // and how many secrets it held.
         let mut fit_whole = [true; 2];
@@ -1465,7 +1471,7 @@ impl Capture<'_> {
             // than the footer that then names the run.
             let preview = match std::str::from_utf8(&preview)
                 .ok()
-                .filter(|_| direct && fits)
+                .filter(|_| direct && fits && !(json && index == 0))
                 .and_then(crate::floor::compact)
             {
                 Some(compact) if compact.len() + 64 < preview.len() => compact.into_bytes(),
@@ -1899,9 +1905,9 @@ fn read_text(mut file: &File, length: u64, limit: u64) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Stdout shown as JSON tables, clipped at whole lines to `max_bytes`, when it is a
-/// JSON array of objects, JSON lines or an object holding such arrays, and the
-/// tables are smaller and decode to the same data. See `jsonview`.
+/// Stdout shown as JSON tables or compact JSON, clipped at whole lines to
+/// `max_bytes`, when the view is smaller and decodes to the same data. See
+/// `jsonview`.
 fn json_view(
     mut file: &File,
     length: u64,
@@ -1944,12 +1950,14 @@ fn json_view(
     let mut shown = String::new();
     for (index, line) in view.split_inclusive('\n').enumerate() {
         let marker = format!(
-            "[{} more lines of these tables in the full log]\n",
+            "[{} more lines of this view in the full log]\n",
             lines - index
         );
         if shown.len() + line.len() + marker.len() > max_bytes {
-            // The legend and a table header alone tell the agent nothing.
-            if index < 3 {
+            // The legend and a table header alone tell the agent nothing, and
+            // neither does a view cut before rows too long for the budget, such as
+            // whole Kubernetes objects: the ordinary preview shows more of them.
+            if index < 3 || shown.len() < max_bytes / 2 {
                 return None;
             }
             shown.push_str(&marker);

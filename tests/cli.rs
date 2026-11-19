@@ -2224,6 +2224,122 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
 }
 
 #[test]
+fn hooks_without_a_post_run_hook_route_json_reads_left_to_their_reader() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let rewrite = |agent: &str, command: &str| {
+        let input = match agent {
+            "hook-gemini" => serde_json::json!({"hook_event_name":"BeforeTool",
+                "tool_name":"run_shell_command","cwd":root,"tool_input":{"command":command}}),
+            "hook-cursor" => {
+                serde_json::json!({"tool_name":"Shell","cwd":root,"tool_input":{"command":command}})
+            }
+            "hook-copilot" => {
+                serde_json::json!({"cwd":root,"toolName":"bash","toolArgs":{"command":command}})
+            }
+            "hook-agy" => serde_json::json!({"workspacePaths":[root],
+                "toolCall":{"name":"run_command","args":{"CommandLine":command,"Cwd":root}}}),
+            _ => serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+                "cwd":root,"tool_input":{"command":command}}),
+        };
+        let output = agent_hook(&root, agent, "before-command", input);
+        let hook = &output["hookSpecificOutput"];
+        [
+            &hook["updatedInput"]["command"],
+            &hook["tool_input"]["command"],
+            &output["updated_input"]["command"],
+            &output["modifiedArgs"]["command"],
+            &output["overwrite"]["CommandLine"],
+        ]
+        .into_iter()
+        .find_map(|command| command.as_str().map(str::to_owned))
+    };
+    let clients = [
+        "hook-codex",
+        "hook-cursor",
+        "hook-gemini",
+        "hook-copilot",
+        "hook-agy",
+    ];
+    for command in [
+        "gh pr list --json number,title --limit 50",
+        "gh issue view 12 --json body",
+        "gh search prs --json url fix",
+        "gh api repos/acme/ledger/issues --paginate",
+        "gh api -X GET repos/acme/ledger -H 'Accept: application/vnd.github+json'",
+        "kubectl get pods -o json",
+        "kubectl -n prod get deploy api -ojson",
+        "kubectl get pods -n prod --output=json -l app=api",
+        "docker ps -a --format json",
+        "docker image ls --format '{{json .}}'",
+        "docker inspect api-1",
+        "docker container inspect --size api-1",
+        "cargo metadata --format-version 1 --no-deps",
+        "npm ls --json --all",
+    ] {
+        for agent in clients {
+            assert_eq!(
+                rewrite(agent, command),
+                Some(format!("justless run --hook -- {command}")),
+                "{agent}: {command}"
+            );
+        }
+        // Claude Code's post-run hook shows large JSON as tables after the run.
+        assert_eq!(rewrite("hook-claude", command), None, "{command}");
+    }
+    // Writes, waits, filters, other formats, and output that a program reads.
+    for command in [
+        "gh api -X POST repos/acme/ledger/issues",
+        "gh api repos/acme/ledger/issues -f title=x",
+        "gh api --input body.json repos/acme/ledger/issues",
+        "gh api graphql",
+        "gh api repos/acme/ledger -H 'X-HTTP-Method-Override: DELETE'",
+        "gh api repos/acme/ledger --jq .name",
+        "gh pr list --json number --jq '.[].number'",
+        "gh pr checks 12 --json state --watch",
+        "gh pr view 12 --json body --web",
+        "gh pr merge 12 --json x",
+        "gh pr list",
+        "kubectl get pods -o yaml",
+        "kubectl get pods -o json -w",
+        "kubectl get -o json",
+        "kubectl delete pod api -o json",
+        "docker ps --format '{{.Names}}'",
+        "docker inspect -f '{{.State.Status}}' api-1",
+        "docker inspect --format json",
+        "cargo metadata --format-version 2",
+        "cargo metadata --manifest-path /elsewhere/Cargo.toml",
+        "cargo build --message-format json",
+        "cargo test --message-format=json",
+        "npm ls",
+        "npm ls --json --parseable",
+        "gh api repos/acme/ledger | jq .name",
+        "gh api repos/acme/ledger > repo.json",
+        "kubectl get pods -o json 2>/dev/null",
+        "pods=$(kubectl get pods -o json)",
+        "kubectl get pods -o json &",
+    ] {
+        for agent in clients.iter().chain(&["hook-claude"]) {
+            assert_eq!(rewrite(agent, command), None, "{agent}: {command}");
+        }
+    }
+    // A client that approves the rewrite only takes lists made entirely of
+    // supported commands; Gemini CLI checks the rewritten list.
+    let mixed = "gh pr list --json number && rm -r out";
+    for agent in clients {
+        let expected = (agent == "hook-gemini")
+            .then(|| "justless run --hook -- gh pr list --json number && rm -r out".to_owned());
+        assert_eq!(rewrite(agent, mixed), expected, "{agent}");
+    }
+    assert_eq!(
+        rewrite("hook-codex", "gh pr list --json number && cargo test").as_deref(),
+        Some(
+            "justless run --hook -- gh pr list --json number && justless run --hook -- cargo test"
+        )
+    );
+}
+
+#[test]
 fn compound_commands_wrap_each_supported_segment_in_place() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();

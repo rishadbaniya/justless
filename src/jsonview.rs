@@ -1,5 +1,7 @@
 //! A lossless table view of JSON output: arrays of objects and JSON lines name their
-//! fields once instead of on every record.
+//! fields once instead of on every record. Other JSON, such as a pretty-printed
+//! dependency tree, is shown compact: the same tokens without the whitespace
+//! between them, after a legend line.
 //!
 //! Scalars, keys and escapes keep their exact source text, so `"1"` and `1`, `1.0`
 //! and `1`, or `"é"` and `"é"` stay apart. Every view is decoded back and must
@@ -26,6 +28,8 @@ const DEPTH: usize = 128;
 /// How deep objects are opened one member per line to reach a table.
 const EXPAND_DEPTH: usize = 4;
 const NOTE: &str = "fields are named once, NAME=VALUE holds in every row, an empty cell is an absent field; exact JSON in the full log";
+/// The legend of JSON shown without its pretty-printing whitespace.
+const COMPACT: &str = "[JSON without its whitespace; exact JSON in the full log]";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Root {
@@ -239,46 +243,82 @@ fn compacted(node: &Node) -> String {
 }
 
 /// The view of JSON output, when it is smaller than `text` and decodes to the same
-/// data. `group` also folds consecutive rows that share a field's value.
+/// data: the tables, or the compact JSON when no table helps or it is smaller.
+/// `group` also folds consecutive rows that share a field's value.
 pub fn render(text: &str, group: bool) -> Option<String> {
     if text.len() < MIN_BYTES || text.len() > LIMIT {
         return None;
     }
-    let first = text.trim_start().as_bytes().first().copied()?;
-    if first != b'[' && first != b'{' {
-        return None;
-    }
-    let (root, nodes) = match parse(text) {
-        Some(node @ Node::Array(_)) => (Root::Array, vec![node]),
-        Some(node @ Node::Object(_)) => (Root::Object, vec![node]),
-        Some(Node::Raw(_)) => return None,
-        None => {
-            let mut records = Vec::new();
-            for line in text.trim_end().split('\n') {
-                match parse(line)? {
-                    node @ Node::Object(_) => records.push(node),
-                    _ => return None,
+    let json = Json::read(text)?;
+    [json.tables(group), json.compact()]
+        .into_iter()
+        .flatten()
+        .filter(|view| view.len() < text.len())
+        .min_by_key(String::len)
+}
+
+/// Output read as one JSON array or object, or as JSON lines whose records are
+/// objects, with its data as compact JSON.
+struct Json<'a> {
+    root: Root,
+    /// The value, or for JSON lines an array of the records.
+    node: Node<'a>,
+    /// What every view must decode to: compact JSON, one line per record for
+    /// JSON lines.
+    original: String,
+}
+
+impl<'a> Json<'a> {
+    fn read(text: &'a str) -> Option<Self> {
+        let first = text.trim_start().as_bytes().first().copied()?;
+        if first != b'[' && first != b'{' {
+            return None;
+        }
+        let (root, node) = match parse(text) {
+            Some(node @ Node::Array(_)) => (Root::Array, node),
+            Some(node @ Node::Object(_)) => (Root::Object, node),
+            Some(Node::Raw(_)) => return None,
+            None => {
+                let mut records = Vec::new();
+                for line in text.trim_end().split('\n') {
+                    match parse(line)? {
+                        node @ Node::Object(_) => records.push(node),
+                        _ => return None,
+                    }
                 }
+                (Root::Lines, Node::Array(records))
             }
-            (Root::Lines, vec![Node::Array(records)])
-        }
-    };
-    let mut view = root.legend();
-    let shown = match (root, &nodes[0]) {
-        (Root::Object, Node::Object(members)) => expand(members, 0, group, 0, &mut view),
-        (_, Node::Array(items)) => table(items, 0, group, &mut view),
-        _ => false,
-    };
-    if !shown || view.len() >= text.len() {
-        return None;
+        };
+        let original = match (root, &node) {
+            (Root::Lines, Node::Array(records)) => {
+                records.iter().map(compacted).collect::<Vec<_>>().join("\n")
+            }
+            (_, node) => compacted(node),
+        };
+        Some(Self {
+            root,
+            node,
+            original,
+        })
     }
-    let original = match (root, &nodes[0]) {
-        (Root::Lines, Node::Array(records)) => {
-            records.iter().map(compacted).collect::<Vec<_>>().join("\n")
-        }
-        (_, node) => compacted(node),
-    };
-    (decode(&view)? == original).then_some(view)
+
+    /// The table view, when a table helps and it decodes to the same data.
+    fn tables(&self, group: bool) -> Option<String> {
+        let mut view = self.root.legend();
+        let shown = match (self.root, &self.node) {
+            (Root::Object, Node::Object(members)) => expand(members, 0, group, 0, &mut view),
+            (_, Node::Array(items)) => table(items, 0, group, &mut view),
+            _ => false,
+        };
+        (shown && decode(&view)? == self.original).then_some(view)
+    }
+
+    /// The same JSON without the whitespace between its tokens, after a legend
+    /// line, when it decodes to the same data.
+    fn compact(&self) -> Option<String> {
+        let view = format!("{COMPACT}\n{}\n", self.original);
+        (decode(&view)? == self.original).then_some(view)
+    }
 }
 
 /// A field name as the header shows it: bare when it is a plain identifier.
@@ -497,7 +537,21 @@ fn expand(
 /// Rebuild compact JSON from a view: the data the view claims to show.
 fn decode(view: &str) -> Option<String> {
     let mut lines = view.strip_suffix('\n')?.split('\n');
-    let root = Root::from_legend(lines.next()?)?;
+    let legend = lines.next()?;
+    if legend == COMPACT {
+        // Each line is one value written compact: the document, or one JSON line's
+        // record.
+        return lines
+            .map(|line| {
+                value_at(line, 0)
+                    .filter(|(value, end)| *end == line.len() && value == line)
+                    .map(|(value, _)| value)
+            })
+            .collect::<Option<Vec<_>>>()
+            .filter(|values| !values.is_empty())
+            .map(|values| values.join("\n"));
+    }
+    let root = Root::from_legend(legend)?;
     let mut lines = lines.peekable();
     let mut out = String::new();
     match root {
@@ -697,6 +751,13 @@ mod tests {
         format!("{text}{}", " ".repeat(MIN_BYTES))
     }
 
+    /// The table view alone, which `render` shows unless the compact JSON is smaller.
+    fn tables(text: &str, group: bool) -> Option<String> {
+        Json::read(text)?
+            .tables(group)
+            .filter(|view| view.len() < text.len())
+    }
+
     #[test]
     fn views_round_trip_exact_values() {
         let cases = [
@@ -714,21 +775,16 @@ mod tests {
         for case in cases {
             for group in [false, true] {
                 let text = padded(case);
-                let view = render(&text, group).unwrap_or_else(|| panic!("no view for {case}"));
-                assert!(view.len() < text.len());
-                let original = match parse(&text) {
-                    Some(node) => compacted(&node),
-                    None => text
-                        .trim_end()
-                        .split('\n')
-                        .map(|line| compacted(&parse(line).unwrap()))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                };
-                assert_eq!(decode(&view).unwrap(), original, "{view}");
+                let original = Json::read(&text).unwrap().original;
+                let table = tables(&text, group).unwrap_or_else(|| panic!("no table for {case}"));
+                let view = render(&text, group).unwrap();
+                assert!(view.len() <= table.len());
+                for view in [table, view] {
+                    assert_eq!(decode(&view).unwrap(), original, "{view}");
+                }
             }
         }
-        let view = render(&padded(cases[0]), false).unwrap();
+        let view = tables(&padded(cases[0]), false).unwrap();
         assert!(
             view.contains("3 objects; fields: name,kind=\"lib\",n,tag,x,y\n"),
             "{view}"
@@ -737,22 +793,74 @@ mod tests {
     }
 
     #[test]
-    fn irregular_or_small_json_has_no_view() {
+    fn irregular_or_small_json_has_no_table() {
         for text in [
             // Keys in conflicting orders.
             padded(r#"[{"a":1,"b":2},{"b":3,"a":4}]"#),
             // A duplicate key.
             padded(r#"[{"a":1,"a":2},{"a":3,"a":4}]"#),
-            // Not all objects, or not JSON at all.
+            // Not all objects.
             padded(r#"[{"a":1},2]"#),
-            padded("{\"a\":1}\nnot json\n"),
-            // Too small to help.
-            r#"[{"a":1},{"a":2}]"#.to_owned(),
             // Every field shared: nothing varies.
             padded(r#"[{"a":1},{"a":1}]"#),
         ] {
+            assert_eq!(tables(&text, false), None, "{text}");
+            // Only the whitespace goes.
+            let compact = text.trim_end();
+            assert_eq!(
+                render(&text, false),
+                Some(format!("{COMPACT}\n{compact}\n")),
+                "{text}"
+            );
+        }
+        // Not JSON at all, or too small to help.
+        for text in [
+            padded("{\"a\":1}\nnot json\n"),
+            r#"[{"a":1},{"a":2}]"#.to_owned(),
+        ] {
             assert_eq!(render(&text, false), None, "{text}");
         }
+    }
+
+    #[test]
+    fn pretty_json_without_tables_is_shown_compact() {
+        // A dependency tree, as `npm ls --json` prints it: nested objects, no arrays
+        // of objects. Scalars keep their source text, escapes and key order.
+        let tree = |name: &str, deps: &str| {
+            format!(
+                "{{\n  \"version\": \"1.0.0\",\n  \"name\": \"{name}\",\n  \"dependencies\": {{{deps}\n  }}\n}}\n"
+            )
+        };
+        let deps: String = (0..8)
+            .map(|i| format!("\n    \"pkg-{i}\": {{\n      \"version\": \"{i}.0\",\n      \"n\": 1.0,\n      \"path\": \"a\\/b\\u00e9\"\n    }},"))
+            .collect();
+        let text = tree("app", deps.trim_end_matches(','));
+        let view = render(&text, false).unwrap();
+        let body = view.strip_prefix(&format!("{COMPACT}\n")).unwrap();
+        assert!(
+            body.starts_with(r#"{"version":"1.0.0","name":"app","dependencies":{"pkg-0":{"version":"0.0","n":1.0,"path":"a\/b\u00e9"},"#),
+            "{view}"
+        );
+        assert_eq!(body.lines().count(), 1);
+        assert_eq!(decode(&view).unwrap(), Json::read(&text).unwrap().original);
+        assert!(
+            view.len() * 4 < text.len() * 3,
+            "{} of {}",
+            view.len(),
+            text.len()
+        );
+        // JSON lines keep one record per line.
+        let lines = "{\"a\": 1, \"b\": [1, 2]}\n{\"b\": [3], \"a\": 2}\n".repeat(16);
+        let view = render(&lines, false).unwrap();
+        assert_eq!(
+            view,
+            format!(
+                "{COMPACT}\n{}",
+                "{\"a\":1,\"b\":[1,2]}\n{\"b\":[3],\"a\":2}\n".repeat(16)
+            )
+        );
+        // Already compact JSON has nothing to drop.
+        assert_eq!(render(&format!("{}\n", body.trim_end()), false), None);
     }
 
     #[test]
@@ -776,16 +884,19 @@ mod tests {
 
     #[test]
     fn decoding_rejects_a_damaged_view() {
-        let view = render(
-            &padded(r#"[{"a":1,"b":"x"},{"a":2,"b":"y"},{"a":3}]"#),
-            false,
-        )
-        .unwrap();
-        assert!(decode(&view).is_some());
+        let text = padded(r#"[{"a":1,"b":"x"},{"a":2,"b":"y"},{"a":3}]"#);
+        let view = tables(&text, false).unwrap();
+        let compact = Json::read(&text).unwrap().compact().unwrap();
+        for view in [&view, &compact] {
+            assert!(decode(view).is_some());
+        }
         for damaged in [
             view.replacen("3 objects", "4 objects", 1),
             view.replacen("2,\"y\"", "2,\"y\",", 1),
             format!("{view}extra\n"),
+            compact.replacen("[{", "[ {", 1),
+            compact.replacen("]\n", "]x\n", 1),
+            format!("{COMPACT}\n"),
         ] {
             assert_eq!(decode(&damaged), None, "{damaged}");
         }

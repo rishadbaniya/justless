@@ -77,6 +77,61 @@ fn json_output_is_shown_as_tables_that_log_reverses() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn json_reads_stay_exact_when_they_fit_unless_compact_json_is_smaller() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = workspace("");
+    let root = dir.path();
+    // A Secret in one line, whose base64 the floor would cut, and a pretty-printed
+    // Deployment that holds no array of objects.
+    let base64 = "QmFzZTY0IGRhdGEgdGhhdCBydW5zIGxvbmcK".repeat(8);
+    let secret = format!(
+        "{{\"apiVersion\":\"v1\",\"data\":{{\"tls.crt\":\"{base64}\"}},\"kind\":\"Secret\"}}\n"
+    );
+    let deployment = serde_json::json!({"apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "api", "labels": {"app": "ledger", "tier": "api"}},
+        "spec": {"replicas": 3, "selector": {"matchLabels": {"app": "ledger"}},
+            "template": {"spec": {"containers": [{"name": "api", "image": "ledger:1.4"}]}}},
+        "status": {"readyReplicas": 3, "updatedReplicas": 3}});
+    let pretty = format!("{}\n", serde_json::to_string_pretty(&deployment).unwrap());
+    fs::write(root.join("secret.json"), &secret).unwrap();
+    fs::write(root.join("deploy.json"), &pretty).unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let kubectl = bin.join("kubectl");
+    fs::write(&kubectl, "#!/bin/sh\ncat \"$2.json\"\n").unwrap();
+    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(args)
+            .current_dir(root)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        output
+    };
+    let hook = |kind: &str| run(&["run", "--hook", "--", "kubectl", "get", kind, "-o", "json"]);
+    let output = hook("secret");
+    assert_eq!(text(&output.stdout), secret);
+    assert_eq!(text(&output.stderr), "");
+    let output = hook("deploy");
+    let compact = serde_json::to_string(&deployment).unwrap();
+    assert_eq!(
+        text(&output.stdout),
+        format!("[JSON without its whitespace; exact JSON in the full log]\n{compact}\n")
+    );
+    let log = run(&["log", &run_id(&output)]);
+    assert_eq!(text(&log.stdout), pretty);
+    // A typed run that fits could feed a pipe, so it stays verbatim.
+    let typed = run(&[
+        "run", "--fresh", "--", "kubectl", "get", "deploy", "-o", "json",
+    ]);
+    assert_eq!(text(&typed.stdout), pretty);
+}
+
 #[test]
 fn previews_collapse_progress_encoded_runs_and_repeats() {
     let dir = workspace("");
