@@ -2,6 +2,10 @@
 
 Ideas and limits that were considered and closed, with the reason. Each reason comes from a measurement of the owner's local Claude Code transcripts on 2026-11-19 (462 transcripts, 35,333 tool results, 103.4 MB: Bash 72.0 MB, Read 27.9 MB; MB = 10⁶ bytes; labels and byte counts only) or from the code. Reopen an item when new data contradicts its reason.
 
+## Do not build
+
+LLM summarization or retrieval, telemetry, client-side rewriting of earlier requests (it invalidates thinking on current Claude models; the opt-in proxy uses server-side context editing instead), networked graph databases, bundled embedding models, and fetching filters from the network. Each breaks the local, deterministic, zero-network promise in the README.
+
 ## Already covered by shipped features
 
 | Idea | Covered by |
