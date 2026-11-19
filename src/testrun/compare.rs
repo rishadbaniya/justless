@@ -225,6 +225,8 @@ enum Group {
     Already,
     /// Fails at the base with another message.
     Changed,
+    /// Fails at the base, with no message on either side to compare.
+    Unclear,
     /// Not run at the base.
     Skipped,
 }
@@ -236,6 +238,7 @@ impl Group {
             Self::Absent => "no-result-at-base",
             Self::Already => "already-failing",
             Self::Changed => "changed",
+            Self::Unclear => "failing-at-both-no-message",
             Self::Skipped => "not-compared",
         }
     }
@@ -246,6 +249,7 @@ impl Group {
             Self::Absent => "New failures, no result at the base (added or renamed since?)",
             Self::Already => "Already failing at the base, same message",
             Self::Changed => "Changed failures, failing at the base with another message",
+            Self::Unclear => "Failing at the base too, no message to compare",
             Self::Skipped => "Not compared, doctests (their names carry line numbers)",
         }
     }
@@ -410,16 +414,26 @@ fn localize(base: &[String], here: &Path, roots: &Roots, checkout: &Checkout) ->
 fn base_argv(kind: Kind, command: &[String], names: &[String]) -> Vec<String> {
     match kind {
         Kind::Cargo => {
-            // Quiet output names no passing test, and fail-fast stops at the
-            // first failing test binary.
+            // Quiet output names no passing test, fail-fast stops at the first
+            // failing test binary, and a target directory given on the command
+            // line would beat the base's own.
             let mut base = Vec::new();
+            let mut separated = false;
             let mut words = command.iter().peekable();
             while let Some(word) = words.next() {
+                separated |= word == "--";
                 if word == "-q" || word == "--quiet" || word == "--format=terse" {
                     continue;
                 }
                 if word == "--format" && words.peek().is_some_and(|next| *next == "terse") {
                     words.next();
+                    continue;
+                }
+                if !separated && word == "--target-dir" {
+                    words.next();
+                    continue;
+                }
+                if !separated && word.starts_with("--target-dir=") {
                     continue;
                 }
                 base.push(word.clone());
@@ -695,6 +709,7 @@ pub(super) fn runner(
         let now = normalize(&here.message, &roots.here);
         let then = at_base.map_or_else(String::new, |base| normalize(&base.message, &roots.base));
         let group = match at_base {
+            Some(_) if now.is_empty() && then.is_empty() => Group::Unclear,
             Some(_) if now == then => Group::Already,
             Some(_) => Group::Changed,
             None if absent.contains(&here.name) => Group::Absent,
@@ -739,6 +754,7 @@ fn render(head: &str, run: Option<&BaseRun>, compared: &[Compared]) -> String {
         Group::New,
         Group::Absent,
         Group::Changed,
+        Group::Unclear,
         Group::Already,
         Group::Skipped,
     ] {
@@ -867,7 +883,7 @@ mod tests {
     #[test]
     fn base_commands_name_every_result_and_do_not_stop_early() {
         let names = vec!["tests::a".to_owned()];
-        let cargo = words("cargo test -q --offline -- --nocapture");
+        let cargo = words("cargo test -q --target-dir /tmp/t --offline -- --nocapture");
         assert_eq!(
             base_argv(Kind::Cargo, &cargo, &names).join(" "),
             "cargo test --offline --no-fail-fast -- --nocapture --exact tests::a"

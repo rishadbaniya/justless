@@ -179,6 +179,49 @@ fn cargo_failures_are_grouped_against_the_merge_base() {
         "{groups:?}"
     );
 
+    // A worktree an interrupted comparison left behind goes with the next one.
+    let stale = temp.path().join("justless-compare-stale");
+    fs::create_dir(&stale).unwrap();
+    let owner = root.canonicalize().unwrap().join(".justless/compare");
+    fs::write(stale.join("owner"), owner.to_string_lossy().as_bytes()).unwrap();
+    let left = stale.join("shop");
+    git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            left.to_str().unwrap(),
+            "main",
+        ],
+    );
+    // Without captured output there is no message to compare.
+    let uncaptured = cli(
+        root,
+        temp.path(),
+        &[
+            "test",
+            "--compare",
+            "main",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+            "--",
+            "--nocapture",
+        ],
+    );
+    assert_eq!(uncaptured.status.code(), Some(101));
+    let err = stderr(&uncaptured);
+    assert!(
+        err.contains(
+            "Failing at the base too, no message to compare (2): tests::changed, tests::old_bug"
+        ),
+        "{err}"
+    );
+    assert_clean(root, temp.path());
+
     // Nothing failed, so nothing runs at the base.
     let passing = cli(
         root,
