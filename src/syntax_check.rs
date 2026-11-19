@@ -551,14 +551,20 @@ fn unstable_rust(root: &Path, file: &str, after: &str) -> bool {
     false
 }
 
-/// Whether `text` holds an inner attribute `#![feature(…)]`.
+/// Whether `text` holds an inner attribute `#![feature(…)]` at the start of a
+/// line, so a mention in a comment or a string does not count.
 fn enables_features(text: &str) -> bool {
     text.match_indices("#!").any(|(at, _)| {
-        text[at + 2..]
-            .trim_start()
-            .strip_prefix('[')
-            .and_then(|rest| rest.trim_start().strip_prefix("feature"))
-            .is_some_and(|rest| rest.trim_start().starts_with('('))
+        let line = text[..at].rfind('\n').map_or(0, |end| end + 1);
+        text[line..at]
+            .trim_start_matches('\u{feff}')
+            .trim()
+            .is_empty()
+            && text[at + 2..]
+                .trim_start()
+                .strip_prefix('[')
+                .and_then(|rest| rest.trim_start().strip_prefix("feature"))
+                .is_some_and(|rest| rest.trim_start().starts_with('('))
     })
 }
 
@@ -614,6 +620,7 @@ mod tests {
         for text in [
             "#![feature(super_let)]\nfn a() {}\n",
             "//! Docs.\n#! [ feature (gen_blocks, yeet_expr) ]\n",
+            "\u{feff}#![feature(never_type)]\n",
         ] {
             assert!(enables_features(text), "{text}");
         }
@@ -622,6 +629,8 @@ mod tests {
             "#[feature(x)]\nfn a() {}\n",
             "#![features(x)]\n",
             "#!/usr/bin/env run\nfn a() {}\n",
+            "//! Enable it with `#![feature(x)]`.\nfn a() {}\n",
+            "const A: &str = \"#![feature(x)]\";\n",
         ] {
             assert!(!enables_features(text), "{text}");
         }
