@@ -1,5 +1,7 @@
 //! Reads, views and checks whose answer must match what the agent was shown and
-//! what its language accepts.
+//! what its language accepts. Command hooks pass everything through on Windows.
+
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -193,13 +195,21 @@ fn outlines_list_top_level_code_in_every_language_that_runs_it() {
         (
             "scripts/run.jl",
             format!(
-                "{}#=\n  Cleanup that runs with the script.\n=#\nrm(\"/data/out\"; recursive=true)\nstep0(1)\n",
+                "usage = \"\"\"\nusage: run\n\"\"\"\nrm(\"/data/tmp\"; recursive=true)\nfunction help()\n    println(\"\"\"\n    more\n    \"\"\")\nend\n\n{}#=\n  Cleanup that runs with the script.\n=#\nrm(\"/data/out\"; recursive=true)\nstep0(1)\n",
                 repeat(
                     30,
                     "\"\"\"\n    step{i}(x)\n\nRun step {i}.\n\"\"\"\nfunction step{i}(x)\n    y = x + {i}\n    println(\"step {i}\")\n    return y * 2\nend\n\n",
                 )
             ),
-            vec!["rm(\"/data/out\"; recursive=true)", "step0(1)"],
+            // The end of a string is no docstring.
+            vec![
+                "usage = \"\"\"",
+                "usage: run",
+                "\"\"\"",
+                "rm(\"/data/tmp\"; recursive=true)",
+                "rm(\"/data/out\"; recursive=true)",
+                "step0(1)",
+            ],
         ),
         (
             "scripts/release.exs",

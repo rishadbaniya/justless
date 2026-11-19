@@ -1813,6 +1813,9 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
     let mut uncovered = Vec::new();
     // The mark that ends the docstring or block comment the line is in.
     let mut closing = None;
+    // A Julia `"""` string that a line of code opened goes on to its closing
+    // `"""`, whose line must not read as a docstring's start.
+    let mut open_string = false;
     // Directives and module docstrings come before the first statement. A string
     // after it can be part of a statement, such as the last operand of a `+`.
     let mut prologue = true;
@@ -1822,9 +1825,16 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
         next += 1;
         if covered[index] {
             prologue = false;
+            open_string = false;
             continue;
         }
         let text = lines[index].trim();
+        let triple_quotes = |text: &str| text.matches("\"\"\"").count() % 2 == 1;
+        if open_string {
+            uncovered.push(index);
+            open_string = !triple_quotes(text);
+            continue;
+        }
         if let Some(mark) = closing {
             if text.contains(mark) {
                 closing = None;
@@ -1853,7 +1863,7 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
         }
         // A Julia docstring documents the definition on the line after it.
         if language == TopLevel::Julia
-            && let Some(end) = julia_docstring(&lines, index)
+            && let Some(end) = julia_docstring(&lines, &covered, index)
             && covered.get(end + 1) == Some(&true)
         {
             next = end + 1;
@@ -1902,14 +1912,16 @@ pub(crate) fn uncovered_code(file: &str, source: &crate::source::Snapshot) -> Op
                 .is_some_and(|(_, covered)| *covered);
         if !wrapper {
             uncovered.push(index);
+            open_string = language == TopLevel::Julia && triple_quotes(text);
         }
     }
     Some(uncovered)
 }
 
 /// The last line of the string literal that starts line `start`, when the line
-/// starts with one and nothing follows it: a `"""` block or a one-line `"…"`.
-fn julia_docstring(lines: &[&str], start: usize) -> Option<usize> {
+/// starts with one and nothing follows it: a `"""` block that no row interrupts,
+/// or a one-line `"…"`.
+fn julia_docstring(lines: &[&str], covered: &[bool], start: usize) -> Option<usize> {
     let first = lines[start].trim();
     if let Some(rest) = first.strip_prefix("\"\"\"") {
         if rest.contains("\"\"\"") {
@@ -1919,7 +1931,8 @@ fn julia_docstring(lines: &[&str], start: usize) -> Option<usize> {
             .iter()
             .position(|line| line.contains("\"\"\""))?;
         let end = start + 1 + closing;
-        return lines[end].trim_end().ends_with("\"\"\"").then_some(end);
+        let inside = covered[start + 1..=end].iter().any(|&covered| covered);
+        return (!inside && lines[end].trim_end().ends_with("\"\"\"")).then_some(end);
     }
     let inner = first.strip_prefix('"')?.strip_suffix('"')?;
     (!inner.replace("\\\\", "").replace("\\\"", "").contains('"')).then_some(start)
