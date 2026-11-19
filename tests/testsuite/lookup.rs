@@ -2,8 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
+
+use crate::common::{BIN, has, lacks, starts, text};
 
 const FILES: &[&str] = &[
     "src/net/retry.rs",
@@ -17,6 +19,8 @@ const FILES: &[&str] = &[
     "data/events.csv",
 ];
 
+const RETRIES: &str = "where are retries configured";
+
 fn fixture() -> TempDir {
     let target = TempDir::new().unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/lookup");
@@ -29,7 +33,7 @@ fn fixture() -> TempDir {
 }
 
 fn cli(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_justless"))
+    Command::new(BIN)
         .arg("--root")
         .arg(root)
         .args(args)
@@ -38,14 +42,8 @@ fn cli(root: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
 fn lookup(root: &Path, args: &[&str]) -> String {
-    let mut all = vec!["lookup"];
-    all.extend_from_slice(args);
-    let output = cli(root, &all);
+    let output = cli(root, &[&["lookup"], args].concat());
     assert!(
         output.status.success(),
         "{args:?}: {}",
@@ -84,10 +82,8 @@ fn store_files(root: &Path) -> Vec<String> {
 }
 
 fn manifest_time(root: &Path) -> std::time::SystemTime {
-    fs::metadata(store(root).join("manifest.bin"))
-        .unwrap()
-        .modified()
-        .unwrap()
+    let manifest = store(root).join("manifest.bin");
+    fs::metadata(manifest).unwrap().modified().unwrap()
 }
 
 fn write(root: &Path, file: &str, contents: &str) {
@@ -99,15 +95,16 @@ fn write(root: &Path, file: &str, contents: &str) {
 #[test]
 fn ranks_symbols_sections_and_config_for_a_question() {
     let root = fixture();
-    let output = lookup(root.path(), &["where are retries configured"]);
+    let output = lookup(root.path(), &[RETRIES]);
     let headers = headers(&output);
     assert_eq!(
         headers[0], "src/net/retry.rs:5-9 struct RetryPolicy",
         "{output}"
     );
-    assert!(output.contains(
-        "  5 | /// How many times a failed download is retried and how long to wait between attempts.\n"
-    ));
+    has(
+        &output,
+        "  5 | /// How many times a failed download is retried and how long to wait between attempts.\n",
+    );
     let top = &headers[..5.min(headers.len())];
     assert!(top.contains(&"config/app.toml:5-7 text retry"), "{output}");
     assert!(
@@ -118,64 +115,53 @@ fn ranks_symbols_sections_and_config_for_a_question() {
         assert!(!files(&output)[..5].contains(&data), "{output}");
     }
     assert!(!headers[0].starts_with("tests/"), "{output}");
-    assert!(
-        output.contains(" ranked · matched retries · no match configured\n"),
-        "{output}"
-    );
-    assert!(
-        output
-            .lines()
-            .last()
-            .unwrap()
-            .starts_with("Next: justless expand "),
-        "{output}"
-    );
+    has(&output, " ranked · matched retries · no match configured\n");
+    starts(output.lines().last().unwrap(), "Next: justless expand ");
     // Lookup is not a read, so it leaves activity alone.
     assert!(!root.path().join(".justless/activity.json").exists());
 }
 
 #[test]
-fn identifier_spellings_meet_across_languages() {
+fn questions_rank_the_symbol_they_name() {
     let root = fixture();
-    let output = lookup(root.path(), &["parseHttpHeader"]);
-    let mut top = headers(&output)[..2].to_vec();
-    top.sort();
-    assert_eq!(
-        top,
-        [
-            "src/net/socket.rs:9-13 function parse_http_header",
-            "web/client.ts:1-7 function parseHttpHeader"
-        ],
-        "{output}"
+    let socket = "src/net/socket.rs:9-13 function parse_http_header";
+    let client = "web/client.ts:1-7 function parseHttpHeader";
+    let reconnect = "src/net/socket.rs:1-7 function reconnect_websocket";
+    let test = "tests/test_fetch.py:4-8 test test_download_retries";
+    // (question, how many first results to search, headers among them, text shown)
+    for (question, first, expected, shown) in [
+        // Identifier spellings meet across languages.
+        ("parseHttpHeader", 2, &[socket, client][..], ""),
+        ("parse_http_header", 2, &[socket, client], ""),
+        // A doc comment explains a symbol.
+        (
+            "how does the websocket reconnect",
+            1,
+            &[reconnect],
+            "  1 | /// Reconnects the websocket after the server closes it.\n",
+        ),
+        // Tests rank when the question asks for them.
+        ("download retry tests", 3, &[test], ""),
+        // An identifier matches through its parts.
+        ("retryBudget", 0, &[], " ranked · matched retrybudget\n"),
+    ] {
+        let output = lookup(root.path(), &[question]);
+        let headers = headers(&output);
+        for header in expected {
+            assert!(headers[..first].contains(header), "{question}: {output}");
+        }
+        assert!(output.contains(shown), "{question}: {output}");
+    }
+    // A file with CRLF line endings keeps its headers, and snippets lose the `\r`.
+    write(
+        root.path(),
+        "docs/windows.md",
+        "# Line endings\r\nCarriage returns stay out of snippets.\r\n",
     );
-    let output = lookup(root.path(), &["parse_http_header"]);
-    assert_eq!(files(&output)[..2].len(), 2);
-}
-
-#[test]
-fn doc_comments_explain_a_symbol() {
-    let root = fixture();
-    let output = lookup(root.path(), &["how does the websocket reconnect"]);
-    assert_eq!(
-        headers(&output)[0],
-        "src/net/socket.rs:1-7 function reconnect_websocket",
-        "{output}"
-    );
-    assert!(
-        output.contains("  1 | /// Reconnects the websocket after the server closes it.\n"),
-        "{output}"
-    );
-}
-
-#[test]
-fn tests_rank_when_the_question_asks_for_them() {
-    let root = fixture();
-    let output = lookup(root.path(), &["download retry tests"]);
-    assert!(
-        files(&output)[..3].contains(&"tests/test_fetch.py"),
-        "{output}"
-    );
-    assert!(output.contains("tests/test_fetch.py:4-8 test test_download_retries"));
+    let output = lookup(root.path(), &["carriage returns"]);
+    starts(&output, "docs/windows.md:1-2 section Line endings\n");
+    has(&output, "  2 | Carriage returns stay out of snippets.\n");
+    lacks(&output, "\r");
 }
 
 fn next_command(output: &str) -> Vec<String> {
@@ -186,29 +172,30 @@ fn next_command(output: &str) -> Vec<String> {
     line.split(' ').map(str::to_owned).collect()
 }
 
-fn snippet_texts(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .skip(1)
-        .take_while(|line| line.starts_with("  "))
-        .map(|line| line.split_once(" | ").unwrap().1.to_owned())
-        .collect()
+/// Runs a printed `Next:` command and returns its output.
+fn open(root: &Path, command: &[String]) -> String {
+    let args = command.iter().map(String::as_str).collect::<Vec<_>>();
+    let opened = cli(root, &args);
+    assert!(opened.status.success(), "{}", text(&opened.stderr));
+    text(&opened.stdout)
 }
 
 #[test]
 fn the_next_command_opens_the_top_result() {
     let root = fixture();
-    let output = lookup(root.path(), &["where are retries configured"]);
+    let output = lookup(root.path(), &[RETRIES]);
     let command = next_command(&output);
     assert_eq!(command[0], "expand");
-    let args = command.iter().map(String::as_str).collect::<Vec<_>>();
-    let opened = cli(root.path(), &args);
-    assert!(opened.status.success(), "{}", text(&opened.stderr));
-    let opened = text(&opened.stdout);
-    let snippets = snippet_texts(&output);
+    let opened = open(root.path(), &command);
+    let snippets: Vec<&str> = output
+        .lines()
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .map(|line| line.split_once(" | ").unwrap().1)
+        .collect();
     assert_eq!(snippets.len(), 2, "{output}");
     for snippet in snippets {
-        assert!(opened.contains(&snippet), "{snippet} not in {opened}");
+        has(&opened, snippet);
     }
 
     // A short result made of long lines is too large to open whole.
@@ -218,10 +205,7 @@ fn the_next_command_opens_the_top_result() {
     }
     write(root.path(), "docs/quorum.md", &notes);
     let output = lookup(root.path(), &["quorum notes"]);
-    assert!(
-        output.starts_with("docs/quorum.md:1-12 section Quorum notes\n"),
-        "{output}"
-    );
+    starts(&output, "docs/quorum.md:1-12 section Quorum notes\n");
     assert_eq!(
         next_command(&output),
         ["code", "docs/quorum.md", "--from", "1", "--to", "12"]
@@ -229,7 +213,7 @@ fn the_next_command_opens_the_top_result() {
     let output = lookup(root.path(), &["quorum notes", "--budget", "8000"]);
     assert_eq!(next_command(&output), ["expand", "docs/quorum.md", "L1-12"]);
 
-    // A long result gets a budgeted 40-line excerpt instead.
+    // A long result gets a budgeted excerpt of under 40 lines instead.
     let mut runbook = String::from("# Runbook\n\n");
     for line in 3..=120 {
         if line == 100 {
@@ -240,22 +224,13 @@ fn the_next_command_opens_the_top_result() {
     }
     write(root.path(), "docs/runbook.md", &runbook);
     let output = lookup(root.path(), &["failover standby"]);
-    assert!(
-        output.starts_with("docs/runbook.md:1-120 section Runbook\n"),
-        "{output}"
-    );
+    starts(&output, "docs/runbook.md:1-120 section Runbook\n");
     let command = next_command(&output);
     assert_eq!(
         command,
         ["code", "docs/runbook.md", "--from", "97", "--to", "120"]
     );
-    let from = command[3].parse::<usize>().unwrap();
-    let to = command[5].parse::<usize>().unwrap();
-    assert!(to - from < 40);
-    let args = command.iter().map(String::as_str).collect::<Vec<_>>();
-    let opened = cli(root.path(), &args);
-    assert!(opened.status.success(), "{}", text(&opened.stderr));
-    assert!(text(&opened.stdout).contains("Trigger the failover"));
+    has(&open(root.path(), &command), "Trigger the failover");
 }
 
 #[test]
@@ -265,42 +240,31 @@ fn output_fits_the_budget_and_limit() {
         .map(|index| format!("missingword{index}"))
         .collect::<Vec<_>>()
         .join(" ");
-    for question in ["where are retries configured", &format!("retries {long}")] {
+    for question in [RETRIES, &format!("retries {long}")] {
         for budget in ["128", "200", "400", "2400"] {
+            let size = budget.parse().unwrap();
             let output = lookup(root.path(), &[question, "--budget", budget]);
-            assert!(
-                output.len() <= budget.parse().unwrap(),
-                "{budget}: {output}"
-            );
+            assert!(output.len() <= size, "{budget}: {output}");
             // Even the smallest budget shows the top result's header.
             assert!(
                 output.starts_with("src/net/retry.rs:"),
                 "{budget}: {output}"
             );
             let output = lookup(root.path(), &[question, "--budget", budget, "--json"]);
-            assert!(
-                output.len() <= budget.parse().unwrap(),
-                "{budget}: {output}"
-            );
+            assert!(output.len() <= size, "{budget}: {output}");
             serde_json::from_str::<Value>(&output).unwrap();
         }
     }
-    let output = lookup(
-        root.path(),
-        &["where are retries configured", "--budget", "128"],
-    );
+    let output = lookup(root.path(), &[RETRIES, "--budget", "128"]);
     assert_eq!(
         headers(&output),
         ["src/net/retry.rs:5-9 struct RetryPolicy"],
         "{output}"
     );
-    assert!(output.contains("\n[context budget reached]\n"), "{output}");
-    let output = lookup(
-        root.path(),
-        &["where are retries configured", "--limit", "1"],
-    );
+    has(&output, "\n[context budget reached]\n");
+    let output = lookup(root.path(), &[RETRIES, "--limit", "1"]);
     assert_eq!(headers(&output).len(), 1, "{output}");
-    assert!(output.contains("1 of "), "{output}");
+    has(&output, "1 of ");
     let output = lookup(
         root.path(),
         &["retry", "--limit", "50", "--budget", "100000"],
@@ -310,20 +274,17 @@ fn output_fits_the_budget_and_limit() {
         let count = found.iter().filter(|other| *other == file).count();
         assert!(count <= 2, "{file} appears {count} times: {output}");
     }
-    let output = cli(root.path(), &["lookup", "retry", "--limit", "0"]);
-    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
 fn json_has_the_same_results_and_no_timestamps() {
     let root = fixture();
-    let first = lookup(root.path(), &["where are retries configured", "--json"]);
-    let second = lookup(root.path(), &["where are retries configured", "--json"]);
-    assert_eq!(first, second);
+    let first = lookup(root.path(), &[RETRIES, "--json"]);
+    assert_eq!(first, lookup(root.path(), &[RETRIES, "--json"]));
     let value: Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(value["query"], "where are retries configured");
-    assert_eq!(value["matched"], serde_json::json!(["retries"]));
-    assert_eq!(value["unmatched"], serde_json::json!(["configured"]));
+    assert_eq!(value["query"], RETRIES);
+    assert_eq!(value["matched"], json!(["retries"]));
+    assert_eq!(value["unmatched"], json!(["configured"]));
     assert_eq!(value["omitted"], 0);
     assert_eq!(value["next"], "justless expand src/net/retry.rs L5-9");
     let results = value["results"].as_array().unwrap();
@@ -339,20 +300,16 @@ fn json_has_the_same_results_and_no_timestamps() {
     assert_eq!(top["name"], "RetryPolicy");
     assert!(top["score"].as_f64().unwrap() > 0.0);
     assert_eq!(top["lines"][0]["line"], 5);
-    let text = lookup(root.path(), &["where are retries configured"]);
+    let text = lookup(root.path(), &[RETRIES]);
     let headers = headers(&text);
     assert_eq!(headers.len(), results.len());
     for (result, header) in results.iter().zip(&headers) {
-        let file = result["file"].as_str().unwrap();
-        assert!(header.starts_with(file), "{header} vs {result}");
+        starts(header, result["file"].as_str().unwrap());
     }
     for key in ["age", "time", "timestamp", "completed_ms"] {
-        assert!(!first.contains(&format!("\"{key}\"")), "{first}");
+        lacks(&first, &format!("\"{key}\""));
     }
-    let small = lookup(
-        root.path(),
-        &["where are retries configured", "--json", "--budget", "700"],
-    );
+    let small = lookup(root.path(), &[RETRIES, "--json", "--budget", "700"]);
     assert!(small.len() <= 700, "{small}");
     let value: Value = serde_json::from_str(&small).unwrap();
     let kept = value["results"].as_array().unwrap().len();
@@ -376,14 +333,8 @@ fn add_modules(root: &Path, count: usize, marker: &str) {
     }
 }
 
-const QUESTIONS: &[&str] = &[
-    "where are retries configured",
-    "parse records",
-    "proxy timeout upload",
-];
-
 fn answers(root: &Path) -> Vec<String> {
-    QUESTIONS
+    [RETRIES, "parse records", "proxy timeout upload"]
         .iter()
         .map(|question| lookup(root, &[question, "--json"]))
         .collect()
@@ -405,11 +356,8 @@ fn incremental_refresh_matches_a_rebuild() {
     assert_eq!(segments(root, "base"), ["base-1.seg"]);
 
     let retry = fs::read_to_string(root.join("src/net/retry.rs")).unwrap();
-    write(
-        root,
-        "src/net/retry.rs",
-        &retry.replace("failed download", "failed upload"),
-    );
+    let retry = retry.replace("failed download", "failed upload");
+    write(root, "src/net/retry.rs", &retry);
     fs::remove_file(root.join("src/net/socket.rs")).unwrap();
     write(
         root,
@@ -421,13 +369,9 @@ fn incremental_refresh_matches_a_rebuild() {
     let incremental = answers(root);
     assert_eq!(segments(root, "base"), ["base-1.seg"]);
     assert_eq!(segments(root, "delta").len(), 1, "{:?}", store_files(root));
-    assert!(
-        incremental[0].contains("failed upload"),
-        "{}",
-        incremental[0]
-    );
-    assert!(!incremental.concat().contains("socket.rs"));
-    assert!(incremental[2].contains("src/net/proxy.rs"));
+    has(&incremental[0], "failed upload");
+    lacks(&incremental.concat(), "socket.rs");
+    has(&incremental[2], "src/net/proxy.rs");
     fs::remove_dir_all(store(root)).unwrap();
     assert_eq!(answers(root), incremental);
 
@@ -450,36 +394,19 @@ fn a_large_first_build_is_announced_once() {
     let root = fixture();
     let root = root.path();
     for index in 0..2_000 {
-        write(
-            root,
-            &format!("notes/n{:02}/{index:04}.txt", index / 100),
-            &format!("note {index}\n"),
-        );
+        let file = format!("notes/n{:02}/{index:04}.txt", index / 100);
+        write(root, &file, &format!("note {index}\n"));
     }
-    let question = "where are retries configured";
-    let first = cli(root, &["lookup", question]);
+    let first = cli(root, &["lookup", RETRIES]);
     assert!(first.status.success());
     assert_eq!(
         text(&first.stderr),
         "Building lookup index for 2009 files…\n"
     );
     write(root, "notes/n00/0000.txt", "changed note\n");
-    let second = cli(root, &["lookup", question]);
+    let second = cli(root, &["lookup", RETRIES]);
     assert_eq!(second.stdout, first.stdout);
     assert!(second.stderr.is_empty(), "{}", text(&second.stderr));
-}
-
-#[test]
-fn an_unchanged_repository_writes_nothing() {
-    let root = fixture();
-    lookup(root.path(), &["retry"]);
-    let before = (manifest_time(root.path()), store_files(root.path()));
-    lookup(root.path(), &["socket"]);
-    lookup(root.path(), &["retry", "--json"]);
-    assert_eq!(
-        (manifest_time(root.path()), store_files(root.path())),
-        before
-    );
 }
 
 #[test]
@@ -487,20 +414,17 @@ fn ignored_large_binary_and_linked_files_are_skipped() {
     let root = fixture();
     let root = root.path();
     write(root, ".justlessignore", "docs/\n");
-    let output = lookup(root, &["rollback"]);
     assert_eq!(
-        output,
+        lookup(root, &["rollback"]),
         "No ranked matches for: rollback. Use justless find TEXT for exact text.\n"
     );
 
     write(root, ".justless.toml", "max_file_bytes = 300\n");
-    let output = lookup(root, &["RetryPolicy"]);
-    assert!(!output.contains("src/net/retry.rs"), "{output}");
+    lacks(&lookup(root, &["RetryPolicy"]), "src/net/retry.rs");
     write(root, ".justless.toml", "max_file_bytes = 100000\n");
-    let output = lookup(root, &["RetryPolicy"]);
-    assert!(
-        output.starts_with("src/net/retry.rs:5-9 struct RetryPolicy"),
-        "{output}"
+    starts(
+        &lookup(root, &["RetryPolicy"]),
+        "src/net/retry.rs:5-9 struct RetryPolicy",
     );
 
     fs::write(
@@ -508,10 +432,9 @@ fn ignored_large_binary_and_linked_files_are_skipped() {
         b"zephyrword \0\x01\x02 zephyrword\n",
     )
     .unwrap();
-    let output = lookup(root, &["zephyrword"]);
-    assert!(
-        output.starts_with("No ranked matches for: zephyrword."),
-        "{output}"
+    starts(
+        &lookup(root, &["zephyrword"]),
+        "No ranked matches for: zephyrword.",
     );
     let manifest = fs::read(store(root).join("manifest.bin")).unwrap();
     assert!(
@@ -525,78 +448,111 @@ fn ignored_large_binary_and_linked_files_are_skipped() {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("net/retry.rs", root.join("src/linked.rs")).unwrap();
-        let output = lookup(root, &["RetryPolicy", "--limit", "50"]);
-        assert!(!output.contains("src/linked.rs"), "{output}");
+        lacks(
+            &lookup(root, &["RetryPolicy", "--limit", "50"]),
+            "src/linked.rs",
+        );
     }
 }
 
 #[test]
-fn a_damaged_store_is_rebuilt_without_touching_other_files() {
+fn damaged_and_foreign_stores_are_rebuilt_without_touching_other_files() {
     let root = fixture();
     let root = root.path();
-    let expected = lookup(root, &["where are retries configured"]);
-    let base = store(root).join(&segments(root, "base")[0]);
-    let bytes = fs::read(&base).unwrap();
-    fs::write(&base, &bytes[..10]).unwrap();
     write(root, "outside.txt", "keep me\n");
+    let expected = lookup(root, &[RETRIES]);
+    let original = fs::read(store(root).join(&segments(root, "base")[0])).unwrap();
+    let header = fs::read(store(root).join("manifest.bin")).unwrap()[..12].to_vec();
     fs::write(store(root).join("notes.txt"), "mine\n").unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("outside.txt"), store(root).join("base-99.seg")).unwrap();
-    assert_eq!(lookup(root, &["where are retries configured"]), expected);
+    type Damage = fn(&mut Vec<u8>);
+    // (case, whether it damages the base segment rather than the manifest, damage)
+    let damages: [(&str, bool, Damage); 4] = [
+        ("truncated base", true, |bytes| bytes.truncate(10)),
+        // The header's fifth section offset is where the postings start.
+        ("zeroed postings", true, |bytes| {
+            let postings = u64::from_le_bytes(bytes[52..60].try_into().unwrap()) as usize;
+            assert!(postings < bytes.len());
+            bytes[postings..].fill(0);
+        }),
+        // A store from another version or format.
+        ("manifest version", false, |bytes| bytes[4] ^= 1),
+        ("manifest format", false, |bytes| bytes[8] ^= 1),
+    ];
+    for (case, in_base, damage) in damages {
+        let name = if in_base {
+            segments(root, "base").remove(0)
+        } else {
+            "manifest.bin".into()
+        };
+        let file = store(root).join(name);
+        let mut bytes = fs::read(&file).unwrap();
+        damage(&mut bytes);
+        fs::write(&file, bytes).unwrap();
+        let output = cli(root, &["lookup", RETRIES]);
+        assert!(output.status.success(), "{case}: {}", text(&output.stderr));
+        assert_eq!(text(&output.stdout), expected, "{case}");
+        if case == "zeroed postings" {
+            has(
+                &text(&output.stderr),
+                "lookup index was damaged and has been rebuilt",
+            );
+        }
+        let rebuilt = segments(root, "base");
+        assert_eq!(rebuilt.len(), 1, "{case}");
+        assert_eq!(
+            fs::read(store(root).join(&rebuilt[0])).unwrap(),
+            original,
+            "{case}"
+        );
+        let manifest = fs::read(store(root).join("manifest.bin")).unwrap();
+        assert_eq!(manifest[..12], header, "{case}");
+        // The next lookup reuses the rebuilt store.
+        let before = manifest_time(root);
+        let output = cli(root, &["lookup", RETRIES]);
+        assert_eq!(text(&output.stdout), expected, "{case}");
+        assert!(output.stderr.is_empty(), "{case}: {}", text(&output.stderr));
+        assert_eq!(manifest_time(root), before, "{case}");
+    }
     assert!(store(root).join("notes.txt").exists());
-    assert_eq!(
-        fs::read_to_string(root.join("outside.txt")).unwrap(),
-        "keep me\n"
-    );
+    let outside = fs::read_to_string(root.join("outside.txt")).unwrap();
+    assert_eq!(outside, "keep me\n");
     // The link at a store name is removed, not followed.
     assert!(fs::symlink_metadata(store(root).join("base-99.seg")).is_err());
-    let rebuilt = segments(root, "base");
-    assert_eq!(rebuilt.len(), 1);
-    let rebuilt = fs::read(store(root).join(&rebuilt[0])).unwrap();
-    assert!(rebuilt.len() > 10);
-    // A second lookup reuses the rebuilt store.
-    let before = manifest_time(root);
-    lookup(root, &["retry"]);
-    assert_eq!(manifest_time(root), before);
 }
 
 #[test]
 fn identical_files_share_one_result() {
     let root = fixture();
     let root = root.path();
-    let question = "where are retries configured";
-    let original = lookup(root, &[question]);
+    let original = lookup(root, &[RETRIES]);
     let docs = fs::read_to_string(root.join("docs/operations.md")).unwrap();
     write(root, "vendor/a/operations.md", &docs);
     write(root, "vendor/b/operations.md", &docs);
-    let output = lookup(root, &[question]);
+    let output = lookup(root, &[RETRIES]);
     let header = "docs/operations.md:9-13 section Retries";
-    assert!(
-        output.contains(&format!(
-            "\n{header} · same in vendor/a/operations.md +1 more\n"
-        )),
-        "{output}"
+    has(
+        &output,
+        &format!("\n{header} · same in vendor/a/operations.md +1 more\n"),
     );
-    assert!(!output.contains("vendor/a/operations.md:"), "{output}");
-    assert!(!output.contains("vendor/b/operations.md:"), "{output}");
+    lacks(&output, "vendor/a/operations.md:");
+    lacks(&output, "vendor/b/operations.md:");
     // The copies take no places, so the same results are shown.
-    assert_eq!(
-        headers(&output)
-            .iter()
-            .map(|header| header.split(" · same in ").next().unwrap())
-            .collect::<Vec<_>>(),
-        headers(&original)
-    );
-    let value: Value = serde_json::from_str(&lookup(root, &[question, "--json"])).unwrap();
-    let docs_result = value["results"]
-        .as_array()
-        .unwrap()
+    let shown: Vec<&str> = headers(&output)
+        .iter()
+        .map(|header| header.split(" · same in ").next().unwrap())
+        .collect();
+    assert_eq!(shown, headers(&original));
+    let value: Value = serde_json::from_str(&lookup(root, &[RETRIES, "--json"])).unwrap();
+    let results = value["results"].as_array().unwrap();
+    let docs_result = results
         .iter()
         .find(|result| result["file"] == "docs/operations.md")
         .unwrap();
     assert_eq!(
         docs_result["same"],
-        serde_json::json!(["vendor/a/operations.md", "vendor/b/operations.md"])
+        json!(["vendor/a/operations.md", "vendor/b/operations.md"])
     );
     // Copies share the two-per-file limit, so a third chunk of the
     // original cannot come back through a copy.
@@ -605,62 +561,20 @@ fn identical_files_share_one_result() {
     write(root, "vendor/c/quorum.md", quorum);
     let output = lookup(root, &["quorum", "--limit", "20"]);
     let found = files(&output);
-    assert_eq!(
-        found
-            .iter()
-            .filter(|file| file.ends_with("quorum.md"))
-            .count(),
-        2,
-        "{output}"
-    );
+    let copies = found.iter().filter(|file| file.ends_with("quorum.md"));
+    assert_eq!(copies.count(), 2, "{output}");
     assert!(!found.contains(&"vendor/c/quorum.md"), "{output}");
-    assert!(
-        output.contains(" · same in vendor/c/quorum.md\n"),
-        "{output}"
-    );
+    has(&output, " · same in vendor/c/quorum.md\n");
 
     // A copy that changes stands on its own again.
-    write(
-        root,
-        "vendor/b/operations.md",
-        &docs.replace("five times", "seven times"),
+    let changed = docs.replace("five times", "seven times");
+    write(root, "vendor/b/operations.md", &changed);
+    let output = lookup(root, &[RETRIES, "--limit", "20"]);
+    has(
+        &output,
+        &format!("\n{header} · same in vendor/a/operations.md\n"),
     );
-    let output = lookup(root, &[question, "--limit", "20"]);
-    assert!(
-        output.contains(&format!("\n{header} · same in vendor/a/operations.md\n")),
-        "{output}"
-    );
-    assert!(output.contains("\nvendor/b/operations.md:9-13 section Retries\n"));
-}
-
-#[test]
-fn damaged_postings_are_rebuilt_on_the_next_lookup() {
-    let root = fixture();
-    let root = root.path();
-    let question = "where are retries configured";
-    let expected = lookup(root, &[question]);
-    let base = store(root).join(&segments(root, "base")[0]);
-    let original = fs::read(&base).unwrap();
-    // The header's fifth section offset is where the postings start.
-    let postings = u64::from_le_bytes(original[52..60].try_into().unwrap()) as usize;
-    assert!(postings < original.len());
-    let mut damaged = original.clone();
-    damaged[postings..].fill(0);
-    fs::write(&base, &damaged).unwrap();
-    let output = cli(root, &["lookup", question]);
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    assert_eq!(text(&output.stdout), expected);
-    assert!(
-        text(&output.stderr).contains("lookup index was damaged and has been rebuilt"),
-        "{}",
-        text(&output.stderr)
-    );
-    let rebuilt = segments(root, "base");
-    assert_eq!(rebuilt.len(), 1);
-    assert_eq!(fs::read(store(root).join(&rebuilt[0])).unwrap(), original);
-    let output = cli(root, &["lookup", question]);
-    assert_eq!(text(&output.stdout), expected);
-    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+    has(&output, "\nvendor/b/operations.md:9-13 section Retries\n");
 }
 
 /// Puts links at store names, as a repository that commits `.justless/` could.
@@ -696,36 +610,29 @@ fn planted_links_in_the_store_are_never_followed() {
         add_modules(root, 60, "record ");
     }
     let root = planted.path();
-    plant(
-        root,
-        &victim,
-        &[
-            "manifest.bin",
-            "manifest.bin.tmp",
-            "base-1.seg",
-            "base-1.seg.tmp",
-            "base-1.seg.postings.tmp",
-        ],
-    );
+    let names = [
+        "manifest.bin",
+        "manifest.bin.tmp",
+        "base-1.seg",
+        "base-1.seg.tmp",
+        "base-1.seg.postings.tmp",
+    ];
+    plant(root, &victim, &names);
     let created = outside.path().join("created");
     std::os::unix::fs::symlink(&created, root.join(".justless/lookup.lock")).unwrap();
-    let question = "where are retries configured";
-    assert_eq!(lookup(root, &[question]), lookup(clean.path(), &[question]));
+    assert_eq!(lookup(root, &[RETRIES]), lookup(clean.path(), &[RETRIES]));
     assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
     assert!(!created.exists());
     assert_no_links(root);
 
     // An incremental refresh writes a delta segment and a new manifest.
-    plant(
-        root,
-        &victim,
-        &[
-            "manifest.bin.tmp",
-            "delta-2.seg",
-            "delta-2.seg.tmp",
-            "delta-2.seg.postings.tmp",
-        ],
-    );
+    let names = [
+        "manifest.bin.tmp",
+        "delta-2.seg",
+        "delta-2.seg.tmp",
+        "delta-2.seg.postings.tmp",
+    ];
+    plant(root, &victim, &names);
     for root in [clean.path(), planted.path()] {
         let retry = fs::read_to_string(root.join("src/net/retry.rs")).unwrap();
         write(
@@ -734,18 +641,10 @@ fn planted_links_in_the_store_are_never_followed() {
             &retry.replace("download", "upload"),
         );
     }
-    assert_eq!(lookup(root, &[question]), lookup(clean.path(), &[question]));
+    assert_eq!(lookup(root, &[RETRIES]), lookup(clean.path(), &[RETRIES]));
     assert_eq!(segments(root, "delta"), ["delta-2.seg"]);
     assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
     assert_no_links(root);
-}
-
-#[cfg(unix)]
-fn running_as_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .is_ok_and(|output| text(&output.stdout).trim() == "0")
 }
 
 #[cfg(unix)]
@@ -757,7 +656,11 @@ fn set_mode(path: &Path, mode: u32) {
 #[cfg(unix)]
 #[test]
 fn an_unwritable_store_still_answers() {
-    if running_as_root() {
+    let running_as_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| text(&output.stdout).trim() == "0");
+    if running_as_root {
         return;
     }
     let root = fixture();
@@ -772,22 +675,24 @@ fn an_unwritable_store_still_answers() {
     let output = cli(path, &["lookup", "upload quota"]);
     set_mode(&store(path), 0o700);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
-    assert!(
-        text(&output.stdout).starts_with("src/net/quota.rs:1-2 constant QUOTA_BYTES"),
-        "{}",
-        text(&output.stdout)
+    starts(
+        &text(&output.stdout),
+        "src/net/quota.rs:1-2 constant QUOTA_BYTES",
     );
-    assert!(text(&output.stderr).contains("lookup index not saved"));
+    has(&text(&output.stderr), "lookup index not saved");
 
     let fresh = fixture();
     let path = fresh.path();
     fs::create_dir(path.join(".justless")).unwrap();
     set_mode(&path.join(".justless"), 0o500);
-    let output = cli(path, &["lookup", "where are retries configured"]);
+    let output = cli(path, &["lookup", RETRIES]);
     set_mode(&path.join(".justless"), 0o700);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
-    assert!(text(&output.stdout).starts_with("src/net/retry.rs:5-9 struct RetryPolicy"));
-    assert!(text(&output.stderr).contains("lookup index not saved"));
+    starts(
+        &text(&output.stdout),
+        "src/net/retry.rs:5-9 struct RetryPolicy",
+    );
+    has(&text(&output.stderr), "lookup index not saved");
     assert!(!store(path).exists());
 }
 
@@ -795,10 +700,10 @@ fn an_unwritable_store_still_answers() {
 fn concurrent_lookups_agree_and_share_one_store() {
     let root = fixture();
     let spawn = || {
-        Command::new(env!("CARGO_BIN_EXE_justless"))
+        Command::new(BIN)
             .arg("--root")
             .arg(root.path())
-            .args(["lookup", "where are retries configured"])
+            .args(["lookup", RETRIES])
             .current_dir(root.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -812,9 +717,11 @@ fn concurrent_lookups_agree_and_share_one_store() {
     );
     assert!(first.status.success() && second.status.success());
     assert_eq!(first.stdout, second.stdout);
+    // An unchanged repository writes nothing, whatever the question.
     let before = (manifest_time(root.path()), store_files(root.path()));
-    let third = lookup(root.path(), &["where are retries configured"]);
-    assert_eq!(third.as_bytes(), first.stdout);
+    assert_eq!(lookup(root.path(), &[RETRIES]).as_bytes(), first.stdout);
+    lookup(root.path(), &["socket"]);
+    lookup(root.path(), &["retry", "--json"]);
     assert_eq!(
         (manifest_time(root.path()), store_files(root.path())),
         before
@@ -850,29 +757,21 @@ fn git_checkouts_use_tracked_and_untracked_files() {
         "/// Reconnect budget.\npub const RECONNECT_BUDGET: u32 = 3;\n",
     );
     let output = lookup(path, &["reconnect", "--limit", "20"]);
-    assert!(
-        output.contains("src/net/socket.rs:1-7 function reconnect_websocket"),
-        "{output}"
+    has(
+        &output,
+        "src/net/socket.rs:1-7 function reconnect_websocket",
     );
-    assert!(output.contains("src/net/untracked.rs"), "{output}");
-    assert!(!output.contains("build/generated.rs"), "{output}");
-    assert!(!output.contains("src/net/linked.rs"), "{output}");
+    has(&output, "src/net/untracked.rs");
+    lacks(&output, "build/generated.rs");
+    lacks(&output, "src/net/linked.rs");
 }
 
 #[test]
 fn logs_add_ranked_run_output() {
     let root = fixture();
     let path = root.path();
-    let run = cli(
-        path,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "echo \"connection reset; retrying upload\"; exit 3",
-        ],
-    );
+    let script = "echo \"connection reset; retrying upload\"; exit 3";
+    let run = cli(path, &["run", "--", "sh", "-c", script]);
     assert_eq!(run.status.code(), Some(3));
     let without = lookup(path, &["upload retrying", "--limit", "20"]);
     let with = lookup(path, &["upload retrying", "--logs", "--limit", "20"]);
@@ -880,9 +779,9 @@ fn logs_add_ranked_run_output() {
         .into_iter()
         .find(|header| header.contains(" log "))
         .unwrap_or_else(|| panic!("{with}"));
-    assert!(log.starts_with("run-"), "{log}");
-    assert!(log.contains(" stdout:1-1 log other · exit 3"), "{log}");
-    assert!(!with.contains(" ago"), "{with}");
+    starts(log, "run-");
+    has(log, " stdout:1-1 log other · exit 3");
+    lacks(&with, " ago");
     let sources = |output: &str| {
         headers(output)
             .into_iter()
@@ -896,18 +795,14 @@ fn logs_add_ranked_run_output() {
     let limited = lookup(path, &["upload retrying", "--logs", "--limit", "2"]);
     assert_eq!(sources(&limited).len(), 2, "{limited}");
     assert_eq!(headers(&limited)[0], log, "{limited}");
-    assert!(limited.contains("\nNext: justless log run-"), "{limited}");
+    has(&limited, "\nNext: justless log run-");
 
     let output = lookup(path, &["connection reset", "--logs"]);
     let run = log.split(' ').next().unwrap();
-    assert!(output.starts_with(run), "{output}");
-    assert!(
-        output.contains("  1 | connection reset; retrying upload\n"),
-        "{output}"
-    );
-    let next = output.lines().last().unwrap();
+    starts(&output, run);
+    has(&output, "  1 | connection reset; retrying upload\n");
     assert_eq!(
-        next,
+        output.lines().last().unwrap(),
         format!("Next: justless log {run} --stream stdout --from 1 --to 1")
     );
     let replay = cli(
@@ -915,8 +810,8 @@ fn logs_add_ranked_run_output() {
         &["log", run, "--stream", "stdout", "--from", "1", "--to", "1"],
     );
     assert_eq!(text(&replay.stdout), "connection reset; retrying upload\n");
-    let value: Value =
-        serde_json::from_str(&lookup(path, &["connection reset", "--logs", "--json"])).unwrap();
+    let json = lookup(path, &["connection reset", "--logs", "--json"]);
+    let value: Value = serde_json::from_str(&json).unwrap();
     let top = &value["results"][0];
     assert_eq!(top["source"], "log");
     assert_eq!(top["run"], run);
@@ -924,7 +819,7 @@ fn logs_add_ranked_run_output() {
     assert_eq!(top["status"], 3);
     assert!(top.get("file").is_none());
     // Without --logs the log is not ranked.
-    assert!(lookup(path, &["connection reset"]).starts_with("No ranked matches"));
+    starts(&lookup(path, &["connection reset"]), "No ranked matches");
 }
 
 #[test]
@@ -933,10 +828,8 @@ fn logs_take_three_places_and_forget_deleted_runs() {
     let path = root.path();
     for shard in 0..5 {
         let script = format!("echo \"quota exceeded on shard {shard}\"; exit 1");
-        assert_eq!(
-            cli(path, &["run", "--", "sh", "-c", &script]).status.code(),
-            Some(1)
-        );
+        let run = cli(path, &["run", "--", "sh", "-c", &script]);
+        assert_eq!(run.status.code(), Some(1));
     }
     let logs = |output: &str| {
         headers(output)
@@ -966,22 +859,22 @@ fn logs_take_three_places_and_forget_deleted_runs() {
 #[test]
 fn questions_need_a_searchable_word() {
     let root = fixture();
-    for question in ["   ", "?!"] {
-        let output = cli(root.path(), &["lookup", question]);
-        assert_eq!(output.status.code(), Some(2));
-        assert!(
-            text(&output.stderr).contains("enter a question or keywords"),
-            "{}",
-            text(&output.stderr)
-        );
+    for (args, error) in [
+        (&["   "][..], "enter a question or keywords"),
+        (&["?!"], "enter a question or keywords"),
+        (
+            &["retry", "--limit", "0"],
+            "--limit expects a number of at least 1",
+        ),
+    ] {
+        let output = cli(root.path(), &[&["lookup"], args].concat());
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        has(&text(&output.stderr), error);
     }
     let output = cli(root.path(), &["lookup", "--", "-v flag"]);
     assert!(output.status.success(), "{}", text(&output.stderr));
     let output = lookup(root.path(), &["where", "are", "retries", "configured"]);
-    assert_eq!(
-        output,
-        lookup(root.path(), &["where are retries configured"])
-    );
+    assert_eq!(output, lookup(root.path(), &[RETRIES]));
 }
 
 #[test]
@@ -1000,56 +893,4 @@ fn the_reference_shows_real_output() {
         lookup(root.path(), &["where are retries configured?"]),
         documented
     );
-}
-
-#[test]
-fn crlf_lines_and_deleted_files_keep_their_headers() {
-    let root = fixture();
-    let path = root.path();
-    write(
-        path,
-        "docs/windows.md",
-        "# Line endings\r\nCarriage returns stay out of snippets.\r\n",
-    );
-    let output = lookup(path, &["carriage returns"]);
-    assert!(
-        output.starts_with("docs/windows.md:1-2 section Line endings\n"),
-        "{output}"
-    );
-    assert!(
-        output.contains("  2 | Carriage returns stay out of snippets.\n"),
-        "{output}"
-    );
-    assert!(!output.contains('\r'));
-}
-
-#[test]
-fn a_store_from_another_version_is_rebuilt() {
-    let root = fixture();
-    let path = root.path();
-    let expected = lookup(path, &["where are retries configured"]);
-    let manifest = store(path).join("manifest.bin");
-    let original = fs::read(&manifest).unwrap();
-    for at in [4, 8] {
-        let mut changed = original.clone();
-        changed[at] ^= 1;
-        fs::write(&manifest, &changed).unwrap();
-        assert_eq!(lookup(path, &["where are retries configured"]), expected);
-        assert_eq!(fs::read(&manifest).unwrap()[..12], original[..12]);
-    }
-}
-
-#[test]
-fn an_identifier_matches_through_its_parts() {
-    let root = fixture();
-    let output = lookup(root.path(), &["retryBudget"]);
-    let counts = output
-        .lines()
-        .find(|line| line.contains(" ranked"))
-        .unwrap();
-    assert!(
-        counts.ends_with(" ranked · matched retrybudget"),
-        "{output}"
-    );
-    assert!(!counts.contains("no match"), "{output}");
 }

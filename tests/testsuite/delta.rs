@@ -3,16 +3,18 @@
 //! session or after compaction.
 
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
+use serde_json::{Value, json};
 use tempfile::TempDir;
+
+use crate::common::{BIN, has, lacks, piped, starts, text, words};
 
 const SESSION_VARIABLES: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "JUSTLESS_SESSION"];
 
 fn cli(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+    let mut command = Command::new(BIN);
     command.args(args).current_dir(root);
     for name in SESSION_VARIABLES {
         command.env_remove(name);
@@ -28,30 +30,21 @@ fn ok_with(root: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
     assert!(
         output.status.success(),
         "{args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
+        text(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn ok(root: &Path, args: &[&str]) -> String {
-    ok_with(root, args, &[])
+/// The output of `line`, split at spaces into arguments.
+fn ok(root: &Path, line: &str) -> String {
+    ok_with(root, &words(line), &[])
 }
 
-fn hook(root: &Path, mode: &str, input: serde_json::Value) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["hook-claude", mode])
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.to_string().as_bytes())
-        .unwrap();
-    assert!(child.wait_with_output().unwrap().status.success());
+fn hook(root: &Path, mode: &str, input: Value) {
+    let mut command = Command::new(BIN);
+    command.args(["hook-claude", mode]).current_dir(root);
+    let output = piped(&mut command, input.to_string().as_bytes());
+    assert!(output.status.success());
 }
 
 /// A crate whose `long_function` has `lines` numbered statements and calls
@@ -96,24 +89,6 @@ fn whole_lines(view: &str) -> Vec<String> {
         .skip(1)
         .map(|line| line.split_once(" | ").unwrap().1.to_owned())
         .collect()
-}
-
-/// Runs the `whole symbol:` command a view printed.
-fn expand_printed(root: &Path, view: &str) -> String {
-    let command = view
-        .split("whole symbol: ")
-        .nth(1)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap();
-    let words: Vec<String> = command
-        .split(' ')
-        .skip(1)
-        .map(|word| word.trim_matches('\'').to_owned())
-        .collect();
-    let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    ok(root, &words)
 }
 
 /// Rebuilds the symbol's new lines from the lines of an earlier whole view and
@@ -170,31 +145,30 @@ fn file_lines(root: &Path, (a, b): (usize, usize)) -> Vec<String> {
         .collect()
 }
 
-const SYMBOL: [&str; 5] = ["context", "--symbol", "long_function", "--session", "s1"];
+const PLAIN: &str = "context --symbol long_function";
+const SYMBOL: &str = "context --symbol long_function --session s1";
+const UNCHANGED: &str = "unchanged since you read it";
 
 #[test]
 fn rereads_print_one_line_or_only_the_changed_lines() {
     let dir = project(30);
     let root = dir.path();
-    let plain = ok(root, &["context", "--symbol", "long_function"]);
-    let first = ok(root, &SYMBOL);
+    let plain = ok(root, PLAIN);
+    let first = ok(root, SYMBOL);
     assert_eq!(first, plain, "the first view in a session is today's view");
 
-    let again = ok(root, &SYMBOL);
+    let again = ok(root, SYMBOL);
     assert_eq!(again.lines().count(), 1, "{again}");
-    assert!(
-        again.starts_with("src/lib.rs:6-38 · unchanged since you read it at "),
-        "{again}"
-    );
-    let printed = expand_printed(root, &again);
+    starts(&again, "src/lib.rs:6-38 · unchanged since you read it at ");
+    // The printed command shows the whole symbol.
+    let command = again.split("whole symbol: ").nth(1).unwrap();
+    let command = command.lines().next().unwrap().replace('\'', "");
+    let printed = ok(root, command.split_once(' ').unwrap().1);
     let expected: String = file_lines(root, (6, 38))
         .iter()
         .map(|line| format!("{line}\n"))
         .collect();
-    assert_eq!(
-        printed, expected,
-        "the printed command shows the whole symbol"
-    );
+    assert_eq!(printed, expected);
 
     // Change one line, delete another and add one.
     edit(
@@ -208,28 +182,17 @@ fn rereads_print_one_line_or_only_the_changed_lines() {
         "    let value_25 = helper(25);\n",
         "    let value_25 = helper(25);\n    let extra = value_25 * 3;\n",
     );
-    let delta = ok(root, &SYMBOL);
-    assert!(
-        delta.starts_with("src/lib.rs:6-38 · 31 of 33 lines unchanged since you read it at "),
-        "{delta}"
+    let delta = ok(root, SYMBOL);
+    starts(
+        &delta,
+        "src/lib.rs:6-38 · 31 of 33 lines unchanged since you read it at ",
     );
-    assert!(
-        delta.contains("\n+ 16 |     let value_10 = helper(100);\n"),
-        "{delta}"
-    );
-    assert!(
-        delta.contains("\n-    |     let value_10 = helper(10);\n"),
-        "{delta}"
-    );
-    assert!(
-        delta.contains("\n-    |     let value_20 = helper(20);\n"),
-        "{delta}"
-    );
-    assert!(
-        delta.contains("\n+ 31 |     let extra = value_25 * 3;\n"),
-        "{delta}"
-    );
-    assert!(!delta.contains("value_5 "), "far lines stay out:\n{delta}");
+    has(&delta, "\n+ 16 |     let value_10 = helper(100);\n");
+    has(&delta, "\n-    |     let value_10 = helper(10);\n");
+    has(&delta, "\n-    |     let value_20 = helper(20);\n");
+    has(&delta, "\n+ 31 |     let extra = value_25 * 3;\n");
+    // Far lines stay out.
+    lacks(&delta, "value_5 ");
     assert!(
         delta.len() < plain.len(),
         "{} vs {}",
@@ -242,22 +205,16 @@ fn rereads_print_one_line_or_only_the_changed_lines() {
         "the delta rebuilds the new text exactly"
     );
 
-    let after = ok(root, &SYMBOL);
+    let after = ok(root, SYMBOL);
     assert_eq!(after.lines().count(), 1, "{after}");
-    assert!(after.contains("unchanged since you read it"), "{after}");
+    has(&after, UNCHANGED);
 
     // A rewrite prints whole, as shown, when that is no longer than the delta.
     let text = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    fs::write(
-        root.join("src/lib.rs"),
-        text.replace("= helper(", "= helper(1 + "),
-    )
-    .unwrap();
-    let rewrite = ok(root, &SYMBOL);
-    assert!(
-        rewrite.starts_with("src/lib.rs:6-38 · changed since you read it at "),
-        "{rewrite}"
-    );
+    let rewritten = text.replace("= helper(", "= helper(1 + ");
+    fs::write(root.join("src/lib.rs"), rewritten).unwrap();
+    let rewrite = ok(root, SYMBOL);
+    starts(&rewrite, "src/lib.rs:6-38 · changed since you read it at ");
     assert_eq!(whole_lines(&rewrite), file_lines(root, (6, 38)));
 }
 
@@ -265,59 +222,43 @@ fn rereads_print_one_line_or_only_the_changed_lines() {
 fn a_line_ending_change_is_shown() {
     let dir = project(30);
     let root = dir.path();
-    ok(root, &SYMBOL);
+    ok(root, SYMBOL);
     edit(root, "helper(4);\n", "helper(4);\r\n");
-    let delta = ok(root, &SYMBOL);
-    assert!(
-        !delta.contains("· unchanged since you read it at"),
-        "{delta}"
-    );
-    assert!(
-        delta.contains("+ 10 |     let value_4 = helper(4);"),
-        "{delta}"
-    );
+    let delta = ok(root, SYMBOL);
+    lacks(&delta, "· unchanged since you read it at");
+    has(&delta, "+ 10 |     let value_4 = helper(4);");
 }
 
 #[test]
 fn moved_renamed_and_deleted_symbols() {
     let dir = project(12);
     let root = dir.path();
-    ok(root, &SYMBOL);
+    ok(root, SYMBOL);
     // Moved down by two lines with the same text.
     let path = root.join("src/lib.rs");
     let text = fs::read_to_string(&path).unwrap();
     fs::write(&path, format!("// moved\n\n{text}")).unwrap();
-    let moved = ok(root, &SYMBOL);
-    assert!(
-        moved.starts_with("src/lib.rs:8-22 · unchanged since you read it at "),
-        "{moved}"
-    );
-    assert!(moved.contains(", then at lines 6-20 ·"), "{moved}");
+    let moved = ok(root, SYMBOL);
+    starts(&moved, "src/lib.rs:8-22 · unchanged since you read it at ");
+    has(&moved, ", then at lines 6-20 ·");
 
-    // Renamed: the new name was never read.
+    // Renamed: the new name was never read, so it prints whole.
     edit(root, "pub fn long_function", "pub fn longer_function");
-    let renamed = ok(
-        root,
-        &["context", "--symbol", "longer_function", "--session", "s1"],
-    );
-    assert_eq!(
-        renamed,
-        ok(root, &["context", "--symbol", "longer_function"]),
-        "a renamed symbol prints whole"
-    );
-    assert!(!cli(root, &SYMBOL, &[]).status.success());
+    let renamed = ok(root, "context --symbol longer_function --session s1");
+    assert_eq!(renamed, ok(root, "context --symbol longer_function"));
+    assert!(!cli(root, &words(SYMBOL), &[]).status.success());
 
     // Moved to another file: a different symbol, printed whole.
     edit(root, "pub fn longer_function", "pub fn long_function");
-    ok(root, &SYMBOL);
+    ok(root, SYMBOL);
     fs::rename(&path, root.join("src/other.rs")).unwrap();
-    let other = ok(root, &SYMBOL);
-    assert!(other.starts_with("src/other.rs:8-22\n"), "{other}");
-    assert!(!other.contains("since you read"), "{other}");
+    let other = ok(root, SYMBOL);
+    starts(&other, "src/other.rs:8-22\n");
+    lacks(&other, "since you read");
 
     // Deleted: an error, not a stale view.
     fs::remove_file(root.join("src/other.rs")).unwrap();
-    let gone = cli(root, &SYMBOL, &[]);
+    let gone = cli(root, &words(SYMBOL), &[]);
     assert!(!gone.status.success());
     assert!(gone.stdout.is_empty());
 }
@@ -326,154 +267,80 @@ fn moved_renamed_and_deleted_symbols() {
 fn new_sessions_and_compaction_print_whole_again() {
     let dir = project(10);
     let root = dir.path();
-    let plain = ok(root, &["context", "--symbol", "long_function"]);
-    ok(root, &SYMBOL);
-    let other = ["context", "--symbol", "long_function", "--session", "s2"];
-    assert_eq!(ok(root, &other), plain, "another session prints whole");
-    assert!(ok(root, &SYMBOL).contains("unchanged since you read it"));
-    assert!(ok(root, &other).contains("unchanged since you read it"));
-    assert!(
-        ok(
-            root,
-            &[
-                "context",
-                "--symbol",
-                "long_function",
-                "--session",
-                "s1",
-                "--fresh"
-            ]
-        )
-        .starts_with("src/lib.rs:6-18\n"),
-        "--fresh prints whole"
-    );
+    let plain = ok(root, PLAIN);
+    ok(root, SYMBOL);
+    let other = "context --symbol long_function --session s2";
+    assert_eq!(ok(root, other), plain, "another session prints whole");
+    has(&ok(root, SYMBOL), UNCHANGED);
+    has(&ok(root, other), UNCHANGED);
+    let fresh = ok(root, &format!("{SYMBOL} --fresh"));
+    starts(&fresh, "src/lib.rs:6-18\n");
     // Without a session nothing changes.
-    assert_eq!(ok(root, &["context", "--symbol", "long_function"]), plain);
+    assert_eq!(ok(root, PLAIN), plain);
 
     // The shell's Claude Code session ID is no session: subagents share it.
     let claude = [("CLAUDE_CODE_SESSION_ID", "8d1c")];
-    let symbol = ["context", "--symbol", "long_function"];
-    assert_eq!(ok_with(root, &symbol, &claude), plain);
-    assert_eq!(ok_with(root, &symbol, &claude), plain);
+    assert_eq!(ok_with(root, &words(PLAIN), &claude), plain);
+    assert_eq!(ok_with(root, &words(PLAIN), &claude), plain);
 
     // `resume` keeps the views; the compaction handoff forgets them all.
-    ok(root, &["resume"]);
-    assert!(ok(root, &SYMBOL).contains("unchanged since you read it"));
-    hook(
-        root,
-        "before-compact",
-        serde_json::json!({"hook_event_name":"PreCompact","trigger":"auto","cwd":root}),
-    );
-    assert_eq!(ok(root, &SYMBOL), plain);
-    assert_eq!(ok(root, &other), plain);
-    assert!(ok(root, &SYMBOL).contains("unchanged since you read it"));
-    hook(
-        root,
-        "after-compact",
-        serde_json::json!({"hook_event_name":"SessionStart","source":"compact","cwd":root}),
-    );
-    assert_eq!(ok(root, &SYMBOL), plain);
+    ok(root, "resume");
+    has(&ok(root, SYMBOL), UNCHANGED);
+    let compact = json!({"hook_event_name":"PreCompact","trigger":"auto","cwd":root});
+    hook(root, "before-compact", compact);
+    assert_eq!(ok(root, SYMBOL), plain);
+    assert_eq!(ok(root, other), plain);
+    has(&ok(root, SYMBOL), UNCHANGED);
+    let start = json!({"hook_event_name":"SessionStart","source":"compact","cwd":root});
+    hook(root, "after-compact", start);
+    assert_eq!(ok(root, SYMBOL), plain);
 }
 
 #[test]
 fn budget_limits_never_hide_what_was_not_printed() {
     let dir = project(120);
     let root = dir.path();
-    let small = [
-        "context",
-        "--symbol",
-        "long_function",
-        "--session",
-        "s1",
-        "--budget",
-        "700",
-    ];
-    let first = ok(root, &small);
+    let budget = |bytes: usize| ok(root, &format!("{SYMBOL} --budget {bytes}"));
+    let first = budget(700);
     assert!(first.ends_with("[context budget reached]\n"), "{first}");
-    assert!(!first.contains("value_60 "));
+    lacks(&first, "value_60 ");
     // Lines the budget cut were never seen, so they are printed now.
-    let rest = ok(
-        root,
-        &[
-            "context",
-            "--symbol",
-            "long_function",
-            "--session",
-            "s1",
-            "--budget",
-            "100000",
-        ],
-    );
-    assert!(!rest.contains("· unchanged since you read it at"), "{rest}");
-    assert!(
-        rest.contains(" lines unchanged since you read it at "),
-        "{rest}"
-    );
-    assert!(
-        rest.contains("|     let value_120 = helper(120);"),
-        "{rest}"
-    );
-    assert!(ok(root, &SYMBOL).contains("unchanged since you read it"));
+    let rest = budget(100_000);
+    lacks(&rest, "· unchanged since you read it at");
+    has(&rest, " lines unchanged since you read it at ");
+    has(&rest, "|     let value_120 = helper(120);");
+    has(&ok(root, SYMBOL), UNCHANGED);
 
     // A delta cut after its first change prints whole next time, so a
     // change it never showed, or one it showed and that went back, is seen.
     edit(root, "helper(3);", "helper(33);");
     edit(root, "helper(118);", "helper(1188);");
-    let cut = ok(
-        root,
-        &[
-            "context",
-            "--symbol",
-            "long_function",
-            "--session",
-            "s1",
-            "--budget",
-            "400",
-        ],
-    );
-    assert!(cut.contains("helper(33)"), "{cut}");
-    assert!(!cut.contains("helper(1188)"), "{cut}");
+    let cut = budget(400);
+    has(&cut, "helper(33)");
+    lacks(&cut, "helper(1188)");
     edit(root, "helper(33);", "helper(3);");
-    let whole = [
-        "context",
-        "--symbol",
-        "long_function",
-        "--session",
-        "s1",
-        "--budget",
-        "100000",
-    ];
-    let next = ok(root, &whole);
-    assert!(next.starts_with("src/lib.rs:6-128\n"), "{next}");
-    assert!(
-        next.contains("\n  9 |     let value_3 = helper(3);\n"),
-        "{next}"
-    );
-    assert!(
-        next.contains("\n  124 |     let value_118 = helper(1188);\n"),
-        "{next}"
-    );
+    let next = budget(100_000);
+    starts(&next, "src/lib.rs:6-128\n");
+    has(&next, "\n  9 |     let value_3 = helper(3);\n");
+    has(&next, "\n  124 |     let value_118 = helper(1188);\n");
 }
 
 #[test]
 fn a_change_reverted_after_a_partial_view_is_shown() {
     let dir = project(30);
     let root = dir.path();
-    ok(root, &SYMBOL);
+    ok(root, SYMBOL);
     edit(root, "helper(4);", "helper(44);");
     edit(root, "helper(24);", "helper(244);");
     // The window shows the first change but not the second.
-    let window = ok(
-        root,
-        &["context", "--at", "src/lib.rs:10", "--session", "s1"],
-    );
-    assert!(window.contains("helper(44)"), "{window}");
-    assert!(!window.contains("helper(244)"), "{window}");
+    let window = ok(root, "context --at src/lib.rs:10 --session s1");
+    has(&window, "helper(44)");
+    lacks(&window, "helper(244)");
     edit(root, "helper(44);", "helper(4);");
-    let view = ok(root, &SYMBOL);
-    assert!(view.contains("|     let value_4 = helper(4);\n"), "{view}");
-    assert!(view.contains("helper(244)"), "{view}");
-    assert!(!view.contains("· unchanged since"), "{view}");
+    let view = ok(root, SYMBOL);
+    has(&view, "|     let value_4 = helper(4);\n");
+    has(&view, "helper(244)");
+    lacks(&view, "· unchanged since");
 }
 
 #[test]
@@ -484,85 +351,68 @@ fn a_change_seen_in_an_overlapping_symbol_is_not_hidden_when_reverted() {
     let mut text = fs::read_to_string(&path).unwrap();
     text.push_str("\npub mod inner {\n    pub fn first() -> u32 {\n        1\n    }\n\n    pub fn second() -> u32 {\n        2\n    }\n}\n");
     fs::write(&path, text).unwrap();
-    let outer = ["context", "--symbol", "inner", "--session", "s1"];
-    let method = ["context", "--symbol", "inner::second", "--session", "s1"];
-    ok(root, &outer);
+    let outer = "context --symbol inner --session s1";
+    ok(root, outer);
     edit(root, "        2\n", "        22\n");
     // The method's own view shows the change; the module's record predates it.
-    assert!(ok(root, &method).contains("        22"));
+    has(
+        &ok(root, "context --symbol inner::second --session s1"),
+        "        22",
+    );
     edit(root, "        22\n", "        2\n");
-    let again = ok(root, &outer);
-    assert!(!again.contains("· unchanged since"), "{again}");
-    assert!(again.contains("|         2\n"), "{again}");
+    let again = ok(root, outer);
+    lacks(&again, "· unchanged since");
+    has(&again, "|         2\n");
 }
 
 #[test]
 fn at_views_print_the_changed_window_lines() {
     let dir = project(20);
     let root = dir.path();
-    let at = ["context", "--at", "src/lib.rs:15-27", "--session", "s1"];
-    let plain = ok(root, &["context", "--at", "src/lib.rs:15-27"]);
-    assert_eq!(ok(root, &at), plain);
-    let again = ok(root, &at);
-    assert!(
-        again.contains("\n  lines 12-26 unchanged since you read them at "),
-        "{again}"
-    );
-    assert!(again.starts_with(plain.lines().next().unwrap()), "{again}");
+    let at = "context --at src/lib.rs:15-27 --session s1";
+    let plain = ok(root, "context --at src/lib.rs:15-27");
+    assert_eq!(ok(root, at), plain);
+    let again = ok(root, at);
+    has(&again, "\n  lines 12-26 unchanged since you read them at ");
+    starts(&again, plain.lines().next().unwrap());
     edit(root, "helper(19);", "helper(199);");
-    let delta = ok(root, &at);
-    assert!(
-        delta.contains("\n  14 of 15 lines unchanged since you read them at "),
-        "{delta}"
+    let delta = ok(root, at);
+    has(
+        &delta,
+        "\n  14 of 15 lines unchanged since you read them at ",
     );
-    assert!(
-        delta.contains("\n+ 25 |     let value_19 = helper(199);\n"),
-        "{delta}"
-    );
-    assert!(
-        delta.contains("\n-    |     let value_19 = helper(19);\n"),
-        "{delta}"
-    );
-    assert!(!delta.contains("value_10 "), "{delta}");
+    has(&delta, "\n+ 25 |     let value_19 = helper(199);\n");
+    has(&delta, "\n-    |     let value_19 = helper(19);\n");
+    lacks(&delta, "value_10 ");
 
     // A window of a few short lines prints whole when that is no longer.
-    let short = ["context", "--at", "src/lib.rs:15", "--session", "s1"];
-    ok(root, &short);
+    let short = "context --at src/lib.rs:15 --session s1";
+    ok(root, short);
     edit(root, "helper(9);", "helper(99);");
-    let window = ok(root, &short);
-    assert_eq!(window, ok(root, &["context", "--at", "src/lib.rs:15"]));
-    assert!(
-        window.contains("\n  15 |     let value_9 = helper(99);\n"),
-        "{window}"
-    );
+    let window = ok(root, short);
+    assert_eq!(window, ok(root, "context --at src/lib.rs:15"));
+    has(&window, "\n  15 |     let value_9 = helper(99);\n");
 }
 
 #[test]
 fn packs_shorten_excerpts_shown_before() {
     let dir = project(6);
     let root = dir.path();
-    let task = ["pack", "what does long_function compute", "--session", "s1"];
-    let first = ok(root, &task);
-    assert_eq!(
-        first,
-        ok(root, &["pack", "what does long_function compute"])
-    );
-    assert!(first.contains("| let doubled = value * 2;"), "{first}");
-    let second = ok(root, &task);
-    assert!(
-        second.contains("    1-3 | unchanged since you read them\n"),
-        "{second}"
-    );
-    assert!(!second.contains("| let doubled = value * 2;"), "{second}");
-    let mut fresh = task.to_vec();
-    fresh.push("--fresh");
-    assert_eq!(ok(root, &fresh), first);
+    let question = "what does long_function compute";
+    let task = ["pack", question, "--session", "s1"];
+    let pack = |args: &[&str]| ok_with(root, args, &[]);
+    let first = pack(&task);
+    assert_eq!(first, pack(&["pack", question]));
+    has(&first, "| let doubled = value * 2;");
+    let second = pack(&task);
+    has(&second, "    1-3 | unchanged since you read them\n");
+    lacks(&second, "| let doubled = value * 2;");
+    assert_eq!(pack(&[&task[..], &["--fresh"]].concat()), first);
     edit(root, "value * 2", "value * 4");
-    assert!(ok(root, &task).contains("| let doubled = value * 4;"));
+    has(&pack(&task), "| let doubled = value * 4;");
     // Changed back, the lines differ from the last ones printed.
     edit(root, "value * 4", "value * 2");
-    let back = ok(root, &task);
-    assert!(back.contains("| let doubled = value * 2;"), "{back}");
+    has(&pack(&task), "| let doubled = value * 2;");
 }
 
 #[test]
@@ -571,35 +421,30 @@ fn twins_that_share_a_name_are_remembered_apart() {
     let root = dir.path();
     let body = "    let first = 1;\n    let second = 2;\n    let third = 3;\n    first + second + third\n}\n";
     let path = root.join("src/lib.rs");
-    let mut text = fs::read_to_string(&path).unwrap();
+    let mut source = fs::read_to_string(&path).unwrap();
     for cfg in ["unix", "not(unix)"] {
-        text.push_str(&format!("\n#[cfg({cfg})]\npub fn twin() -> u32 {{\n{body}"));
+        source.push_str(&format!("\n#[cfg({cfg})]\npub fn twin() -> u32 {{\n{body}"));
     }
-    fs::write(&path, text).unwrap();
+    fs::write(&path, source).unwrap();
     let ambiguous = cli(root, &["context", "--symbol", "twin"], &[]);
-    let message = String::from_utf8_lossy(&ambiguous.stderr).into_owned();
+    let message = text(&ambiguous.stderr);
     let selectors: Vec<&str> = message
         .split_whitespace()
         .filter(|word| word.starts_with("demo::twin@"))
         .map(|word| word.trim_end_matches(')'))
         .collect();
     assert_eq!(selectors.len(), 2, "{message}");
-    let view = |selector: &str| ok(root, &["context", "--symbol", selector, "--session", "s1"]);
+    let view = |selector: &str| ok(root, &format!("context --symbol {selector} --session s1"));
     view(selectors[0]);
     let second = view(selectors[1]);
-    assert!(second.starts_with("src/lib.rs:22-28\n"), "{second}");
-    assert!(!second.contains("since you read"), "{second}");
-    assert!(view(selectors[0]).contains("unchanged since you read it"));
+    starts(&second, "src/lib.rs:22-28\n");
+    lacks(&second, "since you read");
+    has(&view(selectors[0]), UNCHANGED);
 }
 
 /// The Claude Code command hook's answer for `command`, with only `settings`
 /// as the project's permission settings.
-fn claude_command_hook(
-    root: &Path,
-    command: &str,
-    extra: serde_json::Value,
-    settings: Option<&str>,
-) -> serde_json::Value {
+fn claude_command_hook(root: &Path, command: &str, extra: Value, settings: Option<&str>) -> Value {
     let home = TempDir::new().unwrap();
     let claude = root.join(".claude/settings.json");
     match settings {
@@ -611,13 +456,13 @@ fn claude_command_hook(
             let _ = fs::remove_file(&claude);
         }
     }
-    let mut input = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+    let mut input = json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
         "cwd":root,"session_id":"0f3a-session","tool_input":{"command":command}});
     for (key, value) in extra.as_object().unwrap() {
         input[key] = value.clone();
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["hook-claude", "before-command"])
+    let mut hook = Command::new(BIN);
+    hook.args(["hook-claude", "before-command"])
         .current_dir(root)
         .env("CLAUDE_PROJECT_DIR", root)
         .env(
@@ -625,29 +470,18 @@ fn claude_command_hook(
             home.path().join("managed"),
         )
         .env("HOME", home.path())
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.to_string().as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+        .env_remove("CLAUDE_CONFIG_DIR");
+    let output = piped(&mut hook, input.to_string().as_bytes());
     assert!(output.status.success());
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
 #[test]
 fn the_claude_hook_names_the_session_and_subagent() {
-    use serde_json::json;
     let dir = project(10);
     let root = dir.path();
     let read = "justless context --symbol long_function";
-    let rewritten = |answer: &serde_json::Value| {
+    let rewritten = |answer: &Value| {
         answer["hookSpecificOutput"]["updatedInput"]["command"]
             .as_str()
             .unwrap_or_else(|| panic!("{answer}"))
@@ -658,27 +492,25 @@ fn the_claude_hook_names_the_session_and_subagent() {
     let digest = parent.rsplit(' ').next().unwrap().to_owned();
     assert_eq!(parent, format!("{read} --session {digest}"));
     let subagent = json!({"permission_mode":"auto","agent_id":"a41c","agent_type":"Explore"});
-    let child = rewritten(&claude_command_hook(root, read, subagent.clone(), None));
+    let child = rewritten(&claude_command_hook(root, read, subagent, None));
     assert_ne!(child, parent, "a subagent gets its own session");
+    let pack = "justless --root . pack \"what is long_function\"";
     assert_eq!(
         rewritten(&claude_command_hook(
             root,
-            "justless --root . pack \"what is long_function\" 2>&1",
+            &format!("{pack} 2>&1"),
             auto.clone(),
             None
         )),
-        format!("justless --root . pack \"what is long_function\" --session {digest} 2>&1")
+        format!("{pack} --session {digest} 2>&1")
     );
     // The parent's read does not stand for the subagent's, nor the reverse.
-    let run = |line: &str| {
-        let words: Vec<&str> = line.split(' ').skip(1).collect();
-        ok(root, &words)
-    };
-    let plain = ok(root, &["context", "--symbol", "long_function"]);
+    let run = |line: &str| ok(root, line.split_once(' ').unwrap().1);
+    let plain = ok(root, PLAIN);
     assert_eq!(run(&parent), plain);
     assert_eq!(run(&child), plain);
-    assert!(run(&parent).contains("unchanged since you read it"));
-    assert!(run(&child).contains("unchanged since you read it"));
+    has(&run(&parent), UNCHANGED);
+    has(&run(&child), UNCHANGED);
 
     // Without a reported mode the rules are not read, so nothing changes.
     assert_eq!(claude_command_hook(root, read, json!({}), None), json!({}));
@@ -690,18 +522,13 @@ fn the_claude_hook_names_the_session_and_subagent() {
         "justless pack -- what",
         "cargo-justless context --symbol long_function",
     ] {
-        assert_eq!(
-            claude_command_hook(root, command, auto.clone(), None),
-            json!({}),
-            "{command}"
-        );
+        let answer = claude_command_hook(root, command, auto.clone(), None);
+        assert_eq!(answer, json!({}), "{command}");
     }
     // The original command is judged against the permission rules first.
     let default = json!({"permission_mode":"default"});
-    assert_eq!(
-        claude_command_hook(root, read, default.clone(), None),
-        json!({})
-    );
+    let answer = claude_command_hook(root, read, default.clone(), None);
+    assert_eq!(answer, json!({}));
     let allow = r#"{"permissions":{"allow":["Bash(justless context:*)"]}}"#;
     let allowed = claude_command_hook(root, read, default, Some(allow));
     assert_eq!(rewritten(&allowed), parent);
@@ -714,25 +541,18 @@ fn the_claude_hook_names_the_session_and_subagent() {
 fn stats_count_the_bytes_deltas_kept_out() {
     let dir = project(30);
     let root = dir.path();
-    let plain = ok(root, &["context", "--symbol", "long_function"]);
-    ok(root, &SYMBOL);
-    let unchanged = ok(root, &SYMBOL);
+    let plain = ok(root, PLAIN);
+    ok(root, SYMBOL);
+    let unchanged = ok(root, SYMBOL);
     edit(root, "helper(12);", "helper(120);");
-    let delta = ok(root, &SYMBOL);
-    let stats: serde_json::Value = serde_json::from_str(&ok(root, &["stats", "--json"])).unwrap();
+    let delta = ok(root, SYMBOL);
+    let stats: Value = serde_json::from_str(&ok(root, "stats --json")).unwrap();
     let counted = &stats["changed_since_read"];
     assert_eq!(counted["views"], 2, "{counted}");
-    assert_eq!(
-        counted["shown_bytes"],
-        (unchanged.len() + delta.len()) as u64,
-        "{counted}"
-    );
+    let shown = (unchanged.len() + delta.len()) as u64;
+    assert_eq!(counted["shown_bytes"], shown, "{counted}");
     // What the views without a session print.
-    let edited = ok(root, &["context", "--symbol", "long_function"]);
-    assert_eq!(
-        counted["whole_bytes"],
-        (plain.len() + edited.len()) as u64,
-        "{counted}"
-    );
-    assert!(ok(root, &["stats"]).contains("Changed since read: 2 view(s) printed "));
+    let whole = (plain.len() + ok(root, PLAIN).len()) as u64;
+    assert_eq!(counted["whole_bytes"], whole, "{counted}");
+    has(&ok(root, "stats"), "Changed since read: 2 view(s) printed ");
 }
