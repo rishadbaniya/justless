@@ -92,8 +92,8 @@ pub(crate) const PAGED_REPLAY: &str = "JUSTLESS_PAGED_REPLAY";
 
 struct Server {
     root: PathBuf,
-    /// The project's `.justless/`, where a `log` page is recorded against its run.
-    state: PathBuf,
+    /// The served project, where a run a `log` page replays is looked up first.
+    workspace: Workspace,
     exe: PathBuf,
     initialized: bool,
     /// The revision negotiated through `initialize`.
@@ -123,7 +123,7 @@ impl RpcError {
 fn serve(workspace: &Workspace) -> Result<()> {
     let mut server = Server {
         root: workspace.root.clone(),
-        state: workspace.state.clone(),
+        workspace: workspace.clone(),
         exe: std::env::current_exe().context("locate the justless executable")?,
         initialized: false,
         version: None,
@@ -410,7 +410,8 @@ impl Server {
         tool_result(texts, failed)
     }
 
-    /// Records the page and its delivered byte count together after pagination.
+    /// Records the page and its delivered byte count together after pagination,
+    /// against the run in whichever registered project holds it, as `log` found it.
     fn measure_page(&self, arguments: &Map<String, Value>, bytes: usize) {
         let Some(Ok(run)) = arguments
             .get("run_id")
@@ -418,10 +419,9 @@ impl Server {
         else {
             return;
         };
-        let directory = self.state.join("runs").join(run);
-        if !directory.is_dir() {
+        let Ok((_, directory, _)) = crate::registry::locate(&self.workspace, &run) else {
             return;
-        }
+        };
         let whole = arguments.get("from").and_then(Value::as_u64).unwrap_or(1) == 1
             && arguments.get("to").is_none_or(Value::is_null);
         let retrieval = if whole {

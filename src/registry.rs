@@ -309,8 +309,10 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             "saved_bytes": total.saved_bytes(),
             "replayed_bytes": total.replayed_bytes,
             "net_saved_bytes": total.net_saved_bytes,
-            "estimated_tokens_saved": crate::history::estimated_tokens(total.saved_bytes()),
-            "token_estimate": "UTF-8 bytes / 4",
+            "estimated_tokens_saved": total.estimate.saved_tokens(),
+            "estimated_tokens_net_saved": total.estimate.net_tokens(),
+            "token_estimate": crate::tokens::method(),
+            "estimate_by_content": total.estimate.json(),
             "repositories": repositories,
             "temporary_projects_left_out": skipped,
         });
@@ -322,13 +324,15 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
     } else {
         let projects: usize = groups.iter().map(|(_, roots, _)| roots.len()).sum();
         println!(
-            "In the last {days} day(s), kept {} of {} command output out of context at first preview ({:.1}%) across {} run(s) in {projects} project(s), net saved {} (≈{} tokens at first preview, bytes ÷ 4)",
+            "In the last {days} day(s), kept {} of {} command output out of context at first preview ({:.1}%) across {} run(s) in {projects} project(s), net saved {} (≈{} tokens at first preview, ≈{} net, estimated at {})",
             human_bytes(total.saved_bytes()),
             human_bytes(total.raw_bytes),
             percent(total.saved_bytes(), total.raw_bytes),
             total.runs,
             crate::history::signed_bytes(total.net_saved_bytes),
-            crate::history::estimated_tokens(total.saved_bytes()),
+            total.estimate.saved_tokens(),
+            total.estimate.net_tokens(),
+            total.estimate.basis(),
         );
         println!("\nBy repository, most net savings first");
         for (key, roots, summary) in &groups {

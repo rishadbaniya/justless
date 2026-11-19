@@ -131,6 +131,13 @@ impl Estimate {
         self.net[i] = self.net[i].saturating_add(net);
     }
 
+    /// Adds another estimate's bytes, as when several projects' totals are summed.
+    pub(crate) fn merge(&mut self, other: &Estimate) {
+        for c in Content::ALL {
+            self.add(c, other.saved[c as usize], other.net[c as usize]);
+        }
+    }
+
     pub(crate) fn saved_tokens(&self) -> u64 {
         let tokens = Content::ALL
             .iter()
@@ -363,27 +370,41 @@ pub(crate) struct Usage {
     pub output_tokens: u64,
 }
 
+/// Transcripts are not ours, so their counts are added without overflowing.
 impl Usage {
     fn add(&mut self, counts: &Counts) {
-        self.input_tokens += counts.input_tokens.unwrap_or(0);
-        self.cache_creation_input_tokens += counts.cache_creation_input_tokens.unwrap_or(0);
-        self.cache_read_input_tokens += counts.cache_read_input_tokens.unwrap_or(0);
-        self.output_tokens += counts.output_tokens.unwrap_or(0);
+        let add = |total: &mut u64, count: Option<u64>| {
+            *total = total.saturating_add(count.unwrap_or(0));
+        };
+        add(&mut self.input_tokens, counts.input_tokens);
+        add(
+            &mut self.cache_creation_input_tokens,
+            counts.cache_creation_input_tokens,
+        );
+        add(
+            &mut self.cache_read_input_tokens,
+            counts.cache_read_input_tokens,
+        );
+        add(&mut self.output_tokens, counts.output_tokens);
     }
 
     fn merge(&mut self, other: &Usage) {
-        self.requests += other.requests;
-        self.input_tokens += other.input_tokens;
-        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
-        self.cache_read_input_tokens += other.cache_read_input_tokens;
-        self.output_tokens += other.output_tokens;
+        self.requests = self.requests.saturating_add(other.requests);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
     }
 
     fn tokens(&self) -> u64 {
         self.input_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
-            + self.output_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.output_tokens)
     }
 }
 
@@ -482,10 +503,17 @@ fn sessions_in(directory: PathBuf, since_ms: u64) -> Sessions {
         let Ok(handle) = File::open(file) else {
             continue;
         };
-        for line in BufReader::new(handle).lines() {
-            let Ok(line) = line else {
+        let mut reader = BufReader::new(handle);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            // The end of the file or a read error; `read_until` retries interruptions.
+            if !matches!(reader.read_until(b'\n', &mut bytes), Ok(1..)) {
                 break;
-            };
+            }
+            // A tool result may hold bytes that are not UTF-8; they affect only
+            // their own line.
+            let line = String::from_utf8_lossy(&bytes);
             if !line.contains("\"usage\"") {
                 continue;
             }
@@ -774,5 +802,64 @@ mod tests {
         assert_eq!(found.total.requests, 4);
         let json = sessions_json(Some(&found), 7).to_string();
         assert!(!json.contains("SECRET") && json.contains("\"cache_read_input_tokens\":2500"));
+    }
+
+    fn response(id: &str, model: &str, usage: Value) -> String {
+        json!({"type": "assistant", "timestamp": "2026-11-19T10:00:00.000Z",
+               "message": {"id": id, "model": model, "usage": usage,
+                           "content": [{"type": "text", "text": "TEXT"}]}})
+        .to_string()
+    }
+
+    #[test]
+    fn session_usage_reads_past_lines_that_are_not_utf8() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("-work-shop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let usage = json!({"input_tokens": 10, "output_tokens": 5});
+        let mut bytes = Vec::new();
+        for (id, text) in [
+            ("m1", &b"TEXT"[..]),
+            ("m2", b"bad \xff byte"),
+            ("m3", b"TEXT"),
+        ] {
+            let line = response(id, "claude-opus-5-5", usage.clone());
+            let (before, after) = line.split_once("TEXT").unwrap();
+            bytes.extend_from_slice(before.as_bytes());
+            bytes.extend_from_slice(text);
+            bytes.extend_from_slice(after.as_bytes());
+            bytes.push(b'\n');
+            // A tool result that is not UTF-8 between two responses.
+            bytes.extend_from_slice(b"{\"type\":\"user\",\"content\":\"\xfe\xff\"}\n");
+        }
+        bytes.extend_from_slice(b"not json, \"usage\"\n");
+        std::fs::write(dir.join("s1.jsonl"), bytes).unwrap();
+        let found = sessions_in(dir, 0);
+        assert_eq!(
+            (found.total.requests, found.total.input_tokens),
+            (3, 30),
+            "every response counts"
+        );
+    }
+
+    #[test]
+    fn session_usage_saturates_instead_of_overflowing() {
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join("-work-shop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let huge = json!({"input_tokens": u64::MAX, "cache_read_input_tokens": u64::MAX,
+                          "output_tokens": 1});
+        let lines = [
+            response("m1", "claude-opus-5-5", huge.clone()),
+            response("m2", "claude-opus-5-5", huge.clone()),
+            response("m3", "claude-fable-5-2", huge),
+        ];
+        std::fs::write(dir.join("s1.jsonl"), lines.join("\n")).unwrap();
+        let found = sessions_in(dir, 0);
+        assert_eq!(found.total.requests, 3);
+        assert_eq!(found.total.input_tokens, u64::MAX);
+        assert_eq!(found.total.output_tokens, 3);
+        assert_eq!(found.total.tokens(), u64::MAX);
+        assert_eq!(found.models[0].usage.tokens(), u64::MAX);
     }
 }

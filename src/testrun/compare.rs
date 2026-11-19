@@ -272,7 +272,9 @@ struct Roots {
 }
 
 impl Roots {
-    fn new(workspace: &Workspace, checkout: &Checkout) -> Self {
+    /// `target` is Cargo's target directory for the working-tree run, which
+    /// corresponds to the base build's own.
+    fn new(workspace: &Workspace, checkout: &Checkout, target: Option<&Path>) -> Self {
         let forms = |path: &Path, token: &'static str| {
             let mut forms = vec![(path.to_string_lossy().into_owned(), token)];
             if let Ok(canonical) = path.canonicalize() {
@@ -288,8 +290,8 @@ impl Roots {
             root = stripped.trim_end_matches('/').to_owned();
         }
         here.extend(forms(Path::new(&root), "<repo>"));
-        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR").filter(|dir| !dir.is_empty()) {
-            here.extend(forms(Path::new(&target), "<target>"));
+        if let Some(target) = target {
+            here.extend(forms(target, "<target>"));
         }
         let mut base = forms(&checkout.target, "<target>");
         base.extend(forms(&checkout.path, "<repo>"));
@@ -300,6 +302,55 @@ impl Roots {
         }
         Self { here, base }
     }
+}
+
+/// Cargo's target directory for the working-tree command run in `dir`: its
+/// `--target-dir`, else the one `cargo metadata` reports, which follows
+/// `CARGO_TARGET_DIR`, Cargo's configuration and otherwise the Cargo workspace
+/// root's `target/`. Paths there, such as `CARGO_BIN_EXE_<name>` and
+/// `CARGO_TARGET_TMPDIR`, name the same files as the base build's.
+fn cargo_target(command: &[String], dir: &Path) -> Option<PathBuf> {
+    let head: Vec<&str> = command
+        .iter()
+        .map(String::as_str)
+        .take_while(|word| *word != "--")
+        .collect();
+    let value = |flag: &str| -> Option<&str> {
+        let joined = format!("{flag}=");
+        head.iter().enumerate().rev().find_map(|(at, word)| {
+            word.strip_prefix(joined.as_str())
+                .or_else(|| (*word == flag).then(|| head.get(at + 1).copied()).flatten())
+        })
+    };
+    if let Some(target) = value("--target-dir") {
+        return Some(dir.join(target));
+    }
+    let mut metadata = Command::new("cargo");
+    metadata
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(manifest) = value("--manifest-path") {
+        metadata.args(["--manifest-path", manifest]);
+    }
+    let reported = metadata
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
+        .and_then(|value| value["target_directory"].as_str().map(PathBuf::from));
+    reported.or_else(|| {
+        std::env::var_os("CARGO_TARGET_DIR")
+            .filter(|target| !target.is_empty())
+            .map(|target| dir.join(target))
+    })
 }
 
 /// A failure message as compared between the two runs: checkout paths, the
@@ -652,10 +703,13 @@ pub(super) fn runner(
             }
         );
     }
-    let roots = Roots::new(workspace, checkout);
+    let here_dir = selection::runner_dir(workspace, &plan.cwd);
+    let target = (plan.runner == Kind::Cargo)
+        .then(|| cargo_target(&plan.base, &here_dir))
+        .flatten();
+    let roots = Roots::new(workspace, checkout, target.as_deref());
     // pytest stops the whole run over a file that is missing at the base.
     let mut absent: BTreeSet<String> = BTreeSet::new();
-    let here_dir = selection::runner_dir(workspace, &plan.cwd);
     let mut names: Vec<String> = Vec::new();
     for failure in &failing {
         let file = failure.name.split("::").next().unwrap_or_default();
@@ -878,6 +932,19 @@ mod tests {
 
     fn words(text: &str) -> Vec<String> {
         text.split(' ').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_target_directory_on_the_command_line_wins() {
+        let dir = Path::new("/work/shop");
+        assert_eq!(
+            cargo_target(&words("cargo test --target-dir out -- --target-dir x"), dir),
+            Some(dir.join("out"))
+        );
+        assert_eq!(
+            cargo_target(&words("cargo test --target-dir=/tmp/t --offline"), dir),
+            Some(PathBuf::from("/tmp/t"))
+        );
     }
 
     #[test]

@@ -77,7 +77,7 @@ Details: [Install and configure agents](docs/reference.md#install-and-configure-
 
 - `stats` reports bytes kept out of context by day and by command, net of later replays, and `--sessions` adds the token usage Claude Code recorded.
 - Token estimates use bytes-per-token ratios measured on Claude's tokenizer for code, JSON, prose and logs; bytes ÷ 4 counted 56% to 70% of the tokens.
-- `stats --all` totals every project on this machine from a local registry, and `log`, `search` and `context --run` find runs made in another project.
+- `stats --all` totals every project on this machine from a local registry, with tokens estimated by content type as `stats` estimates them, and `log`, `search`, `context --run` and MCP `log` pages find and count runs made in another project.
 - `justless statusline` shows the session's savings in Claude Code's status line; `init --statusline` adds it without replacing an existing one.
 - `discover` lists commands Claude Code and Codex ran outside Justless, as labels and byte counts only, and says when permission rules kept them out.
 

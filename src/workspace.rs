@@ -35,6 +35,7 @@ pub fn display_path(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+#[derive(Clone)]
 pub struct Workspace {
     pub root: PathBuf,
     pub cwd: PathBuf,

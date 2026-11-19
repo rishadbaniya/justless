@@ -241,9 +241,12 @@ fn cli() -> Command<'static> {
                 .about("Show output savings by day and command, recoveries and hook coverage")
                 .arg(number("days", "7", "Days in the timeline; with --all, count runs that finished in them"))
                 .arg(Arg::new("json").long("json").help("Print a JSON report"))
-                .arg(Arg::new("sessions").long("sessions").help(
-                    "Add the token usage Claude Code recorded for this workspace's sessions",
-                ))
+                .arg(
+                    Arg::new("sessions")
+                        .long("sessions")
+                        .conflicts_with("all")
+                        .help("Add the token usage Claude Code recorded for this workspace's sessions"),
+                )
                 .arg(
                     Arg::new("all")
                         .long("all")

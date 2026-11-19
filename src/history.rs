@@ -729,6 +729,9 @@ pub(crate) struct Summary {
     /// Bytes later retrievals printed, measured or estimated.
     pub replayed_bytes: u64,
     pub net_saved_bytes: i64,
+    /// Saved bytes by content type, for the token estimate.
+    #[serde(skip)]
+    pub estimate: crate::tokens::Estimate,
 }
 
 impl Summary {
@@ -738,6 +741,7 @@ impl Summary {
         self.preview_bytes += other.preview_bytes;
         self.replayed_bytes += other.replayed_bytes;
         self.net_saved_bytes = self.net_saved_bytes.saturating_add(other.net_saved_bytes);
+        self.estimate.merge(&other.estimate);
     }
 
     pub fn saved_bytes(&self) -> u64 {
@@ -749,6 +753,7 @@ impl Summary {
 /// `since_ms`, as the `stats` timeline counts them, quietly skipping unreadable runs.
 pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
     let mut totals = Totals::default();
+    let mut estimate = crate::tokens::Estimate::default();
     let mut runs = 0;
     for run in records(workspace, false).into_iter().flatten().flatten() {
         if run.completed_ms < since_ms || run.completed_ms == 0 {
@@ -757,7 +762,13 @@ pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
         let directory = workspace.state.join("runs").join(&run.id);
         let recalls: Recalls = get(&directory.join("recalls.json")).unwrap_or_default();
         let shown = (run.preview_bytes + run.footer_bytes) as u64;
-        totals.add(run.raw_bytes, shown, recalls.replayed(&directory));
+        let later = recalls.replayed(&directory);
+        totals.add(run.raw_bytes, shown, later);
+        estimate.add(
+            crate::tokens::run_content(&directory),
+            net_bytes(run.raw_bytes, shown, 0),
+            net_bytes(run.raw_bytes, shown, later.bytes()),
+        );
         runs += 1;
     }
     Summary {
@@ -766,6 +777,7 @@ pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
         preview_bytes: totals.preview_bytes,
         replayed_bytes: totals.replayed_bytes + totals.estimated_replay_bytes,
         net_saved_bytes: totals.net_saved_bytes,
+        estimate,
     }
 }
 
