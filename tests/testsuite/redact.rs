@@ -981,16 +981,22 @@ fn the_full_replay_after_a_failed_save_is_redacted() {
 fn late_output_of_a_drained_run_is_redacted() {
     let project = Project::new();
     let secret = value("late");
-    let script = format!("(sleep 0.3; echo api_key={secret}) & echo started");
+    // The secret waits for `go`, created once the run is recorded, so it is always
+    // late. The wait ends after a minute so a failed test leaves no process behind.
+    let script = format!(
+        "(i=0; while [ ! -e go ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done; \
+         echo api_key={secret}) & echo started"
+    );
     let output = project.ok(&["run", "--", "sh", "-c", &script]);
     let id = run_id(&output);
     let record = project.record(&id);
     assert_eq!(record["drained"], true, "{record}");
     assert_eq!(record["redaction"]["count"], 0, "{record}");
+    fs::write(project.root().join("go"), "").unwrap();
     let stream = project.run_dir(&id).join("stdout");
     let start = std::time::Instant::now();
     while !fs::read_to_string(&stream).is_ok_and(|text| text.contains(&secret)) {
-        assert!(start.elapsed().as_secs() < 10, "the background write");
+        assert!(start.elapsed().as_secs() < 30, "the background write");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let log = project.stdout(&format!("log {id} --stream stdout"));

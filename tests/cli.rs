@@ -9266,13 +9266,17 @@ fn a_background_writer_returns_at_once_and_its_late_output_stays_within_the_cap(
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
-    let start = std::time::Instant::now();
-    let script = "(sleep 3; yes late | head -c 200000; touch finished) & echo started";
+    // The writer waits for `go`, which exists only once Justless has returned, or
+    // gives up after a minute so a Justless that waits for it still finishes.
+    let script = "(i=0; while [ ! -e go ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done; \
+        yes late | head -c 200000; touch finished) & echo started";
     let output = cli(root, &["run", "--", "sh", "-c", script]);
-    // Justless does not wait for a background process that keeps the output open.
-    assert!(start.elapsed().as_secs_f64() < 2.5, "{:?}", start.elapsed());
+    // Justless does not wait for a background process that keeps the output open:
+    // it returned while the writer was still waiting for `go`.
+    assert!(!root.join("finished").exists(), "Justless waited");
     assert_eq!(stdout(&output), "started\n");
     let id = footer_id(&output);
+    fs::write(root.join("go"), "").unwrap();
     wait_until("the background writer", || root.join("finished").exists());
     let stream = root.join(".justless/runs").join(&id).join("stdout");
     wait_until("the late output", || {
