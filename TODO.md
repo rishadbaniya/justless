@@ -75,6 +75,7 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Progress.** Implemented for Claude Code. The example on the clean `e2c34e6` checkout took 6,505 bytes inline and 1,788 bytes with the hook (72.5% less), including the replay command. The archive replayed the original inline result byte for byte. Workload-wide savings still need transcript replay.
 
 ### 2.1 Shell range reads — biggest measured token win
+- **Update 2026-11-19 (later).** `git show REV:path` reads are on main (§4.E). Remaining forms measured in 472 local transcripts: `cat FILE` 295 results / 3.25 MB, `cd DIR && sed/head/tail` 155 / 0.96 MB, `cat FILE | head/tail/sed` 48 / 0.27 MB: these three are next. `nl -ba | sed -n` (0 results) and `awk 'NR…'` ranges (42 / 0.10 MB) are closed in docs/decisions.md.
 - **Update 2026-11-19.** On main now: standalone `sed -n` with one or several ascending ranges, `head -n N`, `tail -n +N`, and in Claude Code `tail -n N` (the pre-hook skips it because a growing file could change which lines it prints). Wide reads become a range outline with an exact replay; small ones keep their native bytes. Still open: reads inside command lists (2.0), `cat`, `nl -ba | sed -n`, `awk` ranges and `git show REV:path`.
 - **Branch.** `worktree-wf_7175cb10-fff-1` (1 wip commit, 11 files, +1,534 −15).
 - **Problem.** Agents read files through the shell, and hooks pass these through by design. Untouched in Claude Code (Nov 7–18): 4,079 reads, **20.8 MB of 93.6 MB** tool output. `sed -n` ranges alone were 1,754 results / 11.6 MB (ranges over 150 lines: 384 results / 3.9 MB); piped `cat FILE | …` 241 / 2.2 MB; `git show REV:path` 341 / 2.6 MB. In older Codex sessions: `sed -n` 48 MB, `nl -ba | sed -n` 25 MB, `tail FILE` 7 MB, `awk` 3 MB.
@@ -174,22 +175,15 @@ Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). Th
 - `scripts/agent_bench/cc_hooks.py` drives the hook with `bypassPermissions`, so it now reads the machine's real settings; pin `CLAUDE_CONFIG_DIR` and the managed override in the harness.
 - **Progress.** *designed*.
 
-### 4.G Follow-ups from the new languages
-- Test selection treats `.vue`, `.svelte`, `.astro` and the five new languages as code but not as anything a runner tests, so a component change does not select its JS tests; a MATLAB `.m` file is still named Objective-C there because that check has no file text.
-- The five new grammars only report parse problems after edits; measure them on real code (as was done for the older grammars) before letting them block.
-- Not covered: `.mm` files, Perl (a `tree-sitter-perl` crate exists). Groovy uses the third-party `dekobon-tree-sitter-groovy` grammar (Apache-2.0 OR MIT), chosen because the `tree-sitter-groovy` crate misparsed Spock and Gradle code.
-- **Progress.** *designed*.
+### 4.G Follow-ups from the new languages — done
+- **Progress.** *on main* (2026-11-19). Components reach the JS tests that import them; languages without a runner fall back (`data-unlinked`) instead of planning nothing; a MATLAB `.m` is data. Elixir edits now block (0 of 1,376 real files had parse errors); Objective-C, PowerShell, Julia and Groovy stay report-only (8–30% of real files had errors). `.mm` and Perl are closed in docs/decisions.md.
 
 ### 4.I Route JSON-producing commands to the table view
 - The PreToolUse hook never routes JSON-producing commands (`supported_command` rejects `--json`, `--output`, `--message-format`; `kubectl -o json` fails the display check; `gh`, `cargo metadata` and `npm ls` are not supported commands), so JSON tables reach agents only through `justless run`, `exec` and the Claude Code post-run hook. Route unpiped JSON-producing commands for clients without a post-run hook, keeping pipes and redirections untouched, and consider whitespace-only compaction of pretty-printed non-tabular JSON (would cut `npm ls` by 62%).
 - **Progress.** *designed*.
 
-### 4.E `git show REV:path` reads
-- The largest unhandled read family: 803 results, 3.41 MB. Treat `git show REV:path` like the other shell reads (§2.1): exact for small output, outline for wide, verified bytes.
-- **Starts after:** the review of the batch code merges.
-- **Progress.** *designed*.
-
-## 5. Benchmark and release (last, in this order: 5.3 then 5.1)
+### 4.E `git show REV:path` reads — done
+- **Progress.** *on main* (2026-11-19). `git show REV:path`, `REV:./path` and `:path` are verified against the blob (`git cat-file`, no index lock, no lazy fetch) and outlined in Claude Code's post-run hook and in read lists; other Unix clients get a read pinned to the blob id. `HEAD:CHANGELOG.md` 29,191 → 345 bytes (1,930 when clipped before). Lists with `HEAD~1` now parse.
 
 ### 5.1 Paid benchmark pilot
 - **Goal.** A defensible end-to-end number: cost per successful task, justless vs plain Claude Code vs Anthropic's server-side context editing, at equal or better success.

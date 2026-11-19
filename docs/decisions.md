@@ -71,3 +71,7 @@ Ideas and limits that were considered and closed, with the reason. Each reason c
 | Quiet doctest steps and generic or trait-impl fallbacks in `test --affected` | Both fall back safely to broader testing and are documented. |
 | Unlinked external paths and macro callers after a deletion | Labelled "possible", and the report already names mentions outside indexed definitions. |
 | Claude Code's UI label for routed searches | Display only; the model sees the correct result and no hook output can change the label. |
+| Perl grammar | 93 Perl-related Bash results in 472 transcripts, 0.11 MB, and no Perl source reads among the large results. |
+| `.mm` files as Objective-C | 209 of 357 real Objective-C++ files (59%) parse with errors in the Objective-C grammar; on average 6.4% of a file's bytes sit in error nodes. |
+| `nl -ba FILE \| sed -n` reads | 0 results in 472 transcripts. |
+| `awk 'NR>=A && NR<=B'` range reads | 42 results, 0.10 MB. |
