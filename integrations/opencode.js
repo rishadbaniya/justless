@@ -102,9 +102,16 @@ function selectedModel(messages) {
   }
 }
 
+// JUSTLESS_DISABLE=1 turns the plugin's hooks off, as it does every Justless hook.
+function disabled() {
+  const value = process.env.JUSTLESS_DISABLE;
+  return Boolean(value) && value !== "0";
+}
+
 export const Justless = async ({ directory }) => {
   const hooks = {
   "tool.execute.after": async (input, output) => {
+    if (disabled()) return;
     if (input?.tool !== "bash" && input?.tool !== "Bash") return;
     const command = input?.args?.command;
     if (typeof command !== "string" || typeof output?.output !== "string") return;
@@ -114,6 +121,7 @@ export const Justless = async ({ directory }) => {
     if (next !== undefined) output.output = next;
   },
   "experimental.chat.messages.transform": async (_input, { messages }) => {
+    if (disabled()) return;
     const model = selectedModel(messages);
     if (!model) return;
     const locations = [];

@@ -401,7 +401,7 @@ omit = '^make\[\d+\]: (Entering|Leaving) directory'
 
 An empty prefix, an invalid expression or one that matches empty text stops the run with an error.
 
-`exclude_commands` lists commands that every client's command hook and Claude Code's post-command hook leave as written. An entry matches a command that starts with its words, before or after any `NAME=value` assignments, so `"cargo bench"` matches `cargo bench --all` and `RUST_LOG=1 cargo bench` but not `cargo benchmark`. An entry that starts with `^` is a regular expression instead. In a `&&`, `||` or `;` list, Claude Code and Gemini CLI still route the other commands, while Codex, Cursor, Copilot and Antigravity CLI, whose hooks rewrite a list only when every command in it is supported, leave the whole list as written. An empty entry or an invalid expression is a settings error.
+`exclude_commands` lists commands that every client's command hook and Claude Code's post-command hook leave as written. An entry matches a command that starts with its words, before or after any `NAME=value` assignments, so `"cargo bench"` matches `cargo bench --all` and `RUST_LOG=1 cargo bench` but not `cargo benchmark`. An entry that starts with `^` is a regular expression instead. Claude Code's post-command hook leaves a whole line alone when any command in it matches, including one in a pipe or behind a wrapper such as `timeout`. In a `&&`, `||` or `;` list, the command hooks of Claude Code and Gemini CLI still route the other commands, while Codex, Cursor, Copilot and Antigravity CLI, whose hooks rewrite a list only when every command in it is supported, leave the whole list as written. An empty entry or an invalid expression is a settings error.
 
 ```toml
 exclude_commands = ["cargo bench", "npm run dev", "^git (log|show)"]
@@ -573,7 +573,7 @@ Setup records each user file it writes, as it was before, with any directory it 
 
 ### Turn the hooks off
 
-Set `JUSTLESS_DISABLE=1` in the agent's environment to make every Justless hook answer with its client's no-op, as if none were installed, without removing them: commands run as written, and reads, searches and session starts get nothing added. Any value other than empty or `0` counts. To keep only some commands away from the hooks, list them in `exclude_commands` (see [Configuration](#configuration)). `justless rewrite "COMMAND"` shows what a client's hook would do with a command run in the current directory, using the same code as the hook, and records nothing:
+Set `JUSTLESS_DISABLE=1` in the agent's environment to make every Justless hook answer with its client's no-op, as if none were installed, without removing them: commands run as written, reads, searches and session starts get nothing added, and the OpenCode plugin neither compacts results nor masks older ones. Any value other than empty or `0` counts. To keep only some commands away from the hooks, list them in `exclude_commands` (see [Configuration](#configuration)). `justless rewrite "COMMAND"` shows what a client's hook would do with a command run in the current directory, using the same code as the hook, and records nothing:
 
 ```sh
 $ justless rewrite "cargo test" --agent codex

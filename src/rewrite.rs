@@ -85,6 +85,10 @@ impl Exclusions {
         )
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// The entry that matches one command: its text, or the words after any
     /// `NAME=value` assignments, start with the entry's words, or match the
     /// entry's expression.

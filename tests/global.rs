@@ -178,8 +178,27 @@ fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
         });
         lab.hook(&root, &["hook-claude", "after-bash"], &input, &[])
     };
-    assert_ne!(after("cargo test 2>&1 | tail -n 400").trim(), "{}");
-    assert_eq!(after("cargo bench 2>&1 | tail -n 400").trim(), "{}");
+    for (bench, test) in [
+        (
+            "cargo bench 2>&1 | tail -n 400",
+            "cargo test 2>&1 | tail -n 400",
+        ),
+        (
+            "cd src && cargo bench | tail -n 400",
+            "cd src && cargo test | tail -n 400",
+        ),
+        (
+            "RUST_LOG=1 cargo bench 2>&1 | tail -n 400",
+            "RUST_LOG=1 cargo test 2>&1 | tail -n 400",
+        ),
+        (
+            "timeout 60 cargo bench | tail -n 400",
+            "timeout 60 cargo test | tail -n 400",
+        ),
+    ] {
+        assert_ne!(after(test).trim(), "{}", "{test}");
+        assert_eq!(after(bench).trim(), "{}", "{bench}");
+    }
 
     // `JUSTLESS_DISABLE` answers every hook with its client's no-op.
     let off = [("JUSTLESS_DISABLE", "1")];

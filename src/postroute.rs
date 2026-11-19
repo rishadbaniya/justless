@@ -122,9 +122,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     let call = &input["tool_input"];
     let command = call["command"].as_str()?;
-    if call["run_in_background"] == true
-        || crate::rewrite::Exclusions::of(ws).any(command).is_some()
-    {
+    if call["run_in_background"] == true || excluded(ws, command) {
         return None;
     }
     let response = input["tool_response"].as_object()?;
@@ -490,6 +488,20 @@ fn entered(cwd: &Path, root: &Path, cd: &Path) -> Option<PathBuf> {
 }
 
 /// The supported command whose lines make up a shell command line's output.
+/// Whether `exclude_commands` names the line, a command in it, or a command in a
+/// pipe, after its assignments and wrappers such as `env` or `timeout`.
+fn excluded(ws: &Workspace, command: &str) -> bool {
+    let exclusions = crate::rewrite::Exclusions::of(ws);
+    !exclusions.is_empty()
+        && (exclusions.any(command).is_some()
+            || parse(command).is_some_and(|segments| {
+                segments.iter().flatten().any(|stage| {
+                    let words = strip(&stage.words).unwrap_or(&stage.words);
+                    exclusions.matching(&words.join(" ")).is_some()
+                })
+            }))
+}
+
 struct Plan {
     /// Its words after assignments and wrappers such as `env` or `timeout`.
     words: Vec<String>,
