@@ -2703,6 +2703,12 @@ fn discover_classifies_claude_code_shell_commands() {
             "z".repeat(900),
             PathBuf::from("/elsewhere"),
         ),
+        (
+            "t5",
+            "sed -n 1,400p src/lib.rs",
+            "w".repeat(3000),
+            root.clone(),
+        ),
     ] {
         lines.push(serde_json::json!({"type":"assistant","cwd":cwd,"timestamp":"2999-01-01T00:00:00Z",
             "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}}));
@@ -2725,29 +2731,32 @@ fn discover_classifies_claude_code_shell_commands() {
         stdout(&output)
     };
     let report: serde_json::Value = serde_json::from_str(&discover(&["--json"])).unwrap();
-    assert_eq!(report["commands"], 3);
+    assert_eq!(report["commands"], 4);
     assert_eq!(report["sessions"], 1);
     let groups = report["groups"].as_array().unwrap();
     let route = |name: &str| groups.iter().find(|g| g["route"] == name).unwrap();
     assert_eq!(route("through_justless")["labels"][0]["label"], "npm test");
     assert_eq!(route("supported_not_routed")["output_bytes"], 4000);
     assert_eq!(route("supported_not_routed")["estimated_tokens"], 1000);
-    assert_eq!(route("not_supported")["labels"][0]["label"], "ls");
     let plan: serde_json::Value = serde_json::from_str(&discover(&["--json", "--plan"])).unwrap();
     let rows = plan["plan"].as_array().unwrap();
+    // A command a current hook would route, and a range read the post-command
+    // hook outlines, compact now; a listing still needs a formatter.
+    let row = |label: &str| rows.iter().find(|r| r["label"] == label).unwrap();
     assert_eq!(rows[0]["label"], "cargo test");
     assert_eq!(rows[0]["output_bytes"], 4000);
-    assert_eq!(rows[0]["compactable_now_bytes"], 0);
-    assert_eq!(rows[1]["label"], "ls");
+    assert_eq!(rows[0]["compactable_now_bytes"], 4000);
+    assert_eq!(row("sed")["compactable_now_bytes"], 3000);
+    assert_eq!(row("ls")["compactable_now_bytes"], 0);
     let text = discover(&["--plan"]);
     assert!(
         text.contains("Unrouted output by command family, largest first")
-            && text.contains("cargo test ×1 (3.9 KB)"),
+            && text.contains("cargo test ×1 (3.9 KB) · 3.9 KB would compact now"),
         "{text}"
     );
     let text = discover(&[]);
     assert!(
-        text.starts_with("Claude Code ran 3 shell command(s) here in the last 30 day(s), across 1 session(s)")
+        text.starts_with("Claude Code ran 4 shell command(s) here in the last 30 day(s), across 1 session(s)")
             && text.contains("Supported, not routed: 1 command(s) · 3.9 KB output · ≈1000 tokens\n  cargo test ×1 (3.9 KB)")
             && text.contains("justless init --hooks --agent claude")
             && !text.contains("x".repeat(20).as_str()),
