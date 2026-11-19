@@ -112,6 +112,16 @@ impl Listing {
         listing
     }
 
+    /// A listing fed one plain path per call, such as each path of a status.
+    /// `whole` keeps dependency and build directories instead of collapsing them.
+    pub(crate) fn of_paths(whole: bool) -> Self {
+        let mut listing = Self::with_format(Format::Paths);
+        if whole {
+            listing.keep = NOISE.iter().map(|name| (*name).to_owned()).collect();
+        }
+        listing
+    }
+
     fn with_format(format: Format) -> Self {
         Self {
             format,

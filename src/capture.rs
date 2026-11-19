@@ -1534,6 +1534,11 @@ impl Capture<'_> {
             Some(crate::filters::Profile::Listing) => {
                 Some(Grouping::Listing(crate::listing::Listing::new(words)))
             }
+            // A joined stderr, output another program cut or recorded, or a
+            // stream cut short would make the counts of a log or status wrong.
+            None if !merged && origin.is_none() && !ends_early => {
+                crate::gitview::View::select(words, max_bytes).map(Grouping::Git)
+            }
             _ => None,
         };
         let mut locations = Locations::default();
@@ -1645,16 +1650,23 @@ impl Capture<'_> {
         if let Some((_, summary)) = &lint {
             run.summary = summary.clone();
         }
+        // A Git log or status view has no comparison record, and replaces the
+        // preview only when it is smaller, so it takes the room the preview took.
         let grouped = grouping.and_then(|grouping| {
             let previous = previous.as_ref().map(|r| (r.id.as_str(), &r.summary));
             match grouping {
-                Grouping::Search(search) => search.finish(&run.family, max_bytes, previous, true),
-                Grouping::Listing(listing) => {
-                    listing.finish(&run.family, max_bytes, previous, true)
-                }
+                Grouping::Search(search) => search
+                    .finish(&run.family, max_bytes, previous, true)
+                    .map(|(groups, summary)| (groups, Some(summary))),
+                Grouping::Listing(listing) => listing
+                    .finish(&run.family, max_bytes, previous, true)
+                    .map(|(groups, summary)| (groups, Some(summary))),
+                Grouping::Git(view) => view
+                    .finish(max_bytes.min(previews[0].1.len().saturating_sub(1)))
+                    .map(|view| (view, None)),
             }
         });
-        if let Some((_, summary)) = &grouped {
+        if let Some((_, Some(summary))) = &grouped {
             run.summary = summary.clone();
         }
         let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
@@ -1720,10 +1732,13 @@ impl Capture<'_> {
             previews[0].1 = line.into_bytes();
             previews[1].1.clear();
             report = true;
-        } else if let Some((groups, _)) = grouped {
+        } else if let Some((groups, summary)) = grouped {
             // Search and listing groups replace a large stdout only. Smaller output stays
             // verbatim, and stderr keeps messages such as unreadable directories.
-            if !stdout_fits && !groups.is_empty() {
+            if !stdout_fits
+                && !groups.is_empty()
+                && (summary.is_some() || groups.len() < previews[0].1.len())
+            {
                 previews[0].1 = fit(groups, max_bytes).into_bytes();
                 report = true;
             }
@@ -2181,10 +2196,12 @@ struct Observers<'a> {
     locations: &'a mut Locations,
 }
 
-/// Groups stdout of a search by file, or of a file listing by directory.
+/// Groups stdout of a search by file, or of a file listing by directory, or keeps
+/// the newest commits of a log or groups a status by state.
 enum Grouping {
     Search(crate::search::Search),
     Listing(crate::listing::Listing),
+    Git(crate::gitview::View),
 }
 
 /// Read one stream once, through the redactor, and return its preview and whether
@@ -2260,6 +2277,7 @@ fn scan(
             match grouping.as_mut() {
                 Some(Grouping::Search(search)) => search.observe(&text, line_no),
                 Some(Grouping::Listing(listing)) => listing.observe(&text, line_no),
+                Some(Grouping::Git(view)) => view.observe(&text, line_no),
                 None => {}
             }
         } else {

@@ -13,6 +13,7 @@ Notable changes to Justless, newest release first, in the style of [Keep a Chang
 - Compiler and linter findings are grouped by rule with a count and up to four locations, for rustc, Clippy, Ruff, mypy, ESLint, `tsc`, ShellCheck and more.
 - Searches are grouped by file and listings by directory, and searches with context lines report blocks: seven such searches went from 54,940 bytes to 16,045.
 - Git diffs, `git show` and `git log -p` are summarized by commit and hunk, and a `Cargo.lock` change names the packages added, removed and updated.
+- A long `git log` shows its newest commits and counts the rest, and a long `git status` its branch, a count per state and paths by directory: a 100 KB `git log --oneline` shows its 42 newest commits where the clipped preview showed 11 newest and 18 oldest.
 - JSON records become tables and other JSON is shown compact, each verified to decode to the original: 25 `docker ps` JSON lines went from 7.3 KB to 1.4 KB.
 - `docker ps` and `kubectl get` count rows and name the ones that need attention; `docker logs` and `kubectl logs` collapse repeated lines.
 - Previews fold progress frames, long base64 and hex runs and repeated lines and list failures first; a rerun shows what appeared, changed or disappeared.

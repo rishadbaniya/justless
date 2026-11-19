@@ -14,6 +14,7 @@ mod filters;
 mod find;
 mod floor;
 mod focus;
+mod gitview;
 mod global;
 mod history;
 mod impact;

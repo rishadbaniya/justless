@@ -9,6 +9,7 @@ mod compaction;
 mod compare;
 mod delta;
 mod discover;
+mod git_views;
 mod global;
 mod grep_lists;
 mod hook_fixes;
