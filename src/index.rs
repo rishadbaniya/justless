@@ -11,7 +11,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, display_path, lock_state, write_json};
 
-pub(crate) const VERSION: u32 = 8;
+pub(crate) const VERSION: u32 = 9;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -27,6 +27,13 @@ struct Parsed {
     foreign: Option<polyglot::Facts>,
     fingerprint: Fingerprint,
     stamp: Option<FileStamp>,
+}
+
+impl Parsed {
+    /// Whether a non-Rust file was parsed as source, successfully or not.
+    fn structured(&self) -> bool {
+        self.foreign.is_some() || self.error.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -215,8 +222,6 @@ impl Index {
                 continue;
             }
             let stamp = file_stamp(&metadata);
-            let grammar = Grammar::for_file(&file);
-            let structured = is_rust(&file) || grammar.is_some();
             let manifest = Path::new(&file)
                 .file_name()
                 .is_some_and(|name| name == "Cargo.toml");
@@ -227,8 +232,8 @@ impl Index {
                     .get(&file)
                     .is_some_and(|parsed| parsed.stamp == stamp)
             {
+                refresh.reused += usize::from(is_rust(&file) || cache.files[&file].structured());
                 found.insert(file);
-                refresh.reused += usize::from(structured);
                 continue;
             }
             let bytes = match fs::read(path) {
@@ -249,6 +254,9 @@ impl Index {
                 manifests.insert(file.clone(), document);
             }
             let digest = source_digest(&bytes);
+            // Extensionless scripts and `.m` files need their text to pick a grammar.
+            let grammar = Grammar::detect(&file, text);
+            let structured = is_rust(&file) || grammar.is_some();
             found.insert(file.clone());
             if let Some(parsed) = cache.files.get_mut(&file)
                 && parsed.digest == digest
@@ -291,12 +299,12 @@ impl Index {
             refresh.parsed += usize::from(structured);
             changed = true;
         }
-        cache.files.retain(|file, _| {
+        cache.files.retain(|file, parsed| {
             if found.contains(file) {
                 return true;
             }
             changed = true;
-            refresh.removed += usize::from(is_rust(file) || Grammar::for_file(file).is_some());
+            refresh.removed += usize::from(is_rust(file) || parsed.structured());
             false
         });
         if changed {
@@ -758,6 +766,16 @@ impl Index {
         }
     }
 
+    /// The grammar the index parsed a file with, which for extensionless
+    /// scripts comes from their `#!` line. An index built with removed
+    /// definitions restored answers from the file name alone.
+    pub fn grammar(&self, file: &str) -> Option<Grammar> {
+        match &self.source {
+            Some(source) => Some(source.cache.files.get(file)?.foreign.as_ref()?.grammar),
+            None => Grammar::for_file(file),
+        }
+    }
+
     /// Names files that were left out of the index, for a search that found
     /// nothing. A symbol search only mentions files that could define symbols.
     pub fn skipped_note(&self, symbols: bool) -> Option<String> {
@@ -970,7 +988,8 @@ fn import_target<'a>(
             let first = matches.next()?;
             matches.next().is_none().then_some(first)
         }
-        Grammar::C => exact(&normalize(&parent.join(source))?),
+        // `#include "x.h"` and Julia's `include("x.jl")` name a path from the file.
+        Grammar::C | Grammar::Julia => exact(&normalize(&parent.join(source))?),
         _ => None,
     }
 }

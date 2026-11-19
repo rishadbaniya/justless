@@ -163,7 +163,7 @@ pub(crate) fn classify(file: &str, text: &str, lines: usize) -> Class {
         Class::Data
     } else if matches!(extension.as_str(), "md" | "markdown" | "mdx") {
         Class::Doc
-    } else if extension == "rs" || Grammar::for_file(file).is_some() {
+    } else if extension == "rs" || Grammar::detect(file, text).is_some() {
         Class::Code
     } else {
         Class::Text
@@ -280,7 +280,7 @@ fn definitions(file: &str, text: &str, lines: usize, parsers: &mut Parsers) -> V
         // Nothing parsed above outlives this point (the syntax facts hold plain line
         // numbers and a parse error has been dropped), so clearing it is safe.
         proc_macro2::extra::invalidate_current_thread_spans();
-    } else if let Some(grammar) = Grammar::for_file(file)
+    } else if let Some(grammar) = Grammar::detect(file, text)
         && let Ok(facts) = parsers.parse(grammar, text)
     {
         for definition in facts.definitions {

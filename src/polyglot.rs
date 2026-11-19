@@ -28,6 +28,14 @@ pub enum Grammar {
     Hcl,
     Lua,
     Zig,
+    Elixir,
+    ObjectiveC,
+    PowerShell,
+    Julia,
+    Groovy,
+    Vue,
+    Svelte,
+    Astro,
 }
 
 const SQL_TAGS: &str = "
@@ -247,6 +255,173 @@ const ZIG_TAGS: &str = r#"
 (call_expression function: (field_expression member: (identifier) @name)) @reference.call
 "#;
 
+// Elixir declares everything with macro calls. A function head is the call
+// that names it, and ExUnit tests are `test "…" do` calls.
+const ELIXIR_TAGS: &str = r#"
+((call target: (identifier) @_def (arguments . (alias) @name)) @definition.module
+  (#eq? @_def "defmodule"))
+((call target: (identifier) @_def (arguments . (alias) @name)) @definition.protocol
+  (#eq? @_def "defprotocol"))
+((call
+  target: (identifier) @_def
+  (arguments
+    . [
+      (identifier) @name
+      (call target: (identifier) @name)
+      (binary_operator left: (call target: (identifier) @name) operator: "when")
+    ])) @definition.function
+  (#any-of? @_def "def" "defp" "defdelegate" "defguard" "defguardp" "defn" "defnp"))
+((call
+  target: (identifier) @_def
+  (arguments
+    . [
+      (identifier) @name
+      (call target: (identifier) @name)
+      (binary_operator left: (call target: (identifier) @name) operator: "when")
+    ])) @definition.macro
+  (#any-of? @_def "defmacro" "defmacrop"))
+((unary_operator
+  operator: "@"
+  operand: (call
+    target: (identifier) @_type
+    (arguments
+      (binary_operator
+        left: [(identifier) @name (call target: (identifier) @name)]
+        operator: "::")))) @definition.type
+  (#any-of? @_type "type" "typep" "opaque"))
+((call target: (identifier) @_test (arguments . (string) @name)) @definition.test
+  (#eq? @_test "test"))
+((call target: (identifier) @_use (arguments . (alias) @name)) @reference.module
+  (#any-of? @_use "alias" "import" "require" "use"))
+((call target: (identifier) @name) @reference.call
+  (#not-any-of? @name
+    "def" "defp" "defdelegate" "defguard" "defguardp" "defn" "defnp" "defmacro"
+    "defmacrop" "defmodule" "defprotocol" "defimpl" "defstruct" "defexception"
+    "defoverridable" "alias" "import" "require" "use" "case" "cond" "if" "unless"
+    "for" "with" "try" "receive" "quote" "unquote" "unquote_splicing" "raise"
+    "reraise" "throw" "super" "fn" "describe" "test" "setup" "setup_all"))
+(call target: (dot right: (identifier) @name)) @reference.call
+(binary_operator operator: "|>" right: (identifier) @name) @reference.call
+"#;
+
+// Methods are named by their first selector keyword, as messages are, and an
+// `@implementation` or class extension adds members to the class it names.
+const OBJECTIVE_C_TAGS: &str = r#"
+(class_interface . (identifier) @name) @definition.class
+(protocol_declaration . (identifier) @name) @definition.protocol
+(class_interface
+  (property_declaration
+    (struct_declaration
+      (struct_declarator
+        [(identifier) @name (pointer_declarator declarator: (identifier) @name)])))
+    @definition.property)
+(protocol_declaration
+  (property_declaration
+    (struct_declaration
+      (struct_declarator
+        [(identifier) @name (pointer_declarator declarator: (identifier) @name)])))
+    @definition.property)
+(protocol_declaration
+  (method_declaration (method_type) . (identifier) @name) @definition.method)
+(method_definition (method_type) . (identifier) @name) @definition.method
+(method_definition . (identifier) @name) @definition.method
+(message_expression receiver: (_) . method: (identifier) @name) @reference.call
+"#;
+
+// Pester tests are `It '…' { }` commands.
+const POWERSHELL_TAGS: &str = r#"
+(function_statement (function_name) @name) @definition.function
+(class_statement . (simple_name) @name) @definition.class
+(enum_statement . (simple_name) @name) @definition.enum
+(class_method_definition (simple_name) @name) @definition.method
+(class_property_definition (variable) @name) @definition.property
+((command
+  command_name: (command_name) @_it
+  command_elements: (command_elements . (command_argument_sep) . (_) @name)) @definition.test
+  (#any-of? @_it "It" "it" "IT"))
+(command command_name: (command_name) @name) @reference.call
+(invokation_expression (member_name (simple_name) @name)) @reference.call
+"#;
+
+// A Julia signature may carry a return type and a `where` clause around the
+// call that names the function.
+const JULIA_TAGS: &str = r#"
+(module_definition name: (identifier) @name) @definition.module
+(struct_definition
+  (type_head
+    . [
+      (identifier) @name
+      (parametrized_type_expression . (identifier) @name)
+      (binary_expression
+        . [(identifier) @name (parametrized_type_expression . (identifier) @name)])
+    ])) @definition.struct
+(abstract_definition
+  (type_head
+    . [
+      (identifier) @name
+      (parametrized_type_expression . (identifier) @name)
+      (binary_expression
+        . [(identifier) @name (parametrized_type_expression . (identifier) @name)])
+    ])) @definition.type
+(function_definition
+  (signature
+    . [
+      (call_expression . [(identifier) @name (field_expression (identifier) @name .)])
+      (typed_expression
+        . (call_expression . [(identifier) @name (field_expression (identifier) @name .)]))
+      (where_expression
+        . [
+          (call_expression . [(identifier) @name (field_expression (identifier) @name .)])
+          (typed_expression
+            . (call_expression . [(identifier) @name (field_expression (identifier) @name .)]))
+        ])
+    ])) @definition.function
+(assignment
+  . [
+    (call_expression . [(identifier) @name (field_expression (identifier) @name .)])
+    (typed_expression
+      . (call_expression . [(identifier) @name (field_expression (identifier) @name .)]))
+    (where_expression
+      . [
+        (call_expression . [(identifier) @name (field_expression (identifier) @name .)])
+        (typed_expression
+          . (call_expression . [(identifier) @name (field_expression (identifier) @name .)]))
+      ])
+  ]) @definition.function
+(macro_definition (signature . (call_expression . (identifier) @name))) @definition.macro
+(const_statement (assignment . (identifier) @name)) @definition.constant
+((macrocall_expression
+  (macro_identifier (identifier) @_testset)
+  (macro_argument_list . (string_literal) @name)) @definition.test
+  (#eq? @_testset "testset"))
+(call_expression
+  . [(identifier) @name (field_expression (identifier) @name .)]) @reference.call
+(broadcast_call_expression
+  . [(identifier) @name (field_expression (identifier) @name .)]) @reference.call
+(macrocall_expression (macro_identifier (identifier) @name)) @reference.call
+"#;
+
+// Spock names feature methods with strings, and Gradle registers tasks by name.
+const GROOVY_TAGS: &str = r#"
+(class_declaration name: (identifier) @name) @definition.class
+(interface_declaration name: (identifier) @name) @definition.interface
+(trait_declaration name: (identifier) @name) @definition.trait
+(enum_declaration name: (identifier) @name) @definition.enum
+(class_body (method_declaration name: (identifier) @name) @definition.method)
+(class_body (method_declaration name: (quoted_identifier) @name) @definition.test)
+(class_body (constructor_declaration name: (identifier) @name) @definition.constructor)
+(class_body (field_declaration (variable_declarator name: (identifier) @name)) @definition.field)
+(source_file (method_declaration name: (identifier) @name) @definition.function)
+((method_invocation
+  function: (field_access object: (identifier) @_tasks field: (identifier) @_register)
+  arguments: (argument_list . (string_literal) @name)) @definition.task
+  (#eq? @_tasks "tasks")
+  (#any-of? @_register "register" "create"))
+(method_invocation function: (identifier) @name) @reference.call
+(method_invocation function: (field_access field: (identifier) @name)) @reference.call
+(object_creation_expression (type_identifier) @name) @reference.class
+"#;
+
 impl Grammar {
     pub fn for_file(file: &str) -> Option<Self> {
         let path = Path::new(file);
@@ -272,16 +447,101 @@ impl Grammar {
             "tf" | "tfvars" | "tofu" | "hcl" => Self::Hcl,
             "lua" => Self::Lua,
             "zig" => Self::Zig,
+            "ex" | "exs" => Self::Elixir,
+            "m" => Self::ObjectiveC,
+            "ps1" | "psm1" => Self::PowerShell,
+            "jl" => Self::Julia,
+            "groovy" | "gvy" | "gradle" => Self::Groovy,
+            "vue" => Self::Vue,
+            "svelte" => Self::Svelte,
+            "astro" => Self::Astro,
             _ => return None,
         })
     }
 
+    /// The grammar for a file from its name and text: an extensionless script
+    /// takes the language its `#!` line names, and Objective-C headers and
+    /// sources declare themselves with `@interface` or `#import`. MATLAB and
+    /// Octave also use `.m`, so a `.m` file without those markers has none.
+    pub fn detect(file: &str, text: &str) -> Option<Self> {
+        let path = Path::new(file);
+        match Self::for_file(file) {
+            Some(Self::C) if path.extension().is_some_and(|e| e == "h") && objective_c(text) => {
+                Some(Self::ObjectiveC)
+            }
+            Some(Self::ObjectiveC) if !objective_c(text) => None,
+            None if path.extension().is_none() => {
+                if path.file_name().is_some_and(|name| name == "Jenkinsfile") {
+                    return Some(Self::Groovy);
+                }
+                Self::for_interpreter(&crate::exec::Shebang::parse(text.as_bytes())?.program)
+            }
+            grammar => grammar,
+        }
+    }
+
+    /// The grammar for an interpreter a `#!` line names, such as `python3.12`.
+    fn for_interpreter(program: &str) -> Option<Self> {
+        Some(
+            match program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.') {
+                "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" => Self::Bash,
+                "python" | "pypy" => Self::Python,
+                "node" | "nodejs" => Self::JavaScript,
+                "deno" | "bun" | "ts-node" | "tsx" => Self::TypeScript,
+                "ruby" | "jruby" => Self::Ruby,
+                "php" => Self::Php,
+                "lua" | "luajit" => Self::Lua,
+                "elixir" => Self::Elixir,
+                "pwsh" | "powershell" => Self::PowerShell,
+                "julia" => Self::Julia,
+                "groovy" => Self::Groovy,
+                _ => return None,
+            },
+        )
+    }
+
+    /// The language's name in reports such as `map`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::JavaScript => "JavaScript",
+            Self::TypeScript => "TypeScript",
+            Self::Tsx => "TSX",
+            Self::Python => "Python",
+            Self::Go => "Go",
+            Self::Java => "Java",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::CSharp => "C#",
+            Self::Ruby => "Ruby",
+            Self::Php => "PHP",
+            Self::Bash => "Bash",
+            Self::Sql => "SQL",
+            Self::Kotlin => "Kotlin",
+            Self::Swift => "Swift",
+            Self::Scala => "Scala",
+            Self::Dart => "Dart",
+            Self::Hcl => "HCL",
+            Self::Lua => "Lua",
+            Self::Zig => "Zig",
+            Self::Elixir => "Elixir",
+            Self::ObjectiveC => "Objective-C",
+            Self::PowerShell => "PowerShell",
+            Self::Julia => "Julia",
+            Self::Groovy => "Groovy",
+            Self::Vue => "Vue",
+            Self::Svelte => "Svelte",
+            Self::Astro => "Astro",
+        }
+    }
+
     pub fn family(self) -> Self {
         match self {
-            Self::TypeScript | Self::Tsx => Self::JavaScript,
-            Self::Cpp => Self::C,
+            Self::TypeScript | Self::Tsx | Self::Vue | Self::Svelte | Self::Astro => {
+                Self::JavaScript
+            }
+            Self::Cpp | Self::ObjectiveC => Self::C,
             // JVM languages call each other's declarations directly.
-            Self::Kotlin | Self::Scala => Self::Java,
+            Self::Kotlin | Self::Scala | Self::Groovy => Self::Java,
             other => other,
         }
     }
@@ -297,7 +557,8 @@ impl Grammar {
                 tree_sitter_javascript::LANGUAGE,
                 tree_sitter_javascript::TAGS_QUERY,
             ),
-            Self::TypeScript => (
+            // Components are parsed as the TypeScript in their scripts.
+            Self::TypeScript | Self::Vue | Self::Svelte | Self::Astro => (
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
                 tree_sitter_typescript::TAGS_QUERY,
             ),
@@ -330,9 +591,17 @@ impl Grammar {
             Self::Hcl => (tree_sitter_hcl::LANGUAGE, HCL_TAGS),
             Self::Lua => (tree_sitter_lua::LANGUAGE, LUA_TAGS),
             Self::Zig => (tree_sitter_zig::LANGUAGE, ZIG_TAGS),
+            Self::Elixir => (tree_sitter_elixir::LANGUAGE, ELIXIR_TAGS),
+            Self::ObjectiveC => (tree_sitter_objc::LANGUAGE, OBJECTIVE_C_TAGS),
+            Self::PowerShell => (tree_sitter_powershell::LANGUAGE, POWERSHELL_TAGS),
+            Self::Julia => (tree_sitter_julia::LANGUAGE, JULIA_TAGS),
+            Self::Groovy => (dekobon_tree_sitter_groovy::LANGUAGE, GROOVY_TAGS),
         };
         let mut tags = tags.to_owned();
-        if matches!(self, Self::TypeScript | Self::Tsx) {
+        if matches!(
+            self,
+            Self::TypeScript | Self::Tsx | Self::Vue | Self::Svelte | Self::Astro
+        ) {
             tags.push_str(tree_sitter_javascript::TAGS_QUERY);
             tags.push_str(
                 "\n(type_alias_declaration name: (_) @name) @definition.type
@@ -340,8 +609,11 @@ impl Grammar {
                 (class_declaration name: (type_identifier) @name) @definition.class\n",
             );
         }
-        if matches!(self, Self::C | Self::Cpp) {
+        if matches!(self, Self::C | Self::Cpp | Self::ObjectiveC) {
             tags.push_str("\n(call_expression function: (identifier) @name) @reference.call\n");
+        }
+        if self == Self::ObjectiveC {
+            tags.push_str(tree_sitter_c::TAGS_QUERY);
         }
         (language.into(), tags)
     }
@@ -422,6 +694,27 @@ pub struct Parsers(BTreeMap<Grammar, Compiled>);
 
 impl Parsers {
     pub fn parse(&mut self, grammar: Grammar, source: &str) -> anyhow::Result<Facts> {
+        let (syntax, text) = match grammar {
+            Grammar::Vue | Grammar::Svelte | Grammar::Astro => {
+                let (text, jsx) = crate::components::scripts(source, grammar == Grammar::Astro);
+                (
+                    if jsx {
+                        Grammar::Tsx
+                    } else {
+                        Grammar::TypeScript
+                    },
+                    text,
+                )
+            }
+            Grammar::ObjectiveC => (grammar, blank_bare_macros(source)),
+            _ => return self.parse_text(grammar, source),
+        };
+        let mut facts = self.parse_text(syntax, &text)?;
+        facts.grammar = grammar;
+        Ok(facts)
+    }
+
+    fn parse_text(&mut self, grammar: Grammar, source: &str) -> anyhow::Result<Facts> {
         if let std::collections::btree_map::Entry::Vacant(entry) = self.0.entry(grammar) {
             entry.insert(Compiled::new(grammar)?);
         }
@@ -469,7 +762,13 @@ impl Parsers {
             )
         });
         definitions.dedup_by_key(|tag| tag.name_node.byte_range());
-        definitions.retain(|tag| type_extension(grammar, tag.node, source).is_none());
+        definitions.retain(|tag| {
+            type_extension(grammar, tag.node, source).is_none()
+                // A Pester `It` names its test with a string, not a parameter.
+                && (grammar != Grammar::PowerShell
+                    || tag.label != "definition.test"
+                    || literal(tag.name).is_some())
+        });
         let mut facts = Facts {
             import_ranges: Vec::new(),
             grammar,
@@ -486,6 +785,11 @@ impl Parsers {
                 name,
                 label,
             } = definition;
+            // Declarators that share one statement are siblings, not owners.
+            let parent = (0..id).rev().find(|&parent| {
+                let owner = definitions[parent].node;
+                owner.end_byte() >= node.end_byte() && owner.byte_range() != node.byte_range()
+            });
             let (name, kind) = match (grammar, label.strip_prefix("definition.").unwrap()) {
                 (Grammar::Sql, kind) => (sql_name(name), kind),
                 (Grammar::Hcl, "block") => (hcl_block_name(*node, name, source), *name),
@@ -495,23 +799,42 @@ impl Parsers {
                 (Grammar::Dart, "constructor") if name_node.prev_named_sibling().is_none() => {
                     ("new".to_owned(), "constructor")
                 }
+                // PowerShell constructors are methods named after their class,
+                // and callers reach them as `[Type]::new()`.
+                (Grammar::PowerShell, "method")
+                    if parent.is_some_and(|parent| definitions[parent].name == *name) =>
+                {
+                    ("new".to_owned(), "constructor")
+                }
+                (Grammar::PowerShell, "property") => {
+                    (name.trim_start_matches('$').to_owned(), "property")
+                }
+                // `function global:Get-Item` defines `Get-Item` in the global scope.
+                (Grammar::PowerShell, "function") => (
+                    name.rsplit_once(':')
+                        .map_or(*name, |(_, name)| name)
+                        .to_owned(),
+                    "function",
+                ),
+                (Grammar::Groovy, "task") => (literal(name).unwrap_or(name).to_owned(), "task"),
+                // `new Type(…)` names the class, so the constructor takes
+                // Dart's name for it rather than shadowing the class.
+                (Grammar::Groovy, "constructor") => ("new".to_owned(), "constructor"),
                 // Test calls and blocks are named by their quoted description,
                 // which cannot collide with the function under test.
                 (_, "test") => (format!("\"{}\"", literal(name).unwrap_or(name)), "test"),
                 (_, kind) => (name.to_string(), kind),
             };
-            // Declarators that share one statement are siblings, not owners.
-            let parent = (0..id).rev().find(|&parent| {
-                let owner = definitions[parent].node;
-                owner.end_byte() >= node.end_byte() && owner.byte_range() != node.byte_range()
-            });
-            let extension = matches!(grammar, Grammar::Swift | Grammar::Scala)
-                .then(|| {
-                    std::iter::successors(node.parent(), Node::parent).find_map(|ancestor| {
-                        Some((ancestor, type_extension(grammar, ancestor, source)?))
-                    })
+            let extension = matches!(
+                grammar,
+                Grammar::Swift | Grammar::Scala | Grammar::ObjectiveC
+            )
+            .then(|| {
+                std::iter::successors(node.parent(), Node::parent).find_map(|ancestor| {
+                    Some((ancestor, type_extension(grammar, ancestor, source)?))
                 })
-                .flatten();
+            })
+            .flatten();
             let owner = match (parent, extension) {
                 (Some(parent), Some((extension, extended)))
                     if definitions[parent].node.start_byte() <= extension.start_byte()
@@ -530,9 +853,10 @@ impl Parsers {
                     Grammar::Go => name
                         .strip_prefix("Test")
                         .is_some_and(|suffix| suffix.starts_with(char::is_uppercase)),
-                    Grammar::Java | Grammar::Kotlin | Grammar::Scala => {
+                    Grammar::Java | Grammar::Kotlin | Grammar::Scala | Grammar::Groovy => {
                         callable && test_annotation(*node, source)
                     }
+                    Grammar::ObjectiveC => kind == "method" && name.starts_with("test"),
                     // XCTest runs methods named test…; Swift Testing marks them @Test.
                     Grammar::Swift => {
                         (kind == "method" && name.starts_with("test"))
@@ -550,7 +874,16 @@ impl Parsers {
                 node.children(&mut cursor)
                     .find(|child| child.kind() == ":")
                     .map(|colon| colon.end_byte())
-            } else if kind == "test" && matches!(node.kind(), "call_expression" | "function_call") {
+            } else if kind == "test"
+                && matches!(
+                    node.kind(),
+                    "call_expression"
+                        | "function_call"
+                        | "call"
+                        | "command"
+                        | "macrocall_expression"
+                )
+            {
                 // A test call's header is the line that names it.
                 source[name_node.end_byte()..extent.end_byte()]
                     .find('\n')
@@ -576,7 +909,18 @@ impl Parsers {
             });
         }
         let mut seen = BTreeSet::new();
+        // Where a call names the function it defines, as Elixir and Julia
+        // heads do, the name is the definition, not a call to it.
+        let declared: BTreeSet<_> = definitions
+            .iter()
+            .map(|tag| (tag.name_node.start_byte(), tag.name_node.end_byte()))
+            .collect();
         for tag in references {
+            if declared.contains(&(tag.name_node.start_byte(), tag.name_node.end_byte()))
+                || (grammar == Grammar::Elixir && module_attribute(tag.node))
+            {
+                continue;
+            }
             let kind = match tag.label.as_str() {
                 "reference.call" | "reference.send" => Kind::Call,
                 "reference.table" => Kind::Data,
@@ -610,6 +954,7 @@ impl Parsers {
                     | "namespace_use_declaration"
                     | "import_or_export"
             ) || (grammar == Grammar::Kotlin && node.kind() == "import" && node.is_named())
+                || import_like(grammar, node, source)
             {
                 facts.import_ranges.push(node.byte_range());
             }
@@ -745,6 +1090,42 @@ fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 // declaration's body.
 fn header_boundary(grammar: Grammar, node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
+    match grammar {
+        Grammar::Elixir => node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "do_block"),
+        Grammar::PowerShell => node.children(&mut cursor).find(|child| child.kind() == "{"),
+        Grammar::ObjectiveC => node.children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "compound_statement"
+                    | "method_declaration"
+                    | "property_declaration"
+                    | "implementation_definition"
+                    | "instance_variables"
+                    | "@end"
+                    | "@optional"
+                    | "@required"
+            )
+        }),
+        // The signature, type head or module name comes first.
+        Grammar::Julia => matches!(
+            node.kind(),
+            "function_definition"
+                | "macro_definition"
+                | "struct_definition"
+                | "abstract_definition"
+                | "module_definition"
+        )
+        .then(|| node.named_child(1))
+        .flatten(),
+        Grammar::Groovy => node.child_by_field_name("closure"),
+        _ => header_block(grammar, node),
+    }
+}
+
+fn header_block(grammar: Grammar, node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
     let mut children = node.named_children(&mut cursor);
     match grammar {
         Grammar::Kotlin | Grammar::Hcl | Grammar::Zig => {
@@ -770,6 +1151,15 @@ fn header_boundary(grammar: Grammar, node: Node<'_>) -> Option<Node<'_>> {
 // query for the type stays unambiguous.
 fn type_extension(grammar: Grammar, node: Node<'_>, source: &str) -> Option<String> {
     let name = match (grammar, node.kind()) {
+        // `@implementation Type`, a category `@interface Type (Name)` and a
+        // class extension `@interface Type ()`.
+        (Grammar::ObjectiveC, "class_implementation") => Some(text(node.named_child(0)?, source)),
+        (Grammar::ObjectiveC, "class_interface") => {
+            let mut cursor = node.walk();
+            let extends = node.child_by_field_name("category").is_some()
+                || node.children(&mut cursor).any(|child| child.kind() == "(");
+            extends.then_some(text(node.named_child(0)?, source))
+        }
         (Grammar::Swift, "class_declaration") => {
             (node.child_by_field_name("declaration_kind")?.kind() == "extension")
                 .then_some(text(node.child_by_field_name("name")?, source))
@@ -876,6 +1266,79 @@ fn zig_container(node: Node<'_>) -> &'static str {
             _ => None,
         })
         .unwrap_or("constant")
+}
+
+/// Whether an Elixir node sits in a module attribute such as `@spec` or
+/// `@doc`, whose calls are type and documentation syntax.
+fn module_attribute(node: Node<'_>) -> bool {
+    std::iter::successors(Some(node), Node::parent).any(|ancestor| {
+        ancestor.kind() == "unary_operator"
+            && ancestor
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "@")
+    })
+}
+
+/// Import statements that a grammar spells as ordinary calls or commands, so
+/// outlines can show them as imports.
+fn import_like(grammar: Grammar, node: Node<'_>, source: &str) -> bool {
+    match (grammar, node.kind()) {
+        (Grammar::Elixir, "call") => node.child_by_field_name("target").is_some_and(|target| {
+            matches!(text(target, source), "alias" | "import" | "require" | "use")
+        }),
+        (Grammar::PowerShell, "command") => {
+            node.child_by_field_name("command_name")
+                .is_some_and(|name| {
+                    let name = text(name, source);
+                    name.eq_ignore_ascii_case("using") || name.eq_ignore_ascii_case("Import-Module")
+                })
+        }
+        (Grammar::Julia, "using_statement") | (Grammar::ObjectiveC, "module_import") => true,
+        _ => false,
+    }
+}
+
+/// Whether C-family source is Objective-C: a header or source that declares a
+/// class or protocol, or imports with `#import` or `@import`.
+fn objective_c(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        [
+            "@interface",
+            "@implementation",
+            "@protocol",
+            "#import",
+            "@import",
+        ]
+        .iter()
+        .any(|marker| line.starts_with(marker))
+    })
+}
+
+/// Objective-C headers wrap declarations in lines that are a bare macro, such
+/// as `NS_ASSUME_NONNULL_BEGIN`, which the grammar cannot place. Spaces keep
+/// every offset.
+fn blank_bare_macros(source: &str) -> String {
+    let mut blanked = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let code = line.trim();
+        let (name, arguments) = code.split_at(code.find('(').unwrap_or(code.len()));
+        let bare = name.contains('_')
+            && name.starts_with(|c: char| c.is_ascii_uppercase())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && (arguments.is_empty() || (arguments.ends_with(')') && !arguments.contains(';')));
+        if bare {
+            blanked.extend(
+                line.chars()
+                    .map(|c| if c == '\n' || c == '\r' { c } else { ' ' }),
+            );
+        } else {
+            blanked.push_str(line);
+        }
+    }
+    blanked
 }
 
 fn last_line(node: Node<'_>) -> usize {
@@ -1019,8 +1482,16 @@ fn module_import(grammar: Grammar, node: Node<'_>, source: &str) -> Option<Impor
             );
         }
         text(module, source)
-    } else if matches!(grammar, Grammar::C | Grammar::Cpp) && node.kind() == "preproc_include" {
+    } else if matches!(grammar, Grammar::C | Grammar::Cpp | Grammar::ObjectiveC)
+        && node.kind() == "preproc_include"
+    {
         literal(text(node.child_by_field_name("path")?, source))?
+    } else if grammar == Grammar::Julia
+        && node.kind() == "call_expression"
+        && text(node.named_child(0)?, source) == "include"
+    {
+        let argument = node.named_child(1)?.named_child(0)?;
+        (argument.kind() == "string_literal").then(|| literal(text(argument, source)))??
     } else {
         return None;
     };
@@ -1029,4 +1500,70 @@ fn module_import(grammar: Grammar, node: Node<'_>, source: &str) -> Option<Impor
         bindings,
         line: node.start_position().row + 1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grammars_come_from_names_shebangs_and_objective_c_markers() {
+        for (file, text, grammar) in [
+            (
+                "bin/deploy",
+                "#!/usr/bin/env python3.12\n",
+                Some(Grammar::Python),
+            ),
+            ("bin/run", "#!/bin/zsh -e\n", Some(Grammar::Bash)),
+            (
+                "bin/serve",
+                "#!/usr/bin/env -S node --no-warnings\n",
+                Some(Grammar::JavaScript),
+            ),
+            (
+                "bin/task",
+                "#!/usr/bin/env -S deno run\n",
+                Some(Grammar::TypeScript),
+            ),
+            ("bin/report", "#!/usr/bin/ruby\n", Some(Grammar::Ruby)),
+            (
+                "bin/setup",
+                "#!/usr/bin/env pwsh\n",
+                Some(Grammar::PowerShell),
+            ),
+            ("bin/legacy", "#!/usr/bin/perl\n", None),
+            ("bin/notes", "plain text\n", None),
+            ("Jenkinsfile", "pipeline {}\n", Some(Grammar::Groovy)),
+            // An extension wins over a shebang.
+            ("tool.py", "#!/bin/sh\n", Some(Grammar::Python)),
+            (
+                "Thing.h",
+                "#import <Foundation/Foundation.h>\n",
+                Some(Grammar::ObjectiveC),
+            ),
+            ("thing.h", "int thing(void);\n", Some(Grammar::C)),
+            (
+                "Thing.m",
+                "@implementation Thing\n@end\n",
+                Some(Grammar::ObjectiveC),
+            ),
+            ("total.m", "function y = total(x)\n  y = x;\nend\n", None),
+            ("build.gradle", "", Some(Grammar::Groovy)),
+            ("App.vue", "", Some(Grammar::Vue)),
+        ] {
+            assert_eq!(Grammar::detect(file, text), grammar, "{file}");
+        }
+    }
+
+    #[test]
+    fn bare_macro_lines_are_blanked_in_place() {
+        let source =
+            "NS_ASSUME_NONNULL_BEGIN\r\nNS_HEADER_AUDIT_BEGIN(nullability)\nFOO_BAR(x);\n@end\n";
+        let blanked = blank_bare_macros(source);
+        assert_eq!(blanked.len(), source.len());
+        assert_eq!(
+            blanked.split_whitespace().collect::<Vec<_>>(),
+            ["FOO_BAR(x);", "@end"]
+        );
+    }
 }

@@ -1,0 +1,24 @@
+---
+import Layout from './Layout.astro';
+import { applyTax } from './billing';
+
+interface Props {
+  items: number[];
+}
+
+const { items } = Astro.props;
+
+function grandTotal(values: number[]): number {
+  return applyTax(values.reduce((a, b) => a + b, 0));
+}
+---
+<Layout title="Invoice">
+  <p>{grandTotal(items)}</p>
+</Layout>
+
+<script>
+  function printInvoice() {
+    window.print();
+  }
+  document.querySelector('p')?.addEventListener('click', printInvoice);
+</script>

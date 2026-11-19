@@ -1,0 +1,26 @@
+plugins {
+    id 'groovy'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.apache.groovy:groovy:4.0.21'
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+}
+
+def releaseVersion() {
+    return project.findProperty('release') ?: '0.1.0'
+}
+
+tasks.register('printVersion') {
+    doLast {
+        println releaseVersion()
+    }
+}
+
+test {
+    useJUnitPlatform()
+}

@@ -744,6 +744,289 @@ fn terraform_blocks_use_addresses_and_link_references() {
     assert!(found.contains("outputs.tf:2:"), "{found}");
 }
 
+#[test]
+fn elixir_objective_c_powershell_julia_and_groovy_link_calls_and_tests() {
+    for case in [
+        LanguageCase {
+            language: "elixir",
+            file: "billing.ex",
+            rows: &[
+                "#1 L1-26 module Shop.Billing  defmodule Shop.Billing",
+                "#2 L4-4 import import  alias Shop.Ledger",
+                "#4 L9-9 type Shop.Billing::cents  @type cents :: non_neg_integer()",
+                "#5 L12-17 function Shop.Billing::total  def total(%__MODULE__{items: items})",
+                "#7 L23-23 function Shop.Billing::apply_tax  defp apply_tax(amount) when is_integer(amount), do: amount * 2",
+                "#8 L25-25 macro Shop.Billing::cents  defmacro cents(value), do: value",
+                "#10 L29-29 function Shop.Printable::print  def print(document)",
+            ],
+            expand: (
+                "Shop.Billing::apply_tax",
+                "defp apply_tax(amount) when is_integer(amount), do: amount * 2",
+            ),
+            // A module's own functions resolve by name across the project.
+            caller: (
+                "apply_tax",
+                "possible call from billing.ex::Shop.Billing::total at billing.ex:15",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): billing_test.exs::Shop.BillingTest::\"totals items\" [test]",
+            ),
+        },
+        LanguageCase {
+            language: "objc",
+            file: "SHPBilling.m",
+            rows: &[
+                "#1 L1-1 import import  #import \"SHPBilling.h\"",
+                "#3 L4-6 function SHPApplyTax  static NSInteger SHPApplyTax(NSInteger amount)",
+                "#4 L9-9 property SHPInvoiceService::ledger  @property (nonatomic, strong) id<SHPLedger> ledger;",
+                "#6 L22-29 method SHPInvoiceService::totalOfItems  - (NSInteger)totalOfItems:(NSArray<NSNumber *> *)items",
+                "#7 L31-33 method SHPInvoiceService::serviceWithLedger  + (instancetype)serviceWithLedger:(id<SHPLedger>)ledger",
+            ],
+            expand: (
+                "SHPApplyTax",
+                "static NSInteger SHPApplyTax(NSInteger amount) {\n    return amount * 2;\n}",
+            ),
+            caller: (
+                "SHPApplyTax",
+                "call from SHPBilling.m::SHPInvoiceService::totalOfItems at SHPBilling.m:28",
+            ),
+            test: (
+                "totalOfItems",
+                "related test (1 call hops): SHPBillingTests.m::SHPBillingTests::testTotalsItems [test]",
+            ),
+        },
+        LanguageCase {
+            language: "powershell",
+            file: "Billing.psm1",
+            rows: &[
+                "#1 L1-1 import import  using namespace System.Collections.Generic",
+                "#3 L4-11 class InvoiceService  class InvoiceService",
+                "#4 L5-5 property InvoiceService::Currency  [string] $Currency = 'EUR'",
+                "#5 L7-10 method InvoiceService::Total  [int] Total([int[]] $Items)",
+                "#7 L22-25 function Get-InvoiceTotal  function Get-InvoiceTotal([int[]] $Items)",
+            ],
+            expand: (
+                "Invoke-ApplyTax",
+                "function Invoke-ApplyTax {\n    [CmdletBinding()]\n    param(\n        [Parameter(Mandatory)]\n        [int] $Amount\n    )\n    return $Amount * 2\n}",
+            ),
+            caller: (
+                "Invoke-ApplyTax",
+                "call from Billing.psm1::InvoiceService::Total at Billing.psm1:9",
+            ),
+            test: (
+                "Get-InvoiceTotal",
+                "related test (1 call hops): Billing.Tests.ps1::\"totals items\" [test]",
+            ),
+        },
+        LanguageCase {
+            language: "julia",
+            file: "Billing.jl",
+            rows: &[
+                "#1 L1-33 module Billing  module Billing",
+                "#5 L10-13 struct Billing::Invoice  struct Invoice",
+                "#6 L15-15 constant Billing::CURRENCY  const CURRENCY = \"EUR\"",
+                "#7 L17-17 function Billing::apply_tax  apply_tax(amount::Integer) = amount * 2",
+                "#8 L19-25 function Billing::total  function total(invoice::Invoice)",
+                "#9 L27-29 macro Billing::cents  macro cents(value)",
+            ],
+            expand: (
+                "Billing::apply_tax",
+                "apply_tax(amount::Integer) = amount * 2",
+            ),
+            caller: (
+                "apply_tax",
+                "possible call from Billing.jl::Billing::total at Billing.jl:24",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): runtests.jl::\"totals items\" [test]",
+            ),
+        },
+        LanguageCase {
+            language: "groovy",
+            file: "Billing.groovy",
+            rows: &[
+                "#3 L6-8 interface Ledger  interface Ledger",
+                "#5 L10-28 class InvoiceService  @CompileStatic class InvoiceService",
+                "#8 L15-17 constructor InvoiceService::new  InvoiceService(Ledger ledger)",
+                "#9 L19-23 method InvoiceService::total  long total(List<Long> items)",
+                "#12 L31-33 method Taxes::applyTax  static long applyTax(long amount)",
+            ],
+            expand: (
+                "Taxes::applyTax",
+                "static long applyTax(long amount) {\n        amount * 2\n    }",
+            ),
+            caller: (
+                "applyTax",
+                "possible call from Billing.groovy::Taxes::describe at Billing.groovy:36",
+            ),
+            test: (
+                "total",
+                "related test (1 call hops): BillingSpec.groovy::BillingSpec::\"totals items\" [test]",
+            ),
+        },
+    ] {
+        let language = case.language;
+        let repo = check_language(case);
+        let root = repo.path();
+        let outline = |file| success(root, &["read", file, "--outline"]);
+        let expected: &[(&str, &str)] = match language {
+            // Header macros and protocols parse, and a class extension is no
+            // second class.
+            "objc" => &[
+                (
+                    "SHPBilling.h",
+                    "#3 L6-6 method SHPLedger::recordAmount  - (void)recordAmount:(NSInteger)amount;\n",
+                ),
+                (
+                    "SHPBilling.h",
+                    "#4 L9-14 class SHPInvoiceService  @interface SHPInvoiceService : NSObject\n",
+                ),
+            ],
+            "powershell" => &[(
+                "Billing.Tests.ps1",
+                "#1 L6-8 test \"totals items\"  It 'totals items' {\n",
+            )],
+            "groovy" => &[(
+                "build.gradle",
+                "#2 L18-22 task printVersion  tasks.register('printVersion')\n",
+            )],
+            _ => &[],
+        };
+        for (file, row) in expected {
+            let text = outline(file);
+            assert!(text.contains(row), "{row}{text}");
+        }
+        if language == "objc" {
+            let definition = success(
+                root,
+                &["query", "SHPInvoiceService", "--view", "definition"],
+            );
+            assert_eq!(
+                definition,
+                "SHPBilling.h::SHPInvoiceService [class] at SHPBilling.h:9-14\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn vue_svelte_and_astro_scripts_are_indexed_at_their_own_lines() {
+    let repo = language_fixture("components");
+    let root = repo.path();
+    for (file, rows) in [
+        (
+            "InvoiceTotal.vue",
+            &[
+                "#2 L10-10 import import  import { applyTax } from './billing'\n",
+                "#3 L15-18 function total  function total(): number\n",
+                "#4 L20-22 function reset  const reset = () =>\n",
+            ][..],
+        ),
+        (
+            "InvoiceRow.svelte",
+            &["#2 L10-12 function taxed  function taxed(value: number): string\n"][..],
+        ),
+        (
+            "Invoice.astro",
+            &[
+                "#3 L5-7 interface Props  interface Props\n",
+                "#4 L11-13 function grandTotal  function grandTotal(values: number[]): number\n",
+                "#5 L20-22 function printInvoice  function printInvoice()\n",
+            ][..],
+        ),
+    ] {
+        let outline = success(root, &["read", file, "--outline"]);
+        for row in rows {
+            assert!(outline.contains(row), "{row}{outline}");
+        }
+        // Markup and styles stay out of the outline.
+        assert!(
+            !outline.contains("invoice") && !outline.contains("text-align"),
+            "{outline}"
+        );
+    }
+    assert_eq!(
+        success(root, &["expand", "InvoiceRow.svelte", "taxed"]),
+        "function taxed(value: number): string {\n    return `${applyTax(value)} ${currency}`;\n  }"
+    );
+    let callers = success(root, &["query", "applyTax", "--view", "callers"]);
+    for caller in [
+        "call from Invoice.astro::grandTotal at Invoice.astro:12",
+        "call from InvoiceRow.svelte::taxed at InvoiceRow.svelte:11",
+        "call from InvoiceTotal.vue::total at InvoiceTotal.vue:17",
+    ] {
+        assert!(callers.contains(caller), "{callers}");
+    }
+    let affected = success(root, &["affected", "billing.ts"]);
+    assert!(
+        affected
+            .contains("InvoiceTotal.vue:1-27 [file] · import at InvoiceTotal.vue:10 → billing.ts"),
+        "{affected}"
+    );
+    let map = success(root, &["map"]);
+    assert!(
+        map.contains("Astro 1 · Svelte 1 · TypeScript 1 · Vue 1"),
+        "{map}"
+    );
+}
+
+#[test]
+fn extensionless_scripts_take_the_language_of_their_shebang() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::create_dir(root.join("bin")).unwrap();
+    for (file, source) in [
+        (
+            "bin/deploy",
+            "#!/usr/bin/env python3\ndef deploy_release(tag):\n    return tag\n",
+        ),
+        ("bin/rotate", "#!/bin/bash\nrotate_logs() {\n  echo ok\n}\n"),
+        (
+            "bin/serve",
+            "#!/usr/bin/env -S node --no-warnings\nfunction serveSite() {}\n",
+        ),
+        (
+            "bin/report",
+            "#!/usr/bin/env ruby\ndef report_totals\nend\n",
+        ),
+        // Perl has no grammar here, and MATLAB shares `.m` with Objective-C.
+        ("bin/legacy", "#!/usr/bin/perl\nsub legacy_total { 1 }\n"),
+        (
+            "total.m",
+            "function legacy_sum = total(x)\n  legacy_sum = x;\nend\n",
+        ),
+    ] {
+        fs::write(root.join(file), source).unwrap();
+    }
+    for (symbol, file) in [
+        ("deploy_release", "bin/deploy"),
+        ("rotate_logs", "bin/rotate"),
+        ("serveSite", "bin/serve"),
+        ("report_totals", "bin/report"),
+    ] {
+        let definition = success(root, &["query", symbol, "--view", "definition"]);
+        assert!(
+            definition.starts_with(&format!("{file}::{symbol} ")),
+            "{definition}"
+        );
+    }
+    let outline = success(root, &["read", "bin/deploy", "--outline"]);
+    assert!(
+        outline.contains("#1 L2-3 function deploy_release  def deploy_release(tag):\n"),
+        "{outline}"
+    );
+    let map = success(root, &["map"]);
+    assert!(
+        map.contains("Bash 1 · JavaScript 1 · Python 1 · Ruby 1"),
+        "{map}"
+    );
+    for symbol in ["legacy_total", "legacy_sum"] {
+        assert!(!cli(root, &["query", symbol]).status.success(), "{symbol}");
+    }
+}
+
 fn hook(root: &Path, mode: &str, input: serde_json::Value) -> serde_json::Value {
     agent_hook(root, "hook-codex", mode, input)
 }

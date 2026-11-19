@@ -243,28 +243,19 @@ pub(crate) fn language(file: &str) -> Option<&'static str> {
     {
         return Some("Rust");
     }
-    Some(match Grammar::for_file(file)? {
-        Grammar::JavaScript => "JavaScript",
-        Grammar::TypeScript => "TypeScript",
-        Grammar::Tsx => "TSX",
-        Grammar::Python => "Python",
-        Grammar::Go => "Go",
-        Grammar::Java => "Java",
-        Grammar::C => "C",
-        Grammar::Cpp => "C++",
-        Grammar::CSharp => "C#",
-        Grammar::Ruby => "Ruby",
-        Grammar::Php => "PHP",
-        Grammar::Bash => "Bash",
-        Grammar::Sql => "SQL",
-        Grammar::Kotlin => "Kotlin",
-        Grammar::Swift => "Swift",
-        Grammar::Scala => "Scala",
-        Grammar::Dart => "Dart",
-        Grammar::Hcl => "HCL",
-        Grammar::Lua => "Lua",
-        Grammar::Zig => "Zig",
-    })
+    Grammar::for_file(file).map(Grammar::name)
+}
+
+/// The language the index parsed a file as, which also covers scripts named
+/// by their `#!` line and tells Objective-C from MATLAB in `.m` files.
+fn indexed_language(index: &Index, file: &str) -> Option<&'static str> {
+    if Path::new(file)
+        .extension()
+        .is_some_and(|extension| extension == "rs")
+    {
+        return Some("Rust");
+    }
+    index.grammar(file).map(Grammar::name)
 }
 
 /// The name an agent passes to `expand FILE NAME` or `query`: the path within
@@ -698,7 +689,7 @@ fn build(index: &Index) -> (Vec<String>, Vec<Section>, Map<String, Value>) {
     let possible = index.edges.iter().filter(|edge| edge.inferred).count();
     let mut languages = BTreeMap::<&str, usize>::new();
     for file in index.files.keys() {
-        if let Some(language) = language(file) {
+        if let Some(language) = indexed_language(index, file) {
             *languages.entry(language).or_default() += 1;
         }
     }
@@ -753,7 +744,7 @@ fn area_section(graph: &Graph) -> Section {
             languages: BTreeMap::new(),
         });
         area.files.push(file);
-        if let Some(language) = language(file) {
+        if let Some(language) = indexed_language(graph.index, file) {
             *area.languages.entry(language).or_default() += 1;
         }
     }

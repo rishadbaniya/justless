@@ -268,7 +268,7 @@ impl Snapshot {
                     }
                 }
             }
-        } else if let Some(grammar) = Grammar::for_file(file) {
+        } else if let Some(grammar) = Grammar::detect(file, &self.text) {
             let facts = Parsers::default().parse(grammar, &self.text)?;
             imports = facts.import_ranges;
             for def in facts.definitions {

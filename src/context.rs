@@ -777,7 +777,7 @@ fn deleted_symbols(workspace: &Workspace, file: &str, rev: &str, deletions: &mut
                     .collect()
             })
             .unwrap_or_default()
-    } else if let Some(grammar) = crate::polyglot::Grammar::for_file(file) {
+    } else if let Some(grammar) = crate::polyglot::Grammar::detect(file, &snapshot.text) {
         crate::polyglot::Parsers::default()
             .parse(grammar, &snapshot.text)
             .map(|facts| {

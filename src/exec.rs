@@ -147,8 +147,8 @@ impl Lang {
 /// A `#!` first line: the interpreter it names, the options it passes, and the
 /// variables an `env` form sets.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Shebang {
-    program: String,
+pub(crate) struct Shebang {
+    pub(crate) program: String,
     options: Vec<String>,
     env: Vec<(String, String)>,
 }
@@ -157,7 +157,7 @@ impl Shebang {
     /// Reads `#!/bin/sh -e`, `#!/usr/bin/env -S bash -eu` or
     /// `#!/usr/bin/env PYTHONUTF8=1 python3`. Options are split at whitespace, as
     /// macOS does; Linux would pass them as one argument.
-    fn parse(code: &[u8]) -> Option<Self> {
+    pub(crate) fn parse(code: &[u8]) -> Option<Self> {
         let line = code.strip_prefix(b"#!")?;
         let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
         let line = String::from_utf8_lossy(line);
