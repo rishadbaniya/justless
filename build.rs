@@ -23,9 +23,12 @@ fn main() {
         .filter(|id| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()))
         .unwrap_or_default();
     if !revision.is_empty() {
-        // Run again when HEAD moves: a checkout, a commit or a packed ref. A path
-        // that does not exist would rerun this script on every build.
-        let mut names = vec!["HEAD".to_owned(), "packed-refs".to_owned()];
+        // Run again when HEAD moves: a checkout, a commit or a packed ref. The
+        // reflog also changes when a commit writes a branch that was packed. A
+        // path that does not exist would rerun this script on every build.
+        let mut names = ["HEAD", "logs/HEAD", "packed-refs"]
+            .map(String::from)
+            .to_vec();
         names.extend(git(dir, &["symbolic-ref", "-q", "HEAD"]));
         for name in names {
             if let Some(path) = git(dir, &["rev-parse", "--git-path", &name]) {

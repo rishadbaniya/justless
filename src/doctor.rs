@@ -834,7 +834,7 @@ impl Doctor<'_> {
                 return Some(Check::new(
                     Status::Ok,
                     format!(
-                        "`justless` on PATH was built from this checkout's HEAD, {}",
+                        "`justless` on PATH was built from this checkout's HEAD commit, {}. Uncommitted changes are not compared.",
                         short(head)
                     ),
                 ));
