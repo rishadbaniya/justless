@@ -1104,10 +1104,17 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     args.home = Path(args.home)
+    large = task_set(args) == "large"
     if args.campaign is None:
-        # Dry and validation runs never default into a paid campaign's directory.
+        # Dry and validation runs never default into a paid campaign's directory, and the large family never
+        # defaults into the main campaign's.
         args.campaign = {"dry-run": "dry", "validate-tasks": "validate"}.get(args.command) or (
             "anchor-dry" if getattr(args, "dry_anchor", False) else "main")
+        if large:
+            args.campaign = {"dry": "dry-large", "validate": "validate-large", "main": "large"}.get(
+                args.campaign, args.campaign)
+    elif large and args.campaign == "main" and args.command not in ("prepare", "review-tasks"):
+        raise SystemExit("the large task set has its own campaign; pass --campaign large, not main")
     commands = {
         "prepare": cmd_prepare, "validate-tasks": cmd_validate_tasks, "review-tasks": cmd_review,
         "cc-capture": cmd_cc_capture, "parity-diff": cmd_parity_diff, "sandbox-check": cmd_sandbox_check,

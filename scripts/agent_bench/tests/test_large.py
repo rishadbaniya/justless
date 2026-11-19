@@ -78,6 +78,26 @@ class TaskSetTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             run_module.require_frozen_manifest(home, manifest)
 
+    def test_large_set_never_defaults_into_the_main_campaign(self):
+        home = helpers.tempdir(self)
+        seen = {}
+        names = ("cmd_dry_run", "cmd_validate_tasks", "cmd_estimate", "cmd_run")
+        original = {n: getattr(run_module, n) for n in names}
+        try:
+            run_module.cmd_dry_run = lambda args: seen.setdefault("dry-run", args.campaign) and 0
+            run_module.cmd_validate_tasks = lambda args: seen.setdefault("validate-tasks", args.campaign) and 0
+            run_module.cmd_estimate = lambda args: seen.setdefault("estimate", args.campaign) and 0
+            run_module.cmd_run = lambda args, phase="main": seen.setdefault("run", args.campaign) and 0
+            for command in ("dry-run", "validate-tasks", "estimate", "run"):
+                run_module.main([command, "--home", str(home), "--task-set", "large"])
+            with self.assertRaises(SystemExit):
+                run_module.main(["run", "--home", str(home), "--task-set", "large", "--campaign", "main"])
+        finally:
+            for name, value in original.items():
+                setattr(run_module, name, value)
+        self.assertEqual(seen, {"dry-run": "dry-large", "validate-tasks": "validate-large", "estimate": "large",
+                                "run": "large"})
+
     def test_large_tasks_need_a_kind(self):
         task = callers_task()
         self.assertEqual(tasks_module.kind(task), "callers")
