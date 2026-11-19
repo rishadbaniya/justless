@@ -58,6 +58,15 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[track_caller]
+fn contains(text: &str, needle: &str) {
+    assert!(text.contains(needle), "{needle:?} not in:\n{text}");
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
 fn run_id(output: &Output) -> String {
     let text = stderr(output);
     let start = text.find("run-").expect("run footer");
@@ -67,15 +76,17 @@ fn run_id(output: &Output) -> String {
         .collect()
 }
 
+#[derive(Clone)]
 enum Outcome {
-    Ok(&'static str),
-    Fail(i32, &'static str),
+    Ok(String),
+    Fail(i32, String),
     /// A nonzero exit Claude Code shows as a non-error.
-    Unknown(&'static str),
+    Unknown(String),
     /// Raw `content`, `is_error` and `toolUseResult`.
     Raw(String, bool, Value),
 }
 
+#[derive(Clone)]
 struct Call {
     command: String,
     cwd: String,
@@ -92,20 +103,24 @@ fn call(command: &str, outcome: Outcome) -> Call {
     }
 }
 
-fn call_in(dir: &str, command: &str, outcome: Outcome) -> Call {
-    Call {
-        cwd: dir.into(),
-        ..call(command, outcome)
-    }
+fn fail(code: i32, output: impl Into<String>) -> Outcome {
+    Outcome::Fail(code, output.into())
 }
 
-fn failure(code: i32, output: impl Into<String>) -> Outcome {
-    let output = output.into();
-    Outcome::Raw(
-        format!("Exit code {code}\n{output}"),
-        true,
-        json!(format!("Error: Exit code {code}\n{output}")),
-    )
+/// Calls written as `COMMAND => OUTPUT` for one that succeeded, or
+/// `COMMAND => CODE: OUTPUT` for one that exited with CODE.
+fn calls(script: &[&str]) -> Vec<Call> {
+    let parse = |line: &&str| {
+        let (command, rest) = line.split_once(" => ").expect("COMMAND => OUTPUT");
+        let outcome = match rest.split_once(": ") {
+            Some((code, output)) if code.parse::<i32>().is_ok() => {
+                fail(code.parse().unwrap(), output)
+            }
+            _ => Outcome::Ok(rest.into()),
+        };
+        call(command, outcome)
+    };
+    script.iter().map(parse).collect()
 }
 
 struct Lab {
@@ -176,14 +191,23 @@ impl Lab {
         serde_json::from_str(&self.text(&all)).unwrap()
     }
 
-    fn rules(&self, args: &[&str]) -> Vec<Value> {
-        self.json(args)["rules"].as_array().unwrap().clone()
+    fn rules(&self, args: &[&str]) -> Value {
+        self.json(args)["rules"].clone()
     }
 
-    fn run(&self, dir: &str, args: &[&str]) -> Output {
+    /// `justless run` with these space-separated arguments.
+    fn run(&self, dir: &str, args: &str) -> Output {
+        self.run_argv(dir, &words(args))
+    }
+
+    fn run_argv(&self, dir: &str, args: &[&str]) -> Output {
         let mut all = vec!["run"];
         all.extend(args);
         self.command(dir, &all).output().unwrap()
+    }
+
+    fn record(&self, id: &str) -> Value {
+        serde_json::from_str(&self.read(&format!(".justless/runs/{id}/record.json"))).unwrap()
     }
 
     fn tool(&self, name: &str, body: &str) {
@@ -236,22 +260,20 @@ impl Lab {
                     "input": {"command": call.command, "description": "Run"}}]}}),
             );
             let (content, is_error, result) = match call.outcome {
-                Outcome::Ok(output) => (
-                    output.to_owned(),
-                    false,
-                    json!({"stdout": output, "stderr": "", "interrupted": false, "isImage": false}),
-                ),
+                Outcome::Ok(output) => {
+                    let result = json!({"stdout": output, "stderr": "", "interrupted": false, "isImage": false});
+                    (output, false, result)
+                }
                 Outcome::Fail(code, output) => (
                     format!("Exit code {code}\n{output}"),
                     true,
                     json!(format!("Error: Exit code {code}\n{output}")),
                 ),
-                Outcome::Unknown(output) => (
-                    output.to_owned(),
-                    false,
-                    json!({"stdout": output, "stderr": "", "interrupted": false,
-                        "returnCodeInterpretation": "No matches found"}),
-                ),
+                Outcome::Unknown(output) => {
+                    let result = json!({"stdout": output, "stderr": "", "interrupted": false,
+                        "returnCodeInterpretation": "No matches found"});
+                    (output, false, result)
+                }
                 Outcome::Raw(content, is_error, result) => (content, is_error, result),
             };
             lines.push(
@@ -267,21 +289,33 @@ impl Lab {
         fs::write(path, body.join("\n") + "\n").unwrap();
     }
 
+    /// Session `name` in `name.jsonl`, started `age` ms ago, running `script` (see `calls`).
+    fn session(&self, name: &str, age: u64, script: &[&str]) {
+        let file = format!("{name}.jsonl");
+        self.transcript(&file, name, now_ms() - age, calls(script));
+    }
+
     /// The same calls in `count` separate sessions, a day apart.
-    fn sessions(&self, prefix: &str, count: usize, calls: impl Fn() -> Vec<Call>) {
+    fn sessions_of(&self, prefix: &str, count: usize, calls: &[Call]) {
         for index in 0..count {
             let session = format!("{prefix}{index}");
             let start = now_ms() - (index as u64 + 1) * DAY;
-            self.transcript(&format!("{session}.jsonl"), &session, start, calls());
+            self.transcript(&format!("{session}.jsonl"), &session, start, calls.to_vec());
         }
+    }
+
+    fn sessions(&self, prefix: &str, count: usize, script: &[&str]) {
+        self.sessions_of(prefix, count, &calls(script));
     }
 }
 
-fn rule<'a>(rules: &'a [Value], text: &str) -> &'a Value {
+fn rule<'a>(rules: &'a Value, text: &str) -> &'a Value {
     rules
+        .as_array()
+        .unwrap()
         .iter()
         .find(|rule| rule["text"] == text)
-        .unwrap_or_else(|| panic!("no rule {text:?} in {rules:#?}"))
+        .unwrap_or_else(|| panic!("no rule {text:?} in {rules:#}"))
 }
 
 fn held<'a>(report: &'a Value, class: &str) -> Vec<&'a Value> {
@@ -293,90 +327,80 @@ fn held<'a>(report: &'a Value, class: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+/// Why the first held candidate of `class` was held.
+fn reason<'a>(report: &'a Value, class: &str) -> &'a Value {
+    &held(report, class)[0]["reason"]
+}
+
+fn len(array: &Value) -> usize {
+    array.as_array().unwrap().len()
+}
+
+/// The values of these space-separated count fields.
+fn counts(value: &Value, keys: &str) -> Vec<u64> {
+    let count = |key: &&str| {
+        value[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{key}: {value}"))
+    };
+    words(keys).iter().map(count).collect()
+}
+
 const GLOB: &str = "(eval):1: no matches found: --include=*.rs";
 const STATE: &str = ".justless/learned.json";
-
-fn glob_calls() -> Vec<Call> {
-    vec![call(
-        "grep -rn needle --include=*.rs .; echo done",
-        Outcome::Ok("(eval):1: no matches found: --include=*.rs\ndone"),
-    )]
-}
-
+const GLOB_CALLS: [&str; 1] = [
+    "grep -rn needle --include=*.rs .; echo done => (eval):1: no matches found: --include=*.rs\ndone",
+];
 const GLOB_RULE: &str = "Quote glob patterns in shell arguments, as in `--include='*.rs'`; zsh stops a command at an unmatched glob.";
 const GH_RULE: &str = "`gh` is not installed on this machine.";
-
-fn gh_calls() -> Vec<Call> {
-    vec![call(
-        "gh pr list",
-        Outcome::Fail(127, "zsh:1: command not found: gh"),
-    )]
-}
+const GH_CALLS: [&str; 1] = ["gh pr list => 127: zsh:1: command not found: gh"];
+const PYTHON_RULE: &str = "Use `python3`, not `python`; `python` is not installed on this machine.";
+const MAKE_RULE: &str = "Run `make` from `server/`; the repository root has no Makefile.";
+const NO_MAKEFILE: &str =
+    "make test => 2: make: *** No targets specified and no makefile found.  Stop.";
+const MAKE_CALLS: [&str; 2] = [NO_MAKEFILE, "make -C server test => ok"];
 
 #[test]
 fn learn_command_not_found_alternative() {
     let lab = Lab::new();
     lab.tool("python3", "exit 0");
-    lab.transcript(
-        "s1.jsonl",
-        "s1",
-        now_ms() - 30 * MINUTE,
-        vec![
-            call(
-                "python scripts/gen.py",
-                Outcome::Fail(127, "(eval):1: command not found: python"),
-            ),
-            call("python3 scripts/gen.py", Outcome::Ok("generated")),
-        ],
-    );
+    let script = [
+        "python scripts/gen.py => 127: (eval):1: command not found: python",
+        "python3 scripts/gen.py => generated",
+    ];
+    lab.session("s1", 30 * MINUTE, &script);
     let rules = lab.rules(&[]);
-    let found = rule(
-        &rules,
-        "Use `python3`, not `python`; `python` is not installed on this machine.",
-    );
+    let found = rule(&rules, PYTHON_RULE);
     assert_eq!(found["class"], "missing_program");
-    assert_eq!(
-        (found["corrections"].as_u64(), found["sessions"].as_u64()),
-        (Some(1), Some(1))
-    );
+    assert_eq!(counts(found, "corrections sessions"), [1, 1]);
     assert_eq!(found["scope"], "machine");
     assert_eq!(found["check"]["state"], "verified");
     assert_eq!(found["example"], Value::Null);
     let text = lab.text(&[]);
-    assert!(
-        text.contains("missing program · machine · 1 failure(s), 1 correction(s) in 1 session(s)")
-            && text.contains("checked: not on PATH")
-            && !text.contains("scripts/gen.py"),
-        "{text}"
+    contains(
+        &text,
+        "missing program · machine · 1 failure(s), 1 correction(s) in 1 session(s)",
     );
+    contains(&text, "checked: not on PATH");
+    assert!(!text.contains("scripts/gen.py"), "{text}");
 
     // Installing the program makes the rule stale.
     lab.tool("python", "exit 0");
     let report = lab.json(&[]);
-    assert!(report["rules"].as_array().unwrap().is_empty(), "{report:#}");
-    assert_eq!(held(&report, "missing_program")[0]["reason"], "stale");
+    assert_eq!(report["rules"], json!([]), "{report:#}");
+    assert_eq!(reason(&report, "missing_program"), "stale");
     assert_eq!(report["skipped"]["stale"], 1);
 
     // A chain that exits 0 but could not run the alternative is no correction.
     let lab = Lab::new();
     lab.tool("python3", "exit 0");
-    lab.transcript(
-        "s1.jsonl",
-        "s1",
-        now_ms() - 30 * MINUTE,
-        vec![
-            call(
-                "python y.py",
-                Outcome::Fail(127, "zsh:1: command not found: python"),
-            ),
-            call(
-                "python3 y.py || echo failed",
-                Outcome::Ok("zsh:1: command not found: python3\nfailed"),
-            ),
-        ],
-    );
+    let script = [
+        "python y.py => 127: zsh:1: command not found: python",
+        "python3 y.py || echo failed => zsh:1: command not found: python3\nfailed",
+    ];
+    lab.session("s1", 30 * MINUTE, &script);
     let report = lab.json(&[]);
-    assert!(report["rules"].as_array().unwrap().is_empty(), "{report:#}");
+    assert_eq!(report["rules"], json!([]), "{report:#}");
     let python = held(&report, "missing_program")
         .into_iter()
         .find(|held| held["text"] == "`python` is not installed on this machine.")
@@ -387,124 +411,75 @@ fn learn_command_not_found_alternative() {
 #[test]
 fn learn_missing_program_needs_two_sessions() {
     let lab = Lab::new();
-    lab.sessions("a", 1, gh_calls);
+    lab.sessions("a", 1, &GH_CALLS);
     let report = lab.json(&[]);
-    assert!(report["rules"].as_array().unwrap().is_empty());
-    assert_eq!(
-        held(&report, "missing_program")[0]["reason"],
-        "below_min_sessions"
-    );
-    assert!(
-        lab.text(&[])
-            .contains("1 below --min-sessions (--min-sessions 1 lists them)")
+    assert_eq!(report["rules"], json!([]));
+    assert_eq!(reason(&report, "missing_program"), "below_min_sessions");
+    let text = lab.text(&[]);
+    contains(
+        &text,
+        "1 below --min-sessions (--min-sessions 1 lists them)",
     );
     assert_eq!(lab.rules(&["--min-sessions", "1"])[0]["text"], GH_RULE);
 
-    lab.sessions("b", 1, gh_calls);
+    lab.sessions("b", 1, &GH_CALLS);
     // A script that calls gh does not name it in its own command.
-    lab.transcript(
-        "c.jsonl",
-        "c",
-        now_ms() - 3 * DAY,
-        vec![call(
-            "./build.sh",
-            Outcome::Fail(127, "bash: line 3: gh: command not found"),
-        )],
-    );
+    let script = ["./build.sh => 127: bash: line 3: gh: command not found"];
+    lab.session("c", 3 * DAY, &script);
     let rules = lab.rules(&[]);
     let found = rule(&rules, GH_RULE);
-    assert_eq!(
-        (found["failures"].as_u64(), found["sessions"].as_u64()),
-        (Some(2), Some(2))
-    );
+    assert_eq!(counts(found, "failures sessions"), [2, 2]);
     assert_eq!(found["check"]["detail"], "not on PATH");
 
     // An exit-0 list does not contradict the rule; a plain success does.
-    lab.transcript(
-        "d.jsonl",
-        "d",
-        now_ms() - MINUTE,
-        vec![call(
-            "gh --version; true",
-            Outcome::Ok("zsh:1: command not found: gh"),
-        )],
-    );
+    let script = ["gh --version; true => zsh:1: command not found: gh"];
+    lab.session("d", MINUTE, &script);
     assert_eq!(lab.rules(&[])[0]["text"], GH_RULE);
-    lab.transcript(
-        "e.jsonl",
-        "e",
-        now_ms() - MINUTE / 2,
-        vec![call("gh --version", Outcome::Ok("gh version 2.0"))],
-    );
+    lab.session("e", MINUTE / 2, &["gh --version => gh version 2.0"]);
     let report = lab.json(&[]);
-    assert!(report["rules"].as_array().unwrap().is_empty(), "{report:#}");
-    assert_eq!(
-        held(&report, "missing_program")[0]["reason"],
-        "contradicted"
-    );
+    assert_eq!(report["rules"], json!([]), "{report:#}");
+    assert_eq!(reason(&report, "missing_program"), "contradicted");
     assert_eq!(report["skipped"]["contradicted"], 1);
 }
 
 #[test]
 fn learn_zsh_shell_rules() {
     let mut lab = Lab::new();
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
     // Displayed text is not the command's own error.
-    lab.transcript(
-        "notes.jsonl",
-        "notes",
-        now_ms() - 3 * DAY,
-        vec![call("cat notes.txt", Outcome::Ok(GLOB))],
-    );
+    lab.session("notes", 3 * DAY, &[&format!("cat notes.txt => {GLOB}")]);
     let rules = lab.rules(&[]);
     let found = rule(&rules, GLOB_RULE);
     assert_eq!(found["class"], "zsh_glob");
     assert_eq!(found["failures"], 2);
-    assert_eq!(
-        found["example"],
-        json!({"wrong": "--include=*.rs", "right": "--include='*.rs'", "signal": "zsh: no matches found"})
-    );
+    let example = json!({"wrong": "--include=*.rs", "right": "--include='*.rs'", "signal": "zsh: no matches found"});
+    assert_eq!(found["example"], example);
     assert_eq!(found["check"]["detail"], "SHELL is zsh");
 
     lab.shell = "/bin/bash".into();
     let report = lab.json(&[]);
-    assert!(report["rules"].as_array().unwrap().is_empty());
-    assert_eq!(held(&report, "zsh_glob")[0]["reason"], "stale");
+    assert_eq!(report["rules"], json!([]));
+    assert_eq!(reason(&report, "zsh_glob"), "stale");
 
     let lab = Lab::new();
-    lab.sessions("q", 2, || {
-        vec![
-            call("echo ===== done", Outcome::Fail(1, "zsh:1: ==== not found")),
-            // Quoted, the word is not expanded, so the same line is not its error.
-            call(
-                "echo '=====' && cat log",
-                Outcome::Fail(1, "zsh:1: ==== not found"),
-            ),
-        ]
-    });
-    let rules = lab.rules(&[]);
-    let found = rule(
-        &rules,
-        "Quote shell words that start with `=`, as in `echo '=== done'`; zsh expands them as commands.",
-    );
-    assert_eq!(found["failures"], 2);
+    let script = [
+        "echo ===== done => 1: zsh:1: ==== not found",
+        // Quoted, the word is not expanded, so the same line is not its error.
+        "echo '=====' && cat log => 1: zsh:1: ==== not found",
+    ];
+    lab.sessions("q", 2, &script);
+    let text = "Quote shell words that start with `=`, as in `echo '=== done'`; zsh expands them as commands.";
+    assert_eq!(rule(&lab.rules(&[]), text)["failures"], 2);
 
     // Three agent threads of one session are still one session.
     let lab = Lab::new();
     for agent in ["a", "b", "c"] {
-        lab.transcript(
-            &format!("s1/subagents/agent-{agent}.jsonl"),
-            "s1",
-            now_ms() - DAY,
-            glob_calls(),
-        );
+        let file = format!("s1/subagents/agent-{agent}.jsonl");
+        lab.transcript(&file, "s1", now_ms() - DAY, calls(&GLOB_CALLS));
     }
     let report = lab.json(&[]);
     let glob = &held(&report, "zsh_glob")[0];
-    assert_eq!(
-        (glob["threads"].as_u64(), glob["sessions"].as_u64()),
-        (Some(3), Some(1))
-    );
+    assert_eq!(counts(glob, "threads sessions"), [3, 1]);
     assert_eq!(glob["reason"], "below_min_sessions");
 }
 
@@ -521,120 +496,65 @@ fn fake_make(lab: &Lab) {
 fn learn_wrong_directory_from_run_archive() {
     let lab = Lab::new();
     fake_make(&lab);
-    let failed = lab.run("", &["--session", "s1", "--", "make", "test"]);
+    let failed = lab.run("", "--session s1 -- make test");
     assert_eq!(failed.status.code(), Some(2));
     let id = run_id(&failed);
-    assert!(
-        lab.run("server", &["--session", "s1", "--", "make", "test"])
-            .status
-            .success()
-    );
-    let record: Value =
-        serde_json::from_str(&lab.read(&format!(".justless/runs/{id}/record.json"))).unwrap();
-    assert_eq!(
-        (&record["argv"], &record["cwd"], &record["session"]),
-        (&json!(["make", "test"]), &json!(""), &json!("s1"))
-    );
-    let runs: Vec<Value> = fs::read_dir(lab.root.join(".justless/runs"))
-        .unwrap()
-        .map(|entry| {
-            serde_json::from_str(
-                &fs::read_to_string(entry.unwrap().path().join("record.json")).unwrap(),
-            )
-            .unwrap()
-        })
+    let passed = lab.run("server", "--session s1 -- make test");
+    assert!(passed.status.success());
+    let record = lab.record(&id);
+    assert_eq!(record["argv"], json!(["make", "test"]));
+    assert_eq!(record["cwd"], "");
+    assert_eq!(record["session"], "s1");
+    let ids = fs::read_dir(lab.root.join(".justless/runs")).unwrap();
+    let cwds: Vec<Value> = ids
+        .map(|entry| lab.record(entry.unwrap().file_name().to_str().unwrap())["cwd"].clone())
         .collect();
-    assert!(runs.iter().any(|run| run["cwd"] == "server"));
+    assert!(cwds.contains(&json!("server")), "{cwds:?}");
 
     let report = lab.json(&[]);
-    let found = rule(
-        report["rules"].as_array().unwrap(),
-        "Run `make` from `server/`; the repository root has no Makefile.",
-    );
+    let found = rule(&report["rules"], MAKE_RULE);
     assert_eq!(found["scope"], "project");
-    assert_eq!(
-        found["check"],
-        json!({"state": "verified", "detail": "server/Makefile"})
-    );
-    assert_eq!(
-        found["evidence"][0],
-        json!({"source": "run", "id": id, "stream": "stderr"})
-    );
-    assert_eq!(
-        found["example"],
-        json!({"wrong": "make test", "right": "make test (in server/)", "signal": "make: no makefile"})
-    );
+    let check = json!({"state": "verified", "detail": "server/Makefile"});
+    assert_eq!(found["check"], check);
+    let evidence = json!({"source": "run", "id": id, "stream": "stderr"});
+    assert_eq!(found["evidence"][0], evidence);
+    let example = json!({"wrong": "make test", "right": "make test (in server/)", "signal": "make: no makefile"});
+    assert_eq!(found["example"], example);
     assert_eq!(report["sources"]["runs"]["scanned"], 2);
     assert_eq!(report["sources"]["transcripts"]["results"], 0);
     let text = lab.text(&[]);
-    assert!(
-        text.contains(&format!("   evidence: justless log {id} --stream stderr\n"))
-            && text.contains(
-                "Preview only. `justless learn --apply` writes these rules to AGENTS.md."
-            ),
-        "{text}"
+    contains(
+        &text,
+        &format!("   evidence: justless log {id} --stream stderr\n"),
+    );
+    contains(
+        &text,
+        "Preview only. `justless learn --apply` writes these rules to AGENTS.md.",
     );
 
     lab.write("Makefile", "test:\n");
     let report = lab.json(&[]);
-    assert!(report["rules"].as_array().unwrap().is_empty());
-    assert_eq!(held(&report, "wrong_directory")[0]["reason"], "stale");
+    assert_eq!(report["rules"], json!([]));
+    assert_eq!(reason(&report, "wrong_directory"), "stale");
 }
 
 #[test]
 fn learn_wrong_directory_normalizes_commands() {
     let lab = Lab::new();
     lab.write("server/Makefile", "test:\n");
-    let missing = "make: *** No rule to make target `test'.  Stop.";
-    lab.transcript(
-        "a.jsonl",
-        "a",
-        now_ms() - 2 * DAY,
-        vec![
-            call("make test", Outcome::Fail(2, missing)),
-            call("make -C server test", Outcome::Ok("ok")),
-        ],
-    );
-    lab.transcript(
-        "b.jsonl",
-        "b",
-        now_ms() - DAY,
-        vec![
-            call("make test", Outcome::Fail(2, missing)),
-            call("cd server && make test 2>&1 | tail -5", Outcome::Ok("ok")),
-        ],
-    );
+    let missing = "make test => 2: make: *** No rule to make target `test'.  Stop.";
+    lab.session("a", 2 * DAY, &[missing, "make -C server test => ok"]);
+    let piped = "cd server && make test 2>&1 | tail -5 => ok";
+    lab.session("b", DAY, &[missing, piped]);
     lab.write(".claude/worktrees/w1/.git", "gitdir: elsewhere\n");
-    lab.transcript(
-        "c.jsonl",
-        "c",
-        now_ms() - 2 * MINUTE,
-        vec![
-            call_in(
-                ".claude/worktrees/w1",
-                "make test",
-                Outcome::Fail(2, missing),
-            ),
-            call_in(
-                ".claude/worktrees/w1/server",
-                "make test",
-                Outcome::Ok("ok"),
-            ),
-        ],
-    );
+    let mut worktree = calls(&[missing, "make test => ok"]);
+    worktree[0].cwd = ".claude/worktrees/w1".into();
+    worktree[1].cwd = ".claude/worktrees/w1/server".into();
+    lab.transcript("c.jsonl", "c", now_ms() - 2 * MINUTE, worktree);
     let rules = lab.rules(&[]);
-    assert_eq!(rules.len(), 1, "{rules:#?}");
-    assert_eq!(
-        rules[0]["text"],
-        "Run `make` from `server/`; the repository root has no Makefile."
-    );
-    assert_eq!(
-        (
-            rules[0]["corrections"].as_u64(),
-            rules[0]["sessions"].as_u64()
-        ),
-        (Some(3), Some(3))
-    );
+    assert_eq!(len(&rules), 1, "{rules:#}");
+    assert_eq!(rules[0]["text"], MAKE_RULE);
+    assert_eq!(counts(&rules[0], "corrections sessions"), [3, 3]);
 }
 
 #[test]
@@ -644,100 +564,57 @@ fn learn_unknown_target() {
         "package.json",
         r#"{"scripts": {"test:unit": "node --test"}}"#,
     );
-    lab.sessions("n", 1, || {
-        vec![
-            call(
-                "npm test",
-                Outcome::Fail(1, "npm error Missing script: \"test\""),
-            ),
-            call("npm run test:unit", Outcome::Ok("ok")),
-        ]
-    });
+    let npm = [
+        "npm test => 1: npm error Missing script: \"test\"",
+        "npm run test:unit => ok",
+    ];
+    lab.sessions("n", 1, &npm);
     let script = "Run `npm run test:unit`; there is no `test` script.";
     let report = lab.json(&[]);
-    assert!(report["rules"].as_array().unwrap().is_empty());
+    assert_eq!(report["rules"], json!([]));
     assert_eq!(held(&report, "unknown_target")[0]["text"], script);
-    lab.sessions("m", 1, || {
-        vec![
-            call(
-                "npm test",
-                Outcome::Fail(1, "npm error Missing script: \"test\""),
-            ),
-            call("npm run test:unit", Outcome::Ok("ok")),
-        ]
-    });
-    let rules = lab.rules(&[]);
-    assert_eq!(
-        rule(&rules, script)["check"],
-        json!({"state": "verified", "detail": "package.json scripts"})
-    );
+    lab.sessions("m", 1, &npm);
+    let check = json!({"state": "verified", "detail": "package.json scripts"});
+    assert_eq!(rule(&lab.rules(&[]), script)["check"], check);
 
     lab.write("Makefile", "check:\n\ttrue\n");
-    lab.sessions("k", 2, || {
-        vec![
-            call(
-                "make lint",
-                Outcome::Fail(2, "make: *** No rule to make target `lint'.  Stop."),
-            ),
-            call("make check", Outcome::Ok("ok")),
-        ]
-    });
+    let make = [
+        "make lint => 2: make: *** No rule to make target `lint'.  Stop.",
+        "make check => ok",
+    ];
+    lab.sessions("k", 2, &make);
     lab.write("crates/core/Cargo.toml", "[package]\nname = \"core-lib\"\n");
-    lab.sessions("p", 2, || {
-        vec![
-            call(
-                "cargo test -p core",
-                Outcome::Fail(
-                    101,
-                    "error: package ID specification `core` did not match any packages",
-                ),
-            ),
-            call(
-                "cargo test -p core-lib",
-                Outcome::Ok("test result: ok. 3 passed"),
-            ),
-        ]
-    });
+    let cargo = [
+        "cargo test -p core => 101: error: package ID specification `core` did not match any packages",
+        "cargo test -p core-lib => test result: ok. 3 passed",
+    ];
+    lab.sessions("p", 2, &cargo);
     let rules = lab.rules(&[]);
-    assert_eq!(
-        rule(&rules, "Run `make check`; there is no `lint` target.")["check"]["detail"],
-        "Makefile"
+    let make = rule(&rules, "Run `make check`; there is no `lint` target.");
+    assert_eq!(make["check"]["detail"], "Makefile");
+    let cargo = rule(
+        &rules,
+        "Use `cargo test -p core-lib`; there is no package `core`.",
     );
-    assert_eq!(
-        rule(
-            &rules,
-            "Use `cargo test -p core-lib`; there is no package `core`."
-        )["check"]["detail"],
-        "crates/core/Cargo.toml"
-    );
+    assert_eq!(cargo["check"]["detail"], "crates/core/Cargo.toml");
 }
 
 #[test]
 fn learn_options() {
     let lab = Lab::new();
-    lab.sessions("o", 2, || {
-        vec![
-            call(
-                "./tool.py -n 4",
-                Outcome::Fail(2, "usage: tool.py [-h] [--last N]\ntool.py: error: unrecognized arguments: -n"),
-            ),
-            call("./tool.py --last 4", Outcome::Ok("ok")),
-            call(
-                "./tool.py",
-                Outcome::Fail(2, "tool.py: error: the following arguments are required: --x"),
-            ),
-            call("./tool.py --x 1", Outcome::Ok("ok")),
-            call(
-                "./cli build --nope",
-                Outcome::Fail(2, "error: Found argument '--nope' which wasn't expected, or isn't valid in this context"),
-            ),
-            call("./cli build", Outcome::Ok("ok")),
-            call("git commit --ammend", Outcome::Fail(129, "error: unknown option `ammend'")),
-            call("git commit --amend", Outcome::Ok("ok")),
-        ]
-    });
+    let script = [
+        "./tool.py -n 4 => 2: usage: tool.py [-h] [--last N]\ntool.py: error: unrecognized arguments: -n",
+        "./tool.py --last 4 => ok",
+        "./tool.py => 2: tool.py: error: the following arguments are required: --x",
+        "./tool.py --x 1 => ok",
+        "./cli build --nope => 2: error: Found argument '--nope' which wasn't expected, or isn't valid in this context",
+        "./cli build => ok",
+        "git commit --ammend => 129: error: unknown option `ammend'",
+        "git commit --amend => ok",
+    ];
+    lab.sessions("o", 2, &script);
     let report = lab.json(&[]);
-    let rules = report["rules"].as_array().unwrap();
+    let rules = &report["rules"];
     let option = rule(
         rules,
         "`./tool.py` here does not accept `-n`; use `--last`.",
@@ -746,13 +623,11 @@ fn learn_options() {
     assert_eq!(option["check"]["state"], "unverified");
     rule(rules, "Pass `--x` to `./tool.py`.");
     rule(rules, "`./cli build` here does not accept `--nope`.");
-    assert_eq!(rules.len(), 3, "{rules:#?}");
+    assert_eq!(len(rules), 3, "{rules:#}");
     assert_eq!(report["skipped"]["typos"], 2);
     let text = lab.text(&[]);
-    assert!(
-        text.contains("2 typo(s)") && text.contains("not checked"),
-        "{text}"
-    );
+    contains(&text, "2 typo(s)");
+    contains(&text, "not checked");
 }
 
 #[test]
@@ -760,41 +635,29 @@ fn learn_wrong_test_path() {
     let lab = Lab::new();
     fs::create_dir_all(lab.root.join("api/tests")).unwrap();
     fs::create_dir_all(lab.root.join("src")).unwrap();
-    lab.sessions("t", 2, || {
-        vec![
-            call(
-                "pytest tests/test_api.py",
-                Outcome::Fail(4, "ERROR: file or directory not found: tests/test_api.py"),
-            ),
-            call("pytest api/tests/test_api.py", Outcome::Ok("1 passed")),
-            // Another file in the same directory is a one-off.
-            call(
-                "pytest api/tests/test_a.py",
-                Outcome::Fail(4, "ERROR: file or directory not found: api/tests/test_a.py"),
-            ),
-            call("pytest api/tests/test_b.py", Outcome::Ok("1 passed")),
-            call(
-                "node --test tests/x.test.js",
-                Outcome::Fail(1, "Could not find 'tests/x.test.js'"),
-            ),
-            call("node --test src/x.test.js", Outcome::Ok("# pass 1")),
-        ]
-    });
+    let script = [
+        "pytest tests/test_api.py => 4: ERROR: file or directory not found: tests/test_api.py",
+        "pytest api/tests/test_api.py => 1 passed",
+        // Another file in the same directory is a one-off.
+        "pytest api/tests/test_a.py => 4: ERROR: file or directory not found: api/tests/test_a.py",
+        "pytest api/tests/test_b.py => 1 passed",
+        "node --test tests/x.test.js => 1: Could not find 'tests/x.test.js'",
+        "node --test src/x.test.js => # pass 1",
+    ];
+    lab.sessions("t", 2, &script);
     let rules = lab.rules(&[]);
-    assert_eq!(rules.len(), 2, "{rules:#?}");
-    assert_eq!(
-        rule(
-            &rules,
-            "`pytest` tests are under `api/tests/`, not `tests/`."
-        )["check"]["detail"],
-        "api/tests/"
+    assert_eq!(len(&rules), 2, "{rules:#}");
+    let pytest = rule(
+        &rules,
+        "`pytest` tests are under `api/tests/`, not `tests/`.",
     );
+    assert_eq!(pytest["check"]["detail"], "api/tests/");
     rule(
         &rules,
         "`node --test` tests are under `src/`, not `tests/`.",
     );
     fs::create_dir(lab.root.join("tests")).unwrap();
-    assert!(lab.rules(&[]).is_empty());
+    assert_eq!(lab.rules(&[]), json!([]));
 }
 
 #[test]
@@ -811,21 +674,14 @@ fn learn_empty_test_run() {
         "if [ \"$1\" = -k ]; then echo '1 failed'; exit 1; fi\necho 'no tests ran'; exit 5",
     );
     for session in ["s1", "s2"] {
-        for args in [
-            &["cargo", "test"][..],
-            &["cargo", "test", "-p", "core"],
-            &["cargo", "test", "x"],
-            &["cargo", "test", "x", "--lib"],
-            &["pytest"],
-            &["pytest", "-k", "api"],
-        ] {
-            let mut all = vec!["--session", session, "--"];
-            all.extend(args);
-            lab.run("", &all);
+        let commands =
+            "cargo test,cargo test -p core,cargo test x,cargo test x --lib,pytest,pytest -k api";
+        for command in commands.split(',') {
+            lab.run("", &format!("--session {session} -- {command}"));
         }
     }
     let rules = lab.rules(&[]);
-    assert_eq!(rules.len(), 2, "{rules:#?}");
+    assert_eq!(len(&rules), 2, "{rules:#}");
     let cargo = rule(
         &rules,
         "Run tests with `cargo test -p core`; plain `cargo test` here runs no tests.",
@@ -841,45 +697,26 @@ fn learn_empty_test_run() {
 fn learn_wrong_package_manager() {
     let lab = Lab::new();
     lab.write("pnpm-lock.yaml", "lockfileVersion: 9\n");
-    lab.transcript(
-        "a.jsonl",
-        "a",
-        now_ms() - DAY,
-        vec![
-            call(
-                "npm install",
-                Outcome::Fail(1, "npm error code EUNSUPPORTEDPROTOCOL\nnpm error Unsupported URL Type \"workspace:\": workspace:*"),
-            ),
-            call("pnpm install", Outcome::Ok("done")),
-            call(
-                "yarn install",
-                Outcome::Fail(1, "Usage Error: This project is configured to use pnpm because /x/package.json has a \"packageManager\" field"),
-            ),
-            call("pnpm install", Outcome::Ok("done")),
-        ],
-    );
+    let script = [
+        "npm install => 1: npm error code EUNSUPPORTEDPROTOCOL\nnpm error Unsupported URL Type \"workspace:\": workspace:*",
+        "pnpm install => done",
+        "yarn install => 1: Usage Error: This project is configured to use pnpm because /x/package.json has a \"packageManager\" field",
+        "pnpm install => done",
+    ];
+    lab.session("a", DAY, &script);
     let rules = lab.rules(&[]);
     let npm = rule(
         &rules,
         "Use `pnpm`, not `npm`; this project has pnpm-lock.yaml.",
     );
-    assert_eq!(
-        (npm["corrections"].as_u64(), npm["sessions"].as_u64()),
-        (Some(1), Some(1))
-    );
-    rule(
-        &rules,
-        "Use `pnpm`, not `yarn`; this project has pnpm-lock.yaml.",
-    );
+    assert_eq!(counts(npm, "corrections sessions"), [1, 1]);
+    let yarn = "Use `pnpm`, not `yarn`; this project has pnpm-lock.yaml.";
+    rule(&rules, yarn);
     // With npm's lockfile too, the npm rule no longer holds.
     lab.write("package-lock.json", "{}\n");
     let report = lab.json(&[]);
-    let rules = report["rules"].as_array().unwrap();
-    assert_eq!(rules.len(), 1, "{report:#}");
-    assert_eq!(
-        rules[0]["text"],
-        "Use `pnpm`, not `yarn`; this project has pnpm-lock.yaml."
-    );
+    assert_eq!(len(&report["rules"]), 1, "{report:#}");
+    assert_eq!(report["rules"][0]["text"], yarn);
     let npm = held(&report, "wrong_package_manager");
     assert_eq!((npm.len(), &npm[0]["reason"]), (1, &json!("stale")));
 }
@@ -888,57 +725,58 @@ fn learn_wrong_package_manager() {
 fn learn_ignores_non_mistakes() {
     let lab = Lab::new();
     let gh = "zsh:1: command not found: gh\n";
-    let raw = |content: &str, is_error: bool, result: Value| {
-        Outcome::Raw(content.to_owned(), is_error, result)
+    let raw = |command: &str, content: &str, is_error: bool, result: Value| {
+        call(command, Outcome::Raw(content.into(), is_error, result))
     };
-    lab.sessions("x", 2, || {
-        vec![
-            call("gh pr list", raw(&format!("Permission to use Bash has been denied. {gh}"), true, json!("Error: denied"))),
-            call("gh pr list", raw("The user doesn't want to proceed with this tool use.", true, json!("Error"))),
-            call("gh pr list", raw("<tool_use_error>Cancelled</tool_use_error>", true, json!("Error"))),
-            call("gh pr list", raw("This command runs in an isolated worktree.", true, json!("Error"))),
-            call("gh pr list", raw(gh, false, json!({"stdout": gh, "interrupted": true}))),
-            call("gh pr view", raw(gh, false, json!({"stdout": gh, "interrupted": false, "backgroundTaskId": "b1"}))),
-            call("gh pr diff", raw(gh, false, json!({"stdout": gh, "interrupted": false, "timedOutAfterMs": 120000}))),
-            call("grep foo x", Outcome::Unknown("")),
-            call("grep foo x", Outcome::Fail(1, "")),
-            call("grep -r foo .", Outcome::Ok("x:foo")),
-            call(
-                "cargo test",
-                Outcome::Fail(101, "running 2 tests\ntest a ... FAILED\ntest result: FAILED. 1 passed; 1 failed"),
-            ),
-            call("cargo test --release", Outcome::Ok("test result: ok")),
-            call(
-                "python3 x.py",
-                Outcome::Fail(1, "Traceback (most recent call last):\nModuleNotFoundError: No module named 'requests'"),
-            ),
-            call(
-                "justless qury x",
-                Outcome::Fail(2, "error: Found argument 'qury' which wasn't expected"),
-            ),
-            call("justless query x", Outcome::Ok("x")),
-        ]
-    });
+    let denied = format!("Permission to use Bash has been denied. {gh}");
+    let refused = "The user doesn't want to proceed with this tool use.";
+    let cancelled = "<tool_use_error>Cancelled</tool_use_error>";
+    let isolated = "This command runs in an isolated worktree.";
+    let error = json!("Error");
+    let interrupted = json!({"stdout": gh, "interrupted": true});
+    let background = json!({"stdout": gh, "interrupted": false, "backgroundTaskId": "b1"});
+    let timed_out = json!({"stdout": gh, "interrupted": false, "timedOutAfterMs": 120000});
+    let mut ignored = vec![
+        raw("gh pr list", &denied, true, json!("Error: denied")),
+        raw("gh pr list", refused, true, error.clone()),
+        raw("gh pr list", cancelled, true, error.clone()),
+        raw("gh pr list", isolated, true, error),
+        raw("gh pr list", gh, false, interrupted),
+        raw("gh pr view", gh, false, background),
+        raw("gh pr diff", gh, false, timed_out),
+        call("grep foo x", Outcome::Unknown(String::new())),
+    ];
+    ignored.extend(calls(&[
+        "grep foo x => 1: ",
+        "grep -r foo . => x:foo",
+        "cargo test => 101: running 2 tests\ntest a ... FAILED\ntest result: FAILED. 1 passed; 1 failed",
+        "cargo test --release => test result: ok",
+        "python3 x.py => 1: Traceback (most recent call last):\nModuleNotFoundError: No module named 'requests'",
+        "justless qury x => 2: error: Found argument 'qury' which wasn't expected",
+        "justless query x => x",
+    ]));
+    lab.sessions_of("x", 2, &ignored);
     let report = lab.json(&["--min-sessions", "1"]);
     assert_eq!(report["rules"], json!([]), "{report:#}");
     assert_eq!(report["held"], json!([]), "{report:#}");
     let transcripts = &report["sources"]["transcripts"];
-    assert_eq!(transcripts["not_run"], 14);
-    assert_eq!(transcripts["status_unknown"], 2);
-    assert_eq!(transcripts["results"], 16);
+    let expected = [14, 2, 16];
+    assert_eq!(
+        counts(transcripts, "not_run status_unknown results"),
+        expected
+    );
 }
 
 #[test]
 fn learn_transcript_format() {
     let lab = Lab::new();
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
     let summary = |report: Value| {
         let rule = &report["rules"][0];
+        let fields = [&rule["id"], &rule["failures"], &rule["sessions"]];
         (
             report["sources"].clone(),
-            rule["id"].clone(),
-            rule["failures"].clone(),
-            rule["sessions"].clone(),
+            fields.map(Value::clone),
             report["held"].clone(),
         )
     };
@@ -957,15 +795,12 @@ fn learn_transcript_format() {
         "message": {"content": [{"type": "tool_use", "id": "n1", "name": "Bash", "input": {"command": "gh x"}}]}});
     let no_cwd_result = json!({"type": "user", "cwd": lab.root, "timestamp": timestamp(now_ms() - DAY), "sessionId": "g0",
         "message": {"content": [{"type": "tool_result", "tool_use_id": "n1", "content": "zsh:1: command not found: gh"}]}});
-    fs::write(
-        &path,
-        format!("{blob}\n{user_use}\n{no_cwd}\n{no_cwd_result}\n{original}"),
-    )
-    .unwrap();
+    let lines = format!("{blob}\n{user_use}\n{no_cwd}\n{no_cwd_result}\n{original}");
+    fs::write(&path, lines).unwrap();
     assert_eq!(summary(lab.json(&[])), baseline);
 
     // A resumed session replays the same tool_use id: it counts once.
-    let mut replay = glob_calls();
+    let mut replay = calls(&GLOB_CALLS);
     replay[0].id = Some("toolu_g0-jsonl_0".into());
     lab.transcript("g0-resumed.jsonl", "g0", now_ms() - DAY, replay);
     let report = lab.json(&[]);
@@ -973,98 +808,50 @@ fn learn_transcript_format() {
     assert_eq!(report["sources"]["transcripts"]["files"], 3);
 
     // Workflow subagents are read and share their parent's session.
-    lab.transcript(
-        "g1/subagents/workflows/wf_1/agent-a.jsonl",
-        "g1",
-        now_ms() - DAY / 2,
-        glob_calls(),
-    );
-    fs::write(
-        lab.transcripts()
-            .join("g1/subagents/workflows/wf_1/journal.jsonl"),
-        "{\"type\":\"launched\"}\n",
-    )
-    .unwrap();
+    let workflow = "g1/subagents/workflows/wf_1";
+    let agent = format!("{workflow}/agent-a.jsonl");
+    lab.transcript(&agent, "g1", now_ms() - DAY / 2, calls(&GLOB_CALLS));
+    let journal = lab.transcripts().join(workflow).join("journal.jsonl");
+    fs::write(journal, "{\"type\":\"launched\"}\n").unwrap();
     let report = lab.json(&[]);
     let transcripts = &report["sources"]["transcripts"];
-    assert_eq!(
-        (
-            transcripts["files"].as_u64(),
-            transcripts["sessions"].as_u64(),
-            transcripts["threads"].as_u64()
-        ),
-        (Some(4), Some(2), Some(3))
-    );
-    let glob = rule(report["rules"].as_array().unwrap(), GLOB_RULE);
-    assert_eq!(
-        (glob["sessions"].as_u64(), glob["threads"].as_u64()),
-        (Some(2), Some(3))
-    );
+    assert_eq!(counts(transcripts, "files sessions threads"), [4, 2, 3]);
+    let glob = rule(&report["rules"], GLOB_RULE);
+    assert_eq!(counts(glob, "sessions threads"), [2, 3]);
 }
 
 #[test]
 fn learn_links_and_dedupes_runs() {
+    let lab = Lab::new();
+    fake_make(&lab);
+    let hooked = format!("--hook --session {} -- make test", digest("s1"));
+    let id = run_id(&lab.run("", &hooked));
+    // A hooked success that reached the agent verbatim prints no footer.
+    let passed = lab.run("server", &hooked);
+    let quiet = passed.status.success() && stderr(&passed).is_empty();
+    assert!(quiet, "{passed:?}");
+    // A run from another client stays.
+    lab.run("", "--hook --session codex-1 -- make build");
     for form in [
         "[justless {id}] exit 2 · 60 of 60 output bytes · justless log {id}",
         "[justless {id} · exit 2]",
         "[justless {id} · 1.0 KB of 9.0 KB shown · exit 2]",
     ] {
-        let lab = Lab::new();
-        fake_make(&lab);
-        let session = digest("s1");
-        let failed = lab.run("", &["--hook", "--session", &session, "--", "make", "test"]);
-        let id = run_id(&failed);
-        // A hooked success that reached the agent verbatim prints no footer.
-        let passed = lab.run(
-            "server",
-            &["--hook", "--session", &session, "--", "make", "test"],
-        );
-        assert!(
-            passed.status.success() && stderr(&passed).is_empty(),
-            "{passed:?}"
-        );
-        // A run from another client stays.
-        lab.run(
-            "",
-            &["--hook", "--session", "codex-1", "--", "make", "build"],
-        );
-        let footer = form.replace("{id}", &id);
-        lab.transcript(
-            "s1.jsonl",
+        let failed = format!("make test => 2: {}", form.replace("{id}", &id));
+        lab.session(
             "s1",
-            now_ms() - 10 * MINUTE,
-            vec![
-                Call {
-                    outcome: failure(2, footer),
-                    ..call("make test", Outcome::Ok(""))
-                },
-                call("cd server && make test", Outcome::Ok("built test")),
-            ],
+            10 * MINUTE,
+            &[&failed, "cd server && make test => built test"],
         );
         let report = lab.json(&[]);
         let runs = &report["sources"]["runs"];
-        assert_eq!(
-            (
-                runs["scanned"].as_u64(),
-                runs["linked"].as_u64(),
-                runs["covered_by_transcripts"].as_u64()
-            ),
-            (Some(3), Some(1), Some(1)),
-            "{form}"
-        );
-        let found = rule(
-            report["rules"].as_array().unwrap(),
-            "Run `make` from `server/`; the repository root has no Makefile.",
-        );
-        assert_eq!(
-            (found["failures"].as_u64(), found["sessions"].as_u64()),
-            (Some(1), Some(1)),
-            "{form}"
-        );
-        assert_eq!(
-            found["evidence"][0],
-            json!({"source": "run", "id": id, "stream": "stderr"})
-        );
+        let expected = [3, 1, 1];
+        let keys = "scanned linked covered_by_transcripts";
+        assert_eq!(counts(runs, keys), expected, "{form}");
+        let found = rule(&report["rules"], MAKE_RULE);
+        assert_eq!(counts(found, "failures sessions"), [1, 1], "{form}");
+        let evidence = json!({"source": "run", "id": id, "stream": "stderr"});
+        assert_eq!(found["evidence"][0], evidence);
     }
 }
 
@@ -1083,91 +870,68 @@ fn learn_drops_credentials() {
         "ssh host make test".to_owned(),
     ];
     for (index, command) in secrets.iter().enumerate() {
-        let session = format!("c{index}");
-        lab.transcript(
-            &format!("{session}.jsonl"),
-            &session,
-            now_ms() - DAY,
-            vec![
-                Call {
-                    outcome: failure(2, "make: *** No rule to make target `test'.  Stop."),
-                    ..call(command, Outcome::Ok(""))
-                },
-                call(&format!("cd server && {command}"), Outcome::Ok("ok")),
-            ],
-        );
+        let failed = format!("{command} => 2: make: *** No rule to make target `test'.  Stop.");
+        let fixed = format!("cd server && {command} => ok");
+        lab.session(&format!("c{index}"), DAY, &[&failed, &fixed]);
     }
     let report = lab.json(&["--min-sessions", "1"]);
     assert_eq!(report["rules"], json!([]), "{report:#}");
     assert_eq!(report["skipped"]["credentials"], secrets.len());
     let text = lab.text(&["--min-sessions", "1"]) + &report.to_string();
-    for secret in [
-        "abc123",
-        "hunter2",
-        "example.invalid",
-        "ghp_",
-        "Zx8Qk",
-        "/home/someone",
-        "ssh host",
-    ] {
+    let leaked = "abc123,hunter2,example.invalid,ghp_,Zx8Qk,/home/someone,ssh host";
+    for secret in leaked.split(',') {
         assert!(!text.contains(secret), "{secret}: {text}");
     }
-    assert!(
-        text.contains("7 dropped for a possible credential"),
-        "{text}"
-    );
+    contains(&text, "7 dropped for a possible credential");
 }
 
+/// A later success of the failed command, from the root, contradicts a
+/// wrong-directory rule and removes it from the file it was written to.
 #[test]
 fn learn_contradiction() {
-    let lab = Lab::new();
-    lab.write("server/Makefile", "test:\n");
-    let episode = || {
-        vec![
-            call(
-                "make test",
-                Outcome::Fail(
-                    2,
-                    "make: *** No targets specified and no makefile found.  Stop.",
-                ),
-            ),
-            call("make -C server test", Outcome::Ok("ok")),
-        ]
-    };
-    lab.transcript("a.jsonl", "a", now_ms() - DAY, episode());
-    let text = "Run `make` from `server/`; the repository root has no Makefile.";
-    let output = lab.text(&["--apply"]);
-    assert!(
-        output.contains("Updated CLAUDE.md: 1 learned rule(s) (1 added)."),
-        "{output}"
-    );
-    assert!(lab.read("CLAUDE.md").contains(text));
-    lab.transcript(
-        "b.jsonl",
-        "b",
-        now_ms() - MINUTE,
-        vec![call("make test", Outcome::Ok("ok"))],
-    );
-    let report = lab.json(&[]);
-    assert_eq!(
-        held(&report, "wrong_directory")[0]["reason"],
-        "contradicted"
-    );
-    let output = lab.text(&["--apply", "--target", "claude"]);
-    assert!(
-        output.contains(
-            "Updated CLAUDE.md: 0 learned rule(s) (1 removed: the command later succeeded)."
+    let npm_missing = "npm error code ENOENT\nnpm error syscall open\nnpm error path /x/package.json\nnpm error enoent Could not read package.json";
+    let npm_failed = format!("npm test => 254: {npm_missing}");
+    for (manifest, content, failed, fixed, text) in [
+        (
+            "server/Makefile",
+            "test:\n",
+            NO_MAKEFILE,
+            "make -C server test => ok",
+            MAKE_RULE,
         ),
-        "{output}"
-    );
-    assert_eq!(lab.read("CLAUDE.md"), "");
+        (
+            "web/package.json",
+            "{}\n",
+            &npm_failed,
+            "npm --prefix web test => ok",
+            "Run `npm` from `web/`; the repository root has no package.json.",
+        ),
+    ] {
+        let lab = Lab::new();
+        lab.write(manifest, content);
+        lab.session("a", DAY, &[failed, fixed]);
+        let output = lab.text(&["--apply"]);
+        contains(&output, "Updated CLAUDE.md: 1 learned rule(s) (1 added).");
+        contains(&lab.read("CLAUDE.md"), text);
+        let command = failed.split_once(" => ").unwrap().0;
+        lab.session("b", MINUTE, &[&format!("{command} => ok")]);
+        let report = lab.json(&[]);
+        assert_eq!(report["rules"], json!([]), "{report:#}");
+        assert_eq!(reason(&report, "wrong_directory"), "contradicted");
+        let output = lab.text(&["--apply", "--target", "claude"]);
+        contains(
+            &output,
+            "Updated CLAUDE.md: 0 learned rule(s) (1 removed: the command later succeeded).",
+        );
+        assert_eq!(lab.read("CLAUDE.md"), "");
+    }
 }
 
 #[test]
 fn learn_apply_targets() {
     let setup = |files: &[(&str, &str)]| {
         let lab = Lab::new();
-        lab.sessions("g", 2, glob_calls);
+        lab.sessions("g", 2, &GLOB_CALLS);
         for (file, content) in files {
             lab.write(file, content);
         }
@@ -1177,25 +941,26 @@ fn learn_apply_targets() {
         "<!-- justless:learned:begin -->\n## Learned command rules\n\n- {GLOB_RULE}\n<!-- justless:learned:end -->\n"
     );
 
-    // (a) CLAUDE.md imports AGENTS.md.
-    let lab = setup(&[("AGENTS.md", "# Agents\n"), ("CLAUDE.md", "@AGENTS.md\n")]);
-    let report = lab.json(&["--apply"]);
-    assert_eq!(report["apply"]["changed"], json!(["AGENTS.md"]));
-    assert_eq!(
-        report["apply"]["skipped"],
-        json!([{"file": "CLAUDE.md", "reason": "imports AGENTS.md"}])
-    );
-    assert_eq!(lab.read("AGENTS.md"), format!("# Agents\n\n{block}"));
-    assert_eq!(lab.read("CLAUDE.md"), "@AGENTS.md\n");
+    // (a) CLAUDE.md imports AGENTS.md, on a line of its own or inline.
+    for claude in [
+        "@AGENTS.md\n",
+        "# Claude\n\nFollow @AGENTS.md for everything.\n",
+    ] {
+        let lab = setup(&[("AGENTS.md", "# Agents\n"), ("CLAUDE.md", claude)]);
+        let report = lab.json(&["--apply"]);
+        assert_eq!(report["apply"]["changed"], json!(["AGENTS.md"]));
+        let skipped = json!([{"file": "CLAUDE.md", "reason": "imports AGENTS.md"}]);
+        assert_eq!(report["apply"]["skipped"], skipped);
+        assert_eq!(lab.read("AGENTS.md"), format!("# Agents\n\n{block}"));
+        assert_eq!(lab.read("CLAUDE.md"), claude);
+    }
 
     // (b) A mention in backticks or a fence is not an import. (c) Independent files.
     for claude in ["See `@AGENTS.md`.\n", "```\n@AGENTS.md\n```\n"] {
         let lab = setup(&[("AGENTS.md", "# Agents\n"), ("CLAUDE.md", claude)]);
         let report = lab.json(&["--apply"]);
-        assert_eq!(
-            report["apply"]["changed"],
-            json!(["AGENTS.md", "CLAUDE.md"])
-        );
+        let changed = json!(["AGENTS.md", "CLAUDE.md"]);
+        assert_eq!(report["apply"]["changed"], changed);
         assert_eq!(lab.read("CLAUDE.md"), format!("{claude}\n{block}"));
     }
     let lab = setup(&[("AGENTS.md", "a\n"), ("GEMINI.md", "g\n")]);
@@ -1204,15 +969,14 @@ fn learn_apply_targets() {
 
     // (d) With no file, transcript rules create CLAUDE.md and archive rules AGENTS.md.
     let lab = setup(&[]);
-    let output = lab.text(&["--apply"]);
-    assert!(output.contains("Updated CLAUDE.md"), "{output}");
+    contains(&lab.text(&["--apply"]), "Updated CLAUDE.md");
     assert_eq!(lab.read("CLAUDE.md"), block);
     let lab = Lab::new();
     fake_make(&lab);
-    lab.run("", &["--", "make", "test"]);
-    lab.run("server", &["--", "make", "test"]);
+    lab.run("", "-- make test");
+    lab.run("server", "-- make test");
     lab.text(&["--apply"]);
-    assert!(lab.read("AGENTS.md").contains("Run `make` from `server/`"));
+    contains(&lab.read("AGENTS.md"), "Run `make` from `server/`");
     assert!(!lab.root.join("CLAUDE.md").exists());
 
     // (d2) A CLAUDE.md above the root hides AGENTS.md from Claude Code.
@@ -1232,36 +996,24 @@ fn learn_apply_targets() {
         std::os::unix::fs::symlink("AGENTS.md", lab.root.join("CLAUDE.md")).unwrap();
         let report = lab.json(&["--apply"]);
         assert_eq!(report["apply"]["changed"], json!(["AGENTS.md"]));
-        assert_eq!(
-            report["apply"]["skipped"],
-            json!([{"file": "CLAUDE.md", "reason": "symbolic link"}])
-        );
-        assert!(
-            fs::symlink_metadata(lab.root.join("CLAUDE.md"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        let skipped = json!([{"file": "CLAUDE.md", "reason": "symbolic link"}]);
+        assert_eq!(report["apply"]["skipped"], skipped);
+        let link = fs::symlink_metadata(lab.root.join("CLAUDE.md")).unwrap();
+        assert!(link.file_type().is_symlink());
         assert_eq!(lab.read("AGENTS.md").matches("learned:begin").count(), 1);
         // (g) An explicit symlink target is refused.
         let output = lab.learn(&["--apply", "--target", "claude"]);
         assert_eq!(output.status.code(), Some(2));
-        assert!(
-            stderr(&output).contains("CLAUDE.md is a symbolic link"),
-            "{}",
-            stderr(&output)
-        );
+        contains(&stderr(&output), "CLAUDE.md is a symbolic link");
     }
 
     // (f) CLAUDE.md is never created beside AGENTS.md.
     let lab = setup(&[("AGENTS.md", "# Agents\n")]);
     let output = lab.learn(&["--apply", "--target", "claude"]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output)
-            .contains("creating CLAUDE.md would stop Claude Code from reading AGENTS.md"),
-        "{}",
-        stderr(&output)
+    contains(
+        &stderr(&output),
+        "creating CLAUDE.md would stop Claude Code from reading AGENTS.md",
     );
     assert!(!lab.root.join("CLAUDE.md").exists() && !lab.root.join(".justless").exists());
     assert_eq!(lab.read("AGENTS.md"), "# Agents\n");
@@ -1270,69 +1022,52 @@ fn learn_apply_targets() {
 #[test]
 fn learn_apply_byte_preserving_and_idempotent() {
     let lab = Lab::new();
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
     lab.write("AGENTS.md", "# Project\n\nIntro.\n");
-    let init = lab
-        .command("", &["init", "--agent", "codex"])
-        .output()
-        .unwrap();
-    assert!(init.status.success(), "{}", stderr(&init));
+    let init = || {
+        lab.command("", &["init", "--agent", "codex"])
+            .output()
+            .unwrap()
+    };
+    let output = init();
+    assert!(output.status.success(), "{}", stderr(&output));
     let mut original = lab.read("AGENTS.md");
     original.push_str("\n## Notes\n\nKeep this.\n");
     lab.write("AGENTS.md", &original);
     let output = lab.text(&["--apply"]);
-    assert!(
-        output.contains("Updated AGENTS.md: 1 learned rule(s) (1 added)."),
-        "{output}"
-    );
+    contains(&output, "Updated AGENTS.md: 1 learned rule(s) (1 added).");
     let applied = lab.read("AGENTS.md");
     let block = format!(
         "<!-- justless:learned:begin -->\n## Learned command rules\n\n- {GLOB_RULE}\n<!-- justless:learned:end -->"
     );
     let marker = "<!-- justless:end -->";
-    assert_eq!(
-        applied,
-        original.replacen(marker, &format!("{marker}\n\n{block}"), 1)
-    );
+    let expected = original.replacen(marker, &format!("{marker}\n\n{block}"), 1);
+    assert_eq!(applied, expected);
 
     let output = lab.text(&["--apply"]);
-    assert!(
-        output.contains("AGENTS.md is up to date (1 learned rule(s))."),
-        "{output}"
-    );
+    contains(&output, "AGENTS.md is up to date (1 learned rule(s)).");
     assert_eq!(lab.read("AGENTS.md"), applied);
-    let state = fs::metadata(lab.root.join(".justless/learned.json"))
-        .unwrap()
-        .modified()
-        .unwrap();
+    let modified = || {
+        let state = fs::metadata(lab.root.join(STATE)).unwrap();
+        state.modified().unwrap()
+    };
+    let state = modified();
     lab.text(&["--apply"]);
-    assert_eq!(
-        fs::metadata(lab.root.join(".justless/learned.json"))
-            .unwrap()
-            .modified()
-            .unwrap(),
-        state
-    );
-    let init = lab
-        .command("", &["init", "--agent", "codex"])
-        .output()
-        .unwrap();
-    assert!(init.status.success());
+    assert_eq!(modified(), state);
+    assert!(init().status.success());
     assert_eq!(lab.read("AGENTS.md"), applied);
 
     // CRLF files get a CRLF block, and a file without a final newline is handled.
+    let crlf = format!(
+        "# Rules\r\nUse care.\r\n\r\n{}\r\n",
+        block.replace('\n', "\r\n")
+    );
     for (original, expected) in [
-        (
-            "# Rules\r\nUse care.\r\n",
-            format!(
-                "# Rules\r\nUse care.\r\n\r\n{}\r\n",
-                block.replace('\n', "\r\n")
-            ),
-        ),
+        ("# Rules\r\nUse care.\r\n", crlf),
         ("# Rules", format!("# Rules\n\n{block}\n")),
     ] {
         let lab = Lab::new();
-        lab.sessions("g", 2, glob_calls);
+        lab.sessions("g", 2, &GLOB_CALLS);
         lab.write("AGENTS.md", original);
         lab.text(&["--apply"]);
         assert_eq!(lab.read("AGENTS.md"), expected);
@@ -1341,75 +1076,52 @@ fn learn_apply_byte_preserving_and_idempotent() {
     }
 }
 
+/// A call to a program that is not installed, in sessions named after it.
+fn missing(lab: &Lab, program: &str, sessions: usize) {
+    let failed = format!("{program} x => 127: zsh:1: command not found: {program}");
+    lab.sessions(program, sessions, &[&failed]);
+}
+
 #[test]
 fn learn_apply_stability() {
     let lab = Lab::new();
     lab.write("AGENTS.md", "# Project\n");
-    lab.sessions("g", 2, glob_calls);
-    lab.sessions("h", 2, gh_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
+    lab.sessions("h", 2, &GH_CALLS);
     lab.text(&["--apply"]);
     let first = lab.read("AGENTS.md");
-    assert!(
-        first.contains(&format!("- {GLOB_RULE}\n- {GH_RULE}\n")),
-        "{first}"
-    );
+    contains(&first, &format!("- {GLOB_RULE}\n- {GH_RULE}\n"));
 
     // A new rule that outranks both, and a new most frequent glob example.
-    lab.sessions("go", 7, || {
-        vec![call(
-            "go test ./...",
-            Outcome::Fail(127, "zsh:1: command not found: go"),
-        )]
-    });
-    lab.sessions("py", 3, || {
-        vec![call(
-            "ls *.py",
-            Outcome::Fail(1, "zsh:1: no matches found: *.py"),
-        )]
-    });
+    missing(&lab, "go", 7);
+    lab.sessions("py", 3, &["ls *.py => 1: zsh:1: no matches found: *.py"]);
     let preview = lab.json(&[]);
-    assert_eq!(
-        preview["rules"][0]["text"],
-        "`go` is not installed on this machine."
-    );
+    let go = "`go` is not installed on this machine.";
+    assert_eq!(preview["rules"][0]["text"], go);
     // A written rule keeps its text even when the example changes.
-    assert_eq!(
-        rule(preview["rules"].as_array().unwrap(), GLOB_RULE)["example"]["right"],
-        "'*.py'"
-    );
+    let glob = rule(&preview["rules"], GLOB_RULE);
+    assert_eq!(glob["example"]["right"], "'*.py'");
 
     // Held candidates beyond --limit neither hide a full block nor shrink the counts.
     for program in ["fd", "bat", "jq"] {
-        lab.sessions(program, 1, || {
-            vec![call(
-                &format!("{program} x"),
-                failure(127, format!("zsh:1: command not found: {program}")),
-            )]
-        });
+        missing(&lab, program, 1);
     }
     let report = lab.json(&["--apply", "--limit", "2"]);
     assert_eq!(lab.read("AGENTS.md"), first);
-    let held_now = report["held"].as_array().unwrap();
-    assert_eq!(held_now.len(), 2, "{report:#}");
+    let held_now = &report["held"];
+    assert_eq!(len(held_now), 2, "{report:#}");
     assert_eq!(held_now[0]["reason"], "block_full");
-    assert_eq!(
-        held_now[0]["text"],
-        "`go` is not installed on this machine."
-    );
+    assert_eq!(held_now[0]["text"], go);
     let text = lab.text(&["--limit", "1"]);
-    assert!(
-        text.contains("3 below --min-sessions (--min-sessions 1 lists them)"),
-        "{text}"
+    contains(
+        &text,
+        "3 below --min-sessions (--min-sessions 1 lists them)",
     );
 
     lab.text(&["--apply"]);
-    assert_eq!(
-        lab.read("AGENTS.md"),
-        first.replace(
-            "<!-- justless:learned:end -->",
-            "- `go` is not installed on this machine.\n<!-- justless:learned:end -->"
-        )
-    );
+    let end = "<!-- justless:learned:end -->";
+    let expected = first.replace(end, &format!("- {go}\n{end}"));
+    assert_eq!(lab.read("AGENTS.md"), expected);
 }
 
 #[test]
@@ -1417,49 +1129,42 @@ fn learn_apply_persists_dismisses_expires() {
     let lab = Lab::new();
     let original = "# Project\n";
     lab.write("AGENTS.md", original);
-    lab.sessions("g", 2, glob_calls);
-    lab.sessions("h", 2, gh_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
+    lab.sessions("h", 2, &GH_CALLS);
     lab.text(&["--apply"]);
     let applied = lab.read("AGENTS.md");
 
     // A reverted file forgets what was written, so the rules come back.
     lab.write("AGENTS.md", original);
-    let output = lab.text(&["--apply"]);
-    assert!(output.contains("(2 added)"), "{output}");
+    contains(&lab.text(&["--apply"]), "(2 added)");
     assert_eq!(lab.read("AGENTS.md"), applied);
 
     // Rules whose evidence aged out stay.
     let saved = lab.base.join("saved");
     fs::rename(lab.transcripts(), &saved).unwrap();
     let output = lab.text(&["--apply"]);
-    assert!(
-        output.contains("AGENTS.md is up to date (2 learned rule(s))."),
-        "{output}"
-    );
+    contains(&output, "AGENTS.md is up to date (2 learned rule(s)).");
     fs::rename(&saved, lab.transcripts()).unwrap();
 
     // A machine rule whose check fails stays until the check still fails a day later;
     // then it is removed, and a user line in the block keeps its place.
     lab.tool("gh", "exit 0");
     let output = lab.text(&["--apply"]);
-    assert!(
-        output.contains("AGENTS.md is up to date (2 learned rule(s)).")
-            && output.contains("Kept 1 written rule(s) whose check fails here (gh is on PATH)"),
-        "{output}"
+    contains(&output, "AGENTS.md is up to date (2 learned rule(s)).");
+    contains(
+        &output,
+        "Kept 1 written rule(s) whose check fails here (gh is on PATH)",
     );
     assert_eq!(lab.read("AGENTS.md"), applied);
     lab.backdate();
     let output = lab.text(&["--apply"]);
-    assert!(
-        output.contains("(1 removed: its check no longer holds)"),
-        "{output}"
-    );
-    let with_note = lab.read("AGENTS.md").replace(
-        "<!-- justless:learned:end -->",
-        "- Keep this note.\n<!-- justless:learned:end -->",
-    );
+    contains(&output, "(1 removed: its check no longer holds)");
+    let end = "<!-- justless:learned:end -->";
+    let with_note = lab
+        .read("AGENTS.md")
+        .replace(end, &format!("- Keep this note.\n{end}"));
     lab.write("AGENTS.md", &with_note);
-    assert!(lab.text(&["--apply"]).contains("up to date"));
+    contains(&lab.text(&["--apply"]), "up to date");
     assert_eq!(lab.read("AGENTS.md"), with_note);
 
     // Deleting a line dismisses its rule.
@@ -1469,17 +1174,15 @@ fn learn_apply_persists_dismisses_expires() {
     assert_eq!(lab.read("AGENTS.md"), dismissed);
     lab.text(&["--apply"]);
     assert_eq!(lab.read("AGENTS.md"), dismissed);
-    let state: Value = serde_json::from_str(&lab.read(".justless/learned.json")).unwrap();
-    assert_eq!(state["dismissed"].as_array().unwrap().len(), 1);
-    let report = lab.json(&[]);
-    assert_eq!(report["skipped"]["dismissed"], 1);
+    let state: Value = serde_json::from_str(&lab.read(STATE)).unwrap();
+    assert_eq!(len(&state["dismissed"]), 1);
+    assert_eq!(lab.json(&[])["skipped"]["dismissed"], 1);
 
     // Removing the last written rule restores the original bytes.
-    let lab = Lab::new();
+    let mut lab = Lab::new();
     lab.write("AGENTS.md", original);
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
     lab.text(&["--apply"]);
-    let mut lab = lab;
     lab.shell = "/bin/bash".into();
     lab.text(&["--apply"]);
     assert_ne!(lab.read("AGENTS.md"), original);
@@ -1492,28 +1195,22 @@ fn learn_apply_persists_dismisses_expires() {
 fn learn_apply_survives_environment_flips() {
     let mut lab = Lab::new();
     lab.write("AGENTS.md", "# Project\n");
-    lab.sessions("h", 3, gh_calls);
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("h", 3, &GH_CALLS);
+    lab.sessions("g", 2, &GLOB_CALLS);
     lab.text(&["--apply"]);
     let applied = lab.read("AGENTS.md");
-    assert!(
-        applied.contains(&format!("- {GH_RULE}\n- {GLOB_RULE}\n")),
-        "{applied}"
-    );
+    contains(&applied, &format!("- {GH_RULE}\n- {GLOB_RULE}\n"));
+    let stale = |lab: &Lab| lab.read(STATE).contains("stale_since_ms");
 
     // A PATH entry or another shell for one run changes nothing in the file.
     lab.tool("gh", "exit 0");
     lab.text(&["--apply"]);
     assert_eq!(lab.read("AGENTS.md"), applied);
-    assert!(lab.read(STATE).contains("stale_since_ms"));
+    assert!(stale(&lab));
     fs::remove_file(lab.bin.join("gh")).unwrap();
     lab.text(&["--apply"]);
     assert_eq!(lab.read("AGENTS.md"), applied);
-    assert!(
-        !lab.read(STATE).contains("stale_since_ms"),
-        "{}",
-        lab.read(STATE)
-    );
+    assert!(!stale(&lab), "{}", lab.read(STATE));
     lab.shell = "/bin/bash".into();
     lab.text(&["--apply"]);
     lab.shell = "/bin/zsh".into();
@@ -1525,22 +1222,17 @@ fn learn_apply_survives_environment_flips() {
     lab.text(&["--apply"]);
     lab.backdate();
     lab.text(&["--apply"]);
-    assert_eq!(
-        lab.read("AGENTS.md"),
-        applied.replace(&format!("- {GH_RULE}\n"), "")
-    );
+    let without_gh = applied.replace(&format!("- {GH_RULE}\n"), "");
+    assert_eq!(lab.read("AGENTS.md"), without_gh);
     fs::remove_file(lab.bin.join("gh")).unwrap();
-    let output = lab.text(&["--apply"]);
-    assert!(output.contains("(1 added)"), "{output}");
+    contains(&lab.text(&["--apply"]), "(1 added)");
     assert_eq!(lab.read("AGENTS.md"), applied);
     lab.shell = "/bin/bash".into();
     lab.text(&["--apply"]);
     lab.backdate();
     lab.text(&["--apply"]);
-    assert_eq!(
-        lab.read("AGENTS.md"),
-        applied.replace(&format!("- {GLOB_RULE}\n"), "")
-    );
+    let without_glob = applied.replace(&format!("- {GLOB_RULE}\n"), "");
+    assert_eq!(lab.read("AGENTS.md"), without_glob);
     lab.shell = "/bin/zsh".into();
     lab.text(&["--apply"]);
     assert_eq!(lab.read("AGENTS.md"), applied);
@@ -1561,60 +1253,51 @@ fn learn_apply_rejects_bad_markers() {
         format!("<!-- justless:begin -->\n{begin}\n{end}\n<!-- justless:end -->\n"),
     ] {
         let lab = Lab::new();
-        lab.sessions("g", 2, glob_calls);
+        lab.sessions("g", 2, &GLOB_CALLS);
         lab.write("AGENTS.md", &broken);
         lab.write("GEMINI.md", "# Gemini\n");
         let output = lab.learn(&["--apply"]);
         assert_eq!(output.status.code(), Some(2), "{broken}");
-        assert!(stderr(&output).contains("AGENTS.md"), "{}", stderr(&output));
+        contains(&stderr(&output), "AGENTS.md");
         assert_eq!(lab.read("AGENTS.md"), broken);
         assert_eq!(lab.read("GEMINI.md"), "# Gemini\n");
         // A preview reports the file and still shows the rules.
         let report = lab.json(&[]);
         let notes = report["notes"].to_string();
-        assert!(
-            notes.contains("AGENTS.md") && notes.contains("`--apply` stops on it."),
-            "{report:#}"
-        );
-        rule(report["rules"].as_array().unwrap(), GLOB_RULE);
+        contains(&notes, "AGENTS.md");
+        contains(&notes, "`--apply` stops on it.");
+        rule(&report["rules"], GLOB_RULE);
     }
 }
 
 #[test]
 fn learn_preview_fails_open() {
     let lab = Lab::new();
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
     fs::write(lab.root.join("AGENTS.md"), b"# A\n\xff\xfe\n").unwrap();
     for args in [&[][..], &["--target", "agents"]] {
         let report = lab.json(args);
-        assert_eq!(
-            report["notes"],
-            json!([
-                "AGENTS.md is not UTF-8: invalid utf-8 sequence of 1 bytes from index 4; `--apply` stops on it."
-            ]),
-            "{report:#}"
-        );
-        rule(report["rules"].as_array().unwrap(), GLOB_RULE);
+        let note = "AGENTS.md is not UTF-8: invalid utf-8 sequence of 1 bytes from index 4; `--apply` stops on it.";
+        assert_eq!(report["notes"], json!([note]), "{report:#}");
+        rule(&report["rules"], GLOB_RULE);
         let mut apply = vec!["--apply"];
         apply.extend(args);
         let output = lab.learn(&apply);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(stderr(&output).contains("AGENTS.md is not UTF-8"));
+        contains(&stderr(&output), "AGENTS.md is not UTF-8");
     }
     assert!(!lab.root.join("CLAUDE.md").exists());
 
     let lab = Lab::new();
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
     lab.write(STATE, "{not json");
     let report = lab.json(&[]);
+    let note = report["notes"][0].as_str().unwrap();
     assert!(
-        report["notes"][0]
-            .as_str()
-            .unwrap()
-            .starts_with("decode .justless/learned.json"),
+        note.starts_with("decode .justless/learned.json"),
         "{report:#}"
     );
-    rule(report["rules"].as_array().unwrap(), GLOB_RULE);
+    rule(&report["rules"], GLOB_RULE);
     let output = lab.learn(&["--apply"]);
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(lab.read(STATE), "{not json");
@@ -1625,26 +1308,13 @@ fn learn_counts_corrections_across_nested_checkouts() {
     // The same directory in a worktree is another checkout, not another directory.
     let lab = Lab::new();
     lab.write(".claude/worktrees/w1/.git", "gitdir: elsewhere\n");
-    lab.sessions("n", 2, || {
-        vec![
-            call(
-                "make test",
-                Outcome::Fail(
-                    2,
-                    "make: *** No targets specified and no makefile found.  Stop.",
-                ),
-            ),
-            call_in(".claude/worktrees/w1", "make test", Outcome::Ok("ok")),
-        ]
-    });
+    let mut nested = calls(&[NO_MAKEFILE, "make test => ok"]);
+    nested[1].cwd = ".claude/worktrees/w1".into();
+    lab.sessions_of("n", 2, &nested);
     let report = lab.json(&["--min-sessions", "1"]);
     assert_eq!(report["rules"], json!([]), "{report:#}");
     assert_eq!(report["skipped"]["nested_checkout"], 2, "{report:#}");
-    assert!(
-        lab.text(&[]).contains("2 split across nested checkouts"),
-        "{}",
-        lab.text(&[])
-    );
+    contains(&lab.text(&[]), "2 split across nested checkouts");
 }
 
 #[test]
@@ -1656,23 +1326,17 @@ fn learn_notes_only_with_rules() {
     assert_eq!(lab.json(&[])["notes"], json!([]));
 
     // A preview names the files it would skip.
-    lab.sessions("g", 2, glob_calls);
+    lab.sessions("g", 2, &GLOB_CALLS);
     lab.write("CLAUDE.md", "@AGENTS.md\n");
     let text = lab.text(&[]);
-    assert!(
-        text.contains("Skipped CLAUDE.md: it imports AGENTS.md.\n")
-            && text.contains(
-                "Preview only. `justless learn --apply` writes these rules to AGENTS.md."
-            ),
-        "{text}"
+    contains(&text, "Skipped CLAUDE.md: it imports AGENTS.md.\n");
+    contains(
+        &text,
+        "Preview only. `justless learn --apply` writes these rules to AGENTS.md.",
     );
     lab.text(&["--apply"]);
-    assert!(
-        lab.text(&[])
-            .contains("Preview only. AGENTS.md already up to date."),
-        "{}",
-        lab.text(&[])
-    );
+    let text = lab.text(&[]);
+    contains(&text, "Preview only. AGENTS.md already up to date.");
 }
 
 #[test]
@@ -1680,35 +1344,24 @@ fn learn_apply_reports_a_full_block() {
     let lab = Lab::new();
     lab.write("AGENTS.md", "# Agents\n");
     for index in 1..=8 {
-        lab.sessions(&format!("t{index}-"), 2, || {
-            vec![call(
-                &format!("tool{index} x"),
-                failure(127, format!("zsh:1: command not found: tool{index}")),
-            )]
-        });
+        missing(&lab, &format!("tool{index}"), 2);
     }
-    let output = lab.text(&["--apply", "--target", "agents"]);
-    assert!(output.contains("(8 added)"), "{output}");
+    contains(&lab.text(&["--apply", "--target", "agents"]), "(8 added)");
     let written = lab.read("AGENTS.md");
-    lab.sessions("n", 3, || {
-        vec![call(
-            "newtool x",
-            failure(127, "zsh:1: command not found: newtool"),
-        )]
-    });
+    missing(&lab, "newtool", 3);
     let newtool = "`newtool` is not installed on this machine.";
     for args in [
         &["--target", "agents"][..],
         &["--apply", "--target", "agents"],
     ] {
         let text = lab.text(args);
-        assert!(
-            text.contains("\nNot written, the block is full:\n- `newtool` is not installed on this machine.\nDelete a rule's line between the markers to dismiss it and make room.\n")
-                && !text.contains(&format!(". {newtool}"))
-                && !text.contains("beyond --limit")
-                && text.contains("8 rule(s)"),
-            "{text}"
+        contains(
+            &text,
+            "\nNot written, the block is full:\n- `newtool` is not installed on this machine.\nDelete a rule's line between the markers to dismiss it and make room.\n",
         );
+        assert!(!text.contains(&format!(". {newtool}")), "{text}");
+        assert!(!text.contains("beyond --limit"), "{text}");
+        contains(&text, "8 rule(s)");
         let report = lab.json(args);
         let rules = report["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 8, "{report:#}");
@@ -1717,11 +1370,10 @@ fn learn_apply_reports_a_full_block() {
         assert_eq!(report["held"][0]["reason"], "block_full");
         assert_eq!(report["skipped"]["over_limit"], 0);
     }
-    assert!(
-        lab.text(&["--apply"])
-            .contains("AGENTS.md unchanged: 8 learned rule(s); 1 rule(s) did not fit."),
-        "{}",
-        lab.text(&["--apply"])
+    let text = lab.text(&["--apply"]);
+    contains(
+        &text,
+        "AGENTS.md unchanged: 8 learned rule(s); 1 rule(s) did not fit.",
     );
     assert_eq!(lab.read("AGENTS.md"), written);
 }
@@ -1741,77 +1393,55 @@ fn git_lab() -> Lab {
         .output()
         .unwrap();
     assert!(init.status.success(), "{init:?}");
+    lab.write("server/Makefile", "test:\n");
+    lab.sessions("g", 2, &GLOB_CALLS);
+    lab.sessions("m", 2, &MAKE_CALLS);
     lab
-}
-
-fn make_calls() -> Vec<Call> {
-    vec![
-        call(
-            "make test",
-            Outcome::Fail(
-                2,
-                "make: *** No targets specified and no makefile found.  Stop.",
-            ),
-        ),
-        call("make -C server test", Outcome::Ok("ok")),
-    ]
 }
 
 #[test]
 fn learn_keeps_machine_rules_out_of_shared_files() {
-    let make_rule = "Run `make` from `server/`; the repository root has no Makefile.";
     let lab = git_lab();
-    lab.write("server/Makefile", "test:\n");
     lab.write("AGENTS.md", "# Agents\n");
-    lab.sessions("g", 2, glob_calls);
-    lab.sessions("m", 2, make_calls);
     let report = lab.json(&[]);
-    let rules = report["rules"].as_array().unwrap();
-    assert_eq!(rules.len(), 1, "{report:#}");
-    assert_eq!(rules[0]["text"], make_rule);
-    assert_eq!(held(&report, "zsh_glob")[0]["reason"], "machine_scope");
+    let rules = &report["rules"];
+    assert_eq!(len(rules), 1, "{report:#}");
+    assert_eq!(rules[0]["text"], MAKE_RULE);
+    assert_eq!(reason(&report, "zsh_glob"), "machine_scope");
     let text = lab.text(&[]);
-    assert!(
-        text.contains(&format!(
-            "\nAbout this machine, kept out of files Git shares:\n- {GLOB_RULE}\n"
-        )) && text.contains("Rules about this machine stay out of AGENTS.md, which Git shares")
-            && text.contains("`--include-machine` writes them"),
-        "{text}"
+    let machine = format!("\nAbout this machine, kept out of files Git shares:\n- {GLOB_RULE}\n");
+    contains(&text, &machine);
+    contains(
+        &text,
+        "Rules about this machine stay out of AGENTS.md, which Git shares",
     );
+    contains(&text, "`--include-machine` writes them");
     lab.text(&["--apply"]);
     let agents = lab.read("AGENTS.md");
     assert!(
-        agents.contains(make_rule) && !agents.contains(GLOB_RULE),
+        agents.contains(MAKE_RULE) && !agents.contains(GLOB_RULE),
         "{agents}"
     );
 
     // --include-machine writes them, and a later plain run keeps them.
-    let output = lab.text(&["--apply", "--include-machine"]);
-    assert!(output.contains("(1 added)"), "{output}");
+    contains(&lab.text(&["--apply", "--include-machine"]), "(1 added)");
     let agents = lab.read("AGENTS.md");
-    assert!(agents.contains(GLOB_RULE), "{agents}");
-    let output = lab.text(&["--apply"]);
-    assert!(
-        output.contains("is up to date (2 learned rule(s))"),
-        "{output}"
-    );
+    contains(&agents, GLOB_RULE);
+    contains(&lab.text(&["--apply"]), "is up to date (2 learned rule(s))");
     assert_eq!(lab.read("AGENTS.md"), agents);
 
     // An ignored file is personal and takes machine rules.
     let lab = git_lab();
-    lab.write("server/Makefile", "test:\n");
     lab.write(".gitignore", "CLAUDE.md\n");
     lab.write("AGENTS.md", "# Agents\n");
     lab.write("CLAUDE.md", "# Claude\n");
-    lab.sessions("g", 2, glob_calls);
-    lab.sessions("m", 2, make_calls);
     let report = lab.json(&["--apply"]);
-    assert_eq!(report["rules"].as_array().unwrap().len(), 2, "{report:#}");
+    assert_eq!(len(&report["rules"]), 2, "{report:#}");
     assert_eq!(report["held"], json!([]), "{report:#}");
     assert!(!lab.read("AGENTS.md").contains(GLOB_RULE));
     let claude = lab.read("CLAUDE.md");
     assert!(
-        claude.contains(GLOB_RULE) && claude.contains(make_rule),
+        claude.contains(GLOB_RULE) && claude.contains(MAKE_RULE),
         "{claude}"
     );
 }
@@ -1822,20 +1452,13 @@ fn learn_rule_text_injection() {
     let existing = "# P\n\n<!-- justless:learned:begin -->\n## Learned command rules\n\n- Mine.\n<!-- justless:learned:end -->\n";
     lab.write("AGENTS.md", existing);
     lab.write("package.json", r#"{"scripts": {"x-->y": "true"}}"#);
-    lab.sessions("i", 2, || {
-        vec![
-            call(
-                "npm test",
-                Outcome::Fail(1, "npm error Missing script: \"test\""),
-            ),
-            call("npm run 'x-->y'", Outcome::Ok("ok")),
-            call(
-                "make lint",
-                Outcome::Fail(2, "make: *** No rule to make target `lint'.  Stop."),
-            ),
-            call("make '<!--x'", Outcome::Ok("ok")),
-        ]
-    });
+    let script = [
+        "npm test => 1: npm error Missing script: \"test\"",
+        "npm run 'x-->y' => ok",
+        "make lint => 2: make: *** No rule to make target `lint'.  Stop.",
+        "make '<!--x' => ok",
+    ];
+    lab.sessions("i", 2, &script);
     let report = lab.json(&["--apply"]);
     assert_eq!(report["rules"], json!([]));
     let unsafe_text: Vec<&Value> = held(&report, "unknown_target");
@@ -1852,20 +1475,10 @@ fn learn_rule_text_injection() {
 #[test]
 fn learn_json_shape_and_determinism() {
     let lab = Lab::new();
-    lab.sessions("g", 2, glob_calls);
-    lab.sessions("h", 2, gh_calls);
-    lab.sessions("o", 1, || {
-        vec![call(
-            "go version",
-            Outcome::Fail(127, "zsh:1: command not found: go"),
-        )]
-    });
-    lab.sessions("p", 1, || {
-        vec![call(
-            "pip list",
-            Outcome::Fail(127, "zsh:1: command not found: pip"),
-        )]
-    });
+    lab.sessions("g", 2, &GLOB_CALLS);
+    lab.sessions("h", 2, &GH_CALLS);
+    missing(&lab, "go", 1);
+    missing(&lab, "pip", 1);
     let first = lab.text(&["--json"]);
     assert_eq!(lab.text(&["--json"]), first);
     let report: Value = serde_json::from_str(&first).unwrap();
@@ -1877,94 +1490,47 @@ fn learn_json_shape_and_determinism() {
             .cloned()
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        keys(&report),
-        [
-            "days",
-            "min_sessions",
-            "sources",
-            "rules",
-            "held",
-            "skipped",
-            "notes",
-            "apply"
-        ]
-    );
-    assert_eq!(
-        keys(&report["sources"]["transcripts"]),
-        [
-            "available",
-            "directory",
-            "files",
-            "sessions",
-            "threads",
-            "results",
-            "not_run",
-            "status_unknown"
-        ]
-    );
-    assert_eq!(
-        keys(&report["sources"]["runs"]),
-        [
-            "available",
-            "scanned",
-            "without_command",
-            "unreadable",
-            "linked",
-            "covered_by_transcripts",
-            "capped"
-        ]
-    );
+    for (value, expected) in [
+        (
+            &report,
+            "days min_sessions sources rules held skipped notes apply",
+        ),
+        (
+            &report["sources"]["transcripts"],
+            "available directory files sessions threads results not_run status_unknown",
+        ),
+        (
+            &report["sources"]["runs"],
+            "available scanned without_command unreadable linked covered_by_transcripts capped",
+        ),
+        (
+            &report["rules"][0],
+            "id class scope text failures corrections sessions threads failure_bytes first_seen last_seen score check example evidence",
+        ),
+        (
+            &report["held"][0],
+            "id class scope text sessions threads failures reason",
+        ),
+        (
+            &report["apply"],
+            "applied targets changed skipped added removed",
+        ),
+    ] {
+        assert_eq!(keys(value), words(expected), "{value}");
+    }
     let rule = &report["rules"][0];
-    assert_eq!(
-        keys(rule),
-        [
-            "id",
-            "class",
-            "scope",
-            "text",
-            "failures",
-            "corrections",
-            "sessions",
-            "threads",
-            "failure_bytes",
-            "first_seen",
-            "last_seen",
-            "score",
-            "check",
-            "example",
-            "evidence"
-        ]
-    );
     assert_eq!(rule["id"].as_str().unwrap().len(), 12);
     assert!(rule["score"].as_f64().unwrap() > 0.0);
     assert_eq!(rule["last_seen"], timestamp(now_ms() - DAY)[..10]);
     assert_eq!(rule["evidence"][0]["source"], "transcript");
-    assert_eq!(
-        keys(&report["held"][0]),
-        [
-            "id", "class", "scope", "text", "sessions", "threads", "failures", "reason"
-        ]
-    );
-    assert_eq!(
-        keys(&report["apply"]),
-        [
-            "applied", "targets", "changed", "skipped", "added", "removed"
-        ]
-    );
-    assert_eq!(report["held"].as_array().unwrap().len(), 2);
+    assert_eq!(len(&report["held"]), 2);
     let limited = lab.json(&["--limit", "1"]);
-    assert_eq!(limited["rules"].as_array().unwrap().len(), 1);
-    assert_eq!(limited["held"].as_array().unwrap().len(), 1);
+    assert_eq!(len(&limited["rules"]), 1);
+    assert_eq!(len(&limited["held"]), 1);
     assert_eq!(limited["skipped"]["over_limit"], 1);
-    for (flag, value) in [
-        ("--limit", "0"),
-        ("--limit", "33"),
-        ("--days", "0"),
-        ("--min-sessions", "0"),
-    ] {
-        let output = lab.learn(&[flag, value]);
-        assert_eq!(output.status.code(), Some(2), "{flag} {value}");
+    for flags in ["--limit 0", "--limit 33", "--days 0", "--min-sessions 0"] {
+        let output = lab.learn(&words(flags));
+        assert_eq!(output.status.code(), Some(2), "{flags}");
     }
 }
 
@@ -1982,8 +1548,8 @@ fn learn_without_sources() {
 
     // Without HOME or CLAUDE_CONFIG_DIR the archive is still read.
     fake_make(&lab);
-    lab.run("", &["--", "make", "test"]);
-    lab.run("server", &["--", "make", "test"]);
+    lab.run("", "-- make test");
+    lab.run("server", "-- make test");
     let output = lab
         .command("", &["learn", "--json"])
         .env_remove("HOME")
@@ -1994,7 +1560,7 @@ fn learn_without_sources() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["sources"]["transcripts"]["available"], false);
     assert_eq!(report["sources"]["transcripts"]["directory"], Value::Null);
-    assert_eq!(report["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(len(&report["rules"]), 1);
 
     // An unreadable archive still lets the transcripts report print.
     #[cfg(unix)]
@@ -2003,11 +1569,11 @@ fn learn_without_sources() {
         let runs = lab.root.join(".justless/runs");
         fs::set_permissions(&runs, fs::Permissions::from_mode(0o000)).unwrap();
         fs::create_dir_all(lab.transcripts()).unwrap();
-        lab.sessions("g", 2, glob_calls);
+        lab.sessions("g", 2, &GLOB_CALLS);
         let output = lab.learn(&[]);
         fs::set_permissions(&runs, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(output.status.success(), "{}", stderr(&output));
-        assert!(stdout(&output).contains(GLOB_RULE), "{}", stdout(&output));
+        contains(&stdout(&output), GLOB_RULE);
     }
 }
 
@@ -2015,9 +1581,10 @@ fn learn_without_sources() {
 fn learn_archive_withholds_credentials() {
     let lab = Lab::new();
     lab.tool("tool", "exit 1");
-    let records = |output: &Output| -> Value {
-        let id = run_id(output);
-        serde_json::from_str(&lab.read(&format!(".justless/runs/{id}/record.json"))).unwrap()
+    let record = |args: &[&str]| {
+        let mut all = vec!["--"];
+        all.extend(args);
+        lab.record(&run_id(&lab.run_argv("", &all)))
     };
     for args in [
         &[
@@ -2033,14 +1600,9 @@ fn learn_archive_withholds_credentials() {
         &["/bin/sh", "-c", "tool publish --token quux-value"],
         &["/bin/sh", "-c", "true && ssh host make quux-value"],
     ] {
-        let mut all = vec!["--"];
-        all.extend(args);
-        let record = records(&lab.run("", &all));
-        assert_eq!(
-            (&record["argv"], &record["argv_withheld"]),
-            (&json!([]), &json!(true)),
-            "{args:?}"
-        );
+        let record = record(args);
+        assert_eq!(record["argv"], json!([]), "{args:?}");
+        assert_eq!(record["argv_withheld"], true, "{args:?}");
         assert!(!record.to_string().contains("quux-value"), "{record:#}");
     }
     for args in [
@@ -2048,9 +1610,7 @@ fn learn_archive_withholds_credentials() {
         &["tool", "install", "left-pad@latest"],
         &["/bin/sh", "-c", "tool build && tool test"],
     ] {
-        let mut all = vec!["--"];
-        all.extend(args);
-        let record = records(&lab.run("", &all));
+        let record = record(args);
         assert_eq!(record["argv"], json!(args), "{record:#}");
         assert!(record.get("argv_withheld").is_none(), "{record:#}");
     }
@@ -2058,12 +1618,7 @@ fn learn_archive_withholds_credentials() {
     let report = lab.json(&[]);
     assert_eq!(report["skipped"]["credentials"], 6, "{report:#}");
     assert_eq!(report["sources"]["runs"]["without_command"], 0);
-    assert!(
-        lab.text(&[])
-            .contains("6 dropped for a possible credential"),
-        "{}",
-        lab.text(&[])
-    );
+    contains(&lab.text(&[]), "6 dropped for a possible credential");
 }
 
 /// `cargo test` output when a test fails, captured from a scratch crate (exit 101).
@@ -2072,103 +1627,42 @@ const CARGO_FAILED: &str = "running 1 test\ntest tests::it_works ... FAILED\n\nf
 #[test]
 fn learn_test_failures_are_not_missing_options() {
     let lab = Lab::new();
-    lab.sessions("t", 2, || {
-        vec![
-            call("cargo test", failure(101, CARGO_FAILED)),
-            call("cargo test --lib", Outcome::Ok("test result: ok. 1 passed")),
-            call(
-                "cargo test",
-                failure(101, CARGO_FAILED.replace("`--lib`", "`--test cli`")),
-            ),
-            call(
-                "cargo test --test cli",
-                Outcome::Ok("test result: ok. 1 passed"),
-            ),
-            call(
-                "npm test",
-                failure(
-                    1,
-                    "> x@1.0.0 test\n> vitest run\n\n FAIL  api.test.ts\nTests  1 failed | 3 passed\nTry --workspace to run one package",
-                ),
-            ),
-            call("npm test --workspace=api", Outcome::Ok("Tests  3 passed")),
-        ]
-    });
+    let lib = format!("cargo test => 101: {CARGO_FAILED}");
+    let cli = lib.replace("`--lib`", "`--test cli`");
+    let script: [&str; 6] = [
+        &lib,
+        "cargo test --lib => test result: ok. 1 passed",
+        &cli,
+        "cargo test --test cli => test result: ok. 1 passed",
+        "npm test => 1: > x@1.0.0 test\n> vitest run\n\n FAIL  api.test.ts\nTests  1 failed | 3 passed\nTry --workspace to run one package",
+        "npm test --workspace=api => Tests  3 passed",
+    ];
+    lab.sessions("t", 2, &script);
     let report = lab.json(&["--min-sessions", "1"]);
     assert_eq!(report["rules"], json!([]), "{report:#}");
     assert_eq!(report["held"], json!([]), "{report:#}");
 
     // A failure that names the flag its correction adds is still learned.
     let lab = Lab::new();
-    lab.sessions("p", 2, || {
-        vec![
-            call(
-                "git push",
-                failure(
-                    128,
-                    "fatal: The current branch feature has no upstream branch.\nTo push the current branch and set the remote as upstream, use\n\n    git push --set-upstream origin feature\n",
-                ),
-            ),
-            call("git push --set-upstream origin feature", Outcome::Ok("done")),
-        ]
-    });
+    let script = [
+        "git push => 128: fatal: The current branch feature has no upstream branch.\nTo push the current branch and set the remote as upstream, use\n\n    git push --set-upstream origin feature\n",
+        "git push --set-upstream origin feature => done",
+    ];
+    lab.sessions("p", 2, &script);
     rule(&lab.rules(&[]), "Pass `--set-upstream` to `git push`.");
-}
-
-#[test]
-fn learn_npm_test_success_contradicts() {
-    let lab = Lab::new();
-    lab.write("web/package.json", "{}\n");
-    let missing = "npm error code ENOENT\nnpm error syscall open\nnpm error path /x/package.json\nnpm error enoent Could not read package.json";
-    lab.transcript(
-        "a.jsonl",
-        "a",
-        now_ms() - DAY,
-        vec![
-            call("npm test", Outcome::Fail(254, missing)),
-            call("npm --prefix web test", Outcome::Ok("ok")),
-        ],
-    );
-    let text = "Run `npm` from `web/`; the repository root has no package.json.";
-    rule(&lab.rules(&[]), text);
-    lab.transcript(
-        "b.jsonl",
-        "b",
-        now_ms() - MINUTE,
-        vec![call("npm test", Outcome::Ok("ok"))],
-    );
-    let report = lab.json(&[]);
-    assert_eq!(report["rules"], json!([]), "{report:#}");
-    assert_eq!(
-        held(&report, "wrong_directory")[0]["reason"],
-        "contradicted"
-    );
 }
 
 #[test]
 fn learn_self_evident_privacy_and_directory() {
     let lab = Lab::new();
-    lab.sessions("s", 2, || {
-        vec![
-            call(
-                "ssh devbox kubectl get pods",
-                Outcome::Fail(127, "bash: kubectl: command not found"),
-            ),
-            call(
-                "API_TOKEN=s3cr3t rgx foo",
-                Outcome::Fail(127, "zsh:1: command not found: rgx"),
-            ),
-            call(
-                "cd /srv/other/app && ./gradlew build",
-                Outcome::Fail(127, "zsh:1: no such file or directory: ./gradlew"),
-            ),
-            // Opaque within the root: the directory that ran ./mvnw is unknown.
-            call(
-                "D=sub\ncd $D && ./mvnw test",
-                Outcome::Fail(127, "(eval):2: no such file or directory: ./mvnw"),
-            ),
-        ]
-    });
+    let script = [
+        "ssh devbox kubectl get pods => 127: bash: kubectl: command not found",
+        "API_TOKEN=s3cr3t rgx foo => 127: zsh:1: command not found: rgx",
+        "cd /srv/other/app && ./gradlew build => 127: zsh:1: no such file or directory: ./gradlew",
+        // Opaque within the root: the directory that ran ./mvnw is unknown.
+        "D=sub\ncd $D && ./mvnw test => 127: (eval):2: no such file or directory: ./mvnw",
+    ];
+    lab.sessions("s", 2, &script);
     let report = lab.json(&["--min-sessions", "1"]);
     assert_eq!(report["rules"], json!([]), "{report:#}");
     assert_eq!(report["held"], json!([]), "{report:#}");
@@ -2176,21 +1670,17 @@ fn learn_self_evident_privacy_and_directory() {
 
     // A parsed command keeps its directory.
     let lab = Lab::new();
-    lab.sessions("r", 2, || {
-        vec![call(
-            "cd server && ./gradlew build",
-            Outcome::Fail(127, "zsh:1: no such file or directory: ./gradlew"),
-        )]
-    });
-    let found = lab.rules(&[]);
-    let found = rule(
-        &found,
-        "`./gradlew` does not exist here; check the path before running it.",
+    let script =
+        ["cd server && ./gradlew build => 127: zsh:1: no such file or directory: ./gradlew"];
+    lab.sessions("r", 2, &script);
+    let rules = lab.rules(&[]);
+    let text = "`./gradlew` does not exist here; check the path before running it.";
+    assert_eq!(
+        rule(&rules, text)["check"]["detail"],
+        "./gradlew is missing"
     );
-    assert_eq!(found["check"]["detail"], "./gradlew is missing");
     lab.write("server/gradlew", "#!/bin/sh\n");
-    let report = lab.json(&[]);
-    assert_eq!(held(&report, "missing_program")[0]["reason"], "stale");
+    assert_eq!(reason(&lab.json(&[]), "missing_program"), "stale");
 }
 
 #[test]
@@ -2219,28 +1709,14 @@ fn learn_never_crashes_on_bare_programs() {
         "/usr/bin/python3: No module named pytest",
     ];
     let lab = Lab::new();
-    for (index, program) in [
-        "npm",
-        "cargo",
-        "git",
-        "make",
-        "pytest",
-        "node",
-        "yarn",
-        "timeout 5",
-        "env",
-        "python3",
-        "./x",
-    ]
-    .iter()
-    .enumerate()
-    {
+    let programs = "npm,cargo,git,make,pytest,node,yarn,timeout 5,env,python3,./x";
+    for (index, program) in programs.split(',').enumerate() {
         let mut calls = Vec::new();
         for line in lines {
-            calls.push(call(program, failure(1, line)));
-            calls.push(call("pnpm", Outcome::Ok("ok")));
-            calls.push(call(program, failure(2, line)));
-            calls.push(call(&format!("{program} x"), Outcome::Ok("ok")));
+            calls.push(call(program, fail(1, line)));
+            calls.push(call("pnpm", Outcome::Ok("ok".into())));
+            calls.push(call(program, fail(2, line)));
+            calls.push(call(&format!("{program} x"), Outcome::Ok("ok".into())));
         }
         let session = format!("b{index}");
         lab.transcript(&format!("{session}.jsonl"), &session, now_ms() - DAY, calls);
@@ -2252,77 +1728,70 @@ fn learn_never_crashes_on_bare_programs() {
 }
 
 #[test]
-fn learn_apply_inline_import() {
-    let lab = Lab::new();
-    lab.sessions("g", 2, glob_calls);
-    lab.write("AGENTS.md", "# Agents\n");
-    let claude = "# Claude\n\nFollow @AGENTS.md for everything.\n";
-    lab.write("CLAUDE.md", claude);
-    let report = lab.json(&["--apply"]);
-    assert_eq!(report["apply"]["changed"], json!(["AGENTS.md"]));
-    assert_eq!(
-        report["apply"]["skipped"],
-        json!([{"file": "CLAUDE.md", "reason": "imports AGENTS.md"}])
-    );
-    assert_eq!(lab.read("CLAUDE.md"), claude);
-}
-
-#[test]
 fn learn_counts_only_error_lines_of_lists() {
     let lab = Lab::new();
-    let other = "x".repeat(4000);
-    lab.sessions("g", 2, || {
-        let output = format!("{GLOB}\n{other}");
-        vec![call(
-            "grep -rn needle --include=*.rs .; cat notes.txt",
-            Outcome::Raw(
-                output.clone(),
-                false,
-                json!({"stdout": output, "interrupted": false}),
-            ),
-        )]
-    });
-    lab.sessions("h", 2, gh_calls);
+    let output = format!("{GLOB}\n{}", "x".repeat(4000));
+    let result = json!({"stdout": output, "interrupted": false});
+    let list = "grep -rn needle --include=*.rs .; cat notes.txt";
+    let outcome = Outcome::Raw(output.clone(), false, result);
+    lab.sessions_of("g", 2, &[call(list, outcome)]);
+    lab.sessions("h", 2, &GH_CALLS);
     let rules = lab.rules(&[]);
-    assert_eq!(
-        rule(&rules, GLOB_RULE)["failure_bytes"],
-        2 * (GLOB.len() + 1)
-    );
+    let glob = rule(&rules, GLOB_RULE);
+    assert_eq!(glob["failure_bytes"], 2 * (GLOB.len() + 1));
     let gh = "Exit code 127\nzsh:1: command not found: gh";
     assert_eq!(rule(&rules, GH_RULE)["failure_bytes"], 2 * gh.len());
 
     // Transcript evidence points at the thread file and line.
-    let text = lab.text(&[]);
     let path = lab.transcripts().join("g0.jsonl");
-    assert!(
-        text.contains(&format!("   evidence: {}:2\n", path.display())),
-        "{text}"
-    );
+    let evidence = format!("   evidence: {}:2\n", path.display());
+    contains(&lab.text(&[]), &evidence);
 }
 
-/// A run whose Justless was killed keeps the record written before its command
-/// started, with no command line or exit status, and is not mistaken for a run
-/// recorded before command capture.
+/// Runs that do not hold a command line the agent typed are left out: a run whose
+/// Justless was killed keeps the record written before its command started, with no
+/// command line or exit status, and is not mistaken for a run recorded before command
+/// capture; and Claude Code's Bash post-command hook records a result after the
+/// command ran, with the whole command line's status, such as a pipe's 0 after a
+/// failing command.
 #[test]
-fn learn_skips_runs_left_unfinished() {
+fn learn_skips_runs_left_unfinished_or_recorded_after_the_command_ran() {
+    use std::io::Write;
     let lab = Lab::new();
     lab.tool("tool", "exit 1");
-    let id = run_id(&lab.run("", &["--", "tool", "build"]));
-    let file = format!(".justless/runs/{id}/record.json");
-    let mut record: Value = serde_json::from_str(&lab.read(&file)).unwrap();
+    let id = run_id(&lab.run("", "-- tool build"));
+    let mut record = lab.record(&id);
     record["unfinished"] = json!(true);
     record["status"] = json!(-1);
     record["argv"] = json!([]);
-    lab.write(&file, &record.to_string());
-
-    let report = lab.json(&[]);
-    assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
-    assert_eq!(
-        report["sources"]["runs"]["without_command"], 0,
-        "{report:#}"
+    lab.write(
+        &format!(".justless/runs/{id}/record.json"),
+        &record.to_string(),
     );
-    let text = lab.text(&[]);
-    assert!(!text.contains("predate command capture"), "{text}");
+    let report = lab.json(&[]);
+    let runs = &report["sources"]["runs"];
+    assert_eq!(counts(runs, "scanned without_command"), [0, 0]);
+    assert!(!lab.text(&[]).contains("predate command capture"));
+
+    let output: String = (0..400)
+        .map(|i| format!("src/a{}.rs:{i}:let needle = {i};\n", i % 7))
+        .collect();
+    let event = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash",
+        "cwd":lab.root,"tool_input":{"command":"grep -rn needle src | head -400"},
+        "tool_response":{"stdout":output,"stderr":"","interrupted":false,"isImage":false}});
+    let mut child = lab
+        .command("", &["hook-claude", "after-bash"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(event.to_string().as_bytes()).unwrap();
+    drop(stdin);
+    let answer: Value = serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap();
+    let updated = &answer["hookSpecificOutput"]["updatedToolOutput"];
+    assert!(updated.is_object(), "{answer}");
+    assert_eq!(lab.json(&[])["sources"]["runs"]["scanned"], 0);
 }
 
 /// `justless exec` records a script the agent wrote under a key such as
@@ -2338,40 +1807,6 @@ fn learn_skips_exec_runs() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(127), "{}", stderr(&output));
-    let report = lab.json(&[]);
-    assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
-}
-
-/// Claude Code's Bash post-command hook records a result after the command ran,
-/// with the whole command line's status, such as a pipe's 0 after a failing
-/// command, so learn leaves those runs out.
-#[test]
-fn learn_skips_bash_results_recorded_after_the_command_ran() {
-    use std::io::Write;
-    let lab = Lab::new();
-    let output: String = (0..400)
-        .map(|i| format!("src/a{}.rs:{i}:let needle = {i};\n", i % 7))
-        .collect();
-    let event = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash",
-        "cwd":lab.root,"tool_input":{"command":"grep -rn needle src | head -400"},
-        "tool_response":{"stdout":output,"stderr":"","interrupted":false,"isImage":false}});
-    let mut child = lab
-        .command("", &["hook-claude", "after-bash"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(event.to_string().as_bytes())
-        .unwrap();
-    let answer: Value = serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap();
-    assert!(
-        answer["hookSpecificOutput"]["updatedToolOutput"].is_object(),
-        "{answer}"
-    );
     let report = lab.json(&[]);
     assert_eq!(report["sources"]["runs"]["scanned"], 0, "{report:#}");
 }
@@ -2403,14 +1838,10 @@ fn learn_reads_codex_rollouts() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("rollout-2026-11-19T10-00-00-t1.jsonl"), body).unwrap();
     let report = lab.json(&[]);
-    let rules = report["rules"].as_array().unwrap();
-    let text = "Use `python3`, not `python`; `python` is not installed on this machine.";
-    assert_eq!(rule(rules, text)["corrections"], 1);
+    assert_eq!(rule(&report["rules"], PYTHON_RULE)["corrections"], 1);
     assert_eq!(report["sources"]["codex_rollouts"]["results"], 2);
     // Codex reads AGENTS.md, so a rule from its rollouts does not create CLAUDE.md.
     assert_eq!(report["apply"]["targets"], json!(["AGENTS.md"]));
-    assert!(
-        lab.text(&[])
-            .contains("Also read 1 Codex session(s) (2 shell results).")
-    );
+    let text = lab.text(&[]);
+    contains(&text, "Also read 1 Codex session(s) (2 shell results).");
 }
