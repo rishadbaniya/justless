@@ -425,3 +425,61 @@ fn opencode_plugin_compacts_only_bash_results_that_exited_zero() {
     let calls = std::fs::read_to_string(&calls).unwrap();
     assert_eq!(calls.lines().count(), 1, "{calls}");
 }
+
+#[cfg(unix)]
+#[test]
+fn opencode_tool_replays_logs_only_redacted() {
+    use std::os::unix::fs::PermissionsExt;
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipped: node is not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    // A stand-in for OpenCode's plugin package, next to a copy of the plugin.
+    let package = dir.path().join("node_modules/@opencode-ai/plugin");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"@opencode-ai/plugin","type":"module","main":"index.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("index.js"),
+        "const any = { optional: () => any };\nexport function tool(definition) { return definition; }\ntool.schema = { enum: () => any, array: () => any, string: () => any };\n",
+    )
+    .unwrap();
+    let plugin = dir.path().join("plugin.mjs");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("integrations/opencode.js"),
+        &plugin,
+    )
+    .unwrap();
+    let fake = dir.path().join("fake-justless");
+    std::fs::write(&fake, "#!/bin/sh\nprintf '%s ' \"$@\"\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = r#"
+        const { Justless } = await import(process.env.PLUGIN);
+        const { justless } = (await Justless({ directory: "/project" })).tool;
+        const seen = [];
+        for (const args of [["run-a"], ["run-a", "--unredacted"], ["run-a", "--unredacted=1"]]) {
+          try { seen.push((await justless.execute({ command: "log", args })).trim()); }
+          catch { seen.push("refused"); }
+        }
+        console.log(seen.join("|"));
+    "#;
+    let out = Command::new("node")
+        .args(["--input-type=module", "-e", script])
+        .env("JUSTLESS_BIN", &fake)
+        .env("PLUGIN", format!("file://{}", plugin.display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "--root /project log run-a|refused|refused"
+    );
+}

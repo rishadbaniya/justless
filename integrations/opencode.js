@@ -31,6 +31,10 @@ async function queryTool(directory) {
         if (!readonly.includes(command)) {
           throw new Error(`justless: ${command} is not a read-only command`);
         }
+        // Like the MCP tools, replay archived output only with secrets redacted.
+        if ((args ?? []).some((arg) => arg === "--unredacted" || arg.startsWith("--unredacted="))) {
+          throw new Error("justless: --unredacted is not available through this tool");
+        }
         return new Promise((resolve, reject) => {
           execFile(binary(), ["--root", directory, command, ...(args ?? [])], {
             timeout: 30_000, maxBuffer: 64 * 1024 * 1024, encoding: "utf8",
