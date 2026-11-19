@@ -9,6 +9,7 @@ mod doctests;
 mod doctor;
 mod exec;
 mod filters;
+mod find;
 mod focus;
 mod history;
 mod impact;
@@ -232,19 +233,7 @@ fn cli() -> Command<'static> {
                 )
                 .arg(budget()),
         )
-        .subcommand(
-            Command::new("find")
-                .about("Find exact text across source, docs, and configuration")
-                .arg(Arg::new("text").required(true).value_name("TEXT"))
-                .arg(
-                    Arg::new("ignore-case")
-                        .long("ignore-case")
-                        .short('i')
-                        .help("Ignore ASCII case"),
-                )
-                .arg(number("limit", "20", "Maximum matching lines"))
-                .arg(budget()),
-        )
+        .subcommand(find::command())
         .subcommand(lookup::command())
         .subcommand(
             Command::new("path")
@@ -624,14 +613,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 context_budget(&workspace, sub)?,
             )?;
         }
-        ("find", sub) => context::find(
-            &workspace,
-            &Index::open(&workspace)?,
-            sub.value_of("text").unwrap(),
-            sub.is_present("ignore-case"),
-            read_num(sub, "limit", 1)?,
-            context_budget(&workspace, sub)?,
-        )?,
+        ("find", sub) => find::run(&workspace, sub, matches.is_present("root"))?,
         ("path", sub) => context::path(
             &Index::open(&workspace)?,
             sub.value_of("from").unwrap(),

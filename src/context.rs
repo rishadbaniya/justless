@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use regex::Regex;
 
 use crate::capture;
-use crate::index::{Definition, Fingerprint, Index, Removed, is_call, nul_paths};
+use crate::index::{Definition, Index, Removed, is_call, nul_paths};
 use crate::rust_syntax::Kind;
 use crate::workspace::{Location, Workspace, display_path};
 
@@ -179,79 +179,6 @@ pub fn path(index: &Index, from: &str, to: &str, cap: usize) -> Result<()> {
         ));
         if report.clipped {
             break;
-        }
-    }
-    report.finish()
-}
-
-pub fn find(
-    workspace: &Workspace,
-    index: &Index,
-    term: &str,
-    insensitive: bool,
-    limit: usize,
-    cap: usize,
-) -> Result<()> {
-    ensure!(
-        !term.is_empty() && !term.contains('\n'),
-        "enter a non-empty, single-line search term"
-    );
-    let term = if insensitive {
-        term.to_ascii_lowercase()
-    } else {
-        term.to_owned()
-    };
-    let fingerprint = Fingerprint::new(&term);
-    let mut report = Report::new(cap);
-    let mut matches = 0;
-    let mut more = false;
-    'files: for (file, candidate) in &index.fingerprints {
-        if !candidate.includes(fingerprint) {
-            continue;
-        }
-        let Ok(path) = workspace.source_path(file) else {
-            continue;
-        };
-        let Ok(text) = fs::read_to_string(path) else {
-            continue;
-        };
-        for (offset, line) in text.lines().enumerate() {
-            let position = if insensitive {
-                line.to_ascii_lowercase().find(&term)
-            } else {
-                line.find(&term)
-            };
-            if let Some(position) = position {
-                if matches == limit {
-                    more = true;
-                    break 'files;
-                }
-                let start = line.ceil_char_boundary(position.saturating_sub(80));
-                let end = line.floor_char_boundary(
-                    (position + term.len()).saturating_add(180).min(line.len()),
-                );
-                report.line(format!(
-                    "{}:{}: {}",
-                    display_path(file),
-                    offset + 1,
-                    &line[start..end]
-                ));
-                matches += 1;
-                if report.clipped {
-                    break 'files;
-                }
-            }
-        }
-    }
-    if more {
-        report.line(format!(
-            "[limit of {limit} matches reached; more exist. Raise --limit to see them.]"
-        ));
-    }
-    if matches == 0 {
-        report.line("No matching indexed text.");
-        if let Some(note) = index.skipped_note(false) {
-            report.line(note);
         }
     }
     report.finish()

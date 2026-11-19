@@ -761,15 +761,22 @@ impl Index {
     /// Names files that were left out of the index, for a search that found
     /// nothing. A symbol search only mentions files that could define symbols.
     pub fn skipped_note(&self, symbols: bool) -> Option<String> {
+        self.skipped_note_where(symbols, |_| true)
+    }
+
+    /// [`Index::skipped_note`] for the skipped files `keep` accepts, such as
+    /// those a narrowed search would have read.
+    pub fn skipped_note_where(&self, symbols: bool, keep: impl Fn(&str) -> bool) -> Option<String> {
         let skipped: Vec<_> = self
             .refresh
             .skipped
             .iter()
             .filter(|(file, reason)| {
-                !symbols
-                    || reason.starts_with("unreadable")
-                    || is_rust(file)
-                    || Grammar::for_file(file).is_some()
+                keep(file)
+                    && (!symbols
+                        || reason.starts_with("unreadable")
+                        || is_rust(file)
+                        || Grammar::for_file(file).is_some())
             })
             .collect();
         let (file, reason) = skipped.first()?;

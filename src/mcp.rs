@@ -545,6 +545,11 @@ enum Kind {
     Count(u64, u64),
     Flag,
     Choice(&'static [&'static str]),
+    /// One or more workspace-relative files or directories, each passed as
+    /// its own option.
+    Paths,
+    /// One or more strings, each passed as its own option.
+    Texts,
 }
 
 #[derive(Clone, Copy)]
@@ -597,7 +602,8 @@ const BUDGET: Param = option(
     "budget",
     "budget",
     Kind::Count(128, 1_000_000),
-    "Max bytes (default 2400)",
+    // The default is the project's `context_budget`, so it is not named here.
+    "Max bytes",
 );
 const FILE: Param = positional("file", Kind::File, "Workspace-relative path");
 const RUN_ID: Param = positional("run_id", Kind::RunId, "Run ID from `justless run`");
@@ -658,12 +664,15 @@ const TOOLS: &[Tool] = &[
                 Kind::Flag,
                 "Ignore ASCII case",
             ),
+            option("path", "path", Kind::Paths, "Files or dirs"),
+            option("glob", "glob", Kind::Texts, "rg -g globs"),
             option(
                 "limit",
                 "limit",
                 Kind::Count(1, 1000),
                 "Max lines (default 20)",
             ),
+            option("after", "after", Kind::Text, "Next-page cursor"),
             BUDGET,
         ],
         check: None,
@@ -939,6 +948,7 @@ impl Tool {
                 Kind::Count(..) => json!({"type": "integer"}),
                 Kind::Flag => json!({"type": "boolean"}),
                 Kind::Choice(values) => json!({"type": "string", "enum": values}),
+                Kind::Paths | Kind::Texts => json!({"type": "array", "items": {"type": "string"}}),
             };
             schema["description"] = json!(param.help);
             properties.insert(param.name.into(), schema);
@@ -992,6 +1002,23 @@ impl Tool {
                 }
                 continue;
             };
+            if let Kind::Paths | Kind::Texts = param.kind {
+                let items = match value {
+                    Value::String(_) => std::slice::from_ref(value),
+                    Value::Array(items) => items.as_slice(),
+                    _ => {
+                        return Err(format!(
+                            "`{}` must be a string or a list of strings",
+                            param.name
+                        ));
+                    }
+                };
+                for item in items {
+                    let text = validate(param, item)?;
+                    argv.push(format!("--{}={text}", param.flag.unwrap()));
+                }
+                continue;
+            }
             if let Kind::Flag = param.kind {
                 match value {
                     Value::Bool(true) => argv.push(format!("--{}", param.flag.unwrap())),
@@ -1032,7 +1059,7 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
     };
     ensure_text(name, text)?;
     let valid = match param.kind {
-        Kind::File => relative_file(text),
+        Kind::File | Kind::Paths => relative_file(text),
         Kind::Location => text.rsplit_once(':').is_some_and(|(file, lines)| {
             let mut bounds = lines.splitn(2, '-');
             relative_file(file)
@@ -1057,6 +1084,9 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
     }
     Err(match param.kind {
         Kind::File => format!("`{name}` must be a workspace-relative path such as src/main.rs"),
+        Kind::Paths => format!(
+            "`{name}` must be a workspace-relative path or a list of them, such as src or src/main.rs"
+        ),
         Kind::Location => format!("`{name}` must look like src/lib.rs:40 or src/lib.rs:40-52"),
         Kind::RunId => format!("`{name}` must be a run ID such as run-1a2b3c"),
         Kind::RecallId => format!("`{name}` must be a recall ID or a tool_use ID"),

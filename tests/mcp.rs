@@ -919,3 +919,98 @@ fn a_log_page_counts_the_bytes_it_returned_not_the_whole_replay() {
         200_000 - report["preview_bytes"].as_i64().unwrap() - (page + range) as i64
     );
 }
+
+#[test]
+fn find_tool_narrows_by_path_and_glob_and_pages_with_a_cursor() {
+    let fixture = mixed_fixture();
+    let root = fixture.path();
+    for i in 0..4 {
+        fs::write(
+            root.join(format!("db/extra_{i}.sql")),
+            "-- purchase_orders\n",
+        )
+        .unwrap();
+    }
+    let session = |calls: Vec<String>| {
+        let mut lines = vec![legacy_initialize()];
+        lines.extend(calls);
+        exchange(root, &lines)
+    };
+    let responses = session(vec![
+        request("list", "tools/list", json!({})),
+        call(
+            "scoped",
+            "find",
+            json!({"text": "purchase_orders", "path": ["db", "backend"], "glob": ["!extra_*"]}),
+        ),
+        call(
+            "one",
+            "find",
+            json!({"text": "purchase_orders", "path": "db", "limit": 2}),
+        ),
+        call(
+            "missing",
+            "find",
+            json!({"text": "purchase_orders", "path": ["nowhere"]}),
+        ),
+        call(
+            "outside",
+            "find",
+            json!({"text": "purchase_orders", "path": ["../elsewhere"]}),
+        ),
+        call(
+            "not-list",
+            "find",
+            json!({"text": "purchase_orders", "glob": 3}),
+        ),
+    ]);
+    let tools = by_id(&responses, "list")["result"]["tools"]
+        .as_array()
+        .unwrap();
+    let find = tools.iter().find(|tool| tool["name"] == "find").unwrap();
+    let properties = &find["inputSchema"]["properties"];
+    assert_eq!(properties["path"]["type"], "array", "{find:#}");
+    assert_eq!(properties["glob"]["items"]["type"], "string", "{find:#}");
+    assert_eq!(properties["after"]["type"], "string", "{find:#}");
+    assert_eq!(find["inputSchema"]["required"], json!(["text"]));
+    assert_eq!(find["annotations"]["readOnlyHint"], true);
+    let size = serde_json::to_string(tools).unwrap().len();
+    assert!(size < 8_000, "tool list is {size} bytes");
+
+    let scoped = succeeded(by_id(&responses, "scoped"));
+    assert!(
+        scoped.starts_with("[scope: db/, backend/ · glob !extra_* · 3 of "),
+        "{scoped}"
+    );
+    assert!(
+        scoped.contains("backend/orders.py:8: ") && scoped.contains("db/schema.sql:1: "),
+        "{scoped}"
+    );
+    assert!(!scoped.contains("db/extra_"), "{scoped}");
+    let one = succeeded(by_id(&responses, "one"));
+    assert!(
+        one.contains("[--limit 2 reached after 2 of 5 matches in 5 files]\n"),
+        "{one}"
+    );
+    let cursor = one
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("--after="))
+        .unwrap()
+        .to_owned();
+    assert!(failed(by_id(&responses, "missing")).contains("--path nowhere: no such file"));
+    assert!(failed(by_id(&responses, "outside")).contains("`path` must be a workspace-relative"));
+    assert!(failed(by_id(&responses, "not-list")).contains("`glob` must be"));
+
+    let responses = session(vec![call(
+        "next",
+        "find",
+        json!({"text": "purchase_orders", "path": ["db"], "limit": 2, "after": cursor}),
+    )]);
+    let next = succeeded(by_id(&responses, "next"));
+    assert!(next.starts_with("[scope: db/ · 5 of "), "{next}");
+    assert_eq!(next.matches(".sql:1: ").count(), 2, "{next}");
+    assert!(
+        next.contains("[--limit 2 reached after 4 of 5 matches in 5 files]\n"),
+        "{next}"
+    );
+}

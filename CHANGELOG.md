@@ -49,6 +49,7 @@ User-visible changes to Justless are recorded here. No release has been publishe
 - `NAME@FILE:LINE` selects one of several definitions that share a name, such as cfg-gated twins.
 - Rust paths into another crate of the repository resolve through the `path` its dependency names, directly, through `[workspace.dependencies]` or in a `[target.….dependencies]` table. A registry or renamed dependency that shares a workspace crate's package name, or an import such as `use upstream_ctrlc as ctrlc;`, is no longer linked to the local crate.
 - An unreadable or oversized file is skipped rather than failing every query. `index` lists the skipped files, and a query or `find` that finds nothing names them.
+- `find --path PATH` and `--glob GLOB` narrow a search to files and directories or to `rg -g` style globs, and the output names the scope it read. A path with no indexed files or a glob that matches none says so, instead of reading as no matches. A page cut by `--limit` or the budget says which bound cut it, such as `[budget reached after 5 of 60 matches in 58 files, before --limit 20]`, and prints the command for the next page with an `--after` cursor that is rejected if the search or the file it stopped in changed. `--json` returns the same pages, and the MCP `find` tool takes `path`, `glob` and `after`.
 
 ### Reads and edits
 

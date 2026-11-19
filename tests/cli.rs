@@ -5188,11 +5188,16 @@ fn context_and_find_state_their_limits() {
             .contains("  4 | @functools.lru_cache(maxsize=8)\n")
     );
     let limited = success(root, &["find", "marker", "--limit", "3"]);
-    assert_eq!(limited.lines().count(), 4, "{limited}");
+    assert_eq!(limited.lines().count(), 5, "{limited}");
     assert!(
-        limited.ends_with("[limit of 3 matches reached; more exist. Raise --limit to see them.]\n")
+        limited.contains("\n[--limit 3 reached after 3 of 30 matches in 1 file]\nNext page: "),
+        "{limited}"
     );
-    assert!(!success(root, &["find", "marker", "--limit", "30"]).contains("limit of"));
+    let all = success(root, &["find", "marker", "--limit", "30"]);
+    assert!(
+        !all.contains("reached") && !all.contains("Next page"),
+        "{all}"
+    );
     for args in [
         &["code", "main.py", "--from", "400", "--to", "410"][..],
         &["context", "--at", "main.py:5000"],
@@ -17664,4 +17669,455 @@ fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
             "{command}"
         );
     }
+}
+
+/// 62 matches of `retry_budget` in 60 files: one per file except three in
+/// src/mod_07.py, and docs/note_15.md has one line longer than a small page.
+fn paged_find_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "").unwrap();
+    for (dir, count) in [("src", 40), ("docs", 15), ("config", 5)] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+        for i in 1..=count {
+            let (name, text) = match dir {
+                "src" => (
+                    format!("mod_{i:02}.py"),
+                    format!(
+                        "def handler_{i}():\n    # TODO: retry_budget for worker {i}\n    return {i}\n"
+                    ),
+                ),
+                "docs" => (
+                    format!("note_{i:02}.md"),
+                    format!("# Notes {i}\n\nSet retry_budget in config.\n"),
+                ),
+                _ => (format!("svc_{i}.toml"), format!("retry_budget = {i}\n")),
+            };
+            fs::write(root.join(dir).join(name), text).unwrap();
+        }
+    }
+    fs::write(
+        root.join("src/mod_07.py"),
+        "retry_budget = 1\nretry_budget += 1\n# retry_budget again\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/note_15.md"),
+        format!(
+            "# Notes 15\n\n{} retry_budget {}\n",
+            "a".repeat(300),
+            "z".repeat(600)
+        ),
+    )
+    .unwrap();
+    repo
+}
+
+/// The matches on a find page, as `FILE:LINE`.
+fn find_matches(page: &str) -> Vec<String> {
+    page.lines()
+        .filter(|line| !line.starts_with('[') && !line.starts_with("Next page: "))
+        .map(|line| {
+            let mut parts = line.splitn(3, ':');
+            format!("{}:{}", parts.next().unwrap(), parts.next().unwrap())
+        })
+        .collect()
+}
+
+/// Runs the next-page command a find page prints, verbatim, through the shell.
+#[cfg(unix)]
+fn next_find_page(dir: &Path, page: &str) -> Option<String> {
+    let command = page
+        .lines()
+        .find_map(|line| line.strip_prefix("Next page: "))?;
+    let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .args(["-c", command])
+        .current_dir(dir)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{command}: {}", stderr(&output));
+    Some(stdout(&output))
+}
+
+/// The `--after` value in a page's next-page command.
+fn find_cursor(page: &str) -> String {
+    page.lines()
+        .find_map(|line| line.strip_prefix("Next page: "))
+        .and_then(|command| {
+            command
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix("--after="))
+        })
+        .unwrap_or_else(|| panic!("no cursor in {page}"))
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn find_pages_through_every_match_with_a_cursor() {
+    let repo = paged_find_repo();
+    let root = repo.path();
+    let whole = success(
+        root,
+        &[
+            "find",
+            "retry_budget",
+            "--limit",
+            "1000",
+            "--budget",
+            "100000",
+        ],
+    );
+    let expected = find_matches(&whole);
+    assert_eq!(expected.len(), 62, "{whole}");
+    assert!(!whole.contains("Next page"), "{whole}");
+    // The reported case: the budget binds before --limit, so the notice says so
+    // instead of suggesting a larger --limit.
+    let first = success(
+        root,
+        &["find", "retry_budget", "--budget", "512", "--limit", "100"],
+    );
+    let shown = find_matches(&first).len();
+    assert!((1..20).contains(&shown), "{first}");
+    assert!(
+        first.contains(&format!(
+            "[budget reached after {shown} of 62 matches in 60 files, before --limit 100]\n"
+        )),
+        "{first}"
+    );
+    let limited = success(root, &["find", "retry_budget", "--limit", "7"]);
+    assert!(
+        limited.contains("[--limit 7 reached after 7 of 62 matches in 60 files]\n"),
+        "{limited}"
+    );
+    // Following each printed command reaches every match once, in order, and
+    // each page stays within its budget.
+    for (args, budget) in [
+        (&["--budget", "512"][..], 512),
+        (&["--limit", "7"], 2400),
+        (&["--budget", "300", "--limit", "4"], 300),
+    ] {
+        let mut page = success(root, &[&["find", "retry_budget"][..], args].concat());
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            assert!(
+                page.len() <= budget,
+                "{args:?}: {} bytes\n{page}",
+                page.len()
+            );
+            let matches = find_matches(&page);
+            assert!(!matches.is_empty(), "{page}");
+            seen.extend(matches);
+            pages += 1;
+            match next_find_page(root, &page) {
+                Some(next) => page = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, expected, "{args:?}");
+        assert!(pages > 2, "{args:?}");
+        assert!(
+            page.ends_with("[end of 62 matches in 60 files]\n"),
+            "{page}"
+        );
+    }
+    // Every page shows at least one match, even a line longer than the page.
+    let mut page = success(root, &["find", "retry_budget", "--budget", "128"]);
+    let mut seen = Vec::new();
+    loop {
+        let matches = find_matches(&page);
+        assert_eq!(matches.len(), 1, "{page}");
+        seen.extend(matches);
+        match next_find_page(root, &page) {
+            Some(next) => page = next,
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected);
+    // The same cursor pages --json, which keeps each page within its budget.
+    let mut after = None::<String>;
+    let mut seen = Vec::new();
+    loop {
+        let mut args = vec!["find", "retry_budget", "--json", "--budget", "700"];
+        if let Some(cursor) = &after {
+            args.extend(["--after", cursor]);
+        }
+        let text = success(root, &args);
+        assert!(text.len() <= 700, "{} bytes: {text}", text.len());
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["total"], 62, "{value}");
+        assert_eq!(value["files"], 60, "{value}");
+        assert_eq!(value["first"], seen.len() + 1, "{value}");
+        let matches = value["matches"].as_array().unwrap();
+        assert!(!matches.is_empty(), "{value}");
+        for hit in matches {
+            seen.push(format!("{}:{}", hit["file"].as_str().unwrap(), hit["line"]));
+        }
+        match value["after"].as_str() {
+            Some(cursor) => {
+                assert_eq!(value["cut"], "budget", "{value}");
+                assert!(value["next"].as_str().unwrap().contains("--json"));
+                after = Some(cursor.to_owned());
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn find_cursors_reject_a_changed_page_or_another_search() {
+    let repo = paged_find_repo();
+    let root = repo.path();
+    let first = success(root, &["find", "retry_budget", "--limit", "3"]);
+    assert_eq!(
+        find_matches(&first),
+        [
+            "config/svc_1.toml:1",
+            "config/svc_2.toml:1",
+            "config/svc_3.toml:1"
+        ]
+    );
+    let cursor = find_cursor(&first);
+    // Edits outside the file the page stopped in leave the cursor valid.
+    fs::write(
+        root.join("config/svc_1.toml"),
+        "# moved\nretry_budget = 1\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/mod_01.py"), "retry_budget\n\nretry_budget\n").unwrap();
+    let next = success(
+        root,
+        &["find", "retry_budget", "--limit", "3", "--after", &cursor],
+    );
+    assert_eq!(
+        find_matches(&next),
+        [
+            "config/svc_4.toml:1",
+            "config/svc_5.toml:1",
+            "docs/note_01.md:3"
+        ],
+        "{next}"
+    );
+    assert!(
+        next.contains("[--limit 3 reached after 6 of 63 matches in 60 files]"),
+        "{next}"
+    );
+    // A cursor belongs to one search: its text, case and scope.
+    for args in [
+        &["find", "retry", "--after", &cursor][..],
+        &["find", "-i", "retry_budget", "--after", &cursor],
+        &[
+            "find",
+            "retry_budget",
+            "--path",
+            "config",
+            "--after",
+            &cursor,
+        ],
+        &[
+            "find",
+            "retry_budget",
+            "--glob",
+            "*.toml",
+            "--after",
+            &cursor,
+        ],
+    ] {
+        let output = cli(root, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr(&output).contains("this --after cursor belongs to another search"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+    let output = cli(root, &["find", "retry_budget", "--after", "f1.nonsense"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("invalid --after cursor"),
+        "{}",
+        stderr(&output)
+    );
+    // An edit to the file the page stopped in can move its lines.
+    fs::write(root.join("config/svc_3.toml"), "\nretry_budget = 3\n").unwrap();
+    let output = cli(root, &["find", "retry_budget", "--after", &cursor]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains(
+            "config/svc_3.toml changed since that page; run the search again without --after"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    fs::remove_file(root.join("config/svc_3.toml")).unwrap();
+    let output = cli(root, &["find", "retry_budget", "--after", &cursor]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("the file that page stopped in is no longer indexed"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn find_narrows_to_paths_and_globs_as_rg_does() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "").unwrap();
+    for file in [
+        "src/a.rs",
+        "src/b_test.rs",
+        "src/vendor/v.rs",
+        "vendor/w.rs",
+        "docs/x.md",
+        "top.rs",
+    ] {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "needle\n").unwrap();
+    }
+    let files = |dir: &Path, args: &[&str]| {
+        let text = success(dir, &[&["find", "needle"][..], args].concat());
+        text.lines()
+            .filter_map(|line| line.strip_suffix(":1: needle"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    // Each expected list is what `rg --files` printed for the same -g flags
+    // (ripgrep 15.2): the last matching glob wins, a leading ! excludes, and
+    // an excluded directory takes its files with it.
+    for (globs, expected) in [
+        (
+            &["*.rs"][..],
+            &[
+                "src/a.rs",
+                "src/b_test.rs",
+                "src/vendor/v.rs",
+                "top.rs",
+                "vendor/w.rs",
+            ][..],
+        ),
+        (
+            &["!vendor"],
+            &["docs/x.md", "src/a.rs", "src/b_test.rs", "top.rs"],
+        ),
+        (
+            &["*.rs", "!*_test.rs"],
+            &["src/a.rs", "src/vendor/v.rs", "top.rs", "vendor/w.rs"],
+        ),
+        (
+            &["!src/**", "*.rs"],
+            &["src/a.rs", "src/b_test.rs", "top.rs", "vendor/w.rs"],
+        ),
+        (&["*.rs", "!src/**"], &["top.rs", "vendor/w.rs"]),
+        (&["/top.rs"], &["top.rs"]),
+        (&["**/vendor/**"], &["src/vendor/v.rs", "vendor/w.rs"]),
+    ] {
+        let args = globs
+            .iter()
+            .flat_map(|glob| ["--glob", glob])
+            .collect::<Vec<_>>();
+        assert_eq!(files(root, &args), expected, "{globs:?}");
+    }
+    // The output names the scope it searched.
+    assert_eq!(
+        success(root, &["find", "needle", "--path", "docs"]),
+        "[scope: docs/ · 1 of 7 indexed files]\ndocs/x.md:1: needle\n"
+    );
+    assert_eq!(
+        success(
+            root,
+            &[
+                "find", "needle", "-g", "*.md", "--path", "top.rs", "--path", "docs/"
+            ]
+        ),
+        "[scope: top.rs, docs/ · glob *.md · 1 of 7 indexed files]\ndocs/x.md:1: needle\n"
+    );
+    // Paths resolve from the current directory like shell paths.
+    let src = root.join("src");
+    assert_eq!(files(&src, &["--path", "vendor"]), ["src/vendor/v.rs"]);
+    assert_eq!(files(&src, &["--path", "../vendor"]), ["vendor/w.rs"]);
+    assert_eq!(files(&src, &["--path", "."]).len(), 3);
+    // A path that does not exist, or leaves the workspace, is an error.
+    for (path, message) in [
+        (
+            "nope",
+            "--path nope: no such file or directory in the workspace",
+        ),
+        ("..", "--path .. is outside the workspace"),
+    ] {
+        let output = cli(root, &["find", "needle", "--path", path]);
+        assert_eq!(output.status.code(), Some(2), "{path}");
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+    }
+    // A glob or path with no indexed file says so instead of reading as no match.
+    let none = success(root, &["find", "needle", "-g", "*.tsx", "-g", "*.md"]);
+    assert_eq!(
+        none,
+        "[scope: glob *.tsx, *.md · 1 of 7 indexed files]\n[--glob *.tsx matches no indexed file]\ndocs/x.md:1: needle\n"
+    );
+    let empty = success(root, &["find", "needle", "-g", "*.tsx"]);
+    assert_eq!(
+        empty,
+        "[scope: glob *.tsx · 0 of 7 indexed files]\n[--glob *.tsx matches no indexed file]\nNo indexed file is in scope.\n"
+    );
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::write(root.join("node_modules/pkg/index.js"), "needle\n").unwrap();
+    let excluded = success(root, &["find", "needle", "--path", "node_modules"]);
+    assert!(
+        excluded.contains("[--path node_modules/ has no indexed text files]\n"),
+        "{excluded}"
+    );
+    let missing = success(root, &["find", "absent", "--path", "docs"]);
+    assert_eq!(
+        missing,
+        "[scope: docs/ · 1 of 7 indexed files]\nNo matching indexed text.\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn find_next_page_commands_keep_scope_case_and_a_leading_dash() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::write(root.join(".justless.toml"), "").unwrap();
+    fs::create_dir_all(root.join("notes")).unwrap();
+    for i in 1..=5 {
+        fs::write(root.join(format!("notes/{i}.md")), "see -RELEASE.md\n").unwrap();
+        fs::write(root.join(format!("other{i}.md")), "see -release.md\n").unwrap();
+    }
+    let first = success(
+        root,
+        &[
+            "find", "-i", "--path", "notes", "--glob", "!4.md", "--limit", "2", "--", "-release",
+        ],
+    );
+    let command = first
+        .lines()
+        .find_map(|line| line.strip_prefix("Next page: "))
+        .unwrap();
+    assert!(
+        command.starts_with("justless find -i --path=notes '--glob=!4.md' --limit=2 --after=f1."),
+        "{command}"
+    );
+    assert!(command.ends_with(" -- -release"), "{command}");
+    let second = next_find_page(root, &first).unwrap();
+    assert_eq!(
+        find_matches(&second),
+        ["notes/3.md:1", "notes/5.md:1"],
+        "{second}"
+    );
+    assert!(
+        second.ends_with("[end of 4 matches in 4 files]\n"),
+        "{second}"
+    );
 }
