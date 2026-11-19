@@ -600,14 +600,18 @@ def gen_regression(repo, seed, avoid, n=1, label=""):
 
 def generate(kind, repo, count, seed, used, start=1, label=""):
     """At most `count` tasks of one kind from one repository, numbered from `start`, avoiding the files and
-    symbols in `used`."""
-    if kind == "bugfix":
-        return gen_bugfix(repo, count, seed, used["files"], start, label)
-    if kind == "lint":
-        return gen_lint(repo, seed, used["files"], start, label)
-    if kind == "callers":
-        return gen_callers(repo, seed, count, start, label, used["symbols"])
-    return gen_regression(repo, seed, used["files"], start, label)
+    symbols in `used`. A repository that yields no valid task returns none, and the plan fills from FALLBACK."""
+    try:
+        if kind == "bugfix":
+            return gen_bugfix(repo, count, seed, used["files"], start, label)
+        if kind == "lint":
+            return gen_lint(repo, seed, used["files"], start, label)
+        if kind == "callers":
+            return gen_callers(repo, seed, count, start, label, used["symbols"])
+        return gen_regression(repo, seed, used["files"], start, label)
+    except RuntimeError as error:
+        log("large", kind, repo, "no task:", str(error)[:500])
+        return []
 
 
 def main(argv=None):
@@ -620,12 +624,17 @@ def main(argv=None):
     if shutil.which("justless", path=config.SYSTEM_PATH):
         raise SystemExit("justless must not be on the generator's PATH")
     config.HOME = Path(args.home)
-    used = {"files": main_task_files(args.home), "symbols": set()}
-    for task in tasks_module.load_private(args.home, TASK_SET):
-        used["files"].update(e["file"] for e in (task.get("setup") or {}).get("edits") or [])
-        used["symbols"].add((task.get("oracle") or {}).get("symbol"))
     kinds = args.kinds.split(",")
     repos = set(args.repos.split(",")) if args.repos else None
+    used = {"files": main_task_files(args.home), "symbols": set()}
+    for task in tasks_module.load_private(args.home, TASK_SET):
+        plan_repo = (task.get("generator") or {}).get("plan", [None, task["repo"]])[1]
+        if task["kind"] in kinds and (repos is None or plan_repo in repos):
+            # Regenerated below: drop the old file so a rerun draws exactly as the first run did.
+            (tasks_module.private_dir(args.home, TASK_SET) / ("%s.json" % task["id"])).unlink()
+            continue
+        used["files"].update(e["file"] for e in (task.get("setup") or {}).get("edits") or [])
+        used["symbols"].add((task.get("oracle") or {}).get("symbol"))
     numbers = collections.Counter()
     produced = []
     for kind, repo, count in PLAN:
