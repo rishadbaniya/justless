@@ -9963,6 +9963,72 @@ fn clipped_excerpts_end_on_whole_lines_or_mark_the_cut() {
     }
 }
 
+/// The text of `file` under `root`.
+fn file_text(root: &Path, file: &str) -> String {
+    fs::read_to_string(root.join(file)).unwrap()
+}
+
+/// Asserts that `text` contains each of `parts`.
+fn text_has(text: &str, parts: &[&str]) {
+    for part in parts {
+        assert!(text.contains(part), "missing {part:?} in\n{text}");
+    }
+}
+
+/// Asserts that `text` contains none of `parts`.
+fn text_lacks(text: &str, parts: &[&str]) {
+    for part in parts {
+        assert!(!text.contains(part), "unexpected {part:?} in\n{text}");
+    }
+}
+
+/// The command `handler`'s pre-command hook runs instead of `command` in `cwd`,
+/// or `None` when it leaves the command alone.
+fn shell_rewrite(root: &Path, handler: &str, cwd: &Path, command: &str) -> Option<String> {
+    let event = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+        "cwd":cwd,"tool_input":{"command":command}});
+    let output = agent_hook(root, handler, "before-command", event);
+    let input = &output["hookSpecificOutput"]["updatedInput"];
+    (!input.is_null()).then(|| input["command"].as_str().unwrap().to_owned())
+}
+
+/// The stdout of `sh -c COMMAND` in `cwd`.
+fn sh_stdout(cwd: &Path, command: &str) -> Vec<u8> {
+    let output = Command::new("sh")
+        .args(["-c", command])
+        .current_dir(cwd)
+        .output();
+    output.unwrap().stdout
+}
+
+/// The bytes `log --unredacted` replays for the first run that `shown` names.
+fn replayed_run(root: &Path, shown: &str) -> Vec<u8> {
+    let id = shown
+        .split_whitespace()
+        .find(|word| word.starts_with("run-"));
+    let id = id.unwrap_or_else(|| panic!("no run: {shown}"));
+    cli(root, &["log", id, "--unredacted"]).stdout
+}
+
+/// The command on the `Exact: ` line of an outline.
+#[cfg(unix)]
+fn exact_command(outline: &str) -> &str {
+    let exact = outline
+        .lines()
+        .find_map(|line| line.strip_prefix("Exact: "));
+    exact.unwrap_or_else(|| panic!("no Exact line: {outline}"))
+}
+
+/// `cli` with `words` split at whitespace, for arguments without spaces.
+fn cli_words(root: &Path, words: &str) -> Output {
+    cli(root, &words.split_whitespace().collect::<Vec<_>>())
+}
+
+/// `success` with `words` split at whitespace, for arguments without spaces.
+fn success_words(root: &Path, words: &str) -> String {
+    success(root, &words.split_whitespace().collect::<Vec<_>>())
+}
+
 #[test]
 fn the_tail_of_an_enormous_last_line_is_its_real_end() {
     let repo = TempDir::new().unwrap();
@@ -16831,24 +16897,38 @@ fn a_printed_root_named_like_a_secret_survives_output_redaction() {
     let text = stdout(&output);
     assert!(text.contains("token=[redacted:github-token:"), "{text}");
 }
-/// Archives a finished run directly, as `run` leaves it, with its stdout and
-/// stderr.
-fn archived_run(root: &Path, id: &str, status: i32, completed_ms: u64, streams: [&str; 2]) {
-    let run = root.join(".justless/runs").join(id);
-    fs::create_dir_all(&run).unwrap();
-    let record = serde_json::json!({
-        "id": id,
-        "status": status,
-        "raw_bytes": streams[0].len() + streams[1].len(),
-        "preview_bytes": 0,
-        "completed_ms": completed_ms,
-        "family": "other",
-        "diagnostics": [],
-        "source_digests": {},
-    });
-    fs::write(run.join("record.json"), record.to_string()).unwrap();
-    fs::write(run.join("stdout"), streams[0]).unwrap();
-    fs::write(run.join("stderr"), streams[1]).unwrap();
+/// Archives finished runs directly, as `run` leaves them: each with its ID,
+/// status, completion time, stdout and stderr.
+fn archive_runs(root: &Path, runs: &[(&str, i32, u64, &str, &str)]) {
+    for (id, status, completed_ms, out, err) in runs {
+        let record = serde_json::json!({
+            "id": id,
+            "status": status,
+            "raw_bytes": out.len() + err.len(),
+            "preview_bytes": 0,
+            "completed_ms": completed_ms,
+            "family": "other",
+            "diagnostics": [],
+            "source_digests": {},
+        });
+        let run = format!(".justless/runs/{id}");
+        write_files(
+            root,
+            &[
+                (&format!("{run}/record.json"), &record.to_string()),
+                (&format!("{run}/stdout"), out),
+                (&format!("{run}/stderr"), err),
+            ],
+        );
+    }
+}
+
+/// A Git repository holding `runs`, archived as `archive_runs` does.
+fn archived_repo(runs: &[(&str, i32, u64, &str, &str)]) -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    archive_runs(repo.path(), runs);
+    repo
 }
 
 fn order_progress(count: usize) -> String {
@@ -16887,71 +16967,59 @@ fn search_keeps_a_place_for_each_stream_and_counts_what_its_limit_leaves_out() {
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     let id = run_id(&output);
     let id = id.split(' ').next().unwrap();
+    let search = |args: &str| success_words(root, &format!("search {id} order-42 {args}"));
     let failure = "stderr:1: order-42 FAILED at settlement\n";
     // Within the limit, matches are listed stream by stream in line order, and
     // nothing says more exist.
-    assert_eq!(
-        success(root, &["search", id, "order-42", "--limit", "26"]),
-        progress_matches(0..25) + failure
-    );
+    assert_eq!(search("--limit 26"), progress_matches(0..25) + failure);
     // The default limit of 20 no longer fills with stdout progress: the failed
     // run's stderr failure keeps a place and comes first, and the last line
     // counts what each stream left out.
     assert_eq!(
-        success(root, &["search", id, "order-42"]),
+        search(""),
         format!(
             "{failure}{}[20 of 26 matches shown (stdout 19 of 25, stderr 1 of 1); --limit 26 shows all]\n",
             progress_matches(0..19)
         )
     );
     assert_eq!(
-        success(root, &["search", id, "order-42", "--limit", "1"]),
+        search("--limit 1"),
         format!(
             "{failure}[1 of 26 matches shown (stdout 0 of 25, stderr 1 of 1); --limit 26 shows all]\n"
         )
     );
     assert_eq!(
-        success(
-            root,
-            &[
-                "search", id, "order-42", "--stream", "stdout", "--limit", "3"
-            ]
-        ),
+        search("--stream stdout --limit 3"),
         progress_matches(0..3) + "[3 of 25 matches shown (stdout 3 of 25); --limit 25 shows all]\n"
     );
-    assert_eq!(
-        success(root, &["search", id, "order-42", "--stream", "stderr"]),
-        failure
-    );
+    assert_eq!(search("--stream stderr"), failure);
 }
 
 #[test]
 fn search_puts_failure_lines_first_only_for_a_failed_run() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
     // A merged `2>&1` run archives its failure on stdout, after the progress.
     let log = order_progress(25) + "order-42 FAILED at settlement\n";
-    archived_run(root, "run-Failed1", 1, 2_000, [&log, ""]);
-    archived_run(root, "run-Passed1", 0, 1_000, [&log, ""]);
+    let repo = archived_repo(&[
+        ("run-Failed1", 1, 2_000, &log, ""),
+        ("run-Passed1", 0, 1_000, &log, ""),
+    ]);
+    let root = repo.path();
+    let notice = "[5 of 26 matches shown (stdout 5 of 26); --limit 26 shows all]\n";
     assert_eq!(
-        success(root, &["search", "run-Failed1", "order-42", "--limit", "5"]),
+        success_words(root, "search run-Failed1 order-42 --limit 5"),
         format!(
-            "{}stdout:26: order-42 FAILED at settlement\n[5 of 26 matches shown (stdout 5 of 26); --limit 26 shows all]\n",
+            "{}stdout:26: order-42 FAILED at settlement\n{notice}",
             progress_matches(0..4)
         )
     );
     // A run that passed keeps plain line order.
     assert_eq!(
-        success(root, &["search", "run-Passed1", "order-42", "--limit", "5"]),
-        format!(
-            "{}[5 of 26 matches shown (stdout 5 of 26); --limit 26 shows all]\n",
-            progress_matches(0..5)
-        )
+        success_words(root, "search run-Passed1 order-42 --limit 5"),
+        progress_matches(0..5) + notice
     );
     // `history` chooses within each run the same way, newest run first.
     assert_eq!(
-        history_lines(&success(root, &["history", "order-42", "--limit", "3"])),
+        history_lines(&success_words(root, "history order-42 --limit 3")),
         [
             "run-Failed1 other stdout:1: order-42 progress 0",
             "run-Failed1 other stdout:2: order-42 progress 1",
@@ -16963,33 +17031,30 @@ fn search_puts_failure_lines_first_only_for_a_failed_run() {
 
 #[test]
 fn history_counts_matches_past_its_limit_and_keeps_runs_in_order() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    archived_run(root, "run-Old1", 0, 1_000, ["order-42 shipped\n", ""]);
     let failure = "order-42 FAILED at settlement\n";
-    archived_run(root, "run-New2", 1, 2_000, [&order_progress(25), failure]);
+    let repo = archived_repo(&[
+        ("run-Old1", 0, 1_000, "order-42 shipped\n", ""),
+        ("run-New2", 1, 2_000, &order_progress(25), failure),
+    ]);
+    let root = repo.path();
+    let history =
+        |args: &str| history_lines(&success_words(root, &format!("history order-42 {args}")));
     let progress = |range: std::ops::Range<usize>| {
         range
             .map(|i| format!("run-New2 other stdout:{}: order-42 progress {i}", i + 1))
             .collect::<Vec<_>>()
     };
-    let mut expected = vec!["run-New2 other stderr:1: order-42 FAILED at settlement".to_owned()];
+    let failed = "run-New2 other stderr:1: order-42 FAILED at settlement".to_owned();
+    let mut expected = vec![failed.clone()];
     expected.extend(progress(0..11));
     expected.push(
         "[12 of 27 matches shown from 1 of 2 matching runs (stdout 11 of 26, stderr 1 of 1); --limit 27 shows all]"
             .to_owned(),
     );
-    assert_eq!(
-        history_lines(&success(root, &["history", "order-42"])),
-        expected
-    );
+    assert_eq!(history(""), expected);
     // The earliest run still comes first with --oldest.
     assert_eq!(
-        history_lines(&success(
-            root,
-            &["history", "order-42", "--oldest", "--limit", "1"]
-        )),
+        history("--oldest --limit 1"),
         [
             "run-Old1 other stdout:1: order-42 shipped",
             "[1 of 27 matches shown from 1 of 2 matching runs (stdout 1 of 26, stderr 0 of 1); --limit 27 shows all]",
@@ -16997,63 +17062,53 @@ fn history_counts_matches_past_its_limit_and_keeps_runs_in_order() {
     );
     // Everything within the limit is listed as before, without a notice.
     let mut all = progress(0..25);
-    all.push("run-New2 other stderr:1: order-42 FAILED at settlement".to_owned());
-    all.push("run-Old1 other stdout:1: order-42 shipped".to_owned());
-    assert_eq!(
-        history_lines(&success(root, &["history", "order-42", "--limit", "27"])),
-        all
-    );
+    all.extend([
+        failed.clone(),
+        "run-Old1 other stdout:1: order-42 shipped".to_owned(),
+    ]);
+    assert_eq!(history("--limit 27"), all);
     // A budget that cuts the list keeps the failure and says what it left out.
-    let cut = success(
-        root,
-        &["history", "order-42", "--limit", "27", "--budget", "400"],
-    );
+    let cut = success_words(root, "history order-42 --limit 27 --budget 400");
     assert!(cut.len() <= 400, "{} bytes: {cut}", cut.len());
     let lines = history_lines(&cut);
-    assert_eq!(
-        lines[0], "run-New2 other stderr:1: order-42 FAILED at settlement",
-        "{cut}"
-    );
+    assert_eq!(lines[0], failed, "{cut}");
     let notice = lines.last().unwrap();
     assert!(
         notice.contains(" of 27 matches shown from 1 of 2 matching runs (stdout ")
             && notice.ends_with(", stderr 1 of 1); a larger --budget shows all]"),
         "{cut}"
     );
-    assert!(cut.contains("[context budget reached]\n"), "{cut}");
+    text_has(&cut, &["[context budget reached]\n"]);
 }
 
 #[test]
 fn lookup_logs_keep_a_window_for_each_stream_and_count_the_rest() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
     // Two runs of dense progress outrank the one stderr line that explains the
     // failure.
     let busy: String = (0..80)
         .map(|i| format!("order-42 order-42 progress {i}\n"))
         .collect();
-    archived_run(root, "run-Busy1", 0, 1_000, [&busy, ""]);
-    archived_run(
-        root,
-        "run-Fail2",
-        1,
-        2_000,
-        [&busy, "order-42 FAILED at settlement\n"],
-    );
-    let output = success(root, &["lookup", "order-42", "--logs"]);
-    assert!(
-        output.contains(
-            "run-Fail2 stderr:1-1 log other · exit 1\n  1 | order-42 FAILED at settlement\n"
+    let repo = archived_repo(&[
+        ("run-Busy1", 0, 1_000, &busy, ""),
+        (
+            "run-Fail2",
+            1,
+            2_000,
+            &busy,
+            "order-42 FAILED at settlement\n",
         ),
-        "{output}"
+    ]);
+    let root = repo.path();
+    let output = success_words(root, "lookup order-42 --logs");
+    text_has(
+        &output,
+        &[
+            "run-Fail2 stderr:1-1 log other · exit 1\n  1 | order-42 FAILED at settlement\n",
+            " · log windows stdout 2 of 4, stderr 1 of 1",
+        ],
     );
-    assert!(
-        output.contains(" · log windows stdout 2 of 4, stderr 1 of 1"),
-        "{output}"
-    );
-    let value: serde_json::Value =
-        serde_json::from_str(&success(root, &["lookup", "order-42", "--logs", "--json"])).unwrap();
+    let json = success_words(root, "lookup order-42 --logs --json");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(
         value["logs"],
         serde_json::json!({
@@ -17064,285 +17119,10 @@ fn lookup_logs_keep_a_window_for_each_stream_and_count_the_rest() {
         }),
         "{value:#}"
     );
-}
-
-#[test]
-fn mcp_search_and_history_count_the_matches_they_leave_out() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    archived_run(
-        root,
-        "run-New2",
-        1,
-        2_000,
-        [&order_progress(25), "order-42 FAILED at settlement\n"],
-    );
-    let request = |id: u64, method: &str, params: serde_json::Value| {
-        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-            .to_string()
-    };
-    let lines = [
-        request(
-            0,
-            "initialize",
-            serde_json::json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}),
-        ),
-        request(
-            1,
-            "tools/call",
-            serde_json::json!({"name": "search", "arguments": {"run_id": "run-New2", "text": "order-42"}}),
-        ),
-        request(
-            2,
-            "tools/call",
-            serde_json::json!({"name": "history", "arguments": {"text": "order-42"}}),
-        ),
-    ];
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["mcp", "--root"])
-        .arg(root)
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        for line in &lines {
-            writeln!(stdin, "{line}").unwrap();
-        }
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    let text = |id: u64| {
-        stdout(&output)
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|message| message["id"] == id)
-            .unwrap()["result"]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| item["text"].as_str().unwrap().to_owned())
-            .collect::<String>()
-    };
-    let search = text(1);
-    assert!(
-        search.starts_with("stderr:1: order-42 FAILED at settlement\n")
-            && search.ends_with(
-                "[20 of 26 matches shown (stdout 19 of 25, stderr 1 of 1); --limit 26 shows all]\n"
-            ),
-        "{search}"
-    );
-    let history = text(2);
-    assert!(
-        history.contains("run-New2 other stderr:1: order-42 FAILED at settlement\n")
-            && history.ends_with(
-                "[12 of 26 matches shown from 1 of 1 matching runs (stdout 11 of 25, stderr 1 of 1); --limit 26 shows all]\n"
-            ),
-        "{history}"
-    );
-}
-
-#[test]
-fn history_keeps_a_place_for_a_stream_whose_matches_are_all_in_older_runs() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    archived_run(
-        root,
-        "run-Old1",
-        1,
-        1_000,
-        ["", "order-42 FAILED at settlement\n"],
-    );
-    archived_run(root, "run-New2", 0, 2_000, [&order_progress(25), ""]);
-    let mut expected = (0..11)
-        .map(|i| format!("run-New2 other stdout:{}: order-42 progress {i}", i + 1))
-        .collect::<Vec<_>>();
-    expected.push("run-Old1 other stderr:1: order-42 FAILED at settlement".to_owned());
-    expected.push(
-        "[12 of 26 matches shown from 2 of 2 matching runs (stdout 11 of 25, stderr 1 of 1); --limit 26 shows all]"
-            .to_owned(),
-    );
-    assert_eq!(
-        history_lines(&success(root, &["history", "order-42"])),
-        expected
-    );
-    // A single place goes to the newest match, and the notice counts the rest.
-    assert_eq!(
-        history_lines(&success(root, &["history", "order-42", "--limit", "1"])),
-        [
-            "run-New2 other stdout:1: order-42 progress 0",
-            "[1 of 26 matches shown from 1 of 2 matching runs (stdout 1 of 25, stderr 0 of 1); --limit 26 shows all]",
-        ]
-    );
-}
-
-#[test]
-fn history_keeps_a_place_for_an_older_failure_and_no_notice_passes_mcps_limit() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    // A merged run's failure is on stdout, like the newer passing run's matches.
-    let failure = "order-42 FAILED at settlement\n";
-    archived_run(root, "run-Old1", 1, 1_000, [failure, ""]);
-    archived_run(root, "run-New2", 0, 2_000, [&order_progress(25), ""]);
-    assert_eq!(
-        history_lines(&success(root, &["history", "order-42", "--limit", "3"])),
-        [
-            "run-New2 other stdout:1: order-42 progress 0",
-            "run-New2 other stdout:2: order-42 progress 1",
-            "run-Old1 other stdout:1: order-42 FAILED at settlement",
-            "[3 of 26 matches shown from 2 of 2 matching runs (stdout 3 of 26); --limit 26 shows all]",
-        ]
-    );
-    // MCP takes a limit of at most 1000, so a notice never suggests more.
-    archived_run(
-        root,
-        "run-Big3",
-        0,
-        3_000,
-        [&order_progress(1000), "order-42 retry\n"],
-    );
-    let search = |args: &[&str]| {
-        let output = success(root, &[&["search", "run-Big3", "order-42"], args].concat());
-        output.lines().last().unwrap().to_owned()
-    };
-    assert_eq!(
-        search(&["--stream", "stdout"]),
-        "[20 of 1000 matches shown (stdout 20 of 1000); --limit 1000 shows all]"
-    );
-    assert_eq!(
-        search(&[]),
-        "[20 of 1001 matches shown (stdout 19 of 1000, stderr 1 of 1); narrow TEXT or pick one --stream]"
-    );
-    let history = |args: &[&str]| {
-        let output = success(root, &[&["history", "order-42"], args].concat());
-        output.lines().last().unwrap().to_owned()
-    };
-    assert_eq!(
-        history(&[]),
-        "[12 of 1027 matches shown from 2 of 3 matching runs (stdout 11 of 1026, stderr 1 of 1); narrow TEXT, or use --oldest for the oldest first]"
-    );
-    assert!(
-        history(&["--oldest"]).ends_with("; narrow TEXT, or drop --oldest for the newest first]")
-    );
-}
-
-#[test]
-fn search_treats_a_pipe_recorded_as_passing_as_a_possible_failure() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    let log = order_progress(25) + "order-42 FAILED at settlement\n";
-    archived_run(root, "run-Piped1", 0, 1_000, [&log, ""]);
-    // The Bash post-command hook records a pipe with the whole line's status.
-    let record = root.join(".justless/runs/run-Piped1/record.json");
-    let mut value: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
-    value["label"] = "cargo test | tail".into();
-    value["note"] = "captured after the command ran".into();
-    fs::write(&record, value.to_string()).unwrap();
-    assert_eq!(
-        success(root, &["search", "run-Piped1", "order-42", "--limit", "2"]),
-        "stdout:1: order-42 progress 0\nstdout:26: order-42 FAILED at settlement\n\
-         [2 of 26 matches shown (stdout 2 of 26); --limit 26 shows all]\n"
-    );
-}
-
-#[test]
-fn search_reads_a_failure_word_anywhere_in_the_line_not_only_near_the_match() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    // A long test ID puts the searched text far from the `FAILED` that opens
-    // the line, beyond the excerpt printed around the match.
-    let id = format!("tests/test_billing.py::test_cutoff[{}]", "x".repeat(150));
-    let log = order_progress(25) + &format!("FAILED {id} order-42 cutoff\n");
-    archived_run(root, "run-Long1", 1, 1_000, [&log, ""]);
-    let output = success(root, &["search", "run-Long1", "order-42", "--limit", "2"]);
-    let lines = output.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 3, "{output}");
-    assert_eq!(lines[0], "stdout:1: order-42 progress 0", "{output}");
-    assert!(
-        lines[1].starts_with("stdout:26: ") && lines[1].ends_with(" order-42 cutoff"),
-        "{output}"
-    );
-    assert_eq!(
-        lines[2],
-        "[2 of 26 matches shown (stdout 2 of 26); --limit 26 shows all]"
-    );
-    // `history` chooses within the run the same way.
-    let output = success(root, &["history", "order-42", "--limit", "2"]);
-    assert!(output.contains(" stdout:26: "), "{output}");
-}
-
-#[test]
-fn history_keeps_a_match_and_its_notice_within_small_budgets() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    archived_run(root, "run-A1", 1, 1_000, ["", "order-42 panicked\n"]);
-    archived_run(root, "run-B2", 0, 2_000, [&order_progress(30), ""]);
-    for budget in (128..700).step_by(9) {
-        let output = success(
-            root,
-            &["history", "order-42", "--budget", &budget.to_string()],
-        );
-        assert!(output.len() <= budget, "{budget}: {output}");
-        let notice = output.lines().last().unwrap();
-        assert!(
-            notice.starts_with('[') && notice.contains(" of 31 matches shown"),
-            "{budget}: {output}"
-        );
-        // At least one match line is shown whole.
-        assert!(
-            output
-                .lines()
-                .any(|line| line.contains(" other stdout:1: order-42 progress 0")),
-            "{budget}: {output}"
-        );
-    }
-    // The fullest notice is kept whenever it leaves room for a match.
-    let output = success(root, &["history", "order-42", "--budget", "1000"]);
-    assert!(
-        output.ends_with("; --limit 31 and a larger --budget show all]\n")
-            || output.ends_with("; --limit 31 shows all]\n"),
-        "{output}"
-    );
-}
-
-#[test]
-fn lookup_logs_keep_both_streams_when_the_budget_fits_two_windows() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    let busy: String = (0..80)
-        .map(|i| format!("order-42 order-42 progress {i}\n"))
-        .collect();
-    archived_run(root, "run-Busy1", 0, 1_000, [&busy, ""]);
-    archived_run(
-        root,
-        "run-Fail2",
-        1,
-        2_000,
-        [&busy, "order-42 FAILED at settlement\n"],
-    );
+    // Whenever the budget fits two windows, one of them is the stderr window.
     let mut two = 0;
     for budget in (128..800).step_by(8) {
-        let output = success(
-            root,
-            &[
-                "lookup",
-                "order-42",
-                "--logs",
-                "--budget",
-                &budget.to_string(),
-            ],
-        );
+        let output = success_words(root, &format!("lookup order-42 --logs --budget {budget}"));
         let windows = output
             .lines()
             .filter(|line| line.starts_with("run-") && line.contains(" log other"))
@@ -17359,20 +17139,177 @@ fn lookup_logs_keep_both_streams_when_the_budget_fits_two_windows() {
 }
 
 #[test]
-fn history_never_drops_a_stream_as_its_budget_grows() {
-    let repo = TempDir::new().unwrap();
+fn mcp_search_and_history_count_the_matches_they_leave_out() {
+    use serde_json::json;
+    let failure = "order-42 FAILED at settlement\n";
+    let repo = archived_repo(&[("run-New2", 1, 2_000, &order_progress(25), failure)]);
     let root = repo.path();
-    git(root, &["init", "-q"]);
-    archived_run(root, "run-A1", 1, 1_000, ["", "order-42 panicked\n"]);
-    archived_run(root, "run-B2", 0, 2_000, [&order_progress(30), ""]);
+    let calls = [
+        json!({"name": "search", "arguments": {"run_id": "run-New2", "text": "order-42"}}),
+        json!({"name": "history", "arguments": {"text": "order-42"}}),
+    ];
+    let results = mcp_results(root, &["--root", root.to_str().unwrap()], None, &calls);
+    let (search, history) = (&results[0], &results[1]);
+    assert!(
+        search.starts_with("stderr:1: order-42 FAILED at settlement\n")
+            && search.ends_with(
+                "[20 of 26 matches shown (stdout 19 of 25, stderr 1 of 1); --limit 26 shows all]\n"
+            ),
+        "{search}"
+    );
+    assert!(
+        history.contains("run-New2 other stderr:1: order-42 FAILED at settlement\n")
+            && history.ends_with(
+                "[12 of 26 matches shown from 1 of 1 matching runs (stdout 11 of 25, stderr 1 of 1); --limit 26 shows all]\n"
+            ),
+        "{history}"
+    );
+}
+
+#[test]
+fn history_keeps_a_place_for_a_stream_whose_matches_are_all_in_older_runs() {
+    let repo = archived_repo(&[
+        ("run-Old1", 1, 1_000, "", "order-42 FAILED at settlement\n"),
+        ("run-New2", 0, 2_000, &order_progress(25), ""),
+    ]);
+    let root = repo.path();
+    let mut expected = (0..11)
+        .map(|i| format!("run-New2 other stdout:{}: order-42 progress {i}", i + 1))
+        .collect::<Vec<_>>();
+    expected.push("run-Old1 other stderr:1: order-42 FAILED at settlement".to_owned());
+    expected.push(
+        "[12 of 26 matches shown from 2 of 2 matching runs (stdout 11 of 25, stderr 1 of 1); --limit 26 shows all]"
+            .to_owned(),
+    );
+    assert_eq!(
+        history_lines(&success_words(root, "history order-42")),
+        expected
+    );
+    // A single place goes to the newest match, and the notice counts the rest.
+    assert_eq!(
+        history_lines(&success_words(root, "history order-42 --limit 1")),
+        [
+            "run-New2 other stdout:1: order-42 progress 0",
+            "[1 of 26 matches shown from 1 of 2 matching runs (stdout 1 of 25, stderr 0 of 1); --limit 26 shows all]",
+        ]
+    );
+}
+
+#[test]
+fn history_keeps_a_place_for_an_older_failure_and_no_notice_passes_mcps_limit() {
+    // A merged run's failure is on stdout, like the newer passing run's matches.
+    let repo = archived_repo(&[
+        ("run-Old1", 1, 1_000, "order-42 FAILED at settlement\n", ""),
+        ("run-New2", 0, 2_000, &order_progress(25), ""),
+    ]);
+    let root = repo.path();
+    assert_eq!(
+        history_lines(&success_words(root, "history order-42 --limit 3")),
+        [
+            "run-New2 other stdout:1: order-42 progress 0",
+            "run-New2 other stdout:2: order-42 progress 1",
+            "run-Old1 other stdout:1: order-42 FAILED at settlement",
+            "[3 of 26 matches shown from 2 of 2 matching runs (stdout 3 of 26); --limit 26 shows all]",
+        ]
+    );
+    // MCP takes a limit of at most 1000, so a notice never suggests more.
+    let big = order_progress(1000);
+    archive_runs(root, &[("run-Big3", 0, 3_000, &big, "order-42 retry\n")]);
+    let last = |words: &str| {
+        let output = success_words(root, words);
+        output.lines().last().unwrap().to_owned()
+    };
+    assert_eq!(
+        last("search run-Big3 order-42 --stream stdout"),
+        "[20 of 1000 matches shown (stdout 20 of 1000); --limit 1000 shows all]"
+    );
+    assert_eq!(
+        last("search run-Big3 order-42"),
+        "[20 of 1001 matches shown (stdout 19 of 1000, stderr 1 of 1); narrow TEXT or pick one --stream]"
+    );
+    assert_eq!(
+        last("history order-42"),
+        "[12 of 1027 matches shown from 2 of 3 matching runs (stdout 11 of 1026, stderr 1 of 1); narrow TEXT, or use --oldest for the oldest first]"
+    );
+    assert!(
+        last("history order-42 --oldest")
+            .ends_with("; narrow TEXT, or drop --oldest for the newest first]")
+    );
+}
+
+#[test]
+fn search_treats_a_pipe_recorded_as_passing_as_a_possible_failure() {
+    let log = order_progress(25) + "order-42 FAILED at settlement\n";
+    let repo = archived_repo(&[("run-Piped1", 0, 1_000, &log, "")]);
+    let root = repo.path();
+    // The Bash post-command hook records a pipe with the whole line's status.
+    let record = root.join(".justless/runs/run-Piped1/record.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    value["label"] = "cargo test | tail".into();
+    value["note"] = "captured after the command ran".into();
+    fs::write(&record, value.to_string()).unwrap();
+    assert_eq!(
+        success_words(root, "search run-Piped1 order-42 --limit 2"),
+        "stdout:1: order-42 progress 0\nstdout:26: order-42 FAILED at settlement\n\
+         [2 of 26 matches shown (stdout 2 of 26); --limit 26 shows all]\n"
+    );
+}
+
+#[test]
+fn search_reads_a_failure_word_anywhere_in_the_line_not_only_near_the_match() {
+    // A long test ID puts the searched text far from the `FAILED` that opens
+    // the line, beyond the excerpt printed around the match.
+    let id = format!("tests/test_billing.py::test_cutoff[{}]", "x".repeat(150));
+    let log = order_progress(25) + &format!("FAILED {id} order-42 cutoff\n");
+    let repo = archived_repo(&[("run-Long1", 1, 1_000, &log, "")]);
+    let root = repo.path();
+    let output = success_words(root, "search run-Long1 order-42 --limit 2");
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{output}");
+    assert_eq!(lines[0], "stdout:1: order-42 progress 0", "{output}");
+    assert!(
+        lines[1].starts_with("stdout:26: ") && lines[1].ends_with(" order-42 cutoff"),
+        "{output}"
+    );
+    assert_eq!(
+        lines[2],
+        "[2 of 26 matches shown (stdout 2 of 26); --limit 26 shows all]"
+    );
+    // `history` chooses within the run the same way.
+    let output = success_words(root, "history order-42 --limit 2");
+    text_has(&output, &[" stdout:26: "]);
+}
+
+#[test]
+fn history_keeps_a_match_and_its_notice_within_small_budgets() {
+    let repo = archived_repo(&[
+        ("run-A1", 1, 1_000, "", "order-42 panicked\n"),
+        ("run-B2", 0, 2_000, &order_progress(30), ""),
+    ]);
+    let root = repo.path();
     let failure = " run-A1 other stderr:1: order-42 panicked\n";
     let mut since = None;
-    for budget in (128..420).step_by(3) {
-        let output = success(
-            root,
-            &["history", "order-42", "--budget", &budget.to_string()],
-        );
+    // Every third budget up to 420, then every ninth.
+    for budget in (128..700).filter(|b| {
+        let step = if *b < 420 { 3 } else { 9 };
+        (b - 128) % step == 0
+    }) {
+        let output = success_words(root, &format!("history order-42 --budget {budget}"));
         assert!(output.len() <= budget, "{budget}: {output}");
+        let notice = output.lines().last().unwrap();
+        assert!(
+            notice.starts_with('[') && notice.contains(" of 31 matches shown"),
+            "{budget}: {output}"
+        );
+        // At least one match line is shown whole.
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains(" other stdout:1: order-42 progress 0")),
+            "{budget}: {output}"
+        );
+        // A stream shown at one budget is never dropped at a larger one.
         if output.contains(failure) {
             since.get_or_insert(budget);
         } else if let Some(since) = since {
@@ -17380,21 +17317,23 @@ fn history_never_drops_a_stream_as_its_budget_grows() {
         }
     }
     assert!(since.is_some());
+    // The fullest notice is kept whenever it leaves room for a match.
+    let output = success_words(root, "history order-42 --budget 1000");
+    assert!(
+        output.ends_with("; --limit 31 and a larger --budget show all]\n")
+            || output.ends_with("; --limit 31 shows all]\n"),
+        "{output}"
+    );
 }
 
 #[test]
 fn lookup_next_command_opens_a_file_whose_name_starts_with_a_dash() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(
-        root.join("-release.md"),
-        "# Release\nThe release_window is Friday.\n",
-    )
-    .unwrap();
+    let release = "# Release\nThe release_window is Friday.\n";
+    write_files(root, &[("-release.md", release)]);
     git(root, &["init", "-q"]);
-    let output = cli(root, &["lookup", "release_window"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    let text = stdout(&output);
+    let text = success_words(root, "lookup release_window");
     let next = text
         .lines()
         .find_map(|line| line.strip_prefix("Next: "))
@@ -17409,7 +17348,7 @@ fn lookup_next_command_opens_a_file_whose_name_starts_with_a_dash() {
         .output()
         .unwrap();
     assert!(shell.status.success(), "{next}: {}", stderr(&shell));
-    assert!(stdout(&shell).contains("release_window is Friday"));
+    text_has(&stdout(&shell), &["release_window is Friday"]);
 }
 
 /// The `Read` and `Outline` lines `resume` lists for one file.
@@ -18581,50 +18520,20 @@ fn sed_ranges_keep_native_bytes_and_only_charge_the_delivered_outline_and_replay
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
-    let filename = "price list.py";
-    let mut data = String::new();
-    for i in 0..60 {
-        data.push_str(&format!(
-            "def price_{i}(x):\r\n    initial = x + {i}\r\n    return initial * 2\r\n\r\n"
-        ));
-    }
+    let mut data: String = (0..60)
+        .map(|i| {
+            format!("def price_{i}(x):\r\n    initial = x + {i}\r\n    return initial * 2\r\n\r\n")
+        })
+        .collect();
     data.push_str("# no final newline");
-    fs::write(root.join(filename), data).unwrap();
-    let pre = |handler: &str, command: &str| {
-        agent_hook(
-            &root,
-            handler,
-            "before-command",
-            json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}}),
-        )
-    };
-    let exec = |rewritten: &str| {
-        let argv = shlex::split(rewritten).unwrap();
-        assert_eq!(argv[0], "justless");
-        cli(
-            &root,
-            &argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
-        )
-    };
-    let native = |script: &str| {
-        Command::new("sed")
-            .args(["-n", script, filename])
-            .current_dir(&root)
-            .output()
-            .unwrap()
-            .stdout
-    };
+    write_files(&root, &[("package.json", "{}"), ("price list.py", &data)]);
+    let codex = |command: &str| shell_rewrite(&root, "hook-codex", &root, command);
+    let native = |script: &str| sh_stdout(&root, &format!("sed -n '{script}' 'price list.py'"));
     let command = "sed -n '2,200p' 'price list.py'";
-    let first = pre("hook-codex", "sed -n '2,4p' 'price list.py'");
-    let short = exec(
-        first["hookSpecificOutput"]["updatedInput"]["command"]
-            .as_str()
-            .unwrap(),
-    );
+    let short = follow(&root, &codex("sed -n '2,4p' 'price list.py'").unwrap());
     assert_eq!(short.stdout, native("2,4p"));
     assert!(short.stderr.is_empty());
-    assert!(success(&root, &["resume"]).contains("Read price list.py:2-4"));
+    text_has(&success(&root, &["resume"]), &["Read price list.py:2-4"]);
     for other in [
         "sed -n '240,999p' 'price list.py'",
         "sed -n '999,1000p' 'price list.py'",
@@ -18634,12 +18543,9 @@ fn sed_ranges_keep_native_bytes_and_only_charge_the_delivered_outline_and_replay
         "sed -n '1,200p' 'price list.py' other",
         "sed -n '1,200p;201p' 'price list.py'",
     ] {
-        assert!(
-            pre("hook-codex", other)["hookSpecificOutput"]["updatedInput"].is_null(),
-            "{other}"
-        );
+        assert_eq!(codex(other), None, "{other}");
     }
-    assert!(pre("hook-claude", command)["hookSpecificOutput"]["updatedInput"].is_null());
+    assert_eq!(shell_rewrite(&root, "hook-claude", &root, command), None);
     let real = native("2,200p");
     let text = std::str::from_utf8(&real).unwrap();
     for response in [
@@ -18649,35 +18555,23 @@ fn sed_ranges_keep_native_bytes_and_only_charge_the_delivered_outline_and_replay
     ] {
         assert_eq!(after_bash(&root, &root, command, response), json!({}));
     }
-    let codex = pre("hook-codex", command);
-    let output = exec(
-        codex["hookSpecificOutput"]["updatedInput"]["command"]
-            .as_str()
-            .unwrap(),
-    );
+    let output = follow(&root, &codex(command).unwrap());
     assert!(output.status.success() && output.stderr.is_empty());
-    let claude = after_bash(
-        &root,
-        &root,
-        command,
-        json!({"stdout":text,"stderr":"","interrupted":false}),
+    let response = json!({"stdout":text,"stderr":"","interrupted":false});
+    let outputs = [
+        stdout(&output),
+        shown_stdout(&after_bash(&root, &root, command, response)),
+    ];
+    text_has(
+        &success(&root, &["resume"]),
+        &["Outline price list.py:2-200"],
     );
-    let outputs = [stdout(&output), shown_stdout(&claude)];
-    assert!(success(&root, &["resume"]).contains("Outline price list.py:2-200"));
-    fs::write(root.join(filename), "changed since the outline\n").unwrap();
+    fs::write(root.join("price list.py"), "changed since the outline\n").unwrap();
     for view in &outputs {
-        assert!(
-            view.contains("price_1")
-                && !view.contains("price_55")
-                && !view.contains("return initial"),
-            "{view}"
-        );
+        text_has(view, &["price_1"]);
+        text_lacks(view, &["price_55", "return initial"]);
         assert!(view.len() * 2 < real.len(), "{view}");
-        let exact = view
-            .lines()
-            .find_map(|line| line.strip_prefix("Exact: "))
-            .unwrap();
-        assert_eq!(exec(exact).stdout, real);
+        assert_eq!(follow(&root, exact_command(view)).stdout, real);
     }
     let stats = savings(&root);
     let shown: usize = outputs.iter().map(String::len).sum();
@@ -18693,41 +18587,27 @@ fn sed_range_persisted_and_trimmed_outputs_use_the_visible_baseline() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
     let raw: String = (0..150)
         .map(|i| format!("def compute_{i}(amount):\n    return amount + {i}\n\n"))
         .collect();
-    fs::write(root.join("calc.py"), &raw).unwrap();
+    write_files(&root, &[("package.json", "{}"), ("calc.py", &raw)]);
     let command = "sed -n '1,500p' calc.py";
     let trimmed = raw.trim_end_matches('\n');
-    let inline = shown_stdout(&after_bash(
-        &root,
-        &root,
-        command,
-        json!({
-            "stdout":trimmed, "stderr":"", "interrupted":false
-        }),
-    ));
-    let dir = root.join("tool-results");
-    fs::create_dir(&dir).unwrap();
-    let saved = dir.join("result.txt");
-    fs::write(&saved, &raw).unwrap();
+    let response = json!({"stdout":trimmed, "stderr":"", "interrupted":false});
+    let inline = shown_stdout(&after_bash(&root, &root, command, response));
+    let saved = root.join("tool-results/result.txt");
+    write_files(&root, &[("tool-results/result.txt", &raw)]);
     let response = json!({"stdout": &raw[..2000], "stderr":"", "interrupted":false,
         "persistedOutputPath":saved,"persistedOutputSize":raw.len()});
     let answer = after_bash(&root, &root, command, response);
-    assert!(
-        answer["hookSpecificOutput"]["updatedToolOutput"]
-            .get("persistedOutputPath")
-            .is_none()
-    );
+    let updated = &answer["hookSpecificOutput"]["updatedToolOutput"];
+    assert!(updated.get("persistedOutputPath").is_none());
     let page = shown_stdout(&answer);
     assert!(page.contains("Exact:") && page.len() < 2000);
     let stats = savings(&root);
     assert_eq!(stats["raw_bytes"], trimmed.len() + 2000);
-    assert_eq!(
-        stats["net_saved_bytes"],
-        (trimmed.len() + 2000 - inline.len() - page.len()) as i64
-    );
+    let net = trimmed.len() + 2000 - inline.len() - page.len();
+    assert_eq!(stats["net_saved_bytes"], net as i64);
     let id = marker_run(&page);
     assert_eq!(cli(&root, &["log", &id]).stdout, raw.as_bytes());
 }
@@ -18738,48 +18618,22 @@ fn tail_from_line_uses_the_current_eof_and_archives_the_exact_suffix() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
     let file = "fees today.py";
     let mut source = (0..80)
         .map(|i| format!("def fee_{i}(x):\r\n    return x + {i}\r\n\r\n"))
         .collect::<String>();
     source.push_str("# last line");
-    fs::write(root.join(file), &source).unwrap();
-    let before = |agent: &str, command: &str| {
-        agent_hook(
-            &root,
-            agent,
-            "before-command",
-            json!({
-                "hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
-                "tool_input":{"command":command}
-            }),
-        )["hookSpecificOutput"]["updatedInput"]["command"]
-            .as_str()
-            .map(str::to_owned)
-    };
+    write_files(&root, &[("package.json", "{}"), (file, &source)]);
+    let codex = |command: &str| shell_rewrite(&root, "hook-codex", &root, command);
     let run = |rewritten: &str| {
-        let args = shlex::split(rewritten).unwrap();
-        assert_eq!(args[0], "justless");
-        let out = cli(
-            &root,
-            &args.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
-        );
+        let out = follow(&root, rewritten);
         assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
         out.stdout
     };
-    let native = |first: &str| {
-        let out = Command::new("tail")
-            .args(["-n", first, file])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        out.stdout
-    };
+    let native = |first: &str| sh_stdout(&root, &format!("tail -n {first} 'fees today.py'"));
     for first in ["+240", "+241"] {
         let cmd = format!("tail -n {first} 'fees today.py'");
-        assert_eq!(run(&before("hook-codex", &cmd).unwrap()), native(first));
+        assert_eq!(run(&codex(&cmd).unwrap()), native(first));
     }
     for cmd in [
         "tail -n 3 'fees today.py'",
@@ -18791,37 +18645,28 @@ fn tail_from_line_uses_the_current_eof_and_archives_the_exact_suffix() {
         "tail -n +7 'fees today.py' > saved",
         "tail -n +7 'fees today.py' other",
     ] {
-        assert!(before("hook-codex", cmd).is_none(), "{cmd}");
+        assert!(codex(cmd).is_none(), "{cmd}");
     }
 
     let cmd = "tail -n +7 'fees today.py'";
-    assert!(before("hook-claude", cmd).is_none());
-    let rewritten = before("hook-codex", cmd).unwrap();
+    assert!(shell_rewrite(&root, "hook-claude", &root, cmd).is_none());
+    let rewritten = codex(cmd).unwrap();
     // A growing file is read through the EOF at execution, after the pre-hook.
     source.push_str("\r\n# appended");
     fs::write(root.join(file), &source).unwrap();
     let raw = native("+7");
-    let codex = String::from_utf8(run(&rewritten)).unwrap();
-    let claude = shown_stdout(&after_bash(
-        &root,
-        &root,
-        cmd,
-        json!({
-            "stdout":std::str::from_utf8(&raw).unwrap(),"stderr":"","interrupted":false
-        }),
-    ));
-    let short = before("hook-codex", "tail -n +241 'fees today.py'").unwrap();
+    let codex_output = String::from_utf8(run(&rewritten)).unwrap();
+    let response =
+        json!({"stdout":std::str::from_utf8(&raw).unwrap(),"stderr":"","interrupted":false});
+    let claude = shown_stdout(&after_bash(&root, &root, cmd, response));
+    let short = codex("tail -n +241 'fees today.py'").unwrap();
     fs::write(root.join(file), "changed\n").unwrap();
     assert!(run(&short).is_empty());
     let mut shown = 0;
-    for text in [codex, claude] {
+    for text in [codex_output, claude] {
         assert!(text.contains("fee_2") && !text.contains("fee_0(") && text.len() < raw.len());
         shown += text.len();
-        let exact = text
-            .lines()
-            .find_map(|s| s.strip_prefix("Exact: "))
-            .unwrap();
-        assert_eq!(run(exact), raw);
+        assert_eq!(run(exact_command(&text)), raw);
     }
     let stats = savings(&root);
     assert_eq!(stats["commands"][0]["family"], "tail");
@@ -18837,23 +18682,29 @@ fn git_show_reads_outline_the_blob_at_their_revision() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     let sub = root.join("sub");
-    fs::create_dir(&sub).unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
     let version = |name: &str| {
         (0..120)
             .map(|i| format!("def {name}_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    return round(taxed, 2)\n\n"))
             .collect::<String>()
     };
     git(&root, &["init", "-q"]);
-    fs::write(sub.join("prices.py"), version("old")).unwrap();
-    fs::write(root.join("blob.bin"), [0u8, 1, 2].repeat(4000)).unwrap();
-    fs::write(root.join("small.py"), "def tiny():\n    return 1\n").unwrap();
-    let notes = (0..600).map(|i| format!("note {i}: plain text the parsers do not outline\n"));
-    fs::write(root.join("notes.txt"), notes.collect::<String>()).unwrap();
+    let notes: String = (0..600)
+        .map(|i| format!("note {i}: plain text the parsers do not outline\n"))
+        .collect();
     // A guide that quotes a run marker is still a blob to outline.
     let guide = (0..12).map(|i| format!("## Part {i}\n\n{}\n", "Steps and notes.\n".repeat(30)));
     let guide = guide.collect::<String>() + "[justless run-Ab12 · 1.0 KB of 9.0 KB shown]\n";
-    fs::write(root.join("guide.md"), guide).unwrap();
+    write_files(
+        &root,
+        &[
+            ("package.json", "{}"),
+            ("sub/prices.py", &version("old")),
+            ("small.py", "def tiny():\n    return 1\n"),
+            ("notes.txt", &notes),
+            ("guide.md", &guide),
+        ],
+    );
+    fs::write(root.join("blob.bin"), [0u8, 1, 2].repeat(4000)).unwrap();
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-qm", "one"]);
     fs::write(sub.join("prices.py"), version("price")).unwrap();
@@ -18867,17 +18718,8 @@ fn git_show_reads_outline_the_blob_at_their_revision() {
             .current_dir(cwd)
             .output()
             .unwrap();
-        (
-            output.stdout,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
-    };
-    let replay = |shown: &str| {
-        let id = shown
-            .split_whitespace()
-            .find(|word| word.starts_with("run-"))
-            .unwrap_or_else(|| panic!("no run: {shown}"));
-        cli(&root, &["log", id, "--unredacted"]).stdout
+        let err = stderr(&output);
+        (output.stdout, err)
     };
     // Claude Code runs the command; the outline describes the blob it printed.
     for (cwd, command, name) in [
@@ -18892,57 +18734,46 @@ fn git_show_reads_outline_the_blob_at_their_revision() {
     ] {
         let (real, _) = native(cwd, command);
         let text = std::str::from_utf8(&real).unwrap();
-        let shown = shown_stdout(&after_bash(
-            &root,
-            cwd,
-            command,
-            json!({"stdout":text,"stderr":"","interrupted":false}),
-        ));
+        let response = json!({"stdout":text,"stderr":"","interrupted":false});
+        let shown = shown_stdout(&after_bash(&root, cwd, command, response));
         assert!(shown.len() * 4 < real.len(), "{command}: {shown}");
         assert!(
             shown.contains(name) && !shown.contains("disk_"),
             "{command}: {shown}"
         );
-        assert_eq!(replay(&shown), real, "{command}");
+        assert_eq!(replayed_run(&root, &shown), real, "{command}");
     }
-    let header = "HEAD~1:sub/prices.py lines 1-600";
-    let pre = |client: &str, command: &str| {
-        agent_hook(
-            &root,
-            client,
-            "before-command",
-            json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}}),
-        )["hookSpecificOutput"]["updatedInput"]["command"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned()
-    };
+    let codex =
+        |command: &str| shell_rewrite(&root, "hook-codex", &root, command).unwrap_or_default();
     // Claude Code runs the command itself. Codex runs a read of the blob id the
     // name resolved to in the hook, or the run route when no outline would fit.
-    assert_eq!(pre("hook-claude", "git show HEAD~1:sub/prices.py"), "");
-    assert!(pre("hook-codex", "git show HEAD:notes.txt").starts_with("justless run "));
-    let rewritten = pre("hook-codex", "git show HEAD~1:sub/prices.py");
-    assert!(rewritten.contains("--shell-object "), "{rewritten}");
-    let argv = shlex::split(&rewritten).unwrap();
-    let output = cli(
-        &root,
-        &argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
-    );
-    let shown = String::from_utf8(output.stdout).unwrap();
-    assert!(shown.starts_with(header), "{shown}");
     assert_eq!(
-        replay(&shown),
+        shell_rewrite(&root, "hook-claude", &root, "git show HEAD~1:sub/prices.py"),
+        None
+    );
+    assert!(codex("git show HEAD:notes.txt").starts_with("justless run "));
+    let rewritten = codex("git show HEAD~1:sub/prices.py");
+    assert!(rewritten.contains("--shell-object "), "{rewritten}");
+    let shown = String::from_utf8(follow(&root, &rewritten).stdout).unwrap();
+    assert!(
+        shown.starts_with("HEAD~1:sub/prices.py lines 1-600"),
+        "{shown}"
+    );
+    assert_eq!(
+        replayed_run(&root, &shown),
         native(&root, "git show HEAD~1:sub/prices.py").0
     );
     // A wide blob without an outline gets the ordinary run report.
     let (real, _) = native(&root, "git show HEAD:notes.txt");
+    let response =
+        json!({"stdout":String::from_utf8(real).unwrap(),"stderr":"","interrupted":false});
     let shown = shown_stdout(&after_bash(
         &root,
         &root,
         "git show HEAD:notes.txt",
-        json!({"stdout":String::from_utf8(real).unwrap(),"stderr":"","interrupted":false}),
+        response,
     ));
-    assert!(shown.contains("[justless run-"), "{shown}");
+    text_has(&shown, &["[justless run-"]);
     // Small, binary, tree and missing objects keep their usual handling.
     for command in [
         "git show HEAD:small.py",
@@ -18950,17 +18781,11 @@ fn git_show_reads_outline_the_blob_at_their_revision() {
         "git show HEAD:sub",
         "git show HEAD:missing.py",
     ] {
-        assert!(
-            !pre("hook-codex", command).contains("--shell-object"),
-            "{command}"
-        );
+        assert!(!codex(command).contains("--shell-object"), "{command}");
         let (real, stderr) = native(&root, command);
-        let result = after_bash(
-            &root,
-            &root,
-            command,
-            json!({"stdout":String::from_utf8_lossy(&real),"stderr":stderr,"interrupted":false}),
-        );
+        let response =
+            json!({"stdout":String::from_utf8_lossy(&real),"stderr":stderr,"interrupted":false});
+        let result = after_bash(&root, &root, command, response);
         assert!(
             !result.to_string().contains(" lines 1-"),
             "{command}: {result}"
@@ -18973,46 +18798,20 @@ fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
-    let mut data = String::new();
-    for i in 0..120 {
-        data.push_str(&format!(
-            "def price_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    rounded = round(taxed, 2)\n    discounted = rounded - {i} * 0.01\n    capped = min(discounted, 1000)\n    return capped * 2\n\n"
-        ));
-    }
-    fs::write(root.join("prices.py"), &data).unwrap();
-    let native = |command: &str| {
-        Command::new("sh")
-            .args(["-c", command])
-            .current_dir(&root)
-            .output()
-            .unwrap()
-            .stdout
-    };
-    let pre = |command: &str| {
-        agent_hook(
-            &root,
-            "hook-codex",
-            "before-command",
-            json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}}),
-        )
-    };
+    let data: String = (0..120).map(|i| format!(
+        "def price_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    rounded = round(taxed, 2)\n    discounted = rounded - {i} * 0.01\n    capped = min(discounted, 1000)\n    return capped * 2\n\n"
+    )).collect();
+    write_files(&root, &[("package.json", "{}"), ("prices.py", &data)]);
+    let codex = |command: &str| shell_rewrite(&root, "hook-codex", &root, command);
     // Codex runs a workspace read in their place, which prints the native bytes.
     for command in [
         "head -n 3 prices.py",
         "tail -n +950 prices.py",
         "sed -n '2,4p;9,12p' prices.py",
     ] {
-        let rewritten = pre(command)["hookSpecificOutput"]["updatedInput"]["command"]
-            .as_str()
-            .unwrap_or_else(|| panic!("not rewritten: {command}"))
-            .to_owned();
-        let argv = shlex::split(&rewritten).unwrap();
-        let output = cli(
-            &root,
-            &argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
-        );
-        assert_eq!(output.stdout, native(command), "{command}");
+        let rewritten = codex(command).unwrap_or_else(|| panic!("not rewritten: {command}"));
+        let output = follow(&root, &rewritten);
+        assert_eq!(output.stdout, sh_stdout(&root, command), "{command}");
     }
     // sed prints overlapping or out-of-order addresses line by line, and a zero or
     // negative count means something else, so these keep the native command.
@@ -19025,10 +18824,7 @@ fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
         // could print other lines; only the post-run hook takes it.
         "tail -n 5 prices.py",
     ] {
-        assert!(
-            pre(command)["hookSpecificOutput"]["updatedInput"].is_null(),
-            "{command}"
-        );
+        assert_eq!(codex(command), None, "{command}");
     }
     // In Claude Code a wide read becomes an outline whose replay is the native bytes.
     for command in [
@@ -19036,27 +18832,12 @@ fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
         "tail -n 300 prices.py",
         "sed -n '1,120p;200,420p' prices.py",
     ] {
-        let real = native(command);
+        let real = sh_stdout(&root, command);
         let text = std::str::from_utf8(&real).unwrap();
-        let replaced = after_bash(
-            &root,
-            &root,
-            command,
-            json!({"stdout":text,"stderr":"","interrupted":false}),
-        );
-        let shown = replaced["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{command}: {replaced}"));
+        let response = json!({"stdout":text,"stderr":"","interrupted":false});
+        let shown = shown_stdout(&after_bash(&root, &root, command, response));
         assert!(shown.len() * 4 < real.len(), "{command}: {shown}");
-        let id = shown
-            .split_whitespace()
-            .find(|word| word.starts_with("run-"))
-            .unwrap();
-        assert_eq!(
-            cli(&root, &["log", id, "--unredacted"]).stdout,
-            real,
-            "{command}"
-        );
+        assert_eq!(replayed_run(&root, &shown), real, "{command}");
     }
 }
 
@@ -19066,32 +18847,28 @@ fn cat_cd_and_piped_reads_are_exact_or_outlined_like_ranges() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     let sub = root.join("sub");
-    fs::create_dir(&sub).unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
     let data: String = (0..120)
         .map(|i| format!("def price_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    rounded = round(taxed, 2)\n    return rounded\n\n"))
         .collect();
-    fs::write(sub.join("prices.py"), &data).unwrap();
-    fs::write(sub.join("small.py"), "def f():\n    return 1\n").unwrap();
-    fs::write(root.join("blob.bin"), b"\0binary\n").unwrap();
+    write_files(
+        &root,
+        &[
+            ("package.json", "{}"),
+            ("sub/prices.py", &data),
+            ("sub/small.py", "def f():\n    return 1\n"),
+            ("blob.bin", "\0binary\n"),
+        ],
+    );
     let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let sh = |cwd: &Path, command: &str| {
+    let sh = |command: &str| {
         let mut sh = Command::new("sh");
-        sh.args(["-c", command]).current_dir(cwd).env("PATH", &path);
+        sh.args(["-c", command])
+            .current_dir(&root)
+            .env("PATH", &path);
         sh.output().unwrap().stdout
     };
-    let event = |cwd: &Path, command: &str| json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":cwd,"tool_input":{"command":command}});
-    let codex = |command: &str| {
-        agent_hook(&root, "hook-codex", "before-command", event(&root, command))
-            ["hookSpecificOutput"]["updatedInput"]["command"]
-            .as_str()
-            .map(str::to_owned)
-    };
-    let replayed = |shown: &str| {
-        let id = shown.split_whitespace().find(|w| w.starts_with("run-"));
-        cli(&root, &["log", id.unwrap(), "--unredacted"]).stdout
-    };
+    let codex = |command: &str| shell_rewrite(&root, "hook-codex", &root, command);
     // Other clients run a workspace read after the same `cd`: small reads print
     // their native bytes, wide ones an outline whose replay is those bytes.
     for (command, wide) in [
@@ -19101,13 +18878,13 @@ fn cat_cd_and_piped_reads_are_exact_or_outlined_like_ranges() {
         ("cat sub/prices.py", true),
         ("cd sub && cat prices.py | tail -n +500", true),
     ] {
-        let real = sh(&root, command);
+        let real = sh(command);
         let rewritten = codex(command).unwrap_or_else(|| panic!("not rewritten: {command}"));
-        let shown = sh(&root, &rewritten);
+        let shown = sh(&rewritten);
         if wide {
             let text = String::from_utf8(shown).unwrap();
             assert!(text.len() * 2 < real.len(), "{command}: {text}");
-            assert_eq!(replayed(&text), real, "{command}");
+            assert_eq!(replayed_run(&root, &text), real, "{command}");
         } else {
             assert_eq!(shown, real, "{command}");
         }
@@ -19123,27 +18900,25 @@ fn cat_cd_and_piped_reads_are_exact_or_outlined_like_ranges() {
         (&root, "cat sub/prices.py | sed -n '1,120p;200,420p'"),
         (&root, "cat sub/prices.py | tail -n 300"),
     ] {
-        let pre = agent_hook(&root, "hook-claude", "before-command", event(cwd, command));
+        let event = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":cwd,"tool_input":{"command":command}});
+        let pre = agent_hook(&root, "hook-claude", "before-command", event);
         assert_eq!(pre, json!({}), "{command}");
-        let real = sh(&root, command);
+        let real = sh(command);
         let text = std::str::from_utf8(&real).unwrap();
-        let replaced = after_bash(
-            &root,
-            cwd,
-            command,
-            json!({"stdout":text,"stderr":"","interrupted":false}),
-        );
-        let shown = shown_stdout(&replaced);
+        let response = json!({"stdout":text,"stderr":"","interrupted":false});
+        let shown = shown_stdout(&after_bash(&root, cwd, command, response));
         assert!(shown.len() * 2 < real.len(), "{command}: {shown}");
-        assert_eq!(replayed(&shown), real, "{command}");
+        assert_eq!(replayed_run(&root, &shown), real, "{command}");
     }
     let small = "cd sub && cat small.py";
     let response = json!({"stdout":"def f():\n    return 1","stderr":"","interrupted":false});
     assert_eq!(after_bash(&root, &root, small, response), json!({}));
     assert!(codex("cat sub/small.py").is_none());
     let resume = success(&root, &["resume"]);
-    assert!(resume.contains("Read sub/small.py:1-2"), "{resume}");
-    assert!(resume.contains("Outline sub/prices.py:1-400"), "{resume}");
+    text_has(
+        &resume,
+        &["Read sub/small.py:1-2", "Outline sub/prices.py:1-400"],
+    );
     // Other forms, files outside the workspace and binary files keep their output.
     let wide = json!({"stdout":data,"stderr":"","interrupted":false});
     for command in [
@@ -19159,11 +18934,8 @@ fn cat_cd_and_piped_reads_are_exact_or_outlined_like_ranges() {
         "cat blob.bin",
     ] {
         assert!(codex(command).is_none(), "{command}");
-        assert_eq!(
-            after_bash(&root, &root, command, wide.clone()),
-            json!({}),
-            "{command}"
-        );
+        let output = after_bash(&root, &root, command, wide.clone());
+        assert_eq!(output, json!({}), "{command}");
     }
 }
 
@@ -19172,40 +18944,34 @@ fn cat_cd_and_piped_reads_are_exact_or_outlined_like_ranges() {
 fn paged_find_repo() -> TempDir {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(root.join(".justless.toml"), "").unwrap();
-    for (dir, count) in [("src", 40), ("docs", 15), ("config", 5)] {
-        fs::create_dir_all(root.join(dir)).unwrap();
-        for i in 1..=count {
-            let (name, text) = match dir {
-                "src" => (
-                    format!("mod_{i:02}.py"),
-                    format!(
-                        "def handler_{i}():\n    # TODO: retry_budget for worker {i}\n    return {i}\n"
-                    ),
-                ),
-                "docs" => (
-                    format!("note_{i:02}.md"),
-                    format!("# Notes {i}\n\nSet retry_budget in config.\n"),
-                ),
-                _ => (format!("svc_{i}.toml"), format!("retry_budget = {i}\n")),
-            };
-            fs::write(root.join(dir).join(name), text).unwrap();
-        }
+    let mut files = vec![(".justless.toml".to_owned(), String::new())];
+    for i in 1..=40 {
+        let text = format!(
+            "def handler_{i}():\n    # TODO: retry_budget for worker {i}\n    return {i}\n"
+        );
+        files.push((format!("src/mod_{i:02}.py"), text));
     }
-    fs::write(
-        root.join("src/mod_07.py"),
-        "retry_budget = 1\nretry_budget += 1\n# retry_budget again\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join("docs/note_15.md"),
-        format!(
-            "# Notes 15\n\n{} retry_budget {}\n",
-            "a".repeat(300),
-            "z".repeat(600)
-        ),
-    )
-    .unwrap();
+    for i in 1..=15 {
+        let text = format!("# Notes {i}\n\nSet retry_budget in config.\n");
+        files.push((format!("docs/note_{i:02}.md"), text));
+    }
+    for i in 1..=5 {
+        files.push((
+            format!("config/svc_{i}.toml"),
+            format!("retry_budget = {i}\n"),
+        ));
+    }
+    let long = format!(
+        "# Notes 15\n\n{} retry_budget {}\n",
+        "a".repeat(300),
+        "z".repeat(600)
+    );
+    files.push(("docs/note_15.md".to_owned(), long));
+    let twice = "retry_budget = 1\nretry_budget += 1\n# retry_budget again\n";
+    files.push(("src/mod_07.py".to_owned(), twice.to_owned()));
+    for (file, text) in &files {
+        write_files(root, &[(file, text)]);
+    }
     repo
 }
 
@@ -19260,57 +19026,45 @@ fn find_cursor(page: &str) -> String {
 fn find_pages_through_every_match_with_a_cursor() {
     let repo = paged_find_repo();
     let root = repo.path();
-    let whole = success(
-        root,
-        &[
-            "find",
-            "retry_budget",
-            "--limit",
-            "1000",
-            "--budget",
-            "100000",
-        ],
-    );
+    let whole = success_words(root, "find retry_budget --limit 1000 --budget 100000");
     let expected = find_matches(&whole);
     assert_eq!(expected.len(), 62, "{whole}");
     assert!(!whole.contains("Next page"), "{whole}");
     // The reported case: the budget binds before --limit, so the notice says so
     // instead of suggesting a larger --limit.
-    let first = success(
-        root,
-        &["find", "retry_budget", "--budget", "512", "--limit", "100"],
-    );
+    let first = success_words(root, "find retry_budget --budget 512 --limit 100");
     let shown = find_matches(&first).len();
     assert!((1..20).contains(&shown), "{first}");
-    assert!(
-        first.contains(&format!(
+    text_has(
+        &first,
+        &[&format!(
             "[budget reached after {shown} of 62 matches in 60 files, before --limit 100]\n"
-        )),
-        "{first}"
+        )],
     );
-    let limited = success(root, &["find", "retry_budget", "--limit", "7"]);
-    assert!(
-        limited.contains("[--limit 7 reached after 7 of 62 matches in 60 files]\n"),
-        "{limited}"
+    let limited = success_words(root, "find retry_budget --limit 7");
+    text_has(
+        &limited,
+        &["[--limit 7 reached after 7 of 62 matches in 60 files]\n"],
     );
     // Following each printed command reaches every match once, in order, and
-    // each page stays within its budget.
-    for (args, budget) in [
-        (&["--budget", "512"][..], 512),
-        (&["--limit", "7"], 2400),
-        (&["--budget", "300", "--limit", "4"], 300),
+    // each page stays within its budget. Every page shows at least one match,
+    // even a line longer than the page.
+    for (args, budget, per_page) in [
+        ("--budget 512", 512, None),
+        ("--limit 7", 2400, None),
+        ("--budget 300 --limit 4", 300, None),
+        ("--budget 128", 4096, Some(1)),
     ] {
-        let mut page = success(root, &[&["find", "retry_budget"][..], args].concat());
+        let mut page = success_words(root, &format!("find retry_budget {args}"));
         let mut seen = Vec::new();
         let mut pages = 0;
         loop {
-            assert!(
-                page.len() <= budget,
-                "{args:?}: {} bytes\n{page}",
-                page.len()
-            );
+            assert!(page.len() <= budget, "{args}: {} bytes\n{page}", page.len());
             let matches = find_matches(&page);
             assert!(!matches.is_empty(), "{page}");
+            if let Some(count) = per_page {
+                assert_eq!(matches.len(), count, "{page}");
+            }
             seen.extend(matches);
             pages += 1;
             match next_find_page(root, &page) {
@@ -19318,26 +19072,12 @@ fn find_pages_through_every_match_with_a_cursor() {
                 None => break,
             }
         }
-        assert_eq!(seen, expected, "{args:?}");
-        assert!(pages > 2, "{args:?}");
-        assert!(
-            page.ends_with("[end of 62 matches in 60 files]\n"),
-            "{page}"
-        );
-    }
-    // Every page shows at least one match, even a line longer than the page.
-    let mut page = success(root, &["find", "retry_budget", "--budget", "128"]);
-    let mut seen = Vec::new();
-    loop {
-        let matches = find_matches(&page);
-        assert_eq!(matches.len(), 1, "{page}");
-        seen.extend(matches);
-        match next_find_page(root, &page) {
-            Some(next) => page = next,
-            None => break,
+        assert_eq!(seen, expected, "{args}");
+        assert!(pages > 2, "{args}");
+        if per_page.is_none() {
+            text_has(&page, &["[end of 62 matches in 60 files]\n"]);
         }
     }
-    assert_eq!(seen, expected);
     // The same cursor pages --json, which keeps each page within its budget.
     let mut after = None::<String>;
     let mut seen = Vec::new();
@@ -19373,94 +19113,64 @@ fn find_pages_through_every_match_with_a_cursor() {
 fn find_cursors_reject_a_changed_page_or_another_search() {
     let repo = paged_find_repo();
     let root = repo.path();
-    let first = success(root, &["find", "retry_budget", "--limit", "3"]);
-    assert_eq!(
-        find_matches(&first),
-        [
-            "config/svc_1.toml:1",
-            "config/svc_2.toml:1",
-            "config/svc_3.toml:1"
-        ]
-    );
+    let first = success_words(root, "find retry_budget --limit 3");
+    let svc = [
+        "config/svc_1.toml:1",
+        "config/svc_2.toml:1",
+        "config/svc_3.toml:1",
+    ];
+    assert_eq!(find_matches(&first), svc);
     let cursor = find_cursor(&first);
     // Edits outside the file the page stopped in leave the cursor valid.
-    fs::write(
-        root.join("config/svc_1.toml"),
-        "# moved\nretry_budget = 1\n",
-    )
-    .unwrap();
-    fs::write(root.join("src/mod_01.py"), "retry_budget\n\nretry_budget\n").unwrap();
-    let next = success(
+    write_files(
         root,
-        &["find", "retry_budget", "--limit", "3", "--after", &cursor],
-    );
-    assert_eq!(
-        find_matches(&next),
-        [
-            "config/svc_4.toml:1",
-            "config/svc_5.toml:1",
-            "docs/note_01.md:3"
+        &[
+            ("config/svc_1.toml", "# moved\nretry_budget = 1\n"),
+            ("src/mod_01.py", "retry_budget\n\nretry_budget\n"),
         ],
-        "{next}"
     );
-    assert!(
-        next.contains("[--limit 3 reached after 6 of 63 matches in 60 files]"),
-        "{next}"
+    let next = success_words(
+        root,
+        &format!("find retry_budget --limit 3 --after {cursor}"),
     );
-    // A cursor belongs to one search: its text, case and scope.
+    let more = [
+        "config/svc_4.toml:1",
+        "config/svc_5.toml:1",
+        "docs/note_01.md:3",
+    ];
+    assert_eq!(find_matches(&next), more, "{next}");
+    text_has(
+        &next,
+        &["[--limit 3 reached after 6 of 63 matches in 60 files]"],
+    );
+    // A cursor belongs to one search: its text, case and scope. An edit to the
+    // file the page stopped in can move its lines.
+    let rejected = |args: &str, message: &str| {
+        let output = cli_words(root, &format!("find {args} --after {cursor}"));
+        assert_eq!(output.status.code(), Some(2), "{args}");
+        text_has(&stderr(&output), &[message]);
+    };
+    let another = "this --after cursor belongs to another search";
     for args in [
-        &["find", "retry", "--after", &cursor][..],
-        &["find", "-i", "retry_budget", "--after", &cursor],
-        &[
-            "find",
-            "retry_budget",
-            "--path",
-            "config",
-            "--after",
-            &cursor,
-        ],
-        &[
-            "find",
-            "retry_budget",
-            "--glob",
-            "*.toml",
-            "--after",
-            &cursor,
-        ],
+        "retry",
+        "-i retry_budget",
+        "retry_budget --path config",
+        "retry_budget --glob *.toml",
     ] {
-        let output = cli(root, args);
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(
-            stderr(&output).contains("this --after cursor belongs to another search"),
-            "{args:?}: {}",
-            stderr(&output)
-        );
+        rejected(args, another);
     }
-    let output = cli(root, &["find", "retry_budget", "--after", "f1.nonsense"]);
+    let output = cli_words(root, "find retry_budget --after f1.nonsense");
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("invalid --after cursor"),
-        "{}",
-        stderr(&output)
-    );
-    // An edit to the file the page stopped in can move its lines.
+    text_has(&stderr(&output), &["invalid --after cursor"]);
     fs::write(root.join("config/svc_3.toml"), "\nretry_budget = 3\n").unwrap();
-    let output = cli(root, &["find", "retry_budget", "--after", &cursor]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains(
-            "config/svc_3.toml changed since that page; run the search again without --after"
-        ),
-        "{}",
-        stderr(&output)
+    rejected(
+        "retry_budget",
+        "config/svc_3.toml changed since that page; run the search again without --after",
     );
     fs::remove_file(root.join("config/svc_3.toml")).unwrap();
-    let output = cli(root, &["find", "retry_budget", "--after", &cursor]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("the file that page stopped in is no longer indexed"),
-        "{}",
-        stderr(&output)
+    rejected(
+        "retry_budget",
+        "the file that page stopped in is no longer indexed",
     );
 }
 
@@ -19468,81 +19178,64 @@ fn find_cursors_reject_a_changed_page_or_another_search() {
 fn find_narrows_to_paths_and_globs_as_rg_does() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(root.join(".justless.toml"), "").unwrap();
-    for file in [
+    let files = [
         "src/a.rs",
         "src/b_test.rs",
         "src/vendor/v.rs",
         "vendor/w.rs",
         "docs/x.md",
         "top.rs",
-    ] {
-        let path = root.join(file);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "needle\n").unwrap();
+    ];
+    write_files(root, &[(".justless.toml", "")]);
+    for file in files {
+        write_files(root, &[(file, "needle\n")]);
     }
-    let files = |dir: &Path, args: &[&str]| {
-        let text = success(dir, &[&["find", "needle"][..], args].concat());
+    let files = |dir: &Path, args: &str| {
+        let text = success_words(dir, &format!("find needle {args}"));
         text.lines()
             .filter_map(|line| line.strip_suffix(":1: needle"))
             .map(str::to_owned)
             .collect::<Vec<_>>()
+            .join(" ")
     };
     // Each expected list is what `rg --files` printed for the same -g flags
     // (ripgrep 15.2): the last matching glob wins, a leading ! excludes, and
     // an excluded directory takes its files with it.
     for (globs, expected) in [
         (
-            &["*.rs"][..],
-            &[
-                "src/a.rs",
-                "src/b_test.rs",
-                "src/vendor/v.rs",
-                "top.rs",
-                "vendor/w.rs",
-            ][..],
+            "*.rs",
+            "src/a.rs src/b_test.rs src/vendor/v.rs top.rs vendor/w.rs",
         ),
+        ("!vendor", "docs/x.md src/a.rs src/b_test.rs top.rs"),
         (
-            &["!vendor"],
-            &["docs/x.md", "src/a.rs", "src/b_test.rs", "top.rs"],
+            "*.rs !*_test.rs",
+            "src/a.rs src/vendor/v.rs top.rs vendor/w.rs",
         ),
-        (
-            &["*.rs", "!*_test.rs"],
-            &["src/a.rs", "src/vendor/v.rs", "top.rs", "vendor/w.rs"],
-        ),
-        (
-            &["!src/**", "*.rs"],
-            &["src/a.rs", "src/b_test.rs", "top.rs", "vendor/w.rs"],
-        ),
-        (&["*.rs", "!src/**"], &["top.rs", "vendor/w.rs"]),
-        (&["/top.rs"], &["top.rs"]),
-        (&["**/vendor/**"], &["src/vendor/v.rs", "vendor/w.rs"]),
+        ("!src/** *.rs", "src/a.rs src/b_test.rs top.rs vendor/w.rs"),
+        ("*.rs !src/**", "top.rs vendor/w.rs"),
+        ("/top.rs", "top.rs"),
+        ("**/vendor/**", "src/vendor/v.rs vendor/w.rs"),
     ] {
-        let args = globs
-            .iter()
-            .flat_map(|glob| ["--glob", glob])
-            .collect::<Vec<_>>();
-        assert_eq!(files(root, &args), expected, "{globs:?}");
+        let args: Vec<_> = globs
+            .split(' ')
+            .map(|glob| format!("--glob {glob}"))
+            .collect();
+        assert_eq!(files(root, &args.join(" ")), expected, "{globs}");
     }
     // The output names the scope it searched.
     assert_eq!(
-        success(root, &["find", "needle", "--path", "docs"]),
+        success_words(root, "find needle --path docs"),
         "[scope: docs/ · 1 of 7 indexed files]\ndocs/x.md:1: needle\n"
     );
     assert_eq!(
-        success(
-            root,
-            &[
-                "find", "needle", "-g", "*.md", "--path", "top.rs", "--path", "docs/"
-            ]
-        ),
+        success_words(root, "find needle -g *.md --path top.rs --path docs/"),
         "[scope: top.rs, docs/ · glob *.md · 1 of 7 indexed files]\ndocs/x.md:1: needle\n"
     );
     // Paths resolve from the current directory like shell paths.
     let src = root.join("src");
-    assert_eq!(files(&src, &["--path", "vendor"]), ["src/vendor/v.rs"]);
-    assert_eq!(files(&src, &["--path", "../vendor"]), ["vendor/w.rs"]);
-    assert_eq!(files(&src, &["--path", "."]).len(), 3);
+    assert_eq!(files(&src, "--path vendor"), "src/vendor/v.rs");
+    assert_eq!(files(&src, "--path ../vendor"), "vendor/w.rs");
+    assert_eq!(files(&src, "--path .").split(' ').count(), 3);
     // A path that does not exist, or leaves the workspace, is an error.
     for (path, message) in [
         (
@@ -19553,29 +19246,24 @@ fn find_narrows_to_paths_and_globs_as_rg_does() {
     ] {
         let output = cli(root, &["find", "needle", "--path", path]);
         assert_eq!(output.status.code(), Some(2), "{path}");
-        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+        text_has(&stderr(&output), &[message]);
     }
     // A glob or path with no indexed file says so instead of reading as no match.
-    let none = success(root, &["find", "needle", "-g", "*.tsx", "-g", "*.md"]);
     assert_eq!(
-        none,
+        success_words(root, "find needle -g *.tsx -g *.md"),
         "[scope: glob *.tsx, *.md · 1 of 7 indexed files]\n[--glob *.tsx matches no indexed file]\ndocs/x.md:1: needle\n"
     );
-    let empty = success(root, &["find", "needle", "-g", "*.tsx"]);
     assert_eq!(
-        empty,
+        success_words(root, "find needle -g *.tsx"),
         "[scope: glob *.tsx · 0 of 7 indexed files]\n[--glob *.tsx matches no indexed file]\nNo indexed file is in scope.\n"
     );
-    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
-    fs::write(root.join("node_modules/pkg/index.js"), "needle\n").unwrap();
-    let excluded = success(root, &["find", "needle", "--path", "node_modules"]);
-    assert!(
-        excluded.contains("[--path node_modules/ has no indexed text files]\n"),
-        "{excluded}"
+    write_files(root, &[("node_modules/pkg/index.js", "needle\n")]);
+    text_has(
+        &success_words(root, "find needle --path node_modules"),
+        &["[--path node_modules/ has no indexed text files]\n"],
     );
-    let missing = success(root, &["find", "absent", "--path", "docs"]);
     assert_eq!(
-        missing,
+        success_words(root, "find absent --path docs"),
         "[scope: docs/ · 1 of 7 indexed files]\nNo matching indexed text.\n"
     );
 }
@@ -19585,17 +19273,19 @@ fn find_narrows_to_paths_and_globs_as_rg_does() {
 fn find_next_page_commands_keep_scope_case_and_a_leading_dash() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(root.join(".justless.toml"), "").unwrap();
-    fs::create_dir_all(root.join("notes")).unwrap();
+    write_files(root, &[(".justless.toml", "")]);
     for i in 1..=5 {
-        fs::write(root.join(format!("notes/{i}.md")), "see -RELEASE.md\n").unwrap();
-        fs::write(root.join(format!("other{i}.md")), "see -release.md\n").unwrap();
+        write_files(
+            root,
+            &[
+                (&format!("notes/{i}.md"), "see -RELEASE.md\n"),
+                (&format!("other{i}.md"), "see -release.md\n"),
+            ],
+        );
     }
-    let first = success(
+    let first = success_words(
         root,
-        &[
-            "find", "-i", "--path", "notes", "--glob", "!4.md", "--limit", "2", "--", "-release",
-        ],
+        "find -i --path notes --glob !4.md --limit 2 -- -release",
     );
     let command = first
         .lines()
@@ -19723,10 +19413,10 @@ fn source_lines(text: &str, first: usize, last: usize) -> String {
 
 #[test]
 fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
+    use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
-    fs::create_dir(root.join("src")).unwrap();
     // 30 functions of 20 lines each.
     let source: String = (0..30)
         .map(|i| {
@@ -19736,16 +19426,10 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
             )
         })
         .collect();
+    write_files(&root, &[("src/lib.rs", &source)]);
     let path = root.join("src/lib.rs");
-    fs::write(&path, &source).unwrap();
-    let read = |offset: Option<u64>, limit: Option<u64>| {
-        agent_hook(
-            &root,
-            "hook-claude",
-            "after-read",
-            native_read(&path, &source, offset, limit),
-        )
-    };
+    let hook = |event| agent_hook(&root, "hook-claude", "after-read", event);
+    let read = |offset, limit| hook(native_read(&path, &source, offset, limit));
     let revision = success(&root, &["read", "src/lib.rs", "--outline"])
         .split_whitespace()
         .nth(1)
@@ -19755,8 +19439,8 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
     // Lines 110-409 become the rows that overlap them, numbered as in the whole
     // outline, with the revision. Rows are not source lines, so they count from 1.
     let output = read(Some(110), Some(300));
-    let hook = &output["hookSpecificOutput"];
-    let file = &hook["updatedToolOutput"]["file"];
+    let hook_output = &output["hookSpecificOutput"];
+    let file = &hook_output["updatedToolOutput"]["file"];
     let content = file["content"]
         .as_str()
         .unwrap_or_else(|| panic!("{output}"));
@@ -19775,13 +19459,13 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
         rows[15],
         "#21 L401-419 function calibrate_20  pub fn calibrate_20(raw: u64, offset: u64) -> u64"
     );
-    assert_eq!(hook["updatedToolOutput"]["type"], "text");
+    assert_eq!(hook_output["updatedToolOutput"]["type"], "text");
     assert_eq!(file["filePath"], path.to_str().unwrap());
     assert_eq!(file["startLine"], 1);
     assert_eq!(file["numLines"], 17);
     assert_eq!(file["totalLines"], 601);
     assert_eq!(
-        hook["additionalContext"],
+        hook_output["additionalContext"],
         "Justless outline of lines 110-409, the lines this Read returned. L ranges are source line numbers. The same Read with allow_large: true returns those lines as they are, a Read of at most 150 lines is never outlined, and `justless expand src/lib.rs 'REV#ID'` prints one row."
     );
     // `resume` lists the window as an outline of those lines, beside the whole
@@ -19795,68 +19479,50 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
     // nor its output is routed or compacted. `expand` of a line range is exact too.
     let mut whole = native_read(&path, &source, Some(110), Some(300));
     whole["tool_input"]["allow_large"] = true.into();
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "after-read", whole),
-        serde_json::json!({})
-    );
+    assert_eq!(hook(whole), json!({}));
     assert_eq!(
         resume_reads(&root, "src/lib.rs")[0],
         "Read src/lib.rs:110-409"
     );
     let row = source_lines(&source, 121, 139);
     let row = row.trim_end_matches('\n');
-    assert_eq!(
-        success(&root, &["expand", "src/lib.rs", &format!("{revision}#7")]),
-        row
-    );
+    let selector = format!("{revision}#7");
+    assert_eq!(success(&root, &["expand", "src/lib.rs", &selector]), row);
     let expand = format!("justless expand src/lib.rs '{revision}#7'");
-    let call = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
+    let call = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
         "tool_input":{"command":expand}});
     assert_eq!(
         agent_hook(&root, "hook-claude", "before-command", call),
-        serde_json::json!({})
+        json!({})
     );
-    assert_eq!(
-        after_bash(&root, &root, &expand, bash_result(&row.repeat(20))),
-        serde_json::json!({})
-    );
+    let response = bash_result(&row.repeat(20));
+    assert_eq!(after_bash(&root, &root, &expand, response), json!({}));
     assert_eq!(
         success(&root, &["expand", "src/lib.rs", "L110-409"]),
         source_lines(&source, 110, 409)
     );
 
     // A Read of at most 150 lines arrives as Read returned it, however long its
-    // lines, so following the hint never meets an outline.
-    assert_eq!(read(Some(100), Some(150)), serde_json::json!({}));
+    // lines, so following the hint never meets an outline. 151 lines is wide.
+    assert_eq!(read(Some(100), Some(150)), json!({}));
     let wide: String = source
         .lines()
         .map(|line| format!("{line} // {}\n", "x".repeat(300)))
         .collect();
     fs::write(&path, &wide).unwrap();
     let event = native_read(&path, &wide, Some(100), Some(150));
-    assert!(
-        event["tool_response"]["file"]["content"]
-            .as_str()
-            .unwrap()
-            .len()
-            > 45_000
-    );
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "after-read", event),
-        serde_json::json!({})
-    );
-    // 151 lines is a wide window.
+    let content = event["tool_response"]["file"]["content"].as_str().unwrap();
+    assert!(content.len() > 45_000);
+    assert_eq!(hook(event), json!({}));
     let event = native_read(&path, &wide, Some(100), Some(151));
-    assert!(agent_hook(&root, "hook-claude", "after-read", event)["hookSpecificOutput"]
-        ["updatedToolOutput"]
-        .is_object());
+    assert!(hook(event)["hookSpecificOutput"]["updatedToolOutput"].is_object());
 
     // A whole outline now names the largest Read that stays as it is.
     fs::write(&path, &source).unwrap();
     let whole = read(None, None);
+    let context = whole["hookSpecificOutput"]["additionalContext"].as_str();
     assert!(
-        whole["hookSpecificOutput"]["additionalContext"]
-            .as_str()
+        context
             .unwrap()
             .ends_with("or Read original lines with offset and a limit of at most 150."),
         "{whole}"
@@ -19865,7 +19531,7 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
 
 #[test]
 fn claude_read_keeps_ranged_reads_it_cannot_outline_exactly() {
-    use serde_json::json;
+    use serde_json::{Value, json};
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
@@ -19879,107 +19545,99 @@ fn claude_read_keeps_ranged_reads_it_cannot_outline_exactly() {
         })
         .collect();
     let write = |name: &str, text: &str| {
-        let path = root.join(name);
-        fs::write(&path, text).unwrap();
-        path
+        write_files(&root, &[(name, text)]);
+        root.join(name)
     };
     let path = write("lib.rs", &functions);
-    let hook = |event: serde_json::Value| agent_hook(&root, "hook-claude", "after-read", event);
-    let replaced = |event: serde_json::Value| {
-        hook(event)["hookSpecificOutput"]["updatedToolOutput"].is_object()
+    let hook = |event: Value| agent_hook(&root, "hook-claude", "after-read", event);
+    let replaced = |event| hook(event)["hookSpecificOutput"]["updatedToolOutput"].is_object();
+    // The wide read with each of `changes`, a path of keys and a new value.
+    let wide = |changes: &[(&[&str], Value)]| {
+        let mut event = native_read(&path, &functions, Some(50), Some(300));
+        for (keys, value) in changes {
+            let mut at = &mut event;
+            for key in *keys {
+                at = &mut at[*key];
+            }
+            *at = value.clone();
+        }
+        event
     };
-    let wide = || native_read(&path, &functions, Some(50), Some(300));
-    assert!(replaced(wide()));
+    assert!(replaced(wide(&[])));
 
-    // The request asks for the lines as they are, or for something else.
-    let mut event = wide();
-    event["tool_input"]["allow_large"] = json!(true);
-    assert_eq!(hook(event), json!({}));
-    let mut event = wide();
-    event["tool_input"]["pages"] = json!("1-2");
-    assert_eq!(hook(event), json!({}));
-    let mut event = wide();
-    event["tool_response"]["type"] = json!("notebook");
-    assert_eq!(hook(event), json!({}));
-    let mut event = wide();
-    event["tool_response"]["file"]["truncatedByTokenCap"] = json!(true);
-    assert_eq!(hook(event), json!({}));
-    // The response must be the requested range of this file as it is now.
-    let mut event = wide();
-    event["tool_input"]["offset"] = json!(49);
-    assert_eq!(hook(event), json!({}));
-    let mut event = wide();
-    event["tool_input"]["limit"] = json!(299);
-    assert_eq!(hook(event), json!({}));
-    let mut event = wide();
-    event["tool_response"]["file"]["filePath"] = json!(root.join("other.rs"));
-    assert_eq!(hook(event), json!({}));
-    let mut event = wide();
-    event["tool_response"]["file"]["totalLines"] = json!(1000);
-    assert_eq!(hook(event), json!({}));
-    let mut event = wide();
-    event["tool_input"]["offset"] = json!(u64::MAX);
-    event["tool_response"]["file"]["startLine"] = json!(u64::MAX);
-    assert_eq!(hook(event), json!({}));
+    // The request asks for the lines as they are, or for something else. The
+    // response must be the requested range of this file as it is now.
+    for (keys, value) in [
+        (&["tool_input", "allow_large"][..], json!(true)),
+        (&["tool_input", "pages"], json!("1-2")),
+        (&["tool_response", "type"], json!("notebook")),
+        (
+            &["tool_response", "file", "truncatedByTokenCap"],
+            json!(true),
+        ),
+        (&["tool_input", "offset"], json!(49)),
+        (&["tool_input", "limit"], json!(299)),
+        (
+            &["tool_response", "file", "filePath"],
+            json!(root.join("other.rs")),
+        ),
+        (&["tool_response", "file", "totalLines"], json!(1000)),
+    ] {
+        assert_eq!(hook(wide(&[(keys, value)])), json!({}), "{keys:?}");
+    }
+    let huge = [
+        (&["tool_input", "offset"][..], json!(u64::MAX)),
+        (&["tool_response", "file", "startLine"], json!(u64::MAX)),
+    ];
+    assert_eq!(hook(wide(&huge)), json!({}));
     fs::write(&path, functions.replace("handler_30", "handler_x")).unwrap();
-    assert_eq!(hook(wide()), json!({}));
+    assert_eq!(hook(wide(&[])), json!({}));
     fs::write(&path, &functions).unwrap();
     // Numeric strings for the range are read as numbers.
-    let mut event = wide();
-    event["tool_input"]["offset"] = json!("50");
-    event["tool_input"]["limit"] = json!("300");
-    assert!(replaced(event));
+    let strings = [
+        (&["tool_input", "offset"][..], json!("50")),
+        (&["tool_input", "limit"], json!("300")),
+    ];
+    assert!(replaced(wide(&strings)));
 
     // Files outside the workspace, formats without parser rows, and Rust that does
     // not parse.
     let outside = TempDir::new().unwrap();
     let elsewhere = outside.path().canonicalize().unwrap().join("lib.rs");
     fs::write(&elsewhere, &functions).unwrap();
-    assert_eq!(
-        hook(native_read(&elsewhere, &functions, Some(50), Some(300))),
-        json!({})
-    );
-    for name in ["notes.txt", "config.toml"] {
-        let path = write(name, &functions);
-        assert_eq!(
-            hook(native_read(&path, &functions, Some(50), Some(300))),
-            json!({}),
-            "{name}"
-        );
-    }
     let broken = functions.replace(
         "handler_59(request: &Request)",
         "handler_59(request: &Request",
     );
-    let path = write("broken.rs", &broken);
-    assert_eq!(
-        hook(native_read(&path, &broken, Some(50), Some(300))),
-        json!({})
-    );
+    for (path, text) in [
+        (elsewhere, &functions),
+        (write("notes.txt", &functions), &functions),
+        (write("config.toml", &functions), &functions),
+        (write("broken.rs", &broken), &broken),
+    ] {
+        let event = native_read(&path, text, Some(50), Some(300));
+        assert_eq!(hook(event), json!({}), "{}", path.display());
+    }
 
     // A window inside one long function, or mostly inside one, has nothing for the
-    // rows to divide.
+    // rows to divide; and rows that would not fit the context budget even without
+    // their signatures.
     let long = format!(
         "pub fn small() {{}}\n\npub fn long() {{\n{}}}\n\npub fn tail() {{}}\n",
         "    step();\n".repeat(400)
     );
-    let path = write("long.rs", &long);
-    for (offset, limit) in [(10, 300), (1, 300), (250, 200)] {
-        assert_eq!(
-            hook(native_read(&path, &long, Some(offset), Some(limit))),
-            json!({}),
-            "{offset} {limit}"
-        );
-    }
-    // Rows that would not fit the context budget even without their signatures.
     let many: String = (0..400)
         .map(|i| format!("fn tiny_function_number_{i:03}() {{}}\n"))
         .collect();
-    let path = write("many.rs", &many);
-    assert_eq!(
-        hook(native_read(&path, &many, Some(1), Some(400))),
-        json!({})
-    );
+    for (name, text, offset, limit) in [
+        ("long.rs", &long, 10, 300),
+        ("long.rs", &long, 1, 300),
+        ("long.rs", &long, 250, 200),
+        ("many.rs", &many, 1, 400),
+    ] {
+        let event = native_read(&write(name, text), text, Some(offset), Some(limit));
+        assert_eq!(hook(event), json!({}), "{name} {offset} {limit}");
+    }
 }
 
 #[test]
@@ -19996,64 +19654,62 @@ fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets
             )
         })
         .collect();
-    let hook = |path: &Path, text: &str, offset: Option<u64>, limit: Option<u64>| {
-        agent_hook(
-            &root,
-            "hook-claude",
-            "after-read",
-            native_read(path, text, offset, limit),
-        )
+    // The hook's output for a Read of `name`, written as `text`.
+    let hook = |name: &str, text: &str, offset: Option<u64>, limit: Option<u64>| {
+        write_files(&root, &[(name, text)]);
+        let event = native_read(&root.join(name), text, offset, limit);
+        agent_hook(&root, "hook-claude", "after-read", event)
     };
-    let header = |output: &serde_json::Value| {
-        let content = output["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+    let content = |output: &serde_json::Value| {
+        output["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
             .as_str()
             .unwrap_or_else(|| panic!("{output}"))
-            .to_owned();
-        content.lines().next().unwrap().to_owned()
+            .to_owned()
     };
     let expand = |name: &str, range: &str| {
         let output = cli(&root, &["expand", name, range]);
         assert!(output.status.success(), "{}", stderr(&output));
-        output.stdout
+        String::from_utf8(output.stdout).unwrap()
     };
 
     // CRLF lines reach Read as LF lines, and `expand` prints the file's own bytes.
+    // Offset 0 reads from line 1 with `startLine` 0. Read's empty line after a
+    // final newline is not a line of the file, and a file without a final newline
+    // ends on its own last line.
     let crlf = functions.replace('\n', "\r\n");
-    let path = root.join("crlf.rs");
-    fs::write(&path, &crlf).unwrap();
-    let output = hook(&path, &crlf, Some(20), Some(200));
-    assert!(
-        header(&output).ends_with("· 560 lines · window L20-219"),
-        "{output}"
-    );
-    assert_eq!(
-        expand("crlf.rs", "L20-219"),
-        source_lines(&crlf, 20, 219).into_bytes()
-    );
-    // Offset 0 reads from line 1 with `startLine` 0.
-    let output = hook(&path, &crlf, Some(0), Some(200));
-    assert!(header(&output).ends_with("window L1-200"), "{output}");
-
-    // Read's empty line after a final newline is not a line of the file, and a file
-    // without a final newline ends on its own last line.
-    let path = root.join("lib.rs");
-    fs::write(&path, &functions).unwrap();
-    let output = hook(&path, &functions, Some(300), None);
-    assert!(
-        header(&output).ends_with("· 560 lines · window L300-560"),
-        "{output}"
-    );
+    let trimmed = functions.trim_end_matches('\n');
+    for (name, text, offset, limit, header) in [
+        (
+            "crlf.rs",
+            crlf.as_str(),
+            20,
+            Some(200),
+            "· 560 lines · window L20-219",
+        ),
+        ("crlf.rs", crlf.as_str(), 0, Some(200), "window L1-200"),
+        (
+            "lib.rs",
+            functions.as_str(),
+            300,
+            None,
+            "· 560 lines · window L300-560",
+        ),
+        (
+            "trimmed.rs",
+            trimmed,
+            300,
+            Some(1000),
+            "· 559 lines · window L300-559",
+        ),
+    ] {
+        let output = content(&hook(name, text, Some(offset), limit));
+        let first = output.lines().next().unwrap();
+        assert!(first.ends_with(header), "{name}: {output}");
+    }
+    assert_eq!(expand("crlf.rs", "L20-219"), source_lines(&crlf, 20, 219));
     assert_eq!(
         expand("lib.rs", "L300-560"),
-        source_lines(&functions, 300, 560).into_bytes()
-    );
-    let trimmed = functions.trim_end_matches('\n');
-    let path = root.join("trimmed.rs");
-    fs::write(&path, trimmed).unwrap();
-    let output = hook(&path, trimmed, Some(300), Some(1000));
-    assert!(
-        header(&output).ends_with("· 559 lines · window L300-559"),
-        "{output}"
+        source_lines(&functions, 300, 560)
     );
 
     // Markdown sections.
@@ -20066,16 +19722,11 @@ fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets
             ))
             .collect::<String>()
     );
-    let path = root.join("guide.md");
-    fs::write(&path, &guide).unwrap();
-    let output = hook(&path, &guide, Some(20), Some(300));
-    let content = output["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{output}"));
-    let rows: Vec<&str> = content.lines().skip(1).collect();
+    let output = content(&hook("guide.md", &guide, Some(20), Some(300)));
+    let rows: Vec<&str> = output.lines().skip(1).collect();
     assert_eq!(rows[0], "#1 L1-452 heading Guide  # Guide");
     assert_eq!(rows[1], "#3 L18-32 heading Section 2  ## Section 2");
-    assert_eq!(rows.len(), 22, "{content}");
+    assert_eq!(rows.len(), 22, "{output}");
 
     // Top-level code in the window that no row covers follows the rows verbatim, up
     // to 20 lines. More keeps the native read.
@@ -20095,31 +19746,21 @@ fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets
         }
         text
     };
-    let few = script(3);
-    let path = root.join("tasks.py");
-    fs::write(&path, &few).unwrap();
-    let output = hook(&path, &few, Some(100), Some(200));
-    let content = output["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{output}"));
+    let output = hook("tasks.py", &script(3), Some(100), Some(200));
     assert!(
-        content.ends_with(
+        content(&output).ends_with(
             "Code outside these rows:\nL169: register(task_00)\nL170: register(task_01)\nL171: register(task_02)"
         ),
-        "{content}"
+        "{output}"
     );
+    let context = output["hookSpecificOutput"]["additionalContext"].as_str();
     assert!(
-        output["hookSpecificOutput"]["additionalContext"]
-            .as_str()
+        context
             .unwrap()
             .contains("code that no row covers follows the rows verbatim")
     );
-    let more = script(21);
-    fs::write(&path, &more).unwrap();
-    assert_eq!(
-        hook(&path, &more, Some(100), Some(200)),
-        serde_json::json!({})
-    );
+    let more = hook("tasks.py", &script(21), Some(100), Some(200));
+    assert_eq!(more, serde_json::json!({}));
 }
 
 /// Runs justless with `input` on stdin.
@@ -20147,72 +19788,65 @@ fn revision(root: &Path, file: &str) -> String {
     outline["revision"].as_str().unwrap().to_owned()
 }
 
+/// Pipes `text` to `edit FILE SELECTOR` at the file's current revision, with `extra`.
+fn edit_at_head(root: &Path, file: &str, selector: &str, text: &str, extra: &[&str]) -> Output {
+    let rev = revision(root, file);
+    piped(
+        root,
+        &[&["edit", file, selector, "--revision", &rev][..], extra].concat(),
+        text,
+    )
+}
+
 #[test]
 fn edits_that_leave_a_file_unparseable_are_rejected_whole() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    fs::create_dir(root.join("src")).unwrap();
     let source = "pub fn a() -> u32 {\n    1\n}\n\npub fn b() -> u32 {\n    2\n}\n";
-    fs::write(root.join("src/lib.rs"), source).unwrap();
-    let rev = revision(root, "src/lib.rs");
+    let python = "def f():\n    return 1\n";
+    write_files(root, &[("src/lib.rs", source), ("tool.py", python)]);
     let broken = "pub fn a() -> u32 {\n    1 +\n";
-    let edit = ["edit", "src/lib.rs", "a", "--revision", &rev];
-    let rejected = piped(root, &edit, broken);
+    let rejected = edit_at_head(root, "src/lib.rs", "a", broken, &[]);
     assert_eq!(rejected.status.code(), Some(2), "{}", stderr(&rejected));
     assert!(stdout(&rejected).is_empty());
-    let message = stderr(&rejected);
-    for expected in [
-        "edit rejected: it leaves src/lib.rs unparseable, and the file is unchanged\n",
-        "src/lib.rs:1:19: unclosed `{` (Rust parser)\n",
-        "1 | pub fn a() -> u32 {\n  |                   ^\n2 |     1 +\n",
-        "The edit wrote lines 1-2. The file parsed before it.",
-        "--allow-parse-errors",
-    ] {
-        assert!(message.contains(expected), "{expected:?} in\n{message}");
-    }
-    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), source);
+    text_has(
+        &stderr(&rejected),
+        &[
+            "edit rejected: it leaves src/lib.rs unparseable, and the file is unchanged\n",
+            "src/lib.rs:1:19: unclosed `{` (Rust parser)\n",
+            "1 | pub fn a() -> u32 {\n  |                   ^\n2 |     1 +\n",
+            "The edit wrote lines 1-2. The file parsed before it.",
+            "--allow-parse-errors",
+        ],
+    );
+    assert_eq!(file_text(root, "src/lib.rs"), source);
     // A dry run shows the patch and gives the same verdict.
-    let dry = piped(root, &[&edit[..], &["--dry-run"]].concat(), broken);
+    let dry = edit_at_head(root, "src/lib.rs", "a", broken, &["--dry-run"]);
     assert_eq!(dry.status.code(), Some(2));
-    assert!(stdout(&dry).contains("+    1 +\n"), "{}", stdout(&dry));
-    assert!(stderr(&dry).contains("src/lib.rs:1:19: unclosed `{`"));
+    text_has(&stdout(&dry), &["+    1 +\n"]);
+    text_has(&stderr(&dry), &["src/lib.rs:1:19: unclosed `{`"]);
     // One breaking edit rejects its whole batch.
     let batch = serde_json::json!([
         {"selector": "L2", "replacement": "    10\n"},
         {"selector": "L6", "replacement": "    2 *\n"},
     ]);
-    let rejected = piped(
-        root,
-        &["edit", "src/lib.rs", "--batch", "--revision", &rev],
-        &batch.to_string(),
-    );
+    let rev = revision(root, "src/lib.rs");
+    let args = ["edit", "src/lib.rs", "--batch", "--revision", &rev];
+    let rejected = piped(root, &args, &batch.to_string());
     assert_eq!(rejected.status.code(), Some(2));
-    assert!(
-        stderr(&rejected).contains("The edit wrote lines 2, 6."),
-        "{}",
-        stderr(&rejected)
-    );
-    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), source);
+    text_has(&stderr(&rejected), &["The edit wrote lines 2, 6."]);
+    assert_eq!(file_text(root, "src/lib.rs"), source);
     // Python, through a line range.
-    fs::write(root.join("tool.py"), "def f():\n    return 1\n").unwrap();
-    let rev_py = revision(root, "tool.py");
-    let rejected = piped(
-        root,
-        &["edit", "tool.py", "L2", "--revision", &rev_py],
-        "    return (1\n",
-    );
+    let rejected = edit_at_head(root, "tool.py", "L2", "    return (1\n", &[]);
     assert_eq!(rejected.status.code(), Some(2));
-    assert!(
-        stderr(&rejected).contains("tool.py:2:12: unclosed `(` (Python parser)"),
-        "{}",
-        stderr(&rejected)
+    text_has(
+        &stderr(&rejected),
+        &["tool.py:2:12: unclosed `(` (Python parser)"],
     );
-    assert_eq!(
-        fs::read_to_string(root.join("tool.py")).unwrap(),
-        "def f():\n    return 1\n"
-    );
+    assert_eq!(file_text(root, "tool.py"), python);
     // Valid edits print exactly what they printed before.
-    let clean = piped(root, &edit, "pub fn a() -> u32 {\n    10\n}\n");
+    let fixed = "pub fn a() -> u32 {\n    10\n}\n";
+    let clean = edit_at_head(root, "src/lib.rs", "a", fixed, &[]);
     assert!(clean.status.success(), "{}", stderr(&clean));
     assert!(stderr(&clean).is_empty(), "{}", stderr(&clean));
     assert!(stdout(&clean).starts_with("1 edits · revision "));
@@ -20224,62 +19858,42 @@ fn a_forced_or_already_broken_file_reports_its_parse_state() {
     let root = dir.path();
     let source = "pub fn a() -> u32 {\n    1\n}\n\npub fn b() -> u32 {\n    2\n}\n";
     fs::write(root.join("lib.rs"), source).unwrap();
-    let rev = revision(root, "lib.rs");
-    let forced = piped(
-        root,
-        &[
-            "edit",
-            "lib.rs",
+    // Forced through, then an edit elsewhere in the file that did not parse
+    // before, then the fix.
+    for (selector, text, extra, expected) in [
+        (
             "L2",
-            "--revision",
-            &rev,
-            "--allow-parse-errors",
-        ],
-        "    1 +\n",
-    );
-    assert!(forced.status.success(), "{}", stderr(&forced));
-    assert!(stdout(&forced).starts_with("1 edits · revision "));
+            "    1 +\n",
+            &["--allow-parse-errors"][..],
+            "justless: lib.rs no longer parses: lib.rs:3:1: unexpected end of input, expected an expression (Rust parser)\n",
+        ),
+        (
+            "L6",
+            "    20\n",
+            &[],
+            "justless: lib.rs did not parse before this edit and still fails where it did: lib.rs:3:1: unexpected end of input, expected an expression (Rust parser)\n",
+        ),
+        (
+            "L2",
+            "    1\n",
+            &[],
+            "justless: lib.rs parses after this edit; before it, it failed at 3:1\n",
+        ),
+    ] {
+        let output = edit_at_head(root, "lib.rs", selector, text, extra);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stdout(&output).starts_with("1 edits · revision "));
+        assert_eq!(stderr(&output), expected);
+    }
     assert_eq!(
-        stderr(&forced),
-        "justless: lib.rs no longer parses: lib.rs:3:1: unexpected end of input, expected an expression (Rust parser)\n"
-    );
-    // The file did not parse before, so an edit elsewhere goes through and says so.
-    let rev = revision(root, "lib.rs");
-    let elsewhere = piped(
-        root,
-        &["edit", "lib.rs", "L6", "--revision", &rev],
-        "    20\n",
-    );
-    assert!(elsewhere.status.success(), "{}", stderr(&elsewhere));
-    assert_eq!(
-        stderr(&elsewhere),
-        "justless: lib.rs did not parse before this edit and still fails where it did: lib.rs:3:1: unexpected end of input, expected an expression (Rust parser)\n"
-    );
-    let rev = revision(root, "lib.rs");
-    let fixed = piped(
-        root,
-        &["edit", "lib.rs", "L2", "--revision", &rev],
-        "    1\n",
-    );
-    assert!(fixed.status.success(), "{}", stderr(&fixed));
-    assert_eq!(
-        stderr(&fixed),
-        "justless: lib.rs parses after this edit; before it, it failed at 3:1\n"
-    );
-    assert_eq!(
-        fs::read_to_string(root.join("lib.rs")).unwrap(),
+        file_text(root, "lib.rs"),
         source.replace("    2\n", "    20\n")
     );
     // A new error in the text an edit writes to a file that did not parse is
     // reported, and the edit is written.
     let broken = "def f(:\n    return 1\n\ndef g():\n    return 2\n";
     fs::write(root.join("tool.py"), broken).unwrap();
-    let rev = revision(root, "tool.py");
-    let output = piped(
-        root,
-        &["edit", "tool.py", "L5", "--revision", &rev],
-        "    return (2\n",
-    );
+    let output = edit_at_head(root, "tool.py", "L5", "    return (2\n", &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         stderr(&output),
@@ -20294,18 +19908,12 @@ fn a_forced_or_already_broken_file_reports_its_parse_state() {
         ("n.txt", "a\n", false),
     ] {
         fs::write(root.join(file), text).unwrap();
-        let rev = revision(root, file);
-        let output = piped(
-            root,
-            &["edit", file, "L1", "--revision", &rev],
-            "int f( {\n",
-        );
+        let output = edit_at_head(root, file, "L1", "int f( {\n", &[]);
         assert!(output.status.success(), "{file}: {}", stderr(&output));
-        assert_eq!(fs::read_to_string(root.join(file)).unwrap(), "int f( {\n");
+        assert_eq!(file_text(root, file), "int f( {\n");
+        let warning = format!("justless: warning: {file} may no longer parse: {file}:1:");
         assert_eq!(
-            stderr(&output).starts_with(&format!(
-                "justless: warning: {file} may no longer parse: {file}:1:"
-            )),
+            stderr(&output).starts_with(&warning),
             warned,
             "{file}: {}",
             stderr(&output)
@@ -20320,11 +19928,12 @@ fn edits_with_syntax_the_grammar_may_not_know_are_written_with_a_warning() {
     // TypeScript 4.7 variance annotations, which the bundled grammar rejects.
     let source = "export interface Box<T> {\n  value: T;\n}\n";
     fs::write(root.join("box.ts"), source).unwrap();
-    let rev = revision(root, "box.ts");
-    let output = piped(
+    let output = edit_at_head(
         root,
-        &["edit", "box.ts", "L1", "--revision", &rev],
+        "box.ts",
+        "L1",
         "export interface Box<in out T> {\n",
+        &[],
     );
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).starts_with("1 edits · revision "));
@@ -20333,20 +19942,16 @@ fn edits_with_syntax_the_grammar_may_not_know_are_written_with_a_warning() {
         "justless: warning: box.ts may no longer parse: box.ts:1:25: syntax error at identifier (TypeScript parser). The edit was written, because this parser may not know newer syntax or the file's macros. Check the lines it wrote.\n"
     );
     assert_eq!(
-        fs::read_to_string(root.join("box.ts")).unwrap(),
+        file_text(root, "box.ts"),
         source.replace("<T>", "<in out T>")
     );
     // An edit that leaves a brace unclosed is rejected.
     fs::write(root.join("box.ts"), source).unwrap();
-    let rev = revision(root, "box.ts");
-    let output = piped(root, &["edit", "box.ts", "L3", "--revision", &rev], "\n");
+    let output = edit_at_head(root, "box.ts", "L3", "\n", &[]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains(
-            "The edit wrote line 3. The file parsed before it, and its brackets no longer pair up."
-        ),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &["The edit wrote line 3. The file parsed before it, and its brackets no longer pair up."],
     );
 }
 
@@ -20378,78 +19983,102 @@ fn edit_event(tool: &str, path: &Path, before: Option<&str>) -> serde_json::Valu
 
 #[test]
 fn claude_edit_hook_notes_only_an_edit_that_breaks_parsing() {
+    use serde_json::json;
     let dir = TempDir::new().unwrap();
     let root = dir.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
-    fs::create_dir(root.join("src")).unwrap();
-    let lib = root.join("src/lib.rs");
-    let before = "pub fn a() -> u32 {\n    1\n}\n";
     let hook = |event| agent_hook(&root, "hook-claude", "after-edit", event);
-    // The file parsed before the Edit.
-    fs::write(&lib, "pub fn a() -> u32 {\n    1 +\n").unwrap();
-    let output = hook(edit_event("Edit", &lib, Some(before)));
-    assert_eq!(
-        output,
-        serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse",
-            "additionalContext": "Justless parse check: after this Edit, src/lib.rs:1:19: unclosed `{` (Rust parser). The file parsed before it."}})
-    );
-    // A clean edit gets nothing.
-    fs::write(&lib, "pub fn a() -> u32 {\n    2\n}\n").unwrap();
-    assert_eq!(
-        hook(edit_event("Edit", &lib, Some(before))),
-        serde_json::json!({})
-    );
-    // A new file counts as one that parsed.
-    let tool = root.join("tool.py");
-    fs::write(&tool, "def f(:\n    return 1\n").unwrap();
-    let note = hook(edit_event("Write", &tool, None));
-    assert_eq!(
-        note["hookSpecificOutput"]["additionalContext"],
-        "Justless parse check: after this Write, tool.py:1:7: missing `)` (Python parser). The file is new."
-    );
-    // A file that already failed gets a note only for a new error in the new text.
+    let lib = "pub fn a() -> u32 {\n    1\n}\n";
     let broken = "def f(:\n    return 1\n\ndef g():\n    return 2\n";
-    fs::write(&tool, broken.replace("return 2", "return 3")).unwrap();
-    assert_eq!(
-        hook(edit_event("Edit", &tool, Some(broken))),
-        serde_json::json!({})
+    let (worse, closed) = (
+        broken.replace("return 2", "return [2"),
+        broken.replace("return 2", "return 3"),
     );
-    fs::write(&tool, broken.replace("return 2", "return [2")).unwrap();
-    let note = hook(edit_event("Edit", &tool, Some(broken)));
-    assert_eq!(
-        note["hookSpecificOutput"]["additionalContext"],
-        "Justless parse check: after this Edit, tool.py:5:12: unclosed `[` (Python parser). The file had other parse errors, and this one is in the new text."
-    );
-    // An error that may be syntax the parser does not know says so.
-    let shape = root.join("shape.ts");
-    fs::write(&shape, "interface Box<in out T> {\n  value: T;\n}\n").unwrap();
-    let note = hook(edit_event(
-        "Edit",
-        &shape,
-        Some("interface Box<T> {\n  value: T;\n}\n"),
-    ));
-    assert_eq!(
-        note["hookSpecificOutput"]["additionalContext"],
-        "Justless parse check: after this Edit, shape.ts:1:18: syntax error at identifier (TypeScript parser). The file parsed before it. The parser may not know newer syntax, so check the line before changing it."
-    );
+    let shape = "interface Box<T> {\n  value: T;\n}\n";
+    // Each file as the tool left it, with the file before it, and the note.
+    for (file, now, tool, before, note) in [
+        // The file parsed before the Edit; a clean edit gets nothing.
+        (
+            "src/lib.rs",
+            "pub fn a() -> u32 {\n    1 +\n",
+            "Edit",
+            Some(lib),
+            Some(
+                "after this Edit, src/lib.rs:1:19: unclosed `{` (Rust parser). The file parsed before it.",
+            ),
+        ),
+        (
+            "src/lib.rs",
+            "pub fn a() -> u32 {\n    2\n}\n",
+            "Edit",
+            Some(lib),
+            None,
+        ),
+        // A new file counts as one that parsed.
+        (
+            "tool.py",
+            "def f(:\n    return 1\n",
+            "Write",
+            None,
+            Some("after this Write, tool.py:1:7: missing `)` (Python parser). The file is new."),
+        ),
+        // A file that already failed gets a note only for a new error in the new text.
+        ("tool.py", &closed, "Edit", Some(broken), None),
+        (
+            "tool.py",
+            &worse,
+            "Edit",
+            Some(broken),
+            Some(
+                "after this Edit, tool.py:5:12: unclosed `[` (Python parser). The file had other parse errors, and this one is in the new text.",
+            ),
+        ),
+        // An error that may be syntax the parser does not know says so.
+        (
+            "shape.ts",
+            &shape.replace("<T>", "<in out T>"),
+            "Edit",
+            Some(shape),
+            Some(
+                "after this Edit, shape.ts:1:18: syntax error at identifier (TypeScript parser). The file parsed before it. The parser may not know newer syntax, so check the line before changing it.",
+            ),
+        ),
+    ] {
+        write_files(&root, &[(file, now)]);
+        let expected = note.map_or(json!({}), |note| {
+            json!({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                "additionalContext": format!("Justless parse check: {note}")}})
+        });
+        assert_eq!(
+            hook(edit_event(tool, &root.join(file), before)),
+            expected,
+            "{file}"
+        );
+    }
     // Unchecked kinds, C, C++ and shell, whose grammars reject much valid code,
     // files outside the project, an unknown earlier state, other tools and
     // malformed input all pass without a note.
-    fs::write(root.join("a.sql"), "SELECT (1;\n").unwrap();
-    fs::write(root.join("a.c"), "int f( {\n").unwrap();
     let header = root.join("macros.h");
-    fs::write(&header, "BEGIN_DECLS\nint f(void) EXPORT;\nEND_DECLS\n").unwrap();
+    write_files(
+        &root,
+        &[
+            ("a.sql", "SELECT (1;\n"),
+            ("a.c", "int f( {\n"),
+            ("macros.h", "BEGIN_DECLS\nint f(void) EXPORT;\nEND_DECLS\n"),
+            ("src/lib.rs", "fn x( {\n"),
+        ],
+    );
     let outside = TempDir::new().unwrap();
     let outside_file = outside.path().canonicalize().unwrap().join("x.rs");
     fs::write(&outside_file, "fn x( {\n").unwrap();
-    let mut unknown = edit_event("Edit", &lib, None);
-    fs::write(&lib, "fn x( {\n").unwrap();
+    let lib_path = root.join("src/lib.rs");
+    let mut unknown = edit_event("Edit", &lib_path, None);
     unknown["tool_response"]
         .as_object_mut()
         .unwrap()
         .remove("originalFile");
-    let mut read = edit_event("Edit", &lib, Some(before));
-    read["tool_name"] = serde_json::json!("Read");
+    let mut read = edit_event("Edit", &lib_path, Some(lib));
+    read["tool_name"] = json!("Read");
     for event in [
         edit_event("Edit", &root.join("a.sql"), Some("SELECT 1;\n")),
         edit_event("Edit", &root.join("a.c"), Some("int f() {}\n")),
@@ -20457,56 +20086,62 @@ fn claude_edit_hook_notes_only_an_edit_that_breaks_parsing() {
         edit_event("Edit", &outside_file, Some("fn x() {}\n")),
         unknown,
         read,
-        serde_json::json!("not an event"),
+        json!("not an event"),
     ] {
-        assert_eq!(hook(event), serde_json::json!({}));
+        assert_eq!(hook(event), json!({}));
     }
 }
 
+/// Doctor names a missing after-bash or after-edit hook, `init` adds it once, and
+/// removal takes it out with the others.
 #[cfg(unix)]
 #[test]
-fn claude_edit_hook_is_installed_checked_and_removed_with_the_others() {
-    let tools = doctor_tools(&["claude"]);
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    success(root, &["init", "--hooks", "--agent", "claude"]);
-    let claude = root.join(".claude/settings.json");
-    let config: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
-    let entry = config["hooks"]["PostToolUse"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["hooks"][0]["command"] == "justless hook-claude after-edit")
-        .cloned()
-        .unwrap();
-    assert_eq!(entry["matcher"], "^(Edit|MultiEdit|Write)$");
-    assert_eq!(entry["hooks"][0]["timeout"], 5);
-    // An install from before the hook: doctor names it, and init adds it once.
-    let mut older = config.clone();
-    older["hooks"]["PostToolUse"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|entry| entry["matcher"] != "^(Edit|MultiEdit|Write)$");
-    fs::write(&claude, older.to_string()).unwrap();
-    let (status, text) = doctor_text(root, tools.path());
-    assert_eq!(status, Some(1), "{text}");
-    assert!(
-        text.contains("✗ Hooks: .claude/settings.json lacks the after-edit hook"),
-        "{text}"
-    );
-    success(root, &["init", "--hooks", "--agent", "claude"]);
-    success(root, &["init", "--hooks", "--agent", "claude"]);
-    assert_eq!(
-        fs::read_to_string(&claude)
-            .unwrap()
-            .matches("hook-claude after-edit")
-            .count(),
-        1
-    );
-    let (status, text) = doctor_text(root, tools.path());
-    assert_eq!(status, Some(0), "{text}");
-    success(root, &["init", "--remove"]);
-    assert!(!claude.exists() || !fs::read_to_string(&claude).unwrap().contains("after-edit"));
+fn claude_post_tool_hooks_are_installed_checked_and_removed_with_the_others() {
+    for (matcher, mode, timeout) in [
+        ("^Bash$", "after-bash", 10),
+        ("^(Edit|MultiEdit|Write)$", "after-edit", 5),
+    ] {
+        let tools = doctor_tools(&["claude"]);
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        success(root, &["init", "--hooks", "--agent", "claude"]);
+        let claude = root.join(".claude/settings.json");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&file_text(root, ".claude/settings.json")).unwrap();
+        let command = format!("justless hook-claude {mode}");
+        let entries = config["hooks"]["PostToolUse"].as_array_mut().unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry["hooks"][0]["command"] == command.as_str())
+            .unwrap();
+        assert_eq!(entry["matcher"], matcher);
+        assert_eq!(entry["hooks"][0]["timeout"], timeout);
+        // An install from before the hook.
+        entries.retain(|entry| entry["matcher"] != matcher);
+        fs::write(&claude, config.to_string()).unwrap();
+        let (status, text) = doctor_text(root, tools.path());
+        assert_eq!(status, Some(1), "{text}");
+        text_has(
+            &text,
+            &[&format!(
+                "✗ Hooks: .claude/settings.json lacks the {mode} hook\n    fix: justless init --hooks --agent claude"
+            )],
+        );
+        // Running the fix adds it once, and the set is current again.
+        let bin = tools.path().join("bin");
+        let fix = "justless init --hooks --agent claude";
+        let applied = doctor_shell(root, tools.path(), bin.to_str().unwrap(), fix);
+        assert!(applied.status.success(), "{}", stderr(&applied));
+        success(root, &["init", "--hooks", "--agent", "claude"]);
+        let installed = file_text(root, ".claude/settings.json");
+        assert_eq!(installed.matches(&command).count(), 1, "{installed}");
+        let (status, text) = doctor_text(root, tools.path());
+        text_has(&text, &["✓ Hooks: .claude/settings.json has all 8"]);
+        assert_eq!(status, Some(0), "{text}");
+        // Removal takes it out with the others.
+        let removed = success(root, &["init", "--remove"]);
+        text_has(&removed, &["\n  .claude/settings.json: removed 8 hooks"]);
+        assert!(!claude.exists() || !file_text(root, ".claude/settings.json").contains(mode));
+    }
 }
