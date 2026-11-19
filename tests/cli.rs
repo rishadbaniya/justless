@@ -2560,13 +2560,14 @@ fn discover_classifies_claude_code_shell_commands() {
     let plan = discover("discover --json --plan");
     let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
     let rows = plan["plan"].as_array().unwrap();
-    // A command a current hook would route, and a range read the post-command
-    // hook outlines, compact now; a listing still needs a formatter.
+    // A command a current hook would route compacts now; a range read this small
+    // keeps its text after running, and a listing still needs a formatter.
     let row = |label: &str| rows.iter().find(|r| r["label"] == label).unwrap();
     assert_eq!(rows[0]["label"], "cargo test");
     assert_eq!(rows[0]["output_bytes"], 4000);
     assert_eq!(rows[0]["compactable_now_bytes"], 4000);
-    assert_eq!(row("sed")["compactable_now_bytes"], 3000);
+    assert_eq!(row("sed")["compactable_now_bytes"], 0);
+    assert_eq!(route("passed_through")["labels"][0]["label"], "sed");
     assert_eq!(row("ls")["compactable_now_bytes"], 0);
     assert_all_in(
         &discover("discover --plan"),
@@ -4317,17 +4318,14 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
         ["cat ×1", "justless query ×1", "npm test ×1"]
     );
     assert_eq!(labels("supported_not_routed"), ["cargo test ×1"]);
-    assert_eq!(labels("passed_through"), ["cargo test ×1"]);
+    // Reads this small keep their text after running.
+    assert_eq!(
+        labels("passed_through"),
+        ["cargo test ×1", "cat ×1", "sed ×1"]
+    );
     assert_eq!(
         labels("not_supported"),
-        [
-            "cat ×1",
-            "git commit ×1",
-            "mysql ×1",
-            "other ×1",
-            "sed ×1",
-            "ssh ×1"
-        ]
+        ["git commit ×1", "mysql ×1", "other ×1", "ssh ×1"]
     );
     assert!(!text.contains("secretdb") && !text.contains("prod-host"));
 }
@@ -5357,7 +5355,8 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
             .and_then(|g| g["route"].as_str())
     };
     assert_eq!(route("cargo test"), Some("passed_through"), "{report}");
-    assert_eq!(route("grep"), Some("not_supported"), "{report}");
+    // The post-run hook would compact a larger search, and keeps this one whole.
+    assert_eq!(route("grep"), Some("passed_through"), "{report}");
 }
 
 #[test]

@@ -6,6 +6,7 @@ mod common;
 mod compaction;
 mod compare;
 mod delta;
+mod discover;
 mod global;
 mod hook_fixes;
 mod lookup;

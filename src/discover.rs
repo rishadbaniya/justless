@@ -30,10 +30,15 @@ pub(crate) enum Route {
     /// current permission rules and the session's mode.
     LeftByPermissions,
     /// A supported command that the project's `exclude_commands` keeps from the
-    /// hooks, or for Claude Code a supported tool in a pass-through form, which
-    /// it keeps from the post-run hook.
+    /// hooks, or for Claude Code a supported tool in a pass-through form or a
+    /// read, which it keeps from the post-run hook.
     Excluded,
-    /// A supported tool in a form the hooks pass through whole, such as a pipe.
+    /// A command the Claude Code post-run hook would compact after it ran: a
+    /// read, a read list, a supported tool in a pass-through form over the
+    /// context budget, or an unsupported command over its floor.
+    CompactedAfterRunning,
+    /// A supported tool in a form the hooks pass through whole, such as a pipe,
+    /// or a read the post-run hook keeps whole because it is small.
     PassedThrough,
     NotSupported,
 }
@@ -45,7 +50,8 @@ impl Route {
             Self::SupportedNotRouted => "Supported, not routed",
             Self::LeftByPermissions => "Supported, left to Claude Code's permission rules",
             Self::Excluded => "Supported, excluded by exclude_commands",
-            Self::PassedThrough => "Supported tool, passed through",
+            Self::CompactedAfterRunning => "Compacted after running",
+            Self::PassedThrough => "Supported, passed through whole",
             Self::NotSupported => "Not supported yet",
         }
     }
@@ -88,6 +94,69 @@ fn excluded_stage(exclusions: &Exclusions, command: &str) -> bool {
             crate::wrappers::effective(&words)
                 .is_some_and(|words| exclusions.matching(&words.join(" ")).is_some())
         })
+}
+
+/// What the Claude Code post-run hook would make of a result that the command hook
+/// leaves as `route`, using the hook's own check: compacted, kept whole as a
+/// handled command, or left as `route`. `rules` holds the project's exclusions
+/// and context budget, and is `None` while the settings fail to load, when the
+/// hook leaves every result. `entry` is the transcript line holding `part`.
+fn after_running(
+    route: Route,
+    command: &str,
+    entry: &Value,
+    part: &Value,
+    rules: Option<&(Exclusions, usize)>,
+) -> Route {
+    let Some((exclusions, budget)) = rules else {
+        return route;
+    };
+    // A failed command fires PostToolUseFailure, which cannot rewrite a result.
+    if !matches!(
+        route,
+        Route::LeftByPermissions | Route::PassedThrough | Route::NotSupported
+    ) || part["is_error"] == true
+    {
+        return route;
+    }
+    // Claude Code records the tool's own result beside the message; it is the
+    // hook's input, but names one result only when the line holds one.
+    let results = entry["message"]["content"].as_array().map_or(0, |parts| {
+        parts.iter().filter(|p| p["type"] == "tool_result").count()
+    });
+    let response = if results == 1 && entry["toolUseResult"].is_object() {
+        &entry["toolUseResult"]
+    } else {
+        &Value::Null
+    };
+    if response["interrupted"] == true
+        || response["isImage"] == true
+        || ["backgroundTaskId", "timedOutAfterMs", "structuredContent"]
+            .iter()
+            .any(|key| !response[*key].is_null())
+    {
+        return route;
+    }
+    let output = match response["stdout"].as_str() {
+        Some(stdout) => stdout.to_owned(),
+        None => text(&part["content"]),
+    };
+    let persisted = response["persistedOutputPath"]
+        .is_string()
+        .then(|| response["persistedOutputSize"].as_u64().unwrap_or(u64::MAX));
+    let judge =
+        |exclusions| crate::postroute::after_run(command, exclusions, &output, persisted, *budget);
+    match judge(exclusions) {
+        Some(crate::postroute::AfterRun::Compacts) => Route::CompactedAfterRunning,
+        Some(crate::postroute::AfterRun::KeepsWhole) if route == Route::NotSupported => {
+            Route::PassedThrough
+        }
+        // An entry keeps a command from the post-run hook that would handle it.
+        None if route == Route::NotSupported && judge(&Exclusions::default()).is_some() => {
+            Route::Excluded
+        }
+        _ => route,
+    }
 }
 
 /// The footer `justless run` prints on its own line after a captured command:
@@ -162,6 +231,14 @@ fn text_bytes(content: &Value) -> u64 {
     }
 }
 
+fn text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
 fn text_matches(content: &Value, pattern: &Regex) -> bool {
     match content {
         Value::String(text) => pattern.is_match(text),
@@ -198,6 +275,8 @@ struct PlanEntry {
     now_bytes: u64,
     left_commands: u64,
     left_bytes: u64,
+    after_commands: u64,
+    after_bytes: u64,
 }
 
 pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> Result<()> {
@@ -214,6 +293,13 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
     // Past commands are judged by the rules in force now, or by none while the
     // settings fail to load.
     let exclusions = Exclusions::of(workspace).unwrap_or_default();
+    // The post-run hook leaves every result while either fails to load.
+    let post_run = Exclusions::of(workspace).ok().zip(
+        workspace
+            .settings()
+            .ok()
+            .map(|settings| settings.context_budget),
+    );
     // Sessions keep subagent transcripts under <session>/subagents/, and workflow
     // subagents one level deeper under subagents/workflows/<run>/.
     let mut files = Vec::new();
@@ -340,11 +426,12 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                                     });
                                     crate::agents::left_by_permissions(&call.command, mode, rules)
                                 });
-                            if left {
+                            let route = if left {
                                 Route::LeftByPermissions
                             } else {
                                 route
-                            }
+                            };
+                            after_running(route, &call.command, &entry, part, post_run.as_ref())
                         };
                         let bytes = text_bytes(content);
                         // Excluded commands stay as written by choice.
@@ -356,12 +443,16 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                                 entry.left_commands += 1;
                                 entry.left_bytes += bytes;
                             }
-                            // The command hook would route it, or the post-command
-                            // hook would outline a range read or a read list.
-                            if route == Route::SupportedNotRouted
-                                || crate::batch::Batch::parse(&call.command).is_some()
-                                || crate::shellread::parse(&call.command).is_some()
-                            {
+                            if route == Route::CompactedAfterRunning {
+                                entry.after_commands += 1;
+                                entry.after_bytes += bytes;
+                            }
+                            // The command hook would route it, or the post-run hook
+                            // would compact it.
+                            if matches!(
+                                route,
+                                Route::SupportedNotRouted | Route::CompactedAfterRunning
+                            ) {
                                 entry.now_commands += 1;
                                 entry.now_bytes += bytes;
                             }
@@ -402,11 +493,14 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                     "output_bytes": e.bytes,
                     "compactable_now_commands": e.now_commands,
                     "compactable_now_bytes": e.now_bytes,
+                    "compacted_after_running_commands": e.after_commands,
+                    "compacted_after_running_bytes": e.after_bytes,
                     "left_by_permissions_commands": e.left_commands,
                     "left_by_permissions_bytes": e.left_bytes,
                 })).collect::<Vec<_>>()
             }),
             "groups": groups_json(&groups),
+            "what_if": what_if_json(&groups),
             "codex": codex.json(),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -426,16 +520,14 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
         human_bytes(output)
     );
     print_groups(&groups);
+    print_what_if(&groups);
     if plan {
         let mut entries: Vec<_> = unrouted.iter().collect();
         entries.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.0.cmp(b.0)));
         println!("\nUnrouted output by command family, largest first (labels only, no commands):");
         for (label, entry) in entries.iter().take(12) {
-            let now = if entry.now_bytes > 0 {
-                format!(
-                    " · {} would compact now with a hook or `run --`",
-                    human_bytes(entry.now_bytes)
-                )
+            let after = if entry.after_bytes > 0 {
+                format!(", {} of it after running", human_bytes(entry.after_bytes))
             } else {
                 String::new()
             };
@@ -447,6 +539,14 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             } else {
                 String::new()
             };
+            let now = if entry.now_bytes > 0 {
+                format!(
+                    " · {} would compact now with a hook or `run --`{after}",
+                    human_bytes(entry.now_bytes)
+                )
+            } else {
+                String::new()
+            };
             println!(
                 "  {label} ×{} ({}){now}{left}",
                 entry.commands,
@@ -454,7 +554,9 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             );
         }
     }
-    if groups.contains_key(&Route::SupportedNotRouted) {
+    if groups.contains_key(&Route::SupportedNotRouted)
+        || groups.contains_key(&Route::CompactedAfterRunning)
+    {
         println!(
             "\nSupported commands reached the agent unfiltered. Install or refresh hooks with `{} init --hooks --agent claude`, then start a new session.",
             workspace.justless()
@@ -492,6 +594,53 @@ pub(crate) fn groups_json(groups: &BTreeMap<Route, Group>) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// The commands that did not go through Justless, as the current build would
+/// treat them: routed before running, compacted after, or left as written. Each
+/// part is a command count and its output bytes.
+fn what_if(groups: &BTreeMap<Route, Group>) -> [(u64, u64); 3] {
+    let mut parts = [(0, 0); 3];
+    for (route, group) in groups {
+        let part = match route {
+            Route::ThroughJustless => continue,
+            Route::SupportedNotRouted => 0,
+            Route::CompactedAfterRunning => 1,
+            _ => 2,
+        };
+        parts[part].0 += group.commands;
+        parts[part].1 += group.output_bytes;
+    }
+    parts
+}
+
+fn what_if_json(groups: &BTreeMap<Route, Group>) -> Value {
+    let [routed, compacted, written] = what_if(groups);
+    let part = |(commands, bytes): (u64, u64)| serde_json::json!({"commands": commands, "output_bytes": bytes});
+    serde_json::json!({
+        "commands": routed.0 + compacted.0 + written.0,
+        "output_bytes": routed.1 + compacted.1 + written.1,
+        "routed_before_running": part(routed),
+        "compacted_after_running": part(compacted),
+        "as_written": part(written),
+        "basis": "output bytes of the commands that did not go through Justless, as the current build's hooks would treat them; not savings",
+    })
+}
+
+fn print_what_if(groups: &BTreeMap<Route, Group>) {
+    let [routed, compacted, written] = what_if(groups);
+    let commands = routed.0 + compacted.0 + written.0;
+    if commands == 0 {
+        return;
+    }
+    let part = |(commands, bytes): (u64, u64)| format!("{commands} ({})", human_bytes(bytes));
+    println!(
+        "\nWith the current build, of the {commands} command(s) that did not go through Justless ({} output): the command hook would route {}, the post-run hook would compact {}, and {} would reach the agent as written. These are output sizes, not savings.",
+        human_bytes(routed.1 + compacted.1 + written.1),
+        part(routed),
+        part(compacted),
+        part(written),
+    );
 }
 
 fn print_groups(groups: &BTreeMap<Route, Group>) {

@@ -508,6 +508,74 @@ fn excluded(exclusions: &crate::rewrite::Exclusions, command: &str) -> bool {
             }))
 }
 
+/// What [`claude_bash`] does with a successful Bash result, judged from the command
+/// line and the size of the output alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AfterRun {
+    /// It replaces the result with a compaction.
+    Compacts,
+    /// It handles this kind of command but keeps this result whole, as it does a
+    /// small read or a supported command's output within the context budget.
+    KeepsWhole,
+}
+
+/// How [`claude_bash`] treats `command` whose result was `output`, or `persisted`
+/// bytes that Claude Code saved to a file, for `discover`. `None` when it leaves
+/// such a command alone at any size. It takes `context_budget` as the threshold;
+/// a family whose adaptive preview budget is larger keeps more output whole, and
+/// a compaction that would save too little is dropped after the run.
+pub(crate) fn after_run(
+    command: &str,
+    exclusions: &crate::rewrite::Exclusions,
+    output: &str,
+    persisted: Option<u64>,
+    context_budget: usize,
+) -> Option<AfterRun> {
+    if excluded(exclusions, command) || RUN_MARKER.is_match(output) {
+        return None;
+    }
+    let size = persisted.unwrap_or(output.len() as u64);
+    let lines = output.matches('\n').count();
+    let fits = |threshold: usize| persisted.is_none() && size <= threshold as u64;
+    let verdict = |compacts: bool| {
+        Some(if compacts {
+            AfterRun::Compacts
+        } else {
+            AfterRun::KeepsWhole
+        })
+    };
+    let mut handled = false;
+    if !cfg!(windows) {
+        if let Some(read) = crate::shellread::parse(command) {
+            let small = persisted.is_none()
+                && crate::shellread::small(output.lines().count(), output.len());
+            // A `git show` blob too small to outline gets the ordinary report.
+            if !read.object() || !small {
+                return verdict(!small);
+            }
+            handled = true;
+        }
+        if crate::batch::Batch::parse(command).is_some() {
+            if !fits(crate::batch::FLOOR) {
+                return verdict(true);
+            }
+            handled = true;
+        }
+    }
+    let large = size > MAX_BYTES as u64 || persisted.is_none() && lines > MAX_LINES;
+    if plan(command).is_some() {
+        return verdict(!large && !fits(context_budget));
+    }
+    if unknown_plan(command).is_some()
+        && !large
+        && persisted.is_none()
+        && output.len() > UNKNOWN_FACTOR * context_budget
+    {
+        return verdict(true);
+    }
+    handled.then_some(AfterRun::KeepsWhole)
+}
+
 struct Plan {
     /// Its words after assignments and wrappers such as `env` or `timeout`.
     words: Vec<String>,

@@ -86,5 +86,6 @@ Details: [Install and configure agents](docs/reference.md#install-and-configure-
 - `stats --all` totals every project on this machine from a local registry, with tokens estimated by content type as `stats` estimates them, and `log`, `search`, `context --run` and MCP `log` pages find and count runs made in another project.
 - `justless statusline` shows the session's savings in Claude Code's status line; `init --statusline` adds it without replacing an existing one.
 - `discover` lists commands Claude Code and Codex ran outside Justless, as labels and byte counts only, and says when permission rules kept them out.
+- `discover` counts Claude Code commands the post-run hook would compact, such as large `sed -n` and `cat` reads, as compacted after running instead of unsupported, and sums what the current build would route, compact or leave in the window.
 
 Details: [Run history and stats](docs/reference.md#task-packs-and-run-history) · [Status line](docs/reference.md#claude-code-status-line) · [Projects on this machine](docs/reference.md#projects-on-this-machine)

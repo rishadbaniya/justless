@@ -18,6 +18,10 @@ use serde_json::{Value, json};
 
 pub(crate) struct Batch<'a>(Vec<Piece<'a>>);
 
+/// Output at or under this many bytes is kept whole unless Claude Code saved it to
+/// a file.
+pub(crate) const FLOOR: usize = 4096;
+
 /// The recheck only runs builtins with explicit arguments. Cap both its stdout
 /// and its lifetime, including children that close stdout before exiting.
 fn bounded(cmd: &mut Command, cap: usize, deadline: Instant) -> Option<(i32, String)> {
@@ -119,7 +123,7 @@ impl<'a> Batch<'a> {
         let stdout = response["stdout"].as_str()?;
         let persisted = response["persistedOutputPath"].as_str();
         let settings = ws.settings().ok()?;
-        if settings.max_runs == 0 || (persisted.is_none() && stdout.len() <= 4096) {
+        if settings.max_runs == 0 || (persisted.is_none() && stdout.len() <= FLOOR) {
             return None;
         }
         let stored;

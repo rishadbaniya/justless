@@ -277,6 +277,12 @@ pub(crate) struct ShellRead {
     range: LineRange,
 }
 
+/// Whether a read of `lines` lines and `bytes` bytes is small enough to keep its
+/// text instead of an outline.
+pub(crate) fn small(lines: usize, bytes: usize) -> bool {
+    lines <= 150 && bytes <= 6144
+}
+
 /// The read a command line runs, if it is one of the forms `ShellRead` describes.
 pub(crate) fn parse(line: &str) -> Option<ShellRead> {
     let parts = split(line)?;
@@ -499,7 +505,7 @@ impl Selection {
             .iter()
             .map(|window| window.last + 1 - window.first)
             .sum();
-        lines <= 150 && self.text.len() <= 6144
+        small(lines, self.text.len())
     }
 
     fn outline(&mut self, ws: &Workspace, baseline: usize) -> Option<String> {
