@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// A workspace root and its canonical path, which is what the binary reports.
@@ -35,6 +36,10 @@ fn exec(cwd: &Path, args: &[&str]) -> Output {
     justless(cwd).arg("exec").args(args).output().unwrap()
 }
 
+fn sh(cwd: &Path, script: &str) -> Output {
+    exec(cwd, &["--lang", "sh", script])
+}
+
 fn exec_with_stdin(cwd: &Path, args: &[&str], input: &[u8]) -> Output {
     let mut child = justless(cwd)
         .arg("exec")
@@ -55,6 +60,32 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[track_caller]
+fn contains(text: &str, needle: &str) {
+    assert!(text.contains(needle), "{needle:?} not in:\n{text}");
+}
+
+#[track_caller]
+fn starts(text: &str, prefix: &str) {
+    assert!(
+        text.starts_with(prefix),
+        "{prefix:?} does not start:\n{text}"
+    );
+}
+
+#[track_caller]
+fn ends(text: &str, suffix: &str) {
+    assert!(text.ends_with(suffix), "{suffix:?} does not end:\n{text}");
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+fn history(root: &Path) -> String {
+    stdout(&cli(root, &["history"]))
 }
 
 /// The run ID in the footer, as in `[justless run-… · exit 1]`.
@@ -84,6 +115,11 @@ fn new_run(root: &Path, before: &[String]) -> String {
         .collect();
     assert_eq!(added.len(), 1, "{added:?}");
     added[0].clone()
+}
+
+fn record(root: &Path, id: &str) -> Value {
+    let path = root.join(".justless/runs").join(id).join("record.json");
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
 fn run_directories(root: &Path) -> usize {
@@ -116,14 +152,21 @@ fn alive(pid: &str) -> bool {
     }
 }
 
+/// Whether the process whose ID the script wrote to `file` is gone.
+#[cfg(unix)]
+fn stopped(root: &Path, file: &str) -> bool {
+    !alive(fs::read_to_string(root.join(file)).unwrap().trim())
+}
+
 const NUMBERED: &str = "i=1; while [ $i -le 3000 ]; do echo \"line $i ok\"; i=$((i + 1)); done";
 
 #[test]
 fn inline_sh_prints_only_script_output_and_archives_the_run() {
     let (_directory, root) = workspace();
-    let output = exec(&root, &["--lang", "sh", "echo hi; echo oops >&2; exit 3"]);
+    let output = sh(&root, "echo hi; echo oops >&2; exit 3");
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert_eq!(stdout(&output), "hi\n");
+    // The agent footer, not the footer printed for a person.
     let id = run_id(&output);
     assert_eq!(stderr(&output), format!("oops\n[justless {id} · exit 3]\n"));
 
@@ -131,13 +174,8 @@ fn inline_sh_prints_only_script_output_and_archives_the_run() {
     assert_eq!(replay.stdout, b"hi\n");
     let replay = cli(&root, &["log", &id, "--stream", "stderr"]);
     assert_eq!(replay.stderr, b"oops\n");
-    let history = stdout(&cli(&root, &["history"]));
-    assert!(
-        history.contains(&format!("{id} · exec sh · exit 3")),
-        "{history}"
-    );
-    let stats: serde_json::Value =
-        serde_json::from_slice(&cli(&root, &["stats", "--json"]).stdout).unwrap();
+    contains(&history(&root), &format!("{id} · exec sh · exit 3"));
+    let stats: Value = serde_json::from_slice(&cli(&root, &["stats", "--json"]).stdout).unwrap();
     let families: Vec<_> = stats["commands"]
         .as_array()
         .unwrap()
@@ -145,20 +183,34 @@ fn inline_sh_prints_only_script_output_and_archives_the_run() {
         .map(|entry| entry["family"].as_str().unwrap())
         .collect();
     assert_eq!(families, ["exec sh"]);
+    // Hooks did not route the run, so `doctor` and the status line do not count it.
+    let record = record(&root, &id);
+    assert_eq!(record["hook"], false, "{record}");
+    assert_eq!(record["family"], "exec sh", "{record}");
 }
 
 #[test]
-fn verbatim_success_adds_no_footer() {
+fn output_that_fits_is_shown_verbatim_without_a_footer() {
     let (_directory, root) = workspace();
-    let output = exec(&root, &["--lang", "sh", "echo ok"]);
+    let output = sh(&root, "echo ok");
     assert!(output.status.success());
     assert_eq!(stdout(&output), "ok\n");
     assert_eq!(stderr(&output), "");
-    let history = stdout(&cli(&root, &["history"]));
-    assert!(
-        history.contains(&format!("{} · exec sh · exit 0", new_run(&root, &[]))),
-        "{history}"
-    );
+    let id = new_run(&root, &[]);
+    contains(&history(&root), &format!("{id} · exec sh · exit 0"));
+    // An intent is ignored when the output fits, and identical runs always show it.
+    let rows = "i=1; while [ $i -le 40 ]; do echo \"row $i\"; i=$((i + 1)); done";
+    let forty: String = (1..=40).map(|i| format!("row {i}\n")).collect();
+    let short = ["--lang", "sh", "--intent", "anything", "echo short"];
+    for (args, expected) in [
+        (&short[..], "short\n"),
+        (&["--lang", "sh", rows], &forty),
+        (&["--lang", "sh", rows], &forty),
+    ] {
+        let output = exec(&root, args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        assert_eq!(stderr(&output), "", "{args:?}");
+    }
 }
 
 #[test]
@@ -169,14 +221,9 @@ fn clipped_output_gets_the_short_footer_and_keeps_the_full_log() {
     assert!(output.stdout.len() <= 1024, "{}", output.stdout.len());
     let footer = stderr(&output);
     let id = run_id(&output);
-    assert!(
-        footer.starts_with(&format!("[justless {id} · ")),
-        "{footer}"
-    );
-    assert!(
-        footer.ends_with(" shown]\n") && footer.contains(" of "),
-        "{footer}"
-    );
+    starts(&footer, &format!("[justless {id} · "));
+    ends(&footer, " shown]\n");
+    contains(&footer, " of ");
     let replay = cli(&root, &["log", &id, "--stream", "stdout"]);
     let full = String::from_utf8(replay.stdout).unwrap();
     assert_eq!(full.lines().count(), 3000);
@@ -186,11 +233,9 @@ fn clipped_output_gets_the_short_footer_and_keeps_the_full_log() {
     let text = stdout(&output);
     let (head, rest) = text.split_once("[justless] stdout lines ").unwrap();
     let (marker, tail) = rest.split_once('\n').unwrap();
-    assert!(
-        head.starts_with("line 1 ok\n") && head.ends_with(" ok\n"),
-        "{text}"
-    );
-    assert!(tail.ends_with("line 3000 ok\n"), "{text}");
+    starts(head, "line 1 ok\n");
+    ends(head, " ok\n");
+    ends(tail, "line 3000 ok\n");
     let command = marker.split_once(" · ").unwrap().1;
     let words: Vec<&str> = command.split(' ').collect();
     assert_eq!(&words[..5], ["justless", "log", &id, "--stream", "stdout"]);
@@ -204,31 +249,15 @@ fn file_paths_reach_argv_and_env_in_order() {
     let (_directory, root) = workspace();
     fs::write(root.join("data.txt"), "a\n").unwrap();
     fs::write(root.join("other.txt"), "b\n").unwrap();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "--file",
-            "data.txt",
-            "--file",
-            "other.txt",
-            "printf '%s\\n' \"$@\"; echo \"F=$JUSTLESS_FILE\"; echo \"NO_COLOR=$NO_COLOR\"",
-            "--",
-            "extra",
-        ],
-    );
+    let code = "printf '%s\\n' \"$@\"; echo \"F=$JUSTLESS_FILE\"; echo \"NO_COLOR=$NO_COLOR\"";
+    let mut args = words("--lang sh --file data.txt --file other.txt");
+    args.extend([code, "--", "extra"]);
+    let output = exec(&root, &args);
     assert!(output.status.success(), "{}", stderr(&output));
-    let data = root.join("data.txt");
-    assert_eq!(
-        stdout(&output),
-        format!(
-            "{}\n{}\nextra\nF={}\nNO_COLOR=1\n",
-            data.display(),
-            root.join("other.txt").display(),
-            data.display()
-        )
-    );
+    let (data, other) = (root.join("data.txt"), root.join("other.txt"));
+    let (data, other) = (data.display(), other.display());
+    let expected = format!("{data}\n{other}\nextra\nF={data}\nNO_COLOR=1\n");
+    assert_eq!(stdout(&output), expected);
 
     let output = justless(&root)
         .args(["exec", "--lang", "sh", "echo \"F=${JUSTLESS_FILE-unset}\""])
@@ -246,96 +275,105 @@ fn script_file_takes_arguments_after_double_dash_and_runs_in_the_current_directo
     fs::write(root.join("tools/tool.sh"), "printf '%s\\n' \"$@\"; pwd\n").unwrap();
     fs::write(root.join("tools/sub/data.txt"), "x\n").unwrap();
     let sub = root.join("tools/sub");
-    let output = exec(
-        &sub,
-        &[
-            "--script",
-            "../tool.sh",
-            "--file",
-            "data.txt",
-            "--",
-            "--top",
-            "20",
-        ],
-    );
+    let args = words("--script ../tool.sh --file data.txt -- --top 20");
+    let output = exec(&sub, &args);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(
-        stdout(&output),
-        format!(
-            "{}\n--top\n20\n{}\n",
-            sub.join("data.txt").display(),
-            sub.display()
-        )
-    );
-    let history = stdout(&cli(&root, &["history"]));
-    assert!(history.contains("exec sh"), "{history}");
+    let data = sub.join("data.txt");
+    let expected = format!("{}\n--top\n20\n{}\n", data.display(), sub.display());
+    assert_eq!(stdout(&output), expected);
+    contains(&history(&root), "exec sh");
 }
 
+/// Bad arguments and code that cannot run exit 2 before anything runs or is archived.
+/// An expected message that ends in a newline is the whole of stderr, one that starts
+/// with `justless: ` is its start, and any other is part of it.
 #[test]
-fn missing_file_and_missing_code_fail_before_running() {
-    let (_directory, root) = workspace();
-    let output = exec(&root, &["--lang", "sh", "--file", "nope.json", "touch ran"]);
-    assert_eq!(output.status.code(), Some(2));
-    let message = stderr(&output);
-    assert!(
-        message.starts_with("justless: --file nope.json: "),
-        "{message}"
-    );
-    assert!(!message.contains("[justless run-"), "{message}");
-    assert_eq!(run_directories(&root), 0);
-    assert!(!root.join("ran").exists());
-
-    let output = exec(&root, &["--lang", "sh"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("as - to read it from stdin"),
-        "{}",
-        stderr(&output)
-    );
-    // Piped data is never executed as code without an explicit `-`.
-    let output = exec_with_stdin(&root, &["--lang", "sh"], b"touch ran\n");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(!root.join("ran").exists());
-
-    let output = exec(&root, &["--lang", "sh", "--script", "missing.sh"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).starts_with("justless: --script missing.sh: "),
-        "{}",
-        stderr(&output)
-    );
-    assert_eq!(run_directories(&root), 0);
-}
-
-#[test]
-fn code_naming_a_file_points_to_script() {
+fn usage_errors_exit_2_before_running() {
     let (_directory, root) = workspace();
     fs::write(root.join("x.py"), "print(1)\n").unwrap();
-    let output = exec(&root, &["--lang", "python3", "x.py"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        stderr(&output),
-        "justless: x.py is a file; run it with --script x.py\n"
-    );
+    let large = vec![b'#'; 1024 * 1024 + 1];
+    type Case<'a> = (&'a [&'a str], Option<&'a [u8]>, &'a str);
+    let cases: [Case; 12] = [
+        (
+            &["--lang", "sh", "--file", "nope.json", "touch ran"],
+            None,
+            "justless: --file nope.json: ",
+        ),
+        (&["--lang", "sh"], None, "as - to read it from stdin"),
+        // Piped data is never executed as code without an explicit `-`.
+        (&["--lang", "sh"], Some(b"touch ran\n"), ""),
+        (
+            &["--lang", "sh", "--script", "missing.sh"],
+            None,
+            "justless: --script missing.sh: ",
+        ),
+        (
+            &["--lang", "python3", "x.py"],
+            None,
+            "justless: x.py is a file; run it with --script x.py\n",
+        ),
+        (
+            &["--lang", "sh", "-"],
+            Some(b""),
+            "the script on stdin is empty",
+        ),
+        (
+            &["--lang", "sh", "-"],
+            Some(&large),
+            "exceeds 1 MiB; hand data to it with --file",
+        ),
+        (
+            &["#!/usr/bin/env Rscript\nprint(1)"],
+            None,
+            "justless: the #! line names Rscript; pass --lang\n",
+        ),
+        (&["echo hi"], None, "name the language with --lang"),
+        (
+            &["--lang", "sh", "--max-bytes", "100", "touch ran"],
+            None,
+            "at least 512",
+        ),
+        (
+            &["--lang", "sh", "--timeout", "abc", "touch ran"],
+            None,
+            "--timeout expects a whole number of seconds",
+        ),
+        (
+            &["--lang", "sh", "--intent", "what is the", "touch ran"],
+            None,
+            "common words",
+        ),
+    ];
+    for (args, input, expected) in cases {
+        let output = match input {
+            Some(input) => exec_with_stdin(&root, args, input),
+            None => exec(&root, args),
+        };
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let message = stderr(&output);
+        if expected.ends_with('\n') {
+            assert_eq!(message, expected, "{args:?}");
+        } else if expected.starts_with("justless: ") {
+            starts(&message, expected);
+        } else {
+            contains(&message, expected);
+        }
+        assert!(!message.contains("[justless run-"), "{message}");
+        assert!(!root.join("ran").exists(), "{args:?}");
+    }
     assert_eq!(run_directories(&root), 0);
 }
 
 #[test]
-fn stdin_code_with_dash_and_limits() {
+fn stdin_holds_the_code_after_dash_and_reaches_a_script_given_as_an_argument() {
     let (_directory, root) = workspace();
     let output = exec_with_stdin(&root, &["--lang", "sh", "-"], b"echo from-stdin\n");
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "from-stdin\n");
-
-    let output = exec_with_stdin(&root, &["--lang", "sh", "-"], b"");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("the script on stdin is empty"));
-
-    let large = vec![b'#'; 1024 * 1024 + 1];
-    let output = exec_with_stdin(&root, &["--lang", "sh", "-"], &large);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("exceeds 1 MiB; hand data to it with --file"));
-    assert_eq!(runs(&root).len(), 1);
+    let output = exec_with_stdin(&root, &["--lang", "sh", "wc -l"], b"a\nb\n");
+    assert_eq!(stdout(&output).trim(), "2");
+    let output = exec_with_stdin(&root, &["--lang", "sh", "-"], b"cat; echo done\n");
+    assert_eq!(stdout(&output), "done\n");
 }
 
 #[test]
@@ -343,53 +381,19 @@ fn language_comes_from_lang_then_shebang_then_extension() {
     let (_directory, root) = workspace();
     let output = exec(&root, &["#!/bin/sh\necho ok"]);
     assert_eq!(stdout(&output), "ok\n", "{}", stderr(&output));
-    assert!(stdout(&cli(&root, &["history"])).contains("exec sh"));
-
-    let output = exec(&root, &["#!/usr/bin/env Rscript\nprint(1)"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        stderr(&output),
-        "justless: the #! line names Rscript; pass --lang\n"
-    );
-    let output = exec(&root, &["echo hi"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("name the language with --lang"),
-        "{}",
-        stderr(&output)
-    );
-    let output = exec(
-        &root,
-        &["--lang", "sh", "#!/usr/bin/env python3\necho sh-won"],
-    );
-    assert_eq!(stdout(&output), "sh-won\n");
-
+    contains(&history(&root), "exec sh");
     if have("python3") {
-        let output = exec(
-            &root,
-            &["#!/usr/bin/env -S python3 -u\nimport sys\nprint(sys.version_info[0])"],
-        );
+        let code = "#!/usr/bin/env -S python3 -u\nimport sys\nprint(sys.version_info[0])";
+        let output = exec(&root, &[code]);
         assert_eq!(stdout(&output), "3\n", "{}", stderr(&output));
         fs::create_dir(root.join("tools")).unwrap();
         fs::write(root.join("tools/x.py"), "print('from file')\n").unwrap();
         let before = runs(&root);
         let output = exec(&root, &["--script", "tools/x.py"]);
         assert_eq!(stdout(&output), "from file\n", "{}", stderr(&output));
-        let history = stdout(&cli(&root, &["history"]));
-        assert!(
-            history.contains(&format!("{} · exec python3", new_run(&root, &before))),
-            "{history}"
-        );
+        let id = new_run(&root, &before);
+        contains(&history(&root), &format!("{id} · exec python3"));
     }
-}
-
-#[test]
-fn piped_stdin_reaches_script_when_code_is_an_argument() {
-    let (_directory, root) = workspace();
-    let output = exec_with_stdin(&root, &["--lang", "sh", "wc -l"], b"a\nb\n");
-    assert_eq!(stdout(&output).trim(), "2");
-    let output = exec_with_stdin(&root, &["--lang", "sh", "-"], b"cat; echo done\n");
-    assert_eq!(stdout(&output), "done\n");
 }
 
 #[test]
@@ -402,18 +406,14 @@ fn python_runs_from_run_directory_without_cwd_shadowing() {
     let code = "import json; print(json.dumps([1]))";
     let output = exec(&root, &["--lang", "python3", code]);
     assert_eq!(stdout(&output), "[1]\n", "{}", stderr(&output));
-    let script = root
-        .join(".justless/runs")
-        .join(new_run(&root, &[]))
-        .join("script.py");
+    let id = new_run(&root, &[]);
+    let script = root.join(".justless/runs").join(id).join("script.py");
     assert_eq!(fs::read(&script).unwrap(), code.as_bytes());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
 
@@ -423,25 +423,13 @@ fn python_traceback_leads_to_the_saved_script_line() {
         return;
     }
     let (_directory, root) = workspace();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "python3",
-            "import json\nprint(json.load(open('missing.json')))",
-        ],
-    );
+    let code = "import json\nprint(json.load(open('missing.json')))";
+    let output = exec(&root, &["--lang", "python3", code]);
     assert_eq!(output.status.code(), Some(1));
     let id = run_id(&output);
     let context = stdout(&cli(&root, &["context", "--run", &id]));
-    assert!(
-        context.contains(&format!(".justless/runs/{id}/script.py:2")),
-        "{context}"
-    );
-    assert!(
-        context.contains("2 | print(json.load(open('missing.json')))"),
-        "{context}"
-    );
+    contains(&context, &format!(".justless/runs/{id}/script.py:2"));
+    contains(&context, "2 | print(json.load(open('missing.json')))");
     assert!(!context.contains("Source changed"), "{context}");
 }
 
@@ -452,14 +440,8 @@ fn node_require_works_under_type_module_project() {
     }
     let (_directory, root) = workspace();
     fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "node",
-            "const fs = require('fs'); console.log(typeof fs.readFileSync)",
-        ],
-    );
+    let code = "const fs = require('fs'); console.log(typeof fs.readFileSync)";
+    let output = exec(&root, &["--lang", "node", code]);
     assert_eq!(stdout(&output), "function\n", "{}", stderr(&output));
     let version = Command::new("node").arg("--version").output().unwrap();
     let version = String::from_utf8_lossy(&version.stdout);
@@ -470,14 +452,8 @@ fn node_require_works_under_type_module_project() {
         .map(|part| part.parse::<u32>().unwrap_or(0));
     let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
     if (major, minor) >= (22, 7) {
-        let output = exec(
-            &root,
-            &[
-                "--lang",
-                "js",
-                "import fs from 'fs'; console.log(typeof fs.readFileSync)",
-            ],
-        );
+        let code = "import fs from 'fs'; console.log(typeof fs.readFileSync)";
+        let output = exec(&root, &["--lang", "js", code]);
         assert_eq!(stdout(&output), "function\n", "{}", stderr(&output));
     }
 }
@@ -529,10 +505,8 @@ fn interpreter_table_builds_each_command_line() {
         let text = stdout(&output);
         let argv: Vec<_> = text.lines().collect();
         // The saved script is named relative to the working directory.
-        let script = format!(
-            ".justless/runs/{}/script.{extension}",
-            argv[prefix.len()].rsplit('/').nth(1).unwrap()
-        );
+        let id = argv[prefix.len()].rsplit('/').nth(1).unwrap();
+        let script = format!(".justless/runs/{id}/script.{extension}");
         let mut expected: Vec<&str> = prefix.to_vec();
         expected.extend([script.as_str(), data.as_str(), "arg"]);
         assert_eq!(argv, expected, "{lang}");
@@ -554,25 +528,17 @@ fn shebang_options_keep_the_exit_status() {
     let direct = Command::new(&check).current_dir(&root).output().unwrap();
     let output = exec(&root, &["--script", "tools/check.sh"]);
     assert_eq!(output.status.code(), direct.status.code());
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert_eq!(stdout(&output), "");
-
     let inline = exec(&root, &["#!/bin/sh -e\nfalse\necho continued"]);
-    assert_eq!(inline.status.code(), Some(1), "{}", stderr(&inline));
-    assert_eq!(stdout(&inline), "");
-
+    for output in [&output, &inline] {
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(output));
+        assert_eq!(stdout(output), "");
+    }
     if have("bash") {
-        let output = exec(
-            &root,
-            &["#!/usr/bin/env -S bash -eu\necho \"$UNSET_VAR_X\"\necho continued"],
-        );
+        let code = "#!/usr/bin/env -S bash -eu\necho \"$UNSET_VAR_X\"\necho continued";
+        let output = exec(&root, &[code]);
         assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
         assert_eq!(stdout(&output), "");
-        assert!(
-            stderr(&output).contains("UNSET_VAR_X: unbound variable"),
-            "{}",
-            stderr(&output)
-        );
+        contains(&stderr(&output), "UNSET_VAR_X: unbound variable");
     }
     // Variables set by `env` on the `#!` line reach the script.
     let output = exec(
@@ -581,10 +547,7 @@ fn shebang_options_keep_the_exit_status() {
     );
     assert_eq!(stdout(&output), "hi\n", "{}", stderr(&output));
     // A `#!` line for another language than --lang contributes no options.
-    let output = exec(
-        &root,
-        &["--lang", "sh", "#!/usr/bin/env -S python3 -u\necho sh-ran"],
-    );
+    let output = sh(&root, "#!/usr/bin/env -S python3 -u\necho sh-ran");
     assert_eq!(stdout(&output), "sh-ran\n", "{}", stderr(&output));
 }
 
@@ -612,51 +575,15 @@ fn missing_interpreter_is_a_clear_error() {
 }
 
 #[test]
-fn max_bytes_and_timeout_are_validated() {
-    let (_directory, root) = workspace();
-    let output = exec(&root, &["--lang", "sh", "--max-bytes", "100", "touch ran"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("at least 512"),
-        "{}",
-        stderr(&output)
-    );
-    let output = exec(&root, &["--lang", "sh", "--timeout", "abc", "touch ran"]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("--timeout expects a whole number of seconds"),
-        "{}",
-        stderr(&output)
-    );
-    assert!(!root.join("ran").exists());
-}
-
-#[test]
-fn identical_runs_always_show_their_output() {
-    let (_directory, root) = workspace();
-    let script = "i=1; while [ $i -le 40 ]; do echo \"row $i\"; i=$((i + 1)); done";
-    let first = exec(&root, &["--lang", "sh", script]);
-    let second = exec(&root, &["--lang", "sh", script]);
-    assert_eq!(first.stdout, second.stdout);
-    assert_eq!(stdout(&second).lines().count(), 40);
-    assert!(!stdout(&second).contains("Output unchanged since"));
-    assert_eq!(stderr(&second), "");
-}
-
-#[test]
 fn a_later_success_supersedes_failed_attempts_in_pack() {
     let (_directory, root) = workspace();
     fs::write(root.join("data.txt"), "x\n").unwrap();
-    let failed = exec(
-        &root,
-        &["--lang", "sh", "--file", "data.txt", "echo boom; exit 1"],
-    );
-    let id = run_id(&failed);
-    let pack = stdout(&cli(&root, &["pack", "why does it fail"]));
-    assert!(pack.contains(&id), "{pack}");
-    exec(&root, &["--lang", "sh", "--file", "data.txt", "echo ok"]);
-    let pack = stdout(&cli(&root, &["pack", "why does it fail"]));
-    assert!(!pack.contains(&id), "{pack}");
+    let run = |code| exec(&root, &["--lang", "sh", "--file", "data.txt", code]);
+    let pack = || stdout(&cli(&root, &["pack", "why does it fail"]));
+    let id = run_id(&run("echo boom; exit 1"));
+    contains(&pack(), &id);
+    run("echo ok");
+    assert!(!pack().contains(&id), "{}", pack());
 }
 
 #[cfg(unix)]
@@ -664,27 +591,15 @@ fn a_later_success_supersedes_failed_attempts_in_pack() {
 fn timeout_stops_the_group_keeps_partial_output_and_exits_124() {
     let (_directory, root) = workspace();
     let started = Instant::now();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "--timeout",
-            "1",
-            "echo started; sleep 30 & echo $! > bg.pid; wait",
-        ],
-    );
+    let code = "echo started; sleep 30 & echo $! > bg.pid; wait";
+    let output = exec(&root, &["--lang", "sh", "--timeout", "1", code]);
     assert!(started.elapsed() < Duration::from_secs(6));
     assert_eq!(output.status.code(), Some(124));
     assert_eq!(stdout(&output), "started\n");
     let message = stderr(&output);
-    assert!(message.contains(" · exit 124]\n"), "{message}");
-    assert!(
-        message.ends_with("[justless] stopped at --timeout 1s\n"),
-        "{message}"
-    );
-    let pid = fs::read_to_string(root.join("bg.pid")).unwrap();
-    assert!(!alive(pid.trim()), "background sleep survived");
+    contains(&message, " · exit 124]\n");
+    ends(&message, "[justless] stopped at --timeout 1s\n");
+    assert!(stopped(&root, "bg.pid"), "background sleep survived");
     let replay = cli(&root, &["log", &run_id(&output), "--stream", "stdout"]);
     assert_eq!(replay.stdout, b"started\n");
 }
@@ -696,36 +611,22 @@ fn timeout_interrupt_shows_where_python_stopped() {
         return;
     }
     let (_directory, root) = workspace();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "python3",
-            "--timeout",
-            "1",
-            "import time\nprint('scanning')\nwhile True: time.sleep(0.1)",
-        ],
-    );
+    let code = "import time\nprint('scanning')\nwhile True: time.sleep(0.1)";
+    let output = exec(&root, &["--lang", "python3", "--timeout", "1", code]);
     assert_eq!(output.status.code(), Some(124));
     assert_eq!(stdout(&output), "scanning\n");
     let message = stderr(&output);
-    assert!(message.contains("script.py\", line 3"), "{message}");
-    assert!(message.contains("KeyboardInterrupt"), "{message}");
+    contains(&message, "script.py\", line 3");
+    contains(&message, "KeyboardInterrupt");
 }
 
 #[cfg(unix)]
 #[test]
 fn killing_justless_stops_the_script() {
     let (_directory, root) = workspace();
+    let code = "echo $$ > sh.pid; sleep 30 & echo $! > bg.pid; wait";
     let mut child = justless(&root)
-        .args([
-            "exec",
-            "--lang",
-            "sh",
-            "--timeout",
-            "0",
-            "echo $$ > sh.pid; sleep 30 & echo $! > bg.pid; wait",
-        ])
+        .args(["exec", "--lang", "sh", "--timeout", "0", code])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -738,30 +639,20 @@ fn killing_justless_stops_the_script() {
     child.kill().unwrap();
     child.wait().unwrap();
     for file in ["sh.pid", "bg.pid"] {
-        let pid = fs::read_to_string(root.join(file)).unwrap();
-        assert!(!alive(pid.trim()), "{file} survived");
+        assert!(stopped(&root, file), "{file} survived");
     }
     // Like a `run` whose Justless was killed, the run stays listed as unfinished,
     // and it does not disturb later commands.
     let left = runs(&root);
     assert_eq!(left.len(), 1);
-    let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(
-            root.join(".justless/runs")
-                .join(&left[0])
-                .join("record.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    let record = record(&root, &left[0]);
     assert_eq!(record["unfinished"], true, "{record}");
     for args in [&["history"][..], &["stats"], &["resume"]] {
         let output = cli(&root, args);
         assert!(output.status.success(), "{args:?}: {}", stderr(&output));
     }
-    let history = stdout(&cli(&root, &["history"]));
-    assert!(history.contains("exec sh · unfinished"), "{history}");
-    let output = exec(&root, &["--lang", "sh", "echo after"]);
+    contains(&history(&root), "exec sh · unfinished");
+    let output = sh(&root, "echo after");
     assert_eq!(stdout(&output), "after\n", "{}", stderr(&output));
 }
 
@@ -770,28 +661,19 @@ fn killing_justless_stops_the_script() {
 fn background_children_do_not_outlive_a_normal_exit() {
     let (_directory, root) = workspace();
     let started = Instant::now();
-    let output = exec(
-        &root,
-        &["--lang", "sh", "sleep 30 & echo $! > bg.pid; echo done"],
-    );
+    let output = sh(&root, "sleep 30 & echo $! > bg.pid; echo done");
     assert!(output.status.success(), "{}", stderr(&output));
     // The sleep gets two seconds to finish, then is stopped, and the notice names the
     // run although every byte was shown.
     let elapsed = started.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_secs(10),
-        "{elapsed:?}"
-    );
+    let expected = Duration::from_millis(1900)..Duration::from_secs(10);
+    assert!(expected.contains(&elapsed), "{elapsed:?}");
     assert_eq!(stdout(&output), "done\n");
     let id = new_run(&root, &[]);
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "[justless {id}] stopped processes the script left running; output they had not written is missing\n"
-        )
-    );
-    let pid = fs::read_to_string(root.join("bg.pid")).unwrap();
-    assert!(!alive(pid.trim()), "background sleep survived");
+    let notice =
+        "stopped processes the script left running; output they had not written is missing";
+    assert_eq!(stderr(&output), format!("[justless {id}] {notice}\n"));
+    assert!(stopped(&root, "bg.pid"), "background sleep survived");
 }
 
 /// Output that a process substitution writes after the shell exits is archived whole.
@@ -802,38 +684,27 @@ fn readers_the_script_leaves_running_finish_writing() {
         return;
     }
     let (_directory, root) = workspace();
-    let output = exec(
-        &root,
-        &["--lang", "bash", "seq 1 100000 > >(sort -rn | head -3)"],
-    );
+    let bash = |code| exec(&root, &["--lang", "bash", code]);
+    let output = bash("seq 1 100000 > >(sort -rn | head -3)");
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "100000\n99999\n99998\n");
     assert_eq!(stderr(&output), "");
 
-    let before = runs(&root);
-    let output = exec(&root, &["--lang", "bash", "seq 1 100000 > >(sort -rn)"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(!stderr(&output).contains("stopped"), "{}", stderr(&output));
-    let id = new_run(&root, &before);
-    let replay = cli(&root, &["log", &id, "--stream", "stdout"]);
-    assert_eq!(stdout(&replay).lines().count(), 100000);
-
     // A reader that starts late still finishes within the two seconds.
-    let before = runs(&root);
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "bash",
-            "exec > >(sleep 0.2; while read -r l; do echo \"p $l\"; done); seq 1 2000",
-        ],
-    );
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(!stderr(&output).contains("stopped"), "{}", stderr(&output));
-    let id = new_run(&root, &before);
-    let replay = stdout(&cli(&root, &["log", &id, "--stream", "stdout"]));
-    assert_eq!(replay.lines().count(), 2000);
-    assert_eq!(replay.lines().last(), Some("p 2000"));
+    let late = "exec > >(sleep 0.2; while read -r l; do echo \"p $l\"; done); seq 1 2000";
+    for (code, count, last) in [
+        ("seq 1 100000 > >(sort -rn)", 100000, "1"),
+        (late, 2000, "p 2000"),
+    ] {
+        let before = runs(&root);
+        let output = bash(code);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(!stderr(&output).contains("stopped"), "{}", stderr(&output));
+        let id = new_run(&root, &before);
+        let replay = stdout(&cli(&root, &["log", &id, "--stream", "stdout"]));
+        assert_eq!(replay.lines().count(), count, "{code}");
+        assert_eq!(replay.lines().last(), Some(last), "{code}");
+    }
 }
 
 /// A script that ignores SIGINT is killed when the grace period ends.
@@ -842,30 +713,15 @@ fn readers_the_script_leaves_running_finish_writing() {
 fn timeout_kills_a_script_that_ignores_the_interrupt() {
     let (_directory, root) = workspace();
     let started = Instant::now();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "--timeout",
-            "1",
-            "trap '' INT; echo waiting; sleep 30 & echo $! > bg.pid; wait",
-        ],
-    );
+    let code = "trap '' INT; echo waiting; sleep 30 & echo $! > bg.pid; wait";
+    let output = exec(&root, &["--lang", "sh", "--timeout", "1", code]);
     let elapsed = started.elapsed();
     assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
-    assert!(
-        elapsed >= Duration::from_millis(2900) && elapsed < Duration::from_secs(15),
-        "{elapsed:?}"
-    );
+    let expected = Duration::from_millis(2900)..Duration::from_secs(15);
+    assert!(expected.contains(&elapsed), "{elapsed:?}");
     assert_eq!(stdout(&output), "waiting\n");
-    assert!(
-        stderr(&output).ends_with("[justless] stopped at --timeout 1s\n"),
-        "{}",
-        stderr(&output)
-    );
-    let pid = fs::read_to_string(root.join("bg.pid")).unwrap();
-    assert!(!alive(pid.trim()), "background sleep survived");
+    ends(&stderr(&output), "[justless] stopped at --timeout 1s\n");
+    assert!(stopped(&root, "bg.pid"), "background sleep survived");
 }
 
 /// Signals a script sends its own group do not disable the time limit.
@@ -874,16 +730,8 @@ fn timeout_kills_a_script_that_ignores_the_interrupt() {
 fn timeout_holds_when_the_script_signals_its_group() {
     let (_directory, root) = workspace();
     let started = Instant::now();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "--timeout",
-            "1",
-            "trap '' USR1; kill -USR1 0; echo signalled; sleep 30; echo finished",
-        ],
-    );
+    let code = "trap '' USR1; kill -USR1 0; echo signalled; sleep 30; echo finished";
+    let output = exec(&root, &["--lang", "sh", "--timeout", "1", code]);
     assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
     assert!(started.elapsed() < Duration::from_secs(15));
     assert_eq!(stdout(&output), "signalled\n");
@@ -898,16 +746,8 @@ fn timeout_stops_an_interpreter_that_leaves_its_group() {
     }
     let (_directory, root) = workspace();
     let started = Instant::now();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "python3",
-            "--timeout",
-            "1",
-            "import os, signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nos.setpgid(0, os.getpgid(os.getppid()))\nprint('left', flush=True)\ntime.sleep(30)\nprint('finished')",
-        ],
-    );
+    let code = "import os, signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nos.setpgid(0, os.getpgid(os.getppid()))\nprint('left', flush=True)\ntime.sleep(30)\nprint('finished')";
+    let output = exec(&root, &["--lang", "python3", "--timeout", "1", code]);
     let elapsed = started.elapsed();
     assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
     assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
@@ -920,28 +760,19 @@ fn timeout_stops_an_interpreter_that_leaves_its_group() {
 fn saved_script_path_is_relative_to_the_working_directory() {
     let (_directory, root) = workspace();
     fs::create_dir(root.join("src")).unwrap();
-    let before = runs(&root);
-    let output = exec(&root.join("src"), &["--lang", "sh", "echo \"$0\""]);
-    let id = new_run(&root, &before);
-    assert_eq!(
-        stdout(&output),
-        format!("../.justless/runs/{id}/script.sh\n"),
-        "{}",
-        stderr(&output)
-    );
+    let output = sh(&root.join("src"), "echo \"$0\"");
+    let id = new_run(&root, &[]);
+    let expected = format!("../.justless/runs/{id}/script.sh\n");
+    assert_eq!(stdout(&output), expected, "{}", stderr(&output));
     if have("ruby") {
         let output = exec(&root.join("src"), &["--lang", "ruby", "raise 'boom'"]);
         let id = run_id(&output);
-        assert!(
-            stderr(&output).starts_with(&format!("../.justless/runs/{id}/script.rb:1:")),
-            "{}",
-            stderr(&output)
+        starts(
+            &stderr(&output),
+            &format!("../.justless/runs/{id}/script.rb:1:"),
         );
         let context = stdout(&cli(&root, &["context", "--run", &id]));
-        assert!(
-            context.contains(&format!(".justless/runs/{id}/script.rb:1")),
-            "{context}"
-        );
+        contains(&context, &format!(".justless/runs/{id}/script.rb:1"));
     }
 }
 
@@ -952,33 +783,23 @@ fn repeated_locations_resolve_once_and_timestamps_stay_data() {
     let (_directory, root) = workspace();
     fs::write(root.join("price.py"), "def price():\n    return 1\n").unwrap();
     let script = "i=0; while [ $i -lt 2000 ]; do echo \"2025-03-10T00:$((i % 60)):00 INFO row $i\"; if [ $((i % 700)) -eq 0 ]; then echo \"price.py:2: bad row $i\"; fi; i=$((i + 1)); done; exit 1";
-    let output = exec(&root, &["--lang", "sh", script]);
+    let output = sh(&root, script);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     let id = run_id(&output);
     let context = stdout(&cli(&root, &["context", "--run", &id, "--budget", "12000"]));
     for line in [2, 703, 1404] {
-        assert!(
-            context.contains(&format!("price.py:2 · log stdout:{line}")),
-            "{line}: {context}"
-        );
+        contains(&context, &format!("price.py:2 · log stdout:{line}"));
     }
-    assert!(
-        context.starts_with(&format!("Run {id} · 3 source locations\n")),
-        "{context}"
-    );
+    starts(&context, &format!("Run {id} · 3 source locations\n"));
 }
 
 #[cfg(unix)]
 #[test]
 fn signal_death_maps_to_128_plus_n() {
     let (_directory, root) = workspace();
-    let output = exec(&root, &["--lang", "sh", "kill -TERM $$"]);
+    let output = sh(&root, "kill -TERM $$");
     assert_eq!(output.status.code(), Some(143));
-    assert!(
-        stderr(&output).ends_with(" · exit 143]\n"),
-        "{}",
-        stderr(&output)
-    );
+    ends(&stderr(&output), " · exit 143]\n");
 }
 
 /// 3000 lines of filler with matching lines at 1500 and 2900.
@@ -991,27 +812,24 @@ fn markers(text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// `exec --lang sh FLAGS --intent INTENT SCRIPT`.
+fn focus(root: &Path, flags: &str, intent: &str, script: &str) -> Output {
+    let mut args = vec!["--lang", "sh"];
+    args.extend(words(flags));
+    args.extend(["--intent", intent, script]);
+    exec(root, &args)
+}
+
 #[test]
 fn intent_ranks_long_stdout_within_budget() {
     let (_directory, root) = workspace();
-    let args = [
-        "--lang",
-        "sh",
-        "--max-bytes",
-        "1024",
-        "--intent",
-        "payments timeouts",
-        TIMEOUTS,
-    ];
-    let output = exec(&root, &args);
+    let output = focus(&root, "--max-bytes 1024", "payments timeouts", TIMEOUTS);
     assert!(output.status.success());
     let text = stdout(&output);
     assert!(text.len() <= 1024, "{}", text.len());
-    assert!(
-        text.starts_with(
-            "[focus] \"payments timeouts\": 2 of 3000 lines match every term, 0 match some\n"
-        ),
-        "{text}"
+    starts(
+        &text,
+        "[focus] \"payments timeouts\": 2 of 3000 lines match every term, 0 match some\n",
     );
     for expected in [
         "stdout:1500: payments timeout at 1500\n",
@@ -1019,24 +837,19 @@ fn intent_ranks_long_stdout_within_budget() {
         "stdout:1: line 1 ok\n",
         "stdout:3000: line 3000 ok\n",
     ] {
-        assert!(text.contains(expected), "{expected}: {text}");
+        contains(&text, expected);
     }
     let lines = markers(&text);
     assert!(lines.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
-    assert!(text.ends_with("[focus] every match is shown\n"), "{text}");
-    let footer = stderr(&output);
-    assert!(footer.contains(" shown]"), "{footer}");
+    ends(&text, "[focus] every match is shown\n");
+    contains(&stderr(&output), " shown]");
     // The marker expands to the original line.
     let id = run_id(&output);
-    let line = cli(
-        &root,
-        &[
-            "log", &id, "--stream", "stdout", "--from", "1500", "--to", "1500",
-        ],
-    );
+    let range = format!("log {id} --stream stdout --from 1500 --to 1500");
+    let line = cli(&root, &words(&range));
     assert_eq!(line.stdout, b"payments timeout at 1500\n");
 
-    let again = exec(&root, &args);
+    let again = focus(&root, "--max-bytes 1024", "payments timeouts", TIMEOUTS);
     assert_eq!(again.stdout, output.stdout);
     let plain = exec(&root, &["--lang", "sh", "--max-bytes", "1024", TIMEOUTS]);
     assert!(!stdout(&plain).contains("[focus]"));
@@ -1046,17 +859,12 @@ fn intent_ranks_long_stdout_within_budget() {
 fn intent_names_lines_left_out_for_log() {
     let (_directory, root) = workspace();
     let script = "i=1; while [ $i -le 400 ]; do echo \"$i: payments timeout request_id=$i\"; echo \"$i: orders timeout\"; i=$((i + 1)); done";
-    let output = exec(
-        &root,
-        &["--lang", "sh", "--intent", "payments timeouts", script],
-    );
+    let output = focus(&root, "", "payments timeouts", script);
     let text = stdout(&output);
     assert!(text.len() <= 4096, "{}", text.len());
-    assert!(
-        text.starts_with(
-            "[focus] \"payments timeouts\": 400 of 800 lines match every term, 400 match some\n"
-        ),
-        "{text}"
+    starts(
+        &text,
+        "[focus] \"payments timeouts\": 400 of 800 lines match every term, 400 match some\n",
     );
     let shown = markers(&text);
     // Lines that contain every term rank above those that contain one.
@@ -1070,35 +878,25 @@ fn intent_names_lines_left_out_for_log() {
     let (counts, command) = trailer
         .split_once(" · ")
         .unwrap_or_else(|| panic!("{trailer}"));
-    assert!(counts.contains(" more match every term ("), "{trailer}");
+    contains(counts, " more match every term (");
     let words: Vec<&str> = command.split(' ').collect();
     assert_eq!(&words[..5], ["justless", "log", &id, "--stream", "stdout"]);
     let from: usize = words[6].parse().unwrap();
     assert!(!shown.contains(&from), "{from} is already shown: {text}");
     let replay = cli(&root, &words[1..]);
-    let first = stdout(&replay).lines().next().unwrap().to_owned();
-    assert!(first.contains("payments timeout"), "{first}");
+    contains(stdout(&replay).lines().next().unwrap(), "payments timeout");
 }
 
 #[test]
 fn intent_fits_one_line_at_minimum_budget() {
     let (_directory, root) = workspace();
     let script = "x=$(printf '%5000s' '' | tr ' ' x); i=1; while [ $i -le 20 ]; do echo \"$x payments timeout $x\"; i=$((i + 1)); done";
-    let intent = format!(
-        "payments timeout {}",
-        (0..20).map(|n| format!("extra{n} ")).collect::<String>()
-    );
-    let output = exec(
+    let extra: String = (0..20).map(|n| format!("extra{n} ")).collect();
+    let output = focus(
         &root,
-        &[
-            "--lang",
-            "sh",
-            "--max-bytes",
-            "512",
-            "--intent",
-            &intent,
-            script,
-        ],
+        "--max-bytes 512",
+        &format!("payments timeout {extra}"),
+        script,
     );
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
@@ -1109,29 +907,23 @@ fn intent_fits_one_line_at_minimum_budget() {
         .collect();
     assert!(!shown.is_empty(), "{text}");
     assert!(shown.iter().all(|line| line.contains('…')), "{text}");
-    assert!(shown[0].contains("payments"), "{text}");
+    contains(shown[0], "payments");
 }
 
 #[test]
 fn intent_respects_utf8_and_long_lines() {
     let (_directory, root) = workspace();
     let script = "pad=$(printf '%2500s' '' | sed 's/ /é/g'); i=1; while [ $i -le 30 ]; do echo \"$pad café ✓ payments timeout $i $pad\"; echo \"filler $i\"; i=$((i + 1)); done";
-    let output = exec(
+    let output = focus(
         &root,
-        &[
-            "--lang",
-            "sh",
-            "--max-bytes",
-            "1024",
-            "--intent",
-            "\"café ✓ payments\" timeout",
-            script,
-        ],
+        "--max-bytes 1024",
+        "\"café ✓ payments\" timeout",
+        script,
     );
     assert!(output.status.success(), "{}", stderr(&output));
     let text = String::from_utf8(output.stdout).expect("UTF-8 preview");
     assert!(text.len() <= 1024, "{}", text.len());
-    assert!(text.contains("café ✓ payments timeout"), "{text}");
+    contains(&text, "café ✓ payments timeout");
     for line in text.lines().filter(|line| line.starts_with("stdout:")) {
         let excerpt = line.split_once(": ").unwrap().1;
         assert!(excerpt.len() <= 240, "{}", excerpt.len());
@@ -1146,27 +938,21 @@ fn intent_points_to_search_when_a_line_is_too_long_to_rank() {
         return;
     }
     let (_directory, root) = workspace();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "--intent",
-            "quota_exceeded",
-            "yes ok | head -c 4300000 | tr '\\n' ' '; echo quota_exceeded",
-        ],
-    );
+    let code = "yes ok | head -c 4300000 | tr '\\n' ' '; echo quota_exceeded";
+    let output = focus(&root, "", "quota_exceeded", code);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
-    assert!(
-        text.starts_with("[focus] no line matches \"quota_exceeded\" in its first 4 MiB;"),
-        "{text}"
+    starts(
+        &text,
+        "[focus] no line matches \"quota_exceeded\" in its first 4 MiB;",
     );
     let id = run_id(&output);
-    let hint = format!("[focus] justless search {id} TEXT reads whole lines\n");
-    assert!(text.ends_with(&hint), "{text}");
+    ends(
+        &text,
+        &format!("[focus] justless search {id} TEXT reads whole lines\n"),
+    );
     let search = stdout(&cli(&root, &["search", &id, "quota_exceeded"]));
-    assert!(search.starts_with("stdout:1: "), "{search}");
+    starts(&search, "stdout:1: ");
 }
 
 /// One long line, such as `print(json.dumps(rows))`, fills the preview with the parts
@@ -1175,10 +961,7 @@ fn intent_points_to_search_when_a_line_is_too_long_to_rank() {
 fn intent_shows_several_parts_of_one_long_line() {
     let (_directory, root) = workspace();
     let script = "i=1; while [ $i -le 300 ]; do if [ $((i % 10)) -eq 3 ]; then s=PNUTUSDT; else s=BTCUSDT; fi; if [ $((i % 2)) -eq 1 ]; then d=SELL; else d=BUY; fi; printf '{\"id\": %d, \"symbol\": \"%s\", \"side\": \"%s\"}, ' $i $s $d; i=$((i + 1)); done; echo";
-    let output = exec(
-        &root,
-        &["--lang", "sh", "--intent", "PNUTUSDT SELL", script],
-    );
+    let output = focus(&root, "", "PNUTUSDT SELL", script);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     let parts: Vec<&str> = text
@@ -1187,120 +970,46 @@ fn intent_shows_several_parts_of_one_long_line() {
         .collect();
     assert!(parts.len() >= 10, "{text}");
     for part in &parts {
-        assert!(
-            part.contains("\"symbol\": \"PNUTUSDT\", \"side\": \"SELL\""),
-            "{part}"
-        );
+        contains(part, "\"symbol\": \"PNUTUSDT\", \"side\": \"SELL\"");
     }
     assert!(text.len() > 3000, "{}", text.len());
-    assert!(
-        text.lines()
-            .last()
-            .unwrap()
-            .contains("print one record per line"),
-        "{text}"
-    );
+    contains(text.lines().last().unwrap(), "print one record per line");
 }
 
 #[test]
 fn intent_without_a_match_falls_back_to_marked_head_and_tail() {
     let (_directory, root) = workspace();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "--max-bytes",
-            "1024",
-            "--intent",
-            "zebra",
-            NUMBERED,
-        ],
-    );
-    let text = stdout(&output);
+    let text = stdout(&focus(&root, "--max-bytes 1024", "zebra", NUMBERED));
     assert!(text.len() <= 1024, "{}", text.len());
-    assert!(
-        text.starts_with("[focus] no line matches \"zebra\"; first and last of 3000 lines:\n"),
-        "{text}"
+    starts(
+        &text,
+        "[focus] no line matches \"zebra\"; first and last of 3000 lines:\n",
     );
-    assert!(text.contains("stdout:1: line 1 ok\n"), "{text}");
-    assert!(text.ends_with("stdout:3000: line 3000 ok\n"), "{text}");
-}
-
-#[test]
-fn intent_is_ignored_when_output_fits() {
-    let (_directory, root) = workspace();
-    let output = exec(
-        &root,
-        &["--lang", "sh", "--intent", "anything", "echo short"],
-    );
-    assert_eq!(stdout(&output), "short\n");
-    assert_eq!(stderr(&output), "");
-}
-
-#[test]
-fn intent_of_only_common_words_is_rejected_before_running() {
-    let (_directory, root) = workspace();
-    let output = exec(
-        &root,
-        &["--lang", "sh", "--intent", "what is the", "touch ran"],
-    );
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        stderr(&output).contains("common words"),
-        "{}",
-        stderr(&output)
-    );
-    assert!(!root.join("ran").exists());
-    assert_eq!(run_directories(&root), 0);
+    contains(&text, "stdout:1: line 1 ok\n");
+    ends(&text, "stdout:3000: line 3000 ok\n");
 }
 
 #[test]
 fn intent_folds_word_endings_and_matches_quoted_phrases() {
     let (_directory, root) = workspace();
     let script = "i=1; while [ $i -le 300 ]; do echo \"filler line $i\"; i=$((i + 1)); done; echo 'parsed config'; echo 'parsing config'; echo 'parse config'; echo 'connection reset by peer'; echo 'Connection Reset'; echo 'connection was reset'; echo end";
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "--max-bytes",
-            "1024",
-            "--intent",
-            "parse",
-            script,
-        ],
-    );
-    let text = stdout(&output);
-    assert!(
-        text.starts_with("[focus] \"parse\": 3 of 307 lines match\n"),
-        "{text}"
-    );
+    let text = stdout(&focus(&root, "--max-bytes 1024", "parse", script));
+    starts(&text, "[focus] \"parse\": 3 of 307 lines match\n");
     for line in [301, 302, 303] {
-        assert!(text.contains(&format!("stdout:{line}: ")), "{text}");
+        contains(&text, &format!("stdout:{line}: "));
     }
-    let output = exec(
+    let text = stdout(&focus(
         &root,
-        &[
-            "--lang",
-            "sh",
-            "--max-bytes",
-            "1024",
-            "--intent",
-            "\"connection reset\"",
-            script,
-        ],
+        "--max-bytes 1024",
+        "\"connection reset\"",
+        script,
+    ));
+    starts(
+        &text,
+        "[focus] \"connection reset\": 2 of 307 lines match\n",
     );
-    let text = stdout(&output);
-    assert!(
-        text.starts_with("[focus] \"connection reset\": 2 of 307 lines match\n"),
-        "{text}"
-    );
-    assert!(
-        text.contains("stdout:304: connection reset by peer\n"),
-        "{text}"
-    );
-    assert!(text.contains("stdout:305: Connection Reset\n"), "{text}");
+    contains(&text, "stdout:304: connection reset by peer\n");
+    contains(&text, "stdout:305: Connection Reset\n");
     assert!(!text.contains("stdout:306:"), "{text}");
 }
 
@@ -1308,7 +1017,7 @@ fn intent_folds_word_endings_and_matches_quoted_phrases() {
 fn hooks_leave_exec_unwrapped() {
     let (_directory, root) = workspace();
     fs::create_dir(root.join("src")).unwrap();
-    let hook = |handler: &str, input: serde_json::Value| -> serde_json::Value {
+    let hook = |handler: &str, input: Value| -> Value {
         let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
             .args([handler, "before-command"])
             .current_dir(&root)
@@ -1316,35 +1025,28 @@ fn hooks_leave_exec_unwrapped() {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.to_string().as_bytes())
-            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.to_string().as_bytes()).unwrap();
+        drop(stdin);
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         serde_json::from_slice(&output.stdout).unwrap()
     };
-    let bash = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"session_id":"s1","tool_input":{"command":command}});
-    let agy = |command: &str| serde_json::json!({"workspacePaths":[root],"toolCall":{"name":"run_command","args":{"CommandLine":command,"Cwd":root}}});
+    let bash = |command: &str| json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"session_id":"s1","tool_input":{"command":command}});
+    let agy = |command: &str| json!({"workspacePaths":[root],"toolCall":{"name":"run_command","args":{"CommandLine":command,"Cwd":root}}});
+    let rewrite = |output: &Value| {
+        let command = &output["hookSpecificOutput"]["updatedInput"]["command"];
+        command.as_str().unwrap_or_default().to_owned()
+    };
+    let unchanged = |handler: &str, command: &str| hook(handler, bash(command)) == json!({});
+    let overwrites = |command: &str| hook("hook-agy", agy(command)).get("overwrite").is_some();
 
     // Positive controls: the same inputs do rewrite a supported command.
     for handler in ["hook-claude", "hook-codex"] {
         let output = hook(handler, bash("git status"));
-        assert!(
-            output["hookSpecificOutput"]["updatedInput"]["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("-- git status"),
-            "{handler}: {output}"
-        );
+        ends(&rewrite(&output), "-- git status");
     }
-    assert!(
-        hook("hook-agy", agy("git status"))
-            .get("overwrite")
-            .is_some()
-    );
+    assert!(overwrites("git status"));
 
     for command in [
         "justless exec --lang python3 - <<'PY'\nprint(1)\nPY",
@@ -1352,52 +1054,19 @@ fn hooks_leave_exec_unwrapped() {
         "cd src && justless exec --lang sh 'ls'",
     ] {
         for handler in ["hook-claude", "hook-codex"] {
-            assert_eq!(
-                hook(handler, bash(command)),
-                serde_json::json!({}),
-                "{handler}: {command}"
-            );
+            assert!(unchanged(handler, command), "{handler}: {command}");
         }
-        assert!(
-            hook("hook-agy", agy(command)).get("overwrite").is_none(),
-            "{command}"
-        );
+        assert!(!overwrites(command), "{command}");
     }
     let mixed = "cargo test && justless exec --lang sh 'echo hi'";
     let claude = hook("hook-claude", bash(mixed));
-    let rewritten = claude["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap();
-    assert!(rewritten.starts_with("justless run --hook "), "{rewritten}");
-    assert!(
-        rewritten.ends_with("-- cargo test && justless exec --lang sh 'echo hi'"),
-        "{rewritten}"
-    );
-    assert!(
-        claude["hookSpecificOutput"]
-            .get("permissionDecision")
-            .is_none()
-    );
-    assert_eq!(hook("hook-codex", bash(mixed)), serde_json::json!({}));
-    assert!(hook("hook-agy", agy(mixed)).get("overwrite").is_none());
-}
-
-/// An `exec` run prints the agent footer, but hooks did not route it, so `doctor` and
-/// the status line do not count it as a hook-routed run.
-#[test]
-fn exec_runs_are_not_recorded_as_hook_routed() {
-    let (_directory, root) = workspace();
-    let output = exec(&root, &["--lang", "sh", "echo ok; exit 3"]);
-    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
-    let id = run_id(&output);
-    let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(record["hook"], false, "{record}");
-    assert_eq!(record["family"], "exec sh", "{record}");
-    // The agent footer, not the footer printed for a person.
-    assert_eq!(stderr(&output), format!("[justless {id} · exit 3]\n"));
+    let rewritten = rewrite(&claude);
+    starts(&rewritten, "justless run --hook ");
+    ends(&rewritten, &format!("-- {mixed}"));
+    let decision = claude["hookSpecificOutput"].get("permissionDecision");
+    assert!(decision.is_none(), "{claude}");
+    assert!(unchanged("hook-codex", mixed));
+    assert!(!overwrites(mixed));
 }
 
 /// Script output goes through the same pipes as `run`, so `max_run_bytes` caps what
@@ -1406,22 +1075,16 @@ fn exec_runs_are_not_recorded_as_hook_routed() {
 fn exec_output_is_capped_by_max_run_bytes() {
     let (_directory, root) = workspace();
     fs::write(root.join(".justless.toml"), "max_run_bytes = 1000\n").unwrap();
-    let output = exec(
-        &root,
-        &[
-            "--lang",
-            "sh",
-            "i=0; while [ $i -lt 100 ]; do echo 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghij'; i=$((i + 1)); done; echo done >&2; exit 4",
-        ],
+    let line = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij";
+    let code = format!(
+        "i=0; while [ $i -lt 100 ]; do echo '{line}'; i=$((i + 1)); done; echo done >&2; exit 4"
     );
+    let output = sh(&root, &code);
     assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
     let id = run_id(&output);
     let directory = root.join(".justless/runs").join(&id);
     assert_eq!(fs::metadata(directory.join("stdout")).unwrap().len(), 1000);
     assert_eq!(fs::read(directory.join("stderr")).unwrap(), b"done\n");
     let message = stderr(&output);
-    assert!(
-        message.contains("[stdout archive truncated at 1000 B of 4.6 KB]"),
-        "{message}"
-    );
+    contains(&message, "[stdout archive truncated at 1000 B of 4.6 KB]");
 }
