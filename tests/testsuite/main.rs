@@ -11,4 +11,5 @@ mod lookup;
 mod mcp;
 mod read_batch;
 mod redact;
+mod report_fixes;
 mod retirement;
