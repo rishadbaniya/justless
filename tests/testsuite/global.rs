@@ -4,12 +4,13 @@
 //! Command hooks pass every command through on Windows, so these run on Unix.
 #![cfg(unix)]
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+use crate::common::{BIN, git, has, lacks, piped, starts, text, words};
 
 struct Lab {
     _temp: TempDir,
@@ -41,8 +42,14 @@ impl Lab {
         root
     }
 
-    fn command(&self, cwd: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+    fn output(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        input: Option<&Value>,
+        env: &[(&str, &str)],
+    ) -> Output {
+        let mut command = Command::new(BIN);
         command
             .args(args)
             .current_dir(cwd)
@@ -55,41 +62,10 @@ impl Lab {
                 self.base.join("managed"),
             )
             .env_remove("CLAUDE_PROJECT_DIR")
-            .env_remove("JUSTLESS_DISABLE");
-        command
-    }
-
-    fn output(
-        &self,
-        cwd: &Path,
-        args: &[&str],
-        input: Option<&Value>,
-        env: &[(&str, &str)],
-    ) -> Output {
-        let mut child = self
-            .command(cwd, args)
-            .envs(env.iter().copied())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        if let Some(input) = input {
-            stdin.write_all(input.to_string().as_bytes()).unwrap();
-        }
-        drop(stdin);
-        child.wait_with_output().unwrap()
-    }
-
-    fn run(&self, cwd: &Path, args: &[&str]) -> String {
-        let output = self.output(cwd, args, None, &[]);
-        assert!(
-            output.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
+            .env_remove("JUSTLESS_DISABLE")
+            .envs(env.iter().copied());
+        let input = input.map_or(String::new(), Value::to_string);
+        piped(&mut command, input.as_bytes())
     }
 
     fn hook(&self, cwd: &Path, args: &[&str], input: &Value, env: &[(&str, &str)]) -> String {
@@ -97,7 +73,17 @@ impl Lab {
         assert!(
             output.status.success(),
             "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            text(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn run(&self, cwd: &Path, args: &[&str]) -> String {
+        let output = self.output(cwd, args, None, &[]);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            text(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
     }
@@ -116,25 +102,18 @@ fn bash(cwd: &Path, command: &str, mode: Option<&str>) -> Value {
 
 fn routed(answer: &str) -> Option<String> {
     let answer: Value = serde_json::from_str(answer).unwrap();
-    answer["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .map(str::to_owned)
+    let command = answer["hookSpecificOutput"]["updatedInput"]["command"].as_str();
+    command.map(str::to_owned)
 }
 
 #[test]
 fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
     let lab = Lab::new();
-    let root = lab.project(
-        "work",
-        "exclude_commands = [\"cargo bench\", \"^git (log|show)\"]\n",
-    );
+    let settings = "exclude_commands = [\"cargo bench\", \"^git (log|show)\"]\n";
+    let root = lab.project("work", settings);
     let codex = |command: &str| {
-        lab.hook(
-            &root,
-            &["hook-codex", "before-command"],
-            &bash(&root, command, None),
-            &[],
-        )
+        let input = bash(&root, command, None);
+        lab.hook(&root, &["hook-codex", "before-command"], &input, &[])
     };
     assert_eq!(
         routed(&codex("cargo test")).as_deref(),
@@ -151,16 +130,12 @@ fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
     // Codex runs a rewritten list without asking, so one excluded command keeps the
     // whole list as written. Claude Code checks the rewrite, so the rest is routed.
     assert_eq!(codex("cargo bench && cargo test").trim(), "{}");
-    let claude = lab.hook(
+    let input = bash(
         &root,
-        &["hook-claude", "before-command"],
-        &bash(
-            &root,
-            "cargo bench && cargo test",
-            Some("bypassPermissions"),
-        ),
-        &[],
+        "cargo bench && cargo test",
+        Some("bypassPermissions"),
     );
+    let claude = lab.hook(&root, &["hook-claude", "before-command"], &input, &[]);
     assert_eq!(
         routed(&claude).as_deref(),
         Some("cargo bench && justless run --hook -- cargo test")
@@ -178,132 +153,87 @@ fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
         });
         lab.hook(&root, &["hook-claude", "after-bash"], &input, &[])
     };
-    for (bench, test) in [
-        (
-            "cargo bench 2>&1 | tail -n 400",
-            "cargo test 2>&1 | tail -n 400",
-        ),
-        (
-            "cd src && cargo bench | tail -n 400",
-            "cd src && cargo test | tail -n 400",
-        ),
-        (
-            "RUST_LOG=1 cargo bench 2>&1 | tail -n 400",
-            "RUST_LOG=1 cargo test 2>&1 | tail -n 400",
-        ),
-        (
-            "timeout 60 cargo bench | tail -n 400",
-            "timeout 60 cargo test | tail -n 400",
-        ),
+    for (prefix, redirect) in [
+        ("", " 2>&1"),
+        ("cd src && ", ""),
+        ("RUST_LOG=1 ", " 2>&1"),
+        ("timeout 60 ", ""),
     ] {
-        assert_ne!(after(test).trim(), "{}", "{test}");
-        assert_eq!(after(bench).trim(), "{}", "{bench}");
+        let test = format!("{prefix}cargo test{redirect} | tail -n 400");
+        let bench = format!("{prefix}cargo bench{redirect} | tail -n 400");
+        assert_ne!(after(&test).trim(), "{}", "{test}");
+        assert_eq!(after(&bench).trim(), "{}", "{bench}");
     }
 
     // `JUSTLESS_DISABLE` answers every hook with its client's no-op.
     let off = [("JUSTLESS_DISABLE", "1")];
     let input = bash(&root, "cargo test", Some("bypassPermissions"));
+    let ask =
+        |args: &str, input: &Value, env: &[(&str, &str)]| lab.hook(&root, &words(args), input, env);
+    assert_eq!(ask("hook-claude before-command", &input, &off).trim(), "{}");
+    let compact = json!({"hook_event_name": "PreCompact"});
+    assert_eq!(ask("hook-claude before-compact", &compact, &off), "");
     assert_eq!(
-        lab.hook(&root, &["hook-claude", "before-command"], &input, &off)
-            .trim(),
-        "{}"
-    );
-    assert_eq!(
-        lab.hook(
-            &root,
-            &["hook-claude", "before-compact"],
-            &json!({"hook_event_name": "PreCompact"}),
-            &off
-        ),
-        ""
-    );
-    assert_eq!(
-        lab.hook(&root, &["hook-agy", "before-command"], &json!({}), &off)
-            .trim(),
+        ask("hook-agy before-command", &json!({}), &off).trim(),
         r#"{"decision":"allow"}"#
     );
     assert_eq!(
-        lab.hook(&root, &["hook-cursor", "before-command"], &json!({}), &off)
-            .trim(),
+        ask("hook-cursor before-command", &json!({}), &off).trim(),
         "{}"
     );
-    assert!(
-        lab.hook(
-            &root,
-            &["hook-claude", "before-command"],
-            &input,
-            &[("JUSTLESS_DISABLE", "0")]
-        )
-        .contains("justless run")
+    let on = [("JUSTLESS_DISABLE", "0")];
+    has(
+        &ask("hook-claude before-command", &input, &on),
+        "justless run",
     );
 
     // `rewrite` prints the hook's own rewrite and records nothing.
     fs::create_dir_all(root.join(".justless")).unwrap();
-    let report = lab.run(&root, &["rewrite", "--agent", "codex", "cargo test"]);
-    assert!(
-        report.starts_with("Codex hook: rewritten\n  justless run --hook -- cargo test\n"),
-        "{report}"
+    let rewrite = |args: &[&str]| lab.run(&root, &[&["rewrite"], args].concat());
+    let report = rewrite(&["--agent", "codex", "cargo test"]);
+    starts(
+        &report,
+        "Codex hook: rewritten\n  justless run --hook -- cargo test\n",
     );
-    let report = lab.run(
-        &root,
-        &["rewrite", "--agent", "codex", "cargo bench && cargo test"],
+    let report = rewrite(&["--agent", "codex", "cargo bench && cargo test"]);
+    has(
+        &report,
+        "only when every command in it is supported and none is excluded",
     );
-    assert!(
-        report.contains("only when every command in it is supported and none is excluded"),
-        "{report}"
-    );
-    assert!(
-        report.contains("Excluded: `cargo bench` matches `cargo bench`"),
-        "{report}"
-    );
-    let report = lab.run(&root, &["rewrite", "git show HEAD"]);
-    assert!(
-        report.contains("matches `^git (log|show)` in exclude_commands"),
-        "{report}"
-    );
-    let report = lab.run(&root, &["rewrite", "ls", "--agent", "codex"]);
-    assert!(
-        report.contains("no command in it is one the hook routes"),
-        "{report}"
-    );
+    has(&report, "Excluded: `cargo bench` matches `cargo bench`");
+    let report = rewrite(&["git show HEAD"]);
+    has(&report, "matches `^git (log|show)` in exclude_commands");
+    let report = rewrite(&["ls", "--agent", "codex"]);
+    has(&report, "no command in it is one the hook routes");
     // Claude Code's verdict: no rule allows `cargo test` in default mode.
-    let report = lab.run(&root, &["rewrite", "cargo test"]);
-    assert!(
-        report.contains("unchanged\nWhy: Claude Code's permission rules"),
-        "{report}"
-    );
-    assert!(
-        report.contains("Permission: no rule allows it in default mode"),
-        "{report}"
-    );
+    let report = rewrite(&["cargo test"]);
+    has(&report, "unchanged\nWhy: Claude Code's permission rules");
+    has(&report, "Permission: no rule allows it in default mode");
     fs::create_dir_all(root.join(".claude")).unwrap();
     fs::write(
         root.join(".claude/settings.json"),
         r#"{"permissions":{"allow":["Bash(cargo test:*)"]}}"#,
     )
     .unwrap();
-    let report = lab.run(&root, &["rewrite", "cargo test", "--mode", "acceptEdits"]);
-    assert!(
-        report.contains("rewritten\n  justless run --hook -- cargo test\n"),
-        "{report}"
+    let report = rewrite(&["cargo test", "--mode", "acceptEdits"]);
+    has(&report, "rewritten\n  justless run --hook -- cargo test\n");
+    has(
+        &report,
+        "allow rules cover every command in it in acceptEdits mode, so the hook allows the rewrite",
     );
-    assert!(report.contains("allow rules cover every command in it in acceptEdits mode, so the hook allows the rewrite"), "{report}");
     assert!(!root.join(".justless/activity.json").exists());
 
     // An invalid expression is a settings error, not a silent pass.
     fs::write(root.join(".justless.toml"), "exclude_commands = [\"^(\"]\n").unwrap();
     let output = lab.output(&root, &["run", "--", "true"], None, &[]);
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("invalid exclude_commands regex"), "{error}");
+    has(&text(&output.stderr), "invalid exclude_commands regex");
 }
 
 #[test]
 fn discover_reports_excluded_commands_in_their_own_group() {
     let lab = Lab::new();
-    let root = lab.project(
-        "work",
-        "exclude_commands = [\"cargo build\", \"^git log\"]\n",
-    );
+    let settings = "exclude_commands = [\"cargo build\", \"^git log\"]\n";
+    let root = lab.project("work", settings);
     let commands = [
         "cargo build",
         "git log -3",
@@ -324,12 +254,10 @@ fn discover_reports_excluded_commands_in_their_own_group() {
     let rollouts = lab.home.join(".codex/sessions/2026/11/19");
     fs::create_dir_all(&transcripts).unwrap();
     fs::create_dir_all(&rollouts).unwrap();
-    let (mut claude, mut codex) = (
-        Vec::new(),
-        vec![json!({"type": "session_meta",
+    let mut claude = Vec::new();
+    let mut codex = vec![json!({"type": "session_meta",
         "timestamp": "2099-01-01T00:00:00.000Z",
-        "payload": {"id": "t", "session_id": "t", "cwd": root, "source": "cli"}})],
-    );
+        "payload": {"id": "t", "session_id": "t", "cwd": root, "source": "cli"}})];
     for (id, command) in commands.iter().enumerate() {
         let (id, output) = (format!("c{id}"), "x".repeat(1000));
         claude.push(
@@ -349,14 +277,11 @@ fn discover_reports_excluded_commands_in_their_own_group() {
     }
     let lines = |records: Vec<Value>| records.iter().map(|r| format!("{r}\n")).collect::<String>();
     fs::write(transcripts.join("s.jsonl"), lines(claude)).unwrap();
-    fs::write(
-        rollouts.join("rollout-2026-11-19T10-00-00-t.jsonl"),
-        lines(codex),
-    )
-    .unwrap();
+    let rollout = rollouts.join("rollout-2026-11-19T10-00-00-t.jsonl");
+    fs::write(rollout, lines(codex)).unwrap();
 
-    let report: Value =
-        serde_json::from_str(&lab.run(&root, &["discover", "--json", "--plan"])).unwrap();
+    let report = lab.run(&root, &words("discover --json --plan"));
+    let report: Value = serde_json::from_str(&report).unwrap();
     let labels = |groups: &Value, route: &str| -> Vec<String> {
         let groups = groups.as_array().unwrap();
         let group = groups.iter().find(|group| group["route"] == route);
@@ -369,59 +294,40 @@ fn discover_reports_excluded_commands_in_their_own_group() {
     // Claude Code checks a rewrite, so the rest of a list with an excluded command
     // is still routed; Codex keeps such a list as written. Claude Code's post-run
     // hook leaves an excluded pipe alone; Codex has none.
-    assert_eq!(
-        labels(&report["groups"], "excluded"),
-        ["cargo build ×4", "git log ×1"]
-    );
-    assert_eq!(
-        labels(&report["groups"], "supported_not_routed"),
-        ["cargo build ×1", "cargo test ×1"]
-    );
-    assert_eq!(
-        labels(&report["groups"], "passed_through"),
-        ["cargo test ×1"]
-    );
-    assert_eq!(
-        labels(&report["codex"]["groups"], "excluded"),
-        ["cargo build ×2", "git log ×1"]
-    );
-    assert_eq!(
-        labels(&report["codex"]["groups"], "passed_through"),
-        ["cargo build ×3", "cargo test ×1"]
-    );
-    assert_eq!(
-        labels(&report["codex"]["groups"], "supported_not_routed"),
-        ["cargo test ×1"]
-    );
+    let (claude, codex) = (&report["groups"], &report["codex"]["groups"]);
+    for (groups, route, expected) in [
+        (claude, "excluded", &["cargo build ×4", "git log ×1"][..]),
+        (
+            claude,
+            "supported_not_routed",
+            &["cargo build ×1", "cargo test ×1"],
+        ),
+        (claude, "passed_through", &["cargo test ×1"]),
+        (codex, "excluded", &["cargo build ×2", "git log ×1"]),
+        (
+            codex,
+            "passed_through",
+            &["cargo build ×3", "cargo test ×1"],
+        ),
+        (codex, "supported_not_routed", &["cargo test ×1"]),
+    ] {
+        assert_eq!(labels(groups, route), expected, "{route}");
+    }
     let plan = report["plan"].as_array().unwrap();
     assert!(plan.iter().all(|row| row["label"] != "git log"), "{plan:?}");
     let text = lab.run(&root, &["discover"]);
-    assert!(
-        text.contains("Supported, excluded by exclude_commands: 5 command(s)")
-            && !text.contains("xxxx"),
-        "{text}"
+    has(
+        &text,
+        "Supported, excluded by exclude_commands: 5 command(s)",
     );
-}
-
-fn git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(["-c", "user.name=Lab", "-c", "user.email=lab@example.com"])
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?}");
+    lacks(&text, "xxxx");
 }
 
 /// The run ID a `justless run` names on stderr.
 fn run_id(lab: &Lab, cwd: &Path, script: &str) -> String {
     let output = lab.output(cwd, &["run", "--", "sh", "-c", script], None, &[]);
     assert!(output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let start = stderr.find("[justless run-").unwrap() + "[justless ".len();
-    stderr[start..].split([' ', ']']).next().unwrap().to_owned()
+    crate::common::run_id(&output)
 }
 
 #[test]
@@ -440,7 +346,7 @@ fn the_registry_totals_projects_by_repository_and_finds_their_runs() {
 
     let file = lab.home.join(".local/state/justless/projects.json");
     let text = fs::read_to_string(&file).unwrap();
-    assert!(!text.contains("seq"), "{text}");
+    lacks(&text, "seq");
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&file).unwrap().permissions().mode();
@@ -459,78 +365,63 @@ fn the_registry_totals_projects_by_repository_and_finds_their_runs() {
 
     let temp = lab.base.join("tmp");
     let temp = [("JUSTLESS_TEST_TEMP_DIRS", temp.to_str().unwrap())];
-    let stats = |args: &[&str]| -> Value {
-        let output = lab.output(&main, args, None, &temp);
+    let stats = |line: &str| -> Value {
+        let output = lab.output(&main, &words(line), None, &temp);
         assert!(output.status.success());
         serde_json::from_slice(&output.stdout).unwrap()
     };
-    let all = stats(&["stats", "--all", "--json"]);
-    assert_eq!(
-        (&all["projects"], &all["runs"]),
-        (&json!(2), &json!(2)),
-        "{all}"
-    );
+    let all = stats("stats --all --json");
+    let counts = |all: &Value| (all["projects"].clone(), all["runs"].clone());
+    assert_eq!(counts(&all), (json!(2), json!(2)), "{all}");
     assert_eq!(all["temporary_projects_left_out"], 1);
     assert_eq!(all["repositories"][0]["repository"], json!(main));
     assert_eq!(all["repositories"][0]["roots"].as_array().unwrap().len(), 2);
-    let all = stats(&["stats", "--all", "--include-temp", "--json"]);
-    assert_eq!(
-        (&all["projects"], &all["runs"]),
-        (&json!(3), &json!(3)),
-        "{all}"
-    );
+    let all = stats("stats --all --include-temp --json");
+    assert_eq!(counts(&all), (json!(3), json!(3)), "{all}");
     assert_eq!(all["repositories"].as_array().unwrap().len(), 2);
     let output = lab.output(&main, &["stats", "--all"], None, &temp);
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("main (2 checkouts)  2 run(s)"), "{text}");
-    assert!(text.starts_with("In the last 7 day(s), kept "), "{text}");
+    has(&text, "main (2 checkouts)  2 run(s)");
+    starts(&text, "In the last 7 day(s), kept ");
+    has(&text, "Left out 1 project(s) in temporary folders");
     // `--days` counts the runs that finished in the window.
     let old = run_id(&lab, &main, "seq 1 3000");
     let record = main.join(".justless/runs").join(&old).join("record.json");
     let mut run: Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
     run["completed_ms"] = json!(1_000);
     fs::write(&record, run.to_string()).unwrap();
-    let all = stats(&["stats", "--all", "--days", "30", "--json"]);
+    let all = stats("stats --all --days 30 --json");
     assert_eq!(
         (&all["days"], &all["runs"]),
         (&json!(30), &json!(2)),
         "{all}"
     );
-    assert!(
-        text.contains("Left out 1 project(s) in temporary folders"),
-        "{text}"
-    );
 
     // A run made in another project is found through the registry.
     let replay = lab.run(&main, &["log", &elsewhere, "--from", "2", "--to", "3"]);
     assert_eq!(replay, "2\n3\n");
-    assert!(
-        lab.run(&main, &["search", &elsewhere, "needle"])
-            .contains("needle")
-    );
+    has(&lab.run(&main, &["search", &elsewhere, "needle"]), "needle");
     let context = lab.run(&tree, &["context", "--run", &elsewhere]);
-    assert!(
-        context.starts_with(&format!("Run {elsewhere}")),
-        "{context}"
-    );
+    starts(&context, &format!("Run {elsewhere}"));
     let unknown = lab.output(&main, &["log", "run-unknown1"], None, &[]);
-    let error = String::from_utf8_lossy(&unknown.stderr);
-    assert!(error.contains("unknown run ID: run-unknown1"), "{error}");
+    has(
+        &String::from_utf8_lossy(&unknown.stderr),
+        "unknown run ID: run-unknown1",
+    );
 
     // Doctor fails here, in a project with no setup, and still lists the registry.
     let doctor = lab.output(&main, &["doctor"], None, &[]).stdout;
-    let doctor = String::from_utf8_lossy(&doctor);
-    assert!(
-        doctor.contains("Project registry: 3 projects at "),
-        "{doctor}"
+    has(
+        &String::from_utf8_lossy(&doctor),
+        "Project registry: 3 projects at ",
     );
 
     // `--purge` drops the project, and the registry is rebuilt as projects are used.
-    lab.run(&scratch, &["init", "--remove", "--purge"]);
-    assert!(!fs::read_to_string(&file).unwrap().contains("scratch"));
+    lab.run(&scratch, &words("init --remove --purge"));
+    lacks(&fs::read_to_string(&file).unwrap(), "scratch");
     fs::remove_file(&file).unwrap();
     run_id(&lab, &main, "true");
-    assert!(fs::read_to_string(&file).unwrap().contains("main"));
+    has(&fs::read_to_string(&file).unwrap(), "main");
 }
 
 #[test]
@@ -544,7 +435,7 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
     let plain = lab.project("plain", "");
     let opted = lab.project("opted", "global_hooks = false\n");
     let own = lab.project("own", "");
-    lab.run(&own, &["init", "--hooks", "--agent", "claude"]);
+    lab.run(&own, &words("init --hooks --agent claude"));
 
     // Without --agent, setup takes the clients whose config directory exists.
     let setup = lab.run(&lab.base, &["init", "--global"]);
@@ -553,19 +444,12 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
     assert_eq!(settings["model"], "opus");
     let command = &settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"];
     assert_eq!(command, "justless hook-claude before-command --global");
-    assert!(
-        lab.run(&lab.base, &["init", "--global"])
-            .contains("already has the global")
-    );
-    lab.run(&lab.base, &["init", "--global", "--agent", "codex"]);
+    let again = lab.run(&lab.base, &["init", "--global"]);
+    has(&again, "already has the global");
+    lab.run(&lab.base, &words("init --global --agent codex"));
     assert!(codex.is_file());
-    let refused = lab.output(
-        &lab.base,
-        &["init", "--global", "--agent", "cursor"],
-        None,
-        &[],
-    );
-    assert!(!refused.status.success());
+    let refused = words("init --global --agent cursor");
+    assert!(!lab.output(&lab.base, &refused, None, &[]).status.success());
 
     // Each call finds its project from `cwd`, wherever the hook runs.
     let ask = |agent: &str, mode: &str, input: &Value, env: &[(&str, &str)]| {
@@ -588,15 +472,11 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
     // Claude Code loads project hooks from the directory it started in.
     let input = bash(&plain, "cargo test", Some("bypassPermissions"));
     let started = [("CLAUDE_PROJECT_DIR", own.to_str().unwrap())];
-    assert_eq!(
-        ask("hook-claude", "before-command", &input, &started).trim(),
-        "{}"
-    );
+    let answer = ask("hook-claude", "before-command", &input, &started);
+    assert_eq!(answer.trim(), "{}");
     let off = [("JUSTLESS_DISABLE", "1")];
-    assert_eq!(
-        ask("hook-claude", "before-command", &input, &off).trim(),
-        "{}"
-    );
+    let answer = ask("hook-claude", "before-command", &input, &off);
+    assert_eq!(answer.trim(), "{}");
     let compact = json!({"hook_event_name": "PreCompact", "cwd": lab.home});
     assert_eq!(ask("hook-claude", "before-compact", &compact, &[]), "");
 
@@ -605,42 +485,31 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
         String::from_utf8(stdout).unwrap()
     };
     let report = doctor(&plain);
-    assert!(
-        report.contains("Global hooks for Claude Code: 8 handlers in "),
-        "{report}"
-    );
-    assert!(
-        report.contains("The global Codex hooks serve this project"),
-        "{report}"
-    );
-    assert!(doctor(&own).contains("own Claude Code hooks take precedence"));
-    assert!(doctor(&opted).contains("sets global_hooks = false"));
+    has(&report, "Global hooks for Claude Code: 8 handlers in ");
+    has(&report, "The global Codex hooks serve this project");
+    has(&doctor(&own), "own Claude Code hooks take precedence");
+    has(&doctor(&opted), "sets global_hooks = false");
     // The global hooks count as each client's hooks where they serve the project.
     // They write no instructions, and plain `init` adds those without hooks.
-    assert!(
-        report.contains("✓ Hooks: the global Claude Code hooks in ")
-            && report.contains("✗ Instructions: CLAUDE.md does not exist")
-            && report.contains("\n  justless init --agent claude --agent codex\n")
-            && !report.contains("not set up in this project")
-            && !report.contains("Hooks: none"),
-        "{report}"
-    );
-    assert!(doctor(&opted).contains("not set up in this project"));
+    has(&report, "✓ Hooks: the global Claude Code hooks in ");
+    has(&report, "✗ Instructions: CLAUDE.md does not exist");
+    has(&report, "\n  justless init --agent claude --agent codex\n");
+    lacks(&report, "not set up in this project");
+    lacks(&report, "Hooks: none");
+    has(&doctor(&opted), "not set up in this project");
     // A folder outside any project gets the outside report, as the hooks skip it.
     let loose = doctor(&lab.base.join("loose"));
-    assert!(
-        loose.contains("has no Justless setup") && !loose.contains("serve this project"),
-        "{loose}"
-    );
-    lab.run(&plain, &["init", "--agent", "claude", "--agent", "codex"]);
+    has(&loose, "has no Justless setup");
+    lacks(&loose, "serve this project");
+    lab.run(&plain, &words("init --agent claude --agent codex"));
     let report = doctor(&plain);
-    assert!(
-        report.contains("Instructions: CLAUDE.md has the current Justless block")
-            && report.contains("✓ Hooks: the global Codex hooks in ")
-            && !report.contains("Instructions: AGENTS.md has no")
-            && !plain.join(".claude").exists(),
-        "{report}"
+    has(
+        &report,
+        "Instructions: CLAUDE.md has the current Justless block",
     );
+    has(&report, "✓ Hooks: the global Codex hooks in ");
+    lacks(&report, "Instructions: AGENTS.md has no");
+    assert!(!plain.join(".claude").exists());
     let json = lab.output(&plain, &["doctor", "--json"], None, &[]).stdout;
     let json: Value = serde_json::from_slice(&json).unwrap();
     let agents = json["agents"].as_array().unwrap();
@@ -649,34 +518,33 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
 
     // A file nobody edited since is restored byte for byte, and the directory
     // setup created for Codex goes with its file.
-    let dry = lab.run(&lab.base, &["init", "--remove", "--global", "--dry-run"]);
-    assert!(dry.contains("settings.json: remove 8 hooks"), "{dry}");
+    let dry = lab.run(&lab.base, &words("init --remove --global --dry-run"));
+    has(&dry, "settings.json: remove 8 hooks");
     assert!(codex.is_file());
-    lab.run(&lab.base, &["init", "--remove", "--global"]);
+    lab.run(&lab.base, &words("init --remove --global"));
     assert_eq!(fs::read_to_string(&claude).unwrap(), original);
     assert!(!codex.parent().unwrap().exists());
 
     // In an edited file only the handlers with --global go. Another Justless
     // handler there runs in every project too, which doctor reports.
-    lab.run(&lab.base, &["init", "--global", "--agent", "claude"]);
+    lab.run(&lab.base, &words("init --global --agent claude"));
     let mut settings: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
     let mine = json!({"matcher": "^Bash$", "hooks": [
         {"type": "command", "command": "justless hook-claude before-command"},
         {"type": "command", "command": "my-audit"},
     ]});
-    settings["hooks"]["PreToolUse"]
-        .as_array_mut()
-        .unwrap()
-        .push(mine);
+    let hooks = settings["hooks"]["PreToolUse"].as_array_mut().unwrap();
+    hooks.push(mine);
     fs::write(&claude, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
-    assert!(
-        doctor(&plain).contains("runs 1 Justless hook without --global as well as the global ones")
+    has(
+        &doctor(&plain),
+        "runs 1 Justless hook without --global as well as the global ones",
     );
-    lab.run(&lab.base, &["init", "--remove", "--global"]);
+    lab.run(&lab.base, &words("init --remove --global"));
     let left: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
     assert_eq!(left["model"], "opus");
     let hooks = left["hooks"].as_object().unwrap();
     assert_eq!(hooks.keys().collect::<Vec<_>>(), ["PreToolUse"], "{left}");
     assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 1, "{left}");
-    assert!(!left.to_string().contains("--global"));
+    lacks(&left.to_string(), "--global");
 }

@@ -4,12 +4,13 @@
 //! on Windows, so these run on Unix.
 #![cfg(unix)]
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+
+use crate::common::{BIN, has, lacks, piped, text, words};
 
 struct Lab {
     _temp: TempDir,
@@ -32,30 +33,22 @@ impl Lab {
         }
     }
 
-    fn run(&self, args: &[&str], input: Option<&Value>) -> String {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-            .args(args)
+    /// The stdout of `line`, split at spaces, with `input` on stdin.
+    fn run(&self, line: &str, input: Option<&Value>) -> String {
+        let mut command = Command::new(BIN);
+        command
+            .args(words(line))
             .current_dir(&self.root)
             .env("CODEX_HOME", &self.codex)
-            .env("CLAUDE_CONFIG_DIR", self.codex.join("claude"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        if let Some(input) = input {
-            stdin.write_all(input.to_string().as_bytes()).unwrap();
-        }
-        drop(stdin);
-        let output = child.wait_with_output().unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{args:?}: {stderr}");
+            .env("CLAUDE_CONFIG_DIR", self.codex.join("claude"));
+        let input = input.map_or(String::new(), Value::to_string);
+        let output = piped(&mut command, input.as_bytes());
+        assert!(output.status.success(), "{line}: {}", text(&output.stderr));
         String::from_utf8(output.stdout).unwrap()
     }
 
-    fn json(&self, args: &[&str], input: Option<&Value>) -> Value {
-        serde_json::from_str(&self.run(args, input)).unwrap()
+    fn json(&self, line: &str, input: Option<&Value>) -> Value {
+        serde_json::from_str(&self.run(line, input)).unwrap()
     }
 
     fn rollout(&self, name: &str, cwd: &Path, records: &[Value]) {
@@ -70,11 +63,8 @@ impl Lab {
             record["timestamp"] = json!("2099-01-01T00:00:00.000Z");
             text.push_str(&format!("{record}\n"));
         }
-        fs::write(
-            dir.join(format!("rollout-2026-11-19T10-00-00-{name}.jsonl")),
-            text,
-        )
-        .unwrap();
+        let file = format!("rollout-2026-11-19T10-00-00-{name}.jsonl");
+        fs::write(dir.join(file), text).unwrap();
     }
 }
 
@@ -102,7 +92,7 @@ fn output(id: &str, text: &str) -> Value {
 #[test]
 fn code_mode_calls_reach_the_bash_hook_and_are_routed() {
     let lab = Lab::new();
-    lab.run(&["init", "--hooks", "--agent", "codex"], None);
+    lab.run("init --hooks --agent codex", None);
     let config = fs::read_to_string(lab.root.join(".codex/hooks.json")).unwrap();
     let hooks: Value = serde_json::from_str(&config).unwrap();
     // `exec_command` matches as `Bash`, from a script too; Codex has no after-bash hook.
@@ -118,11 +108,9 @@ fn code_mode_calls_reach_the_bash_hook_and_are_routed() {
             "permission_mode": "default", "tool_name": "Bash",
             "tool_input": {"command": command}, "tool_use_id": "exec-0b6d",
         });
-        input
-            .as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        lab.json(&["hook-codex", "before-command"], Some(&input))
+        let extra = extra.as_object().unwrap().clone();
+        input.as_object_mut().unwrap().extend(extra);
+        lab.json("hook-codex before-command", Some(&input))
     };
     let routed = call("cargo test", json!({}));
     let hook = &routed["hookSpecificOutput"];
@@ -136,10 +124,8 @@ fn code_mode_calls_reach_the_bash_hook_and_are_routed() {
     assert_eq!(hook["updatedInput"].as_object().unwrap().len(), 1);
     // An older payload names the directory as a `tool_cwd` URI.
     let uri = json!({"cwd": lab.root, "tool_cwd": format!("file://{}", lab.root.display())});
-    assert_eq!(
-        call("git status", uri)["hookSpecificOutput"]["permissionDecision"],
-        "allow"
-    );
+    let answer = call("git status", uri);
+    assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "allow");
     // Codex runs a rewrite without asking, so a list with an unsupported command stays.
     assert_eq!(call("cargo test && git push", json!({})), json!({}));
 }
@@ -166,13 +152,7 @@ fn rollouts_feed_discover_and_stats() {
             response(json!({"type": "custom_tool_call", "name": "exec", "call_id": "call_2",
                 "input": "text(await tools.exec_command({cmd: 'rg needle src'}))"})),
             nested.clone(),
-            item(
-                "exec-2",
-                "justless run --hook -- git status",
-                root,
-                0,
-                status,
-            ),
+            item("exec-2", "justless run --hook -- git status", root, 0, status),
             json!({"type": "event_msg", "payload": {"type": "item_completed", "item": {
                 "type": "CommandExecution", "id": "exec-3", "command": ["/bin/zsh", "-lc", "ls"],
                 "cwd": root, "exit_code": 0, "aggregated_output": "src\n",
@@ -196,33 +176,25 @@ fn rollouts_feed_discover_and_stats() {
     // A forked thread's copy of a call counts once, and a thread elsewhere not at all.
     lab.rollout("b", root, &[nested]);
     let elsewhere = root.parent().unwrap();
-    lab.rollout(
-        "c",
-        elsewhere,
-        &[item("exec-9", "cargo test", elsewhere, 0, "ok\n")],
-    );
+    let ok = item("exec-9", "cargo test", elsewhere, 0, "ok\n");
+    lab.rollout("c", elsewhere, &[ok]);
 
-    let report = lab.json(&["discover", "--json"], None);
+    let report = lab.json("discover --json", None);
     let codex = &report["codex"];
-    let counts = |keys: &[&str]| {
-        keys.iter()
-            .map(|key| codex[key].clone())
-            .collect::<Vec<_>>()
-    };
+    let counts = [
+        "sessions",
+        "commands",
+        "code_mode_commands",
+        "code_mode_results",
+    ]
+    .map(|key| codex[key].clone());
     assert_eq!(
-        counts(&[
-            "sessions",
-            "commands",
-            "code_mode_commands",
-            "code_mode_results"
-        ]),
+        counts,
         [json!(1), json!(5), json!(2), json!(1)],
         "{codex:#}"
     );
-    assert_eq!(
-        codex["code_mode_output_bytes"],
-        needles.len() + status.len()
-    );
+    let shown = needles.len() + status.len();
+    assert_eq!(codex["code_mode_output_bytes"], shown);
     assert_eq!(codex["repeated_calls"], 1);
     let labels = |route: &str| {
         let groups = codex["groups"].as_array().unwrap();
@@ -240,19 +212,13 @@ fn rollouts_feed_discover_and_stats() {
     );
     assert_eq!(labels("not_supported"), ["git push"]);
 
-    let text = lab.run(&["discover"], None);
-    assert!(
-        text.contains("Codex ran 5 shell command(s) here")
-            && text.contains("2 of them ran inside code-mode scripts")
-            && text.contains("init --hooks --agent codex")
-            && !text.contains("needle"),
-        "{text}"
-    );
-    let stats = lab.json(&["stats", "--json"], None);
+    let text = lab.run("discover", None);
+    has(&text, "Codex ran 5 shell command(s) here");
+    has(&text, "2 of them ran inside code-mode scripts");
+    has(&text, "init --hooks --agent codex");
+    lacks(&text, "needle");
+    let stats = lab.json("stats --json", None);
     assert_eq!(stats["codex"]["commands"], 5, "{stats:#}");
     assert_eq!(stats["codex"]["through_justless_commands"], 1);
-    assert!(
-        lab.run(&["stats"], None)
-            .contains("Codex shell commands here: 5")
-    );
+    has(&lab.run("stats", None), "Codex shell commands here: 5");
 }

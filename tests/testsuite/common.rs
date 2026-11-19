@@ -16,6 +16,23 @@ pub fn words(line: &str) -> Vec<&str> {
     line.split(' ').collect()
 }
 
+/// Runs Git in `root` with a fixed identity and returns its stdout.
+pub fn git(root: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        text(&output.stderr)
+    );
+    text(&output.stdout)
+}
+
 /// Runs `command` with `input` on its stdin and both outputs captured.
 pub fn piped(command: &mut Command, input: &[u8]) -> Output {
     let mut child = command

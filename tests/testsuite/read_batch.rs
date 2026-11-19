@@ -1,15 +1,10 @@
 #![cfg(unix)]
 
 use serde_json::{Value, json};
-use std::{
-    fs,
-    io::Write,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{fs, io::Write, path::Path, process::Command};
 use tempfile::TempDir;
 
-const BIN: &str = env!("CARGO_BIN_EXE_justless");
+use crate::common::{BIN, has, piped, text};
 
 fn native(dir: &Path, script: &str) -> String {
     let output = Command::new("/bin/sh")
@@ -17,11 +12,7 @@ fn native(dir: &Path, script: &str) -> String {
         .current_dir(dir)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
     String::from_utf8(output.stdout).unwrap()
 }
 
@@ -39,26 +30,22 @@ fn hook_in(dir: &Path, cwd: &Path, command: &str, response: Option<Value>) -> Va
     };
     let input = json!({"hook_event_name":event,"tool_name":"Bash","cwd":cwd,"session_id":"batch-test",
         "tool_input":{"command":command},"tool_response":response});
-    let mut child = Command::new(BIN)
-        .args(["--root", dir.to_str().unwrap(), "hook-claude", mode])
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.to_string().as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
+    let mut command = Command::new(BIN);
+    command.args(["--root", dir.to_str().unwrap(), "hook-claude", mode]);
+    let out = piped(command.current_dir(dir), input.to_string().as_bytes());
     assert!(out.status.success());
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
 fn response(text: &str) -> Value {
     json!({"stdout":text,"stderr":"","interrupted":false})
+}
+
+/// The view the post-run hook gives `list` run in `cwd`, if it compacts it.
+fn compacted(dir: &Path, cwd: &Path, list: &str) -> Option<String> {
+    let out = hook_in(dir, cwd, list, Some(response(&native(dir, list))));
+    let view = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"].as_str();
+    view.map(str::to_owned)
 }
 
 fn fixture() -> TempDir {
@@ -73,7 +60,7 @@ fn fixture() -> TempDir {
     fs::write(temp.path().join("part"), "suffix").unwrap();
     native(
         temp.path(),
-        "git init -q && git add big.rs && git -c user.email=a@localhost -c user.name=fixture -c commit.gpgsign=false commit -qm fixture",
+        &format!("git init -q && git add big.rs && {COMMIT} fixture"),
     );
     fs::OpenOptions::new()
         .append(true)
@@ -84,6 +71,9 @@ fn fixture() -> TempDir {
     temp
 }
 
+const COMMIT: &str =
+    "git -c user.email=a@localhost -c user.name=fixture -c commit.gpgsign=false commit -qm";
+
 fn verified(dir: &Path, list: &str, event: Value, expected: &str) -> (String, Value) {
     assert_eq!(hook(dir, list, None), json!({}));
     let result = hook(dir, list, Some(event));
@@ -92,14 +82,10 @@ fn verified(dir: &Path, list: &str, event: Value, expected: &str) -> (String, Va
         .unwrap_or_else(|| panic!("{list} returned {result}"));
     assert_eq!(view.matches("Exact: ").count(), 1);
     assert!(view.len() < expected.len());
-    let id = view
-        .lines()
-        .find(|s| s.starts_with("Exact: "))
-        .unwrap()
-        .split_whitespace()
-        .last()
-        .unwrap();
-    let archived = fs::read(dir.join(".justless/runs").join(id).join("stdout")).unwrap();
+    let exact = view.lines().find(|s| s.starts_with("Exact: ")).unwrap();
+    let id = exact.split_whitespace().last().unwrap();
+    let run = dir.join(".justless/runs").join(id);
+    let archived = fs::read(run.join("stdout")).unwrap();
     assert_eq!(archived, expected.as_bytes());
     let replay = Command::new(BIN)
         .args(["log", id])
@@ -108,10 +94,7 @@ fn verified(dir: &Path, list: &str, event: Value, expected: &str) -> (String, Va
         .unwrap();
     assert!(replay.status.success());
     assert_eq!(replay.stdout, archived);
-    let record = serde_json::from_slice(
-        &fs::read(dir.join(".justless/runs").join(id).join("record.json")).unwrap(),
-    )
-    .unwrap();
+    let record = serde_json::from_slice(&fs::read(run.join("record.json")).unwrap()).unwrap();
     (view.to_owned(), record)
 }
 
@@ -152,7 +135,7 @@ fn mixed_read_list_retains_each_pipeline_and_one_exact_replay() {
     );
     let mut offset = 0;
     for (index, command) in commands.iter().enumerate() {
-        assert!(view.contains(&format!("$ {command} ")));
+        has(&view, &format!("$ {command} "));
         let bytes = native(dir, command);
         let piece = &record["pieces"][index];
         assert_eq!(piece["command_index"], index + 1);
@@ -160,17 +143,14 @@ fn mixed_read_list_retains_each_pipeline_and_one_exact_replay() {
         assert_eq!(piece["first_line"], 1 + raw[..offset].matches('\n').count());
         offset += bytes.len();
         assert_eq!(piece["end_byte"], offset);
-        assert_eq!(
-            piece["last_line"],
-            1 + raw[..offset].matches('\n').count() - usize::from(bytes.ends_with('\n'))
-        );
+        let last = 1 + raw[..offset].matches('\n').count() - usize::from(bytes.ends_with('\n'));
+        assert_eq!(piece["last_line"], last);
     }
     assert_eq!(offset, raw.len());
     assert_eq!(record["raw_bytes"], raw.len());
-    assert_eq!(
-        record["preview_bytes"].as_u64().unwrap() + record["footer_bytes"].as_u64().unwrap(),
-        view.len() as u64
-    );
+    let shown =
+        record["preview_bytes"].as_u64().unwrap() + record["footer_bytes"].as_u64().unwrap();
+    assert_eq!(shown, view.len() as u64);
     // Each file piece is recorded as the single-file read records it: lines
     // shown in full as read, an outline or a column cut as an outline.
     let mut reads = resume_reads(dir);
@@ -187,14 +167,8 @@ fn mixed_read_list_retains_each_pipeline_and_one_exact_replay() {
     );
     fs::write(dir.join("notes"), "alpha\nbeta\n").unwrap();
     let stale = resume_reads(dir);
-    assert_eq!(
-        stale
-            .iter()
-            .filter(|r| r.ends_with(" [source changed]"))
-            .count(),
-        2,
-        "{stale:?}"
-    );
+    let changed = stale.iter().filter(|r| r.ends_with(" [source changed]"));
+    assert_eq!(changed.count(), 2, "{stale:?}");
     assert!(stale.contains(&"Read notes:2-2 [source changed]".to_owned()));
 }
 
@@ -208,7 +182,7 @@ fn status_and_short_circuit_order_are_preserved() {
     event["returnCodeInterpretation"] = json!("No matches found");
     let (view, record) = verified(dir, list, event, raw.trim_end_matches('\n'));
     assert!(!view.contains("cat absent"));
-    assert!(view.contains("git show HEAD:big.rs"));
+    has(&view, "git show HEAD:big.rs");
     assert_eq!(record["status"], 1);
     assert_eq!(record["pieces"][1]["command_index"], 3);
     assert!(record["pieces"][3]["first_line"].is_null());
@@ -233,29 +207,39 @@ fn persisted_output_keeps_its_native_bytes_and_client_preview_baseline() {
 }
 
 #[test]
-fn unsupported_mismatched_and_small_batches_leave_no_run() {
+fn unsupported_mismatched_and_unverifiable_batches_leave_no_run() {
     let temp = fixture();
     let dir = temp.path();
     let list = "cat big.rs; tail -1 notes";
     let raw = native(dir, list);
+    let hosts = native(dir, "cd / && sed -n '1,3p' etc/hosts");
     fs::write(dir.join("notes"), "different\n").unwrap();
+    let ambiguous = "cat big.rs | head -300 && tail -1 notes";
     for (list, body) in [
-        (list, raw.clone()),
+        (list, &raw),
         (
             "head -1 notes; tail -1 notes",
-            native(dir, "head -1 notes; tail -1 notes"),
+            &native(dir, "head -1 notes; tail -1 notes"),
         ),
-        ("cat big.rs; echo hello", raw.clone()),
-        ("cat big.rs; cut -c 1-2 < notes", raw.clone()),
-        ("cat big.rs; git diff --output=unexpected", raw.clone()),
-        (
-            "cat big.rs; grep -n value big.rs --color=always",
-            raw.clone(),
-        ),
-        ("cat big.rs; cat ../outside", raw),
+        ("cat big.rs; echo hello", &raw),
+        ("cat big.rs; cut -c 1-2 < notes", &raw),
+        ("cat big.rs; git diff --output=unexpected", &raw),
+        ("cat big.rs; grep -n value big.rs --color=always", &raw),
+        ("cat big.rs; cat ../outside", &raw),
+        // A `cd` outside the workspace, or back out of it.
+        ("cd / && sed -n '1,3p' etc/hosts", &hosts),
+        ("cd ../.. && sed -n '1,3p' big.rs", &hosts),
+        // A pipe's status is unknown, so the list's short circuit is too.
+        (ambiguous, &native(dir, ambiguous)),
     ] {
-        assert_eq!(hook(dir, list, Some(response(&body))), json!({}), "{list}");
+        assert_eq!(hook(dir, list, Some(response(body))), json!({}), "{list}");
     }
+    // The recheck never runs an external diff program.
+    native(dir, "git config diff.external 'touch external-ran'");
+    let simulated = fs::read_to_string(dir.join("big.rs")).unwrap() + "custom diff\n";
+    let list = "cat big.rs; git diff";
+    assert_eq!(hook(dir, list, Some(response(&simulated))), json!({}));
+    assert!(!dir.join("external-ran").exists());
     assert!(!dir.join(".justless/runs").exists());
     assert!(resume_reads(dir).is_empty());
     assert!(!dir.join("unexpected").exists());
@@ -267,14 +251,13 @@ fn filters_and_quoted_operators_apply_before_accounting() {
     let dir = temp.path();
     fs::write(dir.join("a; b"), "δ beta\n").unwrap();
     // Use real rg where installed. grep supplies the same numbered shape on machines without rg.
-    let search = if [
+    let installed = [
         "/usr/bin/rg",
         "/opt/homebrew/bin/rg",
         "/usr/local/bin/rg",
         "/bin/rg",
-    ]
-    .iter()
-    .any(|p| Path::new(p).is_file())
+    ];
+    let search = if installed.iter().any(|p| Path::new(p).is_file())
         && Command::new("rg").arg("--version").output().is_ok()
     {
         "rg"
@@ -320,23 +303,6 @@ fn diff_uses_global_line_pointers_without_touching_the_real_index() {
 }
 
 #[test]
-fn recheck_skips_external_git_diff_and_ambiguous_pipe_status() {
-    let temp = fixture();
-    let dir = temp.path();
-    let list = "cat big.rs; git diff";
-    native(dir, "git config diff.external 'touch external-ran'");
-    let simulated = fs::read_to_string(dir.join("big.rs")).unwrap() + "custom diff\n";
-    assert_eq!(hook(dir, list, Some(response(&simulated))), json!({}));
-    assert!(!dir.join("external-ran").exists());
-    let list = "cat big.rs | head -300 && tail -1 notes";
-    assert_eq!(
-        hook(dir, list, Some(response(&native(dir, list)))),
-        json!({})
-    );
-    assert!(!dir.join(".justless/runs").exists());
-}
-
-#[test]
 fn wrappers_are_looked_through_before_compacting() {
     let temp = fixture();
     let dir = temp.path();
@@ -351,12 +317,8 @@ fn wrappers_are_looked_through_before_compacting() {
         "cat big.rs",
         "sed -n '1,300p' big.rs | head -200",
     ] {
-        let raw = native(dir, command);
-        let out = hook(dir, command, Some(response(&raw)));
-        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-            .as_str()
-            .unwrap_or("");
-        assert!(shown.contains("big.rs"), "{command}: {out}");
+        let shown = compacted(dir, dir, command).unwrap_or_default();
+        assert!(shown.contains("big.rs"), "{command}: {shown}");
     }
 }
 
@@ -366,38 +328,18 @@ fn cd_lists_compact_in_their_directory() {
     let dir = temp.path();
     fs::create_dir(dir.join("sub")).unwrap();
     fs::copy(dir.join("big.rs"), dir.join("sub/big.rs")).unwrap();
-    for args in [
-        vec!["add", "sub/big.rs"],
-        vec![
-            "-c",
-            "user.email=a@b",
-            "-c",
-            "user.name=x",
-            "commit",
-            "-qm",
-            "sub",
-        ],
-    ] {
-        assert!(
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
+    native(dir, &format!("git add sub/big.rs && {COMMIT} sub"));
     // A `cd` before one read is the single-file read; this list has two pieces.
     let list = "cd sub && sed -n '1,600p' big.rs && tail -n 1 big.rs";
     let raw = native(dir, list);
     let (view, record) = verified(dir, list, response(&raw), &raw);
-    assert!(view.contains("function add_"), "{view}");
+    has(&view, "function add_");
     assert_eq!(record["pieces"][0]["command_index"], 1);
 
     let list = "cd sub; sed -n '1,600p' big.rs";
     let raw = native(dir, list);
     let (view, _) = verified(dir, list, response(&raw), &raw);
-    assert!(view.contains("function add_"), "{view}");
+    has(&view, "function add_");
 
     // Claude Code's main session keeps the `cd`, so it reports the directory
     // the list entered rather than the one it started from.
@@ -405,32 +347,10 @@ fn cd_lists_compact_in_their_directory() {
         "cd sub && sed -n '1,600p' big.rs",
         "cd ./sub && sed -n '1,600p' big.rs",
     ] {
-        let raw = native(dir, list);
-        let out = hook_in(dir, &dir.join("sub"), list, Some(response(&raw)));
-        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{list} stayed raw"));
-        assert!(shown.contains("sub/big.rs lines 1-600"), "{shown}");
+        let shown = compacted(dir, &dir.join("sub"), list);
+        let shown = shown.unwrap_or_else(|| panic!("{list} stayed raw"));
+        has(&shown, "sub/big.rs lines 1-600");
     }
-}
-
-#[test]
-fn a_cd_outside_the_workspace_or_backtracking_stays_raw() {
-    let temp = fixture();
-    let dir = temp.path();
-    let raw = native(dir, "cd / && sed -n '1,3p' etc/hosts");
-    assert_eq!(
-        hook(dir, "cd / && sed -n '1,3p' etc/hosts", Some(response(&raw))),
-        json!({})
-    );
-    assert_eq!(
-        hook(
-            dir,
-            "cd ../.. && sed -n '1,3p' big.rs",
-            Some(response(&raw))
-        ),
-        json!({})
-    );
 }
 
 #[test]
@@ -445,11 +365,7 @@ fn a_cd_the_shell_may_skip_never_moves_later_reads() {
         "grep -n alpha notes || cd sub; sed -n '1,600p' big.rs",
         "grep -n absent notes && cd sub; sed -n '1,600p' big.rs",
     ] {
-        let raw = native(dir, command);
-        let out = hook(dir, command, Some(response(&raw)));
-        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-            .as_str()
-            .unwrap_or("");
+        let shown = compacted(dir, dir, command).unwrap_or_default();
         assert!(!shown.contains("sub/big.rs"), "{command}: {shown}");
     }
 }
@@ -474,10 +390,8 @@ fn a_batch_the_recheck_cannot_verify_still_gets_the_ordinary_report() {
         "git diff | head -400",
     ] {
         let raw = native(dir, command);
-        let out = hook(dir, command, Some(response(&raw)));
-        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{command} stayed raw"));
+        let shown = compacted(dir, dir, command);
+        let shown = shown.unwrap_or_else(|| panic!("{command} stayed raw"));
         assert!(shown.len() < raw.len(), "{command}: {shown}");
         assert!(shown.contains("diff section(s)"), "{command}: {shown}");
     }
@@ -490,22 +404,19 @@ fn git_show_pieces_outline_the_blob_at_their_revision() {
     // HEAD~1 holds the first big.rs, the index a renamed copy and the disk a third.
     native(
         dir,
-        "git -c user.email=a@localhost -c user.name=fixture -c commit.gpgsign=false commit -qam second \
-         && sed 's/add_/staged_/' big.rs > staged && mv staged big.rs && git add big.rs \
-         && sed 's/staged_/disk_/' big.rs > disk && mv disk big.rs",
+        &format!(
+            "{COMMIT} second -a && sed 's/add_/staged_/' big.rs > staged && mv staged big.rs \
+             && git add big.rs && sed 's/staged_/disk_/' big.rs > disk && mv disk big.rs"
+        ),
     );
     let list =
         "git show HEAD~1:big.rs | sed -n '1,400p'; git show :big.rs | head -2; tail -1 notes";
     let raw = native(dir, list);
     let (view, _) = verified(dir, list, response(&raw), &raw);
-    assert!(
-        view.contains("HEAD~1:big.rs lines 1-400\n") && view.contains("function add_000"),
-        "{view}"
-    );
-    assert!(
-        view.contains("pub fn staged_000") && !view.contains("disk_"),
-        "{view}"
-    );
+    has(&view, "HEAD~1:big.rs lines 1-400\n");
+    has(&view, "function add_000");
+    has(&view, "pub fn staged_000");
+    assert!(!view.contains("disk_"), "{view}");
     // A blob shows a revision, not the working file.
     assert_eq!(resume_reads(dir), ["Read notes:2-2"]);
 }

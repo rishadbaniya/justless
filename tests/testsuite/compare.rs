@@ -6,20 +6,11 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(["-c", "user.email=qa@example.com", "-c", "user.name=qa"])
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "git {args:?}: {}", stderr(&output));
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
+use crate::common::{BIN, git, has, lacks, text, words};
 
 /// Runs Justless with its own temporary directory, to check what is left there.
 fn cli(root: &Path, temp: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_justless"))
+    Command::new(BIN)
         .args(args)
         .current_dir(root)
         .env("CARGO_TARGET_DIR", root.join("target"))
@@ -28,23 +19,30 @@ fn cli(root: &Path, temp: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 /// The temporary worktree is gone from the disk and from Git.
 fn assert_clean(root: &Path, temp: &Path) {
-    assert_eq!(
-        fs::read_dir(temp).unwrap().count(),
-        0,
-        "temporary files left"
-    );
+    let left = fs::read_dir(temp).unwrap().count();
+    assert_eq!(left, 0, "temporary files left");
     let worktrees = git(root, &["worktree", "list", "--porcelain"]);
     assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+}
+
+/// `main` with the base files, then `feature` with the branch files.
+fn repository(root: &Path, base: &[(&str, &str)], branch: &[(&str, &str)]) {
+    let commit = |files: &[(&str, &str)], message: &str| {
+        for (file, contents) in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", message]);
+    };
+    git(root, &["init", "-q"]);
+    commit(base, "base");
+    git(root, &["branch", "-M", "main"]);
+    git(root, &["checkout", "-qb", "feature"]);
+    commit(branch, "branch");
 }
 
 const BASE_LIB: &str = r#"pub fn value() -> i32 { 1 }
@@ -89,53 +87,31 @@ mod tests {
 fn cargo_failures_are_grouped_against_the_merge_base() {
     let repo = TempDir::new().unwrap();
     let temp = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"shop\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(root.join(".gitignore"), "target\n").unwrap();
-    fs::create_dir(root.join("src")).unwrap();
-    fs::write(root.join("src/lib.rs"), BASE_LIB).unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "base"]);
-    git(root, &["branch", "-M", "main"]);
-    git(root, &["checkout", "-qb", "feature"]);
-    fs::write(root.join("src/lib.rs"), BRANCH_LIB).unwrap();
-    git(root, &["commit", "-qam", "branch"]);
-
-    let unknown = cli(root, temp.path(), &["test", "--compare", "nope"]);
-    assert_eq!(unknown.status.code(), Some(2));
-    assert!(
-        stderr(&unknown).contains("--compare nope: no such commit"),
-        "{}",
-        stderr(&unknown)
-    );
-
-    let command = [
-        "test",
-        "--compare",
-        "main",
-        "--",
-        "cargo",
-        "test",
-        "--offline",
+    let (root, temp) = (repo.path(), temp.path());
+    let manifest = "[package]\nname = \"shop\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    let base = [
+        ("Cargo.toml", manifest),
+        (".gitignore", "target\n"),
+        ("src/lib.rs", BASE_LIB),
     ];
-    let compared = cli(root, temp.path(), &command);
-    let (out, err) = (stdout(&compared), stderr(&compared));
+    repository(root, &base, &[("src/lib.rs", BRANCH_LIB)]);
+
+    let unknown = cli(root, temp, &words("test --compare nope"));
+    assert_eq!(unknown.status.code(), Some(2));
+    has(&text(&unknown.stderr), "--compare nope: no such commit");
+
+    let compared = cli(
+        root,
+        temp,
+        &words("test --compare main -- cargo test --offline"),
+    );
+    let (out, err) = (text(&compared.stdout), text(&compared.stderr));
     // The working tree's exit status, unchanged.
     assert_eq!(compared.status.code(), Some(101), "{out}\n{err}");
-    assert!(
-        out.contains("failures compared with main (merge-base "),
-        "{out}"
-    );
-    assert!(
-        out.contains(
-            "temporary worktree: cargo test --offline --no-fail-fast -- --exact <4 test names>"
-        ),
-        "{out}"
+    has(&out, "failures compared with main (merge-base ");
+    has(
+        &out,
+        "temporary worktree: cargo test --offline --no-fail-fast -- --exact <4 test names>",
     );
     for line in [
         "reran 4 tests failing here by exact name at the base",
@@ -146,22 +122,14 @@ fn cargo_failures_are_grouped_against_the_merge_base() {
         "tests::changed · base: assertion `left == right` failed left: 1 right: 10",
         "Already failing at the base, same message (1): tests::old_bug",
     ] {
-        assert!(err.contains(line), "missing {line:?} in\n{err}");
+        has(&err, line);
     }
-    assert_clean(root, temp.path());
+    assert_clean(root, temp);
     // The base built in its own target directory, never the working tree's.
     assert!(root.join(".justless/compare/cargo-target").is_dir());
-    let id = err
-        .split_once("[justless ")
-        .unwrap()
-        .1
-        .split_once(']')
-        .unwrap()
-        .0;
-    let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.join(".justless/runs").join(id).join("compare.json")).unwrap(),
-    )
-    .unwrap();
+    let id = crate::common::run_id(&compared);
+    let record = fs::read(root.join(".justless/runs").join(id).join("compare.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
     assert_eq!(record["ref"], "main");
     let groups: Vec<(&str, &str)> = record["tests"]
         .as_array()
@@ -180,7 +148,7 @@ fn cargo_failures_are_grouped_against_the_merge_base() {
     );
 
     // A worktree an interrupted comparison left behind goes with the next one.
-    let stale = temp.path().join("justless-compare-stale");
+    let stale = temp.join("justless-compare-stale");
     fs::create_dir(&stale).unwrap();
     let owner = root.canonicalize().unwrap().join(".justless/compare");
     fs::write(stale.join("owner"), owner.to_string_lossy().as_bytes()).unwrap();
@@ -197,58 +165,25 @@ fn cargo_failures_are_grouped_against_the_merge_base() {
         ],
     );
     // Without captured output there is no message to compare.
-    let uncaptured = cli(
-        root,
-        temp.path(),
-        &[
-            "test",
-            "--compare",
-            "main",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-            "--",
-            "--nocapture",
-        ],
-    );
+    let line = "test --compare main -- cargo test --offline -- --nocapture";
+    let uncaptured = cli(root, temp, &words(line));
     assert_eq!(uncaptured.status.code(), Some(101));
-    let err = stderr(&uncaptured);
-    assert!(
-        err.contains(
-            "Failing at the base too, no message to compare (2): tests::changed, tests::old_bug"
-        ),
-        "{err}"
+    has(
+        &text(&uncaptured.stderr),
+        "Failing at the base too, no message to compare (2): tests::changed, tests::old_bug",
     );
-    assert_clean(root, temp.path());
+    assert_clean(root, temp);
 
     // Nothing failed, so nothing runs at the base.
-    let passing = cli(
-        root,
-        temp.path(),
-        &[
-            "test",
-            "--compare",
-            "main",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-            "stable",
-        ],
+    let line = "test --compare main -- cargo test --offline stable";
+    let passing = cli(root, temp, &words(line));
+    assert_eq!(passing.status.code(), Some(0), "{}", text(&passing.stderr));
+    lacks(&text(&passing.stdout), "Run at main");
+    has(
+        &text(&passing.stderr),
+        "no test failed, so nothing ran at the base.",
     );
-    assert_eq!(passing.status.code(), Some(0), "{}", stderr(&passing));
-    assert!(
-        !stdout(&passing).contains("Run at main"),
-        "{}",
-        stdout(&passing)
-    );
-    assert!(
-        stderr(&passing).contains("no test failed, so nothing ran at the base."),
-        "{}",
-        stderr(&passing)
-    );
-    assert_clean(root, temp.path());
+    assert_clean(root, temp);
 
     // A base that does not build cannot group anything, and says so.
     git(root, &["checkout", "-qb", "broken", "main"]);
@@ -257,112 +192,91 @@ fn cargo_failures_are_grouped_against_the_merge_base() {
     git(root, &["checkout", "-qb", "fixed"]);
     fs::write(root.join("src/lib.rs"), BRANCH_LIB).unwrap();
     git(root, &["commit", "-qam", "fixed"]);
-    let command = [
-        "test",
-        "--compare",
-        "broken",
-        "--",
-        "cargo",
-        "test",
-        "--offline",
-    ];
-    let unbuilt = cli(root, temp.path(), &command);
-    assert_eq!(unbuilt.status.code(), Some(101));
-    let err = stderr(&unbuilt);
-    assert!(
-        err.contains("the base run reported no test result, exit 101 (error")
-            && err.contains("failures are not grouped"),
-        "{err}"
+    let unbuilt = cli(
+        root,
+        temp,
+        &words("test --compare broken -- cargo test --offline"),
     );
-    assert!(!err.contains("New failures"), "{err}");
-    assert_clean(root, temp.path());
+    assert_eq!(unbuilt.status.code(), Some(101));
+    let err = text(&unbuilt.stderr);
+    has(
+        &err,
+        "the base run reported no test result, exit 101 (error",
+    );
+    has(&err, "failures are not grouped");
+    lacks(&err, "New failures");
+    assert_clean(root, temp);
 }
 
 #[cfg(unix)]
 #[test]
 fn pytest_node_ids_compare_and_other_runners_are_unsupported() {
-    use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
     let temp = TempDir::new().unwrap();
     let tools = TempDir::new().unwrap();
-    let root = repo.path();
+    let (root, temp) = (repo.path(), temp.path());
     // A stand-in for pytest: it reports what the checkout's `results` file says
     // and logs its arguments outside the repository.
     let log = tools.path().join("args.log");
     let pytest = tools.path().join("pytest");
-    fs::write(
-        &pytest,
-        format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\ncat results\nexit \"$(cat status)\"\n",
-            log.display()
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> '{}'\ncat results\nexit \"$(cat status)\"\n",
+        log.display()
+    );
+    crate::common::executable(&pytest, &script);
+    let base = [
+        ("tests/test_a.py", ""),
+        (
+            "results",
+            "PASSED tests/test_a.py::test_breaks\nFAILED tests/test_a.py::test_old - assert 1 == 2\n1 failed, 1 passed in 0.10s\n",
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&pytest, fs::Permissions::from_mode(0o700)).unwrap();
-    git(root, &["init", "-q"]);
-    fs::create_dir(root.join("tests")).unwrap();
-    fs::write(root.join("tests/test_a.py"), "").unwrap();
-    fs::write(
-        root.join("results"),
-        "PASSED tests/test_a.py::test_breaks\nFAILED tests/test_a.py::test_old - assert 1 == 2\n1 failed, 1 passed in 0.10s\n",
-    )
-    .unwrap();
-    fs::write(root.join("status"), "1\n").unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "base"]);
-    git(root, &["branch", "-M", "main"]);
-    git(root, &["checkout", "-qb", "feature"]);
-    fs::write(root.join("tests/test_b.py"), "").unwrap();
-    fs::write(
-        root.join("results"),
-        "FAILED tests/test_a.py::test_breaks - assert 3 == 4\nFAILED tests/test_a.py::test_old - assert 1 == 2\nFAILED tests/test_b.py::test_new - RuntimeError: boom\n3 failed in 0.10s\n",
-    )
-    .unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "branch"]);
+        ("status", "1\n"),
+    ];
+    let branch = [
+        ("tests/test_b.py", ""),
+        (
+            "results",
+            "FAILED tests/test_a.py::test_breaks - assert 3 == 4\nFAILED tests/test_a.py::test_old - assert 1 == 2\nFAILED tests/test_b.py::test_new - RuntimeError: boom\n3 failed in 0.10s\n",
+        ),
+    ];
+    repository(root, &base, &branch);
 
-    let program = pytest.to_str().unwrap();
     let compared = cli(
         root,
-        temp.path(),
-        &["test", "--compare", "main", "--", program],
+        temp,
+        &["test", "--compare", "main", "--", pytest.to_str().unwrap()],
     );
-    let err = stderr(&compared);
+    let err = text(&compared.stderr);
     assert_eq!(compared.status.code(), Some(1), "{err}");
     for line in [
         "New failures, passing at the base (1): tests/test_a.py::test_breaks",
         "no result at the base (added or renamed since?) (1): tests/test_b.py::test_new",
         "Already failing at the base, same message (1): tests/test_a.py::test_old",
     ] {
-        assert!(err.contains(line), "missing {line:?} in\n{err}");
+        has(&err, line);
     }
     // The base ran only the failing node IDs whose file exists there.
     let args = fs::read_to_string(&log).unwrap();
-    let base = args.lines().nth(1).unwrap();
     assert_eq!(
-        base,
+        args.lines().nth(1).unwrap(),
         "-rA --maxfail=0 tests/test_a.py::test_breaks tests/test_a.py::test_old"
     );
-    assert_clean(root, temp.path());
+    assert_clean(root, temp);
 
-    let other = cli(
-        root,
-        temp.path(),
-        &[
-            "test",
-            "--compare",
-            "main",
-            "--",
-            "sh",
-            "-c",
-            "echo broken; exit 3",
-        ],
-    );
+    let other = [
+        "test",
+        "--compare",
+        "main",
+        "--",
+        "sh",
+        "-c",
+        "echo broken; exit 3",
+    ];
+    let other = cli(root, temp, &other);
     assert_eq!(other.status.code(), Some(3));
-    assert!(
-        stderr(&other).contains("not supported for command; nothing ran at the base."),
-        "{}",
-        stderr(&other)
+    has(
+        &text(&other.stderr),
+        "not supported for command; nothing ran at the base.",
     );
-    assert_clean(root, temp.path());
+    assert_clean(root, temp);
 }

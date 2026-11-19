@@ -4,7 +4,10 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use serde_json::{Value, json};
 use tempfile::TempDir;
+
+use crate::common::{BIN, git, has, piped, run_id, starts, text, words};
 
 fn workspace(settings: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
@@ -13,7 +16,7 @@ fn workspace(settings: &str) -> TempDir {
 }
 
 fn justless(root: &Path, args: &[&str]) -> Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+    let output = Command::new(BIN)
         .args(args)
         .current_dir(root)
         .output()
@@ -22,19 +25,9 @@ fn justless(root: &Path, args: &[&str]) -> Output {
     output
 }
 
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// The run named by the footer on stderr.
-fn run_id(output: &Output) -> String {
-    let stderr = text(&output.stderr);
-    let start = stderr.find("[justless run-").expect("run marker") + "[justless ".len();
-    stderr[start..]
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-        .next()
-        .unwrap()
-        .to_owned()
+/// The stdout of `line`, split at spaces into arguments.
+fn stdout(root: &Path, line: &str) -> String {
+    text(&justless(root, &words(line)).stdout)
 }
 
 #[test]
@@ -64,23 +57,20 @@ fn json_output_is_shown_as_tables_that_log_reverses() {
         let root = dir.path();
         fs::write(root.join("data.json"), &json).unwrap();
         // A hook-routed command reaches the agent directly.
-        let output = justless(root, &["run", "--hook", "--", "cat", "data.json"]);
+        let output = justless(root, &words("run --hook -- cat data.json"));
         let shown = text(&output.stdout);
-        assert!(shown.starts_with("[JSON array as a table: "), "{shown}");
+        starts(&shown, "[JSON array as a table: ");
         assert!(shown.contains(header) && shown.contains(first), "{shown}");
         assert!(shown.len() < json.len() / 2, "{shown}");
-        let log = justless(root, &["log", &run_id(&output)]);
-        assert_eq!(text(&log.stdout), json);
+        assert_eq!(stdout(root, &format!("log {}", run_id(&output))), json);
         // A typed run that fits could feed a pipe, so it stays verbatim.
-        let typed = justless(root, &["run", "--fresh", "--", "cat", "data.json"]);
-        assert_eq!(text(&typed.stdout), json);
+        assert_eq!(stdout(root, "run --fresh -- cat data.json"), json);
     }
 }
 
 #[cfg(unix)]
 #[test]
 fn json_reads_stay_exact_when_they_fit_unless_compact_json_is_smaller() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = workspace("");
     let root = dir.path();
     // A Secret in one line, whose base64 the floor would cut, and a pretty-printed
@@ -89,7 +79,7 @@ fn json_reads_stay_exact_when_they_fit_unless_compact_json_is_smaller() {
     let secret = format!(
         "{{\"apiVersion\":\"v1\",\"data\":{{\"tls.crt\":\"{base64}\"}},\"kind\":\"Secret\"}}\n"
     );
-    let deployment = serde_json::json!({"apiVersion": "apps/v1", "kind": "Deployment",
+    let deployment = json!({"apiVersion": "apps/v1", "kind": "Deployment",
         "metadata": {"name": "api", "labels": {"app": "ledger", "tier": "api"}},
         "spec": {"replicas": 3, "selector": {"matchLabels": {"app": "ledger"}},
             "template": {"spec": {"containers": [{"name": "api", "image": "ledger:1.4"}]}}},
@@ -99,36 +89,31 @@ fn json_reads_stay_exact_when_they_fit_unless_compact_json_is_smaller() {
     fs::write(root.join("deploy.json"), &pretty).unwrap();
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
-    let kubectl = bin.join("kubectl");
-    fs::write(&kubectl, "#!/bin/sh\ncat \"$2.json\"\n").unwrap();
-    fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
+    crate::common::executable(&bin.join("kubectl"), "#!/bin/sh\ncat \"$2.json\"\n");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let run = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-            .args(args)
+    let run = |line: &str| {
+        let mut command = Command::new(BIN);
+        command
+            .args(words(line))
             .current_dir(root)
-            .env("PATH", &path)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{args:?}: {output:?}");
+            .env("PATH", &path);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{line}: {output:?}");
         output
     };
-    let hook = |kind: &str| run(&["run", "--hook", "--", "kubectl", "get", kind, "-o", "json"]);
-    let output = hook("secret");
+    let output = run("run --hook -- kubectl get secret -o json");
     assert_eq!(text(&output.stdout), secret);
     assert_eq!(text(&output.stderr), "");
-    let output = hook("deploy");
+    let output = run("run --hook -- kubectl get deploy -o json");
     let compact = serde_json::to_string(&deployment).unwrap();
     assert_eq!(
         text(&output.stdout),
         format!("[JSON without its whitespace; exact JSON in the full log]\n{compact}\n")
     );
-    let log = run(&["log", &run_id(&output)]);
+    let log = run(&format!("log {}", run_id(&output)));
     assert_eq!(text(&log.stdout), pretty);
     // A typed run that fits could feed a pipe, so it stays verbatim.
-    let typed = run(&[
-        "run", "--fresh", "--", "kubectl", "get", "deploy", "-o", "json",
-    ]);
+    let typed = run("run --fresh -- kubectl get deploy -o json");
     assert_eq!(text(&typed.stdout), pretty);
 }
 
@@ -141,10 +126,8 @@ fn compact_json_too_long_to_cut_gives_way_to_tables() {
         .collect();
     let ports: Vec<String> = (0..6)
         .map(|i| {
-            format!(
-                "    {{\"name\": \"port-{i}\", \"port\": {}, \"protocol\": \"TCP\"}}",
-                8000 + i
-            )
+            let port = 8000 + i;
+            format!("    {{\"name\": \"port-{i}\", \"port\": {port}, \"protocol\": \"TCP\"}}")
         })
         .collect();
     members.push(format!("  \"ports\": [\n{}\n  ]", ports.join(",\n")));
@@ -152,28 +135,10 @@ fn compact_json_too_long_to_cut_gives_way_to_tables() {
     let dir = workspace("");
     let root = dir.path();
     fs::write(root.join("data.json"), &json).unwrap();
-    let output = justless(
-        root,
-        &[
-            "run",
-            "--hook",
-            "--max-bytes",
-            "2048",
-            "--",
-            "cat",
-            "data.json",
-        ],
-    );
-    let shown = text(&output.stdout);
-    assert!(
-        shown.starts_with("[JSON object with arrays of objects as tables: "),
-        "{shown}"
-    );
-    assert!(shown.contains("\"note 00\": \"value 0"), "{shown}");
-    assert!(
-        shown.contains(" more lines of this view in the full log]\n"),
-        "{shown}"
-    );
+    let shown = stdout(root, "run --hook --max-bytes 2048 -- cat data.json");
+    starts(&shown, "[JSON object with arrays of objects as tables: ");
+    has(&shown, "\"note 00\": \"value 0");
+    has(&shown, " more lines of this view in the full log]\n");
 }
 
 #[test]
@@ -193,65 +158,33 @@ fn previews_collapse_progress_encoded_runs_and_repeats() {
         &blob[..12],
         &blob[788..]
     );
-    let output = justless(root, &["run", "--hook", "--", "cat", "noisy.txt"]);
+    let output = justless(root, &words("run --hook -- cat noisy.txt"));
     assert_eq!(text(&output.stdout), floored);
-    let log = justless(root, &["log", &run_id(&output)]);
-    assert_eq!(text(&log.stdout), noisy);
+    assert_eq!(stdout(root, &format!("log {}", run_id(&output))), noisy);
     // A typed run that fits could feed a pipe, so it stays verbatim, but a clipped
     // one folds its head and tail.
-    let typed = justless(root, &["run", "--fresh", "--", "cat", "noisy.txt"]);
-    assert_eq!(text(&typed.stdout), noisy);
-    let clipped = justless(
-        root,
-        &[
-            "run",
-            "--fresh",
-            "--max-bytes",
-            "1024",
-            "--",
-            "cat",
-            "noisy.txt",
-        ],
+    assert_eq!(stdout(root, "run --fresh -- cat noisy.txt"), noisy);
+    let shown = stdout(root, "run --fresh --max-bytes 1024 -- cat noisy.txt");
+    starts(
+        &shown,
+        "100% [101 earlier progress frame(s) cut]\nwaiting\n[last line repeated 199",
     );
-    let shown = text(&clipped.stdout);
-    assert!(
-        shown.starts_with(
-            "100% [101 earlier progress frame(s) cut]\nwaiting\n[last line repeated 199"
-        ),
-        "{shown}"
-    );
-    assert!(
-        shown.contains("error: kept\nerror: kept\nkey Qmx9"),
-        "{shown}"
-    );
+    has(&shown, "error: kept\nerror: kept\nkey Qmx9");
 }
 
 /// The Claude Code post-run hook's rewrite of a successful Bash result, if any.
 fn after_bash(root: &Path, command: &str, stdout: &str) -> Option<String> {
-    use std::io::Write;
-    let input = serde_json::json!({
+    let input = json!({
         "hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": "s",
         "cwd": root, "tool_input": {"command": command},
         "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false, "isImage": false},
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["hook-claude", "after-bash"])
-        .current_dir(root)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.to_string().as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-        .as_str()
-        .map(str::to_owned)
+    let mut hook = Command::new(BIN);
+    hook.args(["hook-claude", "after-bash"]).current_dir(root);
+    let output = piped(&mut hook, input.to_string().as_bytes());
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let view = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"].as_str();
+    view.map(str::to_owned)
 }
 
 #[cfg(unix)]
@@ -261,25 +194,20 @@ fn the_post_run_hook_floors_large_output_of_unknown_commands() {
     let root = dir.path().canonicalize().unwrap();
     let issues: Vec<String> = (0..200)
         .map(|i| {
-            format!(
-                r#"{{"number":{i},"state":"open","title":"Issue {i}","user":{{"login":"u{}"}}}}"#,
-                i % 3
-            )
+            let login = i % 3;
+            format!(r#"{{"number":{i},"state":"open","title":"Issue {i}","user":{{"login":"u{login}"}}}}"#)
         })
         .collect();
     let issues = format!("[{}]\n", issues.join(","));
     let progress = format!("{}done\n", "waiting for the build\n".repeat(600));
+    let repeated = "waiting for the build\n[last line repeated 599 more time(s)]\ndone\n";
     for (command, stdout, shown) in [
         (
             "gh api repos/acme/widget/issues",
             issues.as_str(),
             Some("[JSON array as a table: "),
         ),
-        (
-            "python3 build.py",
-            progress.as_str(),
-            Some("waiting for the build\n[last line repeated 599 more time(s)]\ndone\n"),
-        ),
+        ("python3 build.py", progress.as_str(), Some(repeated)),
         // Output an agent may edit or copy, and short output, stay whole.
         ("strings build.bin", progress.as_str(), None),
         ("python3 build.py", &progress[..6000], None),
@@ -287,35 +215,18 @@ fn the_post_run_hook_floors_large_output_of_unknown_commands() {
         ("python3 build.py | tail -n 700", progress.as_str(), None),
     ] {
         let rewritten = after_bash(&root, command, stdout);
-        match shown {
-            Some(start) => {
-                let compacted = rewritten.unwrap_or_else(|| panic!("{command} was not compacted"));
-                assert!(compacted.starts_with(start), "{command}: {compacted}");
-                assert!(compacted.len() < stdout.len() / 2, "{command}: {compacted}");
-                let id = compacted
-                    .rsplit_once("[justless ")
-                    .unwrap()
-                    .1
-                    .split(' ')
-                    .next()
-                    .unwrap();
-                let log = justless(&root, &["log", id]);
-                assert_eq!(text(&log.stdout), stdout);
-            }
-            None => assert_eq!(rewritten, None, "{command}"),
-        }
+        let Some(start) = shown else {
+            assert_eq!(rewritten, None, "{command}");
+            continue;
+        };
+        let compacted = rewritten.unwrap_or_else(|| panic!("{command} was not compacted"));
+        assert!(compacted.starts_with(start), "{command}: {compacted}");
+        assert!(compacted.len() < stdout.len() / 2, "{command}: {compacted}");
+        let id = compacted.rsplit_once("[justless ").unwrap().1;
+        let id = id.split(' ').next().unwrap();
+        let log = justless(&root, &["log", id]);
+        assert_eq!(text(&log.stdout), stdout);
     }
-}
-
-fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "git {args:?}: {output:?}");
-    text(&output.stdout)
 }
 
 /// A Cargo.lock holding `(name, version, checksum, dependencies)` packages.
@@ -340,12 +251,13 @@ fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
         let names: Vec<String> = (0..40).map(|i| format!("pkg{i}")).collect();
         let mut packages = head.to_vec();
         packages.extend(names.iter().enumerate().map(|(i, name)| {
-            let version = if updated && i % 5 == 0 {
-                "1.0.1"
-            } else {
-                "1.0.0"
-            };
-            (name.as_str(), version, "00", "")
+            let bumped = updated && i % 5 == 0;
+            (
+                name.as_str(),
+                if bumped { "1.0.1" } else { "1.0.0" },
+                "00",
+                "",
+            )
         }));
         lockfile(&packages)
     };
@@ -372,7 +284,7 @@ fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
     let summary = "Cargo.lock dependencies: 1 added, 9 updated, 1 with changed dependencies, 1 source or checksum change(s)";
     let flag = "checksum changed on existing version mio 1.0.0: bb -> dd";
     // The working tree has no blob for the new side, so the file is read.
-    let output = justless(root, &["run", "--hook", "--", "git", "diff"]);
+    let output = justless(root, &words("run --hook -- git diff"));
     let shown = text(&output.stdout);
     for expected in [
         summary,
@@ -380,81 +292,51 @@ fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
         "pkg5 1.0.0 -> 1.0.1, tokio 1.40.0 -> 1.41.0\n",
         "dependencies: tokio +signal-hook-registry\n",
     ] {
-        assert!(shown.contains(expected), "{expected}: {shown}");
+        has(&shown, expected);
     }
-    let log = justless(root, &["log", &run_id(&output)]);
-    assert_eq!(text(&log.stdout), git(root, &["diff"]));
+    let log = stdout(root, &format!("log {}", run_id(&output)));
+    assert_eq!(log, git(root, &["diff"]));
     // A commit, and a patch too large to show whole, whose hunk summary describes
     // the lockfile with the flag on top.
     let large: String = (0..300).map(|i| format!("fn f{i}() {{}}\n")).collect();
     fs::write(root.join("lib.rs"), large).unwrap();
     git(root, &["commit", "-qam", "bump"]);
-    let show = [
-        "run",
-        "--hook",
-        "--",
-        "git",
-        "show",
-        "HEAD",
-        "--",
-        "Cargo.lock",
-    ];
-    assert!(text(&justless(root, &show).stdout).contains(summary));
-    let diff = ["run", "--hook", "--", "git", "diff", "HEAD~1"];
-    let shown = text(&justless(root, &diff).stdout);
-    assert!(
-        shown.contains(&format!(" diff section(s)\n! Cargo.lock: {flag}\n")),
-        "{shown}"
+    has(
+        &stdout(root, "run --hook -- git show HEAD -- Cargo.lock"),
+        summary,
     );
-    assert!(
-        shown.contains(summary) && !shown.contains("Cargo.lock @@"),
-        "{shown}"
-    );
+    let diff = "run --hook -- git diff HEAD~1";
+    let shown = stdout(root, diff);
+    has(&shown, &format!(" diff section(s)\n! Cargo.lock: {flag}\n"));
+    has(&shown, summary);
+    assert!(!shown.contains("Cargo.lock @@"), "{shown}");
     // A commit too large to show whole lists its header, then the description with
     // the flag on top, and each `[stdout:A-B]` replays exactly those lines.
-    let commit = ["run", "--max-bytes", "1024", "--", "git", "show", "HEAD"];
-    let output = justless(root, &commit);
+    let output = justless(root, &words("run --max-bytes 1024 -- git show HEAD"));
     let shown = text(&output.stdout);
-    assert!(
-        shown.starts_with(&format!(
-            "1 commit(s), 9 diff section(s)\n! Cargo.lock: {flag}\ncommit "
-        )) && shown.contains(" bump [stdout:1-5]\n")
-            && shown.contains(summary)
-            && !shown.contains("Cargo.lock @@"),
-        "{shown}"
-    );
+    let header = format!("1 commit(s), 9 diff section(s)\n! Cargo.lock: {flag}\ncommit ");
+    starts(&shown, &header);
+    has(&shown, " bump [stdout:1-5]\n");
+    has(&shown, summary);
+    assert!(!shown.contains("Cargo.lock @@"), "{shown}");
     let patch: Vec<String> = git(root, &["show", "HEAD"])
         .split_inclusive('\n')
         .map(str::to_owned)
         .collect();
+    let id = run_id(&output);
     for tag in shown.split("[stdout:").skip(1) {
         let (from, to) = tag.split_once(']').unwrap().0.split_once('-').unwrap();
-        let log = ["log", &run_id(&output), "--from", from, "--to", to];
+        let replay = stdout(root, &format!("log {id} --from {from} --to {to}"));
         let (from, to): (usize, usize) = (from.parse().unwrap(), to.parse().unwrap());
-        assert_eq!(
-            text(&justless(root, &log).stdout),
-            patch[from - 1..to].concat()
-        );
+        assert_eq!(replay, patch[from - 1..to].concat());
     }
     // Any other preview still names the flag: a rerun's unchanged notice and a
     // clipped commit whose `--stat` the summary does not read.
-    let clipped = [
-        "run",
-        "--hook",
-        "--max-bytes",
-        "1024",
-        "--",
-        "git",
-        "show",
-        "--stat",
-        "--patch",
-        "HEAD",
-    ];
-    for (args, start) in [(&diff[..], "Output unchanged"), (&clipped[..], "commit ")] {
-        let shown = text(&justless(root, args).stdout);
-        assert!(
-            shown.starts_with(&format!("! Cargo.lock: {flag}\n{start}")),
-            "{shown}"
+    let clipped = "run --hook --max-bytes 1024 -- git show --stat --patch HEAD";
+    for (line, start) in [(diff, "Output unchanged"), (clipped, "commit ")] {
+        starts(
+            &stdout(root, line),
+            &format!("! Cargo.lock: {flag}\n{start}"),
         );
     }
 }

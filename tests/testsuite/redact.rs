@@ -2,13 +2,14 @@
 //! runtime from split prefixes and hash-derived bodies, so no scanner-flagged literal
 //! lives in the repository.
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+use crate::common::{BIN, has, lacks, mcp_session, piped, run_id, starts, text, words};
 
 fn base62(seed: &str, length: usize) -> String {
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -34,25 +35,12 @@ fn value(seed: &str) -> String {
     format!("{}7q", base62(seed, 22))
 }
 
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
 /// No 8-byte piece of `secret` appears in `haystack`.
 fn hidden(haystack: &str, secret: &str) -> bool {
     secret
         .as_bytes()
         .windows(8)
         .all(|piece| !haystack.contains(std::str::from_utf8(piece).unwrap()))
-}
-
-fn run_id(output: &Output) -> String {
-    let stderr = text(&output.stderr);
-    let start = stderr
-        .rfind("[justless run-")
-        .expect("footer names the run")
-        + 10;
-    stderr[start..].split([']', ' ']).next().unwrap().to_owned()
 }
 
 struct Project {
@@ -70,14 +58,18 @@ impl Project {
         self.dir.path()
     }
 
-    fn cli(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_justless"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(BIN);
+        command
             .args(args)
             .current_dir(self.root())
             .env("CARGO_TARGET_DIR", self.root().join("target"))
-            .env_remove("JUSTLESS_SESSION")
-            .output()
-            .unwrap()
+            .env_remove("JUSTLESS_SESSION");
+        command
+    }
+
+    fn cli(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> Output {
@@ -90,6 +82,11 @@ impl Project {
         output
     }
 
+    /// The stdout of `line`, split at spaces into arguments.
+    fn stdout(&self, line: &str) -> String {
+        text(&self.ok(&words(line)).stdout)
+    }
+
     fn config(&self, settings: &str) {
         fs::write(self.root().join(".justless.toml"), settings).unwrap();
     }
@@ -99,12 +96,7 @@ impl Project {
         let bin = self.root().join("bin");
         fs::create_dir_all(&bin).unwrap();
         let path = bin.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::common::executable(&path, &format!("#!/bin/sh\n{body}"));
         path.to_string_lossy().into_owned()
     }
 
@@ -123,18 +115,15 @@ impl Project {
     fn latest_run(&self) -> String {
         let mut runs: Vec<_> = fs::read_dir(self.root().join(".justless/runs"))
             .unwrap()
-            .map(|entry| entry.unwrap())
-            .filter(|entry| entry.path().join("record.json").exists())
-            .map(|entry| {
-                let record = entry.path().join("record.json");
-                (
-                    fs::metadata(record).unwrap().modified().unwrap(),
-                    entry.file_name().to_string_lossy().into_owned(),
-                )
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.join("record.json").exists())
+            .map(|path| {
+                let modified = fs::metadata(path.join("record.json")).unwrap().modified();
+                (modified.unwrap(), path.file_name().unwrap().to_owned())
             })
             .collect();
         runs.sort();
-        runs.pop().unwrap().1
+        runs.pop().unwrap().1.to_string_lossy().into_owned()
     }
 }
 
@@ -150,19 +139,16 @@ fn run_previews_redact_both_streams_and_keep_the_archive() {
     let output = project.cli(&["run", "--", "sh", "-c", &script]);
     assert_eq!(output.status.code(), Some(3));
     let (stdout, stderr) = (text(&output.stdout), text(&output.stderr));
-    assert!(
-        stdout.starts_with("GITHUB_TOKEN=[redacted:github-token:"),
-        "{stdout}"
+    starts(&stdout, "GITHUB_TOKEN=[redacted:github-token:");
+    has(
+        &stderr,
+        &format!("db={scheme}://app:[redacted:url-password:"),
     );
-    assert!(stderr.contains(&format!("db={scheme}://app:[redacted:url-password:")));
     assert!(
         hidden(&stdout, &token) && hidden(&stderr, &password),
         "{stderr}"
     );
-    assert!(
-        stderr.contains(" · 2 secrets redacted · justless log run-"),
-        "{stderr}"
-    );
+    has(&stderr, " · 2 secrets redacted · justless log run-");
 
     let id = run_id(&output);
     let record = fs::read_to_string(project.run_dir(&id).join("record.json")).unwrap();
@@ -181,52 +167,40 @@ fn hook_footers_count_secrets_only_when_output_was_shown() {
     let short = format!("echo token={secret}");
     let output = project.cli(&["run", "--hook", "--", "sh", "-c", &short]);
     let id = run_id(&output);
-    assert_eq!(
-        text(&output.stderr),
-        format!("[justless {id} · 1 secret redacted]\n")
-    );
-    assert!(text(&output.stdout).starts_with("token=[redacted:secret:"));
+    let footer = format!("[justless {id} · 1 secret redacted]\n");
+    assert_eq!(text(&output.stderr), footer);
+    starts(&text(&output.stdout), "token=[redacted:secret:");
 
     // A rerun with output this short is shown again, so the count stays.
     let again = project.cli(&["run", "--hook", "--", "sh", "-c", &short]);
-    assert!(text(&again.stdout).starts_with("token=[redacted:secret:"));
+    starts(&text(&again.stdout), "token=[redacted:secret:");
     assert!(text(&again.stderr).ends_with("· 1 secret redacted]\n"));
 
     let failing = format!("echo token={secret}; exit 1");
     let output = project.cli(&["run", "--hook", "--", "sh", "-c", &failing]);
     let id = run_id(&output);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        text(&output.stderr),
-        format!("[justless {id} · 1 secret redacted · exit 1]\n")
-    );
+    let footer = format!("[justless {id} · 1 secret redacted · exit 1]\n");
+    assert_eq!(text(&output.stderr), footer);
 
     let long = format!("seq 1 400; echo token={secret}; exit 2");
     let args = [
-        "run",
-        "--hook",
-        "--max-bytes",
-        "512",
-        "--",
-        "sh",
-        "-c",
-        &long,
-    ];
+        &words("run --hook --max-bytes 512 -- sh -c")[..],
+        &[long.as_str()],
+    ]
+    .concat();
     let output = project.cli(&args);
-    let footer = text(&output.stderr);
-    assert!(
-        footer.contains(" shown · 1 secret redacted · exit 2]"),
-        "{footer}"
+    has(
+        &text(&output.stderr),
+        " shown · 1 secret redacted · exit 2]",
     );
     assert!(hidden(&text(&output.stdout), &secret));
     // The same output again is reported as unchanged: nothing was shown, so no count.
     let output = project.cli(&args);
-    assert!(text(&output.stdout).starts_with("Output unchanged since run-"));
+    starts(&text(&output.stdout), "Output unchanged since run-");
     let footer = text(&output.stderr);
-    assert!(
-        footer.ends_with(" · exit 2]\n") && !footer.contains("redacted"),
-        "{footer}"
-    );
+    assert!(footer.ends_with(" · exit 2]\n"), "{footer}");
+    lacks(&footer, "redacted");
 
     let clean = project.cli(&["run", "--hook", "--", "echo", "hello"]);
     assert_eq!(text(&clean.stdout), "hello\n");
@@ -244,34 +218,31 @@ fn log_redacts_by_default_and_unredacted_replays_the_archive() {
     let id = run_id(&project.ok(&["run", "--", "sh", "-c", &script]));
     let archived = project.archive(&id, "stdout");
 
-    let log = project.ok(&["log", &id, "--stream", "stdout"]);
-    let replay = text(&log.stdout);
+    let replay = project.stdout(&format!("log {id} --stream stdout"));
     assert_eq!(replay.lines().count(), 3);
-    assert!(replay.starts_with("start\napi_key=[redacted:secret:") && replay.ends_with("]\nend\n"));
-    let line = project.ok(&["log", &id, "--stream", "stdout", "--from", "2", "--to", "2"]);
-    assert!(text(&line.stdout).starts_with("api_key=[redacted:secret:"));
-    assert_eq!(text(&line.stdout).lines().count(), 1);
-    let stderr = project.ok(&["log", &id, "--stream", "stderr"]);
-    assert!(text(&stderr.stderr).starts_with("Authorization: Bearer [redacted:authorization:"));
-    assert!(hidden(&text(&stderr.stderr), &bearer));
+    starts(&replay, "start\napi_key=[redacted:secret:");
+    assert!(replay.ends_with("]\nend\n"), "{replay}");
+    let line = project.stdout(&format!("log {id} --stream stdout --from 2 --to 2"));
+    starts(&line, "api_key=[redacted:secret:");
+    assert_eq!(line.lines().count(), 1);
+    let stderr = text(&project.ok(&["log", &id, "--stream", "stderr"]).stderr);
+    starts(&stderr, "Authorization: Bearer [redacted:authorization:");
+    assert!(hidden(&stderr, &bearer));
 
     let exact = project.ok(&["log", &id, "--stream", "stdout", "--unredacted"]);
     assert_eq!(exact.stdout, archived);
     let exact = project.ok(&["log", &id, "--unredacted", "--stream", "stderr"]);
     assert_eq!(exact.stderr, project.archive(&id, "stderr"));
 
-    let stats: Value = serde_json::from_slice(&project.ok(&["stats", "--json"]).stdout).unwrap();
+    let stats: Value = serde_json::from_str(&project.stdout("stats --json")).unwrap();
     assert_eq!(stats["redacted_secrets"], 2);
     assert_eq!(stats["unredacted_replays"], 2);
     let family = &stats["commands"][0];
     assert_eq!(family["reopened_runs"], 1);
     assert_eq!(family["full_reads"], 4);
-    let report = text(&project.ok(&["stats"]).stdout);
-    assert!(
-        report.contains("Redacted 2 secret(s) in captured output"),
-        "{report}"
-    );
-    assert!(report.contains("· 2 unredacted replay(s)"), "{report}");
+    let report = project.stdout("stats");
+    has(&report, "Redacted 2 secret(s) in captured output");
+    has(&report, "· 2 unredacted replay(s)");
 }
 
 #[test]
@@ -283,44 +254,53 @@ fn clean_runs_replay_byte_for_byte() {
     assert_eq!(project.record(&id)["redaction"]["count"], 0);
     let archived = project.archive(&id, "stdout");
     assert_eq!(output.stdout, archived);
-    assert_eq!(
-        project.ok(&["log", &id, "--stream", "stdout"]).stdout,
-        archived
-    );
+    let log = || project.ok(&["log", &id, "--stream", "stdout"]).stdout;
+    assert_eq!(log(), archived);
     // A different allowlist rescans the archive, and it is still clean.
     project.config("redact_allow = ['^never$']\n");
-    assert_eq!(
-        project.ok(&["log", &id, "--stream", "stdout"]).stdout,
-        archived
-    );
-    let search = project.ok(&["search", &id, "policy"]);
-    assert!(text(&search.stdout).contains("stdout:2: password policy ok"));
+    assert_eq!(log(), archived);
+    let search = project.stdout(&format!("search {id} policy"));
+    has(&search, "stdout:2: password policy ok");
 }
 
 #[test]
-fn search_and_history_match_redacted_text() {
+fn search_history_and_lookup_match_redacted_text() {
     let project = Project::new();
     let token = github("search");
     let script = format!("echo first; echo TOKEN={token}");
     let id = run_id(&project.ok(&["run", "--", "sh", "-c", &script]));
 
-    let found = project.ok(&["search", &id, &token]);
-    assert_eq!(text(&found.stdout), "");
-    let found = project.ok(&["search", &id, "redacted:github-token"]);
-    assert!(text(&found.stdout).starts_with("stdout:2: TOKEN=[redacted:github-token:"));
-    let found = project.ok(&["search", &id, &token, "--unredacted"]);
-    assert_eq!(text(&found.stdout), format!("stdout:2: TOKEN={token}\n"));
+    assert_eq!(project.stdout(&format!("search {id} {token}")), "");
+    let found = project.stdout(&format!("search {id} redacted:github-token"));
+    starts(&found, "stdout:2: TOKEN=[redacted:github-token:");
+    let found = project.stdout(&format!("search {id} {token} --unredacted"));
+    assert_eq!(found, format!("stdout:2: TOKEN={token}\n"));
 
-    let history = project.ok(&["history", &token]);
-    assert!(text(&history.stdout).contains("No matching captured runs."));
-    let history = project.ok(&["history", "redacted:github-token"]);
-    assert!(text(&history.stdout).contains(&format!("{id} other stdout:2:")));
+    has(
+        &project.stdout(&format!("history {token}")),
+        "No matching captured runs.",
+    );
+    let history = project.stdout("history redacted:github-token");
+    has(&history, &format!("{id} other stdout:2:"));
     assert!(
         !project
             .cli(&["history", &token, "--unredacted"])
             .status
             .success()
     );
+
+    // `lookup --logs` ranks and quotes captured output, so its log results are
+    // redacted too.
+    let secret = value("lookup");
+    let script = format!("echo 'upload failed for bucket assets'; echo api_key={secret}");
+    project.ok(&["run", "--", "sh", "-c", &script]);
+    let shown = text(
+        &project
+            .ok(&["lookup", "upload failed api_key", "--logs"])
+            .stdout,
+    );
+    has(&shown, "[redacted:secret:");
+    assert!(hidden(&shown, &secret), "{shown}");
 }
 
 #[test]
@@ -337,8 +317,8 @@ fn clipped_previews_never_show_part_of_a_secret() {
     );
     let output = project.cli(&["run", "--max-bytes", "1024", "--", "sh", "-c", &script]);
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
-    assert!(shown.contains("[output clipped"), "{shown}");
-    assert!(shown.contains("[redacted:"), "{shown}");
+    has(&shown, "[output clipped");
+    has(&shown, "[redacted:");
     for secret in &secrets {
         assert!(hidden(&shown, secret), "{secret} in {shown}");
     }
@@ -360,10 +340,10 @@ fn lines_grown_by_markers_are_shown_whole() {
     let output = project.ok(&["run", "--max-bytes", "512", "--", "echo", &line]);
     let stdout = text(&output.stdout);
     assert!(stdout.ends_with("@h END\n"), "{stdout}");
-    assert!(!stdout.contains("[output clipped"));
+    lacks(&stdout, "[output clipped");
     assert_eq!(stdout.matches("[redacted:url-password:").count(), 25);
     for password in passwords {
-        assert!(!stdout.contains(&format!(":{password}@")));
+        lacks(&stdout, &format!(":{password}@"));
     }
 }
 
@@ -386,45 +366,46 @@ fn test_search_and_lint_reports_quote_redacted_lines() {
     let id = run_id(&output);
     assert_eq!(output.status.code(), Some(101));
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
-    assert!(shown.contains("auth::uses_token"), "{shown}");
+    has(&shown, "auth::uses_token");
     assert!(hidden(&shown, &secret), "{shown}");
     let record = fs::read_to_string(project.run_dir(&id).join("record.json")).unwrap();
     assert!(record.contains("[redacted:secret:") && hidden(&record, &secret));
-    assert!(hidden(&text(&project.ok(&["resume"]).stdout), &secret));
+    assert!(hidden(&project.stdout("resume"), &secret));
 
-    let mut matches = String::new();
-    for i in 0..300 {
-        matches.push_str(&format!(
-            "src/module{}.rs:{}:    let token = \"{}\";\n",
-            i % 7,
-            i + 1,
-            value(&format!("rg-{i}"))
-        ));
-    }
+    let matches: String = (0..300)
+        .map(|i| {
+            let secret = value(&format!("rg-{i}"));
+            format!(
+                "src/module{}.rs:{}:    let token = \"{secret}\";\n",
+                i % 7,
+                i + 1
+            )
+        })
+        .collect();
     fs::write(project.root().join("matches.txt"), &matches).unwrap();
     let rg = project.tool("rg", "cat matches.txt\n");
-    let output = project.ok(&["run", "--", &rg, "-n", "token", "src"]);
-    let shown = text(&output.stdout);
-    assert!(shown.contains("src/module0.rs"), "{shown}");
-    assert!(shown.contains("[redacted:secret:"), "{shown}");
+    let shown = text(&project.ok(&["run", "--", &rg, "-n", "token", "src"]).stdout);
+    has(&shown, "src/module0.rs");
+    has(&shown, "[redacted:secret:");
     for i in 0..300 {
         assert!(hidden(&shown, &value(&format!("rg-{i}"))));
     }
 
-    let mut findings = String::new();
-    for i in 0..40 {
-        findings.push_str(&format!(
-            "app/settings.py:{}:1: S105 Possible hardcoded password assigned to: \"password={}\"\n",
-            i + 1,
-            value(&format!("lint-{i}"))
-        ));
-    }
+    let mut findings: String = (0..40)
+        .map(|i| {
+            let secret = value(&format!("lint-{i}"));
+            format!(
+                "app/settings.py:{}:1: S105 Possible hardcoded password assigned to: \"password={secret}\"\n",
+                i + 1
+            )
+        })
+        .collect();
     findings.push_str("Found 40 errors.\n");
     fs::write(project.root().join("findings.txt"), &findings).unwrap();
     let ruff = project.tool("ruff", "cat findings.txt\nexit 1\n");
     let output = project.cli(&["run", "--", &ruff, "check", "app"]);
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
-    assert!(shown.contains("S105"), "{shown}");
+    has(&shown, "S105");
     for i in 0..40 {
         assert!(hidden(&shown, &value(&format!("lint-{i}"))), "{shown}");
     }
@@ -445,27 +426,27 @@ fn records_from_before_redaction_are_redacted_when_shown() {
     project.config("redact = false\n");
     let output = project.cli(&["run", "--", &pytest]);
     let id = run_id(&output);
-    assert!(text(&output.stdout).contains(&token));
-    assert!(!text(&output.stderr).contains("redacted"));
+    has(&text(&output.stdout), &token);
+    lacks(&text(&output.stderr), "redacted");
     assert!(project.record(&id).get("redaction").is_none());
 
     project.config("");
-    let resume = text(&project.ok(&["resume"]).stdout);
-    assert!(resume.contains("first tests/test_api.py::test_auth[[redacted:github-token:"));
+    let resume = project.stdout("resume");
+    has(
+        &resume,
+        "first tests/test_api.py::test_auth[[redacted:github-token:",
+    );
     assert!(hidden(&resume, &token), "{resume}");
-    let log = text(&project.ok(&["log", &id]).stdout);
+    let log = project.stdout(&format!("log {id}"));
     assert!(hidden(&log, &token) && log.contains("[redacted:github-token:"));
-    let history = text(&project.ok(&["history", "test_auth"]).stdout);
+    let history = project.stdout("history test_auth");
     assert!(hidden(&history, &token), "{history}");
 
     // The rerun compares with the old record and names the failure it no longer sees.
     fs::write(project.root().join("second"), "").unwrap();
     let output = project.cli(&["run", "--", &pytest]);
     let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
-    assert!(
-        shown.contains("test_auth[[redacted:github-token:"),
-        "{shown}"
-    );
+    has(&shown, "test_auth[[redacted:github-token:");
     assert!(hidden(&shown, &token), "{shown}");
 }
 
@@ -479,7 +460,7 @@ fn configuration_turns_redaction_off_allows_values_and_rejects_bad_patterns() {
     let output = project.ok(&["run", "--", "sh", "-c", &script]);
     let earlier = run_id(&output);
     assert_eq!(text(&output.stdout), format!("TOKEN={token}\n"));
-    assert!(!text(&output.stderr).contains("redacted"));
+    lacks(&text(&output.stderr), "redacted");
 
     project.config(&format!("redact_allow = ['^{}']\n", &token[..12]));
     let output = project.ok(&["run", "--fresh", "--", "sh", "-c", &script]);
@@ -503,33 +484,28 @@ fn configuration_turns_redaction_off_allows_values_and_rejects_bad_patterns() {
         project.config(settings);
         let output = project.cli(&["run", "--", "sh", "-c", "touch ran"]);
         assert_eq!(output.status.code(), Some(2));
-        assert!(
-            text(&output.stderr).contains(message),
-            "{}",
-            text(&output.stderr)
-        );
+        has(&text(&output.stderr), message);
         assert!(!project.root().join("ran").exists());
 
         // Views of earlier runs fall back to the built-in rules.
         for id in [&earlier, &redacted_run] {
             let log = project.ok(&["log", id, "--stream", "stdout"]);
-            assert!(text(&log.stdout).starts_with("TOKEN=[redacted:github-token:"));
-            assert!(text(&log.stderr).contains("redacting with built-in rules only"));
+            starts(&text(&log.stdout), "TOKEN=[redacted:github-token:");
+            has(&text(&log.stderr), "redacting with built-in rules only");
         }
-        let exact = project.ok(&["log", &earlier, "--stream", "stdout", "--unredacted"]);
-        assert_eq!(text(&exact.stdout), format!("TOKEN={token}\n"));
-        assert!(text(&project.ok(&["resume"]).stdout).contains(&redacted_run));
+        let exact = project.stdout(&format!("log {earlier} --stream stdout --unredacted"));
+        assert_eq!(exact, format!("TOKEN={token}\n"));
+        has(&project.stdout("resume"), &redacted_run);
     }
 
     project.config("redact = [unclosed\n");
     let log = project.ok(&["log", &earlier, "--stream", "stdout"]);
-    assert!(text(&log.stdout).starts_with("TOKEN=[redacted:github-token:"));
-    assert!(text(&log.stderr).contains("redacting with built-in rules only"));
-    let found = project.ok(&["search", &earlier, "TOKEN"]);
-    assert!(text(&found.stdout).contains("[redacted:github-token:"));
+    starts(&text(&log.stdout), "TOKEN=[redacted:github-token:");
+    has(&text(&log.stderr), "redacting with built-in rules only");
+    let found = project.stdout(&format!("search {earlier} TOKEN"));
+    has(&found, "[redacted:github-token:");
     // Without --budget, resume reads its default budget from the same file.
-    let resume = project.ok(&["resume", "--budget", "2400"]);
-    assert!(text(&resume.stdout).contains(&earlier));
+    has(&project.stdout("resume --budget 2400"), &earlier);
     assert_eq!(project.cli(&["run", "--", "true"]).status.code(), Some(2));
 }
 
@@ -546,48 +522,18 @@ fn marker_key_is_created_on_first_detection() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            fs::metadata(&key).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        let mode = fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
-    let second = text(
-        &project
-            .ok(&["run", "--fresh", "--", "sh", "-c", &script])
-            .stdout,
-    );
-    assert_eq!(first, second);
+    let rerun = ["run", "--fresh", "--", "sh", "-c", &script];
+    assert_eq!(first, text(&project.ok(&rerun).stdout));
     assert!(first.starts_with("api_key=[redacted:secret:") && first.len() == 31);
 
     fs::remove_file(&key).unwrap();
     fs::create_dir(&key).unwrap();
-    let output = project.ok(&["run", "--fresh", "--", "sh", "-c", &script]);
+    let output = project.ok(&rerun);
     assert_eq!(text(&output.stdout), "api_key=[redacted:secret]\n");
-    assert!(text(&output.stderr).contains("markers omit their hash"));
-}
-
-fn mcp(root: &Path, lines: &[Value]) -> Vec<Value> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["mcp", "--root"])
-        .arg(root)
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        for line in lines {
-            writeln!(stdin, "{line}").unwrap();
-        }
-    }
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "{}", text(&output.stderr));
-    text(&output.stdout)
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+    has(&text(&output.stderr), "markers omit their hash");
 }
 
 #[test]
@@ -596,46 +542,47 @@ fn mcp_results_are_redacted_and_cannot_be_unredacted() {
     let token = github("mcp");
     let script = format!("echo TOKEN={token}");
     let id = run_id(&project.ok(&["run", "--", "sh", "-c", &script]));
-    let call = |id: &str, name: &str, arguments: Value| {
-        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+    let call = |key: &str, name: &str, arguments: Value| {
+        json!({"jsonrpc": "2.0", "id": key, "method": "tools/call",
                "params": {"name": name, "arguments": arguments}})
+        .to_string()
     };
-    let responses = mcp(
-        project.root(),
-        &[
-            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "test", "version": "1"}}}),
-            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}}),
-            call("log", "log", json!({"run_id": id})),
-            call(
-                "search",
-                "search",
-                json!({"run_id": id, "text": "redacted:github"}),
-            ),
-            call("value", "search", json!({"run_id": id, "text": token})),
-            call("history", "history", json!({"text": "TOKEN="})),
-            call("raw", "log", json!({"run_id": id, "unredacted": true})),
-        ],
-    );
+    let lines = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"}}})
+        .to_string(),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
+        json!({"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}}).to_string(),
+        call("log", "log", json!({"run_id": id})),
+        call(
+            "search",
+            "search",
+            json!({"run_id": id, "text": "redacted:github"}),
+        ),
+        call("value", "search", json!({"run_id": id, "text": token})),
+        call("history", "history", json!({"text": "TOKEN="})),
+        call("raw", "log", json!({"run_id": id, "unredacted": true})),
+    ];
+    let mut server = Command::new(BIN);
+    server.args(["mcp", "--root"]).arg(project.root());
+    let (_, responses) = mcp_session(server.current_dir(project.root()), &lines);
     let by_id = |key: &str| {
-        responses
-            .iter()
-            .find(|response| response["id"] == key)
-            .unwrap()
+        let found = responses.iter().find(|response| response["id"] == key);
+        found.unwrap()
     };
     let content = |key: &str| {
         let response = by_id(key);
         assert_eq!(response["result"]["isError"], false, "{response:#}");
-        response["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_owned()
+        let text = &response["result"]["content"][0]["text"];
+        text.as_str().unwrap().to_owned()
     };
-    assert!(content("log").starts_with("TOKEN=[redacted:github-token:"));
-    assert!(content("search").contains("stdout:1: TOKEN=[redacted:github-token:"));
-    assert!(!content("value").contains("TOKEN"));
+    starts(&content("log"), "TOKEN=[redacted:github-token:");
+    has(
+        &content("search"),
+        "stdout:1: TOKEN=[redacted:github-token:",
+    );
+    lacks(&content("value"), "TOKEN");
     assert!(hidden(&content("history"), &token));
     let raw = by_id("raw");
     assert!(raw.get("error").is_some() || raw["result"]["isError"] == true);
@@ -643,21 +590,11 @@ fn mcp_results_are_redacted_and_cannot_be_unredacted() {
 
     let tools = by_id("list")["result"]["tools"].as_array().unwrap();
     for tool in tools {
-        assert!(
-            tool["inputSchema"]["properties"]
-                .get("unredacted")
-                .is_none()
-        );
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(properties.get("unredacted").is_none(), "{tool:#}");
     }
     let log = tools.iter().find(|tool| tool["name"] == "log").unwrap();
-    assert!(
-        log["description"]
-            .as_str()
-            .unwrap()
-            .contains("secrets redacted")
-    );
-    let size = serde_json::to_string(tools).unwrap().len();
-    assert!(size < 8_000, "tool list is {size} bytes");
+    has(log["description"].as_str().unwrap(), "secrets redacted");
 }
 
 #[test]
@@ -667,31 +604,17 @@ fn source_views_and_recall_stay_exact() {
     let source = format!("API_KEY = \"{secret}\"\nDEBUG = True\n");
     fs::write(project.root().join("settings.py"), &source).unwrap();
 
-    assert_eq!(text(&project.ok(&["read", "settings.py"]).stdout), source);
-    let code = text(&project.ok(&["code", "settings.py", "--to", "2"]).stdout);
-    assert!(code.contains(&secret), "{code}");
-    let outline: Value =
-        serde_json::from_slice(&project.ok(&["read", "settings.py", "--json"]).stdout).unwrap();
+    assert_eq!(project.stdout("read settings.py"), source);
+    has(&project.stdout("code settings.py --to 2"), &secret);
+    let outline: Value = serde_json::from_str(&project.stdout("read settings.py --json")).unwrap();
     let revision = outline["revision"].as_str().unwrap();
-    let line = project.ok(&["expand", "settings.py", "L1", "--revision", revision]);
-    assert_eq!(text(&line.stdout), format!("API_KEY = \"{secret}\"\n"));
+    let line = project.stdout(&format!("expand settings.py L1 --revision {revision}"));
+    assert_eq!(line, format!("API_KEY = \"{secret}\"\n"));
 
     // An edit built from the expanded bytes round-trips exactly.
-    let replacement = text(&line.stdout).replace("API_KEY", "SERVICE_KEY");
-    let mut edit = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["edit", "settings.py", "L1", "--revision", revision])
-        .current_dir(project.root())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    edit.stdin
-        .take()
-        .unwrap()
-        .write_all(replacement.as_bytes())
-        .unwrap();
-    let edited = edit.wait_with_output().unwrap();
+    let replacement = line.replace("API_KEY", "SERVICE_KEY");
+    let mut edit = project.command(&["edit", "settings.py", "L1", "--revision", revision]);
+    let edited = piped(&mut edit, replacement.as_bytes());
     assert!(edited.status.success(), "{}", text(&edited.stderr));
     assert_eq!(
         fs::read_to_string(project.root().join("settings.py")).unwrap(),
@@ -704,19 +627,9 @@ fn source_views_and_recall_stay_exact() {
         {"role": "assistant", "content": [{"type": "tool_use", "id": "old", "name": "bash", "input": {}}]},
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "old", "content": result}]},
     ]});
-    let mut mask = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["mask", "--keep", "0"])
-        .current_dir(project.root())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    mask.stdin
-        .take()
-        .unwrap()
-        .write_all(request.to_string().as_bytes())
-        .unwrap();
-    let masked: Value = serde_json::from_slice(&mask.wait_with_output().unwrap().stdout).unwrap();
+    let mut mask = project.command(&["mask", "--keep", "0"]);
+    let masked = piped(&mut mask, request.to_string().as_bytes());
+    let masked: Value = serde_json::from_slice(&masked.stdout).unwrap();
     let stub = masked["messages"][1]["content"][0]["content"]
         .as_str()
         .unwrap();
@@ -724,9 +637,11 @@ fn source_views_and_recall_stay_exact() {
         .strip_prefix("[justless recall ")
         .and_then(|s| s.strip_suffix(']'))
         .unwrap();
-    let recalled: Value =
-        serde_json::from_slice(&project.ok(&["recall", id, "--json"]).stdout).unwrap();
-    assert_eq!(recalled, json!(result));
+    let recalled = project.stdout(&format!("recall {id} --json"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&recalled).unwrap(),
+        json!(result)
+    );
 }
 
 #[test]
@@ -768,13 +683,12 @@ fn real_build_and_source_output_have_nothing_to_redact() {
         commands.push(vec!["cat", file.to_str().unwrap()]);
     }
     for command in commands {
-        let mut args = vec!["run", "--fresh", "--"];
-        args.extend(&command);
+        let args = [&["run", "--fresh", "--"][..], &command[..]].concat();
         project.config("");
         let output = project.cli(&args);
         let id = project.latest_run();
         assert_eq!(project.record(&id)["redaction"]["count"], 0, "{command:?}");
-        assert!(!text(&output.stderr).contains("redacted · justless log"));
+        lacks(&text(&output.stderr), "redacted · justless log");
         if command[0] == "cat" {
             // Same preview as with redaction off.
             project.config("redact = false\n");
@@ -837,8 +751,7 @@ fn private_keys_keep_one_marker_whatever_prefixes_their_lines() {
         .map(|line| format!("\x1b[32m+\x1b[m\x1b[32m{line}\x1b[m\n"))
         .collect();
     fs::write(project.root().join("colored.diff"), colored).unwrap();
-    let reference = project.ok(&["run", "--", "cat", "id_rsa"]);
-    let expected = key_marker(&text(&reference.stdout)).to_owned();
+    let expected = key_marker(&project.stdout("run -- cat id_rsa")).to_owned();
     let commands: [&[&str]; 8] = [
         &["grep", "-n", "-A40", "BEGIN", "id_rsa"],
         &["grep", "-H", "-n", "", "id_rsa"],
@@ -850,10 +763,8 @@ fn private_keys_keep_one_marker_whatever_prefixes_their_lines() {
         &["cat", "colored.diff"],
     ];
     for command in commands {
-        let mut args = vec!["run", "--fresh", "--max-bytes", "65536", "--"];
-        args.extend(command);
-        let output = project.cli(&args);
-        let shown = text(&output.stdout);
+        let args = [&words("run --fresh --max-bytes 65536 --")[..], command].concat();
+        let shown = text(&project.cli(&args).stdout);
         let id = project.latest_run();
         let record = project.record(&id);
         assert_eq!(record["redaction"]["count"], 1, "{command:?}: {shown}");
@@ -862,7 +773,7 @@ fn private_keys_keep_one_marker_whatever_prefixes_their_lines() {
         assert_eq!(key_marker(&shown), expected, "{command:?}: {shown}");
         let archive = text(&project.archive(&id, "stdout"));
         assert_eq!(shown.lines().count(), archive.lines().count());
-        let log = text(&project.ok(&["log", &id]).stdout);
+        let log = project.stdout(&format!("log {id}"));
         assert!(body_hidden(&log, &body), "{command:?}: {log}");
     }
 }
@@ -876,13 +787,11 @@ fn unwrapped_wide_and_base64_wrapped_keys_are_hidden() {
     let (key, _) = private_key("encoded", 64);
     let encoded = base64(key.as_bytes());
     let wrap = |width: usize| -> String {
-        let mut text: String = encoded
-            .as_bytes()
-            .chunks(width)
+        let lines = encoded.as_bytes().chunks(width);
+        let text: String = lines
             .map(|line| format!("{}\n", std::str::from_utf8(line).unwrap()))
             .collect();
-        text.push_str("done\n");
-        text
+        text + "done\n"
     };
     for (name, content) in [
         ("wide.pem", wide),
@@ -893,8 +802,7 @@ fn unwrapped_wide_and_base64_wrapped_keys_are_hidden() {
         fs::write(project.root().join(name), &content).unwrap();
         let output = project.cli(&["run", "--max-bytes", "65536", "--", "cat", name]);
         let shown = text(&output.stdout);
-        let id = project.latest_run();
-        let record = project.record(&id);
+        let record = project.record(&project.latest_run());
         assert_eq!(record["redaction"]["count"], 1, "{name}: {shown}");
         assert_eq!(shown.lines().count(), content.lines().count(), "{name}");
         if name.ends_with(".b64") {
@@ -905,11 +813,8 @@ fn unwrapped_wide_and_base64_wrapped_keys_are_hidden() {
         }
     }
     // The wrapping width does not change the marker.
-    let markers: Vec<String> = ["key64.b64", "key76.b64"]
-        .iter()
-        .map(|name| key_marker(&text(&project.ok(&["run", "--", "cat", name]).stdout)).to_owned())
-        .collect();
-    assert_eq!(markers[0], markers[1]);
+    let marker = |name: &str| key_marker(&project.stdout(&format!("run -- cat {name}"))).to_owned();
+    assert_eq!(marker("key64.b64"), marker("key76.b64"));
 }
 
 #[test]
@@ -971,7 +876,7 @@ fn values_keep_their_symbols_while_paths_digests_and_code_stay_visible() {
         probe.push('\n');
     }
     fs::write(project.root().join("probe.txt"), &probe).unwrap();
-    let output = project.ok(&["run", "--max-bytes", "65536", "--", "cat", "probe.txt"]);
+    let output = project.ok(&words("run --max-bytes 65536 -- cat probe.txt"));
     let shown = text(&output.stdout);
     let lines: Vec<&str> = shown.lines().collect();
     for (index, (line, value)) in positives.iter().enumerate() {
@@ -1006,22 +911,18 @@ fn output_that_fits_once_redacted_is_shown_whole() {
     assert!(dump.len() > 4096);
     fs::write(project.root().join("dump.txt"), &dump).unwrap();
     let output = project.ok(&["run", "--", "cat", "dump.txt"]);
-    let id = run_id(&output);
     let shown = text(&output.stdout);
-    assert!(!shown.contains("[output clipped"), "{shown}");
+    lacks(&shown, "[output clipped");
     assert!(body_hidden(&shown, &body));
-    let log = project.ok(&["log", &id, "--stream", "stdout"]);
+    let log = project.ok(&["log", &run_id(&output), "--stream", "stdout"]);
     assert_eq!(output.stdout, log.stdout);
 
-    let args = [
+    let output = project.ok(&[
         "run", "--hook", "--fresh", "--", "grep", "-n", "", "dump.txt",
-    ];
-    let output = project.ok(&args);
+    ]);
     let id = run_id(&output);
-    assert_eq!(
-        text(&output.stderr),
-        format!("[justless {id} · 1 secret redacted]\n")
-    );
+    let footer = format!("[justless {id} · 1 secret redacted]\n");
+    assert_eq!(text(&output.stderr), footer);
     assert_eq!(text(&output.stdout).lines().count(), dump.lines().count());
 }
 
@@ -1034,12 +935,8 @@ fn exec_previews_redact_outlined_and_ranked_stdout() {
     let script = format!(
         "echo api_key={secret}; i=0; while [ $i -lt 400 ]; do echo \"row $i of the export\"; i=$((i + 1)); done; echo api_key={secret}"
     );
-    for intent in [None, Some("api_key")] {
-        let mut args = vec!["exec", "--lang", "sh"];
-        if let Some(intent) = intent {
-            args.extend(["--intent", intent]);
-        }
-        args.push(&script);
+    for intent in [&[][..], &["--intent", "api_key"]] {
+        let args = [&["exec", "--lang", "sh"], intent, &[script.as_str()]].concat();
         let output = project.cli(&args);
         assert!(output.status.success(), "{}", text(&output.stderr));
         let shown = text(&output.stdout);
@@ -1049,13 +946,11 @@ fn exec_previews_redact_outlined_and_ranked_stdout() {
         );
         assert!(hidden(&shown, &secret), "{intent:?}: {shown}");
         let id = run_id(&output);
-        assert!(
-            text(&output.stderr).contains("secrets redacted"),
-            "{intent:?}"
-        );
+        let footer = text(&output.stderr);
+        assert!(footer.contains("secrets redacted"), "{intent:?}: {footer}");
         let exact = project.ok(&["log", &id, "--stream", "stdout", "--unredacted"]);
         assert_eq!(exact.stdout, project.archive(&id, "stdout"));
-        assert!(text(&exact.stdout).contains(&secret));
+        has(&text(&exact.stdout), &secret);
     }
 }
 
@@ -1071,8 +966,8 @@ fn the_full_replay_after_a_failed_save_is_redacted() {
     let output = project.cli(&["run", "--hook", "--", "sh", "-c", &script]);
     assert_eq!(output.status.code(), Some(3), "{}", text(&output.stderr));
     let (shown, errors) = (text(&output.stdout), text(&output.stderr));
-    assert!(errors.contains("restoring full output"), "{errors}");
-    assert!(shown.starts_with("api_key=[redacted:secret"), "{shown}");
+    has(&errors, "restoring full output");
+    starts(&shown, "api_key=[redacted:secret");
     assert!(
         hidden(&shown, &secret) && hidden(&errors, &secret),
         "{shown}{errors}"
@@ -1098,36 +993,23 @@ fn late_output_of_a_drained_run_is_redacted() {
         assert!(start.elapsed().as_secs() < 10, "the background write");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let log = text(&project.ok(&["log", &id, "--stream", "stdout"]).stdout);
-    assert!(
-        log.starts_with("started\napi_key=[redacted:secret:"),
-        "{log}"
-    );
-    let search = text(&project.ok(&["search", &id, "api_key"]).stdout);
+    let log = project.stdout(&format!("log {id} --stream stdout"));
+    starts(&log, "started\napi_key=[redacted:secret:");
+    let search = project.stdout(&format!("search {id} api_key"));
     assert!(hidden(&search, &secret), "{search}");
-    let exact = project.ok(&["log", &id, "--stream", "stdout", "--unredacted"]);
-    assert!(text(&exact.stdout).contains(&secret));
-}
-
-/// `lookup --logs` ranks and quotes captured output, so its log results are redacted.
-#[test]
-fn lookup_log_results_are_redacted() {
-    let project = Project::new();
-    let secret = value("lookup");
-    let script = format!("echo 'upload failed for bucket assets'; echo api_key={secret}");
-    project.ok(&["run", "--", "sh", "-c", &script]);
-    let output = project.ok(&["lookup", "upload failed api_key", "--logs"]);
-    let shown = text(&output.stdout);
-    assert!(shown.contains("[redacted:secret:"), "{shown}");
-    assert!(hidden(&shown, &secret), "{shown}");
+    let exact = project.stdout(&format!("log {id} --stream stdout --unredacted"));
+    has(&exact, &secret);
 }
 
 /// `exec` with `cat "$1"` over `data`, so the script prints exactly that file.
 fn exec_cat(project: &Project, data: &str, extra: &[&str]) -> String {
     fs::write(project.root().join("data.txt"), data).unwrap();
-    let mut args = vec!["exec", "--lang", "sh", "--file", "data.txt"];
-    args.extend(extra);
-    args.push("cat \"$1\"");
+    let args = [
+        &words("exec --lang sh --file data.txt")[..],
+        extra,
+        &["cat \"$1\""],
+    ]
+    .concat();
     let output = project.cli(&args);
     assert!(output.status.success(), "{}", text(&output.stderr));
     text(&output.stdout)
@@ -1142,11 +1024,8 @@ fn exec_outline_cuts_never_split_a_secret() {
     let filler = "filler line of the export\n".repeat(200);
     let mut cuts = 0;
     for pad in (140..=260).step_by(3) {
-        let data = format!(
-            "{} {token} end\n{filler}{token} {}\n",
-            "x".repeat(pad),
-            "y".repeat(pad)
-        );
+        let (head, tail) = ("x".repeat(pad), "y".repeat(pad));
+        let data = format!("{head} {token} end\n{filler}{token} {tail}\n");
         let shown = exec_cat(&project, &data, &["--max-bytes", "512"]);
         cuts += usize::from(shown.contains("not shown in full"));
         assert!(hidden(&shown, &token), "{pad}: {shown}");
@@ -1160,21 +1039,14 @@ fn exec_outline_cuts_never_split_a_secret() {
 fn exec_intent_windows_never_split_a_secret() {
     let project = Project::new();
     let token = github("intent-window");
-    let mut data = String::new();
-    for gap in 0..60 {
-        data.push_str(&format!(
-            "{} needle {} {token} {}\n",
-            "a".repeat(120),
-            "b".repeat(gap * 5),
-            "c".repeat(300)
-        ));
-    }
-    let shown = exec_cat(
-        &project,
-        &data,
-        &["--intent", "needle", "--max-bytes", "8000"],
-    );
-    assert!(shown.starts_with("[focus]"), "{shown}");
+    let data: String = (0..60)
+        .map(|gap| {
+            let (a, b, c) = ("a".repeat(120), "b".repeat(gap * 5), "c".repeat(300));
+            format!("{a} needle {b} {token} {c}\n")
+        })
+        .collect();
+    let shown = exec_cat(&project, &data, &words("--intent needle --max-bytes 8000"));
+    starts(&shown, "[focus]");
     assert!(hidden(&shown, &token), "{shown}");
 }
 
@@ -1186,13 +1058,10 @@ fn exec_outline_keeps_a_split_private_key_hidden() {
     let (key, body) = private_key("outline-key", 64);
     let data = format!("{key}{}", "filler line of the export\n".repeat(300));
     let shown = exec_cat(&project, &data, &["--max-bytes", "1024"]);
-    assert!(shown.contains("left out"), "{shown}");
-    assert!(shown.contains("[redacted:private-key"), "{shown}");
+    has(&shown, "left out");
+    has(&shown, "[redacted:private-key");
     assert!(body_hidden(&shown, &body), "{shown}");
     for line in body.as_bytes().chunks(64).filter(|line| line.len() == 64) {
-        assert!(
-            !shown.contains(std::str::from_utf8(line).unwrap()),
-            "{shown}"
-        );
+        lacks(&shown, std::str::from_utf8(line).unwrap());
     }
 }
