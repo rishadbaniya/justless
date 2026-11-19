@@ -28,6 +28,8 @@ pub(super) enum Source {
     Object(String),
     Git(Vec<String>),
     Search(Vec<String>),
+    /// A `grep`, rerun with the grep the shell ran.
+    Grep(super::grep::Grep),
     /// What the shell prints itself: a literal `echo` or `printf`, or `true`.
     Literal(String),
     /// `pwd`: the directory the shell is in, as it names it.
@@ -50,7 +52,11 @@ impl Source {
     /// The reads a list has to include before it runs as written.
     fn read(&self) -> bool {
         match self {
-            Self::File { .. } | Self::Files(_) | Self::Object(_) | Self::Search(_) => true,
+            Self::File { .. }
+            | Self::Files(_)
+            | Self::Object(_)
+            | Self::Search(_)
+            | Self::Grep(_) => true,
             Self::Git(words) => matches!(words[1].as_str(), "show" | "diff"),
             Self::Literal(_) | Self::Pwd | Self::Listing(_) => false,
         }
@@ -144,7 +150,7 @@ pub(super) enum Filter {
     Columns(Vec<(usize, usize)>),
 }
 
-fn number(s: &str) -> Option<usize> {
+pub(super) fn number(s: &str) -> Option<usize> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -258,9 +264,9 @@ fn piece<'a>(
 ) -> Option<Piece<'a>> {
     let last = stages.len().checked_sub(1)?;
     let mut stages = stages.iter().map(|s| shlex::split(s)).enumerate();
-    let words = stages.next()?.1?;
+    let original = stages.next()?.1?;
     let words = {
-        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let refs: Vec<&str> = original.iter().map(String::as_str).collect();
         crate::wrappers::effective(&refs)?
     };
     let (program, args) = words.split_first()?;
@@ -268,7 +274,8 @@ fn piece<'a>(
     let source = match program.as_str() {
         "git" if object.is_some() => Source::Object(object?),
         "git" if super::git::supported(args) => Source::Git(words),
-        "rg" | "grep" if search_paths(&words).is_some() => Source::Search(words),
+        "rg" if search_paths(&words).is_some() => Source::Search(words),
+        "grep" => Source::Grep(super::grep::parse(&original, words)?),
         "echo" => Source::Literal(echo(args)?),
         "printf" => Source::Literal(printf(args)?),
         "true" | ":" if args.is_empty() => Source::Literal(String::new()),
@@ -508,9 +515,9 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
                         // the recheck rejects any other piece that fails.
                         let skippable = match join {
                             Join::Always => false,
-                            Join::Success => pieces
-                                .iter()
-                                .any(|p: &Piece| matches!(p.source, Source::Search(_))),
+                            Join::Success => pieces.iter().any(|p: &Piece| {
+                                matches!(p.source, Source::Search(_) | Source::Grep(_))
+                            }),
                             Join::Failure => true,
                         };
                         if next == Join::Failure || skippable {

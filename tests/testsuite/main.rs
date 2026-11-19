@@ -9,6 +9,7 @@ mod compare;
 mod delta;
 mod discover;
 mod global;
+mod grep_lists;
 mod hook_fixes;
 mod lookup;
 mod mcp;

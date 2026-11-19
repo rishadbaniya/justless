@@ -12322,14 +12322,6 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
             "echo \"== needle\"; grep -rn needle src; echo \"== call\"; grep -rn call src",
             format!("== needle\n{content}== call\n{content}"),
         ),
-        (
-            "grep -rn needle src; pwd",
-            format!("{content}{}\n", root.display()),
-        ),
-        (
-            "grep -rn needle src && printf done",
-            format!("{content}done"),
-        ),
     ] {
         bash_untouched(&root, &[command], &output);
     }
@@ -12408,6 +12400,23 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
     }
     // Nothing that passed through was archived.
     assert_eq!(run_count(&root), 11);
+    // A line after a search in a read list, rechecked piece by piece, keeps a
+    // section of its own.
+    let root_line = format!("{}\n", root.display());
+    for (command, output, last) in [
+        (
+            "grep -rn needle src; pwd",
+            format!("{content}{root_line}"),
+            format!("$ pwd [stdout:286-286]\n{root_line}"),
+        ),
+        (
+            "grep -rn needle src && printf done",
+            format!("{content}done"),
+            "$ printf done [stdout:286-286]\ndone".into(),
+        ),
+    ] {
+        text_has(&bash_shown(&root, command, &output), &[&last]);
+    }
 }
 
 #[cfg(unix)]

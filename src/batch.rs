@@ -1,6 +1,7 @@
 //! Claude executes the original list. Only attribute stdout to individual
 //! commands when their independently reproduced outputs agree with its capture.
 mod git;
+mod grep;
 mod parse;
 mod reads;
 
@@ -115,6 +116,14 @@ fn listing(ws: &Workspace, cwd: &Path, words: &[String], deadline: Instant) -> O
         &["/usr/bin/wc", "/bin/wc"]
     };
     let binary = candidates.iter().find(|p| Path::new(p).is_file())?;
+    let mut cmd = quiet(Path::new(binary), cwd);
+    let (code, text) = bounded(cmd.args(&words[1..]), MAX_BYTES, deadline)?;
+    (code == 0).then_some(text)
+}
+
+/// A rerun of `binary` in `cwd` with a cleared environment but the shell's
+/// locale, which decides how it sorts, counts and matches characters.
+fn quiet(binary: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd)
         .env_clear()
@@ -124,8 +133,7 @@ fn listing(ws: &Workspace, cwd: &Path, words: &[String], deadline: Instant) -> O
             cmd.env(key, value);
         }
     }
-    let (code, text) = bounded(cmd.args(&words[1..]), MAX_BYTES, deadline)?;
-    (code == 0).then_some(text)
+    cmd
 }
 
 struct Verified<'a> {
@@ -162,6 +170,7 @@ impl<'a> Batch<'a> {
                 && match &piece.source {
                     Source::File { file, .. } => within(file),
                     Source::Listing(words) => parse::operands(words).all(within),
+                    Source::Grep(grep) => grep.files().all(within),
                     _ => true,
                 }
         })
@@ -310,6 +319,17 @@ impl<'a> Batch<'a> {
                     }
                     status = code;
                     outputs.push((None, reads::filter(text, &piece.filters)?, None));
+                }
+                Source::Grep(grep) => {
+                    let rest = &actual[output.len().min(actual.len())..];
+                    let trimmed = persisted.is_none();
+                    let (code, text) =
+                        grep::reproduce(ws, &dir, grep, &piece.filters, rest, trimmed, deadline)?;
+                    if !piece.filters.is_empty() && code != 0 {
+                        return None;
+                    }
+                    status = code;
+                    outputs.push((None, text, None));
                 }
                 Source::Literal(text) => {
                     status = 0;
@@ -524,7 +544,7 @@ fn render(
                 Source::File { .. } | Source::Files(_) | Source::Object(_) => {
                     files.outline(item.source.as_ref()?, text, limit)
                 }
-                Source::Search(words) => {
+                Source::Search(words) | Source::Grep(grep::Grep { words, .. }) => {
                     let args = words.iter().map(String::as_str).collect::<Vec<_>>();
                     let mut engine = crate::search::Search::new(&item.dir, &args);
                     for (n, line) in text.lines().enumerate() {
