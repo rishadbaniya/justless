@@ -308,7 +308,7 @@ impl Item {
         counts
     }
 
-    fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         format!(
             "{} {} [stdout:{}-{}]",
             self.name, self.detail, self.first, self.last

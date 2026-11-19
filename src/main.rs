@@ -21,6 +21,7 @@ mod jsonview;
 mod learn;
 mod lint;
 mod listing;
+mod lockdiff;
 mod lookup;
 mod map;
 mod markdown;

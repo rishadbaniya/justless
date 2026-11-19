@@ -1523,6 +1523,23 @@ impl Capture<'_> {
             run.summary = summary.clone();
         }
         let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
+        // The Cargo.lock sections of a patch, described by their dependency changes.
+        let locks = (!merged && run.produced_bytes.is_empty() && crate::lockdiff::applies(words))
+            .then(|| read_text(&archive.readers[0], lengths[0], crate::lockdiff::LIMIT))
+            .flatten()
+            .map(|patch| {
+                let sections = crate::lockdiff::sections(&patch, &workspace.cwd);
+                (patch, sections)
+            })
+            .filter(|(_, sections)| !sections.is_empty());
+        // The patch with those sections described instead, when it fits and is
+        // smaller than the preview. A rerun keeps its comparison with the earlier run.
+        let lock_view = locks
+            .as_ref()
+            .filter(|_| previous.is_none())
+            .map(|(patch, sections)| crate::lockdiff::view(patch, sections))
+            .filter(|view| (view.len() as u64) < lengths[0] && view.len() <= max_bytes);
+        let mut flags_shown = false;
         let mut notice = false;
         if let Some(prior) = &previous
             && run.unchanged
@@ -1561,6 +1578,13 @@ impl Capture<'_> {
         {
             // A merged stdout also holds the command's stderr, which a test, diff or
             // inventory summary of stdout would drop, so that run keeps its preview.
+            let summary = match &locks {
+                Some((_, sections)) if previous.is_none() && run.summary.kind == "diff" => {
+                    flags_shown = true;
+                    crate::lockdiff::summarize(&run.summary, sections)
+                }
+                _ => summary,
+            };
             previews[0].1 = fit(summary, max_bytes).into_bytes();
         } else if !merged
             && selection.profile.is_none()
@@ -1580,6 +1604,24 @@ impl Capture<'_> {
             )
         {
             previews[0].1 = view;
+        }
+        if let Some(view) = lock_view
+            && !run.unchanged
+            && view.len() < previews[0].1.len()
+        {
+            flags_shown = true;
+            previews[0].1 = view.into_bytes();
+        }
+        // A source or checksum that changed on a locked version is always named, also
+        // above a verbatim patch or a clipped preview.
+        if let Some((_, sections)) = &locks
+            && !flags_shown
+        {
+            let flags: String = sections.iter().map(|s| s.flag_lines()).collect();
+            if !flags.is_empty() {
+                let index = usize::from(previews[0].1.is_empty() && !previews[1].1.is_empty());
+                previews[index].1.splice(0..0, flags.into_bytes());
+            }
         }
         if let Some(shape_stdout) = stdout_preview
             && !run.unchanged
@@ -1828,6 +1870,18 @@ fn footer(
         format!("[reopen with {} log {id}]\n", shown.justless)
     };
     Ok(line + &reopen + &truncation)
+}
+
+/// The first `length` bytes of a stream as text, when they are at most `limit` and
+/// valid UTF-8.
+fn read_text(mut file: &File, length: u64, limit: u64) -> Option<String> {
+    if length > limit {
+        return None;
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(length).read_to_end(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Stdout shown as JSON tables, clipped at whole lines to `max_bytes`, when it is a
