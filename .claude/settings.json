@@ -65,6 +65,16 @@
             "command": "justless hook-claude after-bash"
           }
         ]
+      },
+      {
+        "matcher": "^(Edit|MultiEdit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "justless hook-claude after-edit"
+          }
+        ]
       }
     ],
     "PreCompact": [
