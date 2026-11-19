@@ -1361,6 +1361,14 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
     activity_text(workspace, cap)
 }
 
+/// Whether `resume` has recorded runs, reads or a pack to show.
+pub(crate) fn has_activity(workspace: &Workspace) -> bool {
+    let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
+    !activity.reads.is_empty()
+        || !activity.last_pack.is_empty()
+        || records(workspace, false).is_ok_and(|mut runs| runs.any(|run| run.is_ok()))
+}
+
 /// Recent runs, inspected source and the last pack, with stale source marked.
 /// Returns `None` inside the text when the project has no recorded activity.
 fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {

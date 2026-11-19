@@ -33,8 +33,13 @@ class HookTests(unittest.TestCase):
                                          transcript_path=self.run_dir / "t.jsonl")
 
     def test_session_start_context(self):
-        context = self.hooks.session_start()
-        self.assertIn("Justless indexed", context)
+        # A fresh project gets the index and no context; one with runs gets a pointer.
+        self.assertEqual(self.hooks.session_start(), "")
+        self.assertTrue((self.root / ".justless" / "index.json").is_file())
+        subprocess.run([str(self.run_dir / "jlbin" / "justless"), "run", "--", "git", "status"],
+                       cwd=str(self.root), env=self.env, capture_output=True, check=True)
+        context = self.hooks.session_start("resume")
+        self.assertIn("resume` lists earlier runs and reads.", context)
 
     def test_bash_rewrite_executes_but_transcript_keeps_original(self):
         original = {"command": "git diff", "description": "diff"}

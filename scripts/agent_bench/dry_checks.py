@@ -16,7 +16,9 @@ from pathlib import Path
 import accounting
 import fake_api
 
-CTX_RE = re.compile(r"\n\nJustless indexed[^\n]*")
+# Justless's session context: none on a fresh project, a `resume` pointer once it
+# has runs or reads, and an index line from earlier builds.
+CTX_RE = re.compile(r"\n\n(?:Justless indexed|`[^`\n]* resume` lists earlier)[^\n]*")
 
 
 def read_jsonl(path):
