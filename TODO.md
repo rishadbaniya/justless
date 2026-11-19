@@ -146,14 +146,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 
 ---
 
-### 3.11 Better token figures without a bundled tokenizer
-- **Why not a tokenizer.** Claude's tokenizer is not public; exact counts need Anthropic's token-counting API (network, against the zero-network promise), and a public tokenizer such as `o200k_base` is a different model's and adds megabytes. Every compaction decision already uses exact bytes; tokens appear only in reports.
-- **Plan.** (1) Calibrate bytes-per-token per content type (code, JSON, prose, logs) once, offline, with the benchmark harness and the API, and ship the constants; code runs about 3-3.5 bytes per token, so today's flat bytes ÷ 4 undercounts savings on code. (2) Read the provider-reported usage Claude Code already stores in its local session files (input, cache reads, cache writes) to show real per-session totals in `stats`, offline. Keep the API benchmarks as the only source of measured before-and-after savings.
-- **Progress.** *designed*.
-
-## 4. Remaining build batches (from the 2026-11-19 triage)
-
-Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). These batches touch mostly disjoint files; each starts after the in-progress branch named in it merges.
+### 3.11 Better token figures without a bundled tokenizer — done
+- **Progress.** *on main* (2026-11-19, `src/tokens.rs`). Bytes per token measured once with Anthropic's token-counting endpoint on this repository's own files and output (221 samples; Opus counted the same): code 2.57, JSON 2.22, prose 2.78, logs 2.21; bytes ÷ 4 had counted only 56–70% of the tokens. `stats` classifies each run; the status line and `discover` use the command-output (logs) ratio; the opt-in proxy keeps ÷ 4, the unit of its clear floor, beside the API's own usage. `stats --sessions` adds the provider-reported usage from this workspace's Claude Code transcripts, apart from savings. Recalibrate with `scripts/token_calibration.py`.
 
 ### 4.A Reads outside the workspace, and the duplicate instruction block — done
 - **Progress.** *on main* (2026-11-19). A whole Claude Code Read of a parser-supported file outside the workspace is outlined from the returned content and the original archived with `justless recall ID` (e.g. 35,392 → 2,764 bytes); dotfiles, `$HOME/.*` and tool-results files are skipped. When `CLAUDE.md` imports `@AGENTS.md`, `init` keeps one block in AGENTS.md (this repo's CLAUDE.md went from 941 to 11 bytes), and `doctor` flags a duplicate copy.
