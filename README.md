@@ -115,25 +115,45 @@ The exit status is still 101, and `justless log RUN_ID --stream stdout --from 36
 
 ## Install
 
-Run your agent's line **inside your project folder**. It installs justless and turns it on for that project, using a prebuilt binary when a release exists and otherwise building with [Rust](https://rustup.rs).
+### 1. Run one line in your project folder
 
 ```sh
-# Claude Code: then start a new session
 curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- claude
-# Codex: then run /hooks once and trust them
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- codex
-# Cursor, Gemini CLI, Copilot CLI, OpenCode, Antigravity CLI: then start a new session
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- cursor     # or gemini, copilot, opencode, agy
-# Several agents at once, or every agent on your PATH
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh -s -- claude codex
-curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.sh | sh
 ```
 
-Clients without hooks, such as VS Code, can use the read-only tools over MCP: `justless mcp --install vscode`. For another project later, run `justless init --hooks --agent claude` there.
+Swap `claude` for your agent. The script installs justless (a prebuilt binary when a release exists, otherwise built with [Rust](https://rustup.rs)) and turns it on for this project.
 
-To cover every project at once instead, `justless init --global` adds opt-in user-level hooks for Claude Code and Codex ([details](docs/reference.md#global-hooks)).
+| Your agent | Use | Then |
+| --- | --- | --- |
+| Claude Code | `claude` | Start a new session |
+| Codex | `codex` | Run `/hooks` once and trust them |
+| Cursor | `cursor` | Start a new session |
+| Gemini CLI | `gemini` | Start a new session |
+| Copilot CLI | `copilot` | Start a new session |
+| OpenCode | `opencode` | Start a new session |
+| Antigravity CLI | `agy` | Start a new session |
+| Several at once | `claude codex` | As above, for each |
+| Every agent on your PATH | nothing: end the line at `sh` | As above, for each |
 
-**Check it works:** `justless doctor` checks the setup and prints a fix for anything missing, `justless run -- git status` ends with a `[justless run-…]` line, and `justless stats` shows what was saved. In Claude Code, `justless init --statusline` keeps a running total in the status line. To update, see [install options](docs/reference.md#install-and-configure-agents). `justless init --remove` takes it back out of a project.
+### 2. Check it works
+
+```sh
+justless doctor              # checks the setup and prints a fix for anything missing
+justless run -- git status   # ends with a [justless run-…] line
+justless stats               # what it saved so far
+justless init --statusline   # Claude Code: a running total in the status line
+```
+
+### 3. Optional
+
+| To | Run |
+| --- | --- |
+| Turn it on for every project at once (Claude Code and Codex) | `justless init --global` ([details](docs/reference.md#global-hooks)) |
+| Turn it on for one more project | `justless init --hooks --agent claude` in that folder |
+| Use it from an editor without hooks, such as VS Code | `justless mcp --install vscode` |
+| Pause every hook without uninstalling | Start the agent with `JUSTLESS_DISABLE=1` set |
+| Update | See [install options](docs/reference.md#install-and-configure-agents) |
+| Remove it from a project | `justless init --remove` |
 
 ## How it works
 
