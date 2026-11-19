@@ -71,7 +71,7 @@ LLM summarization or retrieval, telemetry, client-side rewriting of earlier requ
 | Compaction for MCP and WebFetch results | 0 MCP results; WebFetch results are already model-written answers, so only lossy trimming would remain. |
 | Richer and user-global filters | `[[filters]] omit` exists and no in-house tool appears in the measured families. |
 | Structural search and graph analytics | Neither saves tokens nor fixes correctness, and "possible" links make dead-code reports unreliable. |
-| Read deduplication | Re-reads are 1.2% of read bytes; changed-since-last-read covers rereads of changed symbols. |
+| Read deduplication | Unchanged re-reads are 0.12 MB, 0.35% of Read bytes, over the 14 days to 2026-11-19 (509 transcripts, 3,821 Reads, 33.0 MB; within each session or subagent, before compaction): 5 exact repeats (1.6 KB), the rest identical lines in overlapping windows. Changed-since-last-read covers rereads of changed symbols. |
 | Quiet doctest steps and generic or trait-impl fallbacks in `test --affected` | Both fall back safely to broader testing and are documented. |
 | Unlinked external paths and macro callers after a deletion | Labelled "possible", and the report already names mentions outside indexed definitions. |
 | Claude Code's UI label for routed searches | Display only; the model sees the correct result and no hook output can change the label. |
