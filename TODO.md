@@ -106,9 +106,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 ### 3.1 Show what changed since the agent last read a symbol — done, default activation pending
 - **Progress.** *on main* (2026-11-19, `src/seen.rs`). In one session, `context --symbol`, `context --at` and `pack` print only the changed lines of a symbol read before (a real 46-line test with one line edited: 2,039 → 512 bytes; unchanged re-read: 150 bytes), with an exact `expand` command for the whole symbol; compaction hooks forget the records. Sessions come from `--session` or `CLAUDE_CODE_SESSION_ID`, which is ignored when `CLAUDE_CODE_CHILD_SESSION` is set. That flag turned out to be set in top-level Claude Code sessions too, so today deltas need `--session`; see 4.H.
 
-### 4.H Turn changed-since-read on by default
-- Have the Claude Code PreToolUse hook pass a precise session (session ID plus subagent ID, so a subagent's reads never hide text from its parent) to `justless context` and `pack` commands it sees, instead of relying on `CLAUDE_CODE_SESSION_ID`, which is the same in subagents. Mention deltas and `--fresh` in the instruction template, and count delta savings in `stats`.
-- **Progress.** *in progress*.
+### 4.H Turn changed-since-read on by default — done
+- **Progress.** *on main* (2026-11-19). The Claude Code hook appends a `--session` digest (session ID plus subagent `agent_id`) to `justless context`/`pack`, judged by the same permission rules as other rewrites, so in `default`/`acceptEdits` mode it applies when an allow rule covers those commands (e.g. `Bash(justless context:*)`), and always in `auto` and `bypassPermissions`. The instruction line and `stats` counting are in. Unverified: a real subagent hook input carrying `agent_id`.
 
 ### 3.2 `justless test --compare REF` — done
 - **Progress.** *on main* (2026-11-19). Runs the tests in the working tree, reruns only the failing ones at the merge base in a temporary worktree (base builds in `.justless/compare/cargo-target`), and groups them as new failures, changed failures and already failing with the same normalized message. Cargo and pytest (pytest only tested against a stand-in; real pytest still to confirm); other runners say "not supported". Works with `--affected` and `--base`. Exit status is the working tree's.
@@ -166,14 +165,11 @@ Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). Th
 - **Starts after:** the compaction-formats branch (§3.5–§3.7) merges.
 - **Progress.** *designed*.
 
-### 4.C Grouped context searches
-- Parse rg/grep/git grep output with `-A/-B/-C` into blocks (the `--` separators and `:` vs `-`), group by file with block ranges and `[stdout:A-B]` tags, fall back if any line is unaccounted for. Measured: 227 results over 4 KB, 1.42 MB, passed through today on purpose.
-- **Progress.** *in progress*.
+### 4.C Grouped context searches — done
+- **Progress.** *on main* (2026-11-19). rg/grep/git grep output with `-A/-B/-C` is parsed strictly into blocks and grouped by file with exact `[stdout:A-B]` ranges, in `run` previews and the Claude Code post-run hook; anything the parse cannot account for falls back. Seven real 5–12 KB searches: 54,940 → 16,045 bytes. Open: ag/ack layouts unverified (not installed); Claude Code's own Grep tool with context options keeps the matches-only grouping.
 
-### 4.D MCP and history fixes
-- MCP `context` and `affected` take a `base` ref with `changes: true`; `history` keeps one place for the newest match from a failed run when the limit cuts; no cut notice suggests a `--limit` above MCP's 1000.
-- **Starts after:** `find` (§2.4) and changed-since-last-read (§3.1) merge.
-- **Progress.** *designed*.
+### 4.D MCP and history fixes — done
+- **Progress.** *on main* (2026-11-19). MCP `context` and `affected` take `base` (with `changes: true`); `history` keeps one place for the first failed run when the limit cuts (needs a limit of at least 2); no notice suggests a `--limit` above MCP's 1000.
 
 ### 4.F Follow-ups from permission parity
 - `would_route`, `discover` and `doctor`'s "has not routed a command yet" note still assume the Claude Code hook always rewrites; make them use the same permission verdict, and have `doctor` say when a settings file is unreadable (which silently stops pre-routing in every mode).
