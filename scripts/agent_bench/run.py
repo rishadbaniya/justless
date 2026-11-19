@@ -121,19 +121,24 @@ def build_snapshot(home, task, force=False):
 def warm_target(home, task, runner_env_factory):
     """Build the snapshot's warm target in place so each run can clone it."""
     snap = snapshot_dir(home, task)
-    if task["language"] != "rust" or task["family"] not in ("bugfix", "lint"):
+    if task["language"] != "rust" or not tasks_module.is_edit(task):
         return None
     target = snap / "target"
     marker = snap / "target.ok"
     if marker.exists():
         return target
+    pristine_target = Path(home) / "pristine" / task["repo"] / "target"
+    if task["family"] == "large" and not target.exists() and pristine_target.exists():
+        # APFS clone of the repository's warm target, so a workspace snapshot stores only its own crates.
+        workspace.clone_tree(pristine_target, target)
+        workspace.invalidate_local_fingerprints(snap / "repo", target)
     env = runner_env_factory(snap / "repo", target)
     commands = [["cargo", "test", "--offline", "--no-run"] + task["oracle"].get("cargo_scope", [])]
-    if task["family"] == "lint":
+    if tasks_module.kind(task) == "lint":
         commands.append(["cargo", "clippy", "--offline", "--all-targets"] + task["oracle"].get("cargo_scope", []))
     for command in commands:
         proc = subprocess.run(command, cwd=str(snap / "repo"), env=env, capture_output=True, timeout=3600)
-        if proc.returncode != 0 and task["family"] == "bugfix" and "--no-run" not in command:
+        if proc.returncode != 0 and tasks_module.kind(task) != "lint" and "--no-run" not in command:
             raise RuntimeError("warm build failed: %s" % proc.stderr.decode()[-800:])
     # A library without a committed Cargo.lock gets one from the build; record the snapshot as runs see it.
     workspace.normalize_mtimes(snap / "repo")
@@ -294,15 +299,15 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         if proc.returncode != 0:
             raise RuntimeError("justless init failed: %s" % proc.stderr.decode()[-400:])
     workspace.normalize_mtimes(repo)
-    workspace.git_baseline(repo, env=workspace.git_env(repo, home))
+    workspace.git_task_history(repo, task, env=workspace.git_env(repo, home))
     timings["setup_s"] = round(time.time() - t0, 3)
     t1 = time.time()
-    if task["family"] in ("bugfix", "lint") and task["language"] == "rust":
+    if tasks_module.is_edit(task) and task["language"] == "rust":
         scope = task["oracle"].get("cargo_scope", [])
         code, output = runner(["cargo", "test", "--offline", "--no-run"] + scope, 3600)
         if code != 0:
             raise RuntimeError("warm-up build failed in the sandbox: %s" % output[-600:])
-        if task["family"] == "lint":
+        if tasks_module.kind(task) == "lint":
             runner(["cargo", "clippy", "--offline", "--all-targets"] + scope, 3600)
     timings["warmup_s"] = round(time.time() - t1, 3)
     reference = workspace.tree_files(repo)
@@ -326,7 +331,7 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
         variant = settings.variant(task, arm) if callable(settings.variant) else (settings.variant or "correct")
         steps = fake_agent.VARIANTS[variant](task, config.ARMS[arm]["justless"])
         context = {"root": str(repo.resolve()), "store": str(settings.home), "runroot": str(settings.runroot),
-                   "outside": str(settings.runroot.parent)}
+                   "outside": str(settings.runroot.parent), "persist": str(tools_ws.persist_dir.resolve())}
         settings.fake.register(nonce, fake_api.Script(steps, context))
     else:
         variant = None
@@ -380,7 +385,7 @@ def run_once(settings, task, model, effort_name, arm, rep, attempt, manifest, or
     record = {
         "campaign": settings.campaign, "phase": phase, "agent": "harness", "model": model, "effort": effort,
         "effort_setting": effort_name, "arm": arm, "task_id": task["id"], "family": task["family"],
-        "repo": task["repo"], "language": task["language"], "style": task.get("style"),
+        "kind": tasks_module.kind(task), "repo": task["repo"], "language": task["language"], "style": task.get("style"),
         # Impact truth is the rg -w hits of a unique name, so every impact task is grep-solvable by construction.
         "grep_solvable": task.get("grep_solvable", True if task["family"] == "impact" else None),
         "rep": rep, "arm_order_position": order_position,
@@ -422,7 +427,8 @@ def block_pins(settings, manifest):
 def block_identity(settings, task, model, effort_name, arm, rep, manifest):
     """Fields every result record of a block carries, whether or not the run got far enough to be graded."""
     return {"campaign": settings.campaign, "agent": "harness", "model": model, "effort_setting": effort_name,
-            "arm": arm, "task_id": task["id"], "family": task["family"], "repo": task.get("repo"),
+            "arm": arm, "task_id": task["id"], "family": task["family"], "kind": tasks_module.kind(task),
+            "repo": task.get("repo"),
             "language": task.get("language"), "style": task.get("style"), "rep": rep,
             "pins": block_pins(settings, manifest)}
 
@@ -601,16 +607,16 @@ def check_pins(directory, base, cells, new_pins=False):
     return stored
 
 
-def frozen_manifest(home):
-    path = tasks_module.private_dir(home) / "_manifest.json"
+def frozen_manifest(home, task_set="main"):
+    path = tasks_module.private_dir(home, task_set) / "_manifest.json"
     if not path.exists():
         return None
     return json.loads(path.read_text()).get("hash")
 
 
-def require_frozen_manifest(home, manifest):
+def require_frozen_manifest(home, manifest, task_set="main"):
     """The main campaign and its report run only on the task set frozen by review-tasks --approve."""
-    frozen = frozen_manifest(home)
+    frozen = frozen_manifest(home, task_set)
     if frozen != manifest:
         raise SystemExit("the task manifest %s is not the frozen manifest %s; run review-tasks --approve after "
                          "the review, or restore the frozen tasks" % (manifest, frozen))
@@ -618,9 +624,13 @@ def require_frozen_manifest(home, manifest):
 
 # ----------------------------------------------------------------------------- commands
 
+def task_set(args):
+    return getattr(args, "task_set", None) or "main"
+
+
 def load_tasks(args, analysis=True):
     public = tasks_module.load_public()
-    private = tasks_module.load_private(args.home)
+    private = tasks_module.load_private(args.home, task_set(args))
     selector = getattr(args, "tasks", None) or "all"
     if selector == "all-public":
         chosen = public
@@ -644,7 +654,8 @@ def load_tasks(args, analysis=True):
 def full_manifest(args):
     """Run IDs hash the whole task set, not the selected subset, so resuming with a different
     --tasks, --families or --per-family selection never re-runs finished work."""
-    return tasks_module.manifest_hash(tasks_module.load_public() + tasks_module.load_private(args.home))
+    return tasks_module.manifest_hash(tasks_module.load_public()
+                                      + tasks_module.load_private(args.home, task_set(args)))
 
 
 def paid_spend(home, exclude=None):
@@ -767,7 +778,7 @@ def cmd_run(args, phase="main"):
             "dirty" if "dirty" in commit else "not in a Git checkout"))
     refuse_dry_campaign(args.home, args.campaign)
     if phase == "main":
-        require_frozen_manifest(args.home, full_manifest(args))
+        require_frozen_manifest(args.home, full_manifest(args), task_set(args))
     parity = Path(args.home) / "cc_capture" / "parity_report.json"
     if not parity.exists() and not args.accept_deviation:
         raise SystemExit("run parity-diff first (or pass --accept-deviation with the documented items)")
@@ -803,8 +814,13 @@ def load_allowlist(home):
 
 def cmd_prepare(args):
     import gen_tasks
-    if args.generate:
+    if args.generate and task_set(args) == "large":
+        import gen_large
+        gen_large.main(["--home", str(args.home)] + (["--repos", args.repos] if args.repos else []))
+    elif args.generate:
         import baseline_build
+        if "large" in (args.families or "").split(","):
+            raise SystemExit("the large family is its own task set: pass --task-set large")
         repos = args.repos.split(",") if args.repos else sorted(set(r for f in gen_tasks.PLAN.values() for r in f))
         for repo in repos:
             base = Path(args.home) / "pristine" / repo
@@ -845,7 +861,7 @@ def cmd_validate_tasks(args):
     corpus_after = {r: workspace.tree_hash(config.CORPUS / r) for r in corpus_repos}
     exposure = {}
     for task in task_list:
-        if task["family"] in ("bugfix", "lint"):
+        if tasks_module.is_edit(task):
             hidden = sandbox.cargo_git_denies(config.CARGO_HOME, own_repos(task), snapshot_dir(args.home, task) / "repo")
             found = sandbox.answer_key_exposure(task, config.CARGO_HOME, hidden)
             if found:
@@ -863,7 +879,29 @@ def cmd_validate_tasks(args):
     return 0 if ok else 1
 
 
+def estimate_large(args):
+    """The large family's plan priced from its scripted plain paths (dry-run --variants correct), or from the
+    pre-measurement assumption when no dry run is given."""
+    task_list = tasks_module.load_private(args.home, "large")
+    source = "pre-measurement assumption"
+    paths = {t["id"]: accounting.LARGE_PREPILOT_PATH for t in task_list}
+    if getattr(args, "from_dry", None):
+        measured = accounting.dry_run_paths(Path(args.home) / "campaigns" / args.from_dry)
+        missing = sorted(set(paths) - set(measured))
+        if missing:
+            raise SystemExit("no successful dry-run measurement for %s in %s" % (", ".join(missing), args.from_dry))
+        paths = {k: measured[k] for k in paths}
+        source = "dry run %s" % args.from_dry
+    out = accounting.estimate_large(paths, spent=paid_spend(args.home), use_reserve=args.use_reserve)
+    out["source"] = source
+    out["paths"] = paths
+    print(json.dumps(out, indent=1))
+    return 0
+
+
 def cmd_estimate(args):
+    if task_set(args) == "large":
+        return estimate_large(args)
     per_run = accounting.PREPILOT
     source = "pre-pilot assumptions"
     if args.assume != "prepilot":
@@ -917,7 +955,8 @@ def pilot_per_run(args):
 
 def cmd_report(args):
     import report
-    return report.main(["--home", str(args.home), "--campaign", args.campaign] + (["--dry"] if args.dry else []))
+    return report.main(["--home", str(args.home), "--campaign", args.campaign, "--task-set", task_set(args)]
+                       + (["--dry"] if args.dry else []))
 
 
 def cmd_export_audit(args):
@@ -926,7 +965,7 @@ def cmd_export_audit(args):
     import report
     rows = report.harness_only(report.final_rows(read_rows(Path(args.home) / "campaigns" / args.campaign
                                                            / "results.jsonl")))
-    chosen = [r for r in rows if r.get("success") and r.get("family") in ("bugfix", "lint")
+    chosen = [r for r in rows if r.get("success") and (r.get("kind") or r.get("family")) in tasks_module.EDIT_KINDS
               and not ((r.get("oracle") or {}).get("details") or {}).get("exact_revert")]
     out = Path(args.home) / "reports" / args.campaign / "audit"
     if out.exists():
@@ -1003,6 +1042,9 @@ def parser():
         sp.add_argument("--campaign", help="default: dry for dry-run, validate for validate-tasks, anchor-dry for "
                         "anchor --dry-anchor, otherwise main")
         sp.add_argument("--tasks", default="all")
+        sp.add_argument("--task-set", default="main", choices=sorted(tasks_module.TASK_SETS),
+                        help="main: the 32 pre-registered tasks; large: the large-output family, with its own "
+                        "directory, manifest and campaign")
         sp.add_argument("--families")
         sp.add_argument("--per-family", type=int)
         sp.add_argument("--model", default="claude-sonnet-5-5")
@@ -1045,6 +1087,8 @@ def parser():
     dry.add_argument("--variants", default="correct,wrong,tamper,unread_edit,probe,qualified,cfgtest,overrun")
     common(sub.add_parser("pilot"))
     common(sub.add_parser("estimate")).add_argument("--assume", default="pilot", choices=["pilot", "prepilot"])
+    sub.choices["estimate"].add_argument("--from-dry", help="large task set: the dry-run campaign directory "
+                                         "holding the correct variant, such as dry-large-correct")
     common(sub.add_parser("run"))
     common(sub.add_parser("anchor")).add_argument("--dry-anchor", action="store_true",
                                                     help="upstream is the fake API with a scripted agent (free)")

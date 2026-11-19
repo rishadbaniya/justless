@@ -55,6 +55,25 @@ def git_commit_all(root, message, env=None):
     _git(root, ["commit", "-q", "--allow-empty", "-m", message], env)
 
 
+def git_task_history(root, task, env=None):
+    """The baseline commit, plus for a task whose setup is a history (a regression hidden in a cleanup commit)
+    a second fixed-date commit holding that setup. The snapshot holds the final tree, so the setup edits are
+    undone for the first commit and redone for the second. Every file keeps the fixed mtime."""
+    import tasks as tasks_module
+    root = Path(root)
+    setup = task.get("setup") or {}
+    history = setup.get("kind") == "history"
+    if history:
+        tasks_module.apply_edits(root, setup["edits"], reverse=True)
+        normalize_mtimes(root)
+    git_baseline(root, env=env)
+    if history:
+        tasks_module.apply_edits(root, setup["edits"])
+        normalize_mtimes(root)
+        git_commit_all(root, setup["commit_message"], env=env or git_env(root))
+        normalize_mtimes(root / ".git")
+
+
 def normalize_mtimes(root, stamp=None):
     stamp = config.MTIME if stamp is None else stamp
     root = Path(root)

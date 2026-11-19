@@ -1135,6 +1135,21 @@ def truth_checks(task):
                     {"file": path, "symbol": symbol, "line": truth["span"][0]}]}))["success"]:
                 failed.append("qualified answer %r does not succeed" % symbol)
                 break
+    if tasks_module.kind(task) == "callers":
+        units = task["truth"]["required"]
+
+        def callers(chosen):
+            return answer_block({"callers": [{"file": u["file"], "symbol": u["symbol"]} for u in chosen]})
+        if not oracles.grade_callers(task, callers(units))["success"]:
+            failed.append("truth does not succeed")
+        if len(units) >= 10 and oracles.grade_callers(task, callers(units[1:]))["recall"] < 0.9:
+            failed.append("required minus one below 0.9 recall")
+        if oracles.grade_callers(task, callers(units[:1]))["success"]:
+            failed.append("one caller alone succeeds")
+        qualified = [{"file": "./" + u["file"], "symbol": "%s::%s" % (re.sub(r"\.rs$", "", u["file"]).replace(
+            "/", "::"), u["symbol"])} for u in units]
+        if not oracles.grade_callers(task, answer_block({"callers": qualified}))["success"]:
+            failed.append("qualified answer does not succeed")
     if task["family"] == "impact":
         required = task["truth"]["required"]
         neutral = task["truth"]["neutral"]
@@ -1149,7 +1164,8 @@ def truth_checks(task):
 
 def review(args):
     """Print every private task's question and truth for the blind lead review, and optionally freeze it."""
-    task_list = tasks_module.load_private(args.home)
+    task_set = getattr(args, "task_set", None) or "main"
+    task_list = tasks_module.load_private(args.home, task_set)
     print("Rubric: reword only for grammar or ambiguity; drop a location task only if two or more symbols plausibly "
           "answer it; check impact truth against the rg evidence; log every edit with a reason in "
           "<store>/tasks/_review_log.jsonl. Do not look at any arm result.")
@@ -1157,13 +1173,14 @@ def review(args):
         print("=" * 80)
         print(task["id"], task.get("style") or "", "grep_solvable=%s" % task.get("grep_solvable"))
         print(task["prompt"])
-        print("truth:", json.dumps(task.get("truth") or {"mutated_fn": task.get("oracle", {}).get("mutated_fn")}))
+        print("truth:", json.dumps(task.get("truth") or {"mutated_fn": task.get("oracle", {}).get("mutated_fn"),
+                                                          "rule": task.get("oracle", {}).get("rule")}))
     # The same hash every run ID carries (public and private tasks), so run.py and report.py can compare it.
     public = tasks_module.load_public()
     manifest = tasks_module.manifest_hash(public + task_list)
     print("manifest hash:", manifest)
     if getattr(args, "approve", False):
-        path = tasks_module.private_dir(args.home) / "_manifest.json"
+        path = tasks_module.private_dir(args.home, task_set) / "_manifest.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"hash": manifest, "private_hash": tasks_module.manifest_hash(task_list),
                                     "tasks": sorted(t["id"] for t in public + task_list),

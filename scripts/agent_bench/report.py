@@ -12,7 +12,7 @@ import config  # noqa: E402
 import stats  # noqa: E402
 import tasks as tasks_module  # noqa: E402
 
-FAMILIES = ["bugfix", "lint", "location", "impact"]
+FAMILIES = ["bugfix", "lint", "location", "impact", "large"]
 PRIMARY_MODEL = "claude-sonnet-5-5"
 CE_MODEL = "claude-haiku-5-5"
 FAILURE_MODES = ["success", "wrong_fix", "untouched_site", "build_broken", "test_tamper", "lint_remaining",
@@ -226,7 +226,7 @@ def contrast_section(rows, x, y, model, families=None, B=stats.B_DEFAULT, power=
     return result, lines
 
 
-def build(home, campaign, dry=False, B=stats.B_DEFAULT):
+def build(home, campaign, dry=False, B=stats.B_DEFAULT, task_set="main"):
     base = Path(home) / "campaigns" / campaign
     all_rows = final_rows(read_jsonl(base / "results.jsonl"))
     rows = harness_only(all_rows)
@@ -257,11 +257,11 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
     for row in all_rows:
         key = ((row.get("agent") or "harness"), row.get("model")) + stats.pin_key(row)
         sets[key] = sets.get(key, 0) + 1
-    frozen_path = tasks_module.private_dir(home) / "_manifest.json"
+    frozen_path = tasks_module.private_dir(home, task_set) / "_manifest.json"
     frozen = json.loads(frozen_path.read_text()).get("hash") if frozen_path.exists() else None
     manifests = sorted({str((r.get("pins") or {}).get("manifest_hash")) for r in all_rows})
     manifest_ok = bool(frozen) and manifests == [frozen]
-    if campaign == "main" and not dry and all_rows and not manifest_ok:
+    if (campaign == "main" or task_set != "main") and not dry and all_rows and not manifest_ok:
         raise SystemExit("campaign main ran on task manifest(s) %s, not the frozen manifest %s; refusing to report"
                          % (", ".join(manifests), frozen))
     out += ["## 1. Manifest", ""] + ["- %s: `%s`" % (k, v) for k, v in sorted(pins.items())] + [
@@ -288,7 +288,7 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
     summary["edit_families"] = edit
     per_family = {}
     negative = []
-    for family in FAMILIES:
+    for family in [f for f in FAMILIES if any(r.get("family") == f for r in rows)]:
         result, lines = contrast_section(rows, "b", "a", PRIMARY_MODEL, [family], B=min(B, 2000))
         per_family[family] = result
         out += ["### %s" % family, ""] + lines + [""]
@@ -411,7 +411,8 @@ def build(home, campaign, dry=False, B=stats.B_DEFAULT):
             "| Model | Family | Repo | Arm | Runs | Success | Cost per run |", "| --- | --- | --- | --- | ---: | ---: | ---: |"]
     groups = {}
     for r in rows:
-        groups.setdefault((r.get("model"), r.get("family"), r.get("repo"), r.get("arm")), []).append(r)
+        family = "large/%s" % r.get("kind") if r.get("family") == "large" else r.get("family")
+        groups.setdefault((r.get("model"), family, r.get("repo"), r.get("arm")), []).append(r)
     flags = []
     for key in sorted(groups, key=lambda k: tuple(str(x) for x in k)):
         cell = groups[key]
@@ -553,8 +554,9 @@ def main(argv=None):
     parser.add_argument("--campaign", required=True)
     parser.add_argument("--dry", action="store_true")
     parser.add_argument("--bootstrap", type=int, default=stats.B_DEFAULT)
+    parser.add_argument("--task-set", default="main", choices=sorted(tasks_module.TASK_SETS))
     args = parser.parse_args(argv)
-    text, summary = build(args.home, args.campaign, args.dry, args.bootstrap)
+    text, summary = build(args.home, args.campaign, args.dry, args.bootstrap, args.task_set)
     out = Path(args.home) / "reports" / args.campaign
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.md").write_text(text)

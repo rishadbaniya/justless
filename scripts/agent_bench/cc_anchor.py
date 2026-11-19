@@ -145,8 +145,8 @@ def anchor_once(args, task, arm, rep, ledger, pricing, upstream, real_key, resul
     if jl:
         runner([str(jl / "justless"), "init", "--hooks", "--agent", "claude"], 120)
     workspace.normalize_mtimes(repo)
-    workspace.git_baseline(repo, env=workspace.git_env(repo, home))
-    if task["family"] in ("bugfix", "lint") and task["language"] == "rust":
+    workspace.git_task_history(repo, task, env=workspace.git_env(repo, home))
+    if tasks_module.is_edit(task) and task["language"] == "rust":
         runner(["cargo", "test", "--offline", "--no-run"] + task["oracle"].get("cargo_scope", []), 3600)
     reference = workspace.tree_files(repo)
     log = run_dir / "proxy.jsonl"

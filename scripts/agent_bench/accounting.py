@@ -262,6 +262,86 @@ SCALE_UP = [("opus", {"tasks_per_family": 2}), ("sonnet", {"reps": 4}),
                            "families": ["bugfix", "lint"]})]
 
 
+# The large-output family is its own campaign, registered separately from the 32-task plan above: Sonnet, arms
+# a and b, three repetitions of its eight tasks. It is never scaled up or down by the rules above.
+LARGE_PLAN = [{"name": "large-sonnet", "model": "claude-sonnet-5-5", "tasks_per_family": 8, "reps": 3,
+               "arms": ["a", "b"], "families": ["large"]}]
+
+# Per-run planning model, fitted on 2026-11-19 to the main campaign's 246 graded Sonnet runs: the peak prompt is
+# about RUN_MODEL["base"] + RUN_MODEL["per_byte"] x tool bytes seen + RUN_MODEL["per_request"] x requests tokens.
+# Each run writes its whole prompt to the cache once (every run has its own session block) and reads the
+# cached prefix on every later request, which grows roughly linearly. Summed over those runs the model gave
+# $10.55 against $10.35 billed; per run its ratio to the bill had a median of 1.09 (p10 0.73, p90 1.18).
+RUN_MODEL = {"base": 7084, "per_byte": 0.3937, "per_request": 402.7, "first_prompt": 6600,
+             "output_per_request": 200}
+# A model takes more steps and reads more than the minimal scripted path that dry-run measures.
+LARGE_MARGIN = {"requests": 1.5, "bytes": 1.25, "p90": 1.5}
+# Before any dry-run measurement: a plain path of about 120 KB over 9 requests, the median of the scripted
+# large tasks' first measurement.
+LARGE_PREPILOT_PATH = {"a": {"seen": 120000, "requests": 9}, "b": {"seen": 120000, "requests": 9}}
+
+
+def run_cost(model, seen_bytes, requests, pricing_table=None):
+    """Planning cost in USD of one run that sees `seen_bytes` of tool output over `requests` requests."""
+    pricing_table = pricing_table or Pricing()
+    peak = RUN_MODEL["base"] + RUN_MODEL["per_byte"] * seen_bytes + RUN_MODEL["per_request"] * requests
+    tier = pricing_table.tier(model, peak)
+    reads = max(0, requests - 1) * (peak + RUN_MODEL["first_prompt"]) / 2.0
+    output = RUN_MODEL["output_per_request"] * requests
+    return (peak * tier["cache_write_5m"] + reads * tier["cache_read"] + output * tier["output"]) / 1e6
+
+
+def estimate_large(paths, spent=0.0, plan=None, use_reserve=False, budget=config.CAMPAIGN_CAP_USD):
+    """Expected and conservative cost of the large-family plan. paths: {task_id: {arm: {seen, requests}}} from
+    the scripted plain path (dry-run), scaled by LARGE_MARGIN; an arm without a measurement uses arm a's."""
+    plan = plan or LARGE_PLAN
+    rows = []
+    expected = 0.0
+    for cell in plan:
+        cost = 0.0
+        runs = 0
+        per_task = {}
+        for task_id, arms in sorted(paths.items()):
+            task_cost = 0.0
+            for arm in cell["arms"]:
+                path = arms.get(arm) or arms.get("a")
+                task_cost += run_cost(cell["model"], path["seen"] * LARGE_MARGIN["bytes"],
+                                      path["requests"] * LARGE_MARGIN["requests"])
+            per_task[task_id] = round(task_cost * cell["reps"], 3)
+            cost += task_cost * cell["reps"]
+            runs += cell["reps"] * len(cell["arms"])
+        rows.append({"cell": cell["name"], "model": cell["model"], "runs": runs, "usd": round(cost, 2),
+                     "per_task_usd": per_task})
+        expected += cost
+    limit = enforced_limit(budget, use_reserve)
+    room = limit - spent
+    conservative = expected * LARGE_MARGIN["p90"]
+    return {"expected_usd": round(expected, 2), "conservative_usd": round(conservative, 2),
+            "enforced_limit_usd": round(limit, 2), "spent_usd": round(spent, 4), "room_usd": round(room, 2),
+            "fits": conservative <= room, "rows": rows, "margin": LARGE_MARGIN, "run_model": RUN_MODEL}
+
+
+def dry_run_paths(directory):
+    """{task_id: {arm: {seen, requests, source}}} from a dry run's results (the correct variant's campaign)."""
+    out = {}
+    path = Path(directory) / "results.jsonl"
+    if not path.exists():
+        return out
+    with open(str(path)) as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            totals = row.get("totals") or {}
+            if row.get("family") != "large" or not totals or row.get("failure_mode") != "success":
+                continue
+            out.setdefault(row["task_id"], {})[row["arm"]] = {
+                "seen": totals.get("tool_bytes_seen", 0), "requests": totals.get("requests", 0),
+                "source": totals.get("tool_bytes_source")}
+    return out
+
+
 def enforced_limit(budget=config.CAMPAIGN_CAP_USD, use_reserve=False):
     """The total that Ledger.check enforces across campaigns: the cap less the reserve unless it is released."""
     return budget if use_reserve else budget - config.RESERVE_USD

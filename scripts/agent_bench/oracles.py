@@ -590,7 +590,60 @@ def grade_bugfix(task, root, reference, runner):
         return {"success": False, "failure_mode": "wrong_fix", "details": details}
     if not touched:
         return {"success": False, "failure_mode": "untouched_site", "details": details}
+    kept = oracle.get("cleanup_kept")
+    if kept is not None:
+        share, lost = cleanup_preserved(root, oracle.get("cleanup_contexts") or [])
+        details.update(cleanup_kept=round(share, 4), cleanup_lost=lost[:10])
+        if share < kept:
+            return {"success": False, "failure_mode": "reverted_cleanup", "details": details}
     return {"success": True, "failure_mode": "success", "details": details}
+
+
+def cleanup_preserved(root, contexts):
+    """(share, lost) for a regression task: each context is the unique run of lines one behavior-preserving
+    edit of the cleanup commit produced. A fix that reverts the whole commit loses them all."""
+    if not contexts:
+        return 1.0, []
+    texts = {}
+    lost = []
+    for item in contexts:
+        rel = item["file"]
+        if rel not in texts:
+            path = Path(root) / rel
+            texts[rel] = path.read_text(errors="replace") if path.exists() else ""
+        if item["text"] not in texts[rel]:
+            lost.append("%s:%d" % (rel, item.get("line", 0)))
+    return 1.0 - len(lost) / float(len(contexts)), lost
+
+
+def lint_counts(messages):
+    counts = {}
+    for message in messages:
+        key = message.get("code") or message.get("level") or "?"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def grade_lint_rule(task, output, code, details):
+    """A one-rule lint task in a tree that keeps other warnings: the rule must be gone, and no lint code may
+    report more often than it did when the run started."""
+    oracle = task["oracle"]
+    messages = clippy_messages(output)
+    counts = lint_counts(messages)
+    allowed = oracle.get("start_counts") or {}
+    rule = oracle["rule"]
+    details["clippy_exit"] = code
+    details["rule_remaining"] = counts.get(rule, 0)
+    details["clippy_residue"] = [m for m in messages if m.get("code") == rule][:20]
+    grown = sorted(k for k, n in counts.items() if k != rule and n > allowed.get(k, 0))
+    details["grown"] = {k: [allowed.get(k, 0), counts[k]] for k in grown}
+    if compile_failed(output) and not any((m.get("code") or "").startswith("clippy::") for m in messages):
+        return {"success": False, "failure_mode": "build_broken", "details": details}
+    if counts.get(rule, 0):
+        return {"success": False, "failure_mode": "lint_remaining", "details": details}
+    if grown:
+        return {"success": False, "failure_mode": "new_warnings", "details": details}
+    return None
 
 
 def grade_lint(task, root, reference, runner):
@@ -606,10 +659,16 @@ def grade_lint(task, root, reference, runner):
     command = task["oracle"].get("clippy_command") or [
         "cargo", "clippy", "--offline", "--all-targets", "--message-format=json", "--", "-D", "warnings"]
     code, output = runner(command, 1800)
-    messages = clippy_messages(output)
-    details["clippy_exit"] = code
-    details["clippy_residue"] = messages[:20]
-    if code != 0 or messages:
+    if task["oracle"].get("rule"):
+        verdict = grade_lint_rule(task, output, code, details)
+        if verdict is not None:
+            return verdict
+        messages = []
+    else:
+        messages = clippy_messages(output)
+        details["clippy_exit"] = code
+        details["clippy_residue"] = messages[:20]
+    if not task["oracle"].get("rule") and (code != 0 or messages):
         if compile_failed(output) and not any((m.get("code") or "").startswith("clippy::") for m in messages):
             return {"success": False, "failure_mode": "build_broken", "details": details}
         return {"success": False, "failure_mode": "lint_remaining", "details": details}
@@ -625,14 +684,61 @@ def grade_lint(task, root, reference, runner):
     return {"success": True, "failure_mode": "success", "details": details}
 
 
+def grade_callers(task, final_text, root=None):
+    """Recall and precision over the functions whose code mentions a uniquely defined symbol. An answer entry
+    counts when its file matches and its symbol matches a function there; functions that mention the symbol
+    only in comments or strings are neutral."""
+    truth = task["truth"]
+    answer = parse_answer(final_text)
+    entries = answer.get("callers") if isinstance(answer, dict) else None
+    if not isinstance(entries, list):
+        return {"success": False, "failure_mode": "no_answer", "details": {"answer": answer},
+                "recall": 0.0, "precision": 0.0, "f1": 0.0}
+    required = truth["required"]
+    neutral = truth.get("neutral") or []
+    hit = set()
+    counted = 0
+    correct = 0
+    extra = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            counted += 1
+            continue
+        rel = norm_path(entry.get("file"), root)
+        symbol = entry.get("symbol")
+        matches = [i for i, unit in enumerate(required)
+                   if unit["file"] == rel and symbol_matches(symbol, unit["accepted"])]
+        if matches:
+            hit.update(matches)
+            counted += 1
+            correct += 1
+            continue
+        if any(unit["file"] == rel and symbol_matches(symbol, unit["accepted"]) for unit in neutral):
+            continue
+        counted += 1
+        extra.append("%s %s" % (rel, symbol))
+    recall = len(hit) / float(len(required)) if required else 1.0
+    precision = correct / float(counted) if counted else 0.0
+    f1 = 2 * recall * precision / (recall + precision) if recall + precision else 0.0
+    thresholds = task["oracle"]
+    success = recall >= thresholds.get("recall", 0.9) and precision >= thresholds.get("precision", 0.8)
+    mode = "success" if success else ("partial_answer" if hit else "wrong_answer")
+    missing = ["%s %s" % (u["file"], u["symbol"]) for i, u in enumerate(required) if i not in hit]
+    return {"success": success, "failure_mode": mode, "recall": round(recall, 4), "precision": round(precision, 4),
+            "f1": round(f1, 4), "details": {"missing": missing[:20], "extra": extra[:20]}}
+
+
 def grade(task, root, reference, runner, final_text):
     family = task["family"]
-    if family == "bugfix":
+    kind = task.get("kind") if family == "large" else family
+    if kind in ("bugfix", "regression"):
         return grade_bugfix(task, root, reference, runner)
-    if family == "lint":
+    if kind == "lint":
         return grade_lint(task, root, reference, runner)
-    if family == "location":
+    if kind == "location":
         return grade_location(task, final_text, root)
-    if family == "impact":
+    if kind == "impact":
         return grade_impact(task, final_text, root)
-    raise ValueError(family)
+    if kind == "callers":
+        return grade_callers(task, final_text, root)
+    raise ValueError(kind)

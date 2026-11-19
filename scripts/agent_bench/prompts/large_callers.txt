@@ -1,0 +1,7 @@
+Which functions use `{symbol}` (defined in {file})? List every function or method in the repository whose code calls or otherwise refers to it, including tests, but not `{symbol}` itself. Do not make changes.
+
+End your final message with a fenced block tagged `answer` that contains JSON in this form:
+
+```answer
+{"callers": [{"file": "<repo-relative path>", "symbol": "<name or Type::name>"}]}
+```

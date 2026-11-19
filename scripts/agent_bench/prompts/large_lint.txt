@@ -1,0 +1,1 @@
+`{command}` reports many warnings in this repository. This change fixes only the `{rule}` warnings, everywhere they occur; the other warnings are left for later changes. Fix them without changing behavior. Do not add allow attributes or change lint configuration. Make sure the tests still pass.{known}

@@ -9,8 +9,11 @@ list of fake_api steps; paths use the {root} placeholder.
 import json
 
 from fake_api import final, tool_use
+from tasks import kind
 
 FENCE = "```"
+# Claude Code saves a successful command's output above this many characters to a file and shows a preview.
+PERSIST_OVER = 30000
 
 
 def answer_block(value):
@@ -22,9 +25,51 @@ def _bash(command, timeout=600000):
 
 
 def _test_command(task):
-    if task["family"] == "lint":
-        return "cargo clippy --offline --all-targets -- -D warnings"
+    if kind(task) == "lint":
+        return task.get("visible_command") or "cargo clippy --offline --all-targets -- -D warnings"
     return task.get("visible_command") or "cargo test --offline"
+
+
+def _persisted_read(task, tool_id, command, size):
+    """A command whose output Claude Code saves to a file, then a Read of that file, as an agent does after the
+    2 KB preview. Below the threshold the output is shown inline and there is nothing to read."""
+    step = _bash(command)
+    step["content"][-1]["id"] = tool_id
+    if size and size > PERSIST_OVER:
+        return [step, tool_use("Read", {"file_path": "{persist}/%s.txt" % tool_id})]
+    return [step]
+
+
+def large_plain_path(task):
+    """The large family's scripted plain path: the outputs a plain agent reads on the way to the fix, with no
+    narrowing the prompt does not give. dry-run measures its tool bytes."""
+    k = kind(task)
+    large = task.get("large") or {}
+    if k == "callers":
+        symbol = task["oracle"]["symbol"]
+        files = sorted({u["file"] for u in task["truth"]["required"]})
+        steps = [_bash("grep -rnw --include='*.rs' '%s' ." % symbol)]
+        steps += [tool_use("Read", {"file_path": "{root}/" + f}) for f in files]
+        return steps + [final("These functions.\n" + answer_block({"callers": [
+            {"file": u["file"], "symbol": u["symbol"]} for u in task["truth"]["required"]]}))]
+    files = sorted({p["file"] for p in task["controls"]["inverse"]})
+    if k == "lint":
+        steps = _persisted_read(task, "toolu_large_lint_1", _test_command(task), large.get("clippy_human_bytes"))
+        steps += [tool_use("Read", {"file_path": "{root}/" + f}) for f in files]
+        steps += _edits(task)
+        steps.append(_bash(_test_command(task)))
+        steps.append(_bash(" ".join(task["oracle"]["test_command"])))
+        return steps + [final("Fixed it.")]
+    steps = [_bash(_test_command(task))]
+    if k == "regression":
+        steps.append(_bash("git show --stat HEAD"))
+        steps += _persisted_read(task, "toolu_large_show_1", "git show HEAD", large.get("diff_bytes"))
+    else:
+        steps.append(_bash("%s 2>&1 | grep -E '^test .* FAILED$|panicked at'" % _test_command(task)))
+    steps += [tool_use("Read", {"file_path": "{root}/" + f}) for f in files]
+    steps += _edits(task)
+    steps.append(_bash(_test_command(task)))
+    return steps + [final("Fixed it.")]
 
 
 def _edits(task, reverse=False):
@@ -37,8 +82,13 @@ def _edits(task, reverse=False):
 
 
 def correct(task, read_first=True):
-    family = task["family"]
-    if family in ("bugfix", "lint"):
+    family = kind(task)
+    if task["family"] == "large" and read_first:
+        return large_plain_path(task)
+    if family == "callers":
+        return [final("These functions.\n" + answer_block({"callers": [
+            {"file": u["file"], "symbol": u["symbol"]} for u in task["truth"]["required"]]}))]
+    if family in ("bugfix", "lint", "regression"):
         steps = [_bash(_test_command(task))]
         files = sorted({p["file"] for p in task["controls"]["inverse"]})
         if read_first:
@@ -62,7 +112,14 @@ def correct(task, read_first=True):
 
 
 def wrong(task):
-    family = task["family"]
+    family = kind(task)
+    if family == "regression":
+        # Reverting the whole cleanup commit fixes the tests but throws the cleanup away.
+        return [_bash(_test_command(task)), _bash("git checkout HEAD~1 -- ."), _bash(_test_command(task)),
+                final("Reverted the commit.")]
+    if family == "callers":
+        first = task["truth"]["required"][0]
+        return [final(answer_block({"callers": [{"file": first["file"], "symbol": first["symbol"]}]}))]
     if family == "bugfix":
         oracle = task["oracle"]
         return [_bash(_test_command(task)),
@@ -80,8 +137,8 @@ def wrong(task):
 
 
 def tamper(task):
-    family = task["family"]
-    if family == "bugfix":
+    family = kind(task)
+    if family in ("bugfix", "regression"):
         oracle = task["oracle"]
         if task["language"] == "python":
             return [tool_use("Write", {"file_path": "{root}/bench_tests/test_extra.py", "content": "pass\n"}),
@@ -124,7 +181,14 @@ def probe(task, justless):
 def qualified(task):
     """Answers in the forms navigation tools print: an absolute file:line path and a module-qualified symbol.
     Edit families run the correct fix. Every family must succeed."""
-    family = task["family"]
+    family = kind(task)
+    if family == "callers":
+        units = task["truth"]["required"]
+        entries = [{"file": ("{root}/" if i % 2 else "./") + u["file"],
+                    "symbol": "%s::%s" % (u["file"].rsplit(".", 1)[0].replace("/", "::"), u["symbol"])}
+                   for i, u in enumerate(units)]
+        return [_bash("grep -rnw '%s' ." % task["oracle"]["symbol"]),
+                final("These functions.\n" + answer_block({"callers": entries}))]
     if family == "location":
         truth = task["truth"]
         symbol = truth.get("symbol") or ""
@@ -164,7 +228,7 @@ def overrun(task, justless):
     """Does the task, then keeps calling tools until the turn limit stops the run: the oracle must still
     grade the final state (success, stopped_by turn_limit)."""
     steps = [s for s in correct(task, True) if s.get("stop_reason") == "tool_use"]
-    if task["family"] in ("location", "impact"):
+    if kind(task) in ("location", "impact", "callers"):
         answer = correct(task, True)[-1]["content"][0]["text"]
         steps.append(tool_use("Bash", {"command": "true", "description": "Check", "timeout": 600000}, text=answer))
     return steps + [_bash("true")] * 80
@@ -174,22 +238,23 @@ def applies(variant, task):
     """Whether a validation variant is meaningful for a task: cfgtest needs a Rust bug fix, and qualified
     answers exist only for the answer families."""
     if variant == "cfgtest":
-        return task["family"] == "bugfix" and task["language"] == "rust"
+        return kind(task) in ("bugfix", "regression") and task["language"] == "rust"
     if variant == "qualified":
-        return task["family"] in ("location", "impact")
+        return kind(task) in ("location", "impact", "callers")
     return True
 
 
 def noop(task):
     """Runs the visible check and changes nothing: the mutation must make the oracle fail."""
-    if task["family"] in ("bugfix", "lint"):
+    if kind(task) in ("bugfix", "lint", "regression"):
         return [_bash(_test_command(task)), final("No change.")]
     return [final("No answer.")]
 
 
 def bulk_read(task):
     """Reads several files whole, so server-side context editing has old tool results to clear."""
-    files = list((task.get("truth") or {}).get("required") or [])
+    files = [f["file"] if isinstance(f, dict) else f for f in (task.get("truth") or {}).get("required") or []]
+    files = sorted(set(files), key=files.index)
     if not files:
         files = sorted({p["file"] for p in (task.get("controls") or {}).get("inverse") or []})
     steps = [tool_use("Read", {"file_path": "{root}/" + f}) for f in files[:8]]
@@ -215,14 +280,16 @@ VARIANTS = {
 EXPECTED_STOP = {"overrun": "turn_limit"}
 
 EXPECTED = {
-    "noop": {"bugfix": "wrong_fix", "lint": "lint_remaining", "location": "no_answer", "impact": "no_answer"},
+    "noop": {"bugfix": "wrong_fix", "lint": "lint_remaining", "location": "no_answer", "impact": "no_answer",
+             "callers": "no_answer", "regression": "wrong_fix"},
     "correct": "success",
     "unread_edit": "success",
-    "wrong": {"bugfix": "wrong_fix", "lint": "lint_remaining", "location": "wrong_answer", "impact": "partial_answer"},
+    "wrong": {"bugfix": "wrong_fix", "lint": "lint_remaining", "location": "wrong_answer", "impact": "partial_answer",
+              "callers": "partial_answer", "regression": "reverted_cleanup"},
     "tamper": {"bugfix": "test_tamper", "lint": "lint_suppressed", "location": "wrong_answer",
-               "impact": "partial_answer"},
+               "impact": "partial_answer", "callers": "partial_answer", "regression": "test_tamper"},
     "qualified": "success",
-    "cfgtest": {"bugfix": "test_tamper"},
+    "cfgtest": {"bugfix": "test_tamper", "regression": "test_tamper"},
     "overrun": "success",
 }
 
@@ -230,5 +297,5 @@ EXPECTED = {
 def expected(variant, task):
     value = EXPECTED.get(variant)
     if isinstance(value, dict):
-        return value.get(task["family"])
+        return value.get(kind(task))
     return value

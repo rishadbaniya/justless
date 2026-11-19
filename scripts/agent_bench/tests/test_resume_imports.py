@@ -176,7 +176,7 @@ class ResumeTests(unittest.TestCase):
 class ImportTests(unittest.TestCase):
     STDLIB_EXTRA = {"config", "accounting", "api", "cc_capture", "cc_hooks", "cc_profile", "cc_tools", "fake_agent",
                     "fake_api", "gen_tasks", "loop", "oracles", "parity_diff", "report", "sandbox", "stats", "tasks",
-                    "workspace", "baseline_build", "proxy", "cc_anchor", "run", "dry_checks"}
+                    "workspace", "baseline_build", "proxy", "cc_anchor", "run", "dry_checks", "gen_large"}
 
     def test_stdlib_only_and_no_justless_in_generators(self):
         import sys
@@ -196,7 +196,7 @@ class ImportTests(unittest.TestCase):
                     names = [node.module.split(".")[0]]
                 for name in names:
                     self.assertIn(name, stdlib | self.STDLIB_EXTRA, "%s imports %s" % (path.name, name))
-        for name in ("gen_tasks.py", "oracles.py"):
+        for name in ("gen_tasks.py", "gen_large.py", "oracles.py"):
             text = (helpers.BENCH / name).read_text()
             calls = [line for line in text.split("\n") if "subprocess" in line and "justless" in line]
             self.assertEqual(calls, [], name)

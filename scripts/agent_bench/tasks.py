@@ -7,7 +7,13 @@ from pathlib import Path
 
 import config
 
-FAMILIES = ["bugfix", "lint", "location", "impact"]
+FAMILIES = ["bugfix", "lint", "location", "impact", "large"]
+# The large-output family reuses the edit oracles and adds a callers question and a regression hidden in a
+# commit. Its tasks live in their own task set, so they never enter the 32-task manifest.
+LARGE_KINDS = ["bugfix", "lint", "callers", "regression"]
+# Task set -> directory under <store>/tasks. The main set is the directory itself; load_private never descends
+# into subdirectories, so another set cannot change the main manifest.
+TASK_SETS = {"main": None, "large": "large"}
 REQUIRED = ["id", "family", "repo", "language", "prompt", "setup", "oracle"]
 
 
@@ -23,7 +29,22 @@ def validate(task):
         raise TaskError("%s: unknown family %s" % (task["id"], task["family"]))
     if not task["id"].startswith(task["family"] + "-"):
         raise TaskError("%s: id must start with the family" % task["id"])
+    if task["family"] == "large" and task.get("kind") not in LARGE_KINDS:
+        raise TaskError("%s: large tasks need a kind in %s" % (task["id"], ", ".join(LARGE_KINDS)))
     return task
+
+
+def kind(task):
+    """What the oracle and the scripted agents dispatch on: the family, or a large task's kind."""
+    return task.get("kind") if task["family"] == "large" else task["family"]
+
+
+EDIT_KINDS = ("bugfix", "lint", "regression")
+
+
+def is_edit(task):
+    """Edit tasks are graded on the repository: they get a warm Cargo target and a warm-up build."""
+    return kind(task) in EDIT_KINDS
 
 
 def load_public():
@@ -32,12 +53,15 @@ def load_public():
     return [validate(t) for t in data["tasks"]]
 
 
-def private_dir(home):
-    return Path(home) / "tasks"
+def private_dir(home, task_set="main"):
+    if task_set not in TASK_SETS:
+        raise TaskError("unknown task set %s" % task_set)
+    base = Path(home) / "tasks"
+    return base / TASK_SETS[task_set] if TASK_SETS[task_set] else base
 
 
-def load_private(home):
-    directory = private_dir(home)
+def load_private(home, task_set="main"):
+    directory = private_dir(home, task_set)
     if not directory.is_dir():
         return []
     out = []
@@ -49,8 +73,8 @@ def load_private(home):
     return out
 
 
-def save_private(home, task):
-    directory = private_dir(home)
+def save_private(home, task, task_set="main"):
+    directory = private_dir(home, task_set)
     directory.mkdir(parents=True, exist_ok=True)
     with open(directory / ("%s.json" % task["id"]), "w") as handle:
         json.dump(task, handle, indent=1, sort_keys=True)

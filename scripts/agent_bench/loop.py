@@ -118,6 +118,7 @@ class Run:
                        "max_prompt_tokens": 0, "ce_edits": 0, "ce_cleared_tool_uses": 0, "ce_cleared_input_tokens": 0,
                        "ttl_expiry_rewrites": 0, "ttl_expiry_cost": 0.0, "api_s": 0.0, "tools_s": 0.0,
                        "hooks_s": 0.0, "retry_wait_s": 0.0, "tool_bytes_raw": 0, "tool_bytes_seen": 0,
+                       "tool_bytes_source": 0,
                        "hook_bytes_removed": 0, "denials": 0, "input_transformations": 0, "stop_max_tokens": 0,
                        "cargo_cache_access": 0, "cargo_cache_mentions": 0}
         self.tool_counts = {}
@@ -206,6 +207,9 @@ class Run:
         self.totals["tools_s"] += tool_seconds
         self.totals["tool_bytes_raw"] += len(raw_text.encode("utf-8"))
         self.totals["tool_bytes_seen"] += len(seen.encode("utf-8"))
+        # What the command printed or the file held, before Claude Code's previews and excerpts.
+        source_bytes = outcome.extra.get("raw_bytes", len(raw_text.encode("utf-8")))
+        self.totals["tool_bytes_source"] += source_bytes
         self.totals["hook_bytes_removed"] += max(0, outcome.extra.get("hook_bytes_removed", 0))
         self.totals["denials"] += outcome.extra.get("denials", 0)
         kind = outcome.kind
@@ -235,6 +239,7 @@ class Run:
                       render=(outcome.extra.get("render_meta") or {}).get("render"),
                       duration_s=round(tool_seconds, 3), hook_s=round(hook_seconds, 3),
                       bytes_raw=len(raw_text.encode("utf-8")), bytes_seen=len(seen.encode("utf-8")),
+                      bytes_source=source_bytes,
                       hooks=[e.record() for e in hook_events], notes=len(notes),
                       denials=outcome.extra.get("denials", 0), partial=outcome.extra.get("partial"),
                       cargo_cache_access=cache_access, cargo_cache_mention=cache_mention)
