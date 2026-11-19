@@ -394,3 +394,120 @@ fn the_registry_totals_projects_by_repository_and_finds_their_runs() {
     run_id(&lab, &main, "true");
     assert!(fs::read_to_string(&file).unwrap().contains("main"));
 }
+
+#[test]
+fn global_hooks_serve_each_project_once_and_remove_cleanly() {
+    let lab = Lab::new();
+    let claude = lab.home.join(".claude/settings.json");
+    let codex = lab.home.join(".codex/hooks.json");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    let original = "{\n  \"model\": \"opus\",\n  \"env\": {\"A\": \"1\"}\n}\n";
+    fs::write(&claude, original).unwrap();
+    let plain = lab.project("plain", "");
+    let opted = lab.project("opted", "global_hooks = false\n");
+    let own = lab.project("own", "");
+    lab.run(&own, &["init", "--hooks", "--agent", "claude"]);
+
+    // Without --agent, setup takes the clients whose config directory exists.
+    let setup = lab.run(&lab.base, &["init", "--global"]);
+    assert!(setup.contains("Updated ") && !codex.exists(), "{setup}");
+    let settings: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+    assert_eq!(settings["model"], "opus");
+    let command = &settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"];
+    assert_eq!(command, "justless hook-claude before-command --global");
+    assert!(
+        lab.run(&lab.base, &["init", "--global"])
+            .contains("already has the global")
+    );
+    lab.run(&lab.base, &["init", "--global", "--agent", "codex"]);
+    assert!(codex.is_file());
+    let refused = lab.output(
+        &lab.base,
+        &["init", "--global", "--agent", "cursor"],
+        None,
+        &[],
+    );
+    assert!(!refused.status.success());
+
+    // Each call finds its project from `cwd`, wherever the hook runs.
+    let ask = |agent: &str, mode: &str, input: &Value, env: &[(&str, &str)]| {
+        lab.hook(&lab.base, &[agent, mode, "--global"], input, env)
+    };
+    let before = |agent: &str, cwd: &Path| {
+        let input = bash(cwd, "cargo test", Some("bypassPermissions"));
+        routed(&ask(agent, "before-command", &input, &[]))
+    };
+    let wrapped = Some("justless run --hook -- cargo test".to_owned());
+    assert_eq!(before("hook-claude", &plain), wrapped);
+    assert_eq!(before("hook-codex", &plain.join("src")), wrapped);
+    assert_eq!(before("hook-claude", &opted), None);
+    // The project's own Claude Code hooks take precedence; it has none for Codex.
+    assert_eq!(before("hook-claude", &own), None);
+    assert_eq!(before("hook-codex", &own), wrapped);
+    assert_eq!(before("hook-claude", &lab.home), None);
+    fs::create_dir_all(lab.base.join("loose")).unwrap();
+    assert_eq!(before("hook-claude", &lab.base.join("loose")), None);
+    // Claude Code loads project hooks from the directory it started in.
+    let input = bash(&plain, "cargo test", Some("bypassPermissions"));
+    let started = [("CLAUDE_PROJECT_DIR", own.to_str().unwrap())];
+    assert_eq!(
+        ask("hook-claude", "before-command", &input, &started).trim(),
+        "{}"
+    );
+    let off = [("JUSTLESS_DISABLE", "1")];
+    assert_eq!(
+        ask("hook-claude", "before-command", &input, &off).trim(),
+        "{}"
+    );
+    let compact = json!({"hook_event_name": "PreCompact", "cwd": lab.home});
+    assert_eq!(ask("hook-claude", "before-compact", &compact, &[]), "");
+
+    let doctor = |cwd: &Path| {
+        let stdout = lab.output(cwd, &["doctor"], None, &[]).stdout;
+        String::from_utf8(stdout).unwrap()
+    };
+    let report = doctor(&plain);
+    assert!(
+        report.contains("Global hooks for Claude Code: 8 handlers in "),
+        "{report}"
+    );
+    assert!(
+        report.contains("The global Codex hooks serve this project"),
+        "{report}"
+    );
+    assert!(doctor(&own).contains("own Claude Code hooks take precedence"));
+    assert!(doctor(&opted).contains("sets global_hooks = false"));
+
+    // A file nobody edited since is restored byte for byte, and the directory
+    // setup created for Codex goes with its file.
+    let dry = lab.run(&lab.base, &["init", "--remove", "--global", "--dry-run"]);
+    assert!(dry.contains("settings.json: remove 8 hooks"), "{dry}");
+    assert!(codex.is_file());
+    lab.run(&lab.base, &["init", "--remove", "--global"]);
+    assert_eq!(fs::read_to_string(&claude).unwrap(), original);
+    assert!(!codex.parent().unwrap().exists());
+
+    // In an edited file only the handlers with --global go. Another Justless
+    // handler there runs in every project too, which doctor reports.
+    lab.run(&lab.base, &["init", "--global", "--agent", "claude"]);
+    let mut settings: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+    let mine = json!({"matcher": "^Bash$", "hooks": [
+        {"type": "command", "command": "justless hook-claude before-command"},
+        {"type": "command", "command": "my-audit"},
+    ]});
+    settings["hooks"]["PreToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .push(mine);
+    fs::write(&claude, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+    assert!(
+        doctor(&plain).contains("runs 1 Justless hook without --global as well as the global ones")
+    );
+    lab.run(&lab.base, &["init", "--remove", "--global"]);
+    let left: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+    assert_eq!(left["model"], "opus");
+    let hooks = left["hooks"].as_object().unwrap();
+    assert_eq!(hooks.keys().collect::<Vec<_>>(), ["PreToolUse"], "{left}");
+    assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 1, "{left}");
+    assert!(!left.to_string().contains("--global"));
+}

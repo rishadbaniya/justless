@@ -308,7 +308,15 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         );
         return Ok((old != plugin).then(|| (path, plugin.to_string())));
     }
-    let original = read_regular(&path)?;
+    Ok(merge_hooks(&path, agent, "")?.map(|contents| (path, contents)))
+}
+
+/// The hook file at `path` with every Justless hook for `agent` that it lacks,
+/// each running `justless hook-AGENT MODE` followed by `suffix`, or `None` when it
+/// has them all. Other keys and hooks stay. Claude Code, Codex and Antigravity CLI
+/// share this layout; `init --global` passes ` --global` for user-level files.
+pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Option<String>> {
+    let original = read_regular(path)?;
     let mut config: Value = if original.is_empty() {
         json!({})
     } else {
@@ -372,7 +380,7 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
             .or_insert(json!([]))
             .as_array_mut()
             .with_context(|| format!("{event} must contain an array"))?;
-        let command = agent.command(mode);
+        let command = format!("{}{suffix}", agent.command(mode));
         let flat = agent == Agent::Agy && event == "SessionStart";
         let present = entries.iter().any(|entry| {
             if flat {
@@ -400,9 +408,9 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
     if !changed {
         return Ok(None);
     }
-    Ok(Some((
-        path,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
+    Ok(Some(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&config)?
     )))
 }
 
@@ -681,11 +689,24 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
 }
 
 pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
-    let input: Value =
-        serde_json::from_reader(io::stdin().take(8 * 1024 * 1024)).unwrap_or(Value::Null);
-    let workspace = &agent_workspace(workspace, &input);
+    answer_hook(workspace, agent, mode, &read_input())
+}
+
+/// A hook's JSON input from stdin, or `null` when it is not JSON.
+pub(crate) fn read_input() -> Value {
+    serde_json::from_reader(io::stdin().take(8 * 1024 * 1024)).unwrap_or(Value::Null)
+}
+
+/// Print the answer of a Claude Code, Codex or Antigravity CLI hook to `input`.
+pub(crate) fn answer_hook(
+    workspace: &Workspace,
+    agent: Agent,
+    mode: &str,
+    input: &Value,
+) -> Result<()> {
+    let workspace = &agent_workspace(workspace, input);
     let output = if agent == Agent::Agy {
-        agy_hook(workspace, mode, &input).unwrap_or_else(|| {
+        agy_hook(workspace, mode, input).unwrap_or_else(|| {
             if mode == "before-command" {
                 json!({"decision":"allow"})
             } else {
@@ -693,20 +714,20 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
             }
         })
     } else if agent == Agent::Claude && mode == "after-read" {
-        let outline = claude_read(workspace, &input);
-        saw_claude_read(workspace, &input, outline.is_some());
+        let outline = claude_read(workspace, input);
+        saw_claude_read(workspace, input, outline.is_some());
         outline.unwrap_or_else(|| json!({}))
     } else if agent == Agent::Claude && mode == "after-search" {
-        crate::search::claude_tool_output(workspace, &input).unwrap_or_else(|| json!({}))
+        crate::search::claude_tool_output(workspace, input).unwrap_or_else(|| json!({}))
     } else if agent == Agent::Claude && mode == "after-bash" {
         // Any failure, even a panic, answers with no change, so Claude reads the
         // original output.
-        std::panic::catch_unwind(|| crate::postroute::claude_bash(workspace, &input))
+        std::panic::catch_unwind(|| crate::postroute::claude_bash(workspace, input))
             .ok()
             .flatten()
             .unwrap_or_else(|| json!({}))
     } else if agent == Agent::Claude && mode == "after-edit" {
-        std::panic::catch_unwind(|| claude_edit(workspace, &input))
+        std::panic::catch_unwind(|| claude_edit(workspace, input))
             .ok()
             .flatten()
             .unwrap_or_else(|| json!({}))
@@ -746,12 +767,12 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
         && input["tool_name"] == "Bash"
         && input["permission_mode"] != "plan"
     {
-        bash_hook(workspace, agent, &input).unwrap_or_else(|| json!({}))
+        bash_hook(workspace, agent, input).unwrap_or_else(|| json!({}))
     } else {
         json!({})
     };
     if agent == Agent::Claude {
-        crate::statusline::observe(workspace, mode, &input, &output);
+        crate::statusline::observe(workspace, mode, input, &output);
     }
     println!("{output}");
     Ok(())

@@ -13,6 +13,7 @@ mod filters;
 mod find;
 mod floor;
 mod focus;
+mod global;
 mod history;
 mod impact;
 mod index;
@@ -381,6 +382,12 @@ fn cli() -> Command<'static> {
                         .long("statusline")
                         .conflicts_with("remove")
                         .help("Show this session's savings in Claude Code's status line"),
+                )
+                .arg(
+                    Arg::new("global")
+                        .long("global")
+                        .conflicts_with_all(&["hooks", "statusline", "purge"])
+                        .help("Install user-level Claude Code and Codex hooks that work in every project; with --remove, remove them"),
                 ),
         )
         .subcommand(exec::command())
@@ -403,6 +410,11 @@ fn cli() -> Command<'static> {
         .subcommands(["hook-codex", "hook-claude", "hook-agy"].map(|name| {
             Command::new(name)
                 .hide(true)
+                .arg(
+                    Arg::new("global")
+                        .long("global")
+                        .help("Installed by init --global: find the project from the input's cwd"),
+                )
                 .arg(Arg::new("mode").required(true).possible_values([
                     "session-start",
                     "before-command",
@@ -503,6 +515,16 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
     {
         rewrite::pass(
             agents::Agent::parse(client)?,
+            sub.value_of("mode").unwrap_or_default(),
+        );
+        return Ok(0);
+    }
+    // A user-level hook finds its project from the input, not from where it runs.
+    if let Some((name @ ("hook-claude" | "hook-codex"), sub)) = matches.subcommand()
+        && sub.is_present("global")
+    {
+        global::run_hook(
+            agents::Agent::parse(&name[5..])?,
             sub.value_of("mode").unwrap_or_default(),
         );
         return Ok(0);
@@ -743,6 +765,10 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             read_num(sub, "to", 1)?,
             context_budget(&workspace, sub)?,
         )?,
+        ("init", sub) if sub.is_present("global") && sub.is_present("remove") => {
+            global::remove(sub)?
+        }
+        ("init", sub) if sub.is_present("global") => global::init(sub)?,
         ("init", sub) if sub.is_present("remove") => uninstall::run(&workspace, sub)?,
         ("init", sub) => {
             let selected = sub

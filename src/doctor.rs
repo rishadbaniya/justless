@@ -467,7 +467,7 @@ impl Doctor<'_> {
                 .push(Check::new(Status::Fail, message).fix(fix));
         }
         sections.push(others);
-        sections.push(machine_section());
+        sections.push(machine_section(Some(self.workspace)));
         if !mcp.is_empty() {
             let mut section = Section::new("mcp", "MCP servers");
             section.checks = mcp;
@@ -543,7 +543,7 @@ impl Doctor<'_> {
                 )
             } else {
                 format!(
-                    "{} is your home directory. Justless sets up hooks per project, so they never land in your global agent settings.",
+                    "{} is your home directory. Justless sets up hooks per project, and only `justless init --global` adds user-level hooks, which leave the home directory alone.",
                     place.display()
                 )
             },
@@ -583,7 +583,7 @@ impl Doctor<'_> {
             }
         }
         sections.push(project);
-        sections.push(machine_section());
+        sections.push(machine_section(None));
         Report {
             project: false,
             place,
@@ -2653,10 +2653,12 @@ fn list<'a>(items: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
-/// What Justless knows beyond this project: the project registry and the
-/// registered projects whose own settings run Justless hooks. Reads only.
-fn machine_section() -> Section {
+/// What Justless knows beyond this project: the global hooks and whether they
+/// serve `project`, the project registry and the registered projects whose own
+/// settings run Justless hooks. Reads only.
+fn machine_section(project: Option<&Workspace>) -> Section {
     let mut section = Section::new("machine", "This machine");
+    section.checks.extend(global_checks(project));
     let Some(home) = crate::registry::home() else {
         return section;
     };
@@ -2694,6 +2696,94 @@ fn machine_section() -> Section {
         ));
     }
     section
+}
+
+/// The global hooks `init --global` installs: present, current, duplicated by
+/// other Justless hooks in the same user file, and whether they serve `project`.
+fn global_checks(project: Option<&Workspace>) -> Vec<Check> {
+    let installed = crate::global::installed();
+    if installed.is_empty() {
+        return vec![Check::new(
+            Status::Info,
+            "Global hooks: none. `justless init --global` adds opt-in user-level hooks for Claude Code and Codex that work in every project.",
+        )];
+    }
+    let mut checks = Vec::new();
+    for hooks in &installed {
+        let file = hooks.file.display();
+        let name = if hooks.agent == Agent::Claude {
+            "claude"
+        } else {
+            "codex"
+        };
+        if hooks.global > 0 {
+            checks.push(Check::new(
+                Status::Ok,
+                format!(
+                    "Global hooks for {}: {} in {file}",
+                    hooks.label,
+                    plural(hooks.global, "handler")
+                ),
+            ));
+        }
+        if hooks.incomplete {
+            checks.push(
+                Check::new(
+                    Status::Warn,
+                    format!(
+                        "{file} lacks global {} hooks this version adds",
+                        hooks.label
+                    ),
+                )
+                .fix(Fix::Command(format!(
+                    "justless init --global --agent {name}"
+                ))),
+            );
+        }
+        if hooks.plain > 0 {
+            let both = if hooks.global > 0 {
+                " as well as the global ones, so a command can be handled twice"
+            } else {
+                ""
+            };
+            checks.push(
+                Check::new(
+                    Status::Warn,
+                    format!(
+                        "{file} runs {} without --global{both}. Such a handler serves the directory the client starts in, not the project of each call",
+                        plural(hooks.plain, "Justless hook")
+                    ),
+                )
+                .fix(Fix::Manual(format!(
+                    "Remove the `justless hook-{name}` handlers without --global from {file}, then run `justless init --global --agent {name}`"
+                ))),
+            );
+        }
+        let Some(workspace) = project.filter(|_| hooks.global > 0) else {
+            continue;
+        };
+        let opted_out = workspace
+            .settings()
+            .is_ok_and(|settings| !settings.global_hooks);
+        let here = &workspace.cwd;
+        checks.push(Check::new(
+            Status::Info,
+            if opted_out {
+                format!(
+                    "This project sets global_hooks = false, so the global {} hooks leave it alone",
+                    hooks.label
+                )
+            } else if crate::global::project_hooks(hooks.agent, None, here, &workspace.root) {
+                format!(
+                    "This project's own {} hooks take precedence, so the global ones leave it alone",
+                    hooks.label
+                )
+            } else {
+                format!("The global {} hooks serve this project", hooks.label)
+            },
+        ));
+    }
+    checks
 }
 
 #[cfg(test)]

@@ -146,6 +146,8 @@ pub struct Settings {
     /// Commands every hook leaves alone: the first words of a command, or a
     /// regular expression when the entry starts with `^`. See `crate::rewrite`.
     pub exclude_commands: Vec<String>,
+    /// Whether the user-level hooks `init --global` installs work in this project.
+    pub global_hooks: bool,
 }
 
 impl Default for Settings {
@@ -166,6 +168,7 @@ impl Default for Settings {
             adaptive_floor_bytes: None,
             json_grouping: false,
             exclude_commands: Vec::new(),
+            global_hooks: true,
         }
     }
 }

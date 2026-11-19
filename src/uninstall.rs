@@ -436,6 +436,8 @@ struct JsonRules {
     servers: Option<&'static str>,
     /// Cursor and Copilot hook files get `"version": 1` when setup creates them.
     versioned: bool,
+    /// Only the handlers `init --global` writes, which run `justless hook-… --global`.
+    global: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -488,6 +490,7 @@ fn catalog() -> Vec<(String, Kind, Agent)> {
                 status_line: agent == Agent::Claude,
                 servers: None,
                 versioned: matches!(agent, Agent::Cursor | Agent::Copilot),
+                global: false,
             }),
         };
         files.push((format!("{directory}/{file}"), hooks, agent));
@@ -524,6 +527,7 @@ fn kind_of(key: &str) -> Kind {
                 status_line: a.status_line || b.status_line,
                 servers: a.servers.or(b.servers),
                 versioned: a.versioned || b.versioned,
+                global: false,
             }),
             _ => found,
         });
@@ -1175,6 +1179,31 @@ fn is_hook(handler: &Value) -> bool {
     })
 }
 
+/// A hook handler that `init --global` writes: its command passes `--global`.
+fn is_global(handler: &Value) -> bool {
+    justless_args(handler.get("command").and_then(Value::as_str))
+        .is_some_and(|args| args.iter().any(|arg| arg == "--global"))
+}
+
+/// What `init --remove --global` takes out of a user-level hook file: a summary
+/// of the handlers that run `justless hook-… --global`, and the file without them,
+/// or `None` when nothing else is left in it. `Ok(None)` when it has none.
+pub(crate) fn strip_global(key: &str, text: &str) -> Result<Option<(String, Option<String>)>> {
+    let rules = JsonRules {
+        hooks: true,
+        global: true,
+        ..JsonRules::default()
+    };
+    let scan = strip(key, Kind::Json(rules), text)?;
+    Ok(scan.found.map(|found| {
+        let left = match found.outcome {
+            Outcome::Write(text) => Some(text),
+            Outcome::Delete => None,
+        };
+        (join(&found.what), left)
+    }))
+}
+
 /// An MCP server entry that runs `justless mcp`. Clients start `command` directly,
 /// so a path with spaces needs no quotes there.
 fn is_server(command: Option<&str>, args: &[&str]) -> bool {
@@ -1272,7 +1301,7 @@ fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Scan> {
         let group = (rules.hooks && name == "hooks") || (rules.group && name == "justless");
         if group && let Some(events) = value.as_object() {
             let start = paths.len();
-            let (found, emptied) = prune_group(events, name, &mut paths);
+            let (found, emptied) = prune_group(events, name, rules.global, &mut paths);
             hooks += found;
             if emptied {
                 paths.truncate(start);
@@ -1367,8 +1396,10 @@ fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Scan> {
 fn prune_group(
     events: &Map<String, Value>,
     group: &str,
+    global: bool,
     paths: &mut Vec<Vec<Step>>,
 ) -> (usize, bool) {
+    let is_hook = |handler: &Value| is_hook(handler) && (!global || is_global(handler));
     let mut found = 0;
     let mut emptied = 0;
     for (event, entries) in events {

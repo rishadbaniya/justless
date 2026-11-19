@@ -95,6 +95,8 @@ curl -fsSL https://raw.githubusercontent.com/rishadbaniya/justless/main/install.
 
 Clients without hooks, such as VS Code, can use the read-only tools over MCP: `justless mcp --install vscode`. For another project later, run `justless init --hooks --agent claude` there.
 
+To cover every project at once instead, `justless init --global` adds opt-in user-level hooks for Claude Code and Codex ([details](docs/reference.md#global-hooks)).
+
 **Check it works:** `justless doctor` checks the setup and prints a fix for anything missing, `justless run -- git status` ends with a `[justless run-…]` line, and `justless stats` shows what was saved. In Claude Code, `justless init --statusline` keeps a running total in the status line. To update, see [install options](docs/reference.md#install-and-configure-agents). `justless init --remove` takes it back out of a project.
 
 ## How it works
