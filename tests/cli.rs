@@ -7808,20 +7808,12 @@ fn inherited_dependency_resolves_by_name_when_the_workspace_root_is_outside_the_
 fn hook_repo(config: &str, extra: &[(&str, &str)]) -> TempDir {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let git = Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(git.status.success());
+    git(root, &["init", "-q"]);
     write_files(
         root,
         &[
             ("Cargo.toml", "[workspace]\nmembers = [\"sig\"]\n"),
-            (
-                "sig/Cargo.toml",
-                "[package]\nname = \"sig\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("sig/Cargo.toml", &edition_2021_manifest("sig")),
             (
                 "sig/src/lib.rs",
                 "//! Installs a process-wide handler for SIGINT and SIGTERM.\nuse std::sync::Mutex;\n\nstatic HANDLER_SET: Mutex<bool> = Mutex::new(false);\n\n/// Registers `handler` to run on every SIGINT while the process keeps running.\npub fn set_handler<F: FnMut() + Send + 'static>(handler: F) -> Result<(), String> {\n    let mut set = HANDLER_SET.lock().unwrap();\n    if *set {\n        return Err(\"a handler is already configured\".into());\n    }\n    *set = true;\n    listen(handler);\n    Ok(())\n}\n\nfn listen<F: FnMut()>(mut handler: F) {\n    handler();\n}\n",
@@ -7842,81 +7834,53 @@ fn hook_repo(config: &str, extra: &[(&str, &str)]) -> TempDir {
 
 #[test]
 fn pack_surfaces_hook_configuration_for_a_hooks_question() {
-    let repo = hook_repo(".codex/hooks.json", &[]);
-    let root = repo.path();
-    // Signal-handler code shares words with the question ("handler", "running",
-    // "configured"), but the answer is the hook registration.
-    let hooks = success(
-        root,
-        &[
-            "pack",
-            "what hooks are configured and running in this checkout",
-        ],
-    );
-    assert!(
-        hooks.contains(".codex/hooks.json") && hooks.contains("justless hook-codex before-command"),
-        "{hooks}"
-    );
-    // The file named for the question leads, ahead of code that shares its
-    // everyday words, and lists the registered commands rather than bare keys.
-    assert!(hooks.starts_with("Text .codex/hooks.json:"), "{hooks}");
-    assert!(
-        hooks.contains("justless hook-codex session-start"),
-        "{hooks}"
-    );
-    // A signal question still reaches the signal-handler code.
-    let signals = success(root, &["pack", "how is SIGINT handled"]);
-    assert!(
-        signals.contains("sig::set_handler") && signals.contains("sig/src/lib.rs"),
-        "{signals}"
-    );
-}
-
-#[test]
-fn pack_surfaces_hook_configuration_whatever_the_file_is_called() {
-    // The file name no longer says "hooks". Tests named for "running" rank high
-    // among definitions, since few names say it, yet most files do, and a
-    // README mentions the rarer "checkout" once. The configuration still
-    // leads: hooks recur on several of its lines, so it is about a word rarer
-    // than any those test names hold.
+    // whatever_the_file_is_called: the file name no longer says "hooks". Tests
+    // named for "running" rank high among definitions, since few names say it,
+    // yet most files do, and a README mentions the rarer "checkout" once. The
+    // configuration still leads: hooks recur on several of its lines, so it is
+    // about a word rarer than any those test names hold.
     let codes: String = (0..32)
         .map(|n| format!("pub fn code_{n}() -> u8 {{\n    {n}\n}}\n\n"))
         .collect();
+    let readme = "# sig\n\nRun the tests from a checkout of this repository.\n";
     let service = "# Service\n\nKeep the service running while it drains.\n";
-    let repo = hook_repo(
-        ".codex/settings.json",
-        &[
-            (
-                "README.md",
-                "# sig\n\nRun the tests from a checkout of this repository.\n",
-            ),
-            ("sig/src/codes.rs", &codes),
-            ("docs/service1.md", service),
-            ("docs/service2.md", service),
-            ("docs/service3.md", service),
-            ("docs/service4.md", service),
-            ("docs/service5.md", service),
-            ("docs/service6.md", service),
-        ],
-    );
-    let root = repo.path();
-    let hooks = success(
-        root,
-        &[
-            "pack",
-            "what hooks are configured and running in this checkout",
-        ],
-    );
-    assert!(hooks.starts_with("Text .codex/settings.json:"), "{hooks}");
-    assert!(
-        hooks.contains("justless hook-codex before-command"),
-        "{hooks}"
-    );
-    let signals = success(root, &["pack", "how is SIGINT handled"]);
-    assert!(
-        signals.contains("sig::set_handler") && signals.contains("sig/src/lib.rs"),
-        "{signals}"
-    );
+    let whatever_the_file_is_called = [
+        ("README.md", readme),
+        ("sig/src/codes.rs", codes.as_str()),
+        ("docs/service1.md", service),
+        ("docs/service2.md", service),
+        ("docs/service3.md", service),
+        ("docs/service4.md", service),
+        ("docs/service5.md", service),
+        ("docs/service6.md", service),
+    ];
+    let question = "what hooks are configured and running in this checkout";
+    for (config, extra) in [
+        (".codex/hooks.json", &[][..]),
+        (".codex/settings.json", &whatever_the_file_is_called[..]),
+    ] {
+        let repo = hook_repo(config, extra);
+        let root = repo.path();
+        // Signal-handler code shares words with the question ("handler", "running",
+        // "configured"), but the answer is the hook registration.
+        let hooks = success(root, &["pack", question]);
+        // The configuration leads (for hooks.json, the file named for the question),
+        // ahead of code that shares its everyday words, and lists the registered
+        // commands rather than bare keys.
+        let lead = format!("Text {config}:");
+        assert!(hooks.starts_with(&lead), "{config}: {hooks}");
+        let commands = [
+            "justless hook-codex before-command",
+            "justless hook-codex session-start",
+        ];
+        assert_all_in(&hooks, &commands);
+        // A signal question still reaches the signal-handler code.
+        let signals = success(root, &["pack", "how is SIGINT handled"]);
+        assert!(
+            signals.contains("sig::set_handler") && signals.contains("sig/src/lib.rs"),
+            "{config}: {signals}"
+        );
+    }
 }
 
 #[test]
@@ -7930,19 +7894,13 @@ fn inferred_method_calls_stay_within_reachable_crates() {
                 "Cargo.toml",
                 "[workspace]\nmembers = [\"abi\", \"signals\", \"app\"]\n",
             ),
-            (
-                "abi/Cargo.toml",
-                "[package]\nname = \"abi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("abi/Cargo.toml", &edition_2021_manifest("abi")),
             (
                 "abi/src/lib.rs",
                 "pub struct Function {\n    name: String,\n}\n\nimpl Function {\n    pub fn name(&self) -> &str {\n        &self.name\n    }\n}\n\npub fn describe(function: &Function) -> String {\n    function.name().to_owned()\n}\n",
             ),
             // `Builder::name` is std's, and this crate cannot reach `abi`.
-            (
-                "signals/Cargo.toml",
-                "[package]\nname = \"signals\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("signals/Cargo.toml", &edition_2021_manifest("signals")),
             (
                 "signals/src/lib.rs",
                 "pub fn spawn_listener() {\n    std::thread::Builder::new()\n        .name(\"ctrl-c\".into())\n        .spawn(|| {})\n        .unwrap();\n}\n",
@@ -7987,12 +7945,6 @@ fn inferred_method_calls_follow_workspace_and_platform_dependencies() {
         "unix",
         "[target.'cfg(unix)'.dependencies]\nabi = { path = \"../abi\" }\n",
     );
-    let other = manifest("other", "");
-    let (renamed_label, unix_label, other_label) = (
-        label("renamed_label"),
-        label("unix_label"),
-        label("other_label"),
-    );
     write_files(
         root,
         &[
@@ -8007,12 +7959,12 @@ fn inferred_method_calls_follow_workspace_and_platform_dependencies() {
             ),
             // The rename lives in `[workspace.dependencies]`.
             ("renamed/Cargo.toml", &renamed),
-            ("renamed/src/lib.rs", &renamed_label),
+            ("renamed/src/lib.rs", &label("renamed_label")),
             ("unix/Cargo.toml", &unix),
-            ("unix/src/lib.rs", &unix_label),
+            ("unix/src/lib.rs", &label("unix_label")),
             // A crate that does not depend on `abi` cannot hold a `Function`.
-            ("other/Cargo.toml", &other),
-            ("other/src/lib.rs", &other_label),
+            ("other/Cargo.toml", &manifest("other", "")),
+            ("other/src/lib.rs", &label("other_label")),
         ],
     );
     let callers = success(root, &["query", "abi::Function::name", "--view", "callers"]);
@@ -8031,10 +7983,7 @@ fn inferred_method_calls_reach_test_methods_only_from_their_own_target() {
     write_files(
         root,
         &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"relay\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
+            ("Cargo.toml", &edition_2021_manifest("relay")),
             // `tx` is a std channel sender, so its `send` is not the test's.
             (
                 "src/lib.rs",
@@ -8052,29 +8001,14 @@ fn inferred_method_calls_reach_test_methods_only_from_their_own_target() {
             ),
         ],
     );
-    let callers = success(
-        root,
-        &[
-            "query",
-            "relay_test_signals::Run::send",
-            "--view",
-            "callers",
-        ],
-    );
+    let callers_of = |symbol| success(root, &["query", symbol, "--view", "callers"]);
+    let callers = callers_of("relay_test_signals::Run::send");
     assert!(
         callers.contains("possible call from relay_test_signals::sigint at tests/signals.rs:15"),
         "{callers}"
     );
     assert!(!callers.contains("notify"), "{callers}");
-    let alloc = success(
-        root,
-        &[
-            "query",
-            "relay::alloc::Counting::alloc",
-            "--view",
-            "callers",
-        ],
-    );
+    let alloc = callers_of("relay::alloc::Counting::alloc");
     assert!(!alloc.contains("call from"), "{alloc}");
 }
 
@@ -8082,29 +8016,18 @@ fn inferred_method_calls_reach_test_methods_only_from_their_own_target() {
 fn pack_matches_inflections_of_a_word_not_every_word_it_starts() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let mut files = vec![(
-        "docs/tagging.txt".to_owned(),
-        "Write the release notes in CHANGES before tagging a version.\n".to_owned(),
-    )];
+    let tagging = "Write the release notes in CHANGES before tagging a version.\n";
+    write_files(root, &[("docs/tagging.txt", tagging)]);
     // `not` and `Nothing` start like `notes` but are other words, so they must
     // not make `notes` look common.
+    let locks = "Locks\n=====\nDo not release the lock early; it is not kept after the worker exits.\nNothing else is stored here.\n";
     for n in 1..=6 {
-        files.push((
-            format!("docs/locks{n}.txt"),
-            "Locks\n=====\nDo not release the lock early; it is not kept after the worker exits.\nNothing else is stored here.\n".to_owned(),
-        ));
+        write_files(root, &[(&format!("docs/locks{n}.txt"), locks)]);
     }
     for n in 1..=8 {
-        files.push((
-            format!("docs/misc{n}.txt"),
-            format!("Misc {n}\nunrelated text about widgets and gadgets number {n}\n"),
-        ));
+        let misc = format!("Misc {n}\nunrelated text about widgets and gadgets number {n}\n");
+        write_files(root, &[(&format!("docs/misc{n}.txt"), &misc)]);
     }
-    let files: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(path, text)| (path.as_str(), text.as_str()))
-        .collect();
-    write_files(root, &files);
     let notes = success(root, &["pack", "where are the release notes kept"]);
     assert!(
         notes.starts_with("Text docs/tagging.txt:1 Write the release notes"),
@@ -8144,10 +8067,8 @@ fn a_hook_keeps_runs_from_a_nested_repository_in_the_workspace() {
     fs::create_dir(root.join("src")).unwrap();
     let nested = root.join("vendor_lib");
     fs::create_dir(&nested).unwrap();
-    git(&nested, &["init", "-q"]);
     fs::write(nested.join("a.txt"), "x\n").unwrap();
-    git(&nested, &["add", "."]);
-    git(&nested, &["commit", "-qm", "init"]);
+    git_repository(&nested);
     let rewrite = |agent: &str, cwd: &Path, command: &str| {
         let call = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
             "cwd":cwd,"tool_input":{"command":command}});
@@ -8209,11 +8130,10 @@ fn a_hook_keeps_runs_from_a_nested_repository_in_the_workspace() {
 #[cfg(unix)]
 #[test]
 fn missing_and_unrunnable_commands_exit_like_a_shell() {
-    use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     fs::write(root.join("script.sh"), "echo hi\n").unwrap();
-    fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+    set_mode(&root.join("script.sh"), 0o644);
     for mode in [&["run", "--"][..], &["run", "--raw", "--"]] {
         let missing = cli(root, &[mode, &["no-such-tool-xyz", "--flag"]].concat());
         assert_eq!(missing.status.code(), Some(127), "{}", stderr(&missing));
@@ -8231,10 +8151,6 @@ fn missing_and_unrunnable_commands_exit_like_a_shell() {
 #[cfg(unix)]
 #[test]
 fn unwritable_state_still_runs_the_command_and_keeps_its_status() {
-    use std::os::unix::fs::PermissionsExt;
-    let set_mode = |path: &Path, mode| {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    };
     let repo = TempDir::new().unwrap();
     let root = repo.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -8277,16 +8193,8 @@ fn deleting_the_state_directory_during_a_run_keeps_output_and_status() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     // `make clean` with `git clean -fdX` removes ignored directories such as .justless.
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "echo before; rm -rf .justless; echo after; echo oops >&2; exit 3",
-        ],
-    );
+    let script = "echo before; rm -rf .justless; echo after; echo oops >&2; exit 3";
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert_eq!(stdout(&output), "before\nafter\n");
     assert!(stderr(&output).contains("oops\n"), "{}", stderr(&output));
@@ -8297,17 +8205,8 @@ fn deleting_the_state_directory_during_a_run_keeps_output_and_status() {
 fn deleting_the_state_directory_during_a_hook_run_keeps_output_and_status() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--hook",
-            "--",
-            "sh",
-            "-c",
-            "echo before; rm -rf .justless; echo after; echo oops >&2; exit 3",
-        ],
-    );
+    let script = "echo before; rm -rf .justless; echo after; echo oops >&2; exit 3";
+    let output = cli(root, &["run", "--hook", "--", "sh", "-c", script]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert_eq!(stdout(&output), "before\nafter\n");
     let stderr = stderr(&output);
@@ -8388,14 +8287,9 @@ fn terminating_justless_forwards_the_signal_and_keeps_partial_output() {
 fn a_killed_run_stays_listed_and_replayable() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
+    let script = "echo $$ > pid; echo partial; exec sleep 30";
     let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args([
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "echo $$ > pid; echo partial; exec sleep 30",
-        ])
+        .args(["run", "--", "sh", "-c", script])
         .current_dir(root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -8425,16 +8319,8 @@ fn a_killed_run_stays_listed_and_replayable() {
 fn output_written_after_the_command_exits_is_labeled_in_the_log() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "(sleep 0.3; echo late-line) & echo started",
-        ],
-    );
+    let script = "(sleep 0.3; echo late-line) & echo started";
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
     assert_eq!(stdout(&output), "started\n");
     let id = run_id(&output);
     let stream = root.join(".justless/runs").join(&id).join("stdout");
@@ -8550,19 +8436,7 @@ exit 1"#;
 fn clipped_excerpts_end_on_whole_lines_or_mark_the_cut() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--fresh",
-            "--max-bytes",
-            "512",
-            "--",
-            "seq",
-            "1",
-            "5000",
-        ],
-    );
+    let output = cli(root, &argv("run --fresh --max-bytes 512 -- seq 1 5000"));
     let preview = stdout(&output);
     let (head, rest) = preview.split_once("\n[output clipped.").unwrap();
     let numbers: Vec<_> = head.lines().filter(|line| !line.is_empty()).collect();
@@ -8570,18 +8444,10 @@ fn clipped_excerpts_end_on_whole_lines_or_mark_the_cut() {
     assert_eq!(numbers, expected, "{preview}");
     assert!(rest.ends_with("4999\n5000\n"), "{preview}");
 
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--max-bytes",
-            "512",
-            "--",
-            "sh",
-            "-c",
-            "for i in $(seq 1 400); do echo \"removed /var/cache/app/shard-$i/index.db\"; done",
-        ],
-    );
+    let script =
+        "for i in $(seq 1 400); do echo \"removed /var/cache/app/shard-$i/index.db\"; done";
+    let args = ["run", "--max-bytes", "512", "--", "sh", "-c", script];
+    let output = cli(root, &args);
     let preview = stdout(&output);
     for line in preview.lines().filter(|line| line.starts_with("removed")) {
         assert!(
