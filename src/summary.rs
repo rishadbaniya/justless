@@ -81,6 +81,14 @@ pub struct Parser {
     /// Whether that output reached a file's patch, which a plain log never does.
     patched: bool,
     discarded: bool,
+    /// The output can stop in the middle of an item, as `| head` leaves it.
+    ends_early: bool,
+    /// The old and new lines the current hunk's header announced and that have not
+    /// appeared yet.
+    hunk: Option<(usize, usize)>,
+    /// Whether every hunk so far held the lines its header announced, as a patch
+    /// whose lines no filter removed does.
+    whole_hunks: bool,
 }
 
 /// Where a line of `git show` or `git log -p` output falls.
@@ -125,7 +133,35 @@ impl Parser {
             place: Place::Between,
             patched: false,
             discarded: false,
+            ends_early: false,
+            hunk: None,
+            whole_hunks: true,
         }
+    }
+
+    /// Read output that can stop in the middle of an item: a last hunk that holds
+    /// fewer lines than its header announced is marked as cut off.
+    pub fn ends_early(&mut self) {
+        self.ends_early = true;
+    }
+
+    /// Count `line` against the current hunk's announced lines. A header or any
+    /// line outside a hunk ends it, and a hunk header starts the next one.
+    fn count_hunk(&mut self, line: &str) {
+        let remaining = match (self.hunk, line.as_bytes().first()) {
+            (Some((old, new)), Some(b' ')) if old > 0 && new > 0 => Some((old - 1, new - 1)),
+            (Some((old, new)), Some(b'-')) if old > 0 => Some((old - 1, new)),
+            (Some((old, new)), Some(b'+')) if new > 0 => Some((old, new - 1)),
+            (Some(counts), Some(b'\\')) => Some(counts),
+            // A hunk line past the announced count, or a short hunk, means a filter
+            // changed the patch.
+            (Some(counts), first) => {
+                self.whole_hunks &= counts == (0, 0) && !matches!(first, Some(b' ' | b'-' | b'+'));
+                None
+            }
+            (None, _) => None,
+        };
+        self.hunk = remaining.or_else(|| hunk_counts(line));
     }
 
     pub fn observe(&mut self, text: &str, number: usize) {
@@ -246,6 +282,7 @@ impl Parser {
     }
 
     fn diff(&mut self, line: &str, n: usize) {
+        self.count_hunk(line);
         if let Some(names) = line.strip_prefix("diff --git ") {
             self.flush();
             self.file = names
@@ -384,6 +421,15 @@ impl Parser {
         if let Some(inventory) = self.inventory {
             return inventory.finish();
         }
+        // A hunk that a filter such as `grep` thinned out tells nothing about where
+        // the output stopped.
+        if self.ends_early
+            && self.whole_hunks
+            && self.hunk.is_some_and(|counts| counts != (0, 0))
+            && let Some(item) = &mut self.pending
+        {
+            item.detail.push_str(" (cut off)");
+        }
         self.flush();
         self.summary.items.extend(self.failures.into_values());
         self.summary
@@ -392,6 +438,18 @@ impl Parser {
 
 /// The detail of a commit header whose message is empty.
 const NO_MESSAGE: &str = "(no message)";
+
+/// The old and new line counts a `@@ -a,b +c,d @@` hunk header announces. An
+/// omitted count is 1.
+fn hunk_counts(line: &str) -> Option<(usize, usize)> {
+    let ranges = line.strip_prefix("@@ -")?.split_once(" @@")?.0;
+    let (old, new) = ranges.split_once(" +")?;
+    let count = |range: &str| match range.split_once(',') {
+        Some((_, count)) => count.parse().ok(),
+        None => range.parse::<usize>().ok().map(|_| 1),
+    };
+    Some((count(old)?, count(new)?))
+}
 
 /// The commit id on a `commit SHA` or `commit SHA (decorations)` line.
 fn commit_id(line: &str) -> Option<&str> {
@@ -702,5 +760,38 @@ mod tests {
         }
         // `git diff` output still needs `diff --git` first.
         assert!(parse("git diff", SHOW).items.is_empty());
+    }
+
+    #[test]
+    fn a_last_hunk_cut_short_is_marked_only_when_the_output_can_end_early() {
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@ fn a\n x\n-y\n+z\n w\n@@ -9 +9,2 @@\n-q\n+r\n+s\n";
+        let lines: Vec<&str> = patch.split_inclusive('\n').collect();
+        let thinned: String = lines
+            .iter()
+            .filter(|line| !line.starts_with(' '))
+            .copied()
+            .collect();
+        // The text, whether it can end early, and the last item's detail.
+        for (text, ends_early, last) in [
+            (patch.to_owned(), true, "@@ -9 +9,2 @@"),
+            (lines[..11].concat(), true, "@@ -9 +9,2 @@ (cut off)"),
+            (lines[..11].concat(), false, "@@ -9 +9,2 @@"),
+            (lines[..7].concat(), true, "@@ -1,3 +1,3 @@ fn a (cut off)"),
+            (
+                thinned[..thinned.len() - 2].to_owned(),
+                true,
+                "@@ -9 +9,2 @@",
+            ),
+        ] {
+            let mut parser = Parser::new("git diff", None);
+            if ends_early {
+                parser.ends_early();
+            }
+            for (index, line) in text.split_inclusive('\n').enumerate() {
+                parser.observe(line, index + 1);
+            }
+            let summary = parser.finish();
+            assert_eq!(summary.items.last().unwrap().detail, last, "{text}");
+        }
     }
 }

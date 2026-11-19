@@ -197,6 +197,11 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         }
         None => return None,
     };
+    // A window of the lines, such as `| sed -n 'A,Bp'`, is compacted only from the
+    // text Claude Code shows inline.
+    if plan.strict() && persisted.is_some() {
+        return None;
+    }
     let cwd = input["cwd"]
         .as_str()
         .map_or_else(|| ws.cwd.clone(), PathBuf::from)
@@ -237,6 +242,17 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     {
         return None;
     }
+    let shown_text = String::from_utf8_lossy(&output);
+    // A line `cut -c1-N` may have clipped reads as a search match still, since a
+    // match keeps its path and line number at the start, but not as a test, patch,
+    // lint or listing line.
+    if let Some(width) = plan.columns()
+        && plan.profile != Some(crate::filters::Profile::Search)
+        && shown_text.lines().any(|line| line.len() >= width)
+    {
+        return None;
+    }
+    let (start_cut, end_cut) = plan.cut(shown_text.lines().count());
     // For a result Claude Code saved to a file, the agent would have seen the first
     // 2,000 characters. The report gets three quarters of that, so it fits with its
     // error lines and marker.
@@ -279,9 +295,32 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // The same redactor the capture uses for the previews and footer. A
     // configuration it cannot read stops the capture too.
     let redactor = crate::redact::for_run(ws).ok()?;
-    let mut shown =
-        capture::record(&run_ws, &args, &output, status, budget, &session, &origin).ok()?;
-    let archive = ws.state.join("runs").join(&shown.run.id);
+    let record = |budget: usize| {
+        capture::record_cut(
+            &run_ws,
+            &args,
+            &output,
+            status,
+            budget,
+            &session,
+            (&origin, &[], end_cut),
+        )
+        .ok()
+    };
+    let mut shown = record(budget)?;
+    let mut archive = ws.state.join("runs").join(&shown.run.id);
+    // A window with no report gets the floor, when that alone saves enough, and is
+    // otherwise left as it is.
+    if plan.strict() && !shown.report {
+        let _ = fs::remove_dir_all(&archive);
+        let floor = crate::floor::compact(&shown_text)?;
+        if output.len().saturating_sub(floor.len()) < (output.len() / 4).max(512) {
+            return None;
+        }
+        // Within this budget the stream is shown whole, so it gets the floor.
+        shown = record(output.len().saturating_mul(2))?;
+        archive = ws.state.join("runs").join(&shown.run.id);
+    }
     let mut text: String = shown
         .previews
         .iter()
@@ -324,6 +363,22 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     };
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
+    }
+    // A report of what a `head`, `tail` or `sed -n` window kept says so, since the
+    // command may have printed more.
+    if start_cut || end_cut {
+        let chain: Vec<&str> = plan
+            .filters
+            .iter()
+            .map(|(_, words)| words.as_str())
+            .collect();
+        let chain = crate::summary::short(&chain.join(" | "), 160);
+        text.insert_str(
+            0,
+            &format!(
+                "Covers only the lines `{chain}` passed on, not the command's whole output.\n"
+            ),
+        );
     }
     text.push_str(&errors);
     text.push_str(shown.footer.trim_start_matches('\n'));
@@ -610,10 +665,83 @@ struct Plan {
     label: String,
     /// The directories entered with `cd` before it, joined.
     cd: PathBuf,
+    /// The filters its output passed through, with their words.
+    filters: Vec<(Filter, String)>,
+    /// The display profile that compacts its output.
+    profile: Option<crate::filters::Profile>,
+}
+
+impl Plan {
+    /// Whether a filter windowed or clipped the lines, as `sed -n 'A,Bp'` or
+    /// `cut -c1-N` does. Such output is replaced only by a report or the floor, never
+    /// by a clipped preview of the lines the agent picked.
+    fn strict(&self) -> bool {
+        self.filters
+            .iter()
+            .any(|(filter, _)| matches!(filter, Filter::Range(..) | Filter::Columns(_)))
+    }
+
+    /// The width of the narrowest `cut -c1-N`.
+    fn columns(&self) -> Option<usize> {
+        self.filters
+            .iter()
+            .filter_map(|(filter, _)| match filter {
+                Filter::Columns(width) => Some(*width),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Whether the filters may have dropped lines from the start and from the end
+    /// of the command's output, given the `lines` they passed on. A window filter
+    /// that passed on fewer lines than its limit dropped none, when only filters that
+    /// keep every line follow it. Claude Code drops trailing blank lines, so a
+    /// window within a few lines of its limit counts as full.
+    fn cut(&self, lines: usize) -> (bool, bool) {
+        let (mut start, mut end) = (false, false);
+        for (index, (filter, _)) in self.filters.iter().enumerate() {
+            let counted = self.filters[index + 1..]
+                .iter()
+                .all(|(filter, _)| matches!(filter, Filter::Pass | Filter::Columns(_)));
+            let reached = |limit: usize| !counted || lines + TRIMMED >= limit;
+            match *filter {
+                Filter::Pass | Filter::Lines | Filter::Columns(_) => {}
+                Filter::Head(limit) => end |= limit.is_none_or(reached),
+                Filter::Tail(limit) => start |= limit.is_none_or(reached),
+                Filter::Range(first, last_line) => {
+                    start |= first > 1;
+                    end |= last_line.is_some_and(|last_line| reached(last_line + 1 - first));
+                }
+            }
+        }
+        (start, end)
+    }
+}
+
+/// Trailing blank lines Claude Code may have dropped from a window's last lines.
+const TRIMMED: usize = 3;
+
+/// What a filter after the supported command does to its output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Filter {
+    /// Passes every line on, maybe in another order: `cat`, `sort` or `tee`.
+    Pass,
+    /// Selects whole lines, such as `grep` or `uniq`.
+    Lines,
+    /// `head`: the first lines, or with `None` the first bytes.
+    Head(Option<usize>),
+    /// `tail`: the last lines, or with `None` the last bytes or the lines from a
+    /// numbered one.
+    Tail(Option<usize>),
+    /// `sed -n 'A,Bp'`: lines A through B, or through the last.
+    Range(usize, Option<usize>),
+    /// `cut -c1-N`: the first N characters of each line.
+    Columns(usize),
 }
 
 /// Find the one kind of supported command a command line runs. Its output may pass
-/// through filters that keep whole lines, such as `head`, `tail` or `grep`. Other
+/// through filters that keep whole lines, such as `head`, `tail` or `grep`, and in a
+/// line that runs nothing else, a `sed -n 'A,Bp'` window or a `cut -c1-N`. Other
 /// commands in a list may only change directory, change a setting, or print a short
 /// note such as `echo` before it. Several supported commands must select the same
 /// compaction, such as two searches. Anything else, including a command already
@@ -660,9 +788,18 @@ fn plan(command: &str) -> Option<Plan> {
             return None;
         }
         let (first, filters) = segment.split_first()?;
-        if !keeps_stdout(first) || !filters.iter().all(keeps_lines) {
+        if !keeps_stdout(first) {
             return None;
         }
+        let kept = filters
+            .iter()
+            .map(|stage| {
+                let words = strip(&stage.words)?;
+                let text = shlex::try_join(words.iter().map(String::as_str))
+                    .unwrap_or_else(|_| words.join(" "));
+                Some((filter(stage)?, text))
+            })
+            .collect::<Option<Vec<_>>>()?;
         let words = strip(&first.words)?;
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         if !crate::agents::supported_words(&refs) {
@@ -693,7 +830,14 @@ fn plan(command: &str) -> Option<Plan> {
             return None;
         }
         match &found {
-            Some((_, first_kind)) if *first_kind != kind => return None,
+            Some((plan, first_kind)) if *first_kind != kind || plan.strict() => return None,
+            Some(_)
+                if kept
+                    .iter()
+                    .any(|(f, _)| matches!(f, Filter::Range(..) | Filter::Columns(_))) =>
+            {
+                return None;
+            }
             Some(_) => after = true,
             None => {
                 let mut label = crate::history::label(&refs);
@@ -708,6 +852,8 @@ fn plan(command: &str) -> Option<Plan> {
                     program: basename(tool.first().copied().unwrap_or("")).to_owned(),
                     label,
                     cd: cd.clone(),
+                    filters: kept,
+                    profile: kind.0,
                 };
                 found = Some((plan, kind));
             }
@@ -715,6 +861,10 @@ fn plan(command: &str) -> Option<Plan> {
     }
     let (mut plan, _) = found?;
     if after {
+        // A window of one command's lines is reported alone.
+        if plan.strict() {
+            return None;
+        }
         plan.label.push_str("; …");
     }
     Some(plan)
@@ -747,6 +897,8 @@ fn unknown_plan(command: &str) -> Option<Plan> {
         program: program.to_owned(),
         label: crate::history::label(&refs),
         cd: PathBuf::new(),
+        filters: Vec::new(),
+        profile: None,
     })
 }
 
@@ -866,72 +1018,144 @@ fn keeps_stdout(stage: &Stage) -> bool {
         })
 }
 
-/// A filter that passes whole lines of its input through unchanged, so the output
-/// keeps the shape of the command before it.
-fn keeps_lines(stage: &Stage) -> bool {
+/// A filter that passes lines of its input through unchanged, so the output keeps
+/// the shape of the command before it: whole lines, or with `cut -c1-N` the start of
+/// each line.
+fn filter(stage: &Stage) -> Option<Filter> {
     if !keeps_stdout(stage) {
-        return false;
+        return None;
     }
-    let Some((program, args)) = strip(&stage.words).and_then(|words| words.split_first()) else {
-        return false;
-    };
+    let (program, args) = strip(&stage.words)?.split_first()?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match basename(program) {
-        "head" => count_options(&args, false),
-        "tail" => count_options(&args, true),
+    let lines = match basename(program) {
+        "head" => return count_options(&args, false).map(Filter::Head),
+        "tail" => return count_options(&args, true).map(Filter::Tail),
+        "sed" => return line_range(&args),
+        "cut" => return columns(&args).map(Filter::Columns),
         "grep" | "egrep" | "fgrep" | "rg" => line_filter(&args),
-        "sort" => args.iter().all(|arg| {
-            arg.starts_with('-') && !arg.starts_with("-o") && !arg.starts_with("--output")
-        }),
+        "sort" => {
+            let unique = args
+                .iter()
+                .any(|arg| *arg == "--unique" || !arg.starts_with("--") && arg.contains('u'));
+            return args
+                .iter()
+                .all(|arg| {
+                    arg.starts_with('-') && !arg.starts_with("-o") && !arg.starts_with("--output")
+                })
+                .then_some(if unique { Filter::Lines } else { Filter::Pass });
+        }
         "uniq" => args.iter().all(|arg| {
             matches!(
                 *arg,
                 "-d" | "-u" | "-i" | "--repeated" | "--unique" | "--ignore-case"
             )
         }),
-        "cat" | "less" | "more" => args.iter().all(|arg| *arg == "-"),
-        "tee" => args
-            .iter()
-            .all(|arg| !arg.starts_with('-') || matches!(*arg, "-a" | "--append")),
+        "cat" | "less" | "more" => {
+            return args.iter().all(|arg| *arg == "-").then_some(Filter::Pass);
+        }
+        "tee" => {
+            return args
+                .iter()
+                .all(|arg| !arg.starts_with('-') || matches!(*arg, "-a" | "--append"))
+                .then_some(Filter::Pass);
+        }
         _ => false,
-    }
+    };
+    lines.then_some(Filter::Lines)
 }
 
-/// `head` and `tail` options that pick lines or bytes from standard input.
-fn count_options(args: &[&str], tail: bool) -> bool {
-    let number = |text: &str| {
-        let text = if tail {
-            text.strip_prefix('+').unwrap_or(text)
-        } else {
-            text
+/// `head` and `tail` options that pick lines or bytes from standard input: the
+/// number of lines they keep, or `None` for bytes or, with `tail`, the lines from a
+/// numbered one.
+fn count_options(args: &[&str], tail: bool) -> Option<Option<usize>> {
+    let number = |text: &str| -> Option<Option<usize>> {
+        let (from, digits) = match text.strip_prefix('+') {
+            Some(digits) if tail => (true, digits),
+            _ => (false, text),
         };
-        !text.is_empty() && text.chars().all(|c| c.is_ascii_digit())
+        (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+            .then(|| digits.parse().ok().filter(|_| !from))
     };
+    // Both print ten lines unless told otherwise.
+    let mut kept = Some(10);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        let ok = match *arg {
-            "-n" | "-c" | "--lines" | "--bytes" => args.next().is_some_and(|v| number(v)),
-            "-q" | "--quiet" | "--silent" => true,
+        let (bytes, value) = match *arg {
+            "-n" | "--lines" => (false, number(args.next()?)?),
+            "-c" | "--bytes" => (true, number(args.next()?)?),
+            "-q" | "--quiet" | "--silent" => continue,
             _ => {
                 if let Some(value) = arg
                     .strip_prefix("--lines=")
-                    .or_else(|| arg.strip_prefix("--bytes="))
                     .or_else(|| arg.strip_prefix("-n"))
+                {
+                    (false, number(value)?)
+                } else if let Some(value) = arg
+                    .strip_prefix("--bytes=")
                     .or_else(|| arg.strip_prefix("-c"))
                 {
-                    number(value)
-                } else if let Some(value) = arg.strip_prefix('-') {
-                    number(value) && !value.starts_with('+')
+                    (true, number(value)?)
+                } else if let Some(value) = arg.strip_prefix('-').filter(|v| !v.starts_with('+')) {
+                    (false, number(value)?)
+                } else if tail && arg.starts_with('+') {
+                    (false, number(arg)?)
                 } else {
-                    tail && arg.starts_with('+') && number(arg)
+                    return None;
                 }
             }
         };
-        if !ok {
-            return false;
+        kept = value.filter(|_| !bytes);
+    }
+    Some(kept)
+}
+
+/// A `sed -n` that prints one range of numbered lines of standard input, as
+/// `sed -n 'A,Bp'`, `sed -n 'Ap'` or `sed -n 'A,$p'` do.
+fn line_range(args: &[&str]) -> Option<Filter> {
+    let (mut quiet, mut script) = (false, None);
+    let mut args = args.iter();
+    while let Some(&arg) = args.next() {
+        match arg {
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            "-e" | "--expression" if script.is_none() => script = Some(*args.next()?),
+            "-ne" if script.is_none() => (quiet, script) = (true, Some(*args.next()?)),
+            _ if !arg.starts_with('-') && script.is_none() => script = Some(arg),
+            _ => return None,
         }
     }
-    true
+    let script = script?.trim().strip_suffix('p')?.trim_end();
+    let number = |text: &str| {
+        text.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| text.parse::<usize>().ok())
+            .flatten()
+            .filter(|&line| line > 0)
+    };
+    let (first, last) = match script.split_once(',') {
+        Some((first, "$")) => (number(first)?, None),
+        Some((first, last)) => (number(first)?, Some(number(last)?)),
+        None => (number(script)?, Some(number(script)?)),
+    };
+    (quiet && last.is_none_or(|last| last >= first)).then_some(Filter::Range(first, last))
+}
+
+/// The width a `cut -c1-N` or `cut -c-N` keeps of each line. A narrower width could
+/// clip the path or name a report reads from the start of a line.
+fn columns(args: &[&str]) -> Option<usize> {
+    let list = match args {
+        ["-c", list] => *list,
+        [option] => option
+            .strip_prefix("-c")
+            .or_else(|| option.strip_prefix("--characters="))?,
+        _ => return None,
+    };
+    let width = list.strip_prefix("1-").or_else(|| list.strip_prefix('-'))?;
+    width
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| width.parse::<usize>().ok())
+        .flatten()
+        .filter(|&width| width >= 40)
 }
 
 /// A `grep` or `rg` that selects lines of standard input and prints them as they
@@ -1284,4 +1508,87 @@ fn tokens(command: &str) -> Option<Vec<Token>> {
     }
     flush(&mut tokens, &mut word, &mut started);
     Some(tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The filters of `command`'s one pipeline, after its first command.
+    fn filters(command: &str) -> Option<Vec<Filter>> {
+        let segments = parse(command)?;
+        segments[0][1..].iter().map(filter).collect()
+    }
+
+    #[test]
+    fn display_filters_say_which_lines_they_keep() {
+        use Filter::*;
+        for (command, kept) in [
+            ("x | head", Some(vec![Head(Some(10))])),
+            (
+                "x | head -n 40 | tail -5",
+                Some(vec![Head(Some(40)), Tail(Some(5))]),
+            ),
+            (
+                "x | head -c 300 | tail -n +3",
+                Some(vec![Head(None), Tail(None)]),
+            ),
+            ("x | sed -n 89,236p", Some(vec![Range(89, Some(236))])),
+            ("x | sed -n '7p' | cat", Some(vec![Range(7, Some(7)), Pass])),
+            ("x | sed -ne '3,$p'", Some(vec![Range(3, None)])),
+            (
+                "x | cut -c1-160 | sort | sort -u",
+                Some(vec![Columns(160), Pass, Lines]),
+            ),
+            (
+                "x | grep -v '^ ' | cut -c-120",
+                Some(vec![Lines, Columns(120)]),
+            ),
+            ("x | sed -n 9,3p", None),
+            ("x | sed -n 0,3p", None),
+            ("x | sed 1,3p", None),
+            ("x | sed -n '1,3p;5p'", None),
+            ("x | sed -n /re/,/end/p", None),
+            ("x | sed -n 1,3p file", None),
+            ("x | cut -c5-80", None),
+            ("x | cut -c1-20", None),
+            ("x | cut -f1 -d:", None),
+            ("x | head -n 4 file", None),
+            ("x | awk 'NR<9'", None),
+        ] {
+            assert_eq!(filters(command), kept, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_window_that_reached_its_limit_may_have_cut_the_output() {
+        // The pipeline, the lines it passed on, and whether it may have cut the
+        // output's start and end.
+        for (command, lines, cut) in [
+            ("x | head -n 200", 120, (false, false)),
+            ("x | head -n 200", 198, (false, true)),
+            ("x | head -c 900", 3, (false, true)),
+            ("x | tail -40", 40, (true, false)),
+            ("x | tail -n +5", 3, (true, false)),
+            ("x | sed -n 1,400p | cat", 120, (false, false)),
+            ("x | sed -n 9,400p", 120, (true, false)),
+            ("x | sed -n 1,400p | grep -v '^ '", 120, (false, true)),
+            ("x | sed -n 1,10p", 10, (false, true)),
+            ("x | grep fn | sort", 5000, (false, false)),
+        ] {
+            let plan = Plan {
+                words: Vec::new(),
+                program: String::new(),
+                label: String::new(),
+                cd: PathBuf::new(),
+                filters: filters(command)
+                    .unwrap()
+                    .into_iter()
+                    .map(|filter| (filter, String::new()))
+                    .collect(),
+                profile: None,
+            };
+            assert_eq!(plan.cut(lines), cut, "{command} with {lines} lines");
+        }
+    }
 }

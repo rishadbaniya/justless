@@ -412,9 +412,10 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         origin: None,
         pieces: &[],
         json_grouping: settings.json_grouping,
+        ends_early: false,
     };
     match capture.record(&mut archive, family, status, stdout_preview) {
-        Ok((previews, footer, _)) => {
+        Ok(((previews, _), footer, _)) => {
             for (stream, preview) in previews {
                 if let Err(error) = stream.print(&preview)
                     && error.kind() != io::ErrorKind::BrokenPipe
@@ -484,6 +485,9 @@ pub struct Recorded {
     pub run: Run,
     pub previews: Vec<(Stream, Vec<u8>)>,
     pub footer: String,
+    /// Whether a report of the output, such as a test, patch, lint, search or
+    /// listing report, replaced the stdout preview.
+    pub report: bool,
 }
 
 /// Archive output that another program captured and compact it exactly as a
@@ -521,6 +525,29 @@ pub(crate) fn record_with_pieces(
     max_bytes: usize,
     session: &str,
     (origin, pieces): (&Origin, &[RunPiece]),
+) -> Result<Recorded> {
+    record_cut(
+        workspace,
+        args,
+        output,
+        status,
+        max_bytes,
+        session,
+        (origin, pieces, false),
+    )
+}
+
+/// `record_with_pieces`, for output that can stop in the middle of an item, as
+/// `| head` can leave a patch (`ends_early`). A patch report then marks a last
+/// hunk that stops short of its header's line counts.
+pub(crate) fn record_cut(
+    workspace: &Workspace,
+    args: &[OsString],
+    output: &[u8],
+    status: i32,
+    max_bytes: usize,
+    session: &str,
+    (origin, pieces, ends_early): (&Origin, &[RunPiece], bool),
 ) -> Result<Recorded> {
     ensure!(!args.is_empty(), "no command to record");
     let settings = workspace.settings()?;
@@ -566,12 +593,14 @@ pub(crate) fn record_with_pieces(
         origin: Some(origin),
         pieces,
         json_grouping: settings.json_grouping,
+        ends_early,
     };
     match capture.record(&mut archive, family, status, None) {
-        Ok((previews, footer, run)) => Ok(Recorded {
+        Ok(((previews, report), footer, run)) => Ok(Recorded {
             run,
             previews,
             footer,
+            report,
         }),
         Err(error) => {
             // A run that could not be recorded or moved into place is not kept.
@@ -1362,6 +1391,8 @@ struct Capture<'a> {
     pieces: &'a [RunPiece],
     /// `json_grouping` from the settings.
     json_grouping: bool,
+    /// The output can stop in the middle of an item.
+    ends_early: bool,
 }
 
 impl Capture<'_> {
@@ -1375,7 +1406,7 @@ impl Capture<'_> {
         family: String,
         status: i32,
         stdout_preview: Option<StdoutPreview<'_>>,
-    ) -> Result<(Previews, String, Run)> {
+    ) -> Result<((Previews, bool), String, Run)> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.record_unguarded(archive, family, status, stdout_preview)
         }))
@@ -1388,7 +1419,7 @@ impl Capture<'_> {
         family: String,
         status: i32,
         stdout_preview: Option<StdoutPreview<'_>>,
-    ) -> Result<(Previews, String, Run)> {
+    ) -> Result<((Previews, bool), String, Run)> {
         let Self {
             workspace,
             args,
@@ -1406,6 +1437,7 @@ impl Capture<'_> {
             origin,
             pieces,
             json_grouping,
+            ends_early,
         } = *self;
         let directory = archive.directory.clone();
         let lengths = archive.lengths();
@@ -1442,6 +1474,9 @@ impl Capture<'_> {
             if prints_file { "" } else { &run.family },
             selection.profile,
         );
+        if ends_early {
+            parser.ends_early();
+        }
         let mut lint = (selection.profile == Some(crate::filters::Profile::Lint))
             .then(|| crate::lint::Lint::new(&workspace.root));
         let mut grouping = match selection.profile {
@@ -1582,6 +1617,7 @@ impl Capture<'_> {
             .filter(|view| (view.len() as u64) < lengths[0] && view.len() <= max_bytes);
         let mut flags_shown = false;
         let mut notice = false;
+        let mut report = false;
         if let Some(prior) = &previous
             && run.unchanged
         {
@@ -1593,22 +1629,24 @@ impl Capture<'_> {
                 }
                 previews[target].1 = format!("Output unchanged since {}.\n", prior.id).into_bytes();
             }
-        } else if let Some((report, _)) = lint {
+        } else if let Some((findings, _)) = lint {
             // Findings replace both streams: the grouped report names every rule and
             // location, and each group links to its original lines in the full log.
             // Output that fits the budget and is smaller than the report stays
             // verbatim, even on a rerun.
-            let report = fit(report, max_bytes);
+            let lines = fit(findings, max_bytes);
             let clipped = fit_whole.contains(&false);
-            if report.len() < shown || clipped {
-                previews[0].1 = report.into_bytes();
+            if lines.len() < shown || clipped {
+                previews[0].1 = lines.into_bytes();
                 previews[1].1.clear();
+                report = true;
             }
-        } else if let Some((report, _)) = grouped {
+        } else if let Some((groups, _)) = grouped {
             // Search and listing groups replace a large stdout only. Smaller output stays
             // verbatim, and stderr keeps messages such as unreadable directories.
-            if !stdout_fits && !report.is_empty() {
-                previews[0].1 = fit(report, max_bytes).into_bytes();
+            if !stdout_fits && !groups.is_empty() {
+                previews[0].1 = fit(groups, max_bytes).into_bytes();
+                report = true;
             }
         } else if !merged
             && let Some(summary) = run.summary.render(
@@ -1627,6 +1665,7 @@ impl Capture<'_> {
                 _ => summary,
             };
             previews[0].1 = fit(summary, max_bytes).into_bytes();
+            report = true;
         } else if !merged
             && selection.profile.is_none()
             && run.summary.kind.is_empty()
@@ -1654,6 +1693,7 @@ impl Capture<'_> {
         {
             flags_shown = true;
             previews[0].1 = view.into_bytes();
+            report = true;
         }
         // A source or checksum that changed on a locked version is always named, also
         // above a verbatim patch or a clipped preview. The flags take at most a
@@ -1762,7 +1802,7 @@ impl Capture<'_> {
             history::prune(workspace, &run.id, retention.0, retention.1);
         }
         drop(guard);
-        Ok((previews, footer, run))
+        Ok(((previews, report), footer, run))
     }
 }
 

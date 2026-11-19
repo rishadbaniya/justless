@@ -69,6 +69,7 @@ Details: [Recoverable tool history](docs/reference.md#recoverable-tool-history) 
 - A `.justless.toml` that fails to load makes every hook leave commands as written instead of routing them into a run that stops on the error.
 - `exclude_commands` entries match a command's shell words, whatever its spacing or quoting.
 - Claude Code's hooks also compact large output the command hook left alone, such as `cargo test 2>&1 | tail -200`, and large Grep and Glob results.
+- A supported command piped into `sed -n 'A,Bp'` or `cut -c1-N` gets its report on the lines shown, and a report of a `head`, `tail` or `sed` window that may have cut the output says so.
 - Clients without a post-command hook route JSON reads such as `gh … --json` and `kubectl get -o json`: a 90,886-byte `gh api` listing showed 2,789 bytes.
 - `justless init --global` adds opt-in user-level hooks for Claude Code and Codex that serve every project, unless one sets `global_hooks = false`.
 - `exclude_commands` and `JUSTLESS_DISABLE=1` turn hooks off for some commands or all of them; `justless rewrite "COMMAND"` shows what a hook would do and why.
