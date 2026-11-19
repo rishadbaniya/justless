@@ -451,6 +451,9 @@ mod tests {
         assert!(Batch::parse_list("cd ../elsewhere && git diff").is_none());
         assert!(Batch::parse_list("cd .git && git diff").is_none());
         assert!(Batch::parse_list("cd /repo || git diff").is_none());
+        assert!(Batch::parse_list("git diff || cd sub && git diff").is_none());
+        assert!(Batch::parse_list("rg -n x src && cd sub; git diff").is_none());
+        assert!(Batch::parse_list("git diff && cd sub && git diff").is_some());
         assert!(Batch::parse_list("cd /repo && rm -rf x && git diff").is_none());
     }
 }

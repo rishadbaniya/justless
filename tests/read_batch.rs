@@ -371,6 +371,27 @@ fn a_cd_outside_the_workspace_or_backtracking_stays_raw() {
 }
 
 #[test]
+fn a_cd_the_shell_may_skip_never_moves_later_reads() {
+    let temp = fixture();
+    let dir = temp.path();
+    fs::create_dir(dir.join("sub")).unwrap();
+    fs::copy(dir.join("big.rs"), dir.join("sub/big.rs")).unwrap();
+    // Each `cd` is skipped, so `sed` reads the top-level big.rs. Its copy in sub
+    // has the same bytes, so only the attribution could go wrong.
+    for command in [
+        "grep -n alpha notes || cd sub; sed -n '1,600p' big.rs",
+        "grep -n absent notes && cd sub; sed -n '1,600p' big.rs",
+    ] {
+        let raw = native(dir, command);
+        let out = hook(dir, command, Some(response(&raw)));
+        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!shown.contains("sub/big.rs"), "{command}: {shown}");
+    }
+}
+
+#[test]
 fn a_batch_the_recheck_cannot_verify_still_gets_the_ordinary_report() {
     let temp = fixture();
     let dir = temp.path();

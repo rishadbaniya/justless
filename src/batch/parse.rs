@@ -340,7 +340,16 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
                 };
                 match (stages.len() == 1).then(|| change(stages[0])).flatten() {
                     Some(Some(dir)) => {
-                        if next == Join::Failure {
+                        // Later reads start in `dir` only if the shell surely
+                        // entered it. Among the pieces only a search can fail.
+                        let skippable = match join {
+                            Join::Always => false,
+                            Join::Success => pieces
+                                .iter()
+                                .any(|p: &Piece| matches!(p.source, Source::Search(_))),
+                            Join::Failure => true,
+                        };
+                        if next == Join::Failure || skippable {
                             return None;
                         }
                         enter(&mut base, &dir);
