@@ -990,12 +990,18 @@ trait Source: Read {}
 #[cfg(not(unix))]
 impl<T: Read> Source for T {}
 
+/// How long an empty pipe may stay open after the command exited before it counts
+/// as held by a background process. macOS can show the end of the pipe several
+/// milliseconds after the exit under heavy load.
+const CLOSE_GRACE_MILLISECONDS: i32 = 250;
+
 /// Copy a stream's pipe into its archive file until the pipe closes, storing at
 /// most `cap` bytes and counting the rest. Each chunk is written at once, so a
 /// killed Justless leaves what it read on disk. Once `exited` is set, only the
 /// bytes already waiting in the pipe are still the command's. After them, a pipe
 /// that a background process still holds is returned instead of waited on, even
-/// when that process keeps writing.
+/// when that process keeps writing. An empty pipe gets `CLOSE_GRACE_MILLISECONDS`
+/// to close first.
 fn pump<R: Source>(
     mut pipe: R,
     mut file: File,
@@ -1014,9 +1020,12 @@ fn pump<R: Source>(
             left = pending(&pipe);
         }
         let ready = match left {
-            // Readable with nothing waiting means every writer closed the pipe.
+            // Readable with nothing waiting means every writer closed the pipe. The
+            // kernel can report the exit a moment before the command's end of the
+            // pipe closes, so a pipe still open waits a little for that.
             Some(0) => match pending(&pipe) {
-                Some(0) => readable(&pipe, 0),
+                Some(0) => readable(&pipe, CLOSE_GRACE_MILLISECONDS)
+                    .map(|ready| ready && pending(&pipe) == Some(0)),
                 _ => Ok(false),
             },
             Some(_) => Ok(true),
@@ -1214,7 +1223,9 @@ mod signals {
     //! takes longer to exit receives it twice. Like a shell waiting for a
     //! foreground job, Justless waits for the command to exit and then finishes
     //! the record. Once the command has exited, the default dispositions return,
-    //! so another signal stops Justless as usual.
+    //! so another signal stops Justless as usual. The signal that stopped the
+    //! command is the exception: Justless's own copy of it can arrive just after
+    //! the command exited, so it is only recorded until the preview is out.
     use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
@@ -1222,6 +1233,8 @@ mod signals {
     /// The interrupt to forward when the grace period ends.
     static PENDING: AtomicI32 = AtomicI32::new(0);
     static INSTALLED: AtomicU64 = AtomicU64::new(0);
+    /// The signal that stopped the command, whose handler stays until `reraise`.
+    static HELD: AtomicI32 = AtomicI32::new(0);
     const FORWARDED: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
     /// SIGALRM ends the grace period of an interrupt, so its handler goes first.
     const OBSERVED: [libc::c_int; 5] = [
@@ -1274,6 +1287,7 @@ mod signals {
     }
 
     pub fn install() {
+        HELD.store(0, Ordering::SeqCst);
         for signal in OBSERVED {
             // SAFETY: the handler only touches atomics and calls kill and
             // setitimer. A signal that is already ignored, as under nohup, stays
@@ -1313,18 +1327,34 @@ mod signals {
 
     /// Wait until the command exits without reaping it, then stop forwarding.
     pub fn settle(pid: u32) {
+        let mut ended = 0;
         loop {
-            // SAFETY: WNOWAIT leaves the exited command for Child::wait to reap.
-            let waited = unsafe {
+            // SAFETY: WNOWAIT leaves the exited command for Child::wait to reap, and
+            // si_status is read only from a child state change that waitid filled.
+            let (waited, info) = unsafe {
                 let mut info: libc::siginfo_t = std::mem::zeroed();
-                libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+                let waited =
+                    libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT);
+                (waited, info)
             };
-            if waited == 0
-                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
+            if waited == 0 {
+                if matches!(info.si_code, libc::CLD_KILLED | libc::CLD_DUMPED) {
+                    // SAFETY: as above.
+                    let signal = unsafe { info.si_status() };
+                    let held = signal != libc::SIGALRM && OBSERVED.contains(&signal);
+                    ended = if held { signal } else { 0 };
+                }
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                 break;
             }
         }
+        // A group signal reaches Justless and the command together, but Justless
+        // can take its copy after the command is gone. That signal keeps its
+        // handler until `reraise`, so the copy cannot stop Justless before the
+        // preview is out.
+        HELD.store(ended, Ordering::SeqCst);
         restore();
     }
 
@@ -1333,26 +1363,34 @@ mod signals {
     /// it would for the command itself.
     pub fn reraise(status: Option<std::process::ExitStatus>) {
         use std::os::unix::process::ExitStatusExt;
-        let Some(signal) = status.and_then(|status| status.signal()) else {
-            return;
-        };
-        if RECEIVED.load(Ordering::SeqCst) != signal {
-            return;
+        let held = HELD.swap(0, Ordering::SeqCst);
+        if let Some(signal) = status.and_then(|status| status.signal())
+            && RECEIVED.load(Ordering::SeqCst) == signal
+        {
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            // SAFETY: restores the default action and raises the signal on Justless.
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
         }
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        // SAFETY: restores the default action and raises the signal on Justless.
-        unsafe {
-            libc::signal(signal, libc::SIG_DFL);
-            libc::raise(signal);
+        let bit = if held > 0 { 1u64 << held } else { 0 };
+        if INSTALLED.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+            // SAFETY: restores the default action for the signal `settle` held.
+            unsafe { libc::signal(held, libc::SIG_DFL) };
         }
     }
 
+    /// Restore the default action of each signal set by `install`, except the one
+    /// `settle` holds. SIGALRM keeps its handler, which does nothing once the
+    /// command is gone, since a grace period can end just before it is cancelled.
     pub fn restore() {
         CHILD.store(0, Ordering::SeqCst);
         PENDING.store(0, Ordering::SeqCst);
-        // Cancel a grace period while its handler is still installed.
         arm(0);
-        let installed = INSTALLED.swap(0, Ordering::SeqCst);
+        let held = HELD.load(Ordering::SeqCst);
+        let kept = (1u64 << libc::SIGALRM) | if held > 0 { 1u64 << held } else { 0 };
+        let installed = INSTALLED.fetch_and(kept, Ordering::SeqCst) & !kept;
         for signal in OBSERVED {
             if installed & (1 << signal) != 0 {
                 // SAFETY: restores the default action for a signal set above.
