@@ -1203,8 +1203,16 @@ fn claude_hook_reads_allow_rules_from_the_repository_local_file() {
     };
     let home = base.join("home");
     for project in [main.join("sub"), worktree] {
-        assert_eq!(answer(&project, "git status", &home), "approve");
-        assert_eq!(answer(&project, "git log -1", &home), "leave");
+        assert_eq!(
+            answer(&project, "git status", &home),
+            "approve",
+            "{project:?}"
+        );
+        assert_eq!(
+            answer(&project, "git log -1", &home),
+            "leave",
+            "{project:?}"
+        );
     }
     // When the repository root is the home directory, Claude Code keeps the file
     // where the session started.
@@ -6604,6 +6612,20 @@ fn init_remove_refuses_malformed_config_and_keeps_shared_instructions() {
     fs::write(&cursor, good).unwrap();
     assert_eq!(removal_tree(&root), installed);
 
+    // --purge needs --remove, and deletes state that every client shares, so it
+    // takes no --agent.
+    for (args, message) in [
+        (
+            "init --remove --agent codex --purge",
+            "run it without --agent",
+        ),
+        ("init --remove --hooks", "'--hooks'"),
+        ("init --purge", "--remove"),
+    ] {
+        assert_removal_refused(&root, &argv(args), message);
+    }
+    assert_eq!(removal_tree(&root), installed);
+
     // Codex still reads AGENTS.md, so removing Cursor keeps the section.
     let output = success(&root, &["init", "--remove", "--agent", "cursor"]);
     assert!(output.contains("\n  .cursor/hooks.json: removed 2 hooks and deleted the file"));
@@ -6998,16 +7020,10 @@ fn init_remove_takes_no_setup_options() {
     let (_project, root) = removal_project(&[]);
     success(&root, &["init", "--hooks", "--agent", "claude"]);
     // Each setup option conflicts with --remove, so none of them can turn a
-    // removal into a setup, or a setup into a removal. --purge needs --remove,
-    // and deletes state that every client shares, so it takes no --agent.
+    // removal into a setup, or a setup into a removal.
     for (args, message) in [
         ("init --remove --hooks", "'--hooks'"),
         ("init --remove --statusline", "'--statusline'"),
-        ("init --purge", "--remove"),
-        (
-            "init --remove --agent claude --purge",
-            "run it without --agent",
-        ),
     ] {
         assert_removal_refused(&root, &argv(args), message);
     }
