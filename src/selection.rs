@@ -449,10 +449,9 @@ fn enclosing(index: &Index, file: &str, line: usize) -> Option<usize> {
         .or_else(|| ids.first().copied())
 }
 
-/// The file node of the Vue, Svelte or Astro component that holds a
-/// definition, which is what other code imports.
-fn component(index: &Index, id: usize) -> Option<usize> {
-    let file = &index.definitions[id].location.file;
+/// The file node of a Vue, Svelte or Astro component, which is what other
+/// code imports.
+fn component(index: &Index, file: &str) -> Option<usize> {
     if !matches!(
         index.grammar(file),
         Some(Grammar::Vue | Grammar::Svelte | Grammar::Astro)
@@ -461,12 +460,43 @@ fn component(index: &Index, id: usize) -> Option<usize> {
     }
     index
         .at(&Location {
-            file: file.clone(),
+            file: file.to_owned(),
             start: 1,
             end: 1,
         })
         .into_iter()
         .find(|&found| index.definitions[found].kind == "file")
+}
+
+/// The components a walk reached inside, such as a function in a component's
+/// script that calls the change: each file node with whether only inferred
+/// links reached it and what did. A component is imported whole, so its
+/// importers depend on the change too.
+fn components_reached(index: &Index, reached: &Walk) -> BTreeMap<usize, (bool, String)> {
+    let mut found = BTreeMap::<usize, (bool, String)>::new();
+    for reach in reached.levels.iter().flatten() {
+        let (file, what) = match reach.dependent {
+            Dependent::Symbol(id) => {
+                let definition = &index.definitions[id];
+                (definition.location.file.as_str(), name(definition))
+            }
+            Dependent::Scope(file) => (file, "top-level code"),
+        };
+        let Some(node) = component(index, file) else {
+            continue;
+        };
+        if reach.dependent == Dependent::Symbol(node) {
+            // The walk goes on from the file node itself.
+            continue;
+        }
+        let entry = found
+            .entry(node)
+            .or_insert_with(|| (true, format!("{what} in {file} depends on the change")));
+        if !reach.possible && entry.0 {
+            *entry = (false, format!("{what} in {file} depends on the change"));
+        }
+    }
+    found
 }
 
 /// The enclosing test definition at a line, if any.
@@ -1798,14 +1828,48 @@ fn analyze(
             );
         }
         // A Vue, Svelte or Astro component is imported whole, so a change to a
-        // function in its script reaches whatever imports the component too.
+        // function in its script reaches whatever imports the component too,
+        // and so does a change that a function in a component depends on.
         let mut starts = vec![id];
-        starts.extend(component(index, id).filter(|&file| file != id));
+        starts.extend(component(index, &definitions[id].location.file).filter(|&file| file != id));
         let reached = walk(index, &starts, DEPTH);
         if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
             seed.capped = Some(name(&definitions[id]).to_owned());
         }
         collect(index, &reached, &BTreeMap::new(), false, &mut seed);
+        let mut inside = components_reached(index, &reached);
+        for _ in 0..8 {
+            inside.retain(|node, _| !starts.contains(node));
+            if inside.is_empty() {
+                break;
+            }
+            starts.extend(inside.keys().copied());
+            let mut next = BTreeMap::new();
+            for possible in [false, true] {
+                let notes: BTreeMap<usize, String> = inside
+                    .iter()
+                    .filter(|(_, (inferred, _))| *inferred == possible)
+                    .map(|(&node, (_, note))| (node, note.clone()))
+                    .collect();
+                if notes.is_empty() {
+                    continue;
+                }
+                let from: Vec<usize> = notes.keys().copied().collect();
+                let reached = walk(index, &from, DEPTH);
+                if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
+                    seed.capped = Some(name(&definitions[from[0]]).to_owned());
+                }
+                collect(index, &reached, &notes, possible, &mut seed);
+                for (node, (inferred, note)) in components_reached(index, &reached) {
+                    next.entry(node).or_insert((inferred || possible, note));
+                }
+            }
+            inside = next;
+        }
+        inside.retain(|node, _| !starts.contains(node));
+        if !inside.is_empty() {
+            seed.capped = Some(name(&definitions[id]).to_owned());
+        }
         // Walks that start past the symbol: the types of trait methods called
         // implicitly, and code that names the symbol where the index has no link.
         let mut further = BTreeMap::<usize, String>::new();
@@ -2112,8 +2176,8 @@ fn macro_spans(lines: &[String]) -> Vec<(String, usize, usize)> {
 }
 
 /// Records what one walk reached into `seed`. `notes` says how each start was
-/// reached, for walks that start past the changed symbol itself; everything
-/// such a walk reaches is possible.
+/// reached, for walks that start past the changed symbol itself. With
+/// `through_type`, everything the walk reaches is possible.
 fn collect(
     index: &Index,
     reached: &Walk,

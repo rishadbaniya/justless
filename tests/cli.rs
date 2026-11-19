@@ -11277,12 +11277,30 @@ fn affected_components_reach_their_importers_and_untested_languages_fall_back() 
                 "import Parent from \"./Parent.vue\";\ntest(\"p\", () => expect(Parent).toBeTruthy());\n",
             ),
             (
-                "src/Lonely.vue",
-                "<template><p /></template>\n<script setup>\nfunction quiet() { return 1; }\n</script>\n",
+                "src/Lonely.astro",
+                "---\nfunction quiet() { return 1; }\n---\n<p>{quiet()}</p>\n",
+            ),
+            // `@/money` is an alias the index does not resolve: only the call
+            // inside `price` links the component to the helper.
+            (
+                "src/money.ts",
+                "export function cents(n) {\n  return n * 100;\n}\n",
             ),
             (
                 "src/money.test.ts",
-                "test(\"m\", () => expect(1).toBe(1));\n",
+                "import { cents } from \"./money\";\ntest(\"m\", () => expect(cents(1)).toBe(100));\n",
+            ),
+            (
+                "src/Price.vue",
+                "<template><p>{{ price() }}</p></template>\n<script setup>\nimport { cents } from \"@/money\";\nfunction price() { return cents(2); }\n</script>\n",
+            ),
+            (
+                "src/Price.test.ts",
+                "import Price from \"./Price.vue\";\ntest(\"p\", () => expect(Price).toBeTruthy());\n",
+            ),
+            (
+                "src/other.test.ts",
+                "test(\"o\", () => expect(1).toBe(1));\n",
             ),
             (
                 "lib/twice.ex",
@@ -11312,16 +11330,24 @@ fn affected_components_reach_their_importers_and_untested_languages_fall_back() 
     // A function in a component's script reaches the tests that import the
     // component, here through another component.
     let text = plan("src/Child.svelte", "n += 1", "n += 2");
-    has_line(&text, "vitest · subset · 1 of 2 indexed test files");
+    has_line(&text, "vitest · subset · 1 of 4 indexed test files");
     has_line(
         &text,
         "  src/Parent.test.ts · src/Parent.test.ts · exact · import at src/Parent.test.ts:1 → src/Parent.vue · import at src/Parent.vue:3 → src/Child.svelte",
     );
-    // A component no test imports is a change no test reaches.
-    let text = plan("src/Lonely.vue", "return 1", "return 2");
+    // A change that a function in a component calls reaches the component's
+    // importers too.
+    let text = plan("src/money.ts", "n * 100", "n * 10");
+    has_line(&text, "vitest · subset · 2 of 4 indexed test files");
     has_line(
         &text,
-        "  no-tests: no test reaches quiet (src/Lonely.vue:3) through indexed links",
+        "  src/Price.test.ts · src/Price.test.ts · possible · price in src/Price.vue depends on the change · import at src/Price.test.ts:1 → src/Price.vue",
+    );
+    // A component no test imports is a change no test reaches.
+    let text = plan("src/Lonely.astro", "return 1", "return 2");
+    has_line(
+        &text,
+        "  no-tests: no test reaches quiet (src/Lonely.astro:2) through indexed links",
     );
     // Elixir reaches its ExUnit test, which no runner here runs.
     let text = plan("lib/twice.ex", "x * 2", "x + x");
