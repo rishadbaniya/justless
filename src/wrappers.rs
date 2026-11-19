@@ -5,7 +5,8 @@
 //! classified. It is never used to replay a command: the recorded words keep
 //! the wrappers.
 
-fn assignment(word: &str) -> bool {
+/// A shell variable assignment such as `NAME=value`.
+pub(crate) fn assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };
@@ -38,10 +39,8 @@ fn env_rest(words: &[&str]) -> Option<Vec<String>> {
     tail(words, i)
 }
 
-/// The command a wrapper actually runs. Assignments, `env`, `time`, `nohup`,
-/// `command`, `nice`, `timeout`, `stdbuf`, `bash -c` and git's global options
-/// are removed so output can be classified. Never used to replay the command:
-/// the recorded words keep the wrappers.
+/// The command a wrapper actually runs, or `None` for a wrapper option this
+/// does not know.
 pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
     let mut words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
     loop {
@@ -52,12 +51,7 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         let rest = match first.as_str() {
             "env" => env_rest(&refs)?,
-            "time" | "nohup" => match refs.get(1).copied() {
-                Some("-p") | Some("--") => tail(&refs, 2)?,
-                Some(word) if word.starts_with('-') => return None,
-                _ => tail(&refs, 1)?,
-            },
-            "command" => match refs.get(1).copied() {
+            "time" | "nohup" | "command" => match refs.get(1).copied() {
                 Some("-p") | Some("--") => tail(&refs, 2)?,
                 Some(word) if word.starts_with('-') => return None,
                 _ => tail(&refs, 1)?,
@@ -240,11 +234,6 @@ mod tests {
     fn unsafe_wrappers_are_not_unwrapped() {
         assert_eq!(effective_words("command -v cat"), None);
         assert_eq!(effective_words("time -v cat"), None);
-        assert_eq!(effective_words("bash -c 'cargo test; rm -rf /'"), None);
-    }
-
-    #[test]
-    fn compound_shell_strings_are_not_unwrapped() {
         assert_eq!(effective_words("bash -c 'cargo test; rm -rf /'"), None);
     }
 }

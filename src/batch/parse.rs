@@ -205,19 +205,10 @@ fn piece<'a>(
 fn change(stage: &str) -> Option<Option<String>> {
     let words = shlex::split(stage)?;
     match words.as_slice() {
-        [word] if assignment(word) => Some(None),
+        [word] if crate::wrappers::assignment(word) => Some(None),
         [word, dir] if word == "cd" => local(dir).then(|| Some(dir.clone())),
         _ => None,
     }
-}
-
-fn assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
-        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 fn enter(base: &mut Option<String>, dir: &str) {

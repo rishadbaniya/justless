@@ -172,7 +172,6 @@ impl<'a> Batch<'a> {
         let deadline = Instant::now() + Duration::from_secs(4);
         let mut files = reads::Files::new();
         let mut repo: Option<(PathBuf, git::Repository)> = None;
-        let root = ws.root.canonicalize().ok()?;
         let mut status = 0;
         let mut may_have_closed_pipe = false;
         let mut output = String::new();
@@ -200,7 +199,8 @@ impl<'a> Batch<'a> {
                 .join(piece.dir.as_deref().unwrap_or(""))
                 .canonicalize()
                 .ok()?;
-            if !dir.is_dir() || !dir.starts_with(&root) {
+            // The workspace root is already canonical.
+            if !dir.is_dir() || !dir.starts_with(&ws.root) {
                 return None;
             }
             let (text, source) = match &piece.source {
@@ -298,10 +298,16 @@ impl<'a> Batch<'a> {
         if Instant::now() >= deadline {
             return None;
         }
-        let origin=Origin {
-            command:input["tool_input"]["command"].as_str()?.to_owned(),label:"read batch".into(),
-            note:"Verified against Claude Code's Bash result after execution. Piece offsets refer to the archived Claude Code stdout.".into(),
-            outline:Some(SourceOutline{text,baseline,trim_footer:true}),
+        const NOTE: &str = "Verified against Claude Code's Bash result after execution. Piece offsets refer to the archived Claude Code stdout.";
+        let origin = Origin {
+            command: input["tool_input"]["command"].as_str()?.to_owned(),
+            label: "read batch".into(),
+            note: NOTE.into(),
+            outline: Some(SourceOutline {
+                text,
+                baseline,
+                trim_footer: true,
+            }),
         };
         let session = input["session_id"]
             .as_str()
