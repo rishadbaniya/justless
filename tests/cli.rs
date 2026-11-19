@@ -10089,66 +10089,62 @@ fn the_tail_of_an_enormous_last_line_is_its_real_end() {
     let preview = preview_of(&stdout(&output)).to_owned();
     assert!(preview.len() <= 4096, "{}", preview.len());
     assert!(preview.ends_with("xxxx error: TRAILING_ERR\n"), "{preview}");
-    assert!(preview.contains("\n…xxx"), "{preview}");
+    text_has(&preview, &["\n…xxx"]);
 }
 
 #[test]
 fn run_records_stay_small_when_every_line_names_a_location() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(root.join("Cargo.toml"), "").unwrap();
-    fs::create_dir(root.join("src")).unwrap();
     let mut output = String::new();
     for file in 0..300 {
-        fs::write(root.join(format!("src/m{file}.rs")), "fn item() {}\n").unwrap();
+        write_files(root, &[(&format!("src/m{file}.rs"), "fn item() {}\n")]);
         for line in 1..=60 {
             output.push_str(&format!(
                 "src/m{file}.rs:{line}:1: warning: unused item {file}_{line}\n"
             ));
         }
     }
-    fs::write(root.join("src/broken.rs"), "fn broken() {}\n").unwrap();
     output.push_str("src/broken.rs:1:4: error: cannot find value `x` in this scope\n");
-    fs::write(root.join("out.txt"), &output).unwrap();
-    let run = cli(root, &["run", "--", "cat", "out.txt"]);
-    let id = run_id(&run);
+    write_files(
+        root,
+        &[
+            ("Cargo.toml", ""),
+            ("src/broken.rs", "fn broken() {}\n"),
+            ("out.txt", &output),
+        ],
+    );
+    let id = run_id(&cli(root, &["run", "--", "cat", "out.txt"]));
     let record = fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap();
-    assert!(
-        record.len() * 20 < output.len(),
+    let sizes = format!(
         "{} record bytes for {} output bytes",
         record.len(),
         output.len()
     );
+    assert!(record.len() * 20 < output.len(), "{sizes}");
     let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
     let diagnostics = record["diagnostics"].as_array().unwrap();
     assert!(diagnostics.len() <= 200, "{}", diagnostics.len());
     // The error comes first even though it is the last located line.
     assert_eq!(diagnostics[0]["location"]["file"], "src/broken.rs");
-    assert!(success(root, &["history"]).contains(&id));
+    text_has(&success(root, &["history"]), &[&id]);
 }
 
 #[test]
 fn filtered_previews_never_end_on_an_unmarked_fragment() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(
-        root.join(".justless.toml"),
-        "max_output_bytes = 512\n[[filters]]\ncommand = [\"sh\"]\nomit = '^noise'\n",
-    )
-    .unwrap();
+    let config = "max_output_bytes = 512\n[[filters]]\ncommand = [\"sh\"]\nomit = '^noise'\n";
+    fs::write(root.join(".justless.toml"), config).unwrap();
     let script = "for i in $(seq 1 50); do echo noise; done; for i in $(seq 1 200); do echo \"kept line $i of the report\"; done";
     let output = cli(root, &["run", "--", "sh", "-c", script]);
     let preview = preview_of(&stdout(&output)).to_owned();
-    assert!(
-        preview.starts_with("[200 retained lines, 50 filtered, 0 repeats]\n"),
-        "{preview}"
-    );
+    let counts = "[200 retained lines, 50 filtered, 0 repeats]\n";
+    assert!(preview.starts_with(counts), "{preview}");
     assert!(preview.len() <= 512, "{}", preview.len());
     for line in preview.lines().filter(|line| line.starts_with("kept")) {
-        assert!(
-            line.ends_with("of the report") || line.ends_with('…'),
-            "{line:?} in {preview}"
-        );
+        let whole = line.ends_with("of the report") || line.ends_with('…');
+        assert!(whole, "{line:?} in {preview}");
     }
 }
 
@@ -10202,32 +10198,31 @@ exit 101
     let first = cli(root, &["run", "--", cargo, "test"]);
     assert_eq!(first.status.code(), Some(101));
     let report = stdout(&first);
-    for expected in [
-        "tests::parses_alpha src/lib.rs:2:57: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit } [stdout:",
-        "tests::parses_empty src/lib.rs:2:57: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: Empty } [stdout:",
-        "tests::value_is_five src/lib.rs:8:51: expected 5 but got 6 [stdout:",
-    ] {
-        assert!(report.contains(expected), "{expected} in {report}");
-    }
-    assert!(!report.contains("2 test(s)"), "{report}");
+    text_has(
+        &report,
+        &[
+            "tests::parses_alpha src/lib.rs:2:57: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit } [stdout:",
+            "tests::parses_empty src/lib.rs:2:57: called `Result::unwrap()` on an `Err` value: ParseIntError { kind: Empty } [stdout:",
+            "tests::value_is_five src/lib.rs:8:51: expected 5 but got 6 [stdout:",
+        ],
+    );
+    text_lacks(&report, &["2 test(s)"]);
     let id = run_id(&first);
 
     let again = success_or_status(root, &["run", "--", cargo, "test"]);
-    assert!(
-        again.contains(&format!("Compared with {id}:\nIndexed items unchanged")),
-        "{again}"
-    );
+    let unchanged = format!("Compared with {id}:\nIndexed items unchanged");
+    text_has(&again, &[&unchanged]);
 
     fs::write(root.join("value"), "7").unwrap();
     let changed = success_or_status(root, &["run", "--", cargo, "test"]);
-    assert!(
-        changed.contains("+ tests::value_is_five src/lib.rs:8:51: expected 5 but got 7 [stdout:")
-            && changed.contains(
-                "- tests::value_is_five src/lib.rs:8:51: expected 5 but got 6 [prior stdout:"
-            )
-            && !changed.contains("parses_"),
-        "{changed}"
+    text_has(
+        &changed,
+        &[
+            "+ tests::value_is_five src/lib.rs:8:51: expected 5 but got 7 [stdout:",
+            "- tests::value_is_five src/lib.rs:8:51: expected 5 but got 6 [prior stdout:",
+        ],
     );
+    text_lacks(&changed, &["parses_"]);
 }
 
 /// The stdout of a run that is expected to fail.
@@ -10242,17 +10237,15 @@ fn success_or_status(root: &Path, args: &[&str]) -> String {
 fn a_diff_rerun_reports_only_hunks_that_changed_after_line_numbers_shift() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    git(root, &["init", "-q"]);
     let numbers: String = (1..=200).map(|n| format!("{n}\n")).collect();
     fs::write(root.join("f.txt"), &numbers).unwrap();
-    git(root, &["add", "f.txt"]);
-    git(root, &["commit", "-qm", "init"]);
+    commit_all(root);
     let edited = numbers
         .replace("\n100\n", "\none hundred\n")
         .replace("\n150\n", "\none fifty\n");
     fs::write(root.join("f.txt"), &edited).unwrap();
     let first = success(root, &["run", "--", "git", "diff"]);
-    assert!(first.contains("2 diff section(s)"), "{first}");
+    text_has(&first, &["2 diff section(s)"]);
     fs::write(root.join("f.txt"), format!("new first line\n{edited}")).unwrap();
     let rerun = success(root, &["run", "--", "git", "diff"]);
     let changes: Vec<_> = rerun
@@ -10303,52 +10296,67 @@ exit 101
         ),
         "{report}"
     );
-    assert!(
-        report.contains("      thread 'main' (4242) panicked at b/build.rs:2:5:\n      OPENSSL_DIR is not set; install libssl-dev or set OPENSSL_DIR\n")
-            && report.len() <= 4096
-            && report.contains(" more rule(s) with ")
-            && report.ends_with(" finding(s) in full log\n"),
-        "{report}"
+    text_has(
+        &report,
+        &[
+            "      thread 'main' (4242) panicked at b/build.rs:2:5:\n      OPENSSL_DIR is not set; install libssl-dev or set OPENSSL_DIR\n",
+            " more rule(s) with ",
+        ],
     );
+    assert!(report.len() <= 4096, "{report}");
+    assert!(report.ends_with(" finding(s) in full log\n"), "{report}");
+}
+
+/// Starts justless with `args` in `root` with its output piped, in a process
+/// group of its own when `group` is set, as a terminal starts a foreground job.
+#[cfg(unix)]
+fn spawn_justless(root: &Path, args: &[&str], group: bool) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
+    command
+        .args(args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if group {
+        command.process_group(0);
+    }
+    command.spawn().unwrap()
+}
+
+/// Waits until the stdout of a run archived under `root` holds `text`.
+#[cfg(unix)]
+fn wait_for_stream(root: &Path, text: &str) {
+    wait_until(text, || {
+        run_streams(root)
+            .iter()
+            .any(|path| fs::read_to_string(path).is_ok_and(|stream| stream.contains(text)))
+    });
+}
+
+/// Runs `kill` with `args`, which must succeed.
+#[cfg(unix)]
+fn send_kill(args: &[&str]) {
+    let status = Command::new("kill").args(args).status().unwrap();
+    assert!(status.success(), "kill {args:?}");
 }
 
 #[cfg(unix)]
 #[test]
 fn an_interrupted_command_stops_the_caller_after_the_preview() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::os::unix::process::ExitStatusExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["run", "--", "sh", "-c", "echo partial; exec sleep 30"])
-        .current_dir(root)
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_until("partial output", || {
-        run_streams(root)
-            .iter()
-            .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
-    });
+    let script = "echo partial; exec sleep 30";
+    let child = spawn_justless(root, &["run", "--", "sh", "-c", script], true);
+    wait_for_stream(root, "partial");
     // A terminal interrupt reaches the whole foreground process group.
-    let group = format!("-{}", child.id());
-    assert!(
-        Command::new("kill")
-            .args(["-INT", "--", &group])
-            .status()
-            .unwrap()
-            .success()
-    );
+    send_kill(&["-INT", "--", &format!("-{}", child.id())]);
     let output = child.wait_with_output().unwrap();
     // Justless dies from the same signal, so a calling shell stops its script.
     assert_eq!(output.status.signal(), Some(2), "{:?}", output.status);
     assert_eq!(stdout(&output), "partial\n");
-    assert!(
-        stderr(&output).contains("] exit 130 · "),
-        "{}",
-        stderr(&output)
-    );
+    text_has(&stderr(&output), &["] exit 130 · "]);
 }
 
 #[cfg(unix)]
@@ -10371,35 +10379,21 @@ fn an_interrupt_sent_to_justless_alone_stops_the_command() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        wait_until("partial output", || {
-            run_streams(root)
-                .iter()
-                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("started")))
-        });
+        wait_for_stream(root, "started");
         let sent = std::time::Instant::now();
-        assert!(
-            Command::new("kill")
-                .args([format!("-{name}"), child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
+        send_kill(&[&format!("-{name}"), &child.id().to_string()]);
         let output = child.wait_with_output().unwrap();
-        assert!(
-            sent.elapsed().as_secs() < 10,
-            "{name} waited for the command"
-        );
+        let waited = sent.elapsed().as_secs();
+        assert!(waited < 10, "{name} waited for the command");
         assert_eq!(output.status.signal(), Some(signal), "{:?}", output.status);
         assert_eq!(stdout(&output), "started\n");
-        let footer = format!("] exit {} · ", 128 + signal);
-        assert!(stderr(&output).contains(&footer), "{}", stderr(&output));
+        text_has(&stderr(&output), &[&format!("] exit {} · ", 128 + signal)]);
     }
 }
 
 #[cfg(unix)]
 #[test]
 fn a_command_that_handles_an_interrupt_receives_it_once() {
-    use std::os::unix::process::CommandExt;
     let script = "trap 'echo got-int; exit 7' INT; echo started; \
         i=0; while [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done; echo timeout";
     // An interrupt to Justless alone is forwarded once the grace period passes. One
@@ -10408,31 +10402,14 @@ fn a_command_that_handles_an_interrupt_receives_it_once() {
     for group in [false, true] {
         let repo = TempDir::new().unwrap();
         let root = repo.path();
-        let child = Command::new(env!("CARGO_BIN_EXE_justless"))
-            .args(["run", "--", "sh", "-c", script])
-            .current_dir(root)
-            .process_group(0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        wait_until("partial output", || {
-            run_streams(root)
-                .iter()
-                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("started")))
-        });
+        let child = spawn_justless(root, &["run", "--", "sh", "-c", script], true);
+        wait_for_stream(root, "started");
         let target = if group {
             format!("-{}", child.id())
         } else {
             child.id().to_string()
         };
-        assert!(
-            Command::new("kill")
-                .args(["-INT", "--", &target])
-                .status()
-                .unwrap()
-                .success()
-        );
+        send_kill(&["-INT", "--", &target]);
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(7), "group {group}: {output:?}");
         assert_eq!(stdout(&output), "started\ngot-int\n", "group {group}");
@@ -10464,18 +10441,18 @@ exit 101
     // The report would be larger than this output, so the output stays verbatim.
     let rerun = cli(root, &args);
     assert_eq!(rerun.status.code(), Some(101));
-    assert!(
-        stderr(&rerun).starts_with("src/lib.rs:1:18: warning: unused variable: `unused`\n"),
-        "{}",
-        stderr(&rerun)
-    );
+    let warning = "src/lib.rs:1:18: warning: unused variable: `unused`\n";
+    assert!(stderr(&rerun).starts_with(warning), "{}", stderr(&rerun));
     fs::write(root.join("count"), "200").unwrap();
     let report = stdout(&cli(root, &args));
-    assert!(
-        report.starts_with("cargo check: 201 finding(s), 200 error(s), 1 warning(s) · 2 rule(s)")
-            && report.contains("error E0308 ×200  mismatched types: expected `u32`, found `&str`")
-            && report.contains("~ error E0308 ×2 → ×200"),
-        "{report}"
+    let counts = "cargo check: 201 finding(s), 200 error(s), 1 warning(s) · 2 rule(s)";
+    assert!(report.starts_with(counts), "{report}");
+    text_has(
+        &report,
+        &[
+            "error E0308 ×200  mismatched types: expected `u32`, found `&str`",
+            "~ error E0308 ×2 → ×200",
+        ],
     );
 }
 
@@ -10486,6 +10463,13 @@ fn stored_runs(root: &Path) -> Vec<String> {
         .collect();
     runs.sort();
     runs
+}
+
+/// `ids`, sorted.
+fn sorted(ids: &[&String]) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+    ids.sort();
+    ids
 }
 
 #[test]
@@ -10500,9 +10484,7 @@ fn old_runs_are_pruned_to_the_configured_retention() {
             run_id(&output)
         })
         .collect();
-    let mut newest = ids[2..].to_vec();
-    newest.sort();
-    assert_eq!(stored_runs(root), newest);
+    assert_eq!(stored_runs(root), sorted(&[&ids[2], &ids[3], &ids[4]]));
     assert_eq!(success(root, &["log", &ids[4]]), "run 4\n");
     assert!(!cli(root, &["log", &ids[0]]).status.success());
     assert_eq!(success(root, &["history"]).lines().count(), 3);
@@ -10516,7 +10498,7 @@ fn old_runs_are_pruned_to_the_configured_retention() {
     fs::write(root.join(".justless.toml"), "max_runs = 0\n").unwrap();
     let invalid = cli(root, &["run", "--", "true"]);
     assert_eq!(invalid.status.code(), Some(2));
-    assert!(stderr(&invalid).contains("max_runs must be positive"));
+    text_has(&stderr(&invalid), &["max_runs must be positive"]);
 }
 
 #[cfg(unix)]
@@ -10525,59 +10507,44 @@ fn pruning_never_removes_a_run_in_progress() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     fs::write(root.join(".justless.toml"), "max_runs = 1\n").unwrap();
-    let slow = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args([
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "echo started; while [ ! -f release ]; do sleep 0.02; done; echo finished",
-        ])
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_until("the slow run to start", || {
-        run_streams(root)
-            .iter()
-            .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("started")))
-    });
+    let script = "echo started; while [ ! -f release ]; do sleep 0.02; done; echo finished";
+    let slow = spawn_justless(root, &["run", "--", "sh", "-c", script], false);
+    wait_for_stream(root, "started");
     for i in 0..3 {
-        assert!(
-            cli(root, &["run", "--", "sh", "-c", &format!("echo quick {i}")])
-                .status
-                .success()
-        );
+        let quick = cli(root, &["run", "--", "sh", "-c", &format!("echo quick {i}")]);
+        assert!(quick.status.success());
     }
     fs::write(root.join("release"), "").unwrap();
     let slow = slow.wait_with_output().unwrap();
     assert!(slow.status.success(), "{}", stderr(&slow));
     assert_eq!(stdout(&slow), "started\nfinished\n");
-    assert_eq!(
-        success(root, &["log", &run_id(&slow)]),
-        "started\nfinished\n"
-    );
-    assert_eq!(stored_runs(root), vec![run_id(&slow)]);
+    let id = run_id(&slow);
+    assert_eq!(success(root, &["log", &id]), "started\nfinished\n");
+    assert_eq!(stored_runs(root), vec![id]);
+}
+
+/// The inode of run `id`'s archived stdout.
+#[cfg(unix)]
+fn stdout_inode(root: &Path, id: &str) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let path = root.join(".justless/runs").join(id).join("stdout");
+    fs::metadata(path).unwrap().ino()
 }
 
 #[cfg(unix)]
 #[test]
 fn an_unchanged_rerun_shares_the_archived_streams() {
-    use std::os::unix::fs::MetadataExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     let args = ["run", "--", "sh", "-c", "seq 1 20000"];
     let first = run_id(&cli(root, &args));
     let again = cli(root, &args);
-    assert!(stdout(&again).contains(&format!("Output unchanged since {first}")));
+    text_has(
+        &stdout(&again),
+        &[&format!("Output unchanged since {first}")],
+    );
     let second = run_id(&again);
-    let inode = |id: &str| {
-        fs::metadata(root.join(".justless/runs").join(id).join("stdout"))
-            .unwrap()
-            .ino()
-    };
-    assert_eq!(inode(&first), inode(&second));
+    assert_eq!(stdout_inode(root, &first), stdout_inode(root, &second));
     let expected: String = (1..=20000).map(|n| format!("{n}\n")).collect();
     assert_eq!(success(root, &["log", &second]), expected);
 }
@@ -10608,51 +10575,39 @@ fn cat_run(root: &Path, name: &str, line: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn a_stream_shared_by_unchanged_reruns_counts_until_its_last_link_goes() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
     let limit = 250_000;
-    fs::write(
-        root.join(".justless.toml"),
-        format!("max_archive_bytes = {limit}\n"),
-    )
-    .unwrap();
+    // A fresh root whose archive holds at most `limit` bytes.
+    let limited = || {
+        let repo = TempDir::new().unwrap();
+        let config = format!("max_archive_bytes = {limit}\n");
+        fs::write(repo.path().join(".justless.toml"), config).unwrap();
+        repo
+    };
+    let repo = limited();
+    let root = repo.path();
     // Three unchanged runs share one stream, so they fit beside a second command.
     let same: Vec<_> = (0..3).map(|_| cat_run(root, "same", "same")).collect();
     let first = cat_run(root, "first", "first");
-    let mut expected = [same.clone(), vec![first.clone()]].concat();
-    expected.sort();
+    let expected = sorted(&[&same[0], &same[1], &same[2], &first]);
     assert_eq!(stored_runs(root), expected);
     // A third distinct stream does not fit. The shared one goes from every run that
     // links it, so the bytes on disk stay within the limit.
     let second = cat_run(root, "second", "second");
-    let mut expected = vec![first, second];
-    expected.sort();
-    assert_eq!(stored_runs(root), expected);
+    assert_eq!(stored_runs(root), sorted(&[&first, &second]));
     assert!(archived_bytes(root) <= limit, "{}", archived_bytes(root));
 
     // Older copies of a stream go before the run that reruns compare against.
-    let repo = TempDir::new().unwrap();
+    let repo = limited();
     let root = repo.path();
-    fs::write(
-        root.join(".justless.toml"),
-        format!("max_archive_bytes = {limit}\n"),
-    )
-    .unwrap();
     for _ in 0..3 {
         cat_run(root, "page", "old");
     }
     let changed = cat_run(root, "page", "new");
     let other = cat_run(root, "other", "other");
-    let mut expected = vec![changed.clone(), other];
-    expected.sort();
-    assert_eq!(stored_runs(root), expected);
+    assert_eq!(stored_runs(root), sorted(&[&changed, &other]));
     assert!(archived_bytes(root) <= limit, "{}", archived_bytes(root));
-    let rerun = cli(root, &["run", "--", "cat", "page"]);
-    assert!(
-        stdout(&rerun).contains(&format!("Output unchanged since {changed}")),
-        "{}",
-        stdout(&rerun)
-    );
+    let rerun = stdout(&cli(root, &["run", "--", "cat", "page"]));
+    text_has(&rerun, &[&format!("Output unchanged since {changed}")]);
 }
 
 /// The run ID named by a full or compact footer.
@@ -10667,6 +10622,13 @@ fn footer_id(output: &Output) -> String {
             format!("run-{}", &rest[..end])
         })
         .unwrap_or_else(|| panic!("no run footer: {}", stderr(output)))
+}
+
+/// The size of run `id`'s archived `stream`.
+#[cfg(unix)]
+fn stream_len(root: &Path, id: &str, stream: &str) -> u64 {
+    let path = root.join(".justless/runs").join(id).join(stream);
+    fs::metadata(path).unwrap().len()
 }
 
 #[cfg(unix)]
@@ -10684,28 +10646,22 @@ fn a_run_archives_at_most_max_run_bytes_of_each_stream() {
     let marker = "[stdout archive truncated at 64.0 KB of 976.6 KB]\n";
     assert!(stderr(&output).ends_with(marker), "{}", stderr(&output));
     let id = footer_id(&output);
-    let archive = root.join(".justless/runs").join(&id);
-    assert_eq!(fs::metadata(archive.join("stdout")).unwrap().len(), 65536);
+    assert_eq!(stream_len(root, &id, "stdout"), 65536);
     // What was archived replays byte for byte, and the replay says what is missing.
     let log = cli(root, &["log", &id, "--stream", "stdout"]);
     assert_eq!(log.stdout, expected.as_bytes()[..65536]);
-    assert!(
-        stderr(&log).contains(
-            "[justless: stdout archive truncated at 64.0 KB of 976.6 KB; the rest was not stored]"
-        ),
-        "{}",
-        stderr(&log)
+    text_has(
+        &stderr(&log),
+        &["[justless: stdout archive truncated at 64.0 KB of 976.6 KB; the rest was not stored]"],
     );
-    assert_eq!(success(root, &["log", &id, "--stream", "stderr"]), "");
+    let log = cli(root, &["log", &id, "--stream", "stderr"]);
+    assert!(log.status.success());
     assert_eq!(
-        stderr(&cli(root, &["log", &id, "--stream", "stderr"])),
-        "done\n"
+        (stdout(&log), stderr(&log)),
+        (String::new(), "done\n".to_owned())
     );
-    let record = fs::read_to_string(archive.join("record.json")).unwrap();
-    assert!(
-        record.contains("\"produced_bytes\":[1000000,5]"),
-        "{record}"
-    );
+    let record = run_record(root, &id);
+    assert_eq!(record["produced_bytes"], serde_json::json!([1000000, 5]));
 
     // A cap below the preview budget still names the run after a hook-routed
     // success, since the agent did not receive every byte.
@@ -10716,19 +10672,35 @@ fn a_run_archives_at_most_max_run_bytes_of_each_stream() {
     );
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "0".repeat(1024));
-    assert!(
-        stderr(&output).contains(
-            " · 1.0 KB of 1.0 KB shown]\n[stdout archive truncated at 1.0 KB of 2.0 KB]\n"
-        ),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &[" · 1.0 KB of 1.0 KB shown]\n[stdout archive truncated at 1.0 KB of 2.0 KB]\n"],
     );
+}
+
+/// Waits up to `seconds` for `child` to exit, polling every 20 ms, and says
+/// whether it did.
+#[cfg(unix)]
+fn exited_within(
+    child: &mut std::process::Child,
+    seconds: u64,
+    give_up: impl Fn() -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        if start.elapsed().as_secs() >= seconds || give_up() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn a_self_feeding_recursive_grep_stops_at_the_archive_cap() {
-    use std::os::unix::process::CommandExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
@@ -10738,14 +10710,8 @@ fn a_self_feeding_recursive_grep_stops_at_the_archive_cap() {
     fs::write(root.join("seed.txt"), seed).unwrap();
     // `ulimit -f` stops a regression that writes the archive from the command
     // itself; output through a pipe is not limited by it.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["run", "--", "sh", "-c", "ulimit -f 4096; grep -rn x ."])
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let script = "ulimit -f 4096; grep -rn x .";
+    let mut child = spawn_justless(root, &["run", "--", "sh", "-c", script], true);
     let group = format!("-{}", child.id());
     let state_bytes = || -> u64 {
         fn size(path: &Path) -> u64 {
@@ -10761,28 +10727,18 @@ fn a_self_feeding_recursive_grep_stops_at_the_archive_cap() {
         }
         size(&root.join(".justless"))
     };
-    let start = std::time::Instant::now();
-    let finished = loop {
-        if child.try_wait().unwrap().is_some() {
-            break true;
-        }
-        if start.elapsed().as_secs() >= 60 || state_bytes() > 64 * 1024 * 1024 {
-            let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    let finished = exited_within(&mut child, 60, || state_bytes() > 64 * 1024 * 1024);
+    if !finished {
+        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+    }
     let output = child.wait_with_output().unwrap();
     assert!(finished, "the grep did not stop: {} bytes", state_bytes());
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("[stdout archive truncated at 64.0 KB of "),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &["[stdout archive truncated at 64.0 KB of "],
     );
-    let id = footer_id(&output);
-    let stream = root.join(".justless/runs").join(&id).join("stdout");
-    assert_eq!(fs::metadata(stream).unwrap().len(), 65536);
+    assert_eq!(stream_len(root, &footer_id(&output), "stdout"), 65536);
     assert!(state_bytes() < 1024 * 1024, "{}", state_bytes());
 }
 
@@ -10793,34 +10749,24 @@ fn a_background_writer_returns_at_once_and_its_late_output_stays_within_the_cap(
     let root = repo.path();
     fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
     let start = std::time::Instant::now();
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "(sleep 3; yes late | head -c 200000; touch finished) & echo started",
-        ],
-    );
+    let script = "(sleep 3; yes late | head -c 200000; touch finished) & echo started";
+    let output = cli(root, &["run", "--", "sh", "-c", script]);
     // Justless does not wait for a background process that keeps the output open.
     assert!(start.elapsed().as_secs_f64() < 2.5, "{:?}", start.elapsed());
     assert_eq!(stdout(&output), "started\n");
     let id = footer_id(&output);
-    let stream = root.join(".justless/runs").join(&id).join("stdout");
     wait_until("the background writer", || root.join("finished").exists());
+    let stream = root.join(".justless/runs").join(&id).join("stdout");
     wait_until("the late output", || {
         fs::metadata(&stream).is_ok_and(|meta| meta.len() == 65536)
     });
     std::thread::sleep(std::time::Duration::from_millis(200));
-    assert_eq!(fs::metadata(&stream).unwrap().len(), 65536);
+    assert_eq!(stream_len(root, &id, "stdout"), 65536);
     let log = cli(root, &["log", &id, "--stream", "stdout"]);
     assert!(log.stdout.starts_with(b"started\nlate\nlate\n"));
-    assert!(
-        stderr(&log)
-            .contains("the last 65528 byte(s) of stdout were written after the command exited"),
-        "{}",
-        stderr(&log)
+    text_has(
+        &stderr(&log),
+        &["the last 65528 byte(s) of stdout were written after the command exited"],
     );
 }
 
@@ -10833,79 +10779,71 @@ fn a_hook_run_stopped_by_a_timeout_is_recorded_with_its_exit() {
     // so a failed run leaves no process behind.
     let script = "trap 'echo got-term; exit 7' TERM; echo partial; \
         i=0; while [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done";
-    let child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["run", "--hook", "--", "sh", "-c", script])
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_until("partial output", || {
-        run_streams(root)
-            .iter()
-            .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
-    });
-    let pid = child.id().to_string();
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &pid])
-            .status()
-            .unwrap()
-            .success()
-    );
+    let child = spawn_justless(root, &["run", "--hook", "--", "sh", "-c", script], false);
+    wait_for_stream(root, "partial");
+    send_kill(&["-TERM", &child.id().to_string()]);
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
     assert_eq!(stdout(&output), "partial\ngot-term\n");
     // The output reached the agent in full, so the compact marker names the exit.
     let id = footer_id(&output);
-    assert!(
-        stderr(&output).ends_with(&format!("[justless {id} · exit 7]\n")),
-        "{}",
-        stderr(&output)
-    );
+    let marker = format!("[justless {id} · exit 7]\n");
+    assert!(stderr(&output).ends_with(&marker), "{}", stderr(&output));
     assert_eq!(success(root, &["log", &id]), "partial\ngot-term\n");
-    assert!(success(root, &["history"]).contains(&format!("{id} · sh · exit 7")));
+    text_has(
+        &success(root, &["history"]),
+        &[&format!("{id} · sh · exit 7")],
+    );
 }
 
+/// A killed hook run stays listed and replayable, and a run whose Justless was
+/// killed is pruned like any other, though its command outlives it.
 #[cfg(unix)]
 #[test]
 fn a_killed_hook_run_stays_listed_and_replayable() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args([
-            "run",
-            "--hook",
-            "--",
-            "sh",
-            "-c",
-            "echo $$ > pid; echo partial; exec sleep 30",
-        ])
-        .current_dir(root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_until("partial output", || {
-        root.join("pid").exists()
-            && run_streams(root)
-                .iter()
-                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
-    });
-    // A client that gives up on a command can kill Justless outright.
-    child.kill().unwrap();
-    child.wait().unwrap();
-    let sleeper = fs::read_to_string(root.join("pid")).unwrap();
-    let _ = Command::new("kill")
-        .args(["-KILL", sleeper.trim()])
-        .status();
-    let history = success(root, &["history"]);
-    assert!(history.contains(" · sh · unfinished"), "{history}");
-    let id = history.split(' ').next().unwrap();
-    assert_eq!(success(root, &["log", id]), "partial\n");
-    let record =
-        fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap();
-    assert!(record.contains("\"hook\":true"), "{record}");
+    for hook in [true, false] {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path();
+        if !hook {
+            fs::write(root.join(".justless.toml"), "max_runs = 1\n").unwrap();
+        }
+        let script = "echo $$ > pid; echo partial; exec sleep 30";
+        let flags: &[&str] = if hook { &["--hook"] } else { &[] };
+        let args = [&["run"][..], flags, &["--", "sh", "-c", script]].concat();
+        let mut child = spawn_justless(root, &args, false);
+        wait_until("partial output", || {
+            root.join("pid").exists()
+                && run_streams(root)
+                    .iter()
+                    .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
+        });
+        // A client that gives up on a command can kill Justless outright.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let sleeper = file_text(root, "pid");
+        let sleeper = sleeper.trim();
+        if hook {
+            let _ = Command::new("kill").args(["-KILL", sleeper]).status();
+            let history = success(root, &["history"]);
+            text_has(&history, &[" · sh · unfinished"]);
+            let id = history.split(' ').next().unwrap();
+            assert_eq!(success(root, &["log", id]), "partial\n");
+            let record = run_record(root, id);
+            assert_eq!(record["hook"], true, "{record}");
+            continue;
+        }
+        // The command outlives the killed Justless, but it does not keep the run in
+        // progress, so the next run prunes it to stay within `max_runs`.
+        let next = cli(root, &["run", "--", "echo", "next"]);
+        let alive = Command::new("kill").args(["-0", sleeper]).status();
+        let _ = Command::new("kill").args(["-KILL", sleeper]).status();
+        assert!(
+            alive.unwrap().success(),
+            "the orphaned command stopped before the next run"
+        );
+        assert!(next.status.success(), "{}", stderr(&next));
+        assert_eq!(stored_runs(root), vec![run_id(&next)]);
+    }
 }
 
 #[cfg(unix)]
@@ -10914,91 +10852,23 @@ fn a_background_process_that_keeps_writing_does_not_hold_the_run() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     fs::write(root.join(".justless.toml"), "max_run_bytes = 65536\n").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args([
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "for i in 1 2 3 4; do yes & echo $! >> writers; done; sleep 0.2; echo started",
-        ])
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let start = std::time::Instant::now();
-    let returned = loop {
-        if child.try_wait().unwrap().is_some() {
-            break true;
-        }
-        if start.elapsed().as_secs() >= 10 {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    let script = "for i in 1 2 3 4; do yes & echo $! >> writers; done; sleep 0.2; echo started";
+    let mut child = spawn_justless(root, &["run", "--", "sh", "-c", script], false);
+    let returned = exited_within(&mut child, 10, || false);
     // Stop the writers either way, so the drainer sees the pipe close. Several of
     // them keep the pipe from ever running empty.
-    let writers = fs::read_to_string(root.join("writers")).unwrap();
+    let writers = file_text(root, "writers");
     let _ = Command::new("kill")
         .args(writers.split_whitespace())
         .status();
     let output = child.wait_with_output().unwrap();
     assert!(returned, "Justless waited for the background writers");
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("[stdout archive truncated at 64.0 KB of "),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &["[stdout archive truncated at 64.0 KB of "],
     );
-    let stream = root
-        .join(".justless/runs")
-        .join(footer_id(&output))
-        .join("stdout");
-    assert!(fs::metadata(stream).unwrap().len() <= 65536);
-}
-
-#[cfg(unix)]
-#[test]
-fn a_run_whose_justless_was_killed_is_pruned_like_any_other() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    fs::write(root.join(".justless.toml"), "max_runs = 1\n").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args([
-            "run",
-            "--",
-            "sh",
-            "-c",
-            "echo $$ > pid; echo partial; exec sleep 30",
-        ])
-        .current_dir(root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_until("partial output", || {
-        root.join("pid").exists()
-            && run_streams(root)
-                .iter()
-                .any(|path| fs::read_to_string(path).is_ok_and(|text| text.contains("partial")))
-    });
-    child.kill().unwrap();
-    child.wait().unwrap();
-    let sleeper = fs::read_to_string(root.join("pid")).unwrap();
-    let sleeper = sleeper.trim();
-    // The command outlives the killed Justless, but it does not keep the run in
-    // progress, so the next run prunes it to stay within `max_runs`.
-    let next = cli(root, &["run", "--", "echo", "next"]);
-    let alive = Command::new("kill")
-        .args(["-0", sleeper])
-        .status()
-        .unwrap()
-        .success();
-    let _ = Command::new("kill").args(["-KILL", sleeper]).status();
-    assert!(alive, "the orphaned command stopped before the next run");
-    assert!(next.status.success(), "{}", stderr(&next));
-    assert_eq!(stored_runs(root), vec![run_id(&next)]);
+    assert!(stream_len(root, &footer_id(&output), "stdout") <= 65536);
 }
 
 #[cfg(unix)]
@@ -11007,12 +10877,8 @@ fn a_verbatim_hook_run_ignores_output_written_after_the_command_exited() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     // Each command differs, so no run is reported as unchanged.
-    for (i, delay) in ["0.01", "0.02", "0.03", "0.05", "0.08"]
-        .iter()
-        .cycle()
-        .take(15)
-        .enumerate()
-    {
+    let delays = ["0.01", "0.02", "0.03", "0.05", "0.08"];
+    for (i, delay) in delays.iter().cycle().take(15).enumerate() {
         let script = format!("(sleep {delay}; echo late) & echo started-{i}");
         let output = cli(root, &["run", "--hook", "--", "sh", "-c", &script]);
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -11026,7 +10892,6 @@ fn a_verbatim_hook_run_ignores_output_written_after_the_command_exited() {
 #[cfg(unix)]
 #[test]
 fn an_unchanged_rerun_never_links_a_stream_that_a_background_process_still_writes() {
-    use std::os::unix::fs::MetadataExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     let script = "if [ ! -f first ]; then touch first; \
@@ -11036,18 +10901,18 @@ fn an_unchanged_rerun_never_links_a_stream_that_a_background_process_still_write
     let again = cli(root, &args);
     assert_eq!(stdout(&again), "started\n");
     let second = run_id(&again);
-    let runs = root.join(".justless/runs");
-    let record = fs::read_to_string(runs.join(&second).join("record.json")).unwrap();
-    assert!(record.contains("\"unchanged\":true"), "{record}");
+    let record = run_record(root, &second);
+    assert_eq!(record["unchanged"], true, "{record}");
+    let stream = root.join(".justless/runs").join(&first).join("stdout");
     wait_until("the first run's late output", || {
-        fs::read_to_string(runs.join(&first).join("stdout"))
-            .is_ok_and(|text| text.contains("late-from-first-run"))
+        fs::read_to_string(&stream).is_ok_and(|text| text.contains("late-from-first-run"))
     });
-    let inode = |id: &str| fs::metadata(runs.join(id).join("stdout")).unwrap().ino();
-    assert_ne!(inode(&first), inode(&second));
+    assert_ne!(stdout_inode(root, &first), stdout_inode(root, &second));
     let log = cli(root, &["log", &second]);
-    assert_eq!(stdout(&log), "started\n");
-    assert_eq!(stderr(&log), "");
+    assert_eq!(
+        (stdout(&log), stderr(&log)),
+        ("started\n".to_owned(), String::new())
+    );
 }
 
 /// Run Justless with stdout and stderr written to one file, as `2>&1` does.
@@ -11085,33 +10950,20 @@ fn notes_on_stderr_follow_the_output_they_describe() {
     // The run footer comes after a preview that ends inside a line.
     let output = merged(root, &["run", "--", "printf", "abc"]);
     assert!(output.starts_with("abc\n[justless run-"), "{output:?}");
-    let output = merged(
-        root,
-        &["run", "--hook", "--", "sh", "-c", "printf abc; exit 3"],
-    );
+    let script_exit = ["run", "--hook", "--", "sh", "-c", "printf abc; exit 3"];
+    let output = merged(root, &script_exit);
     assert!(output.starts_with("abc\n[justless run-"), "{output:?}");
     assert!(output.ends_with(" · exit 3]\n"), "{output:?}");
 
     // So does the truncation marker after the fallback replay of both streams.
-    let output = merged(
-        root,
-        &[
-            "run",
-            "--",
-            "sh",
-            "-c",
-            &format!("{script}; rm -rf .justless"),
-        ],
-    );
+    let removed = format!("{script}; rm -rf .justless");
+    let output = merged(root, &["run", "--", "sh", "-c", &removed]);
     let replayed = output
         .split_once("restoring full output: ")
         .and_then(|(_, rest)| rest.split_once('\n'))
         .map_or("", |(_, rest)| rest);
-    assert_eq!(
-        replayed,
-        format!("{kept}\n[stdout archive truncated at 1.0 KB of 2.8 KB]\n"),
-        "{output:?}"
-    );
+    let truncated = format!("{kept}\n[stdout archive truncated at 1.0 KB of 2.8 KB]\n");
+    assert_eq!(replayed, truncated, "{output:?}");
 }
 
 /// A committed copy of the multi-package Cargo workspace in fixtures/affected.
@@ -12315,21 +12167,10 @@ fn stray_python_tests_add_no_runner_and_missing_runners_are_not_results() {
 const BUDGET_LOG: &str =
     "i=0; while [ $i -lt 2000 ]; do echo \"row $i of the synthetic build log\"; i=$((i+1)); done\n";
 
-/// The program that prints `BUDGET_LOG`, as an absolute path.
-#[cfg(unix)]
-fn budget_program(root: &Path) -> String {
-    fake_program(root, "synth", BUDGET_LOG)
-        .to_str()
-        .unwrap()
-        .to_owned()
-}
-
 #[cfg(unix)]
 fn budget_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    now.unwrap().as_millis() as u64
 }
 
 /// Seeds `count` finished `synth` runs that showed `shown` of 70,000 bytes, one second
@@ -12344,15 +12185,8 @@ fn seed_budget_runs(
     shown: u64,
     end_ms: u64,
 ) {
-    seed_budget_runs_for(
-        root,
-        ("other", "synth"),
-        tag,
-        count,
-        reopened,
-        shown,
-        end_ms,
-    );
+    let names = ("other", "synth");
+    seed_budget_runs_for(root, names, tag, count, reopened, shown, end_ms);
 }
 
 /// Seeds runs as `seed_budget_runs` does, recorded under `family` and `label`.
@@ -12401,10 +12235,8 @@ fn seed_budget_run(root: &Path, (family, label): (&str, &str), id: &str, run: Se
     });
     fs::write(directory.join("record.json"), record.to_string()).unwrap();
     // The logs only need their sizes.
-    fs::File::create(directory.join("stdout"))
-        .unwrap()
-        .set_len(run.stdout_bytes)
-        .unwrap();
+    let stdout = fs::File::create(directory.join("stdout")).unwrap();
+    stdout.set_len(run.stdout_bytes).unwrap();
     fs::write(directory.join("stderr"), "").unwrap();
     let recalls = serde_json::json!({
         "full": u64::from(run.reopened), "range": 2, "search": 1, "context": 0,
@@ -12412,23 +12244,42 @@ fn seed_budget_run(root: &Path, (family, label): (&str, &str), id: &str, run: Se
     fs::write(directory.join("recalls.json"), recalls.to_string()).unwrap();
 }
 
+/// Seeds `count` runs of `family` that nobody reopened, of `bytes` of which they
+/// showed `shown`, one second apart from `start`.
+#[cfg(unix)]
+fn seed_clean_runs(
+    root: &Path,
+    family: &str,
+    tag: &str,
+    count: u64,
+    start: u64,
+    bytes: u64,
+    shown: u64,
+) {
+    for i in 0..count {
+        let run = SeededRun {
+            completed_ms: start + i * 1000,
+            stdout_bytes: bytes,
+            shown,
+            reopened: false,
+        };
+        seed_budget_run(root, ("other", family), &format!("run-{tag}{i:03}"), run);
+    }
+}
+
 /// Gives the runs `seed_budget_runs` made under `tag` a failing-test summary,
 /// which replaced their stdout preview.
 #[cfg(unix)]
 fn summarize_seeded_runs(root: &Path, tag: &str, count: usize) {
     for i in 0..count {
-        let path = root
-            .join(".justless/runs")
-            .join(format!("run-{tag}{i:03}"))
-            .join("record.json");
-        let mut record: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let path = format!(".justless/runs/run-{tag}{i:03}/record.json");
+        let mut record: serde_json::Value = serde_json::from_str(&file_text(root, &path)).unwrap();
         record["summary"] = serde_json::json!({
             "kind": "tests",
             "items": [{"name": "checkout::totals", "detail": "", "digest": "d", "first": 1, "last": 9}],
             "outcomes": ["test result: FAILED"],
         });
-        fs::write(&path, record.to_string()).unwrap();
+        fs::write(root.join(path), record.to_string()).unwrap();
     }
 }
 
@@ -12436,11 +12287,12 @@ fn summarize_seeded_runs(root: &Path, tag: &str, count: usize) {
 /// from collapsing to an unchanged notice, which says nothing about the budget.
 #[cfg(unix)]
 fn budget_run(root: &Path, options: &[&str]) -> serde_json::Value {
-    let program = budget_program(root);
-    let mut args = vec!["run", "--fresh"];
-    args.extend_from_slice(options);
-    args.extend(["--", &program]);
-    let output = cli(root, &args);
+    let program = fake_program(root, "synth", BUDGET_LOG);
+    let program = program.to_str().unwrap();
+    let output = cli(
+        root,
+        &[&["run", "--fresh"], options, &["--", program]].concat(),
+    );
     assert!(output.status.success(), "{}", stderr(&output));
     budget_run_record(root, &output)
 }
@@ -12448,15 +12300,15 @@ fn budget_run(root: &Path, options: &[&str]) -> serde_json::Value {
 /// The record of the run whose footer `output` printed.
 #[cfg(unix)]
 fn budget_run_record(root: &Path, output: &Output) -> serde_json::Value {
-    let id: String = stderr(output)
+    let footer = stderr(output);
+    let id: String = footer
         .rsplit_once("[justless ")
         .unwrap()
         .1
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
-    let record = fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap();
-    serde_json::from_slice(&record).unwrap()
+    run_record(root, &id)
 }
 
 #[cfg(unix)]
@@ -12479,13 +12331,26 @@ fn budget_row(root: &Path) -> serde_json::Value {
 #[cfg(unix)]
 fn budget_row_named(root: &Path, family: &str) -> serde_json::Value {
     let report = budget_report(root);
-    report["families"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["family"] == family)
-        .cloned()
-        .unwrap_or_else(|| panic!("no {family} budget in {report}"))
+    let rows = report["families"].as_array().unwrap();
+    let row = rows.iter().find(|row| row["family"] == family).cloned();
+    row.unwrap_or_else(|| panic!("no {family} budget in {report}"))
+}
+
+#[cfg(unix)]
+fn budget_state(root: &Path) -> serde_json::Value {
+    fs::read(root.join(".justless/budgets.json"))
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn write_budget_state(root: &Path, state: serde_json::Value) {
+    write_files(root, &[(".justless/budgets.json", &state.to_string())]);
+}
+
+#[cfg(unix)]
+fn reported_unchanged(output: &Output) -> bool {
+    stdout(output).contains("Output unchanged since run-")
 }
 
 #[cfg(unix)]
@@ -12493,6 +12358,7 @@ fn budget_row_named(root: &Path, family: &str) -> serde_json::Value {
 fn preview_budgets_rise_one_step_when_clipped_logs_are_reopened() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
+    let shown = |options: &[&str]| budget_shown(&budget_run(root, options));
     // A clipped plain stream shows about half of its budget: 2,043 bytes of 4,096.
     seed_budget_runs(root, "Seed", 9, 4, 2043, budget_now_ms());
     let raised = budget_run(root, &[]);
@@ -12507,28 +12373,24 @@ fn preview_budgets_rise_one_step_when_clipped_logs_are_reopened() {
         "raised from 4.0 KB: 4 of the last 9 clipped runs were reopened in full \
          · since then 0 of 1 clipped run reopened in full, 5 needed"
     );
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains(
+    text_has(
+        &success(root, &["stats"]),
+        &[
             "Preview budgets per stream (default 4.0 KB, adapting from 2.0 KB to 16.0 KB)\n  \
-             synth    8.0 KB · raised from 4.0 KB: 4 of the last 9 clipped runs were reopened in full"
-        ),
-        "{text}"
+           synth    8.0 KB · raised from 4.0 KB: 4 of the last 9 clipped runs were reopened in full",
+        ],
     );
 
     // The step is judged by the runs it produced, so the evidence that raised it
     // does not raise it again on the next run.
-    assert!((2100..=4096).contains(&budget_shown(&budget_run(root, &[]))));
+    assert!((2100..=4096).contains(&shown(&[])));
     // Hook-routed runs share the budget. An explicit budget always wins and
     // leaves the family's step alone; a preview under a quarter of the family's
     // budget did not come from it, so the run is not evidence either.
-    assert!((2100..=4096).contains(&budget_shown(&budget_run(root, &["--hook"]))));
-    let state = fs::read_to_string(root.join(".justless/budgets.json")).unwrap();
-    assert!(budget_shown(&budget_run(root, &["--max-bytes", "1024"])) <= 1024);
-    assert_eq!(
-        fs::read_to_string(root.join(".justless/budgets.json")).unwrap(),
-        state
-    );
+    assert!((2100..=4096).contains(&shown(&["--hook"])));
+    let state = file_text(root, ".justless/budgets.json");
+    assert!(shown(&["--max-bytes", "1024"]) <= 1024);
+    assert_eq!(file_text(root, ".justless/budgets.json"), state);
     assert_eq!(budget_row(root)["budget_bytes"], 8192);
     // The cached run sizes are derived data: a damaged cache is rebuilt from the
     // records, and a run seeded after it was written is still read.
@@ -12536,7 +12398,7 @@ fn preview_budgets_rise_one_step_when_clipped_logs_are_reopened() {
     assert!(index.is_file());
     fs::write(&index, "{").unwrap();
     seed_budget_runs(root, "Late", 4, 4, 4094, budget_now_ms() + 10_000);
-    assert!(budget_shown(&budget_run(root, &[])) > 4096);
+    assert!(shown(&[]) > 4096);
     let rebuilt: serde_json::Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
     // Seeded, earlier real and late runs: the run being advised did not exist yet.
     assert_eq!(rebuilt["seen"].as_str().unwrap().lines().count(), 9 + 4 + 4);
@@ -12577,14 +12439,13 @@ fn preview_budgets_rise_one_step_when_clipped_logs_are_reopened() {
     assert_eq!(row["budget_bytes"], 4096, "{row}");
     assert_eq!(row["clipped_runs"], 0);
     assert_eq!(row["summaries_reopened"], 6);
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains(
+    text_has(
+        &success(root, &["stats"]),
+        &[
             "  synth    4.0 KB · default · no run was clipped · 6 runs were reopened in full \
-             where the stream was summarized or shown whole, which a larger budget would \
-             not change"
-        ),
-        "{text}"
+           where the stream was summarized or shown whole, which a larger budget would \
+           not change",
+        ],
     );
 }
 
@@ -12597,72 +12458,72 @@ fn preview_budgets_rise_one_step_when_clipped_logs_are_reopened() {
 fn preview_budget_keys_match_the_families_runs_record() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    git(root, &["init", "-q"]);
-    fs::write(root.join("app.py"), "x = 1\n").unwrap();
-    git(root, &["add", "app.py"]);
-    git(root, &["commit", "-q", "-m", "start"]);
+    write_files(root, &[("app.py", "x = 1\n")]);
+    commit_all(root);
     fs::write(root.join("output.txt"), lint_fixture("mypy.txt").repeat(20)).unwrap();
-    let mypy = fake_program(root, "mypy", "cat output.txt\nexit 1\n");
-    let kubectl = fake_program(root, "kubectl", "echo 'NAME READY STATUS'\n");
-    let golangci = fake_program(
-        root,
-        "golangci-lint",
-        "echo 'main.go:3:1: unused (unused)'\n",
-    );
-    let (mypy, kubectl) = (mypy.to_str().unwrap(), kubectl.to_str().unwrap());
-    let golangci = golangci.to_str().unwrap();
+    let program = |name: &str, script: &str| {
+        let path = fake_program(root, name, script);
+        path.to_str().unwrap().to_owned()
+    };
+    let mypy = program("mypy", "cat output.txt\nexit 1\n");
+    let kubectl = program("kubectl", "echo 'NAME READY STATUS'\n");
+    let golangci = program("golangci-lint", "echo 'main.go:3:1: unused (unused)'\n");
+    // Runs the command, then reruns it after seeding five reopened clipped runs
+    // under the family and label its run recorded; returns those names.
+    let seeded = |tag: &str, command: &[&str]| {
+        let args = [&["run", "--fresh", "--"], command].concat();
+        let record = budget_run_record(root, &cli(root, &args));
+        let names =
+            [&record["family"], &record["label"]].map(|name| name.as_str().unwrap().to_owned());
+        seed_budget_runs_for(
+            root,
+            (&names[0], &names[1]),
+            tag,
+            5,
+            5,
+            2043,
+            budget_now_ms(),
+        );
+        cli(root, &args);
+        names
+    };
     for (tag, command, key) in [
-        ("Mypy", vec![mypy, "app.py"], "mypy"),
-        ("Pods", vec![kubectl, "get", "pods"], "kubectl get pods"),
+        ("Mypy", vec![mypy.as_str(), "app.py"], "mypy"),
+        (
+            "Pods",
+            vec![kubectl.as_str(), "get", "pods"],
+            "kubectl get pods",
+        ),
         ("Gitlog", vec!["git", "log"], "git log"),
         // A linter whose subcommand is `run` is not a runner.
-        ("Golangci", vec![golangci, "run"], "golangci-lint run"),
+        (
+            "Golangci",
+            vec![golangci.as_str(), "run"],
+            "golangci-lint run",
+        ),
     ] {
-        let mut args = vec!["run", "--fresh", "--"];
-        args.extend(command);
-        let record = budget_run_record(root, &cli(root, &args));
-        let names = (
-            record["family"].as_str().unwrap(),
-            record["label"].as_str().unwrap(),
-        );
-        seed_budget_runs_for(root, names, tag, 5, 5, 2043, budget_now_ms());
-        cli(root, &args);
-        let state: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join(".justless/budgets.json")).unwrap())
-                .unwrap();
-        assert_eq!(state[key]["level"], 1, "{names:?}: {state}");
+        let names = seeded(tag, &command);
+        assert_eq!(budget_state(root)[key]["level"], 1, "{names:?}");
     }
 
     // A runner's label names the runner rather than the script or target it
     // runs, so its runs mix unrelated work and keep the default however they went.
-    let npm = fake_program(root, "npm", "echo \"npm $*\"\n");
-    let make = fake_program(root, "make", "echo \"make $*\"\n");
-    let python = fake_program(root, "python3", "echo \"python $*\"\n");
-    let cargo = fake_program(root, "cargo", "echo \"cargo $*\"\n");
-    let (npm, make) = (npm.to_str().unwrap(), make.to_str().unwrap());
-    let (python, cargo) = (python.to_str().unwrap(), cargo.to_str().unwrap());
-    let mut labels = Vec::new();
-    for (tag, command) in [
-        ("Npmbuild", vec![npm, "run", "build"]),
-        ("Makeflags", vec![make, "-j8", "lint"]),
+    let npm = program("npm", "echo \"npm $*\"\n");
+    let make = program("make", "echo \"make $*\"\n");
+    let python = program("python3", "echo \"python $*\"\n");
+    let cargo = program("cargo", "echo \"cargo $*\"\n");
+    let labels: Vec<_> = [
+        ("Npmbuild", vec![npm.as_str(), "run", "build"]),
+        ("Makeflags", vec![make.as_str(), "-j8", "lint"]),
         ("Shell", vec!["sh", "-c", "echo hi"]),
-        ("Script", vec![python, "tool.py"]),
-        ("Cargorun", vec![cargo, "run"]),
-    ] {
-        let mut args = vec!["run", "--fresh", "--"];
-        args.extend(command);
-        let record = budget_run_record(root, &cli(root, &args));
-        let names = (
-            record["family"].as_str().unwrap().to_owned(),
-            record["label"].as_str().unwrap().to_owned(),
-        );
-        seed_budget_runs_for(root, (&names.0, &names.1), tag, 5, 5, 2043, budget_now_ms());
-        cli(root, &args);
-        labels.push(names.1);
-    }
+        ("Script", vec![python.as_str(), "tool.py"]),
+        ("Cargorun", vec![cargo.as_str(), "run"]),
+    ]
+    .into_iter()
+    .map(|(tag, command)| seeded(tag, &command)[1].clone())
+    .collect();
     assert_eq!(labels, ["npm run", "make", "sh", "python3", "cargo run"]);
-    let state: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join(".justless/budgets.json")).unwrap()).unwrap();
+    let state = budget_state(root);
     let keys: Vec<_> = state.as_object().unwrap().keys().collect();
     let expected = ["git log", "golangci-lint run", "kubectl get pods", "mypy"];
     assert_eq!(keys, expected, "{state}");
@@ -12679,15 +12540,24 @@ fn preview_budget_keys_match_the_families_runs_record() {
 #[cfg(unix)]
 #[test]
 fn preview_budgets_fall_after_a_clean_window_within_cap_floor_and_setting() {
+    // A fresh root with `settings` as its project settings.
+    let fresh = |settings: &str| {
+        let repo = TempDir::new().unwrap();
+        if !settings.is_empty() {
+            write_files(repo.path(), &[(".justless.toml", settings)]);
+        }
+        repo
+    };
+    let shown = |root: &Path| budget_shown(&budget_run(root, &[]));
     // Twenty clipped runs that nobody reopened in full halve the budget.
-    let repo = TempDir::new().unwrap();
+    let repo = fresh("");
     let root = repo.path();
     seed_budget_runs(root, "Seed", 19, 0, 2043, budget_now_ms());
     assert_eq!(
         budget_row(root)["reason"],
         "default · 0 of the last 19 clipped runs were reopened in full"
     );
-    assert!((1100..=2100).contains(&budget_shown(&budget_run(root, &[]))));
+    assert!((1100..=2100).contains(&shown(root)));
     let row = budget_row(root);
     assert_eq!(row["budget_bytes"], 2048, "{row}");
     assert_eq!(row["adjustment"], "lowered");
@@ -12695,75 +12565,48 @@ fn preview_budgets_fall_after_a_clean_window_within_cap_floor_and_setting() {
         row["reason"],
         "lowered from 4.0 KB: none of the last 20 clipped runs was reopened in full"
     );
-    assert!(budget_shown(&budget_run(root, &[])) <= 1100);
+    assert!(shown(root) <= 1100);
 
     // A configured cap and floor bound the steps.
-    let repo = TempDir::new().unwrap();
+    let repo = fresh("adaptive_cap_bytes = 6000\nadaptive_floor_bytes = 3000\n");
     let root = repo.path();
-    fs::write(
-        root.join(".justless.toml"),
-        "adaptive_cap_bytes = 6000\nadaptive_floor_bytes = 3000\n",
-    )
-    .unwrap();
     seed_budget_runs(root, "Seed", 6, 6, 2043, budget_now_ms());
-    assert!((2100..=3100).contains(&budget_shown(&budget_run(root, &[]))));
+    assert!((2100..=3100).contains(&shown(root)));
     // More reopened runs at the cap keep it there.
     seed_budget_runs(root, "More", 6, 6, 2990, budget_now_ms() + 10_000);
-    assert!((2100..=3100).contains(&budget_shown(&budget_run(root, &[]))));
+    assert!((2100..=3100).contains(&shown(root)));
     let row = budget_row(root);
     assert_eq!(row["budget_bytes"], 6000, "{row}");
-    assert!(
-        row["reason"].as_str().unwrap().ends_with("· at the cap"),
-        "{row}"
-    );
+    let reason = row["reason"].as_str().unwrap();
+    assert!(reason.ends_with("· at the cap"), "{row}");
     let report = budget_report(root);
     assert_eq!(report["floor_bytes"], 3000);
     assert_eq!(report["cap_bytes"], 6000);
-    let repo = TempDir::new().unwrap();
+    let repo = fresh("adaptive_floor_bytes = 3000\n");
     let root = repo.path();
-    fs::write(root.join(".justless.toml"), "adaptive_floor_bytes = 3000\n").unwrap();
     seed_budget_runs(root, "Seed", 20, 0, 2043, budget_now_ms());
-    let lowered = budget_shown(&budget_run(root, &[]));
+    let lowered = shown(root);
     assert!((1100..=1600).contains(&lowered), "{lowered}");
 
     // Turned off, every run uses max_output_bytes and no step is saved.
-    let repo = TempDir::new().unwrap();
+    let repo = fresh("adaptive_previews = false\n");
     let root = repo.path();
-    fs::write(root.join(".justless.toml"), "adaptive_previews = false\n").unwrap();
     seed_budget_runs(root, "Seed", 9, 9, 2043, budget_now_ms());
-    assert!(budget_shown(&budget_run(root, &[])) <= 2100);
+    assert!(shown(root) <= 2100);
     assert!(!root.join(".justless/budgets.json").exists());
     assert_eq!(budget_report(root)["adaptive"], false);
-    assert!(success(root, &["stats"]).contains(
-        "Preview budgets: adaptive_previews is off, so every run uses 4.0 KB per stream"
-    ));
+    text_has(
+        &success(root, &["stats"]),
+        &["Preview budgets: adaptive_previews is off, so every run uses 4.0 KB per stream"],
+    );
 
     // A cap below the default is rejected like any other invalid setting.
     fs::write(root.join(".justless.toml"), "adaptive_cap_bytes = 1000\n").unwrap();
     let output = cli(root, &["run", "--", "sh", "-c", "echo hi"]);
-    assert!(
-        stderr(&output).contains("adaptive_cap_bytes must be at least max_output_bytes"),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &["adaptive_cap_bytes must be at least max_output_bytes"],
     );
-}
-
-#[cfg(unix)]
-fn budget_state(root: &Path) -> serde_json::Value {
-    fs::read(root.join(".justless/budgets.json"))
-        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-        .unwrap_or_default()
-}
-
-#[cfg(unix)]
-fn write_budget_state(root: &Path, state: serde_json::Value) {
-    fs::create_dir_all(root.join(".justless")).unwrap();
-    fs::write(root.join(".justless/budgets.json"), state.to_string()).unwrap();
-}
-
-#[cfg(unix)]
-fn reported_unchanged(output: &Output) -> bool {
-    stdout(output).contains("Output unchanged since run-")
 }
 
 /// A failing `cargo test` prints a short report on stdout, which is summarized,
@@ -12806,10 +12649,8 @@ exit 101
     let run = |stream: &str| {
         let output = cli(root, &["run", "--hook", "--", cargo, "test"]);
         let record = budget_run_record(root, &output);
-        success(
-            root,
-            &["log", record["id"].as_str().unwrap(), "--stream", stream],
-        );
+        let id = record["id"].as_str().unwrap();
+        success(root, &["log", id, "--stream", stream]);
         record
     };
     let first = run("stdout");
@@ -12818,24 +12659,17 @@ exit 101
     }
     assert_eq!(first["family"], "cargo test");
     assert!(first["raw_bytes"].as_u64().unwrap() > 16_000, "{first}");
-    assert!(
-        !first["summary"]["items"].as_array().unwrap().is_empty(),
-        "{first}"
-    );
+    let items = first["summary"]["items"].as_array().unwrap();
+    assert!(!items.is_empty(), "{first}");
     assert_eq!(budget_state(root), serde_json::Value::Null);
-    let replays = root
-        .join(".justless/runs")
-        .join(first["id"].as_str().unwrap())
-        .join("replays.json");
-    let replays: serde_json::Value = serde_json::from_slice(&fs::read(replays).unwrap()).unwrap();
+    let id = first["id"].as_str().unwrap();
+    let replays = file_text(root, &format!(".justless/runs/{id}/replays.json"));
+    let replays: serde_json::Value = serde_json::from_str(&replays).unwrap();
     assert_eq!(replays, serde_json::json!({"stdout": 1, "stderr": 0}));
     let row = budget_row_named(root, "cargo test");
     assert_eq!(row["budget_bytes"], 4096, "{row}");
-    assert_eq!(
-        (&row["clipped_runs"], &row["reopened_runs"]),
-        (&serde_json::json!(8), &serde_json::json!(0)),
-        "{row}"
-    );
+    assert_eq!(row["clipped_runs"], 8, "{row}");
+    assert_eq!(row["reopened_runs"], 0, "{row}");
     assert_eq!(row["summaries_reopened"], 8, "{row}");
     assert_eq!(
         row["reason"],
@@ -12882,18 +12716,11 @@ fn preview_budget_changes_forget_rerun_baselines() {
     assert!(reported_unchanged(&run("b")));
     // Five of seven clipped runs were replayed in full, so the next run doubles
     // the budget.
-    seed_budget_runs_for(
-        root,
-        ("other", "report"),
-        "Raise",
-        5,
-        5,
-        2043,
-        budget_now_ms() - 60_000,
-    );
+    let end = budget_now_ms() - 60_000;
+    seed_budget_runs_for(root, ("other", "report"), "Raise", 5, 5, 2043, end);
     state("FAIL pricing::round");
     let raised = run("a");
-    assert!(stdout(&raised).contains("a: FAIL pricing::round"));
+    text_has(&stdout(&raised), &["a: FAIL pricing::round"]);
     assert_eq!(budget_state(root)["report"]["level"], 1);
     // Twenty clean runs at 8 KB lower it again.
     let since = budget_state(root)["report"]["since_ms"].as_u64().unwrap();
@@ -12915,17 +12742,14 @@ fn preview_budget_changes_forget_rerun_baselines() {
     let lowered = run("a");
     assert_eq!(budget_state(root)["report"]["level"], 0);
     assert!(!reported_unchanged(&lowered), "{}", stdout(&lowered));
-    assert!(stdout(&lowered).contains("a: FAIL checkout::totals"));
+    text_has(&stdout(&lowered), &["a: FAIL checkout::totals"]);
     // So is a sibling command with its own baseline from before the changes.
     let sibling = run("b");
     assert!(!reported_unchanged(&sibling), "{}", stdout(&sibling));
     // Comparisons resume at the new budget.
-    let again = run("a");
-    assert!(
-        stdout(&again).contains(&format!("Output unchanged since {}.", run_id(&lowered))),
-        "{}",
-        stdout(&again)
-    );
+    let again = stdout(&run("a"));
+    let unchanged = format!("Output unchanged since {}.", run_id(&lowered));
+    text_has(&again, &[&unchanged]);
 }
 
 /// After being lowered and raised back, a budget needs twice the clean runs to
@@ -12945,19 +12769,8 @@ fn preview_budgets_raised_back_after_lowering_wait_longer_to_lower_again() {
                        · raised back here once, so lowering it again waits for 40 runs",
         }}),
     );
-    let clean = |tag: &str, start: u64| {
-        for i in 0..20 {
-            let run = SeededRun {
-                completed_ms: start + i * 1000,
-                stdout_bytes: 70_000,
-                shown: 4094,
-                reopened: false,
-            };
-            seed_budget_run(root, ("other", "synth"), &format!("run-{tag}{i:03}"), run);
-        }
-    };
     // Twenty clean runs at 8 KB would have lowered it the first time.
-    clean("First", since + 1000);
+    seed_clean_runs(root, "synth", "First", 20, since + 1000, 70_000, 4094);
     assert!((2100..=8192).contains(&budget_shown(&budget_run(root, &[]))));
     let row = budget_row(root);
     assert_eq!(row["budget_bytes"], 8192, "{row}");
@@ -12969,7 +12782,7 @@ fn preview_budgets_raised_back_after_lowering_wait_longer_to_lower_again() {
         ),
         "{row}"
     );
-    clean("Second", since + 100_000);
+    seed_clean_runs(root, "synth", "Second", 20, since + 100_000, 70_000, 4094);
     assert!(budget_shown(&budget_run(root, &[])) <= 2100);
     let state = budget_state(root);
     assert_eq!(
@@ -13005,15 +12818,7 @@ fn preview_budgets_raised_for_output_that_now_fits_wear_off() {
         root,
         serde_json::json!({"fits": {"level": 2, "since_ms": since, "reason": raised}}),
     );
-    for i in 0..19 {
-        let run = SeededRun {
-            completed_ms: since + (i + 1) * 1000,
-            stdout_bytes: 9_919,
-            shown: 9_919,
-            reopened: false,
-        };
-        seed_budget_run(root, ("other", "fits"), &format!("run-Fits{i:03}"), run);
-    }
+    seed_clean_runs(root, "fits", "Fits", 19, since + 1000, 9_919, 9_919);
     assert_eq!(
         budget_row_named(root, "fits")["reason"],
         format!(
@@ -13021,10 +12826,11 @@ fn preview_budgets_raised_for_output_that_now_fits_wear_off() {
              needed to lower, none reopened in full"
         )
     );
-    let whole = budget_run_record(root, &cli(root, &["run", "--fresh", "--", fits]));
+    let run = || budget_run_record(root, &cli(root, &["run", "--fresh", "--", fits]));
+    let whole = run();
     assert!(whole["raw_bytes"].as_u64().unwrap() > 8192, "{whole}");
     assert_eq!(whole["preview_bytes"], whole["raw_bytes"]);
-    let clipped = budget_run_record(root, &cli(root, &["run", "--fresh", "--", fits]));
+    let clipped = run();
     assert!(budget_shown(&clipped) <= 8192, "{clipped}");
     let state = budget_state(root);
     assert_eq!(state["fits"]["level"], 1, "{state}");
@@ -13041,17 +12847,18 @@ fn preview_budgets_raised_for_output_that_now_fits_wear_off() {
 fn runs_with_an_explicit_budget_leave_the_adaptive_budget_alone() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
+    let shown = |options: &[&str]| budget_shown(&budget_run(root, options));
     for _ in 0..20 {
-        assert!(budget_shown(&budget_run(root, &["--max-bytes", "30000"])) > 8192);
+        assert!(shown(&["--max-bytes", "30000"]) > 8192);
     }
     let row = budget_row(root);
     assert_eq!(row["budget_bytes"], 4096, "{row}");
     assert_eq!(row["clipped_runs"], 0, "{row}");
-    assert!((2000..=4096).contains(&budget_shown(&budget_run(root, &[]))));
+    assert!((2000..=4096).contains(&shown(&[])));
     for _ in 0..20 {
-        assert!(budget_shown(&budget_run(root, &["--max-bytes", "1024"])) <= 1024);
+        assert!(shown(&["--max-bytes", "1024"]) <= 1024);
     }
-    assert!((2000..=4096).contains(&budget_shown(&budget_run(root, &[]))));
+    assert!((2000..=4096).contains(&shown(&[])));
     assert_eq!(budget_state(root), serde_json::Value::Null);
     assert_eq!(budget_row(root)["clipped_runs"], 2);
 }
@@ -13059,62 +12866,46 @@ fn runs_with_an_explicit_budget_leave_the_adaptive_budget_alone() {
 /// The command each shell hook would run instead, or `None` when it passes through.
 fn rewrites(root: &Path, command: &str) -> Vec<(&'static str, Option<String>)> {
     use serde_json::json;
-    let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
     let bash = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
         "tool_input":{"command":command}});
-    let call = |handler: &str, input: serde_json::Value| {
-        agent_hook(root, handler, "before-command", input)
-    };
-    vec![
-        (
-            "claude",
-            text(
-                &call("hook-claude", bash.clone())["hookSpecificOutput"]["updatedInput"]["command"],
-            ),
-        ),
+    let updated = "/hookSpecificOutput/updatedInput/command";
+    [
+        ("claude", "hook-claude", bash.clone(), updated),
         (
             "gemini",
-            text(
-                &call(
-                    "hook-gemini",
-                    json!({"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
-                        "cwd":root,"tool_input":{"command":command}}),
-                )["hookSpecificOutput"]["tool_input"]["command"],
-            ),
+            "hook-gemini",
+            json!({"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
+                "cwd":root,"tool_input":{"command":command}}),
+            "/hookSpecificOutput/tool_input/command",
         ),
-        (
-            "codex",
-            text(&call("hook-codex", bash)["hookSpecificOutput"]["updatedInput"]["command"]),
-        ),
+        ("codex", "hook-codex", bash, updated),
         (
             "cursor",
-            text(
-                &call(
-                    "hook-cursor",
-                    json!({"tool_name":"Shell","cwd":root,"tool_input":{"command":command}}),
-                )["updated_input"]["command"],
-            ),
+            "hook-cursor",
+            json!({"tool_name":"Shell","cwd":root,"tool_input":{"command":command}}),
+            "/updated_input/command",
         ),
         (
             "copilot",
-            text(
-                &call(
-                    "hook-copilot",
-                    json!({"cwd":root,"toolName":"bash","toolArgs":{"command":command}}),
-                )["modifiedArgs"]["command"],
-            ),
+            "hook-copilot",
+            json!({"cwd":root,"toolName":"bash","toolArgs":{"command":command}}),
+            "/modifiedArgs/command",
         ),
         (
             "agy",
-            text(
-                &call(
-                    "hook-agy",
-                    json!({"workspacePaths":[root],"toolCall":{"name":"run_command",
-                        "args":{"CommandLine":command,"Cwd":root}}}),
-                )["overwrite"]["CommandLine"],
-            ),
+            "hook-agy",
+            json!({"workspacePaths":[root],"toolCall":{"name":"run_command",
+                "args":{"CommandLine":command,"Cwd":root}}}),
+            "/overwrite/CommandLine",
         ),
     ]
+    .into_iter()
+    .map(|(client, handler, input, pointer)| {
+        let output = agent_hook(root, handler, "before-command", input);
+        let rewritten = output.pointer(pointer).and_then(|value| value.as_str());
+        (client, rewritten.map(str::to_owned))
+    })
+    .collect()
 }
 
 #[test]
@@ -13125,113 +12916,48 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
     // `cd 2>&1` changes to the home directory, even when this one exists.
     fs::create_dir(root.join("2>&1")).unwrap();
     // Every client wraps the command words in place, so assignments still reach the
-    // command and `2>&1` merges the previews Justless prints.
-    for (command, expected) in [
-        (
-            "cargo test 2>&1",
-            "justless run --hook --merge -- cargo test 2>&1",
-        ),
-        (
-            "RUST_BACKTRACE=1 cargo test",
-            "RUST_BACKTRACE=1 justless run --hook -- cargo test",
-        ),
-        (
-            "RUST_LOG=\"debug\" NO_COLOR=1  cargo test   2>&1",
-            "RUST_LOG=\"debug\" NO_COLOR=1  justless run --hook --merge -- cargo test   2>&1",
-        ),
-        (
-            "cd web && RUST_BACKTRACE=full npm test 2>&1 && git status 2>&1",
-            "cd web && RUST_BACKTRACE=full justless run --hook --merge -- npm test 2>&1 && justless run --hook --merge -- git status 2>&1",
-        ),
-        (
-            "git diff 2>&1; git status",
-            "justless run --hook --merge -- git diff 2>&1; justless run --hook -- git status",
-        ),
-        (
-            "cargo build 2>&1 || cargo test\t2>&1",
-            "justless run --hook --merge -- cargo build 2>&1 || justless run --hook --merge -- cargo test\t2>&1",
-        ),
-        (
-            "LC_ALL=C NO_COLOR=1 TERM=dumb git log --oneline -5 2>&1",
-            "LC_ALL=C NO_COLOR=1 TERM=dumb justless run --hook --merge -- git log --oneline -5 2>&1",
-        ),
+    // command and `2>&1` merges the previews Justless prints. Claude Code and
+    // Gemini CLI check the rewritten command, so any other variable is kept. The
+    // clients that may run a rewrite without asking, or that rewrite only lists
+    // made entirely of supported commands, take display settings with plain
+    // values alone and leave the rest to their own approval. Each case is the
+    // command, ` => `, and its rewrite, after `*` when only those two clients
+    // rewrite it.
+    for case in [
+        "cargo test 2>&1 => justless run --hook --merge -- cargo test 2>&1",
+        "RUST_BACKTRACE=1 cargo test => RUST_BACKTRACE=1 justless run --hook -- cargo test",
+        "RUST_LOG=\"debug\" NO_COLOR=1  cargo test   2>&1 => RUST_LOG=\"debug\" NO_COLOR=1  justless run --hook --merge -- cargo test   2>&1",
+        "cd web && RUST_BACKTRACE=full npm test 2>&1 && git status 2>&1 => cd web && RUST_BACKTRACE=full justless run --hook --merge -- npm test 2>&1 && justless run --hook --merge -- git status 2>&1",
+        "git diff 2>&1; git status => justless run --hook --merge -- git diff 2>&1; justless run --hook -- git status",
+        "cargo build 2>&1 || cargo test\t2>&1 => justless run --hook --merge -- cargo build 2>&1 || justless run --hook --merge -- cargo test\t2>&1",
+        "LC_ALL=C NO_COLOR=1 TERM=dumb git log --oneline -5 2>&1 => LC_ALL=C NO_COLOR=1 TERM=dumb justless run --hook --merge -- git log --oneline -5 2>&1",
         // A quoted `2>&1` is an argument.
-        (
-            "cargo test '2>&1'",
-            "justless run --hook -- cargo test '2>&1'",
-        ),
-    ] {
-        for (client, rewritten) in rewrites(&root, command) {
-            assert_eq!(rewritten.as_deref(), Some(expected), "{client}: {command}");
-        }
-    }
-    // Claude Code and Gemini CLI check the rewritten command, so any other variable
-    // is kept. The clients that may run a rewrite without asking, or that rewrite
-    // only lists made entirely of supported commands, take display settings with
-    // plain values alone and leave the rest to their own approval.
-    for (command, expected) in [
-        (
-            "FOO='a b' cargo test",
-            "FOO='a b' justless run --hook -- cargo test",
-        ),
-        (
-            "NODE_OPTIONS=--require=./hook.js npm test 2>&1",
-            "NODE_OPTIONS=--require=./hook.js justless run --hook --merge -- npm test 2>&1",
-        ),
-        (
-            "GIT_EXTERNAL_DIFF=./x git diff",
-            "GIT_EXTERNAL_DIFF=./x justless run --hook -- git diff",
-        ),
-        (
-            "RUSTC_WRAPPER=./wrap cargo test",
-            "RUSTC_WRAPPER=./wrap justless run --hook -- cargo test",
-        ),
-        (
-            "LANG=/tmp/locale cargo test",
-            "LANG=/tmp/locale justless run --hook -- cargo test",
-        ),
-        (
-            "RUST_BACKTRACE=1 cargo test 2>&1 && git push",
-            "RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1 && git push",
-        ),
-        (
-            "PATH=/tmp/bin cargo test && git status",
-            "PATH=/tmp/bin cargo test && justless run --hook -- git status",
-        ),
-        (
-            "NODE_ENV=production npm test",
-            "NODE_ENV=production justless run --hook -- npm test",
-        ),
-        (
-            "NODE_ENV=production pytest",
-            "NODE_ENV=production justless run --hook -- pytest",
-        ),
-        ("CI=1 make test", "CI=1 justless run --hook -- make test"),
-        (
-            "CI=true cargo test",
-            "CI=true justless run --hook -- cargo test",
-        ),
-        (
-            "TERM=dumb make test 2>&1",
-            "TERM=dumb justless run --hook --merge -- make test 2>&1",
-        ),
+        "cargo test '2>&1' => justless run --hook -- cargo test '2>&1'",
+        "FOO='a b' cargo test => *FOO='a b' justless run --hook -- cargo test",
+        "NODE_OPTIONS=--require=./hook.js npm test 2>&1 => *NODE_OPTIONS=--require=./hook.js justless run --hook --merge -- npm test 2>&1",
+        "GIT_EXTERNAL_DIFF=./x git diff => *GIT_EXTERNAL_DIFF=./x justless run --hook -- git diff",
+        "RUSTC_WRAPPER=./wrap cargo test => *RUSTC_WRAPPER=./wrap justless run --hook -- cargo test",
+        "LANG=/tmp/locale cargo test => *LANG=/tmp/locale justless run --hook -- cargo test",
+        "RUST_BACKTRACE=1 cargo test 2>&1 && git push => *RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1 && git push",
+        "PATH=/tmp/bin cargo test && git status => *PATH=/tmp/bin cargo test && justless run --hook -- git status",
+        "NODE_ENV=production npm test => *NODE_ENV=production justless run --hook -- npm test",
+        "NODE_ENV=production pytest => *NODE_ENV=production justless run --hook -- pytest",
+        "CI=1 make test => *CI=1 justless run --hook -- make test",
+        "CI=true cargo test => *CI=true justless run --hook -- cargo test",
+        "TERM=dumb make test 2>&1 => *TERM=dumb justless run --hook --merge -- make test 2>&1",
         // Setting other variables for later commands changes nothing Justless needs.
-        (
-            "FOO=1; cargo test",
-            "FOO=1; justless run --hook -- cargo test",
-        ),
-        (
-            "export FOO=1 && cargo test",
-            "export FOO=1 && justless run --hook -- cargo test",
-        ),
+        "FOO=1; cargo test => *FOO=1; justless run --hook -- cargo test",
+        "export FOO=1 && cargo test => *export FOO=1 && justless run --hook -- cargo test",
     ] {
+        let (command, expected) = case.split_once(" => ").unwrap();
+        let (mixed, expected) = match expected.strip_prefix('*') {
+            Some(expected) => (true, expected),
+            None => (false, expected),
+        };
         for (client, rewritten) in rewrites(&root, command) {
-            let mixed = matches!(client, "claude" | "gemini");
-            assert_eq!(
-                rewritten.as_deref(),
-                mixed.then_some(expected),
-                "{client}: {command}"
-            );
+            let wraps = !mixed || matches!(client, "claude" | "gemini");
+            let expected = wraps.then_some(expected);
+            assert_eq!(rewritten.as_deref(), expected, "{client}: {command}");
         }
     }
     for command in [
@@ -13322,38 +13048,25 @@ fn routed_assignments_reach_the_command_and_merged_previews_keep_its_status() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     // The last stdout line has no newline, so it must still come before stderr.
-    let cargo = fake_program(
-        &root,
-        "cargo",
-        "echo \"backtrace=$RUST_BACKTRACE\"\nprintf partial\necho 'error: failed' >&2\nexit 101\n",
-    );
-    let bin = cargo.parent().unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_justless"), bin.join("justless")).unwrap();
-    let shell = |command: &str| {
-        Command::new("sh")
-            .args(["-c", command])
-            .current_dir(&root)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .output()
-            .unwrap()
-    };
+    let script =
+        "echo \"backtrace=$RUST_BACKTRACE\"\nprintf partial\necho 'error: failed' >&2\nexit 101\n";
+    fake_program(&root, "cargo", script);
+    let shell = merge_shell(&root);
     let original = "RUST_BACKTRACE=1 cargo test 2>&1";
     let rewritten = rewrites(&root, original)[0].1.clone().unwrap();
     assert_eq!(
         rewritten,
         "RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1"
     );
-    let plain = shell(original);
-    let routed = shell(&rewritten);
+    let plain = shell(original, &[]);
+    let routed = shell(&rewritten, &[]);
     assert_eq!(plain.status.code(), Some(101));
     assert_eq!(routed.status.code(), Some(101), "{}", stderr(&routed));
     // The same merged bytes reach stdout, followed by the run and its exit status.
     assert_eq!(stdout(&plain), "backtrace=1\npartialerror: failed\n");
     assert_eq!(stderr(&routed), "");
-    let footer = stdout(&routed)
-        .strip_prefix(&stdout(&plain))
-        .unwrap()
-        .to_owned();
+    let routed = stdout(&routed);
+    let footer = routed.strip_prefix(&stdout(&plain)).unwrap();
     let id = footer
         .strip_prefix("[justless ")
         .and_then(|rest| rest.strip_suffix(" · exit 101]\n"))
@@ -13364,10 +13077,7 @@ fn routed_assignments_reach_the_command_and_merged_previews_keep_its_status() {
         success(&root, &["log", id, "--stream", "stdout"]),
         "backtrace=1\npartialerror: failed\n"
     );
-    let record: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap(),
-    )
-    .unwrap();
+    let record = run_record(&root, id);
     assert_eq!(record["label"], "cargo test");
     assert_eq!(record["status"], 101);
 }
@@ -13440,20 +13150,21 @@ exit 101
     let shell = merge_shell(&root);
     // The footer's separator and ending: a final line without a newline is ended
     // before the footer.
+    let failure = |separator, ending| Some((separator, ending));
     for (original, vars, code, footer) in [
         ("cargo build 2>&1", ("EXIT", "0"), 0, None),
         (
             "cargo build 2>&1",
             ("EXIT", "1"),
             1,
-            Some(("\n", " · exit 1]\n")),
+            failure("\n", " · exit 1]\n"),
         ),
         ("cargo test 2>&1", ("PASS", "1"), 0, None),
         (
             "cargo test 2>&1",
             ("PASS", ""),
             101,
-            Some(("", " · exit 101]\n")),
+            failure("", " · exit 101]\n"),
         ),
     ] {
         let rewritten = rewrites(&root, original)[0].1.clone().unwrap();
@@ -13463,9 +13174,8 @@ exit 101
         );
         let plain = shell(original, &[vars]);
         let routed = shell(&rewritten, &[vars]);
-        assert!(
-            stdout(&plain).contains("\nerror: could not write") == (original == "cargo test 2>&1")
-        );
+        let interleaved = stdout(&plain).contains("\nerror: could not write");
+        assert!(interleaved == (original == "cargo test 2>&1"));
         assert_eq!(plain.status.code(), Some(code));
         assert_eq!(routed.status.code(), Some(code), "{}", stderr(&routed));
         assert_eq!(stderr(&routed), "");
@@ -13501,7 +13211,8 @@ exit 101
             "{}",
             stdout(&separate)
         );
-        assert!(stderr(&separate).starts_with("error: could not write the coverage report\n"));
+        let coverage = "error: could not write the coverage report\n";
+        assert!(stderr(&separate).starts_with(coverage));
     }
 }
 
@@ -13510,8 +13221,7 @@ exit 101
 fn a_routed_search_with_a_stderr_merge_keeps_its_messages_and_names_the_run() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
-    fs::create_dir(root.join("src")).unwrap();
-    fs::write(root.join("src/a.rs"), "needle\n").unwrap();
+    write_files(&root, &[("src/a.rs", "needle\n")]);
     // Search groups read stdout alone, so a search keeps its streams apart: the
     // message about the unreadable directory follows the matches.
     fake_program(
@@ -13532,30 +13242,32 @@ exit 2
         rewritten,
         "justless run --hook --merge -- rg needle 2>&1 && test 1"
     );
+    let denied = "rg: ./locked: Permission denied (os error 13)\n";
     let small = shell(&rewritten, &[("COUNT", "3")]);
     assert_eq!(small.status.code(), Some(2));
     let text = stdout(&small);
     let (shown, footer) = text.rsplit_once("[justless ").unwrap();
-    assert_eq!(
-        shown,
-        "src/a.rs:1:let needle = 1; // a line long enough to fill the preview budget\n\
-         src/a.rs:2:let needle = 2; // a line long enough to fill the preview budget\n\
-         src/a.rs:3:let needle = 3; // a line long enough to fill the preview budget\n\
-         rg: ./locked: Permission denied (os error 13)\n"
-    );
+    let lines: String = (1..=3)
+        .map(|i| {
+            format!(
+                "src/a.rs:{i}:let needle = {i}; // a line long enough to fill the preview budget\n"
+            )
+        })
+        .collect();
+    assert_eq!(shown, format!("{lines}{denied}"));
     let id = footer
         .strip_suffix(" · stderr after stdout · exit 2]\n")
         .unwrap_or_else(|| panic!("{footer:?}"));
     assert_eq!(
         stderr(&cli(&root, &["log", id, "--stream", "stderr"])),
-        "rg: ./locked: Permission denied (os error 13)\n"
+        denied
     );
     // A large search is grouped, and the message still reaches the agent.
     let large = shell(&rewritten, &[("COUNT", "200")]);
     assert_eq!(large.status.code(), Some(2));
     let text = stdout(&large);
     assert!(text.starts_with("rg: 200 matches in 1 file"), "{text}");
-    assert!(text.contains("\nrg: ./locked: Permission denied (os error 13)\n[justless "));
+    text_has(&text, &[&format!("\n{denied}[justless ")]);
     assert!(text.ends_with(" shown · exit 2]\n"), "{text}");
 }
 
@@ -13566,27 +13278,21 @@ fn discover_counts_a_merged_search_footer_as_routed() {
     fs::create_dir(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let config = repo.path().join("claude");
-    write_transcripts(
-        &root,
-        &config,
-        &[(
-            "S.jsonl",
-            &[
-                (
-                    "rg needle 2>&1",
-                    "src/a.rs:1:needle\nrg: ./locked: Permission denied (os error 13)\n[justless run-Ab1 · stderr after stdout · exit 2]",
-                ),
-                (
-                    "cargo test 2>&1",
-                    "running 1 test\nwarning: slow\n[justless run-Cd2 · stderr after stdout]",
-                ),
-                (
-                    "git diff 2>&1",
-                    "[justless run-Ef3 · stderr after stdout here]",
-                ),
-            ],
-        )],
-    );
+    let commands: &[(&str, &str)] = &[
+        (
+            "rg needle 2>&1",
+            "src/a.rs:1:needle\nrg: ./locked: Permission denied (os error 13)\n[justless run-Ab1 · stderr after stdout · exit 2]",
+        ),
+        (
+            "cargo test 2>&1",
+            "running 1 test\nwarning: slow\n[justless run-Cd2 · stderr after stdout]",
+        ),
+        (
+            "git diff 2>&1",
+            "[justless run-Ef3 · stderr after stdout here]",
+        ),
+    ];
+    write_transcripts(&root, &config, &[("S.jsonl", commands)]);
     let output = Command::new(env!("CARGO_BIN_EXE_justless"))
         .args(["discover", "--json"])
         .current_dir(&root)
@@ -13595,21 +13301,16 @@ fn discover_counts_a_merged_search_footer_as_routed() {
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let groups = report["groups"].as_array().unwrap();
     let labels = |route: &str| -> Vec<String> {
-        report["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|g| g["route"] == route)
-            .map(|g| {
-                g["labels"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|l| l["label"].as_str().unwrap().to_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let group = groups.iter().find(|group| group["route"] == route);
+        group.map_or(Vec::new(), |group| {
+            let labels = group["labels"].as_array().unwrap();
+            labels
+                .iter()
+                .map(|label| label["label"].as_str().unwrap().to_owned())
+                .collect()
+        })
     };
     assert_eq!(labels("through_justless"), ["cargo test", "rg"]);
     assert_eq!(labels("supported_not_routed"), ["git diff"]);
@@ -13625,6 +13326,7 @@ fn access_key() -> String {
 #[cfg(unix)]
 #[test]
 fn a_merged_run_archives_one_capped_pipe_and_redacts_what_it_shows() {
+    use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     let key = access_key();
@@ -13632,15 +13334,13 @@ fn a_merged_run_archives_one_capped_pipe_and_redacts_what_it_shows() {
         "echo 'out 1'; echo 'err 1 {key}' >&2; echo 'out 2 {key}'; echo 'err 2' >&2; exit 3"
     );
     let original = format!("out 1\nerr 1 {key}\nout 2 {key}\nerr 2\n");
-    let output = cli(
-        &root,
-        &["run", "--hook", "--merge", "--", "sh", "-c", &script],
-    );
+    let merged = ["run", "--hook", "--merge", "--", "sh", "-c"];
+    let output = cli(&root, &[&merged[..], &[script.as_str()]].concat());
     // The exit status is the command's, and the preview keeps the order of both
     // streams with the secrets replaced.
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     let shown = stdout(&output);
-    assert!(!shown.contains(&key), "{shown}");
+    text_lacks(&shown, &[&key]);
     let lines: Vec<&str> = shown.lines().collect();
     assert_eq!(lines.len(), 4, "{shown}");
     assert_eq!((lines[0], lines[3]), ("out 1", "err 2"));
@@ -13665,22 +13365,17 @@ fn a_merged_run_archives_one_capped_pipe_and_redacts_what_it_shows() {
         original.as_bytes()
     );
     assert_eq!(fs::metadata(archive.join("stderr")).unwrap().len(), 0);
-    let record: serde_json::Value =
-        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
-    assert_eq!(
-        record["stream_bytes"],
-        serde_json::json!([original.len(), 0])
-    );
+    let record = run_record(&root, &id);
+    assert_eq!(record["stream_bytes"], json!([original.len(), 0]));
     assert!(record.get("drained").is_none(), "{record}");
     assert!(record.get("produced_bytes").is_none(), "{record}");
     assert_eq!(record["redaction"]["count"], 2);
     // `log` replays the merged order redacted, and `--unredacted` the exact bytes.
     assert_eq!(success(&root, &["log", &id]), shown);
-    assert_eq!(
-        cli(&root, &["log", &id, "--unredacted", "--stream", "stdout"]).stdout,
-        original.as_bytes()
-    );
-    let replay = cli(&root, &["log", &id, "--unredacted", "--stream", "stderr"]);
+    let unredacted = ["log", id.as_str(), "--unredacted", "--stream"];
+    let exact = cli(&root, &[&unredacted[..], &["stdout"]].concat());
+    assert_eq!(exact.stdout, original.as_bytes());
+    let replay = cli(&root, &[&unredacted[..], &["stderr"]].concat());
     assert_eq!(
         (stdout(&replay), stderr(&replay)),
         (String::new(), String::new())
@@ -13691,21 +13386,15 @@ fn a_merged_run_archives_one_capped_pipe_and_redacts_what_it_shows() {
     fs::write(root.join(".justless.toml"), "max_run_bytes = 1024\n").unwrap();
     let script = "printf '%01000d\\n' 0; printf '%01000d\\n' 1 >&2; printf '%01000d\\n' 2; \
                   printf '%01000d\\n' 3 >&2; exit 4";
-    let output = cli(
-        &root,
-        &["run", "--hook", "--merge", "--", "sh", "-c", script],
-    );
+    let output = cli(&root, &[&merged[..], &[script]].concat());
     assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
-    assert!(
-        stderr(&output).ends_with("\n[stdout archive truncated at 1.0 KB of 3.9 KB]\n"),
-        "{}",
-        stderr(&output)
-    );
-    let archive = root.join(".justless/runs").join(footer_id(&output));
-    let record: serde_json::Value =
-        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
-    assert_eq!(record["stream_bytes"], serde_json::json!([1024, 0]));
-    assert_eq!(record["produced_bytes"], serde_json::json!([4004, 0]));
+    let truncated = "\n[stdout archive truncated at 1.0 KB of 3.9 KB]\n";
+    assert!(stderr(&output).ends_with(truncated), "{}", stderr(&output));
+    let id = footer_id(&output);
+    let record = run_record(&root, &id);
+    assert_eq!(record["stream_bytes"], json!([1024, 0]));
+    assert_eq!(record["produced_bytes"], json!([4004, 0]));
+    let archive = root.join(".justless/runs").join(&id);
     assert_eq!(fs::metadata(archive.join("stdout")).unwrap().len(), 1024);
     assert_eq!(fs::metadata(archive.join("stderr")).unwrap().len(), 0);
 }
@@ -14548,30 +14237,40 @@ fn claude_bash_replacements_use_the_preview_budget_run_would_give() {
 fn probe_crate(lib: &str) -> TempDir {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::create_dir(root.join("src")).unwrap();
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(
-        root.join(".gitignore"),
-        "/target/\n/Cargo.lock\n/.justless/\n",
-    )
-    .unwrap();
     let others: String = (0..12)
         .map(|n| format!("    #[test]\n    fn other_{n}() {{}}\n"))
         .collect();
-    fs::write(
-        root.join("src/lib.rs"),
-        format!("{lib}\n#[cfg(test)]\nmod others {{\n{others}}}\n"),
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
+    write_files(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (".gitignore", "/target/\n/Cargo.lock\n/.justless/\n"),
+            (
+                "src/lib.rs",
+                &format!("{lib}\n#[cfg(test)]\nmod others {{\n{others}}}\n"),
+            ),
+        ],
+    );
+    commit_all(root);
     git(root, &["branch", "-M", "main"]);
     repo
+}
+
+/// Runs the affected subset of `cargo test --offline`, with `options` before
+/// `--`, and asserts that it fails with `failure` in its report.
+fn subset_fails(root: &Path, options: &str, failure: &str) {
+    let failing = cli_words(
+        root,
+        &format!("test --affected {options} -- cargo test --offline"),
+    );
+    let err = stderr(&failing);
+    let code = failing.status.code();
+    assert_eq!(code, Some(101), "{failure}\n{}{err}", stdout(&failing));
+    text_has(&err, &["Subset failed (cargo)", failure]);
+    assert_no_suite_claim(&failing);
 }
 
 const EXAMPLES: &str = r##"//! Crate docs.
@@ -14661,28 +14360,18 @@ mod tests {
 fn affected_tests_run_every_example_rustdoc_runs() {
     let repo = probe_crate(EXAMPLES);
     let root = repo.path();
-    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
     let plan = || {
-        success(
+        success_words(
             root,
-            &[
-                "test",
-                "--affected",
-                "--dry-run",
-                "--budget",
-                "8000",
-                "--",
-                "cargo",
-                "test",
-                "--offline",
-            ],
+            "test --affected --dry-run --budget 8000 -- cargo test --offline",
         )
     };
     let reset = || git(root, &["checkout", "-q", "--", "."]);
 
     // A broken example fails the subset wherever rustdoc finds it: an indented
-    // block, a tilde fence, crate docs, a block comment, a doc attribute and
-    // documentation a macro builds.
+    // block, a tilde fence, crate docs, a block comment, a doc attribute,
+    // documentation a macro builds, and a method of a generic type `Shop<T>`,
+    // whose example still runs when the method's body changes.
     for (from, to, failure) in [
         (
             "///     assert_eq!(probe::price(), 7);",
@@ -14714,19 +14403,14 @@ fn affected_tests_run_every_example_rustdoc_runs() {
             "assert_eq!(probe::duty(), 7);\")]",
             "  src/lib.rs - duty (line ",
         ),
+        (
+            "        1\n",
+            "        2\n",
+            "  src/lib.rs - Shop<T>::total (line ",
+        ),
     ] {
         replace_in(root, "src/lib.rs", from, to);
-        let failing = cli(root, &affected);
-        let err = stderr(&failing);
-        assert_eq!(
-            failing.status.code(),
-            Some(101),
-            "{to}\n{}{err}",
-            stdout(&failing)
-        );
-        assert!(err.contains("Subset failed (cargo)"), "{to}\n{err}");
-        assert!(err.contains(failure), "{failure:?} in\n{err}");
-        assert_no_suite_claim(&failing);
+        subset_fails(root, "", failure);
         reset();
     }
 
@@ -14743,19 +14427,6 @@ fn affected_tests_run_every_example_rustdoc_runs() {
     );
     reset();
 
-    // rustdoc names a method of a generic type `Shop<T>::total`; its example
-    // still runs when the method's body changes.
-    replace_in(root, "src/lib.rs", "        1\n", "        2\n");
-    let failing = cli(root, &affected);
-    let err = stderr(&failing);
-    assert_eq!(failing.status.code(), Some(101), "{err}");
-    assert!(err.contains("Subset failed (cargo)"), "{err}");
-    assert!(
-        err.contains("  src/lib.rs - Shop<T>::total (line "),
-        "{err}"
-    );
-    reset();
-
     // A shell example is not a doctest, so changing it runs none.
     replace_in(
         root,
@@ -14764,7 +14435,7 @@ fn affected_tests_run_every_example_rustdoc_runs() {
         "/// probe --price 8",
     );
     let text = plan();
-    assert!(!text.contains("--doc"), "{text}");
+    text_lacks(&text, &["--doc"]);
     has_line(
         &text,
         "cargo · subset · 1 of 14 indexed tests in 1 of 1 test targets",
@@ -14784,75 +14455,49 @@ fn affected_tests_with_a_base_ref_cover_the_branch_commits() {
     git(root, &["checkout", "-qb", "review"]);
     replace_in(root, "src/lib.rs", "    5\n", "    8\n");
     git(root, &["commit", "-qam", "raise the rate"]);
-    let plan = |base: &[&str]| {
-        let mut args = vec!["test", "--affected", "--dry-run"];
-        args.extend(base);
-        args.extend(["--", "cargo", "test", "--offline"]);
-        success(root, &args)
+    let plan = |base: &str| {
+        success_words(
+            root,
+            &format!("test --affected --dry-run {base} -- cargo test --offline"),
+        )
     };
 
     // A clean tree says what it compared and how to review a branch.
-    let text = plan(&[]);
-    assert!(
-        text.contains(
-            "No changes against HEAD. To test a branch's commits, add --base REF, such as --base main."
-        ),
-        "{text}"
+    text_has(
+        &plan(""),
+        &[
+            "No changes against HEAD. To test a branch's commits, add --base REF, such as --base main.",
+        ],
     );
     let context = success(root, &["context", "--changes"]);
-    assert!(context.contains("No changed files."), "{context}");
-    assert!(context.contains("add --base REF"), "{context}");
+    text_has(&context, &["No changed files.", "add --base REF"]);
 
     // Against main, the branch's commit is the change, and the header names
     // the ref and its merge base.
-    let text = plan(&["--base", "main"]);
+    let text = plan("--base main");
     has_line(
         &text,
         &format!(
             "Affected tests · working tree vs main (merge-base {merge_base}) · 1 changed file · 1 starting symbol"
         ),
     );
-    assert!(
-        text.contains("  tests::rate_matches · probe --lib · exact"),
-        "{text}"
-    );
-    let failing = cli(
-        root,
-        &[
-            "test",
-            "--affected",
-            "--base",
-            "main",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-        ],
-    );
-    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
-    assert!(
-        stderr(&failing).contains("Subset failed (cargo)"),
-        "{}",
-        stderr(&failing)
-    );
+    text_has(&text, &["  tests::rate_matches · probe --lib · exact"]);
+    subset_fails(root, "--base main", "");
 
     // `affected` and `context` read the same change set.
-    let impact = success(root, &["affected", "--changes", "--base", "main"]);
-    assert!(
-        impact.contains("rate [function] src/lib.rs:1-3 · changed src/lib.rs:2-2"),
-        "{impact}"
+    text_has(
+        &success_words(root, "affected --changes --base main"),
+        &["rate [function] src/lib.rs:1-3 · changed src/lib.rs:2-2"],
     );
-    let context = success(root, &["context", "--changes", "--base", "main"]);
-    assert!(context.contains("Changed src/lib.rs:2-2"), "{context}");
+    text_has(
+        &success_words(root, "context --changes --base main"),
+        &["Changed src/lib.rs:2-2"],
+    );
 
     // A function removed in a commit seeds the code that still names it, and
     // uncommitted edits count on top of the commits.
-    replace_in(
-        root,
-        "src/lib.rs",
-        "pub fn legacy() -> u8 {\n    1\n}\n\n",
-        "",
-    );
+    let legacy = "pub fn legacy() -> u8 {\n    1\n}\n\n";
+    replace_in(root, "src/lib.rs", legacy, "");
     git(root, &["commit", "-qam", "drop legacy"]);
     replace_in(
         root,
@@ -14860,18 +14505,20 @@ fn affected_tests_with_a_base_ref_cover_the_branch_commits() {
         "assert_eq!(super::rate(), 5)",
         "assert_eq!(super::rate(), 8)",
     );
-    let text = plan(&["--base", "main"]);
+    let text = plan("--base main");
     has_line(&text, "Start legacy · removed from src/lib.rs");
-    assert!(
-        text.contains("Start tests::legacy_is_one [test] src/lib.rs:"),
-        "{text}"
+    text_has(
+        &text,
+        &[
+            "Start tests::legacy_is_one [test] src/lib.rs:",
+            "Start tests::rate_matches [test]",
+        ],
     );
-    assert!(text.contains("Start tests::rate_matches [test]"), "{text}");
 
     // An unknown ref is an error, never an empty plan.
-    let unknown = cli(root, &["test", "--affected", "--base", "nope", "--dry-run"]);
+    let unknown = cli_words(root, "test --affected --base nope --dry-run");
     assert!(!unknown.status.success(), "{}", stdout(&unknown));
-    assert!(stderr(&unknown).contains("nope"), "{}", stderr(&unknown));
+    text_has(&stderr(&unknown), &["nope"]);
 }
 
 const CALLING_EXAMPLES: &str = r##"//! Crate docs.
@@ -14951,7 +14598,6 @@ mod tests {
 fn affected_tests_run_examples_that_call_what_a_change_reaches() {
     let repo = probe_crate(CALLING_EXAMPLES);
     let root = repo.path();
-    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
     // Each example exercises the change without naming the changed symbol:
     // through its type for a name as common as `new`, by a name too short for
     // the name net, through the public function that calls it, and through an
@@ -14975,17 +14621,7 @@ fn affected_tests_run_examples_that_call_what_a_change_reaches() {
         ),
     ] {
         replace_in(root, "src/lib.rs", from, to);
-        let failing = cli(root, &affected);
-        let err = stderr(&failing);
-        assert_eq!(
-            failing.status.code(),
-            Some(101),
-            "{to}\n{}{err}",
-            stdout(&failing)
-        );
-        assert!(err.contains("Subset failed (cargo)"), "{to}\n{err}");
-        assert!(err.contains(failure), "{failure:?} in\n{err}");
-        assert_no_suite_claim(&failing);
+        subset_fails(root, "", failure);
         git(root, &["checkout", "-q", "--", "."]);
     }
 }
@@ -14998,17 +14634,16 @@ fn a_clean_branch_suggests_a_base_that_exists() {
     let root = repo.path();
     // Older Git, and Git configured so, names the first branch `master`.
     git(root, &["branch", "-M", "master"]);
-    let plan = |base: &[&str]| {
-        let mut args = vec!["test", "--affected", "--dry-run"];
-        args.extend(base);
-        args.extend(["--", "cargo", "test", "--offline"]);
-        success(root, &args)
+    let plan = |base: &str| {
+        success_words(
+            root,
+            &format!("test --affected --dry-run {base} -- cargo test --offline"),
+        )
     };
 
     // On the only branch there is nothing to compare with, so no ref is named.
-    let text = plan(&[]);
     has_line(
-        &text,
+        &plan(""),
         "No changes against HEAD. To test a branch's commits, add --base REF.",
     );
 
@@ -15017,24 +14652,21 @@ fn a_clean_branch_suggests_a_base_that_exists() {
     git(root, &["checkout", "-qb", "review"]);
     replace_in(root, "src/lib.rs", "    5\n", "    8\n");
     git(root, &["commit", "-qam", "raise the rate"]);
-    let text = plan(&[]);
     has_line(
-        &text,
+        &plan(""),
         "No changes against HEAD. To test a branch's commits, add --base REF, such as --base master.",
     );
-    for command in [&["affected", "--changes"][..], &["context", "--changes"]] {
-        let text = success(root, command);
-        assert!(
-            text.contains(
-                "No changed files. To review a branch's commits, add --base REF, such as --base master."
-            ),
-            "{text}"
+    for command in ["affected --changes", "context --changes"] {
+        text_has(
+            &success_words(root, command),
+            &[
+                "No changed files. To review a branch's commits, add --base REF, such as --base master.",
+            ],
         );
     }
-    let text = plan(&["--base", "master"]);
-    assert!(
-        text.contains("  tests::rate_matches · probe --lib · exact"),
-        "{text}"
+    text_has(
+        &plan("--base master"),
+        &["  tests::rate_matches · probe --lib · exact"],
     );
 }
 
@@ -15043,23 +14675,10 @@ fn affected_tests_run_examples_that_call_a_renamed_export() {
     let repo = probe_crate(
         "mod inner {\n    pub fn price() -> u8 {\n        7\n    }\n}\n\npub use inner::price as cost;\n\n/// A shop.\n///\n/// ```\n/// assert_eq!(probe::cost(), 7);\n/// ```\npub struct Shop;\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn prices() {\n        let _ = super::inner::price();\n    }\n}\n",
     );
-    let root = repo.path();
     // The example calls the changed function only by the name it is
     // exported under.
-    replace_in(root, "src/lib.rs", "        7\n", "        8\n");
-    let failing = cli(
-        root,
-        &["test", "--affected", "--", "cargo", "test", "--offline"],
-    );
-    let err = stderr(&failing);
-    assert_eq!(
-        failing.status.code(),
-        Some(101),
-        "{}{err}",
-        stdout(&failing)
-    );
-    assert!(err.contains("Subset failed (cargo)"), "{err}");
-    assert!(err.contains("  src/lib.rs - Shop (line "), "{err}");
+    replace_in(repo.path(), "src/lib.rs", "        7\n", "        8\n");
+    subset_fails(repo.path(), "", "  src/lib.rs - Shop (line ");
 }
 
 #[test]
@@ -15074,78 +14693,51 @@ fn affected_tests_run_the_crate_doctests_for_a_name_too_common_to_search() {
             "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}"
         )
     };
-    for (path, text) in [
-        (
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n".to_owned(),
-        ),
-        (
-            ".gitignore",
-            "/target/\n/Cargo.lock\n/.justless/\n".to_owned(),
-        ),
-        ("a/Cargo.toml", package("a", "")),
-        (
-            "a/src/lib.rs",
-            format!(
-                "pub fn id() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn ids() {{\n        let _ = super::id();\n    }}\n{others}}}\n"
-            ),
-        ),
-        // More mentions of `id` than the search follows.
-        ("a/src/noise.rs", "// id\n".repeat(4100)),
-        (
-            "b/Cargo.toml",
-            package("b", "[dependencies]\na = { path = \"../a\" }\n"),
-        ),
-        (
-            "b/src/lib.rs",
-            format!(
-                "/// Identifiers.\n///\n/// ```\n/// assert_eq!(b::id(), 1);\n/// ```\npub struct Ids;\n\npub fn id() -> u8 {{\n    a::id()\n}}\n\n#[cfg(test)]\nmod tests {{\n{others}}}\n"
-            ),
-        ),
-    ] {
-        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
-        fs::write(root.join(path), text).unwrap();
-    }
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
-    // `id` changes in `a` and is reached in `b`, whose example calls it.
-    replace_in(root, "a/src/lib.rs", "    1\n", "    2\n");
-    let plan = success(
+    write_files(
         root,
         &[
-            "test",
-            "--affected",
-            "--dry-run",
-            "--budget",
-            "8000",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+            ),
+            (".gitignore", "/target/\n/Cargo.lock\n/.justless/\n"),
+            ("a/Cargo.toml", &package("a", "")),
+            (
+                "a/src/lib.rs",
+                &format!(
+                    "pub fn id() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn ids() {{\n        let _ = super::id();\n    }}\n{others}}}\n"
+                ),
+            ),
+            // More mentions of `id` than the search follows.
+            ("a/src/noise.rs", &"// id\n".repeat(4100)),
+            (
+                "b/Cargo.toml",
+                &package("b", "[dependencies]\na = { path = \"../a\" }\n"),
+            ),
+            (
+                "b/src/lib.rs",
+                &format!(
+                    "/// Identifiers.\n///\n/// ```\n/// assert_eq!(b::id(), 1);\n/// ```\npub struct Ids;\n\npub fn id() -> u8 {{\n    a::id()\n}}\n\n#[cfg(test)]\nmod tests {{\n{others}}}\n"
+                ),
+            ),
         ],
+    );
+    commit_all(root);
+    // `id` changes in `a` and is reached in `b`, whose example calls it.
+    replace_in(root, "a/src/lib.rs", "    1\n", "    2\n");
+    let plan = success_words(
+        root,
+        "test --affected --dry-run --budget 8000 -- cargo test --offline",
     );
     has_line(
         &plan,
         "  Run (doctests): cargo test --offline -p a -p b --doc",
     );
-    assert!(
-        plan.contains("id is named too often to find the examples that use it"),
-        "{plan}"
+    text_has(
+        &plan,
+        &["id is named too often to find the examples that use it"],
     );
-    let failing = cli(
-        root,
-        &["test", "--affected", "--", "cargo", "test", "--offline"],
-    );
-    let err = stderr(&failing);
-    assert_eq!(
-        failing.status.code(),
-        Some(101),
-        "{}{err}",
-        stdout(&failing)
-    );
-    assert!(err.contains("Subset failed (cargo)"), "{err}");
-    assert!(err.contains("  b/src/lib.rs - Ids (line "), "{err}");
+    subset_fails(root, "", "  b/src/lib.rs - Ids (line ");
 }
 
 /// The `probe` crate's manifest, as a piece of a `fixture_files` text.
@@ -15624,52 +15216,56 @@ fn marked_run(text: &str) -> String {
         .to_owned()
 }
 
+/// The command on the line of `text` that starts with `prefix`.
+fn printed_after<'a>(text: &'a str, prefix: &str) -> &'a str {
+    let line = text.lines().find_map(|line| line.strip_prefix(prefix));
+    line.unwrap_or_else(|| panic!("no {prefix:?} line in {text}"))
+}
+
+/// A Git repository with `settlement` in the file `settings.md` and an unrelated
+/// one in `billing/settings.md`, or the other way round when `swapped`.
+fn settings_repo(swapped: bool) -> TempDir {
+    let repo = TempDir::new().unwrap();
+    let (top, billing) = if swapped {
+        (SETTLEMENT, UNRELATED)
+    } else {
+        (UNRELATED, SETTLEMENT)
+    };
+    write_files(
+        repo.path(),
+        &[("settings.md", top), ("billing/settings.md", billing)],
+    );
+    git(repo.path(), &["init", "-q"]);
+    repo
+}
+
+const SETTLEMENT: &str = "# Settlement controls\nThe settlement_cutoff is 19:00.\n";
+const UNRELATED: &str = "# General controls\nThe unrelated value is 05:00.\n";
+
 #[test]
 fn commands_printed_under_a_scoped_root_reach_the_same_files_and_runs() {
-    let repo = TempDir::new().unwrap();
+    let repo = settings_repo(false);
     let root = repo.path().canonicalize().unwrap();
     let billing = root.join("billing");
-    write_files(
-        &root,
-        &[
-            (
-                "settings.md",
-                "# General controls\nThe unrelated value is 05:00.\n",
-            ),
-            (
-                "billing/settings.md",
-                "# Settlement controls\nThe settlement_cutoff is 19:00.\n",
-            ),
-        ],
-    );
-    git(&root, &["init", "-q"]);
     let scoped = |args: &[&str]| cli(&root, &[&["--root", "billing"][..], args].concat());
-    let settlement = "# Settlement controls\nThe settlement_cutoff is 19:00.\n";
 
     // lookup's closing command, as text and as JSON, opens billing's file.
     let text = stdout(&scoped(&["lookup", "settlement_cutoff"]));
-    let next = text
-        .lines()
-        .find_map(|line| line.strip_prefix("Next: "))
-        .unwrap();
+    let next = printed_after(&text, "Next: ");
     let opened = follow(&root, next);
-    assert_eq!(stdout(&opened), settlement, "{next}: {}", stderr(&opened));
-    assert!(
-        next.starts_with(&format!("justless --root {} expand ", billing.display())),
-        "{text}"
-    );
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout(&scoped(&["lookup", "--json", "settlement_cutoff"]))).unwrap();
-    assert_eq!(
-        stdout(&follow(&root, json["next"].as_str().unwrap())),
-        settlement
-    );
+    assert_eq!(stdout(&opened), SETTLEMENT, "{next}: {}", stderr(&opened));
+    let expand = format!("justless --root {} expand ", billing.display());
+    assert!(next.starts_with(&expand), "{text}");
+    let json = stdout(&scoped(&["lookup", "--json", "settlement_cutoff"]));
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let next = json["next"].as_str().unwrap();
+    assert_eq!(stdout(&follow(&root, next)), SETTLEMENT);
 
     // The run footer and the pointers `context --run` prints reopen the run.
     let run = scoped(&["run", "--", "sh", "-c", "echo scoped-output; exit 3"]);
     assert_eq!(run.status.code(), Some(3), "{}", stderr(&run));
-    let id = marked_run(&stderr(&run));
     let footer = stderr(&run);
+    let id = marked_run(&footer);
     let reopen = footer
         .lines()
         .find_map(|line| line.split(" output bytes · ").nth(1))
@@ -15680,27 +15276,18 @@ fn commands_printed_under_a_scoped_root_reach_the_same_files_and_runs() {
         "{footer}"
     );
     let context = stdout(&scoped(&["context", "--run", &id]));
-    let replay = context
-        .lines()
-        .find_map(|line| line.strip_prefix("No indexed source location found. Inspect "))
-        .and_then(|line| line.split(" or ").nth(1)?.strip_suffix('.'))
-        .unwrap();
+    let inspect = printed_after(&context, "No indexed source location found. Inspect ");
+    let replay = inspect.split(" or ").nth(1).unwrap().strip_suffix('.');
+    let replay = replay.unwrap();
     assert_eq!(
         stdout(&follow(&root, replay)),
         "scoped-output\n",
         "{context}"
     );
-    write_files(
-        &root,
-        &[("billing/src/main.rs", "fn main() {\n    let x = 1;\n}\n")],
-    );
-    let failed = scoped(&[
-        "run",
-        "--",
-        "sh",
-        "-c",
-        "echo 'src/main.rs:2:9: error: boom' >&2; exit 1",
-    ]);
+    let main = "fn main() {\n    let x = 1;\n}\n";
+    write_files(&root, &[("billing/src/main.rs", main)]);
+    let script = "echo 'src/main.rs:2:9: error: boom' >&2; exit 1";
+    let failed = scoped(&["run", "--", "sh", "-c", script]);
     let located = stdout(&scoped(&[
         "context",
         "--run",
@@ -15711,104 +15298,58 @@ fn commands_printed_under_a_scoped_root_reach_the_same_files_and_runs() {
         .find_map(|line| line.trim_start().strip_prefix("Replay: "))
         .unwrap_or_else(|| panic!("{located}"));
     // `log` replays stderr to stderr.
-    assert_eq!(
-        stderr(&follow(&root, replay)),
-        "src/main.rs:2:9: error: boom\n",
-        "{located}"
-    );
+    let replayed = stderr(&follow(&root, replay));
+    assert_eq!(replayed, "src/main.rs:2:9: error: boom\n", "{located}");
 
     // An agent may add `--root` to a command that already has it.
+    let billing = billing.to_str().unwrap();
     let repeated = cli(
         &root,
         &[
             "--root",
             "billing",
             "--root",
-            billing.to_str().unwrap(),
+            billing,
             "expand",
             "settings.md",
             "L1-2",
         ],
     );
-    assert_eq!(stdout(&repeated), settlement, "{}", stderr(&repeated));
-    let conflicting = cli(
-        &root,
-        &[
-            "--root",
-            ".",
-            "--root",
-            "billing",
-            "expand",
-            "settings.md",
-            "L1-2",
-        ],
-    );
+    assert_eq!(stdout(&repeated), SETTLEMENT, "{}", stderr(&repeated));
+    let conflicting = cli_words(&root, "--root . --root billing expand settings.md L1-2");
     assert_eq!(conflicting.status.code(), Some(2));
-    assert!(
-        stderr(&conflicting).contains("--root names two different directories"),
-        "{}",
-        stderr(&conflicting)
+    text_has(
+        &stderr(&conflicting),
+        &["--root names two different directories"],
     );
 
     // Where a plain `justless` finds the same root, the commands stay as they were.
-    let plain = success(&root, &["lookup", "unrelated", "value"]);
+    let plain = success_words(&root, "lookup unrelated value");
     assert!(
         plain.ends_with("\nNext: justless expand settings.md L1-2\n"),
         "{plain}"
     );
     let unscoped = cli(&root, &["run", "--", "sh", "-c", "echo plain; exit 1"]);
-    assert!(
-        stderr(&unscoped).contains(&format!(
-            " output bytes · justless log {}\n",
-            marked_run(&stderr(&unscoped))
-        )),
-        "{}",
-        stderr(&unscoped)
-    );
+    let footer = stderr(&unscoped);
+    let log = format!(" output bytes · justless log {}\n", marked_run(&footer));
+    text_has(&footer, &[&log]);
 }
 
 #[test]
 fn an_expand_printed_in_a_subdirectory_opens_the_root_file_it_names() {
-    let repo = TempDir::new().unwrap();
+    let repo = settings_repo(true);
     let root = repo.path().canonicalize().unwrap();
     let billing = root.join("billing");
-    write_files(
-        &root,
-        &[
-            (
-                "settings.md",
-                "# Settlement controls\nThe settlement_cutoff is 19:00.\n",
-            ),
-            (
-                "billing/settings.md",
-                "# General controls\nThe unrelated value is 05:00.\n",
-            ),
-        ],
-    );
-    git(&root, &["init", "-q"]);
     // From billing/, a bare `settings.md` would mean billing's own file.
-    let text = success(&billing, &["lookup", "settlement_cutoff"]);
-    let next = text
-        .lines()
-        .find_map(|line| line.strip_prefix("Next: "))
-        .unwrap();
+    let text = success_words(&billing, "lookup settlement_cutoff");
+    let next = printed_after(&text, "Next: ");
     let opened = follow(&billing, next);
-    assert_eq!(
-        stdout(&opened),
-        "# Settlement controls\nThe settlement_cutoff is 19:00.\n",
-        "{next}: {}",
-        stderr(&opened)
-    );
+    assert_eq!(stdout(&opened), SETTLEMENT, "{next}: {}", stderr(&opened));
     // A command without bare paths finds the run from there unchanged.
     let run = cli(&billing, &["run", "--", "sh", "-c", "echo below; exit 1"]);
-    assert!(
-        stderr(&run).contains(&format!(
-            " output bytes · justless log {}\n",
-            marked_run(&stderr(&run))
-        )),
-        "{}",
-        stderr(&run)
-    );
+    let footer = stderr(&run);
+    let log = format!(" output bytes · justless log {}\n", marked_run(&footer));
+    text_has(&footer, &[&log]);
 }
 
 #[cfg(unix)]
@@ -15822,19 +15363,24 @@ fn runs_recorded_from_a_nested_repository_can_be_reopened_from_there() {
     git(&root, &["init", "-q"]);
     git(&vendor, &["init", "-q"]);
     // The command hook's rewrite inside the nested repository records here.
-    let run = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["--root", root.to_str().unwrap(), "run", "--hook", "--"])
-        .args(["sh", "-c", "seq 1 3000; exit 2"])
-        .current_dir(&vendor)
-        .output()
-        .unwrap();
+    let root_arg = root.to_str().unwrap();
+    let args = [
+        "--root",
+        root_arg,
+        "run",
+        "--hook",
+        "--",
+        "sh",
+        "-c",
+        "seq 1 3000; exit 2",
+    ];
+    let run = cli(&vendor, &args);
     assert_eq!(run.status.code(), Some(2), "{}", stderr(&run));
     let id = marked_run(&stderr(&run));
-    let reopen = stderr(&run)
-        .lines()
-        .find_map(|line| line.strip_prefix("[reopen with ")?.strip_suffix(']'))
-        .map(str::to_owned)
-        .unwrap_or_else(|| panic!("{}", stderr(&run)));
+    let reopen = printed_after(&stderr(&run), "[reopen with ")
+        .strip_suffix(']')
+        .unwrap()
+        .to_owned();
     let replay = follow(&vendor, &reopen);
     let lines: String = (1..=3000).map(|n| format!("{n}\n")).collect();
     assert_eq!(stdout(&replay), lines, "{reopen}: {}", stderr(&replay));
@@ -15848,12 +15394,13 @@ fn runs_recorded_from_a_nested_repository_can_be_reopened_from_there() {
             .to_owned()
     };
     let handoff = context("after-compact", "compact");
-    assert!(handoff.contains(&id), "{handoff}");
-    let inspect = handoff
-        .split('`')
-        .find(|part| part.ends_with(" context --run RUN_ID"))
-        .unwrap()
-        .replace("RUN_ID", &id);
+    text_has(&handoff, &[&id]);
+    let quoted = |text: &str, ending: &str| {
+        let part = text.split('`').find(|part| part.ends_with(ending));
+        part.unwrap_or_else(|| panic!("{ending}: {text}"))
+            .to_owned()
+    };
+    let inspect = quoted(&handoff, " context --run RUN_ID").replace("RUN_ID", &id);
     let inspected = follow(&vendor, &inspect);
     assert!(
         stdout(&inspected).starts_with(&format!("Run {id} · ")),
@@ -15861,11 +15408,8 @@ fn runs_recorded_from_a_nested_repository_can_be_reopened_from_there() {
         stderr(&inspected)
     );
     let started = context("session-start", "startup");
-    let resume = started
-        .split('`')
-        .find(|part| part.ends_with(" resume"))
-        .unwrap();
-    assert!(stdout(&follow(&vendor, resume)).contains(&id), "{started}");
+    let resume = quoted(&started, " resume");
+    text_has(&stdout(&follow(&vendor, &resume)), &[&id]);
 }
 
 #[test]
@@ -15873,6 +15417,7 @@ fn test_follow_ups_keep_the_scoped_root_and_the_runner() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     let app = root.join("app");
+    let lib = "pub fn rate() -> u8 {\n    5\n}\n\npub fn other() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn rate_matches() {\n        assert_eq!(super::rate(), 5);\n    }\n\n    #[test]\n    fn other_matches() {\n        assert_eq!(super::other(), 1);\n    }\n}\n";
     write_files(
         &root,
         &[
@@ -15881,83 +15426,64 @@ fn test_follow_ups_keep_the_scoped_root_and_the_runner() {
                 "app/Cargo.toml",
                 "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
             ),
-            (
-                "app/src/lib.rs",
-                "pub fn rate() -> u8 {\n    5\n}\n\npub fn other() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn rate_matches() {\n        assert_eq!(super::rate(), 5);\n    }\n\n    #[test]\n    fn other_matches() {\n        assert_eq!(super::other(), 1);\n    }\n}\n",
-            ),
+            ("app/src/lib.rs", lib),
         ],
     );
-    git(&root, &["init", "-q"]);
-    git(&root, &["add", "-A"]);
-    git(&root, &["commit", "-qm", "fixture"]);
+    commit_all(&root);
     replace_in(&root, "app/src/lib.rs", "    5\n", "    6\n");
-    let subset = cli(
-        &root,
-        &[
-            "--root",
-            "app",
-            "test",
-            "--affected",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-        ],
-    );
+    let subset = cli_words(&root, "--root app test --affected -- cargo test --offline");
     assert_eq!(subset.status.code(), Some(101), "{}", stderr(&subset));
     let err = stderr(&subset);
-    let (full, why) = err
-        .lines()
-        .find_map(|line| line.strip_prefix("Full suite: ")?.split_once(" · Why: "))
-        .unwrap_or_else(|| panic!("{err}"));
-    assert_eq!(
-        full,
-        format!(
-            "justless --root {} test -- cargo test --offline",
-            app.display()
-        )
+    let (full, why) = printed_after(&err, "Full suite: ")
+        .split_once(" · Why: ")
+        .unwrap();
+    let expected = format!(
+        "justless --root {} test -- cargo test --offline",
+        app.display()
     );
+    assert_eq!(full, expected);
     let reasons = follow(&root, why);
-    assert!(
-        reasons.status.success() && stdout(&reasons).contains("rate_matches"),
-        "{why}: {}{}",
-        stdout(&reasons),
-        stderr(&reasons)
-    );
+    assert!(reasons.status.success(), "{why}: {}", stderr(&reasons));
+    text_has(&stdout(&reasons), &["rate_matches"]);
     let suite = follow(&root, full);
     assert_eq!(suite.status.code(), Some(101), "{}", stderr(&suite));
-    assert!(
-        stderr(&suite).contains("Full suite (cargo): exit 101"),
-        "{}",
-        stderr(&suite)
-    );
+    text_has(&stderr(&suite), &["Full suite (cargo): exit 101"]);
 }
 
+/// Exec line pointers under a scoped root replay those lines, also from a root
+/// named like a secret, which output redaction leaves alone while it still
+/// hides a token the command printed.
 #[cfg(unix)]
 #[test]
 fn exec_line_pointers_under_a_scoped_root_replay_those_lines() {
     let repo = TempDir::new().unwrap();
-    let root = repo.path().canonicalize().unwrap();
-    fs::create_dir(root.join("sub")).unwrap();
-    git(&root, &["init", "-q"]);
-    let output = cli(
-        &root,
-        &["--root", "sub", "exec", "--lang", "sh", "seq 1 3000"],
-    );
-    assert!(output.status.success(), "{}", stderr(&output));
-    let text = stdout(&output);
-    let (range, pointer) = text
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("[justless] stdout lines ")?
-                .split_once(" left out · ")
-        })
-        .unwrap_or_else(|| panic!("{text}"));
-    let (from, to) = range.split_once('-').unwrap();
-    let lines: String = (from.parse::<usize>().unwrap()..=to.parse().unwrap())
-        .map(|n| format!("{n}\n"))
-        .collect();
-    assert_eq!(stdout(&follow(&root, pointer)), lines, "{pointer}");
+    let top = repo.path().canonicalize().unwrap();
+    git(&top, &["init", "-q"]);
+    // The redactor hides a GitHub token, and the second directory is named like one.
+    let token = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    for name in ["sub", token.as_str()] {
+        fs::create_dir(top.join(name)).unwrap();
+        let output = cli(
+            &top,
+            &["--root", name, "exec", "--lang", "sh", "seq 1 3000"],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let text = stdout(&output);
+        let (range, pointer) = printed_after(&text, "[justless] stdout lines ")
+            .split_once(" left out · ")
+            .unwrap();
+        text_has(pointer, &[name]);
+        let (from, to) = range.split_once('-').unwrap();
+        let lines: String = (from.parse::<usize>().unwrap()..=to.parse().unwrap())
+            .map(|n| format!("{n}\n"))
+            .collect();
+        let replay = follow(&top, pointer);
+        assert_eq!(stdout(&replay), lines, "{pointer}: {}", stderr(&replay));
+    }
+    // A token the command printed is still hidden.
+    let script = format!("echo token={token}; seq 1 3000");
+    let output = cli(&top, &["--root", &token, "exec", "--lang", "sh", &script]);
+    text_has(&stdout(&output), &["token=[redacted:github-token:"]);
 }
 
 #[test]
@@ -15970,13 +15496,8 @@ fn a_replaced_read_names_the_root_to_expand_from_the_agents_directory() {
         "def calculate():\n{}    return 42\n",
         "    # detail\n".repeat(400)
     );
-    write_files(
-        &root,
-        &[
-            ("module.py", &source),
-            ("docs/module.py", "def other():\n    return 1\n"),
-        ],
-    );
+    let other = "def other():\n    return 1\n";
+    write_files(&root, &[("module.py", &source), ("docs/module.py", other)]);
     git(&root, &["init", "-q"]);
     let path = root.join("module.py");
     let read = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse","cwd":docs,
@@ -15987,12 +15508,8 @@ fn a_replaced_read_names_the_root_to_expand_from_the_agents_directory() {
     let outline = replaced["updatedToolOutput"]["file"]["content"]
         .as_str()
         .unwrap_or_else(|| panic!("{output}"));
-    let revision = outline
-        .strip_prefix("revision ")
-        .unwrap()
-        .split(' ')
-        .next()
-        .unwrap();
+    let revision = outline.split(' ').nth(1).unwrap();
+    assert!(outline.starts_with("revision "), "{outline}");
     let hint = replaced["additionalContext"].as_str().unwrap();
     let expand = hint
         .split("Expand a row with ")
@@ -16105,98 +15622,35 @@ fn commands_in_mcp_results_reach_the_server_root_from_the_agents_shell() {
     use serde_json::json;
     let dir = TempDir::new().unwrap();
     let top = dir.path().canonicalize().unwrap();
-    let settlement = "# Settlement controls\nThe settlement_cutoff is 19:00.\n";
-    let unrelated = "# General controls\nThe unrelated value is 05:00.\n";
     // The server serves `a`, configured with `--root`, while the agent's shell works
     // in `b`, another repository with a file of the same name.
     write_files(
         &top,
-        &[("a/settings.md", settlement), ("b/settings.md", unrelated)],
+        &[("a/settings.md", SETTLEMENT), ("b/settings.md", UNRELATED)],
     );
     let (a, b) = (top.join("a"), top.join("b"));
     git(&a, &["init", "-q"]);
     git(&b, &["init", "-q"]);
     let lookup = json!({"name":"lookup","arguments":{"question":"settlement_cutoff"}});
     let map = json!({"name":"map","arguments":{}});
-    let results = mcp_results(
-        &b,
-        &["--root", a.to_str().unwrap()],
-        None,
-        &[lookup.clone(), map],
-    );
-    let next = results[0]
-        .lines()
-        .find_map(|line| line.strip_prefix("Next: "))
-        .unwrap_or_else(|| panic!("{}", results[0]));
+    let root = ["--root", a.to_str().unwrap()];
+    let results = mcp_results(&b, &root, None, &[lookup.clone(), map]);
+    let next = printed_after(&results[0], "Next: ");
     let opened = follow(&b, next);
-    assert_eq!(stdout(&opened), settlement, "{next}: {}", stderr(&opened));
-    assert!(
-        results[1].contains(&format!(
-            "Next: justless --root {} expand FILE",
-            a.display()
-        )),
-        "{}",
-        results[1]
-    );
+    assert_eq!(stdout(&opened), SETTLEMENT, "{next}: {}", stderr(&opened));
+    let expand = format!("Next: justless --root {} expand FILE", a.display());
+    text_has(&results[1], &[&expand]);
 
     // Claude Code launched in a subdirectory: the server finds the repository
     // root, and a bare path from the agent's shell would mean the subdirectory's file.
-    write_files(&top, &[("a/sub/settings.md", unrelated)]);
+    write_files(&top, &[("a/sub/settings.md", UNRELATED)]);
     let sub = a.join("sub");
     let results = mcp_results(&sub, &[], Some(&sub), &[lookup]);
-    let next = results[0]
-        .lines()
-        .find_map(|line| line.strip_prefix("Next: "))
-        .unwrap_or_else(|| panic!("{}", results[0]));
+    let next = printed_after(&results[0], "Next: ");
     let opened = follow(&sub, next);
-    assert_eq!(stdout(&opened), settlement, "{next}: {}", stderr(&opened));
+    assert_eq!(stdout(&opened), SETTLEMENT, "{next}: {}", stderr(&opened));
 }
 
-#[cfg(unix)]
-#[test]
-fn a_printed_root_named_like_a_secret_survives_output_redaction() {
-    let repo = TempDir::new().unwrap();
-    let top = repo.path().canonicalize().unwrap();
-    // The redactor hides a GitHub token, and this directory is named like one.
-    let name = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
-    fs::create_dir(top.join(&name)).unwrap();
-    git(&top, &["init", "-q"]);
-    let output = cli(
-        &top,
-        &["--root", &name, "exec", "--lang", "sh", "seq 1 3000"],
-    );
-    assert!(output.status.success(), "{}", stderr(&output));
-    let text = stdout(&output);
-    let (range, pointer) = text
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("[justless] stdout lines ")?
-                .split_once(" left out · ")
-        })
-        .unwrap_or_else(|| panic!("{text}"));
-    assert!(pointer.contains(&name), "{pointer}");
-    let (from, to) = range.split_once('-').unwrap();
-    let lines: String = (from.parse::<usize>().unwrap()..=to.parse().unwrap())
-        .map(|n| format!("{n}\n"))
-        .collect();
-    let replay = follow(&top, pointer);
-    assert_eq!(stdout(&replay), lines, "{pointer}: {}", stderr(&replay));
-
-    // A token the command printed is still hidden.
-    let output = cli(
-        &top,
-        &[
-            "--root",
-            &name,
-            "exec",
-            "--lang",
-            "sh",
-            &format!("echo token={name}; seq 1 3000"),
-        ],
-    );
-    let text = stdout(&output);
-    assert!(text.contains("token=[redacted:github-token:"), "{text}");
-}
 /// Archives finished runs directly, as `run` leaves them: each with its ID,
 /// status, completion time, stdout and stderr.
 fn archive_runs(root: &Path, runs: &[(&str, i32, u64, &str, &str)]) {
