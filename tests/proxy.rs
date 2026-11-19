@@ -19,15 +19,8 @@ use tempfile::{TempDir, tempdir};
 
 const BIN: &str = env!("CARGO_BIN_EXE_justless");
 const BETA: &str = "context-management-2025-06-27";
-const PROXY_VARS: [&str; 7] = [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "ANTHROPIC_BASE_URL",
-];
+const PROXY_VARS: &str =
+    "HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy ANTHROPIC_BASE_URL";
 
 // ---------------------------------------------------------------------------
 // HTTP helpers shared by the mock upstream and the test client
@@ -292,24 +285,18 @@ struct Proxy {
 }
 
 impl Proxy {
-    fn start(root: &Path, upstream: &str, args: &[&str]) -> Self {
+    /// Starts `justless proxy` with these space-separated flags.
+    fn start(root: &Path, upstream: &str, flags: &str) -> Self {
         let mut command = Command::new(BIN);
         command
             .current_dir(root)
-            .args([
-                "--root",
-                root.to_str().unwrap(),
-                "proxy",
-                "--port",
-                "0",
-                "--upstream",
-                upstream,
-            ])
-            .args(args)
+            .args(["--root", root.to_str().unwrap(), "proxy", "--port", "0"])
+            .args(["--upstream", upstream])
+            .args(words(flags))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for name in PROXY_VARS {
+        for name in words(PROXY_VARS) {
             command.env_remove(name);
         }
         let mut child = command.spawn().unwrap();
@@ -341,11 +328,7 @@ impl Proxy {
         // SAFETY: signalling a child process this test started.
         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
         let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "{}", text(&output.stderr));
         output
     }
 
@@ -359,12 +342,16 @@ impl Proxy {
             ("x-api-key", "sk-ant-test"),
         ];
         all.extend_from_slice(headers);
-        self.send(
-            "POST",
-            "/v1/messages",
-            &all,
-            &serde_json::to_vec(body).unwrap(),
-        )
+        let body = serde_json::to_vec(body).unwrap();
+        self.send("POST", "/v1/messages", &all, &body)
+    }
+
+    fn count_tokens(&self, body: &Value) {
+        let mut count = body.clone();
+        count.as_object_mut().unwrap().remove("stream");
+        let json = [("content-type", "application/json")];
+        let count = serde_json::to_vec(&count).unwrap();
+        self.send("POST", "/v1/messages/count_tokens", &json, &count);
     }
 }
 
@@ -392,14 +379,17 @@ fn request_bytes(method: &str, target: &str, headers: &[(&str, &str)], body: &[u
     bytes
 }
 
+fn connect(port: u16, timeout: u64) -> TcpStream {
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let timeout = Duration::from_secs(timeout);
+    stream.set_read_timeout(Some(timeout)).unwrap();
+    stream
+}
+
 fn send(port: u16, method: &str, target: &str, headers: &[(&str, &str)], body: &[u8]) -> Message {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
-        .unwrap();
-    stream
-        .write_all(&request_bytes(method, target, headers, body))
-        .unwrap();
+    let mut stream = connect(port, 20);
+    let request = request_bytes(method, target, headers, body);
+    stream.write_all(&request).unwrap();
     read_message(&mut BufReader::new(stream), method == "HEAD").unwrap()
 }
 
@@ -446,6 +436,14 @@ fn conversation(model: &str, results: &[usize]) -> Value {
         "messages":messages})
 }
 
+/// Four large results the proxy can clear, then two small recent ones.
+const SIZES: [usize; 6] = [2000, 2000, 2000, 2000, 40, 40];
+
+/// `SIZES` followed by `more`.
+fn grown(more: &[usize]) -> Vec<usize> {
+    [&SIZES[..], more].concat()
+}
+
 /// The clearing edit the proxy appended, if any.
 fn our_edit(body: &Value) -> Option<Value> {
     body["context_management"]["edits"]
@@ -463,27 +461,51 @@ fn trigger_keep(edit: &Value) -> (u64, u64) {
 }
 
 fn ledger(root: &Path) -> Vec<Value> {
-    let mut records = Vec::new();
     let Ok(listing) = fs::read_dir(root.join(".justless/proxy")) else {
-        return records;
+        return Vec::new();
+    };
+    let requests = |p: &PathBuf| {
+        p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("requests-")
     };
     let mut files: Vec<PathBuf> = listing
         .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("requests-")
-        })
+        .filter(requests)
         .collect();
     files.sort();
-    for file in files {
-        for line in fs::read_to_string(file).unwrap().lines() {
-            records.push(serde_json::from_str(line).unwrap());
-        }
-    }
+    let lines: Vec<String> = files
+        .iter()
+        .map(|f| fs::read_to_string(f).unwrap())
+        .collect();
+    let records = lines.iter().flat_map(|text| text.lines());
     records
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// One field of every ledger record, in order.
+fn column(root: &Path, key: &str) -> Vec<Value> {
+    ledger(root).iter().map(|r| r[key].clone()).collect()
+}
+
+/// These space-separated fields of `value`.
+fn fields(value: &Value, keys: &str) -> Vec<Value> {
+    words(keys).iter().map(|key| value[key].clone()).collect()
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[track_caller]
+fn contains(text: &str, needle: &str) {
+    assert!(text.contains(needle), "{needle:?} not in:\n{text}");
 }
 
 fn justless(root: &Path, args: &[&str]) -> Output {
@@ -495,26 +517,19 @@ fn justless(root: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-const CLEARING: [&str; 10] = [
-    "--floor",
-    "1000",
-    "--clear-at-least",
-    "100",
-    "--keep",
-    "2",
-    "--cold-after",
-    "0",
-    "--payback",
-    "1000",
-];
+fn stats(root: &Path) -> Value {
+    serde_json::from_slice(&justless(root, &["stats", "--json"]).stdout).unwrap()
+}
+
+const CLEARING: &str = "--floor 1000 --clear-at-least 100 --keep 2 --cold-after 0 --payback 1000";
 
 fn session(
     script: impl FnMut(&Message) -> Reply + Send + 'static,
-    args: &[&str],
+    flags: &str,
 ) -> (TempDir, Mock, Proxy) {
     let dir = tempdir().unwrap();
     let mock = Mock::start(script);
-    let proxy = Proxy::start(dir.path(), &mock.url(), args);
+    let proxy = Proxy::start(dir.path(), &mock.url(), flags);
     (dir, mock, proxy)
 }
 
@@ -525,18 +540,16 @@ fn session(
 fn relays_unplanned_request_byte_for_byte() {
     let reply_body =
         br#"{"id":"msg_01","type":"message","usage":{"input_tokens":5,"output_tokens":2}}"#;
-    let (_dir, mock, proxy) = session(
-        |_| Reply::Raw {
-            status: 201,
-            headers: vec![
-                ("content-type", "application/json".into()),
-                ("request-id", "req_011CVabc".into()),
-                ("anthropic-ratelimit-tokens-remaining", "123".into()),
-            ],
-            body: reply_body.to_vec(),
-        },
-        &[],
-    );
+    let reply = move |_: &Message| Reply::Raw {
+        status: 201,
+        headers: vec![
+            ("content-type", "application/json".into()),
+            ("request-id", "req_011CVabc".into()),
+            ("anthropic-ratelimit-tokens-remaining", "123".into()),
+        ],
+        body: reply_body.to_vec(),
+    };
+    let (dir, mock, proxy) = session(reply, "");
     // Below the default 100K floor, so nothing is added. Pretty-printed with odd
     // spacing: the upstream must see these exact bytes.
     let body = serde_json::to_string_pretty(&conversation("claude-opus-5-5", &[300; 3]))
@@ -557,10 +570,8 @@ fn relays_unplanned_request_byte_for_byte() {
     let response = proxy.send("POST", "/v1/messages?beta=true", &headers, body.as_bytes());
     assert_eq!(response.status(), 201);
     assert_eq!(response.header("request-id"), Some("req_011CVabc"));
-    assert_eq!(
-        response.header("anthropic-ratelimit-tokens-remaining"),
-        Some("123")
-    );
+    let remaining = response.header("anthropic-ratelimit-tokens-remaining");
+    assert_eq!(remaining, Some("123"));
     assert_eq!(response.body, reply_body);
     let seen = mock.seen();
     assert_eq!(seen.len(), 1);
@@ -570,25 +581,14 @@ fn relays_unplanned_request_byte_for_byte() {
     for (name, value) in headers {
         assert_eq!(forwarded.headers_named(name), [value], "{name}");
     }
-    let names: Vec<String> = forwarded
-        .headers
-        .iter()
-        .map(|(n, _)| n.to_ascii_lowercase())
-        .collect();
     for added in ["user-agent", "accept", "connection"] {
-        assert!(
-            !names.contains(&added.to_string()),
-            "{added} was added: {names:?}"
-        );
+        let headers = &forwarded.headers;
+        assert!(forwarded.header(added).is_none(), "{added}: {headers:?}");
     }
-    assert_eq!(
-        forwarded.header("content-length"),
-        Some(body.len().to_string().as_str())
-    );
-    let records = {
-        proxy.stop();
-        ledger(_dir.path())
-    };
+    let length = body.len().to_string();
+    assert_eq!(forwarded.header("content-length"), Some(length.as_str()));
+    proxy.stop();
+    let records = ledger(dir.path());
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["reason"], "below-floor");
     assert_eq!(records[0]["session"], "4f0c-session");
@@ -604,39 +604,31 @@ fn streams_sse_without_buffering() {
             gate: gate.lock().unwrap().take(),
             piece: usize::MAX,
         },
-        &[],
+        "",
     );
-    let mut stream = TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    let mut stream = connect(proxy.port, 5);
     let body = serde_json::to_vec(&conversation("claude-opus-5-5", &[100])).unwrap();
-    stream
-        .write_all(&request_bytes(
-            "POST",
-            "/v1/messages",
-            &[("content-type", "application/json")],
-            &body,
-        ))
-        .unwrap();
+    let json = [("content-type", "application/json")];
+    let request = request_bytes("POST", "/v1/messages", &json, &body);
+    stream.write_all(&request).unwrap();
     let started = Instant::now();
     let mut received = Vec::new();
     let mut buffer = [0; 4096];
-    while !String::from_utf8_lossy(&received).contains("message_start") {
+    while !text(&received).contains("message_start") {
         let read = stream.read(&mut buffer).expect("first event within 5 s");
         assert!(read > 0, "closed before the first event");
         received.extend_from_slice(&buffer[..read]);
     }
     assert!(started.elapsed() < Duration::from_secs(5));
-    let text = String::from_utf8_lossy(&received).into_owned();
-    assert!(text.contains("transfer-encoding: chunked"), "{text}");
-    assert!(!text.contains("message_stop"));
+    let head = text(&received);
+    contains(&head, "transfer-encoding: chunked");
+    assert!(!head.contains("message_stop"));
     gate_tx.send(()).unwrap();
     stream.read_to_end(&mut received).unwrap();
-    let text = String::from_utf8_lossy(&received);
-    assert!(text.contains("event: ping"));
-    assert!(text.contains("message_stop"));
-    assert!(text.ends_with("0\r\n\r\n"));
+    let all = text(&received);
+    contains(&all, "event: ping");
+    contains(&all, "message_stop");
+    assert!(all.ends_with("0\r\n\r\n"));
 }
 
 #[test]
@@ -647,33 +639,23 @@ fn observer_handles_split_events() {
             gate: None,
             piece: 1,
         },
-        &[],
+        "",
     );
     let response = proxy.post(&[], &conversation("claude-opus-5-5", &[100]));
-    let text = String::from_utf8_lossy(&response.body).into_owned();
-    assert_eq!(
-        text,
-        events("claude-opus-5-5", Some((7, 4321)), 555).concat()
-    );
+    let expected = events("claude-opus-5-5", Some((7, 4321)), 555).concat();
+    assert_eq!(text(&response.body), expected);
     proxy.stop();
     let record = &ledger(dir.path())[0];
     assert_eq!(record["observed"], true);
-    assert_eq!(record["input"], 100);
-    assert_eq!(record["cache_read"], 2000);
-    assert_eq!(record["cache_write"], 555);
-    assert_eq!(record["output"], 20);
-    assert_eq!(record["api_cleared_uses"], 7);
-    assert_eq!(record["api_cleared_tokens"], 4321);
+    let keys = "input cache_read cache_write output api_cleared_uses api_cleared_tokens";
+    assert_eq!(fields(record, keys), [100, 2000, 555, 20, 7, 4321]);
 }
 
 #[test]
 fn accepts_chunked_bodies_and_expect_continue() {
-    let (_dir, mock, proxy) = session(|_| ok_json(), &[]);
+    let (_dir, mock, proxy) = session(|_| ok_json(), "");
     let body = serde_json::to_vec(&conversation("claude-opus-5-5", &[200; 2])).unwrap();
-    let mut stream = TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    let mut stream = connect(proxy.port, 10);
     stream
         .write_all(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n")
         .unwrap();
@@ -681,9 +663,8 @@ fn accepts_chunked_bodies_and_expect_continue() {
     assert_eq!(read_line(&mut reader).unwrap(), "HTTP/1.1 100 Continue");
     assert_eq!(read_line(&mut reader).unwrap(), "");
     for part in body.chunks(333) {
-        stream
-            .write_all(format!("{:x}\r\n", part.len()).as_bytes())
-            .unwrap();
+        let size = format!("{:x}\r\n", part.len());
+        stream.write_all(size.as_bytes()).unwrap();
         stream.write_all(part).unwrap();
         stream.write_all(b"\r\n").unwrap();
     }
@@ -698,12 +679,9 @@ fn accepts_chunked_bodies_and_expect_continue() {
 
 #[test]
 fn a_body_cut_short_is_never_forwarded() {
-    let (_dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
+    let (_dir, mock, proxy) = session(|_| ok_json(), CLEARING);
     let body = serde_json::to_vec(&conversation("claude-opus-5-5", &[40])).unwrap();
-    let mut stream = TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
-        .unwrap();
+    let mut stream = connect(proxy.port, 20);
     let head = format!(
         "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -714,11 +692,11 @@ fn a_body_cut_short_is_never_forwarded() {
     let response = read_message(&mut BufReader::new(stream), false).unwrap();
     assert_eq!(response.status(), 400);
     assert_eq!(response.header("connection"), Some("close"));
-    let message = response.json()["error"]["message"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(message.contains("incomplete request body"), "{message}");
+    let error = response.json();
+    contains(
+        error["error"]["message"].as_str().unwrap(),
+        "incomplete request body",
+    );
     // A later complete request still goes through.
     proxy.send("GET", "/v1/models", &[], b"");
     let targets: Vec<String> = mock.seen().iter().map(|m| m.target().to_owned()).collect();
@@ -727,28 +705,19 @@ fn a_body_cut_short_is_never_forwarded() {
 
 #[test]
 fn bodies_over_64_mib_keep_their_content_length() {
-    let (_dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
+    let (_dir, mock, proxy) = session(|_| ok_json(), CLEARING);
     let size = 64 * 1024 * 1024 + 1234;
     let body: Vec<u8> = (0..size).map(|i| b"abcdefghij"[i % 10]).collect();
-    let response = proxy.send(
-        "POST",
-        "/v1/files",
-        &[("content-type", "application/octet-stream")],
-        &body,
-    );
+    let octets = [("content-type", "application/octet-stream")];
+    let response = proxy.send("POST", "/v1/files", &octets, &body);
     assert_eq!(response.status(), 200);
     let seen = mock.seen();
     let forwarded = seen.last().unwrap();
-    assert_eq!(
-        forwarded.header("content-length"),
-        Some(size.to_string().as_str())
-    );
+    let length = size.to_string();
+    assert_eq!(forwarded.header("content-length"), Some(length.as_str()));
     assert!(forwarded.header("transfer-encoding").is_none());
-    assert_eq!(
-        Sha256::digest(&forwarded.body),
-        Sha256::digest(&body),
-        "body changed"
-    );
+    let digest = Sha256::digest(&forwarded.body);
+    assert_eq!(digest, Sha256::digest(&body), "body changed");
 }
 
 #[test]
@@ -762,7 +731,7 @@ fn passthrough_paths_and_invalid_bodies() {
             },
             _ => ok_json(),
         },
-        &CLEARING,
+        CLEARING,
     );
     let head = proxy.send("HEAD", "/api/hello", &[("x-api-key", "k")], b"");
     assert_eq!(head.status(), 200);
@@ -770,34 +739,24 @@ fn passthrough_paths_and_invalid_bodies() {
     assert_eq!(head.header("x-hello"), Some("1"));
     let models = proxy.send("GET", "/v1/models?x=1", &[("x-api-key", "k")], b"");
     assert_eq!(models.status(), 200);
-    let batch = serde_json::to_vec(&json!({"requests":[{"custom_id":"a","params":conversation("claude-haiku-4-5", &[2000; 6])}]})).unwrap();
+    let params = conversation("claude-haiku-4-5", &[2000; 6]);
+    let batch = json!({"requests":[{"custom_id":"a","params":params}]});
+    let batch = serde_json::to_vec(&batch).unwrap();
     proxy.send("POST", "/v1/messages/batches", &[], &batch);
     proxy.send("POST", "/v1/messages", &[], b"not json {");
     let duplicate = br#"{"model":"claude-haiku-4-5","messages":[],"model":"claude-opus-5-5"}"#;
     proxy.send("POST", "/v1/messages", &[], duplicate);
     let large = serde_json::to_vec(&conversation("claude-haiku-4-5", &[2000; 6])).unwrap();
-    proxy.send(
-        "POST",
-        "/v1/messages",
-        &[
-            ("origin", "https://example.com"),
-            ("content-type", "application/json"),
-        ],
-        &large,
-    );
+    let browser = [
+        ("origin", "https://example.com"),
+        ("content-type", "application/json"),
+    ];
+    proxy.send("POST", "/v1/messages", &browser, &large);
     let seen = mock.seen();
     let targets: Vec<&str> = seen.iter().map(Message::target).collect();
-    assert_eq!(
-        targets,
-        [
-            "/api/hello",
-            "/v1/models?x=1",
-            "/v1/messages/batches",
-            "/v1/messages",
-            "/v1/messages",
-            "/v1/messages"
-        ]
-    );
+    let messages = "/v1/messages";
+    let expected = ["/api/hello", "/v1/models?x=1", "/v1/messages/batches"];
+    assert_eq!(targets, [&expected[..], &[messages; 3]].concat());
     assert_eq!(seen[2].body, batch);
     assert_eq!(seen[3].body, b"not json {");
     assert_eq!(seen[4].body, duplicate);
@@ -805,28 +764,15 @@ fn passthrough_paths_and_invalid_bodies() {
     assert!(seen.iter().all(|m| m.header("anthropic-beta").is_none()));
     proxy.stop();
     assert!(!dir.path().join(".justless/tool-uses").exists());
-    let reasons: Vec<Value> = ledger(dir.path())
-        .iter()
-        .map(|r| r["reason"].clone())
-        .collect();
-    assert_eq!(
-        reasons,
-        [
-            "other-path",
-            "other-path",
-            "other-path",
-            "unparsed",
-            "unparsed",
-            "browser-origin"
-        ]
-    );
+    let reasons = "other-path other-path other-path unparsed unparsed browser-origin";
+    assert_eq!(column(dir.path(), "reason"), words(reasons));
 }
 
 #[test]
 fn upstream_prefix_and_unreachable() {
     let dir = tempdir().unwrap();
     let mock = Mock::start(|_| ok_json());
-    let proxy = Proxy::start(dir.path(), &format!("{}/gw/", mock.url()), &[]);
+    let proxy = Proxy::start(dir.path(), &format!("{}/gw/", mock.url()), "");
     let response = proxy.send("POST", "/v1/messages?beta=true", &[], b"{}");
     assert_eq!(response.status(), 200);
     assert_eq!(mock.seen()[0].target(), "/gw/v1/messages?beta=true");
@@ -840,43 +786,27 @@ fn upstream_prefix_and_unreachable() {
             drop(stream);
         }
     });
-    let proxy = Proxy::start(dir.path(), &format!("http://{dead}"), &[]);
+    let proxy = Proxy::start(dir.path(), &format!("http://{dead}"), "");
     let response = proxy.send("POST", "/v1/messages", &[], b"{}");
     assert_eq!(response.status(), 502);
     let error = response.json();
     assert_eq!(error["type"], "error");
     assert_eq!(error["error"]["type"], "api_error");
     let message = error["error"]["message"].as_str().unwrap();
-    assert!(
-        message.starts_with(&format!("justless proxy could not reach http://{dead}")),
-        "{message}"
-    );
+    let unreachable = format!("justless proxy could not reach http://{dead}");
+    assert!(message.starts_with(&unreachable), "{message}");
     proxy.stop();
     // A proxy never forwards to itself, whether or not the port is free.
     let port = dead.port();
-    let refused = justless(
-        dir.path(),
-        &[
-            "proxy",
-            "--port",
-            &port.to_string(),
-            "--upstream",
-            &format!("http://localhost:{port}"),
-        ],
-    );
+    let itself = format!("proxy --port {port} --upstream http://localhost:{port}");
+    let refused = justless(dir.path(), &words(&itself));
     assert_eq!(refused.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("is this proxy"));
+    contains(&text(&refused.stderr), "is this proxy");
     // The upstream URL is printed and logged, so credentials in it are refused.
-    let secret = justless(
-        dir.path(),
-        &[
-            "proxy",
-            "--upstream",
-            "https://user:SECRET3@gateway.example/v1",
-        ],
-    );
+    let upstream = "https://user:SECRET3@gateway.example/v1";
+    let secret = justless(dir.path(), &["proxy", "--upstream", upstream]);
     assert_eq!(secret.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&secret.stderr);
+    let stderr = text(&secret.stderr);
     assert!(stderr.contains("cannot contain credentials") && !stderr.contains("SECRET3"));
 }
 
@@ -885,9 +815,10 @@ fn upstream_prefix_and_unreachable() {
 
 #[test]
 fn adds_clear_tool_uses_with_stable_boundary() {
-    let (dir, mock, proxy) = session(|_| stream(events("claude-haiku-4-5", None, 0)), &CLEARING);
+    let reply = |_: &Message| stream(events("claude-haiku-4-5", None, 0));
+    let (dir, mock, proxy) = session(reply, CLEARING);
     let headers = [("anthropic-beta", "oauth-2025-04-20")];
-    let mut sizes: Vec<usize> = vec![2000, 2000, 2000, 2000, 40, 40];
+    let mut sizes = SIZES.to_vec();
     let mut expected = vec![];
     for (step, added) in [vec![], vec![40], vec![40], vec![40, 2000, 2000, 2000]]
         .into_iter()
@@ -900,11 +831,8 @@ fn adds_clear_tool_uses_with_stable_boundary() {
         assert_eq!(response.status(), 200);
         let forwarded = mock.seen().pop().unwrap();
         // Every byte the client sent is kept; the edit is inserted before the end.
-        assert_eq!(
-            forwarded.body[..bytes.len() - 1],
-            bytes[..bytes.len() - 1],
-            "step {step}"
-        );
+        let end = bytes.len() - 1;
+        assert_eq!(forwarded.body[..end], bytes[..end], "step {step}");
         let sent = forwarded.json();
         for key in ["system", "tools", "messages", "model"] {
             assert_eq!(sent[key], body[key]);
@@ -917,15 +845,11 @@ fn adds_clear_tool_uses_with_stable_boundary() {
             1
         );
         let edit = our_edit(&sent).unwrap();
-        assert_eq!(
-            edit["clear_at_least"],
-            json!({"type":"input_tokens","value":100})
-        );
+        let clear_at_least = json!({"type":"input_tokens","value":100});
+        assert_eq!(edit["clear_at_least"], clear_at_least);
         assert!(edit.get("exclude_tools").is_none() && edit.get("clear_tool_inputs").is_none());
-        assert_eq!(
-            forwarded.headers_named("anthropic-beta"),
-            [format!("oauth-2025-04-20,{BETA}")]
-        );
+        let beta = forwarded.headers_named("anthropic-beta");
+        assert_eq!(beta, [format!("oauth-2025-04-20,{BETA}")]);
         let uses = sizes.len() as u64;
         let (trigger, keep) = trigger_keep(&edit);
         assert_eq!(trigger, uses - 3);
@@ -935,7 +859,7 @@ fn adds_clear_tool_uses_with_stable_boundary() {
     assert_eq!(expected, [4, 4, 4, 10]);
     proxy.stop();
     let records = ledger(dir.path());
-    let moves: Vec<Value> = records.iter().map(|r| r["move"].clone()).collect();
+    let moves = column(dir.path(), "move");
     assert_eq!(
         moves,
         [json!("payback"), Value::Null, Value::Null, json!("payback")]
@@ -943,55 +867,35 @@ fn adds_clear_tool_uses_with_stable_boundary() {
     assert!(records.iter().all(|r| r["mode"] == "cleared"));
     // Between moves, the edit is still sent and the ledger says why the
     // boundary held.
-    let reasons: Vec<Value> = records.iter().map(|r| r["reason"].clone()).collect();
-    assert_eq!(
-        reasons,
-        [
-            Value::Null,
-            json!("below-clear-at-least"),
-            json!("below-clear-at-least"),
-            Value::Null
-        ]
-    );
+    let held = json!("below-clear-at-least");
+    let reasons = [Value::Null, held.clone(), held, Value::Null];
+    assert_eq!(column(dir.path(), "reason"), reasons);
     assert_eq!(records[0]["newly_cleared"]["results"], 4);
     assert_eq!(records[0]["newly_cleared"]["bytes"], 4 * result_bytes(2000));
 }
 
 #[test]
 fn appends_after_client_clear_thinking() {
-    let (_dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
-    let mut body = conversation("claude-haiku-4-5", &[2000, 2000, 2000, 2000, 40, 40]);
-    body["context_management"] = json!({"edits":[{"type":"clear_thinking_20251015","keep":"all"}]});
-    proxy.post(
-        &[(
-            "anthropic-beta",
-            &format!("interleaved-thinking-2025-05-14, {BETA}"),
-        )],
-        &body,
-    );
+    let (_dir, mock, proxy) = session(|_| ok_json(), CLEARING);
+    let mut body = conversation("claude-haiku-4-5", &SIZES);
+    let thinking = json!({"type":"clear_thinking_20251015","keep":"all"});
+    body["context_management"] = json!({"edits":[thinking]});
+    let beta = format!("interleaved-thinking-2025-05-14, {BETA}");
+    proxy.post(&[("anthropic-beta", &beta)], &body);
     let forwarded = &mock.seen()[0];
     let edits = forwarded.json()["context_management"]["edits"].clone();
-    assert_eq!(
-        edits[0],
-        json!({"type":"clear_thinking_20251015","keep":"all"})
-    );
+    assert_eq!(edits[0], thinking);
     assert_eq!(edits[1]["type"], "clear_tool_uses_20250919");
-    assert_eq!(
-        forwarded.headers_named("anthropic-beta"),
-        [format!("interleaved-thinking-2025-05-14, {BETA}")]
-    );
+    assert_eq!(forwarded.headers_named("anthropic-beta"), [beta]);
 }
 
 #[test]
 fn leaves_client_managed_conversations_alone() {
-    let (dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
-    let mut body = conversation("claude-haiku-4-5", &[2000, 2000, 2000, 2000, 40, 40]);
+    let (dir, mock, proxy) = session(|_| ok_json(), CLEARING);
+    let mut body = conversation("claude-haiku-4-5", &SIZES);
     body["context_management"] = json!({"edits":[{"type":"clear_tool_uses_20250919","keep":{"type":"tool_uses","value":12}}]});
     proxy.post(&[], &body);
-    let later = conversation(
-        "claude-haiku-4-5",
-        &[2000, 2000, 2000, 2000, 40, 40, 2000, 2000],
-    );
+    let later = conversation("claude-haiku-4-5", &grown(&[2000, 2000]));
     proxy.post(&[], &later);
     let seen = mock.seen();
     assert_eq!(seen[0].body, serde_json::to_vec(&body).unwrap());
@@ -999,48 +903,43 @@ fn leaves_client_managed_conversations_alone() {
     assert!(seen.iter().all(|m| m.header("anthropic-beta").is_none()));
     proxy.stop();
     let records = ledger(dir.path());
-    assert!(
-        records
-            .iter()
-            .all(|r| r["mode"] == "client" && r["reason"] == "client-managed")
+    let client = |r: &Value| r["mode"] == "client" && r["reason"] == "client-managed";
+    assert!(records.iter().all(client));
+    assert_eq!(column(dir.path(), "client_managed_new"), [true, false]);
+    assert_eq!(
+        stats(dir.path())["proxy"]["client_managed_conversations"],
+        1
     );
-    assert_eq!(records[0]["client_managed_new"], true);
-    assert_eq!(records[1]["client_managed_new"], false);
-    let stats: Value =
-        serde_json::from_slice(&justless(dir.path(), &["stats", "--json"]).stdout).unwrap();
-    assert_eq!(stats["proxy"]["client_managed_conversations"], 1);
 }
 
 #[test]
 fn no_clear_and_no_archive_only_relay_and_record() {
-    let args = [&CLEARING[..], &["--no-clear", "--no-archive"]].concat();
-    let (dir, mock, proxy) = session(|_| ok_json(), &args);
-    let body = conversation("claude-haiku-4-5", &[2000, 2000, 2000, 2000, 40, 40]);
+    let flags = format!("{CLEARING} --no-clear --no-archive");
+    let (dir, mock, proxy) = session(|_| ok_json(), &flags);
+    let body = conversation("claude-haiku-4-5", &SIZES);
     assert_eq!(proxy.post(&[], &body).status(), 200);
     assert_eq!(mock.seen()[0].body, serde_json::to_vec(&body).unwrap());
     proxy.stop();
     assert!(!dir.path().join(".justless/tool-uses").exists());
     let records = ledger(dir.path());
     assert_eq!(
-        (records[0]["mode"].as_str(), records[0]["reason"].as_str()),
-        (Some("pass"), Some("no-clear"))
+        fields(&records[0], "mode reason archived"),
+        [json!("pass"), json!("no-clear"), json!(0)]
     );
-    assert_eq!(records[0]["archived"], 0);
 }
 
 #[test]
 fn passes_threads_compaction_and_other_models_unchanged() {
-    let (dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
-    let sizes = [2000, 2000, 2000, 2000, 40, 40];
-    let mut thread = conversation("claude-haiku-4-5", &sizes);
+    let (dir, mock, proxy) = session(|_| ok_json(), CLEARING);
+    let mut thread = conversation("claude-haiku-4-5", &SIZES);
     thread["thread"] = json!({"id":"thr_01"});
-    let mut compaction = conversation("claude-haiku-4-5", &sizes);
+    let mut compaction = conversation("claude-haiku-4-5", &SIZES);
     compaction["compaction"] = json!({"trigger":{"type":"input_tokens","value":150000}});
     let bodies = [
         thread,
         compaction,
-        conversation("claude-3-7-sonnet-20250219", &sizes),
-        conversation("gpt-5.5", &sizes),
+        conversation("claude-3-7-sonnet-20250219", &SIZES),
+        conversation("gpt-5.5", &SIZES),
         conversation("claude-haiku-4-5", &[]),
     ];
     for body in &bodies {
@@ -1051,43 +950,19 @@ fn passes_threads_compaction_and_other_models_unchanged() {
         assert!(forwarded.header("anthropic-beta").is_none());
     }
     proxy.stop();
-    let reasons: Vec<Value> = ledger(dir.path())
-        .iter()
-        .map(|r| r["reason"].clone())
-        .collect();
-    assert_eq!(
-        reasons,
-        [
-            "thread",
-            "compaction-param",
-            "not-claude",
-            "not-claude",
-            "no-tool-uses"
-        ]
-    );
+    let reasons = "thread compaction-param not-claude not-claude no-tool-uses";
+    assert_eq!(column(dir.path(), "reason"), words(reasons));
 }
 
 #[test]
 fn cold_cache_move() {
-    let args = [
-        "--floor",
-        "1000",
-        "--clear-at-least",
-        "100",
-        "--keep",
-        "2",
-        "--cold-after",
-        "1",
-        "--payback",
-        "0",
-    ];
-    let (dir, mock, proxy) = session(|_| ok_json(), &args);
-    let sizes = [2000, 2000, 2000, 2000, 2000, 2000];
+    let flags = "--floor 1000 --clear-at-least 100 --keep 2 --cold-after 1 --payback 0";
+    let (dir, mock, proxy) = session(|_| ok_json(), flags);
+    let sizes = [2000; 6];
     proxy.post(&[], &conversation("claude-haiku-4-5", &sizes));
     assert!(our_edit(&mock.seen()[0].json()).is_none());
     thread::sleep(Duration::from_millis(1200));
-    let mut grown = sizes.to_vec();
-    grown.push(40);
+    let grown = [&sizes[..], &[40]].concat();
     proxy.post(&[], &conversation("claude-haiku-4-5", &grown));
     let edit = our_edit(&mock.seen()[1].json()).unwrap();
     assert_eq!(trigger_keep(&edit), (4, 2));
@@ -1101,17 +976,8 @@ fn cold_cache_move() {
 
 #[test]
 fn a_model_switch_never_rewrites_another_models_warm_cache() {
-    let args = [
-        "--floor",
-        "1000",
-        "--clear-at-least",
-        "100",
-        "--keep",
-        "2",
-        "--payback",
-        "0",
-    ];
-    let (dir, mock, proxy) = session(|_| ok_json(), &args);
+    let flags = "--floor 1000 --clear-at-least 100 --keep 2 --payback 0";
+    let (dir, mock, proxy) = session(|_| ok_json(), flags);
     let mut sizes = vec![2000; 6];
     for model in ["claude-opus-5-5", "claude-haiku-4-5", "claude-opus-5-5"] {
         proxy.post(&[], &conversation(model, &sizes));
@@ -1119,41 +985,18 @@ fn a_model_switch_never_rewrites_another_models_warm_cache() {
     }
     assert!(mock.seen().iter().all(|m| our_edit(&m.json()).is_none()));
     proxy.stop();
-    let reasons: Vec<Value> = ledger(dir.path())
-        .iter()
-        .map(|r| r["reason"].clone())
-        .collect();
-    assert_eq!(reasons, ["below-payback"; 3]);
+    assert_eq!(column(dir.path(), "reason"), ["below-payback"; 3]);
 }
 
 #[test]
 fn a_token_count_first_does_not_change_the_decision() {
-    let args = [
-        "--floor",
-        "1000",
-        "--clear-at-least",
-        "100",
-        "--keep",
-        "2",
-        "--cold-after",
-        "1",
-        "--payback",
-        "0",
-    ];
+    let flags = "--floor 1000 --clear-at-least 100 --keep 2 --cold-after 1 --payback 0";
     let body = conversation("claude-opus-5-5", &[2000; 8]);
-    let mut count = body.clone();
-    count.as_object_mut().unwrap().remove("stream");
-    let count = serde_json::to_vec(&count).unwrap();
     let mut decisions = Vec::new();
     for count_first in [false, true] {
-        let (dir, mock, proxy) = session(|_| ok_json(), &args);
+        let (dir, mock, proxy) = session(|_| ok_json(), flags);
         if count_first {
-            proxy.send(
-                "POST",
-                "/v1/messages/count_tokens",
-                &[("content-type", "application/json")],
-                &count,
-            );
+            proxy.count_tokens(&body);
             thread::sleep(Duration::from_millis(1200));
         }
         proxy.post(&[], &body);
@@ -1161,40 +1004,23 @@ fn a_token_count_first_does_not_change_the_decision() {
         assert!(our_edit(&forwarded.json()).is_none(), "{count_first}");
         proxy.stop();
         let last = ledger(dir.path()).pop().unwrap();
-        decisions.push((last["reason"].clone(), last["move"].clone()));
+        decisions.push(fields(&last, "reason move"));
     }
     assert_eq!(decisions[0], decisions[1]);
-    assert_eq!(decisions[0], (json!("below-payback"), Value::Null));
+    assert_eq!(decisions[0], [json!("below-payback"), Value::Null]);
 }
 
 #[test]
 fn compaction_and_forks_keep_the_boundary() {
-    let (dir, mock, proxy) = session(|_| ok_json(), &CLEARING);
-    let base = [2000, 2000, 2000, 2000, 40, 40];
-    proxy.post(
-        &[("x-claude-code-request-class", "main")],
-        &conversation("claude-haiku-4-5", &base),
-    );
-    let mut grown = base.to_vec();
-    grown.extend([2000; 5]);
-    let body = conversation("claude-haiku-4-5", &grown);
-    proxy.post(&[("x-claude-code-request-class", "compaction")], &body);
-    proxy.post(
-        &[
-            ("x-claude-code-request-class", "main"),
-            ("x-claude-code-agent-type", "fork"),
-        ],
-        &body,
-    );
-    let mut count = body.clone();
-    count.as_object_mut().unwrap().remove("stream");
-    proxy.send(
-        "POST",
-        "/v1/messages/count_tokens",
-        &[("content-type", "application/json")],
-        &serde_json::to_vec(&count).unwrap(),
-    );
-    proxy.post(&[("x-claude-code-request-class", "main")], &body);
+    let (dir, mock, proxy) = session(|_| ok_json(), CLEARING);
+    let class = |name| ("x-claude-code-request-class", name);
+    proxy.post(&[class("main")], &conversation("claude-haiku-4-5", &SIZES));
+    let body = conversation("claude-haiku-4-5", &grown(&[2000; 5]));
+    proxy.post(&[class("compaction")], &body);
+    let fork = ("x-claude-code-agent-type", "fork");
+    proxy.post(&[class("main"), fork], &body);
+    proxy.count_tokens(&body);
+    proxy.post(&[class("main")], &body);
     let keeps: Vec<(u64, u64)> = mock
         .seen()
         .iter()
@@ -1203,36 +1029,23 @@ fn compaction_and_forks_keep_the_boundary() {
     // Boundary 4 until the main conversation moves it to 11 - 2 = 9.
     assert_eq!(keeps, [(3, 2), (8, 7), (8, 7), (8, 7), (8, 2)]);
     proxy.stop();
-    let roles: Vec<Value> = ledger(dir.path())
-        .iter()
-        .map(|r| r["role"].clone())
-        .collect();
-    assert_eq!(
-        roles,
-        ["mover", "read-only", "read-only", "read-only", "mover"]
-    );
+    let roles = "mover read-only read-only read-only mover";
+    assert_eq!(column(dir.path(), "role"), words(roles));
 }
 
 #[test]
 fn state_survives_restart() {
     let dir = tempdir().unwrap();
     let mock = Mock::start(|_| ok_json());
-    let sizes = [2000, 2000, 2000, 2000, 40, 40];
-    let proxy = Proxy::start(dir.path(), &mock.url(), &CLEARING);
-    proxy.post(&[], &conversation("claude-haiku-4-5", &sizes));
+    let proxy = Proxy::start(dir.path(), &mock.url(), CLEARING);
+    proxy.post(&[], &conversation("claude-haiku-4-5", &SIZES));
     proxy.stop();
-    let state: Value = serde_json::from_slice(
-        &fs::read(dir.path().join(".justless/proxy/conversations.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        state["conversations"]["toolu_00"]["boundaries"],
-        json!(["toolu_03"])
-    );
-    let proxy = Proxy::start(dir.path(), &mock.url(), &CLEARING);
-    let mut grown = sizes.to_vec();
-    grown.push(40);
-    proxy.post(&[], &conversation("claude-haiku-4-5", &grown));
+    let state = fs::read(dir.path().join(".justless/proxy/conversations.json")).unwrap();
+    let state: Value = serde_json::from_slice(&state).unwrap();
+    let boundaries = &state["conversations"]["toolu_00"]["boundaries"];
+    assert_eq!(boundaries, &json!(["toolu_03"]));
+    let proxy = Proxy::start(dir.path(), &mock.url(), CLEARING);
+    proxy.post(&[], &conversation("claude-haiku-4-5", &grown(&[40])));
     let edit = our_edit(&mock.seen()[1].json()).unwrap();
     assert_eq!(trigger_keep(&edit), (4, 3));
     proxy.stop();
@@ -1242,11 +1055,13 @@ fn state_survives_restart() {
     assert_eq!(records[1]["boundary"], 4);
 }
 
+/// The proxy retries without its edit only when the API refuses that edit; any
+/// other 400 reaches the client as it was, with no retry.
 #[test]
 fn falls_back_only_when_the_edit_is_rejected() {
     let (dir, mock, proxy) = session(
         |request| {
-            if String::from_utf8_lossy(&request.body).contains("clear_tool_uses_20250919") {
+            if text(&request.body).contains("clear_tool_uses_20250919") {
                 Reply::Json(
                     400,
                     json!({"type":"error","error":{"type":"invalid_request_error",
@@ -1256,10 +1071,9 @@ fn falls_back_only_when_the_edit_is_rejected() {
                 ok_json()
             }
         },
-        &CLEARING,
+        CLEARING,
     );
-    let sizes = [2000, 2000, 2000, 2000, 40, 40];
-    let body = conversation("claude-x-1", &sizes);
+    let body = conversation("claude-x-1", &SIZES);
     let response = proxy.post(&[], &body);
     assert_eq!(response.status(), 200);
     let seen = mock.seen();
@@ -1267,31 +1081,19 @@ fn falls_back_only_when_the_edit_is_rejected() {
     assert!(our_edit(&seen[0].json()).is_some());
     assert_eq!(seen[1].body, serde_json::to_vec(&body).unwrap());
     assert!(seen[1].header("anthropic-beta").is_none());
-    let mut grown = sizes.to_vec();
-    grown.push(2000);
-    proxy.post(&[], &conversation("claude-x-1", &grown));
+    proxy.post(&[], &conversation("claude-x-1", &grown(&[2000])));
     let seen = mock.seen();
     assert_eq!(seen.len(), 3);
     assert!(our_edit(&seen[2].json()).is_none());
     proxy.stop();
-    let modes: Vec<Value> = ledger(dir.path())
-        .iter()
-        .map(|r| r["mode"].clone())
-        .collect();
-    assert_eq!(modes, ["fallback", "refused"]);
+    assert_eq!(column(dir.path(), "mode"), ["fallback", "refused"]);
     let log = fs::read_to_string(dir.path().join(".justless/proxy/proxy.log")).unwrap();
-    assert!(log.contains("fallback: claude-x-1 answered 400"), "{log}");
-}
+    contains(&log, "fallback: claude-x-1 answered 400");
 
-#[test]
-fn unrelated_400_is_relayed_without_retry() {
     let error = json!({"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1000001 tokens > 1000000 maximum"}});
     let reply = error.clone();
-    let (_dir, mock, proxy) = session(move |_| Reply::Json(400, reply.clone()), &CLEARING);
-    let response = proxy.post(
-        &[],
-        &conversation("claude-haiku-4-5", &[2000, 2000, 2000, 2000, 40, 40]),
-    );
+    let (_dir, mock, proxy) = session(move |_| Reply::Json(400, reply.clone()), CLEARING);
+    let response = proxy.post(&[], &conversation("claude-haiku-4-5", &SIZES));
     assert_eq!(response.status(), 400);
     assert_eq!(response.body, serde_json::to_vec(&error).unwrap());
     let seen = mock.seen();
@@ -1323,6 +1125,11 @@ fn results_request(results: Vec<(String, Value, bool)>) -> Value {
     json!({"model":"claude-opus-5-5","max_tokens":1024,"messages":messages})
 }
 
+/// `justless recall` with these space-separated arguments.
+fn recall(root: &Path, args: &str) -> Output {
+    justless(root, &words(&format!("recall {args}")))
+}
+
 #[test]
 fn archives_only_accepted_requests_and_recalls_exactly() {
     let mut calls = 0;
@@ -1338,167 +1145,100 @@ fn archives_only_accepted_requests_and_recalls_exactly() {
                 ok_json()
             }
         },
-        &[],
+        "",
     );
-    let text = "exact \u{1f980} output\r\n  with spacing\n".repeat(50);
+    let output = "exact \u{1f980} output\r\n  with spacing\n".repeat(50);
     let blocks =
         json!([{"type":"text","text":"first block"},{"type":"text","text":"second block"}]);
     let image = json!([{"type":"text","text":"screen:"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo".repeat(100)}}]);
+    let failed = json!("error: test failed");
     let first = vec![
-        ("toolu_01Bash".to_string(), json!(text), false),
+        ("toolu_01Bash".to_string(), json!(output), false),
         ("toolu_02Read".to_string(), blocks.clone(), false),
         ("toolu_03Shot".to_string(), image.clone(), false),
-        (
-            "toolu_04Bash".to_string(),
-            json!("error: test failed"),
-            true,
-        ),
+        ("toolu_04Bash".to_string(), failed, true),
     ];
-    assert_eq!(
-        proxy.post(&[], &results_request(first.clone())).status(),
-        401
-    );
-    assert_eq!(
-        proxy.post(&[], &results_request(first.clone())).status(),
-        200
-    );
+    let status = |results| proxy.post(&[], &results_request(results)).status();
+    assert_eq!(status(first.clone()), 401);
+    assert_eq!(status(first.clone()), 200);
     thread::sleep(Duration::from_millis(20));
     let mut second = first.clone();
     second[0].1 = json!("changed later by the client");
     second.push(("toolu_05Read".to_string(), json!("newest result"), false));
-    proxy.post(&[], &results_request(second));
+    status(second);
     proxy.stop();
-    let records = ledger(dir.path());
-    assert_eq!(records[0]["archived"], 0);
-    assert_eq!(records[1]["archived"], 4);
-    assert_eq!(records[2]["archived"], 1);
-    let index = dir.path().join(".justless/tool-uses");
+    let root = dir.path();
+    assert_eq!(column(root, "archived"), [0, 4, 1]);
+    let index = root.join(".justless/tool-uses");
     let digest = format!("{:x}", Sha256::digest(b"toolu_01Bash"));
     assert!(index.join(format!("{digest}.json")).is_file());
     // The first copy wins, byte for byte.
-    let recalled = justless(dir.path(), &["recall", "--tool-use", "toolu_01Bash"]);
+    let recalled = recall(root, "--tool-use toolu_01Bash");
     assert!(recalled.status.success());
-    assert_eq!(recalled.stdout, text.as_bytes());
-    let typed = justless(
-        dir.path(),
-        &["recall", "--tool-use", "toolu_02Read", "--json"],
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&typed.stdout).unwrap(),
-        blocks
-    );
-    assert_eq!(
-        justless(dir.path(), &["recall", "--tool-use", "toolu_02Read"]).stdout,
-        b"first block\nsecond block"
-    );
-    let shot =
-        String::from_utf8(justless(dir.path(), &["recall", "--tool-use", "toolu_03Shot"]).stdout)
-            .unwrap();
+    assert_eq!(recalled.stdout, output.as_bytes());
+    let json = |output: Output| serde_json::from_slice::<Value>(&output.stdout).unwrap();
+    assert_eq!(json(recall(root, "--tool-use toolu_02Read --json")), blocks);
+    let read = recall(root, "--tool-use toolu_02Read").stdout;
+    assert_eq!(read, b"first block\nsecond block");
+    let shot = text(&recall(root, "--tool-use toolu_03Shot").stdout);
     assert_eq!(shot, "screen:\n[image/png · 1.1 KB base64 · use --json]");
-    let image_json = justless(
-        dir.path(),
-        &["recall", "--tool-use", "toolu_03Shot", "--json"],
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&image_json.stdout).unwrap(),
-        image
-    );
+    assert_eq!(json(recall(root, "--tool-use toolu_03Shot --json")), image);
     // Listing: newest first, full IDs, filter and limit.
-    let list = String::from_utf8(justless(dir.path(), &["recall", "--list"]).stdout).unwrap();
+    let list = text(&recall(root, "--list").stdout);
     let lines: Vec<&str> = list.lines().collect();
-    assert!(
-        lines[0].starts_with("toolu_05Read  Read  src/capture_4.rs  15 B  "),
-        "{list}"
-    );
-    assert!(
-        list.contains("toolu_04Bash  Bash  cargo test --locked -p crate3  "),
-        "{list}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("toolu_04Bash") && l.ends_with("  error"))
-    );
-    assert_eq!(
-        lines.last().unwrap(),
-        &"5 archived tool results. Print one with `justless recall --tool-use ID`."
-    );
-    let cargo = String::from_utf8(
-        justless(dir.path(), &["recall", "--list", "CARGO", "--limit", "1"]).stdout,
-    )
-    .unwrap();
+    let newest = "toolu_05Read  Read  src/capture_4.rs  15 B  ";
+    assert!(lines[0].starts_with(newest), "{list}");
+    contains(&list, "toolu_04Bash  Bash  cargo test --locked -p crate3  ");
+    let error = |l: &&str| l.starts_with("toolu_04Bash") && l.ends_with("  error");
+    assert!(lines.iter().any(error), "{list}");
+    let footer = "5 archived tool results. Print one with `justless recall --tool-use ID`.";
+    assert_eq!(lines.last().unwrap(), &footer);
+    let cargo = text(&recall(root, "--list CARGO --limit 1").stdout);
     let rows: Vec<&str> = cargo.lines().collect();
     assert_eq!(rows.len(), 2, "{cargo}");
-    assert!(
-        rows[0].contains("Bash  cargo test --locked -p crate"),
-        "{cargo}"
-    );
+    contains(rows[0], "Bash  cargo test --locked -p crate");
     assert_eq!(
         rows[1],
         "2 of 5 archived tool results match \"CARGO\", newest 1 shown. Print one with `justless recall --tool-use ID`."
     );
     // Invalid and unknown IDs.
-    let invalid = justless(dir.path(), &["recall", "--tool-use", "../x"]);
-    assert_eq!(invalid.status.code(), Some(2));
-    let unknown = justless(dir.path(), &["recall", "--tool-use", "toolu_missing"]);
-    assert_eq!(unknown.status.code(), Some(2));
-    assert_eq!(
-        String::from_utf8_lossy(&unknown.stderr),
-        "justless: no archived tool result for toolu_missing; try `justless recall --list TEXT`\n"
+    for args in [
+        "--tool-use ../x",
+        "--tool-use toolu_missing",
+        "--list x --json",
+        "",
+        "toolu_missing",
+        "../x",
+        "toolu_01Bash --json --grep x",
+    ] {
+        assert_eq!(recall(root, args).status.code(), Some(2), "{args}");
+    }
+    let unknown = text(&recall(root, "--tool-use toolu_missing").stderr);
+    let hint =
+        "justless: no archived tool result for toolu_missing; try `justless recall --list TEXT`\n";
+    assert_eq!(unknown, hint);
+    contains(
+        &text(&recall(root, "toolu_missing").stderr),
+        "recall --list TEXT",
     );
-    assert_eq!(
-        justless(dir.path(), &["recall", "--list", "x", "--json"])
-            .status
-            .code(),
-        Some(2)
-    );
-    assert_eq!(justless(dir.path(), &["recall"]).status.code(), Some(2));
     // The positional form reaches the proxy's archive too, with the same text.
-    let positional = justless(dir.path(), &["recall", "toolu_01Bash"]);
+    let positional = recall(root, "toolu_01Bash");
     assert!(positional.status.success());
-    assert_eq!(positional.stdout, text.as_bytes());
-    let missing = justless(dir.path(), &["recall", "toolu_missing"]);
-    assert_eq!(missing.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("recall --list TEXT"));
-    let bad = justless(dir.path(), &["recall", "../x"]);
-    assert_eq!(bad.status.code(), Some(2));
+    assert_eq!(positional.stdout, output.as_bytes());
     // A line range is exact bytes; --grep prints numbered matching lines.
-    let range = justless(
-        dir.path(),
-        &["recall", "toolu_01Bash", "--from", "2", "--to", "3"],
-    );
+    let range = recall(root, "toolu_01Bash --from 2 --to 3").stdout;
+    assert_eq!(range, b"  with spacing\nexact \xf0\x9f\xa6\x80 output\r\n");
+    let grep = text(&recall(root, "--tool-use toolu_01Bash --grep spacing --limit 2").stdout);
     assert_eq!(
-        range.stdout,
-        b"  with spacing\nexact \xf0\x9f\xa6\x80 output\r\n"
+        grep,
+        "2:   with spacing\n4:   with spacing\n[2 of 50 matching lines shown; --limit 50 shows all]\n"
     );
-    let grep = justless(
-        dir.path(),
-        &[
-            "recall",
-            "--tool-use",
-            "toolu_01Bash",
-            "--grep",
-            "spacing",
-            "--limit",
-            "2",
-        ],
-    );
-    assert_eq!(
-        String::from_utf8(grep.stdout).unwrap(),
-        "2:   with spacing\n4:   with spacing\n\
-         [2 of 50 matching lines shown; --limit 50 shows all]\n"
-    );
-    let none = justless(dir.path(), &["recall", "toolu_01Bash", "--grep", "absent"]);
-    assert_eq!(none.stdout, b"No line matches \"absent\".\n");
-    let conflict = justless(
-        dir.path(),
-        &["recall", "toolu_01Bash", "--json", "--grep", "x"],
-    );
-    assert_eq!(conflict.status.code(), Some(2));
+    let none = recall(root, "toolu_01Bash --grep absent").stdout;
+    assert_eq!(none, b"No line matches \"absent\".\n");
     // MCP clients reach the same archive through the recall tool.
     let mut mcp = Command::new(BIN)
-        .args(["mcp", "--root", dir.path().to_str().unwrap()])
-        .current_dir(dir.path())
+        .args(["mcp", "--root", root.to_str().unwrap()])
+        .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1514,84 +1254,52 @@ fn archives_only_accepted_requests_and_recalls_exactly() {
             writeln!(stdin, "{line}").unwrap();
         }
     }
-    let output = mcp.wait_with_output().unwrap();
-    let reply: Value = String::from_utf8(output.stdout)
-        .unwrap()
+    let output = text(&mcp.wait_with_output().unwrap().stdout);
+    let reply: Value = output
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .find(|message| message["id"] == 2)
         .unwrap();
     assert_eq!(reply["result"]["isError"], false, "{reply}");
-    assert_eq!(
-        reply["result"]["content"][0]["text"],
-        "first block\nsecond block"
-    );
+    let content = &reply["result"]["content"][0]["text"];
+    assert_eq!(content, "first block\nsecond block");
 }
 
 #[test]
 fn list_matches_patterns_and_read_ranges() {
-    let (dir, _mock, proxy) = session(|_| ok_json(), &[]);
-    let calls = [
-        (
-            "toolu_g1",
-            "Grep",
-            json!({"pattern":"parse_trade","path":"/repo/src","glob":"*.rs"}),
-        ),
-        (
-            "toolu_g2",
-            "Glob",
-            json!({"pattern":"**/*_test.rs","path":"/repo"}),
-        ),
-        (
-            "toolu_r1",
-            "Read",
-            json!({"file_path":"/repo/src/lib.rs","offset":1,"limit":50}),
-        ),
-        (
-            "toolu_r2",
-            "Read",
-            json!({"file_path":"/repo/src/lib.rs","offset":900}),
-        ),
-        (
-            "toolu_w1",
-            "WebSearch",
-            json!({"query":"rust floor_char_boundary"}),
-        ),
-    ];
+    let (dir, _mock, proxy) = session(|_| ok_json(), "");
+    let calls = json!([
+        ["toolu_g1", "Grep", {"pattern":"parse_trade","path":"/repo/src","glob":"*.rs"}],
+        ["toolu_g2", "Glob", {"pattern":"**/*_test.rs","path":"/repo"}],
+        ["toolu_r1", "Read", {"file_path":"/repo/src/lib.rs","offset":1,"limit":50}],
+        ["toolu_r2", "Read", {"file_path":"/repo/src/lib.rs","offset":900}],
+        ["toolu_w1", "WebSearch", {"query":"rust floor_char_boundary"}]
+    ]);
     let mut messages = vec![json!({"role":"user","content":"go"})];
-    for (id, name, input) in &calls {
+    for call in calls.as_array().unwrap() {
+        let (id, name, input) = (&call[0], &call[1], &call[2]);
         messages.push(json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":name,"input":input}]}));
         messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"result"}]}));
     }
     let body = json!({"model":"claude-opus-5-5","max_tokens":1024,"messages":messages});
     assert_eq!(proxy.post(&[], &body).status(), 200);
     proxy.stop();
-    let list = |text: &str| {
-        String::from_utf8(justless(dir.path(), &["recall", "--list", text]).stdout).unwrap()
-    };
-    let grep = list("parse_trade");
-    assert!(
-        grep.contains("toolu_g1  Grep  parse_trade in /repo/src  "),
-        "{grep}"
-    );
-    let glob = list("_test");
-    assert!(
-        glob.contains("toolu_g2  Glob  **/*_test.rs in /repo  "),
-        "{glob}"
-    );
-    let reads = list("lib.rs");
-    assert!(
-        reads.contains("toolu_r1  Read  /repo/src/lib.rs:1+50  "),
-        "{reads}"
-    );
-    assert!(
-        reads.contains("toolu_r2  Read  /repo/src/lib.rs:900  "),
-        "{reads}"
-    );
+    let list = |pattern: &str| text(&recall(dir.path(), &format!("--list {pattern}")).stdout);
+    for (pattern, row) in [
+        ("parse_trade", "toolu_g1  Grep  parse_trade in /repo/src  "),
+        ("_test", "toolu_g2  Glob  **/*_test.rs in /repo  "),
+        ("lib.rs", "toolu_r1  Read  /repo/src/lib.rs:1+50  "),
+        ("lib.rs", "toolu_r2  Read  /repo/src/lib.rs:900  "),
+        (
+            "floor_char",
+            "toolu_w1  WebSearch  rust floor_char_boundary  ",
+        ),
+    ] {
+        contains(&list(pattern), row);
+    }
     // TEXT also matches the rest of the input, such as a Grep glob.
     let by_glob = list("*.rs\"");
     assert!(by_glob.starts_with("toolu_g1  "), "{by_glob}");
-    assert!(list("floor_char").contains("toolu_w1  WebSearch  rust floor_char_boundary  "));
 }
 
 #[test]
@@ -1611,99 +1319,86 @@ fn records_stats_from_api_usage() {
         },
     ]
     .into_iter();
-    let (dir, _mock, proxy) = session(move |_| replies.next().unwrap_or_else(ok_json), &CLEARING);
-    let sizes = [2000, 2000, 2000, 2000, 40, 40];
-    proxy.post(&[], &conversation("claude-haiku-4-5", &sizes));
+    let (dir, _mock, proxy) = session(move |_| replies.next().unwrap_or_else(ok_json), CLEARING);
+    proxy.post(&[], &conversation("claude-haiku-4-5", &SIZES));
     // The next call repeats cleared call 0 (same tool and input, new ID).
-    let mut repeat = conversation("claude-haiku-4-5", &sizes);
+    let mut repeat = conversation("claude-haiku-4-5", &SIZES);
     let messages = repeat["messages"].as_array_mut().unwrap();
     messages.push(json!({"role":"assistant","content":[{"type":"tool_use","id":"toolu_again","name":"Read","input":tool_input(0)}]}));
     messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_again","content":"x"}]}));
     proxy.post(&[], &repeat);
     proxy.post(&[], &repeat);
     proxy.stop();
-    let records = ledger(dir.path());
-    assert_eq!(records[0]["move"], "payback");
-    assert_eq!(records[0]["rewrite_api"], 1500);
-    assert_eq!(records[0]["mismatch"], false);
-    assert_eq!(records[1]["mismatch"], true);
-    assert_eq!(records[1]["repeats"], 1);
-    assert_eq!(records[2]["observed"], false);
-    let full = justless(dir.path(), &["recall", "--tool-use", "toolu_00"]);
-    let part = justless(
-        dir.path(),
-        &["recall", "toolu_01", "--from", "1", "--to", "1"],
+    let root = dir.path();
+    let records = ledger(root);
+    let first = fields(&records[0], "move rewrite_api mismatch");
+    assert_eq!(first, [json!("payback"), json!(1500), json!(false)]);
+    assert_eq!(
+        fields(&records[1], "mismatch repeats"),
+        [json!(true), json!(1)]
     );
+    assert_eq!(records[2]["observed"], false);
+    let full = recall(root, "--tool-use toolu_00");
+    let part = recall(root, "toolu_01 --from 1 --to 1");
     assert!(full.status.success() && part.status.success());
     let recalled = (full.stdout.len() + part.stdout.len()) as u64;
     assert!(recalled > 0);
-    let stats: Value =
-        serde_json::from_slice(&justless(dir.path(), &["stats", "--json"]).stdout).unwrap();
-    let proxy_stats = &stats["proxy"];
-    assert_eq!(proxy_stats["requests"], 3);
-    assert_eq!(proxy_stats["cleared_requests"], 3);
-    assert_eq!(proxy_stats["moves"], json!({"cold":0,"payback":1}));
-    assert_eq!(proxy_stats["newly_cleared"]["results"], 4);
-    assert_eq!(
-        proxy_stats["newly_cleared"]["bytes"],
-        4 * result_bytes(2000)
-    );
-    assert_eq!(
-        proxy_stats["newly_cleared"]["est_tokens"],
-        4 * result_bytes(2000).div_ceil(4)
-    );
-    assert_eq!(proxy_stats["recalled_bytes"], recalled);
-    assert_eq!(
-        proxy_stats["net_cleared_bytes"],
-        (4 * result_bytes(2000)) as i64 - recalled as i64
-    );
-    assert_eq!(proxy_stats["warm_rewrite_tokens"], 1500);
-    assert_eq!(proxy_stats["tokens_not_sent"], 2010 + 1500);
-    assert_eq!(proxy_stats["mismatches"], 1);
-    assert_eq!(proxy_stats["repeats"], 1);
-    assert_eq!(proxy_stats["unobserved"], 1);
-    assert_eq!(proxy_stats["archived_results"], 7);
-    assert_eq!(proxy_stats["token_estimate"], "UTF-8 bytes / 4");
+    let report = stats(root);
+    let proxy_stats = &report["proxy"];
+    let cleared = 4 * result_bytes(2000);
+    for (key, expected) in [
+        ("requests", json!(3)),
+        ("cleared_requests", json!(3)),
+        ("moves", json!({"cold":0,"payback":1})),
+        ("recalled_bytes", json!(recalled)),
+        ("net_cleared_bytes", json!(cleared as i64 - recalled as i64)),
+        ("warm_rewrite_tokens", json!(1500)),
+        ("tokens_not_sent", json!(2010 + 1500)),
+        ("mismatches", json!(1)),
+        ("repeats", json!(1)),
+        ("unobserved", json!(1)),
+        ("archived_results", json!(7)),
+        ("token_estimate", json!("UTF-8 bytes / 4")),
+    ] {
+        assert_eq!(proxy_stats[key], expected, "{key}");
+    }
+    let newly = &proxy_stats["newly_cleared"];
+    let expected = [
+        json!(4),
+        json!(cleared),
+        json!(4 * result_bytes(2000).div_ceil(4)),
+    ];
+    assert_eq!(fields(newly, "results bytes est_tokens"), expected);
     assert_eq!(proxy_stats["usage"]["cache_write"], 1500);
-    let text = String::from_utf8(justless(dir.path(), &["stats"]).stdout).unwrap();
-    assert!(text.contains("No captured runs yet"), "{text}");
-    assert!(
-        text.contains("Request boundary (justless proxy), last 7 day(s)"),
-        "{text}"
-    );
-    assert!(text.contains("3 requests · clearing requested on 3 · 0 conversations left to Claude Code's own clearing · 0 refusals"), "{text}");
-    assert!(text.contains("4 old tool results marked for clearing (8.1 KB, about 2.07K tokens estimated) in 1 clear: 1 on a warm cache (1.5K tokens written to cache on that request, reported by the API)"), "{text}");
-    assert!(
-        text.contains("3.51K input tokens not sent to the model"),
-        "{text}"
-    );
-    assert!(
-        text.contains("1 read repeated a cleared call with no file change in between"),
-        "{text}"
-    );
-    assert!(text.contains("7 tool results archived"), "{text}");
+    let summary = text(&justless(root, &["stats"]).stdout);
+    for line in [
+        "No captured runs yet",
+        "Request boundary (justless proxy), last 7 day(s)",
+        "3 requests · clearing requested on 3 · 0 conversations left to Claude Code's own clearing · 0 refusals",
+        "4 old tool results marked for clearing (8.1 KB, about 2.07K tokens estimated) in 1 clear: 1 on a warm cache (1.5K tokens written to cache on that request, reported by the API)",
+        "3.51K input tokens not sent to the model",
+        "1 read repeated a cleared call with no file change in between",
+        "7 tool results archived",
+    ] {
+        contains(&summary, line);
+    }
     let empty = tempdir().unwrap();
-    let none: Value =
-        serde_json::from_slice(&justless(empty.path(), &["stats", "--json"]).stdout).unwrap();
-    assert_eq!(none["proxy"], Value::Null);
+    assert_eq!(stats(empty.path())["proxy"], Value::Null);
 }
 
 #[test]
 fn never_persists_credentials() {
     let (dir, _mock, proxy) = session(
         |_| stream(events("claude-haiku-4-5", Some((4, 2000)), 10)),
-        &CLEARING,
+        CLEARING,
     );
-    let body = conversation("claude-haiku-4-5", &[2000, 2000, 2000, 2000, 40, 40]);
-    let response = proxy.post(
-        &[
-            ("x-api-key", "sk-ant-test-SECRET1"),
-            ("authorization", "Bearer SECRET2"),
-            ("x-claude-code-session-id", "s1"),
-        ],
-        &body,
-    );
-    assert_eq!(response.status(), 200);
+    let headers = [
+        ("x-api-key", "sk-ant-test-SECRET1"),
+        ("authorization", "Bearer SECRET2"),
+        ("x-claude-code-session-id", "s1"),
+    ];
+    let body = conversation("claude-haiku-4-5", &SIZES);
+    assert_eq!(proxy.post(&headers, &body).status(), 200);
     proxy.stop();
     fn walk(path: &Path, files: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(path).unwrap() {
@@ -1720,13 +1415,9 @@ fn never_persists_credentials() {
     assert!(files.iter().any(|f| f.ends_with("proxy/proxy.log")));
     assert!(files.len() > 5, "{files:?}");
     for file in files {
-        let bytes = fs::read(&file).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(
-            !text.contains("SECRET1") && !text.contains("SECRET2"),
-            "{}",
-            file.display()
-        );
+        let text = text(&fs::read(&file).unwrap());
+        let leaked = text.contains("SECRET1") || text.contains("SECRET2");
+        assert!(!leaked, "{}", file.display());
     }
 }
 
@@ -1746,20 +1437,15 @@ fn concurrent_streams() {
             gate: shared.lock().unwrap().pop(),
             piece: 64,
         },
-        &[],
+        "",
     );
     let port = proxy.port;
     let clients: Vec<_> = (0..2)
         .map(|_| {
             thread::spawn(move || {
                 let body = serde_json::to_vec(&conversation("claude-opus-5-5", &[50])).unwrap();
-                send(
-                    port,
-                    "POST",
-                    "/v1/messages",
-                    &[("content-type", "application/json")],
-                    &body,
-                )
+                let json = [("content-type", "application/json")];
+                send(port, "POST", "/v1/messages", &json, &body)
             })
         })
         .collect();
@@ -1769,10 +1455,8 @@ fn concurrent_streams() {
     }
     for client in clients {
         let response = client.join().unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&response.body),
-            events("claude-opus-5-5", None, 0).concat()
-        );
+        let expected = events("claude-opus-5-5", None, 0).concat();
+        assert_eq!(text(&response.body), expected);
     }
 }
 
@@ -1780,27 +1464,17 @@ fn concurrent_streams() {
 fn verbose_lines_name_the_decision_without_values() {
     let (_dir, _mock, proxy) = session(
         |_| stream(events("claude-haiku-4-5", Some((4, 2010)), 1500)),
-        &[&CLEARING[..], &["--verbose"]].concat(),
+        &format!("{CLEARING} --verbose"),
     );
-    proxy.post(
-        &[
-            ("x-api-key", "sk-ant-test-SECRET1"),
-            ("x-claude-code-request-class", "main"),
-        ],
-        &conversation("claude-haiku-4-5", &[2000, 2000, 2000, 2000, 40, 40]),
-    );
-    let output = proxy.stop();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.starts_with(
-            "200 messages claude-haiku-4-5 main · 6 uses · cleared 4 (moved, warm, C/M "
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("API cleared 4 calls, 2,010 tokens"),
-        "{stderr}"
-    );
+    let headers = [
+        ("x-api-key", "sk-ant-test-SECRET1"),
+        ("x-claude-code-request-class", "main"),
+    ];
+    proxy.post(&headers, &conversation("claude-haiku-4-5", &SIZES));
+    let stderr = text(&proxy.stop().stderr);
+    let decision = "200 messages claude-haiku-4-5 main · 6 uses · cleared 4 (moved, warm, C/M ";
+    assert!(stderr.starts_with(decision), "{stderr}");
+    contains(&stderr, "API cleared 4 calls, 2,010 tokens");
     assert!(!stderr.contains("SECRET1"));
 }
 
@@ -1823,13 +1497,13 @@ fn wrap_command(root: &Path, bin: &Path, args: &[&str]) -> Command {
         .args(["--root", root.to_str().unwrap(), "wrap"])
         .args(args)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("HOME", root.join("home"))
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("JUSTLESS_PROXY")
-        .env_remove("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
-        .env_remove("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING")
-        .env_remove("CLAUDE_CODE_GATEWAY_HINT_HEADERS");
+        .env("HOME", root.join("home"));
     for name in [
+        "CLAUDE_CONFIG_DIR",
+        "JUSTLESS_PROXY",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+        "CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING",
+        "CLAUDE_CODE_GATEWAY_HINT_HEADERS",
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
@@ -1838,54 +1512,53 @@ fn wrap_command(root: &Path, bin: &Path, args: &[&str]) -> Command {
     ] {
         command.env_remove(name);
     }
-    for name in PROXY_VARS {
+    for name in words(PROXY_VARS) {
         command.env_remove(name);
     }
     command
+}
+
+/// A fake `claude` that writes each argument as `arg=VALUE`, then the environment
+/// variables `pattern` matches, to `root/record`, and exits with `status`.
+fn recording_claude(root: &Path, pattern: &str, status: u8) -> (PathBuf, PathBuf) {
+    let record = root.join("record");
+    let script = format!(
+        "{{ for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done; env | grep -E '{pattern}'; }} > '{}'\nexit {status}",
+        record.display()
+    );
+    (fake_claude(root, &script), record)
+}
+
+fn recorded_args(record: &str) -> Vec<&str> {
+    record
+        .lines()
+        .filter_map(|l| l.strip_prefix("arg="))
+        .collect()
 }
 
 #[test]
 fn wrap_launches_claude_with_proxy_env() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    let record = root.join("record");
-    let bin = fake_claude(
-        root,
-        &format!(
-            "{{ for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done; env | grep -E '^(ANTHROPIC_BASE_URL|JUSTLESS_PROXY|CLAUDE_CODE_)'; }} > '{}'\nexit 7",
-            record.display()
-        ),
-    );
+    let pattern = "^(ANTHROPIC_BASE_URL|JUSTLESS_PROXY|CLAUDE_CODE_)";
+    let (bin, record) = recording_claude(root, pattern, 7);
     let mock = Mock::start(|_| ok_json());
     fs::create_dir(root.join(".claude")).unwrap();
-    fs::write(
-        root.join(".claude/settings.json"),
-        r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#,
-    )
-    .unwrap();
-    let output = wrap_command(
-        root,
-        &bin,
-        &[
-            "--keep", "5", "claude", "--resume", "abc", "-p", "x y", "--help",
-        ],
-    )
-    .env("ANTHROPIC_BASE_URL", mock.url())
-    .env("CLAUDE_CODE_GATEWAY_HINT_HEADERS", "0")
-    .output()
-    .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(7),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let settings = r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#;
+    fs::write(root.join(".claude/settings.json"), settings).unwrap();
+    let args = [
+        "--keep", "5", "claude", "--resume", "abc", "-p", "x y", "--help",
+    ];
+    let output = wrap_command(root, &bin, &args)
+        .env("ANTHROPIC_BASE_URL", mock.url())
+        .env("CLAUDE_CODE_GATEWAY_HINT_HEADERS", "0")
+        .output()
+        .unwrap();
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
     let recorded = fs::read_to_string(&record).unwrap();
-    let args: Vec<&str> = recorded
-        .lines()
-        .filter_map(|l| l.strip_prefix("arg="))
-        .collect();
-    assert_eq!(args, ["--resume", "abc", "-p", "x y", "--help"]);
+    let expected = ["--resume", "abc", "-p", "x y", "--help"];
+    assert_eq!(recorded_args(&recorded), expected);
     let env: Vec<&str> = recorded
         .lines()
         .filter(|l| !l.starts_with("arg="))
@@ -1895,53 +1568,36 @@ fn wrap_launches_claude_with_proxy_env() {
         .find_map(|l| l.strip_prefix("ANTHROPIC_BASE_URL="))
         .unwrap();
     let port = base.strip_prefix("http://127.0.0.1:").unwrap();
-    assert!(
-        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
-        "{base}"
-    );
+    let numeric = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    assert!(numeric, "{base}");
     assert!(env.contains(&"JUSTLESS_PROXY=1"));
     assert!(env.contains(&"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1"));
     // An inherited value is kept.
     assert!(env.contains(&"CLAUDE_CODE_GATEWAY_HINT_HEADERS=0"));
-    let stderr = String::from_utf8(output.stderr).unwrap();
     let canonical = root.canonicalize().unwrap();
-    assert!(
-        stderr.contains(
-            ".claude/settings.json sets ANTHROPIC_BASE_URL; Claude Code may bypass the proxy."
-        ),
-        "{stderr}"
+    contains(
+        &stderr,
+        ".claude/settings.json sets ANTHROPIC_BASE_URL; Claude Code may bypass the proxy.",
     );
     let banner = format!(
         " → {} · old tool results cleared from 100K tokens · archive {}/.justless · justless stats shows what changed",
         mock.url(),
         canonical.display()
     );
-    assert!(
-        stderr.contains("justless: Claude Code → 127.0.0.1:"),
-        "{stderr}"
-    );
-    assert!(stderr.contains(&banner), "{stderr}");
-    assert!(
-        stderr.contains("justless: the proxy received no requests."),
-        "{stderr}"
-    );
+    contains(&stderr, "justless: Claude Code → 127.0.0.1:");
+    contains(&stderr, &banner);
+    contains(&stderr, "justless: the proxy received no requests.");
 }
 
 #[test]
 fn wrap_passes_every_later_argument_and_exempts_loopback_from_proxies() {
     let dir = tempdir().unwrap();
     let root = dir.path();
-    let record = root.join("record");
-    let bin = fake_claude(
-        root,
-        &format!(
-            "{{ for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done; env | grep -E '^(NO_PROXY|no_proxy)='; }} > '{}'\nexit 0",
-            record.display()
-        ),
-    );
+    let (bin, record) = recording_claude(root, "^(NO_PROXY|no_proxy)=", 0);
     let mock = Mock::start(|_| ok_json());
-    let recorded = |args: &[&str], proxied: bool| {
-        let mut command = wrap_command(root, &bin, args);
+    let recorded = |args: &str, proxied: bool| {
+        let args = words(args);
+        let mut command = wrap_command(root, &bin, &args);
         command
             .env("ANTHROPIC_BASE_URL", mock.url())
             .env_remove("NO_PROXY")
@@ -1953,36 +1609,21 @@ fn wrap_passes_every_later_argument_and_exempts_loopback_from_proxies() {
                 .env("no_proxy", "localhost");
         }
         let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "{}", text(&output.stderr));
         fs::read_to_string(&record).unwrap()
     };
-    let args = |text: &str| -> Vec<String> {
-        text.lines()
-            .filter_map(|l| l.strip_prefix("arg=").map(str::to_owned))
-            .collect()
-    };
     // `--` and options Justless also has reach Claude Code unparsed.
-    let plain = recorded(&["claude", "--", "-p", "hi", "--root", "x"], false);
-    assert_eq!(args(&plain), ["--", "-p", "hi", "--root", "x"]);
+    let plain = recorded("claude -- -p hi --root x", false);
+    assert_eq!(recorded_args(&plain), ["--", "-p", "hi", "--root", "x"]);
     assert!(!plain.contains("NO_PROXY"), "{plain}");
-    let proxied = recorded(&["--keep", "4", "claude", "--root", "x"], true);
-    assert_eq!(args(&proxied), ["--root", "x"]);
+    let proxied = recorded("--keep 4 claude --root x", true);
+    assert_eq!(recorded_args(&proxied), ["--root", "x"]);
     let hosts = "corp.example,.internal,localhost,127.0.0.1";
-    assert!(
-        proxied.contains(&format!("NO_PROXY={hosts}\n")),
-        "{proxied}"
-    );
-    assert!(
-        proxied.contains(&format!("no_proxy={hosts}\n")),
-        "{proxied}"
-    );
+    contains(&proxied, &format!("NO_PROXY={hosts}\n"));
+    contains(&proxied, &format!("no_proxy={hosts}\n"));
     let other = wrap_command(root, &bin, &["codex"]).output().unwrap();
     assert_eq!(other.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&other.stderr).contains("wrap launches Claude Code"));
+    contains(&text(&other.stderr), "wrap launches Claude Code");
 }
 
 #[test]
@@ -1990,58 +1631,40 @@ fn wrap_relays_requests_and_summarizes_them() {
     let dir = tempdir().unwrap();
     let root = dir.path();
     let body = root.join("body.json");
-    fs::write(
-        &body,
-        serde_json::to_vec(&conversation(
-            "claude-haiku-4-5",
-            &[2000, 2000, 2000, 2000, 40, 40],
-        ))
-        .unwrap(),
-    )
-    .unwrap();
+    let request = conversation("claude-haiku-4-5", &SIZES);
+    fs::write(&body, serde_json::to_vec(&request).unwrap()).unwrap();
     // The fake Claude Code sends one request through the proxy with curl, which
     // also exercises `Expect: 100-continue` for a large body.
     if Command::new("curl").arg("--version").output().is_err() {
         eprintln!("skipped: curl is not on PATH");
         return;
     }
-    let curl = String::from_utf8(
-        Command::new("sh")
-            .args(["-c", "command -v curl"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let curl = Command::new("sh")
+        .args(["-c", "command -v curl"])
+        .output()
+        .unwrap();
     let bin = fake_claude(
         root,
         &format!(
             "'{}' -s -o /dev/null -H 'content-type: application/json' --data-binary @'{}' \"$ANTHROPIC_BASE_URL/v1/messages\"",
-            curl.trim(),
+            text(&curl.stdout).trim(),
             body.display()
         ),
     );
     let mock = Mock::start(|_| stream(events("claude-haiku-4-5", Some((4, 2010)), 1500)));
-    let mut args = CLEARING.to_vec();
-    args.push("claude");
-    let output = wrap_command(root, &bin, &args)
+    let flags = format!("{CLEARING} claude");
+    let output = wrap_command(root, &bin, &words(&flags))
         .env("ANTHROPIC_BASE_URL", mock.url())
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
     let canonical = root.canonicalize().unwrap();
-    assert!(
-        stderr.ends_with(&format!(
-            "justless: 1 request · 1 clear (0 on an expired cache) · 4 old tool results marked for clearing · 2.01K input tokens not sent to the model · 6 tool results archived in {}/.justless\n",
-            canonical.display()
-        )),
-        "{stderr}"
+    let summary = format!(
+        "justless: 1 request · 1 clear (0 on an expired cache) · 4 old tool results marked for clearing · 2.01K input tokens not sent to the model · 6 tool results archived in {}/.justless\n",
+        canonical.display()
     );
+    assert!(stderr.ends_with(&summary), "{stderr}");
     let seen = mock.seen();
     assert_eq!(seen.len(), 1);
     assert!(our_edit(&seen[0].json()).is_some());
@@ -2081,17 +1704,9 @@ fn wrap_survives_sigint_until_child_exits() {
     unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGINT) };
     let output = child.wait_with_output().unwrap();
     assert!(interrupted.exists(), "the child did not see SIGINT");
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("the proxy received no requests"),
-        "{stderr}"
-    );
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    contains(&stderr, "the proxy received no requests");
 }
 
 #[test]
@@ -2100,49 +1715,35 @@ fn wrap_refuses_unsupported_setups() {
     let root = dir.path();
     let marker = root.join("ran");
     let bin = fake_claude(root, &format!(": > '{}'", marker.display()));
-    for (name, value, message) in [
+    let wrap = |name: &str, value: &str| {
+        let command = &mut wrap_command(root, &bin, &["claude"]);
+        command.env(name, value).output().unwrap()
+    };
+    for (name, message) in [
         (
             "CLAUDE_CODE_USE_BEDROCK",
-            "1",
             "wrap needs the Claude API, but CLAUDE_CODE_USE_BEDROCK is set. Run claude directly.",
         ),
-        (
-            "JUSTLESS_PROXY",
-            "1",
-            "already runs through a Justless proxy",
-        ),
+        ("JUSTLESS_PROXY", "already runs through a Justless proxy"),
     ] {
-        let output = wrap_command(root, &bin, &["claude"])
-            .env(name, value)
-            .output()
-            .unwrap();
+        let output = wrap(name, "1");
         assert_eq!(output.status.code(), Some(2), "{name}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(message),
-            "{name}"
-        );
+        contains(&text(&output.stderr), message);
         assert!(!marker.exists(), "{name}");
     }
     // A falsy provider variable does not refuse.
-    let output = wrap_command(root, &bin, &["claude"])
-        .env("CLAUDE_CODE_USE_VERTEX", "0")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
+    assert!(wrap("CLAUDE_CODE_USE_VERTEX", "0").status.success());
     assert!(marker.exists());
     fs::remove_file(&marker).unwrap();
     let empty = root.join("empty");
     fs::create_dir(&empty).unwrap();
     let missing = wrap_command(root, &empty, &["claude"]).output().unwrap();
     assert_eq!(missing.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("claude is not on PATH"));
-    let betas = wrap_command(root, &bin, &["claude"])
-        .env("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1")
-        .output()
-        .unwrap();
+    contains(&text(&missing.stderr), "claude is not on PATH");
+    let betas = wrap("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1");
     assert!(betas.status.success());
-    assert!(
-        String::from_utf8_lossy(&betas.stderr)
-            .contains("archive only, because CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is set")
+    contains(
+        &text(&betas.stderr),
+        "archive only, because CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is set",
     );
 }
