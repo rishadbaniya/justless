@@ -546,3 +546,41 @@ fn feature_gated_crates_get_syn_errors_reported_not_rejected() {
     );
     has(&text(&rejected.stderr), "unclosed `{`");
 }
+
+/// Claude Code saves a large Bash result to a file and shows the agent its first
+/// 2,000 characters. A read the hook passes through was not shown whole.
+#[test]
+fn a_saved_shell_read_that_passes_through_is_not_recorded_as_shown() {
+    let project = Project::new();
+    let root = project.root();
+    git(&root, &["init", "-q"]);
+    // Thirty lines of top-level code keep the whole read, so the hook passes it on.
+    let source = format!(
+        "{}{}",
+        repeat(
+            60,
+            &format!(
+                "def task_{{i}}(queue):\n{}    return queue\n\n",
+                "    queue.append('a task item that the worker processes in order')\n".repeat(10)
+            ),
+        ),
+        repeat(30, "register(task_{i})\n")
+    );
+    project.write("tasks.py", &source);
+    let session = TempDir::new().unwrap();
+    let saved = session.path().join("tool-results/out.txt");
+    fs::create_dir_all(saved.parent().unwrap()).unwrap();
+    fs::write(&saved, &source).unwrap();
+    let preview: String = source.chars().take(2000).collect();
+    let event = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","cwd":root,
+        "tool_input":{"command":"sed -n '1,900p' tasks.py"},
+        "tool_response":{"stdout":preview,"stderr":"","interrupted":false,"isImage":false,
+        "noOutputExpected":false,"persistedOutputPath":saved,"persistedOutputSize":source.len()}});
+    assert_eq!(
+        project.json_hook(&root, "hook-claude", "after-bash", &event),
+        json!({})
+    );
+    let resume = project.ok(&root, &["resume"]);
+    lacks(&resume, "Read tasks.py");
+    has(&resume, "Outline tasks.py:1-810");
+}

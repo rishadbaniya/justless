@@ -818,7 +818,11 @@ pub(crate) fn claude(
         {
             return Some(other);
         }
-        read.observe(ws, false);
+        // Claude Code shows a result it saved to a file as a preview of its first
+        // characters. The agent did not see the lines whole, so the read is
+        // recorded as an outline of them, which never counts as a repeated read.
+        let saved = input["tool_response"]["persistedOutputPath"].is_string();
+        read.observe(ws, saved);
         return None;
     };
     let mut updated = input["tool_response"].as_object()?.clone();

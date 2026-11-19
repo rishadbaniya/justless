@@ -53,7 +53,7 @@ Details: [Progressive reads and verified edits](docs/reference.md#progressive-re
 - `mask` retires older tool results in an outbound request to `[justless recall ID]` references and `recall` restores them; OpenCode v1 does this automatically.
 - Opt-in `justless wrap claude` runs Claude Code through a local proxy that asks the API to clear old tool results; `justless proxy` serves any Messages client.
 - Claude Code and Codex hooks carry recent run IDs, outcomes and inspected file ranges across compaction within 1,800 bytes, and `resume` prints the same handoff.
-- `resume` lists the files the agent read or outlined, through Justless, the Read hook or shell reads, and marks them `[source changed]` after an edit.
+- `resume` lists the files the agent read or outlined, through Justless, the Read hook or shell reads, and marks them `[source changed]` after an edit; a shell read Claude Code showed only as a preview counts as an outline.
 
 Details: [Recoverable tool history](docs/reference.md#recoverable-tool-history) · [Request-boundary context management](docs/reference.md#request-boundary-context-management)
 
