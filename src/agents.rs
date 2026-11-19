@@ -841,9 +841,10 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     {
         return None;
     }
-    let Some(file) = ws.relative_file(path) else {
+    let Some((ws, file)) = read_file(ws, path) else {
         return outside_read(ws, path, response);
     };
+    let ws = &ws;
     let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
     let budget = ws.settings().ok()?.context_budget;
     let native = result["content"].as_str()?;
@@ -891,6 +892,27 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
         "additionalContext":format!("{context} Expand a row with {justless} expand FILE 'REV#ID', or Read original lines with offset and a limit of at most {READ_WINDOW_LINES}.")}}),
     )
+}
+
+/// The workspace that holds `path` for a Claude Code Read, and the file's path
+/// there. A file in a nested checkout under the root, a directory with its own
+/// `.git` such as a Git worktree, a submodule or a nested repository, belongs to
+/// the nearest one, the root a `justless` started there finds, so its outline
+/// carries the revision that `expand` and `edit` accept there and `resume` lists
+/// the read there. `relative_file` has already refused a path through a symlink.
+fn read_file(ws: &Workspace, path: &Path) -> Option<(Workspace, String)> {
+    let file = ws.relative_file(path)?;
+    let nested = Path::new(&file)
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| !dir.as_os_str().is_empty())
+        .find(|dir| ws.root.join(dir).join(".git").exists());
+    let Some(dir) = nested else {
+        return Some((ws.clone(), file));
+    };
+    let nested = ws.nested(ws.root.join(dir));
+    let file = nested.relative_file(path)?;
+    Some((nested, file))
 }
 
 /// The outline of a whole Read of a file outside the workspace, made from the
@@ -1054,11 +1076,12 @@ fn claude_read_window(ws: &Workspace, args: &Value, response: &Value) -> Option<
         return None;
     }
     let native = result["content"].as_str()?;
+    let (ws, file) = read_file(ws, path)?;
+    let ws = &ws;
     let budget = ws.settings().ok()?.context_budget;
     if native.len() <= budget {
         return None;
     }
-    let file = ws.relative_file(path)?;
     let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
     let normalized = source.text.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.split('\n').collect();
@@ -1129,12 +1152,15 @@ fn saw_claude_read(ws: &Workspace, input: &Value, outlined: bool) -> Option<()> 
     if input["hook_event_name"] != "PostToolUse"
         || input["tool_name"] != "Read"
         || input["tool_response"]["type"] != "text"
-        || !ws.state.is_dir()
     {
         return None;
     }
     let result = &input["tool_response"]["file"];
-    let file = ws.relative_file(Path::new(result["filePath"].as_str()?))?;
+    let (ws, file) = read_file(ws, Path::new(result["filePath"].as_str()?))?;
+    let ws = &ws;
+    if !ws.state.is_dir() {
+        return None;
+    }
     let bytes = fs::read(ws.source_path(&file).ok()?).ok()?;
     let digest = crate::capture::source_digest(&bytes);
     let ranged = ["offset", "limit"]

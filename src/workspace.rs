@@ -256,6 +256,21 @@ impl Workspace {
         }
     }
 
+    /// The workspace of the nested checkout at `root`, a directory under this root,
+    /// for an agent still working in `origin`.
+    pub fn nested(&self, root: PathBuf) -> Self {
+        Self {
+            cwd: if self.cwd.starts_with(&root) {
+                self.cwd.clone()
+            } else {
+                root.clone()
+            },
+            state: root.join(".justless"),
+            origin: self.origin.clone(),
+            root,
+        }
+    }
+
     /// How a printed command starts, for an agent working where this one started.
     pub fn invocation(&self) -> Invocation {
         // A directory that cannot be resolved gets `--root`, which works from anywhere.

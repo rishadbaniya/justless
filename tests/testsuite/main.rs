@@ -12,6 +12,7 @@ mod hook_fixes;
 mod lookup;
 mod mcp;
 mod mixed_lists;
+mod nested_reads;
 mod output_fixes;
 mod piped;
 mod read_batch;
