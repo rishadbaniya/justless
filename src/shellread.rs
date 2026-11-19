@@ -267,7 +267,7 @@ fn split(command: &str) -> Option<Vec<(Range<usize>, &'static str)>> {
 
 /// A recognized read: one of the forms `command` takes, or `cat FILE` piped
 /// into one `head -n N`, `tail -n N`, `tail -n +N` or `sed -n` script, each
-/// after an optional `cd DIR &&`.
+/// after an optional `cd DIR &&` and before an optional `| cat`.
 pub(crate) struct ShellRead {
     /// The `cd DIR && ` that starts the command line, as written.
     prefix: String,
@@ -275,6 +275,8 @@ pub(crate) struct ShellRead {
     dir: Option<String>,
     file: String,
     range: LineRange,
+    /// Where the read ends when a `| cat` follows it.
+    unpiped: Option<usize>,
 }
 
 /// Whether a read of `lines` lines and `bytes` bytes is small enough to keep its
@@ -285,7 +287,18 @@ pub(crate) fn small(lines: usize, bytes: usize) -> bool {
 
 /// The read a command line runs, if it is one of the forms `ShellRead` describes.
 pub(crate) fn parse(line: &str) -> Option<ShellRead> {
-    let parts = split(line)?;
+    let mut parts = split(line)?;
+    // A last `| cat` or `| cat -` prints the read's bytes unchanged.
+    let mut unpiped = None;
+    if let [.., (_, "|"), (last, "")] = parts.as_slice()
+        && crate::agents::literal_command(&line[last.clone()])
+            .is_some_and(|words| words == ["cat"] || words == ["cat", "-"])
+    {
+        parts.pop();
+        let read = parts.last_mut()?;
+        read.1 = "";
+        unpiped = Some(read.0.end);
+    }
     let words = |at: usize| crate::agents::literal_command(&line[parts.get(at)?.0.clone()]);
     let (prefix, dir, first) = match parts.first()?.1 {
         "&&" => match words(0)?.as_slice() {
@@ -322,10 +335,18 @@ pub(crate) fn parse(line: &str) -> Option<ShellRead> {
         dir,
         file: file.to_owned(),
         range,
+        unpiped,
     })
 }
 
 impl ShellRead {
+    /// `line`, the command this read was parsed from, without its last `| cat`,
+    /// so every hook judges the read as it would the read alone.
+    pub(crate) fn unpiped<'l>(&self, line: &'l str) -> &'l str {
+        self.unpiped
+            .map_or(line, |end| line[..end].trim_end_matches([' ', '\t']))
+    }
+
     /// Whether the read is a `git show` of an object, which falls back to the
     /// ordinary run report when it cannot be outlined.
     pub(crate) fn object(&self) -> bool {
@@ -942,6 +963,11 @@ mod tests {
             ("cat a.rs|tail -n +30", ":a.rs +30"),
             ("cat a.rs | sed -n '1,2p;8,9p'", ":a.rs 1-2,8-9"),
             ("cd x && cat a.rs | sed -n 3,4p", "cd x && x:a.rs 3-4"),
+            ("sed -n '1,200p' a.rs | cat", ":a.rs 1-200"),
+            ("cd x && head -n 30 a.rs | cat -", "cd x && x:a.rs 1-30"),
+            ("cat a.rs | head -n 40 | cat", ":a.rs 1-40"),
+            ("cat a.rs|cat", ":a.rs +1 cat"),
+            ("git show HEAD:a.rs | cat", ":HEAD:a.rs +1 object"),
         ] {
             assert_eq!(shown(line).as_deref(), Some(read), "{line}");
         }
@@ -971,6 +997,14 @@ mod tests {
             "cd $HOME && cat a",
             "cd ~/x && cat a",
             "cat ~/a",
+            "cat a | cat | cat",
+            "cat a | cat -n",
+            "cat a | cat -u",
+            "cat a | cat b",
+            "cat a b | cat",
+            "cat a && cat",
+            "cd x && cat",
+            "| cat",
         ] {
             assert_eq!(shown(line), None, "{line}");
         }

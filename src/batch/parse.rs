@@ -22,6 +22,8 @@ pub(super) enum Source {
         select: Filter,
         numbered: bool,
     },
+    /// `cat A B …`: each whole file in turn.
+    Files(Vec<String>),
     /// `git show REV:path`: a file as a revision or the index holds it.
     Object(String),
     Git(Vec<String>),
@@ -150,8 +152,9 @@ fn piece<'a>(
     join: Join,
     dir: Option<String>,
 ) -> Option<Piece<'a>> {
-    let mut stages = stages.iter().map(|s| shlex::split(s));
-    let words = stages.next()??;
+    let last = stages.len().checked_sub(1)?;
+    let mut stages = stages.iter().map(|s| shlex::split(s)).enumerate();
+    let words = stages.next()?.1?;
     let words = {
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         crate::wrappers::effective(&refs)?
@@ -162,6 +165,12 @@ fn piece<'a>(
         "git" if object.is_some() => Source::Object(object?),
         "git" if super::git::supported(args) => Source::Git(words),
         "rg" | "grep" if search_paths(&words).is_some() => Source::Search(words),
+        "cat" if args.len() > 1 => {
+            if !args.iter().all(|file| local(file)) {
+                return None;
+            }
+            Source::Files(args.to_vec())
+        }
         "sed" | "cat" | "head" | "tail" | "nl" => {
             let (file, opts) = args.split_last()?;
             if !local(file) {
@@ -183,10 +192,13 @@ fn piece<'a>(
         _ => return None,
     };
     let mut filters = Vec::new();
-    for words in stages {
+    for (at, words) in stages {
         let words = words?;
         let (program, args) = words.split_first()?;
         filters.push(match program.as_str() {
+            // A last `| cat` or `| cat -` copies its input unchanged. It stays a
+            // stage, so a failing search before it is still told apart.
+            "cat" if at == last && (args.is_empty() || args == ["-"]) => Filter::All,
             "sed"
                 if filters.is_empty()
                     && matches!(
@@ -205,6 +217,10 @@ fn piece<'a>(
             "head" | "tail" => count(program, args)?,
             _ => return None,
         });
+    }
+    // A filter applies to the concatenation, not to each file.
+    if matches!(source, Source::Files(_)) && filters.iter().any(|f| !matches!(f, Filter::All)) {
+        return None;
     }
     Some(Piece {
         header,
@@ -288,7 +304,20 @@ pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
     if !differs && !matches!(program, Some("cat")) {
         return None;
     }
-    piece(command, &[command], Join::Always, None).map(|piece| vec![piece])
+    piece(command, &[command], Join::Always, None)
+        .map(|piece| vec![piece])
+        .filter(|pieces| outputs(pieces) <= 32)
+}
+
+/// How many outputs the pieces print: one for each file of a `cat A B …`.
+pub(super) fn outputs(pieces: &[Piece<'_>]) -> usize {
+    pieces
+        .iter()
+        .map(|piece| match &piece.source {
+            Source::Files(files) => files.len(),
+            _ => 1,
+        })
+        .sum()
 }
 
 pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
@@ -376,7 +405,7 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
                             join,
                             base.clone(),
                         )?);
-                        if pieces.len() > 32 {
+                        if outputs(&pieces) > 32 {
                             return None;
                         }
                     }
@@ -412,7 +441,7 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
     } else if !stages.is_empty() || join != Join::Always {
         return None;
     }
-    (1..=32).contains(&pieces.len()).then_some(pieces)
+    (1..=32).contains(&outputs(&pieces)).then_some(pieces)
 }
 
 #[cfg(test)]

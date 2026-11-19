@@ -410,13 +410,15 @@ fn left_alone(
             false,
         );
     }
-    if claude && crate::batch::Batch::parse_list(command).is_some() {
+    let read = crate::shellread::parse(command);
+    let listed = read.as_ref().map_or(command, |read| read.unpiped(command));
+    if claude && crate::batch::Batch::parse_list(listed).is_some() {
         return (
             "a list of reads runs as written, and the after-bash hook compacts its output.".into(),
             false,
         );
     }
-    if crate::shellread::parse(command).is_some() {
+    if read.is_some() {
         let why = if claude {
             "a file read runs as written, and the after-bash hook outlines its output."
         } else {

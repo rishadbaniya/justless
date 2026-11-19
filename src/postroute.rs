@@ -148,9 +148,13 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // Output with a run marker was already routed, unless it is the text of a
     // `git show` blob, which the read below matches byte for byte.
     let routed = RUN_MARKER.is_match(stdout);
-    if !cfg!(windows)
-        && let Some(read) = crate::shellread::parse(command)
-    {
+    let read = (!cfg!(windows))
+        .then(|| crate::shellread::parse(command))
+        .flatten();
+    // A read that ends in `| cat` printed the read's bytes, so it is handled as
+    // the read alone.
+    let command = read.as_ref().map_or(command, |read| read.unpiped(command));
+    if let Some(read) = read {
         // A `git show` blob that is not outlined gets the ordinary report below.
         let object = read.object();
         if routed && !object {

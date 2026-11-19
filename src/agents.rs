@@ -1541,12 +1541,15 @@ fn wrap_event(
     if exclusions.line(command).is_some() {
         return None;
     }
-    if !cfg!(windows) && rules.claude && crate::batch::Batch::parse_list(command).is_some() {
+    let read = (!cfg!(windows))
+        .then(|| crate::shellread::parse(command))
+        .flatten();
+    // A read that ends in `| cat` is judged as the read alone.
+    let listed = read.as_ref().map_or(command, |read| read.unpiped(command));
+    if !cfg!(windows) && rules.claude && crate::batch::Batch::parse_list(listed).is_some() {
         return None;
     }
-    if !cfg!(windows)
-        && let Some(read) = crate::shellread::parse(command)
-    {
+    if let Some(read) = read {
         let rewritten = crate::shellread::rewrite(workspace, cwd, &read, session, rules.claude);
         if rewritten.is_none() && read.whole() && !rules.claude {
             crate::history::bypass(workspace, command);

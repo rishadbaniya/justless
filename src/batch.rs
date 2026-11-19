@@ -101,6 +101,8 @@ fn search(
 
 struct Verified<'a> {
     piece: &'a Piece<'a>,
+    /// For one file of a `cat A B …`, the `cat` of that file alone.
+    header: Option<String>,
     range: RunPiece,
     source: Option<reads::SourceLines>,
     dir: PathBuf,
@@ -222,7 +224,8 @@ impl<'a> Batch<'a> {
             if !dir.is_dir() || !dir.starts_with(&ws.root) {
                 return None;
             }
-            let (text, source) = match &piece.source {
+            let mut outputs = Vec::new();
+            match &piece.source {
                 Source::File {
                     file,
                     select,
@@ -231,25 +234,30 @@ impl<'a> Batch<'a> {
                     let (text, source) =
                         files.read(ws, &dir, file, select, *numbered, &piece.filters)?;
                     status = 0;
-                    (text, Some(source))
+                    outputs.push((None, text, Some(source)));
+                }
+                // `cat` prints each file in turn, so each is its own piece.
+                Source::Files(names) => {
+                    for name in names {
+                        let (text, source) =
+                            files.read(ws, &dir, name, &parse::Filter::All, false, &[])?;
+                        let header = format!("cat {}", shlex::try_quote(name).ok()?);
+                        outputs.push((Some(header), text, Some(source)));
+                    }
+                    status = 0;
                 }
                 Source::Object(spec) => {
                     let (text, source) = files.object(&dir, spec, &piece.filters)?;
                     status = 0;
-                    (text, Some(source))
+                    outputs.push((None, text, Some(source)));
                 }
                 Source::Git(words) => {
                     if repo.as_ref().is_none_or(|(repo_dir, _)| repo_dir != &dir) {
                         repo = Some((dir.clone(), git::Repository::open(ws, &dir, deadline)?));
                     }
                     status = 0;
-                    (
-                        reads::filter(
-                            repo.as_ref()?.1.output(&dir, &words[1..], deadline)?,
-                            &piece.filters,
-                        )?,
-                        None,
-                    )
+                    let text = repo.as_ref()?.1.output(&dir, &words[1..], deadline)?;
+                    outputs.push((None, reads::filter(text, &piece.filters)?, None));
                 }
                 Source::Search(words) => {
                     let (code, text) = search(ws, &dir, words, deadline)?;
@@ -258,30 +266,33 @@ impl<'a> Batch<'a> {
                         return None;
                     }
                     status = code;
-                    (reads::filter(text, &piece.filters)?, None)
+                    outputs.push((None, reads::filter(text, &piece.filters)?, None));
                 }
-            };
-            let start = output.len();
-            if start + text.len() > MAX_BYTES {
-                return None;
             }
-            let first_line = (!text.is_empty()).then_some(line);
-            line += text.bytes().filter(|&b| b == b'\n').count();
-            let last_line = first_line.map(|_| line - usize::from(text.ends_with('\n')));
-            output.push_str(&text);
-            let range = RunPiece {
-                command_index: index + 1,
-                start_byte: start,
-                end_byte: output.len(),
-                first_line,
-                last_line,
-            };
-            verified.push(Verified {
-                piece,
-                range,
-                source,
-                dir,
-            });
+            for (header, text, source) in outputs {
+                let start = output.len();
+                if start + text.len() > MAX_BYTES {
+                    return None;
+                }
+                let first_line = (!text.is_empty()).then_some(line);
+                line += text.bytes().filter(|&b| b == b'\n').count();
+                let last_line = first_line.map(|_| line - usize::from(text.ends_with('\n')));
+                output.push_str(&text);
+                let range = RunPiece {
+                    command_index: index + 1,
+                    start_byte: start,
+                    end_byte: output.len(),
+                    first_line,
+                    last_line,
+                };
+                verified.push(Verified {
+                    piece,
+                    header,
+                    range,
+                    source,
+                    dir: dir.clone(),
+                });
+            }
         }
         let expected_status = i32::from(
             response["returnCodeInterpretation"]
@@ -408,7 +419,8 @@ fn render(
                 (Some(a), Some(b)) => format!(" [stdout:{a}-{b}]"),
                 _ => " [no output]".into(),
             };
-            format!("$ {}{span}\n", item.piece.header)
+            let header = item.header.as_deref().unwrap_or(item.piece.header);
+            format!("$ {header}{span}\n")
         })
         .collect();
     let mut remaining = budget.checked_sub(headers.iter().map(|s| s.len() + 1).sum())?;
@@ -428,7 +440,7 @@ fn render(
             None
         } else {
             match &item.piece.source {
-                Source::File { .. } | Source::Object(_) => {
+                Source::File { .. } | Source::Files(_) | Source::Object(_) => {
                     files.outline(item.source.as_ref()?, text, limit)
                 }
                 Source::Search(words) => {
@@ -481,6 +493,35 @@ mod tests {
         assert!(Batch::parse("sed -n 1,2p Cargo.toml").is_none());
         assert!(Batch::parse("env FOO=$(cat Cargo.toml) cat Cargo.toml").is_none());
         assert!(Batch::parse("env FOO=1 cat *").is_none());
+    }
+
+    #[test]
+    fn several_files_and_a_last_cat_parse_as_reads() {
+        for (command, outputs) in [
+            ("cat a b", Some(2)),
+            ("timeout 5 cat a b c", Some(3)),
+            ("cd x && cat a b | cat", Some(2)),
+            ("cat a b; sed -n 1,2p c | cat -", Some(3)),
+            ("rg -n x src | cat", Some(1)),
+            ("cat a b | head -n 1", None),
+            ("cat a b | cut -c 1-3 | cat", None),
+            ("cat a | cat | head -n 1", None),
+            ("cat a | cat -n", None),
+            ("cat -n a b", None),
+            ("cat a - b", None),
+            ("cat a ../b", None),
+            ("cat a .git/config", None),
+        ] {
+            let batch = Batch::parse(command);
+            assert_eq!(
+                batch.map(|b| super::parse::outputs(&b.0)),
+                outputs,
+                "{command}"
+            );
+        }
+        let files: Vec<String> = (0..33).map(|i| format!("f{i}")).collect();
+        assert!(Batch::parse(&format!("cat {}", files.join(" "))).is_none());
+        assert!(Batch::parse(&format!("cat {}", files[1..].join(" "))).is_some());
     }
 
     #[test]
