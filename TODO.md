@@ -74,15 +74,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Limits.** Claude Code only (Codex has no post-run hook). Medium effort: the outline, post-run hook and compaction engines exist; the reproduce-and-verify step is new.
 - **Progress.** Implemented for Claude Code. The example on the clean `e2c34e6` checkout took 6,505 bytes inline and 1,788 bytes with the hook (72.5% less), including the replay command. The archive replayed the original inline result byte for byte. Workload-wide savings still need transcript replay.
 
-### 2.1 Shell range reads — biggest measured token win
-- **Update 2026-11-19 (later).** `git show REV:path` reads are on main (§4.E). Remaining forms measured in 472 local transcripts: `cat FILE` 295 results / 3.25 MB, `cd DIR && sed/head/tail` 155 / 0.96 MB, `cat FILE | head/tail/sed` 48 / 0.27 MB: these three are next. `nl -ba | sed -n` (0 results) and `awk 'NR…'` ranges (42 / 0.10 MB) are closed in docs/decisions.md.
-- **Update 2026-11-19.** On main now: standalone `sed -n` with one or several ascending ranges, `head -n N`, `tail -n +N`, and in Claude Code `tail -n N` (the pre-hook skips it because a growing file could change which lines it prints). Wide reads become a range outline with an exact replay; small ones keep their native bytes. Still open: reads inside command lists (2.0), `cat`, `nl -ba | sed -n`, `awk` ranges and `git show REV:path`.
-- **Branch.** `worktree-wf_7175cb10-fff-1` (1 wip commit, 11 files, +1,534 −15).
-- **Problem.** Agents read files through the shell, and hooks pass these through by design. Untouched in Claude Code (Nov 7–18): 4,079 reads, **20.8 MB of 93.6 MB** tool output. `sed -n` ranges alone were 1,754 results / 11.6 MB (ranges over 150 lines: 384 results / 3.9 MB); piped `cat FILE | …` 241 / 2.2 MB; `git show REV:path` 341 / 2.6 MB. In older Codex sessions: `sed -n` 48 MB, `nl -ba | sed -n` 25 MB, `tail FILE` 7 MB, `awk` 3 MB.
-- **Plan.** Recognize single-file read shapes inside the workspace (`sed -n 'A,Bp'`, `nl -ba | sed -n`, `head`/`tail -n`, `awk 'NR>=A && NR<=B'`, `cat FILE [| head|tail|sed -n]`, `git show REV:path`, with `cd DIR &&`). Small reads return exactly what the original prints and are recorded for `resume`; wide reads in a supported language return an outline of that range plus a one-command exact escape (`expand`/`code`) that is never compacted again. Errors such as a missing file surface exactly as before. Rewrite in PreToolUse for all clients, so Codex benefits.
-- **Progress.** Single-file literal `sed -n 'A,Bp' FILE` and `tail -n +N FILE` are implemented. Open-ended tail reads preserve an unterminated final line and use the end of the file at execution. Verified with the Codex hook and real Claude Code, including persisted output, exact historical replay, and net savings after replay. On the generated Rust fixture Claude received 1,197 bytes for a 4,498-byte range. Reopening all 4,499 native bytes made the net cost 1,198 extra bytes.
-- **Next.** Use transcript replay to measure workload-wide savings. The parked branch also covers `nl`, `head`, last-N-line `tail`, `awk`, `cat`, `git show` and command lists. Bring those forms forward separately and check their native byte behavior.
-- **Command-list follow-up.** Test inspection batches that combine `git diff --stat`, a multi-range sed expression, and `rg` piped to `cut`. Both hooks currently pass the tested batch through. Compare automatic handling against `justless exec --lang sh -` on the same script. Preserve shell quoting, the status of the final pipeline, and measure bytes after the pipeline's own filters.
+### 2.1 Shell range reads — biggest measured token win — done
+- **Progress.** *on main* (2026-11-19). Single-file `sed -n` (one or several ranges), `head -n`, `tail -n ±N`, `cat FILE`, `cat FILE | head/tail/sed -n`, `git show REV:path` and any of them after one `cd DIR &&` are verified and outlined when wide, exact when small, in Claude Code's post-run path, read lists and the pre-command rewrite for other clients. On 18 real reads of this repo: Codex 142,885 → 35,660 bytes, Claude Code 35,028 → 15,999 (native 561,367). `nl -ba | sed -n` and `awk` ranges are closed in docs/decisions.md. Follow-up in §4.K: reads inside Claude Code read lists are not yet recorded for `resume`.
 
 ### 2.2 Outline wide ranged `Read` calls — done
 - **Progress.** *on main* (2026-11-19). A ranged Read returning more than 150 lines of a source or Markdown file becomes the outline rows of that window in Claude Code's Read shape; the way back (`allow_large`, any Read of at most 150 lines, or `expand`) is never outlined. Measured: a 300-line window of `src/agents.rs` 14,924 → 1,555 bytes; checked with the real Claude Code binary (outline, native escape, Edit inside the window).
@@ -164,6 +157,10 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 
 ### 4.J Follow-ups from global setup
 - In a project served only by global hooks, `doctor` still fails with "not set up in this project" and "Hooks: none"; `discover` does not apply `exclude_commands`; `stats --all` ignores `--days`.
+- **Progress.** *designed*.
+
+### 4.K Record read-list reads for `resume`
+- Reads served inside Claude Code read lists (`src/batch*`) never call `history::saw_source`/`saw_outline`, so `resume` and `[source changed]` miss them; single-file reads are recorded.
 - **Progress.** *designed*.
 
 ### 4.E `git show REV:path` reads — done
