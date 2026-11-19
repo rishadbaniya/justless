@@ -342,16 +342,25 @@ struct Columns<'n, 'a> {
     keys: Vec<&'a str>,
     /// Each object's value for each column.
     cells: Vec<Vec<Option<&'n Node<'a>>>>,
+    /// The objects as compact JSON lines, in bytes.
+    inline: usize,
 }
 
+/// The most fields a table holds.
+const MAX_FIELDS: usize = 256;
+
 /// The columns of an array of objects whose keys all follow one order, without
-/// repeats.
+/// repeats. Every object gets a cell for every field, so fields that cannot make a
+/// table, such as one key per object, build none.
 fn columns<'n, 'a>(items: &'n [Node<'a>]) -> Option<Columns<'n, 'a>> {
     let mut keys: Vec<&'a str> = Vec::new();
+    let (mut widest, mut present) = (0, 0);
     for item in items {
         let Node::Object(members) = item else {
             return None;
         };
+        widest = members.len().max(widest);
+        present += members.len();
         // Merge this object's keys into the order: a new key goes right before the
         // object's next known key, so every object keeps its own order.
         let mut merged = Vec::with_capacity(keys.len() + members.len());
@@ -369,12 +378,21 @@ fn columns<'n, 'a>(items: &'n [Node<'a>]) -> Option<Columns<'n, 'a>> {
                     known = position + 1;
                 }
                 Some(_) => return None,
+                None if keys.len() + new.len() >= MAX_FIELDS => return None,
                 None => new.push(*key),
             }
         }
         merged.extend_from_slice(&keys[known..]);
         merged.append(&mut new);
         keys = merged;
+    }
+    // More fields than twice the widest object leave most of every row empty. Each
+    // empty cell costs a row at least a comma, so a table with more of them than the
+    // JSON has bytes cannot be smaller.
+    let inline: usize = items.iter().map(|item| compacted(item).len() + 1).sum();
+    let absent = items.len() * keys.len() - present;
+    if keys.len() > 2 * widest || absent >= inline + items.len() {
+        return None;
     }
     let cells = items
         .iter()
@@ -387,7 +405,11 @@ fn columns<'n, 'a>(items: &'n [Node<'a>]) -> Option<Columns<'n, 'a>> {
                 .collect()
         })
         .collect();
-    Some(Columns { keys, cells })
+    Some(Columns {
+        keys,
+        cells,
+        inline,
+    })
 }
 
 /// Write `items` as a table when that is smaller than their compact JSON.
@@ -395,7 +417,12 @@ fn table(items: &[Node], indent: usize, group: bool, out: &mut String) -> bool {
     if items.len() < 2 {
         return false;
     }
-    let Some(Columns { keys, cells }) = columns(items) else {
+    let Some(Columns {
+        keys,
+        cells,
+        inline,
+    }) = columns(items)
+    else {
         return false;
     };
     let text: Vec<Vec<Option<String>>> = cells
@@ -458,7 +485,6 @@ fn table(items: &[Node], indent: usize, group: bool, out: &mut String) -> bool {
         }
         block.push('\n');
     }
-    let inline: usize = items.iter().map(|item| compacted(item).len() + 1).sum();
     if block.len() >= inline {
         return false;
     }
@@ -909,5 +935,46 @@ mod tests {
         ] {
             assert_eq!(decode(&damaged), None, "{damaged}");
         }
+    }
+
+    #[test]
+    fn fields_that_cannot_make_a_table_build_no_cells() {
+        fn objects(lines: &[String]) -> Vec<Node<'_>> {
+            lines.iter().map(|line| parse(line).unwrap()).collect()
+        }
+        // One key per object, as with 600 distinct keys.
+        let distinct: Vec<String> = (0..600).map(|i| format!("{{\"key{i}\":{i}}}")).collect();
+        // Five fields, no object with more than two.
+        let sparse: Vec<String> = [r#"{"a":1,"b":2}"#, r#"{"c":3}"#, r#"{"d":4,"e":5}"#]
+            .map(str::to_owned)
+            .to_vec();
+        // A wide object beside many narrow ones: every narrow row would be mostly
+        // empty commas, more than the JSON's bytes.
+        let wide = format!(
+            "{{{}}}",
+            (0..100)
+                .map(|i| format!("\"k{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let narrow: Vec<String> = std::iter::once(wide)
+            .chain((0..100).map(|i| format!("{{\"k{}\":0}}", i % 100)))
+            .collect();
+        for lines in [&distinct, &sparse, &narrow] {
+            assert!(columns(&objects(lines)).is_none(), "{lines:?}");
+        }
+        // Optional fields still make a table.
+        let optional: Vec<String> = (0..4)
+            .map(|i| {
+                format!(
+                    "{{\"a\":{i},\"b\":{i}{}}}",
+                    if i % 2 == 0 { ",\"c\":1" } else { "" }
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns(&objects(&optional)).unwrap().keys,
+            ["\"a\"", "\"b\"", "\"c\""]
+        );
     }
 }

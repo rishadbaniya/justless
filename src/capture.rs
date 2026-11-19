@@ -1628,7 +1628,8 @@ impl Capture<'_> {
             && origin.is_none_or(|o| o.outline.is_none())
             // JSON reformatted for reading would break a program that parses it, so
             // only output that reaches the agent directly, or that is clipped anyway,
-            // is shown as tables.
+            // is shown as tables. A stream that fits takes a view only when it saves
+            // more than the footer that then names the run, as for the floor.
             && (direct || !stdout_fits)
             && let Some(view) = json_view(
                 &archive.readers[0],
@@ -1637,7 +1638,7 @@ impl Capture<'_> {
                 max_bytes,
                 json_grouping,
             )
-            && (!stdout_fits || view.len() < previews[0].1.len())
+            && (!stdout_fits || view.len() + 64 < previews[0].1.len())
         {
             previews[0].1 = view;
         }

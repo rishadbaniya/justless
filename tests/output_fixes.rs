@@ -170,3 +170,44 @@ fn lockfile_flags_name_every_source_within_a_quarter_of_the_budget() {
         "{calls}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn json_that_fits_takes_a_view_only_when_it_saves_more_than_a_footer() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root();
+    sandbox.stub("emit", "cat \"$1\"\n");
+    let members = |indent: usize| {
+        let pad = " ".repeat(indent);
+        let lines: Vec<String> = (0..16)
+            .map(|i| format!("{pad}\"key{i:02}\": \"{}\"", "v".repeat(30)))
+            .collect();
+        format!("{{\n{}\n}}\n", lines.join(",\n"))
+    };
+    // The compact view saves 40 bytes of the first and 104 of the second.
+    for (indent, view) in [(4, false), (8, true)] {
+        let json = members(indent);
+        fs::write(root.join("data.json"), &json).unwrap();
+        let output = sandbox.justless(&[
+            "run",
+            "--hook",
+            "--max-bytes",
+            "4096",
+            "--",
+            "emit",
+            "data.json",
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        let shown = text(&output.stdout);
+        if view {
+            assert!(
+                shown.starts_with("[JSON without its whitespace; ")
+                    && shown.len() + 64 < json.len(),
+                "{shown}"
+            );
+        } else {
+            assert_eq!(shown, json);
+            assert_eq!(text(&output.stderr), "");
+        }
+    }
+}
