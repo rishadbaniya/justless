@@ -39,7 +39,7 @@ const RG: Spec = Spec {
         --with-filename --hidden -. -u --unrestricted --no-ignore --no-ignore-vcs \
         --no-ignore-parent --no-ignore-dot --no-ignore-global --no-ignore-exclude \
         --no-ignore-files -L --follow -U --multiline --multiline-dotall -P --pcre2 -o \
-        --only-matching -v --invert-match --column -a --text --no-heading --no-messages \
+        --only-matching -v --invert-match --column -a --text --no-heading --heading --no-messages \
         --trim --crlf --sort-files --binary --no-config --one-file-system --vimgrep \
         --max-columns-preview -l --files-with-matches --files-without-match --files",
     valued: "-e --regexp -f --file -g --glob --iglob -t --type -T --type-not --type-add -m \
@@ -241,9 +241,18 @@ pub fn select(words: &[&str]) -> Option<Profile> {
             || parsed.value(&["-d", "--directories"]) == Some("recurse");
         let explicit = parsed.has(&["-e", "--regexp", "-f", "--file"]);
         let files = parsed.positional.len() - usize::from(!explicit).min(parsed.positional.len());
-        if !(recursive || files >= 2 || files == 1 && parsed.has(&["-H", "--with-filename"])) {
+        // One file's numbered lines with context still read as blocks.
+        let blocks = parsed.has(CONTEXT) && parsed.has(&["-n", "--line-number"]);
+        if !(recursive
+            || files >= 2
+            || files == 1 && (blocks || parsed.has(&["-H", "--with-filename"])))
+        {
             return None;
         }
+    }
+    // rg prints file names as headings only on request, and only blocks read them.
+    if parsed.has(&["--heading"]) && !parsed.has(CONTEXT) {
+        return None;
     }
     Some(if parsed.has_any(spec.lists) {
         Profile::Listing
@@ -252,49 +261,67 @@ pub fn select(words: &[&str]) -> Option<Profile> {
     })
 }
 
-/// Whether a search prints lines besides its matches, such as `grep -A5`, or a
-/// pattern that matches every line, such as `grep -rn "" file`. The agent asked for
-/// those lines, and a report grouped by file would show only a few matches.
-pub(crate) fn prints_more_than_matches(words: &[&str]) -> bool {
-    const CONTEXT: &[&str] = &[
-        "-A",
-        "-B",
-        "-C",
-        "--after-context",
-        "--before-context",
-        "--context",
-        "--after",
-        "--before",
-    ];
-    const EVERY_LINE: &[&str] = &["", "^", "$", ".", ".*", "^.*", ".*$", "^.*$"];
-    let Some((&program, args)) = words.split_first() else {
-        return false;
-    };
+/// Options that print lines around each match.
+const CONTEXT: &[&str] = &[
+    "-A",
+    "-B",
+    "-C",
+    "--after-context",
+    "--before-context",
+    "--context",
+    "--after",
+    "--before",
+];
+
+/// A search tool's spec and options, unless it lists file names, such as
+/// `rg --files .`, which prints no lines and may have no pattern.
+fn searched<'a>(words: &[&'a str]) -> Option<(&'static Spec, Parsed<'a>)> {
+    let (&program, args) = words.split_first()?;
     let (spec, args) = match (basename(program), args) {
         ("rg", _) => (&RG, args),
         ("grep" | "egrep" | "fgrep", _) => (&GREP, args),
         ("git", ["grep", rest @ ..]) => (&GIT_GREP, rest),
         ("ag", _) => (&AG, args),
         ("ack" | "ack-grep", _) => (&ACK, args),
-        _ => return false,
+        _ => return None,
     };
-    // A list of file names, such as `rg --files .`, prints no lines and may have no
-    // pattern, so its first operand can be a path.
-    let Some(parsed) = parse(args, spec).filter(|parsed| !parsed.has_any(spec.lists)) else {
-        return false;
-    };
+    let parsed = parse(args, spec).filter(|parsed| !parsed.has_any(spec.lists))?;
+    Some((spec, parsed))
+}
+
+/// The patterns and the path operands of a search.
+fn operands<'p, 'a>(parsed: &'p Parsed<'a>) -> (Vec<&'a str>, &'p [&'a str]) {
     let explicit: Vec<&str> = parsed
         .seen
         .iter()
         .filter(|(flag, _)| matches!(*flag, "-e" | "--regexp"))
         .filter_map(|(_, value)| *value)
         .collect();
-    let patterns = if explicit.is_empty() && !parsed.has(&["-f", "--file"]) {
-        parsed.positional.first().copied().into_iter().collect()
+    if explicit.is_empty() && !parsed.has(&["-f", "--file"]) {
+        let pattern = usize::from(!parsed.positional.is_empty());
+        let (pattern, paths) = parsed.positional.split_at(pattern);
+        (pattern.to_vec(), paths)
     } else {
-        explicit
-    };
-    parsed.has(CONTEXT) || patterns.iter().any(|pattern| EVERY_LINE.contains(pattern))
+        (explicit, &parsed.positional)
+    }
+}
+
+/// Whether a search prints lines around its matches, such as `grep -A5`. Its
+/// report shows blocks rather than matching lines.
+pub(crate) fn prints_context(words: &[&str]) -> bool {
+    searched(words).is_some_and(|(_, parsed)| parsed.has(CONTEXT))
+}
+
+/// Whether a search pattern matches every line, such as `grep -rn "" file`. The
+/// agent asked for those lines, and a report grouped by file would show only a few.
+pub(crate) fn matches_every_line(words: &[&str]) -> bool {
+    const EVERY_LINE: &[&str] = &["", "^", "$", ".", ".*", "^.*", ".*$", "^.*$"];
+    searched(words).is_some_and(|(_, parsed)| {
+        operands(&parsed)
+            .0
+            .iter()
+            .any(|pattern| EVERY_LINE.contains(pattern))
+    })
 }
 
 // `find` options are single-dash words, so it has its own allow list. Actions such
@@ -409,7 +436,48 @@ struct Group {
     matches: usize,
     first: usize,
     last: usize,
+    /// The first matching lines, or in block mode the first block's lines.
     shown: Vec<String>,
+    /// Indexes into `Blocks::list`.
+    blocks: Vec<usize>,
+    /// The first match's place in `shown`, which keeps only the nearest lines
+    /// before it.
+    lead: Option<usize>,
+}
+
+/// Lines a block report shows of each file's first block.
+const BLOCK_LINES: usize = 40;
+/// Lines read before a block's file is known: its leading context.
+const PENDING: usize = 4096;
+
+/// One context block: contiguous lines of one file between `--` separators.
+struct Block {
+    group: usize,
+    /// Its first and last stdout lines.
+    start: usize,
+    end: usize,
+    /// Its first and last file lines, when lines carry numbers.
+    from: Option<usize>,
+    to: Option<usize>,
+}
+
+/// Block mode, for searches that print lines around their matches. Every line
+/// must be a match, a context line, a `--` separator or a heading, or the report
+/// falls back to the ordinary preview.
+struct Blocks {
+    /// Lines carry their numbers, as with `-n`.
+    numbered: bool,
+    /// The one file the command names, whose lines may carry no file name.
+    bare: Option<String>,
+    /// rg `--heading`: each file's name on its own line before its lines.
+    heading: bool,
+    /// The file that unprefixed lines belong to, from `bare` or a heading.
+    section: Option<usize>,
+    list: Vec<Block>,
+    open: Option<usize>,
+    /// Lines before a block's first match, whose file name is not known yet.
+    pending: Vec<(usize, String)>,
+    failed: bool,
 }
 
 /// Groups search output by file while the stream is scanned.
@@ -428,12 +496,40 @@ pub struct Search {
     exists: HashMap<String, bool>,
     checks: usize,
     overflow: bool,
+    blocks: Option<Blocks>,
 }
 
 impl Search {
     /// `base` is the directory relative paths in the output resolve against.
     /// Dependency and build directories named in `words` are not collapsed.
     pub fn new(base: &Path, words: &[&str]) -> Self {
+        let tool = crate::filters::unwrap_tool(words);
+        let blocks = searched(tool)
+            .filter(|(_, parsed)| parsed.has(CONTEXT))
+            .map(|(_, parsed)| {
+                let program = basename(tool[0]);
+                let numbered = parsed.has(&["-n", "--line-number"])
+                    && !parsed.has(&["-N", "--no-line-number"]);
+                let paths = operands(&parsed).1;
+                let bare = (program != "git"
+                    && paths.len() == 1
+                    && !parsed.has(&["-H", "--with-filename"])
+                    && base.join(paths[0]).is_file())
+                .then(|| paths[0].to_owned());
+                let heading = parsed.has(&["--heading"]) && !parsed.has(&["--no-heading"]);
+                Blocks {
+                    numbered,
+                    bare,
+                    heading,
+                    section: None,
+                    list: Vec::new(),
+                    open: None,
+                    pending: Vec::new(),
+                    // ag and ack print other layouts, and lines without numbers
+                    // under a heading cannot be told apart from file names.
+                    failed: matches!(program, "ag" | "ack" | "ack-grep") || heading && !numbered,
+                }
+            });
         Self {
             base: base.to_path_buf(),
             keep: crate::listing::named_noise(words),
@@ -449,6 +545,7 @@ impl Search {
             exists: HashMap::new(),
             checks: 0,
             overflow: false,
+            blocks,
         }
     }
 
@@ -457,6 +554,10 @@ impl Search {
             return;
         }
         let line = text.trim_end_matches(['\n', '\r']);
+        if self.blocks.is_some() {
+            self.block_line(line, n);
+            return;
+        }
         if line.is_empty() {
             return;
         }
@@ -533,6 +634,8 @@ impl Search {
             first: n,
             last: n,
             shown: Vec::new(),
+            blocks: Vec::new(),
+            lead: None,
         });
         Some(self.groups.len() - 1)
     }
@@ -569,32 +672,235 @@ impl Search {
 
     /// The end of the leading path, trying each of the first few colons in turn.
     fn split(&mut self, line: &str) -> Option<usize> {
-        for (i, _) in line.match_indices(':').take(6) {
+        self.path_end(line, ':', false)
+    }
+
+    /// The end of a leading path that `sep` follows, trying each of the first few
+    /// in turn. `numbered` requires a line number and the same `sep` after it.
+    fn path_end(&mut self, line: &str, sep: char, numbered: bool) -> Option<usize> {
+        let tries = if sep == ':' { 6 } else { 16 };
+        for (i, _) in line.match_indices(sep).take(tries) {
             let candidate = &line[..i];
-            if candidate.is_empty() {
+            if candidate.is_empty()
+                || numbered && number(&line[i + 1..]).is_none_or(|(_, kind)| kind != sep)
+            {
                 continue;
             }
-            if self.index.contains_key(candidate) {
+            if self.known(candidate) {
                 return Some(i);
             }
-            let found = match self.exists.get(candidate) {
-                Some(&found) => found,
-                None => {
-                    if self.checks >= MAX_CHECKS {
-                        self.overflow = true;
-                        return None;
-                    }
-                    self.checks += 1;
-                    let found = self.base.join(candidate).is_file();
-                    self.exists.insert(candidate.to_owned(), found);
-                    found
-                }
-            };
-            if found {
-                return Some(i);
+            if self.overflow {
+                return None;
             }
         }
         None
+    }
+
+    /// Whether `candidate` names a file already grouped or an existing file.
+    fn known(&mut self, candidate: &str) -> bool {
+        if self.index.contains_key(candidate) {
+            return true;
+        }
+        if let Some(&found) = self.exists.get(candidate) {
+            return found;
+        }
+        if self.checks >= MAX_CHECKS {
+            self.overflow = true;
+            return false;
+        }
+        self.checks += 1;
+        let found = self.base.join(candidate).is_file();
+        self.exists.insert(candidate.to_owned(), found);
+        found
+    }
+
+    fn mode(&mut self) -> &mut Blocks {
+        self.blocks.as_mut().expect("block mode")
+    }
+
+    /// Read one line of a search that prints context.
+    fn block_line(&mut self, line: &str, n: usize) {
+        if self.mode().failed {
+            return;
+        }
+        if line == "--" {
+            self.close_block();
+            return;
+        }
+        // The first line shows whether the one named file's lines carry its name,
+        // as ugrep prints them with `-r`.
+        if let Some(path) = self.mode().bare.take()
+            && !line
+                .strip_prefix(path.as_str())
+                .is_some_and(|rest| rest.starts_with([':', '-']))
+        {
+            let Some(c) = self.group(&path, n) else {
+                return;
+            };
+            let mode = self.mode();
+            mode.section = Some(c);
+            // Without numbers, its matches, context lines and separators look alike.
+            mode.failed |= !mode.numbered;
+        }
+        let mode = self.mode();
+        if mode.heading {
+            if line.is_empty() {
+                self.close_block();
+                self.mode().section = None;
+                return;
+            }
+            if mode.section.is_none() {
+                match self.known(line).then(|| self.group(line, n)).flatten() {
+                    Some(c) => self.mode().section = Some(c),
+                    None => self.mode().failed = true,
+                }
+                return;
+            }
+        }
+        if let Some(c) = self.mode().section {
+            match number(line) {
+                Some((number, sep)) => self.add_line(c, n, Some(number), sep == ':', line),
+                None => self.mode().failed = true,
+            }
+            return;
+        }
+        if let Some(path) = binary(line)
+            && self.known(path)
+        {
+            self.close_block();
+            if let Some(c) = self.group(path, n) {
+                self.add_line(c, n, None, true, "(binary file matches)");
+            }
+            self.close_block();
+            return;
+        }
+        self.prefixed_line(line, n);
+    }
+
+    /// Read a line that starts with its file name: `path:…` for a match and
+    /// `path-…` for context.
+    fn prefixed_line(&mut self, line: &str, n: usize) {
+        let numbered = self.mode().numbered;
+        if let Some(open) = self.mode().open {
+            let c = self.mode().list[open].group;
+            let len = self.groups[c].path.len();
+            if line.starts_with(self.groups[c].path.as_str())
+                && let Some((matched, number, text)) = parts(line, len, numbered)
+            {
+                // Without numbers, `settings-prod:3` or `settings-prod-3` after
+                // `settings` may name the longer file. A real one wins.
+                let longer = !numbered
+                    && [':', '-'].into_iter().any(|sep| {
+                        line[len + 1..]
+                            .match_indices(sep)
+                            .take(4)
+                            .any(|(i, _)| self.known(&line[..len + 1 + i]))
+                    });
+                if !longer {
+                    self.add_line(c, n, number, matched, text);
+                    return;
+                }
+            }
+            // Another file's line starts a new block: ugrep prints no `--` there.
+            self.close_block();
+        }
+        if let Some(end) = self.path_end(line, ':', numbered) {
+            let path = line[..end].to_owned();
+            let Some(c) = self.group(&path, n) else {
+                return;
+            };
+            // Lines printed before a file's match are its leading context.
+            for (m, before) in std::mem::take(&mut self.mode().pending) {
+                match parts(&before, end, numbered).filter(|(matched, ..)| !matched) {
+                    Some((_, number, text)) if before.starts_with(&path) => {
+                        self.add_line(c, m, number, false, text)
+                    }
+                    _ => self.mode().failed = true,
+                }
+            }
+            if let Some((_, number, text)) = parts(line, end, numbered) {
+                self.add_line(c, n, number, true, text);
+            }
+            return;
+        }
+        let mode = self.mode();
+        mode.failed |= mode.pending.len() >= PENDING;
+        mode.pending.push((n, line.to_owned()));
+    }
+
+    /// End the open block. Context lines that no match followed belong to a block
+    /// cut short, as by `head`, and name their file before a dash.
+    fn close_block(&mut self) {
+        let mode = self.mode();
+        mode.open = None;
+        let pending = std::mem::take(&mut mode.pending);
+        let numbered = mode.numbered;
+        let Some((first, line)) = pending.first() else {
+            return;
+        };
+        let Some(end) = self.path_end(line, '-', numbered) else {
+            self.mode().failed = true;
+            return;
+        };
+        let path = line[..end].to_owned();
+        let Some(c) = self.group(&path, *first) else {
+            return;
+        };
+        for (m, line) in &pending {
+            match parts(line, end, numbered) {
+                Some((false, number, text)) if line.starts_with(&path) => {
+                    self.add_line(c, *m, number, false, text)
+                }
+                _ => self.mode().failed = true,
+            }
+        }
+        self.mode().open = None;
+    }
+
+    /// Add a line to the open block of file `c`, or start one. A block holds
+    /// consecutive lines, so a gap in line numbers starts another, as `-A0`
+    /// prints no `--`.
+    fn add_line(&mut self, c: usize, n: usize, number: Option<usize>, matched: bool, text: &str) {
+        let mode = self.blocks.as_mut().expect("block mode");
+        if let Some(open) = mode.open {
+            let block = &mode.list[open];
+            if block.group != c || number.is_some() && block.to.map(|to| to + 1) != number {
+                mode.open = None;
+            }
+        }
+        let open = *mode.open.get_or_insert_with(|| {
+            mode.list.push(Block {
+                group: c,
+                start: n,
+                end: n,
+                from: number,
+                to: number,
+            });
+            self.groups[c].blocks.push(mode.list.len() - 1);
+            mode.list.len() - 1
+        });
+        let block = &mut mode.list[open];
+        block.end = n;
+        block.to = number;
+        let group = &mut self.groups[c];
+        group.first = group.first.min(n);
+        group.last = group.last.max(n);
+        if group.blocks[0] == open {
+            match group.lead {
+                None if matched => group.lead = Some(group.shown.len()),
+                None if group.shown.len() >= BLOCK_LINES / 2 => {
+                    group.shown.remove(0);
+                }
+                _ => {}
+            }
+            if group.shown.len() < BLOCK_LINES {
+                group.shown.push(clip(text));
+            }
+        }
+        group.matches += usize::from(matched);
+        self.matches += usize::from(matched);
+        self.context += usize::from(!matched);
+        self.records += 1;
     }
 
     /// The grouped report within `budget` bytes and the comparison record, or
@@ -608,6 +914,12 @@ impl Search {
         pointers: bool,
     ) -> Option<(String, Summary)> {
         self.drop_pending();
+        if self.blocks.is_some() {
+            self.close_block();
+            if self.mode().failed || self.matches == 0 {
+                return None;
+            }
+        }
         if self.overflow
             || (self.matches == 0 && self.records > 0)
             || self.unparsed > (self.records / 10).max(16)
@@ -622,6 +934,12 @@ impl Search {
             plural(self.matches, "match", "matches"),
             plural(files, "file", "files")
         );
+        if let Some(blocks) = &self.blocks {
+            header.push_str(&format!(
+                ", {}",
+                plural(blocks.list.len(), "block", "blocks")
+            ));
+        }
         if self.context > 0 {
             header.push_str(&format!(", {} context lines", self.context));
         }
@@ -689,6 +1007,10 @@ impl Search {
             .chain(std::iter::once(other))
             .collect();
         let room = budget.saturating_sub(header.len() + other.len() + 96);
+        if let Some(blocks) = &self.blocks {
+            let body = block_body(&order, &blocks.list, room, pointers);
+            return Some((format!("{header}{body}{other}"), summary));
+        }
         let block = |g: &Group, k: usize| {
             let mut text = format!("{} ×{}{}\n", g.path, g.matches, pointer(pointers, g));
             for line in g.shown.iter().take(k) {
@@ -722,45 +1044,188 @@ impl Search {
             body.push_str(&text);
             listed += 1;
         }
-        // Summarize the remaining files by directory, largest first.
-        let rest = &order[listed..];
-        let mut folders: HashMap<&str, (usize, usize)> = HashMap::new();
-        for group in rest {
-            let folder = group.path.rsplit_once('/').map_or(".", |(dir, _)| dir);
-            let entry = folders.entry(folder).or_default();
-            entry.0 += 1;
-            entry.1 += group.matches;
-        }
-        let mut folders: Vec<_> = folders.into_iter().collect();
-        folders.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
-        let mut names = String::new();
-        let mut named = 0;
-        for (folder, (files, matches)) in &folders {
-            let item = format!("{folder}/ {} ×{matches}", plural(*files, "file", "files"));
-            if body.len() + names.len() + item.len() + 2 > room {
-                break;
-            }
-            if !names.is_empty() {
-                names.push_str(", ");
-            }
-            names.push_str(&item);
-            named += 1;
-        }
-        let matches: usize = rest.iter().map(|g| g.matches).sum();
-        body.push_str(&format!(
-            "+{} with {}{}{}{}\n",
-            plural(rest.len(), "more file", "more files"),
-            plural(matches, "match", "matches"),
-            if named > 0 { " in " } else { "" },
-            names,
-            if named < folders.len() && named > 0 {
-                ", …"
-            } else {
-                ""
-            }
-        ));
+        body.push_str(&fold(&order[listed..], room.saturating_sub(body.len()), ""));
         Some((format!("{header}{body}{other}"), summary))
     }
+}
+
+/// The files that did not fit, summarized by directory, largest first, within
+/// `room` bytes for the directory names, ending with `tag`.
+fn fold(rest: &[&Group], room: usize, tag: &str) -> String {
+    let mut folders: HashMap<&str, (usize, usize)> = HashMap::new();
+    for group in rest {
+        let folder = group.path.rsplit_once('/').map_or(".", |(dir, _)| dir);
+        let entry = folders.entry(folder).or_default();
+        entry.0 += 1;
+        entry.1 += group.matches;
+    }
+    let mut folders: Vec<_> = folders.into_iter().collect();
+    folders.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
+    let mut names = String::new();
+    let mut named = 0;
+    for (folder, (files, matches)) in &folders {
+        let item = format!("{folder}/ {} ×{matches}", plural(*files, "file", "files"));
+        if names.len() + item.len() + 2 > room {
+            break;
+        }
+        if !names.is_empty() {
+            names.push_str(", ");
+        }
+        names.push_str(&item);
+        named += 1;
+    }
+    let matches: usize = rest.iter().map(|g| g.matches).sum();
+    format!(
+        "+{} with {}{}{}{}{tag}\n",
+        plural(rest.len(), "more file", "more files"),
+        plural(matches, "match", "matches"),
+        if named > 0 { " in " } else { "" },
+        names,
+        if named < folders.len() && named > 0 {
+            ", …"
+        } else {
+            ""
+        }
+    )
+}
+
+/// A block report: each file's match and block counts, its first block in full,
+/// then where its other blocks are. Fewer lines, then files alone, then folders
+/// make it fit `room`.
+fn block_body(order: &[&Group], list: &[Block], room: usize, pointers: bool) -> String {
+    let tag = |a: usize, b: usize| match (pointers, a == b) {
+        (false, _) => String::new(),
+        (true, true) => format!(" [stdout:{a}]"),
+        (true, false) => format!(" [stdout:{a}-{b}]"),
+    };
+    let entry = |block: &Block| match (block.from, block.to) {
+        (Some(from), Some(to)) if from == to => format!("L{from}{}", tag(block.start, block.end)),
+        (Some(from), Some(to)) => format!("L{from}-{to}{}", tag(block.start, block.end)),
+        _ => tag(block.start, block.end).trim_start().to_owned(),
+    };
+    let render = |g: &Group, lines: usize, entries: usize| {
+        let mut text = format!(
+            "{} ×{} in {}{}\n",
+            g.path,
+            g.matches,
+            plural(g.blocks.len(), "block", "blocks"),
+            pointer(pointers, g)
+        );
+        if lines == 0 {
+            return text;
+        }
+        // A cut block starts near its first match, and its range covers it whole.
+        let first = &list[g.blocks[0]];
+        let shown = lines.min(g.shown.len());
+        let lead = g.lead.unwrap_or(0);
+        let start = lead.saturating_sub(lines / 4).min(g.shown.len() - shown);
+        for line in &g.shown[start..start + shown] {
+            text.push_str(&format!("  {line}\n"));
+        }
+        let size = first.end - first.start + 1;
+        if size > shown {
+            let whole = entry(first);
+            text.push_str(&if whole.is_empty() {
+                format!("  +{}\n", plural(size - shown, "more line", "more lines"))
+            } else {
+                format!("  whole block {whole}\n")
+            });
+        }
+        if let [_, rest @ ..] = g.blocks.as_slice()
+            && let (Some(&a), Some(&b)) = (rest.first(), rest.last())
+        {
+            text.push_str(&format!(
+                "  +{}{}",
+                plural(rest.len(), "more block", "more blocks"),
+                tag(list[a].start, list[b].end)
+            ));
+            let named: Vec<String> = rest
+                .iter()
+                .take(entries)
+                .map(|&i| entry(&list[i]))
+                .filter(|e| !e.is_empty())
+                .collect();
+            if !named.is_empty() {
+                text.push_str(&format!(": {}", named.join(", ")));
+                if named.len() < rest.len() {
+                    text.push_str(", …");
+                }
+            }
+            text.push('\n');
+        }
+        text
+    };
+    for (lines, entries) in [(BLOCK_LINES, 32), (12, 12), (6, 6), (3, 3), (1, 0)] {
+        let mut body = String::new();
+        for group in order {
+            body.push_str(&render(group, lines, entries));
+            if body.len() > room {
+                break;
+            }
+        }
+        if body.len() <= room {
+            return body;
+        }
+    }
+    // Name files alone while they fit, then fold the rest by directory.
+    let mut body = String::new();
+    let mut listed = 0;
+    for group in order {
+        let text = render(group, 0, 0);
+        if body.len() + text.len() > room * 2 / 3 {
+            break;
+        }
+        body.push_str(&text);
+        listed += 1;
+    }
+    let rest = &order[listed..];
+    if let (Some(a), Some(b)) = (
+        rest.iter().map(|g| g.first).min(),
+        rest.iter().map(|g| g.last).max(),
+    ) {
+        body.push_str(&fold(rest, room.saturating_sub(body.len()), &tag(a, b)));
+    }
+    body
+}
+
+/// The line number at the start of `text` and the separator after it: `12:`
+/// before a match and `12-` before a context line.
+fn number(text: &str) -> Option<(usize, char)> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let number = text[..digits].parse().ok()?;
+    let sep = text[digits..]
+        .chars()
+        .next()
+        .filter(|c| matches!(c, ':' | '-'))?;
+    Some((number, sep))
+}
+
+/// Whether a line whose file name ends at `len` is a match, its line number, and
+/// the text a report shows: from the number on, or from the separator on when
+/// lines carry no numbers.
+fn parts(line: &str, len: usize, numbered: bool) -> Option<(bool, Option<usize>, &str)> {
+    let rest = line.get(len..)?;
+    let sep = rest.chars().next().filter(|c| matches!(c, ':' | '-'))?;
+    if !numbered {
+        return Some((sep == ':', None, rest));
+    }
+    let text = &rest[1..];
+    let (number, kind) = number(text)?;
+    (kind == sep).then_some((sep == ':', Some(number), text))
+}
+
+/// The file a "binary file matches" notice names: `Binary file X matches` from BSD
+/// and older GNU grep, `grep: X: binary file matches` from newer GNU grep on
+/// stderr, and `X: binary file matches (…)` from rg.
+fn binary(line: &str) -> Option<&str> {
+    if let Some(path) = line
+        .strip_prefix("Binary file ")
+        .and_then(|rest| rest.strip_suffix(" matches"))
+    {
+        return Some(path);
+    }
+    let (path, _) = line.split_once(": binary file matches")?;
+    Some(path.strip_prefix("grep: ").unwrap_or(path))
 }
 
 fn pointer(pointers: bool, group: &Group) -> String {
@@ -945,6 +1410,68 @@ fn truncation_note(response: &Value, shown: usize) -> String {
         ),
         (None, _) => {
             "(Results are truncated. Consider using a more specific path or pattern.)\n".into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Search;
+
+    #[test]
+    fn blocks_account_for_every_line_or_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "a-b", "x-1.rs"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let grep = ["grep", "-rn", "-C1", "x", "."];
+        let cases: [(&[&str], &[&str], Option<&str>); 7] = [
+            // ugrep prints no `--` between files.
+            (
+                &grep,
+                &["a-1-p", "a:2:x", "x-1.rs-1-q", "x-1.rs:2:x", "x-1.rs-3-"],
+                Some("2 matches in 2 files, 2 blocks, 3 context lines\na ×1 in 1 block"),
+            ),
+            // Without numbers, `a-b` lines after `a` belong to the longer name.
+            (
+                &["grep", "-r", "-C1", "x", "."],
+                &["a:x", "a-p", "--", "a-b-q", "a-b:x"],
+                Some("a-b ×1 in 1 block [stdout:4-5]\n  -q\n  :x\n"),
+            ),
+            // A block that `head` cut before its match keeps its file.
+            (
+                &grep,
+                &["a:2:x", "a-3-p", "--", "x-1.rs-1-q"],
+                Some("1 match in 2 files, 2 blocks"),
+            ),
+            // A gap in line numbers starts a block, as `-A0` prints no `--`.
+            (
+                &["rg", "-n", "-A0", "x", "a"],
+                &["2:x", "3:x", "5:x"],
+                Some(
+                    "a ×3 in 2 blocks [stdout:1-3]\n  2:x\n  3:x\n  +1 more block [stdout:3]: L5 [stdout:3]\n",
+                ),
+            ),
+            (&grep, &["a:2:x", "stray"], None),
+            // One file's lines without numbers cannot tell matches from context.
+            (&["grep", "-C1", "x", "a"], &["p", "x"], None),
+            (&["ag", "-C1", "x", "."], &["a:2:x"], None),
+        ];
+        for (words, lines, expected) in cases {
+            let mut search = Search::new(dir.path(), words);
+            for (i, line) in lines.iter().enumerate() {
+                search.observe(line, i + 1);
+            }
+            let report = search
+                .finish("grep", 4096, None, true)
+                .map(|(text, _)| text);
+            match expected {
+                Some(part) => assert!(
+                    report.as_deref().is_some_and(|text| text.contains(part)),
+                    "{lines:?}: {report:?}"
+                ),
+                None => assert_eq!(report, None, "{lines:?}"),
+            }
         }
     }
 }

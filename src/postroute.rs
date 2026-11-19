@@ -313,7 +313,11 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         Some(preview) => text.len() > preview,
         None => output.len().saturating_sub(text.len()) < (output.len() / 4).max(512),
     };
-    if shown.footer.is_empty() || small {
+    // A search with context lines is shown as blocks or not at all: any other
+    // preview would hide lines the agent asked for.
+    let words: Vec<&str> = plan.words.iter().map(String::as_str).collect();
+    let blocks = crate::search::prints_context(crate::filters::unwrap_tool(&words));
+    if shown.footer.is_empty() || small || blocks && summary.kind != "search" {
         // The agent keeps the original, so the archive adds nothing.
         let _ = fs::remove_dir_all(&archive);
         return None;
@@ -542,13 +546,14 @@ fn plan(command: &str) -> Option<Plan> {
             crate::filters::profile(&refs),
             crate::summary::family(&args),
         );
-        // A search that prints lines around its matches or every line, such as
-        // `grep -n -A20 fn` or `grep -rn "" file`, is how an agent reads code, and a
-        // report grouped by file would show only the matching lines. A listing
-        // filtered by `grep` names the paths the agent asked for, which a listing
-        // report can collapse into one directory count.
+        // A search whose pattern matches every line, such as `grep -rn "" file`, is
+        // how an agent reads code, and a report grouped by file would show only a few
+        // lines. A search with context lines qualifies only for its block report,
+        // which `claude_bash` checks after the run. A listing filtered by `grep`
+        // names the paths the agent asked for, which a listing report can collapse
+        // into one directory count.
         let tool = crate::filters::unwrap_tool(&refs);
-        if crate::search::prints_more_than_matches(tool)
+        if crate::search::matches_every_line(tool)
             || kind.0 == Some(crate::filters::Profile::Listing)
                 && filters.iter().any(|filter| {
                     strip(&filter.words)

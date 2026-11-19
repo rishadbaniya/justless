@@ -3785,7 +3785,8 @@ fn search_groups_files_whose_names_share_a_prefix() {
         preview.starts_with("grep: 200 matches in 2 files\n") && !preview.contains("context lines"),
         "{preview}"
     );
-    // Real context lines (`settings-2-…`) are still recognized as context.
+    // Real context lines (`settings-2-…`) are still recognized as context, and
+    // the run shows blocks.
     fs::write(
         root.join("settings"),
         "needle one\nplain line\n".repeat(300),
@@ -3807,9 +3808,88 @@ fn search_groups_files_whose_names_share_a_prefix() {
     );
     let preview = stdout(&context);
     assert!(
-        preview.starts_with("grep: 400 matches in 2 files, 300 context lines"),
+        preview.starts_with("grep: 400 matches in 2 files, 2 blocks, 300 context lines")
+            && preview.contains("settings-prod ×100 in 1 block [stdout:"),
         "{preview}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn context_searches_show_blocks_that_log_returns_exactly() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    fs::create_dir(root.join("src")).unwrap();
+    let token = format!("{}{}{}", "gh", "p_", "Zq8Xv2Lm9Rt4Wp7Ks3Nd6Hy1Bc5Fg0Jk2Mn4");
+    let text: String = (1..=400)
+        .map(|i| match i % 10 {
+            0 => format!("    call(needle, {i}); // a-b: c\n"),
+            9 if i == 9 => format!("    let token = \"{token}\";\n"),
+            _ => format!("    other_value({i}) - 1;\n"),
+        })
+        .collect();
+    for name in ["x-1.rs", "y:2.rs"] {
+        fs::write(root.join("src").join(name), &text).unwrap();
+    }
+    for args in [&["init", "-q"][..], &["add", "src"]] {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+    }
+    let rg = Command::new("rg").arg("--version").output().is_ok();
+    for args in [
+        &["grep", "-rn", "-C2", "needle", "src"][..],
+        &["grep", "-n", "-C2", "needle", "src/x-1.rs"],
+        &["git", "grep", "-n", "-A2", "needle", "--", "src"],
+        &["rg", "--sort=path", "-n", "-C2", "needle", "src"],
+        &["rg", "--sort=path", "-C2", "needle", "src"],
+        &[
+            "rg",
+            "--sort=path",
+            "-n",
+            "-C2",
+            "--heading",
+            "needle",
+            "src",
+        ],
+        &["rg", "-n", "-C2", "needle", "src/y:2.rs"],
+    ] {
+        if args[0] == "rg" && !rg {
+            continue;
+        }
+        let raw = stdout(
+            &Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(root)
+                .output()
+                .unwrap(),
+        );
+        let output = cli(root, &[&["run", "--"][..], args].concat());
+        let report = stdout(&output);
+        assert!(
+            report.len() < raw.len()
+                && report.lines().next().unwrap().contains(" blocks, ")
+                && report.contains(" ×40 in 40 blocks [stdout:")
+                && !report.contains(&token),
+            "{args:?}: {report}"
+        );
+        // Every tag names lines that `log` returns exactly.
+        let lines: Vec<&str> = raw.lines().collect();
+        let id = run_id(&output);
+        for tag in report.split("[stdout:").skip(1).take(6) {
+            let range = tag.split(']').next().unwrap();
+            let (from, to) = range.split_once('-').unwrap_or((range, range));
+            let (a, b): (usize, usize) = (from.parse().unwrap(), to.parse().unwrap());
+            let log = ["log", &id, "--unredacted", "--from", from, "--to", to];
+            assert_eq!(
+                success(root, &log),
+                format!("{}\n", lines[a - 1..b].join("\n")),
+                "{args:?} {range}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -13707,9 +13787,8 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
         );
     }
 
-    // Searches that print lines around their matches, or every line, are how an
-    // agent reads code, so they pass through, while the same searches without
-    // context are grouped.
+    // Searches that print every line are how an agent reads code, so they pass
+    // through, while the same searches without that pattern are grouped.
     let vcs = |args: &[&str]| {
         let output = Command::new("git")
             .args(args)
@@ -13729,14 +13808,6 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
     }
     assert_eq!(runs(), 3);
     for command in [
-        "grep -rn -A5 needle src",
-        "grep -rnA5 needle src",
-        "grep -rn -B 2 needle src",
-        "grep -rn --context=3 needle src",
-        "grep -rn --after-context 3 needle src",
-        "grep -rn --before-context=1 needle src",
-        "rg -n -C2 needle src",
-        "git grep -n -B2 needle -- src",
         "grep -rn \"\" src",
         "grep -rn -e '' src",
         "grep -rn '^' src",
@@ -13748,6 +13819,34 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
             "{command}"
         );
     }
+    // Searches with context lines show blocks, and pass through when a line
+    // belongs to no block.
+    let context = stdout(
+        &Command::new("grep")
+            .args(["-rn", "-B1", "needle", "src"])
+            .current_dir(&root)
+            .output()
+            .unwrap(),
+    );
+    for command in [
+        "grep -rn -B1 needle src",
+        "grep -rnB1 needle src",
+        "grep -rn --before-context=1 needle src",
+        "rg -n -B 1 needle src",
+        "git grep -n -B1 needle -- src",
+    ] {
+        let text = shown_stdout(&after_bash(&root, &root, command, bash_result(&context)));
+        assert!(
+            text.contains(" blocks, ") && text.contains("\nsrc/big.rs ×150 in 1 block [stdout:"),
+            "{command}: {text}"
+        );
+    }
+    let stray = format!("{context}grep: src/x: Permission denied\n");
+    let command = "grep -rn -B1 needle src";
+    assert_eq!(
+        after_bash(&root, &root, command, bash_result(&stray)),
+        json!({})
+    );
 
     // A listing filtered by grep names the paths the agent asked for, which a
     // listing report could collapse into a directory count.
@@ -13793,7 +13892,7 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
         assert!(text.contains(" entries"), "{command}: {text}");
     }
     // Nothing that passed through was archived.
-    assert_eq!(runs(), 6);
+    assert_eq!(runs(), 11);
 }
 
 #[cfg(unix)]
