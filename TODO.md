@@ -214,6 +214,12 @@ Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). Th
 - `scripts/agent_bench/cc_hooks.py` drives the hook with `bypassPermissions`, so it now reads the machine's real settings; pin `CLAUDE_CONFIG_DIR` and the managed override in the harness.
 - **Progress.** *designed*.
 
+### 4.G Follow-ups from the new languages
+- Test selection treats `.vue`, `.svelte`, `.astro` and the five new languages as code but not as anything a runner tests, so a component change does not select its JS tests; a MATLAB `.m` file is still named Objective-C there because that check has no file text.
+- The five new grammars only report parse problems after edits; measure them on real code (as was done for the older grammars) before letting them block.
+- Not covered: `.mm` files, Perl (a `tree-sitter-perl` crate exists). Groovy uses the third-party `dekobon-tree-sitter-groovy` grammar (Apache-2.0 OR MIT), chosen because the `tree-sitter-groovy` crate misparsed Spock and Gradle code.
+- **Progress.** *designed*.
+
 ### 4.E `git show REV:path` reads
 - The largest unhandled read family: 803 results, 3.41 MB. Treat `git show REV:path` like the other shell reads (§2.1): exact for small output, outline for wide, verified bytes.
 - **Starts after:** the review of the batch code merges.
