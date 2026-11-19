@@ -1001,7 +1001,12 @@ impl Search {
         self.drop_pending();
         if self.blocks.is_some() {
             self.close_block();
-            if self.mode().failed || self.matches == 0 {
+            // A file named with no lines after it, such as a heading before a blank
+            // line or at the end, is not a form a search prints.
+            if self.mode().failed
+                || self.matches == 0
+                || self.groups.iter().any(|g| g.blocks.is_empty())
+            {
                 return None;
             }
         }
@@ -1196,11 +1201,10 @@ fn block_body(order: &[&Group], list: &[Block], room: usize, pointers: bool) -> 
             plural(g.blocks.len(), "block", "blocks"),
             pointer(pointers, g)
         );
-        if lines == 0 {
-            return text;
-        }
         // A cut block starts near its first match, and its range covers it whole.
-        let first = &list[g.blocks[0]];
+        let Some(first) = g.blocks.first().filter(|_| lines > 0).map(|&b| &list[b]) else {
+            return text;
+        };
         let shown = lines.min(g.shown.len());
         let lead = g.lead.unwrap_or(0);
         let start = lead.saturating_sub(lines / 4).min(g.shown.len() - shown);
@@ -1570,6 +1574,27 @@ mod tests {
                 ),
                 None => assert_eq!(report, None, "{lines:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn a_heading_without_lines_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "a-1"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let words = ["rg", "-n", "-C1", "--heading", "x", "."];
+        // A heading before a blank line, and one at the end of the output.
+        for lines in [
+            &["a", "", "a-1", "1:x", "2-y"][..],
+            &["a-1", "1:x", "", "a"],
+        ] {
+            let mut search = Search::new(dir.path(), &words);
+            for (i, line) in lines.iter().enumerate() {
+                search.observe(line, i + 1);
+            }
+            let report = search.finish("rg", 4096, None, true);
+            assert_eq!(report.map(|(text, _)| text), None, "{lines:?}");
         }
     }
 }

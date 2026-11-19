@@ -1367,7 +1367,22 @@ struct Capture<'a> {
 impl Capture<'_> {
     /// Scan the archived streams, save the record and return the previews and footer.
     /// `stdout_preview` can replace the preview of a stdout longer than `max_bytes`.
+    /// A panic in a summary or view is an error like any other, so the caller still
+    /// restores the command's output and exit status.
     fn record(
+        &self,
+        archive: &mut Archive,
+        family: String,
+        status: i32,
+        stdout_preview: Option<StdoutPreview<'_>>,
+    ) -> Result<(Previews, String, Run)> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.record_unguarded(archive, family, status, stdout_preview)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("an internal error stopped the preview")))
+    }
+
+    fn record_unguarded(
         &self,
         archive: &mut Archive,
         family: String,
