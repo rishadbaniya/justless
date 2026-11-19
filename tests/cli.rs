@@ -9984,6 +9984,7 @@ fn fixture_files(root: &Path, fixture: &str) {
 }
 
 /// The record of run `id` under `root`.
+#[cfg(unix)]
 fn run_record(root: &Path, id: &str) -> serde_json::Value {
     serde_json::from_str(&file_text(
         root,
@@ -13435,12 +13436,14 @@ fn marker_run(text: &str) -> String {
 
 /// What Claude Code's Bash tool shows after the hook replaced `stdout` of
 /// `command` run in `root`.
+#[cfg(unix)]
 fn bash_shown(root: &Path, command: &str, stdout: &str) -> String {
     shown_stdout(&after_bash(root, root, command, bash_result(stdout)))
 }
 
 /// Asserts that the post-command hook leaves each of `commands` printing
 /// `stdout` as it was.
+#[cfg(unix)]
 fn bash_untouched(root: &Path, commands: &[&str], stdout: &str) {
     for command in commands {
         let output = after_bash(root, root, command, bash_result(stdout));
