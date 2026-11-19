@@ -17091,6 +17091,105 @@ fn claude_reads_record_the_lines_or_outline_the_agent_was_shown() {
     );
 }
 
+#[test]
+fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
+    use serde_json::{Value, json};
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    let elsewhere = TempDir::new().unwrap();
+    let outside = elsewhere.path().canonicalize().unwrap();
+    let home = outside.join("home");
+    // Fifty functions, more than the forty rows an outline shows.
+    let module: String = (1..=50)
+        .map(|i| format!("def step_{i}(value):\n    \"\"\"Step {i} of the pipeline.\"\"\"\n    total = value + {i}\n    return total * 2\n\n\n"))
+        .collect();
+    let native = module.trim_end_matches('\n');
+    let notes = "plain words, no code\n".repeat(400);
+    let path = |name: &str| {
+        let path = outside.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &module).unwrap();
+        path
+    };
+    let read = |path: &Path, content: &str| {
+        let lines = content.lines().count();
+        json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+            "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
+            "content":content,"startLine":1,"numLines":lines,"totalLines":lines}}})
+    };
+    let hook = |event: Value| -> Value {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(["hook-claude", "after-read"])
+            .current_dir(&root)
+            .envs(no_claude_settings(&root))
+            .env("HOME", &home)
+            .env_remove("CLAUDE_PROJECT_DIR")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(event.to_string().as_bytes()).unwrap();
+        drop(stdin);
+        serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap()
+    };
+    let module_path = path("lib/pipeline.py");
+    let event = read(&module_path, native);
+    let outlined = hook(event.clone());
+    let output = &outlined["hookSpecificOutput"];
+    let content = output["updatedToolOutput"]["file"]["content"]
+        .as_str()
+        .unwrap();
+    // Only the text and its line count change, as for a workspace outline.
+    let mut expected = event["tool_response"].clone();
+    expected["file"]["content"] = json!(content);
+    expected["file"]["numLines"] = json!(content.lines().count());
+    assert_eq!(output["updatedToolOutput"], expected);
+    let (first, rows) = content.split_once('\n').unwrap();
+    let id = &first["[justless recall ".len()..][..64];
+    assert_eq!(
+        first,
+        format!("[justless recall {id}] exact original Read result · 298 lines")
+    );
+    assert!(rows.starts_with("#1 L1-4 function step_1  def step_1(value):\n"));
+    assert!(rows.ends_with("More rows start at L241; Read from offset 241 for them."));
+    assert!(!content.contains("next --after") && content.len() * 2 < native.len());
+    let context = output["additionalContext"].as_str().unwrap();
+    assert!(context.contains("allow_large: true") && !context.contains("expand"));
+    assert_eq!(success(&root, &["recall", id]), native);
+    assert!(!success(&root, &["resume"]).contains("pipeline.py"));
+
+    let mut whole = read(&module_path, native);
+    whole["tool_input"]["allow_large"] = json!(true);
+    let window: Vec<&str> = native.lines().take(200).collect();
+    let mut ranged = read(&module_path, &window.join("\n"));
+    ranged["tool_input"]["limit"] = json!(200);
+    let mut truncated = event.clone();
+    truncated["tool_response"]["file"]["truncatedByTokenCap"] = json!(true);
+    for (case, event) in [
+        ("dotfile", read(&path("lib/.pipeline.py"), native)),
+        (
+            "under $HOME/.*",
+            read(&path("home/.cache/pipeline.py"), native),
+        ),
+        (
+            "saved tool result",
+            read(&path("s1/tool-results/p.py"), native),
+        ),
+        ("plain text", read(&path("lib/notes.txt"), &notes)),
+        (
+            "small",
+            read(&path("lib/small.py"), "def one():\n    return 1"),
+        ),
+        ("allow_large", whole),
+        ("ranged", ranged),
+        ("truncated", truncated),
+    ] {
+        assert_eq!(hook(event), json!({}), "{case}");
+    }
+}
+
 /// A committed Cargo package whose integration tests run a tracked script and
 /// read a fixture that `.gitattributes` keeps out of line diffs.
 #[cfg(unix)]

@@ -783,7 +783,9 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     {
         return None;
     }
-    let file = ws.relative_file(path)?;
+    let Some(file) = ws.relative_file(path) else {
+        return outside_read(ws, path, response);
+    };
     let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
     let budget = ws.settings().ok()?.context_budget;
     let native = result["content"].as_str()?;
@@ -831,6 +833,127 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
         "additionalContext":format!("{context} Expand a row with {justless} expand FILE 'REV#ID', or Read original lines with offset and a limit of at most {READ_WINDOW_LINES}.")}}),
     )
+}
+
+/// The outline of a whole Read of a file outside the workspace, made from the
+/// text Read returned without opening the file, building an index or taking a
+/// lock. The original is archived in this project's `.justless/`, and the first
+/// line names `justless recall ID`, which prints it exactly. Only files with
+/// parser rows qualify, under the rules of the outline of a workspace file.
+/// `expand` and `edit` take workspace files only, so the hint names Read's own
+/// ways back, which pass through here: any ranged Read, and `allow_large`.
+fn outside_read(ws: &Workspace, path: &Path, mut response: Value) -> Option<Value> {
+    if !outside_file(ws, path) {
+        return None;
+    }
+    let result = &mut response["file"];
+    if result
+        .get("truncatedByTokenCap")
+        .is_some_and(|flag| flag != &Value::Bool(false))
+    {
+        return None;
+    }
+    let native = result["content"].as_str()?.to_owned();
+    let settings = ws.settings().ok()?;
+    let budget = settings.context_budget;
+    if native.len() <= budget
+        || native.len() as u64 > settings.max_file_bytes
+        || native.contains('\0')
+    {
+        return None;
+    }
+    let name = path.to_str()?;
+    let mut source = crate::source::Snapshot::from_text(name, native.clone());
+    source.index(name).ok()?;
+    // Plain text and Rust that does not parse get 80-line pages, not rows.
+    let symbols = source.symbols();
+    if symbols.is_empty() || symbols.iter().any(|(_, kind, ..)| kind == "text") {
+        return None;
+    }
+    let uncovered = uncovered_code(name, &source)?;
+    if uncovered.len() > 20 {
+        return None;
+    }
+    let page = source.page("", None, 40, budget).ok()?;
+    let shown = serde_json::to_value(&page).ok()?["entries"]
+        .as_array()?
+        .len();
+    let display = page.display();
+    // The revision and the `next --after` cursor serve workspace commands only.
+    let (header, rows) = display.split_once('\n')?;
+    let lines = header.rsplit_once(" · ")?.1;
+    let (mut body, cursor): (String, String) = rows
+        .split_inclusive('\n')
+        .partition(|line| !line.starts_with("next --after "));
+    if let Some((_, _, first, _)) = symbols.get(shown).filter(|_| !cursor.is_empty()) {
+        body.push_str(&format!(
+            "More rows start at L{first}; Read from offset {first} for them.\n"
+        ));
+    }
+    let mut covered = "";
+    if !uncovered.is_empty() {
+        let source_lines: Vec<&str> = native.lines().collect();
+        let mut code = String::from("Code outside these rows:\n");
+        for index in uncovered {
+            code.push_str(&format!("L{}: {}\n", index + 1, source_lines[index]));
+        }
+        if code.len() > budget {
+            return None;
+        }
+        body.push_str(&code);
+        covered = ", and code that no row covers follows the rows verbatim";
+    }
+    let first = |id: &str| format!("[justless recall {id}] exact original Read result · {lines}\n");
+    let context = format!(
+        "Justless outline of a file outside the workspace. L ranges are source line numbers{covered}. A Read with offset and a limit of at most {READ_WINDOW_LINES} lines, or with allow_large: true, returns lines as they are, and `{} recall ID` with the first line's ID prints this Read's original result.",
+        ws.justless()
+    );
+    // A recall ID is 64 hex digits.
+    if first(&"0".repeat(64)).len() + body.len() + context.len() >= native.len() {
+        return None;
+    }
+    let id = crate::observations::archive(ws, &Value::String(native)).ok()?;
+    let content = first(&id) + &body;
+    result["numLines"] = json!(content.lines().count());
+    result["content"] = json!(content.trim_end_matches('\n'));
+    Some(json!({"hookSpecificOutput":{"hookEventName":"PostToolUse",
+        "updatedToolOutput":response, "additionalContext":context}}))
+}
+
+/// Whether the outside-read outline may replace a Read of `path`: an absolute path
+/// outside the workspace, also once its directory is resolved, that is not a
+/// dotfile, anything under `$HOME/.*`, such as Claude Code's own settings and
+/// transcripts, or a tool result Claude Code saved to a `tool-results` directory.
+fn outside_file(ws: &Workspace, path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let resolved = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .map(|parent| parent.join(name));
+    let paths = [Some(path.to_path_buf()), resolved];
+    let home = std::env::home_dir();
+    let homes = [home.clone(), home.and_then(|home| home.canonicalize().ok())];
+    let hidden = |path: &Path| {
+        homes.iter().flatten().any(|home| {
+            path.strip_prefix(home).is_ok_and(|rest| {
+                rest.components()
+                    .next()
+                    .is_some_and(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+            })
+        })
+    };
+    path.is_absolute()
+        && !name.to_string_lossy().starts_with('.')
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_none_or(|parent| parent != "tool-results")
+        && paths
+            .iter()
+            .flatten()
+            .all(|path| !path.starts_with(&ws.root) && !hidden(path))
 }
 
 /// The outline rows around the window of a ranged Read that returned more than
