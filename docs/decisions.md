@@ -81,3 +81,4 @@ LLM summarization or retrieval, telemetry, client-side rewriting of earlier requ
 | `awk 'NR>=A && NR<=B'` range reads | 42 results, 0.10 MB. |
 | Cargo.lock descriptions inside `git log -p` | Two git lookups per lockfile section per commit; `git log -p` is 0.05 MB in total. |
 | Compacting lists that mix `git show` with other git commands after they run | 29 results, 0.11 MB; `git diff` lists already pass through the same way. |
+| Prebuilt release binaries | The owner decided on 2026-11-19 that every install builds from source with Cargo; the installer, release workflow and Homebrew formula were simplified to match. |
