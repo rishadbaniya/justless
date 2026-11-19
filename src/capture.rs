@@ -1506,7 +1506,7 @@ impl Capture<'_> {
                 .ok()
                 .and_then(|id| load(workspace, id.trim()).ok())
                 .map(|(_, run)| run)
-                .filter(|run| !run.unfinished)
+                .filter(|prior| !prior.unfinished && !run.summary.other_commits(&prior.summary))
         };
         // A truncated archive holds only a prefix, so its digests cannot show that
         // two runs printed the same output.

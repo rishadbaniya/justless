@@ -466,6 +466,21 @@ impl Summary {
             .map(String::as_str)
     }
 
+    /// Whether this and `prior` are patches of different commits, as `git show HEAD`
+    /// prints before and after a commit. Compared, every item of both would show.
+    pub fn other_commits(&self, prior: &Summary) -> bool {
+        let ids = |summary: &Summary| -> std::collections::BTreeSet<String> {
+            summary
+                .items
+                .iter()
+                .filter(|item| item.is_commit())
+                .map(|item| item.name.clone())
+                .collect()
+        };
+        let (now, then) = (ids(self), ids(prior));
+        !now.is_empty() && !then.is_empty() && now.is_disjoint(&then)
+    }
+
     /// The first line of a patch summary, such as `1 commit(s), 3 diff section(s)`.
     pub(crate) fn patch_heading(&self) -> String {
         let commits = self.items.iter().filter(|item| item.is_commit()).count();
@@ -658,6 +673,12 @@ mod tests {
              + commit 4e5ef6a7fe67 docs(readme): add a logo and tagline [stdout:33-37]\n\
              - commit 4e5ef6a7fe67 docs(readme): add the logo and tagline [prior stdout:33-37]\n"
         );
+        // A rerun that shows only other commits is not compared with them.
+        let second = &SHOW[SHOW.find("commit 4e5").unwrap()..];
+        let other = second.replacen("4e5ef6a7fe67", "fedcba987654", 1);
+        assert!(!parse("git show", second).other_commits(&summary));
+        assert!(parse("git show", &other).other_commits(&summary));
+        assert!(!summary.other_commits(&Summary::default()));
     }
 
     #[test]
