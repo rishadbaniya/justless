@@ -50,7 +50,7 @@ Originals stay recoverable and exit codes matched in every run. The repair task 
   <img src="assets/query-light.svg" alt="Where is would_route defined and what calls it? Without justless, the agent runs rg -n -w would_route src, which prints 4 matching lines, then reads the defining file src/agents.rs: 2,498 lines and 102,590 bytes in all, with the 15-line definition at lines 2110 to 2124. With justless, justless query would_route prints 8 lines (665 bytes): the definition at src/agents.rs:2110-2124, its two callers in src/discover.rs at lines 275 and 292, the functions and types it uses, and a note that no related tests were found." width="100%">
 </picture>
 
-<sub>Where is <code>would_route</code> defined and what calls it? A search plus the file that defines it is 102,590 bytes; <code>justless query</code> answers in 665 (154× here, 57× median over 14 functions).</sub>
+<sub>Where is <code>would_route</code> defined and what calls it? A search plus the file that defines it is 102,590 bytes; <code>justless query</code> answers in 665: 154× against <code>cat</code>, 148× against Claude Code's Read, which stops at 2,000 lines, and 57× median over 14 functions.</sub>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/search-dark.svg">
