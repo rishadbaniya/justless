@@ -4,10 +4,6 @@ Open work only. Finished work is in [CHANGELOG.md](CHANGELOG.md) and the Git his
 
 ## In progress
 
-### Follow-ups from global setup
-- In a project served only by global hooks, `doctor` still fails with "not set up in this project" and "Hooks: none"; `discover` does not apply `exclude_commands`; `stats --all` ignores `--days`.
-- **Progress.** *designed*.
-
 ### Record read-list reads for `resume`
 - Reads served inside Claude Code read lists (`src/batch*`) never call `history::saw_source`/`saw_outline`, so `resume` and `[source changed]` miss them; single-file reads are recorded.
 - **Progress.** *designed*.
