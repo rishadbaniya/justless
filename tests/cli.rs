@@ -2894,7 +2894,7 @@ fn discover_classifies_claude_code_shell_commands() {
     let route = |name: &str| groups.iter().find(|g| g["route"] == name).unwrap();
     assert_eq!(route("through_justless")["labels"][0]["label"], "npm test");
     assert_eq!(route("supported_not_routed")["output_bytes"], 4000);
-    assert_eq!(route("supported_not_routed")["estimated_tokens"], 1000);
+    assert_eq!(route("supported_not_routed")["estimated_tokens"], 1813);
     let plan: serde_json::Value = serde_json::from_str(&discover(&["--json", "--plan"])).unwrap();
     let rows = plan["plan"].as_array().unwrap();
     // A command a current hook would route, and a range read the post-command
@@ -2914,7 +2914,7 @@ fn discover_classifies_claude_code_shell_commands() {
     let text = discover(&[]);
     assert!(
         text.starts_with("Claude Code ran 4 shell command(s) here in the last 30 day(s), across 1 session(s)")
-            && text.contains("Supported, not routed: 1 command(s) · 3.9 KB output · ≈1000 tokens\n  cargo test ×1 (3.9 KB)")
+            && text.contains("Supported, not routed: 1 command(s) · 3.9 KB output · ≈1813 tokens\n  cargo test ×1 (3.9 KB)")
             && text.contains("justless init --hooks --agent claude")
             && !text.contains("x".repeat(20).as_str()),
         "{text}"
@@ -8154,14 +8154,14 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     // Two hook-routed runs in the session: one compacted, one shown verbatim.
     synthetic_run(&root, "run-compact", start + 1_000, 40_000, 2_000, true);
     synthetic_run(&root, "run-verbatim", start + 2_000, 952, 952, true);
-    // (40,000 + 952) - (2,048 + 1,000) bytes kept out = 37,904 bytes ≈ 9,476 tokens.
+    // (40,000 + 952) - (2,048 + 1,000) bytes kept out = 37,904 bytes ≈ 17.2k tokens at 2.21 bytes per token.
     assert_eq!(
         line("s1"),
-        "justless · net ≈9.5k tokens saved this session · 2 runs"
+        "justless · net ≈17.2k tokens saved this session · 2 runs"
     );
     assert_eq!(
         status_line(&root, &[], event("s1").as_bytes(), Some("40")),
-        "justless · net ≈9.5k tokens saved"
+        "justless · net ≈17.2k tokens saved"
     );
 
     // A whole-file Read that the hook replaces with an outline counts for its session.
@@ -8207,7 +8207,10 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
         );
         (source.len() - 1 - read_shown + content.len() - grep_shown) as u64
     };
-    let tokens = format!("{:.1}", (37_904 + tool_saved).div_ceil(4) as f64 / 1000.0);
+    let tokens = format!(
+        "{:.1}",
+        ((37_904 + tool_saved) * 63_191).div_ceil(139_440) as f64 / 1000.0
+    );
     let expected = format!("≈{}k", tokens.strip_suffix(".0").unwrap_or(&tokens));
     assert_eq!(
         line("s1"),
@@ -8216,7 +8219,7 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     // Another session sees the shared project runs, but not this session's reads.
     assert_eq!(
         line("s2"),
-        "justless · net ≈9.5k tokens saved this session · 2 runs"
+        "justless · net ≈17.2k tokens saved this session · 2 runs"
     );
     // A Read the hook leaves alone, such as an explicit range, is not counted.
     let mut ranged = read;
@@ -14756,7 +14759,8 @@ fn statusline_counts_replaced_bash_results_as_hook_runs_of_the_session() {
         - record["preview_bytes"].as_u64().unwrap()
         - record["footer_bytes"].as_u64().unwrap();
     assert_eq!(saved, (content.len() - text.len()) as u64);
-    let tokens = format!("{:.1}", saved.div_ceil(4) as f64 / 1000.0);
+    // Command output is estimated at the logs ratio: 139,440 bytes per 63,191 tokens.
+    let tokens = format!("{:.1}", (saved * 63_191).div_ceil(139_440) as f64 / 1000.0);
     let expected = format!(
         "justless · net ≈{}k tokens saved this session · 1 run",
         tokens.strip_suffix(".0").unwrap_or(&tokens)
@@ -18372,14 +18376,14 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
     .unwrap();
     assert_eq!(
         line(),
-        "justless · net ≈4.7k tokens saved this session · 1 run"
+        "justless · net ≈8.4k tokens saved this session · 1 run"
     );
     // Replaying it whole leaves the session 364 bytes worse off than running
     // the command directly.
     assert_eq!(printed_bytes(&cli(&root, &["log", "run-replayed"])), 19_000);
     assert_eq!(
         line(),
-        "justless · initially ≈4.7k tokens saved · net ≈91 extra tokens this session · 1 run"
+        "justless · initially ≈8.4k tokens saved · net ≈165 extra tokens this session · 1 run"
     );
 
     // An archived tool result printed by `recall` comes back into context too.
@@ -18417,7 +18421,7 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
     // (19,000 - 364 - 19,000) - 6,000 recalled = -6,364 bytes ≈ 1,591 tokens.
     assert_eq!(
         line(),
-        "justless · initially ≈4.7k tokens saved · net ≈1.6k extra tokens this session · 1 run"
+        "justless · initially ≈8.4k tokens saved · net ≈2.9k extra tokens this session · 1 run"
     );
     let report = savings(&root);
     assert_eq!(

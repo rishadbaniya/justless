@@ -338,7 +338,10 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             "sessions": sessions.len(),
             "commands": total,
             "output_bytes": output,
-            "token_estimate": "UTF-8 bytes / 4",
+            "token_estimate": format!(
+                "UTF-8 bytes / {:.2}, the bytes per token measured for command output",
+                crate::tokens::Content::Logs.bytes_per_token()
+            ),
             "plan": plan.then(|| {
                 let mut entries: Vec<_> = unrouted.iter().collect();
                 entries.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes).then(a.0.cmp(b.0)));

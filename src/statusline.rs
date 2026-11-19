@@ -1017,19 +1017,19 @@ mod tests {
         };
         assert_eq!(
             render(&tally, None),
-            "justless · net ≈41.2k tokens saved this session · 23 runs · 1 read · 2 searches"
+            "justless · net ≈74.7k tokens saved this session · 23 runs · 1 read · 2 searches"
         );
         assert_eq!(
             render(&tally, Some(66)),
-            "justless · net ≈41.2k tokens saved this session · 23 runs · 1 read"
+            "justless · net ≈74.7k tokens saved this session · 23 runs · 1 read"
         );
         assert_eq!(
             render(&tally, Some(65)),
-            "justless · net ≈41.2k tokens saved this session · 23 runs"
+            "justless · net ≈74.7k tokens saved this session · 23 runs"
         );
         assert_eq!(
             render(&tally, Some(30)),
-            "justless · net ≈41.2k tokens saved"
+            "justless · net ≈74.7k tokens saved"
         );
         assert_eq!(render(&Tally::default(), Some(5)), "justless · ready");
         assert_eq!(short_number(999), "999");
@@ -1052,7 +1052,7 @@ mod tests {
         assert_eq!(replayed.net_bytes(), -364);
         assert_eq!(
             render(&replayed, None),
-            "justless · initially ≈4.7k tokens saved · net ≈91 extra tokens this session · 1 run"
+            "justless · initially ≈8.4k tokens saved · net ≈165 extra tokens this session · 1 run"
         );
         // A grouped Grep result recalled in part keeps the rest of its saving.
         let recalled = Tally {
@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(recalled.net_bytes(), 5_000);
         assert_eq!(
             render(&recalled, None),
-            "justless · initially ≈2.2k tokens saved · net ≈1.2k tokens saved this session · 1 search"
+            "justless · initially ≈4.1k tokens saved · net ≈2.3k tokens saved this session · 1 search"
         );
     }
 }

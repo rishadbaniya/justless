@@ -640,11 +640,11 @@ struct DayStats {
     totals: Totals,
 }
 
-/// Tokens as UTF-8 bytes divided by four, the flat estimate that the status line,
-/// `discover` and the proxy label as such. `stats` uses the measured ratios in
+/// Tokens in command output, at the bytes per token measured for logs, for the status
+/// line and `discover`, which do not read archives. `stats` classifies each run with
 /// [`crate::tokens`].
 pub fn estimated_tokens(bytes: u64) -> u64 {
-    bytes.div_ceil(4)
+    crate::tokens::Content::Logs.tokens(bytes)
 }
 
 /// [`human_bytes`] for net savings, which can be negative.
