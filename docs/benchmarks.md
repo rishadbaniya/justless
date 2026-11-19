@@ -344,6 +344,33 @@ The 167 replaced windows went from 2,803,765 to 304,590 bytes, a median of 12% o
 
 Against Claude Code 2.1.327 and the harness's local fake API, a Read of lines 100-399 of a generated 482-line Rust file reached the model as the outline and the hint. The same Read again returned the outline again, a 150-line Read returned the native lines, and an Edit inside the outlined window succeeded, as it did in the same script without hooks. After an outlined 300-line window and an outlined 400-line window of 35,231 bytes, the same Read with `allow_large: true` returned exactly what Read returned without hooks. `justless expand` printed the 300-line window exactly, but Claude Code returned the larger window's 32.9 KB as a saved file and a preview, so the hint names the Read.
 
+## Code questions
+
+An agent without an index answers "where is `X` defined and what calls it" by searching and then reading the file that defines it. `justless query X` answers it with the definition, its callers and callees, each with a file and line. Measured on 2026-11-19 at commit 6ee090d of this repository, macOS arm64, a debug build, on 14 functions whose names are unique:
+
+- **Without Justless:** the bytes of `rg -n -w X src`, plus the defining file as Claude Code's Read returns it, at most 2,000 lines with a line-number prefix.
+- **With Justless:** the bytes `justless query X` prints, within its default 2,400-byte budget.
+
+| Function | Defining file | Search + read | `query` | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| `would_route` | `src/agents.rs` | 98,599 | 665 | 148.3× |
+| `left_by_permissions` | `src/agents.rs` | 98,407 | 817 | 120.4× |
+| `saw_source` | `src/history.rs` | 68,003 | 580 | 117.2× |
+| `imported_instructions` | `src/agents.rs` | 98,770 | 870 | 113.5× |
+| `with_seen_session` | `src/agents.rs` | 98,401 | 1,091 | 90.2× |
+| `read_persisted` | `src/postroute.rs` | 54,250 | 687 | 79.0× |
+| `sessions_json` | `src/tokens.rs` | 32,509 | 528 | 61.6× |
+| `run_content` | `src/tokens.rs` | 32,364 | 612 | 52.9× |
+| `merge_hooks` | `src/agents.rs` | 98,638 | 2,027 | 48.7× |
+| `strip_section` | `src/uninstall.rs` | 74,175 | 1,609 | 46.1× |
+| `split_compound` | `src/agents.rs` | 99,170 | 2,400 | 41.3× |
+| `bash_hook` | `src/agents.rs` | 98,597 | 2,400 | 41.1× |
+| `machine_section` | `src/doctor.rs` | 94,754 | 2,400 | 39.5× |
+| `global_checks` | `src/doctor.rs` | 94,681 | 2,400 | 39.5× |
+| **Total** | | **1,141,318** | **19,086** | **59.8×** |
+
+The median ratio is 57×. The ratio grows with the size of the defining file, and this repository's files are large: the median defining file here is about 95 KB. In a project of small files the search and the read are smaller, and so is the ratio. Names that several definitions share were left out, because `query` then lists the candidates with their locations instead of answering.
+
 ## Token estimates
 
 `stats` converts bytes to tokens with one ratio per content type. `scripts/token_calibration.py` measured them on 2026-11-19 at commit e7d0926 with Anthropic's token-counting endpoint, `POST /v1/messages/count_tokens`, for `claude-sonnet-5-5`. The endpoint counts without generating. The samples were this repository's files and the output of commands run on them:

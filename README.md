@@ -5,8 +5,8 @@
 <h1 align="center">justless</h1>
 
 <p align="center">
-  <strong>Your agent reads less. It knows more.</strong><br>
-  Compact by default. Exact on demand.
+  <strong>Your coding agent on 8× fewer tokens.</strong><br>
+  One local tool instead of RTK + graphify + context pruning. Compact by default, exact on demand.
 </p>
 
 <p align="center">
@@ -14,12 +14,68 @@
 </p>
 
 <p align="center">
-  <strong>90%</strong> less command output across 77 real commands · <strong>87%</strong> fewer input tokens on a repair task · <strong>7</strong> agents · <strong>26</strong> languages
+  <strong>8×</strong> fewer input tokens on a repair task · <strong>10×</strong> less command output · <strong>57×</strong> smaller answers to code questions · <strong>85×</strong> smaller reads of old revisions · <strong>0</strong> network calls
 </p>
 
 **justless** is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
 
 > **🔒 100% local. Zero network calls.** justless runs entirely on your machine, between your agent and your shell. It sends nothing anywhere: no telemetry, no analytics, no cloud service, no LLM, no account. Your code and command output never leave your computer. The one exception is opt-in: `justless wrap claude` relays Claude Code's own API requests to Anthropic and adds no requests of its own.
+
+## How much it saves
+
+| What your agent does | Without justless | With justless | Cut |
+| --- | ---: | ---: | ---: |
+| A three-turn repair task, input tokens as the API counted them, on Claude Haiku, Sonnet, Opus 5.5 and Fable 5.2 | 22.4–22.8k | ~2.85k | **8×** |
+| 77 real commands across four Rust and Python repositories | 1,171 KB | 115 KB | **10×** |
+| "Where is `X` and what calls it?": search and read the file, or `justless query X` (14 functions, median) | 1.14 MB | 19 KB | **57×** |
+| One function from a 21 KB source file: read the file, or its outline and then that function (`expand`) | 21 KB | 2.1 KB + 60 B | **10×** |
+| A file at an old revision, `git show HEAD:CHANGELOG.md` | 29.2 KB | 345 B | **85×** |
+| `find .` | 267 KB | 9.4 KB | **28×** |
+| `cargo test` with one failing test ([`fixtures/failing`](fixtures/failing)) | 18,038 B | 700 B | **26×** |
+| `cargo clippy -- -W clippy::pedantic` on this repository, 142 warnings | 79,563 B | 3,916 B | **20×** |
+| `git diff` against older revisions | 274 KB | 13.5 KB | **20×** |
+| Claude Code `Read` calls of more than 150 lines (167 windows) | 2.80 MB | 305 KB | **9×** |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/savings-dark.svg">
+  <img src="assets/savings-light.svg" alt="Bar chart of the bytes an agent received from 77 real commands: 1,171 KB raw versus 115 KB with justless, 90% smaller. git diff against older revisions 274.3 KB to 13.5 KB, find . 267.4 KB to 9.4 KB, grep -rn 200.1 KB to 16.4 KB, git log 143.1 KB to 24.9 KB." width="100%">
+</picture>
+
+Originals stay recoverable and exit codes matched in every run. The repair task passed in all 24 runs; it is one task, and a broader benchmark is in progress. The code-question ratio grows with file size, and this repository's files are large. [Methods](docs/benchmarks.md)
+
+### Watch it in your own sessions
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/statusline-dark.svg">
+  <img src="assets/statusline-light.svg" alt="Claude Code's status line in a real session with justless: justless · initially ≈2.5M tokens saved · net ≈1.8M tokens saved this session · 519 runs · 29 reads." width="100%">
+</picture>
+
+```sh
+justless init --statusline   # running total in Claude Code's status line
+justless stats               # savings by day and command in this project
+justless stats --all         # one total across every project on this machine
+```
+
+The line above is from a real Claude Code session. "Net" subtracts everything the agent later pulled back from the archive. Token figures are estimates from bytes per token measured against Claude's tokenizer; the byte counts are exact.
+
+## One tool instead of three
+
+Token-saving tools each take one slice of the context window. RTK compresses command output, graphify answers code questions from a graph, and context pruning clears old tool results. justless does all three in one local binary, and adds file reads, edits and test selection:
+
+| | justless | RTK | graphify |
+| --- | :---: | :---: | :---: |
+| Compresses command output through agent hooks | ✅ | ✅ | — |
+| Code graph: symbols, calls, imports, `query` and `path` | ✅ | — | ✅ |
+| Outlines big files and returns one symbol's exact bytes | ✅ | — | — |
+| Exact recall of anything it cut | ✅ | ✅ | — |
+| Retires old tool results from the context | ✅ | — | — |
+| Runs only the tests a change reaches | ✅ | — | — |
+| Edits that check the file has not changed | ✅ | — | — |
+| Secret redaction | ✅ | Paid edition | — |
+| Token figures measured against Claude's tokenizer | ✅ | Bytes ÷ 4 | — |
+| No network calls | ✅ | Partly | Partly |
+
+<sub>RTK and graphify columns from each project's README on 2026-11-19; "—" means the README does not mention it. "Partly": RTK pipelines and its proxy can send content to models, and graphify's pass over docs and media can call a model backend. RTK supports more commands (100+) and agents (18); graphify more languages (about 40) and also reads docs, PDFs and images. [Full comparison](docs/comparison.md)</sub>
 
 ## How it cuts tokens
 
@@ -39,26 +95,6 @@
 </picture>
 
 <sub>The same run step by step: the compact result names the archived lines, and <code>justless log</code> returns them byte for byte. One long line is wrapped for display.</sub>
-
-### Measured
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/savings-dark.svg">
-  <img src="assets/savings-light.svg" alt="Bar chart of the bytes an agent received from 77 real commands: 1,171 KB raw versus 115 KB with justless, 90% smaller. git diff against older revisions 274.3 KB to 13.5 KB, find . 267.4 KB to 9.4 KB, grep -rn 200.1 KB to 16.4 KB, git log 143.1 KB to 24.9 KB." width="100%">
-</picture>
-
-| What the agent ran | Raw | With justless |
-| --- | ---: | ---: |
-| 77 real commands across four Rust and Python repositories | 1,171 KB | **115 KB** (90% smaller) |
-| `git diff` against older revisions | 274 KB | 13.5 KB |
-| `find .` | 267 KB | 9.4 KB |
-| `grep -rn` | 200 KB | 16.4 KB |
-| `cargo test` with one failing test ([`fixtures/failing`](fixtures/failing)) | 18,038 B | 700 B |
-| `cargo clippy -- -W clippy::pedantic` on this repository, 142 warnings | 79,563 B | 3,916 B |
-| One 21 KB source file: outline, then one symbol | 21 KB | 2.1 KB → 60 B |
-| Three-turn repair task, input tokens, Claude Haiku, Sonnet, Opus 5.5 and Fable 5.2 | 22.4–22.8k | **~2.85k** (87.3–87.5% fewer) |
-
-Originals stay recoverable and exit codes matched in every run. The repair task passed in all 24 runs; it is one task, and a broader benchmark is in progress. [Methods](docs/benchmarks.md)
 
 ### One failing test
 
