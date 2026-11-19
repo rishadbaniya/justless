@@ -12,8 +12,6 @@ from fake_api import final, tool_use
 from tasks import kind
 
 FENCE = "```"
-# Claude Code saves a successful command's output above this many characters to a file and shows a preview.
-PERSIST_OVER = 30000
 
 
 def answer_block(value):
@@ -30,21 +28,19 @@ def _test_command(task):
     return task.get("visible_command") or "cargo test --offline"
 
 
-def _persisted_read(task, tool_id, command, size):
-    """A command whose output Claude Code saves to a file, then a Read of that file, as an agent does after the
-    2 KB preview. Below the threshold the output is shown inline and there is nothing to read."""
+def _persisted_read(tool_id, command):
+    """A command, then a Read of its saved output as an agent does after Claude Code's 2 KB preview. The Read
+    is taken only when the result really was saved (fake_api's when_persisted); output shown inline, or
+    compacted by a hook below the threshold, leaves nothing to read."""
     step = _bash(command)
     step["content"][-1]["id"] = tool_id
-    if size and size > PERSIST_OVER:
-        return [step, tool_use("Read", {"file_path": "{persist}/%s.txt" % tool_id})]
-    return [step]
+    return [step, {"when_persisted": tool_use("Read", {"file_path": "{persist}/%s.txt" % tool_id})}]
 
 
 def large_plain_path(task):
     """The large family's scripted plain path: the outputs a plain agent reads on the way to the fix, with no
     narrowing the prompt does not give. dry-run measures its tool bytes."""
     k = kind(task)
-    large = task.get("large") or {}
     if k == "callers":
         symbol = task["oracle"]["symbol"]
         files = sorted({u["file"] for u in task["truth"]["required"]})
@@ -54,7 +50,7 @@ def large_plain_path(task):
             {"file": u["file"], "symbol": u["symbol"]} for u in task["truth"]["required"]]}))]
     files = sorted({p["file"] for p in task["controls"]["inverse"]})
     if k == "lint":
-        steps = _persisted_read(task, "toolu_large_lint_1", _test_command(task), large.get("clippy_human_bytes"))
+        steps = _persisted_read("toolu_large_lint_1", _test_command(task))
         steps += [tool_use("Read", {"file_path": "{root}/" + f}) for f in files]
         steps += _edits(task)
         steps.append(_bash(_test_command(task)))
@@ -63,7 +59,7 @@ def large_plain_path(task):
     steps = [_bash(_test_command(task))]
     if k == "regression":
         steps.append(_bash("git show --stat HEAD"))
-        steps += _persisted_read(task, "toolu_large_show_1", "git show HEAD", large.get("diff_bytes"))
+        steps += _persisted_read("toolu_large_show_1", "git show HEAD")
     else:
         steps.append(_bash("%s 2>&1 | grep -E '^test .* FAILED$|panicked at'" % _test_command(task)))
     steps += [tool_use("Read", {"file_path": "{root}/" + f}) for f in files]

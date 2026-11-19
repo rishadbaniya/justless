@@ -230,19 +230,31 @@ class ScriptedPathTests(unittest.TestCase):
     def commands(steps):
         out = []
         for step in steps:
+            step = step.get("when_persisted", step)
             for block in step["content"]:
                 if block.get("type") == "tool_use":
                     out.append((block["name"], block["input"].get("command") or block["input"].get("file_path")))
         return out
 
-    def test_persisted_output_is_read_only_above_the_threshold(self):
-        small = edit_task("regression", large={"diff_bytes": 1000})
-        big = edit_task("regression", large={"diff_bytes": 45000})
-        self.assertNotIn(("Read", "{persist}/toolu_large_show_1.txt"), self.commands(fake_agent.correct(small)))
-        steps = fake_agent.correct(big)
-        self.assertIn(("Read", "{persist}/toolu_large_show_1.txt"), self.commands(steps))
-        show = next(b for s in steps for b in s["content"] if b.get("input", {}).get("command") == "git show HEAD")
+    def test_saved_output_is_read_only_when_claude_code_saved_it(self):
+        import fake_api
+        steps = fake_agent.correct(edit_task("regression"))
+        show = next(b for s in steps for b in s.get("content", []) if b.get("input", {}).get("command") == "git show HEAD")
         self.assertEqual(show["id"], "toolu_large_show_1")
+        self.assertIn(("Read", "{persist}/toolu_large_show_1.txt"), self.commands(steps))
+        start = next(i for i, s in enumerate(steps) if "when_persisted" in s)
+
+        def body(text):
+            return {"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_large_show_1", "content": text},
+                {"type": "text", "text": "<system-reminder>note</system-reminder>"}]}]}
+
+        for text, expected in (("<persisted-output>\nOutput too large", "{persist}/toolu_large_show_1.txt"),
+                               ("diff --git a/x b/x", "{root}/src/lib.rs")):
+            script = fake_api.Script(steps, {})
+            script.index = start
+            step = script.next(body(text))
+            self.assertEqual(step["content"][-1]["input"]["file_path"], expected)
 
     def test_each_kind_has_a_plain_path_and_expected_modes(self):
         bug = edit_task("bugfix")

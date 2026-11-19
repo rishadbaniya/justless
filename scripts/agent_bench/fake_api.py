@@ -209,6 +209,20 @@ def fill(value, context):
     return value
 
 
+def last_tool_result(body):
+    """The text of the last tool result in a request, or ''."""
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") != "user" or not isinstance(message.get("content"), list):
+            continue
+        for block in reversed(message["content"]):
+            if block.get("type") == "tool_result":
+                content = block.get("content")
+                if isinstance(content, list):
+                    return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+                return content or ""
+    return ""
+
+
 class Script:
     """A scripted agent. `steps` is a list of step dicts or a callable(body, state) -> step."""
 
@@ -223,6 +237,13 @@ class Script:
             step = self.steps(body, self.state)
         elif self.index < len(self.steps):
             step = self.steps[self.index]
+            # A step taken only when the previous tool result was saved to a file (Claude Code's 2 KB preview).
+            while "when_persisted" in step:
+                if "<persisted-output>" in last_tool_result(body):
+                    step = step["when_persisted"]
+                    break
+                self.index += 1
+                step = self.steps[self.index]
         else:
             step = {"content": [{"type": "text", "text": "Done."}], "stop_reason": "end_turn"}
         self.index += 1
