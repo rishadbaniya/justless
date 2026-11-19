@@ -353,6 +353,7 @@ impl Workspace {
                 .open(&ignore)
                 .and_then(|mut file| file.write_all(b"*\n"));
         }
+        crate::registry::touch(self);
         Ok(())
     }
 

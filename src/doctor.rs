@@ -467,6 +467,7 @@ impl Doctor<'_> {
                 .push(Check::new(Status::Fail, message).fix(fix));
         }
         sections.push(others);
+        sections.push(machine_section());
         if !mcp.is_empty() {
             let mut section = Section::new("mcp", "MCP servers");
             section.checks = mcp;
@@ -582,6 +583,7 @@ impl Doctor<'_> {
             }
         }
         sections.push(project);
+        sections.push(machine_section());
         Report {
             project: false,
             place,
@@ -2649,6 +2651,49 @@ fn list<'a>(items: impl Iterator<Item = &'a str>) -> String {
         Some((last, [])) => (*last).to_owned(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// What Justless knows beyond this project: the project registry and the
+/// registered projects whose own settings run Justless hooks. Reads only.
+fn machine_section() -> Section {
+    let mut section = Section::new("machine", "This machine");
+    let Some(home) = crate::registry::home() else {
+        return section;
+    };
+    let file = home.join("projects.json");
+    let projects = crate::registry::projects();
+    section.checks.push(Check::new(
+        Status::Info,
+        if projects.is_empty() {
+            format!(
+                "Project registry: none yet at {}. Justless lists each project there as it uses it, for `stats --all` and finding runs from another project.",
+                file.display()
+            )
+        } else {
+            format!(
+                "Project registry: {} at {}",
+                plural(projects.len(), "project"),
+                file.display()
+            )
+        },
+    ));
+    let hooked = crate::registry::hooked_projects();
+    if !hooked.is_empty() {
+        const SHOWN: usize = 8;
+        let mut names: Vec<String> = hooked
+            .iter()
+            .take(SHOWN)
+            .map(|(root, files)| format!("{} ({})", root.display(), files.join(", ")))
+            .collect();
+        if hooked.len() > SHOWN {
+            names.push(format!("and {} more", hooked.len() - SHOWN));
+        }
+        section.checks.push(Check::new(
+            Status::Info,
+            format!("Projects with Justless hooks: {}", names.join("; ")),
+        ));
+    }
+    section
 }
 
 #[cfg(test)]

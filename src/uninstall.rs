@@ -162,6 +162,9 @@ fn remove(
     }
 
     let applied = apply(workspace, &plan, &mut guard);
+    if purge && applied.error.is_none() {
+        crate::registry::forget(&workspace.root);
+    }
     if state && !applied.state && forget(&mut record, &plan, &applied, &chosen) {
         // A stale entry never matches the edited file, so this is best effort.
         let _ = save(workspace, &record);

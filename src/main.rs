@@ -34,6 +34,7 @@ mod polyglot;
 mod postroute;
 mod proxy;
 mod redact;
+mod registry;
 mod rewrite;
 mod rollouts;
 mod runners;
@@ -241,7 +242,18 @@ fn cli() -> Command<'static> {
                 .arg(Arg::new("json").long("json").help("Print a JSON report"))
                 .arg(Arg::new("sessions").long("sessions").help(
                     "Add the token usage Claude Code recorded for this workspace's sessions",
-                )),
+                ))
+                .arg(
+                    Arg::new("all")
+                        .long("all")
+                        .help("One total across every project Justless has worked in, by repository"),
+                )
+                .arg(
+                    Arg::new("include-temp")
+                        .long("include-temp")
+                        .requires("all")
+                        .help("With --all, also count projects in temporary folders"),
+                ),
         )
         .subcommand(
             Command::new("discover")
@@ -572,7 +584,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             );
         }
         ("log", sub) => {
-            let (directory, _) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
+            let (_, directory, _) = registry::locate(&workspace, sub.value_of("run-id").unwrap())?;
             if sub.is_present("unredacted") {
                 redact::bypass();
                 history::recall(&directory, history::Retrieval::Unredacted, None);
@@ -604,7 +616,8 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             }
         }
         ("search", sub) => {
-            let (directory, run) = capture::load(&workspace, sub.value_of("run-id").unwrap())?;
+            let (_, directory, run) =
+                registry::locate(&workspace, sub.value_of("run-id").unwrap())?;
             if sub.is_present("unredacted") {
                 redact::bypass();
                 history::recall(&directory, history::Retrieval::Unredacted, None);
@@ -647,6 +660,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             sub.is_present("plan"),
         )?,
         ("learn", sub) => learn::run(&workspace, sub)?,
+        ("stats", sub) if sub.is_present("all") => registry::stats(sub, &workspace)?,
         ("stats", sub) => history::stats(
             &workspace,
             read_num(sub, "days", 1)? as u64,
@@ -688,12 +702,18 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
             sub.value_of("to").unwrap(),
             context_budget(&workspace, sub)?,
         )?,
+        ("context", sub) if sub.is_present("run") => {
+            // A run made in another project is read with that project's source.
+            let id = sub.value_of("run").unwrap();
+            let (owner, _, _) = registry::locate(&workspace, id)?;
+            let workspace = owner.unwrap_or(workspace);
+            let limit = context_budget(&workspace, sub)?;
+            context::from_run(&workspace, &Index::open(&workspace)?, id, limit)?;
+        }
         ("context", sub) => {
             let limit = context_budget(&workspace, sub)?;
             let index = Index::open(&workspace)?;
-            if let Some(id) = sub.value_of("run") {
-                context::from_run(&workspace, &index, id, limit)?;
-            } else if sub.is_present("at") || sub.is_present("symbol") {
+            if sub.is_present("at") || sub.is_present("symbol") {
                 let mut memory = seen::Memory::open(
                     &workspace,
                     sub.value_of("session"),

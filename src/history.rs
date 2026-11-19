@@ -696,6 +696,51 @@ pub fn utc_date(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// One project's run count and byte totals, counted as `stats` counts them.
+#[derive(Default, Serialize)]
+pub(crate) struct Summary {
+    pub runs: u64,
+    pub raw_bytes: u64,
+    pub preview_bytes: u64,
+    /// Bytes later retrievals printed, measured or estimated.
+    pub replayed_bytes: u64,
+    pub net_saved_bytes: i64,
+}
+
+impl Summary {
+    pub fn add(&mut self, other: &Summary) {
+        self.runs += other.runs;
+        self.raw_bytes += other.raw_bytes;
+        self.preview_bytes += other.preview_bytes;
+        self.replayed_bytes += other.replayed_bytes;
+        self.net_saved_bytes = self.net_saved_bytes.saturating_add(other.net_saved_bytes);
+    }
+
+    pub fn saved_bytes(&self) -> u64 {
+        self.raw_bytes.saturating_sub(self.preview_bytes)
+    }
+}
+
+/// The totals of every run in a project's archive, quietly skipping unreadable runs.
+pub(crate) fn summary(workspace: &Workspace) -> Summary {
+    let mut totals = Totals::default();
+    let mut runs = 0;
+    for run in records(workspace, false).into_iter().flatten().flatten() {
+        let directory = workspace.state.join("runs").join(&run.id);
+        let recalls: Recalls = get(&directory.join("recalls.json")).unwrap_or_default();
+        let shown = (run.preview_bytes + run.footer_bytes) as u64;
+        totals.add(run.raw_bytes, shown, recalls.replayed(&directory));
+        runs += 1;
+    }
+    Summary {
+        runs,
+        raw_bytes: totals.raw_bytes,
+        preview_bytes: totals.preview_bytes,
+        replayed_bytes: totals.replayed_bytes + totals.estimated_replay_bytes,
+        net_saved_bytes: totals.net_saved_bytes,
+    }
+}
+
 pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) -> Result<()> {
     let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
     let mut count = 0u64;

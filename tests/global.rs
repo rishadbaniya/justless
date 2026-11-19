@@ -277,3 +277,120 @@ fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("invalid exclude_commands regex"), "{error}");
 }
+
+fn git(cwd: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(["-c", "user.name=Lab", "-c", "user.email=lab@example.com"])
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+/// The run ID a `justless run` names on stderr.
+fn run_id(lab: &Lab, cwd: &Path, script: &str) -> String {
+    let output = lab.output(cwd, &["run", "--", "sh", "-c", script], None, &[]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let start = stderr.find("[justless run-").unwrap() + "[justless ".len();
+    stderr[start..].split([' ', ']']).next().unwrap().to_owned()
+}
+
+#[test]
+fn the_registry_totals_projects_by_repository_and_finds_their_runs() {
+    let lab = Lab::new();
+    let main = lab.project("main", "");
+    git(&main, &["init", "-q"]);
+    git(&main, &["add", "Cargo.toml"]);
+    git(&main, &["commit", "-qm", "start"]);
+    git(&main, &["worktree", "add", "-q", "../tree"]);
+    let tree = lab.base.join("tree");
+    let scratch = lab.project("tmp/scratch", "");
+    run_id(&lab, &main, "seq 1 3000");
+    run_id(&lab, &tree, "seq 1 3000");
+    let elsewhere = run_id(&lab, &scratch, "seq 1 3000; echo needle");
+
+    let file = lab.home.join(".local/state/justless/projects.json");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(!text.contains("seq"), "{text}");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let registry: Value = serde_json::from_str(&text).unwrap();
+    let projects = registry["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 3, "{text}");
+    let repository = |root: &Path| {
+        let entry = projects.iter().find(|entry| entry["root"] == json!(root));
+        entry.unwrap()["repository"].clone()
+    };
+    assert_eq!(repository(&main), json!(main.join(".git")));
+    assert_eq!(repository(&tree), repository(&main));
+    assert_eq!(repository(&scratch), Value::Null);
+
+    let temp = lab.base.join("tmp");
+    let temp = [("JUSTLESS_TEST_TEMP_DIRS", temp.to_str().unwrap())];
+    let stats = |args: &[&str]| -> Value {
+        let output = lab.output(&main, args, None, &temp);
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let all = stats(&["stats", "--all", "--json"]);
+    assert_eq!(
+        (&all["projects"], &all["runs"]),
+        (&json!(2), &json!(2)),
+        "{all}"
+    );
+    assert_eq!(all["temporary_projects_left_out"], 1);
+    assert_eq!(all["repositories"][0]["repository"], json!(main));
+    assert_eq!(all["repositories"][0]["roots"].as_array().unwrap().len(), 2);
+    let all = stats(&["stats", "--all", "--include-temp", "--json"]);
+    assert_eq!(
+        (&all["projects"], &all["runs"]),
+        (&json!(3), &json!(3)),
+        "{all}"
+    );
+    assert_eq!(all["repositories"].as_array().unwrap().len(), 2);
+    let output = lab.output(&main, &["stats", "--all"], None, &temp);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("main (2 checkouts)  2 run(s)"), "{text}");
+    assert!(
+        text.contains("Left out 1 project(s) in temporary folders"),
+        "{text}"
+    );
+
+    // A run made in another project is found through the registry.
+    let replay = lab.run(&main, &["log", &elsewhere, "--from", "2", "--to", "3"]);
+    assert_eq!(replay, "2\n3\n");
+    assert!(
+        lab.run(&main, &["search", &elsewhere, "needle"])
+            .contains("needle")
+    );
+    let context = lab.run(&tree, &["context", "--run", &elsewhere]);
+    assert!(
+        context.starts_with(&format!("Run {elsewhere}")),
+        "{context}"
+    );
+    let unknown = lab.output(&main, &["log", "run-unknown1"], None, &[]);
+    let error = String::from_utf8_lossy(&unknown.stderr);
+    assert!(error.contains("unknown run ID: run-unknown1"), "{error}");
+
+    // Doctor fails here, in a project with no setup, and still lists the registry.
+    let doctor = lab.output(&main, &["doctor"], None, &[]).stdout;
+    let doctor = String::from_utf8_lossy(&doctor);
+    assert!(
+        doctor.contains("Project registry: 3 projects at "),
+        "{doctor}"
+    );
+
+    // `--purge` drops the project, and the registry is rebuilt as projects are used.
+    lab.run(&scratch, &["init", "--remove", "--purge"]);
+    assert!(!fs::read_to_string(&file).unwrap().contains("scratch"));
+    fs::remove_file(&file).unwrap();
+    run_id(&lab, &main, "true");
+    assert!(fs::read_to_string(&file).unwrap().contains("main"));
+}
