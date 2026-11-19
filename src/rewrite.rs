@@ -380,13 +380,11 @@ fn left_alone(
             false,
         );
     }
-    if let Some(words) = agents::literal_command(command)
-        && crate::shellread::command(&words).is_some()
-    {
+    if crate::shellread::parse(command).is_some() {
         let why = if claude {
-            "a range read runs as written, and the after-bash hook outlines its output."
+            "a file read runs as written, and the after-bash hook outlines its output."
         } else {
-            "the range read cannot be served from the file as it is now, such as one counted from the end."
+            "the file read prints the file as it is now or fits whole, such as one counted from the end or a small file."
         };
         return (why.into(), false);
     }
