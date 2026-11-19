@@ -400,7 +400,8 @@ pub(crate) struct Sessions {
     #[serde(skip)]
     pub directory: PathBuf,
     pub sessions: u64,
-    /// Requests that subagents made, part of `requests`.
+    /// Requests that subagents made, their advisor calls included, part of
+    /// `requests`.
     pub subagent_requests: u64,
     #[serde(flatten)]
     pub total: Usage,
@@ -522,20 +523,24 @@ fn sessions_in(directory: PathBuf, since_ms: u64) -> Sessions {
                 let name = first.as_os_str().to_string_lossy();
                 sessions.insert(name.strip_suffix(".jsonl").unwrap_or(&name).to_owned());
             }
-            subagent_requests += u64::from(entry.sidechain);
+            let mut calls = 1;
             models.entry(model.clone()).or_default().requests += 1;
             match usage.iterations.as_deref() {
                 Some(parts) if !parts.is_empty() => {
                     for part in parts {
                         let owner = part.model.clone().unwrap_or_else(|| model.clone());
-                        let entry = models.entry(owner).or_default();
-                        entry.add(part);
+                        let usage = models.entry(owner).or_default();
+                        usage.add(part);
                         if part.kind.as_deref() == Some("advisor_message") {
-                            entry.requests += 1;
+                            usage.requests += 1;
+                            calls += 1;
                         }
                     }
                 }
                 _ => models.entry(model).or_default().add(&usage),
+            }
+            if entry.sidechain {
+                subagent_requests += calls;
             }
         }
     }
@@ -662,21 +667,24 @@ mod tests {
     }
 
     #[test]
-    fn classifies_this_repositorys_sources_documents_data_and_tool_output() {
+    fn classifies_fixture_sources_documents_data_and_tool_output() {
         for path in [
-            "src/history.rs",
-            "src/tokens.rs",
-            "scripts/benchmark.py",
-            "install.sh",
+            "fixtures/lookup/src/net/retry.rs",
+            "fixtures/mixed/frontend/orders.ts",
+            "fixtures/mixed/backend/orders.py",
+            "fixtures/failing/src/pricing.rs",
         ] {
             assert_eq!(classify(&read(path)), Content::Code, "{path}");
         }
-        for path in ["README.md", "docs/reference.md", "CHANGELOG.md"] {
+        for path in [
+            "fixtures/affected/docs/pricing.md",
+            "fixtures/lookup/docs/operations.md",
+        ] {
             assert_eq!(classify(&read(path)), Content::Prose, "{path}");
         }
         for path in [
             "fixtures/lookup/package-lock.json",
-            "scripts/affected_edits.json",
+            "fixtures/affected/ledger/fixtures/rates.json",
         ] {
             assert_eq!(classify(&read(path)), Content::Json, "{path}");
         }
@@ -686,6 +694,8 @@ mod tests {
         }
         assert_eq!(classify(b"[1, 2"), Content::Json);
         assert_eq!(classify(b"[justless run-abc] exit 0\n"), Content::Logs);
+        // Search matches start with a location, even over source.
+        assert_eq!(classify(b"src/a.rs:3:    let x = f(y);\n"), Content::Logs);
         assert_eq!(classify(b""), Content::Logs);
     }
 

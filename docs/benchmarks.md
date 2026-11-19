@@ -346,10 +346,10 @@ Against Claude Code 2.1.327 and the harness's local fake API, a Read of lines 10
 
 ## Token estimates
 
-`stats` converts bytes to tokens with one ratio per content type. `scripts/token_calibration.py` measured them on 2026-11-19 at commit e7d0926 with Anthropic's token-counting endpoint, `POST /v1/messages/count_tokens`, for `claude-sonnet-5-5`. The endpoint counts without generating. Only this repository's own text was sent:
+`stats` converts bytes to tokens with one ratio per content type. `scripts/token_calibration.py` measured them on 2026-11-19 at commit e7d0926 with Anthropic's token-counting endpoint, `POST /v1/messages/count_tokens`, for `claude-sonnet-5-5`. The endpoint counts without generating. The samples were this repository's files and the output of commands run on them:
 
 - code: tracked source files in every fixture language, the scripts, `src/` and `tests/`, and the patches of the last ten commits under `src/` and `tests/`;
-- JSON: tracked `.json` files, `cargo metadata`, and `cargo check --message-format=json` on a copy of `fixtures/failing`;
+- JSON: tracked `.json` files, `cargo metadata`, which includes the public manifests of the crate's dependencies from the local Cargo registry, and `cargo check --message-format=json` on a copy of `fixtures/failing`;
 - prose: tracked Markdown;
 - logs: the real tool output kept under `fixtures/` as `.txt`, and the output of `cargo test` and `cargo clippy` on a copy of `fixtures/failing`, the crate's unit tests, `git log --stat` without author lines, `cargo tree` and `ls -lRn`.
 
@@ -365,7 +365,7 @@ Command output had the checkout, temporary and home directories replaced by plac
 
 `claude-opus-5-5` returned the same count as `claude-sonnet-5-5` for all 221 samples. Another tokenizer needs a new measurement. Bytes ÷ 4, the earlier estimate, counted 56% (logs, JSON) to 70% (prose) of these tokens. The JSON sample is thin: 96 KB of its 123 KB is `cargo metadata`.
 
-`stats` sorts each run's output by its first 8 KB of stdout, then stderr. On the first 8 KB of the same samples, the classifier put 99.3% of the code bytes, 99.8% of the log bytes and 90.3% of the prose bytes in their own type; `docs/examples.md`, mostly command transcripts, read as logs. Every JSON sample that opens a document read as JSON, while the three later pieces of `cargo metadata`, which start inside a value, read as logs; a run's output is always read from its start.
+`stats` sorts each run's output by its first 8 KB of stdout, then stderr. On the first 8 KB of the same samples, which its rules were tuned on, so the figures are in-sample, the classifier put 99.3% of the code bytes, 99.8% of the log bytes and 90.3% of the prose bytes in their own type; `docs/examples.md`, mostly command transcripts, read as logs. Every JSON sample that opens a document read as JSON, while the three later pieces of `cargo metadata`, which start inside a value, read as logs; a run's output is always read from its start. Search output such as `rg -n` over source counts as logs, because each line starts with a location.
 
 On 73 runs archived in this repository's main checkout, 779,149 bytes were kept out at first preview: 495,743 of code, 241,321 of logs and 42,085 of prose. Bytes ÷ 4 estimated 194,788 tokens; the measured ratios estimate 317,766.
 

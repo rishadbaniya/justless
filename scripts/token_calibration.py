@@ -25,8 +25,10 @@ JSON object per line: the count for "." first, then each sample in order, as in
     done > counts.jsonl
     python3 scripts/token_calibration.py --samples samples.json --counts counts.jsonl --json out.json
 
-It sends only this repository's own text to `POST /v1/messages/count_tokens`,
-which is free and counts without generating:
+It sends this repository's files and the output of commands run on them to
+`POST /v1/messages/count_tokens`, which is free and counts without generating.
+`cargo metadata` includes the manifests of the crate's dependencies from the
+local Cargo registry, which are public crate metadata:
 
 - code: tracked source files (Rust, Python, TypeScript, shell, SQL and the other
   fixture languages) and the patches of the last ten commits under src/ and tests/;
