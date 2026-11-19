@@ -6,7 +6,7 @@ mod reads;
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -151,6 +151,20 @@ impl<'a> Batch<'a> {
         }
         let mut run_ws = ws.working_in(&cwd);
         run_ws.cwd = cwd.clone();
+        // Claude Code's main session keeps a `cd`, so its cwd can already be the
+        // directory the list entered, while a subagent's is where the list started.
+        let mut start = cwd.clone();
+        if let Some(dir) = self.0.last().and_then(|piece| piece.dir.as_deref()) {
+            let entered: PathBuf = Path::new(dir)
+                .components()
+                .filter(|c| *c != Component::CurDir)
+                .collect();
+            if entered.is_relative() && !cwd.join(&entered).is_dir() && cwd.ends_with(&entered) {
+                for _ in entered.components() {
+                    start.pop();
+                }
+            }
+        }
         let budget = settings
             .context_budget
             .min(baseline * 3 / 4)
@@ -182,7 +196,7 @@ impl<'a> Batch<'a> {
                 .filters
                 .iter()
                 .any(|f| matches!(f, parse::Filter::First(_)));
-            let dir = cwd
+            let dir = start
                 .join(piece.dir.as_deref().unwrap_or(""))
                 .canonicalize()
                 .ok()?;

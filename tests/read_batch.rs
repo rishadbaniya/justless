@@ -26,12 +26,18 @@ fn native(dir: &Path, script: &str) -> String {
 }
 
 fn hook(dir: &Path, command: &str, response: Option<Value>) -> Value {
+    hook_in(dir, dir, command, response)
+}
+
+/// A hook event whose session reports `cwd`, as Claude Code's main session
+/// does after a `cd`.
+fn hook_in(dir: &Path, cwd: &Path, command: &str, response: Option<Value>) -> Value {
     let (mode, event) = if response.is_some() {
         ("after-bash", "PostToolUse")
     } else {
         ("before-command", "PreToolUse")
     };
-    let input = json!({"hook_event_name":event,"tool_name":"Bash","cwd":dir,"session_id":"batch-test",
+    let input = json!({"hook_event_name":event,"tool_name":"Bash","cwd":cwd,"session_id":"batch-test",
         "tool_input":{"command":command},"tool_response":response});
     let mut child = Command::new(BIN)
         .args(["--root", dir.to_str().unwrap(), "hook-claude", mode])
@@ -349,6 +355,20 @@ fn cd_lists_compact_in_their_directory() {
     let raw = native(dir, list);
     let (view, _) = verified(dir, list, response(&raw), &raw);
     assert!(view.contains("function add_"), "{view}");
+
+    // Claude Code's main session keeps the `cd`, so it reports the directory
+    // the list entered rather than the one it started from.
+    for list in [
+        "cd sub && sed -n '1,600p' big.rs",
+        "cd ./sub && sed -n '1,600p' big.rs",
+    ] {
+        let raw = native(dir, list);
+        let out = hook_in(dir, &dir.join("sub"), list, Some(response(&raw)));
+        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{list} stayed raw"));
+        assert!(shown.contains("sub/big.rs lines 1-600"), "{shown}");
+    }
 }
 
 #[test]
