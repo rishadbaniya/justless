@@ -36,7 +36,7 @@ Run the tests on Linux or macOS. Hooks are disabled on Windows and several suite
 
 - `tests/cli.rs` runs the binary: command capture, navigation and hooks.
 - `tests/progressive.rs` covers exact spans, stale and concurrent edits, and recovery of retired tool results.
-- `tests/mcp.rs` covers the MCP server.
+- `tests/testsuite/` builds the smaller suites as one test binary: `mcp` covers the MCP server, and `cargo test --test testsuite mcp::` runs one of them.
 - `fixtures/failing` is deliberately broken. Tests copy it to a temporary directory to diagnose and repair it, so do not fix it.
 - `fixtures/mixed` links TypeScript, Python and SQL. `fixtures/languages` has samples for Kotlin, Swift, Scala, Dart, Terraform, Lua and Zig, and `fixtures/lint` holds recorded linter output.
 
