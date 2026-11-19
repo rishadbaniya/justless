@@ -1851,6 +1851,10 @@ fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
 /// through Justless. Each `cd` is checked by its words alone, so a link that leaves
 /// the workspace is not detected here.
 pub fn would_route(command: &str) -> bool {
+    // `wrap_event` leaves a read list to the post-command hook.
+    if !cfg!(windows) && crate::batch::Batch::parse_list(command).is_some() {
+        return false;
+    }
     let rules = Rules {
         mixed: true,
         claude: true,

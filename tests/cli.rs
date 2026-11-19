@@ -5763,7 +5763,18 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
     let transcripts = config.join("projects").join(slug);
     fs::create_dir_all(&transcripts).unwrap();
     let mut lines = Vec::new();
-    for (id, command) in [("t1", absolute.as_str()), ("t2", "grep -rn x src")] {
+    // Claude Code's command hook leaves a read list to the post-command hook,
+    // which keeps a small result as it is.
+    let reads = "git diff --stat; git diff";
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "before-command", call(reads)),
+        serde_json::json!({})
+    );
+    for (id, command) in [
+        ("t1", absolute.as_str()),
+        ("t2", "grep -rn x src"),
+        ("t3", reads),
+    ] {
         lines.push(serde_json::json!({"type":"assistant","cwd":root,"timestamp":"2999-01-01T00:00:00Z",
             "message":{"content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}}).to_string());
         lines.push(serde_json::json!({"type":"user","cwd":root,"timestamp":"2999-01-01T00:00:01Z",
@@ -5779,7 +5790,7 @@ fn declined_command_lists_count_as_pass_through_and_discover_agrees() {
     assert!(output.status.success(), "{}", stderr(&output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let groups = report["groups"].as_array().unwrap();
-    assert_eq!(report["commands"], 2, "{report}");
+    assert_eq!(report["commands"], 3, "{report}");
     // A list the hook declines on purpose must never read as a missing hook.
     assert!(
         groups.iter().all(|g| g["route"] != "supported_not_routed"),
