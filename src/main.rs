@@ -110,10 +110,23 @@ fn streams() -> Arg<'static> {
         .default_value("both")
 }
 
+/// `--version` adds the Git revision of the build on a second line, which
+/// `doctor` compares with a checkout. `-V` and the first line stay the version.
+const LONG_VERSION: &str = if doctor::REVISION.is_empty() {
+    env!("CARGO_PKG_VERSION")
+} else {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nrevision ",
+        env!("JUSTLESS_REVISION")
+    )
+};
+
 fn cli() -> Command<'static> {
     Command::new("justless")
         .about("Compact command output and retrieve source-backed context")
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(LONG_VERSION)
         .subcommand_required(true)
         .arg_required_else_help(true)
         .arg(

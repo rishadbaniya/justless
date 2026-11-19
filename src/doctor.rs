@@ -30,6 +30,8 @@ pub fn command() -> Command<'static> {
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The Git commit this binary was built from, or empty outside Git. See `build.rs`.
+pub const REVISION: &str = env!("JUSTLESS_REVISION");
 /// Run records read for evidence that hooks route commands, newest first.
 const SCANNED_RUNS: usize = 500;
 /// Run directories measured for the archive size.
@@ -726,6 +728,14 @@ impl Doctor<'_> {
         // Kept free of comments, which interactive zsh would pass to `export`.
         let use_this = format!("export PATH={directory}:\"$PATH\"");
         let found = on_path("justless");
+        let same = found
+            .first()
+            .is_some_and(|first| same_file(first, canonical.as_deref()));
+        // What the copy hooks run reports, unless it is this binary.
+        let reported = found
+            .first()
+            .filter(|_| !same)
+            .map(|first| version_of(first));
         match found.first() {
             None => section.checks.push(
                 Check::new(
@@ -734,11 +744,11 @@ impl Doctor<'_> {
                 )
                 .fix(Fix::Command(use_this)),
             ),
-            Some(first) if same_file(first, canonical.as_deref()) => section
+            Some(_) if same => section
                 .checks
                 .push(Check::new(Status::Ok, "`justless` on PATH is this binary")),
-            Some(first) => section.checks.push(match version_of(first) {
-                Some(version) if version == VERSION => Check::new(
+            Some(first) => section.checks.push(match reported.clone().flatten() {
+                Some((version, _)) if version == VERSION => Check::new(
                     Status::Warn,
                     format!(
                         "`justless` on PATH is {}, another copy of {VERSION}. Hooks run that copy. To use this one, put its directory first on PATH here and in your shell profile.",
@@ -746,7 +756,7 @@ impl Doctor<'_> {
                     ),
                 )
                 .fix(Fix::Command(use_this)),
-                Some(version) => Check::new(
+                Some((version, _)) => Check::new(
                     Status::Fail,
                     format!(
                         "`justless` on PATH is {} at version {version}, but this binary is {VERSION}. Hooks run {version}, and doctor checks them against what {VERSION} writes. Put this binary's directory first on PATH here and in your shell profile, or install {VERSION} over that copy.",
@@ -781,7 +791,104 @@ impl Doctor<'_> {
                 ),
             ));
         }
+        if let Some(first) = found.first() {
+            let revision = if same {
+                Some(REVISION.to_owned()).filter(|revision| !revision.is_empty())
+            } else {
+                reported.flatten().and_then(|(_, revision)| revision)
+            };
+            section
+                .checks
+                .extend(self.checkout_build(first, revision.as_deref()));
+        }
         section
+    }
+
+    /// In a Justless checkout, whether the `justless` that hooks run was built
+    /// from its HEAD: by the revision the copy reports, or else by whether the
+    /// file is older than the last commit. One `git log` reads HEAD.
+    fn checkout_build(&self, copy: &Path, revision: Option<&str>) -> Option<Check> {
+        let root = &self.workspace.root;
+        let manifest: toml_edit::DocumentMut = fs::read_to_string(root.join("Cargo.toml"))
+            .ok()?
+            .parse()
+            .ok()?;
+        if manifest.get("package")?.get("name")?.as_str()? != "justless" {
+            return None;
+        }
+        let output = Process::new("git")
+            .args(["log", "-1", "--format=%H %ct"])
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        let line = String::from_utf8(output.stdout).ok()?;
+        let (head, time) = line.trim().split_once(' ')?;
+        let committed = time.parse::<u64>().ok()?.saturating_mul(1000);
+        let short = |id: &str| id.get(..12).unwrap_or(id).to_owned();
+        let problem = match revision {
+            Some(revision) if revision == head => {
+                return Some(Check::new(
+                    Status::Ok,
+                    format!(
+                        "`justless` on PATH was built from this checkout's HEAD, {}",
+                        short(head)
+                    ),
+                ));
+            }
+            Some(revision) => format!(
+                "`justless` on PATH ({}) was built from {}, but this checkout's HEAD is {}.",
+                copy.display(),
+                short(revision),
+                short(head)
+            ),
+            None => {
+                let modified = millis(fs::metadata(copy).ok()?.modified().ok()?);
+                if modified >= committed {
+                    return None;
+                }
+                format!(
+                    "`justless` on PATH ({}) reports no build revision and was built {}, before this checkout's last commit {}.",
+                    copy.display(),
+                    ago(modified),
+                    ago(committed)
+                )
+            }
+        };
+        let message = format!(
+            "{problem} Hooks run that copy, so changes since then do not run in agent sessions."
+        );
+        let install = format!(
+            "cargo install --path {} --locked --force",
+            if self.at_root {
+                ".".into()
+            } else {
+                quote(root)
+            }
+        );
+        // `cargo install` replaces the copy only where Cargo installs binaries.
+        let cargo_bin = std::env::var_os("CARGO_INSTALL_ROOT")
+            .or_else(|| std::env::var_os("CARGO_HOME"))
+            .map(PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
+            .map(|base| base.join("bin"));
+        let installs_there = copy
+            .parent()
+            .zip(cargo_bin)
+            .is_some_and(|(directory, bin)| {
+                same_file(directory, bin.canonicalize().ok().as_deref())
+            });
+        Some(if installs_there {
+            Check::new(Status::Warn, message).fix(Fix::Command(install))
+        } else {
+            Check::new(Status::Warn, message).fix(Fix::Manual(format!(
+                "reinstall {} from this checkout with the tool that installed it, or put Cargo's bin directory first on PATH and run `{install}`",
+                copy.display()
+            )))
+        })
     }
 
     fn audit_agent<'p>(&self, profile: &'p Profile, cli: Option<PathBuf>) -> AgentAudit<'p> {
@@ -2390,10 +2497,10 @@ fn same_file(path: &Path, canonical: Option<&Path>) -> bool {
     canonical.is_some_and(|canonical| path.canonicalize().is_ok_and(|path| path == canonical))
 }
 
-/// The version another `justless` reports, waiting at most two seconds. Only its
-/// first line is read, on a helper thread, because a process it starts can keep
-/// the pipe open after it exits.
-fn version_of(binary: &Path) -> Option<String> {
+/// The version another `justless` reports, and the build revision a current one
+/// adds on the next line, waiting at most two seconds. Lines are read on a helper
+/// thread, because a process it starts can keep the pipe open after it exits.
+fn version_of(binary: &Path) -> Option<(String, Option<String>)> {
     let mut child = Process::new(binary)
         .arg("--version")
         .stdin(Stdio::null())
@@ -2404,18 +2511,34 @@ fn version_of(binary: &Path) -> Option<String> {
     let stdout = child.stdout.take()?;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut line = String::new();
-        let _ = BufReader::new(stdout.take(4096)).read_line(&mut line);
-        let _ = sender.send(line);
+        let mut reader = BufReader::new(stdout.take(4096));
+        for _ in 0..2 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || sender.send(line).is_err() {
+                break;
+            }
+        }
     });
     let line = receiver.recv_timeout(Duration::from_secs(2));
+    // Both lines arrive in one write, so an older copy only costs this wait when
+    // a child keeps the pipe open.
+    let next = line
+        .is_ok()
+        .then(|| receiver.recv_timeout(Duration::from_millis(200)).ok())
+        .flatten();
     if !matches!(child.try_wait(), Ok(Some(_))) {
         let _ = child.kill();
         let _ = child.wait();
     }
     let line = line.ok()?;
     let version = line.trim().strip_prefix("justless ")?.trim();
-    (!version.is_empty()).then(|| version.to_owned())
+    let revision = next
+        .as_deref()
+        .and_then(|next| next.trim().strip_prefix("revision "))
+        .map(str::trim)
+        .filter(|id| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned);
+    (!version.is_empty()).then(|| (version.to_owned(), revision))
 }
 
 // ---------------------------------------------------------------------------

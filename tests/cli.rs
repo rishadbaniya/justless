@@ -6408,6 +6408,102 @@ fn doctor_checks_the_justless_that_hooks_run() {
 
 #[cfg(unix)]
 #[test]
+fn doctor_names_a_justless_on_path_built_before_this_checkout() {
+    use std::os::unix::fs::PermissionsExt;
+    let tools = doctor_tools(&["claude"]);
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    let manifest = |name: &str| {
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n"),
+        )
+        .unwrap();
+    };
+    manifest("justless");
+    git(root, &["init", "-q"]);
+    git(root, &["add", "Cargo.toml"]);
+    git(root, &["commit", "-qm", "checkout"]);
+    let head = git(root, &["rev-parse", "HEAD"]).trim().to_owned();
+    let this = tools.path().join("bin/justless");
+    let cargo = tools.path().join("home/.cargo/bin");
+    let other = tools.path().join("other");
+    fs::create_dir_all(&cargo).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    // A stand-in that reports this version and, unless empty, a revision line.
+    let install = |directory: &Path, revision: &str| {
+        let copy = directory.join("justless");
+        let version = env!("CARGO_PKG_VERSION");
+        fs::write(
+            &copy,
+            format!("#!/bin/sh\nprintf 'justless {version}\\n{revision}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+        copy
+    };
+    let doctor = |first: &Path| {
+        let path = format!(
+            "{}:{}:/usr/bin:/bin",
+            first.display(),
+            this.parent().unwrap().display()
+        );
+        let line = format!("{} doctor", this.display());
+        stdout(&doctor_shell(root, tools.path(), &path, &line))
+    };
+    let install_fix = "fix: cargo install --path . --locked --force";
+
+    // Cargo installed a copy from an older commit, and hooks run it.
+    install(&cargo, &format!("revision {}\\n", "1".repeat(40)));
+    let text = doctor(&cargo);
+    assert!(
+        text.contains(&format!(
+            "was built from 111111111111, but this checkout's HEAD is {}. Hooks run that copy",
+            &head[..12]
+        )),
+        "{text}"
+    );
+    assert!(text.contains(install_fix), "{text}");
+
+    // A copy built from HEAD is current.
+    install(&cargo, &format!("revision {head}\\n"));
+    let text = doctor(&cargo);
+    assert!(
+        text.contains("✓ `justless` on PATH was built from this checkout's HEAD"),
+        "{text}"
+    );
+    assert!(!text.contains("cargo install"), "{text}");
+
+    // Without a revision, a copy older than the last commit is stale.
+    let copy = install(&cargo, "");
+    let touched = Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(&copy)
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    let text = doctor(&cargo);
+    assert!(
+        text.contains("reports no build revision and was built") && text.contains(install_fix),
+        "{text}"
+    );
+
+    // `cargo install` would not replace a copy elsewhere, so that fix is by hand.
+    install(&other, &format!("revision {}\\n", "1".repeat(40)));
+    let text = doctor(&other);
+    assert!(
+        text.contains("by hand: reinstall") && !text.contains(install_fix),
+        "{text}"
+    );
+
+    // Another project is no Justless checkout.
+    manifest("other");
+    let text = doctor(&cargo);
+    assert!(!text.contains("this checkout"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
 fn doctor_outside_a_project_says_how_to_set_one_up() {
     let tools = doctor_tools(&["gemini", "opencode"]);
     let folder = TempDir::new().unwrap();
