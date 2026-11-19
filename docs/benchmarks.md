@@ -163,7 +163,7 @@ Run on 2026-11-19: 248 runs over 31 frozen tasks × 4 repetitions per arm, $10.4
 
 ### Large-output family (separate campaign)
 
-The 32 tasks are small. An interim look at the main campaign's Sonnet cell, while it was still running and with about 77 runs per arm, showed a plain run seeing about 5.6 KB of tool output over about 5 requests, and Justless costing 2.4% more per solved task than plain Claude Code. This family was added after that look; the main result above is still reported only from `report.py`. Justless compacts command output above about 4 KB, and the owner's own Claude Code sessions produce about 37 MB of shell output a week. The main tasks therefore under-represent the work Justless targets. This family adds eight tasks whose plain solution path reads large output. It is registered as its own contrast and is never pooled with the 32-task primary result.
+The main tasks are small. A plain run sees about 5.6 KB of tool output over about 5 requests, and the Sonnet result above shows no demonstrated saving. Justless compacts command output above about 4 KB, and the owner's own Claude Code sessions produce about 37 MB of shell output a week, so the main tasks under-represent the work Justless targets. This family adds eight tasks whose plain solution path reads large output. It was designed after that result, is registered as its own contrast, and is never pooled with the main result.
 
 | Kind | Task | Why the output is large | Success |
 | --- | --- | --- | --- |
