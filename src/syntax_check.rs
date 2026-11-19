@@ -163,9 +163,15 @@ pub fn parser_name(file: &str) -> Option<&'static str> {
 /// found errors in 2,532 of 4,000 C files, 404 of 938 C++ files and 1 of 257
 /// shell scripts, against 4 of 2,854 Ruby files and none of 4,000 Rust, 470
 /// Python, 212 Lua, 84 JavaScript and 45 Java files.
-/// The Elixir, Objective-C, PowerShell, Julia and Groovy grammars were added
-/// after that scan, so their problems are only reported until measured the
-/// same way.
+/// The grammars added later were measured on downloaded releases and the
+/// few local files: Elixir 1.17.3, Phoenix 1.7.14 without its EEx generator
+/// templates, Ecto 3.12.4 and Absinthe 1.7.8 gave errors in none of 1,376
+/// Elixir files, so Elixir blocks. The others only report: Objective-C found
+/// errors in 48 of 614 `.m` files from AFNetworking, SDWebImage,
+/// CocoaLumberjack, FMDB, Mantle, MMKV, Texture and Realm; PowerShell in 133 of
+/// 441 files, mostly from Pester, posh-git and PSScriptAnalyzer; Julia in 130
+/// of 766 files, nearly all from Julia 1.11.1; and Groovy in 527 of 3,174 files
+/// from Groovy 4.0.23 and Spock 2.3, Gradle scripts included.
 pub fn blocks(file: &str) -> bool {
     !matches!(
         Grammar::for_file(file),
@@ -173,7 +179,6 @@ pub fn blocks(file: &str) -> bool {
             Grammar::C
                 | Grammar::Cpp
                 | Grammar::Bash
-                | Grammar::Elixir
                 | Grammar::ObjectiveC
                 | Grammar::PowerShell
                 | Grammar::Julia
@@ -409,6 +414,13 @@ pub fn judge(
     need_before: bool,
 ) -> Option<Verdict> {
     parser_name(file)?;
+    // MATLAB and Octave use `.m` too: a `.m` file is Objective-C only when its
+    // text says so, as the index decides.
+    if Grammar::for_file(file) == Some(Grammar::ObjectiveC)
+        && Grammar::detect(file, after).is_none()
+    {
+        return None;
+    }
     let parsed = match before {
         Some(before) if need_before => both(file, before, after),
         _ => parse(file, after).and_then(|now| {
@@ -868,6 +880,11 @@ mod tests {
             ),
             ("a.rb", "def f\n  g(1)\nend\n", "def f\n  g(1\nend\n"),
             (
+                "a.ex",
+                "defmodule A do\n  def f, do: g(1)\nend\n",
+                "defmodule A do\n  def f, do: g(1\nend\n",
+            ),
+            (
                 "a.rs",
                 "fn a() {\n    let x = 1;\n}\n",
                 "fn a() {\n    let x = ;\n}\n",
@@ -876,8 +893,16 @@ mod tests {
             assert_eq!(judged(file, before, after), "certain", "{after}");
         }
         // Other errors in a Tree-sitter language are reported without blocking, and
-        // C, C++ and Bash never block.
+        // C, C++, Bash, Objective-C, PowerShell, Julia and Groovy never block.
         for (file, before, after) in [
+            (
+                "a.m",
+                "#import <A/A.h>\nint f(void) { return g(1); }\n",
+                "#import <A/A.h>\nint f(void) { return g(1; }\n",
+            ),
+            ("a.ps1", "function f { g(1) }\n", "function f { g(1 }\n"),
+            ("a.jl", "f() = g(1)\n", "f() = g(1\n"),
+            ("a.groovy", "def f() { g(1) }\n", "def f() { g(1 }\n"),
             ("a.rb", "def f\n  1\nend\n", "def f\n  1\n"),
             (
                 "a.py",
@@ -899,6 +924,13 @@ mod tests {
         ] {
             assert_eq!(judged(file, before, after), "reported", "{after}");
         }
+        // MATLAB uses `.m` too, and its code is not checked as Objective-C.
+        let matlab = "function y = f(x)\n  y = x * 2;\nend\n";
+        let change = Change::between(matlab, "function y = f(x\n");
+        assert_eq!(
+            judge("f.m", Some(matlab), "function y = f(x\n", &[change], true),
+            None
+        );
     }
 
     #[test]

@@ -448,6 +448,8 @@ impl Grammar {
             "lua" => Self::Lua,
             "zig" => Self::Zig,
             "ex" | "exs" => Self::Elixir,
+            // Not `.mm`: in Objective-C++ from MMKV, Texture and Realm, this
+            // grammar found errors in 209 of 357 files, against 48 of 614 `.m`.
             "m" => Self::ObjectiveC,
             "ps1" | "psm1" => Self::PowerShell,
             "jl" => Self::Julia,
