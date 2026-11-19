@@ -2935,12 +2935,20 @@ pub fn search(
         tally.show(stream);
     }
     if tally.shown() < tally.total() {
+        // MCP takes no `limit` above its cap, so past it the hint narrows the
+        // search instead.
+        let total = tally.total();
+        let hint = if total <= crate::mcp::MAX_LIMIT {
+            format!("--limit {total} shows all")
+        } else if Stream::BOTH.iter().all(|&stream| tally.of(stream).1 > 0) {
+            "narrow TEXT or pick one --stream".to_owned()
+        } else {
+            "narrow TEXT".to_owned()
+        };
         writeln!(
             out,
-            "[{} of {} matches shown ({tally}); --limit {} shows all]",
-            tally.shown(),
-            tally.total(),
-            tally.total()
+            "[{} of {total} matches shown ({tally}); {hint}]",
+            tally.shown()
         )?;
     }
     Ok(out.written)

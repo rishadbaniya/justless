@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::{self, Run, Stream};
 use crate::context::Report;
+use crate::mcp::MAX_LIMIT;
 use crate::workspace::{Workspace, lock_state, write_json};
 
 pub fn now_ms() -> u64 {
@@ -990,7 +991,7 @@ pub fn history(
 ) -> Result<()> {
     let runs = records(workspace, oldest)?;
     if let Some(needle) = needle {
-        return search_runs(workspace, runs, needle, limit, cap);
+        return search_runs(workspace, runs, needle, oldest, limit, cap);
     }
     let mut report = Report::new(cap);
     let justless = workspace.justless();
@@ -1020,11 +1021,13 @@ pub fn history(
 /// `limit` and within `cap` bytes. Every run is searched to the end, so a last
 /// line can count the matches left out. Within a run that the limit cuts,
 /// each stream keeps a place and a failed run's failure lines come first, as
-/// in `search`. A stream whose matches all lie past the cut keeps a place too.
+/// in `search`. The first failed run listed keeps a place when the runs before
+/// it passed, and so does a stream whose matches all lie past the cut.
 fn search_runs(
     workspace: &Workspace,
     runs: impl Iterator<Item = Result<Run>>,
     needle: &str,
+    oldest: bool,
     limit: usize,
     cap: usize,
 ) -> Result<()> {
@@ -1061,10 +1064,14 @@ fn search_runs(
         report.line("No matching captured runs.");
         return report.finish();
     }
+    let failed = found.iter().position(|(run, _)| run.may_have_failed());
     // The lines for `want` places. Each run gets the places the runs before it
-    // left. When that leaves out every match of a stream, such as an older
-    // failed run's stderr under a newer run's stdout, the first run with one
-    // shows it in the place of the last line listed.
+    // left. When that leaves out every match of the runs that failed, such as
+    // an older failure under a newer passing run's matches, the first failed
+    // run shows its best line in the place of the last line listed. When a
+    // stream's matches are all left out, such as an older failed run's stderr
+    // under a newer run's stdout, the first run with one shows it in the place
+    // of the last line listed before that.
     let lines = |want: usize| {
         let mut places = Vec::with_capacity(found.len());
         let mut left = want;
@@ -1073,8 +1080,19 @@ fn search_runs(
             places.push(take);
             left -= take;
         }
+        let cut = want < total && want >= 2;
+        let mut reserved = None;
+        if cut
+            && let Some(failed) = failed
+            && places[failed] == 0
+            && let Some(last) = places.iter().rposition(|&take| take > 0)
+        {
+            places[last] -= 1;
+            places[failed] = 1;
+            reserved = Some(failed);
+        }
         let mut pinned = Vec::new();
-        if want < total && want >= 2 {
+        if cut {
             for stream in [Stream::Stdout, Stream::Stderr] {
                 let listed = found.iter().zip(&places).any(|((_, matches), &take)| {
                     matches.choose(take).iter().any(|line| line.0 == stream)
@@ -1083,7 +1101,9 @@ fn search_runs(
                     .iter()
                     .enumerate()
                     .find_map(|(index, (_, matches))| Some((index, matches.first(stream)?)));
-                let last = places.iter().rposition(|&take| take > 0);
+                let last = (0..places.len())
+                    .rev()
+                    .find(|&index| places[index] > 0 && Some(index) != reserved);
                 if let (false, Some(first), Some(last)) = (listed, first, last) {
                     places[last] -= 1;
                     pinned.push(first);
@@ -1122,7 +1142,15 @@ fn search_runs(
         if form == 1 {
             return format!("[{shown} of {total} matches shown ({tally})]\n");
         }
+        // MCP takes no `limit` above its cap, so past it the hint narrows
+        // the search or turns it around instead.
         let hint = match (total > limit, budget) {
+            (true, _) if total > MAX_LIMIT && oldest => {
+                "narrow TEXT, or drop --oldest for the newest first".to_owned()
+            }
+            (true, _) if total > MAX_LIMIT => {
+                "narrow TEXT, or use --oldest for the oldest first".to_owned()
+            }
             (true, true) => format!("--limit {total} and a larger --budget show all"),
             (true, false) => format!("--limit {total} shows all"),
             _ => "a larger --budget shows all".to_owned(),

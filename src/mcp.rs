@@ -576,6 +576,9 @@ struct Tool {
 
 const MAX_TEXT: usize = 4096;
 const MAX_LINE: u64 = 100_000_000;
+/// The largest `limit` a tool takes. A cut notice that a tool can return never
+/// suggests more.
+pub(crate) const MAX_LIMIT: usize = 1000;
 const STREAMS: &[&str] = &["both", "stdout", "stderr"];
 
 const fn positional(name: &'static str, kind: Kind, help: &'static str) -> Param {
@@ -613,13 +616,19 @@ const STREAM: Param = option(
     Kind::Choice(STREAMS),
     "Stream (default both)",
 );
+const BASE: Param = option(
+    "base",
+    "base",
+    Kind::Text,
+    "Diff from merge base of this ref and HEAD",
+);
 
 const TOOLS: &[Tool] = &[
     Tool {
         name: "query",
         title: "Find a symbol",
         command: "query",
-        description: "Definition, references, callers, tests or dependencies of a symbol. Use before grepping or reading files.",
+        description: "Definition, references, callers, tests or dependencies of a symbol.",
         params: &[
             positional("symbol", Kind::Text, "Symbol name, optionally qualified"),
             option(
@@ -633,7 +642,7 @@ const TOOLS: &[Tool] = &[
                     "dependencies",
                     "all",
                 ]),
-                "Which relationships to show (default all)",
+                "Relationships to show (default all)",
             ),
             BUDGET,
         ],
@@ -669,7 +678,7 @@ const TOOLS: &[Tool] = &[
             option(
                 "limit",
                 "limit",
-                Kind::Count(1, 1000),
+                Kind::Count(1, MAX_LIMIT as u64),
                 "Max lines (default 20)",
             ),
             option("after", "after", Kind::Text, "Next-page cursor"),
@@ -701,8 +710,9 @@ const TOOLS: &[Tool] = &[
         description: "Source around a location (`at`) or the Git diff (`changes`), with enclosing symbols and related tests.",
         params: &[
             option("at", "at", Kind::Location, "PATH:LINE or PATH:START-END"),
-            option("changes", "changes", Kind::Flag, "Use current Git changes"),
+            option("changes", "changes", Kind::Flag, "Use Git changes"),
             option("staged", "staged", Kind::Flag, "Staged changes only"),
+            BASE,
             BUDGET,
         ],
         check: Some(context_input),
@@ -750,15 +760,10 @@ const TOOLS: &[Tool] = &[
             option(
                 "limit",
                 "limit",
-                Kind::Count(1, 1000),
+                Kind::Count(1, MAX_LIMIT as u64),
                 "Rows per page (default 40)",
             ),
-            option(
-                "after",
-                "after",
-                Kind::Text,
-                "Continue after this REV#ROW reference",
-            ),
+            option("after", "after", Kind::Text, "Next page after this REV#ROW"),
             BUDGET,
         ],
         check: None,
@@ -788,9 +793,9 @@ const TOOLS: &[Tool] = &[
         name: "pack",
         title: "Gather evidence for a question",
         command: "pack",
-        description: "Answers a codebase question in one call with the relevant definitions, links, changes and recent failures within a budget. Start here for open questions.",
+        description: "Budgeted evidence for a task or question: relevant definitions, links, changes and recent failures.",
         params: &[
-            positional("question", Kind::Text, "Task or question in plain language"),
+            positional("question", Kind::Text, "Task or question"),
             BUDGET,
         ],
         check: None,
@@ -814,6 +819,7 @@ const TOOLS: &[Tool] = &[
                 ..positional("target", Kind::Text, "Symbol or file")
             },
             option("changes", "changes", Kind::Flag, "Use Git changes"),
+            BASE,
             option("depth", "depth", Kind::Count(1, 32), "Hops (default 3)"),
             BUDGET,
         ],
@@ -823,7 +829,7 @@ const TOOLS: &[Tool] = &[
         name: "log",
         title: "Replay a captured run",
         command: "log",
-        description: "Output of a `justless run` capture, secrets redacted. Optional stream and line range.",
+        description: "Output of a `justless run` capture, secrets redacted.",
         params: &[
             RUN_ID,
             STREAM,
@@ -841,7 +847,7 @@ const TOOLS: &[Tool] = &[
         name: "search",
         title: "Search a captured run",
         command: "search",
-        description: "Literal text search within one captured run's output, with stream and line numbers.",
+        description: "Literal text in one captured run's output, with stream and line numbers.",
         params: &[
             RUN_ID,
             positional("text", Kind::Text, "Exact text to find"),
@@ -849,7 +855,7 @@ const TOOLS: &[Tool] = &[
             option(
                 "limit",
                 "limit",
-                Kind::Count(1, 1000),
+                Kind::Count(1, MAX_LIMIT as u64),
                 "Max lines (default 20)",
             ),
         ],
@@ -863,22 +869,13 @@ const TOOLS: &[Tool] = &[
         params: &[
             Param {
                 required: false,
-                ..positional(
-                    "text",
-                    Kind::Text,
-                    "Text to search for; omit to list recent runs",
-                )
+                ..positional("text", Kind::Text, "Text to find; omit to list recent runs")
             },
-            option(
-                "oldest",
-                "oldest",
-                Kind::Flag,
-                "Show the oldest matches first",
-            ),
+            option("oldest", "oldest", Kind::Flag, "Oldest first"),
             option(
                 "limit",
                 "limit",
-                Kind::Count(1, 1000),
+                Kind::Count(1, MAX_LIMIT as u64),
                 "Max runs or lines (default 12)",
             ),
             BUDGET,
@@ -912,7 +909,7 @@ const TOOLS: &[Tool] = &[
 ];
 
 fn context_input(arguments: &Map<String, Value>) -> Result<(), String> {
-    let changes = arguments.get("changes") == Some(&Value::Bool(true));
+    let changes = base_input(arguments)?;
     let staged = arguments.get("staged") == Some(&Value::Bool(true));
     let at = arguments.get("at").is_some_and(|value| !value.is_null());
     if changes == at {
@@ -921,11 +918,23 @@ fn context_input(arguments: &Map<String, Value>) -> Result<(), String> {
     if staged && !changes {
         return Err("`staged` requires `changes: true`".into());
     }
+    if staged && arguments.get("base").is_some_and(|value| !value.is_null()) {
+        return Err("pass `staged` or `base`, not both".into());
+    }
     Ok(())
 }
 
-fn affected_input(arguments: &Map<String, Value>) -> Result<(), String> {
+/// Whether `changes` is true, after checking that a `base` comes with it.
+fn base_input(arguments: &Map<String, Value>) -> Result<bool, String> {
     let changes = arguments.get("changes") == Some(&Value::Bool(true));
+    if !changes && arguments.get("base").is_some_and(|value| !value.is_null()) {
+        return Err("`base` requires `changes: true`".into());
+    }
+    Ok(changes)
+}
+
+fn affected_input(arguments: &Map<String, Value>) -> Result<(), String> {
+    let changes = base_input(arguments)?;
     let target = arguments
         .get("target")
         .is_some_and(|value| !value.is_null());

@@ -16632,6 +16632,57 @@ fn history_keeps_a_place_for_a_stream_whose_matches_are_all_in_older_runs() {
 }
 
 #[test]
+fn history_keeps_a_place_for_an_older_failure_and_no_notice_passes_mcps_limit() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    // A merged run's failure is on stdout, like the newer passing run's matches.
+    let failure = "order-42 FAILED at settlement\n";
+    archived_run(root, "run-Old1", 1, 1_000, [failure, ""]);
+    archived_run(root, "run-New2", 0, 2_000, [&order_progress(25), ""]);
+    assert_eq!(
+        history_lines(&success(root, &["history", "order-42", "--limit", "3"])),
+        [
+            "run-New2 other stdout:1: order-42 progress 0",
+            "run-New2 other stdout:2: order-42 progress 1",
+            "run-Old1 other stdout:1: order-42 FAILED at settlement",
+            "[3 of 26 matches shown from 2 of 2 matching runs (stdout 3 of 26); --limit 26 shows all]",
+        ]
+    );
+    // MCP takes a limit of at most 1000, so a notice never suggests more.
+    archived_run(
+        root,
+        "run-Big3",
+        0,
+        3_000,
+        [&order_progress(1000), "order-42 retry\n"],
+    );
+    let search = |args: &[&str]| {
+        let output = success(root, &[&["search", "run-Big3", "order-42"], args].concat());
+        output.lines().last().unwrap().to_owned()
+    };
+    assert_eq!(
+        search(&["--stream", "stdout"]),
+        "[20 of 1000 matches shown (stdout 20 of 1000); --limit 1000 shows all]"
+    );
+    assert_eq!(
+        search(&[]),
+        "[20 of 1001 matches shown (stdout 19 of 1000, stderr 1 of 1); narrow TEXT or pick one --stream]"
+    );
+    let history = |args: &[&str]| {
+        let output = success(root, &[&["history", "order-42"], args].concat());
+        output.lines().last().unwrap().to_owned()
+    };
+    assert_eq!(
+        history(&[]),
+        "[12 of 1027 matches shown from 2 of 3 matching runs (stdout 11 of 1026, stderr 1 of 1); narrow TEXT, or use --oldest for the oldest first]"
+    );
+    assert!(
+        history(&["--oldest"]).ends_with("; narrow TEXT, or drop --oldest for the newest first]")
+    );
+}
+
+#[test]
 fn search_treats_a_pipe_recorded_as_passing_as_a_possible_failure() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();

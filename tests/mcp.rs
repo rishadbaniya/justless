@@ -199,6 +199,19 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
             "context",
             json!({"at": "db/schema.sql:1", "changes": true}),
         ),
+        call("base-alone", "context", json!({"base": "main"})),
+        call(
+            "base-staged",
+            "context",
+            json!({"changes": true, "staged": true, "base": "main"}),
+        ),
+        call(
+            "base-target",
+            "affected",
+            json!({"target": "purchase_orders", "base": "main"}),
+        ),
+        // Only `--base` needs a Git repository, so this error shows it was passed.
+        call("base", "affected", json!({"changes": true, "base": "main"})),
         call("run-id", "log", json!({"run_id": "../../etc"})),
         call("mutating", "run", json!({"command": ["true"]})),
         request(
@@ -313,6 +326,11 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
     assert!(failed(by_id(&responses, "unknown-arg")).contains("unknown argument `lines`"));
     assert!(failed(by_id(&responses, "range")).contains("from 1 to 1000"));
     assert!(failed(by_id(&responses, "both")).contains("exactly one"));
+    for id in ["base-alone", "base-target"] {
+        assert!(failed(by_id(&responses, id)).contains("`base` requires `changes: true`"));
+    }
+    assert!(failed(by_id(&responses, "base-staged")).contains("`staged` or `base`, not both"));
+    assert!(failed(by_id(&responses, "base")).contains("--base needs a Git repository"));
     assert!(failed(by_id(&responses, "run-id")).contains("run ID"));
 
     assert_eq!(by_id(&responses, "mutating")["error"]["code"], -32602);
