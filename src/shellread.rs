@@ -1,9 +1,9 @@
-//! Single-file shell commands that read an inclusive source range, and
+//! Single-file shell commands that read an inclusive source range, `cat`, and
 //! `git show REV:path`, which prints a file as a revision or the index holds it.
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::ops::Range;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -31,6 +31,8 @@ pub(crate) struct LineRange {
     /// The operand names a Git object, such as `HEAD~1:src/a.rs`, rather than
     /// a file in the working tree.
     object: bool,
+    /// A `cat` of the whole file.
+    whole: bool,
 }
 
 fn decimal(text: &str) -> Option<usize> {
@@ -61,17 +63,12 @@ impl Span {
 }
 
 impl LineRange {
-    fn one(span: Span) -> Self {
+    fn new(spans: Vec<Span>) -> Self {
         Self {
-            spans: vec![span],
+            spans,
             object: false,
+            whole: false,
         }
-    }
-
-    /// Whether the read is a `git show` of an object, which falls back to the
-    /// ordinary run report when it cannot be outlined.
-    pub(crate) fn object(&self) -> bool {
-        self.object
     }
 
     /// A `sed -n` script of `A,Bp` addresses, one or several joined by `;`,
@@ -81,10 +78,7 @@ impl LineRange {
             .split(';')
             .map(|part| Span::closed(part.strip_suffix('p')?, ','))
             .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            spans,
-            object: false,
-        })
+        Some(Self::new(spans))
     }
 
     /// The `read --shell-range` argument: `A-B` and `+N` windows joined by commas.
@@ -93,10 +87,7 @@ impl LineRange {
             .split(',')
             .map(|part| Span::tail(part).or_else(|| Span::closed(part, '-')))
             .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            spans,
-            object: false,
-        })
+        Some(Self::new(spans))
     }
 }
 
@@ -196,41 +187,175 @@ pub(crate) fn object(dir: &Path, spec: &str, cap: u64) -> Option<(String, String
 }
 
 /// A standalone single-file read: `sed -n 'A,Bp[;C,Dp…]' FILE`,
-/// `head -n N FILE`, `tail -n N FILE`, `tail -n +N FILE` or `git show REV:path`,
-/// whose operand is then the object name.
-pub(crate) fn command(words: &[String]) -> Option<(&str, LineRange)> {
+/// `head -n N FILE`, `tail -n N FILE`, `tail -n +N FILE`, `cat FILE` or
+/// `git show REV:path`, whose operand is then the object name.
+fn command(words: &[String]) -> Option<(&str, LineRange)> {
+    let whole = || LineRange::new(vec![Span::tail("+1").expect("line 1")]);
     if let Some(spec) = show(words) {
-        let mut range = LineRange::one(Span::tail("+1")?);
+        let mut range = whole();
         range.object = true;
         return Some((spec, range));
     }
-    let [program, flag, address, file] = words else {
-        return None;
-    };
-    if flag != "-n"
-        || file.is_empty()
-        || file.starts_with(['-', '='])
-        || file.chars().any(char::is_control)
-    {
-        return None;
-    }
-    let range = match program.as_str() {
-        "sed" => LineRange::sed(address)?,
-        "head" => LineRange::one(Span {
-            first: 1,
-            last: Some(decimal(address)?),
-            from_end: false,
-        }),
-        "tail" => LineRange::one(Span::tail(address).or_else(|| {
-            Some(Span {
-                first: decimal(address)?,
-                last: None,
-                from_end: true,
-            })
-        })?),
+    let (file, range) = match words {
+        [cat, file] if cat == "cat" => (
+            file,
+            LineRange {
+                whole: true,
+                ..whole()
+            },
+        ),
+        [program, flag, address, file] if flag == "-n" => (
+            file,
+            match program.as_str() {
+                "sed" => LineRange::sed(address)?,
+                "head" => LineRange::new(vec![Span {
+                    first: 1,
+                    last: Some(decimal(address)?),
+                    from_end: false,
+                }]),
+                "tail" => LineRange::new(vec![Span::tail(address).or_else(|| {
+                    Some(Span {
+                        first: decimal(address)?,
+                        last: None,
+                        from_end: true,
+                    })
+                })?]),
+                _ => return None,
+            },
+        ),
         _ => return None,
     };
+    if file.is_empty() || file.starts_with(['-', '=']) || file.chars().any(char::is_control) {
+        return None;
+    }
     Some((file, range))
+}
+
+/// Split a command line at unquoted `&&` and `|`, each part with the operator
+/// after it. Any other operator, expansion or escape fails `literal_command`.
+fn split(command: &str) -> Option<Vec<(Range<usize>, &'static str)>> {
+    let mut parts = Vec::new();
+    let (mut quote, mut start, mut at) = (None, 0, 0);
+    let bytes = command.as_bytes();
+    while let Some(&byte) = bytes.get(at) {
+        let operator = match quote {
+            Some(open) if byte == open => {
+                quote = None;
+                None
+            }
+            None if matches!(byte, b'\'' | b'"') => {
+                quote = Some(byte);
+                None
+            }
+            None if bytes[at..].starts_with(b"&&") => Some("&&"),
+            None if bytes[at..].starts_with(b"||") || byte == b'&' => return None,
+            None if byte == b'|' => Some("|"),
+            _ => None,
+        };
+        match operator {
+            Some(operator) => {
+                parts.push((start..at, operator));
+                at += operator.len();
+                start = at;
+            }
+            None => at += 1,
+        }
+    }
+    parts.push((start..command.len(), ""));
+    Some(parts)
+}
+
+/// A recognized read: one of the forms `command` takes, or `cat FILE` piped
+/// into one `head -n N`, `tail -n N`, `tail -n +N` or `sed -n` script, each
+/// after an optional `cd DIR &&`.
+pub(crate) struct ShellRead {
+    /// The `cd DIR && ` that starts the command line, as written.
+    prefix: String,
+    /// The directory that `cd` enters.
+    dir: Option<String>,
+    file: String,
+    range: LineRange,
+}
+
+/// The read a command line runs, if it is one of the forms `ShellRead` describes.
+pub(crate) fn parse(line: &str) -> Option<ShellRead> {
+    let parts = split(line)?;
+    let words = |at: usize| crate::agents::literal_command(&line[parts.get(at)?.0.clone()]);
+    let (prefix, dir, first) = match parts.first()?.1 {
+        "&&" => match words(0)?.as_slice() {
+            [cd, dir] if cd == "cd" && !dir.starts_with('-') && !dir.contains(char::is_control) => {
+                (
+                    format!("{} ", &line[..parts[1].0.start]),
+                    Some(dir.clone()),
+                    1,
+                )
+            }
+            _ => return None,
+        },
+        _ => (String::new(), None, 0),
+    };
+    let read = words(first)?;
+    let (file, range) = match &parts[first..] {
+        [(_, "")] => command(&read)?,
+        [(_, "|"), (_, "")] => {
+            let filter = words(first + 1)?;
+            let ([cat, file], [program, flag, address]) = (read.as_slice(), filter.as_slice())
+            else {
+                return None;
+            };
+            if cat != "cat" || !matches!(program.as_str(), "head" | "tail" | "sed") {
+                return None;
+            }
+            let (_, range) = command(&[program, flag, address, file].map(String::clone))?;
+            (file.as_str(), range)
+        }
+        _ => return None,
+    };
+    Some(ShellRead {
+        prefix,
+        dir,
+        file: file.to_owned(),
+        range,
+    })
+}
+
+impl ShellRead {
+    /// Whether the read is a `git show` of an object, which falls back to the
+    /// ordinary run report when it cannot be outlined.
+    pub(crate) fn object(&self) -> bool {
+        self.range.object
+    }
+
+    /// Whether the read is a `cat` of the whole file.
+    pub(crate) fn whole(&self) -> bool {
+        self.range.whole
+    }
+
+    /// The workspace directory the read runs in. Claude Code's main session keeps
+    /// a `cd`, so once the command ran its `cwd` can already be the directory a
+    /// relative `cd` entered, while a subagent's is where the command started.
+    fn directory(&self, ws: &Workspace, cwd: &Path, ran: bool) -> Option<PathBuf> {
+        let Some(dir) = &self.dir else {
+            return Some(cwd.to_path_buf());
+        };
+        let entered: PathBuf = Path::new(dir)
+            .components()
+            .filter(|c| *c != Component::CurDir)
+            .collect();
+        let directory = match cwd.join(dir).canonicalize() {
+            Ok(directory) if directory.is_dir() => directory,
+            _ if ran
+                && entered
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_)))
+                && cwd.ends_with(&entered) =>
+            {
+                cwd.to_path_buf()
+            }
+            _ => return None,
+        };
+        directory.starts_with(&ws.root).then_some(directory)
+    }
 }
 
 /// One printed window, resolved against the file.
@@ -367,15 +492,20 @@ impl Selection {
         }
     }
 
-    fn outline(&mut self, ws: &Workspace, baseline: usize) -> Option<String> {
-        let settings = ws.settings().ok()?;
+    /// A read of at most 150 lines and 6 KiB, which keeps its text.
+    fn small(&self) -> bool {
         let lines: usize = self
             .windows
             .iter()
             .map(|window| window.last + 1 - window.first)
             .sum();
+        lines <= 150 && self.text.len() <= 6144
+    }
+
+    fn outline(&mut self, ws: &Workspace, baseline: usize) -> Option<String> {
+        let settings = ws.settings().ok()?;
         let bytes = self.text.len() as u64;
-        if (lines <= 150 && bytes <= 6144)
+        if self.small()
             || bytes > settings.max_run_bytes
             || settings.max_runs == 0
             || bytes > settings.max_archive_bytes
@@ -493,6 +623,7 @@ impl Selection {
             return vec!["git".into(), "show".into(), spec.clone()];
         }
         let (program, address) = match (&self.windows[..], self.closed) {
+            ([window], false) if window.first == 1 => return vec!["cat".into(), self.file.clone()],
             ([window], false) => ("tail", format!("+{}", window.first)),
             (windows, closed) => {
                 let last = windows.len() - 1;
@@ -517,25 +648,41 @@ impl Selection {
     }
 }
 
-/// Other shell clients run a pure workspace read. Leave the native sed in
-/// charge where implementations disagree on an unterminated last line. A
-/// `git show` is pinned to the blob its name resolves to now, and rerouted only
-/// when the outline will shorten it.
+/// Other shell clients run a pure workspace read after the same `cd`. Leave the
+/// native sed in charge where implementations disagree on an unterminated last
+/// line. A `git show` is pinned to the blob its name resolves to now, and like a
+/// `cat` rerouted only when an outline will shorten it. Claude Code runs the
+/// command itself and `claude` checks it after, except a wide `cat` that the
+/// range outline cannot show, which every client reroutes to the outline
+/// `justless read` gives the whole file when there is one.
 pub(crate) fn rewrite(
     ws: &Workspace,
     cwd: &Path,
-    file: &str,
-    range: LineRange,
+    shell: &ShellRead,
     session: Option<&str>,
+    claude: bool,
 ) -> Option<String> {
     // A count from the end is resolved here, before the command runs, so a file
     // that grows in between would print other lines. Only the post-run hook,
     // which checks the bytes the command printed, takes `tail -n N`.
-    if range.spans.iter().any(|span| span.from_end) {
+    if (claude && !shell.whole()) || shell.range.spans.iter().any(|span| span.from_end) {
         return None;
     }
-    let mut read = Selection::open(ws, cwd, file, &range)?;
+    let mut read = Selection::open(
+        ws,
+        &shell.directory(ws, cwd, false)?,
+        &shell.file,
+        &shell.range,
+    )?;
     if read.closed && !read.text().ends_with('\n') {
+        return None;
+    }
+    if shell.whole() && (read.small() || read.outline(ws, read.text.len()).is_none()) {
+        return (!read.small())
+            .then(|| crate::agents::read_instead(ws, &ws.root, &read.file))?
+            .map(|instead| format!("{}{instead}", shell.prefix));
+    }
+    if claude {
         return None;
     }
     let object = match read.object.clone() {
@@ -555,7 +702,8 @@ pub(crate) fn rewrite(
         })
         .unwrap_or_default();
     Some(format!(
-        "justless --root {} read --shell-range {}{object}{session} -- {}",
+        "{}justless --root {} read --shell-range {}{object}{session} -- {}",
+        shell.prefix,
         shell_quote(&ws.root),
         read.ranges(","),
         shell_quote(Path::new(read.name()))
@@ -593,9 +741,9 @@ pub(crate) fn read(
     Ok(())
 }
 
-/// Claude executes the original command itself and checks permissions on the original command.
-/// Accept the result only if it matches the selected source bytes.
-pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange) -> Option<Value> {
+/// The selection a Claude Code Bash result printed, its session's directory and
+/// the bytes Claude Code would show, when the result is exactly those bytes.
+fn ran(ws: &Workspace, input: &Value, shell: &ShellRead) -> Option<(Selection, PathBuf, usize)> {
     let response = &input["tool_response"];
     if !response["stderr"].as_str()?.is_empty()
         || response["returnCodeInterpretation"]
@@ -610,7 +758,12 @@ pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange
         .unwrap_or(&ws.cwd)
         .canonicalize()
         .ok()?;
-    let mut read = Selection::open(ws, &cwd, file, &range)?;
+    let read = Selection::open(
+        ws,
+        &shell.directory(ws, &cwd, true)?,
+        &shell.file,
+        &shell.range,
+    )?;
     let stdout = response["stdout"].as_str()?;
     let persisted = response["persistedOutputPath"].as_str();
     let stored;
@@ -636,6 +789,21 @@ pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange
     if read.closed && !selected.ends_with('\n') {
         return None;
     }
+    Some((read, cwd, baseline))
+}
+
+/// Claude executes the original command itself and checks permissions on the original command.
+/// Accept the result only if it matches the selected source bytes. A result this
+/// cannot outline, other than a small read that keeps its text, gets `fallback`.
+pub(crate) fn claude(
+    ws: &Workspace,
+    input: &Value,
+    shell: &ShellRead,
+    fallback: impl FnOnce() -> Option<Value>,
+) -> Option<Value> {
+    let Some((mut read, cwd, baseline)) = ran(ws, input, shell) else {
+        return fallback();
+    };
     let session = input["session_id"]
         .as_str()
         .map(|s| capture::source_digest(s.as_bytes())[..24].to_owned());
@@ -645,10 +813,15 @@ pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange
         session.as_deref().unwrap_or("terminal"),
         true,
     ) else {
+        if !read.small()
+            && let Some(other) = fallback()
+        {
+            return Some(other);
+        }
         read.observe(ws, false);
         return None;
     };
-    let mut updated = response.as_object()?.clone();
+    let mut updated = input["tool_response"].as_object()?.clone();
     updated.insert("stdout".into(), json!(text));
     for key in [
         "persistedOutputPath",
@@ -662,7 +835,7 @@ pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange
 
 #[cfg(test)]
 mod tests {
-    use super::{blob_path, command};
+    use super::{Span, blob_path, command, parse};
 
     #[test]
     fn git_show_names_a_file_in_a_revision_or_the_index() {
@@ -692,7 +865,7 @@ mod tests {
         }
         let unpaged = words("git --no-pager show HEAD:a.rs");
         let (spec, range) = command(&unpaged).unwrap();
-        assert!(spec == "HEAD:a.rs" && range.object());
+        assert!(spec == "HEAD:a.rs" && range.object);
         for text in [
             "git show HEAD",
             "git show HEAD:a.rs b.rs",
@@ -700,6 +873,81 @@ mod tests {
             "git -C x show HEAD:a.rs",
         ] {
             assert!(command(&words(text)).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn cat_cd_and_piped_reads_are_the_single_file_read() {
+        let shown = |line: &str| {
+            parse(line).map(|read| {
+                let spans = read.range.spans.iter().map(|span| match span {
+                    Span { from_end: true, .. } => format!("-{}", span.first),
+                    Span { last: None, .. } => format!("+{}", span.first),
+                    Span {
+                        last: Some(last), ..
+                    } => format!("{}-{last}", span.first),
+                });
+                let kind = if read.whole() { " cat" } else { "" };
+                let kind = if read.object() { " object" } else { kind };
+                format!(
+                    "{}{}:{} {}{kind}",
+                    read.prefix,
+                    read.dir.unwrap_or_default(),
+                    read.file,
+                    spans.collect::<Vec<_>>().join(",")
+                )
+            })
+        };
+        for (line, read) in [
+            ("cat src/a.rs", ":src/a.rs +1 cat"),
+            ("cat 'a|b && c.rs'", ":a|b && c.rs +1 cat"),
+            ("cd src && cat a.rs", "cd src && src:a.rs +1 cat"),
+            (
+                "cd 'my dir'&&sed -n '5,9p' a.rs",
+                "cd 'my dir'&& my dir:a.rs 5-9",
+            ),
+            ("cd ./x && head -n 40 a.rs", "cd ./x && ./x:a.rs 1-40"),
+            (
+                "cd x && git show HEAD:./a.rs",
+                "cd x && x:HEAD:./a.rs +1 object",
+            ),
+            ("cat a.rs | head -n 40", ":a.rs 1-40"),
+            ("cat ä\u{3000}.rs | head -n 2", ":ä\u{3000}.rs 1-2"),
+            ("cat a.rs | tail -n 30", ":a.rs -30"),
+            ("cat a.rs|tail -n +30", ":a.rs +30"),
+            ("cat a.rs | sed -n '1,2p;8,9p'", ":a.rs 1-2,8-9"),
+            ("cd x && cat a.rs | sed -n 3,4p", "cd x && x:a.rs 3-4"),
+        ] {
+            assert_eq!(shown(line).as_deref(), Some(read), "{line}");
+        }
+        for line in [
+            "cat a b",
+            "cat -n a",
+            "cat -A a",
+            "cat -- a",
+            "cat *.rs",
+            "cat a > b",
+            "cat <<EOF",
+            "cat a | head",
+            "cat a | head -5",
+            "cat a | grep -n x",
+            "cat a | head -n 5 | tail -n 2",
+            "cat a b | head -n 1",
+            "sed -n 1,2p a | head -n 1",
+            "cat a |& head -n 2",
+            "cat a &",
+            "cat a && cat b",
+            "true && cat a",
+            "cd x; cat a",
+            "cd x || cat a",
+            "cd x && cd y && cat a",
+            "cd && cat a",
+            "cd - && cat a",
+            "cd $HOME && cat a",
+            "cd ~/x && cat a",
+            "cat ~/a",
+        ] {
+            assert_eq!(shown(line), None, "{line}");
         }
     }
 }

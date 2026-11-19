@@ -240,7 +240,7 @@ fn filters_and_quoted_operators_apply_before_accounting() {
         "grep -E"
     };
     let list = format!(
-        "head -1 'a; b'; sed -n '1,4p;3,4p' big.rs | tail -3; {search} -Hn 'add_0|unmatched' big.rs | cut -c 1-72; cat big.rs | tail -n +2 | head -250"
+        "head -1 'a; b'; sed -n '1,4p;3,4p' big.rs | tail -3; {search} -Hn 'add_0|unmatched' big.rs | cut -c 1-72; cat big.rs | tail -n +2 | head -250; cat big.rs | sed -n '300,560p'"
     );
     let raw = native(dir, &list);
     let (view, _) = verified(dir, &list, response(&raw), &raw);
@@ -345,7 +345,8 @@ fn cd_lists_compact_in_their_directory() {
                 .success()
         );
     }
-    let list = "cd sub && sed -n '1,600p' big.rs";
+    // A `cd` before one read is the single-file read; this list has two pieces.
+    let list = "cd sub && sed -n '1,600p' big.rs && tail -n 1 big.rs";
     let raw = native(dir, list);
     let (view, record) = verified(dir, list, response(&raw), &raw);
     assert!(view.contains("function add_"), "{view}");

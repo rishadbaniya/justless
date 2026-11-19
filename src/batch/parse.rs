@@ -191,7 +191,12 @@ fn piece<'a>(
                 if filters.is_empty()
                     && matches!(
                         source,
-                        Source::File { numbered: true, .. } | Source::Object(_)
+                        Source::File { numbered: true, .. }
+                            | Source::File {
+                                select: Filter::All,
+                                ..
+                            }
+                            | Source::Object(_)
                     ) =>
             {
                 sed(args)?

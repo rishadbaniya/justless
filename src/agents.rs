@@ -1529,27 +1529,14 @@ fn wrap_event(
         return None;
     }
     if !cfg!(windows)
-        && let Some(words) = literal_command(command)
+        && let Some(read) = crate::shellread::parse(command)
     {
-        if let Some((file, range)) = crate::shellread::command(&words) {
-            if rules.claude {
-                return None;
-            }
-            // A `git show` blob the read would not outline keeps the run route.
-            let object = range.object();
-            let rewritten = crate::shellread::rewrite(workspace, cwd, file, range, session);
-            if rewritten.is_some() || !object {
-                return rewritten;
-            }
+        let rewritten = crate::shellread::rewrite(workspace, cwd, &read, session, rules.claude);
+        if rewritten.is_none() && read.whole() && !rules.claude {
+            crate::history::bypass(workspace, command);
         }
-        if let [program, file] = words.as_slice()
-            && program == "cat"
-            && !file.starts_with('-')
-        {
-            let rewritten = read_instead(workspace, cwd, file);
-            if rewritten.is_none() {
-                crate::history::bypass(workspace, command);
-            }
+        // A `git show` blob the read would not outline keeps the run route.
+        if rewritten.is_some() || !read.object() || rules.claude {
             return rewritten;
         }
     }
@@ -1661,7 +1648,7 @@ fn root_option(workspace: &Workspace, directory: &Path) -> String {
 
 /// A `justless read` command for a single-file `cat` of a large workspace text file
 /// whose outline covers its code.
-fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String> {
+pub(crate) fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Option<String> {
     let path = cwd.join(file);
     let path = path.strip_prefix(&workspace.root).ok()?;
     if path
@@ -2150,11 +2137,7 @@ pub fn left_by_permissions(
 /// or `cat FILE` becomes a `justless read`, and because Codex runs a rewritten command
 /// without asking, a list is routed only when every command in it is supported.
 pub(crate) fn codex_would_route(command: &str) -> bool {
-    if !cfg!(windows)
-        && let Some(words) = literal_command(command)
-        && (crate::shellread::command(&words).is_some()
-            || matches!(words.as_slice(), [program, file] if program == "cat" && !file.starts_with('-')))
-    {
+    if !cfg!(windows) && crate::shellread::parse(command).is_some() {
         return true;
     }
     let rules = Rules {

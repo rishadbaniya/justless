@@ -307,9 +307,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                             // hook would outline a range read or a read list.
                             if route == Route::SupportedNotRouted
                                 || crate::batch::Batch::parse(&call.command).is_some()
-                                || crate::agents::literal_command(&call.command).is_some_and(
-                                    |words| crate::shellread::command(&words).is_some(),
-                                )
+                                || crate::shellread::parse(&call.command).is_some()
                             {
                                 entry.now_commands += 1;
                                 entry.now_bytes += bytes;

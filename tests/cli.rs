@@ -18923,6 +18923,113 @@ fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
     }
 }
 
+#[test]
+fn cat_cd_and_piped_reads_are_exact_or_outlined_like_ranges() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let data: String = (0..120)
+        .map(|i| format!("def price_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    rounded = round(taxed, 2)\n    return rounded\n\n"))
+        .collect();
+    fs::write(sub.join("prices.py"), &data).unwrap();
+    fs::write(sub.join("small.py"), "def f():\n    return 1\n").unwrap();
+    fs::write(root.join("blob.bin"), b"\0binary\n").unwrap();
+    let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let sh = |cwd: &Path, command: &str| {
+        let mut sh = Command::new("sh");
+        sh.args(["-c", command]).current_dir(cwd).env("PATH", &path);
+        sh.output().unwrap().stdout
+    };
+    let event = |cwd: &Path, command: &str| json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":cwd,"tool_input":{"command":command}});
+    let codex = |command: &str| {
+        agent_hook(&root, "hook-codex", "before-command", event(&root, command))
+            ["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    let replayed = |shown: &str| {
+        let id = shown.split_whitespace().find(|w| w.starts_with("run-"));
+        cli(&root, &["log", id.unwrap(), "--unredacted"]).stdout
+    };
+    // Other clients run a workspace read after the same `cd`: small reads print
+    // their native bytes, wide ones an outline whose replay is those bytes.
+    for (command, wide) in [
+        ("cd sub && sed -n '2,4p' prices.py", false),
+        ("cat sub/prices.py | head -n 3", false),
+        ("cd sub && cat prices.py | sed -n '2,4p;9,12p'", false),
+        ("cat sub/prices.py", true),
+        ("cd sub && cat prices.py | tail -n +500", true),
+    ] {
+        let real = sh(&root, command);
+        let rewritten = codex(command).unwrap_or_else(|| panic!("not rewritten: {command}"));
+        let shown = sh(&root, &rewritten);
+        if wide {
+            let text = String::from_utf8(shown).unwrap();
+            assert!(text.len() * 2 < real.len(), "{command}: {text}");
+            assert_eq!(replayed(&text), real, "{command}");
+        } else {
+            assert_eq!(shown, real, "{command}");
+        }
+    }
+    // Claude Code runs them itself, a `cd` from where its main session or a
+    // subagent reports, and the outline replaces only verified bytes.
+    for (cwd, command) in [
+        (&root, "cat sub/prices.py"),
+        (&sub, "cd sub && cat prices.py"),
+        (&root, "cd sub && cat prices.py"),
+        (&root, "cd sub && head -n 400 prices.py"),
+        (&root, "cat sub/prices.py | head -n 400"),
+        (&root, "cat sub/prices.py | sed -n '1,120p;200,420p'"),
+        (&root, "cat sub/prices.py | tail -n 300"),
+    ] {
+        let pre = agent_hook(&root, "hook-claude", "before-command", event(cwd, command));
+        assert_eq!(pre, json!({}), "{command}");
+        let real = sh(&root, command);
+        let text = std::str::from_utf8(&real).unwrap();
+        let replaced = after_bash(
+            &root,
+            cwd,
+            command,
+            json!({"stdout":text,"stderr":"","interrupted":false}),
+        );
+        let shown = shown_stdout(&replaced);
+        assert!(shown.len() * 2 < real.len(), "{command}: {shown}");
+        assert_eq!(replayed(&shown), real, "{command}");
+    }
+    let small = "cd sub && cat small.py";
+    let response = json!({"stdout":"def f():\n    return 1","stderr":"","interrupted":false});
+    assert_eq!(after_bash(&root, &root, small, response), json!({}));
+    assert!(codex("cat sub/small.py").is_none());
+    let resume = success(&root, &["resume"]);
+    assert!(resume.contains("Read sub/small.py:1-2"), "{resume}");
+    assert!(resume.contains("Outline sub/prices.py:1-400"), "{resume}");
+    // Other forms, files outside the workspace and binary files keep their output.
+    let wide = json!({"stdout":data,"stderr":"","interrupted":false});
+    for command in [
+        "cat sub/prices.py sub/small.py",
+        "cat -n sub/prices.py",
+        "cat -A sub/prices.py",
+        "cat sub/*.py",
+        "cat sub/prices.py > copy.py",
+        "cat <<EOF\nx\nEOF",
+        "cd / && cat etc/hosts",
+        "cd .. && cat prices.py",
+        "cat ../prices.py",
+        "cat blob.bin",
+    ] {
+        assert!(codex(command).is_none(), "{command}");
+        assert_eq!(
+            after_bash(&root, &root, command, wide.clone()),
+            json!({}),
+            "{command}"
+        );
+    }
+}
+
 /// 62 matches of `retry_budget` in 60 files: one per file except three in
 /// src/mod_07.py, and docs/note_15.md has one line longer than a small page.
 fn paged_find_repo() -> TempDir {

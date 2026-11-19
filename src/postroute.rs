@@ -146,6 +146,25 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // Output with a run marker was already routed, unless it is the text of a
     // `git show` blob, which the read below matches byte for byte.
     let routed = RUN_MARKER.is_match(stdout);
+    if !cfg!(windows)
+        && let Some(read) = crate::shellread::parse(command)
+    {
+        // A `git show` blob that is not outlined gets the ordinary report below.
+        let object = read.object();
+        if routed && !object {
+            return None;
+        }
+        // A wide read the range outline cannot show, such as a shell script,
+        // keeps the read list's excerpt.
+        let compacted = crate::shellread::claude(ws, input, &read, || {
+            crate::batch::Batch::parse(command)
+                .filter(|_| !object)
+                .and_then(|batch| batch.compact(ws, input))
+        });
+        if compacted.is_some() || !object {
+            return compacted;
+        }
+    }
     // A batch the recheck cannot verify, such as a diff shaped by repository
     // settings, still gets the report for its one kind of command below.
     if !cfg!(windows)
@@ -154,20 +173,6 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             crate::batch::Batch::parse(command).and_then(|batch| batch.compact(ws, input))
     {
         return Some(compacted);
-    }
-    if !cfg!(windows)
-        && let Some(words) = crate::agents::literal_command(command)
-        && let Some((file, range)) = crate::shellread::command(&words)
-    {
-        // A `git show` blob that is not outlined gets the ordinary report below.
-        let object = range.object();
-        if routed && !object {
-            return None;
-        }
-        let compacted = crate::shellread::claude(ws, input, file, range);
-        if compacted.is_some() || !object {
-            return compacted;
-        }
     }
     if routed {
         return None;
