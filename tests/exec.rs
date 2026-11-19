@@ -345,6 +345,7 @@ fn usage_errors_exit_2_before_running() {
         ),
     ];
     for (args, input, expected) in cases {
+        eprintln!("case: {args:?}");
         let output = match input {
             Some(input) => exec_with_stdin(&root, args, input),
             None => exec(&root, args),
@@ -382,6 +383,8 @@ fn language_comes_from_lang_then_shebang_then_extension() {
     let output = exec(&root, &["#!/bin/sh\necho ok"]);
     assert_eq!(stdout(&output), "ok\n", "{}", stderr(&output));
     contains(&history(&root), "exec sh");
+    let output = sh(&root, "#!/usr/bin/env python3\necho sh-won");
+    assert_eq!(stdout(&output), "sh-won\n");
     if have("python3") {
         let code = "#!/usr/bin/env -S python3 -u\nimport sys\nprint(sys.version_info[0])";
         let output = exec(&root, &[code]);
@@ -529,7 +532,8 @@ fn shebang_options_keep_the_exit_status() {
     let output = exec(&root, &["--script", "tools/check.sh"]);
     assert_eq!(output.status.code(), direct.status.code());
     let inline = exec(&root, &["#!/bin/sh -e\nfalse\necho continued"]);
-    for output in [&output, &inline] {
+    for (case, output) in [("--script", &output), ("inline", &inline)] {
+        eprintln!("case: {case}");
         assert_eq!(output.status.code(), Some(1), "{}", stderr(output));
         assert_eq!(stdout(output), "");
     }
@@ -696,6 +700,7 @@ fn readers_the_script_leaves_running_finish_writing() {
         ("seq 1 100000 > >(sort -rn)", 100000, "1"),
         (late, 2000, "p 2000"),
     ] {
+        eprintln!("case: {code}");
         let before = runs(&root);
         let output = bash(code);
         assert!(output.status.success(), "{}", stderr(&output));

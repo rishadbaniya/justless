@@ -837,6 +837,7 @@ fn learn_links_and_dedupes_runs() {
         "[justless {id} · exit 2]",
         "[justless {id} · 1.0 KB of 9.0 KB shown · exit 2]",
     ] {
+        eprintln!("case: {form}");
         let failed = format!("make test => 2: {}", form.replace("{id}", &id));
         lab.session(
             "s1",
@@ -907,6 +908,7 @@ fn learn_contradiction() {
             "Run `npm` from `web/`; the repository root has no package.json.",
         ),
     ] {
+        eprintln!("case: {manifest}");
         let lab = Lab::new();
         lab.write(manifest, content);
         lab.session("a", DAY, &[failed, fixed]);
@@ -946,6 +948,7 @@ fn learn_apply_targets() {
         "@AGENTS.md\n",
         "# Claude\n\nFollow @AGENTS.md for everything.\n",
     ] {
+        eprintln!("case: {claude:?}");
         let lab = setup(&[("AGENTS.md", "# Agents\n"), ("CLAUDE.md", claude)]);
         let report = lab.json(&["--apply"]);
         assert_eq!(report["apply"]["changed"], json!(["AGENTS.md"]));
