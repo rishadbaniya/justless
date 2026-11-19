@@ -86,3 +86,87 @@ fn a_search_heading_without_lines_keeps_the_output_and_status() {
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert_eq!(text(&output.stdout), printed, "{output:?}");
 }
+
+/// A Cargo.lock of version 1.0.0 packages, each `(name, source, checksum)`.
+fn lockfile(packages: &[(String, &str, String)]) -> String {
+    let mut text = String::from("version = 4\n");
+    for (name, source, checksum) in packages {
+        text.push_str(&format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"{source}\"\n"
+        ));
+        if !checksum.is_empty() {
+            text.push_str(&format!("checksum = \"{checksum}\"\n"));
+        }
+    }
+    text
+}
+
+#[cfg(unix)]
+#[test]
+fn lockfile_flags_name_every_source_within_a_quarter_of_the_budget() {
+    let sandbox = Sandbox::new();
+    let stub = sandbox.path("vcs");
+    fs::create_dir_all(stub.join("blobs")).unwrap();
+    // The VCS stub serves two lockfile blobs, records the environment each blob read
+    // runs with, and prints a patch between them for anything else.
+    sandbox.stub(
+        "git",
+        &format!(
+            "case \"$1\" in\n  cat-file) echo \"lazy=$GIT_NO_LAZY_FETCH\" >> {stub}/calls; cat {stub}/blobs/$3 ;;\n  *) cat {stub}/out ;;\nesac\n",
+            stub = stub.display()
+        ),
+    );
+    fs::write(
+        stub.join("out"),
+        "diff --git a/Cargo.lock b/Cargo.lock\nindex 1111111..2222222 100644\n\
+         --- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,2 +1,2 @@\n-old\n+new\n",
+    )
+    .unwrap();
+    let registry = "registry+https://github.com/rust-lang/crates.io-index";
+    let (old_fork, new_fork) = (
+        "git+https://example.invalid/foo?branch=main",
+        "git+https://example.invalid/evil?branch=main",
+    );
+    let package =
+        |name: &str, source, checksum: &str| (name.to_owned(), source, checksum.to_owned());
+    // One of two sources of foo 1.0.0 swapped for another repository.
+    let dupe = (
+        lockfile(&[package("foo", old_fork, ""), package("foo", registry, "aa")]),
+        lockfile(&[package("foo", new_fork, ""), package("foo", registry, "aa")]),
+    );
+    // Every package rebuilt with a new checksum, as by a mirror.
+    let rebuilt = |seed: usize| {
+        let packages: Vec<_> = (0..120)
+            .map(|i| {
+                package(
+                    &format!("pkg{i:03}"),
+                    registry,
+                    &format!("{:064x}", i + seed),
+                )
+            })
+            .collect();
+        lockfile(&packages)
+    };
+    let flag = format!(
+        "! Cargo.lock: source changed on existing version foo 1.0.0: {old_fork} -> {new_fork}\n"
+    );
+    let more = "! +115 more source or checksum change(s)\n";
+    for ((old, new), expected) in [(dupe, flag.as_str()), ((rebuilt(0), rebuilt(1000)), more)] {
+        fs::write(stub.join("blobs/1111111"), old).unwrap();
+        fs::write(stub.join("blobs/2222222"), new).unwrap();
+        // The second run is unchanged, and its notice keeps the flags.
+        for _ in 0..2 {
+            let output = sandbox.justless(&["run", "--max-bytes", "4096", "--", "git", "diff"]);
+            let shown = text(&output.stdout);
+            assert!(output.status.success(), "{output:?}");
+            assert!(shown.len() <= 4096, "{} bytes: {shown}", shown.len());
+            assert!(shown.contains(expected), "{shown}");
+        }
+    }
+    // No blob read may fetch from a remote.
+    let calls = fs::read_to_string(stub.join("calls")).unwrap();
+    assert!(
+        !calls.is_empty() && calls.lines().all(|line| line == "lazy=1"),
+        "{calls}"
+    );
+}

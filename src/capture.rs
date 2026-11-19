@@ -1616,7 +1616,7 @@ impl Capture<'_> {
             let summary = match &locks {
                 Some((_, sections)) if previous.is_none() && run.summary.kind == "diff" => {
                     flags_shown = true;
-                    crate::lockdiff::summarize(&run.summary, sections)
+                    crate::lockdiff::summarize(&run.summary, sections, max_bytes / 4)
                 }
                 _ => summary,
             };
@@ -1649,14 +1649,17 @@ impl Capture<'_> {
             previews[0].1 = view.into_bytes();
         }
         // A source or checksum that changed on a locked version is always named, also
-        // above a verbatim patch or a clipped preview.
+        // above a verbatim patch or a clipped preview. The flags take at most a
+        // quarter of the budget, and the preview below them gives way.
         if let Some((_, sections)) = &locks
             && !flags_shown
         {
-            let flags: String = sections.iter().map(|s| s.flag_lines()).collect();
+            let flags = crate::lockdiff::flag_lines(sections, max_bytes / 4);
             if !flags.is_empty() {
                 let index = usize::from(previews[0].1.is_empty() && !previews[1].1.is_empty());
-                previews[index].1.splice(0..0, flags.into_bytes());
+                let preview = &mut previews[index].1;
+                preview.splice(0..0, flags.into_bytes());
+                fit_lines(preview, max_bytes);
             }
         }
         if let Some(shape_stdout) = stdout_preview
@@ -1990,6 +1993,21 @@ fn clip_view(view: String, max_bytes: usize) -> Option<Vec<u8>> {
         shown.push_str(line);
     }
     Some(shown.into_bytes())
+}
+
+/// A preview cut at a line end to `max_bytes`, with a marker.
+fn fit_lines(preview: &mut Vec<u8>, max_bytes: usize) {
+    const MORE: &[u8] = b"[more in full log]\n";
+    if preview.len() <= max_bytes {
+        return;
+    }
+    let room = max_bytes.saturating_sub(MORE.len()).min(preview.len());
+    let end = preview[..room]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |at| at + 1);
+    preview.truncate(end);
+    preview.extend_from_slice(MORE);
 }
 
 fn fit(mut report: String, max_bytes: usize) -> String {

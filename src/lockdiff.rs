@@ -4,8 +4,9 @@
 //! `Cargo.lock` section of a `git diff` or `git show`, both revisions are read by
 //! the blob ids on its `index OLD..NEW` line, and the section is described as
 //! packages added, removed and updated and dependency links changed. A `source` or
-//! `checksum` that changed on a version present in both revisions is flagged on its
-//! own line, since that is how a substituted package looks.
+//! `checksum` that changed on a version present in both revisions, or a source added
+//! to or removed from such a version, is flagged on its own line, since that is how a
+//! substituted package looks.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -41,14 +42,6 @@ impl Section {
         }
         text.push_str(&self.body);
         text
-    }
-
-    /// The flags as lines that name the file.
-    pub fn flag_lines(&self) -> String {
-        self.flags
-            .iter()
-            .map(|flag| format!("! {}: {flag}\n", self.path))
-            .collect()
     }
 
     fn holds(&self, item: &Item) -> bool {
@@ -181,6 +174,8 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        // A partial clone would otherwise fetch a missing blob from its remote.
+        .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -217,17 +212,40 @@ struct Changes {
     flags: Vec<String>,
 }
 
-fn packages(text: &str) -> Option<BTreeMap<(String, String), Package>> {
+/// A package's name, version and source: one version can be locked from several
+/// sources, such as the registry and a repository.
+type Key = (String, String, Option<String>);
+
+/// The packages of a lockfile by key, or `None` when one repeats, which Cargo does
+/// not write.
+fn packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     if text.is_empty() {
         return Some(BTreeMap::new());
     }
     let lock: Lock = toml_edit::de::from_str(text).ok()?;
-    Some(
-        lock.package
-            .into_iter()
-            .map(|p| ((p.name.clone(), p.version.clone()), p))
-            .collect(),
-    )
+    let mut packages = BTreeMap::new();
+    for package in lock.package {
+        let key = (
+            package.name.clone(),
+            package.version.clone(),
+            package.source.clone(),
+        );
+        if packages.insert(key, package).is_some() {
+            return None;
+        }
+    }
+    Some(packages)
+}
+
+/// How many sources each name and version is locked from.
+fn versions(packages: &BTreeMap<Key, Package>) -> BTreeMap<(&str, &str), usize> {
+    let mut versions = BTreeMap::new();
+    for (name, version, _) in packages.keys() {
+        *versions
+            .entry((name.as_str(), version.as_str()))
+            .or_default() += 1;
+    }
+    versions
 }
 
 /// The names a package depends on. An entry such as `foo 1.0.0 (registry+…)`
@@ -243,59 +261,115 @@ fn links(package: &Package) -> BTreeSet<&str> {
 fn compare(old: &str, new: &str) -> Option<Changes> {
     let old = packages(old)?;
     let new = packages(new)?;
+    let (before, after) = (versions(&old), versions(&new));
     let mut changes = Changes::default();
-    let mut gone: BTreeMap<&str, Vec<&Package>> = BTreeMap::new();
-    let mut came: BTreeMap<&str, Vec<&Package>> = BTreeMap::new();
+    // Packages whose name, version and source the other revision does not lock, by
+    // name and version.
+    let mut left: BTreeMap<(&str, &str), Vec<&Package>> = BTreeMap::new();
+    let mut right: BTreeMap<(&str, &str), Vec<&Package>> = BTreeMap::new();
     for (key, package) in &old {
         match new.get(key) {
-            Some(now) => {
-                for (what, before, after) in [
-                    ("source", &package.source, &now.source),
-                    ("checksum", &package.checksum, &now.checksum),
-                ] {
-                    if before != after {
-                        changes.flags.push(format!(
-                            "{what} changed on existing version {} {}: {} -> {}",
-                            package.name,
-                            package.version,
-                            before.as_deref().unwrap_or("none"),
-                            after.as_deref().unwrap_or("none")
-                        ));
-                    }
-                }
-                changes.link(package, now, &package.name);
-            }
-            None => gone.entry(&package.name).or_default().push(package),
+            Some(now) => changes.kept(package, now),
+            None => left
+                .entry((&package.name, &package.version))
+                .or_default()
+                .push(package),
         }
     }
     for (key, package) in &new {
         if !old.contains_key(key) {
-            came.entry(&package.name).or_default().push(package);
+            right
+                .entry((&package.name, &package.version))
+                .or_default()
+                .push(package);
         }
     }
-    for (name, before) in &gone {
-        match (before.as_slice(), came.get(name).map(Vec::as_slice)) {
-            ([before], Some([after])) => {
+    let mut gone: BTreeMap<&str, Vec<&Package>> = BTreeMap::new();
+    let mut came: BTreeMap<&str, Vec<&Package>> = BTreeMap::new();
+    for (version, was) in left {
+        let now = right.remove(&version).unwrap_or_default();
+        match (was.as_slice(), now.as_slice()) {
+            // A version locked from one source in each revision, and they differ.
+            ([was], [now]) => changes.kept(was, now),
+            // A version still locked, from other sources than before.
+            _ if after.contains_key(&version) => {
+                changes.sources("removed from", &was);
+                changes.sources("added to", &now);
+            }
+            _ => gone.entry(version.0).or_default().extend(was),
+        }
+    }
+    for (version, now) in right {
+        if before.contains_key(&version) {
+            changes.sources("added to", &now);
+        } else {
+            came.entry(version.0).or_default().extend(now);
+        }
+    }
+    for (name, was) in &gone {
+        match (was.as_slice(), came.get(name).map(Vec::as_slice)) {
+            ([was], Some([now])) => {
                 changes
                     .updated
-                    .push(format!("{name} {} -> {}", before.version, after.version));
-                changes.link(before, after, name);
+                    .push(format!("{name} {} -> {}", was.version, now.version));
+                changes.link(was, now, name);
                 came.remove(name);
             }
             _ => changes
                 .removed
-                .extend(before.iter().map(|p| format!("{} {}", p.name, p.version))),
+                .extend(was.iter().map(|p| entry(&before, p))),
         }
     }
-    changes.added = came
-        .values()
-        .flatten()
-        .map(|p| format!("{} {}", p.name, p.version))
-        .collect();
+    changes.added = came.values().flatten().map(|p| entry(&after, p)).collect();
     Some(changes)
 }
 
+/// A package as the lists name it, with its source when its version is locked
+/// from several.
+fn entry(versions: &BTreeMap<(&str, &str), usize>, package: &Package) -> String {
+    let several = versions
+        .get(&(package.name.as_str(), package.version.as_str()))
+        .is_some_and(|&count| count > 1);
+    match &package.source {
+        Some(source) if several => format!("{} {} ({source})", package.name, package.version),
+        _ => format!("{} {}", package.name, package.version),
+    }
+}
+
 impl Changes {
+    /// A version present in both revisions: flag a source or checksum that changed,
+    /// and note its dependency changes.
+    fn kept(&mut self, was: &Package, now: &Package) {
+        for (what, before, after) in [
+            ("source", &was.source, &now.source),
+            ("checksum", &was.checksum, &now.checksum),
+        ] {
+            if before != after {
+                self.flags.push(format!(
+                    "{what} changed on existing version {} {}: {} -> {}",
+                    was.name,
+                    was.version,
+                    before.as_deref().unwrap_or("none"),
+                    after.as_deref().unwrap_or("none")
+                ));
+            }
+        }
+        self.link(was, now, &was.name);
+    }
+
+    /// Flag each source `how` (`added to` or `removed from`) a version that both
+    /// revisions lock.
+    fn sources(&mut self, how: &str, packages: &[&Package]) {
+        for package in packages {
+            self.flags.push(format!(
+                "source {how} existing version {} {}: {}",
+                package.name,
+                package.version,
+                package.source.as_deref().unwrap_or("none")
+            ));
+        }
+    }
+
     fn link(&mut self, before: &Package, after: &Package, name: &str) {
         let (before, after) = (links(before), links(after));
         let mut change: Vec<String> = after
@@ -365,13 +439,30 @@ pub fn view(patch: &str, sections: &[Section]) -> String {
     out
 }
 
-/// A patch summary whose `Cargo.lock` hunks are replaced by their description when
-/// that is shorter, with every flag right after the first line.
-pub fn summarize(summary: &Summary, sections: &[Section]) -> String {
-    let mut out = format!("{}\n", summary.patch_heading());
-    for section in sections {
-        out.push_str(&section.flag_lines());
+/// The flags of `sections` as lines that name the file, within about `budget` bytes:
+/// at least the first, then a count of the rest.
+pub fn flag_lines(sections: &[Section], budget: usize) -> String {
+    let lines: Vec<String> = sections
+        .iter()
+        .flat_map(|s| s.flags.iter().map(|flag| format!("! {}: {flag}\n", s.path)))
+        .collect();
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 && out.len() + line.len() > budget {
+            let rest = lines.len() - index;
+            out.push_str(&format!("! +{rest} more source or checksum change(s)\n"));
+            break;
+        }
+        out.push_str(line);
     }
+    out
+}
+
+/// A patch summary whose `Cargo.lock` hunks are replaced by their description when
+/// that is shorter, with the flags, within `budget` bytes, right after the first line.
+pub fn summarize(summary: &Summary, sections: &[Section], budget: usize) -> String {
+    let mut out = format!("{}\n", summary.patch_heading());
+    out.push_str(&flag_lines(sections, budget));
     let described: Vec<bool> = sections
         .iter()
         .map(|section| {
@@ -486,14 +577,18 @@ mod tests {
             body: "  added: y 1.0.0\n".into(),
         };
         assert_eq!(
-            summarize(&summary, &[section("Cargo.lock dependencies: 1 added\n")]),
+            summarize(
+                &summary,
+                &[section("Cargo.lock dependencies: 1 added\n")],
+                4096
+            ),
             "3 diff section(s)\n! Cargo.lock: source changed on existing version x 1.0.0: a -> b\n\
              Cargo.lock dependencies: 1 added\n  added: y 1.0.0\n\
              src/lib.rs @@ -50,7 +50,8 @@ [[package]] [stdout:50-50]\n"
         );
         // A description longer than the hunk lines it replaces leaves them.
         let long = format!("Cargo.lock dependencies: {}\n", "x".repeat(200));
-        assert!(summarize(&summary, &[section(&long)]).contains("Cargo.lock @@ -30,7"));
+        assert!(summarize(&summary, &[section(&long)], 4096).contains("Cargo.lock @@ -30,7"));
     }
 
     #[test]
@@ -508,5 +603,96 @@ mod tests {
         ] {
             assert_eq!(applies(words), applies_to, "{words:?}");
         }
+    }
+
+    /// A lockfile of `(name, version, source)` packages.
+    fn sourced(packages: &[(&str, &str, &str)]) -> String {
+        let mut text = String::from("version = 4\n");
+        for (name, version, source) in packages {
+            text.push_str(&format!(
+                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"{source}\"\n"
+            ));
+        }
+        text
+    }
+
+    #[test]
+    fn each_source_of_a_version_is_compared() {
+        let (reg, a, b) = ("registry+r", "git+a", "git+b");
+        let flags = |old: &[(&str, &str, &str)], new: &[(&str, &str, &str)]| {
+            compare(&sourced(old), &sourced(new)).unwrap().flags
+        };
+        // One of two sources of a version swapped for another, one added and one
+        // removed.
+        assert_eq!(
+            flags(
+                &[("foo", "1.0.0", a), ("foo", "1.0.0", reg)],
+                &[("foo", "1.0.0", b), ("foo", "1.0.0", reg)]
+            ),
+            ["source changed on existing version foo 1.0.0: git+a -> git+b"]
+        );
+        assert_eq!(
+            flags(
+                &[("foo", "1.0.0", reg)],
+                &[("foo", "1.0.0", b), ("foo", "1.0.0", reg)]
+            ),
+            ["source added to existing version foo 1.0.0: git+b"]
+        );
+        assert_eq!(
+            flags(
+                &[("foo", "1.0.0", a), ("foo", "1.0.0", reg)],
+                &[("foo", "1.0.0", reg)]
+            ),
+            ["source removed from existing version foo 1.0.0: git+a"]
+        );
+        // A new version locked from two sources names both.
+        let changes = compare(
+            &sourced(&[("foo", "1.0.0", reg)]),
+            &sourced(&[("foo", "2.0.0", a), ("foo", "2.0.0", reg)]),
+        )
+        .unwrap();
+        assert_eq!(
+            (changes.added, changes.removed, changes.flags.len()),
+            (
+                vec![
+                    "foo 2.0.0 (git+a)".to_owned(),
+                    "foo 2.0.0 (registry+r)".to_owned()
+                ],
+                vec!["foo 1.0.0".to_owned()],
+                0
+            )
+        );
+        // A package locked twice from one source is not read.
+        let twice = sourced(&[("foo", "1.0.0", reg), ("foo", "1.0.0", reg)]);
+        assert!(compare(&twice, &twice).is_none());
+    }
+
+    #[test]
+    fn flag_lines_keep_the_first_and_count_the_rest_past_their_budget() {
+        let section = |path: &str, flags: &[&str]| Section {
+            path: path.into(),
+            first: 1,
+            last: 9,
+            head: String::new(),
+            flags: flags.iter().map(|f| f.to_string()).collect(),
+            body: String::new(),
+        };
+        let sections = [
+            section(
+                "Cargo.lock",
+                &["checksum changed on existing version a 1.0.0: x -> y"],
+            ),
+            section("tool/Cargo.lock", &["one", "two"]),
+        ];
+        assert_eq!(
+            flag_lines(&sections, 10),
+            "! Cargo.lock: checksum changed on existing version a 1.0.0: x -> y\n\
+             ! +2 more source or checksum change(s)\n"
+        );
+        assert_eq!(
+            flag_lines(&sections, 4096),
+            "! Cargo.lock: checksum changed on existing version a 1.0.0: x -> y\n\
+             ! tool/Cargo.lock: one\n! tool/Cargo.lock: two\n"
+        );
     }
 }
