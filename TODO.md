@@ -33,28 +33,9 @@ All work was stopped on 2026-11-19; it resumed the same day for the wrapper, Ope
 
 **Why this file is long.** §8 is the 50-idea token backlog; §9 and §10 are branch logs kept for provenance.
 
-## Review queue for Claude Code — 2026-11-19
+## Review of the 2026-11-19 DeepSeek commits — done
 
-Everything below is committed on `main`; the merge is `24a8984`, the follow-ups are `7a96af7`, `d01440e` and `616f0c7`, and the hook audit above is documentation only. Review the code, not just this summary.
-
-- `2afa5ea` wrapper lookup for read lists — `src/wrappers.rs`, `src/batch/parse.rs::piece`, `src/filters.rs`; check the pre-command permission contract (no wrapper rewriting, no PATH/LD stripping for auto-approve clients).
-- `d3727fe` docs correction for wrapper coverage.
-- `5c267f1` wrapped single commands as one-piece lists — `src/batch.rs::parse`, `tests/read_batch.rs`.
-- `8e07e1b` `src/wrappers.rs` extraction and the single-command metacharacter/16 KiB guard — `src/batch/parse.rs::literal`, `single`.
-- `5477565` OpenCode after-tool compaction — `integrations/opencode.js` `tool.execute.after`, `metadata.exit` guard; verify `JUSTLESS_BIN` and a failed result staying raw.
-- `cbb0f10` and `3d68e4b` TODO logs; no code.
-- `20dbad2` one-piece pipelines and `cat` singles — `list` now accepts one piece, `single` allows `cat`; confirm `sed`/`head`/`tail` singles still use the plan path.
-- `74929a3` OpenCode read-only tool — review the `readonly` list and the in-`execute` command guard.
-- `24a8984` merge — the only conflict was `TODO.md`; the main branch log was kept and §10 added.
-- `7a96af7` `cd DIR && …` list prefixes — `src/batch/parse.rs::change`/`enter`, `src/batch.rs` resolves each piece's directory inside the workspace and reopens Git per directory; `tests/read_batch.rs` and `tests/cli.rs`. Check that backtracking, `.git`, outside-root and `||` lists stay raw, and that the canonical root check does not read through a symlinked temp path.
-- `d01440e` `discover --plan` — `src/discover.rs::PlanEntry`, `src/main.rs`; verify the output has labels and byte counts only, never command text.
-- `616f0c7` setup — `AGENTS.md`/`CLAUDE.md` instruction block, `.claude/settings.json`, `.gitignore`; confirm the hooks call a binary that exists and that `settings.local.json` stays untracked.
-
-Verification already run on the merged tree: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, 248 CLI tests, 10 batch tests, 212 binary tests, and `scripts/context_benchmark.py`. Replay: `python3 scripts/replay.py --binary ./target/debug/justless`.
-
-Known open after this queue: #3 batch rerun delta (measured small), #6 watch/incremental index/daemon, #7 `explain` and graph exports, #8 session ledger. #5 fixed per-request overhead is measured and closed without a change. An uncommitted `src/setup.rs` draft was removed; no `setup` command shipped.
-
----
+Reviewed against the code on 2026-11-19; 7 real bugs fixed, each with a failing test first: a batch whose recheck failed skipped the ordinary report; `would_route` and `discover --plan` miscounted read lists and supported commands; OpenCode compacted killed commands (`exit: null`); the OpenCode tool passed `log --unredacted` through without a prompt; a skipped `cd` (after `||` or a failed search) was applied to later reads; a relative `cd` was applied twice in Claude Code's main session. `doctor` now warns when the `justless` on PATH is older than the checkout (`--version` prints the build revision). Open: OpenCode's after-tool call omits `--root`, so its runs can land elsewhere when OpenCode starts in a subdirectory.
 
 ## 1. Stopped bug fixes (highest priority)
 
