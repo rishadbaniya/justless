@@ -43,6 +43,29 @@
 
 Originals stay recoverable and exit codes matched in every run. The repair task passed in all 24 runs; it is one task, and a broader benchmark is in progress. The code-question ratio grows with file size, and this repository's files are large. [Methods](docs/benchmarks.md)
 
+### See it
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/query-dark.svg">
+  <img src="assets/query-light.svg" alt="Where is would_route defined and what calls it? Without justless, the agent runs rg -n -w would_route src, which prints 4 matching lines, then reads the defining file src/agents.rs: 2,498 lines and 102,590 bytes in all, with the 15-line definition at lines 2110 to 2124. With justless, justless query would_route prints 8 lines (665 bytes): the definition at src/agents.rs:2110-2124, its two callers in src/discover.rs at lines 275 and 292, the functions and types it uses, and a note that no related tests were found." width="100%">
+</picture>
+
+<sub>Where is <code>would_route</code> defined and what calls it? A search plus the file that defines it is 102,590 bytes; <code>justless query</code> answers in 665 (154× here, 57× median over 14 functions).</sub>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/search-dark.svg">
+  <img src="assets/search-light.svg" alt="A search with lots of output. Without justless, rg -n &quot;fn &quot; src prints 2,512 lines (185,877 bytes), one per match. With justless run, the agent receives 64 lines (2,837 bytes): the match count, 15 files ordered by match count, each with two sample lines and the range of its lines in the archived output, one line summarizing the other 64 files, and a footer with the run ID; the picture leaves out 48 of those lines. justless log then returns lines 245 to 247 of the original output exactly, including a match the report did not show." width="100%">
+</picture>
+
+<sub><code>rg -n "fn " src</code>: 185,877 bytes raw, 2,837 grouped by file (66×). Each group names its lines in the archive, and <code>justless log</code> replays them byte for byte.</sub>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/outline-dark.svg">
+  <img src="assets/outline-light.svg" alt="Reading a big file. Without justless, cat docs/reference.md prints all 1,099 lines (228,160 bytes). With justless, justless read docs/reference.md --outline returns 36 lines (2,367 bytes): one row per heading with its line range, 34 headings on this first page, and a command for the next page; the picture leaves out 18 of those rows. justless expand then returns the Failures section, lines 738 to 741, exactly as in the file (794 bytes)." width="100%">
+</picture>
+
+<sub><code>docs/reference.md</code> is 228,160 bytes; its outline is 2,367 (96×), and <code>justless expand</code> returns one 794-byte section exactly as written.</sub>
+
 ### Watch it in your own sessions
 
 <picture>

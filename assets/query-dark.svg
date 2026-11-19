@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 768" width="1000" height="768" role="img" aria-label="Where is would_route defined and what calls it? Without justless, the agent runs rg -n -w would_route src, which prints 4 matching lines, then reads the defining file src/agents.rs: 2,498 lines and 102,590 bytes in all, with the 15-line definition at lines 2110 to 2124. With justless, justless query would_route prints 8 lines (665 bytes): the definition at src/agents.rs:2110-2124, its two callers in src/discover.rs at lines 275 and 292, the functions and types it uses, and a note that no related tests were found. 154 times fewer bytes.">
+<title>Before and after justless: where is a function and what calls it</title>
+<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:13.5px}.m,.r text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;font-size:12px;white-space:pre}</style>
+<g xml:space="preserve">
+<rect x="4" y="4" width="472" height="760" rx="12" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+<circle cx="24" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="40" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="56" cy="24" r="5.5" fill="#3d444d"/>
+<text x="80" y="29" class="s"><tspan font-weight="600" fill="#e6edf3">Without justless</tspan><tspan fill="#9198a1"> · 2,498 lines · 100.2 KB</tspan></text>
+<line x1="4" y1="44" x2="476" y2="44" stroke="#30363d"/>
+<rect x="496" y="4" width="500" height="328" rx="12" fill="#161b22" stroke="#9b7bff" stroke-width="1.5"/>
+<circle cx="516" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="532" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="548" cy="24" r="5.5" fill="#3d444d"/>
+<text x="572" y="29" class="s"><tspan font-weight="600" fill="#9b7bff">With justless</tspan><tspan fill="#9198a1"> · 8 lines · 665 B</tspan></text>
+<line x1="496" y1="44" x2="996" y2="44" stroke="#30363d"/>
+<text x="20" y="70" class="m"><tspan fill="#9b7bff" font-weight="700">$ </tspan><tspan fill="#e6edf3" font-weight="600">rg -n -w would_route src</tspan></text>
+<g class="r" fill="#e6edf3" transform="translate(20 0)"><text y="90">src/discover.rs:275:                        } else if </text>
+<text x="14.4" y="106">crate::agents::would_route(&amp;call.command) {</text>
+<text y="122">src/discover.rs:292:                        } else if </text>
+<text x="14.4" y="138">crate::agents::would_route(&amp;label) {</text>
+<text y="154">src/agents.rs:2113:pub fn would_route(command: &amp;str) -&gt; bool </text>
+<text x="14.4" y="170">{</text>
+<text y="186">src/agents.rs:2127:/// `would_route`), leaves it as written </text>
+<text x="14.4" y="202">in a session that reports `mode`, because</text></g>
+<text x="20" y="226" class="m"><tspan fill="#9b7bff" font-weight="700">$ </tspan><tspan fill="#e6edf3" font-weight="600">cat src/agents.rs</tspan></text>
+<g class="r" fill="#e6edf3" transform="translate(20 0)"><text y="246">use std::collections::BTreeMap;</text>
+<text y="262">use std::fs;</text>
+<text y="278">use std::io::{self, ErrorKind, Read};</text>
+<text y="294">use std::ops::Range;</text>
+<text y="310">use std::path::{Path, PathBuf};</text>
+<text y="326">use std::sync::LazyLock;</text>
+<text y="358">use anyhow::{Context, Result, ensure};</text>
+<text y="374">use regex::Regex;</text>
+<text y="390">use serde_json::{Value, json};</text></g>
+<line x1="20" y1="408" x2="161.2" y2="408" stroke="#30363d" stroke-dasharray="4 4"/>
+<line x1="318.8" y1="408" x2="460" y2="408" stroke="#30363d" stroke-dasharray="4 4"/>
+<rect x="161.2" y="397" width="157.6" height="22" rx="11" fill="#2a2150"/>
+<text x="240" y="412.5" class="m" text-anchor="middle" fill="#e6edf3" font-weight="600">… 2,099 more lines</text>
+<rect x="12" y="424" width="456" height="304" rx="4" fill="#2a2150"/>
+<g class="r" fill="#e6edf3" transform="translate(20 0)"><text y="434">/// Whether the Claude Code command hook would route all or </text>
+<text x="14.4" y="450">part of this command</text>
+<text y="466">/// through Justless. Each `cd` is checked by its words </text>
+<text x="14.4" y="482">alone, so a link that leaves</text>
+<text y="498">/// the workspace is not detected here.</text>
+<text y="514">pub fn would_route(command: &amp;str) -&gt; bool {</text>
+<text y="530">    // `wrap_event` leaves a read list to the post-command </text>
+<text x="43.2" y="546">hook.</text>
+<text y="562">    if !cfg!(windows) &amp;&amp; </text>
+<text x="43.2" y="578">crate::batch::Batch::parse_list(command).is_some() {</text>
+<text y="594">        return false;</text>
+<text y="610">    }</text>
+<text y="626">    let rules = Rules {</text>
+<text y="642">        mixed: true,</text>
+<text y="658">        claude: true,</text>
+<text y="674">        approves: false,</text>
+<text y="690">    };</text>
+<text y="706">    !plan(command, rules, |_| true).wrap.is_empty()</text>
+<text y="722">}</text></g>
+<line x1="20" y1="740" x2="168.4" y2="740" stroke="#30363d" stroke-dasharray="4 4"/>
+<line x1="311.6" y1="740" x2="460" y2="740" stroke="#30363d" stroke-dasharray="4 4"/>
+<rect x="168.4" y="729" width="143.2" height="22" rx="11" fill="#2a2150"/>
+<text x="240" y="744.5" class="m" text-anchor="middle" fill="#e6edf3" font-weight="600">… 370 more lines</text>
+<text x="512" y="70" class="m"><tspan fill="#9b7bff" font-weight="700">$ </tspan><tspan fill="#e6edf3" font-weight="600">justless query would_route</tspan></text>
+<rect x="504" y="80" width="484" height="96" rx="4" fill="#2a2150"/>
+<g class="r" fill="#e6edf3" transform="translate(512 0)"><text y="90">justless_bin::agents::would_route [function] at </text>
+<text x="14.4" y="106">src/agents.rs:2110-2124</text>
+<text y="122">  call from justless_bin::discover::discover at </text>
+<text x="28.8" y="138">src/discover.rs:275</text>
+<text y="154">  call from justless_bin::discover::discover at </text>
+<text x="28.8" y="170">src/discover.rs:292</text>
+<text y="186">  call → justless_bin::batch::Batch::parse_list [method] at </text>
+<text x="28.8" y="202">src/batch.rs:106-108 (from src/agents.rs:2115)</text>
+<text y="218">  reference → justless_bin::batch::Batch [struct] at </text>
+<text x="28.8" y="234">src/batch.rs:19 (from src/agents.rs:2115)</text>
+<text y="250">  reference → justless_bin::agents::Rules [struct] at </text>
+<text x="28.8" y="266">src/agents.rs:1453-1465 (from src/agents.rs:2118)</text>
+<text y="282">  call → justless_bin::agents::plan [function] at </text>
+<text x="28.8" y="298">src/agents.rs:1908-1981 (from src/agents.rs:2123)</text>
+<text y="314">  No related tests found in indexed calls.</text></g>
+<text x="512" y="375" class="s" style="font-size:15px" font-weight="600" fill="#e6edf3">In this example: 2,498 → 8 lines, 102,590 → 665 bytes</text>
+<text x="512" y="397" class="s" style="font-size:13px" fill="#9198a1">Definition, both callers and what it calls, each with file:line</text>
+<line x1="512" y1="411" x2="980" y2="411" stroke="#30363d"/>
+<text x="512" y="433" class="s" style="font-size:13px" fill="#9198a1">Left: the search, then the whole defining file (cat).</text>
+<text x="512" y="453" class="s" style="font-size:13px" fill="#9198a1">Right: answered from the local code graph in .justless/.</text>
+<text x="512" y="473" class="s" style="font-size:13px" fill="#9198a1">Best of the 14 functions in the benchmark; the median is 57×.</text>
+<text x="512" y="493" class="s" style="font-size:13px" fill="#9198a1">Long lines wrap for display.</text>
+</g>
+</svg>

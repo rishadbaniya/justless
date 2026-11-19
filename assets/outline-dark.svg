@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1037" width="1000" height="1037" role="img" aria-label="Reading a big file. Without justless, cat docs/reference.md prints all 1,099 lines (228,160 bytes). With justless, justless read docs/reference.md --outline returns 36 lines (2,367 bytes): the file's revision and line count, then one row per heading with its line range, 34 headings on this first page, and a command for the next page; this picture leaves out the 18 rows from #8 to #25. justless expand docs/reference.md 'cdf9bb99f0171c76663e2065#28' then returns the Failures section, lines 738 to 741, exactly as they are in the file (794 bytes). The outline is 96 times smaller than the file.">
+<title>Before and after justless: reading a big file</title>
+<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:13.5px}.m,.r text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;font-size:12px;white-space:pre}</style>
+<g xml:space="preserve">
+<rect x="4" y="4" width="472" height="988" rx="12" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+<circle cx="24" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="40" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="56" cy="24" r="5.5" fill="#3d444d"/>
+<text x="80" y="29" class="s"><tspan font-weight="600" fill="#e6edf3">Without justless</tspan><tspan fill="#9198a1"> · 1,099 lines · 222.8 KB</tspan></text>
+<line x1="4" y1="44" x2="476" y2="44" stroke="#30363d"/>
+<rect x="496" y="4" width="500" height="532" rx="12" fill="#161b22" stroke="#9b7bff" stroke-width="1.5"/>
+<circle cx="516" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="532" cy="24" r="5.5" fill="#3d444d"/>
+<circle cx="548" cy="24" r="5.5" fill="#3d444d"/>
+<text x="572" y="29" class="s"><tspan font-weight="600" fill="#9b7bff">With justless</tspan><tspan fill="#9198a1"> · 36 lines · 2,367 B</tspan></text>
+<line x1="496" y1="44" x2="996" y2="44" stroke="#30363d"/>
+<text x="512" y="70" class="m"><tspan fill="#9b7bff" font-weight="700">$ </tspan><tspan fill="#e6edf3" font-weight="600">justless read docs/reference.md --outline</tspan></text>
+<g class="r" fill="#e6edf3" transform="translate(512 0)"><text y="90">revision cdf9bb99f0171c76663e2065 · 1099 lines</text>
+<text y="106">#1 L1-1099 heading Justless reference  # Justless reference</text>
+<text y="122">#2 L3-53 heading Commands  ## Commands</text>
+<text y="138">#3 L54-77 heading Indexing and languages  ## Indexing and </text>
+<text x="14.4" y="154">languages</text>
+<text y="170">#4 L60-77 heading Narrow and page `find`  ### Narrow and page </text>
+<text x="14.4" y="186">`find`</text>
+<text y="202">#5 L78-101 heading Reading a symbol again  ## Reading a symbol </text>
+<text x="14.4" y="218">again</text>
+<text y="234">#6 L102-137 heading Repository map and change impact  ## </text>
+<text x="14.4" y="250">Repository map and change impact</text>
+<text y="266">#7 L138-258 heading Affected tests  ## Affected tests</text></g>
+<line x1="512" y1="284" x2="678" y2="284" stroke="#30363d" stroke-dasharray="4 4"/>
+<line x1="814" y1="284" x2="980" y2="284" stroke="#30363d" stroke-dasharray="4 4"/>
+<rect x="678" y="273" width="136" height="22" rx="11" fill="#2a2150"/>
+<text x="746" y="288.5" class="m" text-anchor="middle" fill="#e6edf3" font-weight="600">… 18 more lines</text>
+<g class="r" fill="#e6edf3" transform="translate(512 0)"><text y="310">#26 L712-725 heading Options  ### Options</text>
+<text y="326">#27 L726-737 heading Recover a cleared result  ### Recover a </text>
+<text x="14.4" y="342">cleared result</text></g>
+<rect x="504" y="348" width="484" height="16" rx="4" fill="#2a2150"/>
+<g class="r" fill="#e6edf3" transform="translate(512 0)"><text y="358">#28 L738-741 heading Failures  ### Failures</text>
+<text y="374">#29 L742-745 heading Credentials and local files  ### </text>
+<text x="14.4" y="390">Credentials and local files</text>
+<text y="406">#30 L746-753 heading Claude Code  ### Claude Code</text>
+<text y="422">#31 L754-757 heading Codex  ### Codex</text>
+<text y="438">#32 L758-772 heading Thinking and history edits  ### Thinking </text>
+<text x="14.4" y="454">and history edits</text>
+<text y="470">#33 L773-791 heading Stats  ### Stats</text>
+<text y="486">#34 L792-799 heading Projects on this machine  ## Projects on </text>
+<text x="14.4" y="502">this machine</text>
+<text y="518">next --after cdf9bb99f0171c76663e2065#34</text></g>
+<rect x="496" y="554" width="500" height="340" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="512" y="577" class="s"><tspan font-weight="600" fill="#9b7bff">Exact on demand</tspan><tspan fill="#9198a1"> · one section, byte for byte</tspan></text>
+<text x="512" y="600" class="m"><tspan fill="#9b7bff" font-weight="700">$ </tspan><tspan fill="#e6edf3" font-weight="600">justless expand docs/reference.md </tspan></text>
+<text x="526.4" y="616" class="m" fill="#e6edf3" font-weight="600">'cdf9bb99f0171c76663e2065#28'</text>
+<g class="r" fill="#e6edf3" transform="translate(512 0)"><text y="636">### Failures</text>
+<text y="668">A body the proxy cannot parse or plan is forwarded unchanged, </text>
+<text x="14.4" y="684">and so is a body over 64 MiB, streamed with its declared </text>
+<text x="14.4" y="700">length. A body that ends before its `Content-Length`, or a </text>
+<text x="14.4" y="716">malformed chunked body, is answered with a 400 and never </text>
+<text x="14.4" y="732">forwarded. `--upstream` and `ANTHROPIC_BASE_URL` cannot carry </text>
+<text x="14.4" y="748">credentials in the URL, because the proxy prints and logs it. </text>
+<text x="14.4" y="764">When the API rejects the clearing edit itself with a 400 or </text>
+<text x="14.4" y="780">422 that names it, the proxy sends the original request once </text>
+<text x="14.4" y="796">more, relays that response, and leaves the edit off for that </text>
+<text x="14.4" y="812">model until it restarts. Every other response, errors </text>
+<text x="14.4" y="828">included, is relayed unchanged and never retried. An </text>
+<text x="14.4" y="844">unreachable upstream returns a 502 with an error in the API's </text>
+<text x="14.4" y="860">format. Compressed responses are relayed but not counted in </text>
+<text x="14.4" y="876">`stats`.</text></g>
+<text x="512" y="937" class="s" style="font-size:15px" font-weight="600" fill="#e6edf3">In this example: 1,099 → 36 lines, 228,160 → 2,367 bytes</text>
+<text x="512" y="959" class="s" style="font-size:13px" fill="#9198a1">Then one section, lines 738–741: 794 bytes, exactly as in the file</text>
+<line x1="512" y1="973" x2="980" y2="973" stroke="#30363d"/>
+<text x="512" y="995" class="s" style="font-size:13px" fill="#9198a1">Gaps mark lines left out of this picture, 18 on the right.</text>
+<text x="512" y="1015" class="s" style="font-size:13px" fill="#9198a1">Long lines wrap for display.</text>
+<text x="20" y="70" class="m"><tspan fill="#9b7bff" font-weight="700">$ </tspan><tspan fill="#e6edf3" font-weight="600">cat docs/reference.md</tspan></text>
+<g class="r" fill="#e6edf3" transform="translate(20 0)"><text y="90"># Justless reference</text>
+<text y="122">## Commands</text>
+<text y="154">| Command | Result |</text>
+<text y="170">| --- | --- |</text>
+<text y="186">| `justless run --max-bytes 4096 -- COMMAND ARG…` | Bounded </text>
+<text x="14.4" y="202">previews for stdout and stderr, the child exit status (127 </text>
+<text x="14.4" y="218">or 126 when the command cannot be found or run), and the </text>
+<text x="14.4" y="234">run ID. Without `--max-bytes`, each command family's </text>
+<text x="14.4" y="250">budget adapts to how often agents replayed its clipped </text>
+<text x="14.4" y="266">streams in full. |</text>
+<text y="282">| `justless exec --lang python3 --file data.json CODE` | </text>
+<text x="14.4" y="298">Runs a short script and returns only what it prints, with </text>
+<text x="14.4" y="314">its exit status. The full output keeps a run ID. The code </text>
+<text x="14.4" y="330">can also come from stdin (`-`) or `--script FILE`. |</text>
+<text y="346">| `justless exec … --intent TEXT` | Replaces stdout longer </text>
+<text x="14.4" y="362">than the preview with the lines most relevant to TEXT, </text>
+<text x="14.4" y="378">each marked for `justless log` |</text>
+<text y="394">| `justless search RUN_ID TEXT` | Literal matches with </text>
+<text x="14.4" y="410">stream and line numbers, up to `--limit`, 20 by default. </text>
+<text x="14.4" y="426">When the limit cuts, every stream with a match keeps a </text>
+<text x="14.4" y="442">place, a failed run's failure lines and stderr come first, </text>
+<text x="14.4" y="458">and a last line counts what each stream left out. |</text>
+<text y="474">| `justless log RUN_ID --stream stdout --from 10 --to 15` | </text>
+<text x="14.4" y="490">Original bytes for the specified inclusive line range, </text>
+<text x="14.4" y="506">with secrets replaced by markers. `--unredacted` returns </text>
+<text x="14.4" y="522">the exact bytes. Omit the range to replay the complete </text>
+<text x="14.4" y="538">stream. |</text>
+<text y="554">| `justless query SYMBOL --view VIEW` | Definition, </text>
+<text x="14.4" y="570">references, callers, or related tests. Use `all` for the </text>
+<text x="14.4" y="586">combined view. |</text>
+<text y="602">| `justless query SYMBOL --view dependencies` | Outgoing </text>
+<text x="14.4" y="618">calls, imports, and other indexed relationships |</text>
+<text y="634">| `justless path FROM TO` | A short relationship chain with </text>
+<text x="14.4" y="650">the location and direction of each edge |</text></g>
+<line x1="20" y1="668" x2="168.4" y2="668" stroke="#30363d" stroke-dasharray="4 4"/>
+<line x1="311.6" y1="668" x2="460" y2="668" stroke="#30363d" stroke-dasharray="4 4"/>
+<rect x="168.4" y="657" width="143.2" height="22" rx="11" fill="#2a2150"/>
+<text x="240" y="672.5" class="m" text-anchor="middle" fill="#e6edf3" font-weight="600">… 723 more lines</text>
+<rect x="12" y="684" width="456" height="272" rx="4" fill="#2a2150"/>
+<g class="r" fill="#e6edf3" transform="translate(20 0)"><text y="694">### Failures</text>
+<text y="726">A body the proxy cannot parse or plan is forwarded </text>
+<text x="14.4" y="742">unchanged, and so is a body over 64 MiB, streamed with its </text>
+<text x="14.4" y="758">declared length. A body that ends before its </text>
+<text x="14.4" y="774">`Content-Length`, or a malformed chunked body, is answered </text>
+<text x="14.4" y="790">with a 400 and never forwarded. `--upstream` and </text>
+<text x="14.4" y="806">`ANTHROPIC_BASE_URL` cannot carry credentials in the URL, </text>
+<text x="14.4" y="822">because the proxy prints and logs it. When the API rejects </text>
+<text x="14.4" y="838">the clearing edit itself with a 400 or 422 that names it, </text>
+<text x="14.4" y="854">the proxy sends the original request once more, relays </text>
+<text x="14.4" y="870">that response, and leaves the edit off for that model </text>
+<text x="14.4" y="886">until it restarts. Every other response, errors included, </text>
+<text x="14.4" y="902">is relayed unchanged and never retried. An unreachable </text>
+<text x="14.4" y="918">upstream returns a 502 with an error in the API's format. </text>
+<text x="14.4" y="934">Compressed responses are relayed but not counted in </text>
+<text x="14.4" y="950">`stats`.</text></g>
+<line x1="20" y1="968" x2="168.4" y2="968" stroke="#30363d" stroke-dasharray="4 4"/>
+<line x1="311.6" y1="968" x2="460" y2="968" stroke="#30363d" stroke-dasharray="4 4"/>
+<rect x="168.4" y="957" width="143.2" height="22" rx="11" fill="#2a2150"/>
+<text x="240" y="972.5" class="m" text-anchor="middle" fill="#e6edf3" font-weight="600">… 359 more lines</text>
+</g>
+</svg>
