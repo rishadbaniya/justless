@@ -286,6 +286,11 @@ impl Grammar {
         }
     }
 
+    /// The Tree-sitter language alone, without compiling the tags query.
+    pub fn language(self) -> Language {
+        self.parser().0
+    }
+
     fn parser(self) -> (Language, String) {
         let (language, tags) = match self {
             Self::JavaScript => (

@@ -192,6 +192,39 @@ fn extract(text: &str, every_macro: bool) -> syn::Result<Syntax> {
     Ok(visitor.syntax)
 }
 
+/// Where and why `text` fails to parse as a Rust file, as a byte range of `text`
+/// and syn's message, or `None` when it parses.
+pub fn first_error(text: &str) -> Option<(std::ops::Range<usize>, String)> {
+    let error = parse_file(text).err()?;
+    let content = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut offset = text.len() - content.len();
+    if content.starts_with("#!") && !skip_trivia(&content[2..]).starts_with('[') {
+        offset += content.find('\n').unwrap_or(content.len());
+    }
+    let span = error.span();
+    // An error with no source location, such as the end of the input, has the
+    // call-site span, which has no source text.
+    let bytes = match span.source_text() {
+        Some(_) => span.byte_range(),
+        None => text.len() - offset..text.len() - offset,
+    };
+    let start = (bytes.start + offset).min(text.len());
+    let end = (bytes.end + offset).clamp(start, text.len());
+    let mut message = error.to_string();
+    // The lexer names no cause, but it stops at the token it could not close.
+    if message == "cannot parse string into token stream" {
+        let rest = text.get(start..).unwrap_or_default();
+        message = match rest.chars().next() {
+            Some(open @ ('{' | '(' | '[')) => format!("unclosed `{open}`"),
+            Some(close @ ('}' | ')' | ']')) => format!("unmatched `{close}`"),
+            Some('"') => "unterminated string".into(),
+            _ if rest.starts_with("/*") => "unterminated block comment".into(),
+            _ => "invalid token".into(),
+        };
+    }
+    Some((start..end, message))
+}
+
 #[derive(Default)]
 struct Extractor {
     syntax: Syntax,

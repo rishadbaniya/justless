@@ -321,6 +321,9 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
         // Bash output the command hook left alone, such as a pipe or Claude Code's
         // own grep, is archived and compacted after it ran.
         ("PostToolUse", "after-bash", "^Bash$", 10),
+        // An edit that leaves a file unparseable gets a note, and its result stays.
+        // Claude Code 2.1.327 has no MultiEdit tool; earlier versions had one.
+        ("PostToolUse", "after-edit", "^(Edit|MultiEdit|Write)$", 5),
         // Compaction drops earlier tool results. Restore the run IDs and source ranges
         // that recover them. This handler stays synchronous so its context is applied
         // before the next model request.
@@ -329,7 +332,7 @@ fn prepare_hooks(workspace: &Workspace, agent: Agent) -> Result<Option<(PathBuf,
     ] {
         let supported = match mode {
             "after-read" | "after-search" | "before-compact" => agent == Agent::Claude,
-            "after-bash" => agent == Agent::Claude,
+            "after-bash" | "after-edit" => agent == Agent::Claude,
             "after-compact" => matches!(agent, Agent::Claude | Agent::Codex),
             _ => true,
         };
@@ -674,6 +677,11 @@ pub fn run_hook(workspace: &Workspace, agent: Agent, mode: &str) -> Result<()> {
             .ok()
             .flatten()
             .unwrap_or_else(|| json!({}))
+    } else if agent == Agent::Claude && mode == "after-edit" {
+        std::panic::catch_unwind(|| claude_edit(workspace, &input))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| json!({}))
     } else if mode == "after-compact"
         && input["hook_event_name"] == "SessionStart"
         && input["source"]
@@ -963,6 +971,69 @@ fn saw_claude_read(ws: &Workspace, input: &Value, outlined: bool) -> Option<()> 
     let to = from.checked_add(lines - 1)?.min(total.max(from));
     crate::history::saw_range(ws, &file, from, to, digest, outlined);
     Some(())
+}
+
+/// A note for the model when a Claude Code Edit, MultiEdit or Write leaves a
+/// workspace file that its language's parser rejects, and the file parsed before
+/// it or the new error is in the text it wrote. The tool result stays as it is.
+/// Claude Code 2.1.327 passes the file as it was before in
+/// `tool_response.originalFile`, which is null for a Write that created it.
+fn claude_edit(ws: &Workspace, input: &Value) -> Option<Value> {
+    use crate::syntax_check::{Change, Verdict};
+    let tool = input["tool_name"].as_str()?;
+    if input["hook_event_name"] != "PostToolUse" || !matches!(tool, "Edit" | "MultiEdit" | "Write")
+    {
+        return None;
+    }
+    let mut path = PathBuf::from(input["tool_input"]["file_path"].as_str()?);
+    if path.is_relative() {
+        path = Path::new(input["cwd"].as_str()?).join(path);
+    }
+    let file = ws
+        .relative_file(&path)
+        .or_else(|| ws.relative_file(&path.canonicalize().ok()?))?;
+    crate::syntax_check::parser_name(&file)?;
+    let response = &input["tool_response"];
+    let before = match &response["originalFile"] {
+        Value::String(text) => Some(text.as_str()),
+        Value::Null if response["type"] == "create" => None,
+        _ => return None,
+    };
+    // Within `max_file_bytes`, like any source read.
+    let after = crate::source::Snapshot::open(ws, &file).ok()?.text;
+    let cap = ws.settings().ok()?.max_file_bytes;
+    if before.is_some_and(|text| text.len() as u64 > cap) {
+        return None;
+    }
+    let change = Change::between(before.unwrap_or_default(), &after);
+    let Verdict::Introduced {
+        problem,
+        parsed_before,
+        certain,
+        ..
+    } = crate::syntax_check::judge(&file, before, &after, &[change], false)?
+    else {
+        return None;
+    };
+    let note = format!(
+        "Justless parse check: after this {tool}, {}. {}{}",
+        crate::syntax_check::located(&file, &after, &problem),
+        match (before, parsed_before) {
+            (None, _) => "The file is new.",
+            (Some(_), true) => "The file parsed before it.",
+            (Some(_), false) => "The file had other parse errors, and this one is in the new text.",
+        },
+        if certain || !parsed_before {
+            ""
+        } else {
+            " The parser may not know newer syntax, so check the line before changing it."
+        }
+    );
+    let note = match crate::redact::for_workspace(ws) {
+        Some(redactor) => redactor.text(&note).into_owned(),
+        None => note,
+    };
+    Some(json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":note}}))
 }
 
 /// The documented bound on a compaction handoff, including its introduction.

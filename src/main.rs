@@ -39,6 +39,7 @@ mod shellread;
 mod source;
 mod statusline;
 mod summary;
+mod syntax_check;
 mod testrun;
 mod uninstall;
 mod workspace;
@@ -351,6 +352,7 @@ fn cli() -> Command<'static> {
                     "after-read",
                     "after-search",
                     "after-bash",
+                    "after-edit",
                     "after-compact",
                     "before-compact",
                 ]))
@@ -684,7 +686,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
 
 /// Parsers recurse once per level of source nesting, so a deep but valid file
 /// needs more stack than the default main thread has.
-const STACK_BYTES: usize = 512 << 20;
+pub(crate) const STACK_BYTES: usize = 512 << 20;
 
 fn main() -> ExitCode {
     let worker = std::thread::Builder::new()

@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::polyglot::{Grammar, Parsers};
+use crate::syntax_check::{self, Change, Verdict};
 use crate::workspace::{Workspace, lock_state};
 
 fn file() -> Arg<'static> {
@@ -97,6 +98,11 @@ pub fn commands() -> Vec<Cli<'static>> {
                 Arg::new("dry-run")
                     .long("dry-run")
                     .help("Print a unified diff and leave the source untouched"),
+            )
+            .arg(
+                Arg::new("allow-parse-errors")
+                    .long("allow-parse-errors")
+                    .help("Write an edit that leaves the file unparseable"),
             ),
     ]
 }
@@ -913,15 +919,45 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
         edited.len() as u64 <= ws.settings()?.max_file_bytes,
         "result exceeds max_file_bytes"
     );
+    let mut shift = 0isize;
+    let changes: Vec<Change> = resolved
+        .iter()
+        .map(|(range, replacement)| {
+            let start = range.start.saturating_add_signed(shift);
+            shift += replacement.len() as isize - range.len() as isize;
+            Change {
+                before: range.clone(),
+                after: start..start + replacement.len(),
+            }
+        })
+        .collect();
+    let verdict = if edited == source.text {
+        None
+    } else {
+        syntax_check::judge(file, Some(&source.text), &edited, &changes, true)
+    };
+    // Only a certain problem in a file that parsed blocks the edit. Others are
+    // reported on stderr after it is written.
+    let rejected = matches!(verdict, Some(Verdict::Introduced { certain: true, .. }))
+        && !args.is_present("allow-parse-errors");
+    let dry_run = args.is_present("dry-run");
+    if rejected && !dry_run {
+        bail!(rejection(ws, file, &edited, &changes, verdict.as_ref()));
+    }
     ws.prepare_state()?;
     let _lock = lock_state(&ws.state.join("edit.lock"))?;
     let path = ws.source_path(file)?;
-    if args.is_present("dry-run") {
+    if dry_run {
         ensure!(
             fs::read(&path)? == source.text.as_bytes(),
             "stale revision; file changed during edit"
         );
-        return preview(file, &path, &source.text, &edited);
+        preview(file, &path, &source.text, &edited)?;
+        if rejected {
+            bail!(rejection(ws, file, &edited, &changes, verdict.as_ref()));
+        }
+        report(file, &source.text, &edited, verdict.as_ref());
+        return Ok(());
     }
     // Opening for writing applies the same permission check as a shell write.
     let mut target = File::options()
@@ -962,7 +998,139 @@ fn edit(ws: &Workspace, file: &str, mut source: Snapshot, args: &ArgMatches) -> 
         resolved.len(),
         revision_for(file, edited.as_bytes())
     );
+    report(file, &source.text, &edited, verdict.as_ref());
     Ok(())
+}
+
+/// Why an edit that leaves the file unparseable was rejected: the parser's
+/// location and message, a few lines around it, the lines the edit wrote and
+/// the flag that writes it anyway. Secrets in the quoted lines are masked.
+fn rejection(
+    ws: &Workspace,
+    file: &str,
+    edited: &str,
+    changes: &[Change],
+    verdict: Option<&Verdict>,
+) -> String {
+    let Some(Verdict::Introduced {
+        problem,
+        unbalanced,
+        ..
+    }) = verdict
+    else {
+        return "edit rejected".into();
+    };
+    let mut out = format!(
+        "edit rejected: it leaves {file} unparseable, and the file is unchanged\n{}\n",
+        syntax_check::located(file, edited, problem)
+    );
+    let (line, column) = syntax_check::line_column(edited, problem.bytes.start);
+    let mut lines: Vec<&str> = edited.split('\n').collect();
+    // The empty piece after a final newline is no line, unless the error is there.
+    if lines.len() > line && lines.last() == Some(&"") {
+        lines.pop();
+    }
+    let first = line.saturating_sub(2).max(1);
+    let last = (line + 2).min(lines.len());
+    let width = last.to_string().len();
+    for number in first..=last {
+        let text = lines[number - 1].trim_end_matches('\r');
+        let text = clipped(text, 160);
+        out.push_str(&format!("{number:>width$} | {text}\n"));
+        if number == line {
+            // Keep tabs so the caret lines up under the column.
+            let pad: String = text
+                .chars()
+                .take(column - 1)
+                .map(|c| if c == '\t' { '\t' } else { ' ' })
+                .collect();
+            out.push_str(&format!("{:>width$} | {pad}^\n", ""));
+        }
+    }
+    let mut written: Vec<String> = changes
+        .iter()
+        .map(|change| {
+            let start = syntax_check::line_column(edited, change.after.start).0;
+            let end = syntax_check::line_column(edited, change.after.end.saturating_sub(1))
+                .0
+                .max(start);
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect();
+    written.dedup();
+    let more = written.len().saturating_sub(4);
+    written.truncate(4);
+    let mut lines = written.join(", ");
+    if more > 0 {
+        lines.push_str(&format!(" and {more} more"));
+    }
+    out.push_str(&format!(
+        "The edit wrote line{} {lines}. The file parsed before it{}. Fix the replacement, or pass --allow-parse-errors to write it anyway.",
+        if lines.contains(['-', ',', ' ']) { "s" } else { "" },
+        if *unbalanced {
+            ", and its brackets no longer pair up"
+        } else {
+            ""
+        }
+    ));
+    match crate::redact::for_workspace(ws) {
+        Some(redactor) => redactor.text(&out).into_owned(),
+        None => out,
+    }
+}
+
+/// Tells stderr how an edit changed a file's parse state when there is news: it
+/// broke the file, or the file did not parse before the edit.
+fn report(file: &str, before: &str, after: &str, verdict: Option<&Verdict>) {
+    let at = |text: &str, problem: &syntax_check::Problem| {
+        let (line, column) = syntax_check::line_column(text, problem.bytes.start);
+        format!("{line}:{column}")
+    };
+    let message = match verdict {
+        Some(Verdict::Introduced {
+            problem,
+            parsed_before: true,
+            certain: true,
+            ..
+        }) => format!(
+            "{file} no longer parses: {}",
+            syntax_check::located(file, after, problem)
+        ),
+        Some(Verdict::Introduced {
+            problem,
+            parsed_before: true,
+            ..
+        }) => format!(
+            "warning: {file} may no longer parse: {}. The edit was written, because this parser may not know newer syntax or the file's macros. Check the lines it wrote.",
+            syntax_check::located(file, after, problem)
+        ),
+        Some(Verdict::Introduced { problem, .. }) => format!(
+            "{file} did not parse before this edit and now also fails in the text it wrote: {}",
+            syntax_check::located(file, after, problem)
+        ),
+        Some(Verdict::Fixed { was }) => format!(
+            "{file} parses after this edit; before it, it failed at {}",
+            at(before, was)
+        ),
+        Some(Verdict::Unchanged { problem }) => format!(
+            "{file} did not parse before this edit and still fails where it did: {}",
+            syntax_check::located(file, after, problem)
+        ),
+        Some(Verdict::Moved { was, now }) => format!(
+            "{file} did not parse before this edit (it failed at {}) and now fails at {}",
+            at(before, was),
+            syntax_check::located(file, after, now)
+        ),
+        Some(Verdict::GaveUp) => {
+            format!("warning: {file} was not parse-checked, because parsing it took too long")
+        }
+        Some(Verdict::Clean) | None => return,
+    };
+    eprintln!("justless: {message}");
 }
 
 /// Whether renaming `temp` over `path` keeps the file's hard links, owner,

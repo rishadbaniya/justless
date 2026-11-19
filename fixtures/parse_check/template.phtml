@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title><?= htmlspecialchars($title) ?></title>
+    <script>
+        const items = <?= json_encode($items) ?>;
+    </script>
+</head>
+<body>
+<?php if ($items): ?>
+    <ul class="items">
+        <?php foreach ($items as $item): ?>
+            <li data-id="<?= $item['id'] ?>"><?= $item['name'] ?></li>
+        <?php endforeach; ?>
+    </ul>
+<?php else: ?>
+    <p>No items.</p>
+<?php endif; ?>
+</body>
+</html>

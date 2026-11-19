@@ -5923,7 +5923,7 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
     assert_eq!(status, Some(0), "{text}");
     assert!(!text.contains('✗'), "{text}");
     assert!(text.contains(
-        "✓ Hooks: .claude/settings.json has all 7 Justless hooks (session-start, after-compact, before-command, after-read, after-search, after-bash, before-compact)"
+        "✓ Hooks: .claude/settings.json has all 8 Justless hooks (session-start, after-compact, before-command, after-read, after-search, after-bash, after-edit, before-compact)"
     ));
     for file in [
         ".codex/hooks.json has all 3",
@@ -6046,7 +6046,7 @@ fn doctor_names_stale_setup_and_its_fixes_clear_it() {
     let (status, text) = doctor_text(root, tools.path());
     assert_eq!(status, Some(1), "{text}");
     assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 7"),
+        text.contains("✓ Hooks: .claude/settings.json has all 8"),
         "{text}"
     );
     assert!(text.contains("✓ Instructions: CLAUDE.md has the current"));
@@ -6281,7 +6281,7 @@ fn doctor_accepts_current_hooks_behind_a_linked_config_directory() {
     let (status, text) = doctor_text(&root, tools.path());
     assert_eq!(status, Some(0), "{text}");
     assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 7"),
+        text.contains("✓ Hooks: .claude/settings.json has all 8"),
         "{text}"
     );
     assert!(text.contains("! Hooks: setup cannot update .claude/settings.json: .claude must be a directory\n    by hand: Replace the .claude link with a directory"), "{text}");
@@ -6325,11 +6325,11 @@ fn doctor_accepts_hooks_that_call_justless_by_path_and_never_copies_them() {
             .matches("hook-claude")
             .count()
     };
-    assert_eq!(handlers(), 7);
+    assert_eq!(handlers(), 8);
     let (status, text) = doctor_text(root, tools.path());
     assert_eq!(status, Some(0), "{text}");
     assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 7"),
+        text.contains("✓ Hooks: .claude/settings.json has all 8"),
         "{text}"
     );
     assert!(text.contains("· Hooks: .claude/settings.json calls justless by its path"));
@@ -6344,7 +6344,7 @@ fn doctor_accepts_hooks_that_call_justless_by_path_and_never_copies_them() {
         [(false, "justless init --agent claude".to_owned())]
     );
     assert!(doctor_apply(root, tools.path(), &text).is_empty());
-    assert_eq!(handlers(), 7);
+    assert_eq!(handlers(), 8);
     let (status, text) = doctor_text(root, tools.path());
     assert_eq!(status, Some(0), "{text}");
 
@@ -6682,7 +6682,7 @@ fn init_remove_restores_every_file_byte_for_byte() {
     for line in [
         "\n  AGENTS.md: remove the Justless section\n",
         "\n  GEMINI.md: remove the Justless section and delete the file, which held nothing else\n",
-        "\n  .claude/settings.json: remove 7 hooks\n",
+        "\n  .claude/settings.json: remove 8 hooks\n",
         "\n  .codex/config.toml: remove the justless MCP server\n",
         "\n  .gemini/settings.json: remove 2 hooks and the justless MCP server\n",
         "\n  .opencode/plugins/justless.js: delete the Justless plugin\n",
@@ -6701,7 +6701,7 @@ fn init_remove_restores_every_file_byte_for_byte() {
 
     let removed = success(&root, &["init", "--remove"]);
     assert!(removed.starts_with(&format!("Removed Justless from {}:\n", root.display())));
-    assert!(removed.contains("\n  .claude/settings.json: removed 7 hooks\n"));
+    assert!(removed.contains("\n  .claude/settings.json: removed 8 hooks\n"));
     assert!(removed.ends_with("Start a new agent session so the clients stop loading Justless.\n"));
     let mut left = removal_tree(&root);
     left.retain(|name, _| !name.starts_with(".justless/"));
@@ -6772,7 +6772,7 @@ fn init_remove_without_a_record_deletes_only_justless_entries() {
 
     let output = success(&root, &["init", "--remove", "--purge"]);
     assert!(
-        output.contains("\n  .claude/settings.json: removed 7 hooks and the status line\n"),
+        output.contains("\n  .claude/settings.json: removed 8 hooks and the status line\n"),
         "{output}"
     );
     let mut left = removal_tree(&root);
@@ -6899,7 +6899,7 @@ fn init_remove_skips_config_without_justless_and_names_the_fix_for_one_with_it()
     success(&root, &["init", "--hooks", "--agent", "claude"]);
     let preview = success(&root, &["init", "--remove", "--dry-run"]);
     assert!(
-        preview.contains("\n  .claude/settings.json: remove 7 hooks"),
+        preview.contains("\n  .claude/settings.json: remove 8 hooks"),
         "{preview}"
     );
     assert!(!preview.contains(".vscode"), "{preview}");
@@ -7030,7 +7030,7 @@ fn init_remove_reports_what_it_did_before_a_failure_and_a_rerun_finishes() {
         );
         for line in [
             "\n  AGENTS.md: removed the Justless section and deleted the file",
-            "\n  .claude/settings.json: removed 7 hooks and deleted the file",
+            "\n  .claude/settings.json: removed 8 hooks and deleted the file",
             "\n  .claude/: removed the empty directory\n",
             "\n  .codex/: removed the empty directory\n",
         ] {
@@ -13872,14 +13872,14 @@ fn doctor_counts_the_bash_output_hook_in_the_current_claude_set() {
     assert!(applied.status.success(), "{}", stderr(&applied));
     let (status, text) = doctor_text(root, tools.path());
     assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 7"),
+        text.contains("✓ Hooks: .claude/settings.json has all 8"),
         "{text}"
     );
     assert_eq!(status, Some(0), "{text}");
     // Removal takes it out with the others.
     let removed = success(root, &["init", "--remove"]);
     assert!(
-        removed.contains("\n  .claude/settings.json: removed 7 hooks"),
+        removed.contains("\n  .claude/settings.json: removed 8 hooks"),
         "{removed}"
     );
 }
@@ -18635,4 +18635,387 @@ fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets
         hook(&path, &more, Some(100), Some(200)),
         serde_json::json!({})
     );
+}
+
+/// Runs justless with `input` on stdin.
+fn piped(root: &Path, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn revision(root: &Path, file: &str) -> String {
+    let outline: serde_json::Value =
+        serde_json::from_str(&success(root, &["read", file, "--outline", "--json"])).unwrap();
+    outline["revision"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn edits_that_leave_a_file_unparseable_are_rejected_whole() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("src")).unwrap();
+    let source = "pub fn a() -> u32 {\n    1\n}\n\npub fn b() -> u32 {\n    2\n}\n";
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    let rev = revision(root, "src/lib.rs");
+    let broken = "pub fn a() -> u32 {\n    1 +\n";
+    let edit = ["edit", "src/lib.rs", "a", "--revision", &rev];
+    let rejected = piped(root, &edit, broken);
+    assert_eq!(rejected.status.code(), Some(2), "{}", stderr(&rejected));
+    assert!(stdout(&rejected).is_empty());
+    let message = stderr(&rejected);
+    for expected in [
+        "edit rejected: it leaves src/lib.rs unparseable, and the file is unchanged\n",
+        "src/lib.rs:1:19: unclosed `{` (Rust parser)\n",
+        "1 | pub fn a() -> u32 {\n  |                   ^\n2 |     1 +\n",
+        "The edit wrote lines 1-2. The file parsed before it.",
+        "--allow-parse-errors",
+    ] {
+        assert!(message.contains(expected), "{expected:?} in\n{message}");
+    }
+    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), source);
+    // A dry run shows the patch and gives the same verdict.
+    let dry = piped(root, &[&edit[..], &["--dry-run"]].concat(), broken);
+    assert_eq!(dry.status.code(), Some(2));
+    assert!(stdout(&dry).contains("+    1 +\n"), "{}", stdout(&dry));
+    assert!(stderr(&dry).contains("src/lib.rs:1:19: unclosed `{`"));
+    // One breaking edit rejects its whole batch.
+    let batch = serde_json::json!([
+        {"selector": "L2", "replacement": "    10\n"},
+        {"selector": "L6", "replacement": "    2 *\n"},
+    ]);
+    let rejected = piped(
+        root,
+        &["edit", "src/lib.rs", "--batch", "--revision", &rev],
+        &batch.to_string(),
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(
+        stderr(&rejected).contains("The edit wrote lines 2, 6."),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), source);
+    // Python, through a line range.
+    fs::write(root.join("tool.py"), "def f():\n    return 1\n").unwrap();
+    let rev_py = revision(root, "tool.py");
+    let rejected = piped(
+        root,
+        &["edit", "tool.py", "L2", "--revision", &rev_py],
+        "    return (1\n",
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(
+        stderr(&rejected).contains("tool.py:2:12: unclosed `(` (Python parser)"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("tool.py")).unwrap(),
+        "def f():\n    return 1\n"
+    );
+    // Valid edits print exactly what they printed before.
+    let clean = piped(root, &edit, "pub fn a() -> u32 {\n    10\n}\n");
+    assert!(clean.status.success(), "{}", stderr(&clean));
+    assert!(stderr(&clean).is_empty(), "{}", stderr(&clean));
+    assert!(stdout(&clean).starts_with("1 edits · revision "));
+}
+
+#[test]
+fn a_forced_or_already_broken_file_reports_its_parse_state() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let source = "pub fn a() -> u32 {\n    1\n}\n\npub fn b() -> u32 {\n    2\n}\n";
+    fs::write(root.join("lib.rs"), source).unwrap();
+    let rev = revision(root, "lib.rs");
+    let forced = piped(
+        root,
+        &[
+            "edit",
+            "lib.rs",
+            "L2",
+            "--revision",
+            &rev,
+            "--allow-parse-errors",
+        ],
+        "    1 +\n",
+    );
+    assert!(forced.status.success(), "{}", stderr(&forced));
+    assert!(stdout(&forced).starts_with("1 edits · revision "));
+    assert_eq!(
+        stderr(&forced),
+        "justless: lib.rs no longer parses: lib.rs:3:1: unexpected end of input, expected an expression (Rust parser)\n"
+    );
+    // The file did not parse before, so an edit elsewhere goes through and says so.
+    let rev = revision(root, "lib.rs");
+    let elsewhere = piped(
+        root,
+        &["edit", "lib.rs", "L6", "--revision", &rev],
+        "    20\n",
+    );
+    assert!(elsewhere.status.success(), "{}", stderr(&elsewhere));
+    assert_eq!(
+        stderr(&elsewhere),
+        "justless: lib.rs did not parse before this edit and still fails where it did: lib.rs:3:1: unexpected end of input, expected an expression (Rust parser)\n"
+    );
+    let rev = revision(root, "lib.rs");
+    let fixed = piped(
+        root,
+        &["edit", "lib.rs", "L2", "--revision", &rev],
+        "    1\n",
+    );
+    assert!(fixed.status.success(), "{}", stderr(&fixed));
+    assert_eq!(
+        stderr(&fixed),
+        "justless: lib.rs parses after this edit; before it, it failed at 3:1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("lib.rs")).unwrap(),
+        source.replace("    2\n", "    20\n")
+    );
+    // A new error in the text an edit writes to a file that did not parse is
+    // reported, and the edit is written.
+    let broken = "def f(:\n    return 1\n\ndef g():\n    return 2\n";
+    fs::write(root.join("tool.py"), broken).unwrap();
+    let rev = revision(root, "tool.py");
+    let output = piped(
+        root,
+        &["edit", "tool.py", "L5", "--revision", &rev],
+        "    return (2\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        "justless: tool.py did not parse before this edit and now also fails in the text it wrote: tool.py:5:12: unclosed `(` (Python parser)\n"
+    );
+    // Kinds of file whose grammars reject valid code, C, C++ and shell, are
+    // written with a warning. SQL and text are not checked.
+    for (file, text, warned) in [
+        ("a.c", "int f() {}\n", true),
+        ("s.sh", "echo a\n", true),
+        ("q.sql", "SELECT 1;\n", false),
+        ("n.txt", "a\n", false),
+    ] {
+        fs::write(root.join(file), text).unwrap();
+        let rev = revision(root, file);
+        let output = piped(
+            root,
+            &["edit", file, "L1", "--revision", &rev],
+            "int f( {\n",
+        );
+        assert!(output.status.success(), "{file}: {}", stderr(&output));
+        assert_eq!(fs::read_to_string(root.join(file)).unwrap(), "int f( {\n");
+        assert_eq!(
+            stderr(&output).starts_with(&format!(
+                "justless: warning: {file} may no longer parse: {file}:1:"
+            )),
+            warned,
+            "{file}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn edits_with_syntax_the_grammar_may_not_know_are_written_with_a_warning() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // TypeScript 4.7 variance annotations, which the bundled grammar rejects.
+    let source = "export interface Box<T> {\n  value: T;\n}\n";
+    fs::write(root.join("box.ts"), source).unwrap();
+    let rev = revision(root, "box.ts");
+    let output = piped(
+        root,
+        &["edit", "box.ts", "L1", "--revision", &rev],
+        "export interface Box<in out T> {\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).starts_with("1 edits · revision "));
+    assert_eq!(
+        stderr(&output),
+        "justless: warning: box.ts may no longer parse: box.ts:1:25: syntax error at identifier (TypeScript parser). The edit was written, because this parser may not know newer syntax or the file's macros. Check the lines it wrote.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("box.ts")).unwrap(),
+        source.replace("<T>", "<in out T>")
+    );
+    // An edit that leaves a brace unclosed is rejected.
+    fs::write(root.join("box.ts"), source).unwrap();
+    let rev = revision(root, "box.ts");
+    let output = piped(root, &["edit", "box.ts", "L3", "--revision", &rev], "\n");
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "The edit wrote line 3. The file parsed before it, and its brackets no longer pair up."
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// The PostToolUse event Claude Code 2.1.327 sends after an Edit or Write, with
+/// the file as it was before in `originalFile`.
+fn edit_event(tool: &str, path: &Path, before: Option<&str>) -> serde_json::Value {
+    let mut response = serde_json::json!({
+        "filePath": path,
+        "originalFile": before,
+        "structuredPatch": [],
+        "userModified": false,
+    });
+    if tool == "Write" {
+        response["type"] = serde_json::json!(if before.is_some() { "update" } else { "create" });
+        response["content"] = serde_json::json!("");
+    } else {
+        response["oldString"] = serde_json::json!("");
+        response["newString"] = serde_json::json!("");
+        response["replaceAll"] = serde_json::json!(false);
+    }
+    serde_json::json!({
+        "session_id": "s",
+        "hook_event_name": "PostToolUse",
+        "tool_name": tool,
+        "tool_input": {"file_path": path},
+        "tool_response": response,
+    })
+}
+
+#[test]
+fn claude_edit_hook_notes_only_an_edit_that_breaks_parsing() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    fs::create_dir(root.join("src")).unwrap();
+    let lib = root.join("src/lib.rs");
+    let before = "pub fn a() -> u32 {\n    1\n}\n";
+    let hook = |event| agent_hook(&root, "hook-claude", "after-edit", event);
+    // The file parsed before the Edit.
+    fs::write(&lib, "pub fn a() -> u32 {\n    1 +\n").unwrap();
+    let output = hook(edit_event("Edit", &lib, Some(before)));
+    assert_eq!(
+        output,
+        serde_json::json!({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+            "additionalContext": "Justless parse check: after this Edit, src/lib.rs:1:19: unclosed `{` (Rust parser). The file parsed before it."}})
+    );
+    // A clean edit gets nothing.
+    fs::write(&lib, "pub fn a() -> u32 {\n    2\n}\n").unwrap();
+    assert_eq!(
+        hook(edit_event("Edit", &lib, Some(before))),
+        serde_json::json!({})
+    );
+    // A new file counts as one that parsed.
+    let tool = root.join("tool.py");
+    fs::write(&tool, "def f(:\n    return 1\n").unwrap();
+    let note = hook(edit_event("Write", &tool, None));
+    assert_eq!(
+        note["hookSpecificOutput"]["additionalContext"],
+        "Justless parse check: after this Write, tool.py:1:7: missing `)` (Python parser). The file is new."
+    );
+    // A file that already failed gets a note only for a new error in the new text.
+    let broken = "def f(:\n    return 1\n\ndef g():\n    return 2\n";
+    fs::write(&tool, broken.replace("return 2", "return 3")).unwrap();
+    assert_eq!(
+        hook(edit_event("Edit", &tool, Some(broken))),
+        serde_json::json!({})
+    );
+    fs::write(&tool, broken.replace("return 2", "return [2")).unwrap();
+    let note = hook(edit_event("Edit", &tool, Some(broken)));
+    assert_eq!(
+        note["hookSpecificOutput"]["additionalContext"],
+        "Justless parse check: after this Edit, tool.py:5:12: unclosed `[` (Python parser). The file had other parse errors, and this one is in the new text."
+    );
+    // An error that may be syntax the parser does not know says so.
+    let shape = root.join("shape.ts");
+    fs::write(&shape, "interface Box<in out T> {\n  value: T;\n}\n").unwrap();
+    let note = hook(edit_event(
+        "Edit",
+        &shape,
+        Some("interface Box<T> {\n  value: T;\n}\n"),
+    ));
+    assert_eq!(
+        note["hookSpecificOutput"]["additionalContext"],
+        "Justless parse check: after this Edit, shape.ts:1:18: syntax error at identifier (TypeScript parser). The file parsed before it. The parser may not know newer syntax, so check the line before changing it."
+    );
+    // Unchecked kinds, files outside the project, an unknown earlier state, other
+    // tools and malformed input all pass without a note.
+    fs::write(root.join("a.sql"), "SELECT (1;\n").unwrap();
+    let outside = TempDir::new().unwrap();
+    let outside_file = outside.path().canonicalize().unwrap().join("x.rs");
+    fs::write(&outside_file, "fn x( {\n").unwrap();
+    let mut unknown = edit_event("Edit", &lib, None);
+    fs::write(&lib, "fn x( {\n").unwrap();
+    unknown["tool_response"]
+        .as_object_mut()
+        .unwrap()
+        .remove("originalFile");
+    let mut read = edit_event("Edit", &lib, Some(before));
+    read["tool_name"] = serde_json::json!("Read");
+    for event in [
+        edit_event("Edit", &root.join("a.sql"), Some("SELECT 1;\n")),
+        edit_event("Edit", &outside_file, Some("fn x() {}\n")),
+        unknown,
+        read,
+        serde_json::json!("not an event"),
+    ] {
+        assert_eq!(hook(event), serde_json::json!({}));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_edit_hook_is_installed_checked_and_removed_with_the_others() {
+    let tools = doctor_tools(&["claude"]);
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    success(root, &["init", "--hooks", "--agent", "claude"]);
+    let claude = root.join(".claude/settings.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+    let entry = config["hooks"]["PostToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["hooks"][0]["command"] == "justless hook-claude after-edit")
+        .cloned()
+        .unwrap();
+    assert_eq!(entry["matcher"], "^(Edit|MultiEdit|Write)$");
+    assert_eq!(entry["hooks"][0]["timeout"], 5);
+    // An install from before the hook: doctor names it, and init adds it once.
+    let mut older = config.clone();
+    older["hooks"]["PostToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["matcher"] != "^(Edit|MultiEdit|Write)$");
+    fs::write(&claude, older.to_string()).unwrap();
+    let (status, text) = doctor_text(root, tools.path());
+    assert_eq!(status, Some(1), "{text}");
+    assert!(
+        text.contains("✗ Hooks: .claude/settings.json lacks the after-edit hook"),
+        "{text}"
+    );
+    success(root, &["init", "--hooks", "--agent", "claude"]);
+    success(root, &["init", "--hooks", "--agent", "claude"]);
+    assert_eq!(
+        fs::read_to_string(&claude)
+            .unwrap()
+            .matches("hook-claude after-edit")
+            .count(),
+        1
+    );
+    let (status, text) = doctor_text(root, tools.path());
+    assert_eq!(status, Some(0), "{text}");
+    success(root, &["init", "--remove"]);
+    assert!(!claude.exists() || !fs::read_to_string(&claude).unwrap().contains("after-edit"));
 }
