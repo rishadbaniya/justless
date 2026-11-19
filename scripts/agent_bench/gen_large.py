@@ -536,7 +536,17 @@ def gen_regression(repo, seed, avoid, n=1, label=""):
     others = [c for c in cands if c["file"] != bug["file"]]
     chosen += pick(others, CLEANUP_EDITS - len(chosen), rng, CLEANUP_PER_FILE, chosen + [dict(bug_edit)],
                    key=lambda c: c["lint"])
-    for _ in range(6):
+    banned_files, banned_packages = set(), set()
+
+    def refill(keep):
+        """Top the cleanup back up from files and packages that have not failed, so it stays long."""
+        taken = {(c["file"], c["offset"]) for c in keep}
+        pool = [c for c in others if (c["file"], c["offset"]) not in taken and c["file"] not in banned_files
+                and c["package"] not in banned_packages and c["package"].replace("-", "_") not in banned_packages]
+        return keep + pick(pool, CLEANUP_EDITS - len(keep), rng, CLEANUP_PER_FILE, keep + [dict(bug_edit)],
+                           key=lambda c: c["lint"])
+
+    for _ in range(10):
         edits = tasks_module.with_new_offsets(chosen)
         tasks_module.apply_edits(work, edits)
         _, output, _ = baseline_build.run(baseline["test_command"], work, target)
@@ -547,18 +557,20 @@ def gen_regression(repo, seed, avoid, n=1, label=""):
             keep = [c for c in chosen if c["file"] not in broken]
             if len(keep) == len(chosen):
                 raise RuntimeError("cleanup does not compile: %s" % output[-1500:])
-            chosen = keep
+            banned_files |= broken
+            chosen = refill(keep)
             continue
         missing = oracles.missing_names(baseline["test_names"], oracles.parse_tests(output), flaky)
         if missing:
             # A rewrite clippy calls equivalent can still change what a test observes (a source-text check, a
-            # custom len). Drop the cleanup in the packages whose tests changed and try again.
+            # custom len). Drop the cleanup in the packages whose tests changed and refill from the others.
             packages = {n.split("@", 1)[0] for n in missing}
             keep = [c for c in chosen if c["package"] not in packages and c["package"].replace("-", "_") not in packages]
             log("large regression: cleanup changed tests in", sorted(packages))
             if len(keep) == len(chosen):
                 raise RuntimeError("cleanup changed test results: %s" % missing[:5])
-            chosen = keep
+            banned_packages |= packages
+            chosen = refill(keep)
             continue
         break
     else:
