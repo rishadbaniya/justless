@@ -7,6 +7,7 @@ mod compaction;
 mod compare;
 mod delta;
 mod global;
+mod hook_fixes;
 mod lookup;
 mod mcp;
 mod read_batch;
