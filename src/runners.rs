@@ -1330,6 +1330,41 @@ pub(crate) struct Tally {
     pub packages: usize,
     /// pytest node IDs it could not find.
     pub not_found: Vec<String>,
+    /// Cargo and pytest: each failing test with its target key and what the
+    /// runner said about it. pytest `ERROR` lines count here, not in `failed`.
+    pub failures: Vec<Failure>,
+}
+
+/// A failing test and the runner's message about it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Failure {
+    /// The target key, as in [`Tally::names`]; empty for pytest.
+    pub target: String,
+    pub name: String,
+    /// Cargo: the test's block under `failures:`; pytest: the reason on its
+    /// summary line. Empty when the runner printed none.
+    pub message: String,
+}
+
+impl Tally {
+    fn failure(&mut self, target: &str, name: &str) -> &mut Failure {
+        let at = match self
+            .failures
+            .iter()
+            .position(|failure| failure.target == target && failure.name == name)
+        {
+            Some(at) => at,
+            None => {
+                self.failures.push(Failure {
+                    target: target.to_owned(),
+                    name: name.to_owned(),
+                    message: String::new(),
+                });
+                self.failures.len() - 1
+            }
+        };
+        &mut self.failures[at]
+    }
 }
 
 /// Reads a finished step's archived streams.
@@ -1387,7 +1422,21 @@ fn cargo_tally(stdout: &str, stderr: &str) -> Tally {
     let mut current = String::from("*");
     // Tests the current block reported by name, to add what only its summary counts.
     let mut named = 0usize;
+    // The `---- NAME stdout ----` block being read: its target, name and lines.
+    let mut output: Option<(String, String, Vec<&str>)> = None;
     for line in stdout.lines() {
+        if output.is_some()
+            && (line == "failures:"
+                || line.starts_with("test result:")
+                || line.starts_with("running ")
+                || line.starts_with("---- "))
+            && let Some((target, name, lines)) = output.take()
+        {
+            tally.failure(&target, &name).message = lines.join("\n").trim().to_owned();
+        }
+        if let Some((_, _, lines)) = &mut output {
+            lines.push(line);
+        }
         if line.starts_with("running ") && (line.ends_with(" tests") || line.ends_with(" test")) {
             current = if paired {
                 binaries[block].clone()
@@ -1406,7 +1455,10 @@ fn cargo_tally(stdout: &str, stderr: &str) -> Tally {
             tally.known = true;
             match outcome {
                 "ok" => {}
-                "FAILED" => tally.failed.push(name.to_owned()),
+                "FAILED" => {
+                    tally.failed.push(name.to_owned());
+                    tally.failure(&current, name);
+                }
                 _ if outcome.starts_with("ignored") => {
                     tally.ignored += 1;
                     continue;
@@ -1440,11 +1492,16 @@ fn cargo_tally(stdout: &str, stderr: &str) -> Tally {
         } else if let Some(name) = line
             .strip_prefix("---- ")
             .and_then(|rest| rest.strip_suffix(" stdout ----"))
-            && !tally.failed.iter().any(|failed| failed == name)
         {
             // A failure's captured output names it, in quiet output too.
-            tally.failed.push(name.to_owned());
+            if !tally.failed.iter().any(|failed| failed == name) {
+                tally.failed.push(name.to_owned());
+            }
+            output = Some((current.clone(), name.to_owned(), Vec::new()));
         }
+    }
+    if let Some((target, name, lines)) = output {
+        tally.failure(&target, &name).message = lines.join("\n").trim().to_owned();
     }
     tally
 }
@@ -1467,9 +1524,28 @@ fn pytest_tally(stdout: &str) -> Tally {
         if let Some(rest) = line.strip_prefix("ERROR: not found: ") {
             tally.not_found.push(rest.trim().to_owned());
         }
-        if let Some(name) = line.strip_prefix("FAILED ") {
-            let name = name.split(" - ").next().unwrap_or(name).trim();
-            tally.failed.push(name.to_owned());
+        // Short summary lines: `FAILED tests/test_a.py::test_b - assert 1 == 2`,
+        // and with `-rA` also `PASSED` and `ERROR` lines.
+        for (prefix, failing) in [("FAILED ", true), ("ERROR ", true), ("PASSED ", false)] {
+            let Some(rest) = line.strip_prefix(prefix) else {
+                continue;
+            };
+            let (name, message) = rest.split_once(" - ").unwrap_or((rest, ""));
+            let name = name.trim();
+            if prefix == "FAILED " {
+                tally.failed.push(name.to_owned());
+            }
+            // `ERROR tests/test_a.py` reports a file that failed to collect.
+            if prefix != "ERROR " || name.contains("::") {
+                tally
+                    .names
+                    .entry(String::new())
+                    .or_default()
+                    .insert(name.to_owned());
+            }
+            if failing && name.contains("::") {
+                tally.failure("", name).message = message.trim().to_owned();
+            }
         }
         if trimmed.contains(" in ")
             && trimmed.starts_with(|c: char| c.is_ascii_digit())
@@ -1596,6 +1672,45 @@ mod tests {
         let stdout = "\nrunning 2 tests\ntest a ... ok\ntest b ... FAILED\n\n---- b stdout ----\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n";
         let named = tally(Kind::Cargo, stdout, "");
         assert_eq!((named.ran, named.failed.len()), (2, 1));
+    }
+
+    #[test]
+    fn cargo_failures_keep_their_binary_and_panic_block() {
+        let stderr = "     Running unittests src/lib.rs (target/debug/deps/shop-1a2b)\n     Running tests/cart.rs (target/debug/deps/cart-9f)\n";
+        let stdout = "\nrunning 2 tests\ntest adds ... FAILED\ntest keeps ... ok\n\nfailures:\n\n---- adds stdout ----\nprinted first\n\nthread 'adds' panicked at src/lib.rs:7:9:\nassertion `left == right` failed\n  left: 4\n right: 5\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    adds\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\nrunning 1 test\ntest adds ... FAILED\n\nfailures:\n\n---- adds stdout ----\nthread 'adds' panicked at tests/cart.rs:3:5:\nempty cart\n\nfailures:\n    adds\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n";
+        let tally = tally(Kind::Cargo, stdout, stderr);
+        assert_eq!(tally.failures.len(), 2);
+        assert_eq!(
+            (
+                tally.failures[0].target.as_str(),
+                tally.failures[0].name.as_str()
+            ),
+            ("shop", "adds")
+        );
+        assert!(tally.failures[0].message.starts_with("printed first"));
+        assert!(tally.failures[0].message.ends_with("display a backtrace"));
+        assert_eq!(tally.failures[1].target, "cart");
+        assert!(tally.failures[1].message.ends_with("empty cart"));
+    }
+
+    #[test]
+    fn pytest_summary_lines_name_failures_and_passes() {
+        let stdout = "PASSED tests/test_a.py::test_ok\nFAILED tests/test_a.py::test_bad - assert 1 == 2\nERROR tests/test_b.py::test_fixture - RuntimeError: boom\nERROR tests/test_c.py\n==== 1 failed, 1 passed, 2 errors in 0.10s ====\n";
+        let tally = tally(Kind::Pytest, stdout, "");
+        assert_eq!(tally.failed, ["tests/test_a.py::test_bad"]);
+        assert_eq!(tally.names[""].len(), 3);
+        let failures: Vec<(&str, &str)> = tally
+            .failures
+            .iter()
+            .map(|failure| (failure.name.as_str(), failure.message.as_str()))
+            .collect();
+        assert_eq!(
+            failures,
+            [
+                ("tests/test_a.py::test_bad", "assert 1 == 2"),
+                ("tests/test_b.py::test_fixture", "RuntimeError: boom")
+            ]
+        );
     }
 
     #[test]

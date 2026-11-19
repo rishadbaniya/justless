@@ -16,6 +16,7 @@
 | `justless affected SYMBOL --depth 3` | Dependents grouped by distance, then the tests that reach the target and a command to run them. Also takes a file path or `--changes`. |
 | `justless test --affected [-- RUNNER ARG…]` | Runs only the tests that can reach the current Git changes, with the project's own runner, through the same capture as `run`. The result is labeled as a subset, keeps the runner's exit status, and falls back to the full suite with a stated reason when the selection cannot be trusted. |
 | `justless test [-- RUNNER ARG…]` | Runs the full suite of each detected runner, or of the given command, labeled as the full suite |
+| `justless test --compare REF [-- RUNNER ARG…]` | Runs the tests, then reruns only the failing ones at the merge base of `REF` and `HEAD` in a temporary Git worktree and groups them as new, changed or already failing there. Cargo and pytest. Keeps the working tree's exit status. Combines with `--affected`. |
 | `justless test --affected --dry-run [--json]` | The selection, the reasons, each test's evidence and the exact commands, without running anything |
 | `justless test --why RUN_ID [--test NAME]` | Why a recorded `test` run chose its tests, with changed files whose source has moved since marked `[source changed]` |
 | `justless find TEXT` | Literal search across indexed text, with exact file and line matches. Stops at `--limit` matches, 20 by default, and says when more exist. |
@@ -188,6 +189,35 @@ Each step's run directory holds `selection.json` beside the streams: the base re
 `--dry-run` runs nothing and records no run; it reads the index and runs `cargo metadata`. `--json` prints the same plan as data, identical across runs on the same tree.
 
 Hooks never narrow a test command; `justless test` is something an agent asks for. `test` executes project code, so like `run` it is not an MCP tool; the read-only `affected` tool shows the same reach.
+
+### Failures compared with a base
+
+`justless test --compare REF` separates the failures a change introduced from those already failing on the base branch. It runs the tests in the working tree as usual, the full suite or with `--affected` the subset, then reruns only the tests that failed, by exact name, at the merge base of `REF` and `HEAD`, in a temporary Git worktree under the system temporary directory. The worktree is removed afterwards, also when the base run fails, and one an interrupted comparison left behind is removed by the next comparison in the project. When nothing failed, nothing runs at the base.
+
+```sh
+justless test --compare main
+justless test --compare main -- cargo test --offline
+justless test --affected --base main --compare main   # the branch's affected tests, compared with main
+```
+
+The base command prints as `Run at main (merge-base 3f2c1ab), temporary worktree: cargo test --no-fail-fast -- --exact <4 test names>`, and the groups follow the verdict on stderr:
+
+```text
+Full suite (cargo): exit 101, 5 tests ran, 4 failed (1.4 s).
+Compare with main (merge-base 3f2c1ab): reran 4 tests failing here by exact name at the base, in a temporary worktree; exit 101 (1.1 s).
+  New failures, passing at the base (1): tests::breaks
+  New failures, no result at the base (added or renamed since?) (1): tests::added
+  Changed failures, failing at the base with another message (1): tests::changed
+    tests::changed · here: assertion `left == right` failed left: 2 right: 10
+    tests::changed · base: assertion `left == right` failed left: 1 right: 10
+  Already failing at the base, same message (1): tests::old_bug
+```
+
+A test is already failing when it fails at the base with the same normalized message. For Cargo that is the test's block under `failures:` from the panic on, without the thread name and ID, the panic's source location, `note:` lines, hexadecimal addresses and the paths of the two checkouts and target directories, so a failure in a file whose lines moved still matches. For pytest it is the reason on the short summary line. "No result at the base" means the base did not report the test, as for one added or renamed since, or one in a pytest file the base does not have. Cargo doctests are listed as not compared, since their names carry line numbers. Tests the change fixed are not listed, because only the failing tests run at the base. Up to eight names are listed per group, and up to three changed failures show both messages.
+
+The base command is the working-tree command with the failing names added. Cargo also gets `--no-fail-fast`, so a failing test binary does not hide the next one, and loses `-q`, so passing tests are named. It builds in `.justless/compare/cargo-target`, which later comparisons reuse, so they rebuild the project's own crates and not its dependencies. It never builds in the working tree's target directory: Cargo would take the base's artifacts for the working tree's, and the next plain `cargo test` would run the base's code. pytest gets `-rA --maxfail=0`, so every outcome is named and no failure stops the run, and `PYTHONPATH` starts with the checkout's runner directory and its `src/`, so an editable install does not import the working tree's code. A node ID whose file does not exist at the base is not passed, since pytest rejects a whole run over one, and one pytest reports as not found is dropped and the rest run again. A relative program path, such as `.venv/bin/pytest`, still names the working tree's program, and an absolute path into the repository, such as a `--manifest-path`, moves into the checkout. The checkout has no untracked or ignored files, such as a `.env` or generated fixtures, and no submodules, and the project's checkout hooks do not run. Comparisons in one project take turns.
+
+The exit status is the working-tree run's, whatever happens at the base. A ref that names no commit or shares no history with `HEAD` exits 2 before anything runs. When the base cannot be checked out, does not build or reports no test result, the comparison says so, as in `the base run reported no test result, exit 101 (error: …); failures are not grouped.` Jest, Vitest, Go and other commands are not compared: the comparison line says `not supported` and nothing runs at the base. Each of the runner's run directories gets `compare.json`: the ref, the merge base, the base command, its status and time, and each test's group with both messages, up to 2 KB each.
 
 ## Progressive reads and verified edits
 

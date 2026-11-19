@@ -18,6 +18,8 @@ use crate::runners::{self, Kind, Tally};
 use crate::selection::{self, Mode, Plan, Reason, RunnerPlan, Step, StepKind};
 use crate::workspace::{Workspace, write_json};
 
+mod compare;
+
 /// Bytes of the step command echoed before each run.
 const ECHO: usize = 200;
 /// Failing tests explained in the verdict.
@@ -55,10 +57,16 @@ pub fn command() -> Command<'static> {
         )
         .arg(crate::base_arg().requires("affected"))
         .arg(
+            Arg::new("compare")
+                .long("compare")
+                .value_name("REF")
+                .help("Rerun the failing tests at the merge base of REF and HEAD and group them as new, already failing or changed"),
+        )
+        .arg(
             Arg::new("why")
                 .long("why")
                 .value_name("RUN_ID")
-                .conflicts_with_all(&["affected", "dry-run", "command"])
+                .conflicts_with_all(&["affected", "dry-run", "command", "compare"])
                 .help("Show why a recorded run selected its tests"),
         )
         .arg(
@@ -118,6 +126,11 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
     if let Some(command) = &command {
         ensure!(!command.is_empty(), "expected a command after --");
     }
+    // A ref that names no commit stops here, before anything runs.
+    let compare = matches
+        .value_of("compare")
+        .map(|reference| compare::resolve(workspace, reference))
+        .transpose()?;
     let settings = workspace.settings()?;
     let index = Index::open(workspace)?;
     let runners = runners::detect(workspace, &index, command.as_deref())?;
@@ -139,6 +152,12 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&plan)?);
         } else {
             print!("{}", render(&plan, affected, budget));
+            if let Some(base) = &compare {
+                println!(
+                    "With --compare, failing tests rerun by name at {} in a temporary worktree.",
+                    base.label
+                );
+            }
         }
         return Ok(0);
     }
@@ -167,6 +186,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             .to_owned(),
         fresh: matches.is_present("fresh"),
         affected,
+        compare,
     };
     execute(workspace, &plan, &options)
 }
@@ -180,6 +200,8 @@ struct Options {
     session: String,
     fresh: bool,
     affected: bool,
+    /// `--compare REF`: the base the failing tests rerun at.
+    compare: Option<compare::Base>,
 }
 
 fn plural(count: usize, noun: &str) -> String {
@@ -598,6 +620,8 @@ struct RunnerResult {
     status: i32,
     ran: usize,
     failed: Vec<String>,
+    /// Failing tests with their target and message.
+    failures: Vec<runners::Failure>,
     known: bool,
     runs: Vec<String>,
     elapsed_ms: u64,
@@ -622,6 +646,7 @@ impl RunnerResult {
             status: 0,
             ran: 0,
             failed: Vec::new(),
+            failures: Vec::new(),
             known: false,
             runs: Vec::new(),
             elapsed_ms: 0,
@@ -646,6 +671,15 @@ impl RunnerResult {
         }
         self.ran += outcome.tally.ran;
         self.failed.extend(outcome.tally.failed.iter().cloned());
+        for failure in &outcome.tally.failures {
+            if !self
+                .failures
+                .iter()
+                .any(|known| known.target == failure.target && known.name == failure.name)
+            {
+                self.failures.push(failure.clone());
+            }
+        }
         self.known |= outcome.tally.known;
         self.elapsed_ms += outcome.elapsed_ms;
         self.shown += outcome.shown;
@@ -784,7 +818,14 @@ fn echoed(argv: &[String]) -> String {
 }
 
 fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32> {
-    println!("{}", header(plan, options.affected));
+    match &options.compare {
+        Some(base) => println!(
+            "{} · failures compared with {}",
+            header(plan, options.affected),
+            base.label
+        ),
+        None => println!("{}", header(plan, options.affected)),
+    }
     if let Some(note) = &plan.note {
         println!("{note}");
     }
@@ -792,6 +833,7 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
     let mut verdicts = Vec::new();
     let mut first_run = None;
     let mut modes = Vec::new();
+    let mut results = Vec::new();
     for runner in &plan.runners {
         println!("{}", runner_line(runner, options.affected));
         let mut result = RunnerResult::new(runner.mode);
@@ -930,6 +972,16 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
         }
         verdicts.push(verdict);
         modes.push(result.mode);
+        results.push(result);
+    }
+    if let Some(base) = &options.compare {
+        // One checkout serves every runner; dropping it removes the worktree.
+        let mut checkout = None;
+        for ((runner, result), verdict) in plan.runners.iter().zip(&results).zip(&mut verdicts) {
+            let text = compare::runner(workspace, base, &mut checkout, runner, result);
+            verdict.push('\n');
+            verdict.push_str(&text);
+        }
     }
     let mut text = String::new();
     for verdict in &verdicts {
