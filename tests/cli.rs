@@ -3979,7 +3979,7 @@ fn lint_reports_keep_findings_under_unusual_paths() {
     // ESLint file names may contain spaces, and rows never inherit an earlier file.
     let mut out = String::from("\n/work/web/src/a.js\n");
     for i in 1..=30 {
-        out.push_str(&format!("  {i}:5  error  'foo' is not defined  no-undef\n"));
+        out += &format!("  {i}:5  error  'foo' is not defined  no-undef\n");
     }
     out.push_str("\n/work/web/src/My Components/Button.jsx\n  10:1   error  'React' is not defined  no-undef\n  12:7   error  'unusedProp' is assigned a value but never used  no-unused-vars\n\n✖ 32 problems (32 errors, 0 warnings)\n");
     let report = fresh("eslint", &["."], &out);
@@ -4001,14 +4001,10 @@ fn lint_reports_keep_findings_under_unusual_paths() {
     // Windows paths keep their drive letter, count as separate files and sort per file.
     let mut out = String::new();
     for (file, line) in [(r"C:\proj\src\b.ts", 3), (r"C:\proj\src\a.ts", 5)] {
-        out.push_str(&format!(
-            "{file}({line},1): error TS2304: Cannot find name 'x'.\n"
-        ));
+        out += &format!("{file}({line},1): error TS2304: Cannot find name 'x'.\n");
     }
     for i in 1..=10 {
-        out.push_str(&format!(
-            "C:\\proj\\src\\c.ts({i},1): error TS2304: Cannot find name 'q'.\n"
-        ));
+        out += &format!("C:\\proj\\src\\c.ts({i},1): error TS2304: Cannot find name 'q'.\n");
     }
     let report = fresh("tsc", &[], &out);
     assert!(
@@ -4020,7 +4016,7 @@ fn lint_reports_keep_findings_under_unusual_paths() {
     );
     let mut out = String::from("\nC:\\proj\\src\\b.js\n");
     for i in 1..=10 {
-        out.push_str(&format!("  {i}:5  error  'foo' is not defined  no-undef\n"));
+        out += &format!("  {i}:5  error  'foo' is not defined  no-undef\n");
     }
     out.push_str("\nC:\\proj\\src\\a.js\n  3:1  error  'bar' is not defined  no-undef\n\nD:\\other\\c.js\n  1:1  error  'baz' is not defined  no-undef\n");
     let report = fresh("eslint", &["."], &out);
@@ -4038,9 +4034,7 @@ Object literal may only specify known properties, and 'extra' does not exist in 
 src/lib/api.ts(9,1): error TS2554: Expected 1 arguments, but got 2.\n"
         .to_owned();
     for i in 21..=26 {
-        out.push_str(&format!(
-            "src/lib/api.ts({i},1): error TS2554: Expected 1 arguments, but got 2.\n"
-        ));
+        out += &format!("src/lib/api.ts({i},1): error TS2554: Expected 1 arguments, but got 2.\n");
     }
     let report = fresh("tsc", &["--noEmit"], &out);
     assert!(
@@ -4056,9 +4050,7 @@ src/lib/api.ts(9,1): error TS2554: Expected 1 arguments, but got 2.\n"
     // One-line findings accept spaces and a colon in the path. The tool's own total stays.
     let mut out = String::new();
     for i in 1..=8 {
-        out.push_str(&format!(
-            "src/app.py:{i}:1: F401 [*] `os{i}` imported but unused\n"
-        ));
+        out += &format!("src/app.py:{i}:1: F401 [*] `os{i}` imported but unused\n");
     }
     out.push_str("src/my mod.py:2:1: F821 Undefined name `x`\nsrc/my mod.py:3:1: F821 Undefined name `y`\nFound 10 errors.\n");
     let report = fresh("ruff", &["check", "."], &out);
@@ -4070,9 +4062,7 @@ src/lib/api.ts(9,1): error TS2554: Expected 1 arguments, but got 2.\n"
     );
     let mut out = String::new();
     for i in 1..=7 {
-        out.push_str(&format!(
-            "pkg/a.py:{i}: error: Name \"v{i}\" is not defined  [name-defined]\n"
-        ));
+        out += &format!("pkg/a.py:{i}: error: Name \"v{i}\" is not defined  [name-defined]\n");
     }
     out.push_str("pkg/a:b.py:9: error: Name \"q\" is not defined  [name-defined]\nFound 8 errors in 2 files (checked 2 source files)\n");
     let report = fresh("mypy", &["pkg"], &out);
@@ -4089,14 +4079,9 @@ src/lib/api.ts(9,1): error TS2554: Expected 1 arguments, but got 2.\n"
 fn lint_reports_name_rustc_lints_and_short_format_errors() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
+    let cargo = |args: &str, err: &str| lint_preview(root, "cargo", &argv(args), "", err);
     // Real `cargo check --message-format=short`: the error code is part of the level.
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "check"],
-        "",
-        &lint_fixture("cargo_short.txt"),
-    );
+    let report = cargo("--fresh check", &lint_fixture("cargo_short.txt"));
     assert!(
         report.starts_with("cargo check: 4 finding(s), 1 error(s), 3 warning(s) · 2 rule(s)")
             && report.contains("error E0308 ×1  mismatched types: expected `u32`, found `&str`\n")
@@ -4108,19 +4093,13 @@ fn lint_reports_name_rustc_lints_and_short_format_errors() {
         "found `&str`\n",
         "found `&str`\n    Checking c2 v0.1.0 (/work/c2)\n",
     );
-    let report = lint_preview(root, "cargo", &["--fresh", "check"], "", &interleaved);
+    let report = cargo("--fresh check", &interleaved);
     assert!(
         report.contains("  src/lib.rs:4:21 [stderr:2-2]\n") && !report.contains("Checking c2"),
         "{report}"
     );
     // rustc names dead_code and unused_imports once, with wording that varies by item.
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "check"],
-        "",
-        &lint_fixture("cargo_dead_code.txt"),
-    );
+    let report = cargo("--fresh check", &lint_fixture("cargo_dead_code.txt"));
     assert!(
         report.starts_with("cargo check: 8 finding(s), 0 error(s), 8 warning(s) · 2 rule(s)")
             && report.contains("warning dead_code ×6")
@@ -4128,35 +4107,18 @@ fn lint_reports_name_rustc_lints_and_short_format_errors() {
         "{report}"
     );
     // `-D warnings` and a lint group on an item still name each lint.
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "clippy"],
-        "",
-        &lint_fixture("clippy_deny_warnings.txt"),
-    );
+    let report = cargo("--fresh clippy", &lint_fixture("clippy_deny_warnings.txt"));
     assert!(
         report.contains("error dead_code ×2") && report.contains("error unused_variables ×2"),
         "{report}"
     );
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "check"],
-        "",
-        &lint_fixture("cargo_deny_group.txt"),
-    );
+    let report = cargo("--fresh check", &lint_fixture("cargo_deny_group.txt"));
     assert!(report.contains("error unused_imports ×2"), "{report}");
     // Real `cargo clippy --message-format=short` names no lint. Common rustc lints are
     // recognized by their wording, a repeated label is dropped, and Clippy's own
     // findings stay grouped by message.
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "clippy", "--message-format=short"],
-        "",
-        &lint_fixture("clippy_short_lints.txt"),
-    );
+    let err = lint_fixture("clippy_short_lints.txt");
+    let report = cargo("--fresh clippy --message-format=short", &err);
     assert!(
         report.starts_with("cargo clippy: 7 finding(s), 0 error(s), 7 warning(s) · 3 rule(s)")
             && report.contains(
@@ -4173,14 +4135,9 @@ fn lint_reports_name_rustc_lints_and_short_format_errors() {
 fn lint_reports_keep_failures_outside_the_findings_visible() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
+    let cargo = |args: &str, err: &str| lint_preview(root, "cargo", &argv(args), "", err);
     // A failed build script has no source location. Its cause stays in the preview.
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "check"],
-        "",
-        &lint_fixture("cargo_build_script.txt"),
-    );
+    let report = cargo("--fresh check", &lint_fixture("cargo_build_script.txt"));
     assert!(
         report.contains("· 1 error(s) without a location\n")
             && report.contains("error: failed to run custom build command for `r05 v0.1.0 (/work/r05)` [stderr:11]\n    Caused by:")
@@ -4190,11 +4147,10 @@ fn lint_reports_keep_failures_outside_the_findings_visible() {
 
     // A stream with no finding, such as a crash on stderr, is summarized by its range.
     let mut out = String::from("************* Module app\n");
-    for i in 1..=8 {
-        out.push_str(&format!(
-            "app.py:{}:0: C0116: Missing function or method docstring (missing-function-docstring)\n",
-            i * 10
-        ));
+    for i in (10..=80).step_by(10) {
+        out += &format!(
+            "app.py:{i}:0: C0116: Missing function or method docstring (missing-function-docstring)\n"
+        );
     }
     let err = "Exception on node <Call l.42> in file '/work/app/models.py'\nTraceback (most recent call last):\n  File \"typecheck.py\", line 1394, in visit_call\n    called = safe_infer(node.func)\nRecursionError: maximum recursion depth exceeded while calling a Python object\n";
     let report = lint_preview(root, "pylint", &["--fresh", "app.py"], &out, err);
@@ -4206,49 +4162,10 @@ fn lint_reports_keep_failures_outside_the_findings_visible() {
         "{report}"
     );
 
-    // `could not compile` lines collapse into one that names each package and target,
-    // and further outcomes are counted.
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "check"],
-        "",
-        &lint_fixture("cargo_workspace.txt"),
-    );
-    assert!(
-        report.contains(
-            "error: could not compile 6 packages: `c1` (lib), `c6` (lib), `c4` (lib), `c5` (lib), `c3` (lib), `c2` (lib) [stderr:11]\n"
-        ),
-        "{report}"
-    );
-    // `--all-targets` fails the library and its test build separately.
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "clippy", "--all-targets", "--keep-going"],
-        "",
-        &lint_fixture("cargo_targets.txt"),
-    );
-    assert!(
-        report.contains("error: could not compile `rt` (lib, lib test) [stderr:11]\n"),
-        "{report}"
-    );
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "clippy", "--all-targets", "--keep-going"],
-        "",
-        &lint_fixture("cargo_workspace_targets.txt"),
-    );
-    assert!(
-        report.contains(
-            "error: could not compile 2 packages: `a` (lib test, lib), `b` (lib, lib test) [stderr:11]\n"
-        ),
-        "{report}"
-    );
     // Many targets of one package are counted, and a line without a target, as older
     // Cargo prints, names the package alone.
-    let mut err = String::from("error: could not compile `old` due to previous error\n");
+    let mut old = lint_fixture("cargo_short.txt");
+    old += "error: could not compile `old` due to previous error\n";
     for target in [
         "lib",
         "lib test",
@@ -4257,33 +4174,40 @@ fn lint_reports_keep_failures_outside_the_findings_visible() {
         "test \"c\"",
         "bin \"d\"",
     ] {
-        err.push_str(&format!(
-            "error: could not compile `rt` ({target}) due to 1 previous error\n"
-        ));
+        old += &format!("error: could not compile `rt` ({target}) due to 1 previous error\n");
     }
-    let report = lint_preview(
-        root,
-        "cargo",
-        &["--fresh", "check"],
-        "",
-        &(lint_fixture("cargo_short.txt") + &err),
-    );
-    assert!(
-        report.contains(
-            "error: could not compile 3 packages: `r04` (lib), `old`, `rt` (lib, lib test, test \"a\", test \"b\" +2 more) [stderr:7]\n"
+    for (args, err, outcome) in [
+        // `could not compile` lines collapse into one that names each package and target,
+        // and further outcomes are counted.
+        (
+            "--fresh check",
+            lint_fixture("cargo_workspace.txt"),
+            "error: could not compile 6 packages: `c1` (lib), `c6` (lib), `c4` (lib), `c5` (lib), `c3` (lib), `c2` (lib) [stderr:11]\n",
         ),
-        "{report}"
-    );
+        // `--all-targets` fails the library and its test build separately.
+        (
+            "--fresh clippy --all-targets --keep-going",
+            lint_fixture("cargo_targets.txt"),
+            "error: could not compile `rt` (lib, lib test) [stderr:11]\n",
+        ),
+        (
+            "--fresh clippy --all-targets --keep-going",
+            lint_fixture("cargo_workspace_targets.txt"),
+            "error: could not compile 2 packages: `a` (lib test, lib), `b` (lib, lib test) [stderr:11]\n",
+        ),
+        (
+            "--fresh check",
+            old,
+            "error: could not compile 3 packages: `r04` (lib), `old`, `rt` (lib, lib test, test \"a\", test \"b\" +2 more) [stderr:7]\n",
+        ),
+    ] {
+        assert_all_in(&cargo(args, &err), &[outcome]);
+    }
     let err: String = (1..=6)
         .map(|i| format!("Error: worker {i} failed\n"))
         .collect();
-    let report = lint_preview(
-        root,
-        "eslint",
-        &["--fresh", "."],
-        &lint_fixture("eslint.txt").repeat(2),
-        &err,
-    );
+    let out = lint_fixture("eslint.txt").repeat(2);
+    let report = lint_preview(root, "eslint", &["--fresh", "."], &out, &err);
     assert!(
         report.contains("✖ 5 problems (4 errors, 1 warning) [stdout:11]\n")
             && report.contains("Error: worker 3 failed [stderr:3]\n")
@@ -4332,33 +4256,23 @@ fn lint_reruns_compare_severity_and_findings_within_the_budget() {
     let first = cargo("cargo_many_before.txt");
     assert!(first.len() <= 4096, "{}", first.len());
     let rerun = cargo("cargo_many_after.txt");
+    let head = "cargo check: 17 finding(s), 16 error(s), 1 warning(s) · 17 rule(s)";
     assert!(
         rerun.len() <= 4096
-            && rerun
-                .starts_with("cargo check: 17 finding(s), 16 error(s), 1 warning(s) · 17 rule(s)")
-            && ["E0599", "E0603", "E0608", "E0614", "E0616", "E0618"]
-                .iter()
-                .all(|code| rerun.contains(&format!("error {code} ×1")))
+            && rerun.starts_with(head)
             && rerun.contains("warning unused_assignments ×1")
             && rerun.contains("Compared with run-")
             && rerun.contains("- error E0308 ×1 (no longer reported)\n")
             && rerun.contains("error: could not compile `r08` (lib) due to 16 previous errors"),
         "{rerun}"
     );
+    for code in ["E0599", "E0603", "E0608", "E0614", "E0616", "E0618"] {
+        assert!(rerun.contains(&format!("error {code} ×1")), "{rerun}");
+    }
     // A smaller budget drops whole groups with a count rather than cutting a line.
-    let exe = root.join("bin/cargo");
-    let output = cli(
-        root,
-        &[
-            "run",
-            "--max-bytes",
-            "1024",
-            "--",
-            exe.to_str().unwrap(),
-            "check",
-        ],
-    );
-    let small = stdout(&output);
+    let exe = root.join("bin/cargo").display().to_string();
+    let args = ["run", "--max-bytes", "1024", "--", &exe, "check"];
+    let small = stdout(&cli(root, &args));
     assert!(
         small.len() <= 1024
             && small.contains("more rule(s) with ")
@@ -4418,9 +4332,9 @@ app.py:3:4: E0602: Undefined variable 'foo' (undefined-variable)\n\
 app.py:9:0: F0001: No module named nope (fatal)\n",
     );
     for i in 10..=30 {
-        out.push_str(&format!(
+        out += &format!(
             "app.py:{i}:0: C0116: Missing function or method docstring (missing-function-docstring)\n"
-        ));
+        );
     }
     let report = lint_preview(root, "pylint", &["--fresh", "app.py"], &out, "");
     assert!(
@@ -4431,13 +4345,8 @@ app.py:9:0: F0001: No module named nope (fatal)\n",
     );
 
     // These samples follow each tool's documented default output.
-    let report = lint_preview(
-        root,
-        "pyright",
-        &["--fresh"],
-        &lint_fixture("pyright.txt"),
-        "",
-    );
+    let out = lint_fixture("pyright.txt");
+    let report = lint_preview(root, "pyright", &["--fresh"], &out, "");
     assert!(
         report.starts_with("pyright: 5 finding(s), 4 error(s), 1 warning(s) · 3 rule(s) · 2 file(s)\n")
             && report.contains("error reportMissingImports ×3  Import \"requestz\" could not be resolved\n  /work/app/main.py:1:8, 2:8, /work/app/util.py:3:8")
@@ -4445,13 +4354,8 @@ app.py:9:0: F0001: No module named nope (fatal)\n",
             && report.contains("4 errors, 1 warning, 0 informations [stdout:9]"),
         "{report}"
     );
-    let report = lint_preview(
-        root,
-        "hadolint",
-        &["--fresh", "Dockerfile"],
-        &lint_fixture("hadolint.txt").repeat(3),
-        "",
-    );
+    let out = lint_fixture("hadolint.txt").repeat(3);
+    let report = lint_preview(root, "hadolint", &["--fresh", "Dockerfile"], &out, "");
     assert!(
         report.starts_with(
             "hadolint: 21 finding(s), 3 error(s), 18 warning(s) · 6 rule(s) · 2 file(s)\n"
@@ -4460,13 +4364,8 @@ app.py:9:0: F0001: No module named nope (fatal)\n",
             && report.contains("  Dockerfile:3, 5 [stdout:1-1]"),
         "{report}"
     );
-    let report = lint_preview(
-        root,
-        "staticcheck",
-        &["--fresh", "./..."],
-        &lint_fixture("staticcheck.txt").repeat(3),
-        "",
-    );
+    let out = lint_fixture("staticcheck.txt").repeat(3);
+    let report = lint_preview(root, "staticcheck", &["--fresh", "./..."], &out, "");
     assert!(
         report.contains(
             "warning S1028 ×6  should use fmt.Errorf(...) instead of errors.New(fmt.Sprintf(...))\n"
@@ -4501,6 +4400,24 @@ fn write_transcripts(root: &Path, config: &Path, files: &[(&str, &[(&str, &str)]
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, lines.join("\n")).unwrap();
     }
+}
+
+/// The labels that a `discover --json` report lists under `route`, as `label ×commands`.
+fn discover_route_labels(report: &serde_json::Value, route: &str) -> Vec<String> {
+    report["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["route"] == route)
+        .map(|g| {
+            g["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| format!("{} ×{}", l["label"].as_str().unwrap(), l["commands"]))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[test]
@@ -4550,32 +4467,11 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
             ),
         ],
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["discover", "--json"])
-        .current_dir(&root)
-        .env("CLAUDE_CONFIG_DIR", &config)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let text = claude_config_success(&root, &config, &["discover", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(report["sessions"], 2);
     assert_eq!(report["commands"], 11);
-    let labels = |route: &str| -> Vec<String> {
-        report["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|g| g["route"] == route)
-            .map(|g| {
-                g["labels"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|l| format!("{} ×{}", l["label"].as_str().unwrap(), l["commands"]))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let labels = |route| discover_route_labels(&report, route);
     assert_eq!(
         labels("through_justless"),
         ["cat ×1", "justless query ×1", "npm test ×1"]
@@ -4593,7 +4489,6 @@ fn discover_reads_subagent_transcripts_and_labels_commands_without_arguments() {
             "ssh ×1"
         ]
     );
-    let text = String::from_utf8_lossy(&output.stdout);
     assert!(!text.contains("secretdb") && !text.contains("prod-host"));
 }
 
@@ -4637,35 +4532,17 @@ fn discover_counts_hook_routed_runs_by_their_short_footers() {
             ],
         )],
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["discover", "--json"])
-        .current_dir(&root)
-        .env("CLAUDE_CONFIG_DIR", &config)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let labels = |route: &str| -> Vec<String> {
-        report["groups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|g| g["route"] == route)
-            .map(|g| {
-                g["labels"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|l| l["label"].as_str().unwrap().to_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let report = claude_config_success(&root, &config, &["discover", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    let labels = |route| discover_route_labels(&report, route);
     assert_eq!(
         labels("through_justless"),
-        ["cargo build", "cargo test", "git log"]
+        ["cargo build ×1", "cargo test ×1", "git log ×1"]
     );
-    assert_eq!(labels("supported_not_routed"), ["git diff", "git status"]);
+    assert_eq!(
+        labels("supported_not_routed"),
+        ["git diff ×1", "git status ×1"]
+    );
 }
 
 #[test]
@@ -4679,19 +4556,13 @@ fn history_orders_by_completion_and_skips_unreadable_records() {
     }
     // A copy can reorder modification times, so the newest run gets the oldest.
     for (k, id) in ids.iter().enumerate() {
-        let record = fs::File::options()
-            .write(true)
-            .open(root.join(".justless/runs").join(id).join("record.json"))
-            .unwrap();
+        let path = root.join(".justless/runs").join(id).join("record.json");
+        let record = fs::File::options().write(true).open(path).unwrap();
         let age = std::time::Duration::from_secs(1000 + k as u64 * 100);
-        record
-            .set_modified(std::time::SystemTime::now() - age)
-            .unwrap();
+        let modified = std::time::SystemTime::now() - age;
+        record.set_modified(modified).unwrap();
     }
-    let oldest = success(
-        root,
-        &["history", "TimeoutError", "--oldest", "--limit", "1"],
-    );
+    let oldest = success(root, &argv("history TimeoutError --oldest --limit 1"));
     assert!(
         oldest.contains(&ids[0]) && oldest.contains("cmd 1: TimeoutError"),
         "{oldest}"
@@ -4703,13 +4574,8 @@ fn history_orders_by_completion_and_skips_unreadable_records() {
     assert_eq!(listed, ids.iter().rev().cloned().collect::<Vec<_>>());
 
     // An empty record and one missing required fields, sorted newest.
-    for (id, record) in [
-        ("run-empty", String::new()),
-        (
-            "run-partial",
-            r#"{"id":"run-partial","status":0,"completed_ms":99999999999999}"#.to_owned(),
-        ),
-    ] {
+    let partial = r#"{"id":"run-partial","status":0,"completed_ms":99999999999999}"#;
+    for (id, record) in [("run-empty", ""), ("run-partial", partial)] {
         let directory = root.join(".justless/runs").join(id);
         fs::create_dir(&directory).unwrap();
         fs::write(directory.join("record.json"), record).unwrap();
@@ -4734,17 +4600,10 @@ fn history_orders_by_completion_and_skips_unreadable_records() {
     let runs: Vec<_> = resume.lines().filter(|l| l.starts_with("run-")).collect();
     assert_eq!(runs.len(), 5, "{resume}");
     assert!(runs[0].starts_with(&ids[5]), "{resume}");
-    let handoff = hook(
-        root,
-        "after-compact",
-        serde_json::json!({"hook_event_name":"SessionStart","source":"compact"}),
-    );
-    assert!(
-        handoff["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains(&ids[5])
-    );
+    let compact = serde_json::json!({"hook_event_name":"SessionStart","source":"compact"});
+    let handoff = hook(root, "after-compact", compact);
+    let context = &handoff["hookSpecificOutput"]["additionalContext"];
+    assert!(context.as_str().unwrap().contains(&ids[5]), "{context}");
 }
 
 #[test]
@@ -4767,20 +4626,18 @@ fn runs_are_listed_by_command_label_and_resume_shows_32_source_ranges() {
         for text in [&history, &resume] {
             assert!(text.contains(&format!("{id} · {label} · exit ")), "{text}");
         }
-        let record =
-            fs::read_to_string(root.join(".justless/runs").join(id).join("record.json")).unwrap();
-        assert!(
-            record.contains(&format!("\"label\":\"{label}\"")),
-            "{record}"
-        );
+        let record = root.join(".justless/runs").join(id).join("record.json");
+        let record = fs::read_to_string(record).unwrap();
+        let field = format!("\"label\":\"{label}\"");
+        assert!(record.contains(&field), "{record}");
     }
     // Arguments stay out of labels. Resume headlines describe output instead.
     assert!(!history.contains("secret-argument") && !history.contains("backend"));
     assert!(!resume.contains("secret-argument"));
 
+    fs::create_dir_all(root.join("notes")).unwrap();
     for n in 1..=40 {
         let file = format!("notes/n{n:02}.txt");
-        fs::create_dir_all(root.join("notes")).unwrap();
         fs::write(root.join(&file), "a\nb\nc\n").unwrap();
         success(root, &["code", &file, "--from", "1", "--to", "2"]);
     }
@@ -4801,52 +4658,46 @@ fn compaction_handoffs_stay_within_1800_bytes_with_their_introduction() {
         cli(root, &["run", "--", "sh", "-c", &script]);
     }
     let deep = ["a_rather_long_directory_name"; 8].join("/");
+    fs::create_dir_all(root.join(&deep)).unwrap();
     for n in 0..32 {
         let file = format!("{deep}/f{n:02}.rs");
-        fs::create_dir_all(root.join(&deep)).unwrap();
         fs::write(root.join(&file), "fn f() {}\n".repeat(10)).unwrap();
         success(root, &["code", &file, "--from", "1", "--to", "5"]);
     }
     let compact = json!({"hook_event_name":"SessionStart","source":"compact"});
-    for handler in ["hook-claude", "hook-codex"] {
+    let after = |handler| {
         let output = agent_hook(root, handler, "after-compact", compact.clone());
-        let context = output["hookSpecificOutput"]["additionalContext"]
-            .as_str()
+        let context = &output["hookSpecificOutput"]["additionalContext"];
+        context.as_str().unwrap().to_owned()
+    };
+    let before = || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+            .args(["hook-claude", "before-compact"])
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
             .unwrap();
+        let pre = json!({"hook_event_name":"PreCompact"}).to_string();
+        child.stdin.take().unwrap().write_all(pre.as_ref()).unwrap();
+        stdout(&child.wait_with_output().unwrap())
+    };
+    let activity = "Justless activity from before compaction.";
+    let keep = "Keep these Justless references verbatim";
+    // The hooks run in this order: both handoffs, then the instructions before compaction.
+    for (case, text, introduction) in [
+        ("hook-claude", after("hook-claude"), activity),
+        ("hook-codex", after("hook-codex"), activity),
+        ("before-compact", before(), keep),
+    ] {
         assert!(
-            context.starts_with("Justless activity from before compaction.")
-                && context.ends_with("[context budget reached]\n")
-                && context.len() <= 1800,
-            "{handler}: {} bytes",
-            context.len()
+            text.starts_with(introduction)
+                && text.ends_with("[context budget reached]\n")
+                && text.len() <= 1800,
+            "{case}: {} bytes",
+            text.len()
         );
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["hook-claude", "before-compact"])
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(
-            json!({"hook_event_name":"PreCompact"})
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let instructions = stdout(&output);
-    assert!(
-        instructions.starts_with("Keep these Justless references verbatim")
-            && instructions.ends_with("[context budget reached]\n")
-            && instructions.len() <= 1800,
-        "{} bytes",
-        instructions.len()
-    );
 }
 
 #[test]
@@ -4858,20 +4709,16 @@ fn resume_keeps_room_for_the_last_pack_after_many_source_ranges() {
         cli(root, &["run", "--", "sh", "-c", &script]);
     }
     let deep = "src/a_fairly_long_directory_name/another_nested_module_directory";
+    let file = |n| format!("{deep}/source_file_number_{n}.rs");
     fs::create_dir_all(root.join(deep)).unwrap();
     for n in 1..=40 {
-        let file = format!("{deep}/source_file_number_{n}.rs");
-        fs::write(
-            root.join(&file),
-            format!("pub fn f{n}() -> u32 {{\n    {n}\n}}\n"),
-        )
-        .unwrap();
-        success(root, &["code", &file, "--from", "1", "--to", "2"]);
+        let source = format!("pub fn f{n}() -> u32 {{\n    {n}\n}}\n");
+        fs::write(root.join(file(n)), source).unwrap();
+        success(root, &["code", &file(n), "--from", "1", "--to", "2"]);
     }
     success(root, &["pack", "Where is purchase_orders defined?"]);
-    let activity: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(root.join(".justless/activity.json")).unwrap())
-            .unwrap();
+    let activity = fs::read_to_string(root.join(".justless/activity.json")).unwrap();
+    let mut activity: serde_json::Value = serde_json::from_str(&activity).unwrap();
     let pack: Vec<_> = activity["last_pack"]
         .as_object()
         .unwrap()
@@ -4880,16 +4727,10 @@ fn resume_keeps_room_for_the_last_pack_after_many_source_ranges() {
         .collect();
     assert!(!pack.is_empty(), "{activity}");
 
-    let handoff = agent_hook(
-        root,
-        "hook-claude",
-        "after-compact",
-        serde_json::json!({"hook_event_name":"SessionStart","source":"compact"}),
-    );
-    let handoff = handoff["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let compact = serde_json::json!({"hook_event_name":"SessionStart","source":"compact"});
+    let output = agent_hook(root, "hook-claude", "after-compact", compact);
+    let handoff = &output["hookSpecificOutput"]["additionalContext"];
+    let handoff = handoff.as_str().unwrap().to_owned();
     assert!(handoff.len() <= 1800, "{} bytes", handoff.len());
     for text in [success(root, &["resume"]), handoff] {
         let lines: Vec<_> = text.lines().collect();
@@ -4909,14 +4750,8 @@ fn resume_keeps_room_for_the_last_pack_after_many_source_ranges() {
     }
 
     // A pack too long for half the space still leaves the other half to ranges.
-    let mut activity = activity;
     activity["last_pack"] = (1..=40)
-        .map(|n| {
-            (
-                format!("{deep}/source_file_number_{n}.rs"),
-                "0".repeat(16).into(),
-            )
-        })
+        .map(|n| (file(n), "0".repeat(16).into()))
         .collect::<serde_json::Map<_, _>>()
         .into();
     fs::write(root.join(".justless/activity.json"), activity.to_string()).unwrap();
