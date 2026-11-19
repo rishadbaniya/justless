@@ -169,11 +169,8 @@ Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). Th
 ### 4.D MCP and history fixes — done
 - **Progress.** *on main* (2026-11-19). MCP `context` and `affected` take `base` (with `changes: true`); `history` keeps one place for the first failed run when the limit cuts (needs a limit of at least 2); no notice suggests a `--limit` above MCP's 1000.
 
-### 4.F Follow-ups from permission parity
-- `would_route`, `discover` and `doctor`'s "has not routed a command yet" note still assume the Claude Code hook always rewrites; make them use the same permission verdict, and have `doctor` say when a settings file is unreadable (which silently stops pre-routing in every mode).
-- "Don't ask again" rules saved in `settings.local.json` at the Git root count only when that directory is `$CLAUDE_PROJECT_DIR`; consider reading the Git root's (and a worktree's main checkout's) local file for allow rules too, if Claude Code does.
-- `scripts/agent_bench/cc_hooks.py` drives the hook with `bypassPermissions`, so it now reads the machine's real settings; pin `CLAUDE_CONFIG_DIR` and the managed override in the harness.
-- **Progress.** *designed*.
+### 4.F Follow-ups from permission parity — done
+- **Progress.** *on main* (2026-11-19). `discover` judges each supported command with the mode its transcript recorded and today's rules, and reports commands the hook would leave in their own group with the right hint; `doctor` uses the sessions' default mode in its "has not routed" note and names settings files it cannot use; the repository-root `.claude/settings.local.json` is read for subdirectory and worktree sessions (allow rules only where Claude Code trusts it); the bench harness pins its config dirs. Follow-up in §4.I: record commands the hook left so `doctor` sees mode switches.
 
 ### 4.G Follow-ups from the new languages — done
 - **Progress.** *on main* (2026-11-19). Components reach the JS tests that import them; languages without a runner fall back (`data-unlinked`) instead of planning nothing; a MATLAB `.m` is data. Elixir edits now block (0 of 1,376 real files had parse errors); Objective-C, PowerShell, Julia and Groovy stay report-only (8–30% of real files had errors). `.mm` and Perl are closed in docs/decisions.md.
