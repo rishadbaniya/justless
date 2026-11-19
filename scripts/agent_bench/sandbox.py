@@ -99,8 +99,10 @@ def profile(run_dir, deny_read=(), allow_read=(), allow_write=(), allow_exec=(),
 def default_denies(config, extra=()):
     """The read-deny list shared by every run."""
     denies = [config.HOME, config.RUNROOT, config.CORPUS, config.SCRATCH, config.USER_HOME]
-    if Path("/private/tmp/claude-502").exists():
-        denies.append(Path("/private/tmp/claude-502"))
+    # Claude Code's per-user temporary folder holds other sessions' scratch files.
+    claude_tmp = Path("/private/tmp") / f"claude-{os.getuid()}"
+    if claude_tmp.exists():
+        denies.append(claude_tmp)
     return [d for d in denies if d] + list(extra)
 
 

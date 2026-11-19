@@ -108,7 +108,7 @@ Prices come from the pricing page as checked on 2026-11-18 and live in `data/pri
 
 ### How to run
 
-Set `AGENT_BENCH_HOME` and `AGENT_BENCH_RUNROOT` to durable private directories first; the defaults live in a scratch directory that can be wiped. The Python bug-fix target is described in `$AGENT_BENCH_HOME/private/python_task.json`, outside the repository because it names private code. Paid commands refuse to start until every secret-scan hit in the snapshots is reviewed: `prepare` lists them, and reviewed `path:line:kind` entries go in `$AGENT_BENCH_HOME/secret_allowlist.json`.
+The store, runs and corpus default to `~/.local/share/justless-bench/{store,runs,corpus}`, a private folder outside the repository; `AGENT_BENCH_SCRATCH` moves all three, and `AGENT_BENCH_HOME`, `AGENT_BENCH_RUNROOT` and `AGENT_BENCH_CORPUS` move one each. The Python bug-fix target is described in `$AGENT_BENCH_HOME/private/python_task.json`, outside the repository because it names private code. Paid commands refuse to start until every secret-scan hit in the snapshots is reviewed: `prepare` lists them, and reviewed `path:line:kind` entries go in `$AGENT_BENCH_HOME/secret_allowlist.json`.
 
 Build the binary under test from the commit being measured, then run these from the repository root. Every step before `pilot` is free.
 

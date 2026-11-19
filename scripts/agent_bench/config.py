@@ -12,15 +12,15 @@ DATA = BENCH_DIR / "data"
 PROMPTS = BENCH_DIR / "prompts"
 PUBLIC_TASKS = BENCH_DIR / "tasks" / "public.json"
 
-# Default locations from the design session. Each can be overridden by environment
-# variable or command-line flag. The store holds private tasks, truth, transcripts and
-# the Claude Code capture; it is never committed.
+# Default locations, in a private folder outside the repository. Each can be overridden
+# by environment variable or command-line flag. The store holds private tasks, truth,
+# transcripts and the Claude Code capture; it is never committed.
 SCRATCH = Path(os.environ.get(
     "AGENT_BENCH_SCRATCH",
-    "/private/tmp/claude-502/-Users-exvalue-dev-justless/06805bcb-b524-4f2c-971a-5291fdf9b057/scratchpad"))
-HOME = Path(os.environ.get("AGENT_BENCH_HOME", str(SCRATCH / "agent_bench_store")))
-CORPUS = Path(os.environ.get("AGENT_BENCH_CORPUS", str(SCRATCH / "qa" / "corpus")))
-RUNROOT = Path(os.environ.get("AGENT_BENCH_RUNROOT", str(SCRATCH / "agent_bench_runs")))
+    str(Path(os.path.expanduser("~")) / ".local" / "share" / "justless-bench")))
+HOME = Path(os.environ.get("AGENT_BENCH_HOME", str(SCRATCH / "store")))
+CORPUS = Path(os.environ.get("AGENT_BENCH_CORPUS", str(SCRATCH / "corpus")))
+RUNROOT = Path(os.environ.get("AGENT_BENCH_RUNROOT", str(SCRATCH / "runs")))
 USER_HOME = Path(os.path.expanduser("~"))
 CARGO_HOME = Path(os.environ.get("CARGO_HOME", str(USER_HOME / ".cargo")))
 RUSTUP_HOME = Path(os.environ.get("RUSTUP_HOME", str(USER_HOME / ".rustup")))
