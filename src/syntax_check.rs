@@ -145,6 +145,14 @@ pub fn parser_name(file: &str) -> Option<&'static str> {
         Grammar::Hcl => "HCL",
         Grammar::Lua => "Lua",
         Grammar::Zig => "Zig",
+        Grammar::Elixir => "Elixir",
+        Grammar::ObjectiveC => "Objective-C",
+        Grammar::PowerShell => "PowerShell",
+        Grammar::Julia => "Julia",
+        Grammar::Groovy => "Groovy",
+        // A component parses only after its script blocks are cut out, which
+        // the index does and this check does not.
+        Grammar::Vue | Grammar::Svelte | Grammar::Astro => return None,
     })
 }
 
@@ -155,10 +163,22 @@ pub fn parser_name(file: &str) -> Option<&'static str> {
 /// found errors in 2,532 of 4,000 C files, 404 of 938 C++ files and 1 of 257
 /// shell scripts, against 4 of 2,854 Ruby files and none of 4,000 Rust, 470
 /// Python, 212 Lua, 84 JavaScript and 45 Java files.
+/// The Elixir, Objective-C, PowerShell, Julia and Groovy grammars were added
+/// after that scan, so their problems are only reported until measured the
+/// same way.
 pub fn blocks(file: &str) -> bool {
     !matches!(
         Grammar::for_file(file),
-        Some(Grammar::C | Grammar::Cpp | Grammar::Bash)
+        Some(
+            Grammar::C
+                | Grammar::Cpp
+                | Grammar::Bash
+                | Grammar::Elixir
+                | Grammar::ObjectiveC
+                | Grammar::PowerShell
+                | Grammar::Julia
+                | Grammar::Groovy
+        )
     )
 }
 
