@@ -116,12 +116,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Progress.** *partial, past half*: new `src/syntax_check.rs` (594 lines), `source.rs` +156, `rust_syntax.rs` +33, the Claude Code hook in `agents.rs` +66, 337 lines of CLI tests and progressive-test updates. Not compiled clean, probed or reviewed.
 - **Next.** Finish; test for false rejections across all 21 languages (macros, decorators, templates); measure parse cost on large files; review.
 
-### 2.4 `find` scoping, paging and search guidance
-- **Branch.** `worktree-wf_c5c37048-0d9-1` (1 wip commit, tests only: `tests/cli.rs` +487, `tests/mcp.rs` +91).
-- **Problem.** Reviewers asked for `--path`/`--glob` on `find`; with 60 matching files and `--budget 512` only five matches appeared, and raising `--limit` changed nothing, with no way to get the next page. The installed instructions do not say which search to use.
-- **Plan.** `--path` and `--glob` (rg -g semantics, `!` negation) on CLI and MCP; an empty scope says so; a cut notice naming which limit bound ("budget reached after 5 of 60 files") and a ready `--after CURSOR` next-page command, also in JSON and MCP; one compact instruction line: `find` for literals, `query` for symbols and callers, `lookup` for questions, `rg` for regular expressions.
-- **Progress.** *partial, tests first*: the failing tests are written; no implementation yet.
-- **Next.** Implement against those tests; measure the instruction block (now about 882 bytes, budget +120).
+### 2.4 `find` scoping, paging and search guidance — done
+- **Progress.** *on main* (2026-11-19, `src/find.rs`). `--path` and `--glob` (rg -g semantics) on the CLI and MCP; an empty scope says so; a cut page names the bound that cut it and prints a `--after CURSOR` next page, rejected with a clear message when the search or the stop file changed. The instruction block gained one line on which search to use (882 → 995 bytes). The MCP tool list is 7,971 of its 8,000-byte cap, so the next MCP parameter must make room.
 
 ### 2.5 `resume` misses whole-file reads — done
 - **Branch.** `fix/resume-whole-file-reads` (1 commit `5faf9dd`, on the current history, 6 files, +298 −21).
