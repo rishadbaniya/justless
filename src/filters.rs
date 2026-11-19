@@ -446,9 +446,9 @@ fn option_values<'a>(args: &'a [&'a str], names: &'a [&str]) -> impl Iterator<It
         })
 }
 
-/// `gh api` options for a GET request whose response is printed as it came: no
-/// fields or input, which make it a POST, no other method, and no `--jq` or
-/// `--template`, which print something else.
+/// `gh api` options for a GET request to a GitHub endpoint path whose response is
+/// printed as it came: no fields or input, which make it a POST, no other method,
+/// no full URL, and no `--jq` or `--template`, which print something else.
 fn gh_api(args: &[&str]) -> bool {
     const VALUED: &[&str] = &[
         "-H",
@@ -460,7 +460,9 @@ fn gh_api(args: &[&str]) -> bool {
         "-p",
         "--preview",
     ];
-    matches!(operands(args, VALUED).as_slice(), [endpoint] if *endpoint != "graphql")
+    // A full URL could name another host.
+    matches!(operands(args, VALUED).as_slice(),
+        [endpoint] if *endpoint != "graphql" && !endpoint.contains("://"))
         && display_options(
             args,
             &["--paginate", "--slurp", "-i", "--include"],

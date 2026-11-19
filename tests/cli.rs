@@ -2293,6 +2293,7 @@ fn hooks_without_a_post_run_hook_route_json_reads_left_to_their_reader() {
         "gh api repos/acme/ledger/issues -f title=x",
         "gh api --input body.json repos/acme/ledger/issues",
         "gh api graphql",
+        "gh api https://example.com/repos/acme/ledger",
         "gh api repos/acme/ledger -H 'X-HTTP-Method-Override: DELETE'",
         "gh api repos/acme/ledger --jq .name",
         "gh pr list --json number --jq '.[].number'",

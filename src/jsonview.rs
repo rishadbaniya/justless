@@ -242,19 +242,23 @@ fn compacted(node: &Node) -> String {
     out
 }
 
-/// The view of JSON output, when it is smaller than `text` and decodes to the same
-/// data: the tables, or the compact JSON when no table helps or it is smaller.
+/// The views of JSON output that are smaller than `text` and decode to the same
+/// data, smallest first: the tables, when a table helps, and the compact JSON.
 /// `group` also folds consecutive rows that share a field's value.
-pub fn render(text: &str, group: bool) -> Option<String> {
+pub fn views(text: &str, group: bool) -> Vec<String> {
     if text.len() < MIN_BYTES || text.len() > LIMIT {
-        return None;
+        return Vec::new();
     }
-    let json = Json::read(text)?;
-    [json.tables(group), json.compact()]
+    let Some(json) = Json::read(text) else {
+        return Vec::new();
+    };
+    let mut views: Vec<String> = [json.tables(group), json.compact()]
         .into_iter()
         .flatten()
         .filter(|view| view.len() < text.len())
-        .min_by_key(String::len)
+        .collect();
+    views.sort_by_key(String::len);
+    views
 }
 
 /// Output read as one JSON array or object, or as JSON lines whose records are
@@ -751,7 +755,12 @@ mod tests {
         format!("{text}{}", " ".repeat(MIN_BYTES))
     }
 
-    /// The table view alone, which `render` shows unless the compact JSON is smaller.
+    /// The smallest view.
+    fn render(text: &str, group: bool) -> Option<String> {
+        views(text, group).into_iter().next()
+    }
+
+    /// The table view alone, which `render` gives unless the compact JSON is smaller.
     fn tables(text: &str, group: bool) -> Option<String> {
         Json::read(text)?
             .tables(group)

@@ -133,6 +133,50 @@ fn json_reads_stay_exact_when_they_fit_unless_compact_json_is_smaller() {
 }
 
 #[test]
+fn compact_json_too_long_to_cut_gives_way_to_tables() {
+    // Quoted keys make the tables larger than the compact JSON, which is one line
+    // longer than the budget, so the tables are cut instead.
+    let mut members: Vec<String> = (0..70)
+        .map(|i| format!("  \"note {i:02}\": \"value {i} for this resource, long enough\""))
+        .collect();
+    let ports: Vec<String> = (0..6)
+        .map(|i| {
+            format!(
+                "    {{\"name\": \"port-{i}\", \"port\": {}, \"protocol\": \"TCP\"}}",
+                8000 + i
+            )
+        })
+        .collect();
+    members.push(format!("  \"ports\": [\n{}\n  ]", ports.join(",\n")));
+    let json = format!("{{\n{}\n}}\n", members.join(",\n"));
+    let dir = workspace("");
+    let root = dir.path();
+    fs::write(root.join("data.json"), &json).unwrap();
+    let output = justless(
+        root,
+        &[
+            "run",
+            "--hook",
+            "--max-bytes",
+            "2048",
+            "--",
+            "cat",
+            "data.json",
+        ],
+    );
+    let shown = text(&output.stdout);
+    assert!(
+        shown.starts_with("[JSON object with arrays of objects as tables: "),
+        "{shown}"
+    );
+    assert!(shown.contains("\"note 00\": \"value 0"), "{shown}");
+    assert!(
+        shown.contains(" more lines of this view in the full log]\n"),
+        "{shown}"
+    );
+}
+
+#[test]
 fn previews_collapse_progress_encoded_runs_and_repeats() {
     let dir = workspace("");
     let root = dir.path();

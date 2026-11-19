@@ -1906,7 +1906,7 @@ fn read_text(mut file: &File, length: u64, limit: u64) -> Option<String> {
 }
 
 /// Stdout shown as JSON tables or compact JSON, clipped at whole lines to
-/// `max_bytes`, when the view is smaller and decodes to the same data. See
+/// `max_bytes`, when a view is smaller and decodes to the same data. See
 /// `jsonview`.
 fn json_view(
     mut file: &File,
@@ -1942,7 +1942,16 @@ fn json_view(
     if text.contains("\"compiler-message\"") {
         return None;
     }
-    let view = crate::jsonview::render(&text, group)?;
+    // The smallest view that fits or can be cut: a compact document on one line
+    // longer than the budget cannot be, and the tables then still can.
+    crate::jsonview::views(&text, group)
+        .into_iter()
+        .find_map(|view| clip_view(view, max_bytes))
+}
+
+/// A view cut at a whole line to `max_bytes`, with a marker, unless that leaves
+/// too little of it.
+fn clip_view(view: String, max_bytes: usize) -> Option<Vec<u8>> {
     if view.len() <= max_bytes {
         return Some(view.into_bytes());
     }
