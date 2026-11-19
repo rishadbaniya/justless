@@ -2,6 +2,7 @@ mod adaptive;
 mod agents;
 mod batch;
 mod capture;
+mod claude_permissions;
 mod context;
 mod discover;
 mod doctests;

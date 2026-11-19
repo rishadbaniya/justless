@@ -383,6 +383,9 @@ impl Doctor<'_> {
                 if audit.hooked {
                     section.checks.extend(routing_note(profile, &facts));
                 }
+                if profile.agent == Agent::Claude {
+                    section.checks.extend(self.claude_permission_checks());
+                }
                 status = section.worst();
                 sections.push(section);
             } else if let Some(cli) = &audit.cli {
@@ -803,6 +806,30 @@ impl Doctor<'_> {
             instructed,
             checks,
         }
+    }
+
+    /// Claude Code allow rules, such as `Bash(justless run *)` saved by "Yes, and
+    /// don't ask again" on a routed command, that let the agent run any command as
+    /// `justless run -- COMMAND` without asking. The command hook does not need
+    /// them: it approves a routed command when the rules allow the command itself.
+    fn claude_permission_checks(&self) -> Vec<Check> {
+        let sources =
+            crate::claude_permissions::Sources::locate(&self.workspace.root, &self.workspace.root);
+        crate::claude_permissions::broad_justless_rules(&sources)
+            .into_iter()
+            .map(|(file, rule)| {
+                let file = self.relative(&file.display().to_string());
+                Check::new(
+                    Status::Warn,
+                    format!(
+                        "Permissions: {rule} in {file} lets the agent run any command without asking, as `justless run -- COMMAND`"
+                    ),
+                )
+                .fix(Fix::Manual(format!(
+                    "Remove {rule} from {file}, and allow the commands themselves instead, such as Bash(cargo test *); the command hook approves a routed command those rules allow"
+                )))
+            })
+            .collect()
     }
 
     /// The agent's hook file: whether it holds Justless entries, and its checks.

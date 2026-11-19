@@ -959,9 +959,30 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value) -> Option<Value
             approves: agent == Agent::Codex,
         },
     )?);
+    // Claude Code checks its permission rules against the rewritten command, so
+    // when it reports a mode, the rules are judged on the original first. See
+    // `claude_permissions`. A routed line always splits into its commands.
+    let mut approve = agent == Agent::Codex;
+    if agent == Agent::Claude
+        && let Some(mode) = crate::claude_permissions::mode(input)
+    {
+        let segments: Vec<&str> = split_compound(command)?
+            .into_iter()
+            .map(|range| &command[range])
+            .collect();
+        match crate::claude_permissions::decide(&workspace.root, mode, &segments) {
+            crate::claude_permissions::Answer::Leave => return None,
+            crate::claude_permissions::Answer::Rewrite => {}
+            crate::claude_permissions::Answer::Approve => approve = true,
+        }
+    }
     let mut hook = json!({"hookEventName":"PreToolUse","updatedInput":updated});
-    if agent == Agent::Codex {
+    if approve {
         hook["permissionDecision"] = json!("allow");
+    }
+    if approve && agent == Agent::Claude {
+        hook["permissionDecisionReason"] =
+            json!("Justless routed a command that Claude Code permission rules allow");
     }
     if command.trim_start().starts_with("rg ") {
         hook["additionalContext"] = json!(format!(

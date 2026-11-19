@@ -748,6 +748,18 @@ fn hook(root: &Path, mode: &str, input: serde_json::Value) -> serde_json::Value 
     agent_hook(root, "hook-codex", mode, input)
 }
 
+/// Variables that point a Claude Code hook's user and managed settings at paths
+/// that do not exist, so a test never reads the machine's own settings.
+fn no_claude_settings(root: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("CLAUDE_CONFIG_DIR", root.join(".no-claude-config")),
+        (
+            "JUSTLESS_TEST_CLAUDE_MANAGED_DIR",
+            root.join(".no-claude-managed"),
+        ),
+    ]
+}
+
 fn agent_hook(
     root: &Path,
     handler: &str,
@@ -757,6 +769,8 @@ fn agent_hook(
     let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
         .args([handler, mode])
         .current_dir(root)
+        .envs(no_claude_settings(root))
+        .env_remove("CLAUDE_PROJECT_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -788,6 +802,208 @@ fn claude_tail(agent: &str, command: &str) -> &'static str {
     } else {
         ""
     }
+}
+
+/// What the Claude Code command hook did with a call: left it, rewrote it, or
+/// rewrote and approved it.
+#[cfg(unix)]
+fn claude_answer(output: &serde_json::Value) -> &'static str {
+    if output == &serde_json::json!({}) {
+        return "leave";
+    }
+    let hook = &output["hookSpecificOutput"];
+    assert!(
+        hook["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("justless run --hook -- "),
+        "{output}"
+    );
+    match hook.get("permissionDecision") {
+        None => "rewrite",
+        Some(decision) => {
+            assert_eq!(decision, "allow", "{output}");
+            assert!(hook["permissionDecisionReason"].is_string(), "{output}");
+            "approve"
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_hook_keeps_the_permission_rules_of_the_original_command() {
+    use serde_json::{Value, json};
+    let repo = mixed_fixture();
+    let root = repo.path().canonicalize().unwrap();
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config");
+    let managed = temp.path().join("managed");
+    let home = temp.path().join("home");
+    let write = |path: &Path, text: &str| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(
+        &config.join("settings.json"),
+        r#"{"permissions":{"allow":["Bash(git status:*)","Bash(git log *)","Bash(rg:*)"]}}"#,
+    );
+    write(
+        &root.join(".claude/settings.json"),
+        r#"{"permissions":{"ask":["Bash(git log:*)"]}}"#,
+    );
+    let local = root.join(".claude/settings.local.json");
+    write(&local, r#"{"permissions":{"allow":["Bash(echo *)"]}}"#);
+    write(
+        &managed.join("managed-settings.json"),
+        r#"{"permissions":{"deny":["Bash(rg fetch*)"]}}"#,
+    );
+    let run = |command: &str, mode: Option<&str>, user: Option<&Path>| -> Value {
+        let mut input = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
+            "tool_input":{"command":command,"description":"check"}});
+        if let Some(mode) = mode {
+            input["permission_mode"] = json!(mode);
+        }
+        let mut hook = Command::new(env!("CARGO_BIN_EXE_justless"));
+        hook.args(["hook-claude", "before-command"])
+            .current_dir(&root)
+            .env("CLAUDE_PROJECT_DIR", &root)
+            .env("JUSTLESS_TEST_CLAUDE_MANAGED_DIR", &managed)
+            .env("HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        match user {
+            Some(config) => hook.env("CLAUDE_CONFIG_DIR", config),
+            None => hook.env_remove("CLAUDE_CONFIG_DIR"),
+        };
+        let mut child = hook.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let modes = [
+        None,
+        Some("default"),
+        Some("acceptEdits"),
+        Some("dontAsk"),
+        Some("bypassPermissions"),
+        Some("auto"),
+        Some("someNewMode"),
+    ];
+    // Each command's answer in each mode above. Without a mode the hook rewrites
+    // as it always has. Deny and ask rules leave the command in every mode; an
+    // allowed one is approved, except in auto mode, where Claude Code's classifier
+    // reviews it; one that no rule allows is rewritten only where Claude Code
+    // would not ask about the rewrite.
+    let allowed = [
+        "rewrite", "approve", "approve", "approve", "approve", "rewrite", "leave",
+    ];
+    let held = [
+        "rewrite", "leave", "leave", "leave", "leave", "leave", "leave",
+    ];
+    let unknown = [
+        "rewrite", "leave", "leave", "leave", "rewrite", "rewrite", "leave",
+    ];
+    for (command, answers) in [
+        // Allowed by a user rule.
+        ("git status", allowed),
+        // Every command of a list is allowed, by user and local rules.
+        ("git status && echo done", allowed),
+        ("rg list_orders frontend", allowed),
+        // The project's ask rule beats the user's allow rule.
+        ("git log -1", held),
+        // A managed deny rule beats the user's allow rule, and matches through an
+        // assignment.
+        ("rg fetch frontend", held),
+        ("NO_COLOR=1 rg fetch frontend", held),
+        // No rule covers it, or not every command of the list.
+        ("git diff", unknown),
+        ("git status && git diff", unknown),
+        ("NO_COLOR=1 git status", unknown),
+    ] {
+        for (mode, expected) in modes.iter().zip(answers) {
+            let output = run(command, *mode, Some(&config));
+            assert_eq!(
+                claude_answer(&output),
+                expected,
+                "{command} {mode:?}: {output}"
+            );
+        }
+    }
+    let approved = run("git status", Some("default"), Some(&config));
+    assert_eq!(
+        approved["hookSpecificOutput"]["updatedInput"],
+        json!({"command":"justless run --hook -- git status","description":"check"})
+    );
+
+    // A settings file that cannot be parsed might deny anything.
+    write(&local, "{");
+    assert_eq!(
+        run("git status", Some("bypassPermissions"), Some(&config)),
+        json!({})
+    );
+    write(&local, r#"{"permissions":{"allow":["Bash(echo *)"]}}"#);
+
+    // Without CLAUDE_CONFIG_DIR, the user settings come from the home directory.
+    assert_eq!(
+        claude_answer(&run("git diff", Some("default"), None)),
+        "leave"
+    );
+    write(
+        &home.join(".claude/settings.json"),
+        r#"{"permissions":{"allow":["Bash(git diff)"]}}"#,
+    );
+    assert_eq!(
+        claude_answer(&run("git diff", Some("default"), None)),
+        "approve"
+    );
+    assert_eq!(
+        claude_answer(&run("git status", Some("default"), None)),
+        "leave"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_warns_about_allow_rules_that_let_justless_run_anything() {
+    let tools = doctor_tools(&["claude"]);
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    success(root, &["init", "--hooks", "--agent", "claude"]);
+    let (_, text) = doctor_text(root, tools.path());
+    assert!(!text.contains("Permissions:"), "{text}");
+    fs::write(
+        root.join(".claude/settings.local.json"),
+        r#"{"permissions":{"allow":["Bash(justless run *)","Bash(justless query:*)","Bash(cargo test *)"]}}"#,
+    )
+    .unwrap();
+    let user = tools.path().join("home/.claude/settings.json");
+    fs::create_dir_all(user.parent().unwrap()).unwrap();
+    fs::write(&user, r#"{"permissions":{"allow":["Bash(justless:*)"]}}"#).unwrap();
+    let (status, text) = doctor_text(root, tools.path());
+    assert_eq!(status, Some(0), "{text}");
+    assert!(
+        text.contains("! Permissions: Bash(justless run *) in .claude/settings.local.json lets the agent run any command without asking"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "! Permissions: Bash(justless:*) in {} lets",
+            user.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("Remove Bash(justless run *) from .claude/settings.local.json"),
+        "{text}"
+    );
+    assert!(!text.contains("justless query"), "{text}");
 }
 
 #[test]
@@ -5603,6 +5819,7 @@ fn doctor_shell(dir: &Path, tools: &Path, path: &str, line: &str) -> Output {
         .env_clear()
         .env("PATH", path)
         .env("HOME", tools.join("home"))
+        .env("JUSTLESS_TEST_CLAUDE_MANAGED_DIR", tools.join("managed"))
         .output()
         .unwrap()
 }
@@ -7624,6 +7841,7 @@ fn claude_hook(
         .args(["hook-claude", mode])
         .current_dir(cwd)
         .env("CLAUDE_PROJECT_DIR", project)
+        .envs(no_claude_settings(project))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -7662,7 +7880,7 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
     // the nested repository. The hook names the outer workspace root, so that
     // run is recorded in the outer project, where `justless log` finds it.
     let event = json!({"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash",
-        "cwd":outer,"permission_mode":"default","tool_input":{"command":"cd nested && git status"}});
+        "cwd":outer,"permission_mode":"bypassPermissions","tool_input":{"command":"cd nested && git status"}});
     let routed = claude_hook(&outer, &outer, "before-command", event);
     let command = routed["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
