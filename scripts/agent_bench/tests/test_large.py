@@ -276,6 +276,16 @@ class GeneratorHelperTests(unittest.TestCase):
         self.assertNotIn("LATE", shown)
         self.assertTrue(shown.startswith("Exit code 101"))
 
+    def test_test_module_files_are_found(self):
+        root = helpers.tempdir(self)
+        (root / "src" / "price").mkdir(parents=True)
+        (root / "src" / "lib.rs").write_text("pub mod price;\n#[cfg(test)]\nmod lib_tests;\n")
+        (root / "src" / "price" / "mod.rs").write_text("#[cfg(test)] mod influence_tests;\npub fn p() {}\n")
+        found = gen_large.test_module_files(root)
+        self.assertIn("src/lib_tests.rs", found)
+        self.assertIn("src/price/influence_tests.rs", found)
+        self.assertNotIn("src/price/mod.rs", found)
+
     def test_pick_spreads_and_spaces(self):
         import random
         cands = [{"file": "f%d.rs" % (i % 3), "offset": i * 50, "lint": "l%d" % (i % 2)} for i in range(30)]
