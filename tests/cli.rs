@@ -15549,7 +15549,7 @@ fn a_replaced_read_names_the_root_to_expand_from_the_agents_directory() {
     let expand = hint
         .split("Expand a row with ")
         .nth(1)
-        .and_then(|rest| rest.split(", or use Read").next())
+        .and_then(|rest| rest.split(", or Read").next())
         .unwrap()
         .replace("FILE", "module.py")
         .replace("'REV#ID'", &format!("'{revision}#1'"));
@@ -16290,7 +16290,9 @@ fn resume_reads(root: &Path, file: &str) -> Vec<String> {
                 || line
                     .strip_prefix("Outline ")
                     .and_then(|rest| rest.strip_prefix(file))
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                    .is_some_and(|rest| {
+                        rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':')
+                    })
         })
         .map(str::to_owned)
         .collect()
@@ -16473,6 +16475,15 @@ fn claude_reads_record_the_lines_or_outline_the_agent_was_shown() {
         resume_reads(&root, "worker.py"),
         ["Read worker.py:1-2 [source changed]"]
     );
+    // Offset 0 reads from line 1, and Read's empty line after a final newline is
+    // not a line of the file.
+    let mut zero = read(&small, "def work():\n    return 2\n", 0, 3, 3);
+    zero["tool_input"]["offset"] = json!(0);
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-read", zero),
+        json!({})
+    );
+    assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
 
     // Images, and files outside the project, are not recorded.
     let before = fs::read_to_string(root.join(".justless/activity.json")).unwrap();
@@ -18186,4 +18197,442 @@ fn init_refreshes_instructions_with_the_search_guidance() {
     ] {
         assert!(instructions.contains(words), "{words}: {instructions}");
     }
+}
+
+/// The Read result Claude Code 2.1.327 returns for `offset` and `limit` of `text`, as
+/// a ranged-Read probe of the real binary recorded it: lines from `max(1, offset)`
+/// joined by `\n`, CRLF read as LF, a final newline counted as one more, empty line,
+/// at most 2,000 lines without a limit, and `startLine` equal to the offset.
+fn native_read(
+    path: &Path,
+    text: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> serde_json::Value {
+    let normalized = text.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let start = offset.unwrap_or(1);
+    let first = start.max(1) as usize;
+    let end = (first - 1 + limit.unwrap_or(2000) as usize).min(lines.len());
+    let window = &lines[first - 1..end];
+    let mut input = serde_json::json!({"file_path": path});
+    if let Some(offset) = offset {
+        input["offset"] = offset.into();
+    }
+    if let Some(limit) = limit {
+        input["limit"] = limit.into();
+    }
+    serde_json::json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+        "tool_input":input,"tool_response":{"type":"text","file":{"filePath":path,
+        "content":window.join("\n"),"numLines":window.len(),"startLine":start,
+        "totalLines":lines.len()}}})
+}
+
+/// Source lines `first..=last` of `text`, with their line endings.
+fn source_lines(text: &str, first: usize, last: usize) -> String {
+    text.split_inclusive('\n')
+        .skip(first - 1)
+        .take(last + 1 - first)
+        .collect()
+}
+
+#[test]
+fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    fs::create_dir(root.join("src")).unwrap();
+    // 30 functions of 20 lines each.
+    let source: String = (0..30)
+        .map(|i| {
+            format!(
+                "/// Converts reading {i} into a calibrated value.\npub fn calibrate_{i:02}(raw: u64, offset: u64) -> u64 {{\n{}    raw.wrapping_add(offset)\n}}\n\n",
+                format!("    let step_{i} = raw.saturating_mul({i});\n").repeat(15)
+            )
+        })
+        .collect();
+    let path = root.join("src/lib.rs");
+    fs::write(&path, &source).unwrap();
+    let read = |offset: Option<u64>, limit: Option<u64>| {
+        agent_hook(
+            &root,
+            "hook-claude",
+            "after-read",
+            native_read(&path, &source, offset, limit),
+        )
+    };
+    let revision = success(&root, &["read", "src/lib.rs", "--outline"])
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+
+    // Lines 110-409 become the rows that overlap them, numbered as in the whole
+    // outline, with the revision. Rows are not source lines, so they count from 1.
+    let output = read(Some(110), Some(300));
+    let hook = &output["hookSpecificOutput"];
+    let file = &hook["updatedToolOutput"]["file"];
+    let content = file["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{output}"));
+    let mut rows = content.lines();
+    assert_eq!(
+        rows.next().unwrap(),
+        format!("revision {revision} · 600 lines · window L110-409")
+    );
+    let rows: Vec<&str> = rows.collect();
+    assert_eq!(rows.len(), 16, "{content}");
+    assert_eq!(
+        rows[0],
+        "#6 L101-119 function calibrate_05  pub fn calibrate_05(raw: u64, offset: u64) -> u64"
+    );
+    assert_eq!(
+        rows[15],
+        "#21 L401-419 function calibrate_20  pub fn calibrate_20(raw: u64, offset: u64) -> u64"
+    );
+    assert_eq!(hook["updatedToolOutput"]["type"], "text");
+    assert_eq!(file["filePath"], path.to_str().unwrap());
+    assert_eq!(file["startLine"], 1);
+    assert_eq!(file["numLines"], 17);
+    assert_eq!(file["totalLines"], 601);
+    assert_eq!(
+        hook["additionalContext"],
+        "Justless outline of lines 110-409, the lines this Read returned. L ranges are source line numbers. The same Read with allow_large: true returns those lines as they are, a Read of at most 150 lines is never outlined, and `justless expand src/lib.rs 'REV#ID'` prints one row."
+    );
+    // `resume` lists the window as an outline of those lines, beside the whole
+    // outline `read` showed.
+    assert_eq!(
+        resume_reads(&root, "src/lib.rs"),
+        ["Outline src/lib.rs:110-409", "Outline src/lib.rs"]
+    );
+    // The same Read with `allow_large` arrives as Read returned it. A row's ID
+    // expands to its definition through its closing brace, and neither the command
+    // nor its output is routed or compacted. `expand` of a line range is exact too.
+    let mut whole = native_read(&path, &source, Some(110), Some(300));
+    whole["tool_input"]["allow_large"] = true.into();
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-read", whole),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        resume_reads(&root, "src/lib.rs")[0],
+        "Read src/lib.rs:110-409"
+    );
+    let row = source_lines(&source, 121, 139);
+    let row = row.trim_end_matches('\n');
+    assert_eq!(
+        success(&root, &["expand", "src/lib.rs", &format!("{revision}#7")]),
+        row
+    );
+    let expand = format!("justless expand src/lib.rs '{revision}#7'");
+    let call = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,
+        "tool_input":{"command":expand}});
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "before-command", call),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        after_bash(&root, &root, &expand, bash_result(&row.repeat(20))),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        success(&root, &["expand", "src/lib.rs", "L110-409"]),
+        source_lines(&source, 110, 409)
+    );
+
+    // A Read of at most 150 lines arrives as Read returned it, however long its
+    // lines, so following the hint never meets an outline.
+    assert_eq!(read(Some(100), Some(150)), serde_json::json!({}));
+    let wide: String = source
+        .lines()
+        .map(|line| format!("{line} // {}\n", "x".repeat(300)))
+        .collect();
+    fs::write(&path, &wide).unwrap();
+    let event = native_read(&path, &wide, Some(100), Some(150));
+    assert!(
+        event["tool_response"]["file"]["content"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 45_000
+    );
+    assert_eq!(
+        agent_hook(&root, "hook-claude", "after-read", event),
+        serde_json::json!({})
+    );
+    // 151 lines is a wide window.
+    let event = native_read(&path, &wide, Some(100), Some(151));
+    assert!(agent_hook(&root, "hook-claude", "after-read", event)["hookSpecificOutput"]
+        ["updatedToolOutput"]
+        .is_object());
+
+    // A whole outline now names the largest Read that stays as it is.
+    fs::write(&path, &source).unwrap();
+    let whole = read(None, None);
+    assert!(
+        whole["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .ends_with("or Read original lines with offset and a limit of at most 150."),
+        "{whole}"
+    );
+}
+
+#[test]
+fn claude_read_keeps_ranged_reads_it_cannot_outline_exactly() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    let functions: String = (0..60)
+        .map(|i| {
+            format!(
+                "pub fn handler_{i:02}(request: &Request) -> Response {{\n{}    Response::ok()\n}}\n\n",
+                "    request.validate().expect(\"a request that passes validation\");\n"
+                    .repeat(6)
+            )
+        })
+        .collect();
+    let write = |name: &str, text: &str| {
+        let path = root.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    };
+    let path = write("lib.rs", &functions);
+    let hook = |event: serde_json::Value| agent_hook(&root, "hook-claude", "after-read", event);
+    let replaced = |event: serde_json::Value| {
+        hook(event)["hookSpecificOutput"]["updatedToolOutput"].is_object()
+    };
+    let wide = || native_read(&path, &functions, Some(50), Some(300));
+    assert!(replaced(wide()));
+
+    // The request asks for the lines as they are, or for something else.
+    let mut event = wide();
+    event["tool_input"]["allow_large"] = json!(true);
+    assert_eq!(hook(event), json!({}));
+    let mut event = wide();
+    event["tool_input"]["pages"] = json!("1-2");
+    assert_eq!(hook(event), json!({}));
+    let mut event = wide();
+    event["tool_response"]["type"] = json!("notebook");
+    assert_eq!(hook(event), json!({}));
+    let mut event = wide();
+    event["tool_response"]["file"]["truncatedByTokenCap"] = json!(true);
+    assert_eq!(hook(event), json!({}));
+    // The response must be the requested range of this file as it is now.
+    let mut event = wide();
+    event["tool_input"]["offset"] = json!(49);
+    assert_eq!(hook(event), json!({}));
+    let mut event = wide();
+    event["tool_input"]["limit"] = json!(299);
+    assert_eq!(hook(event), json!({}));
+    let mut event = wide();
+    event["tool_response"]["file"]["filePath"] = json!(root.join("other.rs"));
+    assert_eq!(hook(event), json!({}));
+    let mut event = wide();
+    event["tool_response"]["file"]["totalLines"] = json!(1000);
+    assert_eq!(hook(event), json!({}));
+    let mut event = wide();
+    event["tool_input"]["offset"] = json!(u64::MAX);
+    event["tool_response"]["file"]["startLine"] = json!(u64::MAX);
+    assert_eq!(hook(event), json!({}));
+    fs::write(&path, functions.replace("handler_30", "handler_x")).unwrap();
+    assert_eq!(hook(wide()), json!({}));
+    fs::write(&path, &functions).unwrap();
+    // Numeric strings for the range are read as numbers.
+    let mut event = wide();
+    event["tool_input"]["offset"] = json!("50");
+    event["tool_input"]["limit"] = json!("300");
+    assert!(replaced(event));
+
+    // Files outside the workspace, formats without parser rows, and Rust that does
+    // not parse.
+    let outside = TempDir::new().unwrap();
+    let elsewhere = outside.path().canonicalize().unwrap().join("lib.rs");
+    fs::write(&elsewhere, &functions).unwrap();
+    assert_eq!(
+        hook(native_read(&elsewhere, &functions, Some(50), Some(300))),
+        json!({})
+    );
+    for name in ["notes.txt", "config.toml"] {
+        let path = write(name, &functions);
+        assert_eq!(
+            hook(native_read(&path, &functions, Some(50), Some(300))),
+            json!({}),
+            "{name}"
+        );
+    }
+    let broken = functions.replace(
+        "handler_59(request: &Request)",
+        "handler_59(request: &Request",
+    );
+    let path = write("broken.rs", &broken);
+    assert_eq!(
+        hook(native_read(&path, &broken, Some(50), Some(300))),
+        json!({})
+    );
+
+    // A window inside one long function, or mostly inside one, has nothing for the
+    // rows to divide.
+    let long = format!(
+        "pub fn small() {{}}\n\npub fn long() {{\n{}}}\n\npub fn tail() {{}}\n",
+        "    step();\n".repeat(400)
+    );
+    let path = write("long.rs", &long);
+    for (offset, limit) in [(10, 300), (1, 300), (250, 200)] {
+        assert_eq!(
+            hook(native_read(&path, &long, Some(offset), Some(limit))),
+            json!({}),
+            "{offset} {limit}"
+        );
+    }
+    // Rows that would not fit the context budget even without their signatures.
+    let many: String = (0..400)
+        .map(|i| format!("fn tiny_function_number_{i:03}() {{}}\n"))
+        .collect();
+    let path = write("many.rs", &many);
+    assert_eq!(
+        hook(native_read(&path, &many, Some(1), Some(400))),
+        json!({})
+    );
+}
+
+#[test]
+fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    let functions: String = (0..80)
+        .map(|i| {
+            format!(
+                "pub fn handler_{i:02}(request: &Request) -> Response {{\n{}    Response::ok()\n}}\n\n",
+                "    request.validate().expect(\"a request that passes validation\");\n"
+                    .repeat(3)
+            )
+        })
+        .collect();
+    let hook = |path: &Path, text: &str, offset: Option<u64>, limit: Option<u64>| {
+        agent_hook(
+            &root,
+            "hook-claude",
+            "after-read",
+            native_read(path, text, offset, limit),
+        )
+    };
+    let header = |output: &serde_json::Value| {
+        let content = output["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{output}"))
+            .to_owned();
+        content.lines().next().unwrap().to_owned()
+    };
+    let expand = |name: &str, range: &str| {
+        let output = cli(&root, &["expand", name, range]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        output.stdout
+    };
+
+    // CRLF lines reach Read as LF lines, and `expand` prints the file's own bytes.
+    let crlf = functions.replace('\n', "\r\n");
+    let path = root.join("crlf.rs");
+    fs::write(&path, &crlf).unwrap();
+    let output = hook(&path, &crlf, Some(20), Some(200));
+    assert!(
+        header(&output).ends_with("· 560 lines · window L20-219"),
+        "{output}"
+    );
+    assert_eq!(
+        expand("crlf.rs", "L20-219"),
+        source_lines(&crlf, 20, 219).into_bytes()
+    );
+    // Offset 0 reads from line 1 with `startLine` 0.
+    let output = hook(&path, &crlf, Some(0), Some(200));
+    assert!(header(&output).ends_with("window L1-200"), "{output}");
+
+    // Read's empty line after a final newline is not a line of the file, and a file
+    // without a final newline ends on its own last line.
+    let path = root.join("lib.rs");
+    fs::write(&path, &functions).unwrap();
+    let output = hook(&path, &functions, Some(300), None);
+    assert!(
+        header(&output).ends_with("· 560 lines · window L300-560"),
+        "{output}"
+    );
+    assert_eq!(
+        expand("lib.rs", "L300-560"),
+        source_lines(&functions, 300, 560).into_bytes()
+    );
+    let trimmed = functions.trim_end_matches('\n');
+    let path = root.join("trimmed.rs");
+    fs::write(&path, trimmed).unwrap();
+    let output = hook(&path, trimmed, Some(300), Some(1000));
+    assert!(
+        header(&output).ends_with("· 559 lines · window L300-559"),
+        "{output}"
+    );
+
+    // Markdown sections.
+    let guide = format!(
+        "# Guide\n\n{}",
+        (1..=30)
+            .map(|i| format!(
+                "## Section {i}\n\n{}\n",
+                "A sentence of guidance that the section explains at length.\n".repeat(12)
+            ))
+            .collect::<String>()
+    );
+    let path = root.join("guide.md");
+    fs::write(&path, &guide).unwrap();
+    let output = hook(&path, &guide, Some(20), Some(300));
+    let content = output["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{output}"));
+    let rows: Vec<&str> = content.lines().skip(1).collect();
+    assert_eq!(rows[0], "#1 L1-452 heading Guide  # Guide");
+    assert_eq!(rows[1], "#3 L18-32 heading Section 2  ## Section 2");
+    assert_eq!(rows.len(), 22, "{content}");
+
+    // Top-level code in the window that no row covers follows the rows verbatim, up
+    // to 20 lines. More keeps the native read.
+    let script = |statements: usize| -> String {
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&format!(
+                "def task_{i:02}(queue):\n{}    return queue\n\n",
+                "    queue.append('a task item that the worker processes in order')\n".repeat(5)
+            ));
+            if i == 20 {
+                for j in 0..statements {
+                    text.push_str(&format!("register(task_{j:02})\n"));
+                }
+                text.push('\n');
+            }
+        }
+        text
+    };
+    let few = script(3);
+    let path = root.join("tasks.py");
+    fs::write(&path, &few).unwrap();
+    let output = hook(&path, &few, Some(100), Some(200));
+    let content = output["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{output}"));
+    assert!(
+        content.ends_with(
+            "Code outside these rows:\nL169: register(task_00)\nL170: register(task_01)\nL171: register(task_02)"
+        ),
+        "{content}"
+    );
+    assert!(
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("code that no row covers follows the rows verbatim")
+    );
+    let more = script(21);
+    fs::write(&path, &more).unwrap();
+    assert_eq!(
+        hook(&path, &more, Some(100), Some(200)),
+        serde_json::json!({})
+    );
 }

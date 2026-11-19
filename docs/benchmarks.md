@@ -327,3 +327,19 @@ What the rows show:
 The new forms cover 9 more commands with 5,840 bytes of output. Pipes account for far more: in the same transcripts, 1,959 commands with 2,004,988 bytes end a command in `2>&1` followed by a pipe, such as `cargo test 2>&1 | tail -50`, and 1,948 commands with 3,047,325 bytes start with an assignment and contain a pipe. Those still pass through the command hook; in Claude Code, the post-command hook compacts their output after they run.
 
 On a copy of `fixtures/failing`, `RUST_BACKTRACE=1 cargo test 2>&1` printed 19,255 bytes and exited with status 101. Its hook form, `RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1`, printed 2,536 bytes with the same status: the head of the output, the failure lines including Cargo's `error: test failed`, the tail and a footer naming the run. Without `--merge`, the test summary and the stderr preview take 914 bytes, but a summary of a merged stream would drop errors the command wrote to stderr, so a merged run keeps its own preview. That costs most on a large passing run: a crate with 300 passing tests printed 8,918 bytes for `cargo test 2>&1`, 2,089 bytes through `--merge`, and 558 bytes as a summary with a separate stderr preview. The byte counts include absolute paths under the scratch directory, so they vary with the checkout location.
+
+## Ranged Read outlines
+
+Local Claude Code transcripts from 2026-11-07 to 2026-11-18 hold 1,234 Reads of workspace files with `offset` or `limit`, 8,482,665 bytes as the model received them, line numbers included. Each window was replayed through the post-read hook only when its file could be recovered exactly: as it is on disk now, or for this repository from any blob version Git still holds, with the window's lines equal at the same position. 217 of the 397 windows over 150 lines could be. The other 180, with 2,601,016 bytes, count unchanged in both columns. Bytes after count the outline as Claude Code numbers it plus the hook's hint.
+
+| Window lines | Reads | Before | After | Replaced |
+| --- | ---: | ---: | ---: | ---: |
+| at most 150 | 837 | 2,404,780 | 2,404,780 | 0 |
+| 151-200 | 97 | 791,883 | 600,221 | 32 |
+| 201-300 | 113 | 1,266,381 | 946,085 | 35 |
+| 301-500 | 119 | 2,077,388 | 1,132,324 | 61 |
+| over 500 | 68 | 1,942,233 | 900,080 | 39 |
+
+The 167 replaced windows went from 2,803,765 to 304,590 bytes, a median of 12% of their size. Of the 50 recovered wide windows that passed through, 45 sat mostly inside one definition and 5 had more rows than the context budget holds. Thresholds of 100, 200 and 300 lines would have replaced 207, 135 and 100 windows and saved 2,676,278, 2,307,513 and 1,987,217 bytes, against 2,499,175 at 150. These figures do not model what the agent read next, such as a narrower Read of the part it needed.
+
+Against Claude Code 2.1.327 and the harness's local fake API, a Read of lines 100-399 of a generated 482-line Rust file reached the model as the outline and the hint. The same Read again returned the outline again, a 150-line Read returned the native lines, and an Edit inside the outlined window succeeded, as it did in the same script without hooks. After an outlined 300-line window and an outlined 400-line window of 35,231 bytes, the same Read with `allow_large: true` returned exactly what Read returned without hooks. `justless expand` printed the 300-line window exactly, but Claude Code returned the larger window's 32.9 KB as a saved file and a preview, so the hint names the Read.

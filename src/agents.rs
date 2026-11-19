@@ -731,22 +731,32 @@ fn agent_workspace(workspace: &Workspace, input: &Value) -> Workspace {
     workspace.working_in(cwd.unwrap_or(&workspace.origin))
 }
 
+/// A ranged Claude Code Read that returns at most this many lines reaches the agent
+/// as Read returned it, so a Read of the lines an outline points to is never
+/// outlined again. In 1,234 ranged Reads of workspace files in Claude Code
+/// transcripts, the 68% that returned at most 150 lines held 28% of the bytes, and
+/// 44% of them were followed by an edit of the file within eight tool calls. The
+/// 32% that returned more held 72% of the bytes, and 6% were followed by an edit.
+const READ_WINDOW_LINES: u64 = 150;
+
 fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     if input["hook_event_name"] != "PostToolUse" || input["tool_name"] != "Read" {
         return None;
     }
     let args = &input["tool_input"];
-    // A range, or `allow_large`, asks for those lines as they are. Claude Code
-    // 2.1.327's Read schema describes `allow_large` as "Set to true to read a text
-    // file, or a line range of one, that is over the usual size limits", and reads
-    // the strings "true" and "false" as booleans.
-    if ["limit", "offset", "pages"]
-        .iter()
-        .any(|key| args.get(key).is_some_and(|v| !v.is_null()))
+    let given = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
+    // `allow_large` asks for the lines as they are. Claude Code 2.1.327's Read
+    // schema describes it as "Set to true to read a text file, or a line range of
+    // one, that is over the usual size limits", and reads the strings "true" and
+    // "false" as booleans. `pages` selects PDF pages.
+    if given("pages")
         || matches!(&args["allow_large"], Value::Bool(true))
         || args["allow_large"] == "true"
     {
         return None;
+    }
+    if given("offset") || given("limit") {
+        return claude_read_window(ws, args, &input["tool_response"]);
     }
     let mut response = input["tool_response"].clone();
     if response["type"] != "text" {
@@ -806,8 +816,115 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     result["content"] = json!(outline.trim_end_matches('\n'));
     Some(
         json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response,
-        "additionalContext":format!("{context} Expand a row with {justless} expand FILE 'REV#ID', or use Read with offset and limit for original lines.")}}),
+        "additionalContext":format!("{context} Expand a row with {justless} expand FILE 'REV#ID', or Read original lines with offset and a limit of at most {READ_WINDOW_LINES}.")}}),
     )
+}
+
+/// The outline rows around the window of a ranged Read that returned more than
+/// `READ_WINDOW_LINES` lines of a source or Markdown file the parsers outline.
+///
+/// Claude Code 2.1.327 returns lines `max(1, offset)` onward joined by `\n`, with
+/// CRLF read as LF and a final newline counted as one more, empty line, and sets
+/// `startLine` to the offset, 0 included. A response that differs from those lines
+/// of the file as it is now, or from the requested range, passes through, as does
+/// a window that the rows would not divide.
+fn claude_read_window(ws: &Workspace, args: &Value, response: &Value) -> Option<Value> {
+    let number = |value: &Value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str()?.trim().parse().ok())
+    };
+    let mut response = response.clone();
+    if response["type"] != "text" {
+        return None;
+    }
+    let result = &mut response["file"];
+    let count = result["numLines"].as_u64()?;
+    if count <= READ_WINDOW_LINES
+        || result
+            .get("truncatedByTokenCap")
+            .is_some_and(|flag| flag != &Value::Bool(false))
+    {
+        return None;
+    }
+    let start = result["startLine"].as_u64()?;
+    let offset = match &args["offset"] {
+        Value::Null => 1,
+        value => number(value)?,
+    };
+    if start != offset || !args["limit"].is_null() && count > number(&args["limit"])? {
+        return None;
+    }
+    let path = Path::new(args["file_path"].as_str()?);
+    if path != Path::new(result["filePath"].as_str()?) {
+        return None;
+    }
+    let native = result["content"].as_str()?;
+    let budget = ws.settings().ok()?.context_budget;
+    if native.len() <= budget {
+        return None;
+    }
+    let file = ws.relative_file(path)?;
+    let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
+    let normalized = source.text.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let first = usize::try_from(start.max(1)).ok()?;
+    let count = usize::try_from(count).ok()?;
+    if result["totalLines"].as_u64()? != lines.len() as u64
+        || lines
+            .get(first - 1..(first - 1).checked_add(count)?)?
+            .join("\n")
+            != native
+    {
+        return None;
+    }
+    // Read's empty line after a final newline is not a line of the file.
+    let last = (first + count - 1).min(source.text.lines().count());
+    source.index(&file).ok()?;
+    let outline = source.window(first, last)?;
+    let uncovered: Vec<usize> = uncovered_code(&file, &source)?
+        .into_iter()
+        .filter(|index| (first - 1..last).contains(index))
+        .collect();
+    if uncovered.len() > 20 {
+        return None;
+    }
+    let mut code = String::new();
+    let mut covered = "";
+    if !uncovered.is_empty() {
+        let lines: Vec<&str> = source.text.lines().collect();
+        code.push_str("Code outside these rows:\n");
+        for index in uncovered {
+            let line = lines[index].trim_end_matches('\r');
+            code.push_str(&format!("L{}: {line}\n", index + 1));
+        }
+        covered = ", and code that no row covers follows the rows verbatim";
+    }
+    // The same Read with `allow_large` passes through, so it returns the window as
+    // Read did, whatever its size. Claude Code 2.1.327 saves a Bash result over about
+    // 30,000 characters to a file and shows a preview, so `expand` of a large window
+    // would not reach the agent whole.
+    let quoted = shlex::try_quote(&file).ok()?;
+    let justless = ws.invocation().files;
+    let context = format!(
+        "Justless outline of lines {first}-{last}, the lines this Read returned. L ranges are source line numbers{covered}. The same Read with allow_large: true returns those lines as they are, a Read of at most {READ_WINDOW_LINES} lines is never outlined, and `{justless} expand {quoted} 'REV#ID'` prints one row."
+    );
+    // Rows drop their signatures when that is what fits the context budget.
+    let content = [true, false]
+        .into_iter()
+        .map(|signatures| outline.display(signatures) + &code)
+        .find(|content| content.len() <= budget)?;
+    // The agent can still read half of the window and come out even.
+    if (content.len() + context.len()) * 2 > native.len() {
+        return None;
+    }
+    // Claude Code numbers the content from `startLine`. The rows are not source
+    // lines, so they count from 1, as in an outline of a whole file.
+    result["startLine"] = json!(1);
+    result["numLines"] = json!(content.lines().count());
+    result["content"] = json!(content.trim_end_matches('\n'));
+    Some(json!({"hookSpecificOutput":{"hookEventName":"PostToolUse",
+        "updatedToolOutput":response, "additionalContext":context}}))
 }
 
 /// Records what a Claude Code Read of a workspace text file showed the agent,
@@ -824,18 +941,27 @@ fn saw_claude_read(ws: &Workspace, input: &Value, outlined: bool) -> Option<()> 
     }
     let result = &input["tool_response"]["file"];
     let file = ws.relative_file(Path::new(result["filePath"].as_str()?))?;
-    let digest = crate::capture::source_digest(&fs::read(ws.source_path(&file).ok()?).ok()?);
-    if outlined {
+    let bytes = fs::read(ws.source_path(&file).ok()?).ok()?;
+    let digest = crate::capture::source_digest(&bytes);
+    let ranged = ["offset", "limit"]
+        .iter()
+        .any(|key| !input["tool_input"][key].is_null());
+    if outlined && !ranged {
         crate::history::saw_outline(ws, &file, digest);
-    } else {
-        let from = usize::try_from(result["startLine"].as_u64()?).ok()?;
-        let lines = usize::try_from(result["numLines"].as_u64()?).ok()?;
-        if from == 0 || lines == 0 {
-            return None;
-        }
-        let to = from.checked_add(lines - 1)?;
-        crate::history::saw_source(ws, &file, from, to, digest);
+        return Some(());
     }
+    // Read returns lines from `max(1, offset)` with `startLine` set to the offset,
+    // and counts the empty line after a final newline, which is not a line of the
+    // file. An outlined window is recorded as an outline of those lines.
+    let from = usize::try_from(result["startLine"].as_u64()?).ok()?.max(1);
+    let lines = usize::try_from(result["numLines"].as_u64()?).ok()?;
+    if lines == 0 {
+        return None;
+    }
+    let total = bytes.iter().filter(|&&byte| byte == b'\n').count()
+        + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
+    let to = from.checked_add(lines - 1)?.min(total.max(from));
+    crate::history::saw_range(ws, &file, from, to, digest, outlined);
     Some(())
 }
 

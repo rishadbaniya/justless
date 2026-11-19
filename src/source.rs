@@ -474,6 +474,92 @@ impl Snapshot {
         }
         Ok(page)
     }
+
+    /// The outline rows that overlap source lines `first..=last`, such as the
+    /// window of a ranged Read, with their usual IDs. `None` when rows would not
+    /// show where to look in the window: the file has no parser rows (a syntax
+    /// error, or 80-line pages), or one row is the narrowest around more than half
+    /// of the window's lines, such as a long function that holds the window.
+    pub fn window(&self, first: usize, last: usize) -> Option<Window> {
+        if first == 0
+            || first > last
+            || self.parse_error.is_some()
+            || self.entries.iter().any(|entry| entry.kind == "text")
+        {
+            return None;
+        }
+        let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let rows: Vec<Row> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let lines = (
+                    self.line(entry.bytes.start),
+                    self.line(entry.bytes.end.saturating_sub(1)),
+                );
+                (lines.0 <= last && lines.1 >= first).then(|| Row {
+                    id: index + 1,
+                    kind: entry.kind.clone(),
+                    name: clipped(&entry.name, 100),
+                    first: lines.0,
+                    last: lines.1,
+                    signature: clipped(
+                        &words(&self.text[entry.signature_start..entry.header_end]),
+                        160,
+                    ),
+                })
+            })
+            .collect();
+        let mut held = vec![0; rows.len()];
+        for line in first..=last {
+            let narrowest = (0..rows.len())
+                .filter(|&index| rows[index].first <= line && line <= rows[index].last)
+                .min_by_key(|&index| rows[index].last - rows[index].first);
+            if let Some(index) = narrowest {
+                held[index] += 1;
+            }
+        }
+        let span = last - first + 1;
+        (!rows.is_empty() && held.iter().all(|&count| count * 2 <= span)).then(|| Window {
+            revision: self.revision.clone(),
+            lines: self.lines.len(),
+            first,
+            last,
+            rows,
+        })
+    }
+}
+
+/// The outline rows around a window of a file, from `Snapshot::window`.
+pub struct Window {
+    revision: String,
+    lines: usize,
+    first: usize,
+    last: usize,
+    rows: Vec<Row>,
+}
+
+impl Window {
+    /// The revision, the window and one line per row, with signatures unless
+    /// `signatures` is false.
+    pub fn display(&self, signatures: bool) -> String {
+        let mut out = format!(
+            "revision {} · {} lines · window L{}-{}\n",
+            self.revision, self.lines, self.first, self.last
+        );
+        for row in &self.rows {
+            if signatures {
+                out.push_str(&row.display());
+            } else {
+                out.push_str(&format!(
+                    "#{} L{}-{} {} {}\n",
+                    row.id, row.first, row.last, row.kind, row.name
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// Offsets within a Rust declaration where its signature starts, after outer
