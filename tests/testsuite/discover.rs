@@ -30,9 +30,13 @@ impl Setup {
         let source: String = (0..300)
             .map(|i| format!("pub fn add_{i:03}(value: u64) -> u64 {{\n    value + {i}\n}}\n"))
             .collect();
-        fs::write(root.join("big.rs"), source).unwrap();
+        fs::write(root.join("big.rs"), &source).unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/big.rs"), &source).unwrap();
+        fs::create_dir_all(temp.path().join("outside")).unwrap();
+        fs::write(temp.path().join("outside/big.rs"), &source).unwrap();
         git(&root, &["init", "-q"]);
-        git(&root, &["add", "big.rs"]);
+        git(&root, &["add", "big.rs", "sub"]);
         git(&root, &["commit", "-qm", "fixture"]);
         Self {
             _temp: temp,
@@ -122,6 +126,14 @@ impl Setup {
             .unwrap();
         assert!(output.status.success(), "{}", text(&output.stderr));
         text(&output.stdout)
+    }
+
+    /// The group `discover` gives `command` with `output` as a session's only call.
+    fn route(&self, command: &str, output: &str) -> String {
+        self.transcript("only", &[(command.into(), output.into(), json!({}))]);
+        let routes = self.routes();
+        assert_eq!(routes.len(), 1, "{command}: {routes:?}");
+        routes.into_keys().next().unwrap().0
     }
 
     /// Commands per `(route, label)` in `discover --json`.
@@ -339,4 +351,70 @@ fn excluded_commands_stay_excluded_after_running() {
         .collect();
     setup.transcript("s1", &calls);
     assert_eq!(setup.routes(), expected);
+}
+
+/// Reads and searches in the forms agents use, inside the workspace and outside
+/// it, count as compacted after running exactly when the hook compacts them.
+#[test]
+fn discover_agrees_with_the_hook_on_where_a_read_runs() {
+    let setup = Setup::new();
+    let outside = setup.root.parent().unwrap().join("outside");
+    let outside = outside.display();
+    for (command, compacts) in [
+        ("sed -n 1,400p big.rs".to_owned(), true),
+        ("head -n 400 big.rs".to_owned(), true),
+        ("tail -n 400 big.rs".to_owned(), true),
+        ("cd sub && sed -n 1,400p big.rs".to_owned(), true),
+        ("git show HEAD:big.rs".to_owned(), true),
+        (format!("sed -n 1,400p {outside}/big.rs"), false),
+        ("sed -n 1,400p ../outside/big.rs".to_owned(), false),
+        (format!("cd {outside} && sed -n 1,400p big.rs"), false),
+        (
+            format!("cd {outside} && grep -rn value . | head -n 900"),
+            false,
+        ),
+    ] {
+        let output = setup.sh(&command);
+        let hook = setup.after_bash(&command, &output).is_some();
+        let route = setup.route(&command, &output);
+        assert_eq!(hook, compacts, "{command}: the hook");
+        // The command hook routes a `git show` of a file before it runs.
+        let before = command.starts_with("git show");
+        assert_eq!(
+            route == "supported_not_routed",
+            before,
+            "{command}: {route}"
+        );
+        assert_eq!(route == AFTER, compacts && !before, "{command}: {route}");
+    }
+}
+
+/// The post-run hook does not consult the permission rules, so a large result of
+/// a command the command hook left to them is compacted after running.
+#[test]
+fn commands_left_to_permissions_are_compacted_after_running_when_large() {
+    let setup = Setup::new();
+    let tests: String = (0..400)
+        .map(|i| format!("test tests::case_{i:03} ... ok\n"))
+        .collect();
+    assert!(setup.after_bash("cargo test", &tests).is_some());
+    let mode = json!({"permissionMode": "default"});
+    let calls = [
+        ("true", String::new(), mode),
+        ("cargo test", tests, json!({})),
+        ("cargo test", "test result: ok".to_owned(), json!({})),
+    ];
+    let calls: Vec<_> = calls
+        .into_iter()
+        .map(|(command, output, extra)| (command.to_owned(), output, extra))
+        .collect();
+    setup.transcript("s1", &calls);
+    let routes = setup.routes();
+    let key = |route: &str| (route.to_owned(), "cargo test".to_owned());
+    assert_eq!(routes.get(&key(AFTER)), Some(&1), "{routes:?}");
+    assert_eq!(
+        routes.get(&key("left_by_permissions")),
+        Some(&1),
+        "{routes:?}"
+    );
 }

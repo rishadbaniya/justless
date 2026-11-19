@@ -245,7 +245,7 @@ fn resolve(workspace: &Workspace, given: &str, root_given: bool) -> Result<Targe
 }
 
 /// `path` with `.` and `..` applied without touching the file system.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let mut clean = PathBuf::new();
     for part in path.components() {
         match part {

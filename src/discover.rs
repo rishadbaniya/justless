@@ -97,16 +97,18 @@ fn excluded_stage(exclusions: &Exclusions, command: &str) -> bool {
 }
 
 /// What the Claude Code post-run hook would make of a result that the command hook
-/// leaves as `route`, using the hook's own check: compacted, kept whole as a
-/// handled command, or left as `route`. `rules` holds the project's exclusions
+/// leaves as `route`, with the hook's own parsers and limits: compacted, kept
+/// whole as a handled command, or left as `route`. `rules` holds the project's exclusions
 /// and context budget, and is `None` while the settings fail to load, when the
-/// hook leaves every result. `entry` is the transcript line holding `part`.
+/// hook leaves every result. `entry` is the transcript line holding `part`, and
+/// `root` the workspace root.
 fn after_running(
     route: Route,
     command: &str,
     entry: &Value,
     part: &Value,
     rules: Option<&(Exclusions, usize)>,
+    root: &Path,
 ) -> Route {
     let Some((exclusions, budget)) = rules else {
         return route;
@@ -144,8 +146,12 @@ fn after_running(
     let persisted = response["persistedOutputPath"]
         .is_string()
         .then(|| response["persistedOutputSize"].as_u64().unwrap_or(u64::MAX));
-    let judge =
-        |exclusions| crate::postroute::after_run(command, exclusions, &output, persisted, *budget);
+    // The hook runs where the session was.
+    let cwd = entry["cwd"].as_str().map_or(root, Path::new);
+    let judge = |exclusions| {
+        let place = (root, cwd);
+        crate::postroute::after_run(command, place, exclusions, &output, persisted, *budget)
+    };
     match judge(exclusions) {
         Some(crate::postroute::AfterRun::Compacts) => Route::CompactedAfterRunning,
         Some(crate::postroute::AfterRun::KeepsWhole) if route == Route::NotSupported => {
@@ -431,7 +437,14 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                             } else {
                                 route
                             };
-                            after_running(route, &call.command, &entry, part, post_run.as_ref())
+                            after_running(
+                                route,
+                                &call.command,
+                                &entry,
+                                part,
+                                post_run.as_ref(),
+                                &workspace.root,
+                            )
                         };
                         let bytes = text_bytes(content);
                         // Excluded commands stay as written by choice.

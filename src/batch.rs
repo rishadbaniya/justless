@@ -115,6 +115,21 @@ impl<'a> Batch<'a> {
         Self::parse_list(command).or_else(|| parse::single(command).map(Self))
     }
 
+    /// Whether every piece runs in `root` when the list starts from `cwd`, judged
+    /// from the command alone, for a list recorded in a transcript.
+    pub(crate) fn inside(&self, root: &Path, cwd: &Path) -> bool {
+        self.0.iter().all(|piece| {
+            let dir = crate::find::lexical(&cwd.join(piece.dir.as_deref().unwrap_or("")));
+            dir.starts_with(root)
+                && match &piece.source {
+                    Source::File { file, .. } => {
+                        crate::find::lexical(&dir.join(file)).starts_with(root)
+                    }
+                    _ => true,
+                }
+        })
+    }
+
     pub(crate) fn compact(&self, ws: &Workspace, input: &Value) -> Option<Value> {
         let response = &input["tool_response"];
         if !response["stderr"].as_str()?.is_empty() {

@@ -519,19 +519,23 @@ pub(crate) enum AfterRun {
     KeepsWhole,
 }
 
-/// How [`claude_bash`] treats `command` whose result was `output`, or `persisted`
-/// bytes that Claude Code saved to a file, for `discover`. `None` when it leaves
-/// such a command alone at any size. It takes `context_budget` as the threshold;
-/// a family whose adaptive preview budget is larger keeps more output whole, and
-/// a compaction that would save too little is dropped after the run.
+/// How [`claude_bash`] would treat `command` run from `cwd` in the workspace at
+/// `root`, whose result was `output`, or `persisted` bytes that Claude Code saved
+/// to a file, for `discover`. `None` when it leaves such a command alone at any
+/// size. It applies the hook's own parsers, exclusions and size limits, with
+/// paths judged from the command's text, since the files may have changed. It
+/// takes `context_budget` as the threshold, so a family whose adaptive preview
+/// budget is larger keeps more output whole, and it cannot tell a compaction that
+/// the hook drops after the run for saving too little.
 pub(crate) fn after_run(
     command: &str,
+    (root, cwd): (&Path, &Path),
     exclusions: &crate::rewrite::Exclusions,
     output: &str,
     persisted: Option<u64>,
     context_budget: usize,
 ) -> Option<AfterRun> {
-    if excluded(exclusions, command) || RUN_MARKER.is_match(output) {
+    if !cwd.starts_with(root) || excluded(exclusions, command) || RUN_MARKER.is_match(output) {
         return None;
     }
     let size = persisted.unwrap_or(output.len() as u64);
@@ -547,6 +551,12 @@ pub(crate) fn after_run(
     let mut handled = false;
     if !cfg!(windows) {
         if let Some(read) = crate::shellread::parse(command) {
+            if !read.inside(root, cwd) {
+                // Only a `git show` blob falls back to the ordinary report.
+                if !read.object() {
+                    return None;
+                }
+            }
             let small = persisted.is_none()
                 && crate::shellread::small(output.lines().count(), output.len());
             // A `git show` blob too small to outline gets the ordinary report.
@@ -555,7 +565,7 @@ pub(crate) fn after_run(
             }
             handled = true;
         }
-        if crate::batch::Batch::parse(command).is_some() {
+        if crate::batch::Batch::parse(command).is_some_and(|batch| batch.inside(root, cwd)) {
             if !fits(crate::batch::FLOOR) {
                 return verdict(true);
             }
@@ -563,8 +573,19 @@ pub(crate) fn after_run(
         }
     }
     let large = size > MAX_BYTES as u64 || persisted.is_none() && lines > MAX_LINES;
-    if plan(command).is_some() {
-        return verdict(!large && !fits(context_budget));
+    if let Some(plan) = plan(command) {
+        // As `entered` judges the directory, from the text alone.
+        let entered = crate::find::lexical(&cwd.join(&plan.cd)).starts_with(root)
+            || plan.cd.is_relative()
+                && plan
+                    .cd
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)));
+        return if entered {
+            verdict(!large && !fits(context_budget))
+        } else {
+            handled.then_some(AfterRun::KeepsWhole)
+        };
     }
     if unknown_plan(command).is_some()
         && !large

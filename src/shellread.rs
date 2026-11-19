@@ -337,6 +337,21 @@ impl ShellRead {
         self.range.whole
     }
 
+    /// Whether the read stays in `root` when it runs from `cwd`, judged from the
+    /// command alone as `directory` and `Selection::open` judge it, for a read
+    /// recorded in a transcript whose files may have changed since.
+    pub(crate) fn inside(&self, root: &Path, cwd: &Path) -> bool {
+        let dir = crate::find::lexical(&cwd.join(self.dir.as_deref().unwrap_or("")));
+        dir.starts_with(root)
+            && (self.range.object
+                || dir
+                    .join(&self.file)
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| {
+                        !relative.components().any(|c| c == Component::ParentDir)
+                    }))
+    }
+
     /// The workspace directory the read runs in. Claude Code's main session keeps
     /// a `cd`, so once the command ran its `cwd` can already be the directory a
     /// relative `cd` entered, while a subagent's is where the command started.
