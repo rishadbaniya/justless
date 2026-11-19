@@ -1301,6 +1301,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         .filter(|root| cwd.starts_with(root))
         .max_by_key(|root| root.components().count())?;
     let workspace = Workspace::discover(Some(&root)).ok()?;
+    // The answer allows the rewrite, so it takes only what Codex's hook approves.
     let rewritten = wrap_event(
         &workspace,
         &cwd,
@@ -1309,7 +1310,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         Rules {
             mixed: false,
             claude: false,
-            approves: false,
+            approves: true,
         },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
@@ -1356,8 +1357,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -
             && !cfg!(windows)
             && crate::claude_permissions::mode(input).is_some()
             && crate::rewrite::Exclusions::of(workspace)
-                .line(command)
-                .is_none() =>
+                .is_ok_and(|exclusions| exclusions.line(command).is_none()) =>
         {
             with_seen_session(command, input)?
         }
@@ -1526,8 +1526,9 @@ fn wrap_event(
     rules: Rules,
 ) -> Option<String> {
     // Commands `exclude_commands` names are left as written. A list keeps its
-    // other commands, which are judged below.
-    let exclusions = crate::rewrite::Exclusions::of(workspace);
+    // other commands, which are judged below. While `.justless.toml` fails to
+    // load, every Justless command stops on the error, so every command is left.
+    let exclusions = crate::rewrite::Exclusions::of(workspace).ok()?;
     if exclusions.line(command).is_some() {
         return None;
     }

@@ -467,15 +467,15 @@ impl Rules {
         // Claude Code also checks the paths that file commands in Bash name against
         // Read and Edit rules and the working directories, which this check does
         // not model, so such a command is never taken as allowed while any apply.
-        let guarded = self.blocks_paths
-            || self
-                .deny
-                .iter()
-                .chain(&self.ask)
-                .any(|rule| names_file_tool(rule));
-        if any(&self.deny) {
+        // Those checks do not see the paths inside `justless run -- …`, so while a
+        // file rule might deny or ask, a line that runs such a command is judged
+        // as that rule would be, and stays as written in every mode.
+        let file_rule = |rules: &[String]| rules.iter().any(|rule| names_file_tool(rule));
+        let reads = segments.iter().any(|segment| reads_files(segment));
+        let guarded = self.blocks_paths || file_rule(&self.deny) || file_rule(&self.ask);
+        if any(&self.deny) || reads && file_rule(&self.deny) {
             Verdict::Deny
-        } else if any(&self.ask) {
+        } else if any(&self.ask) || reads && file_rule(&self.ask) {
             Verdict::Ask
         } else if !segments.is_empty()
             && segments.iter().all(|segment| {
@@ -533,10 +533,35 @@ fn names_file_tool(rule: &str) -> bool {
 }
 
 /// The texts an ask or deny rule is matched against: the command as written, and
-/// its words without quotes, a final `2>&1`, leading assignments or wrappers. Each
-/// wrapper may take options and values, so every one of the next few words may
-/// start the command inside it.
+/// its words without quotes, a final `2>&1`, leading assignments or wrappers.
 fn candidates(segment: &str) -> Vec<String> {
+    let (words, starts) = starts(segment);
+    let mut texts = vec![segment.trim().to_owned()];
+    texts.extend(
+        starts
+            .into_iter()
+            .filter(|&start| start < words.len())
+            .map(|start| words[start..].join(" ")),
+    );
+    texts
+}
+
+/// Whether any word that may start the command, after leading assignments and
+/// wrappers, names a program that reads the files it names, such as `rg`, `cat`
+/// or `git`.
+fn reads_files(segment: &str) -> bool {
+    let (words, starts) = starts(segment);
+    starts
+        .into_iter()
+        .filter_map(|start| words.get(start))
+        .any(|word| FILE_READERS.contains(&basename(word)))
+}
+
+/// A command's words without quotes or a final `2>&1`, and each index at which
+/// the command may start: the first word, the word after each leading
+/// assignment, and each of the few words after a wrapper, which may take options
+/// and values.
+fn starts(segment: &str) -> (Vec<String>, BTreeSet<usize>) {
     let mut words = shlex::split(segment)
         .unwrap_or_else(|| segment.split_whitespace().map(str::to_owned).collect());
     if words.len() > 1 && words.last().is_some_and(|word| word == "2>&1") {
@@ -559,14 +584,7 @@ fn candidates(segment: &str) -> Vec<String> {
             }
         }
     }
-    let mut texts = vec![segment.trim().to_owned()];
-    texts.extend(
-        starts
-            .into_iter()
-            .filter(|&start| start < words.len())
-            .map(|start| words[start..].join(" ")),
-    );
-    texts
+    (words, starts)
 }
 
 fn assignment(word: &str) -> bool {
@@ -843,7 +861,7 @@ mod tests {
         assert!(deny("B*", "cargo test"));
         assert!(deny(" Bash(cargo test) ", "cargo test"));
         assert!(!deny("Bash(git push:*)", "git status"));
-        assert!(!deny("Read(./.env)", "cat .env"));
+        assert!(!deny("Read(./.env)", "cargo test"));
         assert!(!deny("Bash(npm test)", "npm test --watch"));
     }
 
@@ -888,21 +906,32 @@ mod tests {
     }
 
     #[test]
-    fn file_rules_stop_allow_rules_from_approving_file_commands() {
+    fn file_rules_leave_file_commands_and_approve_only_others() {
         // Claude Code checks the paths file commands name against Read and Edit
-        // rules, so with any such rule only other programs can be approved.
+        // rules, which do not see them inside `justless run -- …`, so a line that
+        // runs such a command takes the verdict of the file rule, through
+        // assignments and wrappers and in any command of the list.
         for rule in ["Read(./.env)", "Edit", "R*(./secrets/**)", " Write(x) "] {
-            let set = rules(&["Bash"], &[], &[rule]);
-            for segment in ["cat .env", "rg key", "'git' show HEAD:.env", "/bin/ls -l"] {
-                assert_eq!(
-                    set.verdict(&[segment]),
-                    Verdict::Unknown,
-                    "{rule} {segment}"
-                );
-            }
-            assert_eq!(set.verdict(&["cargo test"]), Verdict::Allow, "{rule}");
+            let denied = rules(&["Bash"], &[], &[rule]);
             let asked = rules(&["Bash"], &[rule], &[]);
-            assert_eq!(asked.verdict(&["cat .env"]), Verdict::Unknown, "{rule}");
+            for segments in [
+                &["cat .env"][..],
+                &["rg key"],
+                &["'git' show HEAD:.env"],
+                &["/bin/ls -l"],
+                &["LC_ALL=C git diff .env"],
+                &["timeout 5 rg key .env"],
+                &["cargo test", "rg key .env"],
+            ] {
+                assert_eq!(
+                    denied.verdict(segments),
+                    Verdict::Deny,
+                    "{rule} {segments:?}"
+                );
+                assert_eq!(asked.verdict(segments), Verdict::Ask, "{rule} {segments:?}");
+            }
+            assert_eq!(denied.verdict(&["cargo test"]), Verdict::Allow, "{rule}");
+            assert_eq!(asked.verdict(&["cargo test"]), Verdict::Allow, "{rule}");
         }
         assert_eq!(
             rules(&["Bash"], &[], &["WebFetch"]).verdict(&["cat .env"]),

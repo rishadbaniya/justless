@@ -1614,7 +1614,9 @@ impl Doctor<'_> {
             Some(Err(error)) => checks.push(
                 Check::new(
                     Status::Fail,
-                    format!(".justless.toml: {error:#}. Every routed command stops on this error."),
+                    format!(
+                        ".justless.toml: {error:#}. Justless commands stop on this error, and the hooks leave every command as written until it is fixed."
+                    ),
                 )
                 .fix(Fix::Manual(
                     "Fix .justless.toml; the Configuration section of docs/reference.md lists its keys"
@@ -2858,6 +2860,10 @@ fn global_checks(project: Option<&Workspace>) -> Vec<Check> {
             match crate::global::skip(hooks.agent, None, &workspace.cwd, workspace) {
                 Some(Skip::OptedOut) => format!(
                     "This project sets global_hooks = false, so the global {} hooks leave it alone",
+                    hooks.label
+                ),
+                Some(Skip::Unreadable) => format!(
+                    "This project's .justless.toml fails to load, so the global {} hooks leave it alone",
                     hooks.label
                 ),
                 Some(Skip::ProjectHooks) => format!(

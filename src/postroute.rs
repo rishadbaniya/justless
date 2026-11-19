@@ -122,7 +122,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     let call = &input["tool_input"];
     let command = call["command"].as_str()?;
-    if call["run_in_background"] == true || excluded(ws, command) {
+    // While `.justless.toml` fails to load, the output stays as the command left it.
+    let exclusions = crate::rewrite::Exclusions::of(ws).ok()?;
+    if call["run_in_background"] == true || excluded(&exclusions, command) {
         return None;
     }
     let response = input["tool_response"].as_object()?;
@@ -495,8 +497,7 @@ fn entered(cwd: &Path, root: &Path, cd: &Path) -> Option<PathBuf> {
 /// The supported command whose lines make up a shell command line's output.
 /// Whether `exclude_commands` names the line, a command in it, or a command in a
 /// pipe, after its assignments and wrappers such as `env` or `timeout`.
-fn excluded(ws: &Workspace, command: &str) -> bool {
-    let exclusions = crate::rewrite::Exclusions::of(ws);
+fn excluded(exclusions: &crate::rewrite::Exclusions, command: &str) -> bool {
     !exclusions.is_empty()
         && (exclusions.any(command).is_some()
             || parse(command).is_some_and(|segments| {

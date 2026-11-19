@@ -54,6 +54,44 @@ const RG: Spec = Spec {
     lists: "-l --files-with-matches --files-without-match --files",
 };
 
+/// Every ripgrep 15 option, as `rg --help` lists it with the `--no-` forms that
+/// turn one off, except those that run another program: `--pre` and
+/// `--pre-glob`, which run a preprocessor on each file, `-z`/`--search-zip`, which
+/// runs decompression programs, and `--hostname-bin`. Hooks route ripgrep with
+/// any option, so a client that approves the rewrite checks it against this list.
+const RG_READS: Spec = Spec {
+    flags: "-s --case-sensitive --crlf -F --fixed-strings -i --ignore-case -v --invert-match \
+        -x --line-regexp --mmap -U --multiline --multiline-dotall --no-unicode --unicode \
+        --null-data -P --pcre2 -S --smart-case --stop-on-nonmatch -a --text -w --word-regexp \
+        --auto-hybrid-regex --no-pcre2-unicode --pcre2-unicode --binary -L --follow \
+        --glob-case-insensitive -. --hidden --ignore-file-case-insensitive --no-ignore \
+        --no-ignore-dot --no-ignore-exclude --no-ignore-files --no-ignore-global \
+        --no-ignore-parent --no-ignore-vcs --no-require-git --one-file-system -u \
+        --unrestricted --block-buffered -b --byte-offset --column --heading -h --help \
+        --include-zero --line-buffered -n --line-number -N --no-line-number \
+        --max-columns-preview -0 --null -o --only-matching --passthru -p --pretty -q --quiet \
+        --trim --vimgrep -H --with-filename -I --no-filename --sort-files -c --count \
+        --count-matches -l --files-with-matches --files-without-match --json --debug \
+        --no-ignore-messages --no-messages --stats --trace --files --no-config \
+        --pcre2-version --type-list -V --version --ignore --ignore-dot --ignore-exclude \
+        --ignore-files --ignore-global --ignore-messages --ignore-parent --ignore-vcs \
+        --messages --require-git --no-auto-hybrid-regex --no-binary --no-block-buffered \
+        --no-byte-offset --no-column --no-context-separator --no-crlf --no-encoding \
+        --no-fixed-strings --no-follow --no-glob-case-insensitive --no-heading --no-hidden \
+        --no-ignore-file-case-insensitive --no-include-zero --no-invert-match --no-json \
+        --no-line-buffered --no-max-columns-preview --no-mmap --no-multiline \
+        --no-multiline-dotall --no-one-file-system --no-pcre2 --no-pre --no-search-zip \
+        --no-sort-files --no-stats --no-text --no-trim",
+    valued: "-e --regexp -f --file --dfa-size-limit -E --encoding --engine -m --max-count \
+        --regex-size-limit -j --threads -g --glob --iglob --ignore-file -d --max-depth \
+        --max-filesize -t --type -T --type-not --type-add --type-clear -A --after-context -B \
+        --before-context --color --colors -C --context --context-separator \
+        --field-context-separator --field-match-separator --hyperlink-format -M --max-columns \
+        --path-separator -r --replace --sort --sortr --generate",
+    optional: "",
+    lists: "",
+};
+
 const GREP: Spec = Spec {
     flags: "-r -R --recursive --dereference-recursive -n --line-number -i --ignore-case \
         --no-ignore-case -y -w --word-regexp -x --line-regexp -v --invert-match -E \
@@ -217,23 +255,51 @@ fn basename(program: &str) -> &str {
         .unwrap_or(program)
 }
 
+/// The option spec of a search or listing and its arguments after any
+/// subcommand, `Some((None, args))` for `find`, which has its own allow list, or
+/// `None` for any other program.
+fn spec<'w, 'a>(words: &'w [&'a str]) -> Option<(Option<&'static Spec>, &'w [&'a str])> {
+    let (&program, args) = words.split_first()?;
+    Some(match (basename(program), args) {
+        ("rg", _) => (Some(&RG), args),
+        ("grep" | "egrep" | "fgrep", _) => (Some(&GREP), args),
+        ("git", ["grep", rest @ ..]) => (Some(&GIT_GREP), rest),
+        ("git", ["ls-files", rest @ ..]) => (Some(&LS_FILES), rest),
+        ("ag", _) => (Some(&AG), args),
+        ("ack" | "ack-grep", _) => (Some(&ACK), args),
+        ("ls", _) => (Some(&LS), args),
+        ("tree", _) => (Some(&TREE), args),
+        ("fd" | "fdfind", _) => (Some(&FD), args),
+        ("find", _) => (None, args),
+        _ => return None,
+    })
+}
+
+/// Whether a search or listing passes only options its spec lists, or `None` for
+/// any other program. Every listed option only selects, matches or formats what
+/// the tool reads and prints, so any other option fails, such as ripgrep's
+/// `--pre`, `--hostname-bin` and `-z`, which run other programs, `fd --exec` or
+/// `find -exec`. Hooks route ripgrep with any option, so it is checked against
+/// all of its options that only read (see `RG_READS`); the others are routed
+/// only with the display options of their spec.
+pub fn read_only(words: &[&str]) -> Option<bool> {
+    let (spec, args) = spec(words)?;
+    let rg = words
+        .first()
+        .is_some_and(|program| basename(program) == "rg");
+    Some(match spec {
+        Some(_) if rg => parse(args, &RG_READS).is_some(),
+        Some(spec) => parse(args, spec).is_some(),
+        None => find_display(args),
+    })
+}
+
 /// Select the search or listing profile for display-oriented invocations only.
 /// Machine formats, counts, NUL separators and side effects select nothing.
 pub fn select(words: &[&str]) -> Option<Profile> {
-    let (&program, args) = words.split_first()?;
-    let program = basename(program);
-    let (spec, args) = match (program, args) {
-        ("rg", _) => (&RG, args),
-        ("grep" | "egrep" | "fgrep", _) => (&GREP, args),
-        ("git", ["grep", rest @ ..]) => (&GIT_GREP, rest),
-        ("git", ["ls-files", rest @ ..]) => (&LS_FILES, rest),
-        ("ag", _) => (&AG, args),
-        ("ack" | "ack-grep", _) => (&ACK, args),
-        ("ls", _) => (&LS, args),
-        ("tree", _) => (&TREE, args),
-        ("fd" | "fdfind", _) => (&FD, args),
-        ("find", _) => return find_display(args).then_some(Profile::Listing),
-        _ => return None,
+    let (spec, args) = spec(words)?;
+    let Some(spec) = spec else {
+        return find_display(args).then_some(Profile::Listing);
     };
     let parsed = parse(args, spec)?;
     if spec.lists.is_empty() {

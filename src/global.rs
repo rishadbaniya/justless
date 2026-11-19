@@ -6,9 +6,9 @@
 //! `justless hook-CLIENT MODE --global`, which finds the project per call from the
 //! hook input's `cwd` and answers with the client's no-op when there is none to
 //! serve: outside a marked project, in the home directory, in a project whose
-//! `.justless.toml` sets `global_hooks = false`, and in a project whose own
-//! settings already run Justless's hook for that event, which takes precedence so
-//! no command is handled twice.
+//! `.justless.toml` sets `global_hooks = false` or fails to load, and in a
+//! project whose own settings already run Justless's hook for that event, which
+//! takes precedence so no command is handled twice.
 //!
 //! Setup records each file it writes, with its digest and the file as it was, in
 //! the private `global-setup.json` beside the project registry. `init --remove
@@ -135,10 +135,15 @@ fn remember(path: &Path, contents: &str) {
     }
     let current = fs::read_to_string(path).ok();
     let key = path.display().to_string();
-    let before = match (&current, record.files.get(path)) {
+    let recorded = record.files.get(path);
+    let before = match (&current, recorded) {
         (None, _) => None,
         (Some(text), Some(entry)) if entry.digest == digest(text) => entry.before.clone(),
-        (Some(text), _) => match crate::uninstall::strip_global(&key, text) {
+        (Some(text), _) => match crate::uninstall::strip_global(
+            &key,
+            text,
+            recorded.and_then(|entry| entry.before.as_deref()),
+        ) {
             Ok(None) => Some(text.clone()),
             Ok(Some((_, left))) => left,
             Err(_) => {
@@ -247,11 +252,15 @@ pub fn remove(matches: &ArgMatches) -> Result<()> {
         }
         let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let key = path.display().to_string();
-        let stripped = crate::uninstall::strip_global(&key, &text)?;
-        let recorded = record
-            .files
-            .get(&path)
-            .filter(|entry| entry.digest == digest(&text));
+        // Setup's record of the file as it was keeps the user's own hook arrays,
+        // even after the file changed since.
+        let entry = record.files.get(&path);
+        let stripped = crate::uninstall::strip_global(
+            &key,
+            &text,
+            entry.and_then(|entry| entry.before.as_deref()),
+        )?;
+        let recorded = entry.filter(|entry| entry.digest == digest(&text));
         let (what, outcome) = match (stripped, recorded) {
             (None, None) => continue,
             (Some((what, _)), Some(entry)) => (what, entry.before.clone()),
@@ -358,6 +367,9 @@ pub enum Skip {
     Outside,
     /// Its `.justless.toml` sets `global_hooks = false`.
     OptedOut,
+    /// Its `.justless.toml` fails to load, so it may opt out, and every Justless
+    /// command stops on the error.
+    Unreadable,
     /// Its own settings run Justless's hook for the same client, which wins.
     ProjectHooks,
 }
@@ -376,18 +388,16 @@ fn outside(root: &Path) -> bool {
 /// `cwd` alone, and why, for `mode` or any mode; `None` when they serve it.
 pub fn skip(agent: Agent, mode: Option<&str>, cwd: &Path, workspace: &Workspace) -> Option<Skip> {
     if crate::workspace::marked_root(cwd).is_none() {
-        Some(Skip::Unmarked)
-    } else if outside(&workspace.root) {
-        Some(Skip::Outside)
-    } else if workspace
-        .settings()
-        .is_ok_and(|settings| !settings.global_hooks)
-    {
-        Some(Skip::OptedOut)
-    } else if project_hooks(agent, mode, cwd, &workspace.root) {
-        Some(Skip::ProjectHooks)
-    } else {
-        None
+        return Some(Skip::Unmarked);
+    }
+    if outside(&workspace.root) {
+        return Some(Skip::Outside);
+    }
+    match workspace.settings() {
+        Err(_) => Some(Skip::Unreadable),
+        Ok(settings) if !settings.global_hooks => Some(Skip::OptedOut),
+        Ok(_) if project_hooks(agent, mode, cwd, &workspace.root) => Some(Skip::ProjectHooks),
+        Ok(_) => None,
     }
 }
 

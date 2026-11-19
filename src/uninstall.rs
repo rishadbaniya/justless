@@ -756,13 +756,18 @@ fn plan(workspace: &Workspace, chosen: &[Agent], purge: bool, record: &Record) -
             continue;
         };
         // Keep a shared section while another client that reads it is still set up.
+        // A `CLAUDE.md` import alone counts only when the record names no reader
+        // of the file, as after a setup that kept no record: a record that lists
+        // other readers shows Claude Code was not set up through it.
         let others: Vec<&str> = owners
             .iter()
             .copied()
             .filter(|&owner| {
                 !chosen.contains(&owner)
-                    && (owner == Agent::Claude && imported.as_ref() == Some(&path)
-                        || configured(workspace, record, owner, &key))
+                    && (configured(workspace, record, owner, &key)
+                        || owner == Agent::Claude
+                            && imported.as_ref() == Some(&path)
+                            && !record.readers.contains_key(&key))
             })
             .map(name)
             .collect();
@@ -1037,7 +1042,7 @@ fn strip(key: &str, kind: Kind, text: &str) -> Result<Scan> {
         // in a form such as JSON with comments that removal cannot edit.
         Kind::Json(_) | Kind::Toml if !mentions(text) => Scan::default(),
         Kind::Toml => strip_toml(key, text)?,
-        Kind::Json(rules) => strip_json(key, rules, text)?,
+        Kind::Json(rules) => strip_json(key, rules, text, &Keep::default())?,
     })
 }
 
@@ -1188,13 +1193,23 @@ fn is_global(handler: &Value) -> bool {
 /// What `init --remove --global` takes out of a user-level hook file: a summary
 /// of the handlers that run `justless hook-… --global`, and the file without them,
 /// or `None` when nothing else is left in it. `Ok(None)` when it has none.
-pub(crate) fn strip_global(key: &str, text: &str) -> Result<Option<(String, Option<String>)>> {
+/// `before`, the file as setup's record holds it from before setup, keeps the
+/// hook groups and event arrays it had even when removal empties them.
+pub(crate) fn strip_global(
+    key: &str,
+    text: &str,
+    before: Option<&str>,
+) -> Result<Option<(String, Option<String>)>> {
     let rules = JsonRules {
         hooks: true,
         global: true,
         ..JsonRules::default()
     };
-    let scan = strip(key, Kind::Json(rules), text)?;
+    let scan = if mentions(text) {
+        strip_json(key, rules, text, &Keep::of(before))?
+    } else {
+        Scan::default()
+    };
     Ok(scan.found.map(|found| {
         let left = match found.outcome {
             Outcome::Write(text) => Some(text),
@@ -1287,7 +1302,38 @@ fn mentions_at(value: &Value, at: Vec<Step>, deleted: &[Vec<Step>], found: &mut 
     }
 }
 
-fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Scan> {
+/// The hook groups and event arrays a user file held before setup, which removal
+/// keeps when it leaves them empty, so only those setup created go with the
+/// handlers.
+#[derive(Default)]
+struct Keep {
+    /// Top-level groups, such as `hooks`.
+    groups: BTreeSet<String>,
+    /// Each group's events, such as `SessionStart` in `hooks`.
+    events: BTreeSet<(String, String)>,
+}
+
+impl Keep {
+    /// What `before`, the file as it was before setup, held. `None`, for a file
+    /// setup created or one without a record, keeps nothing.
+    fn of(before: Option<&str>) -> Self {
+        let mut keep = Self::default();
+        let Some(Ok(Value::Object(root))) = before.map(serde_json::from_str::<Value>) else {
+            return keep;
+        };
+        for (group, value) in root {
+            if let Value::Object(events) = value {
+                for event in events.keys() {
+                    keep.events.insert((group.clone(), event.clone()));
+                }
+                keep.groups.insert(group);
+            }
+        }
+        keep
+    }
+}
+
+fn strip_json(key: &str, rules: JsonRules, text: &str, keep: &Keep) -> Result<Scan> {
     let config: Value = serde_json::from_str(text)
         .map_err(|error| anyhow!("{key} is not valid JSON; {FIX}: {error}"))?;
     let root = config
@@ -1301,9 +1347,10 @@ fn strip_json(key: &str, rules: JsonRules, text: &str) -> Result<Scan> {
         let group = (rules.hooks && name == "hooks") || (rules.group && name == "justless");
         if group && let Some(events) = value.as_object() {
             let start = paths.len();
-            let (found, emptied) = prune_group(events, name, rules.global, &mut paths);
+            let (found, emptied) = prune_group(events, name, rules.global, keep, &mut paths);
             hooks += found;
-            if emptied {
+            // A group the file held before setup stays, even when left empty.
+            if emptied && !keep.groups.contains(name) {
                 paths.truncate(start);
                 paths.push(member());
                 removed.insert(name.as_str());
@@ -1397,6 +1444,7 @@ fn prune_group(
     events: &Map<String, Value>,
     group: &str,
     global: bool,
+    keep: &Keep,
     paths: &mut Vec<Vec<Step>>,
 ) -> (usize, bool) {
     let is_hook = |handler: &Value| is_hook(handler) && (!global || is_global(handler));
@@ -1436,7 +1484,11 @@ fn prune_group(
                 }
             }
         }
-        if dropped > 0 && dropped == entries.len() {
+        // An event the file held before setup keeps its emptied array.
+        if dropped > 0
+            && dropped == entries.len()
+            && !keep.events.contains(&(group.to_owned(), event.clone()))
+        {
             paths.truncate(start);
             paths.push(prefix);
             emptied += 1;
@@ -1614,7 +1666,7 @@ mod tests {
             servers: Some("mcpServers"),
             ..JsonRules::default()
         };
-        let scan = strip_json("s", rules, &text).unwrap();
+        let scan = strip_json("s", rules, &text, &Keep::default()).unwrap();
         assert_eq!(scan.found.unwrap().what, ["1 hook"]);
         assert_eq!(
             scan.leftover,

@@ -623,7 +623,9 @@ pub fn legacy_hook(words: &[&str]) -> bool {
 /// build and test targets and a few display options. No argument may name a path
 /// outside the working tree, so options such as `make -C /elsewhere` or
 /// `pytest --basetemp=/tmp/x` fail, and `-f`, `-I` and `--config` fail for the tools
-/// that load code from them.
+/// that load code from them. Options that run another program or code given on
+/// the command line, or load a plugin or module they name, also fail, such as
+/// `go vet -vettool`, `pylint --init-hook` or `node --test --import`.
 pub fn approvable(words: &[&str]) -> bool {
     let (tool, fetches) = runners(words);
     if fetches {
@@ -632,12 +634,18 @@ pub fn approvable(words: &[&str]) -> bool {
     let Some((&program, args)) = tool.split_first() else {
         return false;
     };
-    // Searches, Git display commands and JSON reads only read, and their options
-    // are checked when they are routed.
-    if crate::search::select(tool).is_some() || program == "git" || json_output(tool) {
+    // Searches and listings take only the options their spec lists, which only
+    // read, so `rg --pre`, `--hostname-bin` and `-z`, which run other programs,
+    // fail like any option the spec does not know.
+    if let Some(read_only) = crate::search::read_only(tool) {
+        return read_only;
+    }
+    // Git display commands and JSON reads only read, and their options are
+    // checked when they are routed.
+    if program == "git" || json_output(tool) {
         return true;
     }
-    if !args.iter().all(|arg| local_argument(arg)) {
+    if !args.iter().all(|arg| local_argument(arg)) || runs_code(program, args) {
         return false;
     }
     const TARGETS: &[&str] = &["all", "build", "test", "check", "clean"];
@@ -783,16 +791,26 @@ pub fn approvable(words: &[&str]) -> bool {
                 )
             },
         ),
-        "cargo" => !args.iter().any(|arg| {
-            arg.starts_with("-Z")
-                || arg.split_once('=').map_or(*arg, |(flag, _)| flag) == "--config"
-        }),
-        "go" => !args.iter().any(|arg| {
-            let flag = arg.split_once('=').map_or(*arg, |(flag, _)| flag);
-            matches!(
-                flag.trim_start_matches('-'),
-                "exec" | "toolexec" | "overlay"
-            )
+        "cargo" => {
+            !args.iter().any(|arg| {
+                arg.starts_with("-Z")
+                    || arg.split_once('=').map_or(*arg, |(flag, _)| flag) == "--config"
+            }) && clippy_lint_levels(args)
+        }
+        // `-vettool` and `-toolexec` run the program they name, `-gccgoflags` and
+        // an `-extld` or `-extldflags` in `-ldflags` choose the compiler's or
+        // linker's helper programs.
+        "go" => !args.iter().enumerate().any(|(index, arg)| {
+            let (flag, value) = arg
+                .split_once('=')
+                .map_or((*arg, None), |(flag, value)| (flag, Some(value)));
+            match flag.trim_start_matches('-') {
+                "exec" | "toolexec" | "overlay" | "vettool" | "gccgoflags" => true,
+                "ldflags" => value
+                    .or_else(|| args.get(index + 1).copied())
+                    .is_some_and(|value| value.contains("extld")),
+                _ => false,
+            }
         }),
         // MSBuild targets and properties, such as `-t:Publish` with a publish
         // profile, and package sources can deploy or fetch from elsewhere.
@@ -819,6 +837,189 @@ pub fn approvable(words: &[&str]) -> bool {
             .any(|arg| arg.split('=').next() == Some("--install-types")),
         _ => true,
     }
+}
+
+/// Whether a tool's arguments run another program or code given on the command
+/// line, or load a plugin or module they name, as these options document:
+///
+/// - pytest `-p NAME` other than `-p no:NAME`, `--pdbcls` and an `addopts`
+///   override that could add them;
+/// - pylint `--init-hook` and `--load-plugins`, mypy `--python-executable`,
+///   pyright `--pythonpath` and RuboCop `-r`/`--require`;
+/// - npm, pnpm, Yarn and Bun `--script-shell`, `--node-options`, `--userconfig`
+///   and `--globalconfig`, which choose the shell or Node options scripts run with;
+/// - `node --test` with `-e`/`--eval`, `-p`/`--print`, `-r`/`--require`,
+///   `--import` or `--loader`, which also take inline `data:` modules, or with
+///   `--env-file`, `--experimental-config-file` or `--run`, which can set them
+///   or run a script;
+/// - Swift `-X…` options passed to the compilers and linker, `--toolchain`,
+///   `--toolset`, `--destination` and `--swift-sdks-path`, which choose them,
+///   and `--disable-sandbox`, which runs package plugins unsandboxed.
+fn runs_code(program: &str, args: &[&str]) -> bool {
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    let named = |names: &[&str]| {
+        args.iter()
+            .take_while(|arg| **arg != "--")
+            .any(|arg| names.iter().any(|name| names_option(arg, name)))
+    };
+    match program {
+        "pytest" | "py.test" => pytest_loads_code(args),
+        "python" | "python3" => {
+            matches!(args, ["-m", "pytest", ..]) && pytest_loads_code(&args[2..])
+        }
+        "pylint" => named(&["--init-hook", "--load-plugins"]),
+        "mypy" | "dmypy" => named(&["--python-executable"]),
+        "pyright" | "basedpyright" => named(&["--pythonpath"]),
+        "rubocop" => named(&["-r", "--require"]),
+        "npm" | "pnpm" | "yarn" | "bun" => named(&[
+            "--script-shell",
+            "--node-options",
+            "--userconfig",
+            "--globalconfig",
+        ]),
+        "node" => named(&[
+            "-e",
+            "--eval",
+            "-p",
+            "--print",
+            "-r",
+            "--require",
+            "--import",
+            "--loader",
+            "--experimental-loader",
+            "--env-file",
+            "--env-file-if-exists",
+            "--experimental-config-file",
+            "--run",
+        ]),
+        "swift" => {
+            args.iter().any(|arg| arg.starts_with("-X"))
+                || named(&[
+                    "--toolchain",
+                    "--toolset",
+                    "--destination",
+                    "--swift-sdks-path",
+                    "--disable-sandbox",
+                ])
+        }
+        _ => false,
+    }
+}
+
+/// Whether `arg` gives the option `name`. A long option matches with or without
+/// `=VALUE`, with `_` for `-`, and by any abbreviation, which npm, argparse and
+/// other parsers accept. A one-letter option matches in any cluster of short
+/// options, alone or with its value attached, as in `-r./x`.
+fn names_option(arg: &str, name: &str) -> bool {
+    if let Some(long) = name.strip_prefix("--") {
+        let Some(key) = arg.strip_prefix("--") else {
+            return false;
+        };
+        let key = key.split_once('=').map_or(key, |(key, _)| key);
+        let key = key.replace('_', "-");
+        !key.is_empty() && long.starts_with(&key)
+    } else {
+        let letter = name.trim_start_matches('-');
+        arg.strip_prefix('-')
+            .is_some_and(|cluster| !cluster.starts_with('-') && cluster.contains(letter))
+    }
+}
+
+/// Whether pytest arguments load a plugin by name with `-p`, other than `-p
+/// no:NAME`, which turns one off, choose a debugger class, or override `addopts`,
+/// which could add either.
+fn pytest_loads_code(args: &[&str]) -> bool {
+    // One-letter options that take a value, alone or attached.
+    const VALUED: &str = "kmcopnrW";
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (key, inline) = long
+                .split_once('=')
+                .map_or((long, None), |(key, value)| (key, Some(value)));
+            if !key.is_empty() && "pdbcls".starts_with(key) {
+                return true;
+            }
+            if !key.is_empty() && "override-ini".starts_with(key) {
+                let value = inline.or_else(|| args.next()).unwrap_or("");
+                if value.trim_start().starts_with("addopts") {
+                    return true;
+                }
+            }
+            continue;
+        }
+        let Some(cluster) = arg.strip_prefix('-').filter(|cluster| !cluster.is_empty()) else {
+            continue;
+        };
+        for (index, letter) in cluster.char_indices() {
+            if !VALUED.contains(letter) {
+                continue;
+            }
+            let rest = &cluster[index + letter.len_utf8()..];
+            let value = if rest.is_empty() {
+                args.next().unwrap_or("")
+            } else {
+                rest
+            };
+            match letter {
+                'p' if !value.starts_with("no:") => return true,
+                'o' if value.trim_start().starts_with("addopts") => return true,
+                _ => {}
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// Whether the arguments `cargo clippy` passes to the compiler after `--`, if
+/// any, only set lint levels, such as `-D warnings`. Others, such as `-C linker`
+/// or `--extern`, choose programs or libraries the compiler runs.
+fn clippy_lint_levels(args: &[&str]) -> bool {
+    if args.first() != Some(&"clippy") {
+        return true;
+    }
+    let Some(at) = args.iter().position(|arg| *arg == "--") else {
+        return true;
+    };
+    const LEVELS: &[&str] = &[
+        "-W",
+        "-A",
+        "-D",
+        "-F",
+        "--warn",
+        "--allow",
+        "--deny",
+        "--forbid",
+        "--force-warn",
+        "--cap-lints",
+    ];
+    let mut rest = args[at + 1..].iter();
+    while let Some(arg) = rest.next() {
+        if LEVELS.contains(arg) {
+            if rest.next().is_none_or(|lint| lint.starts_with('-')) {
+                return false;
+            }
+        } else if !LEVELS.iter().any(|level| {
+            arg.strip_prefix(level).is_some_and(|value| {
+                let value = if level.starts_with("--") {
+                    value.strip_prefix('=')
+                } else {
+                    Some(value)
+                };
+                value.is_some_and(|lint| !lint.is_empty() && !lint.starts_with('-'))
+            })
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether build tool arguments are only the given flags, job counts, options with a
@@ -1101,5 +1302,51 @@ fn append(out: &mut String, text: &str, budget: usize) {
     } else if available >= 20 {
         out.push_str(&fit[..fit.floor_char_boundary(available - "…\n".len())]);
         out.push_str("…\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_reads_each_options_own_syntax() {
+        for (command, approved) in [
+            // A ripgrep option outside its spec, alone, attached or in a cluster.
+            ("rg -n foo", true),
+            ("rg -c --stats --no-pre foo", true),
+            ("rg --hostname-bin=x foo", false),
+            ("rg -nz foo", false),
+            ("rg --pre-glob=*.gz foo", false),
+            // pytest's `-r` takes a value, so `-rp` reports passes and loads nothing.
+            ("pytest -rp", true),
+            ("pytest -vp evil", false),
+            ("pytest -p no:cacheprovider", true),
+            ("pytest --override-ini=addopts=-pevil", false),
+            ("pytest -o log_cli=true", true),
+            ("pytest --pdbcls=x:Y", false),
+            ("python3 -m pytest -pevil", false),
+            // npm reads abbreviations and `_` for `-` in its option names.
+            ("npm test --script-sh=x", false),
+            ("npm test --node_options=x", false),
+            ("npm test --silent", true),
+            // Arguments for the script after `--` are not npm's own.
+            ("npm test -- --script-shell", true),
+            ("node --test --require=x", false),
+            ("node --test -rx", false),
+            ("node --test --test-name-pattern=pre", true),
+            ("go test -ldflags=-X=main.v=1 ./...", true),
+            ("go test -ldflags -extldflags=-B. ./...", false),
+            (
+                "cargo clippy -- -D warnings -Wclippy::pedantic --cap-lints=warn",
+                true,
+            ),
+            ("cargo clippy -- -D -C", false),
+            ("cargo clippy -- -Clinker=x", false),
+            ("cargo test -- --nocapture", true),
+        ] {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert_eq!(approvable(&words), approved, "{command}");
+        }
     }
 }

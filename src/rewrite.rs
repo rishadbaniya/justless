@@ -71,19 +71,17 @@ pub fn check_exclusion(entry: &str) -> Result<()> {
     Ok(())
 }
 
-/// The project's `exclude_commands`. Settings that cannot be read exclude
-/// nothing, so the hooks behave as they did before the setting existed.
+/// The project's `exclude_commands`.
 #[derive(Default)]
 pub struct Exclusions(Vec<String>);
 
 impl Exclusions {
-    pub fn of(workspace: &Workspace) -> Self {
-        Self(
-            workspace
-                .settings()
-                .map(|settings| settings.exclude_commands)
-                .unwrap_or_default(),
-        )
+    /// The project's `exclude_commands`, or why `.justless.toml` fails to load.
+    /// `justless run` refuses to start while it does, so a hook that gets the
+    /// error leaves every command as written rather than route it into a run
+    /// that stops before the command starts.
+    pub fn of(workspace: &Workspace) -> Result<Self> {
+        Ok(Self(workspace.settings()?.exclude_commands))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -92,7 +90,9 @@ impl Exclusions {
 
     /// The entry that matches one command: its text, or the words after any
     /// `NAME=value` assignments, start with the entry's words, or match the
-    /// entry's expression.
+    /// entry's expression. Words are compared after shell quote removal and
+    /// joined by single spaces, so `cargo  test` and `'cargo' test` match
+    /// `cargo test`; an expression sees the text as written.
     pub fn matching(&self, segment: &str) -> Option<&str> {
         if self.0.is_empty() {
             return None;
@@ -144,12 +144,28 @@ fn matches(entry: &str, text: &str) -> bool {
     if entry.starts_with('^') {
         return Regex::new(entry).is_ok_and(|pattern| pattern.is_match(text));
     }
+    // An entry that ends in a blank needs another word after its own.
+    let open = entry.ends_with(char::is_whitespace);
     let entry = entry.trim_start();
-    text.strip_prefix(entry).is_some_and(|rest| {
-        rest.is_empty()
-            || rest.starts_with(char::is_whitespace)
-            || entry.ends_with(char::is_whitespace)
-    })
+    let written = text
+        .strip_prefix(entry)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace) || open);
+    let (words, text) = (shell_words(entry), shell_words(text));
+    written
+        || !words.is_empty()
+            && text
+                .strip_prefix(&words)
+                .is_some_and(|rest| rest.starts_with(' ') || rest.is_empty() && !open)
+}
+
+/// The shell words of `text` without quotes, joined by single spaces, or its
+/// blank-separated words when the shell would not split it, as with an
+/// unclosed quote.
+fn shell_words(text: &str) -> String {
+    match shlex::split(text) {
+        Some(words) => words.join(" "),
+        None => text.split_whitespace().collect::<Vec<_>>().join(" "),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +285,10 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
     } else {
         format!("{client} hook")
     };
-    let exclusions = Exclusions::of(workspace);
+    let (exclusions, unloadable) = match Exclusions::of(workspace) {
+        Ok(exclusions) => (exclusions, None),
+        Err(error) => (Exclusions::default(), Some(format!("{error:#}"))),
+    };
     let answer = if disabled() || cfg!(windows) {
         None
     } else {
@@ -304,7 +323,14 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
         }
         None => {
             lines.push(format!("{heading}: unchanged"));
-            let (why, rules) = left_alone(workspace, agent, mode, command, &exclusions);
+            let (why, rules) = left_alone(
+                workspace,
+                agent,
+                mode,
+                command,
+                &exclusions,
+                unloadable.as_deref(),
+            );
             lines.push(format!("Why: {why}"));
             judged = rules;
         }
@@ -342,13 +368,14 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
 }
 
 /// Why a hook leaves `command` as written, and whether Claude Code's permission
-/// rules are the reason.
+/// rules are the reason. `unloadable` is why `.justless.toml` fails to load.
 fn left_alone(
     workspace: &Workspace,
     agent: Agent,
     mode: &str,
     command: &str,
     exclusions: &Exclusions,
+    unloadable: Option<&str>,
 ) -> (String, bool) {
     let claude = agent == Agent::Claude;
     if disabled() {
@@ -360,6 +387,14 @@ fn left_alone(
     if cfg!(windows) {
         return (
             "command hooks pass every command through on Windows.".into(),
+            false,
+        );
+    }
+    if let Some(error) = unloadable {
+        return (
+            format!(
+                ".justless.toml fails to load ({error}), and Justless commands stop on that error, so every hook leaves commands as written until it is fixed."
+            ),
             false,
         );
     }
@@ -420,6 +455,24 @@ fn left_alone(
                 false,
             );
         }
+    }
+    // A hook whose answer allows the rewrite takes fewer commands than Gemini
+    // CLI's, which leaves the decision to the client.
+    if matches!(agent, Agent::Codex | Agent::Cursor | Agent::Agy)
+        && ask(
+            workspace,
+            Agent::Gemini,
+            &input(workspace, Agent::Gemini, mode, command),
+        )
+        .is_some()
+    {
+        return (
+            format!(
+                "{} runs a rewritten command without asking, so its hook leaves one with an option or assignment it does not approve, such as an option that runs another program, a build target other than a conventional one, or a path outside the working tree.",
+                label(agent)
+            ),
+            false,
+        );
     }
     let after = if claude {
         " The after-bash hook may still compact its output after it runs."

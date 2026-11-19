@@ -444,7 +444,7 @@ impl Coverage {
 pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -> Coverage {
     let mut groups: BTreeMap<Route, Group> = BTreeMap::new();
     let (mut nested, mut nested_bytes) = (0, 0);
-    let exclusions = crate::rewrite::Exclusions::of(workspace);
+    let exclusions = crate::rewrite::Exclusions::of(workspace).unwrap_or_default();
     let scan = scan(&workspace.root, since_ms, |shell| {
         let words = crate::agents::command_label(&shell.command);
         let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());

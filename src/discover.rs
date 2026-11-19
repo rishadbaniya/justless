@@ -211,7 +211,9 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
     };
     let since_ms = now_ms().saturating_sub(days.saturating_mul(86_400_000));
     let codex = crate::rollouts::coverage(workspace, since_ms);
-    let exclusions = Exclusions::of(workspace);
+    // Past commands are judged by the rules in force now, or by none while the
+    // settings fail to load.
+    let exclusions = Exclusions::of(workspace).unwrap_or_default();
     // Sessions keep subagent transcripts under <session>/subagents/, and workflow
     // subagents one level deeper under subagents/workflows/<run>/.
     let mut files = Vec::new();

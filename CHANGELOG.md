@@ -62,6 +62,10 @@ Details: [Recoverable tool history](docs/reference.md#recoverable-tool-history) 
 - `justless init --hooks` sets up Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, Antigravity CLI and OpenCode with a short instruction block, and is safe to rerun.
 - Hooks route supported commands in `&&`, `||` and `;` lists, after `NAME=value` and before a final `2>&1`; Codex and Cursor, which skip approval, route only local tools.
 - The Claude Code hook keeps your permission rules in force by judging the original command, and `doctor` warns about rules such as `Bash(justless run *)`.
+- While a `Read`, `Edit` or `Write` deny or ask rule exists, the Claude Code hook leaves file-reading commands such as `rg SECRET .env` as written in every permission mode.
+- Hooks that approve rewrites, Codex, Cursor and Antigravity, leave commands with options that run other programs or code, such as `rg --pre`, `rg --hostname-bin` or `go vet -vettool`.
+- A `.justless.toml` that fails to load makes every hook leave commands as written instead of routing them into a run that stops on the error.
+- `exclude_commands` entries match a command's shell words, whatever its spacing or quoting.
 - Claude Code's hooks also compact large output the command hook left alone, such as `cargo test 2>&1 | tail -200`, and large Grep and Glob results.
 - Clients without a post-command hook route JSON reads such as `gh … --json` and `kubectl get -o json`: a 90,886-byte `gh api` listing showed 2,789 bytes.
 - `justless init --global` adds opt-in user-level hooks for Claude Code and Codex that serve every project, unless one sets `global_hooks = false`.
@@ -69,6 +73,7 @@ Details: [Recoverable tool history](docs/reference.md#recoverable-tool-history) 
 - `justless doctor` checks the binary, each agent's CLI, hooks, instructions, MCP entries and `.justless/`, and prints a fix for every problem.
 - `justless mcp` serves the read-only commands over stdio, and `mcp --install` adds it to Claude Code, Cursor, Gemini CLI, VS Code or Codex.
 - `justless init --remove` undoes setup and restores untouched files byte for byte; `--dry-run` shows each change and `--purge` also deletes `.justless/`.
+- Removing Codex drops the `AGENTS.md` section that `CLAUDE.md` imports unless Claude Code was set up, and `init --remove --global` keeps your own empty hook arrays.
 - `justless learn` turns command mistakes agents corrected or repeated into project rules, and `--apply` writes them to `AGENTS.md` or `CLAUDE.md`.
 
 Details: [Install and configure agents](docs/reference.md#install-and-configure-agents) · [MCP server](docs/reference.md#mcp-server) · [Check the setup](docs/reference.md#check-the-setup) · [Learned command rules](docs/reference.md#learned-command-rules)
