@@ -792,36 +792,25 @@ mod tests {
 
     #[test]
     fn shebang_names_the_interpreter() {
-        assert_eq!(shebang("#!/bin/sh\necho ok").as_deref(), Some("sh"));
-        assert_eq!(
-            shebang("#!/usr/bin/env python3\n").as_deref(),
-            Some("python3")
-        );
-        assert_eq!(
-            shebang("#!/usr/bin/env -S python3 -u\n").as_deref(),
-            Some("python3")
-        );
-        assert_eq!(
-            shebang("#!/usr/bin/env PYTHONUTF8=1 python3\n").as_deref(),
-            Some("python3")
-        );
-        assert_eq!(
-            shebang("#!/usr/bin/env -u PYTHONPATH python3\n").as_deref(),
-            Some("python3")
-        );
-        assert_eq!(
-            shebang("#! /usr/local/bin/python3.12\r\nprint(1)").as_deref(),
-            Some("python3.12")
-        );
-        assert_eq!(shebang("#!/usr/bin/env node\r\n").as_deref(), Some("node"));
-        assert_eq!(
-            shebang("#!/usr/bin/env Rscript").as_deref(),
-            Some("Rscript")
-        );
-        assert_eq!(shebang("#!/usr/bin/env\n"), None);
-        assert_eq!(shebang("#!/usr/bin/env -S\n"), None);
-        assert_eq!(shebang("#!\n"), None);
-        assert_eq!(shebang("print(1)\n#!/bin/sh"), None);
+        for (code, program) in [
+            ("#!/bin/sh\necho ok", Some("sh")),
+            ("#!/usr/bin/env python3\n", Some("python3")),
+            ("#!/usr/bin/env -S python3 -u\n", Some("python3")),
+            ("#!/usr/bin/env PYTHONUTF8=1 python3\n", Some("python3")),
+            ("#!/usr/bin/env -u PYTHONPATH python3\n", Some("python3")),
+            (
+                "#! /usr/local/bin/python3.12\r\nprint(1)",
+                Some("python3.12"),
+            ),
+            ("#!/usr/bin/env node\r\n", Some("node")),
+            ("#!/usr/bin/env Rscript", Some("Rscript")),
+            ("#!/usr/bin/env\n", None),
+            ("#!/usr/bin/env -S\n", None),
+            ("#!\n", None),
+            ("print(1)\n#!/bin/sh", None),
+        ] {
+            assert_eq!(shebang(code).as_deref(), program, "{code:?}");
+        }
     }
 
     #[test]
@@ -851,26 +840,22 @@ mod tests {
 
     #[test]
     fn deno_and_bun_options_replace_the_default_run() {
-        let words = |list: &[&str]| list.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        let prefix = |lang: Lang, options: &str| {
+            let options: Vec<String> = options.split_whitespace().map(String::from).collect();
+            let prefix = lang.prefix(&options);
+            assert!(prefix.iter().all(|word| !word.contains(' ')), "{prefix:?}");
+            prefix.join(" ")
+        };
+        assert_eq!(prefix(Lang::Deno, ""), "run --allow-all --quiet");
         assert_eq!(
-            Lang::Deno.prefix(&[]),
-            words(&["run", "--allow-all", "--quiet"])
+            prefix(Lang::Deno, "run --allow-read=."),
+            "run --allow-read=."
         );
-        assert_eq!(
-            Lang::Deno.prefix(&words(&["run", "--allow-read=."])),
-            words(&["run", "--allow-read=."])
-        );
-        assert_eq!(
-            Lang::Deno.prefix(&words(&["--allow-net"])),
-            words(&["run", "--allow-net"])
-        );
-        assert_eq!(Lang::Bun.prefix(&[]), words(&["run"]));
-        assert_eq!(
-            Lang::Bun.prefix(&words(&["--smol"])),
-            words(&["run", "--smol"])
-        );
-        assert_eq!(Lang::Sh.prefix(&words(&["-e"])), words(&["-e"]));
-        assert!(Lang::Python3.prefix(&[]).is_empty());
+        assert_eq!(prefix(Lang::Deno, "--allow-net"), "run --allow-net");
+        assert_eq!(prefix(Lang::Bun, ""), "run");
+        assert_eq!(prefix(Lang::Bun, "--smol"), "run --smol");
+        assert_eq!(prefix(Lang::Sh, "-e"), "-e");
+        assert_eq!(prefix(Lang::Python3, ""), "");
     }
 
     #[test]

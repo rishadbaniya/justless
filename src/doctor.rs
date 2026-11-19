@@ -2884,22 +2884,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_fresh_hook_file_is_understood_and_current() {
-        for (_, agent) in AGENTS {
-            if agent == Agent::OpenCode {
-                continue;
-            }
-            let fresh: Value = serde_json::from_str(&agents::fresh_hooks(agent).unwrap()).unwrap();
-            let (group, expected) = expected_hooks(&fresh).unwrap();
-            assert!(!expected.is_empty());
-            let audit = audit_config(agent, &fresh, &group, &expected);
-            assert!(audit.missing.is_empty() && audit.drift.is_empty());
-            assert!(audit.unexpected.is_empty() && audit.shape.is_none());
-            assert_eq!(audit.found, expected.len());
-        }
-    }
-
-    #[test]
     fn a_drifted_matcher_and_a_lost_guard_are_problems() {
         let fresh: Value =
             serde_json::from_str(&agents::fresh_hooks(Agent::Copilot).unwrap()).unwrap();
@@ -2925,23 +2909,17 @@ mod tests {
     #[test]
     fn instruction_blocks_are_judged_like_setup() {
         let (start, end, template) = agents::instruction_block();
-        assert!(matches!(block_state("# Notes\n"), Block::Absent));
-        assert!(matches!(
-            block_state(&format!("# Notes\n\n{template}\n")),
-            Block::Current
-        ));
-        assert!(matches!(
-            block_state(&format!("{start}\nold text\n{end}\n")),
-            Block::Stale
-        ));
-        assert!(matches!(
-            block_state(&format!("{start}\nno end\n")),
-            Block::Broken(_)
-        ));
-        assert!(matches!(
-            block_state(&format!("{template}\n{template}\n")),
-            Block::Broken(_)
-        ));
+        let state = |text: &str| match block_state(text) {
+            Block::Absent => "absent",
+            Block::Current => "current",
+            Block::Stale => "stale",
+            Block::Broken(_) => "broken",
+        };
+        assert_eq!(state("# Notes\n"), "absent");
+        assert_eq!(state(&format!("# Notes\n\n{template}\n")), "current");
+        assert_eq!(state(&format!("{start}\nold text\n{end}\n")), "stale");
+        assert_eq!(state(&format!("{start}\nno end\n")), "broken");
+        assert_eq!(state(&format!("{template}\n{template}\n")), "broken");
     }
 
     #[test]
@@ -3016,21 +2994,25 @@ mod tests {
         );
         assert_eq!(unqualified("notjustless hook-claude x").1, None);
 
+        // Every fresh hook file is understood and current, as it is or with
+        // justless called by path.
         for (_, agent) in AGENTS {
             if agent == Agent::OpenCode {
                 continue;
             }
             let fresh = agents::fresh_hooks(agent).unwrap();
             let (group, expected) = expected_hooks(&serde_json::from_str(&fresh).unwrap()).unwrap();
-            let config: Value = serde_json::from_str(
-                &fresh.replace("\"justless hook-", "\"/opt/bin/justless hook-"),
-            )
-            .unwrap();
-            let audit = audit_config(agent, &config, &group, &expected);
-            assert_eq!(audit.found, expected.len());
-            assert!(audit.missing.is_empty() && audit.unexpected.is_empty());
-            assert!(audit.drift.is_empty(), "{}", audit.drift[0].key);
-            assert_eq!(audit.paths, ["/opt/bin/justless"]);
+            assert!(!expected.is_empty());
+            let by_path = fresh.replace("\"justless hook-", "\"/opt/bin/justless hook-");
+            for (text, paths) in [(&fresh, &[][..]), (&by_path, &["/opt/bin/justless"])] {
+                let config: Value = serde_json::from_str(text).unwrap();
+                let audit = audit_config(agent, &config, &group, &expected);
+                assert_eq!(audit.found, expected.len());
+                assert!(audit.missing.is_empty() && audit.unexpected.is_empty());
+                assert!(audit.drift.is_empty(), "{}", audit.drift[0].key);
+                assert!(audit.shape.is_none());
+                assert_eq!(audit.paths, paths);
+            }
         }
     }
 }

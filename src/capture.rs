@@ -3311,7 +3311,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_words_count_anywhere_in_a_failed_runs_line() {
+    fn failure_words_signals_and_timeouts_count_anywhere_in_a_failed_runs_line() {
         for text in [
             "order-42 FAILED at settlement",
             "raised TimeoutError: slow",
@@ -3319,10 +3319,24 @@ mod tests {
             "found 2 errors",
             "Traceback (most recent call last):",
             "fatal: not a repository",
+            "  2 failing",
+            "Segmentation fault (core dumped)",
+            "segfault at 0 ip 0000",
+            "Aborted (core dumped)",
+            "process killed by signal 9",
+            "Killed",
+            "request timed out after 30s",
+            "not ok 3 - settles order",
         ] {
             assert_eq!(kind_of(true, Stdout, text), FAILURE, "{text}");
         }
-        for text in ["order-42 progress 3", "fail_fast = true", "passed"] {
+        for text in [
+            "order-42 progress 3",
+            "fail_fast = true",
+            "passed",
+            "killed_count = 0",
+            "nothing failing_here",
+        ] {
             assert_eq!(kind_of(true, Stdout, text), PLAIN, "{text}");
         }
         assert_eq!(kind_of(true, Stderr, "Compiling demo"), STDERR);
@@ -3341,28 +3355,5 @@ mod tests {
             tally.every_shown().to_string(),
             "stdout 25 of 25, stderr 1 of 1"
         );
-    }
-
-    #[test]
-    fn summaries_signals_and_timeouts_count_as_failures() {
-        for text in [
-            "  2 failing",
-            "Segmentation fault (core dumped)",
-            "segfault at 0 ip 0000",
-            "Aborted (core dumped)",
-            "process killed by signal 9",
-            "Killed",
-            "request timed out after 30s",
-            "not ok 3 - settles order",
-        ] {
-            assert_eq!(kind_of(true, Stdout, text), FAILURE, "{text}");
-        }
-        for text in [
-            "fail_fast = true",
-            "killed_count = 0",
-            "nothing failing_here",
-        ] {
-            assert_eq!(kind_of(true, Stdout, text), PLAIN, "{text}");
-        }
     }
 }

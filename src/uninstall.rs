@@ -1528,66 +1528,40 @@ mod tests {
 
     #[test]
     fn a_removed_section_takes_the_separator_setup_added() {
-        let strip = |text: &str| strip_section("AGENTS.md", text).unwrap();
-        assert_eq!(strip(&format!("{BLOCK}\n")).as_deref(), Some(""));
-        assert_eq!(
-            strip(&format!("# Team\n\n{BLOCK}\n")).as_deref(),
-            Some("# Team\n")
-        );
-        assert_eq!(
-            strip(&format!("# Team\n\n\n{BLOCK}\n")).as_deref(),
-            Some("# Team\n\n")
-        );
-        assert_eq!(
-            strip(&format!("# A\n\n{BLOCK}\n\n# B\n")).as_deref(),
-            Some("# A\n\n# B\n")
-        );
-        assert_eq!(
-            strip(&format!("# A\n{BLOCK}\n# B\n")).as_deref(),
-            Some("# A\n# B\n")
-        );
-        assert_eq!(
-            strip(&format!("# A\r\n\r\n{BLOCK}\r\n")).as_deref(),
-            Some("# A\r\n")
-        );
-        assert_eq!(strip("# Only\n"), None);
+        for (text, expected) in [
+            (format!("{BLOCK}\n"), ""),
+            (format!("# Team\n\n{BLOCK}\n"), "# Team\n"),
+            (format!("# Team\n\n\n{BLOCK}\n"), "# Team\n\n"),
+            (format!("# A\n\n{BLOCK}\n\n# B\n"), "# A\n\n# B\n"),
+            (format!("# A\n{BLOCK}\n# B\n"), "# A\n# B\n"),
+            (format!("# A\r\n\r\n{BLOCK}\r\n"), "# A\r\n"),
+        ] {
+            let stripped = strip_section("AGENTS.md", &text).unwrap();
+            assert_eq!(stripped.as_deref(), Some(expected), "{text:?}");
+        }
+        assert_eq!(strip_section("AGENTS.md", "# Only\n").unwrap(), None);
         assert!(strip_section("AGENTS.md", "<!-- justless:begin -->\n").is_err());
         assert!(strip_section("AGENTS.md", "<!-- justless:end -->\n").is_err());
         assert!(strip_section("AGENTS.md", &format!("{BLOCK}\n{BLOCK}\n")).is_err());
     }
 
     #[test]
-    fn ignore_lines_and_commands_are_matched_exactly() {
-        assert_eq!(
-            strip_ignore("target\n\n/.justless/\n").as_deref(),
-            Some("target\n")
-        );
-        assert_eq!(strip_ignore("/.justless/\n").as_deref(), Some(""));
-        assert_eq!(
-            strip_ignore("a\n/.justless/\nb\n").as_deref(),
-            Some("a\nb\n")
-        );
-        assert_eq!(strip_ignore(".justless/\n"), None);
-        assert!(is_hook(
-            &serde_json::json!({"command":"justless hook-claude before-command"})
-        ));
-        assert!(is_hook(
-            &serde_json::json!({"bash":"/opt/bin/justless hook-copilot session-start || true"})
-        ));
-        assert!(!is_hook(
-            &serde_json::json!({"command":"justless run -- cargo test"})
-        ));
-        assert!(!is_hook(
-            &serde_json::json!({"command":"notjustless hook-claude x"})
-        ));
-        assert!(is_server(Some("justless"), &["mcp", "--root", "x"]));
-        assert!(!is_server(Some("node"), &["mcp"]));
+    fn ignore_lines_are_matched_exactly() {
+        for (text, expected) in [
+            ("target\n\n/.justless/\n", Some("target\n")),
+            ("/.justless/\n", Some("")),
+            ("a\n/.justless/\nb\n", Some("a\nb\n")),
+            (".justless/\n", None),
+        ] {
+            assert_eq!(strip_ignore(text).as_deref(), expected, "{text:?}");
+        }
     }
 
     #[test]
     fn hooks_match_in_every_shell_form_and_only_hook_subcommands() {
         let hook = |command: &str| is_hook(&serde_json::json!({ "command": command }));
         for command in [
+            "justless hook-claude before-command",
             "\"/Users/Jane Doe/.cargo/bin/justless\" hook-claude before-command",
             "JUSTLESS_LOCK_TIMEOUT=1 justless hook-claude before-command",
             "env A=1 B=2 justless hook-codex session-start",
@@ -1598,8 +1572,13 @@ mod tests {
         ] {
             assert!(hook(command), "{command}");
         }
+        // Copilot names its command `bash`.
+        let copilot = "/opt/bin/justless hook-copilot session-start || true";
+        assert!(is_hook(&serde_json::json!({ "bash": copilot })));
         for command in [
+            "justless run -- cargo test",
             "justless run -- npm run hook-setup",
+            "notjustless hook-claude x",
             "justless hook-unknown before-command",
             "justless statusline",
             "input=$(cat); printf '%s' \"$input\" | { ~/bin/s.sh; }; printf '%s' \"$input\" | justless statusline",
@@ -1608,13 +1587,13 @@ mod tests {
         ] {
             assert!(!hook(command), "{command}");
         }
-        assert!(is_server(
-            Some("/Users/Jane Doe/.cargo/bin/justless"),
-            &["mcp"]
-        ));
-        assert!(is_server(Some("justless mcp"), &[]));
-        assert!(is_server(Some("justless"), &["--root", "mcp", "mcp"]));
-        assert!(!is_server(Some("justless"), &["run", "--", "mcp"]));
+        let server = |command: &str, args: &[&str]| is_server(Some(command), args);
+        assert!(server("/Users/Jane Doe/.cargo/bin/justless", &["mcp"]));
+        assert!(server("justless mcp", &[]));
+        assert!(server("justless", &["mcp", "--root", "x"]));
+        assert!(server("justless", &["--root", "mcp", "mcp"]));
+        assert!(!server("justless", &["run", "--", "mcp"]));
+        assert!(!server("node", &["mcp"]));
     }
 
     #[test]

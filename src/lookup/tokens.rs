@@ -371,42 +371,34 @@ mod tests {
     #[test]
     fn offsets_point_at_the_source_word() {
         let mut found = Vec::new();
-        tokens("let retry_count = 1;", |token, offset| {
-            found.push((token.to_owned(), offset))
+        tokens("let retry_count = 1;", |token, at| {
+            found.push(format!("{token}@{at}"))
         });
-        assert_eq!(
-            found,
-            [
-                ("let".to_owned(), 0),
-                ("retrycount".to_owned(), 4),
-                ("retri".to_owned(), 4),
-                ("count".to_owned(), 4)
-            ]
-        );
+        assert_eq!(found, ["let@0", "retrycount@4", "retri@4", "count@4"]);
     }
 
     #[test]
     fn stemmer_vectors() {
-        for word in ["retries", "retry", "retrying", "retried"] {
-            assert_eq!(stem(word), "retri", "{word}");
+        for (words, stemmed) in [
+            ("retries retry retrying retried", "retri"),
+            ("configured configuration configure", "configur"),
+            ("reconnecting reconnects", "reconnect"),
+            ("called calling", "call"),
+            ("handled handle", "handl"),
+            ("config", "config"),
+            ("parse", "pars"),
+            ("response", "respons"),
+            ("stopped", "stop"),
+            ("classes", "class"),
+            ("status", "status"),
+            ("agreed", "agreed"),
+            ("use", "use"),
+            ("Retries", "Retries"),
+        ] {
+            for word in words.split(' ') {
+                assert_eq!(stem(word), stemmed, "{word}");
+            }
         }
-        for word in ["configured", "configuration", "configure"] {
-            assert_eq!(stem(word), "configur", "{word}");
-        }
-        assert_eq!(stem("config"), "config");
-        assert_eq!(stem("reconnecting"), "reconnect");
-        assert_eq!(stem("reconnects"), "reconnect");
-        assert_eq!(stem("parse"), "pars");
-        assert_eq!(stem("response"), "respons");
-        assert_eq!(stem("called"), "call");
-        assert_eq!(stem("calling"), "call");
-        assert_eq!(stem("stopped"), "stop");
-        assert_eq!(stem("handled"), stem("handle"));
-        assert_eq!(stem("classes"), "class");
-        assert_eq!(stem("status"), "status");
-        assert_eq!(stem("agreed"), "agreed");
-        assert_eq!(stem("use"), "use");
-        assert_eq!(stem("Retries"), "Retries");
     }
 
     #[test]

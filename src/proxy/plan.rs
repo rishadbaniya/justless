@@ -650,6 +650,30 @@ mod tests {
         }
     }
 
+    const OPUS: &str = "claude-opus-5-5";
+    const SONNET: &str = "claude-sonnet-5-5";
+    const HAIKU: &str = "claude-haiku-4-5";
+    const FABLE: &str = "claude-fable-5-2";
+
+    /// A conversation whose models last started at the given times.
+    fn started(models: &[(&str, u64)]) -> Conversation {
+        let last_start = models.iter().map(|(m, ms)| (m.to_string(), *ms));
+        Conversation {
+            last_start: last_start.collect(),
+            ..Default::default()
+        }
+    }
+
+    fn mover(
+        req: &Request,
+        model: &str,
+        at: Option<&Conversation>,
+        o: &Options,
+        ms: u64,
+    ) -> Decision {
+        decide(req, model, at, Role::Mover, o, ms)
+    }
+
     #[test]
     fn enumerates_client_server_and_mcp_tool_uses() {
         let body = json!({"model":"claude-opus-5-5","messages":[
@@ -668,10 +692,8 @@ mod tests {
         let ids: Vec<_> = req.uses.iter().map(|u| u.id.as_str()).collect();
         assert_eq!(ids, ["toolu_a", "srvtoolu_b", "mcptoolu_c", "toolu_d"]);
         assert_eq!(req.key(), Some("toolu_a"));
-        assert_eq!(req.uses[0].result, Some((1, 0)));
-        assert_eq!(req.uses[1].result, Some((0, 3)));
-        assert_eq!(req.uses[2].result, Some((0, 5)));
-        assert_eq!(req.uses[3].result, None);
+        let results: Vec<_> = req.uses.iter().map(|u| u.result).collect();
+        assert_eq!(results, [Some((1, 0)), Some((0, 3)), Some((0, 5)), None]);
         assert_eq!(req.uses[0].result_bytes, 6);
     }
 
@@ -704,35 +726,22 @@ mod tests {
         }
         // As a share of the messages layer before the move: rho / (1 + rho).
         let share = |rho: f64| rho / (1.0 + rho);
-        assert!(close(
-            share(payback_ratio("claude-opus-5-5", false, 12)),
-            2.0 / 3.0
-        ));
-        assert!((share(payback_ratio("claude-fable-5-2", false, 12)) - 0.80).abs() < 0.005);
-        assert!((share(payback_ratio("claude-fable-5-2", true, 12)) - 0.87).abs() < 0.005);
-        assert!((share(payback_ratio("claude-sonnet-5-5", true, 12)) - 0.76).abs() < 0.005);
+        assert!(close(share(payback_ratio(OPUS, false, 12)), 2.0 / 3.0));
+        assert!((share(payback_ratio(FABLE, false, 12)) - 0.80).abs() < 0.005);
+        assert!((share(payback_ratio(FABLE, true, 12)) - 0.87).abs() < 0.005);
+        assert!((share(payback_ratio(SONNET, true, 12)) - 0.76).abs() < 0.005);
         assert!((share(payback_ratio("claude-haiku-5-5", false, 12)) - 0.49).abs() < 0.005);
         assert!((share(payback_ratio("claude-haiku-5-5", true, 12)) - 0.61).abs() < 0.005);
     }
 
     #[test]
     fn warm_moves_need_the_payback_share_and_cold_moves_do_not() {
-        let opts = options();
-        let warm = Conversation {
-            last_start: [("claude-opus-5-5".to_string(), 1_000_000)].into(),
-            ..Default::default()
-        };
-        let rho = payback_ratio("claude-opus-5-5", false, 12);
+        let mut opts = options();
+        let warm = started(&[(OPUS, 1_000_000)]);
+        let rho = payback_ratio(OPUS, false, 12);
         // Eight results of 4,000 bytes with keep 2: six cleared against two kept.
         let req = request(&conversation(&[4000; 8]));
-        let decision = decide(
-            &req,
-            "claude-opus-5-5",
-            Some(&warm),
-            Role::Mover,
-            &opts,
-            1_010_000,
-        );
+        let decision = mover(&req, OPUS, Some(&warm), &opts, 1_010_000);
         assert!(!decision.cold);
         assert!(decision.ratio.unwrap() >= rho, "{decision:?}");
         assert_eq!(decision.boundary, 6);
@@ -740,28 +749,11 @@ mod tests {
         // Seven results of 2,000 bytes with keep 3: warm payback fails, but an
         // expired cache moves anyway.
         let req = request(&conversation(&[2000; 7]));
-        let opts = Options {
-            keep: 3,
-            ..options()
-        };
-        let warm_decision = decide(
-            &req,
-            "claude-opus-5-5",
-            Some(&warm),
-            Role::Mover,
-            &opts,
-            1_010_000,
-        );
+        opts.keep = 3;
+        let warm_decision = mover(&req, OPUS, Some(&warm), &opts, 1_010_000);
         assert!(warm_decision.ratio.unwrap() < rho, "{warm_decision:?}");
         assert_eq!((warm_decision.boundary, warm_decision.moved), (0, None));
-        let cold = decide(
-            &req,
-            "claude-opus-5-5",
-            Some(&warm),
-            Role::Mover,
-            &opts,
-            1_070_000,
-        );
+        let cold = mover(&req, OPUS, Some(&warm), &opts, 1_070_000);
         assert!(cold.cold);
         assert_eq!(cold.boundary, 4);
         let moved = cold.moved.unwrap();
@@ -776,32 +768,11 @@ mod tests {
         );
         // --payback 0 turns warm moves off; --cold-after 0 turns cold moves off.
         let req = request(&conversation(&[4000; 8]));
-        let opts = Options {
-            payback: 0,
-            ..options()
-        };
-        let none = decide(
-            &req,
-            "claude-opus-5-5",
-            Some(&warm),
-            Role::Mover,
-            &opts,
-            1_010_000,
-        );
-        assert_eq!(none.moved, None);
-        let opts = Options {
-            payback: 0,
-            cold_after: Some(0),
-            ..options()
-        };
-        let late = decide(
-            &req,
-            "claude-opus-5-5",
-            Some(&warm),
-            Role::Mover,
-            &opts,
-            9_000_000,
-        );
+        let mut opts = options();
+        opts.payback = 0;
+        assert_eq!(mover(&req, OPUS, Some(&warm), &opts, 1_010_000).moved, None);
+        opts.cold_after = Some(0);
+        let late = mover(&req, OPUS, Some(&warm), &opts, 9_000_000);
         assert!(!late.cold);
         assert_eq!(late.moved, None);
     }
@@ -812,16 +783,16 @@ mod tests {
         let mut opts = options();
         opts.payback = 1000;
         // An unknown conversation counts as warm.
-        let first = decide(&req, "claude-haiku-4-5", None, Role::Mover, &opts, 5);
+        let first = mover(&req, HAIKU, None, &opts, 5);
         assert!(!first.cold);
         assert_eq!(first.boundary, 4);
         opts.floor = req.est_prompt + 1;
-        let below = decide(&req, "claude-haiku-4-5", None, Role::Mover, &opts, 5);
+        let below = mover(&req, HAIKU, None, &opts, 5);
         assert_eq!(below.boundary, 0);
         assert_eq!(below.idle_reason(&req, &opts), "below-floor");
         opts.floor = 1000;
         opts.clear_at_least = 2005;
-        let small_clear = decide(&req, "claude-haiku-4-5", None, Role::Mover, &opts, 5);
+        let small_clear = mover(&req, HAIKU, None, &opts, 5);
         assert_eq!(small_clear.boundary, 0);
         assert_eq!(small_clear.idle_reason(&req, &opts), "below-clear-at-least");
         // A conversation known only from token counts has no start yet, and
@@ -830,14 +801,7 @@ mod tests {
         opts.payback = 0;
         let counted = Conversation::default();
         for conversation in [None, Some(&counted)] {
-            let decision = decide(
-                &req,
-                "claude-haiku-4-5",
-                conversation,
-                Role::Mover,
-                &opts,
-                5_000_000,
-            );
+            let decision = mover(&req, HAIKU, conversation, &opts, 5_000_000);
             assert!(!decision.cold);
             assert_eq!(decision.boundary, 0);
             assert_eq!(decision.idle_reason(&req, &opts), "below-payback");
@@ -846,7 +810,7 @@ mod tests {
         // Fewer than four calls to clear never moves.
         opts.clear_at_least = 1;
         opts.keep = 3;
-        let small = decide(&req, "claude-haiku-4-5", None, Role::Mover, &opts, 5);
+        let small = mover(&req, HAIKU, None, &opts, 5);
         assert_eq!(small.boundary, 0);
         assert_eq!(small.idle_reason(&req, &opts), "nothing-to-clear");
     }
@@ -854,24 +818,12 @@ mod tests {
     #[test]
     fn boundaries_never_move_back_and_survive_rewinds() {
         let req = request(&conversation(&[2000; 6]));
-        let mut state = Conversation {
-            boundaries: vec!["toolu_03".into(), "toolu_05".into()],
-            last_start: [("claude-haiku-4-5".to_string(), 0)].into(),
-            ..Default::default()
-        };
+        let mut state = started(&[(HAIKU, 0)]);
+        state.boundaries = vec!["toolu_03".into(), "toolu_05".into()];
         assert_eq!(state.boundary(&req.uses), 6);
-        let opts = Options {
-            payback: 1000,
-            ..options()
-        };
-        let decision = decide(
-            &req,
-            "claude-haiku-4-5",
-            Some(&state),
-            Role::Mover,
-            &opts,
-            1,
-        );
+        let mut opts = options();
+        opts.payback = 1000;
+        let decision = mover(&req, HAIKU, Some(&state), &opts, 1);
         assert_eq!(
             (decision.before, decision.boundary, decision.moved),
             (6, 6, None)
@@ -886,99 +838,47 @@ mod tests {
     #[test]
     fn a_model_change_moves_only_when_every_cache_has_expired() {
         let req = request(&conversation(&[2000; 6]));
-        let opts = Options {
-            payback: 0,
-            ..options()
-        };
-        let state = Conversation {
-            last_start: [("claude-opus-5-5".to_string(), 1_000)].into(),
-            ..Default::default()
-        };
+        let mut opts = options();
+        opts.payback = 0;
+        let state = started(&[(OPUS, 1_000)]);
         // Opus ran a second ago: its cache is warm, so switching to Sonnet is not
         // an expired cache, and warm moves are off.
-        let switched = decide(
-            &req,
-            "claude-sonnet-5-5",
-            Some(&state),
-            Role::Mover,
-            &opts,
-            2_000,
-        );
+        let switched = mover(&req, SONNET, Some(&state), &opts, 2_000);
         assert!(!switched.cold);
         assert_eq!((switched.boundary, switched.moved.as_ref()), (0, None));
         assert_eq!(switched.idle_reason(&req, &opts), "below-payback");
         // Once Opus has been idle past the window, no cache is warm.
-        let later = decide(
-            &req,
-            "claude-sonnet-5-5",
-            Some(&state),
-            Role::Mover,
-            &opts,
-            62_000,
-        );
+        let later = mover(&req, SONNET, Some(&state), &opts, 62_000);
         assert!(later.cold);
         assert_eq!(later.boundary, 4);
         assert_eq!(later.moved.unwrap().kind, Kind::Cold);
         // Any model that ran within the window keeps the conversation warm.
-        let both = Conversation {
-            last_start: [
-                ("claude-opus-5-5".to_string(), 1_000),
-                ("claude-haiku-4-5".to_string(), 61_000),
-            ]
-            .into(),
-            ..Default::default()
-        };
-        let mixed = decide(
-            &req,
-            "claude-opus-5-5",
-            Some(&both),
-            Role::Mover,
-            &opts,
-            62_000,
-        );
+        let both = started(&[(OPUS, 1_000), (HAIKU, 61_000)]);
+        let mixed = mover(&req, OPUS, Some(&both), &opts, 62_000);
         assert!(!mixed.cold);
         assert_eq!(mixed.boundary, 0);
         // A warm move must pay back at the prices of the warm model with the
         // cheapest cache reads, not only the requesting model's.
-        let fable = Conversation {
-            last_start: [("claude-fable-5-2".to_string(), 1_000)].into(),
-            ..Default::default()
-        };
-        let opts = Options {
-            payback: 12,
-            ..options()
-        };
-        let priced = decide(
-            &req,
-            "claude-haiku-4-5",
-            Some(&fable),
-            Role::Mover,
-            &opts,
-            2_000,
-        );
+        let fable = started(&[(FABLE, 1_000)]);
+        opts.payback = 12;
+        let priced = mover(&req, HAIKU, Some(&fable), &opts, 2_000);
         let threshold = priced.threshold.unwrap();
-        assert!((threshold - payback_ratio("claude-fable-5-2", false, 12)).abs() < 1e-9);
+        assert!((threshold - payback_ratio(FABLE, false, 12)).abs() < 1e-9);
         assert!(priced.ratio.unwrap() < threshold, "{priced:?}");
         assert_eq!(priced.boundary, 0);
-        let read_only = decide(
-            &req,
-            "claude-sonnet-5-5",
-            Some(&state),
-            Role::ReadOnly,
-            &opts,
-            62_000,
-        );
+        let read_only = decide(&req, SONNET, Some(&state), Role::ReadOnly, &opts, 62_000);
         assert_eq!(read_only.boundary, 0);
-        assert_eq!(Role::of(true, None, None), Role::Mover);
-        assert_eq!(Role::of(true, Some("subagent"), None), Role::Mover);
-        assert_eq!(
-            Role::of(true, Some("workflow"), Some("general")),
-            Role::Mover
-        );
-        assert_eq!(Role::of(true, Some("main"), Some("fork")), Role::ReadOnly);
-        assert_eq!(Role::of(true, Some("compaction"), None), Role::ReadOnly);
-        assert_eq!(Role::of(true, Some("auxiliary"), None), Role::ReadOnly);
-        assert_eq!(Role::of(false, None, None), Role::ReadOnly);
+        for (path, class, agent, role) in [
+            (true, None, None, Role::Mover),
+            (true, Some("subagent"), None, Role::Mover),
+            (true, Some("workflow"), Some("general"), Role::Mover),
+            (true, Some("main"), Some("fork"), Role::ReadOnly),
+            (true, Some("compaction"), None, Role::ReadOnly),
+            (true, Some("auxiliary"), None, Role::ReadOnly),
+            (false, None, None, Role::ReadOnly),
+        ] {
+            assert_eq!(Role::of(path, class, agent), role, "{class:?} {agent:?}");
+        }
     }
 
     #[test]

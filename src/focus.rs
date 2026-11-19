@@ -1284,21 +1284,18 @@ mod tests {
     #[test]
     fn tokens_split_camel_case_but_not_digits() {
         let mut seen = Vec::new();
-        tokens(
-            "fooBar E0382 sha256 HTTPServer café-✓",
-            |start, token| seen.push((start, token.to_owned())),
-        );
-        assert_eq!(
-            seen,
-            [
-                (0, "foo".into()),
-                (3, "Bar".into()),
-                (7, "E0382".into()),
-                (13, "sha256".into()),
-                (20, "HTTPServer".into()),
-                (31, "café".into()),
-            ]
-        );
+        tokens("fooBar E0382 sha256 HTTPServer café-✓", |at, token| {
+            seen.push(format!("{at}:{token}"))
+        });
+        let expected = [
+            "0:foo",
+            "3:Bar",
+            "7:E0382",
+            "13:sha256",
+            "20:HTTPServer",
+            "31:café",
+        ];
+        assert_eq!(seen, expected);
     }
 
     #[test]

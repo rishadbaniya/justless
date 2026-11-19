@@ -1892,8 +1892,8 @@ mod tests {
             base64(format!(r#"{{"sub":"{}"}}"#, base62(seed, 12)).as_bytes()).replace('=', "");
         format!("{head}.{claims}.{}", base62(&format!("{seed}s"), 43))
     }
-
-    /// One positive sample per kind, built at runtime: (kind, secret, line).
+    /// One positive sample per kind, built at runtime: (kind, secret, line),
+    /// where the line is the template with `$` replaced by the secret.
     fn samples() -> Vec<(&'static str, String, String)> {
         let github = format!("{}{}", "gh", "p_") + &base62("github", 36);
         let aws = format!("{}{}", "AK", "IA") + &upper("aws", 16);
@@ -1911,73 +1911,33 @@ mod tests {
         let password = base62("url", 10);
         let bearer = base62("bearer", 32);
         let generic = base62("generic", 24);
-        let scheme = "postgres";
-        vec![
-            (
-                "github-token",
-                github.clone(),
-                format!("GITHUB_TOKEN={github}"),
-            ),
-            (
-                "aws-access-key",
-                aws.clone(),
-                format!("  \"AccessKeyId\": \"{aws}\","),
-            ),
-            ("gitlab-token", gitlab.clone(), format!("token: {gitlab}")),
-            (
-                "slack-token",
-                slack.clone(),
-                format!("export SLACK_BOT={slack}"),
-            ),
+        let url = format!("{}://app:$@db.internal:5432/app", "postgres");
+        let authorization = format!("> {}: Bearer $", "Authorization");
+        [
+            ("github-token", github, "GITHUB_TOKEN=$"),
+            ("aws-access-key", aws, "  \"AccessKeyId\": \"$\","),
+            ("gitlab-token", gitlab, "token: $"),
+            ("slack-token", slack, "export SLACK_BOT=$"),
             (
                 "slack-webhook",
-                webhook.clone(),
-                format!("url = https://hooks.slack.com/services/{webhook}"),
+                webhook,
+                "url = https://hooks.slack.com/services/$",
             ),
-            ("stripe-key", stripe.clone(), format!("STRIPE={stripe}")),
-            (
-                "anthropic-key",
-                anthropic.clone(),
-                format!("key {anthropic} loaded"),
-            ),
-            (
-                "openai-key",
-                openai.clone(),
-                format!("{{\"key\": \"{openai}\"}}"),
-            ),
-            (
-                "google-api-key",
-                google.clone(),
-                format!("maps?key={google}&q=1"),
-            ),
-            (
-                "npm-token",
-                npm.clone(),
-                format!("//registry.npmjs.org/:_authToken={npm}"),
-            ),
-            ("pypi-token", pypi.clone(), format!("password = {pypi}")),
-            (
-                "huggingface-token",
-                huggingface.clone(),
-                format!("HF {huggingface}"),
-            ),
-            (
-                "jwt",
-                token.clone(),
-                format!("cookie: session={token}; Path=/"),
-            ),
-            (
-                "url-password",
-                password.clone(),
-                format!("{scheme}://app:{password}@db.internal:5432/app"),
-            ),
-            (
-                "authorization",
-                bearer.clone(),
-                format!("> {}: Bearer {bearer}", "Authorization"),
-            ),
-            ("secret", generic.clone(), format!("API_KEY=\"{generic}\"")),
+            ("stripe-key", stripe, "STRIPE=$"),
+            ("anthropic-key", anthropic, "key $ loaded"),
+            ("openai-key", openai, "{\"key\": \"$\"}"),
+            ("google-api-key", google, "maps?key=$&q=1"),
+            ("npm-token", npm, "//registry.npmjs.org/:_authToken=$"),
+            ("pypi-token", pypi, "password = $"),
+            ("huggingface-token", huggingface, "HF $"),
+            ("jwt", token, "cookie: session=$; Path=/"),
+            ("url-password", password, url.as_str()),
+            ("authorization", bearer, authorization.as_str()),
+            ("secret", generic, "API_KEY=\"$\""),
         ]
+        .into_iter()
+        .map(|(kind, secret, template)| (kind, secret.clone(), template.replace('$', &secret)))
+        .collect()
     }
 
     #[test]

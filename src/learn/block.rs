@@ -733,15 +733,13 @@ mod tests {
         }
     }
 
-    fn merge(
-        file: &str,
-        text: &str,
-        state: &mut State,
-        proposals: &[Proposal],
-        removals: &BTreeMap<String, &'static str>,
-        limit: usize,
-    ) -> Result<Change> {
-        super::merge(file, text, state, proposals, removals, limit, true, 0)
+    /// The text `merge` writes to AGENTS.md, with a limit of 8 rules.
+    fn merged(text: &str, state: &mut State, proposals: &[Proposal], removed: &[&str]) -> String {
+        let removals = removed.iter().map(|id| (id.to_string(), "stale")).collect();
+        super::merge("AGENTS.md", text, state, proposals, &removals, 8, true, 0)
+            .unwrap()
+            .content
+            .unwrap()
     }
 
     #[test]
@@ -752,41 +750,18 @@ mod tests {
             proposal("c", "Rule C."),
         ];
         let mut state = State::default();
-        let written = merge(
-            "AGENTS.md",
-            "# A\n",
-            &mut state,
-            &proposals,
-            &BTreeMap::new(),
-            8,
-        )
-        .unwrap()
-        .content
-        .unwrap();
+        let written = merged("# A\n", &mut state, &proposals, &[]);
         for id in ["a", "b", "c"] {
-            let removals = BTreeMap::from([(id.to_owned(), "stale")]);
-            let without = merge("AGENTS.md", &written, &mut state, &[], &removals, 8)
-                .unwrap()
-                .content
-                .unwrap();
+            let without = merged(&written, &mut state, &[], &[id]);
             assert!(!without.contains(&format!("Rule {}.", id.to_uppercase())));
-            let back = merge(
-                "AGENTS.md",
-                &without,
-                &mut state,
-                &proposals,
-                &BTreeMap::new(),
-                8,
-            )
-            .unwrap();
-            assert_eq!(back.content.unwrap(), written, "{id}");
+            let back = merged(&without, &mut state, &proposals, &[]);
+            assert_eq!(back, written, "{id}");
             assert!(state.removed.is_empty());
         }
     }
 
     #[test]
     fn insertion_and_removal_restore_bytes() {
-        let removals = BTreeMap::new();
         for original in [
             "",
             "# Notes\n",
@@ -796,16 +771,7 @@ mod tests {
             "# Notes\r\nmore\r\n",
         ] {
             let mut state = State::default();
-            let added = merge(
-                "AGENTS.md",
-                original,
-                &mut state,
-                &[proposal("a", "Rule A.")],
-                &removals,
-                8,
-            )
-            .unwrap();
-            let written = added.content.unwrap();
+            let written = merged(original, &mut state, &[proposal("a", "Rule A.")], &[]);
             assert!(written.contains("\n- Rule A."), "{written:?}");
             if original.contains("\r\n") {
                 assert!(
@@ -813,10 +779,7 @@ mod tests {
                     "{written:?}"
                 );
             }
-            let mut removals = BTreeMap::new();
-            removals.insert("a".to_owned(), "stale");
-            let removed = merge("AGENTS.md", &written, &mut state, &[], &removals, 8).unwrap();
-            let restored = removed.content.unwrap();
+            let restored = merged(&written, &mut state, &[], &["a"]);
             let expected = if original == "# Notes" {
                 "# Notes\n"
             } else {

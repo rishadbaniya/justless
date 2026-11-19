@@ -929,14 +929,8 @@ mod tests {
             "",
         ];
         let table = [
-            (
-                Verdict::Deny,
-                [Leave, Leave, Leave, Leave, Leave, Leave, Leave],
-            ),
-            (
-                Verdict::Ask,
-                [Leave, Leave, Leave, Leave, Leave, Leave, Leave],
-            ),
+            (Verdict::Deny, [Leave; 7]),
+            (Verdict::Ask, [Leave; 7]),
             (
                 Verdict::Allow,
                 [Approve, Approve, Approve, Approve, Rewrite, Leave, Leave],

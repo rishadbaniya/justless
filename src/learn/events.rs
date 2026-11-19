@@ -1268,57 +1268,48 @@ mod tests {
         }
     }
 
-    fn argv(cmd: &Cmd) -> Vec<&str> {
-        cmd.argv.iter().map(String::as_str).collect()
+    /// A simple command as `DIR: ARGV`, with ` (masked)` when filters hid its status.
+    fn shown(cwd: &str, text: &str) -> String {
+        let cmd = simple(cwd, text).unwrap();
+        assert!(cmd.argv.iter().all(|word| !word.contains(' ')), "{text}");
+        let masked = if cmd.masked { " (masked)" } else { "" };
+        format!("{}: {}{masked}", cmd.dir, cmd.argv.join(" "))
     }
 
     #[test]
     fn normalizes_directories_wrappers_and_filters() {
-        let cmd = simple("", "cd server && make test 2>&1 | tail -5").unwrap();
-        assert_eq!(
-            (cmd.dir.as_str(), argv(&cmd)),
-            ("server", vec!["make", "test"])
-        );
-        assert!(cmd.masked);
-        let cmd = simple("", "make -C server test").unwrap();
-        assert_eq!(
-            (cmd.dir.as_str(), argv(&cmd)),
-            ("server", vec!["make", "test"])
-        );
-        assert!(!cmd.masked);
-        let cmd = simple(
-            "web",
-            "justless run --hook --session abc -- env CI=1 timeout 60 npm --prefix ../api test",
-        )
-        .unwrap();
-        assert_eq!((cmd.dir.as_str(), argv(&cmd)), ("api", vec!["npm", "test"]));
-        // A hook keeps assignments and a final `2>&1` around the words it wraps.
-        let cmd = simple(
-            "",
-            "RUST_BACKTRACE=1 justless run --hook --merge --session abc -- cargo test 2>&1",
-        )
-        .unwrap();
-        assert_eq!((cmd.dir.as_str(), argv(&cmd)), ("", vec!["cargo", "test"]));
-        let cmd = simple(
-            "",
-            "cargo test --manifest-path core/Cargo.toml -p x || true",
-        )
-        .unwrap();
-        assert_eq!(
-            (cmd.dir.as_str(), argv(&cmd)),
-            ("core", vec!["cargo", "test", "-p", "x"])
-        );
-        assert!(cmd.masked);
-        let cmd = simple("", "bash -c 'cd api && /usr/bin/python3 -m pytest x'").unwrap();
-        assert_eq!(
-            (cmd.dir.as_str(), argv(&cmd)),
-            ("api", vec!["python3", "-m", "pytest", "x"])
-        );
-        let cmd = simple("", "git -C lib commit -C HEAD").unwrap();
-        assert_eq!(
-            (cmd.dir.as_str(), argv(&cmd)),
-            ("lib", vec!["git", "commit", "-C", "HEAD"])
-        );
+        for (cwd, text, expected) in [
+            (
+                "",
+                "cd server && make test 2>&1 | tail -5",
+                "server: make test (masked)",
+            ),
+            ("", "make -C server test", "server: make test"),
+            (
+                "web",
+                "justless run --hook --session abc -- env CI=1 timeout 60 npm --prefix ../api test",
+                "api: npm test",
+            ),
+            // A hook keeps assignments and a final `2>&1` around the words it wraps.
+            (
+                "",
+                "RUST_BACKTRACE=1 justless run --hook --merge --session abc -- cargo test 2>&1",
+                ": cargo test",
+            ),
+            (
+                "",
+                "cargo test --manifest-path core/Cargo.toml -p x || true",
+                "core: cargo test -p x (masked)",
+            ),
+            (
+                "",
+                "bash -c 'cd api && /usr/bin/python3 -m pytest x'",
+                "api: python3 -m pytest x",
+            ),
+            ("", "git -C lib commit -C HEAD", "lib: git commit -C HEAD"),
+        ] {
+            assert_eq!(shown(cwd, text), expected, "{text}");
+        }
     }
 
     #[test]

@@ -745,12 +745,15 @@ mod tests {
         let since = 1_763_000_000_000; // 2025-11-13
         let found = sessions_in(dir, since);
         assert_eq!((found.sessions, found.subagent_requests), (1, 1));
-        let opus = &found
-            .models
-            .iter()
-            .find(|m| m.model == "claude-opus-5-5")
-            .unwrap()
-            .usage;
+        let usage = |model: &str| {
+            &found
+                .models
+                .iter()
+                .find(|m| m.model == model)
+                .unwrap()
+                .usage
+        };
+        let opus = usage("claude-opus-5-5");
         assert_eq!(
             (
                 opus.requests,
@@ -763,12 +766,7 @@ mod tests {
             (opus.cache_read_input_tokens, opus.output_tokens),
             (2500, 130)
         );
-        let fable = &found
-            .models
-            .iter()
-            .find(|m| m.model == "claude-fable-5-2")
-            .unwrap()
-            .usage;
+        let fable = usage("claude-fable-5-2");
         assert_eq!(
             (fable.requests, fable.input_tokens, fable.output_tokens),
             (1, 600, 70)

@@ -684,26 +684,27 @@ mod tests {
 
     #[test]
     fn a_file_that_did_not_parse_reports_its_state() {
+        /// The verdict on an edit to a file that did not parse.
+        fn state(file: &str, before: &str, old: &str, new: &str) -> &'static str {
+            match edit(file, before, old, new).1 {
+                Some(Verdict::Fixed { .. }) => "fixed",
+                Some(Verdict::Unchanged { .. }) => "unchanged",
+                Some(Verdict::Moved { .. }) => "moved",
+                Some(Verdict::Introduced {
+                    parsed_before: false,
+                    ..
+                }) => "new",
+                other => panic!("{other:?}"),
+            }
+        }
         let before = "def f(:\n    return 1\n\ndef g():\n    return 2\n";
-        // Fixed.
-        let (_, verdict) = edit("a.py", before, "def f(:", "def f():");
-        assert!(
-            matches!(verdict, Some(Verdict::Fixed { .. })),
-            "{verdict:?}"
-        );
+        assert_eq!(state("a.py", before, "def f(:", "def f():"), "fixed");
         // An edit elsewhere leaves the error where it was.
-        let (_, verdict) = edit("a.py", before, "return 2", "return 3");
-        assert!(
-            matches!(verdict, Some(Verdict::Unchanged { .. })),
-            "{verdict:?}"
-        );
+        assert_eq!(state("a.py", before, "return 2", "return 3"), "unchanged");
         // So does an edit that changes the line count before it.
         let below = "x = 1\n\ndef g(:\n    return 2\n";
-        let (_, verdict) = edit("a.py", below, "x = 1\n", "x = 1\ny = 2\nz = 3\n");
-        assert!(
-            matches!(verdict, Some(Verdict::Unchanged { .. })),
-            "{verdict:?}"
-        );
+        let lines = "x = 1\ny = 2\nz = 3\n";
+        assert_eq!(state("a.py", below, "x = 1\n", lines), "unchanged");
         // A new error in the written text is introduced, though the file did not parse.
         let (after, verdict) = edit("a.py", before, "return 2", "return (2");
         let Some(Verdict::Introduced {
@@ -718,45 +719,13 @@ mod tests {
         assert_eq!(line_column(&after, problem.bytes.start), (5, 12));
         // Rust reports only the first error. One in the written text is new.
         let rust = "fn a() {\n    1\n}\nfn b() {\n    let = 2;\n}\n";
-        let (_, verdict) = edit("a.rs", rust, "    1\n", "    let = 1;\n");
-        assert!(
-            matches!(
-                verdict,
-                Some(Verdict::Introduced {
-                    parsed_before: false,
-                    ..
-                })
-            ),
-            "{verdict:?}"
-        );
-        let (_, verdict) = edit(
-            "a.rs",
-            rust,
-            "let = 2;",
-            "let x = 2;\n    let = 3;\n}\nfn c() {",
-        );
-        assert!(
-            matches!(
-                verdict,
-                Some(Verdict::Introduced {
-                    parsed_before: false,
-                    ..
-                })
-            ),
-            "{verdict:?}"
-        );
+        assert_eq!(state("a.rs", rust, "    1\n", "    let = 1;\n"), "new");
+        let more = "let x = 2;\n    let = 3;\n}\nfn c() {";
+        assert_eq!(state("a.rs", rust, "let = 2;", more), "new");
         // Fixing the first error shows the next one, outside the written text: a
         // change of state, not a new error.
-        let (_, verdict) = edit(
-            "a.rs",
-            "fn a() {}\nfn b() { let = 2; }\nfn c() { let = 3; }\n",
-            "let = 2;",
-            "let x = 2;",
-        );
-        assert!(
-            matches!(verdict, Some(Verdict::Moved { .. })),
-            "{verdict:?}"
-        );
+        let two = "fn a() {}\nfn b() { let = 2; }\nfn c() { let = 3; }\n";
+        assert_eq!(state("a.rs", two, "let = 2;", "let x = 2;"), "moved");
     }
 
     /// How an edit from `before` to `after` is judged: "clean", "certain" for a
@@ -945,19 +914,17 @@ mod tests {
                 after: 13..15,
             },
         ];
-        assert_eq!(mapped(1, &changes), Some(1));
-        assert_eq!(mapped(2, &changes), None);
-        assert_eq!(mapped(3, &changes), None);
-        assert_eq!(mapped(4, &changes), Some(7));
-        assert_eq!(mapped(9, &changes), Some(12));
-        // Text at an insertion point moves past the inserted text.
-        assert_eq!(mapped(10, &changes), Some(15));
-        let change = Change::between("abcXYdef", "abcQdef");
-        assert_eq!((change.before, change.after), (3..5, 3..4));
-        let change = Change::between("aaa", "aaaa");
-        assert_eq!((change.before, change.after), (3..3, 3..4));
-        let change = Change::between("same", "same");
-        assert_eq!((change.before, change.after), (4..4, 4..4));
+        // Text at an insertion point (10) moves past the inserted text.
+        let at = [1, 2, 3, 4, 9, 10].map(|at| mapped(at, &changes));
+        assert_eq!(at, [Some(1), None, None, Some(7), Some(12), Some(15)]);
+        for (before, after, expected) in [
+            ("abcXYdef", "abcQdef", (3..5, 3..4)),
+            ("aaa", "aaaa", (3..3, 3..4)),
+            ("same", "same", (4..4, 4..4)),
+        ] {
+            let change = Change::between(before, after);
+            assert_eq!((change.before, change.after), expected, "{after}");
+        }
         assert_eq!(line_column("é\nab", 4), (2, 2));
         assert_eq!(line_column("éa", 1), (1, 1));
     }

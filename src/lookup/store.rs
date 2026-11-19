@@ -963,16 +963,8 @@ mod tests {
         });
         let plain = chunks::plain_text("src/a.rs", text);
         assert!(!chunks.is_empty());
-        assert_eq!(
-            chunks
-                .iter()
-                .map(|chunk| (chunk.start, chunk.end))
-                .collect::<Vec<_>>(),
-            plain
-                .iter()
-                .map(|chunk| (chunk.start, chunk.end))
-                .collect::<Vec<_>>()
-        );
+        let spans = |chunks: &[Chunk]| chunks.iter().map(|c| (c.start, c.end)).collect::<Vec<_>>();
+        assert_eq!(spans(&chunks), spans(&plain));
         // The parsers that replaced the broken ones still work.
         let parsed = chunk_file("src/a.rs", text, &mut parsers, chunks::chunk);
         assert!(
