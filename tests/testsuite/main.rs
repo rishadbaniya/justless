@@ -1,0 +1,13 @@
+//! Integration suites for single features, built as one test binary so they link
+//! once and their tests run in parallel. `cargo test --test testsuite mcp::` runs one.
+
+mod codex;
+mod compaction;
+mod compare;
+mod delta;
+mod global;
+mod lookup;
+mod mcp;
+mod read_batch;
+mod redact;
+mod retirement;
