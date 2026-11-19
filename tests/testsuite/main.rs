@@ -10,6 +10,7 @@ mod global;
 mod hook_fixes;
 mod lookup;
 mod mcp;
+mod output_fixes;
 mod read_batch;
 mod redact;
 mod report_fixes;
