@@ -9968,10 +9968,58 @@ fn file_text(root: &Path, file: &str) -> String {
     fs::read_to_string(root.join(file)).unwrap()
 }
 
+/// Writes the files of `fixture` under `root`. Each line `//- PATH` starts a file
+/// whose text is the lines after it, up to the next such line.
+fn fixture_files(root: &Path, fixture: &str) {
+    let mut files: Vec<(&str, String)> = Vec::new();
+    for line in fixture.split_inclusive('\n') {
+        match line.strip_prefix("//- ") {
+            Some(path) => files.push((path.trim_end(), String::new())),
+            None => files.last_mut().expect("a //- line first").1.push_str(line),
+        }
+    }
+    for (path, text) in &files {
+        write_files(root, &[(path, text)]);
+    }
+}
+
+/// The record of run `id` under `root`.
+fn run_record(root: &Path, id: &str) -> serde_json::Value {
+    serde_json::from_str(&file_text(
+        root,
+        &format!(".justless/runs/{id}/record.json"),
+    ))
+    .unwrap()
+}
+
+/// Runs justless with `input` on stdin and each of `envs` set.
+fn piped_with(root: &Path, args: &[&str], envs: &[(&str, &Path)], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(args)
+        .current_dir(root)
+        .envs(envs.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
 /// Asserts that `text` contains each of `parts`.
 fn text_has(text: &str, parts: &[&str]) {
     for part in parts {
         assert!(text.contains(part), "missing {part:?} in\n{text}");
+    }
+}
+
+/// Asserts that each of `lines` is a whole line of `text`.
+fn text_lines(text: &str, lines: &[&str]) {
+    for line in lines {
+        has_line(text, line);
     }
 }
 
@@ -11090,10 +11138,35 @@ fn affected_fixture() -> TempDir {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/affected"),
         repo.path(),
     );
-    git(repo.path(), &["init", "-q"]);
-    git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-qm", "fixture"]);
+    commit_all(repo.path());
     repo
+}
+
+/// Initializes a Git repository in `root` and commits every file in it.
+fn commit_all(root: &Path) {
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+}
+
+/// Writes `text` to `root/file` as an executable.
+#[cfg(unix)]
+fn executable(root: &Path, file: &str, text: &str) {
+    write_files(root, &[(file, text)]);
+    set_mode(&root.join(file), 0o755);
+}
+
+/// Runs justless in `root` with `root/tools` first on PATH and each of `envs` set.
+#[cfg(unix)]
+fn with_tools(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let path = std::env::var("PATH").unwrap_or_default();
+    Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(args)
+        .current_dir(root)
+        .env("PATH", format!("{}:{path}", root.join("tools").display()))
+        .envs(envs.iter().copied())
+        .output()
+        .unwrap()
 }
 
 fn replace_in(root: &Path, file: &str, from: &str, to: &str) {
@@ -11126,123 +11199,91 @@ fn why_id(output: &Output) -> String {
 fn affected_tests_run_a_labeled_subset_with_the_runners_own_status() {
     let repo = affected_fixture();
     let root = repo.path();
-    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
+    let affected = "test --affected -- cargo test --offline";
 
-    let clean = cli(root, &affected);
+    let clean = cli_words(root, affected);
     assert!(clean.status.success(), "{}", stderr(&clean));
-    has_line(
-        &stdout(&clean),
-        "cargo · nothing to run · no change reaches its tests",
+    let nothing = "cargo · nothing to run · no change reaches its tests";
+    has_line(&stdout(&clean), nothing);
+    text_has(
+        &stderr(&clean),
+        &["Nothing ran for cargo; this is not a test result."],
     );
-    assert!(stderr(&clean).contains("Nothing ran for cargo; this is not a test result."));
 
     // One cent too much: the subset fails the way the full suite would.
-    replace_in(
-        root,
-        "ledger/src/tax.rs",
-        "cents * RATE / 100",
-        "cents * RATE / 100 + 1",
-    );
-    let failing = cli(root, &affected);
+    let (exact, wrong) = ("cents * RATE / 100", "cents * RATE / 100 + 1");
+    replace_in(root, "ledger/src/tax.rs", exact, wrong);
+    let failing = cli_words(root, affected);
     assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
     let out = stdout(&failing);
-    let err = stderr(&failing);
-    has_line(
+    text_lines(
         &out,
-        "cargo · subset · 7 of 20 indexed tests in 4 of 7 test targets",
+        &[
+            "cargo · subset · 7 of 20 indexed tests in 4 of 7 test targets",
+            "Run: cargo test --offline -p api -p ledger-core --lib -- <4 test names> --exact",
+            "Run: cargo test --offline -p api -p ledger-core --test cli --test totals",
+            "Run: cargo test --offline -p ledger-core --doc -- tax::vat",
+        ],
     );
-    has_line(
-        &out,
-        "Run: cargo test --offline -p api -p ledger-core --lib -- <4 test names> --exact",
-    );
-    has_line(
-        &out,
-        "Run: cargo test --offline -p api -p ledger-core --test cli --test totals",
-    );
-    has_line(
-        &out,
-        "Run: cargo test --offline -p ledger-core --doc -- tax::vat",
-    );
-    assert!(
-        !out.contains("-p reports") && !out.contains("--test needs"),
-        "{out}"
-    );
+    text_lacks(&out, &["-p reports", "--test needs"]);
     // Cargo stops at the first failing test binary in each step, as `cargo test` does.
-    assert!(
-        err.contains("Subset failed (cargo): 3 of 3 tests that ran failed, exit 101 (7 of 20 indexed tests selected, 13 not run); the full suite was not run"),
-        "{err}"
-    );
-    assert!(
-        err.contains(
-            "  tests::invoice_total_adds_vat · possible · call at api/src/lib.rs:18 → invoice_total"
-        ),
-        "{err}"
+    text_has(
+        &stderr(&failing),
+        &[
+            "Subset failed (cargo): 3 of 3 tests that ran failed, exit 101 (7 of 20 indexed tests selected, 13 not run); the full suite was not run",
+            "  tests::invoice_total_adds_vat · possible · call at api/src/lib.rs:18 → invoice_total",
+        ],
     );
     assert_no_suite_claim(&failing);
     let id = why_id(&failing);
 
     // History, resume and the archived evidence keep the subset label.
     let resume = success(root, &["resume"]);
-    assert!(
-        resume.contains("cargo test (affected subset) · exit 101"),
-        "{resume}"
-    );
-    let why = success(root, &["test", "--why", &id, "--test", "vat_rounds_down"]);
-    assert!(
-        why.contains("cargo test (affected subset) · exit 101 · subset"),
-        "{why}"
+    text_has(&resume, &["cargo test (affected subset) · exit 101"]);
+    let why = success_words(root, &format!("test --why {id} --test vat_rounds_down"));
+    text_has(
+        &why,
+        &[
+            "cargo test (affected subset) · exit 101 · subset",
+            "Changed ledger/src/tax.rs · modified",
+        ],
     );
     has_line(
         &why,
         "  tax::tests::vat_rounds_down · ledger-core --lib · exact · call at ledger/src/tax.rs:28 → tax::vat",
     );
-    assert!(
-        why.contains("Changed ledger/src/tax.rs · modified"),
-        "{why}"
-    );
-    assert!(
-        !why.contains("  money::tests::adds_vat · ledger-core --lib"),
-        "{why}"
-    );
+    text_lacks(&why, &["  money::tests::adds_vat · ledger-core --lib"]);
 
     // Fixed: the subset passes and still says it is one.
-    replace_in(
-        root,
-        "ledger/src/tax.rs",
-        "cents * RATE / 100 + 1",
-        "(cents * RATE) / 100",
+    replace_in(root, "ledger/src/tax.rs", wrong, "(cents * RATE) / 100");
+    let why = success_words(root, &format!("test --why {id}"));
+    text_has(
+        &why,
+        &["Changed ledger/src/tax.rs · modified [source changed]"],
     );
-    let why = success(root, &["test", "--why", &id]);
-    assert!(
-        why.contains("Changed ledger/src/tax.rs · modified [source changed]"),
-        "{why}"
-    );
-    let passing = cli(root, &affected);
+    let passing = cli_words(root, affected);
     assert!(passing.status.success(), "{}", stderr(&passing));
-    assert!(
-        stderr(&passing).contains("Subset passed (cargo): ran 8 tests reachable from your changes (7 of 20 indexed tests selected, 13 not run); the full suite was not run"),
-        "{}",
-        stderr(&passing)
+    text_has(
+        &stderr(&passing),
+        &[
+            "Subset passed (cargo): ran 8 tests reachable from your changes (7 of 20 indexed tests selected, 13 not run); the full suite was not run",
+            // The full suite line repeats the runner given after `--`.
+            "Full suite: justless test -- cargo test --offline · Why: justless test --why run-",
+        ],
     );
-    // The full suite line repeats the runner given after `--`.
-    assert!(stderr(&passing).contains(
-        "Full suite: justless test -- cargo test --offline · Why: justless test --why run-"
-    ));
     assert_no_suite_claim(&passing);
 
     // The full suite is one command away and labeled as such.
-    let full = cli(root, &["test", "--", "cargo", "test", "--offline"]);
+    let full = cli_words(root, "test -- cargo test --offline");
     assert!(full.status.success(), "{}", stderr(&full));
     has_line(&stdout(&full), "cargo · full suite");
-    assert!(
-        stderr(&full).contains("Full suite (cargo): exit 0, 21 tests ran, 0 failed"),
-        "{}",
-        stderr(&full)
+    text_has(
+        &stderr(&full),
+        &["Full suite (cargo): exit 0, 21 tests ran, 0 failed"],
     );
-    let history = success(root, &["history"]);
-    assert!(history.contains("· cargo test · exit 0"), "{history}");
+    text_has(&success(root, &["history"]), &["· cargo test · exit 0"]);
 
-    let unknown = cli(root, &["test", "--why", "run-missing"]);
+    let unknown = cli_words(root, "test --why run-missing");
     assert_eq!(unknown.status.code(), Some(2));
 }
 
@@ -11250,22 +11291,18 @@ fn affected_tests_run_a_labeled_subset_with_the_runners_own_status() {
 fn affected_dry_run_explains_fallbacks_scopes_and_what_it_leaves_out() {
     let repo = affected_fixture();
     let root = repo.path();
-    let plan = |extra: &[&str]| {
-        let mut args = vec!["test", "--affected", "--dry-run", "--budget", "6000"];
-        args.extend_from_slice(extra);
-        let output = cli(root, &args);
-        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
-        let text = stdout(&output);
-        assert!(
-            !text.contains("--test needs"),
-            "required-features target selected:\n{text}"
-        );
+    // No plan selects a target behind an unmet required feature.
+    let plan = |extra: &str| {
+        let words = format!("test --affected --dry-run --budget 6000 {extra}");
+        let text = success_words(root, &words);
+        text_lacks(&text, &["--test needs"]);
         text
     };
     let reset = || {
         git(root, &["checkout", "-q", "--", "."]);
         git(root, &["clean", "-qfd", "--exclude=.justless"]);
     };
+    let nothing = "cargo · nothing to run · no change reaches its tests";
 
     // Code no test reaches: the full suite, or a labeled low-confidence subset.
     replace_in(
@@ -11274,97 +11311,82 @@ fn affected_dry_run_explains_fallbacks_scopes_and_what_it_leaves_out() {
         "{name},{cents}",
         "{name};{cents}",
     );
-    let text = plan(&[]);
-    has_line(
-        &text,
-        "cargo · full suite · no test reaches report::csv (ledger/src/report.rs:1-6) through indexed links",
+    text_lines(
+        &plan(""),
+        &[
+            "cargo · full suite · no test reaches report::csv (ledger/src/report.rs:1-6) through indexed links",
+            "  Run (full suite): cargo test",
+        ],
     );
-    has_line(&text, "  Run (full suite): cargo test");
-    let text = plan(&["--no-fallback"]);
-    assert!(
-        text.contains("cargo · low-confidence subset (no-tests)"),
-        "{text}"
-    );
-    assert!(
-        text.contains("  Run (build only): cargo test -p ledger-core --lib --no-run"),
-        "{text}"
+    text_has(
+        &plan("--no-fallback"),
+        &[
+            "cargo · low-confidence subset (no-tests)",
+            "  Run (build only): cargo test -p ledger-core --lib --no-run",
+        ],
     );
     reset();
 
     // A trait method called implicitly is traced through its type, at low confidence.
     replace_in(root, "ledger/src/money.rs", "\"{}.{:02}\"", "\"{}.{:02} \"");
-    let text = plan(&[]);
-    assert!(text.contains("inferred-only: money::Money::fmt"), "{text}");
-    assert!(
-        text.contains("money::tests::displays_cents · ledger-core --lib · possible · fmt is called implicitly; traced through type money::Money"),
-        "{text}"
+    text_has(
+        &plan(""),
+        &[
+            "inferred-only: money::Money::fmt",
+            "money::tests::displays_cents · ledger-core --lib · possible · fmt is called implicitly; traced through type money::Money",
+        ],
     );
     reset();
 
     // Documentation alone runs nothing.
     fs::write(root.join("docs/pricing.md"), "# Pricing\n\nUpdated.\n").unwrap();
-    let text = plan(&[]);
-    has_line(
-        &text,
-        "docs/pricing.md · no test impact (documentation or repository metadata)",
-    );
-    has_line(
-        &text,
-        "cargo · nothing to run · no change reaches its tests",
+    text_lines(
+        &plan(""),
+        &[
+            "docs/pricing.md · no test impact (documentation or repository metadata)",
+            nothing,
+        ],
     );
     reset();
 
     // A data file selects the test that embeds it; an unmentioned one runs everything.
-    replace_in(
-        root,
-        "ledger/fixtures/rates.json",
-        "\"reduced\": 5",
-        "\"reduced\": 7",
-    );
-    let text = plan(&[]);
+    let (rate, raised) = ("\"reduced\": 5", "\"reduced\": 7");
+    replace_in(root, "ledger/fixtures/rates.json", rate, raised);
     has_line(
-        &text,
+        &plan(""),
         "  Run (selected tests): cargo test -p ledger-core --test data -- rates_file_lists_the_standard_rate --exact",
     );
     fs::write(root.join("ledger/fixtures/extra.bin"), [0u8, 159, 146, 150]).unwrap();
-    let text = plan(&[]);
-    assert!(
-        text.contains(
-            "data-unlinked: ledger/fixtures/extra.bin is not mentioned by indexed source"
-        ),
-        "{text}"
+    text_has(
+        &plan(""),
+        &["data-unlinked: ledger/fixtures/extra.bin is not mentioned by indexed source"],
     );
     reset();
 
     // A member manifest runs its package whole; a removed name reaches its users.
-    fs::write(
-        root.join("reports/Cargo.toml"),
-        "[package]\nname = \"reports\"\nversion = \"0.1.1\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    let text = plan(&[]);
+    let manifest = "[package]\nname = \"reports\"\nversion = \"0.1.1\"\nedition = \"2021\"\n";
+    fs::write(root.join("reports/Cargo.toml"), manifest).unwrap();
+    let text = plan("");
     has_line(&text, "  Run (whole packages): cargo test -p reports");
-    assert!(!text.contains("-p api"), "{text}");
+    text_lacks(&text, &["-p api"]);
     reset();
     replace_in(root, "ledger/src/tax.rs", "pub fn net(", "pub fn net_of(");
-    let text = plan(&[]);
+    let text = plan("");
     has_line(&text, "Start net · removed from ledger/src/tax.rs");
-    assert!(
-        text.contains(
-            "tax::tests::net_removes_tax [test] ledger/src/tax.rs:31-34 · references removed net"
-        ),
-        "{text}"
+    text_has(
+        &text,
+        &["tax::tests::net_removes_tax [test] ledger/src/tax.rs:31-34 · references removed net"],
     );
     reset();
 
     // A deleted source file can leave a stale `mod`: its package builds and runs whole.
     fs::remove_file(root.join("ledger/src/report.rs")).unwrap();
-    let text = plan(&[]);
-    assert!(
-        text.contains(
-            "deleted-file: ledger/src/report.rs was deleted: ledger-core and its dependents run in full"
-        ),
-        "{text}"
+    let text = plan("");
+    text_has(
+        &text,
+        &[
+            "deleted-file: ledger/src/report.rs was deleted: ledger-core and its dependents run in full",
+        ],
     );
     has_line(
         &text,
@@ -11374,63 +11396,53 @@ fn affected_dry_run_explains_fallbacks_scopes_and_what_it_leaves_out() {
 
     // A new function nothing uses only has to compile; no test reaching it is no
     // reason to fall back. The black-box CLI test still runs the changed library.
-    replace_in(
-        root,
-        "ledger/src/tax.rs",
-        "const RATE",
-        "pub fn gross_of(net: u64) -> u64 {\n    net + vat(net)\n}\n\nconst RATE",
-    );
-    let text = plan(&[]);
-    assert!(text.contains("tax::gross_of [function] ledger/src/tax.rs:15-17 · changed ledger/src/tax.rs:15-18 (new)"), "{text}");
-    assert!(!text.contains("no-tests"), "{text}");
-    has_line(
+    let gross = "pub fn gross_of(net: u64) -> u64 {\n    net + vat(net)\n}\n\nconst RATE";
+    replace_in(root, "ledger/src/tax.rs", "const RATE", gross);
+    let text = plan("");
+    text_has(
         &text,
-        "  Run (build only): cargo test -p ledger-core --lib --no-run",
+        &[
+            "tax::gross_of [function] ledger/src/tax.rs:15-17 · changed ledger/src/tax.rs:15-18 (new)",
+        ],
     );
-    has_line(&text, "  Run (whole targets): cargo test -p api --test cli");
+    text_lacks(&text, &["no-tests"]);
+    text_lines(
+        &text,
+        &[
+            "  Run (build only): cargo test -p ledger-core --lib --no-run",
+            "  Run (whole targets): cargo test -p api --test cli",
+        ],
+    );
     reset();
 
     // Project settings: globs that force the full suite or mark files inert.
-    fs::write(
-        root.join(".justless.toml"),
-        "[test]\nfull_suite_on = [\"ledger/fixtures/**\"]\nignore = [\"*.bin\"]\n",
-    )
-    .unwrap();
+    let settings = "[test]\nfull_suite_on = [\"ledger/fixtures/**\"]\nignore = [\"*.bin\"]\n";
+    fs::write(root.join(".justless.toml"), settings).unwrap();
     fs::write(root.join("ledger/extra.bin"), [0u8, 1, 2]).unwrap();
-    let text = plan(&[]);
-    has_line(&text, "ledger/extra.bin · no test impact (test.ignore)");
-    has_line(
+    text_lines(
+        &plan(""),
+        &["ledger/extra.bin · no test impact (test.ignore)", nothing],
+    );
+    replace_in(root, "ledger/fixtures/rates.json", rate, raised);
+    let text = plan("");
+    text_has(
         &text,
-        "cargo · nothing to run · no change reaches its tests",
-    );
-    replace_in(
-        root,
-        "ledger/fixtures/rates.json",
-        "\"reduced\": 5",
-        "\"reduced\": 7",
-    );
-    let text = plan(&[]);
-    assert!(
-        text.contains("configured: ledger/fixtures/rates.json matches test.full_suite_on"),
-        "{text}"
+        &["configured: ledger/fixtures/rates.json matches test.full_suite_on"],
     );
     has_line(&text, "  Run (full suite): cargo test");
     reset();
 
     // Build configuration runs the full suite and says why.
-    fs::create_dir_all(root.join(".cargo")).unwrap();
-    fs::write(root.join(".cargo/config.toml"), "[term]\nverbose = false\n").unwrap();
-    let text = plan(&[]);
-    assert!(
-        text.contains(
-            "workspace-config: .cargo/config.toml changed: build configuration can affect every test"
-        ),
-        "{text}"
+    write_files(root, &[(".cargo/config.toml", "[term]\nverbose = false\n")]);
+    text_has(
+        &plan(""),
+        &[
+            "workspace-config: .cargo/config.toml changed: build configuration can affect every test",
+        ],
     );
     // A command that already selects tests runs as given.
-    let text = plan(&["--", "cargo", "test", "-p", "api"]);
     has_line(
-        &text,
+        &plan("-- cargo test -p api"),
         "cargo · command as given · the command already selects tests (-p)",
     );
     reset();
@@ -11442,32 +11454,28 @@ fn affected_dry_run_explains_fallbacks_scopes_and_what_it_leaves_out() {
         "values.len() as u64",
         "(values.len() as u64)",
     );
-    let first = success(root, &["test", "--affected", "--dry-run", "--json"]);
+    let first = success_words(root, "test --affected --dry-run --json");
     assert_eq!(
         first,
-        success(root, &["test", "--affected", "--dry-run", "--json"])
+        success_words(root, "test --affected --dry-run --json")
     );
     let json: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(json["runners"][0]["mode"], "subset");
+    let argv = |step: usize| {
+        let argv = json["runners"][0]["steps"][step]["argv"]
+            .as_array()
+            .unwrap();
+        argv.iter()
+            .map(|word| word.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     assert_eq!(
-        json["runners"][0]["steps"][0]["argv"],
-        serde_json::json!([
-            "cargo",
-            "test",
-            "-p",
-            "reports",
-            "--lib",
-            "--",
-            "stats::tests::mean_of_nothing_is_zero",
-            "stats::tests::mean_rounds_down",
-            "--exact"
-        ])
+        argv(0),
+        "cargo test -p reports --lib -- stats::tests::mean_of_nothing_is_zero stats::tests::mean_rounds_down --exact"
     );
     // An integration test file that imports the change runs whole.
-    assert_eq!(
-        json["runners"][0]["steps"][1]["argv"],
-        serde_json::json!(["cargo", "test", "-p", "reports", "--test", "summary"])
-    );
+    assert_eq!(argv(1), "cargo test -p reports --test summary");
     let runs = root.join(".justless/runs");
     assert!(
         !runs.exists() || fs::read_dir(&runs).unwrap().next().is_none(),
@@ -11478,220 +11486,162 @@ fn affected_dry_run_explains_fallbacks_scopes_and_what_it_leaves_out() {
 #[cfg(unix)]
 #[test]
 fn affected_tests_drive_pytest_jest_and_go_with_their_own_selectors() {
-    use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let write = |file: &str, text: &str| {
-        let path = root.join(file);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    };
-    let tool = |file: &str, text: &str| {
-        write(file, text);
-        fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o755)).unwrap();
-    };
-    write(".gitignore", "node_modules/\n.venv/\ncalls.log\n");
-    write(
-        "pyproject.toml",
-        "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
-    );
-    write("billing/__init__.py", "");
-    write(
-        "billing/rates.py",
-        "RATE = 20\n\n\ndef vat(cents):\n    return cents * RATE // 100\n",
-    );
-    write(
-        "tests/test_rates.py",
-        "from billing.rates import vat\n\n\ndef test_vat_is_a_fifth():\n    assert vat(500) == 100\n",
-    );
     // A test that reaches the change only through another module gets a node ID.
-    write(
-        "billing/invoice.py",
-        "from billing.rates import vat\n\n\ndef total(cents):\n    return cents + vat(cents)\n",
-    );
-    write(
-        "tests/test_invoice.py",
-        "from billing.invoice import total\n\n\ndef test_total():\n    assert total(500) == 600\n\n\ndef test_unrelated():\n    assert True\n",
+    fixture_files(
+        root,
+        "//- .gitignore\nnode_modules/\n.venv/\ncalls.log\n\
+        //- pyproject.toml\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n\
+        //- billing/__init__.py\n\
+        //- billing/rates.py\nRATE = 20\n\n\ndef vat(cents):\n    return cents * RATE // 100\n\
+        //- tests/test_rates.py\nfrom billing.rates import vat\n\n\ndef test_vat_is_a_fifth():\n    assert vat(500) == 100\n\
+        //- billing/invoice.py\nfrom billing.rates import vat\n\n\ndef total(cents):\n    return cents + vat(cents)\n\
+        //- tests/test_invoice.py\nfrom billing.invoice import total\n\n\ndef test_total():\n    assert total(500) == 600\n\n\ndef test_unrelated():\n    assert True\n\
+        //- web/package.json\n{\"name\": \"web\", \"devDependencies\": {\"jest\": \"29\"}}\n\
+        //- web/src/format.ts\nexport function money(cents: number): string {\n  return (cents / 100).toFixed(2);\n}\n\
+        //- web/src/format.test.ts\nimport { money } from \"./format\";\n\ntest(\"money\", () => {\n  expect(money(1234)).toBe(\"12.34\");\n});\n\
+        //- web/src/cart.ts\nexport const items = 1;\n\
+        //- web/src/cart.test.ts\nimport { items } from \"./cart\";\n\ntest(\"items\", () => {\n  expect(items).toBe(1);\n});\n\
+        //- shop/go.mod\nmodule example.com/shop\n\ngo 1.22\n\
+        //- shop/price/price.go\npackage price\n\nfunc Vat(cents int) int {\n\treturn cents * 20 / 100\n}\n\
+        //- shop/price/price_test.go\npackage price\n\nimport \"testing\"\n\nfunc TestVat(t *testing.T) {\n\tif Vat(500) != 100 {\n\t\tt.Fatal(\"vat\")\n\t}\n}\n",
     );
     for name in ["test_names", "test_dates", "test_other"] {
-        write(
-            &format!("tests/{name}.py"),
-            "def test_one():\n    assert 1\n\n\ndef test_two():\n    assert 2\n",
-        );
+        let two = "def test_one():\n    assert 1\n\n\ndef test_two():\n    assert 2\n";
+        write_files(root, &[(&format!("tests/{name}.py"), two)]);
     }
-    write(
-        "web/package.json",
-        "{\"name\": \"web\", \"devDependencies\": {\"jest\": \"29\"}}\n",
-    );
-    write(
-        "web/src/format.ts",
-        "export function money(cents: number): string {\n  return (cents / 100).toFixed(2);\n}\n",
-    );
-    write(
-        "web/src/format.test.ts",
-        "import { money } from \"./format\";\n\ntest(\"money\", () => {\n  expect(money(1234)).toBe(\"12.34\");\n});\n",
-    );
-    write("web/src/cart.ts", "export const items = 1;\n");
-    write(
-        "web/src/cart.test.ts",
-        "import { items } from \"./cart\";\n\ntest(\"items\", () => {\n  expect(items).toBe(1);\n});\n",
-    );
-    write("shop/go.mod", "module example.com/shop\n\ngo 1.22\n");
-    write(
-        "shop/price/price.go",
-        "package price\n\nfunc Vat(cents int) int {\n\treturn cents * 20 / 100\n}\n",
-    );
-    write(
-        "shop/price/price_test.go",
-        "package price\n\nimport \"testing\"\n\nfunc TestVat(t *testing.T) {\n\tif Vat(500) != 100 {\n\t\tt.Fatal(\"vat\")\n\t}\n}\n",
-    );
-    // Recording stand-ins for the runners, which these tests do not install.
+    // Recording stand-ins for the runners, which these tests do not install. A
+    // project virtualenv's interpreter is preferred over python3.
     let log = root.join("calls.log");
     let fake_pytest = format!(
         "#!/bin/sh\necho \"pytest $*\" >> '{}'\nif [ -n \"$FAIL\" ]; then echo 'FAILED tests/test_rates.py::test_vat_is_a_fifth - assert 101 == 100'; echo '==== 1 failed in 0.01s ===='; exit 1; fi\necho '==== 1 passed in 0.01s ===='\n",
         log.display()
     );
-    tool("tools/pytest", &fake_pytest);
-    // A project virtualenv's interpreter is preferred over python3.
-    tool(".venv/bin/python", &fake_pytest);
-    tool(
-        "web/node_modules/.bin/jest",
-        &format!(
-            "#!/bin/sh\necho \"jest $*\" >> '{}'\necho 'PASS src/format.test.ts' >&2\necho 'Tests:       1 passed, 1 total' >&2\n",
-            log.display()
+    let jest = "echo 'PASS src/format.test.ts' >&2\necho 'Tests:       1 passed, 1 total' >&2\n";
+    let go = "printf 'ok  \\texample.com/shop/price\\t(cached)\\n'\n";
+    for (file, script) in [
+        ("tools/pytest", fake_pytest.clone()),
+        (".venv/bin/python", fake_pytest),
+        (
+            "web/node_modules/.bin/jest",
+            format!("#!/bin/sh\necho \"jest $*\" >> '{}'\n{jest}", log.display()),
         ),
-    );
-    tool(
-        "tools/go",
-        &format!(
-            "#!/bin/sh\necho \"go $*\" >> '{}'\nprintf 'ok  \\texample.com/shop/price\\t(cached)\\n'\n",
-            log.display()
+        (
+            "tools/go",
+            format!("#!/bin/sh\necho \"go $*\" >> '{}'\n{go}", log.display()),
         ),
-    );
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
+    ] {
+        executable(root, file, &script);
+    }
+    commit_all(root);
     let pytest = root.join("tools/pytest");
     let pytest = pytest.to_str().unwrap();
 
     // An edited test runs by its node ID.
+    let unrelated = "def test_unrelated():\n    assert True";
     replace_in(
         root,
         "tests/test_invoice.py",
-        "def test_unrelated():\n    assert True",
+        unrelated,
         "def test_unrelated():\n    assert 1",
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["test", "--affected", "--dry-run", "--", pytest, "-q"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    let text = stdout(&output);
-    has_line(&text, "pytest · subset · 1 of 9 indexed tests");
-    has_line(
+    let text = stdout(&cli(
+        root,
+        &["test", "--affected", "--dry-run", "--", pytest, "-q"],
+    ));
+    text_lines(
         &text,
-        &format!("  Run (selected tests): {pytest} -q tests/test_invoice.py::test_unrelated"),
+        &[
+            "pytest · subset · 1 of 9 indexed tests",
+            &format!("  Run (selected tests): {pytest} -q tests/test_invoice.py::test_unrelated"),
+        ],
     );
     git(root, &["checkout", "-q", "--", "tests/test_invoice.py"]);
 
     replace_in(root, "billing/rates.py", "RATE // 100", "RATE // 100 + 1");
     replace_in(root, "web/src/format.ts", "toFixed(2)", "toFixed(3)");
     replace_in(root, "shop/price/price.go", "20 / 100", "21 / 100");
-    let justless = |args: &[&str], fail: bool| {
-        let path = format!(
-            "{}:{}",
-            root.join("tools").display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
-        command.args(args).current_dir(root).env("PATH", path);
-        if fail {
-            command.env("FAIL", "1");
-        }
-        command.output().unwrap()
-    };
     // pytest: test files that import the changed module, directly or not, by path.
-    let output = justless(
+    let output = with_tools(
+        root,
         &["test", "--affected", "--dry-run", "--", pytest, "-q"],
-        false,
+        &[],
     );
-    let text = stdout(&output);
-    has_line(&text, "pytest · subset · 3 of 9 indexed tests");
-    has_line(
-        &text,
-        "  tests/test_rates.py · tests/test_rates.py · exact · import at tests/test_rates.py:1 → vat",
-    );
-    has_line(
-        &text,
-        "  tests/test_invoice.py · tests/test_invoice.py · exact · import at tests/test_invoice.py:1 → billing/invoice.py · import at billing/invoice.py:1 → vat",
+    text_lines(
+        &stdout(&output),
+        &[
+            "pytest · subset · 3 of 9 indexed tests",
+            "  tests/test_rates.py · tests/test_rates.py · exact · import at tests/test_rates.py:1 → vat",
+            "  tests/test_invoice.py · tests/test_invoice.py · exact · import at tests/test_invoice.py:1 → billing/invoice.py · import at billing/invoice.py:1 → vat",
+        ],
     );
 
     // Go: packages and a -run pattern, kept here as a low-confidence subset.
-    let output = justless(&["test", "--affected", "--dry-run", "--no-fallback"], false);
-    let text = stdout(&output);
-    has_line(
-        &text,
-        "go (shop) · low-confidence subset (inferred-only, too-broad) · 1 of 1 indexed test",
+    let output = with_tools(
+        root,
+        &["test", "--affected", "--dry-run", "--no-fallback"],
+        &[],
     );
-    has_line(
-        &text,
-        "  Run (selected tests): go test -v ./price -run '^(TestVat)$'",
+    text_lines(
+        &stdout(&output),
+        &[
+            "go (shop) · low-confidence subset (inferred-only, too-broad) · 1 of 1 indexed test",
+            "  Run (selected tests): go test -v ./price -run '^(TestVat)$'",
+        ],
     );
 
     // Detected runners: the pytest file and the Jest file that import the change,
     // and Go in full because its links are inferred by name.
-    let output = justless(&["test", "--affected"], false);
+    let output = with_tools(root, &["test", "--affected"], &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     let out = stdout(&output);
-    let err = stderr(&output);
-    has_line(&out, "pytest · subset · 3 of 9 indexed tests");
-    has_line(
+    text_lines(
         &out,
-        "Run: .venv/bin/python -m pytest tests/test_invoice.py tests/test_rates.py",
+        &[
+            "pytest · subset · 3 of 9 indexed tests",
+            "Run: .venv/bin/python -m pytest tests/test_invoice.py tests/test_rates.py",
+            "jest (web) · subset · 1 of 2 indexed test files",
+            "Run: node_modules/.bin/jest src/format.test.ts",
+            "Run: go test ./...",
+        ],
     );
-    has_line(&out, "jest (web) · subset · 1 of 2 indexed test files");
-    has_line(&out, "Run: node_modules/.bin/jest src/format.test.ts");
-    assert!(
-        out.contains(
-            "go (shop) · full suite · Vat (shop/price/price.go:3-5) reaches tests only through inferred links"
-        ),
-        "{out}"
+    text_has(
+        &out,
+        &[
+            "go (shop) · full suite · Vat (shop/price/price.go:3-5) reaches tests only through inferred links",
+        ],
     );
-    has_line(&out, "Run: go test ./...");
-    assert!(
-        err.contains("Subset passed (jest): ran 1 test reachable from your changes (1 of 2 indexed test files selected, 1 not run); the full suite was not run"),
-        "{err}"
-    );
-    assert!(
-        err.contains("Full suite (fallback from --affected: inferred-only, too-broad) (go): exit 0, 1 package reported, 1 replayed from Go's test cache"),
-        "{err}"
+    text_has(
+        &stderr(&output),
+        &[
+            "Subset passed (jest): ran 1 test reachable from your changes (1 of 2 indexed test files selected, 1 not run); the full suite was not run",
+            "Full suite (fallback from --affected: inferred-only, too-broad) (go): exit 0, 1 package reported, 1 replayed from Go's test cache",
+        ],
     );
     assert_no_suite_claim(&output);
-    let calls = fs::read_to_string(&log).unwrap();
     assert_eq!(
-        calls,
+        fs::read_to_string(&log).unwrap(),
         "pytest -m pytest tests/test_invoice.py tests/test_rates.py\njest src/format.test.ts\ngo test ./...\n"
     );
 
     // A failing runner's status is the command's status, and later runners still run.
     fs::remove_file(&log).unwrap();
-    let output = justless(&["test", "--affected"], true);
+    let output = with_tools(root, &["test", "--affected"], &[("FAIL", "1")]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    let err = stderr(&output);
-    assert!(
-        err.contains("Subset failed (pytest): 1 of 1 test that ran failed, exit 1"),
-        "{err}"
+    text_has(
+        &stderr(&output),
+        &[
+            "Subset failed (pytest): 1 of 1 test that ran failed, exit 1",
+            "  tests/test_rates.py::test_vat_is_a_fifth",
+            "Subset passed (jest)",
+        ],
     );
-    assert!(
-        err.contains("  tests/test_rates.py::test_vat_is_a_fifth"),
-        "{err}"
-    );
-    assert!(err.contains("Subset passed (jest)"), "{err}");
     assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 3);
 
     // A command given after -- runs with the selection appended.
     fs::remove_file(&log).unwrap();
-    let output = justless(&["test", "--affected", "--", pytest, "-q"], false);
+    let output = with_tools(root, &["test", "--affected", "--", pytest, "-q"], &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
@@ -11702,122 +11652,89 @@ fn affected_tests_drive_pytest_jest_and_go_with_their_own_selectors() {
 #[cfg(unix)]
 #[test]
 fn affected_components_reach_their_importers_and_untested_languages_fall_back() {
-    use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    write_files(
+    // `@/money` is an alias the index does not resolve: only the call inside
+    // `price` links the component to the helper.
+    fixture_files(
         root,
-        &[
-            (".gitignore", "node_modules/\n"),
-            (
-                "package.json",
-                "{\"devDependencies\": {\"vitest\": \"2\"}}\n",
-            ),
-            ("node_modules/.bin/vitest", "#!/bin/sh\n"),
-            (
-                "src/Child.svelte",
-                "<script>\n  export let n = 1;\n  function bump() { n += 1; }\n</script>\n<button on:click={bump}>{n}</button>\n",
-            ),
-            (
-                "src/Parent.vue",
-                "<template><Child /></template>\n<script setup>\nimport Child from \"./Child.svelte\";\nfunction shout() { return 1; }\n</script>\n",
-            ),
-            (
-                "src/Parent.test.ts",
-                "import Parent from \"./Parent.vue\";\ntest(\"p\", () => expect(Parent).toBeTruthy());\n",
-            ),
-            (
-                "src/Lonely.astro",
-                "---\nfunction quiet() { return 1; }\n---\n<p>{quiet()}</p>\n",
-            ),
-            // `@/money` is an alias the index does not resolve: only the call
-            // inside `price` links the component to the helper.
-            (
-                "src/money.ts",
-                "export function cents(n) {\n  return n * 100;\n}\n",
-            ),
-            (
-                "src/money.test.ts",
-                "import { cents } from \"./money\";\ntest(\"m\", () => expect(cents(1)).toBe(100));\n",
-            ),
-            (
-                "src/Price.vue",
-                "<template><p>{{ price() }}</p></template>\n<script setup>\nimport { cents } from \"@/money\";\nfunction price() { return cents(2); }\n</script>\n",
-            ),
-            (
-                "src/Price.test.ts",
-                "import Price from \"./Price.vue\";\ntest(\"p\", () => expect(Price).toBeTruthy());\n",
-            ),
-            (
-                "src/other.test.ts",
-                "test(\"o\", () => expect(1).toBe(1));\n",
-            ),
-            (
-                "lib/twice.ex",
-                "defmodule Twice do\n  def twice(x), do: x * 2\nend\n",
-            ),
-            (
-                "test/twice_test.exs",
-                "defmodule TwiceTest do\n  use ExUnit.Case\n  test \"twice\" do\n    assert Twice.twice(2) == 4\n  end\nend\n",
-            ),
-            ("model.m", "function y = model(x)\n  y = x * 2;\nend\n"),
-        ],
+        "//- .gitignore\nnode_modules/\n\
+        //- package.json\n{\"devDependencies\": {\"vitest\": \"2\"}}\n\
+        //- src/Child.svelte\n<script>\n  export let n = 1;\n  function bump() { n += 1; }\n</script>\n<button on:click={bump}>{n}</button>\n\
+        //- src/Parent.vue\n<template><Child /></template>\n<script setup>\nimport Child from \"./Child.svelte\";\nfunction shout() { return 1; }\n</script>\n\
+        //- src/Parent.test.ts\nimport Parent from \"./Parent.vue\";\ntest(\"p\", () => expect(Parent).toBeTruthy());\n\
+        //- src/Lonely.astro\n---\nfunction quiet() { return 1; }\n---\n<p>{quiet()}</p>\n\
+        //- src/money.ts\nexport function cents(n) {\n  return n * 100;\n}\n\
+        //- src/money.test.ts\nimport { cents } from \"./money\";\ntest(\"m\", () => expect(cents(1)).toBe(100));\n\
+        //- src/Price.vue\n<template><p>{{ price() }}</p></template>\n<script setup>\nimport { cents } from \"@/money\";\nfunction price() { return cents(2); }\n</script>\n\
+        //- src/Price.test.ts\nimport Price from \"./Price.vue\";\ntest(\"p\", () => expect(Price).toBeTruthy());\n\
+        //- src/other.test.ts\ntest(\"o\", () => expect(1).toBe(1));\n\
+        //- lib/twice.ex\ndefmodule Twice do\n  def twice(x), do: x * 2\nend\n\
+        //- test/twice_test.exs\ndefmodule TwiceTest do\n  use ExUnit.Case\n  test \"twice\" do\n    assert Twice.twice(2) == 4\n  end\nend\n\
+        //- model.m\nfunction y = model(x)\n  y = x * 2;\nend\n",
     );
-    fs::set_permissions(
-        root.join("node_modules/.bin/vitest"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
-    let plan = |file: &str, from: &str, to: &str| {
+    executable(root, "node_modules/.bin/vitest", "#!/bin/sh\n");
+    commit_all(root);
+    for (file, from, to, expected) in [
+        // A function in a component's script reaches the tests that import the
+        // component, here through another component.
+        (
+            "src/Child.svelte",
+            "n += 1",
+            "n += 2",
+            &[
+                "vitest · subset · 1 of 4 indexed test files",
+                "  src/Parent.test.ts · src/Parent.test.ts · exact · import at src/Parent.test.ts:1 → src/Parent.vue · import at src/Parent.vue:3 → src/Child.svelte",
+            ][..],
+        ),
+        // A change that a function in a component calls reaches the component's
+        // importers too.
+        (
+            "src/money.ts",
+            "n * 100",
+            "n * 10",
+            &[
+                "vitest · subset · 2 of 4 indexed test files",
+                "  src/Price.test.ts · src/Price.test.ts · possible · price in src/Price.vue depends on the change · import at src/Price.test.ts:1 → src/Price.vue",
+            ],
+        ),
+        // A component no test imports is a change no test reaches.
+        (
+            "src/Lonely.astro",
+            "return 1",
+            "return 2",
+            &["  no-tests: no test reaches quiet (src/Lonely.astro:2) through indexed links"],
+        ),
+        // Elixir reaches its ExUnit test, which no runner here runs.
+        (
+            "lib/twice.ex",
+            "x * 2",
+            "x + x",
+            &[
+                "  data-unlinked: lib/twice.ex is not mentioned by indexed source, and no runner here runs its language",
+            ],
+        ),
+        // MATLAB code in a `.m` file is data, not Objective-C.
+        (
+            "model.m",
+            "x * 2",
+            "x + x",
+            &["  data-unlinked: model.m is not mentioned by indexed source"],
+        ),
+    ] {
         replace_in(root, file, from, to);
-        let text = stdout(&cli(root, &["test", "--affected", "--dry-run"]));
+        text_lines(
+            &stdout(&cli_words(root, "test --affected --dry-run")),
+            expected,
+        );
         git(root, &["checkout", "-q", "--", file]);
-        text
-    };
-    // A function in a component's script reaches the tests that import the
-    // component, here through another component.
-    let text = plan("src/Child.svelte", "n += 1", "n += 2");
-    has_line(&text, "vitest · subset · 1 of 4 indexed test files");
-    has_line(
-        &text,
-        "  src/Parent.test.ts · src/Parent.test.ts · exact · import at src/Parent.test.ts:1 → src/Parent.vue · import at src/Parent.vue:3 → src/Child.svelte",
-    );
-    // A change that a function in a component calls reaches the component's
-    // importers too.
-    let text = plan("src/money.ts", "n * 100", "n * 10");
-    has_line(&text, "vitest · subset · 2 of 4 indexed test files");
-    has_line(
-        &text,
-        "  src/Price.test.ts · src/Price.test.ts · possible · price in src/Price.vue depends on the change · import at src/Price.test.ts:1 → src/Price.vue",
-    );
-    // A component no test imports is a change no test reaches.
-    let text = plan("src/Lonely.astro", "return 1", "return 2");
-    has_line(
-        &text,
-        "  no-tests: no test reaches quiet (src/Lonely.astro:2) through indexed links",
-    );
-    // Elixir reaches its ExUnit test, which no runner here runs.
-    let text = plan("lib/twice.ex", "x * 2", "x + x");
-    has_line(
-        &text,
-        "  data-unlinked: lib/twice.ex is not mentioned by indexed source, and no runner here runs its language",
-    );
-    // MATLAB code in a `.m` file is data, not Objective-C.
-    let text = plan("model.m", "x * 2", "x + x");
-    has_line(
-        &text,
-        "  data-unlinked: model.m is not mentioned by indexed source",
-    );
+    }
 }
 
 #[test]
 fn agent_hooks_never_narrow_or_rewrap_justless_test() {
     let repo = affected_fixture();
     let root = repo.path();
-    let call = |command: &str| serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}});
     for command in [
         "justless test --affected",
         "justless test --affected -- cargo test --offline",
@@ -11825,11 +11742,10 @@ fn agent_hooks_never_narrow_or_rewrap_justless_test() {
         "justless test",
     ] {
         for handler in ["hook-claude", "hook-codex"] {
-            assert_eq!(
-                agent_hook(root, handler, "before-command", call(command)),
-                serde_json::json!({}),
-                "{handler}: {command}"
-            );
+            let event = serde_json::json!({"hook_event_name":"PreToolUse","tool_name":"Bash",
+                "cwd":root,"tool_input":{"command":command}});
+            let output = agent_hook(root, handler, "before-command", event);
+            assert_eq!(output, serde_json::json!({}), "{handler}: {command}");
         }
     }
 }
@@ -11840,48 +11756,25 @@ fn affected_tests_from_a_member_directory_keep_what_dependencies_reach() {
     // depends on, still reaches api's tests and its black-box CLI test.
     let repo = affected_fixture();
     let root = repo.path();
+    let api = root.join("api");
+    let plan = |extra: &str| {
+        let words = format!("test --affected --dry-run {extra} -- cargo test --offline");
+        success_words(&api, &words)
+    };
     replace_in(
         root,
         "ledger/src/tax.rs",
         "cents * RATE / 100",
         "cents * RATE / 100 + 1",
     );
-    let api = root.join("api");
-    let text = success(
-        &api,
-        &[
-            "test",
-            "--affected",
-            "--dry-run",
-            "--no-fallback",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-        ],
-    );
-    assert!(
-        text.contains("cargo · low-confidence subset (inferred-only"),
-        "{text}"
-    );
+    let text = plan("--no-fallback");
+    text_has(&text, &["cargo · low-confidence subset (inferred-only"]);
     has_line(
         &text,
         "  Run (whole targets): cargo test --offline -p api --test cli",
     );
-    assert!(!text.contains("-p ledger-core"), "{text}");
-    let text = success(
-        &api,
-        &[
-            "test",
-            "--affected",
-            "--dry-run",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-        ],
-    );
-    has_line(&text, "  Run (full suite): cargo test --offline");
+    text_lacks(&text, &["-p ledger-core"]);
+    has_line(&plan(""), "  Run (full suite): cargo test --offline");
     // A change to a package api does not use concerns nothing that runs here.
     git(root, &["checkout", "-q", "--", "."]);
     replace_in(
@@ -11890,20 +11783,8 @@ fn affected_tests_from_a_member_directory_keep_what_dependencies_reach() {
         "values.len() as u64",
         "(values.len() as u64)",
     );
-    let text = success(
-        &api,
-        &[
-            "test",
-            "--affected",
-            "--dry-run",
-            "--",
-            "cargo",
-            "test",
-            "--offline",
-        ],
-    );
     has_line(
-        &text,
+        &plan(""),
         "cargo · nothing to run · no change reaches its tests",
     );
 }
@@ -11914,14 +11795,11 @@ fn affected_tests_from_a_member_directory_keep_what_dependencies_reach() {
 fn affected_fixture_with_hidden_users() -> TempDir {
     let repo = affected_fixture();
     let root = repo.path();
-    let write = |file: &str, text: &str| {
-        let path = root.join(file);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    };
-    write(
-        "ledger/src/money.rs",
-        r#"use std::fmt;
+    write_files(
+        root,
+        &[(
+            "ledger/src/money.rs",
+            r#"use std::fmt;
 
 pub struct Money(pub u64);
 
@@ -11986,58 +11864,40 @@ mod tests {
     }
 }
 "#,
+        )],
     );
     let lib = fs::read_to_string(root.join("reports/src/lib.rs")).unwrap();
-    write(
-        "reports/src/lib.rs",
-        &format!(
-            "#![doc = include_str!(\"../README.md\")]\n//! Report helpers.\n//!\n//! ```\n//! assert_eq!(reports::stats::peak(&[1, 9, 3]), 9);\n//! ```\n{lib}"
-        ),
-    );
-    write(
-        "reports/README.md",
-        "# reports\n\n```\nassert_eq!(reports::stats::mean(&[2, 4]), 3);\n```\n",
-    );
     let stats = fs::read_to_string(root.join("reports/src/stats.rs")).unwrap();
-    write(
-        "reports/src/stats.rs",
-        &stats.replacen(
-            "#[cfg(test)]",
-            "/// The distance between the largest and the smallest value.\npub fn spread(values: &[u64]) -> u64 {\n    peak(values) - values.iter().copied().min().unwrap_or(0)\n}\n\n#[cfg(test)]",
-            1,
-        ),
-    );
-    write(
-        "reports/examples/weekly.rs",
-        "fn main() {\n    println!(\"{}\", reports::stats::spread(&[4, 8, 6]));\n}\n",
+    let spread = "/// The distance between the largest and the smallest value.\npub fn spread(values: &[u64]) -> u64 {\n    peak(values) - values.iter().copied().min().unwrap_or(0)\n}\n\n#[cfg(test)]";
+    let tax = fs::read_to_string(root.join("ledger/src/tax.rs")).unwrap();
+    // A function only a test behind an unmet required feature calls.
+    let extra = "/// A rate behind the `extra` feature.\npub fn extra_rate() -> u64 {\n    7\n}\n\nconst RATE";
+    write_files(
+        root,
+        &[
+            (
+                "reports/src/lib.rs",
+                &format!(
+                    "#![doc = include_str!(\"../README.md\")]\n//! Report helpers.\n//!\n//! ```\n//! assert_eq!(reports::stats::peak(&[1, 9, 3]), 9);\n//! ```\n{lib}"
+                ),
+            ),
+            (
+                "reports/src/stats.rs",
+                &stats.replacen("#[cfg(test)]", spread, 1),
+            ),
+            ("ledger/src/tax.rs", &tax.replacen("const RATE", extra, 1)),
+        ],
     );
     // An example named like an integration test: `--example summary` must not
     // stand in for `--test summary`.
-    write(
-        "reports/examples/summary.rs",
-        "fn main() {\n    println!(\"{}\", reports::stats::mean(&[4, 8]));\n}\n",
-    );
-    // A function only a test behind an unmet required feature calls.
-    let tax = fs::read_to_string(root.join("ledger/src/tax.rs")).unwrap();
-    write(
-        "ledger/src/tax.rs",
-        &tax.replacen(
-            "const RATE",
-            "/// A rate behind the `extra` feature.\npub fn extra_rate() -> u64 {\n    7\n}\n\nconst RATE",
-            1,
-        ),
-    );
-    write(
-        "ledger/tests/needs.rs",
-        "#[test]\nfn extra_feature_is_enabled() {\n    assert!(cfg!(feature = \"extra\"));\n    assert_eq!(ledger_core::tax::extra_rate(), 7);\n}\n",
-    );
-    write(
-        "ledger/migrations/001_init.sql",
-        "CREATE TABLE invoices (\n    id INTEGER PRIMARY KEY\n);\n",
-    );
-    write(
-        "ledger/tests/migrations.rs",
-        "use std::fs;\nuse std::path::Path;\n\n#[test]\nfn every_migration_creates_a_table() {\n    let dir = Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"migrations\");\n    for entry in fs::read_dir(dir).unwrap() {\n        let text = fs::read_to_string(entry.unwrap().path()).unwrap();\n        assert!(text.contains(\"CREATE TABLE\"), \"no table\");\n    }\n}\n",
+    fixture_files(
+        root,
+        "//- reports/README.md\n# reports\n\n```\nassert_eq!(reports::stats::mean(&[2, 4]), 3);\n```\n\
+        //- reports/examples/weekly.rs\nfn main() {\n    println!(\"{}\", reports::stats::spread(&[4, 8, 6]));\n}\n\
+        //- reports/examples/summary.rs\nfn main() {\n    println!(\"{}\", reports::stats::mean(&[4, 8]));\n}\n\
+        //- ledger/tests/needs.rs\n#[test]\nfn extra_feature_is_enabled() {\n    assert!(cfg!(feature = \"extra\"));\n    assert_eq!(ledger_core::tax::extra_rate(), 7);\n}\n\
+        //- ledger/migrations/001_init.sql\nCREATE TABLE invoices (\n    id INTEGER PRIMARY KEY\n);\n\
+        //- ledger/tests/migrations.rs\nuse std::fs;\nuse std::path::Path;\n\n#[test]\nfn every_migration_creates_a_table() {\n    let dir = Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"migrations\");\n    for entry in fs::read_dir(dir).unwrap() {\n        let text = fs::read_to_string(entry.unwrap().path()).unwrap();\n        assert!(text.contains(\"CREATE TABLE\"), \"no table\");\n    }\n}\n",
     );
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "hidden users"]);
@@ -12048,24 +11908,20 @@ mod tests {
 fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
     let repo = affected_fixture_with_hidden_users();
     let root = repo.path();
-    let affected = ["test", "--affected", "--", "cargo", "test", "--offline"];
+    let affected = "test --affected -- cargo test --offline";
     let plan = || {
-        success(
+        success_words(
             root,
-            &[
-                "test",
-                "--affected",
-                "--dry-run",
-                "--budget",
-                "8000",
-                "--",
-                "cargo",
-                "test",
-                "--offline",
-            ],
+            "test --affected --dry-run --budget 8000 -- cargo test --offline",
         )
     };
     let reset = || git(root, &["checkout", "-q", "--", "."]);
+    let fails = |message: &str| {
+        let failing = cli_words(root, affected);
+        assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
+        text_has(&stderr(&failing), &[message]);
+        failing
+    };
 
     // A helper called inside `write!` in a Display impl reaches every test that
     // formats the type, and one called inside an unindexed macro reaches the
@@ -12076,40 +11932,17 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
         "let digits = units.to_string();",
         "let digits = format!(\"{units:0>3}\");",
     );
-    let text = plan();
-    assert!(
-        text.contains(
-            "  money::tests::groups_thousands · ledger-core --lib · exact · call at ledger/src/money.rs"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "  money::tests::displays_cents · ledger-core --lib · possible · fmt is called implicitly; traced through type money::Money"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "  tests::invoice_total_adds_vat · api --lib · possible · fmt is called implicitly"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "  money::tests::labels_are_bracketed · ledger-core --lib · possible · names grouped at ledger/src/money.rs:32"
-        ),
-        "{text}"
+    text_has(
+        &plan(),
+        &[
+            "  money::tests::groups_thousands · ledger-core --lib · exact · call at ledger/src/money.rs",
+            "  money::tests::displays_cents · ledger-core --lib · possible · fmt is called implicitly; traced through type money::Money",
+            "  tests::invoice_total_adds_vat · api --lib · possible · fmt is called implicitly",
+            "  money::tests::labels_are_bracketed · ledger-core --lib · possible · names grouped at ledger/src/money.rs:32",
+        ],
     );
     // `cargo test` fails here, and so does the subset.
-    let failing = cli(root, &affected);
-    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
-    assert!(
-        stderr(&failing).contains("Subset failed (cargo)"),
-        "{}",
-        stderr(&failing)
-    );
-    assert_no_suite_claim(&failing);
+    assert_no_suite_claim(&fails("Subset failed (cargo)"));
     reset();
 
     // Crate-level examples run when they name a changed function.
@@ -12119,14 +11952,13 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
         "values.iter().copied().max().unwrap_or(0)",
         "values.iter().max().copied().unwrap_or(0)",
     );
-    let text = plan();
-    has_line(
-        &text,
-        "  Run (doctests): cargo test --offline -p reports --doc -- 'src/lib.rs - '",
-    );
-    has_line(
-        &text,
-        "  src/lib.rs (doctest) · --doc · mention · its example names peak at reports/src/lib.rs:5",
+    let doctests = "  Run (doctests): cargo test --offline -p reports --doc -- 'src/lib.rs - '";
+    text_lines(
+        &plan(),
+        &[
+            doctests,
+            "  src/lib.rs (doctest) · --doc · mention · its example names peak at reports/src/lib.rs:5",
+        ],
     );
     reset();
 
@@ -12137,9 +11969,8 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
         "values.len() as u64",
         "(values.len() as u64)",
     );
-    let text = plan();
     has_line(
-        &text,
+        &plan(),
         "  Run (whole targets): cargo test --offline -p reports --test summary",
     );
     reset();
@@ -12148,9 +11979,9 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
     // vouches for nothing.
     replace_in(root, "ledger/src/tax.rs", "    7\n", "    8\n");
     let text = plan();
-    assert!(
-        text.contains("  no-tests: no test reaches tax::extra_rate (ledger/src/tax.rs:"),
-        "{text}"
+    text_has(
+        &text,
+        &["  no-tests: no test reaches tax::extra_rate (ledger/src/tax.rs:"],
     );
     has_line(&text, "  Run (full suite): cargo test --offline");
     reset();
@@ -12158,18 +11989,9 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
     // A README included as crate docs runs as doctests when it changes.
     replace_in(root, "reports/README.md", "&[2, 4]), 3)", "&[2, 4]), 4)");
     let text = plan();
-    has_line(
-        &text,
-        "  Run (doctests): cargo test --offline -p reports --doc -- 'src/lib.rs - '",
-    );
-    assert!(!text.contains("no test impact"), "{text}");
-    let failing = cli(root, &affected);
-    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
-    assert!(
-        stderr(&failing).contains("  reports/src/lib.rs - (line"),
-        "{}",
-        stderr(&failing)
-    );
+    has_line(&text, doctests);
+    text_lacks(&text, &["no test impact"]);
+    fails("  reports/src/lib.rs - (line");
     reset();
 
     // A rename that breaks an example fails the build, as `cargo test` would,
@@ -12180,23 +12002,15 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
         "pub fn spread(",
         "pub fn range(",
     );
-    let text = plan();
-    has_line(
-        &text,
-        "cargo · build only · no test reaches the changed code",
+    text_lines(
+        &plan(),
+        &[
+            "cargo · build only · no test reaches the changed code",
+            "  Run (build only): cargo test --offline -p reports --example weekly --lib --no-run",
+        ],
     );
-    has_line(
-        &text,
-        "  Run (build only): cargo test --offline -p reports --example weekly --lib --no-run",
-    );
-    let failing = cli(root, &affected);
-    assert_eq!(failing.status.code(), Some(101), "{}", stderr(&failing));
-    assert!(
-        stderr(&failing).contains(
-            "Build only (cargo) failed with exit 101 building reports --example weekly, reports --lib"
-        ),
-        "{}",
-        stderr(&failing)
+    fails(
+        "Build only (cargo) failed with exit 101 building reports --example weekly, reports --lib",
     );
     // Fixed in the example too: an example nothing tests only has to build.
     replace_in(
@@ -12205,13 +12019,11 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
         "stats::spread(",
         "stats::range(",
     );
-    let passing = cli(root, &affected);
+    let passing = cli_words(root, affected);
     assert!(passing.status.success(), "{}", stderr(&passing));
-    assert!(
-        stderr(&passing)
-            .contains("Build only (cargo): reports --example weekly, reports --lib compiled"),
-        "{}",
-        stderr(&passing)
+    text_has(
+        &stderr(&passing),
+        &["Build only (cargo): reports --example weekly, reports --lib compiled"],
     );
     assert_no_suite_claim(&passing);
     reset();
@@ -12223,12 +12035,13 @@ fn affected_tests_reach_display_doc_examples_examples_and_unlinked_code() {
         "CREATE TABLE",
         "CREATE VIEW",
     );
-    let text = plan();
-    has_line(
-        &text,
-        "  data-unlinked: ledger/migrations/001_init.sql is not mentioned by indexed source, and no runner here runs its language",
+    text_lines(
+        &plan(),
+        &[
+            "  data-unlinked: ledger/migrations/001_init.sql is not mentioned by indexed source, and no runner here runs its language",
+            "  Run (full suite): cargo test --offline",
+        ],
     );
-    has_line(&text, "  Run (full suite): cargo test --offline");
 }
 
 /// A stand-in for `go test`: `-run` matches top-level `func TestX(t *testing.T)`
@@ -12304,109 +12117,45 @@ exit $status
 #[cfg(unix)]
 #[test]
 fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
-    use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let write = |file: &str, text: &str| {
-        let path = root.join(file);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    };
-    let tool = |file: &str, text: &str| {
-        write(file, text);
-        fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o755)).unwrap();
-    };
-    write(".gitignore", "tools/\ncalls.log*\n");
-    tool("tools/go", FAKE_GO);
-    tool("tools/pytest", FAKE_PYTEST);
-    // pytest collects `*_tests.py` here, under tests/ only.
-    write(
-        "pyproject.toml",
-        "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npython_files = [\"test_*.py\", \"*_tests.py\"]\n",
-    );
-    write("billing/__init__.py", "");
-    write(
-        "billing/rates.py",
-        "def vat(amount):\n    return amount // 5\n",
-    );
-    write(
-        "billing/invoice.py",
-        "from billing.rates import vat\n\n\ndef total(amount):\n    return amount + vat(amount)\n",
-    );
-    write(
-        "billing/shipping.py",
-        "def fee(weight):\n    return weight * 2\n",
-    );
-    write(
-        "tests/invoice_tests.py",
-        "from billing.invoice import total\n\n\ndef test_total():\n    assert total(10) == 12\n",
-    );
-    write(
-        "tests/test_rates.py",
-        "from billing.rates import vat\n\n\ndef test_vat():\n    assert vat(10) == 2\n",
-    );
-    // A file pytest does not collect: its tests satisfy nothing.
-    write(
-        "tests/shipping_check.py",
-        "from billing.shipping import fee\n\n\ndef test_fee():\n    assert fee(2) == 4\n",
+    executable(root, "tools/go", FAKE_GO);
+    executable(root, "tools/pytest", FAKE_PYTEST);
+    // pytest collects `*_tests.py` here, under tests/ only. A file pytest does
+    // not collect, shipping_check.py, satisfies nothing.
+    fixture_files(
+        root,
+        "//- .gitignore\ntools/\ncalls.log*\n\
+        //- pyproject.toml\n[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npython_files = [\"test_*.py\", \"*_tests.py\"]\n\
+        //- billing/__init__.py\n\
+        //- billing/rates.py\ndef vat(amount):\n    return amount // 5\n\
+        //- billing/invoice.py\nfrom billing.rates import vat\n\n\ndef total(amount):\n    return amount + vat(amount)\n\
+        //- billing/shipping.py\ndef fee(weight):\n    return weight * 2\n\
+        //- tests/invoice_tests.py\nfrom billing.invoice import total\n\n\ndef test_total():\n    assert total(10) == 12\n\
+        //- tests/test_rates.py\nfrom billing.rates import vat\n\n\ndef test_vat():\n    assert vat(10) == 2\n\
+        //- tests/shipping_check.py\nfrom billing.shipping import fee\n\n\ndef test_fee():\n    assert fee(2) == 4\n\
+        //- shop/go.mod\nmodule example.com/shop\n\ngo 1.22\n\
+        //- shop/cart/cart.go\npackage cart\n\nfunc Count(items []int) int {\n\treturn len(items)\n}\n\
+        //- shop/cart/cart_test.go\npackage cart\n\nimport \"testing\"\n\nfunc TestCount(t *testing.T) {\n\tif Count([]int{1}) != 1 {\n\t\tt.Fatal(\"count\")\n\t}\n}\n\
+        //- shop/cart/suite_test.go\npackage cart\n\nimport (\n\t\"testing\"\n\n\t\"github.com/stretchr/testify/suite\"\n)\n\ntype CartSuite struct {\n\tsuite.Suite\n}\n\nfunc (s *CartSuite) TestCountTwo() {\n\ts.Equal(2, Count([]int{1, 2}))\n}\n\nfunc TestCartSuite(t *testing.T) {\n\tsuite.Run(t, new(CartSuite))\n}\n\
+        //- shop/price/price.go\npackage price\n\nfunc Vat(cents int) int {\n\treturn cents / 5\n}\n\
+        //- shop/price/price_test.go\npackage price\n\nimport \"testing\"\n\nfunc TestVat(t *testing.T) {\n\tif Vat(100) != 20 {\n\t\tt.Fatal(\"vat\")\n\t}\n}\n\
+        //- shop/ship/ship_test.go\npackage ship\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {}\n\nfunc TestB(t *testing.T) {}\n\nfunc TestC(t *testing.T) {}\n\nfunc TestD(t *testing.T) {}\n",
     );
     for name in ["test_names", "test_dates", "test_other"] {
-        write(
-            &format!("tests/{name}.py"),
-            "def test_one():\n    assert 1\n\n\ndef test_two():\n    assert 2\n",
-        );
+        let two = "def test_one():\n    assert 1\n\n\ndef test_two():\n    assert 2\n";
+        write_files(root, &[(&format!("tests/{name}.py"), two)]);
     }
-    write("shop/go.mod", "module example.com/shop\n\ngo 1.22\n");
-    write(
-        "shop/cart/cart.go",
-        "package cart\n\nfunc Count(items []int) int {\n\treturn len(items)\n}\n",
-    );
-    write(
-        "shop/cart/cart_test.go",
-        "package cart\n\nimport \"testing\"\n\nfunc TestCount(t *testing.T) {\n\tif Count([]int{1}) != 1 {\n\t\tt.Fatal(\"count\")\n\t}\n}\n",
-    );
-    write(
-        "shop/cart/suite_test.go",
-        "package cart\n\nimport (\n\t\"testing\"\n\n\t\"github.com/stretchr/testify/suite\"\n)\n\ntype CartSuite struct {\n\tsuite.Suite\n}\n\nfunc (s *CartSuite) TestCountTwo() {\n\ts.Equal(2, Count([]int{1, 2}))\n}\n\nfunc TestCartSuite(t *testing.T) {\n\tsuite.Run(t, new(CartSuite))\n}\n",
-    );
-    write(
-        "shop/price/price.go",
-        "package price\n\nfunc Vat(cents int) int {\n\treturn cents / 5\n}\n",
-    );
-    write(
-        "shop/price/price_test.go",
-        "package price\n\nimport \"testing\"\n\nfunc TestVat(t *testing.T) {\n\tif Vat(100) != 20 {\n\t\tt.Fatal(\"vat\")\n\t}\n}\n",
-    );
-    write(
-        "shop/ship/ship_test.go",
-        "package ship\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {}\n\nfunc TestB(t *testing.T) {}\n\nfunc TestC(t *testing.T) {}\n\nfunc TestD(t *testing.T) {}\n",
-    );
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
+    commit_all(root);
     let calls = root.join("calls.log");
+    let calls_text = || fs::read_to_string(&calls).unwrap();
     let pytest = root.join("tools/pytest");
     let pytest = pytest.to_str().unwrap().to_owned();
     let justless = |args: &[&str], env: &[(&str, &str)]| {
         let _ = fs::remove_file(&calls);
         let _ = fs::remove_file(root.join("calls.log.count"));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_justless"));
-        command
-            .args(args)
-            .current_dir(root)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    root.join("tools").display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env("CALLS", &calls);
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        command.output().unwrap()
+        let calls = calls.to_str().unwrap();
+        with_tools(root, args, &[env, &[("CALLS", calls)]].concat())
     };
     let reset = || git(root, &["checkout", "-q", "--", "."]);
 
@@ -12414,15 +12163,18 @@ fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
     // name a subtest; a failure in it fails the subset.
     replace_in(root, "shop/cart/suite_test.go", "s.Equal(2,", "s.Equal(3,");
     let output = justless(&["test", "--affected", "--dry-run"], &[]);
-    let text = stdout(&output);
-    has_line(&text, "go (shop) · subset · 3 of 8 indexed tests");
-    has_line(&text, "  Run (whole targets): go test -v ./cart");
+    text_lines(
+        &stdout(&output),
+        &[
+            "go (shop) · subset · 3 of 8 indexed tests",
+            "  Run (whole targets): go test -v ./cart",
+        ],
+    );
     let output = justless(&["test", "--affected"], &[("FAIL", "TestCountTwo")]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("Subset failed (go): 2 of 3 tests that ran failed, exit 1"),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &["Subset failed (go): 2 of 3 tests that ran failed, exit 1"],
     );
     assert_no_suite_claim(&output);
     reset();
@@ -12431,59 +12183,52 @@ fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
     replace_in(root, "shop/price/price_test.go", "!= 20", "!= 20+0");
     let output = justless(&["test", "--affected"], &[]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(
-        fs::read_to_string(&calls).unwrap(),
-        "go test -v ./price -run ^(TestVat)$\n"
-    );
-    assert!(
-        stderr(&output).contains("Subset passed (go): ran 1 test reachable from your changes"),
-        "{}",
-        stderr(&output)
+    assert_eq!(calls_text(), "go test -v ./price -run ^(TestVat)$\n");
+    text_has(
+        &stderr(&output),
+        &["Subset passed (go): ran 1 test reachable from your changes"],
     );
     // `[no tests to run]` is not a pass: the package runs again without -run.
     let output = justless(&["test", "--affected"], &[("NOMATCH", "1")]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
-        fs::read_to_string(&calls).unwrap(),
+        calls_text(),
         "go test -v ./price -run ^(TestVat)$\ngo test -v ./price\n"
     );
-    assert!(
-        stderr(&output).contains(
-            "widened: 1 selected test reported no result under their test names; running their packages in full"
-        ),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &[
+            "widened: 1 selected test reported no result under their test names; running their packages in full",
+        ],
     );
     reset();
 
     // pytest: python_files decides what counts as a test file.
+    let dry_run = [
+        "test",
+        "--affected",
+        "--dry-run",
+        "--",
+        pytest.as_str(),
+        "-q",
+    ];
     replace_in(
         root,
         "billing/invoice.py",
         "amount + vat",
         "amount + 0 + vat",
     );
-    let output = justless(
-        &["test", "--affected", "--dry-run", "--", &pytest, "-q"],
-        &[],
-    );
     has_line(
-        &stdout(&output),
+        &stdout(&justless(&dry_run, &[])),
         &format!("  Run (selected tests): {pytest} -q tests/invoice_tests.py"),
     );
     reset();
     // A change only an uncollected file tests has no subset to run.
     replace_in(root, "billing/shipping.py", "weight * 2", "weight * 2 + 0");
-    let output = justless(
-        &["test", "--affected", "--dry-run", "--", &pytest, "-q"],
-        &[],
-    );
-    let text = stdout(&output);
-    assert!(
-        text.contains(
-            "no-tests: no test reaches fee (billing/shipping.py:1-2) through indexed links"
-        ),
-        "{text}"
+    let text = stdout(&justless(&dry_run, &[]));
+    text_has(
+        &text,
+        &["no-tests: no test reaches fee (billing/shipping.py:1-2) through indexed links"],
     );
     has_line(&text, &format!("  Run (full suite): {pytest} -q"));
     reset();
@@ -12493,14 +12238,15 @@ fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
     let affected = ["test", "--affected", "--", pytest.as_str(), "-q"];
     let output = justless(&affected, &[("PLAN", "4,0")]);
     assert!(output.status.success(), "{}", stderr(&output));
-    let err = stderr(&output);
-    assert!(
-        err.contains("Subset passed (pytest)")
-            && err.contains("widened: pytest did not find 1 node ID"),
-        "{err}"
+    text_has(
+        &stderr(&output),
+        &[
+            "Subset passed (pytest)",
+            "widened: pytest did not find 1 node ID",
+        ],
     );
     assert_eq!(
-        fs::read_to_string(&calls).unwrap(),
+        calls_text(),
         "pytest -q tests/test_rates.py::test_vat\npytest -q tests/test_rates.py\n"
     );
     let output = justless(&affected, &[("PLAN", "4,1")]);
@@ -12509,11 +12255,11 @@ fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
     let output = justless(&affected, &[("PLAN", "5,0")]);
     assert!(output.status.success(), "{}", stderr(&output));
     let err = stderr(&output);
-    assert!(
-        err.contains("Full suite (fallback from --affected: runner-mismatch) (pytest): exit 0"),
-        "{err}"
+    text_has(
+        &err,
+        &["Full suite (fallback from --affected: runner-mismatch) (pytest): exit 0"],
     );
-    assert!(!err.contains("full suite was not run"), "{err}");
+    text_lacks(&err, &["full suite was not run"]);
     let history = success(root, &["history"]);
     let newest = history.lines().next().unwrap_or_default();
     assert!(newest.contains(" · pytest · exit 0"), "{history}");
@@ -12523,62 +12269,43 @@ fn affected_go_and_pytest_subsets_match_what_their_runners_collect() {
 #[cfg(unix)]
 #[test]
 fn stray_python_tests_add_no_runner_and_missing_runners_are_not_results() {
-    use std::os::unix::fs::PermissionsExt;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let write = |file: &str, text: &str| {
-        let path = root.join(file);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    };
-    write("go.mod", "module example.com/tool\n\ngo 1.22\n");
-    write(
-        "tool_test.go",
-        "package tool\n\nimport \"testing\"\n\nfunc TestTool(t *testing.T) {}\n",
+    fixture_files(
+        root,
+        "//- go.mod\nmodule example.com/tool\n\ngo 1.22\n\
+        //- tool_test.go\npackage tool\n\nimport \"testing\"\n\nfunc TestTool(t *testing.T) {}\n\
+        //- scripts/test_release.py\ndef test_release():\n    assert True\n",
     );
-    write(
-        "scripts/test_release.py",
-        "def test_release():\n    assert True\n",
-    );
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
+    commit_all(root);
     // A test-named script outside the root and tests/ is not a pytest suite.
-    let text = success(root, &["test", "--dry-run"]);
-    assert!(!text.contains("pytest"), "{text}");
+    let text = success_words(root, "test --dry-run");
+    text_lacks(&text, &["pytest"]);
     has_line(&text, "go · full suite");
 
     // With tests at the root, pytest is detected; a Python without pytest is
     // reported as a runner that could not start, with its status.
-    write("tests/test_tool.py", "def test_tool():\n    assert True\n");
-    write(
-        ".venv/bin/python",
-        "#!/bin/sh\necho \"$0: No module named pytest\" >&2\nexit 1\n",
+    write_files(
+        root,
+        &[("tests/test_tool.py", "def test_tool():\n    assert True\n")],
     );
-    fs::set_permissions(
-        root.join(".venv/bin/python"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["test", "--", ".venv/bin/python", "-m", "pytest"])
-        .current_dir(root)
-        .output()
-        .unwrap();
+    let python = "#!/bin/sh\necho \"$0: No module named pytest\" >&2\nexit 1\n";
+    executable(root, ".venv/bin/python", python);
+    let output = cli_words(root, "test -- .venv/bin/python -m pytest");
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains(
-            "Runner not available (pytest): No module named pytest; exit 1. Its tests did not run; this is not a test result"
-        ),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &[
+            "Runner not available (pytest): No module named pytest; exit 1. Its tests did not run; this is not a test result",
+        ],
     );
-    let output = cli(root, &["test", "--", "no-such-runner-for-justless"]);
+    let output = cli_words(root, "test -- no-such-runner-for-justless");
     assert_eq!(output.status.code(), Some(127), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("Runner not available (command): no-such-runner-for-justless could not be started; exit 127"),
-        "{}",
-        stderr(&output)
+    text_has(
+        &stderr(&output),
+        &[
+            "Runner not available (command): no-such-runner-for-justless could not be started; exit 127",
+        ],
     );
 }
 
@@ -14017,21 +13744,88 @@ fn marker_run(text: &str) -> String {
         .to_owned()
 }
 
+/// What Claude Code's Bash tool shows after the hook replaced `stdout` of
+/// `command` run in `root`.
+fn bash_shown(root: &Path, command: &str, stdout: &str) -> String {
+    shown_stdout(&after_bash(root, root, command, bash_result(stdout)))
+}
+
+/// Asserts that the post-command hook leaves each of `commands` printing
+/// `stdout` as it was.
+fn bash_untouched(root: &Path, commands: &[&str], stdout: &str) {
+    for command in commands {
+        let output = after_bash(root, root, command, bash_result(stdout));
+        assert_eq!(output, serde_json::json!({}), "{command}");
+    }
+}
+
+/// The output of `grep -rn needle PATH` in `dir`.
+#[cfg(unix)]
+fn grep_needle(dir: &Path, path: &str) -> String {
+    stdout(
+        &Command::new("grep")
+            .args(["-rn", "needle", path])
+            .current_dir(dir)
+            .output()
+            .unwrap(),
+    )
+}
+
+/// A Bash result of which Claude Code kept the first 30,000 bytes inline and
+/// saved all of `full` as `dir/name`.
+#[cfg(unix)]
+fn persisted_result(dir: &Path, name: &str, full: &str) -> serde_json::Value {
+    let saved = dir.join(name);
+    fs::write(&saved, full).unwrap();
+    let mut response = bash_result(&full[..30000]);
+    response["persistedOutputPath"] = serde_json::json!(saved);
+    response["persistedOutputSize"] = serde_json::json!(full.len());
+    response
+}
+
+/// 300 lines of trace before a failing test's panic and `ending`, as a test run
+/// cut by `| tail` shows it.
+#[cfg(unix)]
+fn traced_failure(ending: &str) -> String {
+    let trace: String = (0..300)
+        .map(|i| format!("billing-trace step={i} state=ready\n"))
+        .collect();
+    format!(
+        "{trace}\nthread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:\n\
+         assertion `left == right` failed\n  left: 106\n right: 105\n\n{ending}"
+    )
+}
+
+/// The report of 400 passing tests.
+#[cfg(unix)]
+fn passing_tests() -> String {
+    let tests: String = (0..400)
+        .map(|i| format!("test pricing::case_{i} ... ok\n"))
+        .collect();
+    tests
+        + "\ntest result: ok. 400 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s\n"
+}
+
+/// The runs archived under `root`, staged ones aside.
+#[cfg(unix)]
+fn run_count(root: &Path) -> usize {
+    fs::read_dir(root.join(".justless/runs")).map_or(0, |dir| {
+        dir.filter(|entry| {
+            let name = entry.as_ref().unwrap().file_name();
+            name.to_string_lossy().starts_with("run-")
+        })
+        .count()
+    })
+}
+
 #[cfg(unix)]
 #[test]
 fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     use serde_json::json;
     let repo = search_repo();
     let root = repo.path().canonicalize().unwrap();
-    let grep = |dir: &Path, path: &str| {
-        let output = Command::new("grep")
-            .args(["-rn", "needle", path])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        stdout(&output)
-    };
-    let content = grep(&root, "src");
+    let content = grep_needle(&root, "src");
+    let history = || success(&root, &["history"]);
 
     // Claude Code runs its own grep, which the command hook leaves alone. The
     // result is grouped by file and ends with the run marker; every other field,
@@ -14042,10 +13836,8 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
     let text = shown_stdout(&output);
     assert!(text.len() * 3 < content.len(), "{text}");
-    assert!(
-        text.starts_with("grep: ") && text.contains("\nsrc/big.rs ×150 [stdout:"),
-        "{text}"
-    );
+    assert!(text.starts_with("grep: "), "{text}");
+    text_has(&text, &["\nsrc/big.rs ×150 [stdout:"]);
     let last = text.lines().last().unwrap();
     assert!(last.ends_with(" shown]"), "{last}");
     for key in ["stderr", "interrupted", "isImage", "noOutputExpected"] {
@@ -14054,130 +13846,75 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     // The archive replays the exact output and says how it was captured.
     let id = marker_run(&text);
     assert_eq!(success(&root, &["log", &id, "--stream", "stdout"]), content);
-    let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.join(".justless/runs").join(&id).join("record.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        record["note"]
-            .as_str()
-            .unwrap()
-            .contains("after the command ran"),
-        "{record}"
-    );
-    assert!(success(&root, &["history"]).contains(&format!("{id} · grep · exit 0")));
+    let record = run_record(&root, &id);
+    text_has(record["note"].as_str().unwrap(), &["after the command ran"]);
+    text_has(&history(), &[&format!("{id} · grep · exit 0")]);
 
     // A `cd`, an environment prefix, `2>&1` and a filter that keeps whole lines
     // select the same grouping. A subagent's session directory stays where it was,
     // while the main session's follows the `cd`.
-    let nested = grep(&root.join("src"), ".");
+    let nested = grep_needle(&root.join("src"), ".");
+    let command = "cd src && LC_ALL=C grep -rn needle . 2>&1 | head -1000";
     for cwd in [root.clone(), root.join("src")] {
-        let output = after_bash(
-            &root,
-            &cwd,
-            "cd src && LC_ALL=C grep -rn needle . 2>&1 | head -1000",
-            bash_result(&nested),
-        );
-        let text = shown_stdout(&output);
-        assert!(text.contains("big.rs ×150 [stdout:"), "{text}");
+        let text = shown_stdout(&after_bash(&root, &cwd, command, bash_result(&nested)));
+        text_has(&text, &["big.rs ×150 [stdout:"]);
         let id = marker_run(&text);
-        assert!(success(&root, &["history"]).contains(&format!("{id} · grep | head · exit 0")));
+        text_has(&history(), &[&format!("{id} · grep | head · exit 0")]);
     }
     // A `cd` from the home directory resolves through `HOME`, and the archived run
     // answers `search` like any other.
     let event = json!({"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash",
         "cwd":root,"tool_input":{"command":"cd ~/src && grep -rn needle ."},
         "tool_response":bash_result(&nested)});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["hook-claude", "after-bash"])
-        .current_dir(&root)
-        .env("HOME", &root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(event.to_string().as_bytes())
-        .unwrap();
-    let output: serde_json::Value =
-        serde_json::from_slice(&child.wait_with_output().unwrap().stdout).unwrap();
-    let text = shown_stdout(&output);
-    assert!(text.contains("big.rs ×150 [stdout:"), "{text}");
+    let args = ["hook-claude", "after-bash"];
+    let output = piped_with(&root, &args, &[("HOME", &root)], &event.to_string());
+    let text = shown_stdout(&serde_json::from_slice(&output.stdout).unwrap());
+    text_has(&text, &["big.rs ×150 [stdout:"]);
     let found = success(&root, &["search", &marker_run(&text), "needle_149"]);
-    assert!(found.contains("needle_149 = load(needle, 149);"), "{found}");
+    text_has(&found, &["needle_149 = load(needle, 149);"]);
 
     // A test report cut by `| tail` names no failing test, so the failure lines it
     // could not attribute follow it, with their lines in the archive.
-    let mut log: String = (0..300)
-        .map(|i| format!("billing-trace step={i} state=ready\n"))
-        .collect();
-    log.push_str(
-        "\nthread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:\n\
-         assertion `left == right` failed\n  left: 106\n right: 105\n\nfailures:\n    \
-         total_includes_fee\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; \
+    let log = traced_failure(
+        "failures:\n    total_includes_fee\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; \
          0 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `--test checkout`\n",
     );
-    let output = after_bash(
-        &root,
-        &root,
-        "cargo test 2>&1 | tail -320",
-        bash_result(&log),
+    let text = bash_shown(&root, "cargo test 2>&1 | tail -320", &log);
+    text_has(
+        &text,
+        &[
+            "test result: FAILED. 0 passed; 1 failed",
+            "stdout:302: thread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:",
+            "stdout:304: left: 106",
+            "stdout:305: right: 105",
+            "stdout:312: error: test failed, to rerun pass `--test checkout`",
+        ],
     );
-    let text = shown_stdout(&output);
-    for expected in [
-        "test result: FAILED. 0 passed; 1 failed",
-        "stdout:302: thread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:",
-        "stdout:304: left: 106",
-        "stdout:305: right: 105",
-        "stdout:312: error: test failed, to rerun pass `--test checkout`",
-    ] {
-        assert!(text.contains(expected), "{expected}: {text}");
-    }
-    assert!(!text.contains("step=150"), "{text}");
+    text_lacks(&text, &["step=150"]);
     let id = marker_run(&text);
-    assert!(success(&root, &["history"]).contains(&format!("{id} · cargo test | tail · exit 0")));
+    text_has(&history(), &[&format!("{id} · cargo test | tail · exit 0")]);
 
-    // An environment prefix leaves a passing test run to its summary.
-    let passing: String = (0..400)
-        .map(|i| format!("test pricing::case_{i} ... ok\n"))
-        .chain(std::iter::once(
-            "\ntest result: ok. 400 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s\n".to_owned(),
-        ))
-        .collect();
-    let output = after_bash(
-        &root,
-        &root,
-        "RUST_BACKTRACE=1 cargo test",
-        bash_result(&passing),
-    );
-    let text = shown_stdout(&output);
+    // An environment prefix leaves a passing test run to its summary. A compile
+    // error interleaved after a passing target is not hidden by the report of
+    // the target that ran.
+    let passing = passing_tests();
+    let text = bash_shown(&root, "RUST_BACKTRACE=1 cargo test", &passing);
     assert!(
         text.starts_with("0 reported failing test(s)\ntest result: ok. 400 passed;"),
         "{text}"
     );
-    assert!(!text.contains("Error lines"), "{text}");
-
-    // A compile error interleaved after a passing target is not hidden by the
-    // report of the target that ran.
+    text_lacks(&text, &["Error lines"]);
     let broken = format!(
         "{passing}error[E0425]: cannot find value `rate` in this scope\n --> tests/api.rs:4:13\n\
          error: could not compile `shop` (test \"api\") due to 1 previous error\n"
     );
-    let text = shown_stdout(&after_bash(
-        &root,
-        &root,
-        "cargo test 2>&1 | tail -500",
-        bash_result(&broken),
-    ));
-    assert!(
-        text.contains(
+    let text = bash_shown(&root, "cargo test 2>&1 | tail -500", &broken);
+    text_has(
+        &text,
+        &[
             "Error lines not shown above:\nstdout:403: error[E0425]: cannot find value `rate` in this scope\n\
-             stdout:405: error: could not compile `shop` (test \"api\") due to 1 previous error\n"
-        ),
-        "{text}"
+             stdout:405: error: could not compile `shop` (test \"api\") due to 1 previous error\n",
+        ],
     );
 
     // Claude Code reports exit 1 as a valid result only with an interpretation,
@@ -14202,11 +13939,7 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     let results = session.path().join("tool-results");
     fs::create_dir(&results).unwrap();
     let full = content.repeat(4);
-    let saved = results.join("b1.txt");
-    fs::write(&saved, &full).unwrap();
-    let mut response = bash_result(&full[..30000]);
-    response["persistedOutputPath"] = json!(saved);
-    response["persistedOutputSize"] = json!(full.len());
+    let mut response = persisted_result(&results, "b1.txt", &full);
     response["stdoutHoldsOutputEnd"] = json!(false);
     let output = after_bash(&root, &root, "grep -rn needle src", response.clone());
     let updated = &output["hookSpecificOutput"]["updatedToolOutput"];
@@ -14218,7 +13951,7 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
         assert!(updated.get(key).is_none(), "{key}: {updated}");
     }
     let text = shown_stdout(&output);
-    assert!(text.contains("src/big.rs ×600"), "{text}");
+    text_has(&text, &["src/big.rs ×600"]);
     let id = marker_run(&text);
     assert_eq!(success(&root, &["log", &id, "--stream", "stdout"]), full);
 
@@ -14231,16 +13964,14 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     let runs = || fs::read_dir(root.join(".justless/runs")).unwrap().count();
     let before = runs();
     for response in [short, other] {
-        assert_eq!(
-            after_bash(&root, &root, "grep -rn needle src", response),
-            json!({})
-        );
+        let output = after_bash(&root, &root, "grep -rn needle src", response);
+        assert_eq!(output, json!({}));
     }
 
     // Routed and recovery commands, file readers, reshaped output, redirections,
     // substitutions, subshells, background jobs, loops, comments, here-documents
     // and lists of different tools reach Claude unchanged.
-    for command in [
+    let commands = [
         "justless run --hook -- grep -rn needle src",
         "cargo fmt && justless run --hook -- cargo test",
         "cd src && justless run --hook -- rg needle && test 1",
@@ -14264,27 +13995,20 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
         "cd - && grep -rn needle .",
         "grep -rn needle src # all",
         "grep -rn needle src <<END",
-    ] {
-        assert_eq!(
-            after_bash(&root, &root, command, bash_result(&content)),
-            json!({}),
-            "{command}"
-        );
-    }
+    ];
+    bash_untouched(&root, &commands, &content);
     // Output that already carries a marker, small output and shapes this handler
     // does not know stay as they were.
     let marked = format!("{content}[justless run-Abc123 · 2.0 KB of 9.1 KB shown]\n");
-    let small = "src/big.rs:1:let needle_0 = load(needle, 0);\n";
-    for response in [
-        bash_result(&marked),
-        bash_result(small),
-        json!(content),
-        json!({ "stdout": content }),
-    ] {
-        assert_eq!(
-            after_bash(&root, &root, "grep -rn needle src", response),
-            json!({})
-        );
+    bash_untouched(&root, &["grep -rn needle src"], &marked);
+    bash_untouched(
+        &root,
+        &["grep -rn needle src"],
+        "src/big.rs:1:let needle_0 = load(needle, 0);\n",
+    );
+    for response in [json!(content), json!({ "stdout": content })] {
+        let output = after_bash(&root, &root, "grep -rn needle src", response);
+        assert_eq!(output, json!({}));
     }
     // So do results Claude Code did not finish in the foreground.
     for (key, value) in [
@@ -14296,11 +14020,8 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     ] {
         let mut response = bash_result(&content);
         response[key] = value;
-        assert_eq!(
-            after_bash(&root, &root, "grep -rn needle src", response),
-            json!({}),
-            "{key}"
-        );
+        let output = after_bash(&root, &root, "grep -rn needle src", response);
+        assert_eq!(output, json!({}), "{key}");
     }
     let event = json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd":root,
         "tool_input":{"command":"grep -rn needle src","run_in_background":true},
@@ -14313,15 +14034,7 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     assert_eq!(runs(), before);
 
     // Input that is not JSON still answers with no change.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["hook-claude", "after-bash"])
-        .current_dir(&root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"{not json").unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = piped(&root, &["hook-claude", "after-bash"], "{not json");
     assert!(output.status.success());
     assert_eq!(stdout(&output).trim(), "{}");
 }
@@ -14330,72 +14043,49 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
 fn claude_setup_adds_the_bash_output_hook_to_existing_installs() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::create_dir(root.join(".claude")).unwrap();
     // An install from before this hook existed, with a Bash hook of the user's own.
     let earlier = serde_json::json!({"hooks":{"PostToolUse":[
         {"matcher":"^Read$","hooks":[{"type":"command","timeout":5,"command":"justless hook-claude after-read"}]},
         {"matcher":"^Bash$","hooks":[{"type":"command","command":"./scripts/audit.sh"}]}
     ]}});
-    fs::write(root.join(".claude/settings.json"), earlier.to_string()).unwrap();
+    write_files(root, &[(".claude/settings.json", &earlier.to_string())]);
     success(root, &["init", "--hooks", "--agent", "claude"]);
     let settings: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join(".claude/settings.json")).unwrap()).unwrap();
+        serde_json::from_str(&file_text(root, ".claude/settings.json")).unwrap();
     let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
+    let command = |entry: &serde_json::Value| entry["hooks"][0]["command"].clone();
     let bash: Vec<_> = post
         .iter()
-        .filter(|entry| entry["hooks"][0]["command"] == "justless hook-claude after-bash")
+        .filter(|entry| command(entry) == "justless hook-claude after-bash")
         .collect();
     assert_eq!(bash.len(), 1, "{settings:#}");
     assert_eq!(bash[0]["matcher"], "^Bash$");
     assert_eq!(bash[0]["hooks"][0]["timeout"], 10);
     assert!(
         post.iter()
-            .any(|entry| entry["hooks"][0]["command"] == "./scripts/audit.sh")
+            .any(|entry| command(entry) == "./scripts/audit.sh")
     );
     // Running setup again changes nothing.
     let again = success(root, &["init", "--hooks", "--agent", "claude"]);
-    assert!(!again.contains("settings.json"), "{again}");
+    text_lacks(&again, &["settings.json"]);
 }
 
 #[cfg(unix)]
 #[test]
 fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
-    use serde_json::json;
     let repo = search_repo();
     let root = repo.path().canonicalize().unwrap();
-    let content = stdout(
-        &Command::new("grep")
-            .args(["-rn", "needle", "src"])
-            .current_dir(&root)
-            .output()
-            .unwrap(),
-    );
-    let runs = || {
-        fs::read_dir(root.join(".justless/runs"))
-            .map(|dir| {
-                dir.filter(|entry| {
-                    entry
-                        .as_ref()
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("run-")
-                })
-                .count()
-            })
-            .unwrap_or(0)
-    };
+    let content = grep_needle(&root, "src");
 
     // A note printed before the command is fine, and the search is grouped.
     let noted = format!("== needle uses\n{content}");
-    let text = shown_stdout(&after_bash(
-        &root,
+    let text = bash_shown(
         &root,
         "echo \"== needle uses\"; grep -rn needle src",
-        bash_result(&noted),
-    ));
-    assert!(text.contains("src/big.rs ×150 [stdout:"), "{text}");
-    assert_eq!(runs(), 1);
+        &noted,
+    );
+    text_has(&text, &["src/big.rs ×150 [stdout:"]);
+    assert_eq!(run_count(&root), 1);
 
     // A line printed after the command often reports how it ended, which a report
     // of the command's own lines would leave out, so the result stays whole.
@@ -14427,45 +14117,25 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
             format!("{content}done"),
         ),
     ] {
-        assert_eq!(
-            after_bash(&root, &root, command, bash_result(&output)),
-            json!({}),
-            "{command}"
-        );
+        bash_untouched(&root, &[command], &output);
     }
 
     // Searches that print every line are how an agent reads code, so they pass
     // through, while the same searches without that pattern are grouped.
-    let vcs = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", stderr(&output));
-    };
-    vcs(&["init", "-q"]);
-    vcs(&["add", "src"]);
+    git(&root, &["init", "-q"]);
+    git(&root, &["add", "src"]);
     for command in ["rg -n needle src", "git grep -n needle -- src"] {
-        let text = shown_stdout(&after_bash(&root, &root, command, bash_result(&content)));
-        assert!(
-            text.contains("src/big.rs ×150 [stdout:"),
-            "{command}: {text}"
-        );
+        let text = bash_shown(&root, command, &content);
+        text_has(&text, &["src/big.rs ×150 [stdout:"]);
     }
-    assert_eq!(runs(), 3);
-    for command in [
+    assert_eq!(run_count(&root), 3);
+    let every = [
         "grep -rn \"\" src",
         "grep -rn -e '' src",
         "grep -rn '^' src",
         "rg -n '.*' src",
-    ] {
-        assert_eq!(
-            after_bash(&root, &root, command, bash_result(&content)),
-            json!({}),
-            "{command}"
-        );
-    }
+    ];
+    bash_untouched(&root, &every, &content);
     // Searches with context lines show blocks, and pass through when a line
     // belongs to no block.
     let context = stdout(
@@ -14482,18 +14152,14 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
         "rg -n -B 1 needle src",
         "git grep -n -B1 needle -- src",
     ] {
-        let text = shown_stdout(&after_bash(&root, &root, command, bash_result(&context)));
-        assert!(
-            text.contains(" blocks, ") && text.contains("\nsrc/big.rs ×150 in 1 block [stdout:"),
-            "{command}: {text}"
+        let text = bash_shown(&root, command, &context);
+        text_has(
+            &text,
+            &[" blocks, ", "\nsrc/big.rs ×150 in 1 block [stdout:"],
         );
     }
     let stray = format!("{context}grep: src/x: Permission denied\n");
-    let command = "grep -rn -B1 needle src";
-    assert_eq!(
-        after_bash(&root, &root, command, bash_result(&stray)),
-        json!({})
-    );
+    bash_untouched(&root, &["grep -rn -B1 needle src"], &stray);
 
     // A listing filtered by grep names the paths the agent asked for, which a
     // listing report could collapse into a directory count.
@@ -14504,42 +14170,30 @@ fn claude_bash_output_keeps_lines_the_agent_asked_to_see() {
             .output()
             .unwrap(),
     );
-    let filtered: String = found
-        .lines()
-        .filter(|line| line.contains("debug") || line.contains("node_modules"))
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let lines = |keep: &dyn Fn(&str) -> bool| -> String {
+        found
+            .lines()
+            .filter(|line| keep(line))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    };
+    let filtered = lines(&|line| line.contains("debug") || line.contains("node_modules"));
     assert!(filtered.len() > 4096, "{}", filtered.len());
-    for command in [
+    let filters = [
         "find . | grep debug",
         "find . -type f | grep -v src",
         "git ls-files --others | rg modules",
-    ] {
-        assert_eq!(
-            after_bash(&root, &root, command, bash_result(&filtered)),
-            json!({}),
-            "{command}"
-        );
-    }
-    let text = shown_stdout(&after_bash(
-        &root,
-        &root,
-        "find . | head -1000",
-        bash_result(&found),
-    ));
+    ];
+    bash_untouched(&root, &filters, &filtered);
+    let text = bash_shown(&root, "find . | head -1000", &found);
     assert!(text.starts_with("find: "), "{text}");
     // A list of file names has no pattern, so `.` there is a path.
-    let files: String = found
-        .lines()
-        .filter(|line| root.join(line).is_file())
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let files = lines(&|line| root.join(line).is_file());
     for command in ["rg --files . | head -1000", "ag -g . ."] {
-        let text = shown_stdout(&after_bash(&root, &root, command, bash_result(&files)));
-        assert!(text.contains(" entries"), "{command}: {text}");
+        text_has(&bash_shown(&root, command, &files), &[" entries"]);
     }
     // Nothing that passed through was archived.
-    assert_eq!(runs(), 11);
+    assert_eq!(run_count(&root), 11);
 }
 
 #[cfg(unix)]
@@ -14548,76 +14202,47 @@ fn claude_bash_piped_test_failure_shows_in_history_and_resume() {
     let repo = search_repo();
     let root = repo.path().canonicalize().unwrap();
     // `| tail` cut the names of the failing tests but kept the summary line.
-    let mut log: String = (0..300)
-        .map(|i| format!("billing-trace step={i} state=ready\n"))
-        .collect();
-    log.push_str(
-        "\nthread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:\n\
-         assertion `left == right` failed\n  left: 106\n right: 105\n\n\
-         test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+    let log = traced_failure(
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
          finished in 0.00s\n",
     );
-    let text = shown_stdout(&after_bash(
-        &root,
-        &root,
-        "cargo test 2>&1 | tail -320",
-        bash_result(&log),
-    ));
+    let text = bash_shown(&root, "cargo test 2>&1 | tail -320", &log);
     assert!(
         text.starts_with(
             "failing test names not in the captured output\ntest result: FAILED. 0 passed; 1 failed"
         ),
         "{text}"
     );
-    assert!(
-        text.contains(
-            "stdout:302: thread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:"
-        ),
-        "{text}"
+    text_has(
+        &text,
+        &["stdout:302: thread 'total_includes_fee' (77) panicked at tests/checkout.rs:11:5:"],
     );
     let failed = marker_run(&text);
 
     // The status belongs to `tail` or `true`, so lists say so, and resume shows
     // the failing summary line.
-    let passing: String = (0..400)
-        .map(|i| format!("test pricing::case_{i} ... ok\n"))
-        .chain(std::iter::once(
-            "\ntest result: ok. 400 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s\n".to_owned(),
-        ))
-        .collect();
-    let text = shown_stdout(&after_bash(
-        &root,
+    let text = bash_shown(
         &root,
         "RUST_BACKTRACE=1 cargo test || true",
-        bash_result(&passing),
-    ));
+        &passing_tests(),
+    );
     assert!(
         text.starts_with("0 reported failing test(s)\ntest result: ok."),
         "{text}"
     );
     let passed = marker_run(&text);
-    let content = stdout(
-        &Command::new("grep")
-            .args(["-rn", "needle", "src"])
-            .current_dir(&root)
-            .output()
-            .unwrap(),
-    );
-    let plain = marker_run(&shown_stdout(&after_bash(
-        &root,
-        &root,
-        "grep -rn needle src",
-        bash_result(&content),
-    )));
+    let content = grep_needle(&root, "src");
+    let plain = marker_run(&bash_shown(&root, "grep -rn needle src", &content));
 
     let history = success(&root, &["history"]);
-    for expected in [
-        format!("{failed} · cargo test | tail · exit 0 (pipe) · "),
-        format!("{passed} · cargo test; … · exit 0 (last command) · "),
-        format!("{plain} · grep · exit 0 · "),
-    ] {
-        assert!(history.contains(&expected), "{expected}: {history}");
-    }
+    text_has(
+        &history,
+        &[
+            &format!("{failed} · cargo test | tail · exit 0 (pipe) · "),
+            &format!("{passed} · cargo test; … · exit 0 (last command) · "),
+            &format!("{plain} · grep · exit 0 · "),
+        ],
+    );
     let resume = success(&root, &["resume"]);
     let line = |id: &str| {
         resume
@@ -14645,59 +14270,38 @@ fn claude_bash_large_results_stay_within_the_hook_timeout_and_preview() {
     use serde_json::json;
     let repo = search_repo();
     let root = repo.path().canonicalize().unwrap();
-    let content = stdout(
-        &Command::new("grep")
-            .args(["-rn", "needle", "src"])
-            .current_dir(&root)
-            .output()
-            .unwrap(),
-    );
+    let content = grep_needle(&root, "src");
     let runs = root.join(".justless/runs");
 
     // Grouping looks up a path per line, so a result over 20,000 lines passes
     // through untouched and unarchived, inline or saved by Claude Code.
-    let line = "src/big.rs:1:let needle_0 = load(needle, 0);\n";
-    let huge = line.repeat(20_001);
-    assert_eq!(
-        after_bash(&root, &root, "grep -rn needle src", bash_result(&huge)),
-        json!({})
-    );
+    let huge = "src/big.rs:1:let needle_0 = load(needle, 0);\n".repeat(20_001);
+    bash_untouched(&root, &["grep -rn needle src"], &huge);
     let session = TempDir::new().unwrap();
     let results = session.path().join("tool-results");
     fs::create_dir(&results).unwrap();
-    let saved = results.join("huge.txt");
-    fs::write(&saved, &huge).unwrap();
-    let mut response = bash_result(&huge[..30000]);
-    response["persistedOutputPath"] = json!(saved);
-    response["persistedOutputSize"] = json!(huge.len());
-    assert_eq!(
-        after_bash(&root, &root, "grep -rn needle src", response),
-        json!({})
-    );
+    let response = persisted_result(&results, "huge.txt", &huge);
+    let output = after_bash(&root, &root, "grep -rn needle src", response);
+    assert_eq!(output, json!({}));
     assert!(!runs.exists());
 
     // A result Claude Code saved to a file would reach the agent as its first
     // 2,000 characters, so the report is no larger, and stats count those bytes.
     let full = content.repeat(4);
-    let saved = results.join("full.txt");
-    fs::write(&saved, &full).unwrap();
-    let mut response = bash_result(&full[..30000]);
-    response["persistedOutputPath"] = json!(saved);
-    response["persistedOutputSize"] = json!(full.len());
+    let response = persisted_result(&results, "full.txt", &full);
     let text = shown_stdout(&after_bash(&root, &root, "grep -rn needle src", response));
     let preview = full.chars().take(2000).map(char::len_utf8).sum::<usize>();
     assert!(text.len() <= preview, "{} > {preview}: {text}", text.len());
-    assert!(text.contains("src/big.rs ×600"), "{text}");
+    text_has(&text, &["src/big.rs ×600"]);
     let id = marker_run(&text);
     assert_eq!(success(&root, &["log", &id, "--stream", "stdout"]), full);
-    let record: serde_json::Value =
-        serde_json::from_slice(&fs::read(runs.join(&id).join("record.json")).unwrap()).unwrap();
+    let record = run_record(&root, &id);
     assert_eq!(record["raw_bytes"], json!(preview), "{record}");
-    assert!(
-        record["note"].as_str().unwrap().contains(&format!(
+    text_has(
+        record["note"].as_str().unwrap(),
+        &[&format!(
             "would have shown its first 2000 characters, so raw_bytes counts those {preview} bytes"
-        )),
-        "{record}"
+        )],
     );
     let stats: serde_json::Value =
         serde_json::from_str(&success(&root, &["stats", "--json"])).unwrap();
@@ -14714,78 +14318,62 @@ fn claude_bash_large_results_stay_within_the_hook_timeout_and_preview() {
         fs::write(dir.join("stdout"), "partial").unwrap();
     }
     for dir in [&abandoned, &capturing] {
-        assert!(
-            Command::new("touch")
-                .args(["-t", "202001010000"])
-                .arg(dir)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let mut touch = Command::new("touch");
+        touch.args(["-t", "202001010000"]).arg(dir);
+        assert!(touch.status().unwrap().success());
     }
-    let text = shown_stdout(&after_bash(
-        &root,
-        &root,
-        "grep -rn needle src",
-        bash_result(&content),
-    ));
+    let text = bash_shown(&root, "grep -rn needle src", &content);
     assert!(!abandoned.exists());
     assert!(fresh.join("stdout").exists());
     assert!(capturing.join("stdout").exists());
     let id = marker_run(&text);
     assert!(runs.join(&id).join("record.json").exists());
     assert!(!runs.join(".staged").join(&id).exists());
-    let history = success(&root, &["history"]);
-    assert!(history.contains(&id), "{history}");
     // Staged runs are never listed. A run directory in `runs/` without a final
     // record is listed as unfinished, as for any run Justless is still capturing.
-    assert!(!history.contains("Staged"), "{history}");
-    assert!(
-        history.contains("run-InProgress01 · unknown · unfinished"),
-        "{history}"
-    );
+    let history = success(&root, &["history"]);
+    text_has(&history, &[&id, "run-InProgress01 · unknown · unfinished"]);
+    text_lacks(&history, &["Staged"]);
 }
 
 #[test]
 fn claude_setup_warns_about_other_hooks_on_bash_results() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::create_dir(root.join(".claude")).unwrap();
     let shared = serde_json::json!({"hooks":{"PostToolUse":[
         {"matcher":"Bash|Edit","hooks":[{"type":"command","command":"./scripts/redact.sh"}]},
         {"matcher":"^Read$","hooks":[{"type":"command","command":"./scripts/read.sh"}]},
         {"matcher":"Bas","hooks":[{"type":"command","command":"./scripts/exact.sh"}]}
     ]}});
-    fs::write(root.join(".claude/settings.json"), shared.to_string()).unwrap();
     let local = serde_json::json!({"hooks":{"PostToolUse":[
         {"hooks":[{"type":"command","command":"./scripts/log.sh"}]}
     ]}});
-    fs::write(root.join(".claude/settings.local.json"), local.to_string()).unwrap();
-    let output = cli(root, &["init", "--hooks", "--agent", "claude"]);
+    write_files(
+        root,
+        &[
+            (".claude/settings.json", &shared.to_string()),
+            (".claude/settings.local.json", &local.to_string()),
+        ],
+    );
+    let output = cli_words(root, "init --hooks --agent claude");
     assert!(output.status.success(), "{}", stderr(&output));
     let warnings = stderr(&output);
-    for expected in [
-        ".claude/settings.json also runs a PostToolUse hook on Bash results: ./scripts/redact.sh.",
-        ".claude/settings.local.json also runs a PostToolUse hook on Bash results: ./scripts/log.sh.",
-        "keeps the last rewrite",
-    ] {
-        assert!(warnings.contains(expected), "{expected}: {warnings}");
-    }
-    for unexpected in ["read.sh", "exact.sh", "hook-claude"] {
-        assert!(!warnings.contains(unexpected), "{unexpected}: {warnings}");
-    }
+    text_has(
+        &warnings,
+        &[
+            ".claude/settings.json also runs a PostToolUse hook on Bash results: ./scripts/redact.sh.",
+            ".claude/settings.local.json also runs a PostToolUse hook on Bash results: ./scripts/log.sh.",
+            "keeps the last rewrite",
+        ],
+    );
+    text_lacks(&warnings, &["read.sh", "exact.sh", "hook-claude"]);
 
     // A project whose only Bash hooks are Justless's gets no warning.
     let plain = TempDir::new().unwrap();
-    let output = cli(plain.path(), &["init", "--hooks", "--agent", "claude"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    let again = cli(plain.path(), &["init", "--hooks", "--agent", "claude"]);
-    for output in [output, again] {
-        assert!(
-            !stderr(&output).contains("PostToolUse"),
-            "{}",
-            stderr(&output)
-        );
+    for _ in 0..2 {
+        let output = cli_words(plain.path(), "init --hooks --agent claude");
+        assert!(output.status.success(), "{}", stderr(&output));
+        text_lacks(&stderr(&output), &["PostToolUse"]);
     }
 }
 
@@ -14805,13 +14393,7 @@ fn claude_bash_replacements_redact_secrets_and_respect_the_archive_cap() {
     let repo = search_repo();
     let root = repo.path().canonicalize().unwrap();
     let key = access_key();
-    let content = stdout(
-        &Command::new("grep")
-            .args(["-rn", "needle", "src"])
-            .current_dir(&root)
-            .output()
-            .unwrap(),
-    );
+    let content = grep_needle(&root, "src");
     // A secret on a match line the grouped report quotes, on an error line from the
     // interleaved stderr that the report leaves out, and in Claude Code's stderr.
     let original = format!(
@@ -14824,22 +14406,18 @@ fn claude_bash_replacements_redact_secrets_and_respect_the_archive_cap() {
     assert!(hides(&output.to_string(), &key), "{output}");
     let text = shown_stdout(&output);
     assert!(text.len() < original.len() / 2, "{text}");
-    assert!(
-        text.contains("src/keys.rs:1:let needle = \"[redacted:aws-access-key:"),
-        "{text}"
-    );
-    assert!(
-        text.contains("\nError lines not shown above:\nstdout:"),
-        "{text}"
-    );
-    assert!(
-        text.contains(": grep: src/[redacted:aws-access-key:"),
-        "{text}"
+    text_has(
+        &text,
+        &[
+            "src/keys.rs:1:let needle = \"[redacted:aws-access-key:",
+            "\nError lines not shown above:\nstdout:",
+            ": grep: src/[redacted:aws-access-key:",
+        ],
     );
     assert!(text.ends_with(" secrets redacted]\n"), "{text}");
+    let stderr_shown = output["hookSpecificOutput"]["updatedToolOutput"]["stderr"].as_str();
     assert!(
-        output["hookSpecificOutput"]["updatedToolOutput"]["stderr"]
-            .as_str()
+        stderr_shown
             .unwrap()
             .starts_with("Shell cwd was reset; key [redacted:aws-access-key:"),
         "{output}"
@@ -14851,55 +14429,37 @@ fn claude_bash_replacements_redact_secrets_and_respect_the_archive_cap() {
     assert_eq!(exact.stdout, original.as_bytes());
     assert!(hides(&success(&root, &["log", &id]), &key));
     assert!(hides(&success(&root, &["search", &id, "Permission"]), &key));
-    let archive = root.join(".justless/runs").join(&id);
-    let record: serde_json::Value =
-        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
+    let record = run_record(&root, &id);
     assert_eq!(record["hook"], true);
     assert_eq!(record["redaction"]["count"], 2);
+    let note = record["note"].as_str().unwrap();
     assert!(
-        record["note"]
-            .as_str()
-            .unwrap()
-            .starts_with("Captured from a Claude Code Bash result"),
+        note.starts_with("Captured from a Claude Code Bash result"),
         "{record}"
     );
     // What the record counts as shown is what the agent received.
-    assert_eq!(
-        record["preview_bytes"].as_u64().unwrap() + record["footer_bytes"].as_u64().unwrap(),
-        text.len() as u64,
-        "{record}"
-    );
+    let shown =
+        record["preview_bytes"].as_u64().unwrap() + record["footer_bytes"].as_u64().unwrap();
+    assert_eq!(shown, text.len() as u64, "{record}");
 
     // The archived output stops at `max_run_bytes`, as for any run, and the
     // replacement says where. An error line past the cap is not listed, since
     // `log` could not replay it by its number.
     fs::write(root.join(".justless.toml"), "max_run_bytes = 4096\n").unwrap();
     let capped = format!("{content}grep: src/locked: Permission denied\n");
-    let output = after_bash(&root, &root, "grep -rn needle src", bash_result(&capped));
-    let text = shown_stdout(&output);
+    let text = bash_shown(&root, "grep -rn needle src", &capped);
     let truncated = format!(
         "\n[stdout archive truncated at 4.0 KB of {:.1} KB]\n",
         capped.len() as f64 / 1024.0
     );
     assert!(text.ends_with(&truncated), "{text}");
-    assert!(!text.contains("Permission denied"), "{text}");
-    let id = text
-        .rsplit_once("[justless ")
-        .unwrap()
-        .1
-        .split([' ', ']'])
-        .next()
-        .unwrap()
-        .to_owned();
-    let archive = root.join(".justless/runs").join(&id);
-    let record: serde_json::Value =
-        serde_json::from_slice(&fs::read(archive.join("record.json")).unwrap()).unwrap();
+    text_lacks(&text, &["Permission denied"]);
+    let id = marked_run(&text[text.rfind("[justless ").unwrap()..]);
+    let record = run_record(&root, &id);
     assert_eq!(record["stream_bytes"], json!([4096, 0]));
     assert_eq!(record["produced_bytes"], json!([capped.len(), 0]));
-    assert_eq!(
-        cli(&root, &["log", &id, "--unredacted", "--stream", "stdout"]).stdout,
-        capped.as_bytes()[..4096]
-    );
+    let exact = cli(&root, &["log", &id, "--unredacted", "--stream", "stdout"]);
+    assert_eq!(exact.stdout, capped.as_bytes()[..4096]);
 }
 
 #[cfg(unix)]
@@ -14914,15 +14474,9 @@ fn statusline_counts_replaced_bash_results_as_hook_runs_of_the_session() {
     // A nested repository holding the search fixture's files.
     let fixture = search_repo();
     let nested = outer.join("nested");
-    assert!(
-        Command::new("cp")
-            .arg("-R")
-            .arg(fixture.path())
-            .arg(&nested)
-            .status()
-            .unwrap()
-            .success()
-    );
+    let mut copy = Command::new("cp");
+    copy.arg("-R").arg(fixture.path()).arg(&nested);
+    assert!(copy.status().unwrap().success());
     git(&nested, &["init", "-q"]);
     let transcript = temp.path().join("transcript.jsonl");
     fs::write(
@@ -14943,20 +14497,10 @@ fn statusline_counts_replaced_bash_results_as_hook_runs_of_the_session() {
 
     // The session started in the outer project and replaced a Bash result inside
     // the nested repository, where the hook recorded the run.
-    let content = stdout(
-        &Command::new("grep")
-            .args(["-rn", "needle", "src"])
-            .current_dir(&nested)
-            .output()
-            .unwrap(),
-    );
+    let content = grep_needle(&nested, "src");
     let output = claude_hook(&nested, &outer, "after-bash", event(&nested, &content));
     let text = shown_stdout(&output);
-    let id = marker_run(&text);
-    let record: serde_json::Value = serde_json::from_slice(
-        &fs::read(nested.join(".justless/runs").join(&id).join("record.json")).unwrap(),
-    )
-    .unwrap();
+    let record = run_record(&nested, &marker_run(&text));
     assert_eq!(record["hook"], true);
     let saved = record["raw_bytes"].as_u64().unwrap()
         - record["preview_bytes"].as_u64().unwrap()
@@ -14974,62 +14518,9 @@ fn statusline_counts_replaced_bash_results_as_hook_runs_of_the_session() {
     assert_eq!(line(&outer, "s1"), expected);
     assert_eq!(line(&outer, "s2"), "justless · ready");
     // A result the hook leaves alone records and counts nothing.
-    let small = claude_hook(
-        &nested,
-        &outer,
-        "after-bash",
-        event(&nested, "src/a.rs:1:needle\n"),
-    );
-    assert_eq!(small, json!({}));
+    let small = event(&nested, "src/a.rs:1:needle\n");
+    assert_eq!(claude_hook(&nested, &outer, "after-bash", small), json!({}));
     assert_eq!(line(&outer, "s1"), expected);
-}
-
-#[cfg(unix)]
-#[test]
-fn doctor_counts_the_bash_output_hook_in_the_current_claude_set() {
-    let tools = doctor_tools(&["claude"]);
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    git(root, &["init", "-q"]);
-    success(root, &["init", "--hooks", "--agent", "claude"]);
-    // An install from before the post-command hook.
-    let claude = root.join(".claude/settings.json");
-    let mut config: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
-    config["hooks"]["PostToolUse"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|entry| entry["matcher"] != "^Bash$");
-    fs::write(&claude, config.to_string()).unwrap();
-    let (status, text) = doctor_text(root, tools.path());
-    assert_eq!(status, Some(1), "{text}");
-    assert!(
-        text.contains(
-            "✗ Hooks: .claude/settings.json lacks the after-bash hook\n    fix: justless init --hooks --agent claude"
-        ),
-        "{text}"
-    );
-    // Running the fix adds it, and the set is current again.
-    let bin = tools.path().join("bin");
-    let applied = doctor_shell(
-        root,
-        tools.path(),
-        bin.to_str().unwrap(),
-        "justless init --hooks --agent claude",
-    );
-    assert!(applied.status.success(), "{}", stderr(&applied));
-    let (status, text) = doctor_text(root, tools.path());
-    assert!(
-        text.contains("✓ Hooks: .claude/settings.json has all 8"),
-        "{text}"
-    );
-    assert_eq!(status, Some(0), "{text}");
-    // Removal takes it out with the others.
-    let removed = success(root, &["init", "--remove"]);
-    assert!(
-        removed.contains("\n  .claude/settings.json: removed 8 hooks"),
-        "{removed}"
-    );
 }
 
 #[cfg(unix)]
@@ -15043,21 +14534,13 @@ fn claude_bash_replacements_use_the_preview_budget_run_would_give() {
         .map(|i| format!("src/a{}.rs:{i}:let needle = {i};\n", i % 7))
         .collect();
     assert!((4096..8192).contains(&output.len()), "{}", output.len());
-    let replace = || after_bash(&root, &root, "grep -rn needle src", bash_result(&output));
-    let text = shown_stdout(&replace());
+    let text = bash_shown(&root, "grep -rn needle src", &output);
     assert!(text.len() <= 4096 + 256, "{text}");
     // Once the family's budget has been raised to 8 KB, `run` would show this
     // output whole, so the hook leaves it alone too.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    fs::write(
-        root.join(".justless/budgets.json"),
-        serde_json::json!({"grep": {"level": 1, "since_ms": now}}).to_string(),
-    )
-    .unwrap();
-    assert_eq!(replace(), serde_json::json!({}));
+    let state = serde_json::json!({"grep": {"level": 1, "since_ms": budget_now_ms()}});
+    write_budget_state(&root, state);
+    bash_untouched(&root, &["grep -rn needle src"], &output);
 }
 
 /// A one-crate repository committed on `main`, with `lib` and enough other
@@ -15665,13 +15148,28 @@ fn affected_tests_run_the_crate_doctests_for_a_name_too_common_to_search() {
     assert!(err.contains("  b/src/lib.rs - Ids (line "), "{err}");
 }
 
-/// A committed repository whose `file` then loses some lines, as `after`.
-fn deletion_repo(files: &[(&str, &str)], file: &str, after: &str) -> TempDir {
+/// The `probe` crate's manifest, as a piece of a `fixture_files` text.
+const PROBE_TOML: &str =
+    "//- Cargo.toml\n[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
+
+/// `src/legacy.rs` with the `value` that the deletion tests remove.
+const LEGACY_RS: &str =
+    "//- src/legacy.rs\npub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n";
+
+/// A twin of the deleted `value`.
+const CURRENT_RS: &str = "//- src/current.rs\npub fn value() -> u8 { 7 }\n";
+
+/// A legacy module after its `value` was deleted.
+const UNTOUCHED: &str = "pub fn untouched() -> u8 { 5 }\n";
+
+/// A committed repository holding the files of the `fixture_files` texts in
+/// `pieces`, whose `file` then loses some lines, as `after`.
+fn deletion_repo(pieces: &[&str], file: &str, after: &str) -> TempDir {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
     git(root, &["init", "-q"]);
     write_files(root, &[(".gitignore", ".justless/\ntarget/\n")]);
-    write_files(root, files);
+    fixture_files(root, &pieces.concat());
     git(root, &["add", "."]);
     git(
         root,
@@ -15681,38 +15179,37 @@ fn deletion_repo(files: &[(&str, &str)], file: &str, after: &str) -> TempDir {
     repo
 }
 
+/// What `affected --changes` says after the deletion `deletion_repo` makes.
+fn deletion_impact(pieces: &[&str], file: &str, after: &str) -> String {
+    let repo = deletion_repo(pieces, file, after);
+    success(repo.path(), &["affected", "--changes"])
+}
+
 #[test]
 fn deleting_a_function_is_not_referenced_by_a_same_named_function_elsewhere() {
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
     // Nothing names legacy::value. The test calls current::value.
-    let repo = deletion_repo(
+    let lib = "//- src/lib.rs\npub mod legacy;\npub mod current;\n\
+        #[test]\nfn uses_current() { assert_eq!(current::value(), 7); }\n";
+    let pieces = [PROBE_TOML, LEGACY_RS, CURRENT_RS, lib];
+    let impact = deletion_impact(&pieces, "src/legacy.rs", UNTOUCHED);
+    text_has(
+        &impact,
         &[
-            ("Cargo.toml", cargo),
-            (
-                "src/lib.rs",
-                "pub mod legacy;\npub mod current;\n#[test]\nfn uses_current() { assert_eq!(current::value(), 7); }\n",
-            ),
-            (
-                "src/legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
-            ),
-            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
+            "value [function] · deleted from src/legacy.rs (committed lines 1-1)",
+            "no remaining references to legacy::value found · 2 mentions resolve to other definitions, such as current::value [function] src/current.rs:1",
         ],
-        "src/legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains("value [function] · deleted from src/legacy.rs (committed lines 1-1)")
-            && impact.contains("no remaining references to legacy::value found · 2 mentions resolve to other definitions, such as current::value [function] src/current.rs:1")
-            && !impact.contains("current::value [function] src/current.rs:1 ·")
-            && !impact.contains("uses_current")
-            && !impact.contains("references deleted"),
-        "{impact}"
+    text_lacks(
+        &impact,
+        &[
+            "current::value [function] src/current.rs:1 ·",
+            "uses_current",
+            "references deleted",
+        ],
     );
 
     // Each way a surviving reference still reaches it, beside twins that cannot.
-    let lib = "pub mod legacy;\npub mod current;\n\
+    let lib = "//- src/lib.rs\npub mod legacy;\npub mod current;\n\
 use legacy::value as old_value;\n\
 pub fn a() -> u8 { legacy::value() }\n\
 pub fn b() -> u8 { crate::legacy::value() }\n\
@@ -15722,45 +15219,37 @@ mod inner {\n    use super::legacy::*;\n    pub fn e() -> u8 { value() }\n}\n\
 mod other {\n    use crate::current::value;\n    pub fn f() -> u8 { value() }\n}\n\
 mod third {\n    pub fn g() -> u8 { super::legacy::value() + super::current::value() }\n}\n\
 pub struct Item {\n    pub value: u8,\n}\n\
-pub fn h(item: &Item) -> u8 {\n    // value is read from the item\n    item.value\n}\n";
-    let repo = deletion_repo(
-        &[
-            ("Cargo.toml", cargo),
-            ("src/lib.rs", lib),
-            (
-                "src/legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 + value() }\n",
-            ),
-            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
-        ],
-        "src/legacy.rs",
-        "pub fn untouched() -> u8 { 5 + value() }\n",
-    );
+pub fn h(item: &Item) -> u8 {\n    // value is read from the item\n    item.value\n}\n\
+//- src/legacy.rs\npub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 + value() }\n";
+    let after = "pub fn untouched() -> u8 { 5 + value() }\n";
+    let repo = deletion_repo(&[PROBE_TOML, CURRENT_RS, lib], "src/legacy.rs", after);
     let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "a [function] src/lib.rs:4 · still references deleted value at src/lib.rs:4",
-        "b [function] src/lib.rs:5 · still references deleted value at src/lib.rs:5",
-        "c [function] src/lib.rs:6 · still references deleted value at src/lib.rs:6",
-        "inner::e [function] src/lib.rs:10 · still references deleted value at src/lib.rs:10",
-        "third::g [function] src/lib.rs:17 · still references deleted value at src/lib.rs:17",
-        "legacy::untouched [function] src/legacy.rs:1 · still references deleted value at src/legacy.rs:1",
-        "src/lib.rs:3 · file scope still references deleted value",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    for unexpected in [
-        "  d [function]",
-        "other::f",
-        "current::value [function] src/current.rs:1 ·",
-        "Item [struct]",
-        "  h [function]",
-        "possibl",
-        "no remaining references",
-    ] {
-        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
-    }
-    let json: serde_json::Value =
-        serde_json::from_str(&success(repo.path(), &["affected", "--changes", "--json"])).unwrap();
+    text_has(
+        &impact,
+        &[
+            "a [function] src/lib.rs:4 · still references deleted value at src/lib.rs:4",
+            "b [function] src/lib.rs:5 · still references deleted value at src/lib.rs:5",
+            "c [function] src/lib.rs:6 · still references deleted value at src/lib.rs:6",
+            "inner::e [function] src/lib.rs:10 · still references deleted value at src/lib.rs:10",
+            "third::g [function] src/lib.rs:17 · still references deleted value at src/lib.rs:17",
+            "legacy::untouched [function] src/legacy.rs:1 · still references deleted value at src/legacy.rs:1",
+            "src/lib.rs:3 · file scope still references deleted value",
+        ],
+    );
+    text_lacks(
+        &impact,
+        &[
+            "  d [function]",
+            "other::f",
+            "current::value [function] src/current.rs:1 ·",
+            "Item [struct]",
+            "  h [function]",
+            "possibl",
+            "no remaining references",
+        ],
+    );
+    let json = success(repo.path(), &["affected", "--changes", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
     let changed = json["changed"].as_array().unwrap();
     assert!(
         changed.iter().any(|item| item["name"] == "a"
@@ -15772,188 +15261,115 @@ pub fn h(item: &Item) -> u8 {\n    // value is read from the item\n    item.valu
 
 #[test]
 fn deleting_python_and_typescript_functions_resolves_twins_and_marks_guesses() {
-    let repo = deletion_repo(
-        &[
-            (
-                "legacy.py",
-                "def value():\n    return 2\n\n\ndef untouched():\n    return 5\n",
-            ),
-            ("current.py", "def value():\n    return 7\n"),
-            (
-                "test_current.py",
-                "from current import value\n\n\ndef test_current():\n    assert value() == 7\n",
-            ),
-            (
-                "test_modules.py",
-                "import current\n\n\ndef test_module():\n    assert current.value() == 7\n",
-            ),
-            (
-                "uses_legacy.py",
-                "from legacy import value\n\n\ndef old():\n    return value()\n",
-            ),
-            (
-                "app.py",
-                "import os\nimport sys\n\n\ndef main():\n    return sys.argv\n",
-            ),
-        ],
-        "legacy.py",
-        "def untouched():\n    return 5\n",
-    );
+    let python = "//- legacy.py\ndef value():\n    return 2\n\n\ndef untouched():\n    return 5\n\
+        //- current.py\ndef value():\n    return 7\n\
+        //- test_current.py\nfrom current import value\n\n\ndef test_current():\n    assert value() == 7\n\
+        //- test_modules.py\nimport current\n\n\ndef test_module():\n    assert current.value() == 7\n\
+        //- uses_legacy.py\nfrom legacy import value\n\n\ndef old():\n    return value()\n\
+        //- app.py\nimport os\nimport sys\n\n\ndef main():\n    return sys.argv\n";
+    let repo = deletion_repo(&[python], "legacy.py", "def untouched():\n    return 5\n");
     let root = repo.path();
-    fs::write(
-        root.join("app.py"),
-        "import sys\n\n\ndef main():\n    return sys.argv\n",
-    )
-    .unwrap();
+    let app = "import sys\n\n\ndef main():\n    return sys.argv\n";
+    fs::write(root.join("app.py"), app).unwrap();
     let impact = success(root, &["affected", "--changes"]);
-    for expected in [
-        "value [function] · deleted from legacy.py (committed lines 1-4)",
-        "uses_legacy.py:1-5 [file] · still references deleted value at uses_legacy.py:1",
-        "old [function] uses_legacy.py:4-5 · still references deleted value at uses_legacy.py:5",
-        // `current` is a plain module import, so the call is only a name match.
-        "test_module [test] test_modules.py:4-5 · possibly references deleted value at test_modules.py:5 (name match only)",
-        "test_module [test] test_modules.py:4-5 · possible · target itself",
-        // An import is not a definition, so the word `import` is not searched for.
-        "app.py · lines 1-1 removed between symbols · impact unknown",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    for unexpected in [
-        "current.py:1-2",
-        "test_current",
-        "references deleted import",
-    ] {
-        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
-    }
-
-    let repo = deletion_repo(
+    text_has(
+        &impact,
         &[
-            (
-                "src/legacy.ts",
-                "export function value(): number {\n  return 2;\n}\n\nexport function untouched(): number {\n  return 5;\n}\n",
-            ),
-            (
-                "src/current.ts",
-                "export function value(): number {\n  return 7;\n}\n",
-            ),
-            (
-                "src/current.test.ts",
-                "import { value } from './current';\n\ntest('current', () => {\n  expect(value()).toBe(7);\n});\n",
-            ),
-            (
-                "src/old.ts",
-                "import { value as legacyValue } from './legacy';\n\nexport function old(): number {\n  return legacyValue();\n}\n",
-            ),
+            "value [function] · deleted from legacy.py (committed lines 1-4)",
+            "uses_legacy.py:1-5 [file] · still references deleted value at uses_legacy.py:1",
+            "old [function] uses_legacy.py:4-5 · still references deleted value at uses_legacy.py:5",
+            // `current` is a plain module import, so the call is only a name match.
+            "test_module [test] test_modules.py:4-5 · possibly references deleted value at test_modules.py:5 (name match only)",
+            "test_module [test] test_modules.py:4-5 · possible · target itself",
+            // An import is not a definition, so the word `import` is not searched for.
+            "app.py · lines 1-1 removed between symbols · impact unknown",
         ],
-        "src/legacy.ts",
-        "export function untouched(): number {\n  return 5;\n}\n",
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "value [function] · deleted from src/legacy.ts (committed lines 1-4)",
-        "src/old.ts:1-5 [file] · still references deleted value at src/old.ts:1",
-        "old [function] src/old.ts:3-5 · still references deleted value at src/old.ts:4",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    for unexpected in ["current.test.ts", "src/current.ts", "possibl"] {
-        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
-    }
+    text_lacks(
+        &impact,
+        &[
+            "current.py:1-2",
+            "test_current",
+            "references deleted import",
+        ],
+    );
+
+    let typescript = "//- src/legacy.ts\nexport function value(): number {\n  return 2;\n}\n\nexport function untouched(): number {\n  return 5;\n}\n\
+        //- src/current.ts\nexport function value(): number {\n  return 7;\n}\n\
+        //- src/current.test.ts\nimport { value } from './current';\n\ntest('current', () => {\n  expect(value()).toBe(7);\n});\n\
+        //- src/old.ts\nimport { value as legacyValue } from './legacy';\n\nexport function old(): number {\n  return legacyValue();\n}\n";
+    let after = "export function untouched(): number {\n  return 5;\n}\n";
+    let impact = deletion_impact(&[typescript], "src/legacy.ts", after);
+    text_has(
+        &impact,
+        &[
+            "value [function] · deleted from src/legacy.ts (committed lines 1-4)",
+            "src/old.ts:1-5 [file] · still references deleted value at src/old.ts:1",
+            "old [function] src/old.ts:3-5 · still references deleted value at src/old.ts:4",
+        ],
+    );
+    text_lacks(&impact, &["current.test.ts", "src/current.ts", "possibl"]);
 }
 
 #[test]
 fn deleted_symbol_search_says_where_it_stopped() {
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
     let notes: String = (0..300).map(|i| format!("value note {i}\n")).collect();
-    let repo = deletion_repo(
+    let notes = format!("//- NOTES.md\n{notes}//- src/lib.rs\npub mod legacy;\n");
+    let impact = deletion_impact(&[PROBE_TOML, &notes, LEGACY_RS], "src/legacy.rs", UNTOUCHED);
+    text_has(
+        &impact,
         &[
-            ("Cargo.toml", cargo),
-            ("NOTES.md", &notes),
-            ("src/lib.rs", "pub mod legacy;\n"),
-            (
-                "src/legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
-            ),
+            "no remaining references to legacy::value",
+            "name search stopped after 256 matches",
+            "outside indexed definitions, such as NOTES.md:1",
         ],
-        "src/legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
-    );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains("no remaining references to legacy::value")
-            && impact.contains("name search stopped after 256 matches")
-            && impact.contains("outside indexed definitions, such as NOTES.md:1"),
-        "{impact}"
     );
 }
 
 #[test]
 fn deleted_function_calls_inside_macros_and_through_reexports_still_count() {
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
-    let lib = "macro_rules! check {\n    ($e:expr) => {\n        assert!($e)\n    };\n}\n\
+    let lib = "//- src/lib.rs\nmacro_rules! check {\n    ($e:expr) => {\n        assert!($e)\n    };\n}\n\
 pub mod legacy;\npub mod current;\npub use legacy::value;\n\
 pub fn uses_current() {\n    check!(current::value() > 1);\n}\n\
-mod user {\n    use crate::value;\n    pub fn u() -> u8 {\n        value()\n    }\n}\n";
-    let repo = deletion_repo(
+mod user {\n    use crate::value;\n    pub fn u() -> u8 {\n        value()\n    }\n}\n\
+//- src/legacy.rs\npub fn value() -> u8 { 2 }\npub fn untouched() {\n    check!(value() > 1);\n}\n";
+    let after = "pub fn untouched() {\n    check!(value() > 1);\n}\n";
+    let impact = deletion_impact(&[PROBE_TOML, CURRENT_RS, lib], "src/legacy.rs", after);
+    text_has(
+        &impact,
         &[
-            ("Cargo.toml", cargo),
-            ("src/lib.rs", lib),
-            (
-                "src/legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() {\n    check!(value() > 1);\n}\n",
-            ),
-            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
+            // A call inside a macro the index does not read resolves like any other.
+            "legacy::untouched [function] src/legacy.rs:1-3 · still references deleted value at src/legacy.rs:2",
+            "src/lib.rs:8 · file scope still references deleted value",
+            // A named import ends a resolution chain, so code that reaches it only
+            // through the re-export cannot be linked, and stays possible.
+            "user [module] src/lib.rs:12-17 · possibly references deleted value at src/lib.rs:13 (name match only)",
+            "user::u [function] src/lib.rs:14-16 · possibly references deleted value at src/lib.rs:15 (name match only)",
         ],
-        "src/legacy.rs",
-        "pub fn untouched() {\n    check!(value() > 1);\n}\n",
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        // A call inside a macro the index does not read resolves like any other.
-        "legacy::untouched [function] src/legacy.rs:1-3 · still references deleted value at src/legacy.rs:2",
-        "src/lib.rs:8 · file scope still references deleted value",
-        // A named import ends a resolution chain, so code that reaches it only
-        // through the re-export cannot be linked, and stays possible.
-        "user [module] src/lib.rs:12-17 · possibly references deleted value at src/lib.rs:13 (name match only)",
-        "user::u [function] src/lib.rs:14-16 · possibly references deleted value at src/lib.rs:15 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    assert!(!impact.contains("uses_current"), "{impact}");
+    text_lacks(&impact, &["uses_current"]);
 }
 
 #[test]
 fn removing_a_rust_import_selects_the_code_that_used_it() {
-    let repo = deletion_repo(
-        &[
-            (
-                "Cargo.toml",
-                "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "use std::env;\n\npub fn cwd() -> bool { env::current_dir().is_ok() }\n\
-#[test]\nfn test_cwd() { assert!(cwd()); }\n#[test]\nfn test_other() { assert!(true); }\n",
-            ),
-        ],
-        "src/lib.rs",
-        "\npub fn cwd() -> bool { env::current_dir().is_ok() }\n\
-#[test]\nfn test_cwd() { assert!(cwd()); }\n#[test]\nfn test_other() { assert!(true); }\n",
-    );
+    let lib = "use std::env;\n\npub fn cwd() -> bool { env::current_dir().is_ok() }\n\
+#[test]\nfn test_cwd() { assert!(cwd()); }\n#[test]\nfn test_other() { assert!(true); }\n";
+    let pieces = [PROBE_TOML, "//- src/lib.rs\n", lib];
+    let after = lib.replacen("use std::env;\n", "", 1);
+    let repo = deletion_repo(&pieces, "src/lib.rs", &after);
     let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains("src/lib.rs · lines 1-1 removed between symbols · impact unknown")
-            && !impact.contains("references deleted import"),
-        "{impact}"
+    text_has(
+        &impact,
+        &["src/lib.rs · lines 1-1 removed between symbols · impact unknown"],
     );
-    let plan = success(
-        repo.path(),
-        &["test", "--affected", "--dry-run", "--", "cargo", "test"],
-    );
-    assert!(
-        plan.contains("Start cwd [function] src/lib.rs:2 · uses env")
-            && plan.contains("-- test_cwd --exact"),
-        "{plan}"
+    text_lacks(&impact, &["references deleted import"]);
+    let plan = success_words(repo.path(), "test --affected --dry-run -- cargo test");
+    text_has(
+        &plan,
+        &[
+            "Start cwd [function] src/lib.rs:2 · uses env",
+            "-- test_cwd --exact",
+        ],
     );
 }
 
@@ -15961,94 +15377,56 @@ fn removing_a_rust_import_selects_the_code_that_used_it() {
 fn same_named_wrappers_of_a_deleted_function_are_not_cleared() {
     // A wrapper that shares the name still calls the removed function. The
     // index links the bare name to the wrapper itself, so that link proves nothing.
-    let repo = deletion_repo(
+    let python = "//- legacy.py\ndef value():\n    return 2\n\n\ndef untouched():\n    return 5\n\
+        //- current.py\nimport legacy\n\n\ndef value():\n    return legacy.value()\n\
+        //- oneline.py\nimport legacy\n\n\ndef value(): return legacy.value()\n";
+    let impact = deletion_impact(&[python], "legacy.py", "def untouched():\n    return 5\n");
+    text_has(
+        &impact,
         &[
-            (
-                "legacy.py",
-                "def value():\n    return 2\n\n\ndef untouched():\n    return 5\n",
-            ),
-            (
-                "current.py",
-                "import legacy\n\n\ndef value():\n    return legacy.value()\n",
-            ),
-            (
-                "oneline.py",
-                "import legacy\n\n\ndef value(): return legacy.value()\n",
-            ),
+            "value [function] current.py:4-5 · possibly references deleted value at current.py:5 (name match only)",
+            "value [function] oneline.py:4 · possibly references deleted value at oneline.py:4 (name match only)",
         ],
-        "legacy.py",
-        "def untouched():\n    return 5\n",
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "value [function] current.py:4-5 · possibly references deleted value at current.py:5 (name match only)",
-        "value [function] oneline.py:4 · possibly references deleted value at oneline.py:4 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    assert!(!impact.contains("no remaining references"), "{impact}");
+    text_lacks(&impact, &["no remaining references"]);
 
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
     let wrapper = "pub struct Wrapper;\nimpl Wrapper {\n    pub fn value(&self) -> u8 {\n        value()\n    }\n}\n\
 pub fn log() {\n    info!(value = 3, \"done\");\n}\n";
-    let repo = deletion_repo(
+    let lib = "//- src/lib.rs\nmacro_rules! info {\n    ($($t:tt)*) => {};\n}\npub mod legacy;\n\
+        //- src/legacy.rs\npub fn value() -> u8 { 2 }\n";
+    let impact = deletion_impact(&[PROBE_TOML, lib, wrapper], "src/legacy.rs", wrapper);
+    text_has(
+        &impact,
         &[
-            ("Cargo.toml", cargo),
-            (
-                "src/lib.rs",
-                "macro_rules! info {\n    ($($t:tt)*) => {};\n}\npub mod legacy;\n",
-            ),
-            (
-                "src/legacy.rs",
-                &format!("pub fn value() -> u8 {{ 2 }}\n{wrapper}"),
-            ),
+            "legacy::Wrapper::value [method] src/legacy.rs:3-5 · possibly references deleted value at src/legacy.rs:4 (name match only)",
+            // A macro field named like it is not a call, but the macro may use it.
+            "legacy::log [function] src/legacy.rs:7-9 · possibly references deleted value at src/legacy.rs:8 (name match only)",
         ],
-        "src/legacy.rs",
-        wrapper,
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "legacy::Wrapper::value [method] src/legacy.rs:3-5 · possibly references deleted value at src/legacy.rs:4 (name match only)",
-        // A macro field named like it is not a call, but the macro may use it.
-        "legacy::log [function] src/legacy.rs:7-9 · possibly references deleted value at src/legacy.rs:8 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    assert!(
-        !impact.contains("no remaining references") && !impact.contains("still references"),
-        "{impact}"
-    );
+    text_lacks(&impact, &["no remaining references", "still references"]);
 }
 
 #[test]
 fn deleted_symbols_keep_qualified_paths_the_index_cannot_resolve() {
-    // Without a manifest, `legacy::value` from main.rs is not linked, but it
-    // still names the removed function.
-    let repo = deletion_repo(
-        &[
-            (
-                "legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
-            ),
-            (
-                "main.rs",
-                "mod legacy;\nfn main() {\n    legacy::value();\n}\n",
-            ),
-        ],
-        "legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
-    );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains(
-            "main::main [function] main.rs:2-4 · possibly references deleted value at main.rs:3 (name match only)"
-        ) && !impact.contains("no remaining references"),
-        "{impact}"
-    );
+    // Without a manifest, `legacy::value` from main.rs, and `core::value` from a
+    // local module named like the standard library, are not linked, but they
+    // still name the removed function.
+    for module in ["legacy", "core"] {
+        let legacy = LEGACY_RS.replace("src/legacy", module);
+        let main =
+            format!("//- main.rs\nmod {module};\nfn main() {{\n    {module}::value();\n}}\n");
+        let impact = deletion_impact(&[&legacy, &main], &format!("{module}.rs"), UNTOUCHED);
+        text_has(
+            &impact,
+            &[
+                "main::main [function] main.rs:2-4 · possibly references deleted value at main.rs:3 (name match only)",
+            ],
+        );
+        text_lacks(&impact, &["no remaining references"]);
+    }
 
     // A trait method called through a type parameter, an associated function
     // called through a type alias, and a standard library path that shares a name.
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
     let lib = "pub trait Get {\n    fn value(&self) -> u8;\n    fn other(&self) -> u8;\n}\n\
 pub fn through_parameter<T: Get>(t: &T) -> u8 {\n    T::value(t)\n}\n\
 pub struct S;\nimpl S {\n    pub fn var() -> u8 { 2 }\n}\npub type A = S;\n\
@@ -16057,124 +15435,95 @@ pub fn home() -> bool {\n    std::env::var(\"HOME\").is_ok() && ::std::env::var(
     let after = lib
         .replace("    fn value(&self) -> u8;\n", "")
         .replace("    pub fn var() -> u8 { 2 }\n", "");
-    let repo = deletion_repo(
-        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
-        "src/lib.rs",
-        &after,
+    let impact = deletion_impact(&[PROBE_TOML, "//- src/lib.rs\n", lib], "src/lib.rs", &after);
+    text_has(
+        &impact,
+        &[
+            "Get::value [method] · deleted from src/lib.rs (committed lines 2-2)",
+            "S::var [method] · deleted from src/lib.rs (committed lines 10-10)",
+            "through_parameter [function] src/lib.rs:4-6 · possibly references deleted value at src/lib.rs:5 (name match only)",
+            "through_alias [function] src/lib.rs:11-13 · possibly references deleted var at src/lib.rs:12 (name match only)",
+        ],
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "Get::value [method] · deleted from src/lib.rs (committed lines 2-2)",
-        "S::var [method] · deleted from src/lib.rs (committed lines 10-10)",
-        "through_parameter [function] src/lib.rs:4-6 · possibly references deleted value at src/lib.rs:5 (name match only)",
-        "through_alias [function] src/lib.rs:11-13 · possibly references deleted var at src/lib.rs:12 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    assert!(!impact.contains("  home [function]"), "{impact}");
+    text_lacks(&impact, &["  home [function]"]);
 }
 
 #[test]
 fn a_twin_on_the_same_line_does_not_hide_another_mention_of_a_deleted_symbol() {
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
     // `value()` reaches the removed function through a re-export the index
     // does not follow, beside a call that resolves to the twin.
-    let lib = "pub mod legacy;\npub mod current;\npub use legacy::value;\n\
+    let lib = "//- src/lib.rs\npub mod legacy;\npub mod current;\npub use legacy::value;\n\
 mod user {\n    use crate::value;\n    pub fn u() -> u8 {\n        crate::current::value() + value()\n    }\n}\n\
 pub fn twin() -> u8 {\n    current::value()\n}\n";
-    let repo = deletion_repo(
+    let pieces = [PROBE_TOML, lib, LEGACY_RS, CURRENT_RS];
+    let impact = deletion_impact(&pieces, "src/legacy.rs", UNTOUCHED);
+    text_has(
+        &impact,
         &[
-            ("Cargo.toml", cargo),
-            ("src/lib.rs", lib),
-            (
-                "src/legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
-            ),
-            ("src/current.rs", "pub fn value() -> u8 { 7 }\n"),
+            "user::u [function] src/lib.rs:6-8 · possibly references deleted value at src/lib.rs:7 (name match only)",
         ],
-        "src/legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains(
-            "user::u [function] src/lib.rs:6-8 · possibly references deleted value at src/lib.rs:7 (name match only)"
-        ) && !impact.contains("  twin [function]"),
-        "{impact}"
-    );
+    text_lacks(&impact, &["  twin [function]"]);
 
     // A method call on a typed twin beside one on a value of unknown type.
     let lib = "pub struct Old;\nimpl Old {\n    pub fn value(&self) -> u8 { 2 }\n}\n\
 pub struct New;\nimpl New {\n    pub fn value(&self) -> u8 { 7 }\n}\n\
 pub fn mix(n: &New, a: &dyn std::any::Any) -> u8 {\n    let o = a.downcast_ref::<Old>().unwrap();\n    n.value() + o.value()\n}\n\
 pub fn typed(n: &New) -> u8 {\n    n.value()\n}\n";
-    let repo = deletion_repo(
-        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
-        "src/lib.rs",
-        &lib.replace("    pub fn value(&self) -> u8 { 2 }\n", ""),
+    let after = lib.replace("    pub fn value(&self) -> u8 { 2 }\n", "");
+    let impact = deletion_impact(&[PROBE_TOML, "//- src/lib.rs\n", lib], "src/lib.rs", &after);
+    text_has(
+        &impact,
+        &[
+            "mix [function] src/lib.rs:8-11 · possibly references deleted value at src/lib.rs:10 (name match only)",
+        ],
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains(
-            "mix [function] src/lib.rs:8-11 · possibly references deleted value at src/lib.rs:10 (name match only)"
-        ) && !impact.contains("no remaining references")
-            && !impact.contains("  typed [function]")
-            && !impact.contains("New::value [method] src/lib.rs:6 ·"),
-        "{impact}"
+    text_lacks(
+        &impact,
+        &[
+            "no remaining references",
+            "  typed [function]",
+            "New::value [method] src/lib.rs:6 ·",
+        ],
     );
 }
 
 #[test]
 fn format_strings_that_capture_a_deleted_constant_still_count() {
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
-    let lib = "pub mod legacy;\nuse legacy::*;\n\
+    let lib = "//- src/lib.rs\npub mod legacy;\nuse legacy::*;\n\
 pub fn debug() -> String {\n    format!(\"{LIMIT:?}\")\n}\n\
 pub fn precision() -> String {\n    format!(\"{:.LIMIT$}\", 1.0)\n}\n\
-pub fn aligned() -> String {\n    format!(\"{LIMIT:>4}\")\n}\n";
-    let repo = deletion_repo(
+pub fn aligned() -> String {\n    format!(\"{LIMIT:>4}\")\n}\n\
+//- src/legacy.rs\npub const LIMIT: usize = 2;\npub fn untouched() -> u8 { 5 }\n";
+    let impact = deletion_impact(&[PROBE_TOML, lib], "src/legacy.rs", UNTOUCHED);
+    text_has(
+        &impact,
         &[
-            ("Cargo.toml", cargo),
-            ("src/lib.rs", lib),
-            (
-                "src/legacy.rs",
-                "pub const LIMIT: usize = 2;\npub fn untouched() -> u8 { 5 }\n",
-            ),
+            "debug [function] src/lib.rs:3-5 · possibly references deleted LIMIT at src/lib.rs:4 (name match only)",
+            "precision [function] src/lib.rs:6-8 · possibly references deleted LIMIT at src/lib.rs:7 (name match only)",
+            "aligned [function] src/lib.rs:9-11 · possibly references deleted LIMIT at src/lib.rs:10 (name match only)",
         ],
-        "src/legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "debug [function] src/lib.rs:3-5 · possibly references deleted LIMIT at src/lib.rs:4 (name match only)",
-        "precision [function] src/lib.rs:6-8 · possibly references deleted LIMIT at src/lib.rs:7 (name match only)",
-        "aligned [function] src/lib.rs:9-11 · possibly references deleted LIMIT at src/lib.rs:10 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    assert!(!impact.contains("no remaining references"), "{impact}");
+    text_lacks(&impact, &["no remaining references"]);
 }
 
 #[test]
 fn deleted_trait_members_keep_the_same_named_members_tied_to_them() {
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
     // Removing a trait method breaks the implementation that still defines it
     // and the calls that went through the trait.
     let lib = "pub trait Get {\n    fn value(&self) -> u8;\n    fn other(&self) -> u8;\n}\n\
 pub struct X;\nimpl Get for X {\n    fn value(&self) -> u8 { 1 }\n    fn other(&self) -> u8 { 2 }\n}\n\
 pub fn typed(x: &X) -> u8 {\n    x.value()\n}\n";
-    let repo = deletion_repo(
-        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
-        "src/lib.rs",
-        &lib.replace("    fn value(&self) -> u8;\n", ""),
+    let after = lib.replace("    fn value(&self) -> u8;\n", "");
+    let impact = deletion_impact(&[PROBE_TOML, "//- src/lib.rs\n", lib], "src/lib.rs", &after);
+    text_has(
+        &impact,
+        &[
+            "X::value [method] src/lib.rs:6 · possibly references deleted value at src/lib.rs:6 (name match only)",
+            "typed [function] src/lib.rs:9-11 · possibly references deleted value at src/lib.rs:10 (name match only)",
+        ],
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "X::value [method] src/lib.rs:6 · possibly references deleted value at src/lib.rs:6 (name match only)",
-        "typed [function] src/lib.rs:9-11 · possibly references deleted value at src/lib.rs:10 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    assert!(!impact.contains("no remaining references"), "{impact}");
+    text_lacks(&impact, &["no remaining references"]);
 
     // Removing an override falls back to the trait's default, while an
     // inherent method of another type that shares the name is unrelated.
@@ -16183,49 +15532,34 @@ pub struct X;\nimpl Get for X {\n    fn value(&self) -> u8 { 1 }\n}\n\
 pub struct Y;\nimpl Y {\n    pub fn value(&self) -> u8 { 3 }\n}\n\
 pub fn generic<T: Get>(t: &T) -> u8 {\n    t.value()\n}\n\
 pub fn inherent(v: &Y) -> u8 {\n    v.value()\n}\n";
-    let repo = deletion_repo(
-        &[("Cargo.toml", cargo), ("src/lib.rs", lib)],
-        "src/lib.rs",
-        &lib.replace("    fn value(&self) -> u8 { 1 }\n", ""),
+    let after = lib.replace("    fn value(&self) -> u8 { 1 }\n", "");
+    let impact = deletion_impact(&[PROBE_TOML, "//- src/lib.rs\n", lib], "src/lib.rs", &after);
+    text_has(
+        &impact,
+        &[
+            "X::value [method] · deleted from src/lib.rs (committed lines 8-8)",
+            "Get::value [method] src/lib.rs:2-4 · possibly references deleted value at src/lib.rs:2 (name match only)",
+            "generic [function] src/lib.rs:13-15 · possibly references deleted value at src/lib.rs:14 (name match only)",
+        ],
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "X::value [method] · deleted from src/lib.rs (committed lines 8-8)",
-        "Get::value [method] src/lib.rs:2-4 · possibly references deleted value at src/lib.rs:2 (name match only)",
-        "generic [function] src/lib.rs:13-15 · possibly references deleted value at src/lib.rs:14 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
-    for unexpected in ["Y::value [method] src/lib.rs:11 ·", "  inherent [function]"] {
-        assert!(!impact.contains(unexpected), "{unexpected}\n{impact}");
-    }
+    text_lacks(
+        &impact,
+        &["Y::value [method] src/lib.rs:11 ·", "  inherent [function]"],
+    );
 }
 
 #[test]
 fn no_remaining_references_says_mentions_outside_definitions_were_not_read() {
-    let cargo = "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2021\"\n";
     // The only call is in a `macro_rules!` body, which is outside every definition.
-    let lib = "pub mod legacy;\nmacro_rules! old {\n    () => {\n        $crate::legacy::value()\n    };\n}\n\
+    let lib = "//- src/lib.rs\npub mod legacy;\nmacro_rules! old {\n    () => {\n        $crate::legacy::value()\n    };\n}\n\
 pub fn a() -> u8 {\n    old!()\n}\n";
-    let repo = deletion_repo(
+    let impact = deletion_impact(&[PROBE_TOML, lib, LEGACY_RS], "src/legacy.rs", UNTOUCHED);
+    text_has(
+        &impact,
         &[
-            ("Cargo.toml", cargo),
-            ("src/lib.rs", lib),
-            (
-                "src/legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
-            ),
+            "1 mention of value outside indexed definitions, such as src/lib.rs:4 · not followed",
+            "no remaining references to legacy::value found inside indexed definitions",
         ],
-        "src/legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
-    );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains(
-            "1 mention of value outside indexed definitions, such as src/lib.rs:4 · not followed"
-        ) && impact
-            .contains("no remaining references to legacy::value found inside indexed definitions"),
-        "{impact}"
     );
 }
 
@@ -16233,74 +15567,40 @@ pub fn a() -> u8 {\n    old!()\n}\n";
 fn let_patterns_that_name_a_deleted_type_are_not_bindings() {
     // Without a manifest the patterns are not linked, so only the text says
     // they name the removed types.
-    let legacy = "pub enum Mode {\n    Fast,\n    Slow,\n}\npub struct Config {\n    pub host: u8,\n}\n\
+    let legacy = "//- legacy.rs\npub enum Mode {\n    Fast,\n    Slow,\n}\npub struct Config {\n    pub host: u8,\n}\n\
 pub struct Wrapper(pub u8);\npub struct Marker;\npub fn untouched() -> u8 { 5 }\n";
-    let main = "mod legacy;\nmod make;\nuse legacy::*;\n\
+    let main = "//- main.rs\nmod legacy;\nmod make;\nuse legacy::*;\n\
 fn fast() -> u8 {\n    let Mode::Fast = make::mode() else { return 0 };\n    1\n}\n\
 fn host() -> u8 {\n    let Config { host } = make::config();\n    host\n}\n\
 fn inner() -> u8 {\n    let Wrapper(n) = make::wrapper();\n    n\n}\n\
 fn marked() -> u8 {\n    let Marker = make::marker();\n    1\n}\n\
 fn local() -> u8 {\n    let value = make::number();\n    1\n}\n\
 fn main() {}\n";
-    let make = "pub fn mode() -> crate::legacy::Mode { todo!() }\n\
+    let make = "//- make.rs\npub fn mode() -> crate::legacy::Mode { todo!() }\n\
 pub fn config() -> crate::legacy::Config { todo!() }\n\
 pub fn wrapper() -> crate::legacy::Wrapper { todo!() }\n\
 pub fn marker() -> crate::legacy::Marker { todo!() }\npub fn number() -> u8 { 1 }\n";
-    let repo = deletion_repo(
-        &[("legacy.rs", legacy), ("main.rs", main), ("make.rs", make)],
-        "legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
+    let impact = deletion_impact(&[legacy, main, make], "legacy.rs", UNTOUCHED);
+    text_has(
+        &impact,
+        &[
+            "main::fast [function] main.rs:4-7 · possibly references deleted Mode at main.rs:5 (name match only)",
+            "main::host [function] main.rs:8-11 · possibly references deleted Config at main.rs:9 (name match only)",
+            "main::inner [function] main.rs:12-15 · possibly references deleted Wrapper at main.rs:13 (name match only)",
+            "main::marked [function] main.rs:16-19 · possibly references deleted Marker at main.rs:17 (name match only)",
+        ],
     );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    for expected in [
-        "main::fast [function] main.rs:4-7 · possibly references deleted Mode at main.rs:5 (name match only)",
-        "main::host [function] main.rs:8-11 · possibly references deleted Config at main.rs:9 (name match only)",
-        "main::inner [function] main.rs:12-15 · possibly references deleted Wrapper at main.rs:13 (name match only)",
-        "main::marked [function] main.rs:16-19 · possibly references deleted Marker at main.rs:17 (name match only)",
-    ] {
-        assert!(impact.contains(expected), "{expected}\n{impact}");
-    }
 
     // A lowercase name after `let` is a variable, not the removed function.
-    let repo = deletion_repo(
-        &[
-            (
-                "legacy.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
-            ),
-            ("main.rs", main.replace("use legacy::*;", "").as_str()),
-            ("make.rs", "pub fn number() -> u8 { 1 }\n"),
-        ],
-        "legacy.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
-    );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(!impact.contains("main::local"), "{impact}");
+    let pieces: [&str; 3] = [
+        &LEGACY_RS.replace("src/legacy", "legacy"),
+        &main.replace("use legacy::*;", ""),
+        "//- make.rs\npub fn number() -> u8 { 1 }\n",
+    ];
+    let impact = deletion_impact(&pieces, "legacy.rs", UNTOUCHED);
+    text_lacks(&impact, &["main::local"]);
 }
 
-#[test]
-fn a_local_module_named_like_the_standard_library_keeps_its_paths() {
-    // `core::value` names the local module, which the index does not link
-    // without a manifest, not the standard library.
-    let repo = deletion_repo(
-        &[
-            (
-                "core.rs",
-                "pub fn value() -> u8 { 2 }\npub fn untouched() -> u8 { 5 }\n",
-            ),
-            ("main.rs", "mod core;\nfn main() {\n    core::value();\n}\n"),
-        ],
-        "core.rs",
-        "pub fn untouched() -> u8 { 5 }\n",
-    );
-    let impact = success(repo.path(), &["affected", "--changes"]);
-    assert!(
-        impact.contains(
-            "main::main [function] main.rs:2-4 · possibly references deleted value at main.rs:3 (name match only)"
-        ) && !impact.contains("no remaining references"),
-        "{impact}"
-    );
-}
 /// Runs a command Justless printed for the agent the way the agent would: as
 /// printed, from `cwd`, with this build standing in for `justless`.
 fn follow(cwd: &Path, printed: &str) -> Output {
@@ -19765,21 +19065,7 @@ fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets
 
 /// Runs justless with `input` on stdin.
 fn piped(root: &Path, args: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(args)
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+    piped_with(root, args, &[], input)
 }
 
 fn revision(root: &Path, file: &str) -> String {
