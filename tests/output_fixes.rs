@@ -88,6 +88,7 @@ fn a_search_heading_without_lines_keeps_the_output_and_status() {
 }
 
 /// A Cargo.lock of version 1.0.0 packages, each `(name, source, checksum)`.
+#[cfg(unix)]
 fn lockfile(packages: &[(String, &str, String)]) -> String {
     let mut text = String::from("version = 4\n");
     for (name, source, checksum) in packages {

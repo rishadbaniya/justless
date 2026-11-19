@@ -2008,12 +2008,19 @@ fn fit_lines(preview: &mut Vec<u8>, max_bytes: usize) {
     if preview.len() <= max_bytes {
         return;
     }
-    let room = max_bytes.saturating_sub(MORE.len()).min(preview.len());
-    let end = preview[..room]
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .map_or(0, |at| at + 1);
+    let room = max_bytes.saturating_sub(MORE.len() + 1);
+    let end = match preview[..room].iter().rposition(|&byte| byte == b'\n') {
+        Some(at) => at + 1,
+        // A first line longer than the budget is cut inside it, at a character.
+        None => (0..=room)
+            .rev()
+            .find(|&at| preview[at] & 0xC0 != 0x80)
+            .unwrap_or(0),
+    };
     preview.truncate(end);
+    if !preview.is_empty() && !preview.ends_with(b"\n") {
+        preview.push(b'\n');
+    }
     preview.extend_from_slice(MORE);
 }
 
@@ -3449,5 +3456,25 @@ mod tests {
             tally.every_shown().to_string(),
             "stdout 25 of 25, stderr 1 of 1"
         );
+    }
+
+    #[test]
+    fn fit_lines_cuts_at_a_line_end_or_inside_a_long_first_line() {
+        for (preview, expected) in [
+            ("short\n".to_owned(), "short\n".to_owned()),
+            (
+                format!("! flag\n{}\n", "x".repeat(60)),
+                "! flag\n[more in full log]\n".to_owned(),
+            ),
+            // The cut falls inside the `é`, so it moves before it.
+            (
+                format!("! {}é{}\n", "f".repeat(25), "g".repeat(30)),
+                format!("! {}\n[more in full log]\n", "f".repeat(25)),
+            ),
+        ] {
+            let mut bytes = preview.clone().into_bytes();
+            fit_lines(&mut bytes, 48);
+            assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{preview:?}");
+        }
     }
 }
