@@ -73,7 +73,7 @@ Token-saving tools each take one slice of the context window. RTK compresses com
 | Edits that check the file has not changed | ✅ | — | — |
 | Secret redaction | ✅ | Paid edition | — |
 | Token figures measured against Claude's tokenizer | ✅ | Bytes ÷ 4 | — |
-| No network calls | ✅ | Partly | Partly |
+| No network calls | ✅ 🔒 your code stays yours | 📡 Partly | 📡 Partly |
 
 <sub>RTK and graphify columns from each project's README on 2026-11-19; "—" means the README does not mention it. "Partly": RTK pipelines and its proxy can send content to models, and graphify's pass over docs and media can call a model backend. RTK supports more commands (100+) and agents (18); graphify more languages (about 40) and also reads docs, PDFs and images. [Full comparison](docs/comparison.md)</sub>
 
@@ -148,8 +148,12 @@ Hooks route commands through `justless run`, a local index answers code question
 
 ## How do you make money from this?
 
-I don't. justless is for people who want to spend less on tokens, not a funnel into spending more somewhere else. There's no paid edition, no cloud version, no account, no telemetry and no "Pro" features held back: everything on this page is in the one free binary, and it never phones home. If it saves you money, a ⭐ helps the next person find it.
+I don't. justless is for people who want to spend less on tokens, not a funnel into spending more somewhere else. There's no paid edition, no cloud version, no account, no telemetry and no "Pro" features held back: everything on this page is in the one free binary, under the [Apache-2.0 license](LICENSE), and it never phones home. If it saves you money, a ⭐ helps the next person find it.
 
 ## Contributing
 
 Build, test and commit conventions are in [CONTRIBUTING.md](CONTRIBUTING.md), maintainer notes in [AGENTS.md](AGENTS.md), and changes in the [changelog](CHANGELOG.md).
+
+## License
+
+[Apache-2.0](LICENSE)

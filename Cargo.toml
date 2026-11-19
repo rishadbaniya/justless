@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Local command output and source context for coding agents"
+license = "Apache-2.0"
+repository = "https://github.com/rishadbaniya/justless"
 
 [dependencies]
 anyhow = "1"

@@ -9,6 +9,7 @@
 class Justless < Formula
   desc "Local command output and source context for coding agents"
   homepage "https://github.com/rishadbaniya/justless"
+  license "Apache-2.0"
   url "https://github.com/rishadbaniya/justless/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   head "https://github.com/rishadbaniya/justless.git", branch: "main"
