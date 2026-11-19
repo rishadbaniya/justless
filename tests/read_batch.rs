@@ -369,3 +369,32 @@ fn a_cd_outside_the_workspace_or_backtracking_stays_raw() {
         json!({})
     );
 }
+
+#[test]
+fn a_batch_the_recheck_cannot_verify_still_gets_the_ordinary_report() {
+    let temp = fixture();
+    let dir = temp.path();
+    fs::create_dir(dir.join("sub")).unwrap();
+    let old = fs::read_to_string(dir.join("big.rs")).unwrap();
+    fs::write(
+        dir.join("big.rs"),
+        old.replace("wrapping_add", "wrapping_sub"),
+    )
+    .unwrap();
+    // The isolated recheck leaves out repository settings, so its diff differs
+    // from the one the agent saw.
+    native(dir, "git config diff.noprefix true");
+    for command in [
+        "cd sub && git diff",
+        "timeout 30 git diff",
+        "git diff | head -400",
+    ] {
+        let raw = native(dir, command);
+        let out = hook(dir, command, Some(response(&raw)));
+        let shown = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{command} stayed raw"));
+        assert!(shown.len() < raw.len(), "{command}: {shown}");
+        assert!(shown.contains("diff section(s)"), "{command}: {shown}");
+    }
+}

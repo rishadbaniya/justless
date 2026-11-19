@@ -136,10 +136,13 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     {
         return None;
     }
+    // A batch the recheck cannot verify, such as a diff shaped by repository
+    // settings, still gets the report for its one kind of command below.
     if !cfg!(windows)
-        && let Some(batch) = crate::batch::Batch::parse(command)
+        && let Some(compacted) =
+            crate::batch::Batch::parse(command).and_then(|batch| batch.compact(ws, input))
     {
-        return batch.compact(ws, input);
+        return Some(compacted);
     }
     if !cfg!(windows)
         && let Some(words) = crate::agents::literal_command(command)
