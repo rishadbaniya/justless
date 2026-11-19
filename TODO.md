@@ -6,4 +6,5 @@ Open work only. Finished work is in [CHANGELOG.md](CHANGELOG.md) and the Git his
 
 ### Large-output benchmark
 - **Why.** The main campaign (Sonnet, 248 runs, $10.46) found no demonstrated saving on the existing 31 small tasks (−1.5% [−15.4%, +7.6%], success 98.4% both); they read about 5.6 KB of tool output per run. Pilot, preparation and that result are in docs/benchmarks.md.
-- **Next.** Add a pre-registered task family that needs large tool output (long test logs, workspace lints, wide searches, long diffs), validate it for free, then run a Sonnet a/b cell after the owner's go-ahead.
+- **Done 2026-11-20.** The `large` task set exists (8 tasks from prediction_market_workspace, 59–192 KB of tool output per plain run), passed validation and is frozen (manifest `7185d3845e8aeb68`); see "Large-output tasks" in docs/benchmarks.md.
+- **Next.** The paid run, which needs the owner's go-ahead: `run --task-set large --campaign large --model claude-sonnet-5-5 --arms a,b,c,d --reps 3 --ce-trigger 30000 --token-limit 3000000 --budget-usd 35` (96 runs, about $19 expected), then `report --task-set large --campaign large`, and record the result in docs/benchmarks.md and the README.
