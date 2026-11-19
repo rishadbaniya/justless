@@ -5,7 +5,7 @@
 <h1 align="center">justless</h1>
 
 <p align="center">
-  <strong>Your coding agent on 8× fewer tokens.</strong><br>
+  <strong>Up to 148× less for your coding agent to read.</strong><br>
   One local tool instead of RTK + graphify + context pruning. Compact by default, exact on demand.
 </p>
 
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <strong>8×</strong> fewer input tokens on a repair task · <strong>10×</strong> less command output · <strong>57×</strong> smaller answers to code questions · <strong>85×</strong> smaller reads of old revisions · <strong>0</strong> network calls
+  <strong>148×</strong> smaller answer to a code question · <strong>85×</strong> smaller reads of old revisions · <strong>28×</strong> smaller <code>find .</code> · <strong>10×</strong> less command output · <strong>8×</strong> fewer input tokens on a repair task · <strong>0</strong> network calls
 </p>
 
 **justless** is a local Rust CLI that sits between your coding agent and its tools. It intercepts shell commands through agent hooks and parses their output into compact, structured results. It answers code questions from an incremental **code graph** of symbols, calls, imports, HTTP routes and SQL tables, so agents stop reading whole files. Every byte it cuts is archived locally and one command away.
@@ -25,16 +25,16 @@
 
 | What your agent does | Without justless | With justless | Cut |
 | --- | ---: | ---: | ---: |
-| A three-turn repair task, input tokens as the API counted them, on Claude Haiku, Sonnet, Opus 5.5 and Fable 5.2 | 22.4–22.8k | ~2.85k | **8×** |
-| 77 real commands across four Rust and Python repositories | 1,171 KB | 115 KB | **10×** |
-| "Where is `X` and what calls it?": search and read the file, or `justless query X` (14 functions, median) | 1.14 MB | 19 KB | **57×** |
-| One function from a 21 KB source file: read the file, or its outline and then that function (`expand`) | 21 KB | 2.1 KB + 60 B | **10×** |
 | A file at an old revision, `git show HEAD:CHANGELOG.md` | 29.2 KB | 345 B | **85×** |
+| "Where is `X` and what calls it?": search and read the file, or `justless query X` (14 functions) | 1.14 MB | 19 KB | **57×** median, up to 148× |
 | `find .` | 267 KB | 9.4 KB | **28×** |
 | `cargo test` with one failing test ([`fixtures/failing`](fixtures/failing)) | 18,038 B | 700 B | **26×** |
 | `cargo clippy -- -W clippy::pedantic` on this repository, 142 warnings | 79,563 B | 3,916 B | **20×** |
 | `git diff` against older revisions | 274 KB | 13.5 KB | **20×** |
+| 77 real commands across four Rust and Python repositories | 1,171 KB | 115 KB | **10×** |
+| One function from a 21 KB source file: read the file, or its outline and then that function (`expand`) | 21 KB | 2.1 KB + 60 B | **10×** |
 | Claude Code `Read` calls of more than 150 lines (167 windows) | 2.80 MB | 305 KB | **9×** |
+| A three-turn repair task, input tokens as the API counted them, on Claude Haiku, Sonnet, Opus 5.5 and Fable 5.2 | 22.4–22.8k | ~2.85k | **8×** |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/savings-dark.svg">
