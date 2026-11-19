@@ -63,6 +63,14 @@ pub(crate) const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const PREVIEW_CHARS: usize = 2_000;
 /// Lines of the original that the shown text left out and that report an error.
 const ERROR_LINES: usize = 8;
+/// Output of a command no hook supports is compacted only past this many context
+/// budgets.
+const UNKNOWN_FACTOR: usize = 4;
+/// Programs whose output is file content an agent may be about to edit or copy.
+const READERS: &[&str] = &[
+    "cat", "head", "tail", "sed", "awk", "gawk", "less", "more", "bat", "batcat", "nl", "cut",
+    "base64", "xxd", "od", "hexdump", "strings", "git", "echo", "printf",
+];
 const NOTE: &str = "Captured from a Claude Code Bash result after the command ran. The archive holds the output Claude Code recorded, with stdout and stderr interleaved, and Claude Code may have shortened it at its own output limits. The exit status is the whole command line's as Claude Code reported it: 0, or 1 where Claude Code read exit 1 as a valid result, so a pipe can hide its first command's failure.";
 
 /// A run marker that `justless run` already printed, alone on its line.
@@ -155,7 +163,15 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     if persisted.is_none() && stdout.len() <= settings.context_budget {
         return None;
     }
-    let plan = plan(command)?;
+    // A command no hook supports gets only the floor and JSON tables, never a
+    // clipped preview, and only when its output is large.
+    let (plan, unknown) = match plan(command) {
+        Some(plan) => (plan, false),
+        None if persisted.is_none() && stdout.len() > UNKNOWN_FACTOR * settings.context_budget => {
+            (unknown_plan(command)?, true)
+        }
+        None => return None,
+    };
     let cwd = input["cwd"]
         .as_str()
         .map_or_else(|| ws.cwd.clone(), PathBuf::from)
@@ -176,8 +192,16 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // The preview budget `justless run` would give these words, which adapts to
     // how often agents reopened the family's clipped logs. The run path shows
     // output up to this size, or the context budget, verbatim.
-    let run_budget = crate::adaptive::preview_budget(&run_ws, &args).ok()?;
-    let threshold = settings.context_budget.max(run_budget);
+    let run_budget = if unknown {
+        stdout.len()
+    } else {
+        crate::adaptive::preview_budget(&run_ws, &args).ok()?
+    };
+    let threshold = if unknown {
+        UNKNOWN_FACTOR * settings.context_budget
+    } else {
+        settings.context_budget.max(run_budget)
+    };
     let output = match persisted {
         Some(path) => read_persisted(path, response.get("persistedOutputSize")?, stdout)?,
         None => stdout.as_bytes().to_vec(),
@@ -562,6 +586,36 @@ fn plan(command: &str) -> Option<Plan> {
         plan.label.push_str("; …");
     }
     Some(plan)
+}
+
+/// One command that no hook supports, alone on its line with its output reaching
+/// the agent: no pipe, list or redirection of stdout, and not a program that prints
+/// file content.
+fn unknown_plan(command: &str) -> Option<Plan> {
+    let segments = parse(command)?;
+    let [segment] = segments.as_slice() else {
+        return None;
+    };
+    let [stage] = segment.as_slice() else {
+        return None;
+    };
+    let words = strip(&stage.words)?;
+    let program = basename(words.first()?);
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    if !keeps_stdout(stage)
+        || program == "justless"
+        || READERS.contains(&program)
+        || quiet(words).is_some()
+        || crate::agents::supported_words(&refs)
+    {
+        return None;
+    }
+    Some(Plan {
+        words: words.to_vec(),
+        program: program.to_owned(),
+        label: crate::history::label(&refs),
+        cd: PathBuf::new(),
+    })
 }
 
 fn basename(program: &str) -> &str {

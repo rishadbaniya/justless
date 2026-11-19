@@ -127,6 +127,86 @@ fn previews_collapse_progress_encoded_runs_and_repeats() {
     );
 }
 
+/// The Claude Code post-run hook's rewrite of a successful Bash result, if any.
+fn after_bash(root: &Path, command: &str, stdout: &str) -> Option<String> {
+    use std::io::Write;
+    let input = serde_json::json!({
+        "hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": "s",
+        "cwd": root, "tool_input": {"command": command},
+        "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false, "isImage": false},
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(["hook-claude", "after-bash"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[test]
+fn the_post_run_hook_floors_large_output_of_unknown_commands() {
+    let dir = workspace("");
+    let root = dir.path().canonicalize().unwrap();
+    let issues: Vec<String> = (0..200)
+        .map(|i| {
+            format!(
+                r#"{{"number":{i},"state":"open","title":"Issue {i}","user":{{"login":"u{}"}}}}"#,
+                i % 3
+            )
+        })
+        .collect();
+    let issues = format!("[{}]\n", issues.join(","));
+    let progress = format!("{}done\n", "waiting for the build\n".repeat(600));
+    for (command, stdout, shown) in [
+        (
+            "gh api repos/acme/widget/issues",
+            issues.as_str(),
+            Some("[JSON array as a table: "),
+        ),
+        (
+            "python3 build.py",
+            progress.as_str(),
+            Some("waiting for the build\n[last line repeated 599 more time(s)]\ndone\n"),
+        ),
+        // Output an agent may edit or copy, and short output, stay whole.
+        ("strings build.bin", progress.as_str(), None),
+        ("python3 build.py", &progress[..6000], None),
+        // A pipe or list is left to the supported-command rules.
+        ("python3 build.py | tail -n 700", progress.as_str(), None),
+    ] {
+        let rewritten = after_bash(&root, command, stdout);
+        match shown {
+            Some(start) => {
+                let compacted = rewritten.unwrap_or_else(|| panic!("{command} was not compacted"));
+                assert!(compacted.starts_with(start), "{command}: {compacted}");
+                assert!(compacted.len() < stdout.len() / 2, "{command}: {compacted}");
+                let id = compacted
+                    .rsplit_once("[justless ")
+                    .unwrap()
+                    .1
+                    .split(' ')
+                    .next()
+                    .unwrap();
+                let log = justless(&root, &["log", id]);
+                assert_eq!(text(&log.stdout), stdout);
+            }
+            None => assert_eq!(rewritten, None, "{command}"),
+        }
+    }
+}
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
