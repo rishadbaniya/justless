@@ -7070,16 +7070,13 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     synthetic_run(&root, "run-before", start - 3_600_000, 100_000, 1_000, true);
     synthetic_run(&root, "run-typed", start + 3_000, 90_000, 500, false);
     fs::create_dir_all(root.join(".justless/runs/run-running")).unwrap();
-    fs::create_dir_all(root.join(".justless/runs/run-broken")).unwrap();
-    fs::write(root.join(".justless/runs/run-broken/record.json"), "{").unwrap();
+    write_files(&root, &[(".justless/runs/run-broken/record.json", "{")]);
     // Two hook-routed runs in the session: one compacted, one shown verbatim.
     synthetic_run(&root, "run-compact", start + 1_000, 40_000, 2_000, true);
     synthetic_run(&root, "run-verbatim", start + 2_000, 952, 952, true);
     // (40,000 + 952) - (2,048 + 1,000) bytes kept out = 37,904 bytes ≈ 17.2k tokens at 2.21 bytes per token.
-    assert_eq!(
-        line("s1"),
-        "justless · net ≈17.2k tokens saved this session · 2 runs"
-    );
+    let two_runs = "justless · net ≈17.2k tokens saved this session · 2 runs";
+    assert_eq!(line("s1"), two_runs);
     assert_eq!(
         status_line(&root, &[], event("s1").as_bytes(), Some("40")),
         "justless · net ≈17.2k tokens saved"
@@ -7110,24 +7107,14 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
         "tool_response":{"mode":"content","numFiles":0,"filenames":[],"content":content,
             "numLines":content.lines().count(),"appliedLimit":250}});
     let grouped = agent_hook(&root, "hook-claude", "after-search", grep);
-    assert!(grouped["hookSpecificOutput"]["updatedToolOutput"].is_object());
-    let tool_saved = {
-        let shown = |hook: &serde_json::Value, text: &str| {
-            text.len() + hook["additionalContext"].as_str().unwrap().len()
-        };
-        let read_shown = shown(
-            replaced,
-            replaced["updatedToolOutput"]["file"]["content"]
-                .as_str()
-                .unwrap(),
-        );
-        let group = &grouped["hookSpecificOutput"];
-        let grep_shown = shown(
-            group,
-            group["updatedToolOutput"]["content"].as_str().unwrap(),
-        );
-        (source.len() - 1 - read_shown + content.len() - grep_shown) as u64
+    let group = &grouped["hookSpecificOutput"];
+    assert!(group["updatedToolOutput"].is_object());
+    let shown = |hook: &serde_json::Value, text: &serde_json::Value| {
+        text.as_str().unwrap().len() + hook["additionalContext"].as_str().unwrap().len()
     };
+    let read_shown = shown(replaced, &replaced["updatedToolOutput"]["file"]["content"]);
+    let grep_shown = shown(group, &group["updatedToolOutput"]["content"]);
+    let tool_saved = (source.len() - 1 + content.len() - read_shown - grep_shown) as u64;
     let tokens = format!(
         "{:.1}",
         ((37_904 + tool_saved) * 63_191).div_ceil(139_440) as f64 / 1000.0
@@ -7138,10 +7125,7 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
         format!("justless · net {expected} tokens saved this session · 2 runs · 1 read · 1 search")
     );
     // Another session sees the shared project runs, but not this session's reads.
-    assert_eq!(
-        line("s2"),
-        "justless · net ≈17.2k tokens saved this session · 2 runs"
-    );
+    assert_eq!(line("s2"), two_runs);
     // A Read the hook leaves alone, such as an explicit range, is not counted.
     let mut ranged = read;
     ranged["tool_input"]["limit"] = json!(20);
@@ -7171,38 +7155,26 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
 fn statusline_prints_one_line_whatever_its_input() {
     let empty = TempDir::new().unwrap();
     let root = empty.path();
-    assert_eq!(status_line(root, &[], b"", None), "justless · ready");
-    assert_eq!(
-        status_line(root, &[], b"not json", None),
-        "justless · ready"
-    );
-    assert_eq!(
-        status_line(root, &[], br#"{"session_id":null,"cwd":42}"#, None),
-        "justless · ready"
-    );
-    assert_eq!(
-        status_line(
-            root,
-            &[],
-            br#"{"transcript_path":"/nonexistent/t.jsonl","cost":{"total_duration_ms":"soon"}}"#,
-            None
+    for (args, input, expected) in [
+        ("", "", "justless · ready"),
+        ("", "not json", "justless · ready"),
+        ("", r#"{"session_id":null,"cwd":42}"#, "justless · ready"),
+        (
+            "",
+            r#"{"transcript_path":"/nonexistent/t.jsonl","cost":{"total_duration_ms":"soon"}}"#,
+            "justless · ready",
         ),
-        "justless · ready"
-    );
-    // A project that cannot be opened prints the bare fallback, still with exit 0.
-    assert_eq!(
-        status_line(
-            root,
-            &[],
-            br#"{"workspace":{"current_dir":"/nonexistent/project"}}"#,
-            None
+        // A project that cannot be opened prints the bare fallback, still with exit 0.
+        (
+            "",
+            r#"{"workspace":{"current_dir":"/nonexistent/project"}}"#,
+            "justless",
         ),
-        "justless"
-    );
-    assert_eq!(
-        status_line(root, &["--root", "/nonexistent/project"], b"{}", None),
-        "justless"
-    );
+        ("--root /nonexistent/project", "{}", "justless"),
+    ] {
+        let line = status_line(root, &argv(args), input.as_bytes(), None);
+        assert_eq!(line, expected, "args {args:?}, input {input:?}");
+    }
     // The status line only reads: it creates no state directory.
     assert!(!root.join(".justless").exists());
 }
@@ -7216,6 +7188,27 @@ fn with_config(root: &Path, config: &Path, args: &[&str]) -> Output {
         .env("CLAUDE_CONFIG_DIR", config)
         .output()
         .unwrap()
+}
+
+/// Runs a suggested status line command under `sh` with this build's `justless`
+/// first on `PATH`, giving it session JSON on stdin as Claude Code does, and
+/// returns what it printed.
+fn run_status_command(root: &Path, command: &str) -> String {
+    let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut child = Command::new("sh")
+        .args(["-c", command])
+        .current_dir(root)
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    stdout(&output)
 }
 
 #[test]
@@ -7285,8 +7278,7 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
     fs::write(local.join(".claude/settings.local.json"), own).unwrap();
     let user = project("user");
     let user_config = temp.path().join("user-config");
-    fs::create_dir(&user_config).unwrap();
-    fs::write(user_config.join("settings.json"), own).unwrap();
+    write_files(&user_config, &[("settings.json", own)]);
     for (root, config, file) in [
         (&shared, &config, ".claude/settings.json"),
         (&local, &config, ".claude/settings.local.json"),
@@ -7300,8 +7292,7 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
         let output = with_config(root, config, &["init", "--statusline"]);
         assert!(output.status.success(), "{}", stderr(&output));
         let message = stderr(&output);
-        assert!(message.contains("Kept the status line set in"), "{message}");
-        assert!(message.contains(file), "{message}");
+        assert_all_in(&message, &["Kept the status line set in", file]);
         assert_eq!(files(root), before);
         assert!(!root.join(".justless").exists());
         // The suggested command prints both lines from the same session JSON. For
@@ -7326,50 +7317,17 @@ fn init_statusline_adds_one_status_line_and_keeps_any_existing_one() {
                 .unwrap()
                 .to_owned()
         };
-        let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
-        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-        let mut child = Command::new("sh")
-            .args(["-c", &combined])
-            .current_dir(root)
-            .env("PATH", path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(b"{}").unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(stdout(&output), "mine\njustless · ready\n");
+        let shown = run_status_command(root, &combined);
+        assert_eq!(shown, "mine\njustless · ready\n");
     }
 
     // In the home directory, the project file is the user's own settings file.
     let home = project("home");
     let output = with_config(&home, &home.join(".claude"), &["init", "--statusline"]);
     assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("user settings file"),
-        "{}",
-        stderr(&output)
-    );
+    let message = stderr(&output);
+    assert!(message.contains("user settings file"), "{message}");
     assert!(!home.join(".claude/settings.json").exists());
-}
-
-/// Runs a suggested status line command under `sh` with this build's `justless`
-/// first on `PATH`, giving it session JSON on stdin as Claude Code does.
-#[cfg(unix)]
-fn run_status_command(root: &Path, command: &str) -> Output {
-    let bin = Path::new(env!("CARGO_BIN_EXE_justless")).parent().unwrap();
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let mut child = Command::new("sh")
-        .args(["-c", command])
-        .current_dir(root)
-        .env("PATH", path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"{}").unwrap();
-    child.wait_with_output().unwrap()
 }
 
 #[cfg(unix)]
@@ -7391,12 +7349,8 @@ fn statusline_suggestions_parse_and_keep_the_users_other_fields() {
     // suggested local setting must keep, or it would turn them off here.
     let user = project("user");
     let user_config = temp.path().join("user-config");
-    fs::create_dir(&user_config).unwrap();
-    fs::write(
-        user_config.join("settings.json"),
-        r#"{"statusLine":{"type":"command","command":"echo hi;","padding":1,"refreshInterval":5,"hideVimModeIndicator":true}}"#,
-    )
-    .unwrap();
+    let settings = r#"{"statusLine":{"type":"command","command":"echo hi;","padding":1,"refreshInterval":5,"hideVimModeIndicator":true}}"#;
+    write_files(&user_config, &[("settings.json", settings)]);
     let suggested = last_json(&with_config(&user, &user_config, &["init", "--statusline"]));
     let setting = &suggested["statusLine"];
     assert_eq!(setting["type"], "command");
@@ -7404,8 +7358,7 @@ fn statusline_suggestions_parse_and_keep_the_users_other_fields() {
     assert_eq!(setting["refreshInterval"], 5);
     assert_eq!(setting["hideVimModeIndicator"], true);
     let shown = run_status_command(&user, setting["command"].as_str().unwrap());
-    assert!(shown.status.success(), "{}", stderr(&shown));
-    assert_eq!(stdout(&shown), "hi\njustless · ready\n");
+    assert_eq!(shown, "hi\njustless · ready\n");
 
     // A local status line that ends in a comment, which would swallow a `; }`.
     let local = project("local");
@@ -7418,8 +7371,7 @@ fn statusline_suggestions_parse_and_keep_the_users_other_fields() {
     fs::create_dir(&config).unwrap();
     let suggested = last_json(&with_config(&local, &config, &["init", "--statusline"]));
     let shown = run_status_command(&local, suggested.as_str().unwrap());
-    assert!(shown.status.success(), "{}", stderr(&shown));
-    assert_eq!(stdout(&shown), "mine\njustless · ready\n");
+    assert_eq!(shown, "mine\njustless · ready\n");
 }
 
 #[test]
@@ -7430,11 +7382,9 @@ fn init_statusline_stops_before_writing_when_a_settings_file_is_unreadable() {
     // A trailing comma in the user settings may hide a status line, so setup
     // stops before it writes hooks, instructions or state.
     let broken = temp.path().join("broken-config");
-    fs::create_dir(&broken).unwrap();
-    fs::write(broken.join("settings.json"), r#"{"theme":"dark",}"#).unwrap();
+    write_files(&broken, &[("settings.json", r#"{"theme":"dark",}"#)]);
     let root = temp.path().join("user");
-    fs::create_dir(&root).unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
+    write_files(&root, &[("package.json", "{}")]);
     for args in [&both[..], &["init", "--statusline"]] {
         let output = with_config(&root, &broken, args);
         assert!(!output.status.success(), "{args:?}");
@@ -7450,16 +7400,12 @@ fn init_statusline_stops_before_writing_when_a_settings_file_is_unreadable() {
     let config = temp.path().join("config");
     fs::create_dir(&config).unwrap();
     let root = temp.path().join("local");
-    fs::create_dir_all(root.join(".claude")).unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
-    fs::write(root.join(".claude/settings.local.json"), "{").unwrap();
+    let files = [("package.json", "{}"), (".claude/settings.local.json", "{")];
+    write_files(&root, &files);
     let output = with_config(&root, &config, &both);
     assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains(".claude/settings.local.json"),
-        "{}",
-        stderr(&output)
-    );
+    let message = stderr(&output);
+    assert!(message.contains(".claude/settings.local.json"), "{message}");
     for created in [
         ".claude/settings.json",
         "CLAUDE.md",
@@ -7500,19 +7446,14 @@ fn init_statusline_keeps_its_local_settings_out_of_git_and_names_missing_hooks()
     };
     let repository = |name: &str| {
         let root = temp.path().join(name);
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("package.json"), "{}").unwrap();
+        write_files(&root, &[("package.json", "{}")]);
         let output = isolated("git", &root, &config, &["init", "-q"]);
         assert!(output.status.success(), "{}", stderr(&output));
         root
     };
     let untracked = |root: &Path| {
-        stdout(&isolated(
-            "git",
-            root,
-            &config,
-            &["status", "--short", "--untracked-files=all"],
-        ))
+        let args = argv("status --short --untracked-files=all");
+        stdout(&isolated("git", root, &config, &args))
     };
 
     // The local file is personal, so a repository that does not ignore it yet
@@ -7520,11 +7461,7 @@ fn init_statusline_keeps_its_local_settings_out_of_git_and_names_missing_hooks()
     // hooks, setup says the line stays at `ready`.
     let root = repository("repo");
     let text = justless(&root, &["init", "--statusline"]);
-    assert!(text.contains("settings.local.json"), "{text}");
-    assert!(
-        text.contains("Updated") && text.contains(".gitignore"),
-        "{text}"
-    );
+    assert_all_in(&text, &["settings.local.json", "Updated", ".gitignore"]);
     assert!(
         text.contains("justless init --hooks --agent claude"),
         "{text}"
@@ -7537,10 +7474,7 @@ fn init_statusline_keeps_its_local_settings_out_of_git_and_names_missing_hooks()
     assert!(!status.contains(".claude"), "{status}");
     assert!(!status.contains(".justless"), "{status}");
     // With the hooks installed, the note goes away and nothing is added twice.
-    let text = justless(
-        &root,
-        &["init", "--hooks", "--agent", "claude", "--statusline"],
-    );
+    let text = justless(&root, &argv("init --hooks --agent claude --statusline"));
     assert!(text.contains("already shows Justless savings"), "{text}");
     assert!(!text.contains("init --hooks"), "{text}");
     let ignore = fs::read_to_string(root.join(".gitignore")).unwrap();
@@ -7549,8 +7483,7 @@ fn init_statusline_keeps_its_local_settings_out_of_git_and_names_missing_hooks()
     // Git's global excludes may already list the file, as Claude Code adds it
     // there, and then the project's .gitignore is left alone.
     let excludes = config.join("xdg/git");
-    fs::create_dir_all(&excludes).unwrap();
-    fs::write(excludes.join("ignore"), "**/.claude/settings.local.json\n").unwrap();
+    write_files(&excludes, &[("ignore", "**/.claude/settings.local.json\n")]);
     let other = repository("other");
     justless(&other, &["init", "--statusline"]);
     assert!(other.join(".claude/settings.local.json").is_file());
@@ -7559,8 +7492,7 @@ fn init_statusline_keeps_its_local_settings_out_of_git_and_names_missing_hooks()
 
     // Outside a repository there is nothing to ignore.
     let plain = temp.path().join("plain");
-    fs::create_dir(&plain).unwrap();
-    fs::write(plain.join("package.json"), "{}").unwrap();
+    write_files(&plain, &[("package.json", "{}")]);
     justless(&plain, &["init", "--statusline"]);
     assert!(plain.join(".claude/settings.local.json").is_file());
     assert!(!plain.join(".gitignore").exists());
@@ -7641,17 +7573,9 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
     assert!(!nested.join(".justless/runs").exists());
     // Then the agent works inside it: a large run recorded in the nested
     // repository itself, and a replaced Read.
+    let args = format!("run --hook --session {digest} -- seq 1 30000");
     let run = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args([
-            "run",
-            "--hook",
-            "--session",
-            &digest,
-            "--",
-            "seq",
-            "1",
-            "30000",
-        ])
+        .args(argv(&args))
         .current_dir(&nested)
         .output()
         .unwrap();
@@ -7688,272 +7612,192 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
         "justless · net ≈0 tokens saved this session · 1 run"
     );
     // The session's roots are kept in the project it started in.
-    let listed = fs::read_to_string(
-        outer
-            .join(".justless/sessions")
-            .join(format!("{digest}.roots")),
-    )
-    .unwrap();
-    assert_eq!(listed, format!("{}\n", nested.display()));
+    let listed = fs::read_to_string(outer.join(format!(".justless/sessions/{digest}.roots")));
+    assert_eq!(listed.unwrap(), format!("{}\n", nested.display()));
 }
 
-/// Write `files` (path, contents) under `root`, creating parent directories.
-fn write_tree(root: &Path, files: &[(&str, &str)]) {
-    for (path, contents) in files {
-        let path = root.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, contents).unwrap();
+/// A Cargo workspace whose root manifest lists `crates` as members, followed by
+/// the `workspace` tables. Each crate is (directory, package name, dependency
+/// tables, `src/lib.rs`).
+fn dependency_workspace(workspace: &str, crates: &[(&str, &str, &str, &str)]) -> TempDir {
+    let repo = TempDir::new().unwrap();
+    // A blank line sets off the tables that follow the first one.
+    let then = |tables: &str| match tables {
+        "" => String::new(),
+        tables => format!("\n{tables}"),
+    };
+    let members: Vec<_> = crates.iter().map(|c| format!("{:?}", c.0)).collect();
+    let members = members.join(", ");
+    let root = format!("[workspace]\nmembers = [{members}]\n{}", then(workspace));
+    fs::write(repo.path().join("Cargo.toml"), root).unwrap();
+    for (dir, name, dependencies, lib) in crates {
+        let manifest = format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{}",
+            then(dependencies)
+        );
+        let files = [("Cargo.toml", manifest.as_str()), ("src/lib.rs", lib)];
+        write_files(&repo.path().join(dir), &files);
     }
+    repo
 }
 
 #[test]
-fn renamed_registry_dependency_calls_are_not_local_callers() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    write_tree(
-        root,
-        &[
-            (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"ctrlc\", \"app\"]\n",
-            ),
-            (
-                "ctrlc/Cargo.toml",
-                "[package]\nname = \"ctrlc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [dev-dependencies]\nupstream_ctrlc = { package = \"ctrlc\", version = \"=3.5.2\" }\n",
-            ),
-            (
-                "ctrlc/src/lib.rs",
-                "pub fn set_handler(handler: fn()) {\n    handler();\n}\n",
-            ),
-            (
-                "ctrlc/tests/signals.rs",
-                "fn through_registry() {\n    upstream_ctrlc::set_handler(|| {}).unwrap();\n}\n\
-                 fn through_local() {\n    ctrlc::set_handler(|| {});\n}\n",
-            ),
-            // A renamed dependency that really points at the workspace crate still resolves.
-            (
-                "app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\nlocal_alias = { package = \"ctrlc\", path = \"../ctrlc\" }\n",
-            ),
-            (
-                "app/src/lib.rs",
-                "pub fn install() {\n    local_alias::set_handler(|| {});\n}\n",
-            ),
-        ],
+fn callers_resolve_cargo_dependencies_to_the_crate_they_name() {
+    let ctrlc = (
+        "ctrlc",
+        "ctrlc",
+        "[dev-dependencies]\nupstream_ctrlc = { package = \"ctrlc\", version = \"=3.5.2\" }\n",
+        "pub fn set_handler(handler: fn()) {\n    handler();\n}\n",
     );
-    let callers = success(root, &["query", "ctrlc::set_handler", "--view", "callers"]);
-    assert!(
-        callers.contains("through_local") && callers.contains("ctrlc/tests/signals.rs:5"),
-        "{callers}"
-    );
-    assert!(
-        callers.contains("install") && callers.contains("app/src/lib.rs:2"),
-        "{callers}"
-    );
-    assert!(
-        !callers.contains("through_registry") && !callers.contains("signals.rs:2"),
-        "{callers}"
-    );
-}
-
-#[test]
-fn inherited_dependencies_resolve_to_the_crate_their_path_names() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    write_tree(
-        root,
-        &[
-            (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"engine\", \"app\", \"other\"]\n\n\
-                 [workspace.dependencies]\nengine = { path = \"engine\" }\n\
-                 fast = { package = \"engine\", path = \"./engine/\" }\n\
-                 published = { package = \"engine\", version = \"1\" }\n",
-            ),
-            (
-                "engine/Cargo.toml",
-                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
-            ("engine/src/lib.rs", "pub fn start() {}\n"),
-            (
-                "app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\nengine = { workspace = true }\nfast.workspace = true\n\
-                 published = { workspace = true }\n",
-            ),
-            (
-                "app/src/lib.rs",
-                "pub fn through_path() {\n    engine::start();\n}\n\
-                 pub fn through_dotted() {\n    fast::start();\n}\n\
-                 pub fn through_published() {\n    published::start();\n}\n",
-            ),
-            // A registry dependency that shares the workspace crate's name stays external.
-            (
-                "other/Cargo.toml",
-                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\nengine = \"1\"\n",
-            ),
-            (
-                "other/src/lib.rs",
-                "pub fn through_registry() {\n    engine::start();\n}\n",
-            ),
-        ],
-    );
-    let callers = success(root, &["query", "engine::start", "--view", "callers"]);
-    for expected in [
-        "app::through_path at app/src/lib.rs:2",
-        "app::through_dotted at app/src/lib.rs:5",
-    ] {
-        assert!(callers.contains(expected), "{expected}\n{callers}");
+    let engine = ("engine", "engine", "", "pub fn start() {}\n");
+    // (case, workspace tables, crates, ctrlc/tests/signals.rs, queried function,
+    // callers listed, callers left out)
+    let cases = [
+        (
+            "renamed_registry_dependency_calls_are_not_local_callers",
+            "",
+            &[
+                ctrlc,
+                // A renamed dependency that really points at the workspace crate still resolves.
+                (
+                    "app",
+                    "app",
+                    "[dependencies]\nlocal_alias = { package = \"ctrlc\", path = \"../ctrlc\" }\n",
+                    "pub fn install() {\n    local_alias::set_handler(|| {});\n}\n",
+                ),
+            ][..],
+            "fn through_registry() {\n    upstream_ctrlc::set_handler(|| {}).unwrap();\n}\n\
+             fn through_local() {\n    ctrlc::set_handler(|| {});\n}\n",
+            "ctrlc::set_handler",
+            &[
+                "through_local",
+                "ctrlc/tests/signals.rs:5",
+                "install",
+                "app/src/lib.rs:2",
+            ][..],
+            &["through_registry", "signals.rs:2"][..],
+        ),
+        (
+            "inherited_dependencies_resolve_to_the_crate_their_path_names",
+            "[workspace.dependencies]\nengine = { path = \"engine\" }\n\
+             fast = { package = \"engine\", path = \"./engine/\" }\n\
+             published = { package = \"engine\", version = \"1\" }\n",
+            &[
+                engine,
+                (
+                    "app",
+                    "app",
+                    "[dependencies]\nengine = { workspace = true }\nfast.workspace = true\n\
+                     published = { workspace = true }\n",
+                    "pub fn through_path() {\n    engine::start();\n}\n\
+                     pub fn through_dotted() {\n    fast::start();\n}\n\
+                     pub fn through_published() {\n    published::start();\n}\n",
+                ),
+                // A registry dependency that shares the workspace crate's name stays external.
+                (
+                    "other",
+                    "other",
+                    "[dependencies]\nengine = \"1\"\n",
+                    "pub fn through_registry() {\n    engine::start();\n}\n",
+                ),
+            ][..],
+            "",
+            "engine::start",
+            &[
+                "app::through_path at app/src/lib.rs:2",
+                "app::through_dotted at app/src/lib.rs:5",
+            ][..],
+            &["through_published", "through_registry"][..],
+        ),
+        (
+            "import_that_renames_a_registry_crate_shadows_the_local_crate",
+            "",
+            &[ctrlc][..],
+            "fn direct() {\n    ctrlc::set_handler(|| {});\n}\n\
+             fn scoped() {\n    use upstream_ctrlc as ctrlc;\n    ctrlc::set_handler(|| {});\n}\n\
+             mod shadow {\n    use upstream_ctrlc as ctrlc;\n    fn renamed_registry() {\n        ctrlc::set_handler(|| {});\n    }\n\
+             \x20   mod nested {\n        use super::*;\n        fn globbed_registry() {\n            ctrlc::set_handler(|| {});\n        }\n    }\n}\n\
+             mod reimport {\n    use ctrlc;\n    fn reimported_local() {\n        ctrlc::set_handler(|| {});\n    }\n}\n",
+            "ctrlc::set_handler",
+            &[
+                "ctrlc_test_signals::direct at ctrlc/tests/signals.rs:2",
+                "ctrlc_test_signals::reimport::reimported_local at ctrlc/tests/signals.rs:23",
+            ][..],
+            &["scoped", "renamed_registry", "globbed_registry"][..],
+        ),
+        (
+            "platform_specific_path_dependency_resolves_to_the_workspace_crate",
+            "",
+            &[
+                engine,
+                (
+                    "platform",
+                    "platform",
+                    "[target.'cfg(unix)'.dependencies]\nengine = { path = \"../engine\" }\n",
+                    "pub fn install() {\n    engine::start();\n}\n",
+                ),
+                // A platform-specific registry dependency stays external.
+                (
+                    "other",
+                    "other",
+                    "[target.'cfg(windows)'.dependencies]\nengine = \"1\"\n",
+                    "pub fn published() {\n    engine::start();\n}\n",
+                ),
+            ][..],
+            "",
+            "engine::start",
+            &["platform::install at platform/src/lib.rs:2"][..],
+            &["published"][..],
+        ),
+    ];
+    for (case, workspace, crates, signals, function, listed, left_out) in cases {
+        let repo = dependency_workspace(workspace, crates);
+        if !signals.is_empty() {
+            write_files(repo.path(), &[("ctrlc/tests/signals.rs", signals)]);
+        }
+        let query = format!("query {function} --view callers");
+        let callers = success(repo.path(), &argv(&query));
+        for needle in listed {
+            assert!(callers.contains(needle), "{case}: {needle}\n{callers}");
+        }
+        for needle in left_out {
+            assert!(!callers.contains(needle), "{case}: {needle}\n{callers}");
+        }
     }
-    assert!(
-        !callers.contains("through_published") && !callers.contains("through_registry"),
-        "{callers}"
-    );
-}
-
-#[test]
-fn import_that_renames_a_registry_crate_shadows_the_local_crate() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    write_tree(
-        root,
-        &[
-            ("Cargo.toml", "[workspace]\nmembers = [\"ctrlc\"]\n"),
-            (
-                "ctrlc/Cargo.toml",
-                "[package]\nname = \"ctrlc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [dev-dependencies]\nupstream_ctrlc = { package = \"ctrlc\", version = \"=3.5.2\" }\n",
-            ),
-            (
-                "ctrlc/src/lib.rs",
-                "pub fn set_handler(handler: fn()) {\n    handler();\n}\n",
-            ),
-            (
-                "ctrlc/tests/signals.rs",
-                "fn direct() {\n    ctrlc::set_handler(|| {});\n}\n\
-                 fn scoped() {\n    use upstream_ctrlc as ctrlc;\n    ctrlc::set_handler(|| {});\n}\n\
-                 mod shadow {\n    use upstream_ctrlc as ctrlc;\n    fn renamed_registry() {\n        ctrlc::set_handler(|| {});\n    }\n\
-                 \x20   mod nested {\n        use super::*;\n        fn globbed_registry() {\n            ctrlc::set_handler(|| {});\n        }\n    }\n}\n\
-                 mod reimport {\n    use ctrlc;\n    fn reimported_local() {\n        ctrlc::set_handler(|| {});\n    }\n}\n",
-            ),
-        ],
-    );
-    let callers = success(root, &["query", "ctrlc::set_handler", "--view", "callers"]);
-    for expected in [
-        "ctrlc_test_signals::direct at ctrlc/tests/signals.rs:2",
-        "ctrlc_test_signals::reimport::reimported_local at ctrlc/tests/signals.rs:23",
-    ] {
-        assert!(callers.contains(expected), "{expected}\n{callers}");
-    }
-    for unexpected in ["scoped", "renamed_registry", "globbed_registry"] {
-        assert!(!callers.contains(unexpected), "{unexpected}\n{callers}");
-    }
-}
-
-#[test]
-fn platform_specific_path_dependency_resolves_to_the_workspace_crate() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    write_tree(
-        root,
-        &[
-            (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"engine\", \"platform\", \"other\"]\n",
-            ),
-            (
-                "engine/Cargo.toml",
-                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
-            ("engine/src/lib.rs", "pub fn start() {}\n"),
-            (
-                "platform/Cargo.toml",
-                "[package]\nname = \"platform\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [target.'cfg(unix)'.dependencies]\nengine = { path = \"../engine\" }\n",
-            ),
-            (
-                "platform/src/lib.rs",
-                "pub fn install() {\n    engine::start();\n}\n",
-            ),
-            // A platform-specific registry dependency stays external.
-            (
-                "other/Cargo.toml",
-                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [target.'cfg(windows)'.dependencies]\nengine = \"1\"\n",
-            ),
-            (
-                "other/src/lib.rs",
-                "pub fn published() {\n    engine::start();\n}\n",
-            ),
-        ],
-    );
-    let callers = success(root, &["query", "engine::start", "--view", "callers"]);
-    assert!(
-        callers.contains("platform::install at platform/src/lib.rs:2"),
-        "{callers}"
-    );
-    assert!(!callers.contains("published"), "{callers}");
 }
 
 #[test]
 fn inherited_dependency_resolves_by_name_when_the_workspace_root_is_outside_the_index() {
-    let repo = TempDir::new().unwrap();
-    let root = repo.path();
-    write_tree(
-        root,
+    let repo = dependency_workspace(
+        "[workspace.dependencies]\nmy-util = { path = \"crates/util\" }\n",
         &[
+            ("crates/util", "my-util", "", "pub fn helper() {}\n"),
             (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"crates/util\", \"crates/app\", \"crates/other\"]\n\n\
-                 [workspace.dependencies]\nmy-util = { path = \"crates/util\" }\n",
-            ),
-            (
-                "crates/util/Cargo.toml",
-                "[package]\nname = \"my-util\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-            ),
-            ("crates/util/src/lib.rs", "pub fn helper() {}\n"),
-            (
-                "crates/app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\nmy-util.workspace = true\n",
-            ),
-            (
-                "crates/app/src/lib.rs",
+                "crates/app",
+                "app",
+                "[dependencies]\nmy-util.workspace = true\n",
                 "pub fn inherited() {\n    my_util::helper();\n}\n",
             ),
             // A registry dependency names a version and no path, so it stays external.
             (
-                "crates/other/Cargo.toml",
-                "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-                 [dependencies]\nmy-util = \"1\"\n",
-            ),
-            (
-                "crates/other/src/lib.rs",
+                "crates/other",
+                "other",
+                "[dependencies]\nmy-util = \"1\"\n",
                 "pub fn published() {\n    my_util::helper();\n}\n",
             ),
         ],
     );
     for (args, expected) in [
         (
-            &[
-                "--root",
-                "crates",
-                "query",
-                "my_util::helper",
-                "--view",
-                "callers",
-            ][..],
+            "--root crates query my_util::helper --view callers",
             "app::inherited at app/src/lib.rs:2",
         ),
         (
-            &["query", "my_util::helper", "--view", "callers"][..],
+            "query my_util::helper --view callers",
             "app::inherited at crates/app/src/lib.rs:2",
         ),
     ] {
-        let callers = success(root, args);
+        let callers = success(repo.path(), &argv(args));
         assert!(callers.contains(expected), "{expected}\n{callers}");
         assert!(!callers.contains("published"), "{callers}");
     }
