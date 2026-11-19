@@ -214,6 +214,11 @@ impl<'a> Batch<'a> {
                     status = 0;
                     (text, Some(source))
                 }
+                Source::Object(spec) => {
+                    let (text, source) = files.object(&dir, spec, &piece.filters)?;
+                    status = 0;
+                    (text, Some(source))
+                }
                 Source::Git(words) => {
                     if repo.as_ref().is_none_or(|(repo_dir, _)| repo_dir != &dir) {
                         repo = Some((dir.clone(), git::Repository::open(ws, &dir, deadline)?));
@@ -394,7 +399,9 @@ fn render(
             None
         } else {
             match &item.piece.source {
-                Source::File { .. } => files.outline(item.source.as_ref()?, text, limit),
+                Source::File { .. } | Source::Object(_) => {
+                    files.outline(item.source.as_ref()?, text, limit)
+                }
                 Source::Search(words) => {
                     let args = words.iter().map(String::as_str).collect::<Vec<_>>();
                     let mut engine = crate::search::Search::new(&item.dir, &args);

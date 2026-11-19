@@ -43,6 +43,13 @@ pub fn commands() -> Vec<Cli<'static>> {
                     .help("Return a structured outline"),
             )
             .arg(
+                Arg::new("shell-object")
+                    .long("shell-object")
+                    .value_name("ID")
+                    .hidden(true)
+                    .requires("shell-range"),
+            )
+            .arg(
                 Arg::new("shell-session")
                     .long("shell-session")
                     .value_name("ID")
@@ -761,11 +768,12 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
     if name == "read"
         && let Some(range) = args.value_of("shell-range")
     {
-        // The hook passes the already resolved, workspace-relative file.
+        // The hook passes the already resolved, workspace-relative file, or the
+        // `git show` object name with the blob it resolved to.
         return crate::shellread::read(
             ws,
-            Snapshot::open(ws, argument)?,
             argument,
+            args.value_of("shell-object"),
             range,
             args.value_of("shell-session").unwrap_or("terminal"),
         );

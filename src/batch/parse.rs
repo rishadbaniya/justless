@@ -22,6 +22,8 @@ pub(super) enum Source {
         select: Filter,
         numbered: bool,
     },
+    /// `git show REV:path`: a file as a revision or the index holds it.
+    Object(String),
     Git(Vec<String>),
     Search(Vec<String>),
 }
@@ -155,7 +157,9 @@ fn piece<'a>(
         crate::wrappers::effective(&refs)?
     };
     let (program, args) = words.split_first()?;
+    let object = crate::shellread::show(&words).map(str::to_owned);
     let source = match program.as_str() {
+        "git" if object.is_some() => Source::Object(object?),
         "git" if super::git::supported(args) => Source::Git(words),
         "rg" | "grep" if search_paths(&words).is_some() => Source::Search(words),
         "sed" | "cat" | "head" | "tail" | "nl" => {
@@ -184,7 +188,11 @@ fn piece<'a>(
         let (program, args) = words.split_first()?;
         filters.push(match program.as_str() {
             "sed"
-                if filters.is_empty() && matches!(source, Source::File { numbered: true, .. }) =>
+                if filters.is_empty()
+                    && matches!(
+                        source,
+                        Source::File { numbered: true, .. } | Source::Object(_)
+                    ) =>
             {
                 sed(args)?
             }
@@ -220,10 +228,19 @@ fn enter(base: &mut Option<String>, dir: &str) {
     *base = Some(joined);
 }
 
+/// The shell expands an unquoted `~` at the start of a word or after `=` or
+/// `:`, so only one inside a name such as `HEAD~1` is literal.
+fn tilde(command: &str, at: usize) -> bool {
+    command[..at]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || "^~_.-/@".contains(c))
+}
+
 fn literal(command: &str) -> bool {
     let mut quote = None;
     let mut chars = command.char_indices().peekable();
-    while let Some((_, c)) = chars.next() {
+    while let Some((i, c)) = chars.next() {
         if let Some(q) = quote {
             if c == q {
                 quote = None;
@@ -243,6 +260,7 @@ fn literal(command: &str) -> bool {
                 Some((_, next)) if !next.is_control() => {}
                 _ => return false,
             },
+            '~' if tilde(command, i) => {}
             ';' | '|' | '&' | '$' | '`' | '(' | ')' | '<' | '>' | '{' | '}' | '[' | ']' | '*'
             | '?' | '#' | '~' | '!' => return false,
             c if c.is_control() && c != '\t' => return false,
@@ -362,6 +380,7 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
                 segment = start;
                 join = next;
             }
+            '~' if tilde(command, i) => {}
             '$' | '`' | '(' | ')' | '<' | '>' | '{' | '}' | '[' | ']' | '*' | '?' | '#' | '~'
             | '!' => return None,
             c if c.is_control() && c != '\t' => return None,
@@ -389,4 +408,21 @@ pub(super) fn list(command: &str) -> Option<Vec<Piece<'_>>> {
         return None;
     }
     (1..=32).contains(&pieces.len()).then_some(pieces)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_a_tilde_inside_a_word_is_literal() {
+        assert!(super::list("git show HEAD~1:a.rs; sed -n 1,2p b").is_some());
+        assert!(super::single("timeout 5 git show main~2:a.rs").is_some());
+        for list in [
+            "cat ~/a; cat b",
+            "cat a; cat x=~/b",
+            "git show HEAD:~/a; cat b",
+            "cat a;~/b",
+        ] {
+            assert!(super::list(list).is_none(), "{list}");
+        }
+    }
 }

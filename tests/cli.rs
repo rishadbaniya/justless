@@ -18324,6 +18324,144 @@ fn tail_from_line_uses_the_current_eof_and_archives_the_exact_suffix() {
     assert_eq!(stats["net_saved_bytes"], -(shown as i64));
 }
 
+#[cfg(unix)]
+#[test]
+fn git_show_reads_outline_the_blob_at_their_revision() {
+    use serde_json::json;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    let version = |name: &str| {
+        (0..120)
+            .map(|i| format!("def {name}_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    return round(taxed, 2)\n\n"))
+            .collect::<String>()
+    };
+    git(&root, &["init", "-q"]);
+    fs::write(sub.join("prices.py"), version("old")).unwrap();
+    fs::write(root.join("blob.bin"), [0u8, 1, 2].repeat(4000)).unwrap();
+    fs::write(root.join("small.py"), "def tiny():\n    return 1\n").unwrap();
+    let notes = (0..600).map(|i| format!("note {i}: plain text the parsers do not outline\n"));
+    fs::write(root.join("notes.txt"), notes.collect::<String>()).unwrap();
+    // A guide that quotes a run marker is still a blob to outline.
+    let guide = (0..12).map(|i| format!("## Part {i}\n\n{}\n", "Steps and notes.\n".repeat(30)));
+    let guide = guide.collect::<String>() + "[justless run-Ab12 · 1.0 KB of 9.0 KB shown]\n";
+    fs::write(root.join("guide.md"), guide).unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "one"]);
+    fs::write(sub.join("prices.py"), version("price")).unwrap();
+    git(&root, &["commit", "-qam", "two"]);
+    fs::write(sub.join("prices.py"), version("staged")).unwrap();
+    git(&root, &["add", "-A"]);
+    fs::write(sub.join("prices.py"), version("disk")).unwrap();
+    let native = |cwd: &Path, command: &str| {
+        let output = Command::new("sh")
+            .args(["-c", command])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        (
+            output.stdout,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let replay = |shown: &str| {
+        let id = shown
+            .split_whitespace()
+            .find(|word| word.starts_with("run-"))
+            .unwrap_or_else(|| panic!("no run: {shown}"));
+        cli(&root, &["log", id, "--unredacted"]).stdout
+    };
+    // Claude Code runs the command; the outline describes the blob it printed.
+    for (cwd, command, name) in [
+        (&root, "git show HEAD~1:sub/prices.py", "function old_0"),
+        (&sub, "git show :./prices.py", "function staged_0"),
+        (
+            &root,
+            "git --no-pager show HEAD:sub/prices.py",
+            "function price_0",
+        ),
+        (&root, "git show HEAD:guide.md", "heading Part 0"),
+    ] {
+        let (real, _) = native(cwd, command);
+        let text = std::str::from_utf8(&real).unwrap();
+        let shown = shown_stdout(&after_bash(
+            &root,
+            cwd,
+            command,
+            json!({"stdout":text,"stderr":"","interrupted":false}),
+        ));
+        assert!(shown.len() * 4 < real.len(), "{command}: {shown}");
+        assert!(
+            shown.contains(name) && !shown.contains("disk_"),
+            "{command}: {shown}"
+        );
+        assert_eq!(replay(&shown), real, "{command}");
+    }
+    let header = "HEAD~1:sub/prices.py lines 1-600";
+    let pre = |client: &str, command: &str| {
+        agent_hook(
+            &root,
+            client,
+            "before-command",
+            json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":command}}),
+        )["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // Claude Code runs the command itself. Codex runs a read of the blob id the
+    // name resolved to in the hook, or the run route when no outline would fit.
+    assert_eq!(pre("hook-claude", "git show HEAD~1:sub/prices.py"), "");
+    assert!(pre("hook-codex", "git show HEAD:notes.txt").starts_with("justless run "));
+    let rewritten = pre("hook-codex", "git show HEAD~1:sub/prices.py");
+    assert!(rewritten.contains("--shell-object "), "{rewritten}");
+    let argv = shlex::split(&rewritten).unwrap();
+    let output = cli(
+        &root,
+        &argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>(),
+    );
+    let shown = String::from_utf8(output.stdout).unwrap();
+    assert!(shown.starts_with(header), "{shown}");
+    assert_eq!(
+        replay(&shown),
+        native(&root, "git show HEAD~1:sub/prices.py").0
+    );
+    // A wide blob without an outline gets the ordinary run report.
+    let (real, _) = native(&root, "git show HEAD:notes.txt");
+    let shown = shown_stdout(&after_bash(
+        &root,
+        &root,
+        "git show HEAD:notes.txt",
+        json!({"stdout":String::from_utf8(real).unwrap(),"stderr":"","interrupted":false}),
+    ));
+    assert!(shown.contains("[justless run-"), "{shown}");
+    // Small, binary, tree and missing objects keep their usual handling.
+    for command in [
+        "git show HEAD:small.py",
+        "git show HEAD:blob.bin",
+        "git show HEAD:sub",
+        "git show HEAD:missing.py",
+    ] {
+        assert!(
+            !pre("hook-codex", command).contains("--shell-object"),
+            "{command}"
+        );
+        let (real, stderr) = native(&root, command);
+        let result = after_bash(
+            &root,
+            &root,
+            command,
+            json!({"stdout":String::from_utf8_lossy(&real),"stderr":stderr,"interrupted":false}),
+        );
+        assert!(
+            !result.to_string().contains(" lines 1-"),
+            "{command}: {result}"
+        );
+    }
+}
+
 #[test]
 fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
     use serde_json::json;

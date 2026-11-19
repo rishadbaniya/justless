@@ -12,7 +12,12 @@ pub(super) struct Files {
 }
 
 pub(super) struct SourceLines {
+    /// The loaded text: a workspace path, or a blob id and path.
+    key: String,
+    /// What the outline header calls it, such as `HEAD~1:src/a.rs`.
     name: String,
+    /// The path that picks the parser.
+    path: String,
     spans: Vec<(usize, usize)>,
     cut: bool,
 }
@@ -58,7 +63,41 @@ impl Files {
             }
             self.files.insert(name.to_owned(), snap);
         }
-        let snap = self.files.get(name)?;
+        self.select(name, name, name, select, numbered, filters)
+    }
+
+    /// The blob `git show SPEC` prints in `cwd`, which outlines as the text at
+    /// that revision. Its key cannot collide with a workspace path.
+    pub fn object(
+        &mut self,
+        cwd: &Path,
+        spec: &str,
+        filters: &[Filter],
+    ) -> Option<(String, SourceLines)> {
+        let path = crate::shellread::blob_path(spec)?;
+        let (id, text) = crate::shellread::object(cwd, spec, MAX_BYTES as u64)?;
+        let key = format!("\0{id}\0{path}");
+        if !self.files.contains_key(&key) {
+            self.bytes += text.len();
+            if self.bytes > MAX_BYTES * 4 {
+                return None;
+            }
+            self.files
+                .insert(key.clone(), Snapshot::from_text(path, text));
+        }
+        self.select(&key, spec, path, &Filter::All, false, filters)
+    }
+
+    fn select(
+        &self,
+        key: &str,
+        name: &str,
+        path: &str,
+        select: &Filter,
+        numbered: bool,
+        filters: &[Filter],
+    ) -> Option<(String, SourceLines)> {
+        let snap = self.files.get(key)?;
         let mut rows = Vec::new();
         for (i, line) in snap.text.split_inclusive('\n').enumerate() {
             if i >= 100_000 {
@@ -100,7 +139,9 @@ impl Files {
         Some((
             text,
             SourceLines {
+                key: key.to_owned(),
                 name: name.to_owned(),
+                path: path.to_owned(),
                 spans,
                 cut: filters.iter().any(|f| matches!(f, Filter::Columns(_))),
             },
@@ -116,11 +157,11 @@ impl Files {
         if source.spans.is_empty() {
             return None;
         }
-        let snap = self.files.get_mut(&source.name)?;
+        let snap = self.files.get_mut(&source.key)?;
         if snap.symbols().is_empty() {
-            snap.index(&source.name).ok()?;
+            snap.index(&source.path).ok()?;
         }
-        if crate::agents::uncovered_code(&source.name, snap)?
+        if crate::agents::uncovered_code(&source.path, snap)?
             .iter()
             .any(|&i| source.spans.iter().any(|&(a, b)| a - 1 <= i && i < b))
         {

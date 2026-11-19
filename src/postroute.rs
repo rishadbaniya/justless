@@ -140,13 +140,16 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         ]
         .iter()
         .any(|key| response.get(*key).is_some_and(|value| !value.is_null()))
-        || RUN_MARKER.is_match(stdout)
     {
         return None;
     }
+    // Output with a run marker was already routed, unless it is the text of a
+    // `git show` blob, which the read below matches byte for byte.
+    let routed = RUN_MARKER.is_match(stdout);
     // A batch the recheck cannot verify, such as a diff shaped by repository
     // settings, still gets the report for its one kind of command below.
     if !cfg!(windows)
+        && !routed
         && let Some(compacted) =
             crate::batch::Batch::parse(command).and_then(|batch| batch.compact(ws, input))
     {
@@ -156,7 +159,18 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         && let Some(words) = crate::agents::literal_command(command)
         && let Some((file, range)) = crate::shellread::command(&words)
     {
-        return crate::shellread::claude(ws, input, file, range);
+        // A `git show` blob that is not outlined gets the ordinary report below.
+        let object = range.object();
+        if routed && !object {
+            return None;
+        }
+        let compacted = crate::shellread::claude(ws, input, file, range);
+        if compacted.is_some() || !object {
+            return compacted;
+        }
+    }
+    if routed {
+        return None;
     }
     let settings = ws.settings().ok()?;
     let persisted = response.get("persistedOutputPath").and_then(Value::as_str);

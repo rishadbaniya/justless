@@ -1,8 +1,10 @@
-//! Single-file shell commands that read an inclusive source range.
+//! Single-file shell commands that read an inclusive source range, and
+//! `git show REV:path`, which prints a file as a revision or the index holds it.
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Component, Path};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -26,6 +28,9 @@ struct Span {
 #[derive(Clone)]
 pub(crate) struct LineRange {
     spans: Vec<Span>,
+    /// The operand names a Git object, such as `HEAD~1:src/a.rs`, rather than
+    /// a file in the working tree.
+    object: bool,
 }
 
 fn decimal(text: &str) -> Option<usize> {
@@ -57,7 +62,16 @@ impl Span {
 
 impl LineRange {
     fn one(span: Span) -> Self {
-        Self { spans: vec![span] }
+        Self {
+            spans: vec![span],
+            object: false,
+        }
+    }
+
+    /// Whether the read is a `git show` of an object, which falls back to the
+    /// ordinary run report when it cannot be outlined.
+    pub(crate) fn object(&self) -> bool {
+        self.object
     }
 
     /// A `sed -n` script of `A,Bp` addresses, one or several joined by `;`,
@@ -67,7 +81,10 @@ impl LineRange {
             .split(';')
             .map(|part| Span::closed(part.strip_suffix('p')?, ','))
             .collect::<Option<Vec<_>>>()?;
-        Some(Self { spans })
+        Some(Self {
+            spans,
+            object: false,
+        })
     }
 
     /// The `read --shell-range` argument: `A-B` and `+N` windows joined by commas.
@@ -76,13 +93,117 @@ impl LineRange {
             .split(',')
             .map(|part| Span::tail(part).or_else(|| Span::closed(part, '-')))
             .collect::<Option<Vec<_>>>()?;
-        Some(Self { spans })
+        Some(Self {
+            spans,
+            object: false,
+        })
     }
 }
 
+/// The object name in `git show REV:path`, `git show REV:./path` or
+/// `git show :path` (the index), also after `git --no-pager`.
+pub(crate) fn show(words: &[String]) -> Option<&str> {
+    let spec = match words {
+        [git, show, spec] if git == "git" && show == "show" => spec,
+        [git, pager, show, spec] if git == "git" && pager == "--no-pager" && show == "show" => spec,
+        _ => return None,
+    };
+    blob_path(spec).map(|_| spec.as_str())
+}
+
+/// The path part of an object name that names a file, such as `src/a.rs` in
+/// `HEAD~1:./src/a.rs`. The revision is a plain name with `~`, `^` and `@`, so
+/// a `:/text` message search, a `:N:path` stage or a `^{type}` peel is not one.
+pub(crate) fn blob_path(spec: &str) -> Option<&str> {
+    let (rev, path) = spec.split_once(':')?;
+    if rev.starts_with('-')
+        || !rev
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/~^@".contains(&b))
+    {
+        return None;
+    }
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let normal = Path::new(path)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)));
+    (normal
+        && !path.is_empty()
+        && !path.starts_with('-')
+        && !path.ends_with('/')
+        && !path.contains(':')
+        && !path.chars().any(char::is_control))
+    .then_some(path)
+}
+
+/// A Git invocation that only reads: no optional locks, no fsmonitor hook, and
+/// no fetch of an object a partial clone left out.
+fn git(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["--no-pager", "-c", "core.fsmonitor=false"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// The text of blob `id`, as `git show` prints it: no text conversion, at most
+/// `cap` bytes, UTF-8 without NUL bytes. A tree, a submodule commit or any
+/// other object type fails `cat-file blob`.
+fn blob(dir: &Path, id: &str, cap: u64) -> Option<String> {
+    if ![40, 64].contains(&id.len()) || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut child = git(dir)
+        .args(["cat-file", "blob", id])
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()?
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() as u64 > cap {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    if !child.wait().ok()?.success() || bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// The blob that `git show SPEC` prints in `dir`, and its id.
+pub(crate) fn object(dir: &Path, spec: &str, cap: u64) -> Option<(String, String)> {
+    blob_path(spec)?;
+    let output = git(dir)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options", spec])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8(output.stdout).ok()?;
+    let id = id.strip_suffix('\n')?.to_owned();
+    let text = blob(dir, &id, cap)?;
+    Some((id, text))
+}
+
 /// A standalone single-file read: `sed -n 'A,Bp[;C,Dp…]' FILE`,
-/// `head -n N FILE`, `tail -n N FILE` or `tail -n +N FILE`.
+/// `head -n N FILE`, `tail -n N FILE`, `tail -n +N FILE` or `git show REV:path`,
+/// whose operand is then the object name.
 pub(crate) fn command(words: &[String]) -> Option<(&str, LineRange)> {
+    if let Some(spec) = show(words) {
+        let mut range = LineRange::one(Span::tail("+1")?);
+        range.object = true;
+        return Some((spec, range));
+    }
     let [program, flag, address, file] = words else {
         return None;
     };
@@ -121,7 +242,10 @@ struct Window {
 
 struct Selection {
     source: Snapshot,
+    /// The workspace file, or for a Git object its path, which picks the parser.
     file: String,
+    /// For `git show`: the object name as the command gave it, and the blob id.
+    object: Option<(String, String)>,
     windows: Vec<Window>,
     text: String,
     /// The last window stops at a requested line rather than at the end of
@@ -156,10 +280,36 @@ impl Selection {
         Some(Self {
             source,
             file: file.to_owned(),
+            object: None,
             windows,
             text,
             closed,
         })
+    }
+
+    /// The blob `git show SPEC` prints in `dir`, as `id` when the hook already
+    /// resolved the name.
+    fn object(
+        ws: &Workspace,
+        dir: &Path,
+        spec: &str,
+        id: Option<&str>,
+        range: &LineRange,
+    ) -> Option<Self> {
+        let path = blob_path(spec)?;
+        let cap = ws.settings().ok()?.max_file_bytes;
+        let (id, text) = match id {
+            Some(id) => (id.to_owned(), blob(dir, id, cap)?),
+            None => object(dir, spec, cap)?,
+        };
+        let mut read = Self::new(Snapshot::from_text(path, text), path, range)?;
+        read.object = Some((spec.to_owned(), id));
+        Some(read)
+    }
+
+    /// How the outline header names the read.
+    fn name(&self) -> &str {
+        self.object.as_ref().map_or(&self.file, |(spec, _)| spec)
     }
 
     /// The windows as `read --shell-range` and the outline header name them.
@@ -180,6 +330,11 @@ impl Selection {
     }
 
     fn open(ws: &Workspace, cwd: &Path, file: &str, range: &LineRange) -> Option<Self> {
+        if range.object {
+            return cwd
+                .starts_with(&ws.root)
+                .then(|| Self::object(ws, cwd, file, None, range))?;
+        }
         let path = cwd.join(file);
         let relative = path.strip_prefix(&ws.root).ok()?;
         if relative.components().any(|c| c == Component::ParentDir) {
@@ -195,6 +350,10 @@ impl Selection {
     }
 
     fn observe(&self, ws: &Workspace, outline: bool) {
+        // A blob from a revision or the index is not the working file.
+        if self.object.is_some() {
+            return;
+        }
         let digest = capture::source_digest(self.source.text.as_bytes());
         for window in &self.windows {
             history::saw_range(
@@ -246,7 +405,7 @@ impl Selection {
             .map(|window| format!("{}-{}", window.first, window.last))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut outline = format!("{} lines {shown}\n", self.file);
+        let mut outline = format!("{} lines {shown}\n", self.name());
         let mut count = 0;
         let mut shown = 0;
         for (name, kind, a, b) in self.source.symbols() {
@@ -291,30 +450,17 @@ impl Selection {
         claude: bool,
     ) -> Option<String> {
         let outline = self.outline(ws, baseline)?;
-        let (program, address) = match (&self.windows[..], self.closed) {
-            ([window], false) => ("tail", format!("+{}", window.first)),
-            (windows, closed) => {
-                let last = windows.len() - 1;
-                let script = windows
-                    .iter()
-                    .enumerate()
-                    .map(|(i, window)| {
-                        if i == last && !closed {
-                            format!("{},$p", window.first)
-                        } else {
-                            format!("{},{}p", window.first, window.last)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(";");
-                ("sed", script)
-            }
-        };
-        let words = [program, "-n", &address, &self.file];
+        let words = self.command();
         let args: Vec<_> = words.iter().map(OsString::from).collect();
         let origin = Origin {
-            command: shlex::try_join(words).ok()?,
-            label: program.into(),
+            command: shlex::try_join(words.iter().map(String::as_str)).ok()?,
+            // Kept apart from `git show` patches, whose preview budget adapts
+            // to how often their clipped runs are replayed.
+            label: if self.object.is_some() {
+                "git show REV:path".into()
+            } else {
+                words[0].clone()
+            },
             note: String::new(),
             outline: Some(SourceOutline {
                 text: outline,
@@ -340,10 +486,41 @@ impl Selection {
         self.observe(ws, true);
         Some(text)
     }
+
+    /// The command that prints these bytes, which keys the archived run.
+    fn command(&self) -> Vec<String> {
+        if let Some((spec, _)) = &self.object {
+            return vec!["git".into(), "show".into(), spec.clone()];
+        }
+        let (program, address) = match (&self.windows[..], self.closed) {
+            ([window], false) => ("tail", format!("+{}", window.first)),
+            (windows, closed) => {
+                let last = windows.len() - 1;
+                let script = windows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, window)| {
+                        if i == last && !closed {
+                            format!("{},$p", window.first)
+                        } else {
+                            format!("{},{}p", window.first, window.last)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                ("sed", script)
+            }
+        };
+        [program, "-n", &address, &self.file]
+            .map(str::to_owned)
+            .to_vec()
+    }
 }
 
 /// Other shell clients run a pure workspace read. Leave the native sed in
-/// charge where implementations disagree on an unterminated last line.
+/// charge where implementations disagree on an unterminated last line. A
+/// `git show` is pinned to the blob its name resolves to now, and rerouted only
+/// when the outline will shorten it.
 pub(crate) fn rewrite(
     ws: &Workspace,
     cwd: &Path,
@@ -357,10 +534,17 @@ pub(crate) fn rewrite(
     if range.spans.iter().any(|span| span.from_end) {
         return None;
     }
-    let read = Selection::open(ws, cwd, file, &range)?;
+    let mut read = Selection::open(ws, cwd, file, &range)?;
     if read.closed && !read.text().ends_with('\n') {
         return None;
     }
+    let object = match read.object.clone() {
+        Some((_, id)) => {
+            read.outline(ws, read.text.len())?;
+            format!(" --shell-object {id}")
+        }
+        None => String::new(),
+    };
     let session = session
         .filter(|id| !id.is_empty())
         .map(|id| {
@@ -371,23 +555,32 @@ pub(crate) fn rewrite(
         })
         .unwrap_or_default();
     Some(format!(
-        "justless --root {} read --shell-range {}{session} -- {}",
+        "justless --root {} read --shell-range {}{object}{session} -- {}",
         shell_quote(&ws.root),
         read.ranges(","),
-        shell_quote(Path::new(&read.file))
+        shell_quote(Path::new(read.name()))
     ))
 }
 
+/// `read --shell-range`: `file` is a workspace file, or with `object` the name
+/// a `git show` gave blob `object`.
 pub(crate) fn read(
     ws: &Workspace,
-    source: Snapshot,
     file: &str,
+    object: Option<&str>,
     range: &str,
     session: &str,
 ) -> Result<()> {
     let range = LineRange::parse(range)
         .context("expected positive line ranges A-B or +N, joined by commas")?;
-    let Some(mut read) = Selection::new(source, file, &range) else {
+    let read = match object {
+        Some(id) => Some(
+            Selection::object(ws, &ws.cwd, file, Some(id), &range)
+                .with_context(|| format!("read Git blob {id} as {file}"))?,
+        ),
+        None => Selection::new(Snapshot::open(ws, file)?, file, &range),
+    };
+    let Some(mut read) = read else {
         return Ok(());
     };
     let mut out = io::stdout().lock();
@@ -465,4 +658,48 @@ pub(crate) fn claude(ws: &Workspace, input: &Value, file: &str, range: LineRange
         updated.remove(key);
     }
     Some(json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":updated}}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{blob_path, command};
+
+    #[test]
+    fn git_show_names_a_file_in_a_revision_or_the_index() {
+        let words = |text: &str| shlex::split(text).unwrap();
+        for (spec, path) in [
+            ("HEAD:src/a.rs", "src/a.rs"),
+            ("HEAD~1:./a.rs", "a.rs"),
+            (":a.rs", "a.rs"),
+            ("main^:a", "a"),
+            ("@~2:a/b.py", "a/b.py"),
+        ] {
+            assert_eq!(blob_path(spec), Some(path), "{spec}");
+        }
+        for spec in [
+            "HEAD",
+            "HEAD:",
+            "HEAD:./",
+            ":/fix",
+            ":0:a.rs",
+            "HEAD:../a",
+            "HEAD^{tree}:a",
+            "-p:a",
+            "HEAD:src/",
+            "a b:c",
+        ] {
+            assert_eq!(blob_path(spec), None, "{spec}");
+        }
+        let unpaged = words("git --no-pager show HEAD:a.rs");
+        let (spec, range) = command(&unpaged).unwrap();
+        assert!(spec == "HEAD:a.rs" && range.object());
+        for text in [
+            "git show HEAD",
+            "git show HEAD:a.rs b.rs",
+            "git show -p HEAD:a.rs",
+            "git -C x show HEAD:a.rs",
+        ] {
+            assert!(command(&words(text)).is_none(), "{text}");
+        }
+    }
 }

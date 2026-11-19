@@ -439,3 +439,28 @@ fn a_batch_the_recheck_cannot_verify_still_gets_the_ordinary_report() {
         assert!(shown.contains("diff section(s)"), "{command}: {shown}");
     }
 }
+
+#[test]
+fn git_show_pieces_outline_the_blob_at_their_revision() {
+    let temp = fixture();
+    let dir = temp.path();
+    // HEAD~1 holds the first big.rs, the index a renamed copy and the disk a third.
+    native(
+        dir,
+        "git -c user.email=a@localhost -c user.name=fixture -c commit.gpgsign=false commit -qam second \
+         && sed 's/add_/staged_/' big.rs > staged && mv staged big.rs && git add big.rs \
+         && sed 's/staged_/disk_/' big.rs > disk && mv disk big.rs",
+    );
+    let list =
+        "git show HEAD~1:big.rs | sed -n '1,400p'; git show :big.rs | head -2; tail -1 notes";
+    let raw = native(dir, list);
+    let (view, _) = verified(dir, list, response(&raw), &raw);
+    assert!(
+        view.contains("HEAD~1:big.rs lines 1-400\n") && view.contains("function add_000"),
+        "{view}"
+    );
+    assert!(
+        view.contains("pub fn staged_000") && !view.contains("disk_"),
+        "{view}"
+    );
+}

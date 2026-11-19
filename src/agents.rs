@@ -1491,7 +1491,12 @@ fn wrap_event(
             if rules.claude {
                 return None;
             }
-            return crate::shellread::rewrite(workspace, cwd, file, range, session);
+            // A `git show` blob the read would not outline keeps the run route.
+            let object = range.object();
+            let rewritten = crate::shellread::rewrite(workspace, cwd, file, range, session);
+            if rewritten.is_some() || !object {
+                return rewritten;
+            }
         }
         if let [program, file] = words.as_slice()
             && program == "cat"
