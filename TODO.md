@@ -122,11 +122,12 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 
 ## 3. Next features (not started unless noted)
 
-### 3.1 Show what changed since the agent last read a symbol — top token idea from a reviewer
-- **Problem.** The read → edit → test → inspect loop resends whole functions. A reviewer inspected a real test with `context --symbol`, changed one line, inspected again, and got 2,342 bytes for 46 lines.
-- **Plan.** `context` and `pack` remember the revision of each symbol actually shown in the current session; the next read of a changed symbol shows the changed lines with surrounding context and a command to expand the whole function; after compaction or in a new session, full context again.
-- **Progress.** *not started*. The pieces exist: revision-bound outlines, the session ID on hook runs, and the activity file that 2.5 extends.
-- **Measure.** Total input tokens and task success over complete tasks, not bytes per call (use the benchmark in 5.1).
+### 3.1 Show what changed since the agent last read a symbol — done, default activation pending
+- **Progress.** *on main* (2026-11-19, `src/seen.rs`). In one session, `context --symbol`, `context --at` and `pack` print only the changed lines of a symbol read before (a real 46-line test with one line edited: 2,039 → 512 bytes; unchanged re-read: 150 bytes), with an exact `expand` command for the whole symbol; compaction hooks forget the records. Sessions come from `--session` or `CLAUDE_CODE_SESSION_ID`, which is ignored when `CLAUDE_CODE_CHILD_SESSION` is set. That flag turned out to be set in top-level Claude Code sessions too, so today deltas need `--session`; see 4.H.
+
+### 4.H Turn changed-since-read on by default
+- Have the Claude Code PreToolUse hook pass a precise session (session ID plus subagent ID, so a subagent's reads never hide text from its parent) to `justless context` and `pack` commands it sees, instead of relying on `CLAUDE_CODE_SESSION_ID`, which is the same in subagents. Mention deltas and `--fresh` in the instruction template, and count delta savings in `stats`.
+- **Progress.** *in progress*.
 
 ### 3.2 `justless test --compare REF` — done
 - **Progress.** *on main* (2026-11-19). Runs the tests in the working tree, reruns only the failing ones at the merge base in a temporary worktree (base builds in `.justless/compare/cargo-target`), and groups them as new failures, changed failures and already failing with the same normalized message. Cargo and pytest (pytest only tested against a stand-in; real pytest still to confirm); other runners say "not supported". Works with `--affected` and `--base`. Exit status is the working tree's.
