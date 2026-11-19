@@ -299,7 +299,7 @@ impl<'a> Batch<'a> {
                 }
             }
         }
-        let text = render(&mut files, &verified, actual, budget)?;
+        let (text, verbatim) = render(&mut files, &verified, actual, budget)?;
         if Instant::now() >= deadline {
             return None;
         }
@@ -318,7 +318,7 @@ impl<'a> Batch<'a> {
             .as_str()
             .filter(|s| !s.is_empty())
             .map(|s| capture::source_digest(s.as_bytes())[..24].to_owned());
-        let ranges = verified.into_iter().map(|v| v.range).collect::<Vec<_>>();
+        let ranges = verified.iter().map(|v| v.range.clone()).collect::<Vec<_>>();
         let config = crate::redact::for_run(ws).ok()?;
         if config.is_some_and(|r| matches!(r.text(actual), std::borrow::Cow::Owned(_))) {
             return None;
@@ -347,6 +347,14 @@ impl<'a> Batch<'a> {
         ] {
             updated.remove(key);
         }
+        // Only a list whose result is replaced records what the agent saw.
+        for (item, verbatim) in verified.iter().zip(verbatim) {
+            if let Some(source) = &item.source
+                && item.range.first_line.is_some()
+            {
+                files.observe(ws, source, verbatim);
+            }
+        }
         Some(
             json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":updated}}),
         )
@@ -373,7 +381,7 @@ fn render(
     items: &[Verified<'_>],
     output: &str,
     budget: usize,
-) -> Option<String> {
+) -> Option<(String, Vec<bool>)> {
     let headers: Vec<_> = items
         .iter()
         .map(|item| {
@@ -388,6 +396,8 @@ fn render(
     let mut order = (0..items.len()).collect::<Vec<_>>();
     order.sort_by_key(|&i| items[i].range.end_byte - items[i].range.start_byte);
     let mut bodies = vec![String::new(); items.len()];
+    // Whether each piece's bytes are shown as they are.
+    let mut verbatim = vec![false; items.len()];
     for (pos, i) in order.into_iter().enumerate() {
         let item = &items[i];
         let limit = remaining / (items.len() - pos);
@@ -426,6 +436,7 @@ fn render(
             .filter(|s| !s.is_empty() && s.len() <= limit && s.len() < text.len())
             .unwrap_or_else(|| excerpt(text, limit));
         remaining = remaining.checked_sub(body.len())?;
+        verbatim[i] = text.len() <= limit;
         bodies[i] = body;
     }
     let mut out = String::new();
@@ -436,7 +447,7 @@ fn render(
             out.push('\n');
         }
     }
-    Some(out)
+    Some((out, verbatim))
 }
 
 #[cfg(test)]

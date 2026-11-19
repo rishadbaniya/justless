@@ -115,6 +115,22 @@ fn verified(dir: &Path, list: &str, event: Value, expected: &str) -> (String, Va
     (view.to_owned(), record)
 }
 
+/// The source `resume` lists as read or outlined, newest first.
+fn resume_reads(dir: &Path) -> Vec<String> {
+    let out = Command::new(BIN)
+        .args(["resume", "--budget", "100000"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("Read ") || line.starts_with("Outline "))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
 fn mixed_read_list_retains_each_pipeline_and_one_exact_replay() {
     let temp = fixture();
@@ -155,6 +171,31 @@ fn mixed_read_list_retains_each_pipeline_and_one_exact_replay() {
         record["preview_bytes"].as_u64().unwrap() + record["footer_bytes"].as_u64().unwrap(),
         view.len() as u64
     );
+    // Each file piece is recorded as the single-file read records it: lines
+    // shown in full as read, an outline or a column cut as an outline.
+    let mut reads = resume_reads(dir);
+    reads.sort();
+    assert_eq!(
+        reads,
+        [
+            "Outline big.rs:1-170",
+            "Outline big.rs:222-348",
+            "Outline notes:1-2",
+            "Read notes:2-2",
+            "Read part:1-1",
+        ]
+    );
+    fs::write(dir.join("notes"), "alpha\nbeta\n").unwrap();
+    let stale = resume_reads(dir);
+    assert_eq!(
+        stale
+            .iter()
+            .filter(|r| r.ends_with(" [source changed]"))
+            .count(),
+        2,
+        "{stale:?}"
+    );
+    assert!(stale.contains(&"Read notes:2-2 [source changed]".to_owned()));
 }
 
 #[test]
@@ -216,6 +257,7 @@ fn unsupported_mismatched_and_small_batches_leave_no_run() {
         assert_eq!(hook(dir, list, Some(response(&body))), json!({}), "{list}");
     }
     assert!(!dir.join(".justless/runs").exists());
+    assert!(resume_reads(dir).is_empty());
     assert!(!dir.join("unexpected").exists());
 }
 
@@ -464,4 +506,6 @@ fn git_show_pieces_outline_the_blob_at_their_revision() {
         view.contains("pub fn staged_000") && !view.contains("disk_"),
         "{view}"
     );
+    // A blob shows a revision, not the working file.
+    assert_eq!(resume_reads(dir), ["Read notes:2-2"]);
 }

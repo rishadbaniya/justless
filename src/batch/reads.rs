@@ -20,6 +20,8 @@ pub(super) struct SourceLines {
     path: String,
     spans: Vec<(usize, usize)>,
     cut: bool,
+    /// A `git show` blob, which shows a revision rather than the working file.
+    object: bool,
 }
 
 struct Row {
@@ -85,7 +87,9 @@ impl Files {
             self.files
                 .insert(key.clone(), Snapshot::from_text(path, text));
         }
-        self.select(&key, spec, path, &Filter::All, false, filters)
+        let (text, mut source) = self.select(&key, spec, path, &Filter::All, false, filters)?;
+        source.object = true;
+        Some((text, source))
     }
 
     fn select(
@@ -144,8 +148,30 @@ impl Files {
                 path: path.to_owned(),
                 spans,
                 cut: filters.iter().any(|f| matches!(f, Filter::Columns(_))),
+                object: false,
             },
         ))
+    }
+
+    /// Records the lines of a workspace file a replaced list showed, for
+    /// `resume` and its `[source changed]` notice, as a single-file read does.
+    /// Lines shown in full count as read; an outline, an excerpt or a column
+    /// cut counts as an outline of the same lines.
+    pub fn observe(&self, ws: &Workspace, source: &SourceLines, verbatim: bool) {
+        let Some(snap) = self.files.get(&source.key).filter(|_| !source.object) else {
+            return;
+        };
+        let digest = crate::capture::source_digest(snap.text.as_bytes());
+        for &(first, last) in &source.spans {
+            crate::history::saw_range(
+                ws,
+                &source.path,
+                first,
+                last,
+                digest.clone(),
+                !verbatim || source.cut,
+            );
+        }
     }
 
     pub fn outline(
