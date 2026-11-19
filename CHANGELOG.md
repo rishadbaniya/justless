@@ -67,6 +67,7 @@ Details: [Recoverable tool history](docs/reference.md#recoverable-tool-history) 
 - Hooks route supported commands in `&&`, `||` and `;` lists, after `NAME=value` and before a final `2>&1`; Codex, Cursor and Antigravity CLI, whose hooks approve the rewrite, route only local tools.
 - The Claude Code hook keeps your permission rules in force by judging the original command, and `doctor` warns about rules such as `Bash(justless run *)`.
 - While a `Read`, `Edit` or `Write` deny or ask rule exists, the Claude Code hook leaves file-reading commands such as `rg SECRET .env` as written in every permission mode.
+- The Codex hook reads a code-mode script's lines as a list, turns each file read in a list into a `justless read`, and runs a supported command piped into `head -n N` through Justless with the `head` kept; every hook also reads `cat -n FILE` or `nl -ba FILE` piped into `sed -n` or `head -n` as a numbered range read.
 - Hooks that approve rewrites, Codex, Cursor and Antigravity, leave commands with options that run other programs or code, such as `rg --pre`, `rg --hostname-bin` or `go vet -vettool`.
 - A `.justless.toml` that fails to load makes every hook leave commands as written instead of routing them into a run that stops on the error.
 - `exclude_commands` entries match a command's shell words, whatever its spacing or quoting.

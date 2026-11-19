@@ -22,8 +22,8 @@ pub struct Form {
 }
 
 /// Whether `bytes[at]` is the `>` of a `2>&1` that ends its command: it follows a
-/// blank, and only blanks lie between it and the end of the line, a `;`, or a
-/// blank-separated `&&` or `||`. A command list may contain it there, and `parse`
+/// blank, and only blanks lie between it and the end of the line, a `;`, a
+/// newline, or a blank-separated `&&` or `||`. A command list may contain it there, and `parse`
 /// keeps it out of the command words. Anywhere else, such as before `cd` in
 /// `2>&1 cd /tmp`, the list passes through.
 pub fn merge_at(bytes: &[u8], at: usize) -> bool {
@@ -36,9 +36,10 @@ pub fn merge_at(bytes: &[u8], at: usize) -> bool {
         .iter()
         .position(|byte| !blank(byte))
         .unwrap_or(rest.len())..];
-    rest.first().is_none_or(|byte| blank(byte) || *byte == b';')
+    rest.first()
+        .is_none_or(|byte| blank(byte) || matches!(byte, b';' | b'\n'))
         && (next.is_empty()
-            || next[0] == b';'
+            || matches!(next[0], b';' | b'\n')
             || next.starts_with(b"&&")
             || next.starts_with(b"||"))
 }
@@ -48,7 +49,7 @@ pub fn merge_at(bytes: &[u8], at: usize) -> bool {
 pub fn merges(rest: &str) -> bool {
     rest.trim_start_matches([' ', '\t'])
         .strip_prefix(MERGE)
-        .is_some_and(|after| after.is_empty() || after.starts_with([' ', '\t', ';']))
+        .is_some_and(|after| after.is_empty() || after.starts_with([' ', '\t', ';', '\n']))
 }
 
 /// Whether a command of a list may change, for the commands after it, a variable

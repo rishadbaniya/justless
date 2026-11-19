@@ -283,6 +283,9 @@ pub struct Shape<'a> {
     pub raw: bool,
     pub session: &'a str,
     pub fresh: bool,
+    /// `run --window`: a filter after the command shows the agent only part of
+    /// the report, so the run is never compared with another, in either direction.
+    pub window: bool,
     /// The run was routed by an agent hook rather than typed by a person.
     pub hook: bool,
     /// Print the agent footer, as after a hook-routed run: nothing when every byte was
@@ -314,7 +317,7 @@ pub fn execute(
     max_bytes: usize,
     raw: bool,
     session: &str,
-    fresh: bool,
+    (fresh, window): (bool, bool),
     hook: bool,
     merge: bool,
 ) -> Result<i32> {
@@ -326,6 +329,7 @@ pub fn execute(
             raw,
             session,
             fresh,
+            window,
             hook,
             agent_footer: hook,
             family: None,
@@ -342,6 +346,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         raw,
         session,
         fresh,
+        window,
         hook,
         agent_footer,
         family,
@@ -402,7 +407,8 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         selection: &selection,
         max_bytes,
         session,
-        fresh,
+        fresh: fresh || window,
+        window,
         hook,
         agent_footer,
         merge,
@@ -584,6 +590,7 @@ pub(crate) fn record_cut(
         max_bytes,
         session,
         fresh: true,
+        window: false,
         hook: true,
         agent_footer: true,
         merge: false,
@@ -1376,6 +1383,8 @@ struct Capture<'a> {
     max_bytes: usize,
     session: &'a str,
     fresh: bool,
+    /// Keep no baseline for a later run to compare with (see `Shape::window`).
+    window: bool,
     hook: bool,
     agent_footer: bool,
     /// `run --merge` was given.
@@ -1428,6 +1437,7 @@ impl Capture<'_> {
             max_bytes,
             session,
             fresh,
+            window,
             hook,
             agent_footer,
             merge,
@@ -1796,7 +1806,7 @@ impl Capture<'_> {
             archive.share(&workspace.state.join("runs").join(&prior.id), prior, &run);
         }
         if guard.is_some() {
-            if let Err(error) = crate::workspace::write_text(&baseline, &run.id) {
+            if !window && let Err(error) = crate::workspace::write_text(&baseline, &run.id) {
                 eprintln!("justless: could not update run baseline: {error:#}");
             }
             history::prune(workspace, &run.id, retention.0, retention.1);

@@ -676,6 +676,7 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         mixed: agent == Agent::Gemini,
         claude: false,
         approves: agent == Agent::Cursor,
+        codex: false,
     };
     let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
     args["command"] = Value::String(rewritten);
@@ -1340,6 +1341,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
             mixed: false,
             claude: false,
             approves: true,
+            codex: false,
         },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
@@ -1377,6 +1379,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -
             mixed: agent != Agent::Codex,
             claude: agent == Agent::Claude,
             approves: agent == Agent::Codex,
+            codex: agent == Agent::Codex,
         },
     );
     updated["command"] = Value::String(match routed {
@@ -1497,6 +1500,10 @@ struct Rules {
     /// The client runs a rewritten command without asking, so each command must
     /// also pass `filters::approvable`.
     approves: bool,
+    /// Codex: a code-mode script's lines are a list, a file read in a list
+    /// becomes a `justless read`, and a supported command piped only into `head`
+    /// runs through Justless with `head` kept. See `plan`.
+    codex: bool,
 }
 
 /// What the Claude Code hook appends after a routed last command whose exit status
@@ -1588,15 +1595,6 @@ fn wrap_event(
             return rewritten;
         }
     }
-    let session = session
-        .filter(|id| !id.is_empty())
-        .map(|id| {
-            format!(
-                " --session {}",
-                &crate::capture::source_digest(id.as_bytes())[..24]
-            )
-        })
-        .unwrap_or_default();
     // Follow each `cd` so a later one is checked from the directory it starts in,
     // and each wrapped command knows where it runs.
     let mut directories = vec![cwd.to_path_buf()];
@@ -1610,6 +1608,23 @@ fn wrap_event(
             _ => false,
         }
     });
+    // Each read in a list becomes the `justless read` that prints it from the
+    // directory it runs in. One that cannot, such as a file outside the workspace
+    // or one counted from the end, leaves the list as written.
+    let mut reads = Vec::new();
+    for wrap in plan.wrap.iter().filter(|wrap| wrap.step == Step::Read) {
+        let directory = directories.get(wrap.entered).map_or(cwd, PathBuf::as_path);
+        match crate::shellread::parse_script(&command[wrap.words.clone()])
+            .and_then(|read| crate::shellread::piece(workspace, directory, &read, session))
+        {
+            Some(text) => reads.push(text),
+            None => {
+                plan.other
+                    .extend(plan.wrap.drain(..).map(|wrap| wrap.words));
+                break;
+            }
+        }
+    }
     for range in std::mem::take(&mut plan.other) {
         crate::history::bypass(workspace, &command[range]);
     }
@@ -1617,16 +1632,25 @@ fn wrap_event(
     if plan.wrap.is_empty() {
         return None;
     }
+    let session = session
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            format!(
+                " --session {}",
+                &crate::capture::source_digest(id.as_bytes())[..24]
+            )
+        })
+        .unwrap_or_default();
     // Where `EXIT_TAIL` goes: after the last command, when it is wrapped and the
     // client reads its exit status 1 as valid. Its assignments count as written.
     let tail = plan
         .last
         .filter(|last| {
             rules.claude
-                && plan.wrap.last().is_some_and(|(words, _)| {
-                    last.start <= words.start
-                        && words.end <= last.end
-                        && exit1_valid(&command[last.start..words.end])
+                && plan.wrap.last().is_some_and(|wrap| {
+                    last.start <= wrap.words.start
+                        && wrap.words.end <= last.end
+                        && exit1_valid(&command[last.start..wrap.words.end])
                 })
         })
         .map(|last| last.end);
@@ -1634,16 +1658,29 @@ fn wrap_event(
     // shell still sees the original operators, spacing and unsupported commands.
     let mut rewritten = String::with_capacity(command.len() + 64);
     let mut copied = 0;
-    for (range, entered) in plan.wrap {
+    let mut reads = reads.into_iter();
+    for Wrap {
+        words: range,
+        entered,
+        step,
+    } in plan.wrap
+    {
+        rewritten.push_str(&command[copied..range.start]);
+        copied = range.end;
+        if step == Step::Read {
+            rewritten.push_str(&reads.next()?);
+            continue;
+        }
         let root = directories
             .get(entered)
             .map(|directory| root_option(workspace, directory))
             .unwrap_or_default();
-        rewritten.push_str(&command[copied..range.start]);
         // A final `2>&1` joins Justless's own streams, and `--merge` joins the
         // command's, so its archive and preview keep the order it wrote them in.
         let merge = if crate::shell_form::merges(&command[range.end..]) {
             " --merge"
+        } else if step == Step::Window {
+            " --window"
         } else {
             ""
         };
@@ -1651,7 +1688,6 @@ fn wrap_event(
             "justless{root} run --hook{merge}{session} -- {}",
             &command[range.clone()]
         ));
-        copied = range.end;
     }
     if let Some(end) = tail {
         rewritten.push_str(&command[copied..end]);
@@ -2053,12 +2089,32 @@ fn module_binding(language: TopLevel, lines: &[&str], start: usize) -> Option<us
     None
 }
 
+/// How a hook rewrites one command of a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// `justless run --hook -- WORDS`.
+    Run,
+    /// For Codex, a command piped only into `head -n N`: `justless run --hook
+    /// --window -- WORDS | head -n N`, so `head` keeps the start of the report.
+    Window,
+    /// For Codex, a file read in a list, replaced whole by a `justless read`.
+    Read,
+}
+
+/// One command a hook rewrites: the words it replaces, the number of `cd`
+/// commands accepted before it, and how.
+#[derive(Clone, Debug)]
+struct Wrap {
+    words: Range<usize>,
+    entered: usize,
+    step: Step,
+}
+
 /// The commands of a shell command line that a hook runs through Justless, and the
 /// others that it counts as passed through.
 #[derive(Default)]
 struct Plan {
-    /// Each command to wrap, with the number of `cd` commands accepted before it.
-    wrap: Vec<(Range<usize>, usize)>,
+    wrap: Vec<Wrap>,
     other: Vec<Range<usize>>,
     /// The last command of the line, with its assignments and any final `2>&1`.
     last: Option<Range<usize>>,
@@ -2069,14 +2125,64 @@ impl Plan {
     /// mix commands keeps the others; one that runs a rewritten list without asking
     /// gets the list as written, as for any unsupported command.
     fn exclude(&mut self, command: &str, rules: Rules, exclusions: &crate::rewrite::Exclusions) {
-        let excluded =
-            |(words, _): &(Range<usize>, usize)| exclusions.within(command, words).is_some();
+        let excluded = |wrap: &Wrap| exclusions.within(command, &wrap.words).is_some();
         if rules.mixed {
             self.wrap.retain(|wrap| !excluded(wrap));
         } else if self.wrap.iter().any(excluded) {
             self.wrap.clear();
         }
     }
+
+    /// Pass the whole line through, counting each command but a `cd` as passed.
+    fn pass(&mut self, command: &str, segments: &[Range<usize>]) {
+        self.wrap.clear();
+        self.last = None;
+        self.other = segments
+            .iter()
+            .filter(|range| directory_change(&command[(*range).clone()]).is_none())
+            .cloned()
+            .collect();
+    }
+}
+
+/// Whether a filter after a pipe only keeps the first lines of what it reads:
+/// `head -n N` or `head -N`, with no file operand.
+fn keeps_head(filter: &str) -> bool {
+    let count =
+        |n: &str| !n.is_empty() && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit());
+    literal_command(filter).is_some_and(|words| match words.as_slice() {
+        [head, n, count_word] => head == "head" && n == "-n" && count(count_word),
+        [head, option] => head == "head" && option.strip_prefix('-').is_some_and(count),
+        _ => false,
+    })
+}
+
+/// The command before and the filter after the one `|` outside quotes in `segment`,
+/// as trimmed ranges.
+fn pipe_parts(segment: &str) -> Option<(Range<usize>, Range<usize>)> {
+    let mut quote = None;
+    let mut pipe = None;
+    for (at, byte) in segment.bytes().enumerate() {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None if matches!(byte, b'\'' | b'"') => quote = Some(byte),
+            None if byte == b'|' => {
+                if pipe.replace(at).is_some() {
+                    return None;
+                }
+            }
+            None => {}
+        }
+    }
+    let pipe = pipe?;
+    let trimmed = |range: Range<usize>| {
+        let text = &segment[range.clone()];
+        let lead = text.len() - text.trim_start_matches(SHELL_BLANKS).len();
+        let start = range.start + lead;
+        start..(start + text.trim_matches(SHELL_BLANKS).len())
+    };
+    Some((trimmed(0..pipe), trimmed(pipe + 1..segment.len())))
 }
 
 /// Decide which commands of a list to rewrite. A list that changes directory in any
@@ -2085,7 +2191,7 @@ impl Plan {
 fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Plan {
     // The range of the words to wrap inside a supported command, after any
     // `NAME=value` assignments and before a final `2>&1`, which stay where they are.
-    let supported = |segment: &str| {
+    let supported = |segment: &str, json: bool| {
         let form = crate::shell_form::parse(segment)?;
         let words = &segment[form.command.clone()];
         // A client that approves a rewrite, or may not check it again, takes only
@@ -2093,7 +2199,7 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         let env = form.keeps_justless(segment)
             && (rules.mixed && !rules.approves || form.approvable(segment));
         (env && literal_command(&segment[..form.command.end]).is_some()
-            && supported_command(words, !rules.claude)
+            && supported_command(words, json)
             && !(rules.claude && runs_grep(words))
             && (!rules.approves
                 || literal_command(words).is_some_and(|words| {
@@ -2105,21 +2211,58 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
     let within = |range: &Range<usize>, words: Range<usize>| {
         range.start + words.start..range.start + words.end
     };
+    // How Codex rewrites one command of a line: a file read becomes a `justless
+    // read`, and a `git show REV:path` blob takes the run route, as in a list it
+    // is not outlined. A supported command piped only into `head` runs through
+    // Justless with `head` kept, which then cuts its display report. JSON reads
+    // are left out there, since `head` is meant to show the JSON as printed.
+    let codex = |range: &Range<usize>| {
+        let segment = &command[range.clone()];
+        if crate::shellread::parse_script(segment).is_some() {
+            return Some((range.clone(), Step::Read));
+        }
+        if let Some(words) = supported(segment, true) {
+            return Some((within(range, words), Step::Run));
+        }
+        let (producer, filter) = pipe_parts(segment)?;
+        let words = supported(&segment[producer.clone()], false)?;
+        let rest = &segment[producer.start + words.end..producer.end];
+        (keeps_head(&segment[filter]) && !crate::shell_form::merges(rest)).then(|| {
+            let words = within(&producer, words);
+            (within(range, words), Step::Window)
+        })
+    };
     let mut plan = Plan::default();
-    let Some(segments) = split_compound(command).filter(|s| s.len() > 1) else {
+    let segments = if rules.codex {
+        split_list(command, true)
+    } else {
+        split_compound(command).filter(|s| s.len() > 1)
+    };
+    let Some(segments) = segments else {
         let start = command.len() - command.trim_start_matches(SHELL_BLANKS).len();
         let range = start..command.trim_end_matches(SHELL_BLANKS).len().max(start);
         plan.last = Some(range.clone());
-        match supported(&command[range.clone()]) {
-            Some(words) => plan.wrap.push((within(&range, words), 0)),
+        match supported(&command[range.clone()], !rules.claude) {
+            Some(words) => plan.wrap.push(Wrap {
+                words: within(&range, words),
+                entered: 0,
+                step: Step::Run,
+            }),
             None => plan.other.push(range),
         }
         return plan;
     };
     plan.last = segments.last().cloned();
     let mut entered = 0;
+    // A read resolves its file where the hook saw the directory, so after a `cd`
+    // that runs only on a previous command's status, after `&&` or `||`, the shell
+    // may read another file. Such a read passes the list through.
+    let (mut skippable, mut previous) = (false, 0);
     for range in &segments {
         let segment = &command[range.clone()];
+        let before = &command[previous..range.start];
+        let conditional = before.contains("&&") || before.contains("||");
+        previous = range.end;
         // A command that changes `PATH` or another variable that steers Justless for
         // the commands after it, such as `PATH=/x;` or `export PATH=/x &&`, passes
         // the list through like a change of directory.
@@ -2128,28 +2271,33 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         } else {
             directory_change(segment)
         };
+        let step = if rules.codex {
+            codex(range).filter(|(_, step)| !(skippable && *step == Step::Read))
+        } else {
+            supported(segment, !rules.claude).map(|words| (within(range, words), Step::Run))
+        };
         match change {
-            None => match supported(segment) {
-                Some(words) => plan.wrap.push((within(range, words), entered)),
+            None => match step {
+                Some((words, step)) => plan.wrap.push(Wrap {
+                    words,
+                    entered,
+                    step,
+                }),
                 None => plan.other.push(range.clone()),
             },
-            Some(Some(directory)) if descends(&directory) && enter(&directory) => entered += 1,
+            Some(Some(directory)) if descends(&directory) && enter(&directory) => {
+                entered += 1;
+                skippable |= conditional;
+            }
             Some(_) => {
-                return Plan {
-                    wrap: Vec::new(),
-                    other: segments
-                        .iter()
-                        .filter(|range| directory_change(&command[(*range).clone()]).is_none())
-                        .cloned()
-                        .collect(),
-                    last: None,
-                };
+                plan.pass(command, &segments);
+                return plan;
             }
         }
     }
     if !rules.mixed && !plan.other.is_empty() {
         plan.other
-            .extend(plan.wrap.drain(..).map(|(range, _)| range));
+            .extend(plan.wrap.drain(..).map(|wrap| wrap.words));
     }
     plan
 }
@@ -2224,6 +2372,20 @@ fn descends(directory: &str) -> bool {
 /// grouping, background jobs and comments return `None` so the whole command passes
 /// through unchanged.
 pub(crate) fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
+    split_list(command, false)
+}
+
+/// The commands of a Codex command line, as its hook splits them (see `split_list`).
+pub(crate) fn split_script(command: &str) -> Option<Vec<Range<usize>>> {
+    split_list(command, true)
+}
+
+/// `split_compound`, and with `script`, as Codex writes a code-mode script's
+/// commands, also at a newline outside quotes, as at `;`, skipping blank lines. A
+/// line that ends in `&&`, `||` or `|` goes on at the next one, so it passes the
+/// command through, as does a newline inside quotes. A single `|` stays inside its
+/// command for `plan` to judge.
+fn split_list(command: &str, script: bool) -> Option<Vec<Range<usize>>> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
@@ -2237,6 +2399,18 @@ pub(crate) fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
     };
     while i < bytes.len() {
         let c = bytes[i];
+        if script && c == b'\n' && quote.is_none() {
+            let before = command[..i].trim_end_matches(SHELL_BLANKS);
+            if before.ends_with('|') || before.ends_with("&&") {
+                return None;
+            }
+            if !command[start..i].trim_matches(SHELL_BLANKS).is_empty() {
+                push(start, i)?;
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
         if c.is_ascii_control() && c != b'\t' || matches!(c, b'$' | b'\\' | b'`') {
             return None;
         }
@@ -2260,6 +2434,7 @@ pub(crate) fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
                     i += 3;
                     continue;
                 }
+                b'|' if script && bytes.get(i + 1) != Some(&b'&') => {}
                 b'&' | b'|' | b';' | b'<' | b'>' | b'(' | b')' | b'{' | b'}' | b'#' | b'!' => {
                     return None;
                 }
@@ -2297,6 +2472,7 @@ pub fn would_route(command: &str, exclusions: &crate::rewrite::Exclusions) -> bo
         mixed: true,
         claude: true,
         approves: false,
+        codex: false,
     };
     let mut plan = plan(command, rules, |_| true);
     plan.exclude(command, rules, exclusions);
@@ -2334,6 +2510,7 @@ pub(crate) fn codex_would_route(command: &str, exclusions: &crate::rewrite::Excl
         mixed: false,
         claude: false,
         approves: true,
+        codex: true,
     };
     let mut plan = plan(command, rules, |_| true);
     plan.exclude(command, rules, exclusions);
@@ -2637,7 +2814,61 @@ pub(crate) fn setup_error(
 
 #[cfg(test)]
 mod tests {
-    use super::exit1_valid;
+    use super::{codex_would_route, command_label, exit1_valid, split_script};
+
+    /// What `discover` counts as routed for Codex, judged from the command alone,
+    /// on the shapes Codex scripts write.
+    #[cfg(unix)]
+    #[test]
+    fn codex_routes_script_lists_reads_and_head_windows() {
+        let none = crate::rewrite::Exclusions::default();
+        for (command, routed) in [
+            ("sed -n '1,80p' a.rs\nsed -n '90,120p' b.rs", true),
+            ("cat a.md && rg -n x src | head -n 20\ngit status", true),
+            ("cd src\nnl -ba a.rs | sed -n '5,9p'", true),
+            ("rg -n x src | head -30", true),
+            ("cat a.md\ntail -n 20 b.log", false),
+            ("cat a.md\npython3 x.py", false),
+            ("rg -n x src | head -n 5 a.rs", false),
+            ("rg -n x src 2>&1 | head -n 5", false),
+            ("sed -n '1,2p' a.rs | nl -ba", false),
+            ("git status &&\ngit diff", false),
+            ("git status\n# done", false),
+        ] {
+            assert_eq!(codex_would_route(command, &none), routed, "{command:?}");
+        }
+    }
+
+    /// `discover` counts a rewritten Codex line as routed by its label.
+    #[test]
+    fn rewritten_codex_lines_are_labelled_as_justless() {
+        for line in [
+            "justless --root /w read --shell-range 1-2 -- a.rs\njustless run --hook -- git status",
+            "justless run --hook --window -- rg -n x src | head -n 5",
+            "cd src\njustless --root /w read --shell-range 3-9 --shell-numbered nl -- src/a.rs",
+        ] {
+            let label = command_label(line);
+            assert!(label.starts_with("justless"), "{line:?}: {label}");
+        }
+    }
+
+    #[test]
+    fn script_lines_split_like_semicolons() {
+        fn split(command: &str) -> Option<Vec<&str>> {
+            let ranges = split_script(command)?;
+            Some(ranges.into_iter().map(|range| &command[range]).collect())
+        }
+        assert_eq!(
+            split("a\n\n  b | c ;\nd 2>&1\n"),
+            Some(vec!["a", "b | c", "d 2>&1"])
+        );
+        assert_eq!(split("a &&\nb"), None);
+        assert_eq!(split("a ||\nb"), None);
+        assert_eq!(split("a |\nb"), None);
+        assert_eq!(split("a |& b"), None);
+        assert_eq!(split("echo 'x\ny'"), None);
+        assert_eq!(split("a\r\nb"), None);
+    }
 
     /// The rule described at `EXIT_TAIL`. The cases with an assignment, a path,
     /// quotes, a wrapper, a group or Git options were also run through Claude Code

@@ -302,18 +302,24 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
             lines.push(format!("{heading}: rewritten"));
             lines.push(format!("  {new}"));
             let runs = new.matches(" run --hook").count();
-            lines.push(if new.contains(" read --") {
+            let commands = if runs == 1 {
+                "it runs a supported command".to_owned()
+            } else {
+                format!("it runs {runs} supported commands")
+            };
+            lines.push(if new.contains(" read --") && runs > 0 {
+                format!("Why: {commands} through `justless run`, which archives the full output and prints a compact preview, and each file read becomes `justless read`, which prints an outline or the exact lines.")
+            } else if new.contains(" read --") {
                 "Why: a file read becomes `justless read`, which prints an outline or the exact lines with a revision to expand.".into()
             } else if runs == 0 {
                 "Why: the hook names the session, so a symbol read again prints only what changed.".into()
+            } else if new.contains(" run --hook --window") {
+                format!(
+                    "Why: {commands} through `justless run`, which archives the full output and prints a compact preview, and the `head` after it keeps the start of that preview."
+                )
             } else {
                 format!(
-                    "Why: {} through `justless run`, which archives the full output and prints a compact preview.",
-                    if runs == 1 {
-                        "it runs a supported command".to_owned()
-                    } else {
-                        format!("it runs {runs} supported commands")
-                    }
+                    "Why: {commands} through `justless run`, which archives the full output and prints a compact preview."
                 )
             });
         }
@@ -438,7 +444,12 @@ fn left_alone(
             );
         }
     }
-    let segments = agents::split_compound(command).unwrap_or_default();
+    let segments = if agent == Agent::Codex {
+        agents::split_script(command)
+    } else {
+        agents::split_compound(command)
+    };
+    let segments = segments.unwrap_or_default();
     if !matches!(agent, Agent::Claude | Agent::Gemini) && segments.len() > 1 {
         let routable = segments.iter().any(|range| {
             ask(

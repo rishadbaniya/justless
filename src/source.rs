@@ -50,6 +50,14 @@ pub fn commands() -> Vec<Cli<'static>> {
                     .requires("shell-range"),
             )
             .arg(
+                Arg::new("shell-numbered")
+                    .long("shell-numbered")
+                    .value_name("cat|nl")
+                    .possible_values(["cat", "nl"])
+                    .hidden(true)
+                    .requires("shell-range"),
+            )
+            .arg(
                 Arg::new("shell-session")
                     .long("shell-session")
                     .value_name("ID")
@@ -774,7 +782,14 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
             ws,
             argument,
             args.value_of("shell-object"),
-            range,
+            (
+                range,
+                args.value_of("shell-numbered")
+                    .map(|numbering| match numbering {
+                        "cat" => crate::shellread::Numbering::Cat,
+                        _ => crate::shellread::Numbering::Nl,
+                    }),
+            ),
             args.value_of("shell-session").unwrap_or("terminal"),
         );
     }

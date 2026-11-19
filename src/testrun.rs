@@ -500,7 +500,7 @@ fn run_step(
         options.max_bytes,
         false,
         &options.session,
-        options.fresh,
+        (options.fresh, false),
         false,
         false,
     ) {

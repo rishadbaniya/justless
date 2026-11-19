@@ -33,6 +33,27 @@ pub(crate) struct LineRange {
     object: bool,
     /// A `cat` of the whole file.
     whole: bool,
+    /// `cat -n FILE | …` or `nl -ba FILE | …`: each line after its number.
+    numbered: Option<Numbering>,
+}
+
+/// How a read numbers its lines: as `cat -n` and `nl -ba` both print them, the
+/// number right-aligned in six columns and a tab before the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Numbering {
+    Cat,
+    /// `nl` also starts a new section, and its numbers again, at a line that is
+    /// only `\:`, `\:\:` or `\:\:\:`.
+    Nl,
+}
+
+impl Numbering {
+    fn command(self) -> [&'static str; 2] {
+        match self {
+            Self::Cat => ["cat", "-n"],
+            Self::Nl => ["nl", "-ba"],
+        }
+    }
 }
 
 fn decimal(text: &str) -> Option<usize> {
@@ -68,6 +89,7 @@ impl LineRange {
             spans,
             object: false,
             whole: false,
+            numbered: None,
         }
     }
 
@@ -265,6 +287,17 @@ fn split(command: &str) -> Option<Vec<(Range<usize>, &'static str)>> {
     Some(parts)
 }
 
+/// `head -N …` as the same `head -n N …`.
+fn head_count(mut words: Vec<String>) -> Vec<String> {
+    if let [head, count, ..] = words.as_slice()
+        && head == "head"
+        && let Some(count) = count.strip_prefix('-').and_then(decimal)
+    {
+        words.splice(1..2, ["-n".to_owned(), count.to_string()]);
+    }
+    words
+}
+
 /// A recognized read: one of the forms `command` takes, or `cat FILE` piped
 /// into one `head -n N`, `tail -n N`, `tail -n +N` or `sed -n` script, each
 /// after an optional `cd DIR &&` and before an optional `| cat`.
@@ -313,19 +346,31 @@ pub(crate) fn parse(line: &str) -> Option<ShellRead> {
         },
         _ => (String::new(), None, 0),
     };
-    let read = words(first)?;
+    let read = head_count(words(first)?);
     let (file, range) = match &parts[first..] {
         [(_, "")] => command(&read)?,
         [(_, "|"), (_, "")] => {
-            let filter = words(first + 1)?;
-            let ([cat, file], [program, flag, address]) = (read.as_slice(), filter.as_slice())
-            else {
+            let filter = head_count(words(first + 1)?);
+            let [program, flag, address] = filter.as_slice() else {
                 return None;
             };
-            if cat != "cat" || !matches!(program.as_str(), "head" | "tail" | "sed") {
+            // `cat -n` and `nl -ba` number every line, `nl` with sections.
+            let (file, numbered) = match read.as_slice() {
+                [cat, file] if cat == "cat" => (file, None),
+                [cat, n, file] if cat == "cat" && n == "-n" => (file, Some(Numbering::Cat)),
+                [nl, ba, file] if nl == "nl" && ba == "-ba" => (file, Some(Numbering::Nl)),
+                _ => return None,
+            };
+            let filters: &[&str] = if numbered.is_some() {
+                &["head", "sed"]
+            } else {
+                &["head", "tail", "sed"]
+            };
+            if !filters.contains(&program.as_str()) {
                 return None;
             }
-            let (_, range) = command(&[program, flag, address, file].map(String::clone))?;
+            let (_, mut range) = command(&[program, flag, address, file].map(String::clone))?;
+            range.numbered = numbered;
             (file.as_str(), range)
         }
         _ => return None,
@@ -419,6 +464,8 @@ struct Selection {
     /// the file, where sed and head implementations differ on a missing
     /// final newline.
     closed: bool,
+    /// `text` numbers each line as `cat -n` or `nl -ba` does.
+    numbered: Option<Numbering>,
 }
 
 impl Selection {
@@ -439,10 +486,33 @@ impl Selection {
             let (last, bytes) = source.line_window(first, span.last.unwrap_or(usize::MAX))?;
             windows.push(Window { first, last, bytes });
         }
-        let text = windows
+        let mut text: String = windows
             .iter()
             .map(|window| &source.text[window.bytes.clone()])
             .collect();
+        if let Some(numbering) = range.numbered {
+            // Past six digits a number widens its column.
+            let last = windows.last()?.last;
+            if last > 999_999
+                || numbering == Numbering::Nl
+                    && source
+                        .text
+                        .lines()
+                        .take(last)
+                        .any(|line| matches!(line, "\\:" | "\\:\\:" | "\\:\\:\\:"))
+            {
+                return None;
+            }
+            text = windows
+                .iter()
+                .flat_map(|window| {
+                    source.text[window.bytes.clone()]
+                        .split_inclusive('\n')
+                        .zip(window.first..)
+                })
+                .map(|(line, number)| format!("{number:>6}\t{line}"))
+                .collect();
+        }
         let closed = range.spans.last()?.last.is_some();
         Some(Self {
             source,
@@ -451,6 +521,7 @@ impl Selection {
             windows,
             text,
             closed,
+            numbered: range.numbered,
         })
     }
 
@@ -494,6 +565,34 @@ impl Selection {
             })
             .collect::<Vec<_>>()
             .join(separator)
+    }
+
+    /// The `justless read --shell-range` command that prints this selection.
+    fn shell_command(&self, ws: &Workspace, session: Option<&str>) -> String {
+        let object = match &self.object {
+            Some((_, id)) => format!(" --shell-object {id}"),
+            None => String::new(),
+        };
+        let session = session
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                format!(
+                    " --shell-session {}",
+                    &capture::source_digest(id.as_bytes())[..24]
+                )
+            })
+            .unwrap_or_default();
+        let numbered = match self.numbered {
+            Some(Numbering::Cat) => " --shell-numbered cat",
+            Some(Numbering::Nl) => " --shell-numbered nl",
+            None => "",
+        };
+        format!(
+            "justless --root {} read --shell-range {}{numbered}{object}{session} -- {}",
+            shell_quote(&ws.root),
+            self.ranges(","),
+            shell_quote(Path::new(self.name()))
+        )
     }
 
     fn open(ws: &Workspace, cwd: &Path, file: &str, range: &LineRange) -> Option<Self> {
@@ -624,8 +723,13 @@ impl Selection {
         let outline = self.outline(ws, baseline)?;
         let words = self.command();
         let args: Vec<_> = words.iter().map(OsString::from).collect();
+        let mut command = shlex::try_join(words.iter().map(String::as_str)).ok()?;
+        if self.numbered.is_some() {
+            let script = shlex::try_quote(&self.sed_script()).ok()?.into_owned();
+            command = format!("{command} | sed -n {script}");
+        }
         let origin = Origin {
-            command: shlex::try_join(words.iter().map(String::as_str)).ok()?,
+            command,
             // Kept apart from `git show` patches, whose preview budget adapts
             // to how often their clipped runs are replayed.
             label: if self.object.is_some() {
@@ -659,30 +763,36 @@ impl Selection {
         Some(text)
     }
 
+    /// The `sed -n` script that prints these windows.
+    fn sed_script(&self) -> String {
+        let last = self.windows.len() - 1;
+        self.windows
+            .iter()
+            .enumerate()
+            .map(|(i, window)| {
+                if i == last && !self.closed {
+                    format!("{},$p", window.first)
+                } else {
+                    format!("{},{}p", window.first, window.last)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
     /// The command that prints these bytes, which keys the archived run.
     fn command(&self) -> Vec<String> {
         if let Some((spec, _)) = &self.object {
             return vec!["git".into(), "show".into(), spec.clone()];
         }
+        if let Some(numbering) = self.numbered {
+            let [program, flag] = numbering.command();
+            return [program, flag, &self.file].map(str::to_owned).to_vec();
+        }
         let (program, address) = match (&self.windows[..], self.closed) {
             ([window], false) if window.first == 1 => return vec!["cat".into(), self.file.clone()],
             ([window], false) => ("tail", format!("+{}", window.first)),
-            (windows, closed) => {
-                let last = windows.len() - 1;
-                let script = windows
-                    .iter()
-                    .enumerate()
-                    .map(|(i, window)| {
-                        if i == last && !closed {
-                            format!("{},$p", window.first)
-                        } else {
-                            format!("{},{}p", window.first, window.last)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(";");
-                ("sed", script)
-            }
+            _ => ("sed", self.sed_script()),
         };
         [program, "-n", &address, &self.file]
             .map(str::to_owned)
@@ -727,29 +837,59 @@ pub(crate) fn rewrite(
     if claude {
         return None;
     }
-    let object = match read.object.clone() {
-        Some((_, id)) => {
-            read.outline(ws, read.text.len())?;
-            format!(" --shell-object {id}")
-        }
-        None => String::new(),
-    };
-    let session = session
-        .filter(|id| !id.is_empty())
-        .map(|id| {
-            format!(
-                " --shell-session {}",
-                &capture::source_digest(id.as_bytes())[..24]
-            )
-        })
-        .unwrap_or_default();
+    if read.object.is_some() {
+        read.outline(ws, read.text.len())?;
+    }
     Some(format!(
-        "{}justless --root {} read --shell-range {}{object}{session} -- {}",
+        "{}{}",
         shell.prefix,
-        shell_quote(&ws.root),
-        read.ranges(","),
-        shell_quote(Path::new(read.name()))
+        read.shell_command(ws, session)
     ))
+}
+
+/// A read a Codex command list runs as one of its commands, as `parse` takes it,
+/// that `piece` can print before it runs: not a `git show` blob, which takes the
+/// run route there, and not counted from the end of the file.
+pub(crate) fn parse_script(line: &str) -> Option<ShellRead> {
+    parse(line).filter(|read| {
+        read.prefix.is_empty()
+            && !read.range.object
+            && !read.range.spans.iter().any(|span| span.from_end)
+    })
+}
+
+/// The `justless read` that replaces a read in a Codex command list run from
+/// `cwd`. Nothing in a list Codex approves may run as written, so a small file,
+/// which a single read leaves alone, gets the command too, and it prints the same
+/// bytes. A read counted from the end, a file outside the workspace, one that
+/// cannot be read as text and a closed range that ends without a newline leave the
+/// list as written.
+pub(crate) fn piece(
+    ws: &Workspace,
+    cwd: &Path,
+    shell: &ShellRead,
+    session: Option<&str>,
+) -> Option<String> {
+    if shell.range.object || shell.range.spans.iter().any(|span| span.from_end) {
+        return None;
+    }
+    let mut read = Selection::open(
+        ws,
+        &shell.directory(ws, cwd, false)?,
+        &shell.file,
+        &shell.range,
+    )?;
+    if read.closed && !read.text().ends_with('\n') {
+        return None;
+    }
+    if shell.whole()
+        && !read.small()
+        && read.outline(ws, read.text.len()).is_none()
+        && let Some(instead) = crate::agents::read_instead(ws, &ws.root, &read.file)
+    {
+        return Some(instead);
+    }
+    Some(read.shell_command(ws, session))
 }
 
 /// `read --shell-range`: `file` is a workspace file, or with `object` the name
@@ -758,11 +898,12 @@ pub(crate) fn read(
     ws: &Workspace,
     file: &str,
     object: Option<&str>,
-    range: &str,
+    (range, numbered): (&str, Option<Numbering>),
     session: &str,
 ) -> Result<()> {
-    let range = LineRange::parse(range)
+    let mut range = LineRange::parse(range)
         .context("expected positive line ranges A-B or +N, joined by commas")?;
+    range.numbered = numbered;
     let read = match object {
         Some(id) => Some(
             Selection::object(ws, &ws.cwd, file, Some(id), &range)
@@ -933,8 +1074,17 @@ mod tests {
                         last: Some(last), ..
                     } => format!("{}-{last}", span.first),
                 });
-                let kind = if read.whole() { " cat" } else { "" };
-                let kind = if read.object() { " object" } else { kind };
+                let kind = match read.range.numbered {
+                    Some(numbering) => numbering.command().join(" ").replace(' ', ""),
+                    None if read.whole() => "cat".into(),
+                    None => String::new(),
+                };
+                let kind = if kind.is_empty() {
+                    kind
+                } else {
+                    format!(" {kind}")
+                };
+                let kind = if read.object() { " object" } else { &kind };
                 format!(
                     "{}{}:{} {}{kind}",
                     read.prefix,
@@ -967,6 +1117,19 @@ mod tests {
             ("cd x && head -n 30 a.rs | cat -", "cd x && x:a.rs 1-30"),
             ("cat a.rs | head -n 40 | cat", ":a.rs 1-40"),
             ("cat a.rs|cat", ":a.rs +1 cat"),
+            ("cat -n a.rs | sed -n '5,9p'", ":a.rs 5-9 cat-n"),
+            ("cat -n a.rs | head -n 40", ":a.rs 1-40 cat-n"),
+            ("cat a.rs | head -40", ":a.rs 1-40"),
+            ("head -25 a.rs", ":a.rs 1-25"),
+            ("cat -n a.rs | head -7", ":a.rs 1-7 cat-n"),
+            (
+                "nl -ba a.rs | sed -n '5,9p;20,30p'",
+                ":a.rs 5-9,20-30 nl-ba",
+            ),
+            (
+                "cd x && nl -ba a.rs | head -n 3 | cat",
+                "cd x && x:a.rs 1-3 nl-ba",
+            ),
             ("git show HEAD:a.rs | cat", ":HEAD:a.rs +1 object"),
         ] {
             assert_eq!(shown(line).as_deref(), Some(read), "{line}");
@@ -980,11 +1143,19 @@ mod tests {
             "cat a > b",
             "cat <<EOF",
             "cat a | head",
-            "cat a | head -5",
+            "cat a | head -05",
+            "cat a | head -n5",
             "cat a | grep -n x",
             "cat a | head -n 5 | tail -n 2",
             "cat a b | head -n 1",
             "sed -n 1,2p a | head -n 1",
+            "cat -n a | tail -n 2",
+            "cat -n a | head",
+            "cat -b a | head -n 2",
+            "nl a | sed -n 1,2p",
+            "nl -b a a | sed -n 1,2p",
+            "sed -n 1,2p a | nl -ba",
+            "cat -n a b | head -n 2",
             "cat a |& head -n 2",
             "cat a &",
             "cat a && cat b",

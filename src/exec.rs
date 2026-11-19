@@ -388,6 +388,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             // The output is the answer the script was written for, so it is never
             // collapsed into a notice that it matches an earlier run.
             fresh: true,
+            window: false,
             // Hooks pass `exec` through, so its runs are not hook-routed, but the agent
             // reads its output the way it reads a hook-routed run's.
             hook: false,

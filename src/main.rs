@@ -178,6 +178,12 @@ fn cli() -> Command<'static> {
                         .help("Routed by an agent hook: print a footer only when it adds information"),
                 )
                 .arg(
+                    Arg::new("window")
+                        .long("window")
+                        .hide(true)
+                        .help("A filter after the command shows only part of the preview: compare no runs with this one"),
+                )
+                .arg(
                     Arg::new("merge")
                         .long("merge")
                         .hide(true)
@@ -603,7 +609,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 max_bytes,
                 raw,
                 sub.value_of("session").unwrap_or(&default_session),
-                sub.is_present("fresh"),
+                (sub.is_present("fresh"), sub.is_present("window")),
                 sub.is_present("hook"),
                 sub.is_present("merge"),
             );

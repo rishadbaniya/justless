@@ -2,6 +2,7 @@
 //! once and their tests run in parallel. `cargo test --test testsuite mcp::` runs one.
 
 mod codex;
+mod codex_lists;
 mod common;
 mod compaction;
 mod compare;
