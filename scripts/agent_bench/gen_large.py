@@ -551,7 +551,15 @@ def gen_regression(repo, seed, avoid, n=1, label=""):
             continue
         missing = oracles.missing_names(baseline["test_names"], oracles.parse_tests(output), flaky)
         if missing:
-            raise RuntimeError("cleanup changed test results: %s" % missing[:5])
+            # A rewrite clippy calls equivalent can still change what a test observes (a source-text check, a
+            # custom len). Drop the cleanup in the packages whose tests changed and try again.
+            packages = {n.split("@", 1)[0] for n in missing}
+            keep = [c for c in chosen if c["package"] not in packages and c["package"].replace("-", "_") not in packages]
+            log("large regression: cleanup changed tests in", sorted(packages))
+            if len(keep) == len(chosen):
+                raise RuntimeError("cleanup changed test results: %s" % missing[:5])
+            chosen = keep
+            continue
         break
     else:
         raise RuntimeError("cleanup did not settle")
