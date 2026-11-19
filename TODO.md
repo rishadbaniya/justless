@@ -149,11 +149,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 - **Plan.** Verify with one real Codex session; then route or post-compact nested commands; then a Codex PostToolUse compactor (`decision: "block"` with the compact text) for piped `rg` and failing output, which a replay put at 15.3 MB → 1.2 MB in older sessions.
 - **Progress.** *not started* (research done).
 
-### 3.4 Permission parity for rewritten commands — confirmed, design ready, halted
-- **Problem (confirmed in code on 2026-11-19).** The Claude Code PreToolUse handler (`client_command` in `src/agents.rs`) rewrites supported commands to `justless run --hook … -- CMD` but sets no `permissionDecision` (only the Codex branch does), and `init` adds no allow rule. Claude Code checks permission rules against the rewritten command, so in default mode a `Bash(cargo test:*)` allow rule stops matching and every routed command prompts as `justless run …`. Approving with "don't ask again" stores a rule like `Bash(justless run:*)`, after which the agent can run any command as `justless run -- <cmd>` without asking. Ask and deny rules on the original command stop matching too. The docs do not mention any of this.
-- **Design.** Read `permissions.allow/ask/deny` from managed, user (`$CLAUDE_CONFIG_DIR` or `~/.claude`), project and local settings; an unreadable file counts as "might deny". Evaluate the original command's top-level commands: allow strictly (`Bash`, exact, `prefix:*` at a word boundary only), deny/ask liberally (through `NAME=value`, `timeout`, `nice`, `env`, globs). Deny or ask: no rewrite, in every mode. Allow: rewrite with `permissionDecision: allow`. No match: rewrite as today in `bypassPermissions` and `auto`, no rewrite in other modes (the post-run hook still compacts successful output; failed output stays full because hooks cannot rewrite a failed result). `permission_mode` absent: today's behaviour. `doctor` warns about allow rules that start with `Bash(justless`. Isolate tests from real settings with `CLAUDE_CONFIG_DIR` and a test-only managed-path override.
-- **Progress.** *designed*. Two attempts were stopped to save usage before any code was written. Use the official docs (https://code.claude.com/docs/en/settings and the permissions page) for rule syntax; the fail-safe design does not need the binary reverse-engineered.
-- **Interim note for users.** Do not allow `Bash(justless:*)` or `Bash(justless run:*)`: it lets the agent run anything through `justless run`.
+### 3.4 Permission parity for rewritten commands — done
+- **Progress.** *on main* (2026-11-19, `src/claude_permissions.rs`). The Claude Code hook reads allow/ask/deny rules from managed, user, project and local settings and judges the original command: deny or ask leaves it alone in every mode; allow rewrites with `permissionDecision: allow` (not in `auto`, where the classifier reviews instead); no matching rule rewrites only in `bypassPermissions` and `auto`. `doctor` warns about `Bash(justless…)` allow rules that would let `justless run -- <anything>` through. Checked in an isolated project for each case.
 
 ### 3.5 Generic compaction floor
 - **Problem.** Ad-hoc scripts are the largest untouched family by count; unknown commands get only a head/tail preview.
@@ -221,6 +218,12 @@ Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). Th
 ### 4.D MCP and history fixes
 - MCP `context` and `affected` take a `base` ref with `changes: true`; `history` keeps one place for the newest match from a failed run when the limit cuts; no cut notice suggests a `--limit` above MCP's 1000.
 - **Starts after:** `find` (§2.4) and changed-since-last-read (§3.1) merge.
+- **Progress.** *designed*.
+
+### 4.F Follow-ups from permission parity
+- `would_route`, `discover` and `doctor`'s "has not routed a command yet" note still assume the Claude Code hook always rewrites; make them use the same permission verdict, and have `doctor` say when a settings file is unreadable (which silently stops pre-routing in every mode).
+- "Don't ask again" rules saved in `settings.local.json` at the Git root count only when that directory is `$CLAUDE_PROJECT_DIR`; consider reading the Git root's (and a worktree's main checkout's) local file for allow rules too, if Claude Code does.
+- `scripts/agent_bench/cc_hooks.py` drives the hook with `bypassPermissions`, so it now reads the machine's real settings; pin `CLAUDE_CONFIG_DIR` and the managed override in the harness.
 - **Progress.** *designed*.
 
 ### 4.E `git show REV:path` reads
