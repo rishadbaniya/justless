@@ -627,6 +627,7 @@ def main(argv=None):
     kinds = args.kinds.split(",")
     repos = set(args.repos.split(",")) if args.repos else None
     used = {"files": main_task_files(args.home), "symbols": set()}
+    numbers = collections.Counter()
     for task in tasks_module.load_private(args.home, TASK_SET):
         plan_repo = (task.get("generator") or {}).get("plan", [None, task["repo"]])[1]
         if task["kind"] in kinds and (repos is None or plan_repo in repos):
@@ -635,7 +636,8 @@ def main(argv=None):
             continue
         used["files"].update(e["file"] for e in (task.get("setup") or {}).get("edits") or [])
         used["symbols"].add((task.get("oracle") or {}).get("symbol"))
-    numbers = collections.Counter()
+        # Kept tasks keep their numbers, so a partial rerun numbers new tasks as a full run would.
+        numbers[(task["kind"], task["repo"])] += 1
     produced = []
     for kind, repo, count in PLAN:
         if kind not in kinds or (repos and repo not in repos):
