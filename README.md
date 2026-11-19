@@ -41,7 +41,7 @@
   <img src="assets/savings-light.svg" alt="Bar chart of the bytes an agent received from 77 real commands: 1,171 KB raw versus 115 KB with justless, 90% smaller. git diff against older revisions 274.3 KB to 13.5 KB, find . 267.4 KB to 9.4 KB, grep -rn 200.1 KB to 16.4 KB, git log 143.1 KB to 24.9 KB." width="100%">
 </picture>
 
-Originals stay recoverable and exit codes matched in every run. The repair task passed in all 24 runs; it is one task, and a broader benchmark is in progress. The code-question ratio grows with file size, and this repository's files are large. [Methods](docs/benchmarks.md)
+Originals stay recoverable and exit codes matched in every run. The repair task passed in all 24 runs. On small tasks that read little output (about 5.6 KB per run), a 248-run benchmark found no difference in cost or success: justless pays off on large output and long sessions, which is what it compacts. The code-question ratio grows with file size, and this repository's files are large. [Methods](docs/benchmarks.md)
 
 ### See it
 

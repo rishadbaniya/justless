@@ -154,7 +154,12 @@ The free steps check the harness before any money is spent. `validate-tasks` run
 
 | Model | Contrast | Success | Cost per successful task | Δs [95% CI] | S [95% CI] | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| Sonnet 5.5 | b vs a | not run | not run | not run | not run | not run |
+| Sonnet 5.5 | b vs a | 98.4% vs 98.4% | $0.0432 vs $0.0426 | +0.0 pp [−2.4, +2.4] | −1.5% [−15.4%, +7.6%] | No demonstrated saving |
+| Sonnet 5.5, bug fix + lint | b vs a | 100% vs 100% | $0.0499 vs $0.0508 | +0.0 pp | +1.6% [−2.6%, +5.8%] | No demonstrated saving |
+
+Run on 2026-11-19: 248 runs over 31 frozen tasks × 4 repetitions per arm, $10.46, no harness errors. The Haiku, Opus, context-editing and anchor cells were stopped before they started, because the Sonnet cell already answered the question these tasks can answer.
+
+**What it shows.** On these tasks justless neither saves nor costs: success is identical and the cost difference sits inside the noise. The tasks are small — about 5 requests and 5.6 KB of tool output per run — so there is almost nothing for Justless to compact, while its instruction block rode in every request (since cut from 1,220 to 434 bytes). Justless targets large command output and long sessions; the owner's real Claude Code sessions produce about 37 MB of shell output a week. A task family that needs large tool output is being added so the benchmark measures that workload.
 
 ## Earlier single-task illustrations
 
