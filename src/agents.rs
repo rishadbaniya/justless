@@ -992,6 +992,11 @@ fn claude_edit(ws: &Workspace, input: &Value) -> Option<Value> {
     let file = ws
         .relative_file(&path)
         .or_else(|| ws.relative_file(&path.canonicalize().ok()?))?;
+    // C, C++ and Bash grammars reject much valid code, such as a new file of
+    // macros, so their errors get no note.
+    if !crate::syntax_check::blocks(&file) {
+        return None;
+    }
     crate::syntax_check::parser_name(&file)?;
     let response = &input["tool_response"];
     let before = match &response["originalFile"] {

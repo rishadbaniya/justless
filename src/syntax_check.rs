@@ -49,11 +49,13 @@ impl Parse {
 
     /// Opening minus closing `(`, `[` and `{` among the grammar's punctuation
     /// tokens. Tokens such as `${`, `#{` and `\(` count their bracket, and text in
-    /// strings and comments counts nothing.
-    fn brackets(&self, text: &str) -> [isize; 3] {
+    /// strings and comments counts nothing. `None` when error recovery skipped
+    /// text with a bracket in it, which may be in a string or a comment, so the
+    /// count proves nothing.
+    fn brackets(&self, text: &str) -> Option<[isize; 3]> {
         self.tree
             .as_ref()
-            .map_or([0; 3], |tree| brackets(tree, text))
+            .map_or(Some([0; 3]), |tree| brackets(tree, text))
     }
 }
 
@@ -116,9 +118,8 @@ pub enum Verdict {
 }
 
 /// The parser that checks `file`, named for messages, or `None` when edits to
-/// this kind of file are not checked. SQL is left out because its grammar
-/// rejects most dialects: in local corpora of working code it found errors in
-/// 93% of `.sql` files.
+/// this kind of file are not checked. SQL is left out because its one grammar
+/// rejects much of each dialect's syntax.
 pub fn parser_name(file: &str) -> Option<&'static str> {
     if file.ends_with(".rs") {
         return Some("Rust");
@@ -149,10 +150,12 @@ pub fn parser_name(file: &str) -> Option<&'static str> {
 
 /// Whether a certain problem in `file` blocks an edit. The C, C++ and Bash
 /// grammars reject valid code, such as macros, Objective-C headers and the
-/// POSIX `for NAME do` loop, so their problems are only reported: in local
-/// corpora of working code they found errors in 43% of `.c`, 67% of `.h`, 45% of
-/// `.cc` and 1.1% of `.sh` files, against at most 0.2% for the others.
-fn blocks(file: &str) -> bool {
+/// POSIX `for NAME do` loop, so their problems are only reported. In a scan of
+/// the local Cargo registry, Homebrew's Cellar and its Python packages, they
+/// found errors in 2,532 of 4,000 C files, 404 of 938 C++ files and 1 of 257
+/// shell scripts, against 4 of 2,854 Ruby files and none of 4,000 Rust, 470
+/// Python, 212 Lua, 84 JavaScript and 45 Java files.
+pub fn blocks(file: &str) -> bool {
     !matches!(
         Grammar::for_file(file),
         Some(Grammar::C | Grammar::Cpp | Grammar::Bash)
@@ -239,43 +242,44 @@ fn parse(file: &str, text: &str) -> Option<Parse> {
 
 /// Opening minus closing brackets among the punctuation tokens of `tree`, a
 /// parse of `text`. See [`Parse::brackets`].
-fn brackets(tree: &Tree, text: &str) -> [isize; 3] {
+fn brackets(tree: &Tree, text: &str) -> Option<[isize; 3]> {
     let mut count = [0; 3];
-    let mut add = |tokens: &str| {
-        for c in tokens.chars() {
-            match c {
-                '(' => count[0] += 1,
-                ')' => count[0] -= 1,
-                '[' => count[1] += 1,
-                ']' => count[1] -= 1,
-                '{' => count[2] += 1,
-                '}' => count[2] -= 1,
-                _ => {}
-            }
-        }
-    };
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
         if node.is_error() {
-            // Error recovery can skip text without making tokens of it, so the
-            // bytes of an ERROR node that no child covers count by character.
+            // Error recovery can skip text without making tokens of it. Its
+            // brackets may be in a string or a comment, so they cannot be counted.
             let mut at = node.start_byte();
             let mut children = node.walk();
+            let mut skipped = String::new();
             for child in node.children(&mut children) {
-                add(text.get(at..child.start_byte()).unwrap_or_default());
+                skipped.push_str(text.get(at..child.start_byte()).unwrap_or_default());
                 at = child.end_byte();
             }
-            add(text.get(at..node.end_byte()).unwrap_or_default());
+            skipped.push_str(text.get(at..node.end_byte()).unwrap_or_default());
+            if skipped.contains(['(', ')', '[', ']', '{', '}']) {
+                return None;
+            }
         } else if node.child_count() == 0 && !node.is_named() && !node.is_missing() {
-            add(node.kind());
+            for c in node.kind().chars() {
+                match c {
+                    '(' => count[0] += 1,
+                    ')' => count[0] -= 1,
+                    '[' => count[1] += 1,
+                    ']' => count[1] -= 1,
+                    '{' => count[2] += 1,
+                    '}' => count[2] -= 1,
+                    _ => {}
+                }
+            }
         }
         if cursor.goto_first_child() {
             continue;
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
-                return count;
+                return Some(count);
             }
         }
     }
@@ -410,7 +414,13 @@ pub fn judge(
         };
         // A missing token, or a bracket claim that the counts confirm, says more
         // than the first error does.
-        let unbalanced = now.brackets(after) != was.brackets(before.unwrap_or_default());
+        let unbalanced = match (
+            now.brackets(after),
+            was.brackets(before.unwrap_or_default()),
+        ) {
+            (Some(now), Some(was)) => now != was,
+            _ => false,
+        };
         let problem = now
             .problems
             .iter()
@@ -755,6 +765,17 @@ mod tests {
                 "fun f() {\n    log()\n}\n",
                 "context(logger: Logger)\nfun f() {\n    logger.info(\"x\")\n}\n",
             ),
+            // Brackets in strings and comments that the grammar skipped.
+            (
+                "a.kt",
+                "fun f() {\n    log()\n}\n",
+                "context(logger: Logger)\nfun f() {\n    logger.info(\"(x\")\n}\n",
+            ),
+            (
+                "a.kt",
+                "fun f() {\n    log()\n}\n",
+                "context(logger: Logger) // (\nfun f() {\n    logger.info(\"x\")\n}\n",
+            ),
             (
                 "a.kt",
                 "fun f(x: Any) = when (x) {\n    is String -> 0\n    else -> 1\n}\n",
@@ -906,7 +927,7 @@ mod tests {
             };
             checked += 1;
             // Punctuation tokens such as `${` and `#[` pair up in valid code.
-            if parse.brackets(&text) != [0; 3] {
+            if parse.brackets(&text) != Some([0; 3]) {
                 failures.push(format!("{name}: brackets {:?}", parse.brackets(&text)));
             }
             let found = parse.problems;

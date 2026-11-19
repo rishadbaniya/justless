@@ -18947,9 +18947,13 @@ fn claude_edit_hook_notes_only_an_edit_that_breaks_parsing() {
         note["hookSpecificOutput"]["additionalContext"],
         "Justless parse check: after this Edit, shape.ts:1:18: syntax error at identifier (TypeScript parser). The file parsed before it. The parser may not know newer syntax, so check the line before changing it."
     );
-    // Unchecked kinds, files outside the project, an unknown earlier state, other
-    // tools and malformed input all pass without a note.
+    // Unchecked kinds, C, C++ and shell, whose grammars reject much valid code,
+    // files outside the project, an unknown earlier state, other tools and
+    // malformed input all pass without a note.
     fs::write(root.join("a.sql"), "SELECT (1;\n").unwrap();
+    fs::write(root.join("a.c"), "int f( {\n").unwrap();
+    let header = root.join("macros.h");
+    fs::write(&header, "BEGIN_DECLS\nint f(void) EXPORT;\nEND_DECLS\n").unwrap();
     let outside = TempDir::new().unwrap();
     let outside_file = outside.path().canonicalize().unwrap().join("x.rs");
     fs::write(&outside_file, "fn x( {\n").unwrap();
@@ -18963,6 +18967,8 @@ fn claude_edit_hook_notes_only_an_edit_that_breaks_parsing() {
     read["tool_name"] = serde_json::json!("Read");
     for event in [
         edit_event("Edit", &root.join("a.sql"), Some("SELECT 1;\n")),
+        edit_event("Edit", &root.join("a.c"), Some("int f() {}\n")),
+        edit_event("Write", &header, None),
         edit_event("Edit", &outside_file, Some("fn x() {}\n")),
         unknown,
         read,
