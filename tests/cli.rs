@@ -11249,6 +11249,94 @@ fn affected_tests_drive_pytest_jest_and_go_with_their_own_selectors() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn affected_components_reach_their_importers_and_untested_languages_fall_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            (".gitignore", "node_modules/\n"),
+            (
+                "package.json",
+                "{\"devDependencies\": {\"vitest\": \"2\"}}\n",
+            ),
+            ("node_modules/.bin/vitest", "#!/bin/sh\n"),
+            (
+                "src/Child.svelte",
+                "<script>\n  export let n = 1;\n  function bump() { n += 1; }\n</script>\n<button on:click={bump}>{n}</button>\n",
+            ),
+            (
+                "src/Parent.vue",
+                "<template><Child /></template>\n<script setup>\nimport Child from \"./Child.svelte\";\nfunction shout() { return 1; }\n</script>\n",
+            ),
+            (
+                "src/Parent.test.ts",
+                "import Parent from \"./Parent.vue\";\ntest(\"p\", () => expect(Parent).toBeTruthy());\n",
+            ),
+            (
+                "src/Lonely.vue",
+                "<template><p /></template>\n<script setup>\nfunction quiet() { return 1; }\n</script>\n",
+            ),
+            (
+                "src/money.test.ts",
+                "test(\"m\", () => expect(1).toBe(1));\n",
+            ),
+            (
+                "lib/twice.ex",
+                "defmodule Twice do\n  def twice(x), do: x * 2\nend\n",
+            ),
+            (
+                "test/twice_test.exs",
+                "defmodule TwiceTest do\n  use ExUnit.Case\n  test \"twice\" do\n    assert Twice.twice(2) == 4\n  end\nend\n",
+            ),
+            ("model.m", "function y = model(x)\n  y = x * 2;\nend\n"),
+        ],
+    );
+    fs::set_permissions(
+        root.join("node_modules/.bin/vitest"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+    let plan = |file: &str, from: &str, to: &str| {
+        replace_in(root, file, from, to);
+        let text = stdout(&cli(root, &["test", "--affected", "--dry-run"]));
+        git(root, &["checkout", "-q", "--", file]);
+        text
+    };
+    // A function in a component's script reaches the tests that import the
+    // component, here through another component.
+    let text = plan("src/Child.svelte", "n += 1", "n += 2");
+    has_line(&text, "vitest · subset · 1 of 2 indexed test files");
+    has_line(
+        &text,
+        "  src/Parent.test.ts · src/Parent.test.ts · exact · import at src/Parent.test.ts:1 → src/Parent.vue · import at src/Parent.vue:3 → src/Child.svelte",
+    );
+    // A component no test imports is a change no test reaches.
+    let text = plan("src/Lonely.vue", "return 1", "return 2");
+    has_line(
+        &text,
+        "  no-tests: no test reaches quiet (src/Lonely.vue:3) through indexed links",
+    );
+    // Elixir reaches its ExUnit test, which no runner here runs.
+    let text = plan("lib/twice.ex", "x * 2", "x + x");
+    has_line(
+        &text,
+        "  data-unlinked: lib/twice.ex is not mentioned by indexed source, and no runner here runs its language",
+    );
+    // MATLAB code in a `.m` file is data, not Objective-C.
+    let text = plan("model.m", "x * 2", "x + x");
+    has_line(
+        &text,
+        "  data-unlinked: model.m is not mentioned by indexed source",
+    );
+}
+
 #[test]
 fn agent_hooks_never_narrow_or_rewrap_justless_test() {
     let repo = affected_fixture();

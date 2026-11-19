@@ -16,7 +16,8 @@ use crate::context::{Change, Since, changes, relationship};
 use crate::doctests::{Docs, Group, doc_like, markdown_examples, may_hold_examples, spans_lines};
 use crate::impact::{Dependent, Walk, walk};
 use crate::index::{Definition, Fingerprint, Index};
-use crate::map::{is_test_file, language, name};
+use crate::map::{is_test_file, name};
+use crate::polyglot::Grammar;
 use crate::runners::{Cargo, Kind, Package, Runner, Target, enabled_features, under};
 use crate::workspace::{Location, Workspace};
 
@@ -448,6 +449,26 @@ fn enclosing(index: &Index, file: &str, line: usize) -> Option<usize> {
         .or_else(|| ids.first().copied())
 }
 
+/// The file node of the Vue, Svelte or Astro component that holds a
+/// definition, which is what other code imports.
+fn component(index: &Index, id: usize) -> Option<usize> {
+    let file = &index.definitions[id].location.file;
+    if !matches!(
+        index.grammar(file),
+        Some(Grammar::Vue | Grammar::Svelte | Grammar::Astro)
+    ) {
+        return None;
+    }
+    index
+        .at(&Location {
+            file: file.clone(),
+            start: 1,
+            end: 1,
+        })
+        .into_iter()
+        .find(|&found| index.definitions[found].kind == "file")
+}
+
 /// The enclosing test definition at a line, if any.
 fn enclosing_test(index: &Index, file: &str, line: usize) -> Option<usize> {
     index
@@ -460,12 +481,30 @@ fn enclosing_test(index: &Index, file: &str, line: usize) -> Option<usize> {
         .find(|&id| index.definitions[id].test)
 }
 
-/// A language, with JavaScript and its typed dialects as one.
-fn language_family(file: &str) -> Option<&'static str> {
-    match language(file)? {
-        "TypeScript" | "TSX" => Some("JavaScript"),
+/// A file's language as `map` names it from the file name, except that a `.m`
+/// file is Objective-C only when the index parsed it as that, from the markers
+/// in its text: MATLAB and Octave use `.m` too. A `.m` file the index does not
+/// hold, such as a deleted one, has no language and counts as data.
+fn language(index: &Index, file: &str) -> Option<&'static str> {
+    match crate::map::language(file)? {
+        "Objective-C" if index.grammar(file) != Some(Grammar::ObjectiveC) => None,
         other => Some(other),
     }
+}
+
+/// A language, with JavaScript, its typed dialects and the Vue, Svelte and
+/// Astro components that import it as one.
+fn language_family(index: &Index, file: &str) -> Option<&'static str> {
+    if javascript(file) {
+        return Some("JavaScript");
+    }
+    language(index, file)
+}
+
+/// Whether a file is JavaScript, TypeScript or a Vue, Svelte or Astro
+/// component: code that Jest and Vitest tests import.
+fn javascript(file: &str) -> bool {
+    Grammar::for_file(file).is_some_and(|grammar| grammar.family() == Grammar::JavaScript)
 }
 
 fn short(definition: &Definition) -> &str {
@@ -607,12 +646,10 @@ fn comment_only(line: &str) -> bool {
 }
 
 /// Whether a file is code in a language some runner tests: Rust, Python,
-/// JavaScript or TypeScript, or Go. Anything else changes tests only as data.
+/// JavaScript, TypeScript and their components, or Go. Anything else changes
+/// tests only as data.
 fn runner_language(file: &str) -> bool {
-    file.ends_with(".rs")
-        || file.ends_with(".py")
-        || file.ends_with(".go")
-        || matches!(language(file), Some("JavaScript" | "TypeScript" | "TSX"))
+    file.ends_with(".rs") || file.ends_with(".py") || file.ends_with(".go") || javascript(file)
 }
 
 /// Whether a Rust line is documentation, whose examples run as doctests.
@@ -1155,13 +1192,23 @@ pub(crate) fn plan(
     )?;
     // Code in a language no runner here runs, such as SQL or shell, reaches
     // tests only through what names it or links to it; otherwise it is data.
+    // A link to a test counts when Justless has a runner for the test's
+    // language, run here or not. Tests no runner knows, such as Elixir's ExUnit
+    // tests, vouch for nothing, so the code falls back.
     for file in std::mem::take(&mut analysis.unmentioned_code) {
         let runnable = runners
             .iter()
             .any(|runner| in_scope_language(runner, &file));
+        let run = |test: &str| {
+            runner_language(test) || runners.iter().any(|runner| in_scope(runner, test))
+        };
         let linked = analysis.seeds.iter().any(|seed| {
             index.definitions[seed.id].location.file == file
-                && (!seed.tests.is_empty() || !seed.files.is_empty())
+                && (seed
+                    .tests
+                    .keys()
+                    .any(|&test| run(&index.definitions[test].location.file))
+                    || seed.files.keys().any(|test| run(test)))
         });
         if runnable || linked {
             continue;
@@ -1376,7 +1423,7 @@ fn analyze(
         if !exists {
             analysis.deleted.insert((*file).to_owned());
         }
-        if language(file).is_none() {
+        if language(index, file).is_none() {
             continue;
         }
         // Definitions present at the base and gone now, renamed ones included.
@@ -1571,7 +1618,7 @@ fn analyze(
             let Some(lines) = find(index, &mut texts, candidate, false) else {
                 // Named too often to follow. Code is traced through its symbols;
                 // data with this many mentions cannot be pinned to a few tests.
-                if language(file).is_none() {
+                if language(index, file).is_none() {
                     analysis.unlinked.entry(file.clone()).or_insert(Reason {
                         code: "data-unlinked",
                         message: format!(
@@ -1610,7 +1657,7 @@ fn analyze(
                 continue;
             }
             // Ancestor directories count only from code, not from prose.
-            if language(&path).is_none() {
+            if language(index, &path).is_none() {
                 continue;
             }
             let hit = || Hit {
@@ -1699,7 +1746,7 @@ fn analyze(
         if mentioned {
             continue;
         }
-        let code = language(file).is_some();
+        let code = language(index, file).is_some();
         let ignored = ignore_globs
             .as_ref()
             .is_some_and(|globs| globs.matched_path_or_any_parents(file, false).is_ignore());
@@ -1750,7 +1797,11 @@ fn analyze(
                 },
             );
         }
-        let reached = walk(index, &[id], DEPTH);
+        // A Vue, Svelte or Astro component is imported whole, so a change to a
+        // function in its script reaches whatever imports the component too.
+        let mut starts = vec![id];
+        starts.extend(component(index, id).filter(|&file| file != id));
+        let reached = walk(index, &starts, DEPTH);
         if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
             seed.capped = Some(name(&definitions[id]).to_owned());
         }
@@ -1765,7 +1816,7 @@ fn analyze(
         // macro the index does not expand, and other code that does the same.
         let definition = &definitions[id];
         let word = short(definition);
-        let family = language_family(&definition.location.file);
+        let family = language_family(index, &definition.location.file);
         if word.len() >= 3
             && !UBIQUITOUS.contains(&word)
             && !definition.test
@@ -1795,7 +1846,7 @@ fn analyze(
                             continue;
                         }
                         // Names only count within one language.
-                        if language_family(&path) != family {
+                        if language_family(index, &path) != family {
                             continue;
                         }
                         if let Some(test) = enclosing_test(index, &path, line)
@@ -1852,7 +1903,7 @@ fn analyze(
                     .or_insert_with(|| implicitly(definitions, dependent, type_id));
             }
         }
-        let mut started = BTreeSet::from([id]);
+        let mut started: BTreeSet<usize> = starts.into_iter().collect();
         for _ in 0..8 {
             further.retain(|start, _| started.insert(*start));
             if further.is_empty() {
@@ -2241,9 +2292,7 @@ fn in_scope(runner: &Runner, file: &str) -> bool {
                 })
         }
         Kind::Pytest => file.ends_with(".py"),
-        Kind::Jest | Kind::Vitest => {
-            matches!(language(file), Some("JavaScript" | "TypeScript" | "TSX"))
-        }
+        Kind::Jest | Kind::Vitest => javascript(file),
         Kind::Go => file.ends_with(".go"),
         Kind::Command => true,
     }
@@ -2371,7 +2420,10 @@ fn plan_runner(
             // Nested conftest: every test file under its directory.
             continue;
         }
-        if language(file).is_some() && runner.contains(file) && in_scope_language(runner, file) {
+        if language(index, file).is_some()
+            && runner.contains(file)
+            && in_scope_language(runner, file)
+        {
             if let Some(error) = index.errors.get(file.as_str()) {
                 reasons.push(Reason {
                     code: "parse-error",
@@ -2632,9 +2684,7 @@ fn in_scope_language(runner: &Runner, file: &str) -> bool {
     match runner.kind {
         Kind::Cargo => file.ends_with(".rs"),
         Kind::Pytest => file.ends_with(".py"),
-        Kind::Jest | Kind::Vitest => {
-            matches!(language(file), Some("JavaScript" | "TypeScript" | "TSX"))
-        }
+        Kind::Jest | Kind::Vitest => javascript(file),
         Kind::Go => file.ends_with(".go"),
         Kind::Command => false,
     }
@@ -3509,8 +3559,12 @@ fn pytest_node(definition: &Definition) -> Option<String> {
     collected.then(|| parts.join("::"))
 }
 
+/// A JavaScript or TypeScript test file. Components hold no tests of their own.
 fn collectable_js(file: &str) -> bool {
-    matches!(language(file), Some("JavaScript" | "TypeScript" | "TSX")) && is_test_file(file)
+    matches!(
+        crate::map::language(file),
+        Some("JavaScript" | "TypeScript" | "TSX")
+    ) && is_test_file(file)
 }
 
 /// Whether the runner's full suite runs tests in `file`: pytest's
