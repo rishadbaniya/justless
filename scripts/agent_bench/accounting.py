@@ -276,9 +276,9 @@ RUN_MODEL = {"base": 7084, "per_byte": 0.3937, "per_request": 402.7, "first_prom
              "output_per_request": 200}
 # A model takes more steps and reads more than the minimal scripted path that dry-run measures.
 LARGE_MARGIN = {"requests": 1.5, "bytes": 1.25, "p90": 1.5}
-# Before any dry-run measurement: a plain path of about 120 KB over 9 requests, the median of the scripted
-# large tasks' first measurement.
-LARGE_PREPILOT_PATH = {"a": {"seen": 120000, "requests": 9}, "b": {"seen": 120000, "requests": 9}}
+# Without a dry-run measurement: every arm priced like the plain path's medians in the 2026-11-19 dry run
+# (about 101 KB seen over 8 requests).
+LARGE_PREPILOT_PATH = {"a": {"seen": 101000, "requests": 8}}
 
 
 def run_cost(model, seen_bytes, requests, pricing_table=None):
