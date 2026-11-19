@@ -154,11 +154,8 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 
 Closed ideas and their reasons are in [docs/decisions.md](docs/decisions.md). These batches touch mostly disjoint files; each starts after the in-progress branch named in it merges.
 
-### 4.A Reads outside the workspace, and the duplicate instruction block
-- **Outside-read outlines.** A successful whole text Read (no offset, limit, pages or `allow_large`) of a parser-supported file outside the workspace is outlined from the Read result in memory, archived with `observations::archive` so the first line names `justless recall ID`; dotfiles, `$HOME/.*` and Claude Code's tool-results files are skipped; `expand`/`edit` stay workspace-only. Measured: 351 such reads over 4 KB, 6.81 MB, of which parsable 4.16 MB; outline ratios 0.04–0.14.
-- **Duplicate instruction block.** When `CLAUDE.md` imports `@AGENTS.md` and `AGENTS.md` holds the block, `init` writes no second copy into `CLAUDE.md` (and removes one on re-run); `doctor` and `init --remove` agree. Saves about 905 B on every request.
-- **Starts after:** Read/Edit hooks (§2.2/§2.3), permission parity (§3.4) and `find` (§2.4) merge.
-- **Progress.** *designed*.
+### 4.A Reads outside the workspace, and the duplicate instruction block — done
+- **Progress.** *on main* (2026-11-19). A whole Claude Code Read of a parser-supported file outside the workspace is outlined from the returned content and the original archived with `justless recall ID` (e.g. 35,392 → 2,764 bytes); dotfiles, `$HOME/.*` and tool-results files are skipped. When `CLAUDE.md` imports `@AGENTS.md`, `init` keeps one block in AGENTS.md (this repo's CLAUDE.md went from 941 to 11 bytes), and `doctor` flags a duplicate copy.
 
 ### 4.B Commit-aware diff summary for `git show` patches
 - Map the patch forms of `git show` (and `git log -p`) to the diff summary, reading each commit header as an item before the per-file and per-hunk items; anything unrecognized still falls back to the preview. Measured: 138 results over 4 KB, 1.53 MB, clipped today because the diff parser requires `diff --git` first.
