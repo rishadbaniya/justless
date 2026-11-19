@@ -94,18 +94,29 @@ fn subcommand<'a>(words: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
 
 static HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^commit [0-9a-f]{7,64}(?: |$)").unwrap());
+static ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{4,64}(?: |$)").unwrap());
+
+/// How a log's commits are separated.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// Each commit starts at a `commit SHA` line, as the default format prints.
+    Headers,
+    /// Each line is a commit that starts with its id, as `--oneline` prints.
+    Ids,
+    /// Each line is a commit, as a one-line `--format` template prints.
+    Lines,
+}
 
 /// A log's newest commits within the budget, and the count of the rest.
 pub struct Log {
     /// `--reverse`: the newest commits come last.
     reverse: bool,
-    /// Each commit starts at a `commit SHA` line; otherwise each line is one.
-    headers: bool,
+    shape: Shape,
     budget: usize,
     bytes: usize,
     lines: usize,
     commits: usize,
-    /// The output did not start with a commit header.
+    /// A line did not start a commit where one had to.
     unknown: bool,
     /// The commit being read: its text, while it can still fit, and first line.
     current: Option<(String, usize)>,
@@ -134,9 +145,18 @@ impl Log {
                     | "--cc"
                     | "--dd"
                     | "--remerge-diff"
-            ) || ["-U", "--unified", "--diff-merges", "-L", "--output"]
-                .iter()
-                .any(|prefix| arg.starts_with(prefix))
+                    | "--binary"
+            ) || [
+                "-U",
+                "--unified",
+                "--diff-merges",
+                "-L",
+                "--output",
+                "--word-diff",
+                "--color-words",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
         };
         // Options that print more lines for each commit, which only commit headers
         // can then separate.
@@ -160,7 +180,7 @@ impl Log {
             .iter()
             .any(|option| arg.starts_with(option))
         };
-        let mut headers = Some(true);
+        let mut shape = Some(Shape::Headers);
         let mut reverse = false;
         let mut more = false;
         for &arg in args.iter().take_while(|arg| **arg != "--") {
@@ -170,26 +190,26 @@ impl Log {
             if arg == "--reverse" {
                 reverse = true;
             } else if arg == "--oneline" {
-                headers = Some(false);
+                shape = Some(Shape::Ids);
             } else if arg == "--pretty" {
-                headers = Some(true);
+                shape = Some(Shape::Headers);
             } else if let Some(format) = arg
                 .strip_prefix("--pretty=")
                 .or_else(|| arg.strip_prefix("--format="))
             {
-                headers = pretty(format);
+                shape = pretty(format);
             } else if extra(arg) {
                 more = true;
             }
         }
-        let headers = headers?;
+        let shape = shape?;
         // A line per commit holds no room for the lines these options add.
-        if !headers && more {
+        if shape != Shape::Headers && more {
             return None;
         }
         Some(Self {
             reverse,
-            headers,
+            shape,
             budget,
             bytes: 0,
             lines: 0,
@@ -209,8 +229,15 @@ impl Log {
             return;
         }
         let line = text.trim_end_matches(['\n', '\r']);
-        let starts = !self.headers || HEADER.is_match(line);
-        if n == 1 && !starts {
+        let starts = match self.shape {
+            Shape::Headers => HEADER.is_match(line),
+            Shape::Ids => ID.is_match(line),
+            Shape::Lines => true,
+        };
+        // A header format's first line, and every line of `--oneline`, starts
+        // a commit. Other lines, such as a patch or a signature check that
+        // the configuration adds, are no commit to count.
+        if !starts && (n == 1 || self.shape == Shape::Ids) {
             self.unknown = true;
             return;
         }
@@ -319,12 +346,11 @@ impl Log {
     }
 }
 
-/// Whether a `--pretty` or `--format` value prints commit headers (`Some(true)`),
-/// one line per commit (`Some(false)`), or something else.
-fn pretty(format: &str) -> Option<bool> {
+/// How a `--pretty` or `--format` value separates commits, if it is known.
+fn pretty(format: &str) -> Option<Shape> {
     match format {
-        "" | "short" | "medium" | "full" | "fuller" | "raw" => Some(true),
-        "oneline" | "reference" => Some(false),
+        "" | "short" | "medium" | "full" | "fuller" | "raw" => Some(Shape::Headers),
+        "oneline" | "reference" => Some(Shape::Ids),
         "email" | "mboxrd" => None,
         _ => {
             let template = format
@@ -338,7 +364,9 @@ fn pretty(format: &str) -> Option<bool> {
                 || ["%n", "%b", "%B", "%N", "%(trailers", "%w(", "%G", "%x0"]
                     .iter()
                     .any(|code| template.contains(code));
-            (!multiline).then_some(false)
+            // A JSON template keeps the JSON view.
+            let json = template.trim_start().starts_with(['{', '[']);
+            (!multiline && !json).then_some(Shape::Lines)
         }
     }
 }
@@ -662,6 +690,10 @@ mod tests {
             "git log --pretty=email",
             "git log --pretty=myalias",
             "git log -L1,2:src/main.rs",
+            "git log --oneline --word-diff",
+            "git log --color-words",
+            "git log --binary",
+            "git log --format={\"h\":\"%h\"}",
             "git status --porcelain",
             "git status --porcelain=v2",
             "git status -z",
@@ -746,6 +778,10 @@ mod tests {
     fn a_log_in_an_unknown_format_keeps_the_preview() {
         let log = "abc\n".repeat(1000);
         assert_eq!(view("git log", &log, 512), None);
+        // Every `--oneline` line starts with a commit id; a patch line does not.
+        let mut log = oneline(200);
+        log.insert_str(log.find('\n').unwrap() + 1, "+added line\n");
+        assert_eq!(view("git log --oneline", &log, 512), None);
     }
 
     #[test]

@@ -1661,8 +1661,10 @@ impl Capture<'_> {
                 Grouping::Listing(listing) => listing
                     .finish(&run.family, max_bytes, previous, true)
                     .map(|(groups, summary)| (groups, Some(summary))),
-                Grouping::Git(view) => view
-                    .finish(max_bytes.min(previews[0].1.len().saturating_sub(1)))
+                // Output that fits takes the path it would take without one.
+                Grouping::Git(view) => (!stdout_fits)
+                    .then(|| view.finish(max_bytes.min(previews[0].1.len().saturating_sub(1))))
+                    .flatten()
                     .map(|view| (view, None)),
             }
         });
