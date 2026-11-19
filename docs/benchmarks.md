@@ -161,6 +161,36 @@ Run on 2026-11-19: 248 runs over 31 frozen tasks × 4 repetitions per arm, $10.4
 
 **What it shows.** On these tasks justless neither saves nor costs: success is identical and the cost difference sits inside the noise. The tasks are small — about 5 requests and 5.6 KB of tool output per run — so there is almost nothing for Justless to compact, while its instruction block rode in every request (since cut from 1,220 to 434 bytes). Justless targets large command output and long sessions; the owner's real Claude Code sessions produce about 37 MB of shell output a week. A task family that needs large tool output is being added so the benchmark measures that workload.
 
+### Large-output family (separate campaign)
+
+The 32 tasks are small. In the main campaign's Sonnet cell, about 77 runs per arm, a plain run sees about 5.6 KB of tool output over about 5 requests, and Justless costs 2.4% more per solved task than plain Claude Code. Justless compacts command output above about 4 KB, and the owner's own Claude Code sessions produce about 37 MB of shell output a week. The main tasks therefore under-represent the work Justless targets. This family adds eight tasks whose plain solution path reads large output. It is registered as its own contrast and is never pooled with the 32-task primary result.
+
+| Kind | Task | Why the output is large | Success |
+| --- | --- | --- | --- |
+| Bug fix | A validated mutation, as in the main family, in a file of at least 30 KB in the big workspace. The prompt gives the workspace-wide `cargo test` and names no package. | Every crate's test list. The failure is usually outside the 10 KB excerpt that Claude Code shows of a failing command, and the bug is in a large file. | As for the main bug-fix family |
+| Lint | One clippy rule, injected at about five sites, in a tree that keeps about 50 other injected warnings. The prompt asks for that rule only. | The clippy report runs to tens of kilobytes, more than the 30,000 characters Claude Code shows inline. | No warning of the rule remains, no other lint reports more often than at the start, nothing is suppressed, and the baseline tests pass |
+| Callers | List every function whose code uses a uniquely defined free function, found from 8 to 40 callers in at least 4 files totalling at least 100 KB. | A wide search, then each hit's context, to name the enclosing function | Recall of 0.9 or more and precision of 0.8 or more over (file, function) pairs. Functions that mention the name only in comments or strings are neutral. |
+| Regression | The last of two fixed-date commits is a behavior-preserving cleanup of about 60 clippy-style rewrites with one validated mutation hidden among them. | The commit's diff is longer than Claude Code shows inline. | As for a bug fix, and at least 80% of the cleanup rewrites remain, so reverting the commit fails |
+
+Generation is `gen_large.py`, seeded like the main families, and never runs Justless. Truth comes from cargo, clippy, rg and the Rust lexer in `oracles.py`. Candidate verdicts use a fresh copy of the warm target with the repository's own crates invalidated, because Cargo's fingerprints for path packages ignore the path and would replay stale diagnostics. The plan places 2 bug-fix tasks in the big workspace, one lint task each in the big workspace and the shared crate, and one callers and one regression task in each of those two repositories. A repository that yields no valid task is filled from the big workspace; the shared crate has no free function with enough callers, so both callers tasks come from the workspace. The tasks never reuse a main task's file and live in `$AGENT_BENCH_HOME/tasks/large/`, with their own manifest, so the 32-task manifest and its run IDs are unchanged. Every command takes `--task-set large`.
+
+The table gives the tool output that the scripted plain path saw (`dry-run --variants correct`, arm a). The scripted path takes no narrowing step that the prompt does not offer: it runs the stated command, filters a failing test run for its failures, reads a saved output when Claude Code saved it, reads the files it edits, and checks its fix. Dry runs page Read with the bytes/2 estimator instead of `count_tokens`, so a paid run's partial views are somewhat larger. "Source" is what the commands printed and the files held, before Claude Code's previews and excerpts.
+
+LARGE_TABLE
+
+The campaign is Sonnet 5.5, arms a and b, three repetitions: 48 runs. It uses the same endpoints, decision rule, bootstrap and seed as the primary contrast, and is reported as "large-output family, b vs a". With 24 blocks it is underpowered for the 10-point success margin, so a verdict other than WIN may reflect sample size. `estimate --task-set large --from-dry <dry campaign>-correct` prices the plan from the measured plain paths. Its per-run model was fitted to the main campaign's 246 graded Sonnet runs, where it summed to within 2% of the bill. The estimate assumes 1.5 times the scripted requests and 1.25 times the scripted bytes, and gives a conservative figure 1.5 times higher. LARGE_ESTIMATE The campaign shares the $80 ledger limit with every other campaign.
+
+```sh
+python3 scripts/agent_bench/run.py prepare --generate --task-set large --campaign validate-large
+python3 scripts/agent_bench/run.py validate-tasks --task-set large --tasks all-private --arms a,b --campaign validate-large --binary $B
+python3 scripts/agent_bench/run.py dry-run --task-set large --tasks all-private --variants correct --arms a,b --campaign dry-large --binary $B
+python3 scripts/agent_bench/run.py estimate --task-set large --from-dry dry-large-correct
+python3 scripts/agent_bench/run.py review-tasks --task-set large --approve
+# paid, not yet run:
+python3 scripts/agent_bench/run.py run --task-set large --campaign large --model claude-sonnet-5-5 --arms a,b --reps 3 --token-limit <L sonnet> --binary $B
+python3 scripts/agent_bench/run.py report --task-set large --campaign large
+```
+
 ## Earlier single-task illustrations
 
 The results below come from single pairs on a vendor-written fixture. They illustrate the mechanism and are not evidence of task-level savings.

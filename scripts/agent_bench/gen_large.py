@@ -280,7 +280,7 @@ def edit_spans(texts, edits):
     return out
 
 
-def verify_injection(work, target, command, base_msgs, chosen, rounds=6):
+def verify_injection(work, target, command, base_msgs, chosen, rounds=8):
     """Apply all edits, run clippy once, and keep each edit only if exactly its own lint fires on its lines and
     nothing new fires elsewhere in its file. Repeats until every kept edit is accounted for."""
     current = [dict(c) for c in chosen]
@@ -301,10 +301,18 @@ def verify_injection(work, target, command, base_msgs, chosen, rounds=6):
                 matched[i].append(m["code"])
             if not hits:
                 unexplained.append(m)
-        bad = {i for i, e in enumerate(edits) if matched[i] != [e["lint"]]}
-        extra = collections.Counter((m["code"], m["file"]) for m in unexplained) - base_cf
-        for (_, rel) in extra:
-            bad |= {i for i, e in enumerate(edits) if e["file"] == rel}
+        errors = {m["file"] for m in messages if m["level"] == "error"}
+        if errors:
+            # A crate that does not compile hides every crate that depends on it from clippy, so edits without
+            # a message prove nothing this round: drop only the edits in files that report an error.
+            bad = {i for i, e in enumerate(edits) if e["file"] in errors}
+            if not bad:
+                raise RuntimeError("clippy reports errors outside the injected files: %s" % sorted(errors)[:3])
+        else:
+            bad = {i for i, e in enumerate(edits) if matched[i] != [e["lint"]]}
+            extra = collections.Counter((m["code"], m["file"]) for m in unexplained) - base_cf
+            for (_, rel) in extra:
+                bad |= {i for i, e in enumerate(edits) if e["file"] == rel}
         if not bad:
             return edits, messages
         log("large lint: dropping", len(bad), "of", len(edits))
