@@ -16107,18 +16107,16 @@ fn lookup_next_command_opens_a_file_whose_name_starts_with_a_dash() {
 
 /// The `Read` and `Outline` lines `resume` lists for one file.
 fn resume_reads(root: &Path, file: &str) -> Vec<String> {
+    fn of<'a>(line: &'a str, kind: &str, file: &str) -> Option<&'a str> {
+        line.strip_prefix(kind)?.strip_prefix(file)
+    }
     success(root, &["resume", "--budget", "100000"])
         .lines()
         .filter(|line| {
-            line.strip_prefix("Read ")
-                .and_then(|rest| rest.strip_prefix(file))
-                .is_some_and(|rest| rest.starts_with(':'))
-                || line
-                    .strip_prefix("Outline ")
-                    .and_then(|rest| rest.strip_prefix(file))
-                    .is_some_and(|rest| {
-                        rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':')
-                    })
+            of(line, "Read ", file).is_some_and(|rest| rest.starts_with(':'))
+                || of(line, "Outline ", file).is_some_and(|rest| {
+                    rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':')
+                })
         })
         .map(str::to_owned)
         .collect()
@@ -16129,50 +16127,43 @@ fn whole_file_reads_and_outlines_are_recorded_for_resume() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
-    fs::write(root.join("worker.py"), "def work():\n    return 1\n").unwrap();
+    let worker = "def work():\n    return 1\n";
+    fs::write(root.join("worker.py"), worker).unwrap();
+    let repeated = |count: &str| {
+        let stats = success(&root, &["stats"]);
+        text_has(
+            &stats,
+            &[&format!(" {count} repeated source-range read(s)")],
+        );
+    };
 
     // A small file comes back verbatim and is recorded like `expand L1-2`.
-    assert_eq!(
-        success(&root, &["read", "worker.py"]),
-        "def work():\n    return 1\n"
-    );
+    assert_eq!(success(&root, &["read", "worker.py"]), worker);
     assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
     fs::write(root.join("worker.py"), "def work():\n    return 2\n").unwrap();
-    assert_eq!(
-        resume_reads(&root, "worker.py"),
-        ["Read worker.py:1-2 [source changed]"]
-    );
+    let changed = "Read worker.py:1-2 [source changed]";
+    assert_eq!(resume_reads(&root, "worker.py"), [changed]);
     // The compaction handoff carries the same notice.
-    let handoff = agent_hook(
-        &root,
-        "hook-claude",
-        "after-compact",
-        serde_json::json!({"hook_event_name":"SessionStart","source":"compact"}),
-    );
-    let context = handoff["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        context.contains("Read worker.py:1-2 [source changed]\n"),
-        "{handoff}"
-    );
+    let compact = serde_json::json!({"hook_event_name":"SessionStart","source":"compact"});
+    let handoff = agent_hook(&root, "hook-claude", "after-compact", compact);
+    let context = handoff["hookSpecificOutput"]["additionalContext"].as_str();
+    text_has(context.unwrap_or_default(), &[&format!("{changed}\n")]);
     // Reading it again replaces the entry. Reading unchanged source again, by
     // `read` or by `expand` of the same lines, counts as a repeated read.
     success(&root, &["read", "worker.py"]);
     success(&root, &["read", "worker.py"]);
     success(&root, &["expand", "worker.py", "L1-2"]);
     assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
-    assert!(success(&root, &["stats"]).contains(" 2 repeated source-range read(s)"));
+    repeated("2");
     // From a subdirectory, the entry still names the workspace-relative file.
-    fs::create_dir(root.join("jobs")).unwrap();
-    fs::write(root.join("jobs/queue.py"), "QUEUE = []\n").unwrap();
-    success(&root.join("jobs"), &["read", "queue.py"]);
-    assert_eq!(
-        resume_reads(&root, "jobs/queue.py"),
-        ["Read jobs/queue.py:1-1"]
+    write_files(
+        &root,
+        &[("jobs/queue.py", "QUEUE = []\n"), ("empty.py", "")],
     );
+    success(&root.join("jobs"), &["read", "queue.py"]);
+    let queue = resume_reads(&root, "jobs/queue.py");
+    assert_eq!(queue, ["Read jobs/queue.py:1-1"]);
     // An empty file shows no lines, so nothing is recorded.
-    fs::write(root.join("empty.py"), "").unwrap();
     assert_eq!(success(&root, &["read", "empty.py"]), "");
     assert!(resume_reads(&root, "empty.py").is_empty());
 
@@ -16182,60 +16173,56 @@ fn whole_file_reads_and_outlines_are_recorded_for_resume() {
         .map(|n| format!("def f{n}(x):\n    y = x + {n}\n    return y * 2\n\n"))
         .collect();
     fs::write(root.join("big.py"), &big).unwrap();
-    let outline = success(&root, &["read", "big.py", "--budget", "400"]);
-    assert!(
-        outline.starts_with("revision ") && outline.contains("next --after "),
-        "{outline}"
-    );
+    let outline = success_words(&root, "read big.py --budget 400");
+    assert!(outline.starts_with("revision "), "{outline}");
+    text_has(&outline, &["next --after "]);
     assert_eq!(resume_reads(&root, "big.py"), ["Outline big.py"]);
-    success(&root, &["read", "big.py", "--outline", "--match", "f7"]);
-    success(&root, &["read", "big.py", "--json"]);
-    success(&root, &["read", "worker.py", "--outline"]);
+    success_words(&root, "read big.py --outline --match f7");
+    success_words(&root, "read big.py --json");
+    success_words(&root, "read worker.py --outline");
     assert_eq!(resume_reads(&root, "big.py"), ["Outline big.py"]);
     assert_eq!(
         resume_reads(&root, "worker.py"),
         ["Outline worker.py", "Read worker.py:1-2"]
     );
-    assert!(success(&root, &["stats"]).contains(" 2 repeated source-range read(s)"));
+    repeated("2");
     fs::write(root.join("big.py"), big.replace("x + 7\n", "x + 70\n")).unwrap();
-    assert_eq!(
-        resume_reads(&root, "big.py"),
-        ["Outline big.py [source changed]"]
-    );
+    let changed = ["Outline big.py [source changed]"];
+    assert_eq!(resume_reads(&root, "big.py"), changed);
 
     // A pack lists its files once, as before, and adds no ranges of its own.
     success(&root, &["pack", "where is f3 defined"]);
-    let resume = success(&root, &["resume", "--budget", "100000"]);
-    assert!(resume.contains("Last pack: big.py"), "{resume}");
-    assert_eq!(
-        resume_reads(&root, "big.py"),
-        ["Outline big.py [source changed]"]
-    );
-}
+    let resume = success_words(&root, "resume --budget 100000");
+    text_has(&resume, &["Last pack: big.py"]);
+    assert_eq!(resume_reads(&root, "big.py"), changed);
 
-#[test]
-fn reads_recorded_before_outlines_existed_still_load() {
+    // Reads recorded before outlines existed still load: activity.json as an
+    // earlier Justless wrote it.
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
-    fs::write(root.join("worker.py"), "def work():\n    return 1\n").unwrap();
-    fs::create_dir(root.join(".justless")).unwrap();
-    // activity.json as an earlier Justless wrote it.
-    fs::write(
-        root.join(".justless/activity.json"),
-        r#"{"bypasses":{"cat":1},"reads":[{"file":"worker.py","digest":"0","from":1,"to":1}],"repeat_reads":3,"last_pack":{}}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        resume_reads(&root, "worker.py"),
-        ["Read worker.py:1-1 [source changed]"]
+    let activity = r#"{"bypasses":{"cat":1},"reads":[{"file":"worker.py","digest":"0","from":1,"to":1}],"repeat_reads":3,"last_pack":{}}"#;
+    write_files(
+        &root,
+        &[("worker.py", worker), (".justless/activity.json", activity)],
     );
+    let earlier = "Read worker.py:1-1 [source changed]";
+    assert_eq!(resume_reads(&root, "worker.py"), [earlier]);
     success(&root, &["read", "worker.py"]);
-    assert_eq!(
-        resume_reads(&root, "worker.py"),
-        ["Read worker.py:1-2", "Read worker.py:1-1 [source changed]"]
+    let reads = resume_reads(&root, "worker.py");
+    assert_eq!(reads, ["Read worker.py:1-2", earlier]);
+    text_has(
+        &success(&root, &["stats"]),
+        &[" 3 repeated source-range read(s)"],
     );
-    assert!(success(&root, &["stats"]).contains(" 3 repeated source-range read(s)"));
+}
+
+/// The PostToolUse event Claude Code sends after reading `lines` lines of `path`
+/// from line `start`, of `total`, as `content`.
+fn read_event(path: &Path, content: &str, start: u64, lines: u64, total: u64) -> serde_json::Value {
+    serde_json::json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+        "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
+        "content":content,"startLine":start,"numLines":lines,"totalLines":total}}})
 }
 
 #[test]
@@ -16244,94 +16231,74 @@ fn claude_reads_record_the_lines_or_outline_the_agent_was_shown() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
-    let small = root.join("worker.py");
-    fs::write(&small, "def work():\n    return 1\n").unwrap();
-    let large = root.join("module.py");
     let source = format!(
         "def calculate():\n{}    return 42\n",
         "    # detail\n".repeat(400)
     );
-    fs::write(&large, &source).unwrap();
-    let read = |path: &Path, content: &str, start: u64, lines: u64, total: u64| {
-        json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
-            "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
-            "content":content,"startLine":start,"numLines":lines,"totalLines":total}}})
-    };
-    let small_read = read(&small, "def work():\n    return 1", 1, 2, 2);
+    write_files(
+        &root,
+        &[
+            ("worker.py", "def work():\n    return 1\n"),
+            ("module.py", &source),
+        ],
+    );
+    let (small, large) = (root.join("worker.py"), root.join("module.py"));
+    let hook = |event| agent_hook(&root, "hook-claude", "after-read", event);
+    let small_read = read_event(&small, "def work():\n    return 1", 1, 2, 2);
 
     // A project without a state directory is left without one.
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "after-read", small_read.clone()),
-        json!({})
-    );
+    assert_eq!(hook(small_read.clone()), json!({}));
     assert!(!root.join(".justless").exists());
 
     success(&root, &["index"]);
     // A small whole read passes through and records the whole file.
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "after-read", small_read.clone()),
-        json!({})
-    );
+    assert_eq!(hook(small_read.clone()), json!({}));
     assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
     // A ranged read records the lines Claude Code returned.
-    let mut ranged = read(&large, "    # detail\n    # detail", 3, 2, 402);
+    let mut ranged = read_event(&large, "    # detail\n    # detail", 3, 2, 402);
     ranged["tool_input"]["offset"] = json!(3);
     ranged["tool_input"]["limit"] = json!(2);
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "after-read", ranged),
-        json!({})
-    );
+    assert_eq!(hook(ranged), json!({}));
     assert_eq!(resume_reads(&root, "module.py"), ["Read module.py:3-4"]);
     // A whole read replaced by an outline records the outline only.
-    let whole = read(&large, source.trim_end_matches('\n'), 1, 402, 402);
-    let replaced = agent_hook(&root, "hook-claude", "after-read", whole);
-    assert!(
-        replaced["hookSpecificOutput"]["updatedToolOutput"].is_object(),
-        "{replaced}"
-    );
+    let whole = read_event(&large, source.trim_end_matches('\n'), 1, 402, 402);
+    let replaced = hook(whole);
+    let updated = &replaced["hookSpecificOutput"]["updatedToolOutput"];
+    assert!(updated.is_object(), "{replaced}");
     assert_eq!(
         resume_reads(&root, "module.py"),
         ["Outline module.py", "Read module.py:3-4"]
     );
     // The same whole read, unchanged, counts as a repeated read.
-    agent_hook(&root, "hook-claude", "after-read", small_read);
-    assert!(success(&root, &["stats"]).contains(" 1 repeated source-range read(s)"));
-    fs::write(&small, "def work():\n    return 2\n").unwrap();
-    assert_eq!(
-        resume_reads(&root, "worker.py"),
-        ["Read worker.py:1-2 [source changed]"]
+    hook(small_read);
+    text_has(
+        &success(&root, &["stats"]),
+        &[" 1 repeated source-range read(s)"],
     );
+    fs::write(&small, "def work():\n    return 2\n").unwrap();
+    let changed = ["Read worker.py:1-2 [source changed]"];
+    assert_eq!(resume_reads(&root, "worker.py"), changed);
     // Offset 0 reads from line 1, and Read's empty line after a final newline is
     // not a line of the file.
-    let mut zero = read(&small, "def work():\n    return 2\n", 0, 3, 3);
+    let mut zero = read_event(&small, "def work():\n    return 2\n", 0, 3, 3);
     zero["tool_input"]["offset"] = json!(0);
-    assert_eq!(
-        agent_hook(&root, "hook-claude", "after-read", zero),
-        json!({})
-    );
+    assert_eq!(hook(zero), json!({}));
     assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
 
     // Images, and files outside the project, are not recorded.
-    let before = fs::read_to_string(root.join(".justless/activity.json")).unwrap();
+    let before = file_text(&root, ".justless/activity.json");
     let image = root.join("logo.png");
     fs::write(&image, b"\x89PNG\r\n").unwrap();
-    let picture = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
+    hook(
+        json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
         "tool_input":{"file_path":image},"tool_response":{"type":"image","file":{"base64":"",
-        "type":"image/png","originalSize":6}}});
-    agent_hook(&root, "hook-claude", "after-read", picture);
+        "type":"image/png","originalSize":6}}}),
+    );
     let elsewhere = TempDir::new().unwrap();
     let outside = elsewhere.path().canonicalize().unwrap().join("notes.txt");
     fs::write(&outside, "note\n").unwrap();
-    agent_hook(
-        &root,
-        "hook-claude",
-        "after-read",
-        read(&outside, "note", 1, 1, 1),
-    );
-    assert_eq!(
-        fs::read_to_string(root.join(".justless/activity.json")).unwrap(),
-        before
-    );
+    hook(read_event(&outside, "note", 1, 1, 1));
+    assert_eq!(file_text(&root, ".justless/activity.json"), before);
 }
 
 #[test]
@@ -16350,16 +16317,12 @@ fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
     let native = module.trim_end_matches('\n');
     let notes = "plain words, no code\n".repeat(400);
     let path = |name: &str| {
-        let path = outside.join(name);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, &module).unwrap();
-        path
+        write_files(&outside, &[(name, &module)]);
+        outside.join(name)
     };
     let read = |path: &Path, content: &str| {
-        let lines = content.lines().count();
-        json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
-            "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
-            "content":content,"startLine":1,"numLines":lines,"totalLines":lines}}})
+        let lines = content.lines().count() as u64;
+        read_event(path, content, 1, lines, lines)
     };
     let hook = |event: Value| -> Value {
         let mut child = Command::new(env!("CARGO_BIN_EXE_justless"))
@@ -16402,7 +16365,7 @@ fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
     let context = output["additionalContext"].as_str().unwrap();
     assert!(context.contains("allow_large: true") && !context.contains("expand"));
     assert_eq!(success(&root, &["recall", id]), native);
-    assert!(!success(&root, &["resume"]).contains("pipeline.py"));
+    text_lacks(&success(&root, &["resume"]), &["pipeline.py"]);
 
     let mut whole = read(&module_path, native);
     whole["tool_input"]["allow_large"] = json!(true);
@@ -16440,41 +16403,21 @@ fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
 fn file_level_fixture() -> TempDir {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let write = |file: &str, text: &str| {
-        let path = root.join(file);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    };
-    write(".gitignore", "/target/\n/Cargo.lock\n");
-    write(".gitattributes", "fixtures/golden.txt -diff\n");
-    write(
-        "Cargo.toml",
-        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    fixture_files(
+        root,
+        "//- .gitignore\n/target/\n/Cargo.lock\n\
+        //- .gitattributes\nfixtures/golden.txt -diff\n\
+        //- Cargo.toml\n[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+        //- src/lib.rs\npub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n\
+        //- README.md\n# Demo\n\
+        //- fixtures/golden.txt\nexpected output\n\
+        //- tests/files.rs\n#[test]\nfn script_runs() {\n    let script = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/scripts/check.sh\");\n    assert!(std::process::Command::new(script).status().unwrap().success());\n}\n\n\
+        #[test]\nfn golden_matches() {\n    let path = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/fixtures/golden.txt\");\n    assert_eq!(std::fs::read_to_string(path).unwrap(), \"expected output\\n\");\n}\n",
     );
-    write(
-        "src/lib.rs",
-        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n",
-    );
-    write("README.md", "# Demo\n");
-    write("scripts/check.sh", "#!/bin/sh\necho ok\n");
-    set_mode(&root.join("scripts/check.sh"), 0o755);
-    write("fixtures/golden.txt", "expected output\n");
+    executable(root, "scripts/check.sh", "#!/bin/sh\necho ok\n");
     fs::write(root.join("fixtures/blob.bin"), [0u8, 159, 146, 150]).unwrap();
     std::os::unix::fs::symlink("golden.txt", root.join("fixtures/current")).unwrap();
-    write(
-        "tests/files.rs",
-        concat!(
-            "#[test]\nfn script_runs() {\n",
-            "    let script = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/scripts/check.sh\");\n",
-            "    assert!(std::process::Command::new(script).status().unwrap().success());\n}\n\n",
-            "#[test]\nfn golden_matches() {\n",
-            "    let path = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/fixtures/golden.txt\");\n",
-            "    assert_eq!(std::fs::read_to_string(path).unwrap(), \"expected output\\n\");\n}\n",
-        ),
-    );
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
+    commit_all(root);
     repo
 }
 
@@ -16483,153 +16426,141 @@ fn file_level_fixture() -> TempDir {
 fn changes_git_shows_without_a_line_diff_stay_in_the_change_set() {
     let repo = file_level_fixture();
     let root = repo.path();
-    let cargo = ["--", "cargo", "test", "--offline"];
-    let plan = |extra: &[&str]| {
-        success(
-            root,
-            &[&["test", "--affected", "--dry-run"][..], extra, &cargo].concat(),
-        )
+    let plan = |extra: &str| {
+        let words = format!("test --affected --dry-run {extra} -- cargo test --offline");
+        success_words(root, &words)
     };
-    let clean = |root: &Path| {
-        let text = success(root, &["context", "--changes"]);
+    // Asserts that `context` and `affected` with `options` name `what` as changed.
+    let both_name = |options: &str, what: &str| {
+        has_line(
+            &success_words(root, &format!("context --changes {options}")),
+            what,
+        );
+        let affected = success_words(root, &format!("affected --changes {options}"));
+        has_line(&affected, &format!("  {what}"));
+    };
+    let clean = || {
+        let text = success_words(root, "context --changes");
         assert!(text.starts_with("No changed files."), "{text}");
     };
-    clean(root);
+    let full_suite = "  Run (full suite): cargo test --offline";
+    clean();
 
     // The executable bit alone: Git shows 100755 -> 100644 and no line. The
     // test that names the script would pass, so only the full suite is safe.
     set_mode(&root.join("scripts/check.sh"), 0o644);
     let what = "scripts/check.sh · mode 100755 -> 100644";
-    has_line(&success(root, &["context", "--changes"]), what);
-    has_line(
-        &success(root, &["affected", "--changes"]),
-        &format!("  {what}"),
-    );
-    let text = plan(&[]);
-    has_line(&text, &format!("Changed {what}"));
+    both_name("", what);
     let reason = "scripts/check.sh changed without a line diff (mode 100755 -> 100644)";
-    assert!(
-        text.contains(&format!("cargo · full suite · {reason}")),
-        "{text}"
+    let text = plan("");
+    text_lines(
+        &text,
+        &[
+            &format!("Changed {what}"),
+            &format!("  no-line-diff: {reason}"),
+            full_suite,
+        ],
     );
-    has_line(&text, &format!("  no-line-diff: {reason}"));
-    has_line(&text, "  Run (full suite): cargo test --offline");
-    let kept = plan(&["--no-fallback"]);
-    assert!(
-        kept.contains("cargo · low-confidence subset (no-line-diff)"),
-        "{kept}"
+    text_has(&text, &[&format!("cargo · full suite · {reason}")]);
+    text_has(
+        &plan("--no-fallback"),
+        &["cargo · low-confidence subset (no-line-diff)"],
     );
     // Staged, it reads the same.
     git(root, &["add", "scripts/check.sh"]);
-    has_line(&success(root, &["context", "--changes", "--staged"]), what);
-    has_line(
-        &success(root, &["affected", "--changes", "--staged"]),
-        &format!("  {what}"),
-    );
+    both_name("--staged", what);
     // Committed on a branch, `--base` reads it the same.
     git(root, &["tag", "base"]);
     git(root, &["commit", "-qm", "drop the executable bit"]);
-    clean(root);
-    has_line(
-        &success(root, &["context", "--changes", "--base", "base"]),
-        what,
-    );
-    has_line(
-        &success(root, &["affected", "--changes", "--base", "base"]),
-        &format!("  {what}"),
-    );
-    let text = plan(&["--base", "base"]);
-    has_line(&text, &format!("  no-line-diff: {reason}"));
-    has_line(&text, "  Run (full suite): cargo test --offline");
+    clean();
+    both_name("--base base", what);
+    let text = plan("--base base");
+    text_lines(&text, &[&format!("  no-line-diff: {reason}"), full_suite]);
     git(root, &["reset", "-q", "--hard", "base"]);
-    clean(root);
+    clean();
 
     // A binary fixture, staged too, and a symlink that points elsewhere.
     fs::write(root.join("fixtures/blob.bin"), [0u8, 1, 2, 3]).unwrap();
     let what = "fixtures/blob.bin · binary or no line diff";
-    has_line(&success(root, &["context", "--changes"]), what);
-    let text = plan(&[]);
-    has_line(&text, &format!("Changed {what}"));
-    has_line(
-        &text,
-        "  no-line-diff: fixtures/blob.bin changed without a line diff (binary or no line diff)",
+    has_line(&success_words(root, "context --changes"), what);
+    text_lines(
+        &plan(""),
+        &[
+            &format!("Changed {what}"),
+            "  no-line-diff: fixtures/blob.bin changed without a line diff (binary or no line diff)",
+        ],
     );
     git(root, &["add", "fixtures/blob.bin"]);
-    has_line(&success(root, &["context", "--changes", "--staged"]), what);
+    has_line(&success_words(root, "context --changes --staged"), what);
     git(root, &["reset", "-q", "--hard"]);
     fs::remove_file(root.join("fixtures/current")).unwrap();
     std::os::unix::fs::symlink("blob.bin", root.join("fixtures/current")).unwrap();
-    let text = plan(&[]);
-    has_line(
-        &text,
-        "Changed fixtures/current · symlink target changed to blob.bin",
+    text_lines(
+        &plan(""),
+        &[
+            "Changed fixtures/current · symlink target changed to blob.bin",
+            "  no-line-diff: fixtures/current changed without a line diff (symlink target changed to blob.bin)",
+            full_suite,
+        ],
     );
-    has_line(
-        &text,
-        "  no-line-diff: fixtures/current changed without a line diff (symlink target changed to blob.bin)",
-    );
-    has_line(&text, "  Run (full suite): cargo test --offline");
     // Kept as a subset, an untraceable change never reads as reaching nothing.
-    let kept = plan(&["--no-fallback"]);
-    assert!(
-        kept.lines().any(
-            |line| line.starts_with("cargo · nothing to run, low confidence (")
-                && line.contains("no-line-diff")
-        ),
-        "{kept}"
-    );
-    assert!(!kept.contains("no change reaches its tests"), "{kept}");
+    let kept = plan("--no-fallback");
+    let low = kept.lines().any(|line| {
+        line.starts_with("cargo · nothing to run, low confidence (")
+            && line.contains("no-line-diff")
+    });
+    assert!(low, "{kept}");
+    text_lacks(&kept, &["no change reaches its tests"]);
     git(root, &["reset", "-q", "--hard"]);
-    clean(root);
+    clean();
 
     // A fixture marked `-diff`: Git reports it like a binary file.
     replace_in(root, "fixtures/golden.txt", "expected", "changed");
-    has_line(
-        &success(root, &["context", "--changes"]),
-        "fixtures/golden.txt · binary or no line diff",
-    );
-    let text = plan(&[]);
-    has_line(
+    let what = "fixtures/golden.txt · binary or no line diff";
+    has_line(&success_words(root, "context --changes"), what);
+    let text = plan("");
+    has_line(&text, &format!("Changed {what}"));
+    text_has(
         &text,
-        "Changed fixtures/golden.txt · binary or no line diff",
-    );
-    assert!(
-        text.contains("cargo · full suite · fixtures/golden.txt changed without a line diff (binary or no line diff)"),
-        "{text}"
+        &[
+            "cargo · full suite · fixtures/golden.txt changed without a line diff (binary or no line diff)",
+        ],
     );
     git(root, &["reset", "-q", "--hard"]);
 
     // A mode change beside edited lines keeps both.
     set_mode(&root.join("src/lib.rs"), 0o755);
     replace_in(root, "src/lib.rs", "a + b", "b + a");
-    let context = success(root, &["context", "--changes"]);
-    has_line(&context, "src/lib.rs · mode 100644 -> 100755");
-    has_line(&context, "Changed src/lib.rs:2-2");
-    let text = plan(&[]);
-    has_line(
+    text_lines(
+        &success_words(root, "context --changes"),
+        &[
+            "src/lib.rs · mode 100644 -> 100755",
+            "Changed src/lib.rs:2-2",
+        ],
+    );
+    let text = plan("");
+    text_lines(
         &text,
-        "Changed src/lib.rs · modified, mode 100644 -> 100755",
+        &[
+            "Changed src/lib.rs · modified, mode 100644 -> 100755",
+            full_suite,
+        ],
     );
-    assert!(
-        text.contains(
-            "  no-line-diff: src/lib.rs changed without a line diff (mode 100644 -> 100755)"
-        ),
-        "{text}"
+    text_has(
+        &text,
+        &["  no-line-diff: src/lib.rs changed without a line diff (mode 100644 -> 100755)"],
     );
-    has_line(&text, "  Run (full suite): cargo test --offline");
     git(root, &["reset", "-q", "--hard"]);
 
     // Documentation stays inert, and still says what changed.
     set_mode(&root.join("README.md"), 0o755);
-    let text = plan(&[]);
-    has_line(&text, "Changed README.md · mode 100644 -> 100755");
-    has_line(
-        &text,
-        "README.md · no test impact (documentation or repository metadata)",
-    );
-    has_line(
-        &text,
-        "cargo · nothing to run · no change reaches its tests",
+    text_lines(
+        &plan(""),
+        &[
+            "Changed README.md · mode 100644 -> 100755",
+            "README.md · no test impact (documentation or repository metadata)",
+            "cargo · nothing to run · no change reaches its tests",
+        ],
     );
 }
 
@@ -16639,21 +16570,21 @@ fn changes_name_symlinks_submodules_renames_and_type_changes() {
     use std::os::unix::fs::symlink;
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    fs::write(root.join("text.txt"), "a\nb\n").unwrap();
-    fs::write(root.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
-    fs::write(root.join("becomes-link"), "plain\n").unwrap();
-    fs::write(root.join("before.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    write_files(
+        root,
+        &[
+            ("text.txt", "a\nb\n"),
+            ("run.sh", "#!/bin/sh\necho hi\n"),
+            ("becomes-link", "plain\n"),
+            ("before.txt", "one\ntwo\nthree\nfour\n"),
+            ("sub/a", "a\n"),
+        ],
+    );
     symlink("text.txt", root.join("link")).unwrap();
     symlink("text.txt", root.join("gone-link")).unwrap();
     let sub = root.join("sub");
-    fs::create_dir(&sub).unwrap();
-    git(&sub, &["init", "-q"]);
-    fs::write(sub.join("a"), "a\n").unwrap();
-    git(&sub, &["add", "a"]);
-    git(&sub, &["commit", "-qm", "a"]);
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
+    commit_all(&sub);
+    commit_all(root);
 
     fs::remove_file(root.join("link")).unwrap();
     symlink("run.sh", root.join("link")).unwrap();
@@ -16673,29 +16604,27 @@ fn changes_name_symlinks_submodules_renames_and_type_changes() {
         "sub · submodule changed",
         "new-link · new symlink to nowhere",
     ];
-    let context = success(root, &["context", "--changes"]);
-    for line in described {
-        has_line(&context, line);
-    }
+    let context = success_words(root, "context --changes");
+    text_lines(&context, &described);
     has_line(&context, "before.txt · deleted");
-    let affected = success(root, &["affected", "--changes"]);
+    let affected = success_words(root, "affected --changes");
     for line in described {
         has_line(&affected, &format!("  {line}"));
     }
 
     // Staged, the index side names the same changes.
     git(root, &["add", "-A"]);
-    let staged = success(root, &["context", "--changes", "--staged"]);
-    for line in described {
-        has_line(&staged, line);
-    }
+    text_lines(
+        &success_words(root, "context --changes --staged"),
+        &described,
+    );
 
     // A nested repository Git cannot list file by file is kept too.
     let nested = root.join("nested");
     fs::create_dir(&nested).unwrap();
     git(&nested, &["init", "-q"]);
     has_line(
-        &success(root, &["context", "--changes"]),
+        &success_words(root, "context --changes"),
         "nested/ · new nested Git repository",
     );
 }
@@ -16705,51 +16634,37 @@ fn changes_name_symlinks_submodules_renames_and_type_changes() {
 fn affected_tests_widen_for_a_file_level_change_outside_the_runner_root() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    let write = |file: &str, text: &str| {
-        let path = root.join(file);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    };
-    write(".gitignore", "target/\nCargo.lock\n");
-    write(
-        "app/Cargo.toml",
-        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    fixture_files(
+        root,
+        "//- .gitignore\ntarget/\nCargo.lock\n\
+        //- app/Cargo.toml\n[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+        //- app/src/lib.rs\npub fn one() -> i32 {\n    1\n}\n\
+        //- app/tests/script.rs\n#[test]\nfn script_runs() {\n    let script = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../scripts/check.sh\");\n    assert!(std::process::Command::new(script).status().unwrap().success());\n}\n",
     );
-    write("app/src/lib.rs", "pub fn one() -> i32 {\n    1\n}\n");
-    write(
-        "app/tests/script.rs",
-        "#[test]\nfn script_runs() {\n    let script = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../scripts/check.sh\");\n    assert!(std::process::Command::new(script).status().unwrap().success());\n}\n",
-    );
-    write("scripts/check.sh", "#!/bin/sh\necho ok\n");
-    set_mode(&root.join("scripts/check.sh"), 0o755);
-    git(root, &["init", "-q"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "fixture"]);
+    executable(root, "scripts/check.sh", "#!/bin/sh\necho ok\n");
+    commit_all(root);
     set_mode(&root.join("scripts/check.sh"), 0o644);
-    let text = success(root, &["test", "--affected", "--dry-run"]);
-    assert!(
-        text.contains("cargo (app) · full suite · scripts/check.sh changed without a line diff (mode 100755 -> 100644)"),
-        "{text}"
+    text_has(
+        &success_words(root, "test --affected --dry-run"),
+        &[
+            "cargo (app) · full suite · scripts/check.sh changed without a line diff (mode 100755 -> 100644)",
+        ],
     );
 }
 
 /// The outline rows of a Markdown file as (name, first line, last line).
 fn markdown_rows(root: &Path, file: &str) -> (String, Vec<(String, u64, u64)>) {
-    let outline: serde_json::Value =
-        serde_json::from_str(&success(root, &["read", file, "--outline", "--json"])).unwrap();
-    let rows = outline["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| {
-            (
-                entry["name"].as_str().unwrap().to_owned(),
-                entry["first"].as_u64().unwrap(),
-                entry["last"].as_u64().unwrap(),
-            )
-        })
-        .collect();
-    (outline["revision"].as_str().unwrap().to_owned(), rows)
+    let outline = success(root, &["read", file, "--outline", "--json"]);
+    let outline: serde_json::Value = serde_json::from_str(&outline).unwrap();
+    let rows = outline["entries"].as_array().unwrap().iter().map(|entry| {
+        let line = |key: &str| entry[key].as_u64().unwrap();
+        let name = entry["name"].as_str().unwrap().to_owned();
+        (name, line("first"), line("last"))
+    });
+    (
+        outline["revision"].as_str().unwrap().to_owned(),
+        rows.collect(),
+    )
 }
 
 #[test]
@@ -16763,7 +16678,7 @@ fn markdown_setext_heading_ends_the_section_before_it() {
         .map(|(name, first, last)| (name.to_owned(), first, last));
     assert_eq!(rows, expected);
     assert_eq!(
-        success(root, &["expand", "README.md", "Install"]),
+        success_words(root, "expand README.md Install"),
         "# Install\n\nRun the installer.\n\n"
     );
     // Replacing Install leaves the Usage section and its subsection alone.
@@ -16771,26 +16686,25 @@ fn markdown_setext_heading_ends_the_section_before_it() {
     let replacement = input.path().join("install.md");
     fs::write(&replacement, "# Install\n\nUse brew.\n\n").unwrap();
     let selector = format!("{revision}#1");
+    let replacement = replacement.to_str().unwrap();
     let edit = [
         "edit",
         "README.md",
         &selector,
         "--replacement-file",
-        replacement.to_str().unwrap(),
+        replacement,
     ];
     let diff = success(root, &[&edit[..], &["--dry-run"]].concat());
-    assert!(
-        diff.contains("+Use brew.") && !diff.contains("-Usage") && !diff.contains("-Call"),
-        "{diff}"
-    );
+    text_has(&diff, &["+Use brew."]);
+    text_lacks(&diff, &["-Usage", "-Call"]);
     success(root, &edit);
     assert_eq!(
-        fs::read_to_string(root.join("README.md")).unwrap(),
+        file_text(root, "README.md"),
         text.replace("Run the installer.", "Use brew.")
     );
     // lookup ranks the Usage section as its own place, from its first line.
-    let found = success(root, &["lookup", "call the tool"]);
-    assert!(found.contains("README.md:5-9 section Usage"), "{found}");
+    let found = success_words(root, "lookup call the tool");
+    text_has(&found, &["README.md:5-9 section Usage"]);
 }
 
 #[test]
@@ -16863,6 +16777,17 @@ fn markdown_section_edits_touch_only_their_own_bytes() {
     let replacement = input.path().join("replacement.md");
     let marker = "replaced section\n";
     fs::write(&replacement, marker).unwrap();
+    let replacement = replacement.to_str().unwrap();
+    let edit = |selector: &str| {
+        let args = [
+            "edit",
+            "guide.md",
+            selector,
+            "--replacement-file",
+            replacement,
+        ];
+        success(root, &args);
+    };
     for ending in ["\n", "\r\n"] {
         let text = lines.map(|line| format!("{line}{ending}")).concat();
         // Byte offsets of each line start, then the end of the file.
@@ -16870,11 +16795,9 @@ fn markdown_section_edits_touch_only_their_own_bytes() {
         starts.extend(text.match_indices(ending).map(|(at, _)| at + ending.len()));
         fs::write(root.join("guide.md"), &text).unwrap();
         let (revision, rows) = markdown_rows(root, "guide.md");
-        assert_eq!(
-            rows,
-            expected.map(|(name, first, last)| (name.to_owned(), first as u64, last as u64)),
-            "{ending:?}"
-        );
+        let named =
+            expected.map(|(name, first, last)| (name.to_owned(), first as u64, last as u64));
+        assert_eq!(rows, named, "{ending:?}");
         for (row, (name, first, last)) in expected.iter().enumerate() {
             let span = starts[first - 1]..starts[*last];
             let selector = format!("{revision}#{}", row + 1);
@@ -16884,22 +16807,9 @@ fn markdown_section_edits_touch_only_their_own_bytes() {
                 text[span.clone()],
                 "{name} {ending:?}"
             );
-            success(
-                root,
-                &[
-                    "edit",
-                    "guide.md",
-                    &selector,
-                    "--replacement-file",
-                    replacement.to_str().unwrap(),
-                ],
-            );
-            let edited = fs::read_to_string(root.join("guide.md")).unwrap();
-            assert_eq!(
-                edited,
-                format!("{}{marker}{}", &text[..span.start], &text[span.end..]),
-                "{name} {ending:?}"
-            );
+            edit(&selector);
+            let edited = format!("{}{marker}{}", &text[..span.start], &text[span.end..]);
+            assert_eq!(file_text(root, "guide.md"), edited, "{name} {ending:?}");
         }
     }
 }
@@ -16908,28 +16818,28 @@ fn markdown_section_edits_touch_only_their_own_bytes() {
 fn root_given_before_and_after_the_subcommand_must_agree() {
     let temp = TempDir::new().unwrap();
     let (a, b) = (temp.path().join("a"), temp.path().join("b"));
+    write_files(
+        temp.path(),
+        &[
+            ("a/lib.rs", "fn alpha() {}\n"),
+            ("b/lib.rs", "fn beta() {}\n"),
+        ],
+    );
     for dir in [&a, &b] {
-        fs::create_dir_all(dir).unwrap();
         git(dir, &["init", "-q"]);
     }
-    fs::write(a.join("lib.rs"), "fn alpha() {}\n").unwrap();
-    fs::write(b.join("lib.rs"), "fn beta() {}\n").unwrap();
     let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
     // Clap copies the later value over the earlier one, so this ran in b.
     let split = cli(temp.path(), &["--root", a, "find", "fn", "--root", b]);
     assert!(!split.status.success(), "{}", stdout(&split));
-    assert!(
-        stderr(&split).contains("--root names two different directories"),
-        "{}",
-        stderr(&split)
-    );
+    text_has(&stderr(&split), &["--root names two different directories"]);
     let joined = format!("--root={a}");
     let split = cli(temp.path(), &[&joined, "find", "fn", "--root", b]);
     assert!(!split.status.success(), "{}", stdout(&split));
     // The same directory twice still works.
     let same = cli(temp.path(), &["--root", a, "find", "fn", "--root", a]);
     assert!(same.status.success(), "{}", stderr(&same));
-    assert!(stdout(&same).contains("alpha"));
+    text_has(&stdout(&same), &["alpha"]);
     // Arguments after `run --` belong to the command it starts.
     let run = cli(
         temp.path(),
@@ -16958,22 +16868,24 @@ fn savings(root: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-/// Writes 19,000 bytes of output, more than a preview shows, to `output.txt`.
-fn nineteen_thousand_bytes(root: &Path) {
+/// Writes 19,000 bytes of output, more than a preview shows, to `output.txt`,
+/// and runs `cat` on it.
+fn nineteen_thousand_bytes(root: &Path) -> Output {
     let text: String = (0..500)
         .map(|i| format!("line {i:04} {}\n", "x".repeat(27)))
         .collect();
     assert_eq!(text.len(), 19_000);
     fs::write(root.join("output.txt"), &text).unwrap();
+    let run = cli(root, &["run", "--", "cat", "output.txt"]);
+    assert!(run.status.success(), "{}", stderr(&run));
+    run
 }
 
 #[test]
 fn stats_subtract_a_full_replay_from_the_savings_it_reverses() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    nineteen_thousand_bytes(root);
-    let run = cli(root, &["run", "--", "cat", "output.txt"]);
-    assert!(run.status.success(), "{}", stderr(&run));
+    let run = nineteen_thousand_bytes(root);
     let id = run_id(&run);
     let shown = printed_bytes(&run);
     assert!(shown < 19_000 / 2, "{shown}");
@@ -16983,10 +16895,9 @@ fn stats_subtract_a_full_replay_from_the_savings_it_reverses() {
     assert_eq!(before["saved_bytes"], 19_000 - shown);
     assert_eq!(before["replayed_bytes"], 0);
     assert_eq!(before["net_saved_bytes"], 19_000 - shown);
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains("No run output was retrieved again, so net saved: "),
-        "{text}"
+    text_has(
+        &success(root, &["stats"]),
+        &["No run output was retrieved again, so net saved: "],
     );
 
     // The agent reads the whole log back.
@@ -17018,14 +16929,13 @@ fn stats_subtract_a_full_replay_from_the_savings_it_reverses() {
         assert_eq!(group["replayed_bytes"], 19_000, "{group}");
         assert_eq!(group["net_saved_bytes"], net, "{group}");
     }
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains(
-            "Later replays and lookups printed 18.6 KB of run output again, so net saved: -"
-        ) && text.contains(&format!(
-            "tokens saved at first preview, ≈{net_tokens} net (estimated at "
-        )) && text.contains("1/1 reopened in full · 18.6 KB retrieved later"),
-        "{text}"
+    text_has(
+        &success(root, &["stats"]),
+        &[
+            "Later replays and lookups printed 18.6 KB of run output again, so net saved: -",
+            &format!("tokens saved at first preview, ≈{net_tokens} net (estimated at "),
+            "1/1 reopened in full · 18.6 KB retrieved later",
+        ],
     );
 }
 
@@ -17035,10 +16945,8 @@ fn each_retrieval_of_a_run_adds_exactly_what_it_printed() {
     let root = repo.path();
     let text: String = (0..400)
         .map(|i| {
-            format!(
-                "entry {i:03} {}\n",
-                if i % 50 == 7 { "needle" } else { "hay" }
-            )
+            let word = if i % 50 == 7 { "needle" } else { "hay" };
+            format!("entry {i:03} {word}\n")
         })
         .collect();
     fs::write(root.join("output.txt"), &text).unwrap();
@@ -17048,27 +16956,27 @@ fn each_retrieval_of_a_run_adds_exactly_what_it_printed() {
     assert!(initial > 0, "{initial}");
     let mut expected = 0;
     for args in [
-        vec!["log", &id, "--from", "5", "--to", "9"],
-        vec!["search", &id, "needle"],
-        vec!["context", "--run", &id],
-        vec!["history", "needle"],
+        format!("log {id} --from 5 --to 9"),
+        format!("search {id} needle"),
+        format!("context --run {id}"),
+        "history needle".to_owned(),
     ] {
-        let output = cli(root, &args);
-        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
-        assert!(!output.stdout.is_empty(), "{args:?}");
-        assert_eq!(stderr(&output), "", "{args:?}");
+        let output = cli_words(root, &args);
+        assert!(output.status.success(), "{args}: {}", stderr(&output));
+        assert!(!output.stdout.is_empty(), "{args}");
+        assert_eq!(stderr(&output), "", "{args}");
         expected += output.stdout.len() as u64;
-        assert_eq!(savings(root)["replayed_bytes"], expected, "{args:?}");
+        assert_eq!(savings(root)["replayed_bytes"], expected, "{args}");
     }
     let report = savings(root);
-    assert_eq!(report["commands"][0]["targeted_lookups"], 3);
-    assert_eq!(report["commands"][0]["excerpts"], 1);
-    assert_eq!(report["commands"][0]["reopened_runs"], 0);
+    let command = &report["commands"][0];
+    assert_eq!(command["targeted_lookups"], 3);
+    assert_eq!(command["excerpts"], 1);
+    assert_eq!(command["reopened_runs"], 0);
     assert_eq!(report["net_saved_bytes"], initial - expected as i64);
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains(" · 3 targeted lookup(s) · 1 log excerpt(s) · "),
-        "{text}"
+    text_has(
+        &success(root, &["stats"]),
+        &[" · 3 targeted lookup(s) · 1 log excerpt(s) · "],
     );
 }
 
@@ -17099,10 +17007,8 @@ fn log_lines_shown_beside_source_count_and_the_source_does_not() {
     // A task pack's recorded failure counts, its source excerpts do not.
     let before = replayed();
     let pack = success(root, &["pack", "fix the mypy error"]);
-    assert!(
-        pack.starts_with(&format!("Recorded mypy failure: {id}")),
-        "{pack}"
-    );
+    let recorded = format!("Recorded mypy failure: {id}");
+    assert!(pack.starts_with(&recorded), "{pack}");
     let failure: u64 = pack
         .lines()
         .take_while(|line| !line.starts_with("app.py ["))
@@ -17129,34 +17035,34 @@ fn log_lines_shown_beside_source_count_and_the_source_does_not() {
 fn stats_estimate_replays_recorded_before_bytes_were_counted() {
     let repo = TempDir::new().unwrap();
     let root = repo.path();
-    nineteen_thousand_bytes(root);
-    let run = cli(root, &["run", "--", "cat", "output.txt"]);
+    let run = nineteen_thousand_bytes(root);
     let id = run_id(&run);
     let saved = 19_000 - printed_bytes(&run) as i64;
-    let recalls = root.join(".justless/runs").join(&id).join("recalls.json");
-    let write = |value: serde_json::Value| fs::write(&recalls, value.to_string()).unwrap();
+    // Writes the counts an earlier Justless recorded for the run's retrievals.
+    let write = |full: u64, range: u64, search: u64| {
+        let recalls =
+            serde_json::json!({"full": full, "range": range, "search": search, "context": 0});
+        let path = format!(".justless/runs/{id}/recalls.json");
+        fs::write(root.join(path), recalls.to_string()).unwrap();
+    };
 
     // An old record with no retrievals changes nothing, and says nothing.
-    write(serde_json::json!({"full": 0, "range": 0, "search": 0, "context": 0}));
+    write(0, 0, 0);
     let report = savings(root);
     assert_eq!(report["net_saved_bytes"], saved);
     assert_eq!(report["unmeasured_retrievals"], 0);
-    let text = success(root, &["stats"]);
-    assert!(!text.contains("without their size"), "{text}");
+    text_lacks(&success(root, &["stats"]), &["without their size"]);
 
     // An old whole replay is estimated at the archive's size, and labelled so.
-    write(serde_json::json!({"full": 1, "range": 0, "search": 0, "context": 0}));
+    write(1, 0, 0);
     let report = savings(root);
     assert_eq!(report["replayed_bytes"], 0);
     assert_eq!(report["estimated_replays"], 1);
     assert_eq!(report["estimated_replay_bytes"], 19_000);
     assert_eq!(report["net_saved_bytes"], saved - 19_000);
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains(
-            "and about 18.6 KB estimated for 1 whole replay(s) recorded without their size"
-        ),
-        "{text}"
+    text_has(
+        &success(root, &["stats"]),
+        &["and about 18.6 KB estimated for 1 whole replay(s) recorded without their size"],
     );
 
     // A replay measured after the upgrade is not counted twice.
@@ -17169,14 +17075,15 @@ fn stats_estimate_replays_recorded_before_bytes_were_counted() {
 
     // Old range, search and context requests cannot be sized, so they are
     // counted and named but not subtracted.
-    write(serde_json::json!({"full": 0, "range": 2, "search": 1, "context": 0}));
+    write(0, 2, 1);
     let report = savings(root);
     assert_eq!(report["unmeasured_retrievals"], 3);
     assert_eq!(report["net_saved_bytes"], saved);
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains("3 earlier range, search or context request(s) were recorded without their size and are not subtracted"),
-        "{text}"
+    text_has(
+        &success(root, &["stats"]),
+        &[
+            "3 earlier range, search or context request(s) were recorded without their size and are not subtracted",
+        ],
     );
 }
 
@@ -17185,25 +17092,19 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
-    fs::write(root.join("package.json"), "{}").unwrap();
     let start: u64 = 1_767_323_045_678;
     let transcript = root.join("transcript.jsonl");
-    fs::write(
-        &transcript,
-        "{\"type\":\"user\",\"timestamp\":\"2026-01-02T03:04:05.678Z\",\"sessionId\":\"s1\"}\n",
-    )
-    .unwrap();
+    let user =
+        "{\"type\":\"user\",\"timestamp\":\"2026-01-02T03:04:05.678Z\",\"sessionId\":\"s1\"}\n";
+    write_files(&root, &[("package.json", "{}"), ("transcript.jsonl", user)]);
     let event = json!({"session_id":"s1","transcript_path":transcript,"cwd":root,
         "workspace":{"current_dir":root,"project_dir":root}})
     .to_string();
     let line = || status_line(&root, &[], event.as_bytes(), None);
     // A hook-routed run printed 19,000 bytes and showed 364, footer included.
     synthetic_run(&root, "run-replayed", start + 1_000, 19_000, 364 - 48, true);
-    fs::write(
-        root.join(".justless/runs/run-replayed/stdout"),
-        "y".repeat(19_000),
-    )
-    .unwrap();
+    let y = "y".repeat(19_000);
+    write_files(&root, &[(".justless/runs/run-replayed/stdout", &y)]);
     assert_eq!(
         line(),
         "justless · net ≈8.4k tokens saved this session · 1 run"
@@ -17222,20 +17123,8 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
         {"role": "assistant", "content": [{"type": "tool_use", "id": "old", "name": "bash", "input": {}}]},
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "old", "content": result}]},
     ]});
-    let mut mask = Command::new(env!("CARGO_BIN_EXE_justless"))
-        .args(["mask", "--keep", "0"])
-        .current_dir(&root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    mask.stdin
-        .take()
-        .unwrap()
-        .write_all(request.to_string().as_bytes())
-        .unwrap();
-    let masked: serde_json::Value =
-        serde_json::from_slice(&mask.wait_with_output().unwrap().stdout).unwrap();
+    let masked = piped(&root, &["mask", "--keep", "0"], &request.to_string());
+    let masked: serde_json::Value = serde_json::from_slice(&masked.stdout).unwrap();
     let id = masked["messages"][1]["content"][0]["content"]
         .as_str()
         .unwrap()
@@ -17244,10 +17133,8 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
         .unwrap()
         .to_owned();
     assert_eq!(success(&root, &["recall", &id]), result);
-    assert_eq!(
-        success(&root, &["recall", &id, "--from", "1", "--to", "1"]),
-        result
-    );
+    let lines = success_words(&root, &format!("recall {id} --from 1 --to 1"));
+    assert_eq!(lines, result);
     // (19,000 - 364 - 19,000) - 6,000 recalled = -6,364 bytes ≈ 1,591 tokens.
     assert_eq!(
         line(),
@@ -17258,10 +17145,11 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
         report["archive_recalls"],
         json!({"recalls": 2, "bytes": 6_000})
     );
-    let text = success(&root, &["stats"]);
-    assert!(
-        text.contains("Archived tool results printed by `justless recall`, last 7 day(s): 2, 5.9 KB back in context."),
-        "{text}"
+    text_has(
+        &success(&root, &["stats"]),
+        &[
+            "Archived tool results printed by `justless recall`, last 7 day(s): 2, 5.9 KB back in context.",
+        ],
     );
     // A listing prints no archived result and is not counted.
     success(&root, &["recall", "--list"]);
@@ -18875,7 +18763,8 @@ fn claude_post_tool_hooks_are_installed_checked_and_removed_with_the_others() {
         assert!(applied.status.success(), "{}", stderr(&applied));
         success(root, &["init", "--hooks", "--agent", "claude"]);
         let installed = file_text(root, ".claude/settings.json");
-        assert_eq!(installed.matches(&command).count(), 1, "{installed}");
+        let handler = format!("hook-claude {mode}");
+        assert_eq!(installed.matches(&handler).count(), 1, "{installed}");
         let (status, text) = doctor_text(root, tools.path());
         text_has(&text, &["✓ Hooks: .claude/settings.json has all 8"]);
         assert_eq!(status, Some(0), "{text}");
