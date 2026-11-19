@@ -128,23 +128,14 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 ### 3.7 Dependency-aware diffs for lockfiles, starting with Cargo.lock — done
 - **Progress.** *on main* (2026-11-19, `src/lockdiff.rs`). Cargo.lock sections of `git diff`/`git show` are described by added, removed and updated packages and changed links when smaller; `source`/`checksum` changes on an existing version are always flagged. Real commit: 16.5 KB → 1.2 KB.
 
-### 3.8 `init --global`
-- **Problem.** Hooks are per project; 12.5 MB was lost in sessions whose project had no hooks. RTK offers `init -g` for 13 agents.
-- **Plan.** Opt-in user-level hooks that resolve the project root per call, with a per-project opt-out, and `doctor`/`init --remove` support.
-- **Progress.** *not started*.
+### 3.8 `init --global` — done
+- **Progress.** *on main* (2026-11-19, `src/global.rs`). `init --global` merges hooks into Claude Code's and Codex's user settings, keeping every other key; each call resolves the project from the hook input's cwd and stays out of the home folder, projects with `global_hooks = false` and projects whose own settings already run the hook. `init --remove --global` restores untouched files byte for byte. Follow-ups in §4.J.
 
-### 3.9 Global project registry — machine-wide stats and run lookup
-- **Problem.** All state lives in each project's `.justless/`, so nothing sees across projects: `stats` covers one checkout, runs made in a git worktree or nested repository count only there, and `justless log RUN` from another directory answers "unknown run ID". On 2026-11-19 this repo's `stats` showed 5 runs because a session's other work ran in worktrees and scratch folders.
-- **Plan.** Keep every project's data where it is (archives can hold secrets; deleting `.justless/` must still remove them; index, `resume` and `[source changed]` are per checkout). Add one small local registry, for example `~/.local/state/justless/projects.json` (honouring `XDG_STATE_HOME`), listing each project root, its repository identity (`git rev-parse --git-common-dir`) and when it was last used. Use it for: `justless stats --all` (one total, worktrees of one repository grouped together); `justless log`/`search`/`context --run RUN` falling back to the registry when the run is not in the current project (run IDs are already unique); `doctor` listing projects with hooks. Exclude temporary folders (`$TMPDIR`, test and benchmark roots) from totals by default, with a flag to include them. `init --remove --purge` drops the project's entry.
-- **Constraints.** Local only (no network), private file permissions, never stores run output or command lines (paths and counts only), and safe to delete (it is rebuilt as projects are used).
-- **Relation.** Shares the user-level home that `init --global` (3.8) needs; build them together if both are taken up.
-- **Progress.** *designed*.
+### 3.9 Global project registry — machine-wide stats and run lookup — done
+- **Progress.** *on main* (2026-11-19, `src/registry.rs`). A private `$XDG_STATE_HOME/justless/projects.json` (paths, repository, last use) feeds `stats --all` (worktrees grouped, temp folders excluded), run lookup across projects for `log`/`search`/`context --run`, and doctor's "This machine" section; `init --remove --purge` drops the entry.
 
-### 3.10 Hook kill switches and diagnostics
-- **Plan.** `exclude_commands` (prefix or regex) in `.justless.toml`, an environment variable that disables routing, and `justless rewrite "<cmd>"` that prints what a hook would do.
-- **Progress.** *not started*.
-
----
+### 3.10 Hook kill switches and diagnostics — done
+- **Progress.** *on main* (2026-11-19, `src/rewrite.rs`). `exclude_commands` (prefixes or `^` regexes) in `.justless.toml`, `JUSTLESS_DISABLE=1` for every hook and the OpenCode plugin, and `justless rewrite "CMD" [--agent] [--mode]` to show what a hook would do.
 
 ### 3.11 Better token figures without a bundled tokenizer — done
 - **Progress.** *on main* (2026-11-19, `src/tokens.rs`). Bytes per token measured once with Anthropic's token-counting endpoint on this repository's own files and output (221 samples; Opus counted the same): code 2.57, JSON 2.22, prose 2.78, logs 2.21; bytes ÷ 4 had counted only 56–70% of the tokens. `stats` classifies each run; the status line and `discover` use the command-output (logs) ratio; the opt-in proxy keeps ÷ 4, the unit of its clear floor, beside the API's own usage. `stats --sessions` adds the provider-reported usage from this workspace's Claude Code transcripts, apart from savings. Recalibrate with `scripts/token_calibration.py`.
@@ -169,6 +160,10 @@ Stopped mid-build on 2026-11-19. The last commit on each is a `wip:` snapshot th
 
 ### 4.I Route JSON-producing commands to the table view
 - The PreToolUse hook never routes JSON-producing commands (`supported_command` rejects `--json`, `--output`, `--message-format`; `kubectl -o json` fails the display check; `gh`, `cargo metadata` and `npm ls` are not supported commands), so JSON tables reach agents only through `justless run`, `exec` and the Claude Code post-run hook. Route unpiped JSON-producing commands for clients without a post-run hook, keeping pipes and redirections untouched, and consider whitespace-only compaction of pretty-printed non-tabular JSON (would cut `npm ls` by 62%).
+- **Progress.** *designed*.
+
+### 4.J Follow-ups from global setup
+- In a project served only by global hooks, `doctor` still fails with "not set up in this project" and "Hooks: none"; `discover` does not apply `exclude_commands`; `stats --all` ignores `--days`.
 - **Progress.** *designed*.
 
 ### 4.E `git show REV:path` reads — done
