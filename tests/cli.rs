@@ -97,6 +97,30 @@ fn argv(line: &str) -> Vec<&str> {
     line.split_whitespace().collect()
 }
 
+/// The folder where Claude Code keeps the transcripts of `root` under `config`.
+fn claude_transcript_dir(config: &Path, root: &Path) -> PathBuf {
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    config.join("projects").join(slug)
+}
+
+/// Runs a command that must succeed with Claude Code's configuration in `config`
+/// and no managed settings.
+fn claude_config_success(root: &Path, config: &Path, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args(args)
+        .current_dir(root)
+        .env("CLAUDE_CONFIG_DIR", config)
+        .env("JUSTLESS_TEST_CLAUDE_MANAGED_DIR", config.join("managed"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    stdout(&output)
+}
+
 #[test]
 fn failing_cargo_test_leads_to_source_and_exact_log_slice() {
     let root = fixture();
@@ -2412,23 +2436,20 @@ fn stats_report_savings_by_command_with_token_estimates() {
     // Linter output is estimated at the ratio measured for logs.
     let logs = &report["estimate_by_content"]["logs"];
     assert_eq!(logs["saved_bytes"], saved);
-    assert_eq!(
-        report["estimated_tokens_saved"],
-        logs_tokens(&report, saved)
-    );
+    let tokens = logs_tokens(&report, saved);
+    assert_eq!(report["estimated_tokens_saved"], tokens);
     let ratio = format!("{:.2}", logs["bytes_per_token"].as_f64().unwrap());
     let method = report["token_estimate"].as_str().unwrap();
     assert!(method.contains(&format!("logs {ratio}")), "{method}");
     assert_eq!(report["commands"][0]["family"], "mypy");
     assert_eq!(report["days"].as_array().unwrap().len(), 1);
-    let text = success(root, &["stats"]);
-    assert!(
-        text.contains("tokens saved at first preview, ≈")
-            && text.contains(&format!(
-                " net (estimated at {ratio} bytes per token for logs)"
-            ))
-            && text.contains("By command, most net savings first\n  mypy"),
-        "{text}"
+    assert_all_in(
+        &success(root, &["stats"]),
+        &[
+            "tokens saved at first preview, ≈",
+            &format!(" net (estimated at {ratio} bytes per token for logs)"),
+            "By command, most net savings first\n  mypy",
+        ],
     );
 }
 
@@ -2439,12 +2460,7 @@ fn stats_sessions_add_claude_code_usage_apart_from_savings() {
     fs::create_dir(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let config = repo.path().join("claude");
-    let slug: String = root
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let transcripts = config.join("projects").join(slug);
+    let transcripts = claude_transcript_dir(&config, &root);
     fs::create_dir_all(&transcripts).unwrap();
     let usage = serde_json::json!({"input_tokens": 3, "cache_creation_input_tokens": 2000,
         "cache_read_input_tokens": 40000, "output_tokens": 500});
@@ -2454,21 +2470,11 @@ fn stats_sessions_add_claude_code_usage_apart_from_savings() {
     .to_string();
     // Claude Code writes a response once per content block.
     fs::write(transcripts.join("s.jsonl"), format!("{line}\n{line}\n")).unwrap();
-    let stats = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-            .arg("stats")
-            .args(args)
-            .current_dir(&root)
-            .env("CLAUDE_CONFIG_DIR", &config)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", stderr(&output));
-        stdout(&output)
-    };
-    let plain: serde_json::Value = serde_json::from_str(&stats(&["--json"])).unwrap();
+    let stats = |args: &str| claude_config_success(&root, &config, &argv(args));
+    let plain: serde_json::Value = serde_json::from_str(&stats("stats --json")).unwrap();
     assert!(plain.get("claude_code_sessions").is_none());
-    let report: serde_json::Value =
-        serde_json::from_str(&stats(&["--json", "--sessions"])).unwrap();
+    let report = stats("stats --json --sessions");
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
     let sessions = &report["claude_code_sessions"];
     assert_eq!(
         (&sessions["sessions"], &sessions["requests"]),
@@ -2476,15 +2482,17 @@ fn stats_sessions_add_claude_code_usage_apart_from_savings() {
     );
     assert_eq!(sessions["cache_read_input_tokens"], 40000);
     assert_eq!(sessions["models"][0]["model"], "claude-opus-5-5");
-    let text = stats(&["--sessions"]);
-    assert!(
-        text.contains("as the provider reported it. This is total usage, not savings.")
-            && text.contains("1 session(s) · 1 request(s), 0 from subagents")
-            && text.contains("claude-opus-5-5")
-            && text.contains("40.0k")
-            && !text.contains("private words"),
-        "{text}"
+    let text = stats("stats --sessions");
+    assert_all_in(
+        &text,
+        &[
+            "as the provider reported it. This is total usage, not savings.",
+            "1 session(s) · 1 request(s), 0 from subagents",
+            "claude-opus-5-5",
+            "40.0k",
+        ],
     );
+    assert_none_in(&text, &["private words"]);
 }
 
 #[test]
@@ -2494,14 +2502,10 @@ fn discover_classifies_claude_code_shell_commands() {
     fs::create_dir(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let config = repo.path().join("claude");
-    let slug: String = root
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let transcripts = config.join("projects").join(slug);
+    let transcripts = claude_transcript_dir(&config, &root);
     fs::create_dir_all(&transcripts).unwrap();
     let mut lines = Vec::new();
+    let elsewhere = PathBuf::from("/elsewhere");
     for (id, command, output, cwd) in [
         ("t1", "cargo test", "x".repeat(4000), root.clone()),
         (
@@ -2511,12 +2515,7 @@ fn discover_classifies_claude_code_shell_commands() {
             root.join("web"),
         ),
         ("t3", "ls", "y".repeat(100), root.clone()),
-        (
-            "t4",
-            "cargo test",
-            "z".repeat(900),
-            PathBuf::from("/elsewhere"),
-        ),
+        ("t4", "cargo test", "z".repeat(900), elsewhere),
         (
             "t5",
             "sed -n 1,400p src/lib.rs",
@@ -2533,18 +2532,8 @@ fn discover_classifies_claude_code_shell_commands() {
     }
     let body: Vec<_> = lines.iter().map(|l| l.to_string()).collect();
     fs::write(transcripts.join("session.jsonl"), body.join("\n")).unwrap();
-    let discover = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-            .arg("discover")
-            .args(args)
-            .current_dir(&root)
-            .env("CLAUDE_CONFIG_DIR", &config)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", stderr(&output));
-        stdout(&output)
-    };
-    let report: serde_json::Value = serde_json::from_str(&discover(&["--json"])).unwrap();
+    let discover = |args: &str| claude_config_success(&root, &config, &argv(args));
+    let report: serde_json::Value = serde_json::from_str(&discover("discover --json")).unwrap();
     assert_eq!(report["commands"], 4);
     assert_eq!(report["sessions"], 1);
     let groups = report["groups"].as_array().unwrap();
@@ -2552,7 +2541,8 @@ fn discover_classifies_claude_code_shell_commands() {
     assert_eq!(route("through_justless")["labels"][0]["label"], "npm test");
     assert_eq!(route("supported_not_routed")["output_bytes"], 4000);
     assert_eq!(route("supported_not_routed")["estimated_tokens"], 1813);
-    let plan: serde_json::Value = serde_json::from_str(&discover(&["--json", "--plan"])).unwrap();
+    let plan = discover("discover --json --plan");
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
     let rows = plan["plan"].as_array().unwrap();
     // A command a current hook would route, and a range read the post-command
     // hook outlines, compact now; a listing still needs a formatter.
@@ -2562,20 +2552,28 @@ fn discover_classifies_claude_code_shell_commands() {
     assert_eq!(rows[0]["compactable_now_bytes"], 4000);
     assert_eq!(row("sed")["compactable_now_bytes"], 3000);
     assert_eq!(row("ls")["compactable_now_bytes"], 0);
-    let text = discover(&["--plan"]);
+    assert_all_in(
+        &discover("discover --plan"),
+        &[
+            "Unrouted output by command family, largest first",
+            "cargo test ×1 (3.9 KB) · 3.9 KB would compact now",
+        ],
+    );
+    let text = discover("discover");
     assert!(
-        text.contains("Unrouted output by command family, largest first")
-            && text.contains("cargo test ×1 (3.9 KB) · 3.9 KB would compact now"),
+        text.starts_with(
+            "Claude Code ran 4 shell command(s) here in the last 30 day(s), across 1 session(s)"
+        ),
         "{text}"
     );
-    let text = discover(&[]);
-    assert!(
-        text.starts_with("Claude Code ran 4 shell command(s) here in the last 30 day(s), across 1 session(s)")
-            && text.contains("Supported, not routed: 1 command(s) · 3.9 KB output · ≈1813 tokens\n  cargo test ×1 (3.9 KB)")
-            && text.contains("justless init --hooks --agent claude")
-            && !text.contains("x".repeat(20).as_str()),
-        "{text}"
+    assert_all_in(
+        &text,
+        &[
+            "Supported, not routed: 1 command(s) · 3.9 KB output · ≈1813 tokens\n  cargo test ×1 (3.9 KB)",
+            "justless init --hooks --agent claude",
+        ],
     );
+    assert_none_in(&text, &[&"x".repeat(20)]);
 }
 
 /// A supported command that the Claude Code hook leaves as written under the
@@ -2586,18 +2584,10 @@ fn discover_separates_commands_left_to_claude_code_permissions() {
     let root = repo.path().join("work");
     fs::create_dir_all(root.join(".claude")).unwrap();
     let root = root.canonicalize().unwrap();
-    fs::write(
-        root.join(".claude/settings.local.json"),
-        r#"{"permissions":{"allow":["Bash(git status:*)"]}}"#,
-    )
-    .unwrap();
+    let local = r#"{"permissions":{"allow":["Bash(git status:*)"]}}"#;
+    fs::write(root.join(".claude/settings.local.json"), local).unwrap();
     let config = repo.path().join("claude");
-    let slug: String = root
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let transcripts = config.join("projects").join(slug);
+    let transcripts = claude_transcript_dir(&config, &root);
     let transcript = |file: &str, mode: Option<&str>, calls: &[(&str, &str, usize)]| {
         let mut lines: Vec<String> = mode
             .map(|mode| {
@@ -2617,33 +2607,14 @@ fn discover_separates_commands_left_to_claude_code_permissions() {
     };
     // In default mode the hook leaves a command no allow rule covers, and a
     // subagent takes its session's only mode. Without a mode it always rewrites.
-    transcript(
-        "s1.jsonl",
-        Some("default"),
-        &[("a", "cargo test", 1000), ("b", "git status", 10)],
-    );
-    transcript(
-        "s1/subagents/agent-1.jsonl",
-        None,
-        &[("c", "cargo build", 300)],
-    );
+    let calls = [("a", "cargo test", 1000), ("b", "git status", 10)];
+    transcript("s1.jsonl", Some("default"), &calls);
+    let calls = [("c", "cargo build", 300)];
+    transcript("s1/subagents/agent-1.jsonl", None, &calls);
     transcript("s2.jsonl", None, &[("d", "cargo test", 20)]);
-    let discover = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_justless"))
-            .arg("discover")
-            .args(args)
-            .current_dir(&root)
-            .env("CLAUDE_CONFIG_DIR", &config)
-            .env(
-                "JUSTLESS_TEST_CLAUDE_MANAGED_DIR",
-                repo.path().join("managed"),
-            )
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", stderr(&output));
-        stdout(&output)
-    };
-    let report: serde_json::Value = serde_json::from_str(&discover(&["--json", "--plan"])).unwrap();
+    let discover = |args: &str| claude_config_success(&root, &config, &argv(args));
+    let report = discover("discover --json --plan");
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
     let groups = report["groups"].as_array().unwrap();
     let route = |name: &str| groups.iter().find(|g| g["route"] == name).unwrap();
     assert_eq!(route("left_by_permissions")["commands"], 2);
@@ -2653,12 +2624,13 @@ fn discover_separates_commands_left_to_claude_code_permissions() {
     let row = rows.iter().find(|r| r["label"] == "cargo test").unwrap();
     assert_eq!(row["left_by_permissions_bytes"], 1000);
     assert_eq!(row["compactable_now_bytes"], 20);
-    let text = discover(&["--plan"]);
-    assert!(
-        text.contains("Supported, left to Claude Code's permission rules: 2 command(s)")
-            && text.contains("cargo test ×2 (1020 B) · 20 B would compact now with a hook or `run --` · 1000 B left to permission rules")
-            && text.contains("Allow the commands you run, such as Bash(cargo test *)"),
-        "{text}"
+    assert_all_in(
+        &discover("discover --plan"),
+        &[
+            "Supported, left to Claude Code's permission rules: 2 command(s)",
+            "cargo test ×2 (1020 B) · 20 B would compact now with a hook or `run --` · 1000 B left to permission rules",
+            "Allow the commands you run, such as Bash(cargo test *)",
+        ],
     );
 }
 
@@ -2678,9 +2650,7 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
         r#"{"mcpServers":{"other":{"command":"other"}},"hooks":{"BeforeTool":[{"matcher":"write_file","hooks":[{"type":"command","command":"scan"}]}]}}"#,
     )
     .unwrap();
-    let setup = [
-        "init", "--hooks", "--agent", "copilot", "--agent", "gemini", "--agent", "cursor",
-    ];
+    let setup = argv("init --hooks --agent copilot --agent gemini --agent cursor");
     // An invalid file stops setup before anything is written.
     assert!(!cli(&root, &setup).status.success());
     assert!(!root.join("GEMINI.md").exists() && !root.join(".github").exists());
@@ -2763,44 +2733,38 @@ fn cursor_gemini_and_copilot_hooks_merge_and_follow_their_contracts() {
     };
 
     // Session context in each client's documented field.
-    let context = |output: &Value, pointer: &str| {
-        output
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .is_some_and(|text| text.starts_with("Justless indexed"))
-    };
-    let start = hook(
-        "hook-cursor",
-        "session-start",
-        json!({"hook_event_name":"sessionStart","session_id":"s","workspace_roots":[root]}),
-    );
-    assert!(context(&start, "/additional_context"), "{start}");
-    assert_eq!(start.as_object().unwrap().len(), 1);
-    let start = hook(
-        "hook-gemini",
-        "session-start",
-        json!({"hook_event_name":"SessionStart","source":"startup","cwd":root}),
-    );
-    assert_eq!(start["hookSpecificOutput"]["hookEventName"], "SessionStart");
-    assert!(
-        context(&start, "/hookSpecificOutput/additionalContext"),
-        "{start}"
-    );
-    let start = hook(
-        "hook-copilot",
-        "session-start",
-        json!({"sessionId":"s","timestamp":1,"cwd":root,"source":"startup"}),
-    );
-    assert!(context(&start, "/additionalContext"), "{start}");
-    assert!(root.join(".justless/index.json").is_file());
-    assert_eq!(
-        hook(
-            "hook-gemini",
-            "session-start",
-            json!({"hook_event_name":"BeforeTool"})
+    for (handler, input, pointer) in [
+        (
+            "hook-cursor",
+            json!({"hook_event_name":"sessionStart","session_id":"s","workspace_roots":[root]}),
+            "/additional_context",
         ),
-        json!({})
-    );
+        (
+            "hook-gemini",
+            json!({"hook_event_name":"SessionStart","source":"startup","cwd":root}),
+            "/hookSpecificOutput/additionalContext",
+        ),
+        (
+            "hook-copilot",
+            json!({"sessionId":"s","timestamp":1,"cwd":root,"source":"startup"}),
+            "/additionalContext",
+        ),
+    ] {
+        let start = hook(handler, "session-start", input);
+        let context = start.pointer(pointer).and_then(Value::as_str);
+        assert!(
+            context.is_some_and(|text| text.starts_with("Justless indexed")),
+            "{start}"
+        );
+        if handler == "hook-cursor" {
+            assert_eq!(start.as_object().unwrap().len(), 1);
+        } else if handler == "hook-gemini" {
+            assert_eq!(start["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        }
+    }
+    assert!(root.join(".justless/index.json").is_file());
+    let event = json!({"hook_event_name":"BeforeTool"});
+    assert_eq!(hook("hook-gemini", "session-start", event), json!({}));
 
     // Cursor returns `permission: "allow"` with a rewrite, so a list that contains
     // an unsupported command passes through, as for Codex.
