@@ -411,6 +411,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         retention: (settings.max_runs, settings.max_archive_bytes),
         origin: None,
         pieces: &[],
+        json_grouping: settings.json_grouping,
     };
     match capture.record(&mut archive, family, status, stdout_preview) {
         Ok((previews, footer, _)) => {
@@ -564,6 +565,7 @@ pub(crate) fn record_with_pieces(
         retention: (settings.max_runs, settings.max_archive_bytes),
         origin: Some(origin),
         pieces,
+        json_grouping: settings.json_grouping,
     };
     match capture.record(&mut archive, family, status, None) {
         Ok((previews, footer, run)) => Ok(Recorded {
@@ -1358,6 +1360,8 @@ struct Capture<'a> {
     /// Output another program captured, recorded after its command ran.
     origin: Option<&'a Origin>,
     pieces: &'a [RunPiece],
+    /// `json_grouping` from the settings.
+    json_grouping: bool,
 }
 
 impl Capture<'_> {
@@ -1386,6 +1390,7 @@ impl Capture<'_> {
             retention,
             origin,
             pieces,
+            json_grouping,
         } = *self;
         let directory = archive.directory.clone();
         let lengths = archive.lengths();
@@ -1557,6 +1562,24 @@ impl Capture<'_> {
             // A merged stdout also holds the command's stderr, which a test, diff or
             // inventory summary of stdout would drop, so that run keeps its preview.
             previews[0].1 = fit(summary, max_bytes).into_bytes();
+        } else if !merged
+            && selection.profile.is_none()
+            && run.summary.kind.is_empty()
+            && run.produced_bytes.is_empty()
+            && origin.is_none_or(|o| o.outline.is_none())
+            // JSON reformatted for reading would break a program that parses it, so
+            // only output that reaches the agent directly, or that is clipped anyway,
+            // is shown as tables.
+            && (hook || !stdout_fits)
+            && let Some(view) = json_view(
+                &archive.readers[0],
+                lengths[0],
+                redactor.filter(|_| secrets[0] > 0),
+                max_bytes,
+                json_grouping,
+            )
+        {
+            previews[0].1 = view;
         }
         if let Some(shape_stdout) = stdout_preview
             && !run.unchanged
@@ -1805,6 +1828,67 @@ fn footer(
         format!("[reopen with {} log {id}]\n", shown.justless)
     };
     Ok(line + &reopen + &truncation)
+}
+
+/// Stdout shown as JSON tables, clipped at whole lines to `max_bytes`, when it is a
+/// JSON array of objects, JSON lines or an object holding such arrays, and the
+/// tables are smaller and decode to the same data. See `jsonview`.
+fn json_view(
+    mut file: &File,
+    length: u64,
+    redactor: Option<&crate::redact::Redactor>,
+    max_bytes: usize,
+    group: bool,
+) -> Option<Vec<u8>> {
+    if length > crate::jsonview::LIMIT as u64 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut bytes = Vec::new();
+    let mut start = [0; 64];
+    let read = file.take(length).read(&mut start).ok()?;
+    if !start[..read]
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|&byte| byte == b'[' || byte == b'{')
+    {
+        return None;
+    }
+    bytes.extend_from_slice(&start[..read]);
+    file.take(length - read as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    // Parse what the agent may see, so a secret never reaches a table cell.
+    if let Some(redactor) = redactor {
+        bytes = redactor.bytes(&bytes).into_owned();
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    // Cargo's compiler messages keep their rendered diagnostics.
+    if text.contains("\"compiler-message\"") {
+        return None;
+    }
+    let view = crate::jsonview::render(&text, group)?;
+    if view.len() <= max_bytes {
+        return Some(view.into_bytes());
+    }
+    let lines = view.split_inclusive('\n').count();
+    let mut shown = String::new();
+    for (index, line) in view.split_inclusive('\n').enumerate() {
+        let marker = format!(
+            "[{} more lines of these tables in the full log]\n",
+            lines - index
+        );
+        if shown.len() + line.len() + marker.len() > max_bytes {
+            // The legend and a table header alone tell the agent nothing.
+            if index < 3 {
+                return None;
+            }
+            shown.push_str(&marker);
+            break;
+        }
+        shown.push_str(line);
+    }
+    Some(shown.into_bytes())
 }
 
 fn fit(mut report: String, max_bytes: usize) -> String {

@@ -140,6 +140,9 @@ pub struct Settings {
     pub adaptive_cap_bytes: Option<usize>,
     /// The lowest adapted budget. Defaults to half of `max_output_bytes`, at least 512.
     pub adaptive_floor_bytes: Option<usize>,
+    /// Show JSON tables with consecutive rows that share a field's value under
+    /// one `@ VALUE` line. Off by default: plain rows are easier to count and quote.
+    pub json_grouping: bool,
 }
 
 impl Default for Settings {
@@ -158,6 +161,7 @@ impl Default for Settings {
             adaptive_previews: true,
             adaptive_cap_bytes: None,
             adaptive_floor_bytes: None,
+            json_grouping: false,
         }
     }
 }

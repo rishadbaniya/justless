@@ -17,6 +17,7 @@ mod impact;
 mod index;
 mod inventory;
 mod json_edit;
+mod jsonview;
 mod learn;
 mod lint;
 mod listing;
