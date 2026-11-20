@@ -159,7 +159,7 @@ The free steps check the harness before any money is spent. `validate-tasks` run
 
 Run on 2026-11-19: 248 runs over 31 frozen tasks × 4 repetitions per arm, $10.46, no harness errors. The Haiku, Opus, context-editing and anchor cells were stopped before they started, because the Sonnet cell already answered the question these tasks can answer.
 
-**What it shows.** On these tasks justless neither saves nor costs: success is identical and the cost difference sits inside the noise. The tasks are small — about 5 requests and 5.6 KB of tool output per run — so there is almost nothing for Justless to compact, while its instruction block rode in every request (since cut from 1,220 to 434 bytes). Justless targets large command output and long sessions; the owner's real Claude Code sessions produce about 37 MB of shell output a week. A task family that needs large tool output is being added so the benchmark measures that workload.
+**What it shows.** On these tasks justless neither saves nor costs: success is identical and the cost difference sits inside the noise. The tasks are small — about 5 requests and 5.6 KB of tool output per run — so there is almost nothing for Justless to compact, while its instruction block rode in every request (since cut from 1,220 to 434 bytes). Justless targets large command output and long sessions; the owner's real Claude Code sessions produce about 37 MB of shell output a week. A task family built around large tool output was added to measure that workload; its result is below.
 
 ### Large-output family (separate campaign)
 
@@ -197,10 +197,20 @@ python3 scripts/agent_bench/run.py validate-tasks --task-set large --tasks all-p
 python3 scripts/agent_bench/run.py dry-run --task-set large --tasks all-private --variants correct --arms a,b --campaign dry-large --binary $B
 python3 scripts/agent_bench/run.py estimate --task-set large --from-dry dry-large-correct
 python3 scripts/agent_bench/run.py review-tasks --task-set large --approve
-# paid, not yet run:
-python3 scripts/agent_bench/run.py run --task-set large --campaign large --model claude-sonnet-5-5 --arms a,b --reps 3 --token-limit <L large> --binary $B
+# paid, run on 2026-11-20 with the context-editing arms added:
+python3 scripts/agent_bench/run.py run --task-set large --campaign large --model claude-sonnet-5-5 --arms a,b,c,d --reps 3 --ce-trigger 30000 --token-limit 3000000 --budget-usd 35 --binary $B
 python3 scripts/agent_bench/run.py report --task-set large --campaign large
 ```
+
+#### Result
+
+| Model | Contrast | Success | Cost per successful task | Δs [95% CI] | S [95% CI] | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sonnet 5.5, large-output family | b vs a | 100% vs 95.8% | $0.0664 vs $0.0596 | +4.2 pp [+0.0, +12.5] | −11.5% [−46.0%, +15.1%] | No demonstrated saving |
+
+Run on 2026-11-20: 96 runs over the 8 frozen tasks × 3 repetitions × 4 arms, $5.99, with Justless at commit `29dc245`. Three runs were cut off when the session that started the campaign ended; they are recorded as harness errors and were run again, so every arm has 24 graded runs. Paired over the 24 blocks, the Justless arm's cost per run was 1.07 times the plain arm's [0.95, 1.28] and its prompt tokens 1.12 times [0.94, 1.45]. With context editing on in both arms (d vs c), cost per run was 0.97 times [0.89, 1.08]. By kind, a run cost $0.106 with Justless against $0.064 plain on the bug-fix tasks, $0.050 against $0.056 on the regression tasks, and the same within two percent on the callers and lint tasks. The one failure was a plain run of a callers task that gave a partial answer.
+
+**What it shows.** The model did not take the scripted path. Where the scripted plain path saw 59 to 192 KB of tool output, a plain Sonnet run saw a median of 9.1 KB (10.9 KB with Justless): it filtered its own commands, searched 24 times and never used Read. So this family did not put large output in front of Justless either. In the 48 runs with Justless, the hooks changed 34 of 343 Bash and Read results: 6 commands rewritten before they ran, 27 Bash results and 1 Read compacted after. The agent typed `justless` itself 28 times in arm b, and that arm resent more of the conversation from cache, 2.40M tokens in all against 1.51M. On these tasks, with this model, Justless again neither saved nor clearly cost, and the campaign is too small to tell an 11% difference from none. It ran before reads of at most 600 lines kept their text (see "What the agent read next"), so it measured the earlier thresholds.
 
 ## Earlier single-task illustrations
 
