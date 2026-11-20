@@ -54,7 +54,7 @@ Details: [Indexing and languages](docs/reference.md#indexing-and-languages) · [
 - A glob in a Claude Code read list, as in `grep -n add src/*.rs` or `wc -l docs/*.md`, is read as the files it names: in 30 days of this project's transcripts, 75 more results (0.6 MB) qualify.
 - An awk line range, `awk 'NR>=A && NR<=B' FILE` or `NR==A,NR==B`, is read like the same `sed -n` range in Claude Code, alone or in a read list.
 - A `grep` in a Claude Code read list may name files outside the workspace under the same rules as a read there, and still walks no folder out there.
-- In Claude Code, a line no rule reads, such as a script, a loop or a tool no hook knows, gets a run's clipped preview once its output is over the preview budget, where it used to get only the compaction floor past 9.6 KB. Lines that may print file content, and commands a hook supports, keep their own rules: in 30 days of this project's transcripts, 289 results (1.7 MB) that reached the agent whole now qualify.
+- In Claude Code, a line no rule reads, such as a script, a loop or a tool no hook knows, gets a run's clipped preview once its output is over the preview budget, where it used to get only the compaction floor past 9.6 KB. Lines that may print file content, and commands a hook supports, keep their own rules: in 30 days of this project's transcripts, 168 results over 4 KB (1.4 MB) that reached the agent whole now qualify.
 - Outlines list up to 20 lines of top-level code that no row covers, in scripts named by their `#!` line, Elixir, PowerShell, Julia and Groovy files and Vue, Svelte and Astro components too; a file with more keeps its full read.
 - Claude Code's post-edit hook tells the model when a native Edit or Write leaves a file that parsed before unparseable.
 

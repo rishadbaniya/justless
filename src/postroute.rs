@@ -88,6 +88,8 @@ const KEYWORDS: &[&str] = &[
 const SEARCHERS: &[&str] = &[
     "grep", "egrep", "fgrep", "ugrep", "rg", "ag", "ack", "find", "fd", "bfs", "ls", "tree", "wc",
 ];
+/// Shells that run the text of a word after `-c`.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 const BEFORE_A_COMMAND: &[&str] = &[
     "if", "then", "else", "elif", "while", "until", "do", "time", "!", "{",
 ];
@@ -1015,8 +1017,13 @@ fn loose(commands: &Commands, alone: bool) -> Option<Plan> {
     if !alone {
         label.push_str("; …");
     }
+    // A program some report is made for, such as a linter printing a machine
+    // format, is recorded as `sh`, which selects none.
+    let reported = crate::filters::Selection::for_run(&[OsString::from(&program)], &[])
+        .map_or(true, |selection| selection.profile.is_some());
+    let recorded = if reported { "sh" } else { program.as_str() };
     Some(Plan {
-        words: vec![program.clone()],
+        words: vec![recorded.to_owned()],
         program,
         label,
         cd: PathBuf::new(),
@@ -1036,8 +1043,10 @@ type Commands = Vec<(Vec<String>, bool)>;
 /// `git`, `diff` or the `read` of a loop appears as a word anywhere outside single
 /// quotes, other than a line filter right after a pipe, as in
 /// `python3 report.py | tail -40`. Text in single quotes and the body of a
-/// here-document are a program's own input and are not read. `None` too when the
-/// line runs `justless` or nothing but notes such as `echo`.
+/// here-document are a program's own input and are not read, except that a shell
+/// given its commands with `-c`, and `eval`, run text this cannot see, so such a
+/// line is `None`. `None` too when the line runs `justless` or nothing but notes
+/// such as `echo`.
 fn runs(command: &str) -> Option<(Commands, bool)> {
     enum Piece {
         Word(String),
@@ -1167,6 +1176,8 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
     // Whether the next word starts a command, follows a pipe, names a
     // redirection's target, or belongs to the last command found.
     let (mut starts, mut piped, mut target, mut collecting) = (true, false, false, false);
+    // The word before this one.
+    let mut shell = String::new();
     for piece in pieces {
         let word = match piece {
             Piece::Word(word) => word,
@@ -1185,10 +1196,16 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
         }
         let name = basename(&word);
         let reader = READERS.contains(&name) && !matches!(name, "echo" | "printf")
-            || matches!(name, "read" | "diff" | "justless");
+            || matches!(name, "read" | "diff" | "justless" | "eval");
         if reader && !(starts && piped && LINE_FILTERS.contains(&name)) {
             return None;
         }
+        // A shell told its commands in a word, as in `bash -c '…'`.
+        let told = word.starts_with('-') && !word.starts_with("--") && word.ends_with('c');
+        if told && SHELLS.contains(&basename(&shell)) {
+            return None;
+        }
+        shell.clone_from(&word);
         if !starts {
             if collecting && let Some((words, _)) = commands.last_mut() {
                 words.push(word);
@@ -1853,6 +1870,17 @@ mod tests {
         ] {
             assert_eq!(loosely(command).as_deref(), Some(label), "{command}");
         }
+        // A program a report is made for is recorded as `sh`, so a line that
+        // mixes commands gets no report meant for one command's lines.
+        let recorded = |command: &str| unknown_plan(command).map(|plan| plan.words.join(" "));
+        assert_eq!(
+            recorded("cd web && eslint -f json . | python3 tally.py").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            recorded("cd tools && python3 report.py; echo done").as_deref(),
+            Some("python3")
+        );
         for command in [
             // A reader as a word anywhere outside single quotes.
             "python3 report.py; cat report.txt",
@@ -1869,6 +1897,10 @@ mod tests {
             "for f in src/*; do grep -n needle $f; done",
             "find . -name '*.py' | xargs wc -l",
             "(cd web && ls -la)",
+            // A shell given its commands as text, which may read a file.
+            "bash -c 'cat a.rs | grep x'",
+            "cd web && sh -ec 'npm run report'",
+            "ssh host 'uptime' && eval \"$CMD\"",
             // Justless itself, and lines of notes alone.
             "./target/debug/justless stats",
             "echo one; printf two",
