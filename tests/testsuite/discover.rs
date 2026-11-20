@@ -206,11 +206,17 @@ fn discover_groups_commands_as_the_post_run_hook_treats_them() {
             "passed_through",
             "cargo test",
         ),
-        // An unsupported command: over and under its floor.
+        // A line no rule reads: over and under the budget, alone or in a loop.
         ("python3 build.py", progress.clone(), AFTER, "python3"),
         (
+            "for i in 1 2; do python3 build.py $i; done",
+            progress.clone(),
+            AFTER,
+            "for",
+        ),
+        (
             "python3 build.py",
-            progress[..6000].to_owned(),
+            progress[..2000].to_owned(),
             "not_supported",
             "python3",
         ),

@@ -12218,7 +12218,6 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
         "/opt/bin/justless recall abc",
         "cat src/big.rs",
         "sed -n 1,400p src/big.rs",
-        "python3 report.py",
         "grep -rn needle src | cut -c3-40",
         "grep -rn needle src | cut -d: -f1",
         "grep -rn needle src | awk '{print $1}'",
@@ -12272,6 +12271,15 @@ fn claude_bash_output_the_command_hook_left_alone_is_compacted_after_it_ran() {
     );
     // Nothing above was archived.
     assert_eq!(runs(), before);
+    // A script no hook knows does not print a file: once its output is large it
+    // is clipped like any run's, and the run replays it.
+    let text = bash_shown(&root, "python3 report.py", &content);
+    text_has(
+        &text,
+        &["[output clipped. Full log retained.]\n", "[justless run-"],
+    );
+    assert!(text.len() * 2 < content.len(), "{text}");
+    assert_eq!(runs(), before + 1);
 
     // Input that is not JSON still answers with no change.
     let output = piped(&root, &["hook-claude", "after-bash"], "{not json");

@@ -189,7 +189,7 @@ fn after_bash(root: &Path, command: &str, stdout: &str) -> Option<String> {
 
 #[cfg(unix)]
 #[test]
-fn the_post_run_hook_floors_large_output_of_unknown_commands() {
+fn the_post_run_hook_previews_large_output_of_unknown_commands() {
     let dir = workspace("");
     let root = dir.path().canonicalize().unwrap();
     let issues: Vec<String> = (0..200)
@@ -208,11 +208,54 @@ fn the_post_run_hook_floors_large_output_of_unknown_commands() {
             Some("[JSON array as a table: "),
         ),
         ("python3 build.py", progress.as_str(), Some(repeated)),
+        // So does a pipe, a list, a loop or a script fed by a here-document.
+        (
+            "python3 build.py | tail -n 700",
+            progress.as_str(),
+            Some(repeated),
+        ),
+        (
+            "cd tools && python3 build.py; echo done",
+            progress.as_str(),
+            Some(repeated),
+        ),
+        (
+            "for i in 1 2; do python3 build.py $i; done",
+            progress.as_str(),
+            Some(repeated),
+        ),
+        (
+            "python3 - <<'PY'\nimport build\nprint(open('cat').read())\nPY",
+            progress.as_str(),
+            Some(repeated),
+        ),
         // Output an agent may edit or copy, and short output, stay whole.
         ("strings build.bin", progress.as_str(), None),
-        ("python3 build.py", &progress[..6000], None),
-        // A pipe or list is left to the supported-command rules.
-        ("python3 build.py | tail -n 700", progress.as_str(), None),
+        ("python3 build.py", &progress[..3000], None),
+        ("python3 build.py; cat build.log", progress.as_str(), None),
+        (
+            "for f in a b; do sed -n 1,40p $f; done",
+            progress.as_str(),
+            None,
+        ),
+        ("python3 list.py | xargs cat", progress.as_str(), None),
+        (
+            "while read line; do echo \"$line\"; done < build.log",
+            progress.as_str(),
+            None,
+        ),
+        // A command a hook supports keeps its own rules in any shape.
+        (
+            "for f in src/*; do grep -n waiting $f; done",
+            progress.as_str(),
+            None,
+        ),
+        (
+            "cargo test 2>&1 | python3 filter.py",
+            progress.as_str(),
+            None,
+        ),
+        ("./target/debug/justless stats", progress.as_str(), None),
     ] {
         let rewritten = after_bash(&root, command, stdout);
         let Some(start) = shown else {

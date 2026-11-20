@@ -63,13 +63,33 @@ pub(crate) const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const PREVIEW_CHARS: usize = 2_000;
 /// Lines of the original that the shown text left out and that report an error.
 const ERROR_LINES: usize = 8;
-/// Output of a command no hook supports is compacted only past this many context
-/// budgets.
-const UNKNOWN_FACTOR: usize = 4;
 /// Programs whose output is file content an agent may be about to edit or copy.
 const READERS: &[&str] = &[
     "cat", "head", "tail", "sed", "awk", "gawk", "less", "more", "bat", "batcat", "nl", "cut",
     "base64", "xxd", "od", "hexdump", "strings", "git", "echo", "printf",
+];
+/// Readers that, right after a pipe, only pass on lines of the output before them.
+const LINE_FILTERS: &[&str] = &[
+    "head", "tail", "cut", "sed", "awk", "gawk", "nl", "less", "more",
+];
+/// Words that start a command and print nothing, or only the words given to them.
+const SILENT: &[&str] = &[
+    "echo", "printf", "cd", "pwd", "true", "false", ":", "set", "export", "unset", "local",
+    "declare", "typeset", "readonly", "test", "[", "sleep", "wait", "shift", "break", "continue",
+    "return", "exit", "trap", "umask", "mkdir", "touch",
+];
+/// Shell words that open or close a compound command, and those a command follows.
+const KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "time", "!", "{", "}", "[[",
+];
+/// Search and listing programs, whose lines the rules for supported commands
+/// and read lists know in the forms they take.
+const SEARCHERS: &[&str] = &[
+    "grep", "egrep", "fgrep", "ugrep", "rg", "ag", "ack", "find", "fd", "bfs", "ls", "tree", "wc",
+];
+const BEFORE_A_COMMAND: &[&str] = &[
+    "if", "then", "else", "elif", "while", "until", "do", "time", "!", "{",
 ];
 const NOTE: &str = "Captured from a Claude Code Bash result after the command ran. The archive holds the output Claude Code recorded, with stdout and stderr interleaved, and Claude Code may have shortened it at its own output limits. The exit status is the whole command line's as Claude Code reported it: 0, or 1 where Claude Code read exit 1 as a valid result, so a pipe can hide its first command's failure.";
 
@@ -210,13 +230,12 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     if persisted.is_none() && stdout.len() <= settings.context_budget {
         return None;
     }
-    // A command no hook supports gets only the floor and JSON tables, never a
-    // clipped preview, and only when its output is large.
-    let (plan, unknown) = match plan(command) {
-        Some(plan) => (plan, false),
-        None if persisted.is_none() && stdout.len() > UNKNOWN_FACTOR * settings.context_budget => {
-            (unknown_plan(command)?, true)
-        }
+    // A line no rule above reads, such as a script, a loop or a tool no hook
+    // knows, gets the clipped preview of a run, unless it prints file content.
+    // Claude Code already shows a result it saved to a file as a short preview.
+    let plan = match plan(command) {
+        Some(plan) => plan,
+        None if persisted.is_none() => unknown_plan(command)?,
         None => return None,
     };
     // A window of the lines, such as `| sed -n 'A,Bp'`, is compacted only from the
@@ -244,16 +263,8 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // The preview budget `justless run` would give these words, which adapts to
     // how often agents reopened the family's clipped logs. The run path shows
     // output up to this size, or the context budget, verbatim.
-    let run_budget = if unknown {
-        stdout.len()
-    } else {
-        crate::adaptive::preview_budget(&run_ws, &args).ok()?
-    };
-    let threshold = if unknown {
-        UNKNOWN_FACTOR * settings.context_budget
-    } else {
-        settings.context_budget.max(run_budget)
-    };
+    let run_budget = crate::adaptive::preview_budget(&run_ws, &args).ok()?;
+    let threshold = settings.context_budget.max(run_budget);
     let output = match persisted {
         Some(path) => read_persisted(path, response.get("persistedOutputSize")?, stdout)?,
         None => stdout.as_bytes().to_vec(),
@@ -667,11 +678,7 @@ pub(crate) fn after_run(
             handled.then_some(AfterRun::KeepsWhole)
         };
     }
-    if unknown_plan(command).is_some()
-        && !large
-        && persisted.is_none()
-        && output.len() > UNKNOWN_FACTOR * context_budget
-    {
+    if unknown_plan(command).is_some() && !large && !fits(context_budget) {
         return verdict(true);
     }
     handled.then_some(AfterRun::KeepsWhole)
@@ -937,10 +944,19 @@ fn plan(command: &str) -> Option<Plan> {
     Some(plan)
 }
 
+/// A line no rule reads whose output is not file content, as [`runs`] judges it:
+/// one command that no hook supports, alone on its line, or any other line, such
+/// as a script fed by a here-document, a loop, a list or a pipe. Its output gets
+/// the clipped preview of a run.
+fn unknown_plan(command: &str) -> Option<Plan> {
+    let (commands, alone) = runs(command)?;
+    lone(command).or_else(|| loose(&commands, alone))
+}
+
 /// One command that no hook supports, alone on its line with its output reaching
 /// the agent: no pipe, list or redirection of stdout, and not a program that prints
 /// file content.
-fn unknown_plan(command: &str) -> Option<Plan> {
+fn lone(command: &str) -> Option<Plan> {
     let segments = parse(command)?;
     let [segment] = segments.as_slice() else {
         return None;
@@ -968,6 +984,229 @@ fn unknown_plan(command: &str) -> Option<Plan> {
         later: Vec::new(),
         profile: None,
     })
+}
+
+/// A plan for a line [`runs`] reads, when no command that starts a pipeline on it
+/// is one a hook supports or a search or listing: such a command's lines are left
+/// to the rules above,
+/// which pass them through when a report or a preview would hide lines the agent
+/// asked to see. The run is recorded under its first command's program alone, so
+/// no report made for one command's lines is applied to a line that mixes several.
+fn loose(commands: &Commands, alone: bool) -> Option<Plan> {
+    let mut first = None;
+    for (words, piped) in commands {
+        let words = strip(words).unwrap_or(words);
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let known = refs
+            .first()
+            .is_some_and(|word| SEARCHERS.contains(&basename(word)))
+            || crate::agents::supported_words(&refs);
+        if !piped && known {
+            return None;
+        }
+        first = first.or(Some(words));
+    }
+    let words = first?;
+    let program = basename(words.first()?).to_owned();
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    let mut label = crate::history::label(&refs);
+    if !alone {
+        label.push_str("; …");
+    }
+    Some(Plan {
+        words: vec![program.clone()],
+        program,
+        label,
+        cd: PathBuf::new(),
+        filters: Vec::new(),
+        later: Vec::new(),
+        profile: None,
+    })
+}
+
+/// The words of each command on a line, and whether it follows a pipe.
+type Commands = Vec<(Vec<String>, bool)>;
+
+/// The commands on a line that print a result of their own, each with whether it
+/// follows a pipe, and whether the line is one command alone, read from the text
+/// so that loops, here-documents, substitutions and comments are no obstacle.
+/// `None` when the line may print file content: a reader such as `cat`, `sed`,
+/// `git`, `diff` or the `read` of a loop appears as a word anywhere outside single
+/// quotes, other than a line filter right after a pipe, as in
+/// `python3 report.py | tail -40`. Text in single quotes and the body of a
+/// here-document are a program's own input and are not read. `None` too when the
+/// line runs `justless` or nothing but notes such as `echo`.
+fn runs(command: &str) -> Option<(Commands, bool)> {
+    enum Piece {
+        Word(String),
+        Pipe,
+        /// Any other operator, or the start of a substitution: a command follows.
+        Break,
+        /// A redirection, whose next word is a file or descriptor.
+        Target,
+    }
+    if command.len() > 64 * 1024 {
+        return None;
+    }
+    // Drop the body of each here-document.
+    let mut text = String::with_capacity(command.len());
+    let mut body: Option<(String, bool)> = None;
+    for line in command.split_inclusive('\n') {
+        if let Some((end, tabs)) = &body {
+            let mut last = line.trim_end_matches('\n');
+            if *tabs {
+                last = last.trim_start_matches('\t');
+            }
+            if last == end {
+                body = None;
+            }
+            continue;
+        }
+        text.push_str(line);
+        let marker = line.find("<<").filter(|&at| !line[at..].starts_with("<<<"));
+        if let Some(at) = marker {
+            let rest = &line[at + 2..];
+            let tabs = rest.starts_with('-');
+            let end: String = rest
+                .trim_start_matches('-')
+                .trim_start()
+                .trim_start_matches(['\'', '"', '\\'])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !end.is_empty() {
+                body = Some((end, tabs));
+            }
+        }
+    }
+    let mut pieces = Vec::new();
+    let mut word = String::new();
+    let mut double = false;
+    let mut chars = text.chars().peekable();
+    fn flush(pieces: &mut Vec<Piece>, word: &mut String) {
+        if !word.is_empty() {
+            pieces.push(Piece::Word(std::mem::take(word)));
+        }
+    }
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                // Opaque text, which still makes a word.
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                }
+                word.push('\0');
+            }
+            '"' => double = !double,
+            '\\' => {
+                if let Some(next) = chars.next().filter(|next| *next != '\n') {
+                    word.push(next);
+                }
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                chars.next();
+                flush(&mut pieces, &mut word);
+                pieces.push(Piece::Break);
+            }
+            '`' => {
+                flush(&mut pieces, &mut word);
+                pieces.push(Piece::Break);
+            }
+            '\n' if !double => {
+                flush(&mut pieces, &mut word);
+                pieces.push(Piece::Break);
+            }
+            c if c.is_whitespace() => flush(&mut pieces, &mut word),
+            c if double => word.push(c),
+            '#' if word.is_empty() => {
+                while chars.peek().is_some_and(|next| *next != '\n') {
+                    chars.next();
+                }
+            }
+            ';' | '&' | '(' | ')' => {
+                flush(&mut pieces, &mut word);
+                pieces.push(Piece::Break);
+            }
+            '|' => {
+                flush(&mut pieces, &mut word);
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    pieces.push(Piece::Break);
+                } else {
+                    if chars.peek() == Some(&'&') {
+                        chars.next();
+                    }
+                    pieces.push(Piece::Pipe);
+                }
+            }
+            '<' | '>' => {
+                // A descriptor before the operator is part of it.
+                if word.bytes().all(|b| b.is_ascii_digit()) {
+                    word.clear();
+                }
+                flush(&mut pieces, &mut word);
+                while chars
+                    .peek()
+                    .is_some_and(|next| matches!(next, '<' | '>' | '&' | '|' | '-'))
+                {
+                    chars.next();
+                }
+                pieces.push(Piece::Target);
+            }
+            c => word.push(c),
+        }
+    }
+    flush(&mut pieces, &mut word);
+
+    let mut commands: Commands = Vec::new();
+    let mut compound = false;
+    // Whether the next word starts a command, follows a pipe, names a
+    // redirection's target, or belongs to the last command found.
+    let (mut starts, mut piped, mut target, mut collecting) = (true, false, false, false);
+    for piece in pieces {
+        let word = match piece {
+            Piece::Word(word) => word,
+            Piece::Target => {
+                target = true;
+                continue;
+            }
+            Piece::Pipe | Piece::Break => {
+                piped = matches!(piece, Piece::Pipe);
+                (starts, target, collecting, compound) = (true, false, false, true);
+                continue;
+            }
+        };
+        if std::mem::take(&mut target) {
+            continue;
+        }
+        let name = basename(&word);
+        let reader = READERS.contains(&name) && !matches!(name, "echo" | "printf")
+            || matches!(name, "read" | "diff" | "justless");
+        if reader && !(starts && piped && LINE_FILTERS.contains(&name)) {
+            return None;
+        }
+        if !starts {
+            if collecting && let Some((words, _)) = commands.last_mut() {
+                words.push(word);
+            }
+            continue;
+        }
+        if assignment(&word) {
+            continue;
+        }
+        starts = false;
+        if KEYWORDS.contains(&name) {
+            starts = BEFORE_A_COMMAND.contains(&name);
+            compound = true;
+        } else if !SILENT.contains(&name) {
+            commands.push((vec![word], piped));
+            collecting = true;
+        }
+    }
+    let alone = commands.len() == 1 && !compound;
+    (!commands.is_empty()).then_some((commands, alone))
 }
 
 fn basename(program: &str) -> &str {
@@ -1586,6 +1825,55 @@ mod tests {
     fn filters(command: &str) -> Option<Vec<Filter>> {
         let segments = parse(command)?;
         segments[0][1..].iter().map(filter).collect()
+    }
+
+    /// The label of the plan for a line no other rule reads, if it gets one.
+    fn loosely(command: &str) -> Option<String> {
+        unknown_plan(command).map(|plan| plan.label)
+    }
+
+    #[test]
+    fn a_line_no_rule_reads_is_previewed_unless_it_prints_file_content() {
+        for (command, label) in [
+            ("python3 report.py", "python3"),
+            ("python3 report.py 2>&1 | tail -40", "python3; …"),
+            ("cd tools && X=1 python3 report.py; echo done", "python3; …"),
+            ("timeout 60 node build.js | sort | uniq -c", "node; …"),
+            ("for i in 1 2 3; do ./bench.sh $i; done", "bench.sh; …"),
+            ("if test -f a; then node report.js; fi", "node; …"),
+            (
+                "python3 - <<'PY'\nprint(open('cat').read())\nPY",
+                "python3; …",
+            ),
+            ("# git log\ncurl -s https://example.test/api", "curl; …"),
+            ("jq -r '.items[] | .name' data.json", "jq"),
+            ("echo \"$(python3 report.py)\"", "python3; …"),
+        ] {
+            assert_eq!(loosely(command).as_deref(), Some(label), "{command}");
+        }
+        for command in [
+            // A reader as a word anywhere outside single quotes.
+            "python3 report.py; cat report.txt",
+            "for f in a b; do sed -n 1,40p $f; done",
+            "python3 list.py | xargs cat",
+            "while read line; do echo \"$line\"; done < log.txt",
+            "echo \"$(cat notes.md)\"",
+            "docker exec app cat /etc/app.conf",
+            "python3 tool.py && git stash list",
+            "python3 a.py > out.txt; diff out.txt want.txt",
+            "python3 report.py | cut -c1-80 | cat",
+            // A command a hook supports, a search or a listing starts a pipeline.
+            "cargo test 2>&1 | python3 filter.py",
+            "for f in src/*; do grep -n needle $f; done",
+            "find . -name '*.py' | xargs wc -l",
+            "(cd web && ls -la)",
+            // Justless itself, and lines of notes alone.
+            "./target/debug/justless stats",
+            "echo one; printf two",
+            "cd src && true",
+        ] {
+            assert_eq!(loosely(command), None, "{command}");
+        }
     }
 
     #[test]
