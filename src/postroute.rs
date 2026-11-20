@@ -112,6 +112,18 @@ const TOOL_ERRORS: &[&str] = &[
     "not a directory",
 ];
 
+/// Whether a Bash result's `stderr` holds nothing the command printed: it is
+/// empty, or only the note Claude Code adds on a line of its own after a command
+/// left the session's working directories, `Shell cwd was reset to DIR`. Claude
+/// Code's main session adds it to every `cd` to a folder outside them.
+pub(crate) fn no_stderr(stderr: &str) -> bool {
+    let note = stderr.trim_matches('\n');
+    note.is_empty()
+        || note
+            .strip_prefix("Shell cwd was reset to ")
+            .is_some_and(|dir| !dir.is_empty() && !dir.contains('\n'))
+}
+
 /// Claude Code PostToolUse handler for the Bash tool. Returns `None` to leave the
 /// result unchanged: a command already routed through Justless, a background,
 /// interrupted or image result, output the run path would show verbatim, and any

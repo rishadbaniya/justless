@@ -94,18 +94,24 @@ impl Lab {
 
     /// The post-run hook's replacement for `command`, whose result was `stdout`.
     fn after(&self, command: &str, stdout: &str) -> Option<String> {
+        let result = self.result(command, stdout, "");
+        result["stdout"].as_str().map(str::to_owned)
+    }
+
+    /// The result the post-run hook gives Claude Code for `command`, which
+    /// printed `stdout` and left `stderr`, or null when it keeps the result.
+    fn result(&self, command: &str, stdout: &str, stderr: &str) -> Value {
         let input = json!({
             "hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": "outside",
             "cwd": self.root, "tool_input": {"command": command},
-            "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false},
+            "tool_response": {"stdout": stdout, "stderr": stderr, "interrupted": false},
         });
         let mut hook = self.command(BIN);
         hook.args(["hook-claude", "after-bash"]);
         let output = piped(&mut hook, input.to_string().as_bytes());
         assert!(output.status.success(), "{}", text(&output.stderr));
         let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let view = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"].as_str();
-        view.map(str::to_owned)
+        reply["hookSpecificOutput"]["updatedToolOutput"].clone()
     }
 
     fn justless(&self, args: &[&str]) -> String {
@@ -287,4 +293,33 @@ fn a_line_that_sets_plain_variables_is_read_as_the_shell_ran_it() {
         assert_eq!(lab.after(&command, &raw), None, "{command}");
     }
     assert_eq!(lab.runs(), before);
+}
+
+/// Claude Code's main session returns to its folder after a `cd` out of its
+/// working directories and says so in `stderr`, where the note stays.
+#[test]
+fn the_note_about_a_reset_directory_does_not_keep_a_list_raw() {
+    let lab = Lab::new();
+    let (scratch, root) = (path(&lab.scratch), path(&lab.root));
+    let note = format!("\nShell cwd was reset to {root}");
+    for command in [
+        format!("cd {scratch} && sed -n 1,400p big.rs"),
+        format!("cd {scratch} && cat sub/notes.txt; grep -n add_ big.rs"),
+    ] {
+        let raw = lab.sh(&command);
+        let result = lab.result(&command, &raw, &note);
+        let view = result["stdout"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{command} stayed as printed"));
+        assert!(view.len() * 2 < raw.len(), "{command}: {view}");
+        assert_eq!(result["stderr"], json!(note), "{command}");
+        // Anything else in `stderr` is the command's own.
+        for stderr in [
+            "sed: big.rs: Permission denied".to_owned(),
+            format!("{note}\nsed: big.rs: Permission denied"),
+            "Shell cwd was reset to ".to_owned(),
+        ] {
+            assert_eq!(lab.result(&command, &raw, &stderr), Value::Null, "{stderr}");
+        }
+    }
 }

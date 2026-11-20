@@ -203,7 +203,8 @@ impl<'a> Batch<'a> {
 
     pub(crate) fn compact(&self, ws: &Workspace, input: &Value) -> Option<Value> {
         let response = &input["tool_response"];
-        if !response["stderr"].as_str()?.is_empty() {
+        // The note about a reset directory stays in `stderr` as it is.
+        if !crate::postroute::no_stderr(response["stderr"].as_str()?) {
             return None;
         }
         let stdout = response["stdout"].as_str()?;
