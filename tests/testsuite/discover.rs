@@ -371,6 +371,13 @@ fn discover_agrees_with_the_hook_on_where_a_read_runs() {
         (format!("sed -n 1,400p {outside}/big.rs"), true),
         (format!("cd {outside} && sed -n 1,400p big.rs"), true),
         (format!("cd {outside} && cat big.rs; echo done"), true),
+        // A variable the line sets to a plain word is filled in first.
+        (format!("S={outside}; sed -n 1,400p $S/big.rs"), true),
+        ("F=big.rs; sed -n 1,400p $F".to_owned(), true),
+        (
+            format!("S=$(echo {outside}); sed -n 1,400p $S/big.rs"),
+            false,
+        ),
         ("sed -n 1,400p ../outside/big.rs".to_owned(), false),
         (
             format!("cd {outside} && grep -rn value . | head -n 900"),

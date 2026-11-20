@@ -417,6 +417,145 @@ fn literal(command: &str) -> bool {
     quote.is_none()
 }
 
+/// A `NAME=value` that stands alone as a command, and its value when the value
+/// is a word of plain path characters, quoted or not: one bash and zsh both
+/// expand to itself wherever `$NAME` is used, without splitting or globbing.
+fn assigned(stage: &str) -> Option<(String, Option<String>)> {
+    let words = shlex::split(stage)?;
+    let [word] = words.as_slice() else {
+        return None;
+    };
+    if !crate::wrappers::assignment(word) {
+        return None;
+    }
+    let (name, value) = word.split_once('=')?;
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+:,./-".contains(c))
+        && !stage.contains(['\\', '$', '`', '~']);
+    Some((name.to_owned(), plain.then(|| value.to_owned())))
+}
+
+/// `stage` with each `$NAME` and `${NAME}` of `values` filled in, bare or in
+/// double quotes, but not in single quotes or after a backslash. A name followed by `[` or `:` stays, since zsh reads a
+/// subscript or a modifier there, and so does every other use of `$`, which
+/// the list parser refuses.
+fn fill(stage: &str, values: &[(String, String)], used: &mut bool) -> String {
+    let mut out = String::with_capacity(stage.len());
+    let mut quote = None;
+    let mut rest = stage;
+    while let Some(c) = rest.chars().next() {
+        let mut take = c.len_utf8();
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+        } else if c == '\\' {
+            take += rest[take..].chars().next().map_or(0, char::len_utf8);
+        } else if quote == Some(c) {
+            quote = None;
+        } else if quote.is_none() && matches!(c, '\'' | '"') {
+            quote = Some(c);
+        } else if c == '$' {
+            let (name, braced) = match rest[1..].strip_prefix('{') {
+                Some(inner) => (inner.split_once('}').map_or("", |(name, _)| name), true),
+                None => {
+                    let end = rest[1..]
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .map_or(rest.len() - 1, |end| end);
+                    (&rest[1..1 + end], false)
+                }
+            };
+            let after = 1 + name.len() + 2 * usize::from(braced);
+            let value = values
+                .iter()
+                .rev()
+                .find(|(known, _)| known == name)
+                .filter(|_| braced || !rest[after..].starts_with(['[', ':']));
+            if let Some((_, value)) = value {
+                out.push_str(value);
+                *used = true;
+                rest = &rest[after..];
+                continue;
+            }
+        }
+        out.push_str(&rest[..take]);
+        rest = &rest[take..];
+    }
+    out
+}
+
+/// The line the shell runs once the variables it sets itself are filled in:
+/// `D=/tmp/notes; sed -n 1,90p $D/a.md` reads `/tmp/notes/a.md`. An assignment
+/// counts when it stands alone with a plain value (see [`assigned`]) where the
+/// shell surely runs it and goes on: after the start of the line, `;` or a
+/// newline, or `&&` behind nothing but assignments, and before `;`, a newline
+/// or `&&`. It is dropped from the result, as it prints nothing. Any other
+/// standalone assignment, such as one from a command substitution, leaves the
+/// line as written, and so does a line that uses none of its names. A prefix
+/// assignment, as in `D=/x cat $D/f`, sets nothing the line can use, which is
+/// how the shell reads it too. The recheck still compares every byte.
+pub(super) fn expand(command: &str) -> Option<String> {
+    if command.len() > 16 * 1024 || !command.contains('$') || !command.contains('=') {
+        return None;
+    }
+    let mut stages = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut chars = command.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if q == '"' && c == '\\' {
+                chars.next()?;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => {
+                chars.next()?;
+            }
+            ';' | '\n' | '&' | '|' => {
+                let paired =
+                    c != ';' && c != '\n' && chars.peek().is_some_and(|(_, next)| *next == c);
+                if paired {
+                    chars.next();
+                }
+                let end = i + 1 + usize::from(paired);
+                stages.push((&command[start..i], &command[i..end]));
+                start = end;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    stages.push((&command[start..], ""));
+    let mut values: Vec<(String, String)> = Vec::new();
+    let mut out = String::with_capacity(command.len());
+    let (mut used, mut only_assignments, mut before) = (false, true, ";");
+    for (stage, separator) in stages {
+        let Some((name, value)) = assigned(stage.trim()) else {
+            only_assignments = false;
+            out.push_str(&fill(stage, &values, &mut used));
+            out.push_str(separator);
+            before = separator;
+            continue;
+        };
+        let runs = matches!(before, ";" | "\n") || before == "&&" && only_assignments;
+        if !runs || !matches!(separator, ";" | "\n" | "&&" | "") {
+            return None;
+        }
+        values.push((name, value?));
+        before = separator;
+    }
+    used.then(|| out.trim().to_owned())
+}
+
 /// One command that is not a list: a wrapped read or a `cat`. With `plain`, any
 /// read, which the single-file read otherwise takes.
 pub(super) fn single(command: &str, plain: bool) -> Option<Vec<Piece<'_>>> {
@@ -669,6 +808,51 @@ mod tests {
         ] {
             assert!(super::single(single, false).is_none(), "{single}");
         }
+    }
+
+    #[test]
+    fn variables_a_line_sets_to_plain_words_are_filled_in() {
+        for (line, expected) in [
+            (
+                "D=/tmp/n; sed -n 1,9p $D/a.md",
+                Some("sed -n 1,9p /tmp/n/a.md"),
+            ),
+            (
+                "D=/tmp/n\ncat \"$D/a b\" ${D}x",
+                Some("cat \"/tmp/n/a b\" /tmp/nx"),
+            ),
+            (
+                "D='/tmp/n' && E=\"sub\" && cat $D/$E/a",
+                Some("cat /tmp/n/sub/a"),
+            ),
+            (
+                "cat a; D=b; cat $D; D=c; cat $D",
+                Some("cat a; cat b; cat c"),
+            ),
+            // A prefix assignment sets nothing the line can use.
+            ("D=/x; D=/y cat $D/f", Some("D=/y cat /x/f")),
+            ("D=/y cat $D/f", None),
+            // Single quotes and a backslash keep the dollar.
+            ("D=/x; cat '$D' \\$D \"it's\" '$D'", None),
+            ("D=/x; cat \"it's $D\"", Some("cat \"it's /x\"")),
+            // A value the shells may change, or a name zsh reads further.
+            ("D=~/x; cat $D/f", None),
+            ("D=$(pwd); cat $D/f", None),
+            ("D='a b'; cat $D", None),
+            ("D=a*; cat $D", None),
+            ("D=/x; cat $D[1] $D:h", None),
+            ("D=/x; cat $E/f ${D:-y}", None),
+            // An assignment the shell may skip, or whose status decides more.
+            ("cat a && D=/x; cat $D/f", None),
+            ("D=/x || cat $D/f", None),
+            ("D=/x | cat $D/f", None),
+            ("D=/x & cat $D/f", None),
+            ("cat a; D=/x", None),
+        ] {
+            assert_eq!(super::expand(line).as_deref(), expected, "{line}");
+        }
+        let expanded = super::expand("D=sub; cat $D/a; sed -n 1,2p $D/b").unwrap();
+        assert_eq!(super::list(&expanded).unwrap().len(), 2);
     }
 
     #[test]

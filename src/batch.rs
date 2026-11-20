@@ -136,6 +136,12 @@ fn quiet(binary: &Path, cwd: &Path) -> Command {
     cmd
 }
 
+/// The line with the plain variables it sets itself filled in, for the read
+/// parsers, when it sets and uses any. See [`parse::expand`].
+pub(crate) fn expanded(command: &str) -> Option<String> {
+    parse::expand(command)
+}
+
 struct Verified<'a> {
     piece: &'a Piece<'a>,
     /// For one file of a `cat A B …`, the `cat` of that file alone.

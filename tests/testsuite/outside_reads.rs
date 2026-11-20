@@ -233,3 +233,46 @@ fn files_the_outside_read_rules_exclude_stay_as_printed() {
     assert_eq!(lab.runs(), 0);
     assert_eq!(lab.reads(), Vec::<String>::new());
 }
+
+#[test]
+fn a_line_that_sets_plain_variables_is_read_as_the_shell_ran_it() {
+    let lab = Lab::new();
+    let scratch = path(&lab.scratch);
+    let run = regex::Regex::new(r"run-[A-Za-z0-9]+").unwrap();
+    for command in [
+        format!("S={scratch}; sed -n 1,400p $S/big.rs"),
+        format!("S={scratch}\ncd $S && cat sub/notes.txt"),
+        format!("S=\"{scratch}\" && F=big.rs && head -n 400 \"$S/$F\""),
+        format!(
+            "S={scratch}; sed -n 1,200p ${{S}}/big.rs; echo ----; head -n 300 $S/sub/notes.txt"
+        ),
+        // A workspace file takes the single-file read's outline.
+        "F=big.rs; sed -n 1,400p $F".to_owned(),
+    ] {
+        let raw = lab.sh(&command);
+        let view = lab
+            .after(&command, &raw)
+            .unwrap_or_else(|| panic!("{command} stayed as printed"));
+        assert!(view.len() * 2 < raw.len(), "{command}: {view}");
+        lacks(&view, "$S");
+        let id = run
+            .find(&view)
+            .unwrap_or_else(|| panic!("{command}: {view}"))
+            .as_str();
+        assert_eq!(lab.justless(&["log", id]), raw, "{command}");
+    }
+    let before = lab.runs();
+    for command in [
+        // A value from a command or another variable, and an assignment the
+        // shell may skip.
+        format!("S=$(echo {scratch}); sed -n 1,400p $S/big.rs"),
+        format!("S={scratch}; T=$S; sed -n 1,400p $T/big.rs"),
+        format!("true && S={scratch}; sed -n 1,400p $S/big.rs"),
+        // The file's own rules still hold.
+        format!("S={scratch}; cat $S/.hidden.rs"),
+    ] {
+        let raw = lab.sh(&command);
+        assert_eq!(lab.after(&command, &raw), None, "{command}");
+    }
+    assert_eq!(lab.runs(), before);
+}

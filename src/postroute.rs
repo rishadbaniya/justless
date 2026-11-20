@@ -148,12 +148,19 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // Output with a run marker was already routed, unless it is the text of a
     // `git show` blob, which the read below matches byte for byte.
     let routed = RUN_MARKER.is_match(stdout);
+    // The read parsers take the line with the plain variables it sets itself
+    // filled in, as the shell ran it. The reports below read it as written.
+    let expanded = (!cfg!(windows))
+        .then(|| crate::batch::expanded(command))
+        .flatten();
+    let reads = expanded.as_deref().unwrap_or(command);
     let read = (!cfg!(windows))
-        .then(|| crate::shellread::parse(command))
+        .then(|| crate::shellread::parse(reads))
         .flatten();
     // A read that ends in `| cat` printed the read's bytes, so it is handled as
     // the read alone.
-    let command = read.as_ref().map_or(command, |read| read.unpiped(command));
+    let reads = read.as_ref().map_or(reads, |read| read.unpiped(reads));
+    let command = if expanded.is_some() { command } else { reads };
     if let Some(read) = read {
         // A `git show` blob that is not outlined gets the ordinary report below.
         let object = read.object();
@@ -166,8 +173,8 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         let session = input["cwd"].as_str().map_or(ws.cwd.as_path(), Path::new);
         let outside = !read.inside(&ws.root, session);
         let compacted = crate::shellread::claude(ws, input, &read, || {
-            read_list(command)
-                .or_else(|| crate::batch::Batch::parse_read(command).filter(|_| outside))
+            read_list(reads)
+                .or_else(|| crate::batch::Batch::parse_read(reads).filter(|_| outside))
                 .filter(|_| !object)
                 .and_then(|batch| batch.compact(ws, input))
         });
@@ -179,7 +186,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // settings, still gets the report for its one kind of command below.
     if !cfg!(windows)
         && !routed
-        && let Some(compacted) = read_list(command).and_then(|batch| batch.compact(ws, input))
+        && let Some(compacted) = read_list(reads).and_then(|batch| batch.compact(ws, input))
     {
         return Some(compacted);
     }
@@ -605,13 +612,16 @@ pub(crate) fn after_run(
     };
     let mut handled = false;
     if !cfg!(windows) {
-        if let Some(read) = crate::shellread::parse(command) {
+        // As the hook reads it, with the variables the line sets filled in.
+        let expanded = crate::batch::expanded(command);
+        let reads = expanded.as_deref().unwrap_or(command);
+        if let Some(read) = crate::shellread::parse(reads) {
             // Outside the workspace a `git show` blob falls back to the ordinary
             // report, and a file is shown as a read list or left alone.
             if !read.inside(root, cwd) && !read.object() {
-                let command = read.unpiped(command);
-                return read_list(command)
-                    .or_else(|| crate::batch::Batch::parse_read(command))
+                let reads = read.unpiped(reads);
+                return read_list(reads)
+                    .or_else(|| crate::batch::Batch::parse_read(reads))
                     .filter(|batch| batch.reachable(root, cwd))
                     .and_then(|_| verdict(!fits(crate::batch::FLOOR)));
             }
@@ -623,7 +633,7 @@ pub(crate) fn after_run(
             }
             handled = true;
         }
-        if read_list(command).is_some_and(|batch| batch.reachable(root, cwd)) {
+        if read_list(reads).is_some_and(|batch| batch.reachable(root, cwd)) {
             if !fits(crate::batch::FLOOR) {
                 return verdict(true);
             }
