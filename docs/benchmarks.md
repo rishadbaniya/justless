@@ -392,16 +392,23 @@ Against Claude Code 2.1.327 and the harness's local fake API, a Read of lines 10
 
 ### What the agent read next
 
-The figures above stop at the outline. On 2026-11-20, `python3 scripts/read_followups.py` read 30 days of this project's Claude Code transcripts and, for each Read the hook had replaced with an outline, added up the later Reads of the same lines within 20 tool results. The hook was a few days old, so there were 94 outlined Reads. The 562 raw Reads of more than 150 lines from before it are the baseline, since an agent also reads parts of a file again after seeing all of it. "All bytes" is the first result plus those later Reads, against one raw Read of the lines; for outlined lines that raw size is estimated from the bytes per line of the Reads that followed.
+The figures above stop at the outline. On 2026-11-20, `python3 scripts/read_followups.py` read 30 days of this project's Claude Code transcripts and, for each read the hooks had replaced with an outline, added up the later Reads and shell reads of the same lines within 20 tool results, and any `justless log` of its run. The hooks were a few days old, so there were 94 outlined Reads and 100 compacted shell reads. Raw reads of more than 150 lines from before them are the baseline, since an agent also reads parts of a file again after seeing all of it: 562 Reads, and 522 shell reads that were one `sed -n 'A,Bp' FILE` or `cat FILE`. "All bytes" is the first result plus those later reads, against one raw read of the lines; for outlined lines that raw size is estimated from the bytes per line of the reads that followed.
 
-| Lines | Outlined | Read again | Lines read again | Later Reads | All bytes | Raw | Read again | Lines read again | Later Reads | All bytes |
+| Read tool, lines | Outlined | Read again | Lines read again | Later reads | All bytes | Raw | Read again | Lines read again | Later reads | All bytes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 151-300 | 35 | 91% | 78% | 1.74 | 104% | 235 | 34% | 26% | 0.42 | 121% |
-| 301-600 | 29 | 75% | 68% | 1.76 | 95% | 207 | 32% | 26% | 0.37 | 123% |
-| 601-1,200 | 16 | 50% | 44% | 3.38 | 70% | 114 | 31% | 18% | 0.40 | 118% |
-| over 1,200 | 5 | 20% | 9% | 2.80 | 23% | 6 | 0% | 0% | 0.00 | 100% |
+| 151-300 | 35 | 91% | 78% | 1.74 | 104% | 235 | 36% | 26% | 0.45 | 121% |
+| 301-600 | 29 | 79% | 71% | 1.83 | 98% | 207 | 32% | 26% | 0.38 | 124% |
+| 601-1,200 | 16 | 75% | 55% | 3.88 | 83% | 114 | 32% | 18% | 0.41 | 118% |
+| over 1,200 | 5 | 40% | 20% | 3.40 | 32% | 6 | 16% | 2% | 0.17 | 102% |
 
-An outline of at most 600 lines was read again three times in four, a quarter of the time whole with `allow_large`, and the agent ended with about as many bytes as one raw Read, 14% to 23% fewer than the raw baseline, after about 1.4 more Reads. Over 600 lines it ended with 70% of a raw Read, and over 1,200 lines with 23%. Each further Read that needs a request of its own also resends the conversation, whose median size in these sessions was 201K tokens, so under 600 lines the outline saved few bytes and cost requests. The sample is small and comes from one project, mostly sessions that develop Justless itself and so read files in order to change them. On this evidence the default threshold for outlining a Read went from 150 to 600 lines on 2026-11-20, as the `read_outline_lines` setting, so the table above this one describes the earlier threshold.
+| Shell reads, lines | Compacted | Read again | Lines read again | Later reads | All bytes | Raw | Read again | Lines read again | Later reads | All bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| at most 150 | 49 | 67% | 72% | 1.04 | 127% | | | | | |
+| 151-300 | 30 | 76% | 63% | 1.43 | 95% | 272 | 18% | 2% | 0.19 | 102% |
+| 301-600 | 18 | 83% | 76% | 1.44 | 98% | 220 | 24% | 1% | 0.27 | 101% |
+| 601-1,200 | 3 | 66% | 71% | 1.67 | 77% | 29 | 6% | 2% | 0.10 | 102% |
+
+An outlined Read of at most 600 lines was read again about four times in five, and the agent ended with about as many bytes as one raw Read, a fifth fewer than the raw baseline, after about 1.4 more reads. Over 600 lines it ended with 83% of a raw Read, and over 1,200 lines with 32%. A compacted shell read of at most 600 lines saved nothing: the agent ended with 95% to 127% of the bytes of the raw read after about one more read, where after a raw shell read it almost never read the lines again. Each further read that needs a request of its own also resends the conversation, whose median size in these sessions was 201K tokens. The sample is small and comes from one project, mostly sessions that develop Justless itself and so read files in order to change them. On this evidence the default threshold for outlining a Read went from 150 to 600 lines on 2026-11-20, as the `read_outline_lines` setting, so the table above these describes the earlier threshold.
 
 ## Code questions
 
