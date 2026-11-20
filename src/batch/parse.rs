@@ -195,6 +195,22 @@ fn sed(args: &[String]) -> Option<Filter> {
     (ranges.len() <= 32).then_some(Filter::Sed(ranges))
 }
 
+/// The lines an awk program prints when it is only a range of line numbers:
+/// `NR>=A && NR<=B` or `NR==A,NR==B`, with or without a plain `{print}`.
+fn awk(script: &str) -> Option<Filter> {
+    let script: String = script.chars().filter(|c| !c.is_whitespace()).collect();
+    let script = script
+        .strip_suffix("{print}")
+        .or_else(|| script.strip_suffix("{print$0}"))
+        .unwrap_or(&script);
+    let (first, last) = match script.strip_prefix("NR>=") {
+        Some(rest) => rest.split_once("&&NR<=")?,
+        None => script.strip_prefix("NR==")?.split_once(",NR==")?,
+    };
+    let (first, last) = (address(first)?, address(last)?);
+    (first <= last).then(|| Filter::Sed(vec![(first, last)]))
+}
+
 fn columns(args: &[String]) -> Option<Filter> {
     let spec = match args {
         [flag, spec] if flag == "-c" => spec.as_str(),
@@ -291,6 +307,17 @@ fn piece<'a>(
                 return None;
             }
             Source::Files(args.to_vec())
+        }
+        "awk" => {
+            let [script, file] = args else { return None };
+            if !local(file) {
+                return None;
+            }
+            Source::File {
+                file: file.clone(),
+                select: awk(script)?,
+                numbered: Numbers::None,
+            }
         }
         "sed" | "cat" | "head" | "tail" | "nl" => {
             let (file, opts) = args.split_last()?;
@@ -689,8 +716,8 @@ pub(super) fn glob(command: &str, base: Option<&Path>) -> Option<String> {
     found.then_some(out)
 }
 
-/// One command that is not a list: a wrapped read or a `cat`. With `plain`, any
-/// read, which the single-file read otherwise takes.
+/// One command that is not a list: a wrapped read, a `cat` or an awk range.
+/// With `plain`, any read, which the single-file read otherwise takes.
 pub(super) fn single(command: &str, plain: bool) -> Option<Vec<Piece<'_>>> {
     if command.len() > 16 * 1024 || !literal(command) {
         return None;
@@ -701,7 +728,8 @@ pub(super) fn single(command: &str, plain: bool) -> Option<Vec<Piece<'_>>> {
     let differs =
         effective.len() != refs.len() || effective.iter().zip(&refs).any(|(a, b)| a.as_str() != *b);
     let program = effective.first().map(String::as_str);
-    if !plain && !differs && !matches!(program, Some("cat")) {
+    // The single-file read takes neither several files nor an awk range.
+    if !plain && !differs && !matches!(program, Some("cat" | "awk")) {
         return None;
     }
     // Only a list mixes in other pieces.
@@ -986,6 +1014,32 @@ mod tests {
         }
         let expanded = super::expand("D=sub; cat $D/a; sed -n 1,2p $D/b").unwrap();
         assert_eq!(super::list(&expanded).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_awk_line_range_is_a_file_read() {
+        for (script, lines) in [
+            ("NR>=10 && NR<=20", Some((10, 20))),
+            ("NR>=3&&NR<=3 {print}", Some((3, 3))),
+            ("NR==5,NR==9", Some((5, 9))),
+            ("NR >= 1 && NR <= 400 { print $0 }", Some((1, 400))),
+            ("NR>=20 && NR<=10", None),
+            ("NR>=0 && NR<=10", None),
+            ("NR>=10", None),
+            ("NR>=10 && NR<=20 {print $1}", None),
+            ("/x/ && NR<=20", None),
+            ("NR>=10 && NR<=20 || /x/", None),
+        ] {
+            let range = super::awk(script).map(|filter| match filter {
+                super::Filter::Sed(ranges) => ranges[0],
+                _ => unreachable!(),
+            });
+            assert_eq!(range, lines, "{script}");
+        }
+        assert!(super::single("awk 'NR>=10 && NR<=20' a.rs", false).is_some());
+        assert!(super::single("awk '{print $1}' a.rs", false).is_none());
+        assert!(super::single("awk -F: 'NR>=10 && NR<=20' a.rs", false).is_none());
+        assert!(super::list("cd src && awk 'NR==5,NR==9' a.rs; cat b").is_some());
     }
 
     #[test]

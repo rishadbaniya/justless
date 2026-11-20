@@ -78,7 +78,6 @@ LLM summarization or retrieval, telemetry, client-side rewriting of earlier requ
 | Perl grammar | 93 Perl-related Bash results in 472 transcripts, 0.11 MB, and no Perl source reads among the large results. |
 | `.mm` files as Objective-C | 209 of 357 real Objective-C++ files (59%) parse with errors in the Objective-C grammar; on average 6.4% of a file's bytes sit in error nodes. |
 | `nl -ba FILE \| sed -n` reads | 0 results in 472 transcripts. |
-| `awk 'NR>=A && NR<=B'` range reads | 42 results, 0.10 MB. |
 | Cargo.lock descriptions inside `git log -p` | Two git lookups per lockfile section per commit; `git log -p` is 0.05 MB in total. |
 | Compacting lists that mix `git show` with other git commands after they run | 29 results, 0.11 MB; `git diff` lists already pass through the same way. |
 | Prebuilt release binaries | The owner decided on 2026-11-19 that every install builds from source with Cargo; the installer, release workflow and Homebrew formula were simplified to match. |

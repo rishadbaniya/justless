@@ -246,6 +246,28 @@ fn unsupported_mismatched_and_unverifiable_batches_leave_no_run() {
 }
 
 #[test]
+fn an_awk_line_range_is_read_like_a_sed_range() {
+    let temp = fixture();
+    let dir = temp.path();
+    for list in [
+        "awk 'NR>=1 && NR<=400' big.rs",
+        "awk 'NR==20,NR==300 {print}' big.rs; tail -1 notes",
+    ] {
+        let raw = native(dir, list);
+        let (view, _) = verified(dir, list, response(&raw), &raw);
+        has(&view, "function add_");
+    }
+    // Any other awk program prints what the recheck cannot name.
+    for list in [
+        "awk '{print $1}' big.rs",
+        "awk 'NR>=1 && NR<=400 {print NR\": \"$0}' big.rs",
+    ] {
+        let raw = native(dir, list);
+        assert_eq!(hook(dir, list, Some(response(&raw))), json!({}), "{list}");
+    }
+}
+
+#[test]
 fn a_glob_is_read_as_the_files_it_names() {
     let temp = fixture();
     let dir = temp.path();
