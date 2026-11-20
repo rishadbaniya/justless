@@ -621,7 +621,7 @@ pub(crate) fn after_run(
     exclusions: &crate::rewrite::Exclusions,
     output: &str,
     persisted: Option<u64>,
-    context_budget: usize,
+    (context_budget, outline_lines): (usize, u64),
 ) -> Option<AfterRun> {
     if !cwd.starts_with(root) || excluded(exclusions, command) || RUN_MARKER.is_match(output) {
         return None;
@@ -637,6 +637,8 @@ pub(crate) fn after_run(
         })
     };
     let mut handled = false;
+    // Shown whole and at most `read_outline_lines` lines.
+    let few = persisted.is_none() && lines as u64 <= outline_lines;
     if !cfg!(windows) {
         // As the hook reads it, with the variables the line sets filled in and
         // one file standing for each glob.
@@ -650,18 +652,23 @@ pub(crate) fn after_run(
                 return read_list(reads)
                     .or_else(|| crate::batch::Batch::parse_read(reads))
                     .filter(|batch| batch.reachable(root, cwd))
-                    .and_then(|_| verdict(!fits(crate::batch::FLOOR)));
+                    .and_then(|_| verdict(!fits(crate::batch::FLOOR) && !few));
             }
-            let small = persisted.is_none()
-                && crate::shellread::small(output.lines().count(), output.len());
+            let small = crate::shellread::small(
+                output.lines().count(),
+                output.len(),
+                persisted.is_none().then_some(outline_lines),
+            ) && persisted.is_none();
             // A `git show` blob too small to outline gets the ordinary report.
             if !read.object() || !small {
                 return verdict(!small);
             }
             handled = true;
         }
-        if read_list(reads).is_some_and(|batch| batch.reachable(root, cwd)) {
-            if !fits(crate::batch::FLOOR) {
+        if let Some(batch) = read_list(reads).filter(|batch| batch.reachable(root, cwd)) {
+            // File reads of few lines in all stay as printed.
+            let kept = few && batch.files_only();
+            if !fits(crate::batch::FLOOR) && !kept {
                 return verdict(true);
             }
             handled = true;

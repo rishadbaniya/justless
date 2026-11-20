@@ -50,6 +50,12 @@ fn compacted(dir: &Path, cwd: &Path, list: &str) -> Option<String> {
 
 fn fixture() -> TempDir {
     let temp = TempDir::new().unwrap();
+    // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+    fs::write(
+        temp.path().join(".justless.toml"),
+        "read_outline_lines = 0\n",
+    )
+    .unwrap();
     let source = (0..200)
         .map(|i| {
             format!("pub fn add_{i:03}(value: u64) -> u64 {{\n    value.wrapping_add({i})\n}}\n")
@@ -243,6 +249,44 @@ fn unsupported_mismatched_and_unverifiable_batches_leave_no_run() {
     assert!(!dir.join(".justless/runs").exists());
     assert!(resume_reads(dir).is_empty());
     assert!(!dir.join("unexpected").exists());
+}
+
+#[test]
+fn shell_reads_of_at_most_600_lines_stay_as_printed() {
+    let temp = fixture();
+    let dir = temp.path();
+    // The default threshold. `big.rs` has 601 lines.
+    fs::remove_file(dir.join(".justless.toml")).unwrap();
+    let replaced = |list: &str| {
+        let raw = native(dir, list);
+        let answer = hook(dir, list, Some(response(&raw)));
+        answer["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .map(|view| assert!(view.len() < raw.len(), "{list}: {view}"))
+            .is_some()
+    };
+    // An agent reads most of such a read again, so it keeps its lines.
+    for list in [
+        "sed -n '1,600p' big.rs",
+        "cat big.rs | head -n 500",
+        "sed -n '1,170p' big.rs; sed -n '222,348p' big.rs",
+        "sed -n '1,300p' big.rs; echo ----; head -n 300 big.rs",
+    ] {
+        assert!(!replaced(list), "{list}");
+    }
+    assert!(!dir.join(".justless/runs").exists());
+    // More lines of files, or a large piece of another kind, are compacted.
+    for list in [
+        "cat big.rs",
+        "sed -n '1,400p' big.rs; sed -n '100,400p' big.rs",
+        "sed -n '1,100p' big.rs; grep -n add_ big.rs",
+    ] {
+        assert!(replaced(list), "{list}");
+    }
+    // The project's setting moves the threshold.
+    fs::write(dir.join(".justless.toml"), "read_outline_lines = 200\n").unwrap();
+    assert!(replaced("sed -n '1,201p' big.rs"));
+    assert!(!replaced("sed -n '1,200p' big.rs"));
 }
 
 #[test]

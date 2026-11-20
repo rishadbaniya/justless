@@ -22,6 +22,8 @@ impl Fixture {
             home: TempDir::new().unwrap(),
         };
         let dir = fixture.dir();
+        // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+        fs::write(dir.join(".justless.toml"), "read_outline_lines = 0\n").unwrap();
         fs::create_dir_all(fixture.home().join(".config/git")).unwrap();
         fs::write(fixture.home().join(".config/git/ignore"), "*.tmp\n").unwrap();
         fs::create_dir_all(dir.join("sub/deep")).unwrap();

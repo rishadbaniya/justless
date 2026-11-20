@@ -168,6 +168,17 @@ impl<'a> Batch<'a> {
     /// One plain read of a file, such as `sed -n '1,90p' FILE`. The single-file
     /// read takes these in the workspace, so [`Self::parse`] leaves them to it;
     /// outside the workspace only the recheck of a list can show one.
+    /// Whether every piece prints a file's lines or a literal, so the list
+    /// stays as printed up to `read_outline_lines` lines.
+    pub(crate) fn files_only(&self) -> bool {
+        self.0.iter().all(|piece| {
+            matches!(
+                piece.source,
+                Source::File { .. } | Source::Files(_) | Source::Object(_) | Source::Literal(_)
+            )
+        })
+    }
+
     pub(crate) fn parse_read(command: &'a str) -> Option<Self> {
         parse::single(command, true)
             .filter(|pieces| matches!(pieces[0].source, Source::File { .. }))
@@ -445,6 +456,24 @@ impl<'a> Batch<'a> {
                             - usize::from(kept.ends_with('\n'))
                     });
                 }
+            }
+        }
+        // File reads of at most `read_outline_lines` lines in all stay as
+        // printed, as one such read does, unless another piece is large or the
+        // client saved the result to a file and shows only its start.
+        if persisted.is_none() {
+            let (mut lines, mut other) = (0, 0);
+            for item in &verified {
+                let text = &actual[item.range.start_byte..item.range.end_byte];
+                match item.piece.source {
+                    Source::File { .. } | Source::Files(_) | Source::Object(_) => {
+                        lines += text.lines().count() as u64;
+                    }
+                    _ => other += text.len(),
+                }
+            }
+            if lines > 0 && lines <= settings.read_outline_lines && other <= FLOOR {
+                return None;
             }
         }
         // A small file of a `cat A B …` is shown whole, as its own `cat` would

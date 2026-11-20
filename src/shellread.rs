@@ -312,10 +312,14 @@ pub(crate) struct ShellRead {
     unpiped: Option<usize>,
 }
 
-/// Whether a read of `lines` lines and `bytes` bytes is small enough to keep its
-/// text instead of an outline.
-pub(crate) fn small(lines: usize, bytes: usize) -> bool {
-    lines <= 150 && bytes <= 6144
+/// Whether a read of `lines` lines and `bytes` bytes keeps its text instead of an
+/// outline: at most 150 lines and 6 KiB, or, when the client shows it whole, at
+/// most `whole` lines, the `read_outline_lines` setting. In 30 days of this
+/// project's Claude Code transcripts, a compacted shell read of at most 600
+/// lines was read again 67% to 83% of the time and left the agent with 95% to
+/// 127% of the bytes of the raw read (`scripts/read_followups.py`, 2026-11-20).
+pub(crate) fn small(lines: usize, bytes: usize, whole: Option<u64>) -> bool {
+    lines <= 150 && bytes <= 6144 || whole.is_some_and(|whole| lines as u64 <= whole)
 }
 
 /// The read a command line runs, if it is one of the forms `ShellRead` describes.
@@ -633,20 +637,27 @@ impl Selection {
         }
     }
 
-    /// A read of at most 150 lines and 6 KiB, which keeps its text.
-    fn small(&self) -> bool {
+    /// A read that keeps its text (see [`small`]). `shown` is whether the client
+    /// shows the result whole, not as a preview of a file it saved.
+    fn small(&self, ws: &Workspace, shown: bool) -> bool {
+        let whole = ws
+            .settings()
+            .ok()
+            .filter(|_| shown)
+            .map(|settings| settings.read_outline_lines);
         let lines: usize = self
             .windows
             .iter()
             .map(|window| window.last + 1 - window.first)
             .sum();
-        small(lines, self.text.len())
+        small(lines, self.text.len(), whole)
     }
 
     fn outline(&mut self, ws: &Workspace, baseline: usize) -> Option<String> {
         let settings = ws.settings().ok()?;
         let bytes = self.text.len() as u64;
-        if self.small()
+        // A smaller baseline is the preview of a result the client saved.
+        if self.small(ws, baseline >= self.text.len())
             || bytes > settings.max_run_bytes
             || settings.max_runs == 0
             || bytes > settings.max_archive_bytes
@@ -829,8 +840,8 @@ pub(crate) fn rewrite(
     if read.closed && !read.text().ends_with('\n') {
         return None;
     }
-    if shell.whole() && (read.small() || read.outline(ws, read.text.len()).is_none()) {
-        return (!read.small())
+    if shell.whole() && (read.small(ws, true) || read.outline(ws, read.text.len()).is_none()) {
+        return (!read.small(ws, true))
             .then(|| crate::agents::read_instead(ws, &ws.root, &read.file))?
             .map(|instead| format!("{}{instead}", shell.prefix));
     }
@@ -883,7 +894,7 @@ pub(crate) fn piece(
         return None;
     }
     if shell.whole()
-        && !read.small()
+        && !read.small(ws, true)
         && read.outline(ws, read.text.len()).is_none()
         && let Some(instead) = crate::agents::read_instead(ws, &ws.root, &read.file)
     {
@@ -996,7 +1007,8 @@ pub(crate) fn claude(
         session.as_deref().unwrap_or("terminal"),
         true,
     ) else {
-        if !read.small()
+        let shown = !input["tool_response"]["persistedOutputPath"].is_string();
+        if !read.small(ws, shown)
             && let Some(other) = fallback()
         {
             return Some(other);

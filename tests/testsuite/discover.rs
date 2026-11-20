@@ -27,6 +27,8 @@ impl Setup {
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&home).unwrap();
         let root = root.canonicalize().unwrap();
+        // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+        fs::write(root.join(".justless.toml"), "read_outline_lines = 0\n").unwrap();
         let source: String = (0..300)
             .map(|i| format!("pub fn add_{i:03}(value: u64) -> u64 {{\n    value + {i}\n}}\n"))
             .collect();

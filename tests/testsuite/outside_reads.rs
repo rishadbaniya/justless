@@ -42,6 +42,8 @@ impl Lab {
             fs::create_dir_all(dir).unwrap();
         }
         fs::write(root.join("big.rs"), &rust).unwrap();
+        // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+        fs::write(root.join(".justless.toml"), "read_outline_lines = 0\n").unwrap();
         for file in [
             "big.rs",
             "sub/big.rs",

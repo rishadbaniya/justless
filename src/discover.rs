@@ -98,8 +98,8 @@ fn excluded_stage(exclusions: &Exclusions, command: &str) -> bool {
 
 /// What the Claude Code post-run hook would make of a result that the command hook
 /// leaves as `route`, with the hook's own parsers and limits: compacted, kept
-/// whole as a handled command, or left as `route`. `rules` holds the project's exclusions
-/// and context budget, and is `None` while the settings fail to load, when the
+/// whole as a handled command, or left as `route`. `rules` holds the project's exclusions,
+/// context budget and `read_outline_lines`, and is `None` while the settings fail to load, when the
 /// hook leaves every result. `entry` is the transcript line holding `part`, and
 /// `root` the workspace root.
 fn after_running(
@@ -107,7 +107,7 @@ fn after_running(
     command: &str,
     entry: &Value,
     part: &Value,
-    rules: Option<&(Exclusions, usize)>,
+    rules: Option<&(Exclusions, (usize, u64))>,
     root: &Path,
 ) -> Route {
     let Some((exclusions, budget)) = rules else {
@@ -304,7 +304,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
         workspace
             .settings()
             .ok()
-            .map(|settings| settings.context_budget),
+            .map(|settings| (settings.context_budget, settings.read_outline_lines)),
     );
     // Sessions keep subagent transcripts under <session>/subagents/, and workflow
     // subagents one level deeper under subagents/workflows/<run>/.

@@ -15742,6 +15742,8 @@ fn sed_ranges_keep_native_bytes_and_only_charge_the_delivered_outline_and_replay
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
+    // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 0\n")]);
     let mut data: String = (0..60)
         .map(|i| {
             format!("def price_{i}(x):\r\n    initial = x + {i}\r\n    return initial * 2\r\n\r\n")
@@ -15840,6 +15842,8 @@ fn tail_from_line_uses_the_current_eof_and_archives_the_exact_suffix() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
+    // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 0\n")]);
     let file = "fees today.py";
     let mut source = (0..80)
         .map(|i| format!("def fee_{i}(x):\r\n    return x + {i}\r\n\r\n"))
@@ -15903,6 +15907,8 @@ fn git_show_reads_outline_the_blob_at_their_revision() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
+    // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 0\n")]);
     let sub = root.join("sub");
     let version = |name: &str| {
         (0..120)
@@ -16020,6 +16026,8 @@ fn head_tail_and_multi_range_sed_reads_are_exact_or_outlined() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
+    // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 0\n")]);
     let data: String = (0..120).map(|i| format!(
         "def price_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    rounded = round(taxed, 2)\n    discounted = rounded - {i} * 0.01\n    capped = min(discounted, 1000)\n    return capped * 2\n\n"
     )).collect();
@@ -16068,6 +16076,8 @@ fn cat_cd_and_piped_reads_are_exact_or_outlined_like_ranges() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
+    // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 0\n")]);
     let sub = root.join("sub");
     let data: String = (0..120)
         .map(|i| format!("def price_{i}(x):\n    initial = x + {i}\n    taxed = initial * 1.2\n    rounded = round(taxed, 2)\n    return rounded\n\n"))

@@ -23,6 +23,8 @@ impl Lab {
         let root = base.join("work");
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
+        // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+        fs::write(root.join(".justless.toml"), "read_outline_lines = 0\n").unwrap();
         fs::write(root.join("notes.md"), "# Notes\n\nshort\n").unwrap();
         fs::write(
             root.join("src/small.rs"),
