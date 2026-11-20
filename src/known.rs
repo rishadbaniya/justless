@@ -3,10 +3,13 @@
 //!
 //! A command listed in [`ROUTED`] has no report of its own: its run is archived
 //! and shown with the clipped preview every run gets. [`PROGRESS`] names lines a
-//! tool prints while it works, which the preview leaves out and the log keeps.
-//! Both lists hold only invocations that build, test, check, install or display.
-//! Commands that change remote state or print secrets are not listed, and no
-//! listed command is run for a client without the client asking first.
+//! tool prints while it works, which the preview leaves out when the other
+//! lines then fit, and the log keeps. Both lists hold invocations that build,
+//! test, check, install or display. A command whose purpose is to change remote
+//! state or to read secrets or a data store is not listed, nor is one that runs
+//! any target the project defines, and no listed command is run for a client
+//! without the client asking first. A tool the hooks already routed gets no
+//! progress lines here, so its preview is unchanged.
 use std::path::Path;
 
 /// Options that follow a stream until interrupted.
@@ -78,8 +81,6 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["nx", "build"], &[]),
     (&["nx", "lint"], &[]),
     (&["nx", "test"], &[]),
-    (&["nx", "run-many"], &[]),
-    (&["nx", "affected"], &[]),
     // Python
     (&["ruff", "format"], &[]),
     (&["sqlfluff", "lint"], &[]),
@@ -120,7 +121,10 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["composer", "update"], &[]),
     (&["composer", "require"], &[]),
     // JVM, Elixir and other builds
-    (&["mvnd"], &[]),
+    (&["mvnd", "compile"], &[]),
+    (&["mvnd", "test"], &[]),
+    (&["mvnd", "package"], &[]),
+    (&["mvnd", "verify"], &[]),
     (&["sbt", "test"], &[]),
     (&["sbt", "compile"], &[]),
     (&["sbt", "clean"], &[]),
@@ -133,9 +137,8 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["ctest"], &[]),
     (&["xcodebuild"], &[]),
     (&["trunk", "build"], &[]),
-    (&["pio", "run"], &[]),
+    (&["pio", "run"], &["-t", "--target"]),
     (&["quarto", "render"], &[]),
-    (&["just"], &[]),
     // Linters and checks
     (&["markdownlint"], &[]),
     (&["markdownlint-cli2"], &[]),
@@ -149,9 +152,9 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     // Containers and infrastructure, display and dry runs only
     (&["docker", "images"], &[]),
     (&["docker", "image", "ls"], &[]),
-    (&["docker", "build"], &[]),
+    (&["docker", "build"], &["--push"]),
     (&["docker", "compose", "ps"], &[]),
-    (&["docker", "compose", "build"], &[]),
+    (&["docker", "compose", "build"], &["--push"]),
     (&["docker", "compose", "logs"], FOLLOW),
     (&["kubectl", "describe"], &[]),
     (&["oc", "get"], &["-w", "--watch"]),
@@ -162,7 +165,6 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["helm", "status"], &[]),
     (&["helm", "history"], &[]),
     (&["helm", "lint"], &[]),
-    (&["helm", "template"], &[]),
     (&["terraform", "plan"], &[]),
     (&["terraform", "validate"], &[]),
     (&["terraform", "fmt"], &[]),
@@ -299,49 +301,6 @@ const PROGRESS: &[(&[&str], &str)] = &[
         &["sbt"],
         r"^\[info\] (welcome to sbt|loading |set current project to|[Rr]esolving |Fetching |Fetched |Updating |Updated |[Cc]ompiling \d+ |done compiling)",
     ),
-    // Tools the hooks already route.
-    (
-        &["make"],
-        r"^g?make(\[\d+\])?: (Entering|Leaving) directory ",
-    ),
-    (
-        &["gmake"],
-        r"^g?make(\[\d+\])?: (Entering|Leaving) directory ",
-    ),
-    (&["ninja"], r"^\[\d+/\d+\] "),
-    (&["cmake", "--build"], r"^\[ *\d+(/\d+|%)\] "),
-    (
-        &["gradle"],
-        r"^(> Task :\S+( (UP-TO-DATE|NO-SOURCE|FROM-CACHE|SKIPPED))?$|Download(ing)? https?://)",
-    ),
-    (
-        &["gradlew"],
-        r"^(> Task :\S+( (UP-TO-DATE|NO-SOURCE|FROM-CACHE|SKIPPED))?$|Download(ing)? https?://)",
-    ),
-    (
-        &["mvn"],
-        r"^((\[INFO\] )?Download(ing|ed) from \S+: |Progress \(\d+\): )",
-    ),
-    (
-        &["mvnw"],
-        r"^((\[INFO\] )?Download(ing|ed) from \S+: |Progress \(\d+\): )",
-    ),
-    (
-        &["mvnd"],
-        r"^((\[INFO\] )?Download(ing|ed) from \S+: |Progress \(\d+\): )",
-    ),
-    (
-        &["dotnet"],
-        r"^(Determining projects to restore\.\.\.|Restored \S.* \(in [\d.,]+ \w+\)\.?$|All projects are up-to-date for restore\.)",
-    ),
-    (
-        &["go"],
-        r"^(go: (downloading|finding|extracting) |\?\s+\S+\s+\[no test files\]$)",
-    ),
-    (
-        &["swift"],
-        r"^(\[\d+/\d+\] (Compiling|Emitting|Linking|Write|Wrapping|Planning|Copying|Merging|Archiving)\b|(Fetching|Fetched|Computing version for|Computed|Creating working copy for|Working copy of) https?://)",
-    ),
 ];
 
 /// The entry with the longest command that `words` start with, reading the
@@ -425,6 +384,12 @@ mod tests {
             "npm run dev",
             "npm publish",
             "sbt run",
+            "just deploy",
+            "mvnd deploy",
+            "nx run-many --target=deploy",
+            "docker build --push .",
+            "pio run -t upload",
+            "helm template web ./chart",
             "deno run main.ts",
             "sops -d secrets.yaml",
             "psql -c select",
@@ -562,51 +527,6 @@ mod tests {
                 "[info] welcome to sbt 1.10.2 (Eclipse Adoptium Java 21.0.4)",
                 "[info] Passed: Total 12, Failed 0, Errors 0, Passed 12",
             ),
-            (
-                "make test",
-                "make[1]: Entering directory '/src/lib'",
-                "cc -o lib.o -c lib.c",
-            ),
-            (
-                "ninja",
-                "[12/340] Building CXX object src/CMakeFiles/app.dir/main.cpp.o",
-                "ninja: build stopped: subcommand failed.",
-            ),
-            (
-                "cmake --build build",
-                "[ 50%] Building CXX object CMakeFiles/app.dir/main.cpp.o",
-                "gmake: *** [Makefile:91: all] Error 2",
-            ),
-            (
-                "./gradlew build",
-                "> Task :app:compileJava UP-TO-DATE",
-                "BUILD SUCCESSFUL in 2s",
-            ),
-            (
-                "mvn test",
-                "Downloading from central: https://repo.maven.apache.org/maven2/junit/junit/4.13.2/junit-4.13.2.pom",
-                "[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0",
-            ),
-            (
-                "dotnet build",
-                "  Determining projects to restore...",
-                "Build succeeded.",
-            ),
-            (
-                "go test ./...",
-                "?   \texample.com/app/cmd\t[no test files]",
-                "ok  \texample.com/app/store\t0.412s",
-            ),
-            (
-                "go build ./...",
-                "go: downloading golang.org/x/sys v0.26.0",
-                "./main.go:12:2: undefined: missing",
-            ),
-            (
-                "swift build",
-                "[12/40] Compiling App main.swift",
-                "Build complete! (3.21s)",
-            ),
         ] {
             assert!(omitted(command, dropped), "{command}: {dropped}");
             assert!(!omitted(command, kept), "{command}: {kept}");
@@ -616,6 +536,11 @@ mod tests {
     #[test]
     fn every_progress_rule_compiles_and_matches_no_empty_or_failing_line() {
         for (command, pattern) in PROGRESS {
+            // A tool the hooks already routed keeps the preview it had.
+            assert!(
+                !legacy_hook(command) && profile(command).is_none(),
+                "{command:?}"
+            );
             let omit = regex::Regex::new(pattern).unwrap();
             assert!(!omit.is_match(""), "{command:?}");
             for line in [
@@ -633,14 +558,16 @@ mod tests {
 
     #[test]
     fn a_rule_from_the_project_settings_replaces_the_built_in_one() {
-        let args: Vec<OsString> = ["make", "test"].iter().map(OsString::from).collect();
+        let args: Vec<OsString> = ["pip", "install", "x"].iter().map(OsString::from).collect();
+        assert!(Selection::for_run(&args, &[]).unwrap().built_in);
         let rules = [crate::filters::Rule {
-            command: vec!["make".into()],
-            omit: "^cc ".into(),
+            command: vec!["pip".into()],
+            omit: "^Looking in indexes".into(),
         }];
         let selection = Selection::for_run(&args, &rules).unwrap();
+        assert!(!selection.built_in);
         let omit = selection.omit.unwrap();
-        assert!(omit.is_match("cc -o lib.o -c lib.c"));
-        assert!(!omit.is_match("make[1]: Entering directory '/src/lib'"));
+        assert!(omit.is_match("Looking in indexes: https://pypi.org/simple"));
+        assert!(!omit.is_match("Collecting x"));
     }
 }

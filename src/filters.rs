@@ -1197,6 +1197,10 @@ impl Rule {
 pub struct Selection {
     pub profile: Option<Profile>,
     pub omit: Option<Regex>,
+    /// Whether `omit` holds a tool's built-in progress lines, not a rule from the
+    /// settings. Such a preview replaces the ordinary one only when it shows
+    /// every other line.
+    pub built_in: bool,
 }
 
 impl Selection {
@@ -1215,16 +1219,21 @@ impl Selection {
             })
             .max_by_key(|r| r.command.len());
         // A rule from the settings replaces the tool's built-in progress lines.
-        let omit = match rule {
-            Some(rule) => Some(rule.validate()?),
-            None => crate::known::progress(&words)
-                .map(Regex::new)
-                .transpose()
-                .context("invalid built-in progress rule")?,
+        let (omit, built_in) = match rule {
+            Some(rule) => (Some(rule.validate()?), false),
+            None => {
+                let omit = crate::known::progress(&words)
+                    .map(Regex::new)
+                    .transpose()
+                    .context("invalid built-in progress rule")?;
+                let built_in = omit.is_some();
+                (omit, built_in)
+            }
         };
         Ok(Self {
             profile: profile(&words),
             omit,
+            built_in,
         })
     }
 }
@@ -1324,7 +1333,8 @@ impl<'a> LineFilter<'a> {
         }
     }
 
-    pub fn finish(self) -> Option<Vec<u8>> {
+    /// The filtered preview, and whether it shows every line the filter kept.
+    pub fn finish(self) -> Option<(Vec<u8>, bool)> {
         if self.invalid || self.omitted + self.duplicate == 0 {
             return None;
         }
@@ -1332,7 +1342,10 @@ impl<'a> LineFilter<'a> {
             "[{} retained lines, {} filtered, {} repeats]\n",
             self.retained, self.omitted, self.duplicate
         );
-        if self.clipped || report.len() + self.prefix.len() > self.limit {
+        let whole = !self.clipped && report.len() + self.prefix.len() <= self.limit;
+        if whole {
+            report.push_str(&self.prefix);
+        } else {
             if !self.evidence.is_empty() {
                 report.push_str(&self.evidence);
             }
@@ -1341,10 +1354,8 @@ impl<'a> LineFilter<'a> {
             for line in self.tail {
                 append(&mut report, &line, self.limit);
             }
-        } else {
-            report.push_str(&self.prefix);
         }
-        Some(report.into_bytes())
+        Some((report.into_bytes(), whole))
     }
 }
 

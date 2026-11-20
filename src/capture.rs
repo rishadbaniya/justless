@@ -2385,8 +2385,12 @@ fn scan(
     }
     run.digests
         .push(format!("{:x}", file.into_inner().digest.finalize()));
-    if let Some(filtered) = filter.finish()
+    // A tool's built-in progress lines only ever shorten a preview: when the
+    // other lines still do not fit, the ordinary preview, which puts failures
+    // before warnings, is shown.
+    if let Some((filtered, whole)) = filter.finish()
         && (filtered.len() < preview.len() || truncated && filtered.len() <= max_bytes)
+        && (whole || !selection.built_in)
     {
         return Ok((filtered, !truncated));
     }

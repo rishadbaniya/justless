@@ -32,6 +32,24 @@ echo "  # aws_instance.web[3] will be updated in-place"
 echo "Plan: 0 to add, 1 to change, 0 to destroy."
 "#;
 
+/// A plan that refreshes one resource, warns 400 times, fails once and then
+/// prints 400 more lines, so its preview is clipped whatever is left out.
+const TOFU: &str = r#"#!/bin/sh
+echo "aws_instance.web: Refreshing state... [id=i-0abc]"
+i=0
+while [ "$i" -lt 400 ]; do
+  echo "Warning: Deprecated attribute in module.net[$i]"
+  i=$((i + 1))
+done
+echo "Error: Unsupported argument on main.tf line 12"
+i=0
+while [ "$i" -lt 400 ]; do
+  echo "  + resource \"aws_subnet\" \"s$i\" { cidr = known after apply }"
+  i=$((i + 1))
+done
+exit 1
+"#;
+
 impl Lab {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
@@ -41,6 +59,7 @@ impl Lab {
             fs::create_dir_all(dir).unwrap();
         }
         executable(&tools.join("terraform"), TERRAFORM);
+        executable(&tools.join("tofu"), TOFU);
         git(&root, &["init", "-q"]);
         Self {
             _temp: temp,
@@ -190,4 +209,20 @@ fn the_post_run_hook_previews_a_listed_command_that_ran_as_written() {
     has(&shown, "exit=0");
     has(&shown, "[justless run-");
     assert!(shown.len() < ended.len() / 2, "{shown}");
+}
+
+#[test]
+fn a_clipped_run_keeps_the_ordinary_preview_with_its_failure_first() {
+    let lab = Lab::new();
+    let output = lab
+        .command(BIN)
+        .args(["run", "--hook", "--", "tofu", "plan"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let preview = text(&output.stdout);
+    // Leaving out the one progress line does not make the rest fit, so the
+    // preview is the one any run gets, which shows the failure among the warnings.
+    has(&preview, "Error: Unsupported argument on main.tf line 12");
+    lacks(&preview, "filtered");
 }
