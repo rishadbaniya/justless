@@ -390,6 +390,19 @@ The 167 replaced windows went from 2,803,765 to 304,590 bytes, a median of 12% o
 
 Against Claude Code 2.1.327 and the harness's local fake API, a Read of lines 100-399 of a generated 482-line Rust file reached the model as the outline and the hint. The same Read again returned the outline again, a 150-line Read returned the native lines, and an Edit inside the outlined window succeeded, as it did in the same script without hooks. After an outlined 300-line window and an outlined 400-line window of 35,231 bytes, the same Read with `allow_large: true` returned exactly what Read returned without hooks. `justless expand` printed the 300-line window exactly, but Claude Code returned the larger window's 32.9 KB as a saved file and a preview, so the hint names the Read.
 
+### What the agent read next
+
+The figures above stop at the outline. On 2026-11-20, `python3 scripts/read_followups.py` read 30 days of this project's Claude Code transcripts and, for each Read the hook had replaced with an outline, added up the later Reads of the same lines within 20 tool results. The hook was a few days old, so there were 94 outlined Reads. The 562 raw Reads of more than 150 lines from before it are the baseline, since an agent also reads parts of a file again after seeing all of it. "All bytes" is the first result plus those later Reads, against one raw Read of the lines; for outlined lines that raw size is estimated from the bytes per line of the Reads that followed.
+
+| Lines | Outlined | Read again | Lines read again | Later Reads | All bytes | Raw | Read again | Lines read again | Later Reads | All bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 151-300 | 35 | 91% | 78% | 1.74 | 104% | 235 | 34% | 26% | 0.42 | 121% |
+| 301-600 | 29 | 75% | 68% | 1.76 | 95% | 207 | 32% | 26% | 0.37 | 123% |
+| 601-1,200 | 16 | 50% | 44% | 3.38 | 70% | 114 | 31% | 18% | 0.40 | 118% |
+| over 1,200 | 5 | 20% | 9% | 2.80 | 23% | 6 | 0% | 0% | 0.00 | 100% |
+
+An outline of at most 600 lines was read again three times in four, a quarter of the time whole with `allow_large`, and the agent ended with about as many bytes as one raw Read, 14% to 23% fewer than the raw baseline, after about 1.4 more Reads. Over 600 lines it ended with 70% of a raw Read, and over 1,200 lines with 23%. Each further Read that needs a request of its own also resends the conversation, whose median size in these sessions was 201K tokens, so under 600 lines the outline saved few bytes and cost requests. The sample is small and comes from one project, mostly sessions that develop Justless itself and so read files in order to change them.
+
 ## Code questions
 
 An agent without an index answers "where is `X` defined and what calls it" by searching and then reading the file that defines it. `justless query X` answers it with the definition, its callers and callees, each with a file and line. Measured on 2026-11-19 at commit 6ee090d of this repository, macOS arm64, a debug build, on 14 functions whose names are unique:
