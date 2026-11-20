@@ -160,6 +160,16 @@ fn a_read_outside_the_workspace_is_verified_archived_and_replayed() {
         ),
         // Under the home folder, but not in one of its dot folders.
         (format!("sed -n 1,400p {home}/big.rs"), true),
+        // A search of named files, which walks nothing.
+        (format!("cd {scratch} && grep -n add_ big.rs"), false),
+        (
+            format!("cd {scratch} && grep -n add_ big.rs sub/big.rs | head -n 500"),
+            false,
+        ),
+        (
+            format!("sed -n 1,400p big.rs; grep -n -A1 add_01 {scratch}/big.rs"),
+            true,
+        ),
     ] {
         let raw = lab.sh(&command);
         let view = lab
@@ -181,7 +191,7 @@ fn a_read_outside_the_workspace_is_verified_archived_and_replayed() {
         assert_eq!(lab.justless(&["log", id]), raw, "{command}");
     }
     // A file outside the workspace is never recorded as read.
-    assert_eq!(lab.reads(), Vec::<String>::new());
+    assert_eq!(lab.reads(), ["Outline big.rs:1-400"]);
 
     // In one list with a workspace file, only the workspace file is recorded.
     let mixed = format!("sed -n 1,200p big.rs; sed -n 1,200p {scratch}/big.rs");
@@ -189,7 +199,7 @@ fn a_read_outside_the_workspace_is_verified_archived_and_replayed() {
     let view = lab.after(&mixed, &raw).unwrap();
     has(&view, "big.rs lines 1-200\n");
     has(&view, &format!("{scratch}/big.rs lines 1-200\n"));
-    assert_eq!(lab.reads(), ["Outline big.rs:1-200"]);
+    assert_eq!(lab.reads().len(), 2, "{:?}", lab.reads());
 }
 
 #[test]
@@ -210,9 +220,11 @@ fn files_the_outside_read_rules_exclude_stay_as_printed() {
         // Back out of the workspace by a parent folder.
         "cat ../scratch/big.rs".to_owned(),
         "cd ../scratch && cat big.rs".to_owned(),
-        // Only file reads leave the workspace: nothing is rerun out there.
-        format!("cd {scratch} && grep -n add_ big.rs"),
-        format!("grep -n add_ {scratch}/big.rs"),
+        // No folder out there is walked or listed, and a search keeps the
+        // file's rules.
+        format!("cd {scratch} && grep -rn add_ ."),
+        format!("cd {scratch} && grep -n add_ .hidden.rs"),
+        "cd away && grep -n add_ big.rs".to_owned(),
         format!("cd {scratch} && wc -l big.rs; cat big.rs"),
         format!("cd {scratch} && ls; cat big.rs"),
         format!("cd {scratch} && pwd; cat big.rs"),

@@ -379,6 +379,8 @@ fn discover_agrees_with_the_hook_on_where_a_read_runs() {
             false,
         ),
         ("sed -n 1,400p ../outside/big.rs".to_owned(), false),
+        // A search of a named file out there, but no walk.
+        (format!("cd {outside} && grep -n value big.rs"), true),
         (
             format!("cd {outside} && grep -rn value . | head -n 900"),
             false,

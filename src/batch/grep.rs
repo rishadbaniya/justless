@@ -73,8 +73,8 @@ fn bypasses(word: &str) -> bool {
         || matches!(word, "--null" | "--null-data")
 }
 
-/// A `grep` of workspace files whose options only select and format lines, with
-/// the words before it, such as a wrapper.
+/// A `grep` of files whose options only select and format lines, with the words
+/// before it, such as a wrapper.
 pub(super) fn parse(original: &[String], words: Vec<String>) -> Option<Grep> {
     // An assignment such as `LC_ALL=C` before grep changes what it prints. A
     // wrapper such as `timeout` or `bash -c` runs the system grep.
@@ -187,9 +187,20 @@ pub(super) fn parse(original: &[String], words: Vec<String>) -> Option<Grep> {
 }
 
 impl Grep {
-    /// The operands and pattern files, as a list recorded in a transcript names them.
-    pub(super) fn files(&self) -> impl Iterator<Item = &String> {
-        self.paths.iter().chain(&self.patterns)
+    /// Whether the recheck reaches every operand and pattern file when grep runs
+    /// in `dir`, judged from the words alone, for a list recorded in a
+    /// transcript: each is in `root`, or is an operand of a search that walks
+    /// nothing and names a file outside it that a read list may reread.
+    pub(super) fn reaches(&self, root: &Path, dir: &Path) -> bool {
+        let place = |file: &String| crate::find::lexical(&dir.join(file));
+        self.patterns
+            .iter()
+            .all(|file| place(file).starts_with(root))
+            && self.paths.iter().all(|file| {
+                let path = place(file);
+                path.starts_with(root)
+                    || !self.recursive && crate::agents::outside_file(root, &path)
+            })
     }
 
     /// The words without the file operands, to search one file at a time.
@@ -261,7 +272,9 @@ fn answers(binary: &Path, deadline: Instant) -> bool {
 
 struct Run<'a> {
     ws: &'a Workspace,
+    /// The resolved directory grep runs in, and the shell's name for it.
     dir: &'a Path,
+    named: &'a Path,
     deadline: Instant,
 }
 
@@ -293,11 +306,15 @@ impl Run<'_> {
     }
 
     /// Whether `path` names a file, or a directory a recursive search walks,
-    /// inside the workspace.
-    fn inside(&self, path: &str, directory: bool) -> Option<bool> {
-        let path = self.dir.join(path).canonicalize().ok()?;
+    /// inside the workspace. With `leaves`, a file outside the workspace counts
+    /// when a read list may reread it there; no directory out there is walked.
+    fn inside(&self, path: &str, directory: bool, leaves: bool) -> Option<bool> {
+        let spelled = self.dir.join(path);
+        let named = self.named.join(path);
+        let path = spelled.canonicalize().ok()?;
         if !path.starts_with(&self.ws.root) {
-            return None;
+            return (leaves && reads::outside(self.ws, &spelled, &named).is_some())
+                .then_some(false);
         }
         if path.is_file() {
             Some(false)
@@ -368,20 +385,25 @@ pub(super) fn arrange(
 /// Code's stdout shows it, after the piece's filters.
 pub(super) fn reproduce(
     ws: &Workspace,
-    dir: &Path,
+    (dir, named): (&Path, &Path),
     grep: &Grep,
     filters: &[Filter],
     rest: &str,
     trimmed: bool,
     deadline: Instant,
 ) -> Option<(i32, String)> {
-    let run = Run { ws, dir, deadline };
+    let run = Run {
+        ws,
+        dir,
+        named,
+        deadline,
+    };
     let mut walks = false;
     for path in &grep.paths {
-        walks |= run.inside(path, grep.recursive)?;
+        walks |= run.inside(path, grep.recursive, true)?;
     }
     for path in &grep.patterns {
-        run.inside(path, false)?;
+        run.inside(path, false, false)?;
     }
     let args = &grep.words[1..];
     let several = walks || grep.paths.len() > 1;

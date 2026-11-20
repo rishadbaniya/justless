@@ -177,8 +177,9 @@ impl<'a> Batch<'a> {
 
     /// Whether the recheck reaches every piece when the list starts from `cwd`,
     /// judged from the command alone, for a list recorded in a transcript: each
-    /// runs in `root`, except that a file read may name a file outside it that
-    /// [`crate::agents::outside_file`] allows, and a literal prints anywhere.
+    /// runs in `root`, except that a file read, and a `grep` that walks nothing,
+    /// may name a file outside it that [`crate::agents::outside_file`] allows,
+    /// and a literal prints anywhere.
     pub(crate) fn reachable(&self, root: &Path, cwd: &Path) -> bool {
         self.0.iter().all(|piece| {
             let dir = crate::find::lexical(&cwd.join(piece.dir.as_deref().unwrap_or("")));
@@ -194,7 +195,7 @@ impl<'a> Batch<'a> {
                 Source::Listing(words) => {
                     dir.starts_with(root) && parse::operands(words).all(within)
                 }
-                Source::Grep(grep) => dir.starts_with(root) && grep.files().all(within),
+                Source::Grep(grep) => grep.reaches(root, &dir),
                 _ => dir.starts_with(root),
             }
         })
@@ -290,11 +291,12 @@ impl<'a> Batch<'a> {
                 .join(piece.dir.as_deref().unwrap_or(""))
                 .canonicalize()
                 .ok()?;
-            // The workspace root is already canonical. Only a file read, which
-            // `Files::read` holds to the outside-read rules, and a literal leave it.
+            // The workspace root is already canonical. Only a file read and a
+            // `grep` of named files, both held to the outside-read rules, and a
+            // literal leave it.
             let leaves = matches!(
                 piece.source,
-                Source::File { .. } | Source::Files(_) | Source::Literal(_)
+                Source::File { .. } | Source::Files(_) | Source::Grep(_) | Source::Literal(_)
             );
             if !dir.is_dir() || !(leaves || dir.starts_with(&ws.root)) {
                 return None;
@@ -355,7 +357,7 @@ impl<'a> Batch<'a> {
                     let rest = &actual[output.len().min(actual.len())..];
                     let trimmed = persisted.is_none();
                     let (code, text) =
-                        grep::reproduce(ws, &dir, grep, &piece.filters, rest, trimmed, deadline)?;
+                        grep::reproduce(ws, place, grep, &piece.filters, rest, trimmed, deadline)?;
                     if !piece.filters.is_empty() && code != 0 {
                         return None;
                     }

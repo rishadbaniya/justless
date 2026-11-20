@@ -181,10 +181,18 @@ fn a_grep_that_differs_or_reaches_outside_passes_the_list_through() {
         let changed = format!("{}{to}{}", &raw[..at], &raw[at + from.len()..]);
         assert_eq!(fixture.view(&list, &changed), None, "{piece}");
     }
+    // A named file outside the workspace is searched where a read list may
+    // reread it.
+    let list = format!("{READ}; grep -n needle {outside}");
+    let view = fixture.view(&list, &fixture.sh(&list)).expect("compacted");
+    has(&view, &format!("$ grep -n needle {outside} [stdout:"));
+    let folder = fixture.outside.path().to_str().unwrap();
     for piece in [
-        // Paths and pattern files outside, and a walk that follows links.
+        // A walk outside, a path through a link out of the workspace, a pattern
+        // file outside, and a walk that follows links.
+        format!("grep -rn needle {folder}"),
         "grep -rn needle away".to_owned(),
-        format!("grep -n needle {outside}"),
+        "grep -n needle away/secret.rs".to_owned(),
         format!("grep -n -f {outside} src/a.rs"),
         "grep -Rn needle src".into(),
         // Options that change what grep prints.

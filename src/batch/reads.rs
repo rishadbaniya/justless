@@ -78,12 +78,9 @@ impl Files {
         self.select(name, name, name, select, numbered, filters)
     }
 
-    /// A regular file outside the workspace, reread where the shell read it:
-    /// `path` under its resolved directory, which the shell names `named`.
-    /// Neither spelling, nor the file they resolve to, may be one the outline of
-    /// an outside Read leaves alone, and the name itself may not be a link. The
-    /// text is outlined by its own path and never recorded as read, since
-    /// `resume`, `expand` and `edit` take workspace files only.
+    /// A file outside the workspace that [`outside`] allows, reread where the
+    /// shell read it. The text is outlined by its own path and never recorded
+    /// as read, since `resume`, `expand` and `edit` take workspace files only.
     fn outside(
         &mut self,
         ws: &Workspace,
@@ -93,15 +90,7 @@ impl Files {
         filters: &[Filter],
     ) -> Option<(String, SourceLines)> {
         let named = crate::find::lexical(named);
-        let real = path.canonicalize().ok()?;
-        let allowed = |path: &Path| crate::agents::outside_file(&ws.root, path);
-        if !allowed(&named)
-            || !allowed(path)
-            || !allowed(&real)
-            || !std::fs::symlink_metadata(path).ok()?.file_type().is_file()
-        {
-            return None;
-        }
+        let real = outside(ws, path, &named)?;
         let (name, real) = (named.to_str()?, real.to_str()?);
         let key = format!("\0\0{real}");
         if !self.files.contains_key(&key) {
@@ -297,6 +286,21 @@ impl Files {
         }
         Some(out)
     }
+}
+
+/// The file a piece names outside the workspace, resolved, when the recheck may
+/// open it: `path` under its resolved directory, which the shell names `named`.
+/// Neither spelling, nor the file they resolve to, may be one the outline of an
+/// outside Read leaves alone, and the name itself must be a regular file, not a
+/// link, so a path that leaves the workspace through a link is refused.
+pub(super) fn outside(ws: &Workspace, path: &Path, named: &Path) -> Option<std::path::PathBuf> {
+    let real = path.canonicalize().ok()?;
+    let allowed = |path: &Path| crate::agents::outside_file(&ws.root, path);
+    (allowed(&crate::find::lexical(named))
+        && allowed(path)
+        && allowed(&real)
+        && std::fs::symlink_metadata(path).ok()?.file_type().is_file())
+    .then_some(real)
 }
 
 pub(super) fn filter(text: String, filters: &[Filter]) -> Option<String> {
