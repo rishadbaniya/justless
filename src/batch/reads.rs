@@ -1,6 +1,7 @@
 //! Reproduce the bytes downstream of line selections and column cuts while
 //! retaining the source line of each surviving row.
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Component, Path};
 
 use super::{
@@ -25,6 +26,8 @@ pub(super) struct SourceLines {
     cut: bool,
     /// A `git show` blob, which shows a revision rather than the working file.
     object: bool,
+    /// A file outside the workspace, which is never recorded as read.
+    outside: bool,
 }
 
 struct Row {
@@ -40,17 +43,21 @@ impl Files {
         }
     }
 
+    /// The lines a read of `file` prints in the resolved directory `cwd`, which
+    /// the shell names `named`.
     pub fn read(
         &mut self,
         ws: &Workspace,
-        cwd: &Path,
+        (cwd, named): (&Path, &Path),
         file: &str,
         select: &Filter,
         numbered: Numbers,
         filters: &[Filter],
     ) -> Option<(String, SourceLines)> {
         let path = cwd.join(file);
-        let relative = path.strip_prefix(&ws.root).ok()?;
+        let Ok(relative) = path.strip_prefix(&ws.root) else {
+            return self.outside(ws, (&path, &named.join(file)), select, numbered, filters);
+        };
         let name: std::path::PathBuf = relative
             .components()
             .filter(|c| *c != Component::CurDir)
@@ -69,6 +76,59 @@ impl Files {
             self.files.insert(name.to_owned(), snap);
         }
         self.select(name, name, name, select, numbered, filters)
+    }
+
+    /// A regular file outside the workspace, reread where the shell read it:
+    /// `path` under its resolved directory, which the shell names `named`.
+    /// Neither spelling, nor the file they resolve to, may be one the outline of
+    /// an outside Read leaves alone, and the name itself may not be a link. The
+    /// text is outlined by its own path and never recorded as read, since
+    /// `resume`, `expand` and `edit` take workspace files only.
+    fn outside(
+        &mut self,
+        ws: &Workspace,
+        (path, named): (&Path, &Path),
+        select: &Filter,
+        numbered: Numbers,
+        filters: &[Filter],
+    ) -> Option<(String, SourceLines)> {
+        let named = crate::find::lexical(named);
+        let real = path.canonicalize().ok()?;
+        let allowed = |path: &Path| crate::agents::outside_file(&ws.root, path);
+        if !allowed(&named)
+            || !allowed(path)
+            || !allowed(&real)
+            || !std::fs::symlink_metadata(path).ok()?.file_type().is_file()
+        {
+            return None;
+        }
+        let (name, real) = (named.to_str()?, real.to_str()?);
+        let key = format!("\0\0{real}");
+        if !self.files.contains_key(&key) {
+            let cap = (MAX_BYTES as u64).min(ws.settings().ok()?.max_file_bytes);
+            let mut bytes = Vec::new();
+            std::fs::File::open(real)
+                .ok()?
+                .take(cap.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() as u64 > cap {
+                return None;
+            }
+            let text = String::from_utf8(bytes).ok()?;
+            if text.contains('\0') {
+                return None;
+            }
+            self.bytes += text.len();
+            if self.bytes > MAX_BYTES * 4 {
+                return None;
+            }
+            self.files
+                .insert(key.clone(), Snapshot::from_text(real, text));
+        }
+        let (text, mut source) = self.select(&key, name, real, select, numbered, filters)?;
+        source.outside = true;
+        Some((text, source))
     }
 
     /// The blob `git show SPEC` prints in `cwd`, which outlines as the text at
@@ -152,6 +212,7 @@ impl Files {
                 spans,
                 cut: filters.iter().any(|f| matches!(f, Filter::Columns(_))),
                 object: false,
+                outside: false,
             },
         ))
     }
@@ -161,7 +222,8 @@ impl Files {
     /// Lines shown in full count as read; an outline, an excerpt or a column
     /// cut counts as an outline of the same lines.
     pub fn observe(&self, ws: &Workspace, source: &SourceLines, verbatim: bool) {
-        let Some(snap) = self.files.get(&source.key).filter(|_| !source.object) else {
+        let recorded = !source.object && !source.outside;
+        let Some(snap) = self.files.get(&source.key).filter(|_| recorded) else {
             return;
         };
         let digest = crate::capture::source_digest(snap.text.as_bytes());

@@ -417,7 +417,9 @@ fn literal(command: &str) -> bool {
     quote.is_none()
 }
 
-pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
+/// One command that is not a list: a wrapped read or a `cat`. With `plain`, any
+/// read, which the single-file read otherwise takes.
+pub(super) fn single(command: &str, plain: bool) -> Option<Vec<Piece<'_>>> {
     if command.len() > 16 * 1024 || !literal(command) {
         return None;
     }
@@ -427,7 +429,7 @@ pub(super) fn single(command: &str) -> Option<Vec<Piece<'_>>> {
     let differs =
         effective.len() != refs.len() || effective.iter().zip(&refs).any(|(a, b)| a.as_str() != *b);
     let program = effective.first().map(String::as_str);
-    if !differs && !matches!(program, Some("cat")) {
+    if !plain && !differs && !matches!(program, Some("cat")) {
         return None;
     }
     // Only a list mixes in other pieces.
@@ -665,14 +667,14 @@ mod tests {
             "env A=1 pwd",
             "cat -n a",
         ] {
-            assert!(super::single(single).is_none(), "{single}");
+            assert!(super::single(single, false).is_none(), "{single}");
         }
     }
 
     #[test]
     fn only_a_tilde_inside_a_word_is_literal() {
         assert!(super::list("git show HEAD~1:a.rs; sed -n 1,2p b").is_some());
-        assert!(super::single("timeout 5 git show main~2:a.rs").is_some());
+        assert!(super::single("timeout 5 git show main~2:a.rs", false).is_some());
         for list in [
             "cat ~/a; cat b",
             "cat a; cat x=~/b",

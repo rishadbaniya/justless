@@ -366,9 +366,12 @@ fn discover_agrees_with_the_hook_on_where_a_read_runs() {
         ("tail -n 400 big.rs".to_owned(), true),
         ("cd sub && sed -n 1,400p big.rs".to_owned(), true),
         ("git show HEAD:big.rs".to_owned(), true),
-        (format!("sed -n 1,400p {outside}/big.rs"), false),
+        // A file read reaches a file outside the workspace, but not by a
+        // parent folder, and no search is rerun out there.
+        (format!("sed -n 1,400p {outside}/big.rs"), true),
+        (format!("cd {outside} && sed -n 1,400p big.rs"), true),
+        (format!("cd {outside} && cat big.rs; echo done"), true),
         ("sed -n 1,400p ../outside/big.rs".to_owned(), false),
-        (format!("cd {outside} && sed -n 1,400p big.rs"), false),
         (
             format!("cd {outside} && grep -rn value . | head -n 900"),
             false,

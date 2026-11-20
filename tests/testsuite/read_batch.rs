@@ -226,7 +226,7 @@ fn unsupported_mismatched_and_unverifiable_batches_leave_no_run() {
         ("cat big.rs; git diff --output=unexpected", &raw),
         ("cat big.rs; grep -n value big.rs --color=always", &raw),
         ("cat big.rs; cat ../outside", &raw),
-        // A `cd` outside the workspace, or back out of it.
+        // A read outside the workspace that is small, and a `cd` back out of it.
         ("cd / && sed -n '1,3p' etc/hosts", &hosts),
         ("cd ../.. && sed -n '1,3p' big.rs", &hosts),
         // A pipe's status is unknown, so the list's short circuit is too.

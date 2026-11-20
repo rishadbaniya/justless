@@ -18,6 +18,7 @@ mod mcp;
 mod mixed_lists;
 mod nested_reads;
 mod output_fixes;
+mod outside_reads;
 mod piped;
 mod read_batch;
 mod read_fixes;

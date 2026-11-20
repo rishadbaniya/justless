@@ -924,7 +924,7 @@ fn read_file(ws: &Workspace, path: &Path) -> Option<(Workspace, String)> {
 /// ways back, which pass through here: any ranged Read first, then `allow_large`
 /// and `recall`, which both cost the whole result, priced in the hint.
 fn outside_read(ws: &Workspace, path: &Path, mut response: Value) -> Option<Value> {
-    if !outside_file(ws, path) {
+    if !outside_file(&ws.root, path) {
         return None;
     }
     let result = &mut response["file"];
@@ -1002,11 +1002,12 @@ fn outside_read(ws: &Workspace, path: &Path, mut response: Value) -> Option<Valu
         "updatedToolOutput":response, "additionalContext":context}}))
 }
 
-/// Whether the outside-read outline may replace a Read of `path`: an absolute path
-/// outside the workspace, also once its directory is resolved, that is not a
-/// dotfile, anything under `$HOME/.*`, such as Claude Code's own settings and
-/// transcripts, or a tool result Claude Code saved to a `tool-results` directory.
-fn outside_file(ws: &Workspace, path: &Path) -> bool {
+/// Whether the outside-read outline may replace a Read of `path`, or a read list
+/// may reread it: an absolute path outside the workspace at `root`, also once its
+/// directory is resolved, that is not a dotfile, anything under `$HOME/.*`, such
+/// as Claude Code's own settings and transcripts, or a tool result Claude Code
+/// saved to a `tool-results` directory.
+pub(crate) fn outside_file(root: &Path, path: &Path) -> bool {
     let Some(name) = path.file_name() else {
         return false;
     };
@@ -1035,7 +1036,7 @@ fn outside_file(ws: &Workspace, path: &Path) -> bool {
         && paths
             .iter()
             .flatten()
-            .all(|path| !path.starts_with(&ws.root) && !hidden(path))
+            .all(|path| !path.starts_with(root) && !hidden(path))
 }
 
 /// The outline rows around the window of a ranged Read that returned more than

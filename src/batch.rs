@@ -151,7 +151,16 @@ impl<'a> Batch<'a> {
     }
 
     pub(crate) fn parse(command: &'a str) -> Option<Self> {
-        Self::parse_list(command).or_else(|| parse::single(command).map(Self))
+        Self::parse_list(command).or_else(|| parse::single(command, false).map(Self))
+    }
+
+    /// One plain read of a file, such as `sed -n '1,90p' FILE`. The single-file
+    /// read takes these in the workspace, so [`Self::parse`] leaves them to it;
+    /// outside the workspace only the recheck of a list can show one.
+    pub(crate) fn parse_read(command: &'a str) -> Option<Self> {
+        parse::single(command, true)
+            .filter(|pieces| matches!(pieces[0].source, Source::File { .. }))
+            .map(Self)
     }
 
     /// Whether the command hook leaves the list as written for the post-run
@@ -160,19 +169,28 @@ impl<'a> Batch<'a> {
         parse::reads_only(&self.0)
     }
 
-    /// Whether every piece runs in `root` when the list starts from `cwd`, judged
-    /// from the command alone, for a list recorded in a transcript.
-    pub(crate) fn inside(&self, root: &Path, cwd: &Path) -> bool {
+    /// Whether the recheck reaches every piece when the list starts from `cwd`,
+    /// judged from the command alone, for a list recorded in a transcript: each
+    /// runs in `root`, except that a file read may name a file outside it that
+    /// [`crate::agents::outside_file`] allows, and a literal prints anywhere.
+    pub(crate) fn reachable(&self, root: &Path, cwd: &Path) -> bool {
         self.0.iter().all(|piece| {
             let dir = crate::find::lexical(&cwd.join(piece.dir.as_deref().unwrap_or("")));
             let within = |file: &String| crate::find::lexical(&dir.join(file)).starts_with(root);
-            dir.starts_with(root)
-                && match &piece.source {
-                    Source::File { file, .. } => within(file),
-                    Source::Listing(words) => parse::operands(words).all(within),
-                    Source::Grep(grep) => grep.files().all(within),
-                    _ => true,
+            let read = |file: &String| {
+                within(file)
+                    || crate::agents::outside_file(root, &crate::find::lexical(&dir.join(file)))
+            };
+            match &piece.source {
+                Source::File { file, .. } => read(file),
+                Source::Files(files) => files.iter().all(read),
+                Source::Literal(_) => true,
+                Source::Listing(words) => {
+                    dir.starts_with(root) && parse::operands(words).all(within)
                 }
+                Source::Grep(grep) => dir.starts_with(root) && grep.files().all(within),
+                _ => dir.starts_with(root),
+            }
         })
     }
 
@@ -266,10 +284,17 @@ impl<'a> Batch<'a> {
                 .join(piece.dir.as_deref().unwrap_or(""))
                 .canonicalize()
                 .ok()?;
-            // The workspace root is already canonical.
-            if !dir.is_dir() || !dir.starts_with(&ws.root) {
+            // The workspace root is already canonical. Only a file read, which
+            // `Files::read` holds to the outside-read rules, and a literal leave it.
+            let leaves = matches!(
+                piece.source,
+                Source::File { .. } | Source::Files(_) | Source::Literal(_)
+            );
+            if !dir.is_dir() || !(leaves || dir.starts_with(&ws.root)) {
                 return None;
             }
+            let named = crate::find::lexical(&logical.join(piece.dir.as_deref().unwrap_or("")));
+            let place = (dir.as_path(), named.as_path());
             let mut outputs = Vec::new();
             match &piece.source {
                 Source::File {
@@ -278,7 +303,7 @@ impl<'a> Batch<'a> {
                     numbered,
                 } => {
                     let (text, source) =
-                        files.read(ws, &dir, file, select, *numbered, &piece.filters)?;
+                        files.read(ws, place, file, select, *numbered, &piece.filters)?;
                     status = 0;
                     outputs.push((None, text, Some(source)));
                 }
@@ -287,7 +312,7 @@ impl<'a> Batch<'a> {
                     for name in names {
                         let (text, source) = files.read(
                             ws,
-                            &dir,
+                            place,
                             name,
                             &parse::Filter::All,
                             parse::Numbers::None,

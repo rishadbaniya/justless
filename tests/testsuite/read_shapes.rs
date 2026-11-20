@@ -281,7 +281,8 @@ fn a_cat_of_several_files_reads_as_one_piece_per_file() {
         json!({})
     );
 
-    // Outside the workspace, not UTF-8, filtered or flagged: left as printed.
+    // Through a link out of the workspace, not UTF-8, filtered or flagged: left
+    // as printed.
     let outside = TempDir::new().unwrap();
     fs::write(
         outside.path().join("secret.rs"),

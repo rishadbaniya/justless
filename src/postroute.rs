@@ -161,9 +161,13 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             return None;
         }
         // A wide read the range outline cannot show, such as a shell script,
-        // keeps the read list's excerpt.
+        // keeps the read list's excerpt, and so does a read of a file outside
+        // the workspace, which the single-file read never takes.
+        let session = input["cwd"].as_str().map_or(ws.cwd.as_path(), Path::new);
+        let outside = !read.inside(&ws.root, session);
         let compacted = crate::shellread::claude(ws, input, &read, || {
             read_list(command)
+                .or_else(|| crate::batch::Batch::parse_read(command).filter(|_| outside))
                 .filter(|_| !object)
                 .and_then(|batch| batch.compact(ws, input))
         });
@@ -602,11 +606,14 @@ pub(crate) fn after_run(
     let mut handled = false;
     if !cfg!(windows) {
         if let Some(read) = crate::shellread::parse(command) {
-            if !read.inside(root, cwd) {
-                // Only a `git show` blob falls back to the ordinary report.
-                if !read.object() {
-                    return None;
-                }
+            // Outside the workspace a `git show` blob falls back to the ordinary
+            // report, and a file is shown as a read list or left alone.
+            if !read.inside(root, cwd) && !read.object() {
+                let command = read.unpiped(command);
+                return read_list(command)
+                    .or_else(|| crate::batch::Batch::parse_read(command))
+                    .filter(|batch| batch.reachable(root, cwd))
+                    .and_then(|_| verdict(!fits(crate::batch::FLOOR)));
             }
             let small = persisted.is_none()
                 && crate::shellread::small(output.lines().count(), output.len());
@@ -616,7 +623,7 @@ pub(crate) fn after_run(
             }
             handled = true;
         }
-        if read_list(command).is_some_and(|batch| batch.inside(root, cwd)) {
+        if read_list(command).is_some_and(|batch| batch.reachable(root, cwd)) {
             if !fits(crate::batch::FLOOR) {
                 return verdict(true);
             }
