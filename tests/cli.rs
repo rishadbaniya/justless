@@ -1994,7 +1994,6 @@ fn hooks_without_a_post_run_hook_route_json_reads_left_to_their_reader() {
         "gh pr checks 12 --json state --watch",
         "gh pr view 12 --json body --web",
         "gh pr merge 12 --json x",
-        "gh pr list",
         "kubectl get pods -o yaml",
         "kubectl get pods -o json -w",
         "kubectl get -o json",

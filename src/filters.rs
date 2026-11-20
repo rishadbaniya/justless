@@ -645,6 +645,11 @@ pub fn approvable(words: &[&str]) -> bool {
     if program == "git" || json_output(tool) {
         return true;
     }
+    // A command routed for its preview alone installs, builds or reaches a
+    // service, so it runs only when the client asks.
+    if crate::known::listed(tool) {
+        return false;
+    }
     if !args.iter().all(|arg| local_argument(arg)) || runs_code(program, args) {
         return false;
     }
@@ -1209,9 +1214,17 @@ impl Selection {
                 words.starts_with(&r.command.iter().map(String::as_str).collect::<Vec<_>>())
             })
             .max_by_key(|r| r.command.len());
+        // A rule from the settings replaces the tool's built-in progress lines.
+        let omit = match rule {
+            Some(rule) => Some(rule.validate()?),
+            None => crate::known::progress(&words)
+                .map(Regex::new)
+                .transpose()
+                .context("invalid built-in progress rule")?,
+        };
         Ok(Self {
             profile: profile(&words),
-            omit: rule.map(Rule::validate).transpose()?,
+            omit,
         })
     }
 }

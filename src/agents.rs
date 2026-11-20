@@ -2614,8 +2614,9 @@ fn supported_command(command: &str, json: bool) -> bool {
     if crate::filters::json_output(&words) {
         return json;
     }
-    let supported =
-        crate::filters::legacy_hook(&words) || crate::filters::profile(&words).is_some();
+    let supported = crate::filters::legacy_hook(&words)
+        || crate::filters::profile(&words).is_some()
+        || crate::known::routes(&words);
     if !supported
         || words.iter().any(|word| {
             let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);

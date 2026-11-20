@@ -1008,10 +1008,12 @@ fn loose(commands: &Commands, alone: bool) -> Option<Plan> {
     for (words, piped) in commands {
         let words = strip(words).unwrap_or(words);
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        // A command routed for its preview alone has no report that would hide
+        // lines, so a line that mixes it with others keeps the clipped preview.
         let known = refs
             .first()
             .is_some_and(|word| SEARCHERS.contains(&basename(word)))
-            || crate::agents::supported_words(&refs);
+            || crate::agents::supported_words(&refs) && !crate::known::listed(&refs);
         if !piped && known {
             return None;
         }
