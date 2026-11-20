@@ -91,14 +91,14 @@ Token-saving tools each take one slice of the context window. RTK compresses com
 | Code graph: symbols, calls, imports, `query` and `path` | ✅ | — | ✅ |
 | Outlines big files and returns one symbol's exact bytes | ✅ | — | — |
 | Exact recall of anything it cut | ✅ | ✅ | — |
-| Retires old tool results from the context | ✅ | — | — |
+| Retires old tool results from the context | ✅ | Opt-in proxy | — |
 | Runs only the tests a change reaches | ✅ | — | — |
 | Edits that check the file has not changed | ✅ | — | — |
 | Secret redaction | ✅ | Paid edition | — |
 | Token estimates calibrated to Claude's tokenizer, built in, nothing sent | ✅ | Bytes ÷ 4 | — |
 | No network calls | ✅ 🔒 your code stays yours | 📡 Partly | 📡 Partly |
 
-<sub>RTK and graphify columns from each project's README on 2026-11-19; "—" means the README does not mention it. "Partly": RTK pipelines and its proxy can send content to models, and graphify's pass over docs and media can call a model backend. RTK supports more commands (100+) and agents (18); graphify more languages (about 40) and also reads docs, PDFs and images. [Full comparison](docs/comparison.md)</sub>
+<sub>RTK and graphify columns from each project's README on 2026-11-19; "—" means the README does not mention it. "Opt-in proxy": RTK's pipeline docs list a proxy method, off by default, that shortens large tool results already in the conversation. "Partly": RTK pipelines and its proxy can send content to models, and graphify's pass over docs and media can call a model backend. RTK supports more commands (100+) and agents (18); graphify more languages (about 40) and also reads docs, PDFs and images. [Full comparison](docs/comparison.md)</sub>
 
 ## How it cuts tokens
 
