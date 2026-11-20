@@ -556,6 +556,139 @@ pub(super) fn expand(command: &str) -> Option<String> {
     used.then(|| out.trim().to_owned())
 }
 
+/// Whether `name` matches a pattern of literal characters, `*` and `?`.
+fn wildcard(pattern: &[char], name: &[char]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some(('*', rest)) => (0..=name.len()).any(|skip| wildcard(rest, &name[skip..])),
+        Some((c, rest)) => name
+            .split_first()
+            .is_some_and(|(first, name)| (*c == '?' || c == first) && wildcard(rest, name)),
+    }
+}
+
+/// The words the shell puts in place of `word`, whose last path component holds
+/// `*` or `?`, in `base`: the names in that folder it matches, in byte order,
+/// without dotfiles unless the pattern names the dot. `None` for no match, which
+/// zsh refuses and bash leaves as written, for more than 64, and for any other
+/// pattern, such as a class or a wildcard in a folder name. Without `base`, for
+/// a line recorded in a transcript, the word stands for one file of its folder.
+fn matches(word: &str, base: Option<&Path>) -> Option<Vec<String>> {
+    let (folder, pattern) = match word.rsplit_once('/') {
+        Some((folder, pattern)) => (format!("{folder}/"), pattern),
+        None => (String::new(), word),
+    };
+    if folder.contains(['*', '?'])
+        || word.contains(['[', ']', '{', '}', '~'])
+        || word.starts_with('-')
+        || !local(word)
+    {
+        return None;
+    }
+    let Some(base) = base else {
+        return Some(vec![format!(
+            "{folder}{}",
+            pattern.replace(['*', '?'], "_")
+        )]);
+    };
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(base.join(&folder)).ok()?.flatten() {
+        let name = entry.file_name().into_string().ok()?;
+        let chars: Vec<char> = name.chars().collect();
+        if (pattern.first() == Some(&'.') || !name.starts_with('.')) && wildcard(&pattern, &chars) {
+            names.push(format!("{folder}{name}"));
+        }
+    }
+    names.sort();
+    (1..=64).contains(&names.len()).then_some(names)
+}
+
+/// The line with each bare word that holds `*` or `?` replaced by the files the
+/// shell names for it (see [`matches`]), read from `base`, where the line
+/// starts, and the folders a plain `cd` enters after it. Claude Code's main
+/// session keeps a `cd`, so `base` can already be the folder a relative `cd`
+/// entered. A word with a quote or a backslash is left as it is, as the shell
+/// leaves it, and a word that names no file leaves the whole line as written.
+/// The order is the shell's for plain names; where it is not, the recheck finds
+/// the bytes differ and keeps the result.
+pub(super) fn glob(command: &str, base: Option<&Path>) -> Option<String> {
+    if command.len() > 16 * 1024 || !command.contains(['*', '?']) {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut folder = base.map(Path::to_path_buf);
+    // The words of the stage so far, to spot a `cd`.
+    let mut stage: Vec<&str> = Vec::new();
+    let mut found = false;
+    let mut rest = command;
+    while !rest.is_empty() {
+        let space = rest
+            .find(|c: char| !c.is_whitespace() || c == '\n')
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..space]);
+        rest = &rest[space..];
+        let Some(c) = rest.chars().next() else { break };
+        if matches!(c, ';' | '\n' | '&' | '|') {
+            if let ["cd", dir] = stage.as_slice()
+                && let Some(folder) = &mut folder
+            {
+                let entered = folder.join(dir);
+                // Already entered when the session's folder ends in it.
+                if entered.is_dir() || !folder.ends_with(dir) {
+                    *folder = entered;
+                }
+            }
+            stage.clear();
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        // One word, with its quoted parts.
+        let mut quote = None;
+        let mut end = rest.len();
+        let mut chars = rest.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some('"') if c == '\\' => {
+                    chars.next();
+                }
+                Some(_) => {}
+                None if matches!(c, '\'' | '"') => quote = Some(c),
+                None if c == '\\' => {
+                    chars.next();
+                }
+                None if c.is_whitespace() || matches!(c, ';' | '&' | '|') => {
+                    end = i;
+                    break;
+                }
+                None => {}
+            }
+        }
+        let word = &rest[..end];
+        rest = &rest[end..];
+        let bare = !word.contains(['\'', '"', '\\', '$', '`']);
+        if bare && word.contains(['*', '?']) && !stage.is_empty() {
+            let names = matches(word, folder.as_deref())?;
+            let quoted: Option<Vec<_>> = names
+                .iter()
+                .map(|name| {
+                    shlex::try_quote(name)
+                        .ok()
+                        .map(|quoted| quoted.into_owned())
+                })
+                .collect();
+            out.push_str(&quoted?.join(" "));
+            found = true;
+        } else {
+            out.push_str(word);
+        }
+        stage.push(word);
+    }
+    found.then_some(out)
+}
+
 /// One command that is not a list: a wrapped read or a `cat`. With `plain`, any
 /// read, which the single-file read otherwise takes.
 pub(super) fn single(command: &str, plain: bool) -> Option<Vec<Piece<'_>>> {
@@ -853,6 +986,51 @@ mod tests {
         }
         let expanded = super::expand("D=sub; cat $D/a; sed -n 1,2p $D/b").unwrap();
         assert_eq!(super::list(&expanded).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_glob_names_the_files_the_shell_would() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        std::fs::create_dir(dir.join("src")).unwrap();
+        for name in [
+            "src/b.rs",
+            "src/a.rs",
+            "src/c d.rs",
+            "src/.hidden.rs",
+            "notes.md",
+        ] {
+            std::fs::write(dir.join(name), "x\n").unwrap();
+        }
+        for (line, expected) in [
+            (
+                "cat a; grep -n x src/*.rs",
+                Some("cat a; grep -n x src/a.rs src/b.rs 'src/c d.rs'"),
+            ),
+            ("cd src && wc -l ?.rs", Some("cd src && wc -l a.rs b.rs")),
+            ("cat src/.h*", Some("cat src/.hidden.rs")),
+            (
+                "cat *.md src/*.rs",
+                Some("cat notes.md src/a.rs src/b.rs 'src/c d.rs'"),
+            ),
+            // A quoted or escaped wildcard is the program's own.
+            ("grep -n 'a*' notes.md", None),
+            ("grep -n a\\* notes.md", None),
+            // No file, a class, a wildcard folder, and a word that starts a command.
+            ("cat src/*.zz", None),
+            ("cat src/[ab].rs", None),
+            ("cat */a.rs", None),
+            ("cat **/*.rs", None),
+            ("*.sh", None),
+            ("cat a; grep -n x src/*.rs src/*.zz", None),
+        ] {
+            assert_eq!(super::glob(line, Some(dir)).as_deref(), expected, "{line}");
+        }
+        // A line from a transcript: one file stands for each glob.
+        assert_eq!(
+            super::glob("cd src && grep -n x *.rs", None).as_deref(),
+            Some("cd src && grep -n x _.rs")
+        );
     }
 
     #[test]

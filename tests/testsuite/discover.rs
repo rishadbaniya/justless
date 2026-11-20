@@ -380,6 +380,11 @@ fn discover_agrees_with_the_hook_on_where_a_read_runs() {
         // A variable the line sets to a plain word is filled in first.
         (format!("S={outside}; sed -n 1,400p $S/big.rs"), true),
         ("F=big.rs; sed -n 1,400p $F".to_owned(), true),
+        // A glob stands for the files it names.
+        (
+            "sed -n 1,400p big.rs; grep -n value sub/*.rs".to_owned(),
+            true,
+        ),
         (
             format!("S=$(echo {outside}); sed -n 1,400p $S/big.rs"),
             false,

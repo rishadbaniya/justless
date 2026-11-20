@@ -136,10 +136,15 @@ fn quiet(binary: &Path, cwd: &Path) -> Command {
     cmd
 }
 
-/// The line with the plain variables it sets itself filled in, for the read
-/// parsers, when it sets and uses any. See [`parse::expand`].
-pub(crate) fn expanded(command: &str) -> Option<String> {
-    parse::expand(command)
+/// The line as the shell ran it, for the read parsers: with the plain variables
+/// it sets itself filled in (see [`parse::expand`]) and each glob replaced by
+/// the files it names in `cwd`, where the line starts (see [`parse::glob`]).
+/// Without `cwd`, for a line recorded in a transcript, a glob stands for one
+/// file. `None` when the line has neither.
+pub(crate) fn as_run(command: &str, cwd: Option<&Path>) -> Option<String> {
+    let filled = parse::expand(command);
+    let globbed = parse::glob(filled.as_deref().unwrap_or(command), cwd);
+    globbed.or(filled)
 }
 
 struct Verified<'a> {

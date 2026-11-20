@@ -181,9 +181,11 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // `git show` blob, which the read below matches byte for byte.
     let routed = RUN_MARKER.is_match(stdout);
     // The read parsers take the line with the plain variables it sets itself
-    // filled in, as the shell ran it. The reports below read it as written.
+    // filled in and its globs expanded, as the shell ran it. The reports below
+    // read it as written.
+    let session = input["cwd"].as_str().map_or(ws.cwd.as_path(), Path::new);
     let expanded = (!cfg!(windows))
-        .then(|| crate::batch::expanded(command))
+        .then(|| crate::batch::as_run(command, Some(session)))
         .flatten();
     let reads = expanded.as_deref().unwrap_or(command);
     let read = (!cfg!(windows))
@@ -202,7 +204,6 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         // A wide read the range outline cannot show, such as a shell script,
         // keeps the read list's excerpt, and so does a read of a file outside
         // the workspace, which the single-file read never takes.
-        let session = input["cwd"].as_str().map_or(ws.cwd.as_path(), Path::new);
         let outside = !read.inside(&ws.root, session);
         let compacted = crate::shellread::claude(ws, input, &read, || {
             read_list(reads)
@@ -635,8 +636,9 @@ pub(crate) fn after_run(
     };
     let mut handled = false;
     if !cfg!(windows) {
-        // As the hook reads it, with the variables the line sets filled in.
-        let expanded = crate::batch::expanded(command);
+        // As the hook reads it, with the variables the line sets filled in and
+        // one file standing for each glob.
+        let expanded = crate::batch::as_run(command, None);
         let reads = expanded.as_deref().unwrap_or(command);
         if let Some(read) = crate::shellread::parse(reads) {
             // Outside the workspace a `git show` blob falls back to the ordinary

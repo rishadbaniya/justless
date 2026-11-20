@@ -246,6 +246,43 @@ fn unsupported_mismatched_and_unverifiable_batches_leave_no_run() {
 }
 
 #[test]
+fn a_glob_is_read_as_the_files_it_names() {
+    let temp = fixture();
+    let dir = temp.path();
+    fs::create_dir(dir.join("src")).unwrap();
+    for name in ["a.rs", "b.rs"] {
+        fs::copy(dir.join("big.rs"), dir.join("src").join(name)).unwrap();
+    }
+    for (list, piece) in [
+        (
+            "sed -n '1,170p' big.rs; grep -n add_00 src/*.rs",
+            "$ grep -n add_00 src/a.rs src/b.rs [stdout:",
+        ),
+        (
+            "wc -l src/*.rs; cat big.rs",
+            "$ wc -l src/a.rs src/b.rs [stdout:1-3]",
+        ),
+        ("cat src/?.rs", "$ cat src/b.rs [stdout:"),
+        (
+            "cd src && grep -c add_ *.rs; cat a.rs",
+            "$ grep -c add_ a.rs b.rs [stdout:1-2]",
+        ),
+    ] {
+        let raw = native(dir, list);
+        let (view, _) = verified(dir, list, response(&raw), &raw);
+        has(&view, piece);
+    }
+    // A glob that names no file, and a pattern the recheck does not expand.
+    for list in [
+        "grep -n add_00 src/*.zz; sed -n '1,170p' big.rs",
+        "cat src/[ab].rs",
+    ] {
+        let raw = native(dir, list);
+        assert_eq!(hook(dir, list, Some(response(&raw))), json!({}), "{list}");
+    }
+}
+
+#[test]
 fn filters_and_quoted_operators_apply_before_accounting() {
     let temp = fixture();
     let dir = temp.path();
