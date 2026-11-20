@@ -15811,6 +15811,8 @@ fn sed_range_persisted_and_trimmed_outputs_use_the_visible_baseline() {
     use serde_json::json;
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
+    // These fixtures are sized for the outlines of small reads, as with a threshold of 0.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 0\n")]);
     let raw: String = (0..150)
         .map(|i| format!("def compute_{i}(amount):\n    return amount + {i}\n\n"))
         .collect();

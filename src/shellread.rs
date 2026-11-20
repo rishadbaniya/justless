@@ -637,8 +637,10 @@ impl Selection {
         }
     }
 
-    /// A read that keeps its text (see [`small`]). `shown` is whether the client
-    /// shows the result whole, not as a preview of a file it saved.
+    /// A read that keeps its text (see [`small`]). `shown` is whether Claude Code
+    /// shows the result whole, not as a preview of a file it saved. The line
+    /// threshold was measured on Claude Code, so other clients keep the earlier
+    /// rule and pass false.
     fn small(&self, ws: &Workspace, shown: bool) -> bool {
         let whole = ws
             .settings()
@@ -653,11 +655,13 @@ impl Selection {
         small(lines, self.text.len(), whole)
     }
 
-    fn outline(&mut self, ws: &Workspace, baseline: usize) -> Option<String> {
+    fn outline(&mut self, ws: &Workspace, baseline: usize, claude: bool) -> Option<String> {
         let settings = ws.settings().ok()?;
         let bytes = self.text.len() as u64;
-        // A smaller baseline is the preview of a result the client saved.
-        if self.small(ws, baseline >= self.text.len())
+        // Claude Code drops the final newlines of a result it shows whole. A
+        // baseline smaller than that is the preview of a result it saved to a file.
+        let shown = claude && baseline >= self.text.trim_end_matches('\n').len();
+        if self.small(ws, shown)
             || bytes > settings.max_run_bytes
             || settings.max_runs == 0
             || bytes > settings.max_archive_bytes
@@ -731,7 +735,7 @@ impl Selection {
         session: &str,
         claude: bool,
     ) -> Option<String> {
-        let outline = self.outline(ws, baseline)?;
+        let outline = self.outline(ws, baseline, claude)?;
         let words = self.command();
         let args: Vec<_> = words.iter().map(OsString::from).collect();
         let mut command = shlex::try_join(words.iter().map(String::as_str)).ok()?;
@@ -840,8 +844,9 @@ pub(crate) fn rewrite(
     if read.closed && !read.text().ends_with('\n') {
         return None;
     }
-    if shell.whole() && (read.small(ws, true) || read.outline(ws, read.text.len()).is_none()) {
-        return (!read.small(ws, true))
+    let small = read.small(ws, claude);
+    if shell.whole() && (small || read.outline(ws, read.text.len(), claude).is_none()) {
+        return (!small)
             .then(|| crate::agents::read_instead(ws, &ws.root, &read.file))?
             .map(|instead| format!("{}{instead}", shell.prefix));
     }
@@ -849,7 +854,7 @@ pub(crate) fn rewrite(
         return None;
     }
     if read.object.is_some() {
-        read.outline(ws, read.text.len())?;
+        read.outline(ws, read.text.len(), false)?;
     }
     Some(format!(
         "{}{}",
@@ -894,8 +899,8 @@ pub(crate) fn piece(
         return None;
     }
     if shell.whole()
-        && !read.small(ws, true)
-        && read.outline(ws, read.text.len()).is_none()
+        && !read.small(ws, false)
+        && read.outline(ws, read.text.len(), false).is_none()
         && let Some(instead) = crate::agents::read_instead(ws, &ws.root, &read.file)
     {
         return Some(instead);

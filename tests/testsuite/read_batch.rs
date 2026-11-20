@@ -257,13 +257,21 @@ fn shell_reads_of_at_most_600_lines_stay_as_printed() {
     let dir = temp.path();
     // The default threshold. `big.rs` has 601 lines.
     fs::remove_file(dir.join(".justless.toml")).unwrap();
+    // Claude Code drops the final newline of an inline result, so both forms count.
     let replaced = |list: &str| {
         let raw = native(dir, list);
-        let answer = hook(dir, list, Some(response(&raw)));
-        answer["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-            .as_str()
-            .map(|view| assert!(view.len() < raw.len(), "{list}: {view}"))
-            .is_some()
+        let answers = [raw.as_str(), raw.trim_end_matches('\n')].map(|stdout| {
+            let answer = hook(dir, list, Some(response(stdout)));
+            answer["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+                .as_str()
+                .map(|view| assert!(view.len() < raw.len(), "{list}: {view}"))
+                .is_some()
+        });
+        assert_eq!(
+            answers[0], answers[1],
+            "{list}: with and without the final newline"
+        );
+        answers[0]
     };
     // An agent reads most of such a read again, so it keeps its lines.
     for list in [
