@@ -112,7 +112,7 @@ fn reads_in_a_worktree_bind_their_outline_to_the_worktree() {
     let path = tree.join("src/big.rs");
     fs::create_dir_all(tree.join(".justless")).unwrap();
     for (hook_dir, agent_dir) in [(&root, &root), (&root, &tree), (&tree, &tree)] {
-        for window in [None, Some((300, 400))] {
+        for window in [None, Some((300, 650))] {
             let answer = hook(home, hook_dir, &read(agent_dir, &path, &body, window));
             let (row, start) = second_row(&answer);
             // From the main checkout the hint names the worktree's root.
@@ -130,7 +130,7 @@ fn reads_in_a_worktree_bind_their_outline_to_the_worktree() {
         }
     }
     let resume = justless(home, &tree, &["resume"], None);
-    has(&text(&resume.stdout), "src/big.rs:300-699");
+    has(&text(&resume.stdout), "src/big.rs:300-949");
 }
 
 #[test]

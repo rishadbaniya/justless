@@ -15,6 +15,6 @@ Open work only. Finished work is in [CHANGELOG.md](CHANGELOG.md) and the Git his
 - **Done 2026-11-20.** Output of scripts, loops and tools no hook knows is clipped over the preview budget (168 results over 4 KB, 1.4 MB). Of results over 4 KB that did not go through Justless, 77% of the bytes now qualify with globs, up from 69%.
 - **Check.** These outside results share the `read batch` label in `stats`, so watch how often those runs are reopened in full now that scratch notes and logs get an excerpt.
 
-### Read outlines under 600 lines
-- **Why.** `scripts/read_followups.py` on 30 days of this project's transcripts (2026-11-20): of 64 outlined Reads of 151 to 600 lines, 75% to 91% were read again within 20 tool results, a quarter of them whole, and the agent received 95% to 104% of the bytes of one raw Read after about 1.4 more Reads. Over 600 lines an outline left 70% of the bytes, and over 1,200 lines 23%. The table is in "What the agent read next" in docs/benchmarks.md.
-- **Next.** Owner's call: raise the 150-line threshold for Read outlines, whole and ranged, toward 600 lines, and measure shell reads the same way before changing theirs. Rerun the script as sessions with the hook accumulate; 94 outlined Reads is a small sample.
+### Shell read outlines under 600 lines
+- **Why.** Read outlines now start above 600 lines (`read_outline_lines`, 2026-11-20), after `scripts/read_followups.py` showed that outlines of 151 to 600 lines were read again 75% to 91% of the time for no saving in bytes. Shell reads (`cat`, `sed -n`, read lists) still outline from 150 lines or 6 KB and were not measured: `stats` counts a `justless log` replay as a reopening, but not a later Read or narrower `sed` of the same file.
+- **Next.** Extend the script to shell reads, then decide their threshold the same way. Rerun it for Reads as sessions with the new threshold accumulate; 94 outlined Reads was a small sample from one project.

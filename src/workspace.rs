@@ -119,6 +119,10 @@ pub(crate) const PROJECT_MARKERS: &[&str] = &[
 pub struct Settings {
     pub filters: Vec<crate::filters::Rule>,
     pub context_budget: usize,
+    /// A Claude Code Read that returns at most this many lines is never replaced
+    /// by an outline; 0 outlines any whole Read over the context budget. See
+    /// `agents.rs`.
+    pub read_outline_lines: u64,
     pub max_output_bytes: usize,
     pub max_file_bytes: u64,
     /// The most captured runs kept under `.justless/runs/`, newest first.
@@ -156,6 +160,7 @@ impl Default for Settings {
         Self {
             filters: Vec::new(),
             context_budget: 2400,
+            read_outline_lines: 600,
             max_output_bytes: 4096,
             max_file_bytes: 2 * 1024 * 1024,
             max_runs: 200,

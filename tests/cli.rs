@@ -7135,12 +7135,12 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     let path = root.join("module.py");
     let source = format!(
         "def calculate():\n{}    return 42\n",
-        "    # detail\n".repeat(400)
+        "    # detail\n".repeat(700)
     );
     fs::write(&path, &source).unwrap();
     let read = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
         "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
-        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":702,"totalLines":702}}});
     let output = agent_hook(&root, "hook-claude", "after-read", read.clone());
     let replaced = &output["hookSpecificOutput"];
     assert!(replaced["updatedToolOutput"].is_object(), "{output}");
@@ -7632,12 +7632,12 @@ fn statusline_keeps_counting_a_nested_repository_after_the_session_leaves_it() {
     let module = nested.join("module.py");
     let source = format!(
         "def calculate():\n{}    return 42\n",
-        "    # detail\n".repeat(400)
+        "    # detail\n".repeat(700)
     );
     fs::write(&module, &source).unwrap();
     let read = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse",
         "tool_input":{"file_path":module},"tool_response":{"type":"text","file":{"filePath":module,
-        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":702,"totalLines":702}}});
     let replaced = claude_hook(&nested, &outer, "after-read", read);
     assert!(replaced["hookSpecificOutput"]["updatedToolOutput"].is_object());
 
@@ -14062,7 +14062,7 @@ fn a_replaced_read_names_the_root_to_expand_from_the_agents_directory() {
     let docs = root.join("docs");
     let source = format!(
         "def calculate():\n{}    return 42\n",
-        "    # detail\n".repeat(400)
+        "    # detail\n".repeat(700)
     );
     let other = "def other():\n    return 1\n";
     write_files(&root, &[("module.py", &source), ("docs/module.py", other)]);
@@ -14070,7 +14070,7 @@ fn a_replaced_read_names_the_root_to_expand_from_the_agents_directory() {
     let path = root.join("module.py");
     let read = json!({"session_id":"s1","tool_name":"Read","hook_event_name":"PostToolUse","cwd":docs,
         "tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,
-        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+        "content":source.trim_end_matches('\n'),"startLine":1,"numLines":702,"totalLines":702}}});
     let output = agent_hook(&root, "hook-claude", "after-read", read);
     let replaced = &output["hookSpecificOutput"];
     let outline = replaced["updatedToolOutput"]["file"]["content"]
@@ -14801,7 +14801,7 @@ fn claude_reads_record_the_lines_or_outline_the_agent_was_shown() {
     git(&root, &["init", "-q"]);
     let source = format!(
         "def calculate():\n{}    return 42\n",
-        "    # detail\n".repeat(400)
+        "    # detail\n".repeat(700)
     );
     write_files(
         &root,
@@ -14823,13 +14823,13 @@ fn claude_reads_record_the_lines_or_outline_the_agent_was_shown() {
     assert_eq!(hook(small_read.clone()), json!({}));
     assert_eq!(resume_reads(&root, "worker.py"), ["Read worker.py:1-2"]);
     // A ranged read records the lines Claude Code returned.
-    let mut ranged = read_event(&large, "    # detail\n    # detail", 3, 2, 402);
+    let mut ranged = read_event(&large, "    # detail\n    # detail", 3, 2, 702);
     ranged["tool_input"]["offset"] = json!(3);
     ranged["tool_input"]["limit"] = json!(2);
     assert_eq!(hook(ranged), json!({}));
     assert_eq!(resume_reads(&root, "module.py"), ["Read module.py:3-4"]);
     // A whole read replaced by an outline records the outline only.
-    let whole = read_event(&large, source.trim_end_matches('\n'), 1, 402, 402);
+    let whole = read_event(&large, source.trim_end_matches('\n'), 1, 702, 702);
     let replaced = hook(whole);
     let updated = &replaced["hookSpecificOutput"]["updatedToolOutput"];
     assert!(updated.is_object(), "{replaced}");
@@ -14875,6 +14875,8 @@ fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
+    // These fixtures are sized for outlines from 151 lines, below the default.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 150\n")]);
     let elsewhere = TempDir::new().unwrap();
     let outside = elsewhere.path().canonicalize().unwrap();
     let home = outside.join("home");
@@ -16650,6 +16652,8 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
+    // These fixtures are sized for outlines from 151 lines, below the default.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 150\n")]);
     // 30 functions of 20 lines each.
     let source: String = (0..30)
         .map(|i| {
@@ -16763,11 +16767,72 @@ fn claude_read_outlines_a_wide_ranged_read_with_a_way_back_to_its_lines() {
 }
 
 #[test]
+fn claude_read_keeps_reads_of_at_most_600_lines_as_they_are() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    // 70 functions of 10 lines each.
+    let source: String = (0..70)
+        .map(|i| {
+            format!(
+                "pub fn handler_{i:02}(request: &Request) -> Response {{\n{}    Response::ok()\n}}\n\n",
+                "    request.validate().expect(\"a request that passes validation\");\n".repeat(7)
+            )
+        })
+        .collect();
+    write_files(&root, &[("src/lib.rs", &source)]);
+    let path = root.join("src/lib.rs");
+    let replaced = |event: serde_json::Value| {
+        let output = agent_hook(&root, "hook-claude", "after-read", event);
+        output["hookSpecificOutput"]["updatedToolOutput"].is_object()
+    };
+    let window = |offset, limit| native_read(&path, &source, Some(offset), Some(limit));
+    // An agent reads most of a file of this size again after an outline, so a
+    // window or a whole file of at most 600 lines arrives as Read returned it.
+    assert!(!replaced(window(1, 600)));
+    assert!(!replaced(window(50, 400)));
+    assert!(replaced(window(1, 601)));
+    assert!(replaced(native_read(&path, &source, None, None)));
+    let short: String = source
+        .lines()
+        .take(600)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&path, &short).unwrap();
+    let whole = native_read(&path, short.trim_end_matches('\n'), None, None);
+    assert_eq!(whole["tool_response"]["file"]["numLines"], 600);
+    assert!(!replaced(whole));
+    // The project sets the threshold. A ranged Read of at most 150 lines, which
+    // an outline's hint names, stays as it is at any setting.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 200\n")]);
+    fs::write(&path, &source).unwrap();
+    assert!(replaced(window(50, 400)));
+    assert!(!replaced(window(50, 200)));
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 0\n")]);
+    assert!(replaced(window(50, 151)));
+    assert!(!replaced(window(50, 150)));
+    let short: String = source
+        .lines()
+        .take(100)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&path, &short).unwrap();
+    assert!(replaced(native_read(
+        &path,
+        short.trim_end_matches('\n'),
+        None,
+        None
+    )));
+}
+
+#[test]
 fn claude_read_keeps_ranged_reads_it_cannot_outline_exactly() {
     use serde_json::{Value, json};
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
+    // These fixtures are sized for outlines from 151 lines, below the default.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 150\n")]);
     let functions: String = (0..60)
         .map(|i| {
             format!(
@@ -16878,6 +16943,8 @@ fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets
     let repo = TempDir::new().unwrap();
     let root = repo.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
+    // These fixtures are sized for outlines from 151 lines, below the default.
+    write_files(&root, &[(".justless.toml", "read_outline_lines = 150\n")]);
     let functions: String = (0..80)
         .map(|i| {
             format!(

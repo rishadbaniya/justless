@@ -401,7 +401,7 @@ The figures above stop at the outline. On 2026-11-20, `python3 scripts/read_foll
 | 601-1,200 | 16 | 50% | 44% | 3.38 | 70% | 114 | 31% | 18% | 0.40 | 118% |
 | over 1,200 | 5 | 20% | 9% | 2.80 | 23% | 6 | 0% | 0% | 0.00 | 100% |
 
-An outline of at most 600 lines was read again three times in four, a quarter of the time whole with `allow_large`, and the agent ended with about as many bytes as one raw Read, 14% to 23% fewer than the raw baseline, after about 1.4 more Reads. Over 600 lines it ended with 70% of a raw Read, and over 1,200 lines with 23%. Each further Read that needs a request of its own also resends the conversation, whose median size in these sessions was 201K tokens, so under 600 lines the outline saved few bytes and cost requests. The sample is small and comes from one project, mostly sessions that develop Justless itself and so read files in order to change them.
+An outline of at most 600 lines was read again three times in four, a quarter of the time whole with `allow_large`, and the agent ended with about as many bytes as one raw Read, 14% to 23% fewer than the raw baseline, after about 1.4 more Reads. Over 600 lines it ended with 70% of a raw Read, and over 1,200 lines with 23%. Each further Read that needs a request of its own also resends the conversation, whose median size in these sessions was 201K tokens, so under 600 lines the outline saved few bytes and cost requests. The sample is small and comes from one project, mostly sessions that develop Justless itself and so read files in order to change them. On this evidence the default threshold for outlining a Read went from 150 to 600 lines on 2026-11-20, as the `read_outline_lines` setting, so the table above this one describes the earlier threshold.
 
 ## Code questions
 

@@ -235,10 +235,10 @@ fn native_reads_preserve_explicit_windows_and_reject_mismatched_content() {
     let path = subdir.join("sample with space.py");
     let source = format!(
         "def calculate():\n{}    return 42\n",
-        "    # detail\n".repeat(400)
+        "    # detail\n".repeat(700)
     );
     fs::write(&path, &source).unwrap();
-    let mut event = json!({"tool_name":"Read","hook_event_name":"PostToolUse","tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,"content":source.trim_end_matches('\n'),"startLine":1,"numLines":402,"totalLines":402}}});
+    let mut event = json!({"tool_name":"Read","hook_event_name":"PostToolUse","tool_input":{"file_path":path},"tool_response":{"type":"text","file":{"filePath":path,"content":source.trim_end_matches('\n'),"startLine":1,"numLines":702,"totalLines":702}}});
     let post = |event: &Value| json_output(&root, &["hook-claude", "after-read"], event);
     let compact = |event: &Value| {
         let result = post(event);
@@ -249,7 +249,7 @@ fn native_reads_preserve_explicit_windows_and_reject_mismatched_content() {
     };
     let file = compact(&event);
     contains(file["content"].as_str().unwrap(), "calculate");
-    assert_eq!(file["totalLines"], 402);
+    assert_eq!(file["totalLines"], 702);
     event["tool_input"]["limit"] = json!(32);
     assert_eq!(post(&event), json!({}));
     event["tool_input"].as_object_mut().unwrap().remove("limit");
@@ -836,6 +836,8 @@ fn padded(template: &str) -> String {
 fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
     let d = tempdir().unwrap();
     let root = d.path().canonicalize().unwrap();
+    // These scripts are sized for outlines from 151 lines, below the default.
+    fs::write(root.join(".justless.toml"), "read_outline_lines = 150\n").unwrap();
     let steps: String = (1..=21).map(|n| format!("step {n}\n")).collect();
     // `None` keeps the native read. Otherwise the outline lists these lines of code
     // that no row covers, and only a file with none has its `cat` rewritten.

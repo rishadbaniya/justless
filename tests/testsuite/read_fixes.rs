@@ -161,6 +161,8 @@ fn outlines_list_top_level_code_in_every_language_that_runs_it() {
     let project = Project::new();
     let root = project.root();
     git(&root, &["init", "-q"]);
+    // These files are sized for outlines of any whole Read, as with a threshold of 0.
+    project.write(".justless.toml", "read_outline_lines = 0\n");
     let ts_helpers = repeat(
         30,
         "function helper{i}(n: number): number {\n  const doubled = n * 2\n  return doubled + {i}\n}\n",

@@ -802,13 +802,26 @@ fn agent_workspace(workspace: &Workspace, input: &Value) -> Workspace {
     workspace.working_in(cwd.unwrap_or(&workspace.origin))
 }
 
-/// A ranged Claude Code Read that returns at most this many lines reaches the agent
-/// as Read returned it, so a Read of the lines an outline points to is never
-/// outlined again. In 1,234 ranged Reads of workspace files in Claude Code
+/// The window an outline's hint names for exact lines: a ranged Claude Code Read
+/// of at most this many lines, which is never outlined again whatever
+/// `read_outline_lines` is. In 1,234 ranged Reads of workspace files in Claude Code
 /// transcripts, the 68% that returned at most 150 lines held 28% of the bytes, and
 /// 44% of them were followed by an edit of the file within eight tool calls. The
 /// 32% that returned more held 72% of the bytes, and 6% were followed by an edit.
 const READ_WINDOW_LINES: u64 = 150;
+
+/// The `read_outline_lines` setting: a Claude Code Read, whole or ranged, that
+/// returns at most this many lines, 600 by default, reaches the agent as Read
+/// returned it. `scripts/read_followups.py` on 30 days of this project's
+/// transcripts (2026-11-20): of 64 outlined Reads of 151 to 600 lines, 75% to
+/// 91% were read again within 20 tool results, a quarter of them whole, and the
+/// agent received 95% to 104% of the bytes of one raw Read after about 1.4 more
+/// Reads. Over 600 lines an outline left 70% of the bytes, and over 1,200 lines
+/// 23%. A ranged Read of at most `READ_WINDOW_LINES` lines, which an outline's
+/// hint names, is never outlined at any setting.
+fn outline_lines(ws: &Workspace) -> Option<u64> {
+    Some(ws.settings().ok()?.read_outline_lines)
+}
 
 fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     if input["hook_event_name"] != "PostToolUse" || input["tool_name"] != "Read" {
@@ -841,10 +854,18 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     {
         return None;
     }
+    let lines = result["numLines"].as_u64()?;
     let Some((ws, file)) = read_file(ws, path) else {
+        if lines <= outline_lines(ws)? {
+            return None;
+        }
         return outside_read(ws, path, response);
     };
     let ws = &ws;
+    // The checkout that holds the file sets the threshold, as it sets the budget.
+    if lines <= outline_lines(ws)? {
+        return None;
+    }
     let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
     let budget = ws.settings().ok()?.context_budget;
     let native = result["content"].as_str()?;
@@ -1040,7 +1061,7 @@ pub(crate) fn outside_file(root: &Path, path: &Path) -> bool {
 }
 
 /// The outline rows around the window of a ranged Read that returned more than
-/// `READ_WINDOW_LINES` lines of a source or Markdown file the parsers outline.
+/// `read_outline_lines` lines of a source or Markdown file the parsers outline.
 ///
 /// Claude Code 2.1.327 returns lines `max(1, offset)` onward joined by `\n`, with
 /// CRLF read as LF and a final newline counted as one more, empty line, and sets
@@ -1082,7 +1103,7 @@ fn claude_read_window(ws: &Workspace, args: &Value, response: &Value) -> Option<
     let (ws, file) = read_file(ws, path)?;
     let ws = &ws;
     let budget = ws.settings().ok()?.context_budget;
-    if native.len() <= budget {
+    if native.len() <= budget || count <= outline_lines(ws)? {
         return None;
     }
     let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
