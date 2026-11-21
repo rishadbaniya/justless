@@ -402,7 +402,7 @@ Against Claude Code 2.1.327 and the harness's local fake API, a Read of lines 10
 
 ### What the agent read next
 
-The figures above stop at the outline. On 2026-11-20, `python3 scripts/read_followups.py` read 30 days of this project's Claude Code transcripts and, for each read the hooks had replaced with an outline, added up the later Reads and shell reads of the same lines within 20 tool results, and any `justless log` of its run. The hooks were a few days old, so there were 94 outlined Reads and 100 compacted shell reads. Raw reads of more than 150 lines from before them are the baseline, since an agent also reads parts of a file again after seeing all of it: 562 Reads, and 522 shell reads that were one `sed -n 'A,Bp' FILE` or `cat FILE`. "All bytes" is the first result plus those later reads, against one raw read of the lines; for outlined lines that raw size is estimated from the bytes per line of the reads that followed.
+The figures above stop at the outline. On 2026-11-20, `python3 scripts/read_followups.py` read this project's Claude Code transcripts, which began on 2026-11-17, and, for each read the hooks had replaced with an outline, added up the later Reads and shell reads of the same lines within 20 tool results, and any `justless log` of its run. The hooks were a few days old, so there were 94 outlined Reads and 100 compacted shell reads. Raw reads of more than 150 lines from before them are the baseline, since an agent also reads parts of a file again after seeing all of it: 562 Reads, and 522 shell reads that were one `sed -n 'A,Bp' FILE` or `cat FILE`. "All bytes" is the first result plus those later reads, against one raw read of the lines; for outlined lines that raw size is estimated from the bytes per line of the reads that followed.
 
 | Read tool, lines | Outlined | Read again | Lines read again | Later reads | All bytes | Raw | Read again | Lines read again | Later reads | All bytes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -473,3 +473,40 @@ Command output had the checkout, temporary and home directories replaced by plac
 On 73 runs archived in this repository's main checkout, 779,149 bytes were kept out at first preview: 495,743 of code, 241,321 of logs and 42,085 of prose. Bytes ÷ 4 estimated 194,788 tokens; the measured ratios estimate 317,766.
 
 To repeat the measurement, run `python3 scripts/token_calibration.py` with `ANTHROPIC_API_KEY` set, or `--collect samples.json` first to read every sample before anything is sent, and copy the printed bytes and tokens into `CALIBRATION` in `src/tokens.rs`.
+
+## Where the prompt tokens go
+
+Every request resends the conversation, so a tool result is paid for once when it is written to the prompt cache and again on each later request that reads it. On 2026-11-21, `python3 scripts/context_spend.py` read the `usage` record of every request in the owner's Claude Code transcripts of two projects, priced each at API list prices, and split what it sent between where the tokens came from by the bytes each part added. A byte of tool result added 0.39 tokens to every later prompt here (2.57 bytes per token, the median of 1,837 steps that added one large result) and 0.44 in the other project. The shares are of list-price dollars. A subscription is billed differently, so they compare parts of the spend and are not a bill.
+
+| | This repository | prediction_market_workspace |
+| --- | ---: | ---: |
+| Days with requests | 5, 2026-11-17 to 21 | 13, 2026-11-09 to 21 |
+| Main sessions and subagents | 2 and 236 | 8 and 201 |
+| Requests | 24,020 | 16,015 |
+| Prompt tokens read from cache | 98.6% | 98.4% |
+| Spend inside subagents | 88% | 50% |
+| The advisor reading the conversation | 28.3% | 3.9% |
+| Writing: thinking, text and tool calls | 19.4% | 28.9% |
+| What the model wrote, read again later | 19.4% | 24.6% |
+| Bash results | 12.4% | 17.6% |
+| Read results | 5.5% | 7.1% |
+| What a session started with | 8.8% | 6.0% |
+| What a summary kept | 1.4% | 7.1% |
+| Reminders, attachments and framing | 2.8% | 3.7% |
+| User messages | 1.1% | 0.7% |
+
+A request that consults the advisor runs the model twice over the prompt and sends the whole conversation to the advisor's model, none of it from cache: 380 calls read 74.8M tokens here. `usage.iterations` lists those passes, and the top-level counts hold the model's own passes only, so the advisor's tokens are added once.
+
+What the hooks did, in this repository:
+
+- They shortened 258 Bash and Read results and kept 3.23 MB out of the prompt, 1.1% of the spend.
+- 84 of those results were fetched from again, by a `justless` lookup that names the run or a Read of the outlined file within 20 results. All 182 fetches cost 1.0% of the spend, most of it for the lines they printed. The net is 0.17% if the shortening caused every fetch and 1.1% if it caused none; an agent also reads parts of a file again after reading all of it.
+- By the bytes one result kept out, every size was net positive. The 49 results that kept out under 4 KB netted about nothing.
+- One more tool call costs as much as 3 KB of output kept to the end of the session, because it resends the prompt. In the other project it is 4 KB.
+- Clipping every other Bash and Read result to 4 KB would keep out 24.1 MB, 7.6% of the spend, if no agent fetched anything again. Most of those results are reads of at most 600 lines, which keep their text because agents read outlines of that size again.
+
+In prediction_market_workspace the hooks had run for a day: 30 shortened results, 0.26 MB. Clipping every other result to 4 KB would keep out 25.4 MB there, 10.5% of the spend, on the same condition.
+
+A shortened result counts for what Claude Code would have shown without the hooks. That is never more than the largest whole result of the tool in the same transcripts: 29.9 KB for Bash, where Claude Code clips output itself, and 102.3 KB for Read. Commands that name `justless` are not counted for the hooks, because here they are mostly tests of the tool on made-up output: 214 results, 2.65 MB by the same rule. Before both rules, the same transcripts appeared to hold 897 MB kept out.
+
+So in these sessions the hooks can reach the 18% to 25% of the spend that Bash and Read results make up, and have kept out about 1% of the spend so far. The larger parts are the advisor, the model's own writing, and how long sessions and subagents run. Those are settings and habits of the client, not output a hook can shorten.
