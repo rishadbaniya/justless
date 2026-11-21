@@ -44,8 +44,8 @@ BYTES = re.compile(r"\[justless (run-\w+)\] exit \d+ · (\d+) of (\d+) output by
 OUTLINE = re.compile(r"revision [0-9a-f]{8,} · (\d+) lines(?: · window L(\d+)-(\d+))?")
 RETRIEVAL = re.compile(r"(?:^|[;&|]\s*)justless (?:log|search|recall|expand|context --run)\b")
 RUN = re.compile(r"\brun-\w+")
-# Kept-out bytes of one shortened result, as the upper edge of each row.
-BUCKETS = [(2000, "under 2 KB"), (4000, "2 to 4 KB"), (8000, "4 to 8 KB"), (16000, "8 to 16 KB"), (None, "16 KB or more")]
+# Kept-out bytes of one clipped result, as the upper edge of each row.
+BUCKETS = [(4000, "under 4 KB"), (16000, "4 to 16 KB"), (None, "16 KB or more")]
 UNIT = {"B": 1, "KB": 1000, "MB": 1000000}
 LISTS = ("break even", "sizes", "shortened items")
 ADVICE = "advice the advisor returned"
@@ -377,21 +377,30 @@ def report(name, files, totals):
         f"{100 * (totals['saved dollars'] - fetched) / spent:.2f}% of the spend"
     )
     if totals["shortened"]:
-        print("    by bytes kept out of one result, with the fetches that name its run or read its file")
+        # A fetch is charged to a result only when the call names its run or
+        # reads its file, so these rows hold fewer fetches than the line above.
+        groups = [("Read outlines of at most 600 lines", lambda item: item["how"] == "outline" and item["lines"] <= 600)]
+        groups.append(("Read outlines of more than 600 lines", lambda item: item["how"] == "outline" and item["lines"] > 600))
         floor = 0
         for ceiling, label in BUCKETS:
-            rows = [
-                item
-                for item in totals["shortened items"]
-                if item["saved"] >= floor and (ceiling is None or item["saved"] < ceiling)
-            ]
+            groups.append(
+                (
+                    f"command output, {label} kept out",
+                    lambda item, low=floor, high=ceiling: item["how"] == "clipped"
+                    and item["saved"] >= low
+                    and (high is None or item["saved"] < high),
+                )
+            )
             floor = ceiling or 0
+        print("    by kind of result, with the fetches that name its run or read its file")
+        for label, wanted in groups:
+            rows = [item for item in totals["shortened items"] if wanted(item)]
             if rows:
                 worth = sum(item["worth"] for item in rows)
                 back = sum(item.get("fetched", 0.0) for item in rows)
                 again = sum(1 for item in rows if item.get("fetches"))
                 print(
-                    f"      {label:14} {len(rows):4} results  {sum(item['saved'] for item in rows) / 1e6:5.2f} MB  "
+                    f"      {label:44} {len(rows):4} results  {sum(item['saved'] for item in rows) / 1e6:5.2f} MB  "
                     f"worth ${worth:6.2f}  {again:3} fetched from again for ${back:6.2f}  net ${worth - back:7.2f}"
                 )
     if totals["named"]:
@@ -469,7 +478,7 @@ def main():
         "every later request until the session ends or is summarized. The figures for the "
         "hooks assume the agent would have done the same with the longer output, and count "
         "as fetching again only `justless` lookups and Reads of a file within 20 results of "
-        "its outline. The rows by size charge a fetch to a result only when the call names "
+        "its outline. The rows by kind charge a fetch to a result only when the call names "
         "its run or reads its file, so they hold fewer fetches than the line above them."
     )
 

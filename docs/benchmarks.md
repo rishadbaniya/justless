@@ -501,7 +501,15 @@ What the hooks did, in this repository:
 
 - They shortened 258 Bash and Read results and kept 3.23 MB out of the prompt, 1.1% of the spend.
 - 84 of those results were fetched from again, by a `justless` lookup that names the run or a Read of the outlined file within 20 results. All 182 fetches cost 1.0% of the spend, most of it for the lines they printed. The net is 0.17% if the shortening caused every fetch and 1.1% if it caused none; an agent also reads parts of a file again after reading all of it.
-- By the bytes one result kept out, every size was net positive. The 49 results that kept out under 4 KB netted about nothing.
+- By kind of result, with a fetch charged to a result only when the call names its run or reads its file:
+
+  | Kind | Results | Kept out | Fetched from again | Cost of the fetches, of what the results kept out |
+  | --- | ---: | ---: | ---: | ---: |
+  | Read outline of at most 600 lines | 59 | 0.71 MB | 48 | 249% |
+  | Read outline of more than 600 lines | 19 | 0.92 MB | 9 | 36% |
+  | Clipped command output | 180 | 1.60 MB | 26 | 17% |
+
+  A Read of at most 600 lines has kept its text since 2026-11-20, so the first row no longer occurs. The other 199 results net 0.66% of the spend on the same strict assumption.
 - One more tool call costs as much as 3 KB of output kept to the end of the session, because it resends the prompt. In the other project it is 4 KB.
 - Clipping every other Bash and Read result to 4 KB would keep out 24.1 MB, 7.6% of the spend, if no agent fetched anything again. Most of those results are reads of at most 600 lines, which keep their text because agents read outlines of that size again.
 
