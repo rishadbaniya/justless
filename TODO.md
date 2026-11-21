@@ -6,7 +6,7 @@ Open work only. Finished work is in [CHANGELOG.md](CHANGELOG.md) and the Git his
 
 ### Spend the hooks do not reach
 - **Why.** On 2026-11-21 `scripts/context_spend.py` priced every request in the owner's Claude Code transcripts of two projects. Bash and Read results are 18% to 25% of the spend at list prices, and the hooks have kept out about 1% of the spend in this repository; clipping every other result to 4 KB would keep out 7.6% to 10.5% before any fetch. The advisor (28% here), the model's own writing (39% to 54%) and subagents (88% here) are larger. Results are in docs/benchmarks.md.
-- **Next.** Rerun the script in prediction_market_workspace once the hooks have run there for a week; on 2026-11-21 they had run for a day and shortened 30 results. Decide whether `discover` should print this split, so a user sees what a client setting costs next to what the hooks keep out.
+- **Next.** Rerun the script in prediction_market_workspace once the hooks have run there for a week; its first shortened result is from 2026-11-19, and by 2026-11-21 there were 30. Decide whether `discover` should print this split, so a user sees what a client setting costs next to what the hooks keep out.
 
 ### A benchmark that reaches large output
 - **Why.** Both agent campaigns found no demonstrated saving: the main one on small tasks (Sonnet, 248 runs, −1.5% [−15.4%, +7.6%]), and on 2026-11-20 the large-output family (Sonnet, 96 runs, $5.99, −11.5% [−46.0%, +15.1%], success 100% vs 95.8%). In the second the model filtered its own commands and a plain run saw a median of 9.1 KB of tool output where the scripted path saw 59 to 192 KB, so the hooks changed 34 of 343 results. Results are in docs/benchmarks.md.

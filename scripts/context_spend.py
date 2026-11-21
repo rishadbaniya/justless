@@ -13,9 +13,10 @@ only, never content.
 
 A shortened result counts for what Claude Code would have shown without the
 hooks, which is never more than the largest whole result of that tool in the
-same transcripts: Claude Code clips a command's output itself. A command that
-names `justless` is not counted for the hooks, since in this repository those
-are mostly tests of the tool on made-up output.
+same transcripts: Claude Code clips a command's output itself. A result counts
+for the hooks only when it ends in the marker of a hook-routed run and is as
+long as that marker says, which leaves out a marker a test of the tool printed.
+A command that runs `justless` itself is not counted for the hooks either.
 """
 
 import argparse
@@ -39,14 +40,22 @@ RATES = {
 }
 CLIP = 4096
 # The two footers a clipped run ends in, each with the bytes the command printed.
-SHOWN = re.compile(r"\[justless (run-\w+) · ([\d.]+) (B|KB|MB) of ([\d.]+) (B|KB|MB) shown")
-BYTES = re.compile(r"\[justless (run-\w+)\] exit \d+ · (\d+) of (\d+) output bytes")
+# The marker a hook-routed run ends in, and the one `justless run` prints when
+# an agent or a script types it. Each holds the bytes shown and the bytes printed.
+SHOWN = re.compile(r"\[justless (run-\w+) · ([\d.]+) (B|KB|MB|GB) of ([\d.]+) (B|KB|MB|GB) shown")
+BYTES = re.compile(r"\[justless (run-\w+)\] exit -?\d+ · (\d+) of (\d+) output bytes")
+# What Claude Code adds after a command's output.
+TRAILER = re.compile(r"\n+Shell cwd was reset to [^\n]*\s*\Z")
+SEGMENT = re.compile(r"&&|\|\||[;|\n(]")
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(\S*)\Z")
 OUTLINE = re.compile(r"revision [0-9a-f]{8,} · (\d+) lines(?: · window L(\d+)-(\d+))?")
 RETRIEVAL = re.compile(r"(?:^|[;&|]\s*)justless (?:log|search|recall|expand|context --run)\b")
 RUN = re.compile(r"\brun-\w+")
 # Kept-out bytes of one clipped result, as the upper edge of each row.
 BUCKETS = [(4000, "under 4 KB"), (16000, "4 to 16 KB"), (None, "16 KB or more")]
-UNIT = {"B": 1, "KB": 1000, "MB": 1000000}
+UNIT = {"B": 1, "KB": 1000, "MB": 1000000, "GB": 1000000000}
+# How far a rounded size in a marker can be from the bytes it stands for.
+ROUNDING = {"B": 1, "KB": 60, "MB": 60000, "GB": 60000000}
 LISTS = ("break even", "sizes", "shortened items")
 ADVICE = "advice the advisor returned"
 OTHER = "reminders, attachments and framing"
@@ -84,22 +93,40 @@ def tokens_of(usage):
     }
 
 
+def runs_tool(command):
+    """Whether a command line runs `justless` itself or keeps its binary in a variable."""
+    for segment in SEGMENT.split(command):
+        for word in segment.split():
+            assigned = ASSIGNMENT.match(word)
+            if os.path.basename((assigned.group(1) if assigned else word).strip("\"'")) == "justless":
+                return True
+            if not assigned:
+                break
+    return False
+
+
 def result(name, call, content):
-    """One tool result: its bytes and, for a Bash or Read result the hooks
+    """One tool result: its bytes and, for a Bash or Read result that was
     shortened, what it stood for: the bytes a run printed, or the lines an
     outline replaced. `settle` turns those into bytes kept out."""
     item = {"kind": name or "other tool", "bytes": size(content), "saved": 0, "over": 0, "how": None}
     if name not in ("Bash", "Read"):
         return item
     text = text_of(content)
-    # A footer counts only as the last line: tests of the tool print footers too.
-    last = text.rstrip("\n").rsplit("\n", 1)[-1]
-    shown, printed = SHOWN.match(last), BYTES.match(last)
     outline = OUTLINE.search(text[:160]) if name == "Read" else None
-    if shown or printed:
-        item["how"] = "named" if "justless" in call.get("command", "") else "clipped"
-        item["run"] = (shown or printed).group(1)
-        item["stood for"] = int(float(shown.group(4)) * UNIT[shown.group(5)]) if shown else int(printed.group(3))
+    # A marker counts as the last line of a result about as long as it says:
+    # tests of the tool print markers too, inside longer or shorter output.
+    last = TRAILER.sub("", text).rstrip("\n").rsplit("\n", 1)[-1]
+    shown, typed = SHOWN.match(last), BYTES.match(last)
+    if shown:
+        showed, slack = float(shown.group(2)) * UNIT[shown.group(3)], ROUNDING[shown.group(3)]
+    elif typed:
+        showed, slack = int(typed.group(2)), 1
+    if (shown or typed) and -slack <= item["bytes"] - showed <= 400 + slack:
+        hooked = shown and not runs_tool(call.get("command", ""))
+        item["how"] = "clipped" if hooked else "named"
+        item["run"] = (shown or typed).group(1)
+        item["stood for"] = int(float(shown.group(4)) * UNIT[shown.group(5)]) if shown else int(typed.group(3))
     elif outline:
         first = int(outline.group(2) or 1)
         last = int(outline.group(3) or outline.group(1))
@@ -405,7 +432,7 @@ def report(name, files, totals):
                 )
     if totals["named"]:
         print(
-            f"    not counted: {totals['named']} results of commands that name `justless`, "
+            f"    not counted: {totals['named']} results of commands that run `justless` themselves, "
             f"{totals['named bytes'] / 1e6:.2f} MB by the same rule"
         )
     print(

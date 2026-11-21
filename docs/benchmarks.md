@@ -482,10 +482,10 @@ Every request resends the conversation, so a tool result is paid for once when i
 | --- | ---: | ---: |
 | Days with requests | 5, 2026-11-17 to 21 | 13, 2026-11-09 to 21 |
 | Main sessions and subagents | 2 and 236 | 8 and 201 |
-| Requests | 24,020 | 16,015 |
+| Requests | 24,039 | 16,015 |
 | Prompt tokens read from cache | 98.6% | 98.4% |
 | Spend inside subagents | 88% | 50% |
-| The advisor reading the conversation | 28.3% | 3.9% |
+| The advisor reading the conversation | 28.4% | 3.9% |
 | Writing: thinking, text and tool calls | 19.4% | 28.9% |
 | What the model wrote, read again later | 19.4% | 24.6% |
 | Bash results | 12.4% | 17.6% |
@@ -495,26 +495,26 @@ Every request resends the conversation, so a tool result is paid for once when i
 | Reminders, attachments and framing | 2.8% | 3.7% |
 | User messages | 1.1% | 0.7% |
 
-A request that consults the advisor runs the model twice over the prompt and sends the whole conversation to the advisor's model, none of it from cache: 380 calls read 74.8M tokens here. `usage.iterations` lists those passes, and the top-level counts hold the model's own passes only, so the advisor's tokens are added once.
+A request that consults the advisor runs the model twice over the prompt and sends the whole conversation to the advisor's model, none of it from cache: 381 calls read 75.0M tokens here. `usage.iterations` lists those passes, and the top-level counts hold the model's own passes only, so the advisor's tokens are added once.
 
 What the hooks did, in this repository:
 
-- They shortened 258 Bash and Read results and kept 3.23 MB out of the prompt, 1.1% of the spend.
-- 84 of those results were fetched from again, by a `justless` lookup that names the run or a Read of the outlined file within 20 results. All 182 fetches cost 1.0% of the spend, most of it for the lines they printed. The net is 0.17% if the shortening caused every fetch and 1.1% if it caused none; an agent also reads parts of a file again after reading all of it.
+- They shortened 283 Bash and Read results and kept 3.55 MB out of the prompt, 1.2% of the spend.
+- 84 of those results were fetched from again, by a `justless` lookup that names the run or a Read of the outlined file within 20 results. All 182 fetches cost 1.0% of the spend, most of it for the lines they printed. The net is 0.27% if the shortening caused every fetch and 1.2% if it caused none; an agent also reads parts of a file again after reading all of it.
 - By kind of result, with a fetch charged to a result only when the call names its run or reads its file:
 
   | Kind | Results | Kept out | Fetched from again | Cost of the fetches, of what the results kept out |
   | --- | ---: | ---: | ---: | ---: |
   | Read outline of at most 600 lines | 59 | 0.71 MB | 48 | 249% |
   | Read outline of more than 600 lines | 19 | 0.92 MB | 9 | 36% |
-  | Clipped command output | 180 | 1.60 MB | 26 | 17% |
+  | Clipped command output | 205 | 1.92 MB | 27 | 15% |
 
-  A Read of at most 600 lines has kept its text since 2026-11-20, so the first row no longer occurs. The other 199 results net 0.66% of the spend on the same strict assumption.
+  A Read of at most 600 lines has kept its text since 2026-11-20, so the first row no longer occurs. The other 224 results net 0.76% of the spend on the same strict assumption.
 - One more tool call costs as much as 3 KB of output kept to the end of the session, because it resends the prompt. In the other project it is 4 KB.
 - Clipping every other Bash and Read result to 4 KB would keep out 24.1 MB, 7.6% of the spend, if no agent fetched anything again. Most of those results are reads of at most 600 lines, which keep their text because agents read outlines of that size again.
 
-In prediction_market_workspace the hooks had run for a day: 30 shortened results, 0.26 MB. Clipping every other result to 4 KB would keep out 25.4 MB there, 10.5% of the spend, on the same condition.
+In prediction_market_workspace the first shortened result is from 2026-11-19, after most of its requests: 30 shortened results, 0.26 MB. Clipping every other result to 4 KB would keep out 25.4 MB there, 10.5% of the spend, on the same condition.
 
-A shortened result counts for what Claude Code would have shown without the hooks. That is never more than the largest whole result of the tool in the same transcripts: 29.9 KB for Bash, where Claude Code clips output itself, and 102.3 KB for Read. Commands that name `justless` are not counted for the hooks, because here they are mostly tests of the tool on made-up output: 214 results, 2.65 MB by the same rule. Before both rules, the same transcripts appeared to hold 897 MB kept out.
+A shortened result counts for what Claude Code would have shown without the hooks. That is never more than the largest whole result of the tool in the same transcripts: 29.9 KB for Bash, where Claude Code clips output itself, and 102.3 KB for Read. A result counts for the hooks only when it ends in the marker of a hook-routed run and is as long as that marker says, and its command does not run `justless` itself. That leaves out the markers that tests of the tool print, here on made-up output of up to 200 MB, and 58 results of commands an agent ran through `justless` by name, 0.66 MB by the same rule. Before these rules, the same transcripts appeared to hold 897 MB kept out.
 
 So in these sessions the hooks can reach the 18% to 25% of the spend that Bash and Read results make up, and have kept out about 1% of the spend so far. The larger parts are the advisor, the model's own writing, and how long sessions and subagents run. Those are settings and habits of the client, not output a hook can shorten.
