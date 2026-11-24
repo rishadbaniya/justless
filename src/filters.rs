@@ -599,20 +599,152 @@ fn docker_json(args: &[&str]) -> bool {
 }
 
 pub fn legacy_hook(words: &[&str]) -> bool {
-    matches!(
-        unwrap_tool(words),
+    match unwrap_tool(words) {
         ["cargo", "build" | "check" | "clippy" | "test", ..]
-            | ["make" | "gmake" | "ninja", ..]
-            | ["cmake", "--build", ..]
-            | ["gradle" | "gradlew" | "./gradlew", ..]
-            | ["mvn" | "mvnw" | "./mvnw", ..]
-            | ["dotnet", "build" | "test" | "restore", ..]
-            | ["swift", "build" | "test", ..]
-            | ["git", "diff" | "show" | "status" | "log", ..]
-            | ["go", "test" | "build", ..]
-            | ["python" | "python3", "-m", "pytest", ..]
-            | ["pytest" | "rg", ..]
-    )
+        | ["make" | "gmake" | "ninja", ..]
+        | ["cmake", "--build", ..]
+        | ["gradle" | "gradlew" | "./gradlew", ..]
+        | ["mvn" | "mvnw" | "./mvnw", ..]
+        | ["dotnet", "build" | "test" | "restore", ..]
+        | ["swift", "build" | "test", ..]
+        | ["git", "diff" | "show" | "status" | "log", ..]
+        | ["go", "test" | "build", ..]
+        | ["python" | "python3", "-m", "pytest", ..]
+        | ["pytest" | "rg", ..] => true,
+        ["git", "branch", rest @ ..] => git_branch_display(rest),
+        _ => false,
+    }
+}
+
+/// Whether `git branch` arguments only list or inspect branches in display format.
+/// Creating, deleting, renaming, copying, tracking, editing descriptions and
+/// machine-formatted output (`--format`) return `false`.
+fn git_branch_display(args: &[&str]) -> bool {
+    let mut list = false;
+    let mut iter = args.iter().copied().peekable();
+    while let Some(arg) = iter.next() {
+        if let Some(short) = arg
+            .strip_prefix('-')
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        {
+            if !short.chars().all(|c| matches!(c, 'a' | 'r' | 'v' | 'i')) {
+                return false;
+            }
+            continue;
+        }
+        if arg.starts_with("--") {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg, None), |(f, v)| (f, Some(v)));
+            match flag {
+                "--list" if inline.is_none() => list = true,
+                "--all" | "--remotes" | "--verbose" | "--ignore-case" | "--show-current"
+                | "--no-abbrev" | "--no-color" | "--no-column"
+                    if inline.is_none() => {}
+                "--color" | "--column" | "--abbrev" => {
+                    if inline.is_some_and(str::is_empty) {
+                        return false;
+                    }
+                }
+                "--merged" | "--no-merged" => {
+                    if inline.is_some_and(str::is_empty) {
+                        return false;
+                    }
+                    if inline.is_none() && iter.peek().is_some_and(|next| !next.starts_with('-')) {
+                        iter.next();
+                    }
+                }
+                "--contains" | "--no-contains" | "--points-at" => {
+                    let value = match inline {
+                        Some(v) => Some(v),
+                        None => iter.next(),
+                    };
+                    if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                        return false;
+                    }
+                }
+                "--sort" => {
+                    let value = match inline {
+                        Some(v) => Some(v),
+                        None => iter.next(),
+                    };
+                    if value.is_none_or(|v| v.is_empty() || v.starts_with("--")) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            continue;
+        }
+        // Positional operands create a branch unless `--list` puts `git branch` in
+        // pattern-listing mode.
+        if !list {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `words` is a read-only `cargo fmt --check` invocation with local paths
+/// and display/selection options only. Bare `cargo fmt` writes files and stays
+/// unapproved.
+fn cargo_fmt_check(words: &[&str]) -> bool {
+    let ["cargo", "fmt", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let (before, after) = match args.iter().position(|arg| *arg == "--") {
+        Some(at) => (&args[..at], &args[at + 1..]),
+        None => (args, &[][..]),
+    };
+    let mut check = false;
+    let mut iter = before.iter();
+    while let Some(&arg) = iter.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--check" if inline.is_none() => check = true,
+            "--all" | "-v" | "--verbose" | "-q" | "--quiet" | "--offline" | "--frozen"
+            | "--locked"
+                if inline.is_none() => {}
+            "-p" | "--package" | "--manifest-path" | "--color" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    let mut iter = after.iter();
+    while let Some(&arg) = iter.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--check" if inline.is_none() => check = true,
+            "-l" | "--files-with-diff" | "-v" | "--verbose" | "-q" | "--quiet"
+            | "--skip-children"
+                if inline.is_none() => {}
+            "--edition" | "--color" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    check
 }
 
 /// Whether a routed command may also run without the client asking, for a client
@@ -642,13 +774,17 @@ pub fn approvable(words: &[&str]) -> bool {
     }
     // Git display commands and JSON reads only read, and their options are
     // checked when they are routed.
-    if program == "git" || json_output(tool) {
+    if json_output(tool) {
         return true;
     }
+    if program == "git" {
+        return legacy_hook(tool);
+    }
     // A command routed for its preview alone installs, builds or reaches a
-    // service, so it runs only when the client asks.
+    // service, so it runs only when the client asks — except read-only
+    // `cargo fmt --check`, which only reports formatting diffs.
     if crate::known::listed(tool) {
-        return false;
+        return cargo_fmt_check(tool);
     }
     if !args.iter().all(|arg| local_argument(arg)) || runs_code(program, args) {
         return false;
@@ -1447,9 +1583,54 @@ mod tests {
             ("eslint --init", false),
             ("eslint --plugin x src", false),
             ("eslint src", true),
+            // Read-only `cargo fmt --check` is approved; mutating `cargo fmt` is not.
+            ("cargo fmt", false),
+            ("cargo fmt --all", false),
+            ("cargo fmt --check", true),
+            ("cargo fmt --all -- --check", true),
+            ("cargo fmt -p app -- --check --edition 2021", true),
+            (
+                "cargo fmt --manifest-path crates/a/Cargo.toml -- --check",
+                true,
+            ),
+            (
+                "cargo fmt --manifest-path ../outside/Cargo.toml -- --check",
+                false,
+            ),
+            ("cargo fmt --check --config net.offline=false", false),
+            ("cargo fmt -- --check --config-path rustfmt.toml", false),
+            ("cargo fmt -- --check --emit=stdout", false),
+            // Read-only `git branch` display is approved; mutating or formatted forms are not.
+            ("git branch", true),
+            ("git branch -a", true),
+            ("git branch -avv", true),
+            ("git branch -r --sort=-committerdate", true),
+            ("git branch --merged main", true),
+            ("git branch --no-merged", true),
+            ("git branch --contains HEAD", true),
+            ("git branch --list feat/*", true),
+            ("git branch --show-current", true),
+            ("git branch new-branch", false),
+            ("git branch -a new-branch", false),
+            ("git branch -d old", false),
+            ("git branch -D old", false),
+            ("git branch -m old new", false),
+            ("git branch -c old new", false),
+            ("git branch -f main HEAD", false),
+            ("git branch -u origin/main", false),
+            ("git branch --set-upstream-to=origin/main", false),
+            ("git branch --format=%(refname:short)", false),
+            ("git branch --list -d old", false),
+            ("git branch --contains", false),
         ] {
             let words: Vec<&str> = command.split(' ').collect();
             assert_eq!(approvable(&words), approved, "{command}");
         }
+        // `legacy_hook` and `approvable` agree on `git branch` forms.
+        assert!(legacy_hook(&["git", "branch", "-a"]));
+        assert!(legacy_hook(&["git", "branch", "--list", "feat/*"]));
+        assert!(!legacy_hook(&["git", "branch", "new-branch"]));
+        assert!(!legacy_hook(&["git", "branch", "-D", "old"]));
+        assert!(!legacy_hook(&["git", "branch", "--format=%(refname)"]));
     }
 }

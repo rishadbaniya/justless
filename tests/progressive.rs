@@ -1070,4 +1070,23 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
         matched.contains("#4 L4-4 import import  use std::path::PathBuf;\n"),
         "{matched}"
     );
+
+    // Budget-truncated outlines at normal budgets reserve room for the progress line
+    // while strictly honoring `--budget`.
+    let budgeted = String::from_utf8(out(
+        root,
+        &[
+            "read",
+            "lib.rs",
+            "--outline",
+            "--limit",
+            "40",
+            "--budget",
+            "320",
+        ],
+    ))
+    .unwrap();
+    assert!(budgeted.len() <= 320, "len={}: {budgeted}", budgeted.len());
+    assert!(budgeted.contains(" more "), "{budgeted}");
+    assert!(budgeted.contains("next --after "), "{budgeted}");
 }

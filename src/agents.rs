@@ -2219,16 +2219,57 @@ impl Plan {
         }
     }
 
-    /// Pass the whole line through, counting each command but a `cd` as passed.
+    /// Pass the whole line through, counting each command but a `cd` or safe
+    /// `set` preamble as passed.
     fn pass(&mut self, command: &str, segments: &[Range<usize>]) {
         self.wrap.clear();
         self.last = None;
         self.other = segments
             .iter()
-            .filter(|range| directory_change(&command[(*range).clone()]).is_none())
+            .filter(|range| {
+                let segment = &command[(*range).clone()];
+                directory_change(segment).is_none() && !safe_shell_set(segment)
+            })
             .cloned()
             .collect();
     }
+}
+
+/// Whether a segment in a command list only turns on `errexit` or `nounset` via
+/// `set` (`set -e`, `set -u`, `set -eu`, `set -o errexit`, `set -o nounset`),
+/// without changing `pipefail`, tracing, positional parameters or variables.
+fn safe_shell_set(segment: &str) -> bool {
+    let Some(words) = literal_command(segment) else {
+        return false;
+    };
+    let Some((first, rest)) = words.split_first() else {
+        return false;
+    };
+    if first != "set" || rest.is_empty() {
+        return false;
+    }
+    let mut iter = rest.iter().map(String::as_str);
+    while let Some(arg) = iter.next() {
+        let Some(flags) = arg.strip_prefix('-') else {
+            return false;
+        };
+        if flags.is_empty() || flags.starts_with('-') {
+            return false;
+        }
+        let mut chars = flags.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                'e' | 'u' => {}
+                'o' if chars.peek().is_none() => {
+                    if !matches!(iter.next(), Some("errexit" | "nounset")) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Whether a filter after a pipe only keeps the first lines of what it reads:
@@ -2360,6 +2401,7 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
             supported(segment, !rules.claude).map(|words| (within(range, words), Step::Run))
         };
         match change {
+            None if safe_shell_set(segment) => {}
             None => match step {
                 Some((words, step)) => plan.wrap.push(Wrap {
                     words,
@@ -2614,14 +2656,14 @@ pub fn command_label(command: &str) -> String {
                 .filter(|s| !s.is_empty())
                 .collect()
         });
-    let is_cd = |s: &&str| s.split_whitespace().next() == Some("cd");
+    let is_preamble = |s: &&str| s.split_whitespace().next() == Some("cd") || safe_shell_set(s);
     // Label `RUST_BACKTRACE=1 cargo test 2>&1` by the words a hook wraps.
     let words_of =
         |s: &str| crate::shell_form::parse(s).map_or(s.to_owned(), |f| s[f.command].to_owned());
     let first = segments
         .iter()
-        .find(|s| !is_cd(s) && supported_command(&words_of(s), false))
-        .or_else(|| segments.iter().find(|s| !is_cd(s)))
+        .find(|s| !is_preamble(s) && supported_command(&words_of(s), false))
+        .or_else(|| segments.iter().find(|s| !is_preamble(s)))
         .or(segments.first())
         .copied()
         .unwrap_or(command);
@@ -2911,6 +2953,24 @@ mod tests {
             ("cat a.md && rg -n x src | head -n 20\ngit status", true),
             ("cd src\nnl -ba a.rs | sed -n '5,9p'", true),
             ("rg -n x src | head -30", true),
+            (
+                "cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test",
+                true,
+            ),
+            ("cargo fmt && cargo test", false),
+            ("git status && git branch -a", true),
+            ("git status && git branch new-branch", false),
+            (
+                "set -e\ncargo clippy --all-targets -- -D warnings\ncargo test",
+                true,
+            ),
+            ("set -eu\ngit status\ngit branch -vv", true),
+            ("set -o errexit\ncargo check", true),
+            ("set -e", false),
+            ("set -o pipefail\ncargo test", false),
+            ("set -euo pipefail\ncargo test", false),
+            ("set -x\ncargo test", false),
+            ("set -- foo\ncargo test", false),
             ("cat a.md\ntail -n 20 b.log", false),
             ("cat a.md\npython3 x.py", false),
             ("rg -n x src | head -n 5 a.rs", false),

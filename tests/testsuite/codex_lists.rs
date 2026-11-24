@@ -121,6 +121,28 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
             "git status\ngit diff",
             Some("justless run --hook -- git status\njustless run --hook -- git diff".into()),
         ),
+        (
+            "set -e\ncargo fmt --all -- --check\ngit branch -a",
+            Some(
+                "set -e\njustless run --hook -- cargo fmt --all -- --check\njustless run --hook -- git branch -a"
+                    .into(),
+            ),
+        ),
+        (
+            "git status && git branch --merged main",
+            Some(
+                "justless run --hook -- git status && justless run --hook -- git branch --merged main"
+                    .into(),
+            ),
+        ),
+        // Mutating `cargo fmt`, `git branch` creation/deletion, and `set` options
+        // outside `errexit`/`nounset` stay as written.
+        ("cargo fmt && git status", None),
+        ("git status && git branch new-branch", None),
+        ("git branch -d old", None),
+        ("set -e", None),
+        ("set -o pipefail\ngit status", None),
+        ("set -x\ngit status", None),
         // A supported command piped only into `head` keeps the `head`.
         (
             "rg -n fn src | head -n 5",

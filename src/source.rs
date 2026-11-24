@@ -456,7 +456,8 @@ impl Snapshot {
             let room = budget.saturating_sub(page.display().len() + 42 + 32 + 1);
             page.parse_error = (room >= 32).then(|| clipped(error, room.min(240)));
         }
-        let mut size = page.display().len() + 42;
+        let reserve = if budget >= 256 { 80 } else { 42 };
+        let mut size = page.display().len() + reserve;
         let mut last = None;
         let filter = filter.to_lowercase();
         let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
