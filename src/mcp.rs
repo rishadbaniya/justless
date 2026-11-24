@@ -755,7 +755,7 @@ const TOOLS: &[Tool] = &[
                 "match",
                 "match",
                 Kind::Text,
-                "Rows whose name or signature contains this",
+                "Rows whose name or signature contains this (use a|b for multiple terms)",
             ),
             option(
                 "limit",

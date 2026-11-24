@@ -1071,6 +1071,31 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
         "{matched}"
     );
 
+    // Multi-term `--match a|b` matches entries containing any term, while
+    // space-containing filters stay literal substring matches.
+    let multi = String::from_utf8(out(
+        root,
+        &["read", "lib.rs", "--outline", "--match", "PathBuf|func_7"],
+    ))
+    .unwrap();
+    assert!(
+        multi.contains("#4 L4-4 import import  use std::path::PathBuf;\n"),
+        "{multi}"
+    );
+    assert!(
+        multi.contains("#12 L13-13 function func_7  pub fn func_7() -> usize\n"),
+        "{multi}"
+    );
+    assert!(!multi.contains("func_0"), "{multi}");
+
+    let literal_pipe = String::from_utf8(out(
+        root,
+        &["read", "lib.rs", "--outline", "--match", "PathBuf | func_7"],
+    ))
+    .unwrap();
+    assert!(!literal_pipe.contains("PathBuf"), "{literal_pipe}");
+    assert!(!literal_pipe.contains("func_7"), "{literal_pipe}");
+
     // Budget-truncated outlines at normal budgets reserve room for the progress line
     // while strictly honoring `--budget`.
     let budgeted = String::from_utf8(out(
@@ -1089,4 +1114,30 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
     assert!(budgeted.len() <= 320, "len={}: {budgeted}", budgeted.len());
     assert!(budgeted.contains(" more "), "{budgeted}");
     assert!(budgeted.contains("next --after "), "{budgeted}");
+
+    // `stats` measures outline views, avoids double-counting file bytes across
+    // repeated/paged/filtered outlines of the same unchanged file, and subtracts
+    // follow-up `expand` bytes from net outline savings.
+    let stats_json: Value = serde_json::from_slice(&out(root, &["stats", "--json"])).unwrap();
+    let outlines = &stats_json["source_outlines"];
+    assert_eq!(outlines["views"], 5, "{outlines}");
+    assert_eq!(outlines["whole_bytes"], source.len() as u64, "{outlines}");
+    assert_eq!(
+        outlines["expanded_bytes"],
+        (first_import.len() + func0.len()) as u64,
+        "{outlines}"
+    );
+    let shown = outlines["shown_bytes"].as_u64().unwrap();
+    let expanded = outlines["expanded_bytes"].as_u64().unwrap();
+    assert_eq!(
+        outlines["net_saved_bytes"].as_i64().unwrap(),
+        source.len() as i64 - shown as i64 - expanded as i64,
+        "{outlines}"
+    );
+    let stats_text = String::from_utf8(out(root, &["stats"])).unwrap();
+    assert!(
+        stats_text.contains("Source outlines: 5 view(s) printed "),
+        "{stats_text}"
+    );
+    assert!(stats_text.contains("expanded), net "), "{stats_text}");
 }

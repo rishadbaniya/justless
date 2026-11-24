@@ -370,6 +370,10 @@ struct Activity {
     /// `crate::seen`.
     #[serde(default)]
     deltas: Deltas,
+    /// Source outlines printed by `justless read` (CLI or MCP) instead of reading
+    /// the full file, alongside follow-up `expand` bytes on those outlined files.
+    #[serde(default)]
+    outlines: Outlines,
     /// Commands the Claude Code command hook left as written for the permission
     /// rules, by the permission mode the session reported. See `left_by_permissions`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -383,6 +387,16 @@ struct Deltas {
     views: u64,
     whole_bytes: u64,
     shown_bytes: u64,
+}
+
+/// Measured bytes for `justless read` outlines and follow-up `expand` calls on
+/// those outlined files.
+#[derive(Default, Serialize, Deserialize)]
+struct Outlines {
+    views: u64,
+    whole_bytes: u64,
+    shown_bytes: u64,
+    expanded_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -513,6 +527,65 @@ pub fn saw_outline(workspace: &Workspace, file: &str, digest: String) {
     saw_range(workspace, file, 0, 0, digest, true);
 }
 
+/// Records an outline printed by `justless read` (CLI or MCP) together with its
+/// measured file and output sizes for `stats`. Re-outlining or paging through an
+/// already-outlined unchanged file adds only `shown_bytes`, never double-counting
+/// `whole_bytes`.
+pub fn saw_outline_measured(
+    workspace: &Workspace,
+    file: &str,
+    digest: String,
+    file_bytes: u64,
+    shown_bytes: u64,
+) {
+    if workspace.prepare_state().is_err() {
+        return;
+    }
+    let _ = update(
+        &workspace.state.join("activity.json"),
+        |a: &mut Activity| {
+            let already_outlined = a
+                .reads
+                .iter()
+                .any(|r| r.file == file && r.digest == digest && r.outline);
+            if !already_outlined {
+                a.outlines.whole_bytes += file_bytes;
+            }
+            a.outlines.views += 1;
+            a.outlines.shown_bytes += shown_bytes;
+            record_read(a, file, 0, 0, digest, true);
+        },
+    );
+}
+
+/// Records a source slice printed by `justless expand` (CLI or MCP). When the
+/// same unchanged file was outlined, its `shown_bytes` are subtracted from net
+/// outline savings in `stats`.
+pub fn saw_expand(
+    workspace: &Workspace,
+    file: &str,
+    from: usize,
+    to: usize,
+    digest: String,
+    shown_bytes: u64,
+) {
+    if workspace.prepare_state().is_err() {
+        return;
+    }
+    let _ = update(
+        &workspace.state.join("activity.json"),
+        |a: &mut Activity| {
+            if a.reads
+                .iter()
+                .any(|r| r.file == file && r.digest == digest && r.outline)
+            {
+                a.outlines.expanded_bytes += shown_bytes;
+            }
+            record_read(a, file, from, to, digest, false);
+        },
+    );
+}
+
 pub(crate) fn saw_range(
     workspace: &Workspace,
     file: &str,
@@ -526,28 +599,39 @@ pub(crate) fn saw_range(
     }
     let _ = update(
         &workspace.state.join("activity.json"),
-        |a: &mut Activity| {
-            if let Some(i) = a.reads.iter().position(|r| {
-                r.file == file && r.from == from && r.to == to && r.outline == outline
-            }) {
-                let old = a.reads.remove(i);
-                if old.digest == digest && !outline {
-                    a.repeat_reads += 1;
-                }
-            }
-            a.reads.insert(
-                0,
-                Read {
-                    file: file.into(),
-                    digest,
-                    from,
-                    to,
-                    outline,
-                },
-            );
-            a.reads.truncate(32);
+        |a: &mut Activity| record_read(a, file, from, to, digest, outline),
+    );
+}
+
+fn record_read(
+    a: &mut Activity,
+    file: &str,
+    from: usize,
+    to: usize,
+    digest: String,
+    outline: bool,
+) {
+    if let Some(i) = a
+        .reads
+        .iter()
+        .position(|r| r.file == file && r.from == from && r.to == to && r.outline == outline)
+    {
+        let old = a.reads.remove(i);
+        if old.digest == digest && !outline {
+            a.repeat_reads += 1;
+        }
+    }
+    a.reads.insert(
+        0,
+        Read {
+            file: file.into(),
+            digest,
+            from,
+            to,
+            outline,
         },
     );
+    a.reads.truncate(32);
 }
 
 /// Records that `views` views printed `shown` bytes of changes since an
@@ -852,6 +936,13 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             .cmp(&a.totals.net_saved_bytes)
             .then(a.family.cmp(&b.family))
     });
+    let outlines = &activity.outlines;
+    let outline_saved = net_bytes(outlines.whole_bytes, outlines.shown_bytes, 0);
+    let outline_net = net_bytes(
+        outlines.whole_bytes,
+        outlines.shown_bytes,
+        outlines.expanded_bytes,
+    );
     if as_json {
         // The keys from before retrievals were measured keep their meaning:
         // `saved_*` and `estimated_tokens_saved` are savings at first preview.
@@ -880,6 +971,16 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
                 "shown_bytes": activity.deltas.shown_bytes,
                 "saved_bytes": activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes),
                 "estimated_tokens_saved": crate::tokens::Content::Code.tokens(activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes)),
+            },
+            "source_outlines": {
+                "views": outlines.views,
+                "whole_bytes": outlines.whole_bytes,
+                "shown_bytes": outlines.shown_bytes,
+                "expanded_bytes": outlines.expanded_bytes,
+                "saved_bytes": outline_saved,
+                "net_saved_bytes": outline_net,
+                "estimated_tokens_saved": crate::tokens::Content::Code.tokens_signed(outline_saved),
+                "estimated_tokens_net_saved": crate::tokens::Content::Code.tokens_signed(outline_net),
             },
             "redacted_secrets": secrets,
             "unredacted_replays": unredacted,
@@ -1053,6 +1154,22 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             human_bytes(deltas.whole_bytes),
             human_bytes(saved),
             crate::tokens::Content::Code.tokens(saved),
+            crate::tokens::Content::Code.bytes_per_token()
+        );
+    }
+    if outlines.views > 0 {
+        let expanded = if outlines.expanded_bytes > 0 {
+            format!(" (+{} expanded)", human_bytes(outlines.expanded_bytes))
+        } else {
+            String::new()
+        };
+        println!(
+            "Source outlines: {} view(s) printed {} instead of {}{expanded}, net {} kept out (≈{} tokens, estimated at {:.2} bytes per token for code)",
+            outlines.views,
+            human_bytes(outlines.shown_bytes),
+            human_bytes(outlines.whole_bytes),
+            signed_bytes(outline_net),
+            crate::tokens::Content::Code.tokens_signed(outline_net),
             crate::tokens::Content::Code.bytes_per_token()
         );
     }

@@ -64,7 +64,12 @@ pub fn commands() -> Vec<Cli<'static>> {
                     .hidden(true)
                     .requires("shell-range"),
             )
-            .arg(Arg::new("match").long("match").value_name("TEXT"))
+            .arg(
+                Arg::new("match")
+                    .long("match")
+                    .value_name("TEXT")
+                    .help("Keep entries matching TEXT (use a|b for multiple terms)"),
+            )
             .arg(
                 Arg::new("after")
                     .long("after")
@@ -460,6 +465,19 @@ impl Snapshot {
         let mut size = page.display().len() + reserve;
         let mut last = None;
         let filter = filter.to_lowercase();
+        let terms: Vec<&str> =
+            if !filter.is_empty() && !filter.contains(' ') && filter.contains('|') {
+                let parts: Vec<&str> = filter.split('|').collect();
+                if parts.iter().all(|part| !part.is_empty()) {
+                    parts
+                } else {
+                    vec![filter.as_str()]
+                }
+            } else if filter.is_empty() {
+                Vec::new()
+            } else {
+                vec![filter.as_str()]
+            };
         let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut index = start;
         while index < self.entries.len() {
@@ -500,14 +518,16 @@ impl Snapshot {
             } else {
                 let signature = words(&self.text[e.signature_start..e.header_end]);
                 // Matching also covers the docs and attributes the row leaves out.
-                if !filter.is_empty()
-                    && !e.name.to_lowercase().contains(&filter)
-                    && !words(&self.text[e.bytes.start..e.header_end])
-                        .to_lowercase()
-                        .contains(&filter)
-                {
-                    index += 1;
-                    continue;
+                if !terms.is_empty() {
+                    let name = e.name.to_lowercase();
+                    let header = words(&self.text[e.bytes.start..e.header_end]).to_lowercase();
+                    if !terms
+                        .iter()
+                        .any(|term| name.contains(term) || header.contains(term))
+                    {
+                        index += 1;
+                        continue;
+                    }
                 }
                 let row = Row {
                     id: index + 1,
@@ -900,12 +920,22 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
             crate::read_num(args, "limit", 1)?,
             budget,
         )?;
-        if args.is_present("json") {
-            serde_json::to_writer(io::stdout().lock(), &page)?;
+        let shown_bytes = if args.is_present("json") {
+            let encoded = serde_json::to_vec(&page)?;
+            io::stdout().lock().write_all(&encoded)?;
+            encoded.len() as u64
         } else {
-            print!("{}", page.display());
-        }
-        crate::history::saw_outline(ws, file, digest);
+            let rendered = page.display();
+            print!("{rendered}");
+            rendered.len() as u64
+        };
+        crate::history::saw_outline_measured(
+            ws,
+            file,
+            digest,
+            source.text.len() as u64,
+            shown_bytes,
+        );
     } else {
         if name == "edit" {
             return edit(ws, file, source, args);
@@ -918,28 +948,29 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
         let first = source.line(span.start);
         let last = source.line(span.end.saturating_sub(1));
         let content = &source.text[span.clone()];
-        if args.is_present("json") {
+        let shown_bytes = if args.is_present("json") {
             let anchor = source
                 .entries
                 .iter()
                 .position(|entry| entry.bytes == span)
                 .map(|index| source.reference(index))
                 .unwrap_or_else(|| format!("{}#L{first}-{last}", source.revision));
-            serde_json::to_writer(
-                io::stdout().lock(),
-                &serde_json::json!({
-                    "file": file, "revision": source.revision, "selector": anchor, "first": first, "last": last, "content": content,
-                }),
-            )?;
+            let encoded = serde_json::to_vec(&serde_json::json!({
+                "file": file, "revision": source.revision, "selector": anchor, "first": first, "last": last, "content": content,
+            }))?;
+            io::stdout().lock().write_all(&encoded)?;
+            encoded.len() as u64
         } else {
             io::stdout().lock().write_all(content.as_bytes())?;
-        }
-        crate::history::saw_source(
+            content.len() as u64
+        };
+        crate::history::saw_expand(
             ws,
             file,
             first,
             last,
             crate::capture::source_digest(source.text.as_bytes()),
+            shown_bytes,
         );
     }
     Ok(())
