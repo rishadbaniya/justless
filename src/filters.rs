@@ -600,7 +600,7 @@ fn docker_json(args: &[&str]) -> bool {
 
 pub fn legacy_hook(words: &[&str]) -> bool {
     match unwrap_tool(words) {
-        ["cargo", "build" | "check" | "clippy" | "test", ..]
+        ["cargo", "build" | "check" | "clippy" | "test" | "tree", ..]
         | ["make" | "gmake" | "ninja", ..]
         | ["cmake", "--build", ..]
         | ["gradle" | "gradlew" | "./gradlew", ..]
@@ -1600,6 +1600,14 @@ mod tests {
             ("cargo fmt --check --config net.offline=false", false),
             ("cargo fmt -- --check --config-path rustfmt.toml", false),
             ("cargo fmt -- --check --emit=stdout", false),
+            // Read-only `cargo tree` is approved with local paths and no `--config`/`-Z`.
+            (
+                "cargo tree -p app --no-default-features --edges normal",
+                true,
+            ),
+            ("cargo tree --config net.offline=false", false),
+            ("cargo tree -Z unstable-options", false),
+            ("cargo tree --manifest-path ../outside/Cargo.toml", false),
             // Read-only `git branch` display is approved; mutating or formatted forms are not.
             ("git branch", true),
             ("git branch -a", true),

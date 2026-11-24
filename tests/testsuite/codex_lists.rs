@@ -135,6 +135,14 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
                     .into(),
             ),
         ),
+        (
+            "cargo check -p app && cargo tree -p app --no-default-features --edges normal",
+            Some(
+                "justless run --hook -- cargo check -p app && justless run --hook -- cargo tree -p app --no-default-features --edges normal"
+                    .into(),
+            ),
+        ),
+        ("cargo tree --config net.offline=false", None),
         // Mutating `cargo fmt`, `git branch` creation/deletion, and `set` options
         // outside `errexit`/`nounset` stay as written.
         ("cargo fmt && git status", None),

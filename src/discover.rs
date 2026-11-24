@@ -21,7 +21,7 @@ use crate::history::{estimated_tokens, human_bytes, now_ms, utc_date};
 use crate::rewrite::Exclusions;
 use crate::workspace::Workspace;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Route {
     ThroughJustless,
@@ -73,7 +73,7 @@ impl Route {
             Self::SupportedNotRouted
         } else if routes(command, &none) {
             Self::Excluded
-        } else if !routes(label, &none) {
+        } else if !routes(label, &none) && !has_routable_segment(command, &routes) {
             Self::NotSupported
         } else if post_run && excluded_stage(exclusions, command) {
             Self::Excluded
@@ -81,6 +81,21 @@ impl Route {
             Self::PassedThrough
         }
     }
+}
+
+/// Whether any top-level segment of `command` would be routed on its own. This
+/// keeps chains such as `cargo fmt --all -- --check && python3 x.py` or
+/// `ls -la | grep foo` in `PassedThrough` when the bare command label alone
+/// (`cargo fmt`, `ls`) is not routed.
+fn has_routable_segment(command: &str, routes: &impl Fn(&str, &Exclusions) -> bool) -> bool {
+    let none = Exclusions::default();
+    command
+        .split(['\n', ';', '|'])
+        .flat_map(|part| part.split("&&"))
+        .flat_map(|part| part.split("||"))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .any(|part| routes(part, &none))
 }
 
 /// Whether an entry names the line, a command in it, or a command of a pipe
@@ -526,7 +541,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             "No Claude Code shell commands found for this workspace in the last {days} day(s) under {}.",
             dir.display()
         );
-        print_codex(workspace, &codex, days);
+        print_codex(workspace, &codex, days, plan);
         print_agy(workspace, &agy, days, plan);
         return Ok(());
     }
@@ -591,7 +606,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             }
         );
     }
-    print_codex(workspace, &codex, days);
+    print_codex(workspace, &codex, days, plan);
     print_agy(workspace, &agy, days, plan);
     Ok(())
 }
@@ -684,7 +699,7 @@ fn print_groups(groups: &BTreeMap<Route, Group>) {
 }
 
 /// The Codex part of the report, when Codex threads started in this workspace.
-fn print_codex(workspace: &Workspace, codex: &crate::rollouts::Coverage, days: u64) {
+fn print_codex(workspace: &Workspace, codex: &crate::rollouts::Coverage, days: u64, plan: bool) {
     let scan = &codex.scan;
     if scan.files == 0 {
         return;
@@ -715,6 +730,12 @@ fn print_codex(workspace: &Workspace, codex: &crate::rollouts::Coverage, days: u
         );
     }
     print_groups(&codex.groups);
+    if plan {
+        print_unrouted_plan(
+            &codex.groups,
+            "Unrouted Codex output by command family, largest first (labels only, no commands):",
+        );
+    }
     if codex.groups.contains_key(&Route::SupportedNotRouted) {
         println!(
             "\nSupported commands reached Codex unfiltered. Install or refresh hooks with `{} init --hooks --agent codex`, trust them with /hooks in Codex, then start a new session.",
@@ -736,38 +757,10 @@ fn print_agy(workspace: &Workspace, agy: &crate::agy_sessions::Coverage, days: u
     );
     print_groups(&agy.groups);
     if plan {
-        let mut ranked: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
-        for (route, group) in &agy.groups {
-            if matches!(route, Route::ThroughJustless | Route::Excluded) {
-                continue;
-            }
-            for (label, &(n, bytes)) in &group.labels {
-                let entry = ranked.entry(label.as_str()).or_default();
-                entry.0 += n;
-                entry.1 += bytes;
-                if *route == Route::SupportedNotRouted {
-                    entry.2 += bytes;
-                }
-            }
-        }
-        if !ranked.is_empty() {
-            let mut entries: Vec<_> = ranked.into_iter().collect();
-            entries.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
-            println!(
-                "\nUnrouted Antigravity CLI output by command family, largest first (labels only, no commands):"
-            );
-            for (label, (commands, bytes, now_bytes)) in entries.into_iter().take(12) {
-                let now = if now_bytes > 0 {
-                    format!(
-                        " · {} would compact now with a hook or `run --`",
-                        human_bytes(now_bytes)
-                    )
-                } else {
-                    String::new()
-                };
-                println!("  {label} ×{commands} ({}){now}", human_bytes(bytes));
-            }
-        }
+        print_unrouted_plan(
+            &agy.groups,
+            "Unrouted Antigravity CLI output by command family, largest first (labels only, no commands):",
+        );
     }
     if agy.groups.contains_key(&Route::SupportedNotRouted) {
         println!(
@@ -778,9 +771,43 @@ fn print_agy(workspace: &Workspace, agy: &crate::agy_sessions::Coverage, days: u
     }
 }
 
+fn print_unrouted_plan(groups: &BTreeMap<Route, Group>, heading: &str) {
+    let mut ranked: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
+    for (route, group) in groups {
+        if matches!(route, Route::ThroughJustless | Route::Excluded) {
+            continue;
+        }
+        for (label, &(n, bytes)) in &group.labels {
+            let entry = ranked.entry(label.as_str()).or_default();
+            entry.0 += n;
+            entry.1 += bytes;
+            if *route == Route::SupportedNotRouted {
+                entry.2 += bytes;
+            }
+        }
+    }
+    if ranked.is_empty() {
+        return;
+    }
+    let mut entries: Vec<_> = ranked.into_iter().collect();
+    entries.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
+    println!("\n{heading}");
+    for (label, (commands, bytes, now_bytes)) in entries.into_iter().take(12) {
+        let now = if now_bytes > 0 {
+            format!(
+                " · {} would compact now with a hook or `run --`",
+                human_bytes(now_bytes)
+            )
+        } else {
+            String::new()
+        };
+        println!("  {label} ×{commands} ({}){now}", human_bytes(bytes));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::FOOTER;
+    use super::{FOOTER, Route};
 
     #[test]
     fn footers_with_secret_counts_and_split_streams_count_as_routed() {
@@ -804,5 +831,41 @@ mod tests {
         ] {
             assert!(!FOOTER.is_match(&format!("output\n{line}")), "{line}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrouted_chains_with_routable_segments_count_as_passed_through() {
+        let none = crate::rewrite::Exclusions::default();
+        assert_eq!(
+            Route::unrouted(
+                "cargo fmt --all -- --check && python3 scripts/check.py",
+                "cargo fmt",
+                &none,
+                false,
+                crate::agents::codex_would_route,
+            ),
+            Route::PassedThrough
+        );
+        assert_eq!(
+            Route::unrouted(
+                "cargo fmt && python3 scripts/check.py",
+                "cargo fmt",
+                &none,
+                false,
+                crate::agents::codex_would_route,
+            ),
+            Route::NotSupported
+        );
+        assert_eq!(
+            Route::unrouted(
+                "ls -la | grep foo",
+                "ls",
+                &none,
+                false,
+                crate::agents::codex_would_route,
+            ),
+            Route::PassedThrough
+        );
     }
 }

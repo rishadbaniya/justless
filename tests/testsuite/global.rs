@@ -698,6 +698,21 @@ fn discover_and_stats_read_antigravity_cli_transcripts() {
         )
     };
     let secret_body = "SECRET_PAYLOAD_NEVER_PRINTED\n".repeat(40);
+    let bg_started = concat!(
+        "Created At: 2099-01-01T00:00:02Z\n",
+        "Tool is running as a background task with task id: conv/task-7\n",
+        "Task logs are available at: file:///tmp/task-7.log\n",
+    );
+    let bg_done = format!(
+        "<SYSTEM_MESSAGE>\n\
+         [Message] timestamp=2099-01-01T00:00:05Z sender=conv/task-7 content=Task id \"conv/task-7\" finished with result:\n\
+         A pre-tool hook changed the arguments of this tool call before it ran. Changed: CommandLine.\n\n\
+         Command exited with code 0.\n\n\
+         Command output:\n\
+         {secret_body}\
+         Log: file:///tmp/task-7.log\n\
+         </SYSTEM_MESSAGE>\n"
+    );
     let transcript = [
         json!({
             "type": "PLANNER_RESPONSE",
@@ -707,7 +722,8 @@ fn discover_and_stats_read_antigravity_cli_transcripts() {
                 {"name": "run_command", "args": {"CommandLine": "git diff"}},
                 {"name": "run_command", "args": {"CommandLine": "cargo test"}},
                 {"name": "run_command", "args": {"CommandLine": "cargo build"}},
-                {"name": "run_command", "args": {"CommandLine": "python3 custom.py"}}
+                {"name": "run_command", "args": {"CommandLine": "python3 custom.py"}},
+                {"name": "run_command", "args": {"CommandLine": "cargo clippy --all-targets -- -D warnings"}}
             ]
         }),
         json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": "file text"}),
@@ -715,6 +731,8 @@ fn discover_and_stats_read_antigravity_cli_transcripts() {
         json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": raw_output(&secret_body)}),
         json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": raw_output(&secret_body)}),
         json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": raw_output(&secret_body)}),
+        json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:02Z", "content": bg_started}),
+        json!({"type": "SYSTEM_MESSAGE", "created_at": "2099-01-01T00:00:05Z", "content": bg_done}),
     ];
     let text: String = transcript.iter().map(|r| format!("{r}\n")).collect();
     fs::write(logs.join("transcript_full.jsonl"), text).unwrap();
@@ -723,7 +741,7 @@ fn discover_and_stats_read_antigravity_cli_transcripts() {
         serde_json::from_str(&lab.run(&root, &words("discover --json --plan"))).unwrap();
     let agy_json = &report["agy"];
     assert_eq!(agy_json["sessions"], 1, "{agy_json}");
-    assert_eq!(agy_json["commands"], 4, "{agy_json}");
+    assert_eq!(agy_json["commands"], 5, "{agy_json}");
     let route_commands = |route: &str| {
         agy_json["groups"]
             .as_array()
@@ -732,13 +750,13 @@ fn discover_and_stats_read_antigravity_cli_transcripts() {
             .find(|g| g["route"] == route)
             .map_or(0, |g| g["commands"].as_u64().unwrap())
     };
-    assert_eq!(route_commands("through_justless"), 1, "{agy_json}");
+    assert_eq!(route_commands("through_justless"), 2, "{agy_json}");
     assert_eq!(route_commands("supported_not_routed"), 1, "{agy_json}");
     assert_eq!(route_commands("excluded"), 1, "{agy_json}");
     assert_eq!(route_commands("not_supported"), 1, "{agy_json}");
 
     let plain = lab.run(&root, &words("discover --plan"));
-    has(&plain, "Antigravity CLI ran 4 shell command(s) here");
+    has(&plain, "Antigravity CLI ran 5 shell command(s) here");
     has(&plain, "Unrouted Antigravity CLI output by command family");
     has(&plain, "cargo test ×1");
     lacks(&plain, "SECRET_PAYLOAD_NEVER_PRINTED");
@@ -747,13 +765,13 @@ fn discover_and_stats_read_antigravity_cli_transcripts() {
     let stats_text = lab.run(&root, &["stats"]);
     has(
         &stats_text,
-        "Antigravity CLI shell commands here: 4 returning ",
+        "Antigravity CLI shell commands here: 5 returning ",
     );
-    has(&stats_text, "1 of them (");
+    has(&stats_text, "2 of them (");
     let stats_json: Value = serde_json::from_str(&lab.run(&root, &words("stats --json"))).unwrap();
-    assert_eq!(stats_json["agy"]["commands"], 4, "{stats_json}");
+    assert_eq!(stats_json["agy"]["commands"], 5, "{stats_json}");
     assert_eq!(
-        stats_json["agy"]["through_justless_commands"], 1,
+        stats_json["agy"]["through_justless_commands"], 2,
         "{stats_json}"
     );
 }
