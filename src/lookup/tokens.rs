@@ -228,6 +228,12 @@ pub(crate) fn stem(word: &str) -> std::borrow::Cow<'_, str> {
     let length = stem.len();
     if stem.ends_with(b"ation") && length - 5 >= 4 {
         stem.truncate(length - 5);
+    } else if stem.ends_with(b"ion") && length - 3 >= 4 && matches!(stem[length - 4], b't' | b's') {
+        stem.truncate(length - 3);
+    } else if stem.ends_with(b"or") && length - 2 >= 4 && stem[length - 3] == b't' {
+        stem.truncate(length - 2);
+    } else if stem.ends_with(b"ery") && length > 5 {
+        stem.truncate(length - 1);
     } else if stem.ends_with(b"ate") && length - 3 >= 4 {
         stem.truncate(length - 3);
     } else if stripped && stem.ends_with(b"at") && length - 2 >= 4 {
@@ -382,6 +388,15 @@ mod tests {
         for (words, stemmed) in [
             ("retries retry retrying retried", "retri"),
             ("configured configuration configure", "configur"),
+            ("redaction redactor redacted redacting redact", "redact"),
+            (
+                "compaction compactor compacted compacting compact",
+                "compact",
+            ),
+            ("selection selector selected selecting select", "select"),
+            ("discovery discover discovered discovering", "discover"),
+            ("recovery recover recovered recovering", "recover"),
+            ("editor edit edited editing", "edit"),
             ("reconnecting reconnects", "reconnect"),
             ("called calling", "call"),
             ("handled handle", "handl"),

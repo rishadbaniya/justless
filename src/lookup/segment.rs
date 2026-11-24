@@ -23,7 +23,7 @@ use super::chunks::{Chunk, Class, FIELDS, PATH};
 use super::tokens::{self, Tokenizer};
 
 /// Bump on any tokenizer, chunker or format change.
-pub(crate) const LOOKUP_VERSION: u32 = 2;
+pub(crate) const LOOKUP_VERSION: u32 = 3;
 
 const MAGIC: &[u8; 4] = b"JLS1";
 const HEADER: usize = 108;
