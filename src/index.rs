@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -871,10 +872,17 @@ impl Index {
         self.outgoing[id].iter().map(|&edge| &self.edges[edge])
     }
 
+    /// Shortest link chain between `start` and `end`, preferring paths with fewer
+    /// inferred (`possible`) links before minimizing hop count so exact calls are
+    /// never bypassed by a shorter guessed link.
     pub fn path(&self, start: usize, end: usize) -> Option<Vec<(&Edge, bool)>> {
-        let mut queue = VecDeque::from([start]);
-        let mut previous = BTreeMap::from([(start, None)]);
-        while let Some(node) = queue.pop_front() {
+        let mut best = BTreeMap::from([(start, (0usize, 0usize))]);
+        let mut previous = BTreeMap::<usize, Option<(usize, usize, bool)>>::from([(start, None)]);
+        let mut heap = BinaryHeap::from([Reverse((0usize, 0usize, start))]);
+        while let Some(Reverse((inferred, hops, node))) = heap.pop() {
+            if best.get(&node).is_some_and(|&cost| cost < (inferred, hops)) {
+                continue;
+            }
             if node == end {
                 let mut route = Vec::new();
                 let mut current = node;
@@ -894,9 +902,11 @@ impl Index {
                         .filter_map(|&id| Some((self.edges[id].from?, id, true))),
                 );
             for (target, edge, reverse) in adjacent {
-                if let std::collections::btree_map::Entry::Vacant(entry) = previous.entry(target) {
-                    entry.insert(Some((node, edge, reverse)));
-                    queue.push_back(target);
+                let next_cost = (inferred + usize::from(self.edges[edge].inferred), hops + 1);
+                if best.get(&target).is_none_or(|&cost| next_cost < cost) {
+                    best.insert(target, next_cost);
+                    previous.insert(target, Some((node, edge, reverse)));
+                    heap.push(Reverse((next_cost.0, next_cost.1, target)));
                 }
             }
         }
@@ -1575,6 +1585,14 @@ impl Resolver<'_> {
         let path = &reference.path;
         if reference.inferred_receiver {
             let Some(name) = path.first() else { return };
+            // Ubiquitous Rust standard-library method names on untyped receivers
+            // (such as `Iterator::next`, `len`, `get`, `push`) almost always call
+            // stdlib rather than a local method that happens to share the name.
+            // Calls with a known receiver type (`self.next()`, `req.next()`) have
+            // `inferred_receiver == false` and still resolve normally.
+            if is_std_inferred_method(name) {
+                return;
+            }
             let candidates = self
                 .by_name
                 .get(name)
@@ -1786,6 +1804,203 @@ impl Resolver<'_> {
 
 /// The module of the same crate that an import path starting with `crate`,
 /// `self` or `super` names.
+/// Common Rust standard-library trait and collection method names that should not
+/// be guessed to point at an unrelated local method when the receiver type is
+/// unknown.
+fn is_std_inferred_method(name: &str) -> bool {
+    matches!(
+        name,
+        "next"
+            | "next_back"
+            | "peek"
+            | "peekable"
+            | "iter"
+            | "iter_mut"
+            | "into_iter"
+            | "map"
+            | "filter"
+            | "filter_map"
+            | "flat_map"
+            | "flatten"
+            | "collect"
+            | "fold"
+            | "try_fold"
+            | "for_each"
+            | "any"
+            | "all"
+            | "find"
+            | "find_map"
+            | "position"
+            | "rposition"
+            | "count"
+            | "take"
+            | "take_while"
+            | "skip"
+            | "skip_while"
+            | "enumerate"
+            | "zip"
+            | "chain"
+            | "rev"
+            | "copied"
+            | "cloned"
+            | "fuse"
+            | "nth"
+            | "last"
+            | "max"
+            | "min"
+            | "max_by"
+            | "min_by"
+            | "max_by_key"
+            | "min_by_key"
+            | "sum"
+            | "product"
+            | "partition"
+            | "unzip"
+            | "dedup"
+            | "unwrap"
+            | "unwrap_or"
+            | "unwrap_or_default"
+            | "unwrap_or_else"
+            | "expect"
+            | "ok"
+            | "err"
+            | "ok_or"
+            | "ok_or_else"
+            | "is_some"
+            | "is_some_and"
+            | "is_none"
+            | "is_none_or"
+            | "is_ok"
+            | "is_err"
+            | "and_then"
+            | "or_else"
+            | "map_or"
+            | "map_or_else"
+            | "as_ref"
+            | "as_mut"
+            | "as_deref"
+            | "as_deref_mut"
+            | "replace"
+            | "transpose"
+            | "context"
+            | "with_context"
+            | "clone"
+            | "clone_from"
+            | "default"
+            | "from"
+            | "into"
+            | "try_from"
+            | "try_into"
+            | "eq"
+            | "ne"
+            | "cmp"
+            | "partial_cmp"
+            | "hash"
+            | "fmt"
+            | "drop"
+            | "deref"
+            | "deref_mut"
+            | "borrow"
+            | "borrow_mut"
+            | "to_owned"
+            | "to_string"
+            | "as_str"
+            | "as_bytes"
+            | "as_slice"
+            | "as_path"
+            | "as_os_str"
+            | "into_owned"
+            | "into_bytes"
+            | "into_string"
+            | "len"
+            | "is_empty"
+            | "push"
+            | "push_str"
+            | "push_front"
+            | "push_back"
+            | "pop"
+            | "pop_front"
+            | "pop_back"
+            | "get"
+            | "get_mut"
+            | "first"
+            | "first_mut"
+            | "last_mut"
+            | "split_first"
+            | "split_last"
+            | "insert"
+            | "remove"
+            | "retain"
+            | "clear"
+            | "truncate"
+            | "extend"
+            | "append"
+            | "drain"
+            | "contains"
+            | "contains_key"
+            | "entry"
+            | "keys"
+            | "values"
+            | "values_mut"
+            | "sort"
+            | "sort_by"
+            | "sort_by_key"
+            | "sort_unstable"
+            | "binary_search"
+            | "starts_with"
+            | "ends_with"
+            | "strip_prefix"
+            | "strip_suffix"
+            | "trim"
+            | "trim_start"
+            | "trim_end"
+            | "trim_matches"
+            | "trim_start_matches"
+            | "trim_end_matches"
+            | "split"
+            | "split_once"
+            | "rsplit"
+            | "rsplit_once"
+            | "split_whitespace"
+            | "lines"
+            | "chars"
+            | "bytes"
+            | "char_indices"
+            | "to_lowercase"
+            | "to_uppercase"
+            | "to_ascii_lowercase"
+            | "to_ascii_uppercase"
+            | "repeat"
+            | "join"
+            | "parent"
+            | "file_name"
+            | "file_stem"
+            | "extension"
+            | "components"
+            | "exists"
+            | "is_file"
+            | "is_dir"
+            | "canonicalize"
+            | "to_path_buf"
+            | "to_string_lossy"
+            | "display"
+            | "read"
+            | "read_to_end"
+            | "read_to_string"
+            | "write"
+            | "write_all"
+            | "flush"
+            | "saturating_add"
+            | "saturating_sub"
+            | "saturating_mul"
+            | "checked_add"
+            | "checked_sub"
+            | "saturating_div"
+            | "div_ceil"
+            | "clamp"
+    )
+}
+
 fn local_module(module: &[String], path: &[String]) -> Option<Vec<String>> {
     let (first, mut rest) = path.split_first()?;
     let mut base = match first.as_str() {

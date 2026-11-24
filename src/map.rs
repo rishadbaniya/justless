@@ -356,8 +356,8 @@ pub(crate) fn is_test_file(file: &str) -> bool {
 
 /// Files that belong to tests, fixtures, scripts, examples or benchmarks rather
 /// than the project's primary source. Used to keep production code ahead of
-/// support code when ranking hubs, communities, links and entry points.
-fn is_support_file(file: &str) -> bool {
+/// support code when ranking hubs, communities, links, entry points and packs.
+pub(crate) fn is_support_file(file: &str) -> bool {
     is_test_file(file)
         || Path::new(file)
             .parent()

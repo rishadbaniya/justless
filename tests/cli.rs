@@ -17520,3 +17520,166 @@ fn claude_post_tool_hooks_are_installed_checked_and_removed_with_the_others() {
         assert!(!claude.exists() || !file_text(root, ".claude/settings.json").contains(mode));
     }
 }
+
+#[test]
+fn inferred_method_calls_skip_stdlib_and_path_prefers_exact_links() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            ("Cargo.toml", &edition_2021_manifest("graphcheck")),
+            (
+                "src/lib.rs",
+                r#"
+pub struct Cursor;
+
+impl Cursor {
+    fn next(&self) -> usize {
+        1
+    }
+
+    pub fn custom_step(&self) -> usize {
+        2
+    }
+}
+
+pub fn entry<T>(items: &[u32], raw: &[T]) -> usize {
+    let _ = items.iter().next();
+    let _ = raw.iter().map(|c| c.custom_step()).count();
+    middle(raw)
+}
+
+pub fn middle<T>(raw: &[T]) -> usize {
+    leaf(&[1, 2], raw)
+}
+
+pub fn leaf<T>(items: &[u32], raw: &[T]) -> usize {
+    let _ = raw.iter().map(|c| c.custom_step()).count();
+    items.iter().next().copied().unwrap_or(0) as usize
+}
+
+pub fn uses_cursor(cursor: &Cursor) -> usize {
+    cursor.next()
+}
+"#,
+            ),
+        ],
+    );
+    // Untyped `items.iter().next()` must not create bogus possible callers on `Cursor::next`,
+    // while a typed receiver (`cursor: &Cursor`) still resolves as an exact caller.
+    let callers = success(root, &["query", "Cursor::next", "--view", "callers"]);
+    assert!(
+        callers.contains("call from graphcheck::uses_cursor"),
+        "{callers}"
+    );
+    assert!(!callers.contains("entry"), "{callers}");
+    assert!(!callers.contains("leaf"), "{callers}");
+
+    // Even when a non-stdlib inferred method (`custom_step`) creates a shorter 2-hop
+    // possible shortcut between `entry` and `leaf`, `path` prefers the exact call chain.
+    let route = success(root, &["path", "entry", "leaf"]);
+    assert!(route.contains("graphcheck::middle"), "{route}");
+    assert!(!route.contains("Cursor::next"), "{route}");
+    assert!(!route.contains("custom_step"), "{route}");
+}
+
+#[test]
+fn pack_ranks_production_code_ahead_of_tests_and_handles_acronyms_and_stems() {
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    write_files(
+        root,
+        &[
+            ("Cargo.toml", &edition_2021_manifest("packcheck")),
+            (
+                "src/lib.rs",
+                r#"
+pub fn cli() -> &'static str {
+    "cli"
+}
+
+pub struct Redactor;
+
+impl Redactor {
+    pub fn redact(&self, input: &str) -> String {
+        input.to_owned()
+    }
+}
+
+pub fn discover_transcripts() -> usize {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn redactor() -> Redactor {
+        Redactor
+    }
+
+    #[test]
+    fn redaction_hides_secrets_in_previews() {
+        let _ = redactor().redact("secret");
+    }
+}
+"#,
+            ),
+            (
+                "tests/integration.rs",
+                r#"
+#[test]
+fn antigravity_cli_transcript_discovery_works() {
+    assert_eq!(packcheck::discover_transcripts(), 1);
+}
+"#,
+            ),
+        ],
+    );
+
+    // Stemming matches "redaction" to `Redactor`/`redact` in `src/`, ahead of
+    // both `#[test]` functions and inline `mod tests` helpers.
+    let redact_pack = success(
+        root,
+        &["pack", "how does redaction hide secrets in previews"],
+    );
+    let leads: Vec<_> = redact_pack
+        .lines()
+        .filter(|line| !line.starts_with(' '))
+        .collect();
+    assert!(
+        leads
+            .first()
+            .is_some_and(|line| line.contains("packcheck::Redactor")
+                || line.contains("packcheck::Redactor::redact")),
+        "{redact_pack}"
+    );
+    assert!(
+        !leads.iter().any(|line| line.contains("::tests::")),
+        "{redact_pack}"
+    );
+
+    // ALL-CAPS acronym `CLI` does not give an exact-identifier boost to lowercase
+    // `fn cli()`, and `discover_transcripts` in `src/` outranks `tests/integration.rs`.
+    let cli_pack = success(
+        root,
+        &["pack", "how does Antigravity CLI transcript discovery work"],
+    );
+    let cli_leads: Vec<_> = cli_pack
+        .lines()
+        .filter(|line| !line.starts_with(' '))
+        .collect();
+    assert!(
+        cli_leads
+            .first()
+            .is_some_and(|line| line.contains("packcheck::discover_transcripts")),
+        "{cli_pack}"
+    );
+    assert!(
+        !cli_leads
+            .iter()
+            .any(|line| line.contains("tests/integration.rs")),
+        "{cli_pack}"
+    );
+}
