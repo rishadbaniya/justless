@@ -445,9 +445,11 @@ impl Snapshot {
         let mut page = Page {
             revision: self.revision.clone(),
             lines: self.lines.len(),
+            total_entries: self.entries.len(),
             parse_error: None,
             entries: Vec::new(),
             next: None,
+            progress: None,
         };
         if let Some(error) = &self.parse_error {
             // Leave room for the cursor line and one short row.
@@ -458,25 +460,66 @@ impl Snapshot {
         let mut last = None;
         let filter = filter.to_lowercase();
         let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        for (index, e) in self.entries.iter().enumerate().skip(start) {
-            let signature = words(&self.text[e.signature_start..e.header_end]);
-            // Matching also covers the docs and attributes the row leaves out.
-            if !filter.is_empty()
-                && !e.name.to_lowercase().contains(&filter)
-                && !words(&self.text[e.bytes.start..e.header_end])
-                    .to_lowercase()
-                    .contains(&filter)
-            {
-                continue;
-            }
-            let mut row = Row {
-                id: index + 1,
-                name: clipped(&e.name, 100),
-                kind: e.kind.clone(),
-                first: self.line(e.bytes.start),
-                last: self.line(e.bytes.end.saturating_sub(1)),
-                signature: clipped(&signature, 160),
+        let mut index = start;
+        while index < self.entries.len() {
+            let e = &self.entries[index];
+            // Fold runs of 3+ contiguous imports in unfiltered outlines so large
+            // import blocks don't crowd real declarations off page 1. Individual
+            // `#N` entry IDs stay unchanged for `expand` and `edit`.
+            let (row, end_index) = if filter.is_empty() && e.kind == "import" {
+                let mut run_end = index + 1;
+                while run_end < self.entries.len() && self.entries[run_end].kind == "import" {
+                    run_end += 1;
+                }
+                let run_len = run_end - index;
+                if run_len >= 3 {
+                    let row = Row {
+                        id: index + 1,
+                        end_id: Some(run_end),
+                        name: format!("{run_len} items"),
+                        kind: "imports".into(),
+                        first: self.line(e.bytes.start),
+                        last: self.line(self.entries[run_end - 1].bytes.end.saturating_sub(1)),
+                        signature: String::new(),
+                    };
+                    (row, run_end - 1)
+                } else {
+                    let signature = words(&self.text[e.signature_start..e.header_end]);
+                    let row = Row {
+                        id: index + 1,
+                        end_id: None,
+                        name: clipped(&e.name, 100),
+                        kind: e.kind.clone(),
+                        first: self.line(e.bytes.start),
+                        last: self.line(e.bytes.end.saturating_sub(1)),
+                        signature: clipped(&signature, 160),
+                    };
+                    (row, index)
+                }
+            } else {
+                let signature = words(&self.text[e.signature_start..e.header_end]);
+                // Matching also covers the docs and attributes the row leaves out.
+                if !filter.is_empty()
+                    && !e.name.to_lowercase().contains(&filter)
+                    && !words(&self.text[e.bytes.start..e.header_end])
+                        .to_lowercase()
+                        .contains(&filter)
+                {
+                    index += 1;
+                    continue;
+                }
+                let row = Row {
+                    id: index + 1,
+                    end_id: None,
+                    name: clipped(&e.name, 100),
+                    kind: e.kind.clone(),
+                    first: self.line(e.bytes.start),
+                    last: self.line(e.bytes.end.saturating_sub(1)),
+                    signature: clipped(&signature, 160),
+                };
+                (row, index)
             };
+            let mut row = row;
             let row_size = row.display().len();
             if let Some(id) = last
                 && (page.entries.len() == limit || size + row_size > budget)
@@ -491,7 +534,21 @@ impl Snapshot {
             }
             size += row.display().len();
             page.entries.push(row);
-            last = Some(index);
+            last = Some(end_index);
+            index = end_index + 1;
+        }
+        if let Some(shown) = page.next_index() {
+            let remaining = self.entries.len().saturating_sub(shown);
+            if remaining > 0 {
+                let noun = if remaining == 1 { "entry" } else { "entries" };
+                let line = format!(
+                    "… {remaining} more {noun} ({shown} of {})\n",
+                    self.entries.len()
+                );
+                if page.display().len() + line.len() <= budget {
+                    page.progress = Some(line);
+                }
+            }
         }
         Ok(page)
     }
@@ -521,6 +578,7 @@ impl Snapshot {
                 );
                 (lines.0 <= last && lines.1 >= first).then(|| Row {
                     id: index + 1,
+                    end_id: None,
                     kind: entry.kind.clone(),
                     name: clipped(&entry.name, 100),
                     first: lines.0,
@@ -661,14 +719,19 @@ fn clipped(text: &str, max: usize) -> String {
 pub struct Page {
     revision: String,
     lines: usize,
+    total_entries: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_error: Option<String>,
     entries: Vec<Row>,
     next: Option<String>,
+    #[serde(skip)]
+    progress: Option<String>,
 }
 #[derive(Serialize)]
 struct Row {
     id: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_id: Option<usize>,
     kind: String,
     name: String,
     first: usize,
@@ -677,13 +740,29 @@ struct Row {
 }
 impl Row {
     fn display(&self) -> String {
-        format!(
-            "#{} L{}-{} {} {}  {}\n",
-            self.id, self.first, self.last, self.kind, self.name, self.signature
-        )
+        if let Some(end_id) = self.end_id {
+            format!(
+                "#{}..#{} L{}-{} {} ({})\n",
+                self.id, end_id, self.first, self.last, self.kind, self.name
+            )
+        } else {
+            format!(
+                "#{} L{}-{} {} {}  {}\n",
+                self.id, self.first, self.last, self.kind, self.name, self.signature
+            )
+        }
     }
 }
 impl Page {
+    pub(crate) fn next_index(&self) -> Option<usize> {
+        self.next
+            .as_deref()?
+            .split_once('#')?
+            .1
+            .parse::<usize>()
+            .ok()
+    }
+
     pub fn display(&self) -> String {
         let mut out = format!("revision {} · {} lines\n", self.revision, self.lines);
         if let Some(error) = &self.parse_error {
@@ -694,6 +773,9 @@ impl Page {
             out.push_str(&row.display());
         }
         if let Some(next) = &self.next {
+            if let Some(progress) = &self.progress {
+                out.push_str(progress);
+            }
             out.push_str(&format!("next --after {next}\n"));
         }
         out

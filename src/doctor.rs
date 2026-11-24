@@ -1387,8 +1387,15 @@ impl Doctor<'_> {
             .iter()
             .filter_map(|name| Client::parse(name).ok())
         {
-            let file = client.file();
-            let text = match fs::read_to_string(self.workspace.root.join(file)) {
+            let Ok(path) = client.path(self.workspace) else {
+                continue;
+            };
+            let file = if client.is_global() {
+                path.display().to_string()
+            } else {
+                client.file().to_owned()
+            };
+            let text = match fs::read_to_string(&path) {
                 Ok(text) if text.contains("justless") => text,
                 _ => continue,
             };

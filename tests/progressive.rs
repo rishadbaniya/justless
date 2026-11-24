@@ -1009,3 +1009,65 @@ fn script_outlines_show_or_keep_top_level_code_the_rows_leave_out() {
         );
     }
 }
+
+#[test]
+fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let root = repo.path();
+    let mut source = String::from(
+        "use std::collections::BTreeMap;\n\
+         use std::fs;\n\
+         use std::io;\n\
+         use std::path::PathBuf;\n\n",
+    );
+    for index in 0..8 {
+        source.push_str(&format!("pub fn func_{index}() -> usize {{ {index} }}\n"));
+    }
+    fs::write(root.join("lib.rs"), &source).unwrap();
+
+    // Unfiltered outline folds the 4 contiguous imports into one line while
+    // keeping exact `#N` IDs for expand/edit and reporting progress when paged.
+    let outline =
+        String::from_utf8(out(root, &["read", "lib.rs", "--outline", "--limit", "3"])).unwrap();
+    assert!(
+        outline.contains("#1..#4 L1-4 imports (4 items)\n"),
+        "{outline}"
+    );
+    assert!(
+        outline.contains("#5 L6-6 function func_0  pub fn func_0() -> usize\n"),
+        "{outline}"
+    );
+    assert!(
+        outline.contains("… 6 more entries (6 of 12)\n"),
+        "{outline}"
+    );
+    let rev = outline
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    assert!(
+        outline.contains(&format!("next --after {rev}#6\n")),
+        "{outline}"
+    );
+
+    // Individual `#N` selectors inside and after the folded block still expand exact bytes.
+    let first_import =
+        String::from_utf8(out(root, &["expand", "lib.rs", &format!("{rev}#1")])).unwrap();
+    assert_eq!(first_import, "use std::collections::BTreeMap;");
+    let func0 = String::from_utf8(out(root, &["expand", "lib.rs", &format!("{rev}#5")])).unwrap();
+    assert_eq!(func0, "pub fn func_0() -> usize { 0 }");
+
+    // Filtering with `--match` searches individual imports without folding them.
+    let matched = String::from_utf8(out(
+        root,
+        &["read", "lib.rs", "--outline", "--match", "PathBuf"],
+    ))
+    .unwrap();
+    assert!(
+        matched.contains("#4 L4-4 import import  use std::path::PathBuf;\n"),
+        "{matched}"
+    );
+}

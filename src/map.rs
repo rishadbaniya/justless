@@ -354,6 +354,59 @@ pub(crate) fn is_test_file(file: &str) -> bool {
         || stem.ends_with("Tests")
 }
 
+/// Files that belong to tests, fixtures, scripts, examples or benchmarks rather
+/// than the project's primary source. Used to keep production code ahead of
+/// support code when ranking hubs, communities, links and entry points.
+fn is_support_file(file: &str) -> bool {
+    is_test_file(file)
+        || Path::new(file)
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .any(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some(
+                        "tests"
+                            | "test"
+                            | "__tests__"
+                            | "spec"
+                            | "specs"
+                            | "fixtures"
+                            | "fixture"
+                            | "scripts"
+                            | "script"
+                            | "examples"
+                            | "benches"
+                            | "bench"
+                    )
+                )
+            })
+}
+
+/// Whether an area name such as `tests/` or `fixtures/` represents support code.
+fn is_support_area(area: &str) -> bool {
+    Path::new(area).components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some(
+                "tests"
+                    | "test"
+                    | "__tests__"
+                    | "spec"
+                    | "specs"
+                    | "fixtures"
+                    | "fixture"
+                    | "scripts"
+                    | "script"
+                    | "examples"
+                    | "benches"
+                    | "bench"
+            )
+        )
+    })
+}
+
 pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("1 {noun}")
@@ -494,6 +547,27 @@ fn areas(index: &Index) -> BTreeMap<&str, String> {
             break;
         };
         if total == 0 || size * 2 <= total || !largest.ends_with('/') || largest == "(root)" {
+            break;
+        }
+        // Keep a flat directory of many files (such as `src/` with dozens of
+        // sibling modules) intact instead of shattering it into single-file
+        // areas that all sink below `tests/` or `fixtures/`. Split when it has
+        // a small set of direct children or when subdirectories hold at least
+        // half of its symbols.
+        let mut direct_children = BTreeSet::new();
+        let mut subdir_symbols = 0;
+        for (file, area) in &assigned {
+            if *area != largest {
+                continue;
+            }
+            if let Some(rest) = file.strip_prefix(largest) {
+                direct_children.insert(rest.split('/').next().unwrap_or(rest));
+                if rest.contains('/') {
+                    subdir_symbols += symbols.get(file).copied().unwrap_or(0);
+                }
+            }
+        }
+        if direct_children.len() > 12 && subdir_symbols * 2 < size {
             break;
         }
         splits.insert(largest.trim_end_matches('/').to_owned());
@@ -808,7 +882,12 @@ fn hub_section(graph: &Graph) -> Section {
     let mut hubs: Vec<usize> = (0..graph.index.definitions.len())
         .filter(|&id| central(graph.definition(id)) && degrees.rank(id).1 > 0)
         .collect();
-    hubs.sort_by_key(|&id| graph.rank(id));
+    hubs.sort_by_key(|&id| {
+        (
+            is_support_file(&graph.definition(id).location.file),
+            graph.rank(id),
+        )
+    });
     let mut section = Section::new(
         "hubs",
         "Hubs · in = dependents, out = dependencies".into(),
@@ -837,7 +916,13 @@ fn hub_section(graph: &Graph) -> Section {
 }
 
 fn community_section(graph: &Graph) -> Section {
-    let groups = communities(graph.index);
+    let mut groups = communities(graph.index);
+    groups.sort_by_key(|members| {
+        let support_only = members
+            .iter()
+            .all(|&id| is_support_file(&graph.definition(id).location.file));
+        (support_only, Reverse(members.len()), members[0])
+    });
     let mut section = Section::new(
         "communities",
         format!("Communities · {} groups of linked symbols", groups.len()),
@@ -927,6 +1012,7 @@ fn link_section(graph: &Graph) -> Section {
     let mut crossings: Vec<_> = crossings.into_iter().collect();
     crossings.sort_by_key(|((from, to, source, target), crossing)| {
         (
+            is_support_area(from) && is_support_area(to),
             source == target,
             Reverse(crossing.certain),
             Reverse(crossing.count),
@@ -1030,7 +1116,13 @@ fn entry_section(graph: &Graph) -> Section {
     }
     let mut listed = BTreeSet::new();
     entries.retain(|(_, id, _)| listed.insert(*id));
-    entries.sort_by_key(|(order, id, _)| (*order, graph.rank(*id)));
+    entries.sort_by_key(|(order, id, _)| {
+        (
+            is_support_file(&definitions[*id].location.file),
+            *order,
+            graph.rank(*id),
+        )
+    });
     let mut section = Section::new(
         "entry_points",
         format!("Entry points · {}", entries.len()),

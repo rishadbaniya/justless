@@ -296,6 +296,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
     };
     let since_ms = now_ms().saturating_sub(days.saturating_mul(86_400_000));
     let codex = crate::rollouts::coverage(workspace, since_ms);
+    let agy = crate::agy_sessions::coverage(workspace, since_ms);
     // Past commands are judged by the rules in force now, or by none while the
     // settings fail to load.
     let exclusions = Exclusions::of(workspace).unwrap_or_default();
@@ -515,6 +516,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             "groups": groups_json(&groups),
             "what_if": what_if_json(&groups),
             "codex": codex.json(),
+            "agy": agy.json(),
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -525,6 +527,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             dir.display()
         );
         print_codex(workspace, &codex, days);
+        print_agy(workspace, &agy, days, plan);
         return Ok(());
     }
     println!(
@@ -589,6 +592,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
         );
     }
     print_codex(workspace, &codex, days);
+    print_agy(workspace, &agy, days, plan);
     Ok(())
 }
 
@@ -714,6 +718,61 @@ fn print_codex(workspace: &Workspace, codex: &crate::rollouts::Coverage, days: u
     if codex.groups.contains_key(&Route::SupportedNotRouted) {
         println!(
             "\nSupported commands reached Codex unfiltered. Install or refresh hooks with `{} init --hooks --agent codex`, trust them with /hooks in Codex, then start a new session.",
+            workspace.justless()
+        );
+    }
+}
+
+/// The Antigravity CLI part of the report, when Antigravity CLI sessions ran in this workspace.
+fn print_agy(workspace: &Workspace, agy: &crate::agy_sessions::Coverage, days: u64, plan: bool) {
+    let total = agy.commands();
+    if total == 0 {
+        return;
+    }
+    println!(
+        "\nAntigravity CLI ran {total} shell command(s) here in the last {days} day(s), across {} session(s), returning {} of output.",
+        agy.scan.sessions.len(),
+        human_bytes(agy.bytes())
+    );
+    print_groups(&agy.groups);
+    if plan {
+        let mut ranked: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
+        for (route, group) in &agy.groups {
+            if matches!(route, Route::ThroughJustless | Route::Excluded) {
+                continue;
+            }
+            for (label, &(n, bytes)) in &group.labels {
+                let entry = ranked.entry(label.as_str()).or_default();
+                entry.0 += n;
+                entry.1 += bytes;
+                if *route == Route::SupportedNotRouted {
+                    entry.2 += bytes;
+                }
+            }
+        }
+        if !ranked.is_empty() {
+            let mut entries: Vec<_> = ranked.into_iter().collect();
+            entries.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
+            println!(
+                "\nUnrouted Antigravity CLI output by command family, largest first (labels only, no commands):"
+            );
+            for (label, (commands, bytes, now_bytes)) in entries.into_iter().take(12) {
+                let now = if now_bytes > 0 {
+                    format!(
+                        " · {} would compact now with a hook or `run --`",
+                        human_bytes(now_bytes)
+                    )
+                } else {
+                    String::new()
+                };
+                println!("  {label} ×{commands} ({}){now}", human_bytes(bytes));
+            }
+        }
+    }
+    if agy.groups.contains_key(&Route::SupportedNotRouted) {
+        println!(
+            "\nSupported commands reached Antigravity CLI unfiltered. Install or refresh hooks with `{} init --hooks --agent agy` (or `{} init --global --agent agy`), then start a new session.",
+            workspace.justless(),
             workspace.justless()
         );
     }

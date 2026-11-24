@@ -1127,7 +1127,8 @@ fn relative_file(text: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Client setup
 
-/// MCP clients with a verified project-level config file.
+/// MCP clients with a verified config file (project-level, or user-level for
+/// Antigravity CLI's `~/.gemini/config/mcp_config.json`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Client {
     Claude,
@@ -1135,10 +1136,12 @@ pub enum Client {
     Gemini,
     VsCode,
     Codex,
+    Agy,
 }
 
 impl Client {
-    pub(crate) const NAMES: [&'static str; 5] = ["claude", "cursor", "gemini", "vscode", "codex"];
+    pub(crate) const NAMES: [&'static str; 6] =
+        ["claude", "cursor", "gemini", "vscode", "codex", "agy"];
 
     pub(crate) fn parse(name: &str) -> Result<Self> {
         Ok(match name {
@@ -1147,6 +1150,7 @@ impl Client {
             "gemini" => Self::Gemini,
             "vscode" => Self::VsCode,
             "codex" => Self::Codex,
+            "agy" => Self::Agy,
             _ => bail!("unknown MCP client: {name}"),
         })
     }
@@ -1158,10 +1162,17 @@ impl Client {
             Self::Gemini => "Gemini CLI",
             Self::VsCode => "VS Code",
             Self::Codex => "Codex",
+            Self::Agy => "Antigravity CLI",
         }
     }
 
-    /// Project config file, relative to the workspace root.
+    /// Whether this client's MCP config is user-level rather than project-local.
+    pub(crate) fn is_global(self) -> bool {
+        self == Self::Agy
+    }
+
+    /// Project config file, relative to the workspace root (or the global file
+    /// name for `Client::Agy`; use [`Self::path`] for the resolved path).
     ///
     /// Sources, checked 2026-11-18:
     /// - Claude Code `.mcp.json` `mcpServers`, stdio when `type` is absent:
@@ -1175,6 +1186,7 @@ impl Client {
     ///   <https://code.visualstudio.com/docs/copilot/reference/mcp-configuration>
     /// - Codex `.codex/config.toml` `[mcp_servers.NAME]`, trusted projects only:
     ///   <https://learn.chatgpt.com/docs/extend/mcp?surface=cli>
+    /// - Antigravity CLI `~/.gemini/config/mcp_config.json` `mcpServers` (global)
     pub fn file(self) -> &'static str {
         match self {
             Self::Claude => ".mcp.json",
@@ -1182,7 +1194,17 @@ impl Client {
             Self::Gemini => ".gemini/settings.json",
             Self::VsCode => ".vscode/mcp.json",
             Self::Codex => ".codex/config.toml",
+            Self::Agy => "~/.gemini/config/mcp_config.json",
         }
+    }
+
+    pub(crate) fn path(self, workspace: &Workspace) -> Result<PathBuf> {
+        if self == Self::Agy {
+            return crate::global::config_dir(crate::agents::Agent::Agy)
+                .context("no home directory to find Antigravity MCP config in")
+                .map(|dir| dir.join("mcp_config.json"));
+        }
+        Ok(workspace.root.join(self.file()))
     }
 
     pub(crate) fn servers_key(self) -> &'static str {
@@ -1204,7 +1226,7 @@ impl Client {
                 "command": "justless",
                 "args": ["mcp", "--root", "${workspaceFolder}"],
             }),
-            Self::Claude | Self::Gemini | Self::Codex => {
+            Self::Claude | Self::Gemini | Self::Codex | Self::Agy => {
                 json!({"command": "justless", "args": ["mcp"]})
             }
         }
@@ -1219,7 +1241,7 @@ pub struct ConfigFile {
     pub contents: Option<String>,
 }
 
-/// Renders each client's project config with the `justless` server added.
+/// Renders each client's config with the `justless` server added.
 /// Every other key is preserved, and an existing `justless` entry is kept
 /// as it is.
 pub fn config_entries(
@@ -1229,13 +1251,14 @@ pub fn config_entries(
     clients
         .iter()
         .map(|&client| {
-            let relative = client.file();
-            let path = workspace.root.join(relative);
-            if let Some(directory) = Path::new(relative)
-                .parent()
-                .filter(|dir| *dir != Path::new(""))
-            {
-                match fs::symlink_metadata(workspace.root.join(directory)) {
+            let path = client.path(workspace)?;
+            let display = if client.is_global() {
+                path.display().to_string()
+            } else {
+                client.file().to_owned()
+            };
+            if let Some(directory) = path.parent().filter(|dir| *dir != workspace.root) {
+                match fs::symlink_metadata(directory) {
                     Ok(metadata) => ensure!(
                         metadata.is_dir(),
                         "{} must be a directory",
@@ -1250,10 +1273,10 @@ pub fn config_entries(
             }
             let original = read_regular(&path)?;
             let contents = if client == Client::Codex {
-                merge_toml(relative, &original, &client.server_entry())?
+                merge_toml(&display, &original, &client.server_entry())?
             } else {
                 merge_json(
-                    relative,
+                    &display,
                     &original,
                     client.servers_key(),
                     client.server_entry(),
@@ -1342,17 +1365,30 @@ fn read_regular(path: &Path) -> Result<String> {
 }
 
 fn install(workspace: &Workspace, clients: &BTreeSet<Client>) -> Result<()> {
-    workspace.prepare_state()?;
-    let _guard = lock_state(&workspace.state.join("setup.lock"))?;
+    let project_local = clients.iter().any(|client| !client.is_global());
+    let _guard = if project_local {
+        workspace.prepare_state()?;
+        Some(lock_state(&workspace.state.join("setup.lock"))?)
+    } else {
+        None
+    };
     // Validate every selected file before writing any of them.
     let files = config_entries(workspace, clients)?;
-    // Absolute paths show which project was changed.
+    // Absolute paths show which project or user config was changed.
     for file in files {
         let path = file.path.display();
         match file.contents {
             Some(contents) => {
-                crate::uninstall::remember(workspace, &file.path, &contents);
-                private_dir(file.path.parent().context("config directory")?)?;
+                let parent = file.path.parent().context("config directory")?;
+                if file.client.is_global() {
+                    if fs::symlink_metadata(parent).is_err() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("create {}", parent.display()))?;
+                    }
+                } else {
+                    crate::uninstall::remember(workspace, &file.path, &contents);
+                    private_dir(parent)?;
+                }
                 write_text(&file.path, &contents)?;
                 println!("{}: added justless to {path}", file.client.label());
             }

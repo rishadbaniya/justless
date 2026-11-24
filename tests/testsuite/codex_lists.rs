@@ -186,10 +186,11 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
         ("nl -ba delim.txt | sed -n '3,3p'", None),
     ];
     for (line, expected) in &cases {
-        assert_eq!(&lab.rewrite("codex", line), expected, "{line:?}");
+        assert_eq!(&lab.rewrite("codex", line), expected, "codex: {line:?}");
+        assert_eq!(&lab.rewrite("agy", line), expected, "agy: {line:?}");
     }
-    // Newline lists and reads inside lists are Codex's alone.
-    for agent in ["claude", "cursor", "agy", "gemini"] {
+    // Newline lists and reads inside lists belong to Codex and Antigravity CLI.
+    for agent in ["claude", "cursor", "gemini"] {
         assert_eq!(lab.rewrite(agent, "git status\ngit diff"), None, "{agent}");
     }
     assert_eq!(

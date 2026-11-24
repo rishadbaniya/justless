@@ -1,5 +1,6 @@
 mod adaptive;
 mod agents;
+mod agy_sessions;
 mod batch;
 mod capture;
 mod cargo_tests;
@@ -270,7 +271,7 @@ fn cli() -> Command<'static> {
         )
         .subcommand(
             Command::new("discover")
-                .about("Find shell commands agents ran here without Justless, from Claude Code transcripts and Codex rollouts")
+                .about("Find shell commands agents ran here without Justless, from Claude Code, Codex and Antigravity CLI transcripts")
                 .arg(number("days", "30", "Days of transcripts to scan"))
                 .arg(Arg::new("json").long("json").help("Print a JSON report"))
                 .arg(

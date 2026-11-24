@@ -58,6 +58,7 @@ impl Lab {
             .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))
             .env("CODEX_HOME", self.home.join(".codex"))
             .env_remove("JUSTLESS_TEST_AGY_CONFIG_DIR")
+            .env_remove("JUSTLESS_TEST_AGY_HOME")
             .env(
                 "JUSTLESS_TEST_CLAUDE_MANAGED_DIR",
                 self.base.join("managed"),
@@ -660,4 +661,99 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
         "{left}"
     );
     lacks(&left.to_string(), "--global");
+}
+
+#[test]
+fn discover_and_stats_read_antigravity_cli_transcripts() {
+    let lab = Lab::new();
+    let root = lab.project("work", "exclude_commands = [\"cargo build\"]\n");
+    let agy = lab.home.join(".gemini/antigravity-cli");
+    let session = "11111111-2222-3333-4444-555555555555";
+    let logs = agy
+        .join("brain")
+        .join(session)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        agy.join("history.jsonl"),
+        format!(
+            "{}\n",
+            json!({"conversationId": session, "workspace": root, "timestamp": 4_000_000_000_000u64})
+        ),
+    )
+    .unwrap();
+    let rewritten = concat!(
+        "Created At: 2099-01-01T00:00:00Z\n",
+        "Completed At: 2099-01-01T00:00:01Z\n",
+        "A pre-tool hook changed the arguments of this tool call before it ran. Changed: CommandLine.\n\n",
+        "Created At: 2099-01-01T00:00:00Z\n",
+        "Completed At: 2099-01-01T00:00:01Z\n",
+        "Command exited with code 0.\n\n",
+        "Command output:\n",
+        "short preview\n",
+    );
+    let raw_output = |body: &str| {
+        format!(
+            "Created At: 2099-01-01T00:00:00Z\nCompleted At: 2099-01-01T00:00:01Z\nCommand exited with code 0.\n\nCommand output:\n{body}"
+        )
+    };
+    let secret_body = "SECRET_PAYLOAD_NEVER_PRINTED\n".repeat(40);
+    let transcript = [
+        json!({
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2099-01-01T00:00:00Z",
+            "tool_calls": [
+                {"name": "read_file", "args": {"Path": "/tmp/a"}},
+                {"name": "run_command", "args": {"CommandLine": "git diff"}},
+                {"name": "run_command", "args": {"CommandLine": "cargo test"}},
+                {"name": "run_command", "args": {"CommandLine": "cargo build"}},
+                {"name": "run_command", "args": {"CommandLine": "python3 custom.py"}}
+            ]
+        }),
+        json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": "file text"}),
+        json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": rewritten}),
+        json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": raw_output(&secret_body)}),
+        json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": raw_output(&secret_body)}),
+        json!({"type": "GENERIC", "created_at": "2099-01-01T00:00:01Z", "content": raw_output(&secret_body)}),
+    ];
+    let text: String = transcript.iter().map(|r| format!("{r}\n")).collect();
+    fs::write(logs.join("transcript_full.jsonl"), text).unwrap();
+
+    let report: Value =
+        serde_json::from_str(&lab.run(&root, &words("discover --json --plan"))).unwrap();
+    let agy_json = &report["agy"];
+    assert_eq!(agy_json["sessions"], 1, "{agy_json}");
+    assert_eq!(agy_json["commands"], 4, "{agy_json}");
+    let route_commands = |route: &str| {
+        agy_json["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["route"] == route)
+            .map_or(0, |g| g["commands"].as_u64().unwrap())
+    };
+    assert_eq!(route_commands("through_justless"), 1, "{agy_json}");
+    assert_eq!(route_commands("supported_not_routed"), 1, "{agy_json}");
+    assert_eq!(route_commands("excluded"), 1, "{agy_json}");
+    assert_eq!(route_commands("not_supported"), 1, "{agy_json}");
+
+    let plain = lab.run(&root, &words("discover --plan"));
+    has(&plain, "Antigravity CLI ran 4 shell command(s) here");
+    has(&plain, "Unrouted Antigravity CLI output by command family");
+    has(&plain, "cargo test ×1");
+    lacks(&plain, "SECRET_PAYLOAD_NEVER_PRINTED");
+    lacks(&plain, "custom.py");
+
+    let stats_text = lab.run(&root, &["stats"]);
+    has(
+        &stats_text,
+        "Antigravity CLI shell commands here: 4 returning ",
+    );
+    has(&stats_text, "1 of them (");
+    let stats_json: Value = serde_json::from_str(&lab.run(&root, &words("stats --json"))).unwrap();
+    assert_eq!(stats_json["agy"]["commands"], 4, "{stats_json}");
+    assert_eq!(
+        stats_json["agy"]["through_justless_commands"], 1,
+        "{stats_json}"
+    );
 }

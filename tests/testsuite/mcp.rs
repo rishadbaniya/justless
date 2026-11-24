@@ -792,3 +792,44 @@ fn find_tool_narrows_by_path_and_glob_and_pages_with_a_cursor() {
         "[--limit 2 reached after 4 of 5 matches in 5 files]\n",
     );
 }
+
+#[test]
+fn mcp_install_agy_updates_global_mcp_config_and_doctor_checks_it() {
+    let repo = mixed_fixture();
+    let root = repo.path();
+    let agy_dir = TempDir::new().unwrap();
+    let config = agy_dir.path().join("mcp_config.json");
+    fs::write(
+        &config,
+        r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#,
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .current_dir(root)
+            .env("JUSTLESS_TEST_AGY_CONFIG_DIR", agy_dir.path())
+            .output()
+            .unwrap()
+    };
+    let out = run(&["mcp", "--install", "agy"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    has(&text(&out.stdout), "Antigravity CLI: added justless to ");
+    assert!(!root.join(".justless").exists());
+
+    let installed: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(installed["mcpServers"]["other"]["command"], "other-mcp");
+    assert_eq!(
+        installed["mcpServers"]["justless"],
+        json!({"command": "justless", "args": ["mcp"]})
+    );
+
+    let again = run(&["mcp", "--install", "agy"]);
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    has(&text(&again.stdout), "already lists justless");
+
+    let doctor = run(&["doctor"]);
+    has(&text(&doctor.stdout), "Antigravity CLI:");
+    has(&text(&doctor.stdout), "mcp_config.json");
+}

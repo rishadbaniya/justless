@@ -977,17 +977,18 @@ fn outside_read(ws: &Workspace, path: &Path, mut response: Value) -> Option<Valu
         return None;
     }
     let page = source.page("", None, 40, budget).ok()?;
-    let shown = serde_json::to_value(&page).ok()?["entries"]
-        .as_array()?
-        .len();
+    let next_entry = page.next_index();
     let display = page.display();
     // The revision and the `next --after` cursor serve workspace commands only.
     let (header, rows) = display.split_once('\n')?;
     let lines = header.rsplit_once(" · ")?.1;
     let (mut body, cursor): (String, String) = rows
         .split_inclusive('\n')
-        .partition(|line| !line.starts_with("next --after "));
-    if let Some((_, _, first, _)) = symbols.get(shown).filter(|_| !cursor.is_empty()) {
+        .partition(|line| !line.starts_with("next --after ") && !line.starts_with("… "));
+    if let Some((_, _, first, _)) = next_entry
+        .and_then(|index| symbols.get(index))
+        .filter(|_| !cursor.is_empty())
+    {
         body.push_str(&format!(
             "More rows start at L{first}; Read from offset {first} for them.\n"
         ));
@@ -1415,6 +1416,8 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         .max_by_key(|root| root.components().count())?;
     let workspace = Workspace::discover(Some(&root)).ok()?.working_in(&cwd);
     // The answer allows the rewrite, so it takes only what Codex's hook approves.
+    // Like Codex, Antigravity has no output-rewriting post-tool hook, so it also
+    // gets Codex's pre-command script lists, read lists and `| head` windows.
     let rewritten = wrap_event(
         &workspace,
         &cwd,
@@ -1424,7 +1427,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
             mixed: false,
             claude: false,
             approves: true,
-            codex: false,
+            codex: true,
         },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))

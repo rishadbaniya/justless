@@ -2996,6 +2996,40 @@ fn map_orients_with_located_areas_hubs_links_and_entry_points() {
     ] {
         has_line(&map, expected);
     }
+
+    // A flat `src/` with many sibling files stays intact as `src/` instead of
+    // shattering into dozens of single-file areas below `tests/` or `scripts/`,
+    // and production hubs/entries rank ahead of test and script helpers.
+    let flat = TempDir::new().unwrap();
+    let mut files: Vec<(String, String)> = vec![
+        ("Cargo.toml".into(), "[package]\nname = \"flat\"\nversion = \"0.1.0\"\n".into()),
+        ("src/main.rs".into(), "mod core;\nfn main() { core::hub(); }\n".into()),
+        ("src/core.rs".into(), "pub fn hub() {}\n".into()),
+        (
+            "tests/helpers.rs".into(),
+            "pub fn helper() {}\n#[test]\nfn t1() { helper(); }\n#[test]\nfn t2() { helper(); }\n#[test]\nfn t3() { helper(); }\n#[test]\nfn t4() { helper(); }\n".into(),
+        ),
+        (
+            "scripts/bench.py".into(),
+            "def a(): pass\ndef b(): pass\ndef c(): pass\ndef d(): pass\ndef main():\n    a()\n    b()\n    c()\n    d()\n".into(),
+        ),
+    ];
+    for index in 0..14 {
+        files.push((
+            format!("src/mod_{index}.rs"),
+            format!("pub fn f_{index}() {{ crate::core::hub(); }}\n"),
+        ));
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    write_files(flat.path(), &refs);
+    let json: serde_json::Value =
+        serde_json::from_str(&success(flat.path(), &["map", "--json"])).unwrap();
+    assert_eq!(json["areas"][0]["area"], "src/", "{json}");
+    assert_eq!(json["hubs"][0]["file"], "src/core.rs", "{json}");
+    assert_eq!(json["entry_points"][0]["file"], "src/main.rs", "{json}");
 }
 
 #[test]

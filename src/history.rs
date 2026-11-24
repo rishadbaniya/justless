@@ -830,6 +830,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
     let recalls = archive_recalls(&workspace.state, since);
     let proxy = crate::proxy::report(workspace, since, recalls.proxy_bytes)?;
     let codex = crate::rollouts::stats(workspace, since);
+    let agy = crate::agy_sessions::stats(workspace, since);
     let usage = sessions
         .then(|| crate::tokens::sessions(&workspace.root, since))
         .flatten();
@@ -882,6 +883,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             "archive_recalls": {"recalls": recalls.count, "bytes": recalls.bytes},
             "preview_budgets": crate::adaptive::stats_json(workspace),
             "codex": codex.as_ref().map(|codex| &codex.json),
+            "agy": agy.as_ref().map(|agy| &agy.json),
         });
         if sessions {
             report["claude_code_sessions"] = crate::tokens::sessions_json(usage.as_ref(), days);
@@ -1063,6 +1065,9 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
     }
     if let Some(codex) = &codex {
         println!("{}", codex.line);
+    }
+    if let Some(agy) = &agy {
+        println!("{}", agy.line);
     }
     if let Some(proxy) = &proxy {
         proxy.print(days, &workspace.justless());
