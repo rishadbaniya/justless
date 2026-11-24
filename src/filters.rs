@@ -598,6 +598,29 @@ fn docker_json(args: &[&str]) -> bool {
     }
 }
 
+/// Skip Git global options that only disable pagers/locks or control pathspec
+/// matching without changing directory, repository or configuration.
+pub(crate) fn git_display_subcommand<'a, 'b>(mut args: &'a [&'b str]) -> &'a [&'b str] {
+    while let Some((first, tail)) = args.split_first() {
+        if matches!(
+            *first,
+            "--no-pager"
+                | "-P"
+                | "--no-optional-locks"
+                | "--no-replace-objects"
+                | "--literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+        ) {
+            args = tail;
+        } else {
+            break;
+        }
+    }
+    args
+}
+
 pub fn legacy_hook(words: &[&str]) -> bool {
     match unwrap_tool(words) {
         ["cargo", "build" | "check" | "clippy" | "test" | "tree", ..]
@@ -607,11 +630,14 @@ pub fn legacy_hook(words: &[&str]) -> bool {
         | ["mvn" | "mvnw" | "./mvnw", ..]
         | ["dotnet", "build" | "test" | "restore", ..]
         | ["swift", "build" | "test", ..]
-        | ["git", "diff" | "show" | "status" | "log", ..]
         | ["go", "test" | "build", ..]
         | ["python" | "python3", "-m", "pytest", ..]
         | ["pytest" | "rg", ..] => true,
-        ["git", "branch", rest @ ..] => git_branch_display(rest),
+        ["git", rest @ ..] => match git_display_subcommand(rest) {
+            ["diff" | "show" | "status" | "log", ..] => true,
+            ["branch", branch_args @ ..] => git_branch_display(branch_args),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1630,6 +1656,19 @@ mod tests {
             ("git branch --format=%(refname:short)", false),
             ("git branch --list -d old", false),
             ("git branch --contains", false),
+            // Safe non-interactive Git global flags (`--no-pager`, `-P`, `--no-optional-locks`)
+            // are approved for display subcommands; `-c`, `-C`, `--paginate` stay unapproved.
+            ("git --no-pager diff", true),
+            ("git -P log -n 20", true),
+            ("git --no-pager --no-optional-locks status -sb", true),
+            ("git --no-pager branch -a", true),
+            ("git --no-pager grep -n foo", true),
+            ("git --no-pager ls-files", true),
+            ("git --no-pager branch new-branch", false),
+            ("git --no-pager push", false),
+            ("git -c diff.external=evil diff", false),
+            ("git -C /tmp diff", false),
+            ("git --paginate diff", false),
         ] {
             let words: Vec<&str> = command.split(' ').collect();
             assert_eq!(approvable(&words), approved, "{command}");

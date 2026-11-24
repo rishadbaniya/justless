@@ -143,6 +143,16 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
             ),
         ),
         ("cargo tree --config net.offline=false", None),
+        (
+            "git --no-pager status -sb && git -P diff --stat && git --no-pager grep -n fn src",
+            Some(
+                "justless run --hook -- git --no-pager status -sb && justless run --hook -- git -P diff --stat && justless run --hook -- git --no-pager grep -n fn src"
+                    .into(),
+            ),
+        ),
+        ("git -c diff.external=cat diff", None),
+        ("git -C src diff", None),
+        ("git --paginate log", None),
         // Mutating `cargo fmt`, `git branch` creation/deletion, and `set` options
         // outside `errexit`/`nounset` stay as written.
         ("cargo fmt && git status", None),

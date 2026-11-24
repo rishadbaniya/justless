@@ -261,8 +261,11 @@ fn spec<'w, 'a>(words: &'w [&'a str]) -> Option<(Option<&'static Spec>, &'w [&'a
     Some(match (basename(program), args) {
         ("rg", _) => (Some(&RG), args),
         ("grep" | "egrep" | "fgrep", _) => (Some(&GREP), args),
-        ("git", ["grep", rest @ ..]) => (Some(&GIT_GREP), rest),
-        ("git", ["ls-files", rest @ ..]) => (Some(&LS_FILES), rest),
+        ("git", rest) => match crate::filters::git_display_subcommand(rest) {
+            ["grep", tail @ ..] => (Some(&GIT_GREP), tail),
+            ["ls-files", tail @ ..] => (Some(&LS_FILES), tail),
+            _ => return None,
+        },
         ("ag", _) => (Some(&AG), args),
         ("ack" | "ack-grep", _) => (Some(&ACK), args),
         ("ls", _) => (Some(&LS), args),

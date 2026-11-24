@@ -87,6 +87,11 @@ pub fn label(words: &[&str]) -> String {
     {
         return "other".into();
     }
+    let rest = if program == "git" {
+        crate::filters::git_display_subcommand(rest)
+    } else {
+        rest
+    };
     match rest.first() {
         Some(sub)
             if SUBCOMMANDS.contains(&program)

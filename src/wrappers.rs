@@ -149,7 +149,8 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                         | "--glob-pathspecs"
                         | "--noglob-pathspecs"
                         | "--icase-pathspecs"
-                        | "--no-replace-objects" => i += 1,
+                        | "--no-replace-objects"
+                        | "--no-optional-locks" => i += 1,
                         word if word.starts_with("--git-dir=")
                             || word.starts_with("--work-tree=")
                             || word.starts_with("--namespace=")
