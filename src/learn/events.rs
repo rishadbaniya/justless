@@ -138,7 +138,8 @@ pub struct Event {
     pub session: String,
     /// Read from an agent transcript or rollout, which holds the text the agent read.
     pub transcript: bool,
-    /// Read from a Codex rollout rather than a Claude Code transcript.
+    /// Read from a Codex rollout or Antigravity CLI transcript rather than a
+    /// Claude Code transcript, so rules it supports target AGENTS.md.
     pub codex: bool,
     pub time_ms: u64,
     /// The command as the agent wrote it. Used for privacy and operand checks only.
@@ -448,6 +449,57 @@ pub fn rollouts(
         });
     });
     stats.directory = scan.home.map(|home| home.join("sessions"));
+    stats.available = stats.directory.as_ref().is_some_and(|dir| dir.is_dir());
+    stats.files = scan.files;
+}
+
+/// Shell commands from Antigravity CLI transcripts of sessions in this workspace,
+/// read like transcript results. A rule they support goes to AGENTS.md, which
+/// Antigravity CLI reads.
+pub fn agy_sessions(
+    workspace: &Workspace,
+    since_ms: u64,
+    stats: &mut TranscriptStats,
+    result: &mut Transcripts,
+) {
+    let mut normalizer = Normalizer::new(&workspace.root);
+    let scan = crate::agy_sessions::scan(&workspace.root, since_ms, |shell| {
+        // A call a hook or sandbox refused, or that returned no exit status, never finished.
+        let Some(code) = shell.status else {
+            stats.not_run += 1;
+            return;
+        };
+        let cwd = Path::new(&shell.cwd)
+            .strip_prefix(&workspace.root)
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let file = shell.file.to_string_lossy().into_owned();
+        let call = Pending {
+            command: shell.command,
+            cwd,
+            time_ms: shell.time_ms,
+            session: session_key(&shell.session),
+        };
+        let event = event(
+            workspace,
+            &mut normalizer,
+            &shell.output,
+            Status::Code(code),
+            call,
+            &file,
+            stats,
+            &mut result.linked,
+        );
+        result.events.push(Event {
+            codex: true,
+            pointer: Pointer::Transcript {
+                file,
+                line: shell.line,
+            },
+            ..event
+        });
+    });
+    stats.directory = scan.home.map(|home| home.join("brain"));
     stats.available = stats.directory.as_ref().is_some_and(|dir| dir.is_dir());
     stats.files = scan.files;
 }

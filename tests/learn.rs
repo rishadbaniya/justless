@@ -166,8 +166,9 @@ impl Lab {
             .env("PATH", &self.bin)
             .env("SHELL", &self.shell)
             .env("HOME", self.base.join("home"))
-            // Codex rollouts are read from the lab's home directory.
+            // Codex rollouts and Antigravity CLI transcripts are read from the lab's home directory.
             .env_remove("CODEX_HOME")
+            .env_remove("JUSTLESS_TEST_AGY_HOME")
             .env_remove("JUSTLESS_SESSION")
             .env_remove("CLAUDE_PROJECT_DIR");
         command
@@ -1847,4 +1848,75 @@ fn learn_reads_codex_rollouts() {
     assert_eq!(report["apply"]["targets"], json!(["AGENTS.md"]));
     let text = lab.text(&[]);
     contains(&text, "Also read 1 Codex session(s) (2 shell results).");
+}
+
+#[test]
+fn learn_reads_antigravity_cli_transcripts() {
+    let lab = Lab::new();
+    lab.tool("python3", "exit 0");
+    let at = timestamp(now_ms() - 30 * MINUTE);
+    let agy_home = lab.base.join("home/.gemini/antigravity-cli");
+    let logs = agy_home.join("brain/conv-1/.system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        agy_home.join("history.jsonl"),
+        format!(
+            "{}\n",
+            json!({"conversationId": "conv-1", "workspace": lab.root})
+        ),
+    )
+    .unwrap();
+    // One Antigravity CLI session: a direct call fails, and a backgrounded call
+    // finishes in a SYSTEM_MESSAGE and corrects it.
+    let failed = concat!(
+        "Created At: 2026-11-25T00:05:32+05:45\n",
+        "Completed At: 2026-11-25T00:05:33+05:45\n",
+        "Command exited with code 127.\n\n",
+        "Command output:\n",
+        "bash: python: command not found\n",
+    );
+    let bg_started = concat!(
+        "Created At: 2026-11-25T00:06:00+05:45\n",
+        "Tool is running as a background task with task id: conv-1/task-2\n",
+        "Task logs are available at: file:///tmp/task-2.log\n",
+    );
+    let bg_done = concat!(
+        "<SYSTEM_MESSAGE>\n",
+        "[Message] timestamp=2026-11-25T00:06:05Z sender=conv-1/task-2 content=Task id \"conv-1/task-2\" finished with result:\n",
+        "Command exited with code 0.\n\n",
+        "Command output:\n",
+        "generated\n",
+        "Log: file:///tmp/task-2.log\n",
+        "</SYSTEM_MESSAGE>\n",
+    );
+    let records = [
+        json!({
+            "type": "PLANNER_RESPONSE",
+            "created_at": at,
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "python scripts/gen.py"}}],
+        }),
+        json!({"type": "GENERIC", "created_at": at, "content": failed}),
+        json!({
+            "type": "PLANNER_RESPONSE",
+            "created_at": at,
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "python3 scripts/gen.py"}}],
+        }),
+        json!({"type": "GENERIC", "created_at": at, "content": bg_started}),
+        json!({"type": "SYSTEM_MESSAGE", "created_at": at, "content": bg_done}),
+    ];
+    let mut body = String::new();
+    for record in records {
+        body.push_str(&format!("{record}\n"));
+    }
+    fs::write(logs.join("transcript_full.jsonl"), body).unwrap();
+    let report = lab.json(&[]);
+    assert_eq!(rule(&report["rules"], PYTHON_RULE)["corrections"], 1);
+    assert_eq!(report["sources"]["agy_sessions"]["results"], 2);
+    // Antigravity CLI reads AGENTS.md, so a rule from its transcripts does not create CLAUDE.md.
+    assert_eq!(report["apply"]["targets"], json!(["AGENTS.md"]));
+    let text = lab.text(&[]);
+    contains(
+        &text,
+        "Also read 1 Antigravity CLI session(s) (2 shell results).",
+    );
 }

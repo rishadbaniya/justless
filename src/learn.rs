@@ -150,9 +150,13 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let mut transcripts = events::transcripts(workspace, since, &mut transcript_stats);
     let mut codex_stats = events::TranscriptStats::default();
     events::rollouts(workspace, since, &mut codex_stats, &mut transcripts);
+    let mut agy_stats = events::TranscriptStats::default();
+    events::agy_sessions(workspace, since, &mut agy_stats, &mut transcripts);
     let sessions: BTreeSet<String> = transcript_stats
         .sessions
-        .union(&codex_stats.sessions)
+        .iter()
+        .chain(&codex_stats.sessions)
+        .chain(&agy_stats.sessions)
         .cloned()
         .collect();
     let mut run_stats = events::RunStats::default();
@@ -392,6 +396,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         min_sessions,
         transcripts: &transcript_stats,
         codex: &codex_stats,
+        agy: &agy_stats,
         runs: &run_stats,
         proposed: &proposed,
         held: &held,
@@ -465,6 +470,7 @@ struct Report<'a> {
     min_sessions: u64,
     transcripts: &'a events::TranscriptStats,
     codex: &'a events::TranscriptStats,
+    agy: &'a events::TranscriptStats,
     runs: &'a events::RunStats,
     proposed: &'a [&'a Rule<'a>],
     held: &'a [(&'a Rule<'a>, Reason)],
@@ -590,6 +596,15 @@ impl Report<'_> {
                     "results": self.codex.results,
                     "not_run": self.codex.not_run,
                 },
+                "agy_sessions": {
+                    "available": self.agy.available,
+                    "directory": self.agy.directory.as_ref().map(|dir| dir.to_string_lossy()),
+                    "files": self.agy.files,
+                    "sessions": self.agy.sessions.len(),
+                    "threads": self.agy.threads.len(),
+                    "results": self.agy.results,
+                    "not_run": self.agy.not_run,
+                },
                 "runs": {
                     "available": r.available,
                     "scanned": r.scanned,
@@ -649,6 +664,13 @@ impl Report<'_> {
                 "Also read {} Codex session(s) ({} shell results).\n",
                 thousands(self.codex.sessions.len() as u64),
                 thousands(self.codex.results)
+            ));
+        }
+        if self.agy.results > 0 {
+            out.push_str(&format!(
+                "Also read {} Antigravity CLI session(s) ({} shell results).\n",
+                thousands(self.agy.sessions.len() as u64),
+                thousands(self.agy.results)
             ));
         }
         if !t.available {

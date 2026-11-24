@@ -847,7 +847,7 @@ Every file is read and checked first. A config file that never mentions justless
 
 ## Learned command rules
 
-`justless learn` reads this workspace's archived runs, its Claude Code transcripts and the Codex rollouts of threads that started here from the last 30 days (`--days`), including subagent and workflow transcripts. Codex calls from code-mode scripts count with the output the script received. Rules that only Codex rollouts support go to `AGENTS.md`, which Codex reads. It proposes short rules for command mistakes that agents corrected or keep repeating. It runs locally, makes no model calls and runs none of the recorded commands; the only program it starts is `git check-ignore`, to learn which instruction files Git shares.
+`justless learn` reads this workspace's archived runs, its Claude Code transcripts, the Codex rollouts of threads that started here and Antigravity CLI transcripts for this workspace from the last 30 days (`--days`), including subagent and workflow transcripts. Codex calls from code-mode scripts and completed background Antigravity CLI commands count with the output the agent received. Rules that only Codex rollouts or Antigravity CLI transcripts support go to `AGENTS.md`, which both clients read. It proposes short rules for command mistakes that agents corrected or keep repeating. It runs locally, makes no model calls and runs none of the recorded commands; the only program it starts is `git check-ignore`, to learn which instruction files Git shares.
 
 Without `--apply`, the report shows what `--apply` would write. An instructions file it cannot read, a learned block with bad markers or an unreadable `.justless/learned.json` becomes a note in the preview; `--apply` stops on it before writing anything.
 

@@ -11,7 +11,7 @@
 //!
 //! Only command labels and byte counts leave this module's callers; command lines
 //! and output are scanned, never printed.
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -23,9 +23,15 @@ use crate::discover::{Group, Route};
 
 /// One shell command Antigravity CLI ran.
 pub(crate) struct Shell {
+    pub file: PathBuf,
+    pub line: usize,
     pub session: String,
+    pub cwd: String,
     pub command: String,
-    /// Output bytes after stripping Antigravity's timestamp/status wrapper.
+    pub time_ms: u64,
+    /// Exit status from `Command exited with code N.`, if reported.
+    pub status: Option<i32>,
+    /// Output text after stripping Antigravity's timestamp, truncation and status headers.
     pub output: String,
     pub bytes: u64,
     /// Whether Antigravity prefixed the result with its `CommandLine` rewrite notice.
@@ -141,15 +147,21 @@ fn read(
         return;
     };
     // Each `tool_calls` slot matches the next `GENERIC` result in order:
-    // `Some((command, time_ms))` for `run_command`, `None` for any other tool.
-    let mut pending: VecDeque<Option<(String, u64)>> = VecDeque::new();
-    for line in BufReader::new(handle).lines() {
+    // `Some((command, cwd, time_ms))` for `run_command`, `None` for any other tool.
+    let mut pending: VecDeque<Option<(String, String, u64)>> = VecDeque::new();
+    // Background `run_command` calls return a task id first and deliver their
+    // real exit code and output in a later `SYSTEM_MESSAGE`.
+    let mut pending_tasks: HashMap<String, (String, String, u64, bool)> = HashMap::new();
+    for (index, line) in BufReader::new(handle).lines().enumerate() {
         let Ok(line) = line else {
             break;
         };
         let wanted = line.contains("\"PLANNER_RESPONSE\"")
             || line.contains("\"USER_INPUT\"")
-            || !pending.is_empty() && line.contains("\"GENERIC\"");
+            || !pending.is_empty() && line.contains("\"GENERIC\"")
+            || !pending_tasks.is_empty()
+                && line.contains("\"SYSTEM_MESSAGE\"")
+                && line.contains("finished with result:");
         if !wanted {
             continue;
         }
@@ -172,7 +184,11 @@ fn read(
                         && let Some(raw) = call["args"]["CommandLine"].as_str()
                     {
                         let command = decode_command(raw, compact);
-                        pending.push_back(Some((command, time_ms)));
+                        let cwd = call["args"]["Cwd"]
+                            .as_str()
+                            .map(|raw| decode_command(raw, compact))
+                            .unwrap_or_default();
+                        pending.push_back(Some((command, cwd, time_ms)));
                     } else {
                         pending.push_back(None);
                     }
@@ -182,7 +198,52 @@ fn read(
                 let Some(slot) = pending.pop_front() else {
                     continue;
                 };
-                let Some((command, call_time)) = slot else {
+                let Some((command, cwd, call_time)) = slot else {
+                    continue;
+                };
+                let raw = entry["content"].as_str().unwrap_or("");
+                if let Some((started_rewrote, task_id)) = background_task_id(raw) {
+                    pending_tasks.insert(
+                        task_id.to_owned(),
+                        (command, cwd, call_time, started_rewrote),
+                    );
+                    continue;
+                }
+                let result_time = entry["created_at"]
+                    .as_str()
+                    .and_then(crate::learn::events::parse_timestamp)
+                    .unwrap_or(call_time);
+                let time_ms = if result_time > 0 {
+                    result_time
+                } else {
+                    call_time
+                };
+                if time_ms > 0 && time_ms < since_ms {
+                    continue;
+                }
+                let (hook_rewrote, status, body) = parse_result(raw);
+                scan.sessions.insert(session.to_owned());
+                each(Shell {
+                    file: file.to_path_buf(),
+                    line: index + 1,
+                    session: session.to_owned(),
+                    cwd,
+                    command,
+                    time_ms,
+                    status,
+                    output: body.to_owned(),
+                    bytes: body.len() as u64,
+                    hook_rewrote,
+                });
+            }
+            Some("SYSTEM_MESSAGE") => {
+                let raw = entry["content"].as_str().unwrap_or("");
+                let Some((task_id, task_body)) = parse_task_completion(raw) else {
+                    continue;
+                };
+                let Some((command, cwd, call_time, started_rewrote)) =
+                    pending_tasks.remove(task_id)
+                else {
                     continue;
                 };
                 let result_time = entry["created_at"]
@@ -197,15 +258,19 @@ fn read(
                 if time_ms > 0 && time_ms < since_ms {
                     continue;
                 }
-                let raw = entry["content"].as_str().unwrap_or("");
-                let (hook_rewrote, body) = strip_wrapper(raw);
+                let (finished_rewrote, status, body) = parse_result(task_body);
                 scan.sessions.insert(session.to_owned());
                 each(Shell {
+                    file: file.to_path_buf(),
+                    line: index + 1,
                     session: session.to_owned(),
+                    cwd,
                     command,
+                    time_ms,
+                    status,
                     output: body.to_owned(),
                     bytes: body.len() as u64,
-                    hook_rewrote,
+                    hook_rewrote: started_rewrote || finished_rewrote,
                 });
             }
             _ => {}
@@ -226,10 +291,9 @@ fn decode_command(raw: &str, compact: bool) -> String {
     raw.to_owned()
 }
 
-/// Strips Antigravity CLI's `Created At` / `Completed At` / `Command exited with
-/// code` headers from a `run_command` result, and reports whether a pre-tool hook
-/// rewrote `CommandLine`.
-fn strip_wrapper(raw: &str) -> (bool, &str) {
+/// If `raw` is Antigravity CLI's background-task launch notice, return
+/// `(hook_rewrote, task_id)`.
+fn background_task_id(raw: &str) -> Option<(bool, &str)> {
     let mut rest = raw;
     let mut hook_rewrote = false;
     loop {
@@ -255,19 +319,82 @@ fn strip_wrapper(raw: &str) -> (bool, &str) {
         }
         break;
     }
-    if let Some(after) = rest.strip_prefix("Command exited with code ")
-        && let Some((_, tail)) = after.split_once('\n')
+    let after = rest.strip_prefix("Tool is running as a background task with task id:")?;
+    let id = after
+        .split_once('\n')
+        .map_or(after, |(line, _)| line)
+        .trim();
+    (!id.is_empty()).then_some((hook_rewrote, id))
+}
+
+/// Extract `(task_id, body)` from an Antigravity CLI `SYSTEM_MESSAGE` reporting
+/// a finished background `run_command` task.
+fn parse_task_completion(raw: &str) -> Option<(&str, &str)> {
+    let after_marker = raw.split_once("Task id \"")?.1;
+    let (task_id, rest) = after_marker.split_once("\" finished with result:")?;
+    let mut body = rest
+        .trim_start_matches(['\r', '\n'])
+        .trim_end_matches(['\r', '\n']);
+    if let Some(before_end) = body.strip_suffix("</SYSTEM_MESSAGE>") {
+        body = before_end.trim_end_matches(['\r', '\n']);
+    }
+    if let Some((before_log, last_line)) = body.rsplit_once('\n')
+        && last_line.trim_start().starts_with("Log: file://")
     {
+        body = before_log.trim_end_matches(['\r', '\n']);
+    } else if body.trim_start().starts_with("Log: file://") {
+        body = "";
+    }
+    Some((task_id, body))
+}
+
+/// Strips Antigravity CLI's `Created At` / `Completed At` / truncation /
+/// `Command exited with code` headers from a `run_command` result, returning
+/// `(hook_rewrote, exit_status, body)`.
+fn parse_result(raw: &str) -> (bool, Option<i32>, &str) {
+    let mut rest = raw;
+    let mut hook_rewrote = false;
+    loop {
+        let trimmed = rest.trim_start_matches(['\n', '\r']);
+        if trimmed.len() != rest.len() {
+            rest = trimmed;
+            continue;
+        }
+        if let Some(after) = rest
+            .strip_prefix("Created At:")
+            .or_else(|| rest.strip_prefix("Completed At:"))
+            .or_else(|| rest.strip_prefix("The tool's output was truncated"))
+            .or_else(|| rest.strip_prefix("Here is a preview"))
+        {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix(REWRITE_PREFIX) {
+            let (line, tail) = after.split_once('\n').unwrap_or((after, ""));
+            if line.contains("CommandLine") {
+                hook_rewrote = true;
+            }
+            rest = tail;
+            continue;
+        }
+        break;
+    }
+    if let Some(after) = rest.strip_prefix("Command exited with code ") {
+        let (head, tail) = after.split_once('\n').unwrap_or((after, ""));
+        let status = head.trim().trim_end_matches('.').parse::<i32>().ok();
         let tail = tail.trim_start_matches(['\n', '\r']);
         if let Some(body) = tail
             .strip_prefix("Command output:\n")
             .or_else(|| tail.strip_prefix("Command output:\r\n"))
         {
-            return (hook_rewrote, body);
+            return (hook_rewrote, status, body);
         }
-        return (hook_rewrote, tail);
+        if tail.trim() == "No output from the command." {
+            return (hook_rewrote, status, "");
+        }
+        return (hook_rewrote, status, tail);
     }
-    (hook_rewrote, rest)
+    (hook_rewrote, None, rest)
 }
 
 /// Antigravity CLI shell commands by route and label, as `discover` and `stats`
@@ -367,7 +494,7 @@ pub(crate) fn stats(workspace: &crate::workspace::Workspace, since_ms: u64) -> O
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_command, strip_wrapper};
+    use super::{background_task_id, decode_command, parse_result, parse_task_completion};
 
     #[test]
     fn wrapper_detects_hook_rewrite_and_strips_headers() {
@@ -381,7 +508,7 @@ mod tests {
             "Command output:\n",
             "ok\n",
         );
-        assert_eq!(strip_wrapper(rewritten), (true, "ok\n"));
+        assert_eq!(parse_result(rewritten), (true, Some(0), "ok\n"));
 
         let raw = concat!(
             "Created At: 2026-11-25T00:05:32+05:45\n",
@@ -390,7 +517,51 @@ mod tests {
             "Command output:\n",
             "boom\n",
         );
-        assert_eq!(strip_wrapper(raw), (false, "boom\n"));
+        assert_eq!(parse_result(raw), (false, Some(1), "boom\n"));
+
+        let truncated = concat!(
+            "Created At: 2026-11-25T00:05:32+05:45\n",
+            "Completed At: 2026-11-25T00:05:36+05:45\n",
+            "The tool's output was truncated due to being too long. You can find the full output in a file at file:///tmp/out.txt.\n\n",
+            "Here is a preview with the middle of the output truncated:\n",
+            "A pre-tool hook changed the arguments of this tool call before it ran. Changed: CommandLine.\n\n",
+            "Command exited with code 101.\n\n",
+            "Command output:\n",
+            "error[E0308]: mismatched types\n",
+        );
+        assert_eq!(
+            parse_result(truncated),
+            (true, Some(101), "error[E0308]: mismatched types\n")
+        );
+
+        let empty = concat!(
+            "Created At: 2026-11-25T00:05:32+05:45\n",
+            "Completed At: 2026-11-25T00:05:36+05:45\n",
+            "Command exited with code 0.\n\n",
+            "No output from the command.\n",
+        );
+        assert_eq!(parse_result(empty), (false, Some(0), ""));
+
+        let bg = concat!(
+            "Created At: 2026-11-25T00:05:32+05:45\n",
+            "Tool is running as a background task with task id: conv-1/task-9\n",
+            "Task logs are available at: file:///tmp/task-9.log\n",
+        );
+        assert_eq!(background_task_id(bg), Some((false, "conv-1/task-9")));
+
+        let done = concat!(
+            "<SYSTEM_MESSAGE>\n",
+            "[Message] timestamp=2026-11-24T18:52:51Z sender=conv-1/task-9 content=Task id \"conv-1/task-9\" finished with result:\n",
+            "A pre-tool hook changed the arguments of this tool call before it ran. Changed: CommandLine.\n\n",
+            "Command exited with code 101.\n\n",
+            "Command output:\n",
+            "clippy failed\n",
+            "Log: file:///tmp/task-9.log\n",
+            "</SYSTEM_MESSAGE>\n",
+        );
+        let (task_id, body) = parse_task_completion(done).unwrap();
+        assert_eq!(task_id, "conv-1/task-9");
+        assert_eq!(parse_result(body), (true, Some(101), "clippy failed"));
 
         assert_eq!(decode_command("\"git diff\"", true), "git diff");
         assert_eq!(decode_command("\"git diff\"", false), "\"git diff\"");
