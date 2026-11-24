@@ -116,8 +116,8 @@ impl Project {
             "hook-gemini" => json!({"hook_event_name":"BeforeTool",
                 "tool_name":"run_shell_command","cwd":root,"tool_input":{"command":command}}),
             "hook-copilot" => json!({"cwd":root,"toolName":"bash","toolArgs":{"command":command}}),
-            "hook-agy" => json!({"workspacePaths":[root],
-                "toolCall":{"name":"run_command","args":{"CommandLine":command,"Cwd":root}}}),
+            "hook-agy" => json!({"cwd":root,"workspacePaths":[root],
+                "toolCall":{"name":"run_command","args":{"CommandLine":command}}}),
             _ => json!({"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"s1",
                 "cwd":root,"tool_input":{"command":command}}),
         };
@@ -345,6 +345,10 @@ fn a_settings_file_that_fails_to_load_leaves_every_command() {
             let answer = project.hook(&[handler, "before-command", "--global"], &input);
             assert_eq!(answer, json!({}), "{handler}: {text}");
         }
+        let agy_input = json!({"cwd":project.root,"workspacePaths":[project.root],
+            "toolCall":{"name":"run_command","args":{"CommandLine":"cargo build"}}});
+        let answer = project.hook(&["hook-agy", "before-command", "--global"], &agy_input);
+        assert_eq!(answer, json!({"decision":"allow"}), "hook-agy: {text}");
         // The post-command hook leaves large output as it was.
         assert_eq!(after_bash(), json!({}), "{text}");
         let rewrite = project.success(&["rewrite", "--agent", "codex", "cargo build"]);

@@ -1321,6 +1321,51 @@ fn startup(workspace: &Workspace) -> Option<String> {
     })
 }
 
+fn explicit_value(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Null => None,
+        Value::String(text) if text.is_empty() => None,
+        other => Some(other),
+    }
+}
+
+/// The directory an Antigravity `run_command` call executes in.
+/// Antigravity IDE passes `toolCall.args.Cwd`; Antigravity CLI has no `Cwd`
+/// tool argument and reports the agent's working directory in the top-level
+/// `cwd` field instead, defaulting to the sole workspace root when neither
+/// is present.
+fn agy_cwd<'a>(args: &'a Value, input: &'a Value, paths: &'a [Value]) -> Option<&'a Path> {
+    let path = if let Some(value) = args.get("Cwd").and_then(explicit_value) {
+        value.as_str()?
+    } else if let Some(value) = input.get("cwd").and_then(explicit_value) {
+        let text = value.as_str()?;
+        text.strip_prefix("file://").unwrap_or(text)
+    } else if paths.len() == 1 {
+        paths[0].as_str()?
+    } else {
+        return None;
+    };
+    Some(Path::new(path))
+}
+
+/// The working directory an Antigravity hook input targets, for `init --global`
+/// to locate the project before invoking `agy_hook`.
+pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path> {
+    let paths = input["workspacePaths"].as_array()?;
+    if mode == "before-command" {
+        return agy_cwd(&input["toolCall"]["args"], input, paths);
+    }
+    let path = if let Some(value) = input.get("cwd").and_then(explicit_value) {
+        let text = value.as_str()?;
+        text.strip_prefix("file://").unwrap_or(text)
+    } else if paths.len() == 1 {
+        paths[0].as_str()?
+    } else {
+        return None;
+    };
+    Some(Path::new(path))
+}
+
 fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     let paths = input["workspacePaths"].as_array()?;
     let mut roots = paths
@@ -1332,10 +1377,20 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     if mode == "session-start" {
         let root = if paths.len() == 1 {
             roots.next()?
+        } else if let Some(value) = input.get("cwd").and_then(explicit_value) {
+            let text = value.as_str()?;
+            let cwd = Path::new(text.strip_prefix("file://").unwrap_or(text));
+            if !cwd.is_absolute() {
+                return None;
+            }
+            let cwd = cwd.canonicalize().ok()?;
+            roots
+                .filter(|root| cwd.starts_with(root))
+                .max_by_key(|root| root.components().count())?
         } else {
             roots.find(|root| root == &current.root)?
         };
-        let workspace = Workspace::discover(Some(&root)).ok()?;
+        let workspace = agent_workspace(&Workspace::discover(Some(&root)).ok()?, input);
         return Some(json!({"injectSteps":[{"ephemeralMessage":startup(&workspace)?}]}));
     }
     let call = &input["toolCall"];
@@ -1343,13 +1398,14 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     if mode != "before-command"
         || call["name"] != "run_command"
         || args["RunPersistent"] == true
+        || args["IsDaemon"] == true
         || args["RequestedTerminalID"]
             .as_str()
             .is_some_and(|id| !id.is_empty())
     {
         return None;
     }
-    let cwd = Path::new(args["Cwd"].as_str()?);
+    let cwd = agy_cwd(args, input, paths)?;
     if !cwd.is_absolute() {
         return None;
     }
@@ -1357,7 +1413,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     let root = roots
         .filter(|root| cwd.starts_with(root))
         .max_by_key(|root| root.components().count())?;
-    let workspace = Workspace::discover(Some(&root)).ok()?;
+    let workspace = Workspace::discover(Some(&root)).ok()?.working_in(&cwd);
     // The answer allows the rewrite, so it takes only what Codex's hook approves.
     let rewritten = wrap_event(
         &workspace,

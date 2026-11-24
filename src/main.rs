@@ -399,7 +399,7 @@ fn cli() -> Command<'static> {
                     Arg::new("global")
                         .long("global")
                         .conflicts_with_all(&["hooks", "statusline", "purge"])
-                        .help("Install user-level Claude Code and Codex hooks that work in every project; with --remove, remove them"),
+                        .help("Install user-level Claude Code, Codex and Antigravity CLI hooks that work in every project; with --remove, remove them"),
                 ),
         )
         .subcommand(exec::command())
@@ -532,7 +532,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         return Ok(0);
     }
     // A user-level hook finds its project from the input, not from where it runs.
-    if let Some((name @ ("hook-claude" | "hook-codex"), sub)) = matches.subcommand()
+    if let Some((name @ ("hook-claude" | "hook-codex" | "hook-agy"), sub)) = matches.subcommand()
         && sub.is_present("global")
     {
         global::run_hook(

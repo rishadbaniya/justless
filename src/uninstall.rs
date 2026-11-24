@@ -1196,12 +1196,14 @@ fn is_global(handler: &Value) -> bool {
 /// `before`, the file as setup's record holds it from before setup, keeps the
 /// hook groups and event arrays it had even when removal empties them.
 pub(crate) fn strip_global(
+    agent: Agent,
     key: &str,
     text: &str,
     before: Option<&str>,
 ) -> Result<Option<(String, Option<String>)>> {
     let rules = JsonRules {
-        hooks: true,
+        hooks: agent != Agent::Agy,
+        group: agent == Agent::Agy,
         global: true,
         ..JsonRules::default()
     };

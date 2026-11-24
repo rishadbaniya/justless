@@ -1,14 +1,14 @@
-//! `justless init --global`: opt-in user-level hooks for Claude Code and Codex.
+//! `justless init --global`: opt-in user-level hooks for Claude Code, Codex and Antigravity CLI.
 //!
 //! Setup merges the same hooks `init --hooks` writes into the user's own hook file,
-//! `settings.json` in `CLAUDE_CONFIG_DIR` or `~/.claude`, and `hooks.json` in
-//! `CODEX_HOME` or `~/.codex`, with every other key kept. Each handler runs
-//! `justless hook-CLIENT MODE --global`, which finds the project per call from the
-//! hook input's `cwd` and answers with the client's no-op when there is none to
-//! serve: outside a marked project, in the home directory, in a project whose
-//! `.justless.toml` sets `global_hooks = false` or fails to load, and in a
-//! project whose own settings already run Justless's hook for that event, which
-//! takes precedence so no command is handled twice.
+//! `settings.json` in `CLAUDE_CONFIG_DIR` or `~/.claude`, `hooks.json` in
+//! `CODEX_HOME` or `~/.codex`, and `hooks.json` in `~/.gemini/config`, with every
+//! other key kept. Each handler runs `justless hook-CLIENT MODE --global`, which
+//! finds the project per call from the hook input's `cwd` and answers with the
+//! client's no-op when there is none to serve: outside a marked project, in the
+//! home directory, in a project whose `.justless.toml` sets `global_hooks = false`
+//! or fails to load, and in a project whose own settings already run Justless's
+//! hook for that event, which takes precedence so no command is handled twice.
 //!
 //! Setup records each file it writes, with its digest and the file as it was, in
 //! the private `global-setup.json` beside the project registry. `init --remove
@@ -30,7 +30,7 @@ use crate::agents::{self, Agent};
 use crate::workspace::{Workspace, private_dir, write_json, write_text};
 
 /// The clients with user-level hooks.
-pub const CLIENTS: [Agent; 2] = [Agent::Claude, Agent::Codex];
+pub const CLIENTS: [Agent; 3] = [Agent::Claude, Agent::Codex, Agent::Agy];
 /// What each global handler passes after its mode.
 const SUFFIX: &str = " --global";
 const RECORD: &str = "global-setup.json";
@@ -48,23 +48,27 @@ fn home() -> Option<PathBuf> {
 fn name(agent: Agent) -> &'static str {
     match agent {
         Agent::Claude => "claude",
-        _ => "codex",
+        Agent::Codex => "codex",
+        _ => "agy",
     }
 }
 
 fn label(agent: Agent) -> &'static str {
     match agent {
         Agent::Claude => "Claude Code",
-        _ => "Codex",
+        Agent::Codex => "Codex",
+        _ => "Antigravity CLI",
     }
 }
 
 /// A client's user-level config directory: `CLAUDE_CONFIG_DIR` or `~/.claude`,
-/// `CODEX_HOME` or `~/.codex`.
+/// `CODEX_HOME` or `~/.codex`, and `~/.gemini/config` for Antigravity CLI
+/// (overridden in tests by `JUSTLESS_TEST_AGY_CONFIG_DIR`).
 pub fn config_dir(agent: Agent) -> Option<PathBuf> {
     let (key, folder) = match agent {
         Agent::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
         Agent::Codex => ("CODEX_HOME", ".codex"),
+        Agent::Agy => ("JUSTLESS_TEST_AGY_CONFIG_DIR", ".gemini/config"),
         _ => return None,
     };
     variable(key).or_else(|| home().map(|home| home.join(folder)))
@@ -123,7 +127,7 @@ fn save(record: &Record) -> Result<()> {
 /// Note that setup is about to replace `path` with `contents`, and the directories
 /// it is about to create, as `uninstall::remember` does for project files. A lost
 /// record only costs exactness on removal, so a failure never stops setup.
-fn remember(path: &Path, contents: &str) {
+fn remember(agent: Agent, path: &Path, contents: &str) {
     let mut record = load();
     for directory in path.ancestors().skip(1) {
         match fs::symlink_metadata(directory) {
@@ -140,6 +144,7 @@ fn remember(path: &Path, contents: &str) {
         (None, _) => None,
         (Some(text), Some(entry)) if entry.digest == digest(text) => entry.before.clone(),
         (Some(text), _) => match crate::uninstall::strip_global(
+            agent,
             &key,
             text,
             recorded.and_then(|entry| entry.before.as_deref()),
@@ -164,7 +169,7 @@ fn remember(path: &Path, contents: &str) {
 }
 
 /// The clients `--agent` names, which must have user-level hooks. Without it,
-/// setup takes those whose config directory exists and removal takes both.
+/// setup takes those whose config directory exists and removal takes all of them.
 fn chosen(matches: &ArgMatches, setup: bool) -> Result<Vec<Agent>> {
     if matches.occurrences_of("agent") > 0 {
         let mut agents = Vec::new();
@@ -172,7 +177,7 @@ fn chosen(matches: &ArgMatches, setup: bool) -> Result<Vec<Agent>> {
             let agent = Agent::parse(value)?;
             ensure!(
                 CLIENTS.contains(&agent),
-                "--global sets up Claude Code and Codex only, not {value}"
+                "--global sets up Claude Code, Codex and Antigravity CLI only, not {value}"
             );
             if !agents.contains(&agent) {
                 agents.push(agent);
@@ -189,7 +194,7 @@ fn chosen(matches: &ArgMatches, setup: bool) -> Result<Vec<Agent>> {
         .collect();
     ensure!(
         !found.is_empty(),
-        "found no Claude Code or Codex config directory; name the client with --agent claude or --agent codex"
+        "found no Claude Code, Codex or Antigravity CLI config directory; name the client with --agent claude, --agent codex or --agent agy"
     );
     Ok(found)
 }
@@ -210,8 +215,8 @@ pub fn init(matches: &ArgMatches) -> Result<()> {
             ),
         }
     }
-    for (_, path, contents) in &plan {
-        remember(path, contents);
+    for (agent, path, contents) in &plan {
+        remember(*agent, path, contents);
         let parent = path.parent().context("hook file without a directory")?;
         if fs::symlink_metadata(parent).is_err() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -256,6 +261,7 @@ pub fn remove(matches: &ArgMatches) -> Result<()> {
         // even after the file changed since.
         let entry = record.files.get(&path);
         let stripped = crate::uninstall::strip_global(
+            agent,
             &key,
             &text,
             entry.and_then(|entry| entry.before.as_deref()),
@@ -343,8 +349,12 @@ pub fn run_hook(agent: Agent, mode: &str) {
 
 /// The project a global hook serves for this call, if any.
 fn project(agent: Agent, mode: &str, input: &Value) -> Option<Workspace> {
-    let cwd = input["cwd"].as_str()?;
-    let cwd = Path::new(cwd.strip_prefix("file://").unwrap_or(cwd));
+    let cwd = if agent == Agent::Agy {
+        agents::agy_input_cwd(mode, input)?
+    } else {
+        let cwd = input["cwd"].as_str()?;
+        Path::new(cwd.strip_prefix("file://").unwrap_or(cwd))
+    };
     if !cwd.is_absolute() {
         return None;
     }
@@ -403,8 +413,9 @@ pub fn skip(agent: Agent, mode: Option<&str>, cwd: &Path, workspace: &Workspace)
 
 /// Whether a project's own settings run Justless's hook for `agent`, for `mode`
 /// or any mode: Claude Code's project settings in `$CLAUDE_PROJECT_DIR`, where it
-/// loads them, or else in `cwd` and its parents up to `root`, and the Codex hook
-/// files in `cwd` and its parents up to `root`. The user-level file never counts.
+/// loads them, or else in `cwd` and its parents up to `root`, and the Codex and
+/// Antigravity CLI hook files in `cwd` and its parents up to `root`. The
+/// user-level file never counts.
 pub fn project_hooks(agent: Agent, mode: Option<&str>, cwd: &Path, root: &Path) -> bool {
     let user = hook_file(agent).and_then(|file| file.canonicalize().ok());
     let mut directories: Vec<PathBuf> = cwd
@@ -419,7 +430,13 @@ pub fn project_hooks(agent: Agent, mode: Option<&str>, cwd: &Path, root: &Path) 
             }
             &[".claude/settings.json", ".claude/settings.local.json"]
         }
-        _ => &[".codex/hooks.json"],
+        Agent::Codex => &[".codex/hooks.json"],
+        _ => &[
+            ".agents/hooks.json",
+            ".agent/hooks.json",
+            "_agents/hooks.json",
+            "_agent/hooks.json",
+        ],
     };
     directories.iter().any(|directory| {
         files.iter().any(|file| {
@@ -438,20 +455,30 @@ pub fn project_hooks(agent: Agent, mode: Option<&str>, cwd: &Path, root: &Path) 
 /// How many handlers in a hook config run `justless hook-AGENT`, for `mode` or any
 /// mode, with `--global` or without it.
 fn handlers(config: &Value, agent: Agent, mode: Option<&str>, global: bool) -> usize {
-    let Some(events) = config["hooks"].as_object() else {
-        return 0;
+    let count_events = |events: &serde_json::Map<String, Value>| {
+        events
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .flat_map(|entry| {
+                let nested = entry["hooks"].as_array().into_iter().flatten();
+                std::iter::once(entry).chain(nested)
+            })
+            .filter_map(|handler| handler["command"].as_str())
+            .filter(|command| runs(command, agent, mode, global))
+            .count()
     };
-    events
-        .values()
-        .filter_map(Value::as_array)
-        .flatten()
-        .flat_map(|entry| {
-            let nested = entry["hooks"].as_array().into_iter().flatten();
-            std::iter::once(entry).chain(nested)
-        })
-        .filter_map(|handler| handler["command"].as_str())
-        .filter(|command| runs(command, agent, mode, global))
-        .count()
+    if agent == Agent::Agy {
+        return config
+            .as_object()
+            .into_iter()
+            .flat_map(|groups| groups.values())
+            .filter_map(Value::as_object)
+            .filter(|events| events.get("enabled") != Some(&Value::Bool(false)))
+            .map(count_events)
+            .sum();
+    }
+    config["hooks"].as_object().map_or(0, count_events)
 }
 
 /// Whether a shell command runs `justless hook-AGENT MODE`, with `--global` or not.

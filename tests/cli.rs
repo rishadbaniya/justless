@@ -1434,22 +1434,55 @@ fn install_and_run_claude_and_agy_hooks() {
     assert_eq!(output, json!({}));
     let elsewhere = TempDir::new().unwrap();
     let agy_input = |command: &str, cwd: &Path| json!({"workspacePaths":[root],"toolCall":{"name":"run_command","args":{"CommandLine":command,"Cwd":cwd,"WaitMsBeforeAsync":10}}});
+    let agy_cli_input = |command: &str, cwd: &Path| json!({"cwd":cwd,"workspacePaths":[root],"toolCall":{"name":"run_command","args":{"CommandLine":command,"WaitMsBeforeAsync":10}}});
     let agy_hook = |dir: &Path, mode: &str, input| agent_hook(dir, "hook-agy", mode, input);
     let dispatch = |command: &str, cwd: &Path| {
         agy_hook(elsewhere.path(), "before-command", agy_input(command, cwd))
     };
-    assert_eq!(
-        dispatch("git diff", &root),
-        json!({"decision":"allow","overwrite":{"CommandLine":"justless run --hook -- git diff"}})
-    );
+    let cli_dispatch = |command: &str, cwd: &Path| {
+        agy_hook(
+            elsewhere.path(),
+            "before-command",
+            agy_cli_input(command, cwd),
+        )
+    };
+    let rewritten =
+        json!({"decision":"allow","overwrite":{"CommandLine":"justless run --hook -- git diff"}});
+    assert_eq!(dispatch("git diff", &root), rewritten);
+    // Antigravity CLI has no `Cwd` tool argument and passes top-level `cwd`.
+    assert_eq!(cli_dispatch("git diff", &root), rewritten);
+    assert_eq!(cli_dispatch("git diff", &root.join("backend")), rewritten);
     let allow = json!({"decision":"allow"});
     assert_eq!(dispatch("git diff", elsewhere.path()), allow);
+    assert_eq!(cli_dispatch("git diff", elsewhere.path()), allow);
     assert_eq!(dispatch("git diff | cat", &root), allow);
-    let mut multiple = agy_input("git diff", &root);
+    // An explicit `args.Cwd` outside the workspace still wins over top-level `cwd`.
+    let mut explicit_outside = agy_input("git diff", elsewhere.path());
+    explicit_outside["cwd"] = json!(root);
+    assert_eq!(
+        agy_hook(elsewhere.path(), "before-command", explicit_outside),
+        allow
+    );
+    // When neither `args.Cwd` nor top-level `cwd` is present, a sole workspace root applies,
+    // while multiple workspace roots stay ambiguous and pass through.
+    let no_cwd = json!({"workspacePaths":[root],"toolCall":{"name":"run_command","args":{"CommandLine":"git diff"}}});
+    assert_eq!(
+        agy_hook(elsewhere.path(), "before-command", no_cwd),
+        rewritten
+    );
+    let ambiguous = json!({"workspacePaths":[elsewhere.path(), root],"toolCall":{"name":"run_command","args":{"CommandLine":"git diff"}}});
+    assert_eq!(
+        agy_hook(elsewhere.path(), "before-command", ambiguous),
+        allow
+    );
+    let mut multiple = agy_cli_input("git diff", &root);
     multiple["workspacePaths"] = json!([elsewhere.path(), root]);
     let result = agy_hook(elsewhere.path(), "before-command", multiple.clone());
     let command = &result["overwrite"]["CommandLine"];
     assert_eq!(command, "justless run --hook -- git diff");
+    let mut daemon = multiple.clone();
+    daemon["toolCall"]["args"]["IsDaemon"] = json!(true);
+    assert_eq!(agy_hook(&root, "before-command", daemon), allow);
     multiple["toolCall"]["args"]["RunPersistent"] = json!(true);
     assert_eq!(agy_hook(&root, "before-command", multiple), allow);
     let startup = || {
@@ -1463,6 +1496,16 @@ fn install_and_run_claude_and_agy_hooks() {
     let message = startup()["injectSteps"][0]["ephemeralMessage"].clone();
     let resume = format!("`justless --root {} resume`", root.display());
     assert_eq!(message, format!("{resume} lists earlier runs and reads."));
+    // When Antigravity CLI reports top-level `cwd` inside the workspace, plain `justless` applies.
+    let cli_startup = agy_hook(
+        elsewhere.path(),
+        "session-start",
+        json!({"cwd":root,"workspacePaths":[elsewhere.path(), root]}),
+    );
+    assert_eq!(
+        cli_startup["injectSteps"][0]["ephemeralMessage"],
+        "`justless resume` lists earlier runs and reads."
+    );
     assert!(!elsewhere.path().join(".justless").exists());
 }
 

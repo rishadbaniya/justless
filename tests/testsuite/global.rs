@@ -57,6 +57,7 @@ impl Lab {
             .env("XDG_STATE_HOME", self.home.join(".local/state"))
             .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))
             .env("CODEX_HOME", self.home.join(".codex"))
+            .env_remove("JUSTLESS_TEST_AGY_CONFIG_DIR")
             .env(
                 "JUSTLESS_TEST_CLAUDE_MANAGED_DIR",
                 self.base.join("managed"),
@@ -546,5 +547,117 @@ fn global_hooks_serve_each_project_once_and_remove_cleanly() {
     let hooks = left["hooks"].as_object().unwrap();
     assert_eq!(hooks.keys().collect::<Vec<_>>(), ["PreToolUse"], "{left}");
     assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 1, "{left}");
+    lacks(&left.to_string(), "--global");
+}
+
+#[test]
+fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
+    let lab = Lab::new();
+    let agy = lab.home.join(".gemini/config/hooks.json");
+    fs::create_dir_all(agy.parent().unwrap()).unwrap();
+    let original = "{\n  \"other\": {\"enabled\": false}\n}\n";
+    fs::write(&agy, original).unwrap();
+    let plain = lab.project("plain", "");
+    let opted = lab.project("opted", "global_hooks = false\n");
+    let own = lab.project("own", "");
+    lab.run(&own, &words("init --hooks --agent agy"));
+
+    let setup = lab.run(&lab.base, &words("init --global --agent agy"));
+    has(&setup, "Updated ");
+    let hooks: Value = serde_json::from_str(&fs::read_to_string(&agy).unwrap()).unwrap();
+    assert_eq!(hooks["other"]["enabled"], false);
+    assert_eq!(
+        hooks["justless"]["PreToolUse"][0]["hooks"][0]["command"],
+        "justless hook-agy before-command --global"
+    );
+    assert_eq!(
+        hooks["justless"]["SessionStart"][0]["command"],
+        "justless hook-agy session-start --global"
+    );
+    has(
+        &lab.run(&lab.base, &words("init --global --agent agy")),
+        "already has the global Antigravity CLI hooks",
+    );
+
+    let ask = |mode: &str, input: &Value| {
+        let out = lab.hook(&lab.base, &["hook-agy", mode, "--global"], input, &[]);
+        serde_json::from_str::<Value>(&out).unwrap()
+    };
+    let before = |root: &Path, cwd: &Path| {
+        let input = json!({
+            "cwd": cwd,
+            "workspacePaths": [root],
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "cargo test"}},
+        });
+        ask("before-command", &input)
+    };
+    let rewritten = json!({"decision": "allow", "overwrite": {"CommandLine": "justless run --hook -- cargo test"}});
+    let allow = json!({"decision": "allow"});
+    assert_eq!(before(&plain, &plain), rewritten);
+    assert_eq!(before(&plain, &plain.join("src")), rewritten);
+    assert_eq!(before(&opted, &opted), allow);
+    assert_eq!(before(&own, &own), allow);
+    assert_eq!(before(&lab.home, &lab.home), allow);
+    let loose = lab.base.join("loose");
+    fs::create_dir_all(&loose).unwrap();
+    assert_eq!(before(&loose, &loose), allow);
+    assert_eq!(before(agy.parent().unwrap(), agy.parent().unwrap()), allow);
+
+    // SessionStart indexes a served project and skips opted-out and local-hook projects.
+    let start = |root: &Path| {
+        ask(
+            "session-start",
+            &json!({"cwd": root, "workspacePaths": [root]}),
+        )
+    };
+    assert_eq!(start(&opted), json!({}));
+    assert!(!opted.join(".justless").exists());
+    assert_eq!(start(&plain), json!({}));
+    assert!(plain.join(".justless/index.json").is_file());
+    run_id(&lab, &plain, "true");
+    assert_eq!(
+        start(&plain)["injectSteps"][0]["ephemeralMessage"],
+        "`justless resume` lists earlier runs and reads."
+    );
+
+    let doctor =
+        |cwd: &Path| String::from_utf8(lab.output(cwd, &["doctor"], None, &[]).stdout).unwrap();
+    let report = doctor(&plain);
+    has(&report, "Global hooks for Antigravity CLI: 2 handlers in ");
+    has(
+        &report,
+        "The global Antigravity CLI hooks serve this project",
+    );
+    has(&report, "✓ Hooks: the global Antigravity CLI hooks in ");
+    has(&doctor(&own), "own Antigravity CLI hooks take precedence");
+    has(&doctor(&opted), "sets global_hooks = false");
+
+    // Unedited file restores byte for byte.
+    lab.run(&lab.base, &words("init --remove --global --agent agy"));
+    assert_eq!(fs::read_to_string(&agy).unwrap(), original);
+
+    // Edited file removes only the --global handlers, keeping plain and custom ones.
+    lab.run(&lab.base, &words("init --global --agent agy"));
+    let mut edited: Value = serde_json::from_str(&fs::read_to_string(&agy).unwrap()).unwrap();
+    edited["justless"]["PreToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"matcher": "^run_command$", "hooks": [
+            {"type": "command", "command": "justless hook-agy before-command"},
+            {"type": "command", "command": "my-guard"},
+        ]}));
+    fs::write(&agy, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+    has(
+        &doctor(&plain),
+        "runs 1 Justless hook without --global as well as the global ones",
+    );
+    lab.run(&lab.base, &words("init --remove --global --agent agy"));
+    let left: Value = serde_json::from_str(&fs::read_to_string(&agy).unwrap()).unwrap();
+    assert_eq!(left["other"]["enabled"], false);
+    assert_eq!(
+        left["justless"]["PreToolUse"].as_array().unwrap().len(),
+        1,
+        "{left}"
+    );
     lacks(&left.to_string(), "--global");
 }

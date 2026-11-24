@@ -228,8 +228,9 @@ fn input(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -> Valu
             "tool_input": {"command": command},
         }),
         Agent::Agy => json!({
+            "cwd": cwd,
             "workspacePaths": [workspace.root.display().to_string()],
-            "toolCall": {"name": "run_command", "args": {"CommandLine": command, "Cwd": cwd}},
+            "toolCall": {"name": "run_command", "args": {"CommandLine": command}},
         }),
         Agent::Cursor => json!({
             "tool_name": "Shell", "cwd": cwd,

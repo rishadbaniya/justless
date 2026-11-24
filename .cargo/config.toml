@@ -4,3 +4,4 @@
 XDG_STATE_HOME = { value = "target/test-home/state", relative = true, force = true }
 CLAUDE_CONFIG_DIR = { value = "target/test-home/claude", relative = true, force = true }
 CODEX_HOME = { value = "target/test-home/codex", relative = true, force = true }
+JUSTLESS_TEST_AGY_CONFIG_DIR = { value = "target/test-home/agy", relative = true, force = true }

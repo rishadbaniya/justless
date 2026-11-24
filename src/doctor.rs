@@ -2797,16 +2797,16 @@ fn global_checks(project: Option<&Workspace>) -> Vec<Check> {
     if installed.is_empty() {
         return vec![Check::new(
             Status::Info,
-            "Global hooks: none. `justless init --global` adds opt-in user-level hooks for Claude Code and Codex that work in every project.",
+            "Global hooks: none. `justless init --global` adds opt-in user-level hooks for Claude Code, Codex and Antigravity CLI that work in every project.",
         )];
     }
     let mut checks = Vec::new();
     for hooks in &installed {
         let file = hooks.file.display();
-        let name = if hooks.agent == Agent::Claude {
-            "claude"
-        } else {
-            "codex"
+        let name = match hooks.agent {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
+            _ => "agy",
         };
         if hooks.global > 0 {
             checks.push(Check::new(
