@@ -568,7 +568,7 @@ fn refresh(directory: &Path, mut index: Index) -> Option<(Index, bool)> {
     }
     for key in keys {
         let list = index.runs.get_mut(&key).expect("key was just added");
-        list.sort_by(|a, b| b.completed_ms.cmp(&a.completed_ms));
+        list.sort_by_key(|a| std::cmp::Reverse(a.completed_ms));
         list.truncate(KEEP);
     }
     index.seen = seen_text;

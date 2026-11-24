@@ -206,7 +206,7 @@ fn rank_in(
     // two-per-file limit as one file.
     let digest = |candidate: &Candidate| {
         let digest = loaded.digest(file(candidate).0)?;
-        Some(*digest).filter(|_| candidate.group == SOURCE)
+        (candidate.group == SOURCE).then_some(*digest)
     };
     let copy = |candidate: &Candidate| {
         let row = file(candidate).1;

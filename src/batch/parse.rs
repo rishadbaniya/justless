@@ -490,7 +490,7 @@ fn fill(stage: &str, values: &[(String, String)], used: &mut bool) -> String {
                 None => {
                     let end = rest[1..]
                         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .map_or(rest.len() - 1, |end| end);
+                        .unwrap_or(rest.len() - 1);
                     (&rest[1..1 + end], false)
                 }
             };

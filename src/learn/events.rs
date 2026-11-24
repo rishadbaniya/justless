@@ -627,7 +627,7 @@ pub fn runs(
         });
     }
     // Oldest first, so a correction follows its failure.
-    events.sort_by(|a, b| a.time_ms.cmp(&b.time_ms));
+    events.sort_by_key(|a| a.time_ms);
     events
 }
 

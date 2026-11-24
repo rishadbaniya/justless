@@ -162,10 +162,7 @@ pub(crate) struct Posting {
 }
 
 fn encode_posting(out: &mut Vec<u8>, previous: &mut Option<u32>, posting: &Posting) {
-    put_varint(
-        out,
-        u64::from(posting.chunk - previous.map_or(0, |previous| previous)),
-    );
+    put_varint(out, u64::from(posting.chunk - previous.unwrap_or(0)));
     *previous = Some(posting.chunk);
     let mask = posting
         .frequency

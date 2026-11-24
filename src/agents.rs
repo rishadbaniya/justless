@@ -2253,11 +2253,8 @@ fn pipe_parts(segment: &str) -> Option<(Range<usize>, Range<usize>)> {
             Some(open) if byte == open => quote = None,
             Some(_) => {}
             None if matches!(byte, b'\'' | b'"') => quote = Some(byte),
-            None if byte == b'|' => {
-                if pipe.replace(at).is_some() {
-                    return None;
-                }
-            }
+            None if byte == b'|' && pipe.is_some() => return None,
+            None if byte == b'|' => pipe = Some(at),
             None => {}
         }
     }

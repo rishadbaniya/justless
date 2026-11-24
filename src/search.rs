@@ -222,12 +222,10 @@ pub(crate) fn parse<'a>(args: &[&'a str], spec: &Spec) -> Option<Parsed<'a>> {
                     None => args.next()?,
                 };
                 parsed.seen.push((flag, Some(value)));
-            } else if let Some(flag) = known(key, spec.optional)
-                .or_else(|| inline.is_none().then(|| known(key, spec.flags)).flatten())
-            {
-                parsed.seen.push((flag, inline));
             } else {
-                return None;
+                let flag = known(key, spec.optional)
+                    .or_else(|| inline.is_none().then(|| known(key, spec.flags)).flatten())?;
+                parsed.seen.push((flag, inline));
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
             let body = &arg[1..];

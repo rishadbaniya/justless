@@ -2263,10 +2263,7 @@ fn scan(
     } else {
         usize::MAX
     };
-    loop {
-        let Some(cut) = read_line(&mut file, &mut raw, line_limit, &mut end, tail_limit)? else {
-            break;
-        };
+    while let Some(cut) = read_line(&mut file, &mut raw, line_limit, &mut end, tail_limit)? {
         line_no += 1;
         let text = String::from_utf8_lossy(&raw);
         let text = ANSI.replace_all(&text, "");
