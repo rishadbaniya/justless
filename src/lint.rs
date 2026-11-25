@@ -24,8 +24,10 @@
 //!   SQLFluff (`== [path] FAIL` + `L: N | P: M | RULE | message`), Ansible-lint two-line
 //!   blocks (`rule[sub]: message` + `path:line`), and Credo (`[W] ↗ message` +
 //!   `┃   path:line:col` and `--format oneline`).
-//! - Pyright's `  path:line:col - error: message (rule)` rows and hadolint's
-//!   `path:line DL3008 warning: message`.
+//! - Pyright's `  path:line:col - error: message (rule)` rows, hadolint's
+//!   `path:line DL3008 warning: message`, and Dart/Flutter analyzer's bullet (`•`)
+//!   and dash (`-`) diagnostic rows (`severity • message • path:line:col • rule`
+//!   and `severity - path:line:col - message - rule`).
 //!
 //! Errors without a source location and the tools' own totals stay visible as outcome
 //! lines. A stream that produced no finding is summarized by its line range, so other
@@ -60,6 +62,7 @@ pub enum Tool {
     AnsibleLint,
     Actionlint,
     Credo,
+    DartAnalyze,
 }
 
 #[allow(dead_code)]
@@ -77,6 +80,7 @@ impl Tool {
         Self::AnsibleLint,
         Self::Actionlint,
         Self::Credo,
+        Self::DartAnalyze,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -93,6 +97,7 @@ impl Tool {
             "ansible-lint" => Some(Self::AnsibleLint),
             "actionlint" => Some(Self::Actionlint),
             "credo" | "mix credo" => Some(Self::Credo),
+            "dart-analyze" | "dart analyze" | "flutter analyze" => Some(Self::DartAnalyze),
             _ => None,
         }
     }
@@ -111,6 +116,7 @@ impl Tool {
             Self::AnsibleLint => "ansible-lint",
             Self::Actionlint => "actionlint",
             Self::Credo => "credo",
+            Self::DartAnalyze => "dart-analyze",
         }
     }
 }
@@ -285,6 +291,19 @@ static PYRIGHT_RULE: LazyLock<Regex> =
 static HADOLINT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\S.*?):(\d+)(?::(\d+))? ((?:DL|SC)\d{4}) (error|warning|info|style): (.+)$")
         .unwrap()
+});
+static DART_ANALYZE_START: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?i)(error|warning|info|hint)\s+(•|-)\s+(.+)$").unwrap());
+static DART_ANALYZE_LOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([^\s:](?:[^:]|:[^\s\d])*?\.[A-Za-z0-9]+):(\d+)(?::(\d+))?$").unwrap()
+});
+static DART_ANALYZE_RULE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9_.-]*$").unwrap());
+static DART_ANALYZE_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^(?:Analyzing .+\.\.\.(?:\s+\d+(?:\.\d+)?s)?$|No issues found!(?: \(ran in [^)]+\))?$|Running "flutter pub get" in .+\.\.\.(?:\s+\d+(?:\.\d+)?s)?$)"#,
+    )
+    .unwrap()
 });
 static SHELLCHECK_FILE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^In (.+) line (\d+):$").unwrap());
@@ -519,6 +538,10 @@ fn build_status(line: &str) -> Option<(StatusKind, bool, bool)> {
     }
     if CREDO_CLEAN.is_match(line) {
         let finished = line.ends_with("found no issues.");
+        return Some((StatusKind::Lint, finished, !finished));
+    }
+    if DART_ANALYZE_STATUS.is_match(line) {
+        let finished = line.starts_with("No issues found!");
         return Some((StatusKind::Lint, finished, !finished));
     }
     None
@@ -1014,6 +1037,7 @@ impl Lint {
             && !CREDO_ONELINE.is_match(line)
             && !PHPSTAN_HEADER.is_match(line)
             && !PHPSTAN_BORDER.is_match(line)
+            && !DART_ANALYZE_START.is_match(line)
             && !is_build_outcome(line.trim())
             && !TOTAL.is_match(line.trim())
             && build_status(line).is_none()
@@ -1037,6 +1061,7 @@ impl Lint {
             && !CREDO_ONELINE.is_match(line)
             && !PHPSTAN_HEADER.is_match(line)
             && !PHPSTAN_BORDER.is_match(line)
+            && !DART_ANALYZE_START.is_match(line)
             && !(self.phpstan_file.is_some() && PHPSTAN_ROW.is_match(line))
             && !is_build_outcome(line.trim())
             && !TOTAL.is_match(line.trim())
@@ -1297,6 +1322,10 @@ impl Lint {
             let finding = Finding::new(Severity::parse(&c[4]), rule, &c[5], stream)
                 .at(&self.root, &c[1], &c[2], c.get(3))
                 .lines(n, line);
+            self.push(finding, false);
+            return true;
+        }
+        if let Some(finding) = parse_dart_analyze(line, &self.root, n, stream) {
             self.push(finding, false);
             return true;
         }
@@ -2013,6 +2042,44 @@ fn located(file: &str, message: &str, stream: Stream, tool: Option<Tool>) -> Opt
     Some(Finding::new(severity, rule, text, stream))
 }
 
+/// Parse Dart and Flutter analyzer lines in both modern bullet (`•`) and
+/// classic/Windows dash (`-`) formats, supporting both `message • loc • rule`
+/// and `loc - message - rule` field orders.
+fn parse_dart_analyze(line: &str, root: &str, n: usize, stream: Stream) -> Option<Finding> {
+    let c = DART_ANALYZE_START.captures(line)?;
+    let sep = if &c[2] == "•" { " • " } else { " - " };
+    let rest = c[3].trim();
+    let (mid, raw_rule) = rest.rsplit_once(sep)?;
+    let rule = raw_rule.trim();
+    if !DART_ANALYZE_RULE.is_match(rule) {
+        return None;
+    }
+    let (loc, message) = if let Some((left, right)) = mid.split_once(sep)
+        && let Some(loc) = DART_ANALYZE_LOC.captures(left.trim())
+    {
+        (loc, right.trim())
+    } else if let Some((left, right)) = mid.rsplit_once(sep)
+        && let Some(loc) = DART_ANALYZE_LOC.captures(right.trim())
+    {
+        (loc, left.trim())
+    } else {
+        return None;
+    };
+    if message.is_empty() {
+        return None;
+    }
+    Some(
+        Finding::new(
+            Severity::parse(&c[1]),
+            Some(rule.to_owned()),
+            message,
+            stream,
+        )
+        .at(root, &loc[1], &loc[2], loc.get(3))
+        .lines(n, line.trim()),
+    )
+}
+
 /// The rustc lint a Rust finding's wording implies. Other languages' compilers, such
 /// as javac's `unreachable statement`, keep their message.
 fn rustc_lint(finding: &Finding) -> Option<&'static str> {
@@ -2489,7 +2556,7 @@ cmd/server/main.go:8:2: undefined: secretKey
 
     #[test]
     fn tool_dispatch_names_round_trip() {
-        assert_eq!(Tool::ALL.len(), 12);
+        assert_eq!(Tool::ALL.len(), 13);
         let expected = [
             ("phpstan", Tool::Phpstan),
             ("clang-tidy", Tool::ClangTidy),
@@ -2503,6 +2570,7 @@ cmd/server/main.go:8:2: undefined: secretKey
             ("ansible-lint", Tool::AnsibleLint),
             ("actionlint", Tool::Actionlint),
             ("credo", Tool::Credo),
+            ("dart-analyze", Tool::DartAnalyze),
         ];
         for (name, tool) in expected {
             assert_eq!(Tool::from_name(name), Some(tool), "{name}");
@@ -2513,6 +2581,8 @@ cmd/server/main.go:8:2: undefined: secretKey
             Some(Tool::Markdownlint)
         );
         assert_eq!(Tool::from_name("mix credo"), Some(Tool::Credo));
+        assert_eq!(Tool::from_name("dart analyze"), Some(Tool::DartAnalyze));
+        assert_eq!(Tool::from_name("flutter analyze"), Some(Tool::DartAnalyze));
         assert_eq!(Tool::from_name("unknown-tool"), None);
 
         let mut lint = Lint::for_tool(Path::new("/repo"), Tool::Phpstan);
@@ -3849,5 +3919,116 @@ lib/parser.ex:102:7: F: Function is too complex (cyclomatic complexity is 12, ma
                 report.len()
             );
         }
+    }
+
+    #[test]
+    fn dart_and_flutter_analyze_bullet_and_dash_formats_group_by_rule() {
+        // 1. Modern `flutter analyze` bullet (`•`) format with errors, warnings, and info.
+        let mut bullet_out = String::from("Analyzing my_app...\n\n");
+        for (file, line) in [
+            ("lib/foo.dart", 12),
+            ("lib/foo.dart", 14),
+            ("lib/bar.dart", 5),
+            ("lib/baz.dart", 9),
+            ("lib/qux.dart", 3),
+        ] {
+            bullet_out.push_str(&format!(
+                "   info • Unused import: 'dart:math' • {file}:{line}:8 • unused_import\n"
+            ));
+        }
+        bullet_out.push_str(concat!(
+            "warning • The value of the local variable 'x' isn't used • lib/bar.dart:42:9 • unused_local_variable\n",
+            "warning • Dead code • lib/bar.dart:51:5 • dead_code\n",
+            "  error • Target of URI doesn't exist: 'package:missing/x.dart' • lib/main.dart:3:8 • uri_does_not_exist\n",
+            "  error • Target of URI doesn't exist: 'package:missing/y.dart' • lib/app.dart:7:8 • uri_does_not_exist\n",
+            "\n9 issues found. (ran in 1.4s)\n",
+        ));
+        let (report, _) = feed(&bullet_out, "")
+            .finish("flutter analyze", 4096, None)
+            .unwrap();
+        let saved = bullet_out.len().saturating_sub(report.len());
+        let pct = (saved as f64 / bullet_out.len() as f64) * 100.0;
+        println!(
+            "flutter analyze: {} B -> {} B (-{pct:.1}%)",
+            bullet_out.len(),
+            report.len()
+        );
+        assert!(
+            report.len() < bullet_out.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            bullet_out.len()
+        );
+        assert!(
+            report.contains(
+                "flutter analyze: 9 finding(s), 2 error(s), 7 warning(s) · 4 rule(s) · 6 file(s)"
+            ),
+            "{report}"
+        );
+        // Errors are pinned before warnings/info.
+        let err_pos = report.find("error uri_does_not_exist ×2").expect(&report);
+        let info_pos = report.find("warning unused_import ×5").expect(&report);
+        assert!(
+            err_pos < info_pos,
+            "errors must precede warnings:\n{report}"
+        );
+        assert!(
+            report.contains("lib/app.dart:7:8, lib/main.dart:3:8 [stdout:10-10]"),
+            "{report}"
+        );
+        assert!(report.contains("[stdout:3-3]"), "{report}");
+        assert!(
+            report.contains("9 issues found. (ran in 1.4s) [stdout:13]"),
+            "{report}"
+        );
+
+        // 2. Classic / Windows / `dart analyze` dash (`-`) format (both field orders + embedded ` - `).
+        let dash_out = concat!(
+            "Analyzing my_app...\n",
+            "   info - lib/foo.dart:12:8 - Unused import: 'dart:math'. - unused_import\n",
+            "   info - lib/bar.dart:18:8 - Unused import: 'dart:async'. - unused_import\n",
+            "warning - Value 'a - b' isn't used - lib/bar.dart:42:9 - unused_local_variable\n",
+            "  error - lib/main.dart:3:8 - Target of URI doesn't exist: 'package:missing/x.dart'. - uri_does_not_exist\n",
+            "\n4 issues found.\n",
+        );
+        let (dash_report, _) = feed(dash_out, "")
+            .finish("dart analyze", 4096, None)
+            .unwrap();
+        assert!(
+            dash_report.contains(
+                "dart analyze: 4 finding(s), 1 error(s), 3 warning(s) · 3 rule(s) · 3 file(s)"
+            ),
+            "{dash_report}"
+        );
+        assert!(
+            dash_report.find("error uri_does_not_exist ×1").unwrap()
+                < dash_report.find("warning unused_import ×2").unwrap(),
+            "{dash_report}"
+        );
+        assert!(
+            dash_report.contains("warning unused_local_variable ×1  Value 'a - b' isn't used"),
+            "{dash_report}"
+        );
+        assert!(
+            dash_report.contains("lib/main.dart:3:8 [stdout:5-5]"),
+            "{dash_report}"
+        );
+        assert!(
+            dash_report.contains("4 issues found. [stdout:7]"),
+            "{dash_report}"
+        );
+
+        // 3. Clean `No issues found!` summary collapses, while incomplete progress fails closed.
+        let clean_out = "Analyzing my_app...                                             1.4s\nNo issues found! (ran in 1.4s)\n";
+        let clean = feed(clean_out, "").clean("flutter analyze").unwrap();
+        assert!(
+            clean.contains("flutter analyze: 0 findings")
+                && clean.contains("No issues found! (ran in 1.4s)"),
+            "{clean}"
+        );
+        assert_eq!(
+            feed("Analyzing my_app...\n", "").clean("dart analyze"),
+            None
+        );
     }
 }

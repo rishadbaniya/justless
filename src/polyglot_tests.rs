@@ -1,7 +1,7 @@
 //! Structured streaming parsers and compactors for polyglot test runners:
 //! Pytest, Python `unittest`, Go `go test`, .NET `dotnet test`, Maven Surefire/
 //! Failsafe, Gradle, Swift (`XCTest` and Swift Testing), CTest, Elixir
-//! `mix test`, and `deno test`.
+//! `mix test`, `deno test`, and Flutter/Dart (`flutter test`, `dart test`).
 //!
 //! Each runner is parsed by a dedicated streaming sub-scanner across both
 //! `stdout` and `stderr`, emitting exact 1-based inclusive `[stdout:A-B]` /
@@ -185,6 +185,28 @@ static DENO_FILE_LOC: LazyLock<Regex> = LazyLock::new(|| {
         .expect("deno file loc pattern")
 });
 
+// Dart / Flutter test regexes
+static DART_TEST_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(\d{2,}:\d{2})\s+\+(\d+)(?:\s+~(\d+))?(?:\s+-(\d+))?:\s*(.+)$")
+        .expect("dart test line pattern")
+});
+static DART_TERSE_FRAME_LOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^((?:file://|package:|dart:)?[^\s]+\.dart)\s+(\d+:\d+)\s+\S")
+        .expect("dart terse stack frame pattern")
+});
+static DART_TERSE_FRAME_PKG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:package:|dart:)[A-Za-z0-9_./-]+\s{2,}\S")
+        .expect("dart terse framework frame pattern")
+});
+static DART_VM_FRAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^#\d+\s+\S.*?\(([^()\s]+?\.dart:\d+(?::\d+)?)\)\s*$")
+        .expect("dart vm stack frame pattern")
+});
+static DART_INLINE_LOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"((?:[A-Za-z]:[\\/]|/|\./)?[^\s()'`\x22=:]+?\.dart:\d+(?::\d+)?)")
+        .expect("dart inline file location pattern")
+});
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -202,6 +224,7 @@ pub enum Runner {
     Ctest,
     Mix,
     Deno,
+    DartTest,
 }
 
 #[allow(dead_code)]
@@ -218,6 +241,7 @@ impl Runner {
             Self::Ctest => "ctest",
             Self::Mix => "mix test",
             Self::Deno => "deno test",
+            Self::DartTest => "dart test",
         }
     }
 }
@@ -355,8 +379,52 @@ pub fn runner_for_words(words: &[&str]) -> Option<Runner> {
             }
             Some(Runner::Deno)
         }
+        "dart" | "flutter" => {
+            let ["test", tail @ ..] = args else {
+                return None;
+            };
+            if dart_test_excluded(tail) {
+                return None;
+            }
+            Some(Runner::DartTest)
+        }
         _ => None,
     }
+}
+
+fn dart_test_excluded(tail: &[&str]) -> bool {
+    let mut iter = tail.iter().copied();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if matches!(arg, "--machine" | "--start-paused") {
+            return true;
+        }
+        if let Some(val) = arg
+            .strip_prefix("--reporter=")
+            .or_else(|| arg.strip_prefix("-r="))
+        {
+            if !matches!(val.to_ascii_lowercase().as_str(), "compact" | "expanded") {
+                return true;
+            }
+            continue;
+        }
+        if matches!(arg, "-r" | "--reporter") {
+            let val = iter.next().unwrap_or("");
+            if !matches!(val.to_ascii_lowercase().as_str(), "compact" | "expanded") {
+                return true;
+            }
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("-r")
+            && !val.is_empty()
+            && !matches!(val.to_ascii_lowercase().as_str(), "compact" | "expanded")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[allow(dead_code)]
@@ -451,6 +519,7 @@ enum RunnerScan {
     Ctest(CtestScan),
     Mix(MixScan),
     Deno(DenoScan),
+    DartTest(DartTestScan),
 }
 
 #[allow(dead_code)]
@@ -467,6 +536,7 @@ impl Scan {
             Runner::Ctest => RunnerScan::Ctest(CtestScan::default()),
             Runner::Mix => RunnerScan::Mix(MixScan::default()),
             Runner::Deno => RunnerScan::Deno(DenoScan::default()),
+            Runner::DartTest => RunnerScan::DartTest(DartTestScan::default()),
         };
         Self { inner }
     }
@@ -485,6 +555,7 @@ impl Scan {
             RunnerScan::Ctest(s) => s.observe(line, n, stream),
             RunnerScan::Mix(s) => s.observe(line, n, stream),
             RunnerScan::Deno(s) => s.observe(line, n, stream),
+            RunnerScan::DartTest(s) => s.observe(line, n, stream),
         }
     }
 
@@ -506,6 +577,7 @@ impl Scan {
             RunnerScan::Ctest(s) => s.finish()?,
             RunnerScan::Mix(s) => s.finish()?,
             RunnerScan::Deno(s) => s.finish()?,
+            RunnerScan::DartTest(s) => s.finish()?,
         };
         finalize_report(parsed, exit_code, stdout_bytes, stderr_bytes, budget)
     }
@@ -3804,7 +3876,397 @@ impl DenoScan {
 }
 
 // ---------------------------------------------------------------------------
-// Comprehensive Unit Tests (All 10 Runners)
+// 11. Flutter & Dart (`flutter test` / `dart test`) Scanner
+// ---------------------------------------------------------------------------
+
+struct DartOpen {
+    index: usize,
+    stream: Stream,
+}
+
+struct DartPendingException {
+    stream: Stream,
+    start: usize,
+    end: usize,
+    active: bool,
+    in_description: bool,
+    error: String,
+    fallback: String,
+    location: Option<String>,
+    excerpt: Vec<String>,
+    first_line: String,
+    last_line: String,
+}
+
+#[derive(Default)]
+struct DartTestScan {
+    failures: Vec<RawFailure>,
+    open: Option<DartOpen>,
+    pending_exception: Option<DartPendingException>,
+    saw_total: bool,
+    reported_ok: bool,
+    reported_failed_count: usize,
+    reported_failed_banner: bool,
+    has_test_stderr: bool,
+    passed: [Range; 2],
+    totals: Vec<String>,
+    other: [Other; 2],
+    overflowed: bool,
+}
+
+impl DartTestScan {
+    fn observe(&mut self, line: &str, n: usize, stream: Stream) {
+        if line.contains('\r') {
+            for seg in line.split('\r') {
+                if !seg.trim().is_empty() {
+                    self.observe_segment(seg, n, stream);
+                }
+            }
+            return;
+        }
+        self.observe_segment(line, n, stream);
+    }
+
+    fn flush_pending_exception(&mut self) {
+        if let Some(exc) = self.pending_exception.take() {
+            let other = &mut self.other[exc.stream as usize];
+            other.observe(&exc.first_line, exc.start);
+            if exc.end > exc.start {
+                other.observe(&exc.last_line, exc.end);
+            }
+        }
+    }
+
+    fn observe_segment(&mut self, line: &str, n: usize, stream: Stream) {
+        let trimmed = line.trim();
+        let idx = stream as usize;
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.open.as_ref().is_some_and(|o| o.stream != stream) {
+            self.open = None;
+        }
+
+        // Flutter widget test exception banner printed before the `[E]` line.
+        if is_flutter_exception_header(trimmed) {
+            self.open = None;
+            if let Some(exc) = self.pending_exception.as_mut()
+                && exc.stream == stream
+            {
+                exc.active = true;
+                exc.in_description = false;
+                exc.end = n;
+                exc.last_line = line.to_owned();
+                return;
+            }
+            self.flush_pending_exception();
+            self.pending_exception = Some(DartPendingException {
+                stream,
+                start: n,
+                end: n,
+                active: true,
+                in_description: false,
+                error: String::new(),
+                fallback: String::new(),
+                location: None,
+                excerpt: Vec::new(),
+                first_line: line.to_owned(),
+                last_line: line.to_owned(),
+            });
+            return;
+        }
+
+        if let Some(exc) = self.pending_exception.as_mut()
+            && exc.active
+            && exc.stream == stream
+        {
+            exc.end = n;
+            exc.last_line = line.to_owned();
+            if is_flutter_exception_border(trimmed) {
+                exc.active = false;
+                exc.in_description = false;
+                if exc.error.is_empty() && !exc.fallback.is_empty() {
+                    exc.error = exc.fallback.clone();
+                }
+                return;
+            }
+            if trimmed == "The test description was:" {
+                exc.in_description = true;
+                return;
+            }
+            if exc.in_description || trimmed == "When the exception was thrown, this was the stack:"
+            {
+                return;
+            }
+            if trimmed.starts_with("The following ") && trimmed.ends_with(':') {
+                if exc.fallback.is_empty() {
+                    exc.fallback = short(trimmed, 220);
+                }
+                return;
+            }
+            observe_dart_detail(&mut exc.error, &mut exc.location, &mut exc.excerpt, trimmed);
+            return;
+        }
+
+        // Timestamped `package:test` / `flutter test` progress, failure, and summary lines.
+        if let Some(cap) = DART_TEST_LINE.captures(trimmed) {
+            let failed_count = cap
+                .get(4)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            let rest = cap[5].trim();
+            if stream == Stream::Stderr {
+                self.has_test_stderr = true;
+            }
+
+            if matches!(
+                rest,
+                "All tests passed!" | "All tests skipped." | "No tests ran."
+            ) {
+                self.open = None;
+                self.flush_pending_exception();
+                self.saw_total = true;
+                self.reported_failed_count = self.reported_failed_count.max(failed_count);
+                if failed_count == 0 && rest != "No tests ran." {
+                    self.reported_ok = true;
+                } else if failed_count > 0 {
+                    self.reported_failed_banner = true;
+                }
+                self.totals.push(short(trimmed, 220));
+                return;
+            }
+
+            if rest == "Some tests failed." || rest.starts_with("Some tests failed.") {
+                self.open = None;
+                self.flush_pending_exception();
+                self.saw_total = true;
+                self.reported_failed_count = self.reported_failed_count.max(failed_count);
+                self.reported_failed_banner = true;
+                self.totals.push(short(trimmed, 220));
+                return;
+            }
+
+            if let Some(test_name) = rest.strip_suffix(" [E]") {
+                self.open = None;
+                self.reported_failed_count = self.reported_failed_count.max(failed_count);
+                let mut f = RawFailure::new(test_name.trim().to_owned(), stream, n);
+                if let Some(exc) = self.pending_exception.take() {
+                    if exc.stream == stream && !exc.active {
+                        f.start = exc.start;
+                        f.error = exc.error;
+                        f.location = exc.location;
+                        f.excerpt = exc.excerpt;
+                    } else {
+                        self.pending_exception = Some(exc);
+                        self.flush_pending_exception();
+                    }
+                }
+                if let Some(index) =
+                    push_failure_bounded(&mut self.failures, &mut self.overflowed, f)
+                {
+                    self.open = Some(DartOpen { index, stream });
+                }
+                return;
+            }
+
+            // Normal progress / passing / loading line.
+            self.open = None;
+            self.flush_pending_exception();
+            self.reported_failed_count = self.reported_failed_count.max(failed_count);
+            self.passed[idx].add(n);
+            return;
+        }
+
+        if is_dart_test_boilerplate(trimmed) {
+            return;
+        }
+
+        if let Some(open) = self.open.as_mut() {
+            let f = &mut self.failures[open.index];
+            f.end = n;
+            observe_dart_detail(&mut f.error, &mut f.location, &mut f.excerpt, trimmed);
+            return;
+        }
+
+        self.other[idx].observe(line, n);
+    }
+
+    fn finish(mut self) -> Option<ParsedReport> {
+        self.flush_pending_exception();
+        if !self.saw_total {
+            return None;
+        }
+        for f in &mut self.failures {
+            if f.error == "Test failed. See exception logs above."
+                && f.location.is_none()
+                && f.excerpt.is_empty()
+            {
+                f.key = format!("test:{}", f.test);
+            }
+        }
+        let mut passed = Vec::new();
+        for stream in Stream::BOTH {
+            let r = &self.passed[stream as usize];
+            if r.count > 0 {
+                passed.push(PassedSummary {
+                    label: format!("dart test: {} progress/pass line(s)", r.count),
+                    stream,
+                    first: r.first,
+                    last: r.last,
+                });
+            }
+        }
+        let (notes, compact_notes, covers_stderr) = build_notes(&self.other, self.has_test_stderr);
+        Some(ParsedReport {
+            failures: self.failures,
+            passed,
+            totals: self.totals,
+            notes,
+            compact_notes,
+            covers_stderr,
+            reported_failed: self.reported_failed_banner || self.reported_failed_count > 0,
+            min_expected_failures: self.reported_failed_count,
+            reported_clean: self.reported_ok,
+            overflowed: self.overflowed,
+        })
+    }
+}
+
+fn strip_file_uri(path: &str) -> &str {
+    match path.strip_prefix("file://") {
+        Some(rest)
+            if rest.len() >= 3
+                && rest.as_bytes()[0] == b'/'
+                && rest.as_bytes()[1].is_ascii_alphabetic()
+                && rest.as_bytes()[2] == b':' =>
+        {
+            &rest[1..]
+        }
+        Some(rest) => rest,
+        None => path,
+    }
+}
+
+fn is_dart_framework_frame(path: &str) -> bool {
+    path.starts_with("dart:")
+        || path == "package:matcher"
+        || path.starts_with("package:matcher/")
+        || path == "package:test"
+        || path.starts_with("package:test/")
+        || path == "package:test_api"
+        || path.starts_with("package:test_api/")
+        || path == "package:test_core"
+        || path.starts_with("package:test_core/")
+        || path == "package:flutter_test"
+        || path.starts_with("package:flutter_test/")
+        || path == "package:flutter"
+        || path.starts_with("package:flutter/")
+        || path.starts_with("package:stack_trace")
+        || path.starts_with("package:fake_async")
+}
+
+fn is_flutter_exception_header(trimmed: &str) -> bool {
+    trimmed.starts_with('═') && trimmed.contains("EXCEPTION CAUGHT BY ")
+}
+
+fn is_flutter_exception_border(trimmed: &str) -> bool {
+    trimmed.chars().count() >= 10 && trimmed.chars().all(|c| c == '═')
+}
+
+fn is_dart_test_boilerplate(trimmed: &str) -> bool {
+    trimmed.starts_with("Running \"flutter pub get\" in ")
+        || trimmed.starts_with("Consider enabling the flag chain-stack-traces")
+        || trimmed.starts_with("For example, 'dart test --chain-stack-traces'")
+        || trimmed.starts_with("For example, 'flutter test --chain-stack-traces'")
+}
+
+fn observe_dart_detail(
+    error: &mut String,
+    location: &mut Option<String>,
+    excerpt: &mut Vec<String>,
+    trimmed: &str,
+) {
+    if trimmed.starts_with("To run this test again:")
+        || trimmed.starts_with("The test description was:")
+        || trimmed == "<asynchronous suspension>"
+        || trimmed.chars().all(|c| matches!(c, '^' | '~' | '═'))
+    {
+        return;
+    }
+    if let Some(cap) = DART_VM_FRAME.captures(trimmed) {
+        let raw_loc = &cap[1];
+        if location.is_none() && !is_dart_framework_frame(raw_loc) {
+            *location = Some(strip_file_uri(raw_loc).to_owned());
+        }
+        return;
+    }
+    if trimmed.starts_with('#')
+        && trimmed[1..].starts_with(|c: char| c.is_ascii_digit())
+        && trimmed.contains(" (")
+    {
+        return;
+    }
+    if let Some(cap) = DART_TERSE_FRAME_LOC.captures(trimmed) {
+        let path = &cap[1];
+        if location.is_none() && !is_dart_framework_frame(path) {
+            *location = Some(format!("{}:{}", strip_file_uri(path), &cap[2]));
+        }
+        return;
+    }
+    if DART_TERSE_FRAME_PKG.is_match(trimmed) {
+        return;
+    }
+    if trimmed == "Test failed. See exception logs above." {
+        if error.is_empty() {
+            *error = trimmed.to_owned();
+        }
+        return;
+    }
+    if trimmed.starts_with("Expected:") {
+        if error.is_empty() || error == "Test failed. See exception logs above." {
+            *error = short(trimmed, 220);
+        } else if excerpt.len() < MAX_EXCERPT {
+            excerpt.push(short(trimmed, 200));
+        }
+        return;
+    }
+    if trimmed.starts_with("Actual:") {
+        if error.starts_with("Expected:") && !error.contains("Actual:") {
+            let combined = format!("{error}, {trimmed}");
+            *error = short(&combined, 220);
+        } else if error.is_empty() || error == "Test failed. See exception logs above." {
+            *error = short(trimmed, 220);
+        } else if excerpt.len() < MAX_EXCERPT {
+            excerpt.push(short(trimmed, 200));
+        }
+        return;
+    }
+    if trimmed.starts_with("Which:") {
+        if excerpt.len() < MAX_EXCERPT {
+            excerpt.push(short(trimmed, 200));
+        }
+        return;
+    }
+    if location.is_none()
+        && let Some(cap) = DART_INLINE_LOC.captures(trimmed)
+        && !is_dart_framework_frame(&cap[1])
+    {
+        *location = Some(strip_file_uri(&cap[1]).to_owned());
+    }
+    if error.is_empty() || error == "Test failed. See exception logs above." {
+        *error = short(trimmed, 220);
+    } else if excerpt.len() < MAX_EXCERPT
+        && (error.starts_with("Failed to load ")
+            || is_assertion_excerpt(trimmed)
+            || trimmed.contains("Error:")
+            || trimmed.contains("Exception:"))
+    {
+        excerpt.push(short(trimmed, 200));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comprehensive Unit Tests (All 11 Runners)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -5281,6 +5743,223 @@ mod tests {
             );
             assert!(rep.text.len() < raw, "{label} not smaller");
             assert_valid_pointers(&rep, &out, &err);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. Flutter & Dart (`flutter test` / `dart test`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flutter_test_passing_run_and_multi_failure_dedup() {
+        // 1. Noisy passing progress run collapses to clean pass summary.
+        let mut pass_out = String::from("00:00 +0: loading test/widget_test.dart\n");
+        for i in 1..=40 {
+            pass_out.push_str(&format!(
+                "00:{:02} +{i}: test/widget_test.dart: widget scenario {i:02} renders expected state\n",
+                i / 10
+            ));
+        }
+        pass_out.push_str("00:05 +40: All tests passed!\n");
+
+        let pass = format(Runner::DartTest, &pass_out, "", Some(0), DEFAULT_BUDGET).unwrap();
+        let pass_pct = 100.0 * (1.0 - (pass.text.len() as f64 / pass_out.len() as f64));
+        println!(
+            "flutter test pass: {} B -> {} B (-{pass_pct:.1}%)",
+            pass_out.len(),
+            pass.text.len()
+        );
+        assert!(pass.items.is_empty());
+        assert!(pass.covers_stderr);
+        assert!(
+            pass.text
+                .contains("dart test: 41 progress/pass line(s) [stdout:1-41]"),
+            "{}",
+            pass.text
+        );
+        assert!(
+            pass.text.contains("00:05 +40: All tests passed!"),
+            "{}",
+            pass.text
+        );
+        assert!(pass.text.len() < pass_out.len() / 5, "{}", pass.text);
+
+        // 2. Multi-failure run: two identical root causes (volatile ts/hex normalized) + Flutter widget exception.
+        let mut fail_out = String::from("00:00 +0: loading test/auth_test.dart\n");
+        for i in 1..=25 {
+            fail_out.push_str(&format!(
+                "00:01 +{i}: test/auth_test.dart: valid auth case {i:02}\n"
+            ));
+        }
+        fail_out.push_str(concat!(
+            "00:03 +25 -1: test/auth_test.dart: rejects expired token [E]\n",
+            "  Expected: <200>\n",
+            "    Actual: <401> at 2026-11-25T10:00:01Z (0x7f1234560001)\n",
+            "\n",
+            "  package:matcher                                     expect\n",
+            "  package:flutter_test/src/widget_tester.dart 473:18  expect\n",
+            "  test/auth_test.dart 42:5                            main.<fn>\n",
+            "\n",
+            "00:03 +25 -2: test/auth_test.dart: rejects revoked token [E]\n",
+            "  Expected: <200>\n",
+            "    Actual: <401> at 2026-11-25T10:00:02Z (0x7f1234560002)\n",
+            "\n",
+            "  package:matcher                                     expect\n",
+            "  package:flutter_test/src/widget_tester.dart 473:18  expect\n",
+            "  test/auth_test.dart 42:5                            main.<fn>\n",
+            "\n",
+            "00:04 +26 -2: test/widget_test.dart: counter increments\n",
+            "══╡ EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK ╞════════════════════════════════════\n",
+            "The following TestFailure object was thrown running a test:\n",
+            "  Expected: exactly one matching candidate\n",
+            "  Actual: _TextWidgetFinder:<Found 0 widgets with text \"1\": []>\n",
+            "   Which: means none were found but one was expected\n",
+            "\n",
+            "When the exception was thrown, this was the stack:\n",
+            "#0      fail (package:matcher/src/expect/expect.dart:149:31)\n",
+            "#1      expect (package:flutter_test/src/widget_tester.dart:473:18)\n",
+            "#2      main.<anonymous closure> (file:///repo/test/widget_test.dart:28:5)\n",
+            "<asynchronous suspension>\n",
+            "\n",
+            "The test description was:\n",
+            "  counter increments\n",
+            "════════════════════════════════════════════════════════════════════════════════════\n",
+            "00:04 +26 -3: test/widget_test.dart: counter increments [E]\n",
+            "  Test failed. See exception logs above.\n",
+            "  The test description was: counter increments\n",
+            "\n",
+            "00:05 +26 -3: Some tests failed.\n",
+            "Consider enabling the flag chain-stack-traces to receive more detailed exceptions.\n",
+            "For example, 'flutter test --chain-stack-traces'.\n",
+        ));
+
+        let rep = format(Runner::DartTest, &fail_out, "", Some(1), DEFAULT_BUDGET).unwrap();
+        let fail_pct = 100.0 * (1.0 - (rep.text.len() as f64 / fail_out.len() as f64));
+        println!(
+            "flutter test fail: {} B -> {} B (-{fail_pct:.1}%)",
+            fail_out.len(),
+            rep.text.len()
+        );
+        assert!(rep.text.len() < fail_out.len(), "{}", rep.text);
+        assert_eq!(rep.items.len(), 3);
+        assert_valid_pointers(&rep, &fail_out, "");
+
+        // Identical root causes deduplicate into a single `2 test(s)` group.
+        assert!(
+            rep.text.contains("3 reported failing test(s)"),
+            "{}",
+            rep.text
+        );
+        assert!(
+            rep.text
+                .contains("2 test(s): Expected: <200>, Actual: <401>"),
+            "{}",
+            rep.text
+        );
+        assert!(
+            rep.text.contains("test/auth_test.dart:42:5"),
+            "{}",
+            rep.text
+        );
+        assert!(
+            rep.text
+                .contains("test/auth_test.dart: rejects expired token [stdout:27-33]"),
+            "{}",
+            rep.text
+        );
+        assert!(
+            rep.text
+                .contains("test/auth_test.dart: rejects revoked token [stdout:35-41]"),
+            "{}",
+            rep.text
+        );
+        // Flutter exception block merges cleanly into the widget test failure with exact span.
+        assert!(
+            rep.text
+                .contains("1 test(s): test/widget_test.dart: counter increments"),
+            "{}",
+            rep.text
+        );
+        assert!(
+            rep.text
+                .contains("Expected: exactly one matching candidate"),
+            "{}",
+            rep.text
+        );
+        assert!(
+            rep.text.contains("/repo/test/widget_test.dart:28:5"),
+            "{}",
+            rep.text
+        );
+        assert!(
+            rep.text.contains("00:05 +26 -3: Some tests failed."),
+            "{}",
+            rep.text
+        );
+        let widget_slice = slice_lines(&fail_out, rep.items[2].start, rep.items[2].end);
+        assert!(
+            widget_slice.contains("EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK")
+                && widget_slice.contains("Test failed. See exception logs above."),
+            "{widget_slice}"
+        );
+    }
+
+    #[test]
+    fn dart_test_fail_closed_and_runner_detection() {
+        // 1. Nonzero exit with unparsed crash fails closed.
+        let crash = "Error: Unable to find pubspec.yaml in /repo.\nUnhandled exception:\nBad state: No element\n";
+        assert!(format(Runner::DartTest, "", crash, Some(1), DEFAULT_BUDGET).is_none());
+
+        // 2. Nonzero exit even if stdout claims All tests passed! fails closed.
+        let mut pass_out = String::from("00:00 +0: loading test/a_test.dart\n");
+        for i in 1..=20 {
+            pass_out.push_str(&format!("00:01 +{i}: test/a_test.dart: case {i}\n"));
+        }
+        pass_out.push_str("00:02 +20: All tests passed!\n");
+        assert!(format(Runner::DartTest, &pass_out, "", Some(0), DEFAULT_BUDGET).is_some());
+        assert!(format(Runner::DartTest, &pass_out, "", Some(1), DEFAULT_BUDGET).is_none());
+
+        // 3. Summary failure count contradicting parsed `[E]` count fails closed.
+        let contradict = concat!(
+            "00:00 +0: loading test/a_test.dart\n",
+            "00:01 +1 -1: test/a_test.dart: fails once [E]\n",
+            "  Expected: <1>\n",
+            "    Actual: <2>\n",
+            "00:02 +1 -2: Some tests failed.\n",
+        );
+        assert!(format(Runner::DartTest, contradict, "", Some(1), DEFAULT_BUDGET).is_none());
+
+        // 4. `runner_for_words` accepts display invocations and skips machine reporters.
+        for words in [
+            &["flutter", "test"][..],
+            &["dart", "test"][..],
+            &[
+                "flutter",
+                "test",
+                "test/widget_test.dart",
+                "--update-goldens",
+            ][..],
+            &["dart", "test", "-r", "expanded"][..],
+            &["dart", "test", "--reporter=compact"][..],
+        ] {
+            assert_eq!(
+                runner_for_words(words),
+                Some(Runner::DartTest),
+                "expected DartTest for {words:?}"
+            );
+        }
+        for words in [
+            &["dart", "test", "-r", "json"][..],
+            &["dart", "test", "--reporter=json"][..],
+            &["dart", "test", "--reporter", "json"][..],
+            &["flutter", "test", "-rjson"][..],
+            &["flutter", "test", "--reporter=github"][..],
+            &["flutter", "test", "--machine"][..],
+            &["flutter", "test", "--help"][..],
+            &["dart", "test", "-h"][..],
+            &["flutter", "analyze"][..],
+        ] {
+            assert_eq!(runner_for_words(words), None, "expected None for {words:?}");
         }
     }
 }

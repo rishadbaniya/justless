@@ -1782,6 +1782,7 @@ impl Capture<'_> {
                         | crate::polyglot_tests::Runner::Ctest
                         | crate::polyglot_tests::Runner::Mix
                         | crate::polyglot_tests::Runner::Deno
+                        | crate::polyglot_tests::Runner::DartTest
                 )) {
             polyglot_test_view(
                 runner,
@@ -2559,7 +2560,8 @@ fn deptree_view(
 
 /// Format structured polyglot test runner output (`pytest`, `unittest`,
 /// `go test`, `dotnet test`, `mvn test`, `gradle test`, `swift test`, `ctest`,
-/// `mix test`, `deno test`), redacting both streams before formatting.
+/// `mix test`, `deno test`, `flutter test`, `dart test`), redacting both
+/// streams before formatting.
 fn polyglot_test_view(
     runner: crate::polyglot_tests::Runner,
     readers: &[File],
@@ -2649,6 +2651,7 @@ fn known_lint_tool(words: &[&str]) -> Option<crate::lint::Tool> {
                         | "gitlab"
                         | "rdjson"
                         | "yaml"
+                        | "machine"
                 ) {
                     return None;
                 }
@@ -2669,6 +2672,13 @@ fn known_lint_tool(words: &[&str]) -> Option<crate::lint::Tool> {
         ("ansible-lint", _) => Some(crate::lint::Tool::AnsibleLint),
         ("actionlint", _) => Some(crate::lint::Tool::Actionlint),
         ("mix", ["credo", ..]) => Some(crate::lint::Tool::Credo),
+        ("dart" | "flutter", ["analyze", tail @ ..]) => {
+            let skip = tail.iter().take_while(|&&a| a != "--").any(|&arg| {
+                let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+                matches!(flag, "--write" | "--machine")
+            });
+            (!skip).then_some(crate::lint::Tool::DartAnalyze)
+        }
         _ => None,
     }
 }
@@ -5009,5 +5019,37 @@ done"#,
         assert_eq!(jest_run.replaced.as_deref(), Some("both"));
         assert_eq!(jest_run.budget_bytes, Some(budget));
         assert!(!jest_run.explicit_budget);
+    }
+
+    #[test]
+    fn known_lint_tool_recognizes_dart_and_flutter_analyze() {
+        for words in [
+            &["dart", "analyze"][..],
+            &["dart", "analyze", "lib/"][..],
+            &["flutter", "analyze"][..],
+            &["flutter", "analyze", "--no-pub", "--fatal-infos"][..],
+            &["/usr/local/bin/flutter", "analyze"][..],
+        ] {
+            assert_eq!(
+                known_lint_tool(words),
+                Some(crate::lint::Tool::DartAnalyze),
+                "expected DartAnalyze for {words:?}"
+            );
+        }
+        for words in [
+            &["dart", "analyze", "--format=json"][..],
+            &["dart", "analyze", "--format", "json"][..],
+            &["dart", "analyze", "--format=machine"][..],
+            &["dart", "analyze", "--format", "machine"][..],
+            &["flutter", "analyze", "--write=report.txt"][..],
+            &["flutter", "analyze", "--write", "report.txt"][..],
+            &["flutter", "analyze", "--watch"][..],
+            &["dart", "analyze", "--help"][..],
+            &["flutter", "analyze", "-h"][..],
+            &["dart", "test"][..],
+            &["flutter", "test"][..],
+        ] {
+            assert_eq!(known_lint_tool(words), None, "expected None for {words:?}");
+        }
     }
 }
