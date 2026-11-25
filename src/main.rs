@@ -40,6 +40,7 @@ mod merge;
 mod observations;
 mod pack;
 mod polyglot;
+mod polyglot_tests;
 mod postroute;
 mod proxy;
 mod redact;
