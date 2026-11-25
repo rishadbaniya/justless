@@ -414,6 +414,16 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         {
             replacement = Some((view, false));
         }
+        // 2a. Cloud & Kubernetes diff/manifest/listing compactors (`kubectl`/`oc diff`,
+        //     `helm template`/`get manifest`, `aws s3 ls`, `gcloud`/`az`/`aws` display lists).
+        if replacement.is_none()
+            && let Some(view) = crate::cloud_views::format(&cmd_refs, &redacted_text, budget)
+            && view.len() <= budget
+            && view.len() < output.len()
+            && (was_clipped || view.len() + 64 < text.len())
+        {
+            replacement = Some((view, false));
+        }
         // 2b. BuildKit / Docker / Compose / Podman build logs.
         if replacement.is_none()
             && crate::buildkit::is_build_command(&cmd_refs)
@@ -1028,6 +1038,7 @@ fn plan(command: &str) -> Option<Plan> {
         String,
         Option<&'static str>,
         Option<&'static str>,
+        Option<&'static str>,
         bool,
     );
     let mut found: Option<(Plan, KindKey)> = None;
@@ -1085,10 +1096,12 @@ fn plan(command: &str) -> Option<Plan> {
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         let extra_inv = extra_inventory_kind(&refs).map(ExtraInventory::tag);
         let cli_view = crate::cli_views::kind_tag(&refs);
+        let cloud_view = crate::cloud_views::kind_tag(&refs);
         let log_cmd = is_log_command(&refs);
         if !crate::agents::supported_words(&refs)
             && extra_inv.is_none()
             && cli_view.is_none()
+            && cloud_view.is_none()
             && !log_cmd
         {
             return None;
@@ -1099,6 +1112,7 @@ fn plan(command: &str) -> Option<Plan> {
             crate::summary::family(&args),
             extra_inv,
             cli_view,
+            cloud_view,
             log_cmd,
         );
         // A search whose pattern matches every line, such as `grep -rn "" file`, is
@@ -3187,5 +3201,168 @@ Events:
         );
         assert!(shown.len() * 15 < tf_state.len(), "{shown}");
         assert_archive_exact_and_accounted(&ws, &shown, &tf_state);
+    }
+
+    #[test]
+    fn post_run_cloud_views_compact_kube_diff_helm_s3_and_cloud_tables() {
+        let (_dir, ws) = test_workspace("");
+
+        // 1. `kubectl -n prod diff -f k8s/` with metadata noise + redaction safety.
+        let mut diff = String::from(
+            "\
+diff -u -N /tmp/LIVE-1/apps.v1.Deployment.prod.api /tmp/MERGED-1/apps.v1.Deployment.prod.api
+--- /tmp/LIVE-1/apps.v1.Deployment.prod.api\t2026-01-15 10:00:00 +0000
++++ /tmp/MERGED-1/apps.v1.Deployment.prod.api\t2026-01-15 10:00:00 +0000
+@@ -1,120 +1,120 @@
+ apiVersion: apps/v1
+ kind: Deployment
+ metadata:
+   managedFields:
+   - apiVersion: apps/v1
+     fieldsType: FieldsV1
+     fieldsV1:
+",
+        );
+        for i in 0..160 {
+            diff.push_str(&format!(
+                "       f:noise-managed-field-{i:03}: {{\"f:subkey\": {{}}}}\n"
+            ));
+        }
+        diff.push_str(concat!(
+            "   name: api\n",
+            "   namespace: prod\n",
+            "-  resourceVersion: \"100\"\n",
+            "+  resourceVersion: \"101\"\n",
+            " spec:\n",
+            "-  replicas: 2\n",
+            "+  replicas: 4\n",
+            "   template:\n",
+            "     spec:\n",
+            "       containers:\n",
+            "       - name: api\n",
+            "-        image: ghcr.io/acme/api:1.4.1\n",
+            "+        image: ghcr.io/acme/api:1.4.2\n",
+        ));
+        assert!(diff.len() > 4_096);
+        let shown = post_bash(&ws, "kubectl -n prod diff -f k8s/", &diff)
+            .expect("kubectl diff compacted via postroute");
+        assert!(shown.contains("+  replicas: 4"), "{shown}");
+        assert!(
+            shown.contains("+        image: ghcr.io/acme/api:1.4.2"),
+            "{shown}"
+        );
+        assert!(shown.contains("folded metadata:"), "{shown}");
+        assert!(!shown.contains("f:noise-managed-field-050"), "{shown}");
+        assert!(shown.len() * 4 < diff.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &diff);
+
+        // Redaction safety inside `kubectl diff` real change line.
+        let token = format!("{}{}{}", "gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        let secret_diff = diff.replace(
+            "+        image: ghcr.io/acme/api:1.4.2",
+            &format!("+        image: ghcr.io/acme/api:1.4.2\n+        token: {token}"),
+        );
+        let shown = post_bash(&ws, "kubectl -n prod diff -f k8s/", &secret_diff)
+            .expect("secret-bearing kubectl diff compacted");
+        assert!(!shown.contains(&token), "secret leaked: {shown}");
+        assert!(shown.contains("[redacted:"), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &secret_diff);
+
+        // 2. `helm template` (not pre-routed in known::ROUTED, compacted post-run).
+        let mut helm = String::new();
+        for i in 1..=8 {
+            helm.push_str(&format!(
+                "\
+---
+# Source: app/templates/deployment-{i}.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-{i:02}
+  namespace: prod
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/acme/api-{i:02}:2.0.0
+          env:
+            - name: ENV_A
+              value: val-a
+            - name: ENV_B
+              value: val-b
+            - name: ENV_C
+              value: val-c
+---
+# Source: app/templates/configmap-{i}.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cfg-{i:02}
+  namespace: prod
+data:
+  K1: v1
+  K2: v2
+  K3: v3
+  K4: v4
+  K5: v5
+"
+            ));
+        }
+        assert!(helm.len() > 4_096);
+        let shown = post_bash(&ws, "helm template app ./charts/app", &helm)
+            .expect("helm template compacted via postroute");
+        assert!(
+            shown.contains("Deployment/api-01 (3 replicas, image=ghcr.io/acme/api-01:2.0.0)"),
+            "{shown}"
+        );
+        assert!(shown.contains("ConfigMap/cfg-01 (5 keys)"), "{shown}");
+        assert!(shown.len() * 4 < helm.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &helm);
+
+        // 3. `aws s3 ls --recursive` (not pre-routed in known::ROUTED, compacted post-run).
+        let mut s3 = String::from("                           PRE archive/\n");
+        for i in 1..=120 {
+            s3.push_str(&format!(
+                "2026-01-15 10:22:{:02}    {:>9} warehouse/events/part-{i:05}.parquet\n",
+                i % 60,
+                262_144 + i * 512
+            ));
+        }
+        assert!(s3.len() > 6_000);
+        let shown = post_bash(&ws, "aws s3 ls s3://acme-data/ --recursive", &s3)
+            .expect("aws s3 ls compacted via postroute");
+        assert!(shown.contains("PRE archive/ [stdout:1]"), "{shown}");
+        assert!(shown.contains("warehouse/events/"), "{shown}");
+        assert!(shown.contains(".parquet ×120"), "{shown}");
+        assert!(shown.len() * 15 < s3.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &s3);
+
+        // 4. `gcloud compute instances list` (unhealthy pinned, healthy grouped).
+        let mut gce = String::from(
+            "NAME                 ZONE           MACHINE_TYPE   PREEMPTIBLE  INTERNAL_IP   EXTERNAL_IP    STATUS\n",
+        );
+        for i in 1..=50 {
+            gce.push_str(&format!(
+                "web-prod-{i:02}          us-central1-a  e2-standard-4               10.128.0.{:<3}  34.120.1.{:<3}   RUNNING\n",
+                i + 1,
+                i + 10
+            ));
+        }
+        gce.push_str(
+            "worker-dead-01       us-central1-b  n2-standard-8               10.128.1.10   34.120.2.10    TERMINATED\n",
+        );
+        assert!(gce.len() > 4_096);
+        let shown = post_bash(&ws, "gcloud compute instances list", &gce)
+            .expect("gcloud compute instances list compacted via postroute");
+        assert!(shown.contains("worker-dead-01"), "{shown}");
+        assert!(shown.contains("TERMINATED"), "{shown}");
+        assert!(
+            shown.contains("RUNNING (us-central1-a, e2-standard-4) ×50"),
+            "{shown}"
+        );
+        assert!(shown.len() * 8 < gce.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &gce);
     }
 }

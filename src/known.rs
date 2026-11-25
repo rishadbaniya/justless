@@ -255,6 +255,19 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["tofu", "init"], &[]),
     (&["pulumi", "preview"], &[]),
     (&["pulumi", "stack", "ls"], &[]),
+    // Cloud display lists (read-only, non-secret, rejecting machine formats)
+    (
+        &["aws", "cloudformation", "describe-stack-events"],
+        &["--output", "-o", "--query"],
+    ),
+    (
+        &["gcloud", "run", "services", "list"],
+        &["--format", "--uri"],
+    ),
+    (
+        &["gcloud", "container", "clusters", "list"],
+        &["--format", "--uri"],
+    ),
     // The machine
     (&["df"], &[]),
     (&["du"], &[]),
@@ -482,6 +495,52 @@ fn longest<'a, T>(table: &'a [(&'static [&'static str], T)], words: &[&str]) -> 
             }
             (&[], rest)
         }
+        "aws" => {
+            let mut rest = args;
+            while let Some((&arg, tail)) = rest.split_first() {
+                if ["--profile", "--region"].contains(&arg)
+                    && tail.first().is_some_and(|v| !v.starts_with('-'))
+                {
+                    rest = &tail[1..];
+                } else if arg.starts_with("--profile=") || arg.starts_with("--region=") {
+                    rest = tail;
+                } else {
+                    break;
+                }
+            }
+            (&[], rest)
+        }
+        "gcloud" => {
+            let mut rest = args;
+            while let Some((&arg, tail)) = rest.split_first() {
+                if [
+                    "--project",
+                    "--configuration",
+                    "--region",
+                    "--zone",
+                    "--location",
+                ]
+                .contains(&arg)
+                    && tail.first().is_some_and(|v| !v.starts_with('-'))
+                {
+                    rest = &tail[1..];
+                } else if let Some((flag, _)) = arg.split_once('=')
+                    && [
+                        "--project",
+                        "--configuration",
+                        "--region",
+                        "--zone",
+                        "--location",
+                    ]
+                    .contains(&flag)
+                {
+                    rest = tail;
+                } else {
+                    break;
+                }
+            }
+            (&[], rest)
+        }
         _ => (&[], args),
     };
     table
@@ -594,6 +653,20 @@ mod tests {
             "terraform state rm aws_instance.web",
             "terraform state show aws_instance.web",
             "tofu state pull",
+            // Cloud & Kubernetes secret-printing commands must stay as written.
+            "aws secretsmanager get-secret-value --secret-id prod/db",
+            "aws ssm get-parameter --name /prod/db --with-decryption",
+            "aws ssm get-parameters-by-path --path /prod",
+            "aws sts get-caller-identity",
+            "aws iam list-access-keys",
+            "aws kms decrypt --ciphertext-blob abc",
+            "gcloud auth print-access-token",
+            "gcloud secrets versions access latest --secret=db",
+            "az keyvault secret show --vault-name prod --name db",
+            "az account get-access-token",
+            "kubectl get secret db-creds",
+            "helm get values web",
+            "helm get all web",
         ] {
             let words: Vec<&str> = line.split(' ').collect();
             assert!(!crate::agents::supported_words(&words), "{line}");
@@ -678,6 +751,13 @@ mod tests {
             "kubectl -n prod diff -f k8s.yaml",
             "oc diff -f k8s.yaml",
             "oc --context staging diff -f k8s.yaml",
+            // Safe read-only cloud display listings.
+            "gcloud run services list",
+            "gcloud --project acme-prod run services list",
+            "gcloud container clusters list",
+            "gcloud --region us-central1 container clusters list",
+            "aws cloudformation describe-stack-events --stack-name prod",
+            "aws --region us-east-1 cloudformation describe-stack-events --stack-name prod",
         ] {
             let words: Vec<&str> = line.split(' ').collect();
             assert!(routes(&words), "{line}");
@@ -720,6 +800,13 @@ mod tests {
             "stylelint --formatter json src/",
             "actionlint -format json",
             "mix credo --format json",
+            "gcloud run services list --format json",
+            "gcloud run services list --format=yaml",
+            "gcloud container clusters list --format json",
+            "aws cloudformation describe-stack-events --output json",
+            "aws cloudformation describe-stack-events -o json",
+            "aws cloudformation describe-stack-events -o yaml",
+            "aws cloudformation describe-stack-events --query StackEvents",
         ] {
             let words: Vec<&str> = rejected.split(' ').collect();
             assert!(!routes(&words), "must stay unrouted: {rejected}");
