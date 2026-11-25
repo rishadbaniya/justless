@@ -31,3 +31,4 @@ mod report_fixes;
 mod retirement;
 mod source_upgrades;
 mod stacktrace;
+mod wave2_wiring;
