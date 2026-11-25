@@ -227,4 +227,72 @@ fn a_clean_build_is_one_line_and_anything_else_keeps_its_lines() {
         assert_eq!(text(&output.stdout), "");
         starts(&text(&output.stderr), &stderr);
     }
+
+    // Clean `cargo doc` prints `Documenting`, `Finished` and `Generated` status
+    // lines, which also collapse to the one-line clean summary when shorter.
+    let doc_clean = concat!(
+        "   Compiling proc-macro2 v1.0.86\n",
+        "   Compiling unicode-ident v1.0.12\n",
+        "   Compiling quote v1.0.37\n",
+        "   Compiling syn v2.0.77\n",
+        " Documenting demo-core v0.1.0 (/work/demo/core)\n",
+        " Documenting demo v0.1.0 (/work/demo)\n",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.82s\n",
+        "   Generated /work/demo/target/doc/demo/index.html\n",
+    );
+    let doc_file = sandbox.file("doc_clean.err", doc_clean);
+    let output = sandbox.justless(
+        &["run", "--hook", "--", "cargo", "doc", "--no-deps"],
+        (&empty, &doc_file),
+        0,
+    );
+    assert_eq!(
+        text(&output.stdout),
+        "cargo doc: 0 findings · 8 cargo status line(s) [stderr:1-8] · \
+         Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.82s\n"
+    );
+
+    // Rustdoc follow-up broken-link warnings (which omit `= note: #[warn(...)]`)
+    // group under `rustdoc::broken_intra_doc_links` alongside the first warning.
+    let doc_warn = concat!(
+        " Documenting demo v0.1.0 (/work/demo)\n",
+        "warning: unresolved link to `missing`\n",
+        " --> src/lib.rs:3:10\n",
+        "  |\n",
+        "3 | /// See [`missing`].\n",
+        "  |          ^^^^^^^^^ no item named `missing` in scope\n",
+        "  |\n",
+        "  = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default\n",
+        "\n",
+        "warning: `matches` is both a function and a macro\n",
+        " --> src/parse.rs:12:10\n",
+        "  |\n",
+        "12 | /// See [`matches`].\n",
+        "  |          ^^^^^^^^^ ambiguous link\n",
+        "\n",
+        "warning: `demo` (lib doc) generated 2 warnings\n",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s\n",
+        "   Generated /work/demo/target/doc/demo/index.html\n",
+    );
+    let warn_file = sandbox.file("doc_warn.err", doc_warn);
+    let output = sandbox.justless(
+        &[
+            "run",
+            "--hook",
+            "--fresh",
+            "--",
+            "cargo",
+            "doc",
+            "--no-deps",
+        ],
+        (&empty, &warn_file),
+        0,
+    );
+    let shown = text(&output.stdout);
+    has(
+        &shown,
+        "cargo doc: 2 finding(s), 0 error(s), 2 warning(s) · 1 rule(s) · 2 file(s)",
+    );
+    has(&shown, "warning rustdoc::broken_intra_doc_links ×2");
+    has(&shown, "src/lib.rs:3:10, src/parse.rs:12:10");
 }

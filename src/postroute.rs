@@ -112,7 +112,7 @@ static ERROR_LINE: LazyLock<Regex> = LazyLock::new(|| {
 /// whose `FAILED` line a `| tail` cut off, is followed by these instead.
 static FAILURE_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?:thread '[^']*' (?:\(\d+\) )?panicked at |assertion|  left: | right: |--- FAIL: |FAILED |failures:\s*$)",
+        r"^(?:thread '[^']*' (?:\(\d+\) )?panicked at |assertion|  left: | right: |--- FAIL: |FAILED |\s*(?:FAIL|TIMEOUT) \[|failures:\s*$)",
     )
     .expect("test failure pattern")
 });

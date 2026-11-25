@@ -106,7 +106,7 @@ static UNCOMPILED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^error: could not compile `([^`]+)`(?: \(([^)]+)\))?").unwrap());
 pub(crate) static CARGO_STATUS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^ +(?:Compiling|Checking|Finished|Building|Blocking|Fresh|Documenting|Downloaded|Downloading|Updating|Locking|Adding|Running|Packaging|Verifying) \S",
+        r"^ +(?:Compiling|Checking|Finished|Building|Blocking|Fresh|Documenting|Generated|Scraping|Downloaded|Downloading|Updating|Locking|Adding|Running|Packaging|Verifying) \S",
     )
     .unwrap()
 });
@@ -144,6 +144,11 @@ static RUSTC_LINTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         ),
         (r"^unreachable patterns?\b", "unreachable_patterns"),
         (r"^unnecessary parentheses around ", "unused_parens"),
+        (
+            r"^unresolved link to `|^`[^`]+` is both a ",
+            "rustdoc::broken_intra_doc_links",
+        ),
+        (r"^this URL is not a hyperlink$", "rustdoc::bare_urls"),
     ]
     .into_iter()
     .map(|(pattern, lint)| (Regex::new(pattern).unwrap(), lint))

@@ -133,13 +133,77 @@ pub fn prints_file(words: &[&str]) -> bool {
         Some(words) => words.iter().map(String::as_str).collect(),
         None => words.to_vec(),
     };
+    let is_git = |program: &str| {
+        std::path::Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("git")
+    };
     match words.as_slice() {
-        [git, "show", rest @ ..] if git.ends_with("git") => rest
-            .iter()
-            .any(|arg| !arg.starts_with('-') && arg.contains(':')),
-        [git, "cat-file", ..] => git.ends_with("git"),
+        [git, "show", rest @ ..] if is_git(git) => {
+            let mut iter = rest.iter().copied();
+            while let Some(arg) = iter.next() {
+                if arg == "--" {
+                    break;
+                }
+                if matches!(
+                    arg,
+                    "-S" | "-G"
+                        | "-L"
+                        | "-n"
+                        | "-U"
+                        | "--max-count"
+                        | "--since"
+                        | "--after"
+                        | "--until"
+                        | "--before"
+                        | "--author"
+                        | "--committer"
+                        | "--grep"
+                        | "--format"
+                        | "--pretty"
+                        | "--date"
+                        | "--output"
+                        | "--unified"
+                ) {
+                    iter.next();
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    continue;
+                }
+                if git_show_object_is_path(arg) {
+                    return true;
+                }
+            }
+            false
+        }
+        [git, "cat-file", ..] => is_git(git),
         _ => false,
     }
+}
+
+/// Whether a `git show` positional object spec names a blob/tree path (`REV:PATH`,
+/// `:PATH`, `:0:PATH`) rather than a commit search (`:/msg`) or a reflog timestamp
+/// (`HEAD@{2026-01-01 12:00:00}`).
+fn git_show_object_is_path(arg: &str) -> bool {
+    if arg.starts_with(":/") {
+        return false;
+    }
+    let mut depth = 0usize;
+    let bytes = arg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' && i > 0 && matches!(bytes[i - 1], b'@' | b'^') {
+            depth += 1;
+        } else if bytes[i] == b'}' && depth > 0 {
+            depth -= 1;
+        } else if bytes[i] == b':' && depth == 0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// A line the floor shows, with its line break, and whether it is the
@@ -220,9 +284,24 @@ mod tests {
     fn file_reads_are_recognized() {
         for (words, expected) in [
             (&["git", "show", "HEAD:data.json"][..], true),
+            (&["git", "show", ":0:Cargo.toml"][..], true),
             (&["git", "cat-file", "-p", "HEAD:x"][..], true),
+            (
+                &["/usr/bin/git", "--no-pager", "show", "HEAD:src/lib.rs"][..],
+                true,
+            ),
             (&["git", "show", "HEAD"][..], false),
             (&["git", "show", "--format=%h:%s"][..], false),
+            (&["git", "show", "-S", "foo:bar", "HEAD"][..], false),
+            (&["git", "show", "-G", "err:.*", "HEAD"][..], false),
+            (
+                &["git", "show", "--since", "2026-01-01T12:00:00", "HEAD"][..],
+                false,
+            ),
+            (&["git", "show", "HEAD@{2026-01-01 12:00:00}"][..], false),
+            (&["git", "show", ":/fix-bug"][..], false),
+            (&["git", "show", "HEAD", "--", "foo:bar.txt"][..], false),
+            (&["lazygit", "show", "HEAD:data.json"][..], false),
         ] {
             assert_eq!(prints_file(words), expected, "{words:?}");
         }

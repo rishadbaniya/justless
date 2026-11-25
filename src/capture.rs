@@ -1223,9 +1223,11 @@ mod signals {
     //! takes longer to exit receives it twice. Like a shell waiting for a
     //! foreground job, Justless waits for the command to exit and then finishes
     //! the record. Once the command has exited, the default dispositions return,
-    //! so another signal stops Justless as usual. The signal that stopped the
-    //! command is the exception: Justless's own copy of it can arrive just after
-    //! the command exited, so it is only recorded until the preview is out.
+    //! so another signal stops Justless as usual. Any signal that stopped the
+    //! command, along with group interrupts (`SIGINT` and `SIGQUIT`), are the
+    //! exception: Justless's own copy can arrive just after the command exited
+    //! (even when the command handled the interrupt and exited cleanly), so they
+    //! are only recorded until the preview is out.
     use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
@@ -1233,8 +1235,10 @@ mod signals {
     /// The interrupt to forward when the grace period ends.
     static PENDING: AtomicI32 = AtomicI32::new(0);
     static INSTALLED: AtomicU64 = AtomicU64::new(0);
-    /// The signal that stopped the command, whose handler stays until `reraise`.
-    static HELD: AtomicI32 = AtomicI32::new(0);
+    /// Signals whose handlers stay until `reraise`: any signal that stopped the
+    /// command, plus `SIGINT` and `SIGQUIT`, which a process-group interrupt can
+    /// still deliver to Justless after a command catches its copy and exits.
+    static HELD: AtomicU64 = AtomicU64::new(0);
     const FORWARDED: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
     /// SIGALRM ends the grace period of an interrupt, so its handler goes first.
     const OBSERVED: [libc::c_int; 5] = [
@@ -1351,10 +1355,15 @@ mod signals {
             }
         }
         // A group signal reaches Justless and the command together, but Justless
-        // can take its copy after the command is gone. That signal keeps its
-        // handler until `reraise`, so the copy cannot stop Justless before the
-        // preview is out.
-        HELD.store(ended, Ordering::SeqCst);
+        // can take its copy after the command is gone, whether the command died
+        // from the signal or caught it and exited. Hold group interrupts and any
+        // fatal signal until `reraise`, so a late copy cannot stop Justless
+        // before the preview is out.
+        let mut held = (1u64 << libc::SIGINT) | (1u64 << libc::SIGQUIT);
+        if ended > 0 {
+            held |= 1u64 << ended;
+        }
+        HELD.store(held, Ordering::SeqCst);
         restore();
     }
 
@@ -1374,22 +1383,23 @@ mod signals {
                 libc::raise(signal);
             }
         }
-        let bit = if held > 0 { 1u64 << held } else { 0 };
-        if INSTALLED.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
-            // SAFETY: restores the default action for the signal `settle` held.
-            unsafe { libc::signal(held, libc::SIG_DFL) };
+        let clear = INSTALLED.fetch_and(!held, Ordering::SeqCst) & held;
+        for signal in OBSERVED {
+            if clear & (1u64 << signal) != 0 {
+                // SAFETY: restores the default action for signals `settle` held.
+                unsafe { libc::signal(signal, libc::SIG_DFL) };
+            }
         }
     }
 
-    /// Restore the default action of each signal set by `install`, except the one
+    /// Restore the default action of each signal set by `install`, except the ones
     /// `settle` holds. SIGALRM keeps its handler, which does nothing once the
     /// command is gone, since a grace period can end just before it is cancelled.
     pub fn restore() {
         CHILD.store(0, Ordering::SeqCst);
         PENDING.store(0, Ordering::SeqCst);
         arm(0);
-        let held = HELD.load(Ordering::SeqCst);
-        let kept = (1u64 << libc::SIGALRM) | if held > 0 { 1u64 << held } else { 0 };
+        let kept = (1u64 << libc::SIGALRM) | HELD.load(Ordering::SeqCst);
         let installed = INSTALLED.fetch_and(kept, Ordering::SeqCst) & !kept;
         for signal in OBSERVED {
             if installed & (1 << signal) != 0 {
