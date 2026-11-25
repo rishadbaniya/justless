@@ -893,4 +893,160 @@ fn the_reference_shows_real_output() {
         lookup(root.path(), &["where are retries configured?"]),
         documented
     );
+    // Ordinary non-relational lookup must never open or build the code graph index.
+    assert!(
+        !root.path().join(".justless/index.json").exists(),
+        "non-relational lookup must not open the code graph index"
+    );
+}
+
+fn copy_tree(src: &Path, dst: &Path) {
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == ".justless" {
+            continue;
+        }
+        let target = dst.join(name);
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn graph_traversal_traces_cross_language_and_auto_relational_queries() {
+    let mixed = TempDir::new().unwrap();
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mixed"),
+        mixed.path(),
+    );
+    let root = mixed.path();
+
+    // Auto-relational natural-language query traces TypeScript -> Python -> SQL.
+    let auto = lookup(
+        root,
+        &["how do frontend orders connect to purchase_orders?"],
+    );
+    has(&auto, "Graph paths · 1");
+    has(
+        &auto,
+        "fetchOrders [function · TypeScript] frontend/orders.ts:3-7",
+    );
+    has(
+        &auto,
+        "→ possible HTTP route at frontend/orders.ts:4 → list_orders [function · Python] backend/orders.py:6-8",
+    );
+    has(
+        &auto,
+        "→ possible SQL relation at backend/orders.py:8 → purchase_orders [table · SQL] db/schema.sql:1-3",
+    );
+
+    // Shorter relational wording without naming "frontend" also finds the chain.
+    let auto_short = lookup(root, &["how does orders connect to purchase_orders?"]);
+    has(&auto_short, "Graph paths · ");
+    has(&auto_short, "fetchOrders");
+    has(&auto_short, "list_orders");
+    has(&auto_short, "purchase_orders");
+
+    // Explicit --graph works on non-relational keywords and emits structured JSON.
+    let raw_json = lookup(root, &["orders purchase_orders", "--graph", "--json"]);
+    let parsed: Value = serde_json::from_str(&raw_json).unwrap();
+    let paths = parsed["graph_paths"]
+        .as_array()
+        .expect("graph_paths array in JSON");
+    assert!(!paths.is_empty(), "{parsed:#}");
+    assert_eq!(paths[0]["from"]["name"], "fetchOrders");
+    assert_eq!(paths[0]["to"]["name"], "purchase_orders");
+    assert_eq!(paths[0]["hops"], 2);
+    assert_eq!(paths[0]["directed"], true);
+    assert_eq!(paths[0]["possible"], true);
+    assert_eq!(paths[0]["steps"].as_array().unwrap().len(), 2);
+
+    // Tight budget keeps both text and JSON strictly within the byte ceiling.
+    let tight_text = lookup(
+        root,
+        &[
+            "how do frontend orders connect to purchase_orders?",
+            "--budget",
+            "650",
+        ],
+    );
+    assert!(
+        tight_text.len() <= 650,
+        "{} bytes\n{tight_text}",
+        tight_text.len()
+    );
+    has(&tight_text, "Graph paths · ");
+
+    let tight_json = lookup(
+        root,
+        &[
+            "how do frontend orders connect to purchase_orders?",
+            "--json",
+            "--budget",
+            "1100",
+        ],
+    );
+    assert!(
+        tight_json.len() <= 1100,
+        "{} bytes\n{tight_json}",
+        tight_json.len()
+    );
+    let _: Value = serde_json::from_str(&tight_json).unwrap();
+
+    // Non-relational query without --graph emits no graph_paths key in JSON.
+    let plain_json: Value =
+        serde_json::from_str(&lookup(root, &["purchase_orders", "--json"])).unwrap();
+    assert!(
+        plain_json.get("graph_paths").is_none(),
+        "plain lookup JSON must omit graph_paths: {plain_json:#}"
+    );
+}
+
+#[test]
+fn graph_traversal_labels_reverse_hops_and_respects_hop_bound() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // Two distinct leaves `alpha_leaf` and `beta_leaf` share a common caller
+    // `shared_caller`, so connecting them requires a reverse edge (`←`).
+    write(
+        root,
+        "src/shared.py",
+        "from src.alpha import alpha_leaf\nfrom src.beta import beta_leaf\ndef shared_caller():\n    return alpha_leaf() + beta_leaf()\n",
+    );
+    write(root, "src/alpha.py", "def alpha_leaf():\n    return 1\n");
+    write(root, "src/beta.py", "def beta_leaf():\n    return 2\n");
+    // A 7-hop chain exceeds the 5-hop traversal bound.
+    write(
+        root,
+        "src/chain.py",
+        "def hop_start():\n    return hop_1()\ndef hop_1():\n    return hop_2()\ndef hop_2():\n    return hop_3()\ndef hop_3():\n    return hop_4()\ndef hop_4():\n    return hop_5()\ndef hop_5():\n    return hop_6()\ndef hop_6():\n    return hop_end()\ndef hop_end():\n    return 0\n",
+    );
+
+    let reverse = lookup(root, &["how does alpha_leaf connect to beta_leaf?"]);
+    has(&reverse, "Graph paths · 1");
+    has(&reverse, "via reverse");
+    has(&reverse, "← call at src/shared.py:");
+    has(&reverse, "shared_caller");
+
+    let rev_json: Value = serde_json::from_str(&lookup(
+        root,
+        &["how does alpha_leaf connect to beta_leaf?", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(
+        rev_json["graph_paths"][0]["directed"], false,
+        "{rev_json:#}"
+    );
+    assert_eq!(
+        rev_json["graph_paths"][0]["steps"][0]["direction"], "reverse",
+        "{rev_json:#}"
+    );
+
+    let too_far = lookup(root, &["hop_start hop_end", "--graph"]);
+    has(&too_far, "Graph paths · none within 5 hops");
 }

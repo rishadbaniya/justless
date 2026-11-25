@@ -7,6 +7,7 @@
 //! in a name counts more than one in a signature, doc comment or body.
 
 mod chunks;
+mod graph;
 mod logs;
 mod score;
 mod segment;
@@ -53,6 +54,11 @@ pub fn command() -> Command<'static> {
             Arg::new("logs")
                 .long("logs")
                 .help("Also rank output captured by justless run"),
+        )
+        .arg(
+            Arg::new("graph")
+                .long("graph")
+                .help("Trace shortest code-graph paths connecting ranked symbols"),
         )
         .arg(crate::budget())
 }
@@ -717,7 +723,17 @@ fn counts(ranking: &Ranking, shown: usize, limit: Option<usize>) -> String {
     line
 }
 
+#[cfg(test)]
 fn render_text(ranking: &Ranking, budget: usize) -> String {
+    render_text_with_graph(ranking, None, false, budget)
+}
+
+fn render_text_with_graph(
+    ranking: &Ranking,
+    graph_paths: Option<&[graph::GraphPath]>,
+    explicit_graph: bool,
+    budget: usize,
+) -> String {
     if ranking.hits.is_empty() {
         let mut limit = MAX_WORDS;
         loop {
@@ -738,8 +754,13 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
         next(&ranking.hits[0], budget, &ranking.justless)
     );
     let all = counts(ranking, blocks.len(), Some(MAX_WORDS));
-    if blocks.iter().map(String::len).sum::<usize>() + all.len() + next.len() <= budget {
-        return blocks.concat() + &all + &next;
+    let full_graph = graph_paths
+        .map(|paths| graph::render_section(paths, explicit_graph, usize::MAX))
+        .unwrap_or_default();
+    if blocks.iter().map(String::len).sum::<usize>() + full_graph.len() + all.len() + next.len()
+        <= budget
+    {
+        return blocks.concat() + &full_graph + &all + &next;
     }
     // Reserve the footer, then add whole results in rank order while they
     // fit. A footer too large for the budget shortens its word lists first,
@@ -756,7 +777,25 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
     if footer(limit, &next) > budget {
         next = None;
     }
-    let mut used = footer(limit, &next);
+    let footer_bytes = footer(limit, &next);
+    let available = budget.saturating_sub(footer_bytes);
+    // When graph paths are active, reserve enough room for at least the first
+    // connecting path (or up to ~45% of available body bytes) whenever it fits
+    // alongside the top excerpt, so both key excerpts and the chain appear.
+    let mut graph_block = if let Some(paths) = graph_paths {
+        let top_block = blocks.first().map_or(0, String::len);
+        let graph_cap = if top_block < available {
+            let share = available * 45 / 100;
+            let min_first = graph::first_path_bytes(paths, explicit_graph);
+            share.max(min_first).min(available - top_block)
+        } else {
+            0
+        };
+        graph::render_section(paths, explicit_graph, graph_cap)
+    } else {
+        String::new()
+    };
+    let mut used = footer_bytes + graph_block.len();
     let mut shown = 0;
     for block in &blocks {
         if used + block.len() > budget {
@@ -765,6 +804,18 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
         used += block.len();
         shown += 1;
     }
+    // If all blocks fit with spare room left, give the leftover bytes back to
+    // graph paths so extra connecting chains can appear.
+    if let Some(paths) = graph_paths
+        && !full_graph.is_empty()
+        && graph_block.len() < full_graph.len()
+    {
+        let blocks_bytes: usize = blocks[..shown].iter().map(String::len).sum();
+        let spare = available.saturating_sub(blocks_bytes);
+        if spare > graph_block.len() {
+            graph_block = graph::render_section(paths, explicit_graph, spare);
+        }
+    }
     if shown == 0
         && let Some(output) = squeezed(ranking, &blocks[0], next.as_deref(), budget)
     {
@@ -772,8 +823,10 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
     }
     if shown == 0 {
         next = None;
+        graph_block.clear();
     }
     let mut output = blocks[..shown].concat();
+    output.push_str(&graph_block);
     output.push_str(&counts(ranking, shown, limit));
     output.push_str(MARKER);
     output.push_str(next.as_deref().unwrap_or_default());
@@ -848,14 +901,32 @@ fn cut(words: &[String], limit: usize) -> (&[String], usize) {
     (&words[..kept], words.len() - kept)
 }
 
+#[cfg(test)]
 fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<String> {
+    render_json_with_graph(question, ranking, None, budget)
+}
+
+fn render_json_with_graph(
+    question: &str,
+    ranking: &Ranking,
+    graph_paths: Option<&[graph::GraphPath]>,
+    budget: usize,
+) -> Result<String> {
     let results = ranking
         .hits
         .iter()
         .map(|hit| serde_json::to_string(&result_json(hit)))
         .collect::<serde_json::Result<Vec<_>>>()?;
+    let encoded_paths = graph_paths
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| serde_json::to_string(&graph::path_json(path)))
+                .collect::<serde_json::Result<Vec<_>>>()
+        })
+        .transpose()?;
     // `limit` bounds the echoed question and each word list, in bytes.
-    let envelope = |kept: usize, limit: usize| {
+    let envelope = |kept: usize, kept_paths: usize, limit: usize| {
         let (matched, more) = cut(&ranking.matched, limit);
         let (unmatched, less) = cut(&ranking.unmatched, limit);
         let mut value = json!({
@@ -885,6 +956,13 @@ fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<Strin
             budget,
             &ranking.justless
         )));
+        if let Some(paths) = &encoded_paths {
+            let parsed: Vec<Value> = paths[..kept_paths]
+                .iter()
+                .map(|item| serde_json::from_str(item).expect("valid path JSON"))
+                .collect();
+            value["graph_paths"] = Value::Array(parsed);
+        }
         value["results"] = json!([]);
         value.to_string()
     };
@@ -894,25 +972,53 @@ fn render_json(question: &str, ranking: &Ranking, budget: usize) -> Result<Strin
             + kept.saturating_sub(1)
             + 1
     };
-    let fits = |kept: usize, limit: usize| {
-        let base = envelope(kept, limit);
+    let fits = |kept: usize, kept_paths: usize, limit: usize| {
+        let base = envelope(kept, kept_paths, limit);
         (size(&base, kept) <= budget).then_some((kept, base))
     };
     // Shorter lists, down to none, for the budgets too small for them.
     let limits = || std::iter::successors(Some(MAX_WORDS), |limit| limit.checked_sub(8));
-    // As many results as fit beside the full envelope; otherwise the top
-    // result with a shorter question and word lists; otherwise none.
-    let (kept, base) = (1..=results.len())
-        .rev()
-        .find_map(|kept| fits(kept, usize::MAX))
-        .or_else(|| {
-            (!results.is_empty())
-                .then(|| limits().find_map(|limit| fits(1, limit)))
-                .flatten()
-        })
-        .or_else(|| fits(0, usize::MAX))
-        .or_else(|| limits().find_map(|limit| fits(0, limit)))
-        .unwrap_or_else(|| (0, envelope(0, 0)));
+    let total_paths = encoded_paths.as_ref().map_or(0, Vec::len);
+    // Prefer fitting results alongside graph paths when graph tracing is active,
+    // gracefully shedding trailing paths or results under tight budgets.
+    let (kept, base) = if total_paths == 0 {
+        (1..=results.len())
+            .rev()
+            .find_map(|kept| fits(kept, 0, usize::MAX))
+            .or_else(|| {
+                (!results.is_empty())
+                    .then(|| limits().find_map(|limit| fits(1, 0, limit)))
+                    .flatten()
+            })
+            .or_else(|| fits(0, 0, usize::MAX))
+            .or_else(|| limits().find_map(|limit| fits(0, 0, limit)))
+            .unwrap_or_else(|| (0, envelope(0, 0, 0)))
+    } else {
+        // First try keeping all paths with as many results as fit, then fewer paths.
+        let mut chosen = None;
+        'outer: for kept_paths in (1..=total_paths).rev() {
+            for kept in (1..=results.len()).rev() {
+                if let Some(found) = fits(kept, kept_paths, usize::MAX) {
+                    chosen = Some(found);
+                    break 'outer;
+                }
+            }
+        }
+        chosen
+            .or_else(|| {
+                (1..=results.len())
+                    .rev()
+                    .find_map(|kept| fits(kept, 0, usize::MAX))
+            })
+            .or_else(|| {
+                (!results.is_empty())
+                    .then(|| limits().find_map(|limit| fits(1, 0, limit)))
+                    .flatten()
+            })
+            .or_else(|| fits(0, 0, usize::MAX))
+            .or_else(|| limits().find_map(|limit| fits(0, 0, limit)))
+            .unwrap_or_else(|| (0, envelope(0, 0, 0)))
+    };
     let body = format!("[{}]", results[..kept].join(","));
     let base = base
         .strip_suffix("[]}")
@@ -933,11 +1039,17 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         logs: matches.is_present("logs"),
     };
     let ranking = rank(workspace, &question, &options)?;
+    let explicit_graph = matches.is_present("graph");
+    let graph_paths = if explicit_graph || graph::is_relational_question(&question) {
+        Some(graph::trace(workspace, &question, &ranking.hits)?)
+    } else {
+        None
+    };
     let json = matches.is_present("json");
     let output = if json {
-        render_json(&question, &ranking, budget)?
+        render_json_with_graph(&question, &ranking, graph_paths.as_deref(), budget)?
     } else {
-        render_text(&ranking, budget)
+        render_text_with_graph(&ranking, graph_paths.as_deref(), explicit_graph, budget)
     };
     io::stdout().lock().write_all(output.as_bytes())?;
     note_log_windows(workspace, &ranking, &output, json);

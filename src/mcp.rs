@@ -822,6 +822,7 @@ const TOOLS: &[Tool] = &[
             positional("question", Kind::Text, ""),
             option("limit", "limit", Kind::Count(1, 50), ""),
             option("logs", "logs", Kind::Flag, "Search logs"),
+            option("graph", "graph", Kind::Flag, "Trace paths"),
             BUDGET,
         ],
         check: None,
@@ -905,8 +906,11 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "map",
         command: "map",
-        description: "Repo map: areas, hubs, cross-lang links, tests.",
-        params: &[BUDGET],
+        description: "Repo map, or architectural explain for a symbol.",
+        params: &[
+            option("explain", "explain", Kind::Text, "Explain symbol"),
+            BUDGET,
+        ],
         check: None,
     },
     Tool {
@@ -1638,6 +1642,14 @@ mod tests {
             by_name("lookup")["inputSchema"]["properties"]["logs"]["type"],
             "boolean"
         );
+        assert_eq!(
+            by_name("lookup")["inputSchema"]["properties"]["graph"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            by_name("map")["inputSchema"]["properties"]["explain"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -1690,6 +1702,18 @@ mod tests {
                 .argv(&map(json!({"question": "err", "logs": true})))
                 .unwrap(),
             ["lookup", "--logs", "--", "err"]
+        );
+        assert_eq!(
+            tool("lookup")
+                .argv(&map(json!({"question": "orders", "graph": true})))
+                .unwrap(),
+            ["lookup", "--graph", "--", "orders"]
+        );
+        assert_eq!(
+            tool("map")
+                .argv(&map(json!({"explain": "would_route", "budget": 1200})))
+                .unwrap(),
+            ["map", "--explain=would_route", "--budget=1200"]
         );
 
         // Recall filters and list
