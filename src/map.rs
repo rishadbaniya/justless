@@ -15,10 +15,17 @@ use crate::index::{Definition, Edge, Index};
 use crate::polyglot::Grammar;
 use crate::rust_syntax::Kind;
 use crate::summary::short;
-use crate::workspace::{Location, Workspace};
+use crate::workspace::{Location, Workspace, display_path};
 
 const NAME_BYTES: usize = 80;
 const RANKED: usize = 48;
+const MAX_RANKED: usize = 256;
+
+/// Priority order when fitting `map` sections into a tight budget: areas, hubs
+/// (scheduled twice per round so core types fill out the architecture map),
+/// entry points, cross-area links, tests, then communities. Visual rendering
+/// still follows the natural section order.
+const MAP_ORDER: [usize; 7] = [0, 1, 4, 3, 5, 1, 2];
 
 pub fn command() -> Command<'static> {
     Command::new("map")
@@ -35,8 +42,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let budget = crate::context_budget(workspace, matches)?;
     let index = Index::open(workspace)?;
     let json = matches.is_present("json");
-    let (header, sections, summary) = build(&index);
-    let order: Vec<_> = (0..sections.len()).collect();
+    let (header, sections, summary) = build(&index, budget);
     // `--root` for `expand` also serves `query` and `affected`.
     let footer = [format!(
         "Next: {} expand FILE NAME, query NAME or affected NAME",
@@ -46,7 +52,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         &header,
         &sections,
         &footer,
-        &order,
+        &MAP_ORDER,
         Fill::RoundRobin,
         budget,
         json.then_some(summary),
@@ -99,11 +105,12 @@ pub(crate) enum Fill {
     InOrder,
 }
 
-/// Room for `Report`'s clipping marker, which should never be needed.
-const RESERVE: usize = 32;
+/// Exact byte length of `Report::CLIPPED` (`"[context budget reached]\n"`),
+/// which `Report` reserves so fitted lines never trigger clipping.
+const RESERVE: usize = 25;
 
 fn more(count: usize) -> String {
-    format!("  … {count} more")
+    format!("  … +{count} more")
 }
 
 /// Writes the report lines for `shown` lines per section. A section with
@@ -309,6 +316,68 @@ fn spot(definition: &Definition) -> String {
     )
 }
 
+/// `:start` or `:start-end`, matching `Location`'s line formatting without the file path.
+fn line_span(location: &Location) -> String {
+    if location.start == location.end {
+        format!(":{}", location.start)
+    } else {
+        format!(":{}-{}", location.start, location.end)
+    }
+}
+
+/// Whether `dir` (ending with `/`) has at least two path segments, making
+/// prefix deduplication worthwhile while keeping shallow `src/` / `tests/` paths intact.
+fn is_nested_dir(dir: &str) -> bool {
+    dir.ends_with('/') && dir.bytes().filter(|&b| b == b'/').count() >= 2
+}
+
+/// `name :start-end` when the enclosing file is already named earlier on the line.
+fn spot_in_file(definition: &Definition) -> String {
+    if definition.kind == "file" {
+        return line_span(&definition.location);
+    }
+    format!(
+        "{} {}",
+        short(name(definition), NAME_BYTES),
+        line_span(&definition.location)
+    )
+}
+
+/// `name ./rel:start-end` when `dir` is a nested directory prefix already shown
+/// on the same line; otherwise the full `spot`.
+fn spot_under_dir(definition: &Definition, dir: &str) -> String {
+    if definition.kind != "file"
+        && is_nested_dir(dir)
+        && let Some(rel) = definition.location.file.strip_prefix(dir)
+    {
+        return format!(
+            "{} ./{}{}",
+            short(name(definition), NAME_BYTES),
+            display_path(rel),
+            line_span(&definition.location)
+        );
+    }
+    spot(definition)
+}
+
+/// `name [kind] ./rel:start-end` when `dir` is a nested directory prefix already
+/// shown on the same line; otherwise the full `label`.
+fn label_under_dir(definition: &Definition, dir: &str) -> String {
+    if definition.kind != "file"
+        && is_nested_dir(dir)
+        && let Some(rel) = definition.location.file.strip_prefix(dir)
+    {
+        return format!(
+            "{} [{}] ./{}{}",
+            short(name(definition), NAME_BYTES),
+            kind(definition),
+            display_path(rel),
+            line_span(&definition.location)
+        );
+    }
+    label(definition)
+}
+
 pub(crate) fn node(definition: &Definition) -> Value {
     json!({
         "name": name(definition),
@@ -407,6 +476,17 @@ fn is_support_area(area: &str) -> bool {
     })
 }
 
+/// Whether a test directory belongs to fixtures, examples or benchmarks rather
+/// than the project's primary test suites.
+fn is_fixture_test_dir(dir: &str) -> bool {
+    Path::new(dir).components().any(|part| {
+        matches!(
+            part.as_os_str().to_str(),
+            Some("fixtures" | "fixture" | "examples" | "benches" | "bench")
+        )
+    })
+}
+
 pub(crate) fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("1 {noun}")
@@ -499,6 +579,304 @@ impl Degrees {
             part("in", self.dependents[id], self.certain_dependents[id]),
             part("out", self.dependencies[id], self.certain_dependencies[id])
         )
+    }
+}
+
+/// Weighted iterative PageRank centrality and outgoing architectural reach.
+///
+/// Key properties:
+/// - **Transitive hub authority**: symbols referenced by important hubs inherit
+///   their callers' authority across up to 32 damped power iterations.
+/// - **Per-caller-file diminishing returns** (`1 / (k + 1)^2` decay across
+///   callers from the same file): a utility called 50 times inside one file
+///   receives at most `pi^2 / 6 ≈ 1.645×` one caller's flow from that file, so
+///   cross-file and cross-area connectors decisively outrank local helpers.
+/// - **Boundary & certainty weighting**: cross-area links (`3.0`) outrank
+///   cross-file (`1.5`) and same-file (`0.5`) links; resolved links and
+///   cross-boundary routes/SQL relations outrank name-heuristic inferences;
+///   support/test callers are damped when scoring production hubs.
+/// - **Deterministic**: all graphs, edge lists, and accumulations iterate in
+///   sorted order and quantize to fixed-point `u64` rank keys.
+struct Centrality {
+    score: Vec<f64>,
+    rank_key: Vec<u64>,
+    out_reach: Vec<u64>,
+    caller_files: Vec<usize>,
+    caller_areas: Vec<usize>,
+}
+
+impl Centrality {
+    const DAMPING: f64 = 0.85;
+    /// Virtual self-retention added to each node's outgoing weight denominator so
+    /// a single weak same-file or inferred edge does not re-normalize to 1.0.
+    const LEAK: f64 = 1.0;
+    const MAX_ITERS: usize = 32;
+    const EPSILON: f64 = 1e-6;
+    const SCALE: f64 = 1_000_000.0;
+
+    fn quantize(value: f64) -> u64 {
+        if !value.is_finite() || value <= 0.0 {
+            return 0;
+        }
+        (value * Self::SCALE).round().min(u64::MAX as f64) as u64
+    }
+
+    fn new(index: &Index, areas: &BTreeMap<&str, String>) -> Self {
+        let def_count = index.definitions.len();
+        let area_of = |file: &str| areas.get(file).map_or("(root)", String::as_str);
+
+        // Map files that already have a `"file"` definition, then allocate
+        // deterministic virtual file-scope nodes for any remaining files that
+        // emit file-scope edges (`edge.from == None`, e.g. Rust imports).
+        let mut file_nodes = BTreeMap::<&str, usize>::new();
+        for (id, def) in index.definitions.iter().enumerate() {
+            if def.kind == "file" {
+                file_nodes.insert(def.location.file.as_str(), id);
+            }
+        }
+        let mut extra_files = BTreeSet::<&str>::new();
+        for edge in &index.edges {
+            if edge.from.is_none() && !file_nodes.contains_key(edge.location.file.as_str()) {
+                extra_files.insert(edge.location.file.as_str());
+            }
+        }
+        let mut node_file: Vec<&str> = index
+            .definitions
+            .iter()
+            .map(|d| d.location.file.as_str())
+            .collect();
+        for file in extra_files {
+            let id = node_file.len();
+            file_nodes.insert(file, id);
+            node_file.push(file);
+        }
+        let node_count = node_file.len();
+        let node_area: Vec<&str> = node_file.iter().map(|&f| area_of(f)).collect();
+        let node_support: Vec<bool> = node_file.iter().map(|&f| is_support_file(f)).collect();
+
+        // Deduplicate directed edges `(src, dst)` keeping the strongest edge weight
+        // and tracking per-definition external file/area diversity.
+        let mut edge_weights = BTreeMap::<(usize, usize), f64>::new();
+        let mut ext_in_files = vec![BTreeSet::<&str>::new(); def_count];
+        let mut ext_in_areas = vec![BTreeSet::<&str>::new(); def_count];
+        let mut ext_out_areas = vec![BTreeSet::<&str>::new(); def_count];
+        let mut has_strong_in = vec![false; def_count];
+
+        for edge in &index.edges {
+            let src = match edge.from {
+                Some(id) => id,
+                None => file_nodes[edge.location.file.as_str()],
+            };
+            let dst = edge.to;
+            if src == dst {
+                continue;
+            }
+            let src_file = node_file[src];
+            let dst_file = node_file[dst];
+            let src_area = node_area[src];
+            let dst_area = node_area[dst];
+
+            let boundary = if src_area != dst_area {
+                3.0
+            } else if src_file != dst_file {
+                1.5
+            } else {
+                0.5
+            };
+            let certainty = if !edge.inferred {
+                1.0
+            } else if matches!(edge.kind, Kind::Route | Kind::Data) {
+                0.7
+            } else {
+                0.2
+            };
+            let kind_w = match edge.kind {
+                Kind::Route | Kind::Data => 1.2,
+                Kind::Call | Kind::Method => 1.0,
+                Kind::Import => 0.9,
+                Kind::Reference => 0.8,
+            };
+            let support = if node_support[src] && !node_support[dst] {
+                0.35
+            } else {
+                1.0
+            };
+            let weight = boundary * certainty * kind_w * support;
+            edge_weights
+                .entry((src, dst))
+                .and_modify(|existing| {
+                    if weight > *existing {
+                        *existing = weight;
+                    }
+                })
+                .or_insert(weight);
+
+            if dst < def_count {
+                let count_caller = !node_support[src] || node_support[dst];
+                if count_caller && src_file != dst_file {
+                    ext_in_files[dst].insert(src_file);
+                }
+                if count_caller && src_area != dst_area {
+                    ext_in_areas[dst].insert(src_area);
+                }
+                if !edge.inferred || matches!(edge.kind, Kind::Route | Kind::Data) {
+                    has_strong_in[dst] = true;
+                }
+            }
+            if src < def_count && src_area != dst_area && (!node_support[dst] || node_support[src])
+            {
+                ext_out_areas[src].insert(dst_area);
+            }
+        }
+
+        let mut out_sum = vec![0.0f64; node_count];
+        let mut outgoing = vec![Vec::<(usize, f64)>::new(); def_count];
+        for (&(src, dst), &weight) in &edge_weights {
+            out_sum[src] += weight;
+            if src < def_count {
+                outgoing[src].push((dst, weight));
+            }
+        }
+
+        // Pre-group each target's incoming edges by caller file in deterministic
+        // order so the power-iteration loop does zero per-iteration allocations.
+        let mut by_dst_file = vec![BTreeMap::<&str, Vec<(usize, f64)>>::new(); node_count];
+        for (&(src, dst), &weight) in &edge_weights {
+            let trans = weight / (out_sum[src] + Self::LEAK);
+            by_dst_file[dst]
+                .entry(node_file[src])
+                .or_default()
+                .push((src, trans));
+        }
+        let incoming_groups: Vec<Vec<Vec<(usize, f64)>>> = by_dst_file
+            .into_iter()
+            .map(|groups| groups.into_values().collect())
+            .collect();
+
+        // Active nodes start with base teleportation mass (support files damped).
+        let base: Vec<f64> = (0..node_count)
+            .map(|u| {
+                if out_sum[u] == 0.0 && incoming_groups[u].is_empty() {
+                    0.0
+                } else if node_support[u] {
+                    0.25
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+
+        let mut rank = base.clone();
+        let mut next = vec![0.0f64; node_count];
+        let mut incoming_flow = vec![0.0f64; node_count];
+        let mut flows = Vec::<f64>::new();
+
+        for _ in 0..Self::MAX_ITERS {
+            let mut max_delta = 0.0f64;
+            for dst in 0..node_count {
+                let mut received = 0.0f64;
+                for group in &incoming_groups[dst] {
+                    if group.len() == 1 {
+                        let (src, trans) = group[0];
+                        received += rank[src] * trans;
+                    } else {
+                        flows.clear();
+                        for &(src, trans) in group {
+                            flows.push(rank[src] * trans);
+                        }
+                        flows.sort_unstable_by(|a, b| b.total_cmp(a));
+                        for (k, &flow) in flows.iter().enumerate() {
+                            let step = (k + 1) as f64;
+                            received += flow / (step * step);
+                        }
+                    }
+                }
+                incoming_flow[dst] = received;
+                let updated = (1.0 - Self::DAMPING) * base[dst] + Self::DAMPING * received;
+                let delta = (updated - rank[dst]).abs();
+                if delta > max_delta {
+                    max_delta = delta;
+                }
+                next[dst] = updated;
+            }
+            std::mem::swap(&mut rank, &mut next);
+            if max_delta < Self::EPSILON {
+                break;
+            }
+        }
+
+        let mut score = vec![0.0f64; def_count];
+        let mut rank_key = vec![0u64; def_count];
+        let mut caller_files = vec![0usize; def_count];
+        let mut caller_areas = vec![0usize; def_count];
+        for id in 0..def_count {
+            let files = ext_in_files[id].len();
+            let in_areas = ext_in_areas[id].len();
+            let out_areas = ext_out_areas[id].len();
+            caller_files[id] = files;
+            caller_areas[id] = in_areas;
+            let mut value = incoming_flow[id];
+            if value > 0.0 {
+                let area_factor = 1.0 + 0.35 * (in_areas as f64 + 0.5 * out_areas as f64).ln_1p();
+                let file_factor = 1.0 + 0.15 * (files as f64).ln_1p();
+                let kind_factor = if matches!(
+                    index.definitions[id].kind.as_str(),
+                    "struct" | "class" | "enum" | "trait" | "interface" | "table" | "protocol"
+                ) {
+                    1.25
+                } else {
+                    1.0
+                };
+                value *= area_factor * file_factor * kind_factor;
+                if !has_strong_in[id] {
+                    value *= 0.25;
+                }
+            }
+            score[id] = value;
+            rank_key[id] = Self::quantize(value);
+        }
+
+        // Propagate outgoing reach a few hops backward so thin entry-point
+        // wrappers (`main -> run -> dispatch -> core hubs`) inherit the
+        // centrality of the architecture they orchestrate.
+        let direct_reach: Vec<f64> = (0..def_count)
+            .map(|src| {
+                outgoing[src]
+                    .iter()
+                    .map(|&(dst, weight)| {
+                        let authority = if dst < def_count {
+                            0.25 + score[dst]
+                        } else {
+                            0.25
+                        };
+                        weight * authority
+                    })
+                    .sum()
+            })
+            .collect();
+        let mut reach = direct_reach.clone();
+        let mut next_reach = vec![0.0f64; def_count];
+        for _ in 0..4 {
+            for src in 0..def_count {
+                let denom = out_sum[src] + 0.25;
+                let downstream: f64 = outgoing[src]
+                    .iter()
+                    .filter(|&&(dst, _)| dst < def_count)
+                    .map(|&(dst, weight)| (weight / denom) * reach[dst])
+                    .sum();
+                next_reach[src] = direct_reach[src] + 0.65 * downstream;
+            }
+            std::mem::swap(&mut reach, &mut next_reach);
+        }
+        let out_reach = reach.into_iter().map(Self::quantize).collect();
+
+        Self {
+            score,
+            rank_key,
+            out_reach,
+            caller_files,
+            caller_areas,
+        }
     }
 }
 
@@ -710,14 +1088,75 @@ fn kind_rank(kind: Kind) -> u8 {
     }
 }
 
+/// Formats one or more cross-language pairs (`source != target`), preserving
+/// every language tag while collapsing pairs that share the same target
+/// (e.g. `Astro/Svelte/Vue → TypeScript`).
+fn format_language_pairs(pairs: &BTreeMap<(&str, &str), usize>) -> String {
+    if pairs.is_empty() {
+        return String::new();
+    }
+    if pairs.len() == 1 {
+        let (&(source, target), _) = pairs.iter().next().unwrap();
+        return format!(" · {source} → {target}");
+    }
+    let mut by_target = BTreeMap::<&str, (usize, Vec<(&str, usize)>)>::new();
+    for (&(source, target), &count) in pairs {
+        let entry = by_target.entry(target).or_insert((0, Vec::new()));
+        entry.0 += count;
+        entry.1.push((source, count));
+    }
+    let mut grouped: Vec<_> = by_target.into_iter().collect();
+    grouped.sort_by_key(|(target, (total, _))| (Reverse(*total), *target));
+    let rendered = grouped
+        .into_iter()
+        .map(|(target, (_, mut sources))| {
+            sources.sort_by_key(|&(source, count)| (Reverse(count), source));
+            let left = sources
+                .into_iter()
+                .map(|(source, _)| source)
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{left} → {target}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" · {rendered}")
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct RankKey<'a> {
+    centrality: Reverse<u64>,
+    out_reach: Reverse<u64>,
+    certain_degree: Reverse<usize>,
+    total_degree: Reverse<usize>,
+    location: &'a Location,
+    id: usize,
+}
+
 /// The index with the derived facts every section uses.
 struct Graph<'a> {
     index: &'a Index,
     degrees: Degrees,
+    centrality: Centrality,
     areas: BTreeMap<&'a str, String>,
+    ranked_limit: usize,
 }
 
 impl<'a> Graph<'a> {
+    fn new(index: &'a Index, budget: usize) -> Self {
+        let degrees = Degrees::new(index);
+        let areas = areas(index);
+        let centrality = Centrality::new(index, &areas);
+        let ranked_limit = (budget / 40).clamp(RANKED, MAX_RANKED);
+        Self {
+            index,
+            degrees,
+            centrality,
+            areas,
+            ranked_limit,
+        }
+    }
+
     fn definition(&self, id: usize) -> &'a Definition {
         &self.index.definitions[id]
     }
@@ -726,16 +1165,21 @@ impl<'a> Graph<'a> {
         self.areas.get(file).map_or("(root)", String::as_str)
     }
 
-    /// Sort key that puts the most connected symbol first.
-    fn rank(&self, id: usize) -> (Reverse<(usize, usize)>, &'a Location, usize) {
-        (
-            Reverse(self.degrees.rank(id)),
-            &self.definition(id).location,
+    /// Sort key that puts the most architecturally central symbol first,
+    /// falling back to outgoing reach and degree when incoming centrality ties.
+    fn rank(&self, id: usize) -> RankKey<'a> {
+        let (certain, total) = self.degrees.rank(id);
+        RankKey {
+            centrality: Reverse(self.centrality.rank_key[id]),
+            out_reach: Reverse(self.centrality.out_reach[id]),
+            certain_degree: Reverse(certain),
+            total_degree: Reverse(total),
+            location: &self.definition(id).location,
             id,
-        )
+        }
     }
 
-    /// The most connected hub-worthy symbol among `ids`, else the first by location.
+    /// The most central hub-worthy symbol among `ids`, else the first by location.
     fn leader(&self, ids: &[usize]) -> Option<usize> {
         let central = ids
             .iter()
@@ -749,12 +1193,47 @@ impl<'a> Graph<'a> {
     }
 }
 
-fn build(index: &Index) -> (Vec<String>, Vec<Section>, Map<String, Value>) {
-    let graph = Graph {
-        index,
-        degrees: Degrees::new(index),
-        areas: areas(index),
+fn format_header(
+    files: usize,
+    symbols: usize,
+    links: usize,
+    possible: usize,
+    by_count: &[(&str, usize)],
+    budget: usize,
+) -> String {
+    let possible_part = if possible > 0 {
+        format!(" ({possible} possible)")
+    } else {
+        String::new()
     };
+    let prefix = format!(
+        "Map · {} · {} · {}{possible_part}",
+        plural(files, "file"),
+        plural(symbols, "symbol"),
+        plural(links, "link"),
+    );
+    let all_langs: String = by_count
+        .iter()
+        .map(|(language, count)| format!(" · {language} {count}"))
+        .collect();
+    let full = format!("{prefix}{all_langs}");
+    // Preserve every language verbatim on normal repos and generous budgets;
+    // fold only the long tail on fixture-heavy polyglot repos under tight budgets.
+    const KEEP_TOP: usize = 6;
+    if by_count.len() <= KEEP_TOP + 1 || full.len().saturating_mul(8) <= budget {
+        return full;
+    }
+    let top: String = by_count[..KEEP_TOP]
+        .iter()
+        .map(|(language, count)| format!(" · {language} {count}"))
+        .collect();
+    let rest_langs = by_count.len() - KEEP_TOP;
+    let rest_files: usize = by_count[KEEP_TOP..].iter().map(|(_, count)| *count).sum();
+    format!("{prefix}{top} · +{rest_langs} langs ({rest_files})")
+}
+
+fn build(index: &Index, budget: usize) -> (Vec<String>, Vec<Section>, Map<String, Value>) {
+    let graph = Graph::new(index, budget);
     let symbols = index
         .definitions
         .iter()
@@ -769,15 +1248,13 @@ fn build(index: &Index) -> (Vec<String>, Vec<Section>, Map<String, Value>) {
     }
     let mut by_count: Vec<_> = languages.iter().map(|(&l, &n)| (l, n)).collect();
     by_count.sort_by_key(|&(language, files)| (Reverse(files), language));
-    let mut header = vec![format!(
-        "Map · {} · {} · {} ({possible} possible){}",
-        plural(index.files.len(), "file"),
-        plural(symbols, "symbol"),
-        plural(index.edges.len(), "link"),
-        by_count
-            .iter()
-            .map(|(language, files)| format!(" · {language} {files}"))
-            .collect::<String>()
+    let mut header = vec![format_header(
+        index.files.len(),
+        symbols,
+        index.edges.len(),
+        possible,
+        &by_count,
+        budget,
     )];
     if !index.errors.is_empty() {
         header.push(format!(
@@ -831,27 +1308,48 @@ fn area_section(graph: &Graph) -> Section {
     }
     let mut ordered: Vec<_> = grouped.into_iter().collect();
     ordered.sort_by_key(|(name, area)| {
+        let tier = if area.symbols.is_empty() {
+            2u8
+        } else if is_support_area(name) {
+            1u8
+        } else {
+            0u8
+        };
         (
+            tier,
             Reverse(area.symbols.len()),
             Reverse(area.files.len()),
             *name,
         )
     });
     let mut section = Section::new("areas", format!("Areas · {}", ordered.len()), 5);
-    section.unlisted = ordered.len().saturating_sub(RANKED);
-    for (name, area) in ordered.iter().take(RANKED) {
+    let limit = graph.ranked_limit;
+    section.unlisted = ordered.len().saturating_sub(limit);
+    for (name, area) in ordered.iter().take(limit) {
         let mut languages: Vec<_> = area.languages.iter().collect();
         languages.sort_by_key(|(language, files)| (Reverse(**files), **language));
         let languages: Vec<&str> = languages.iter().take(3).map(|(l, _)| **l).collect();
         let (anchor, anchor_json) = match graph.leader(&area.symbols) {
-            Some(id) => (
-                format!("hub {}", spot(graph.definition(id))),
-                node(graph.definition(id)),
-            ),
-            None => (
-                format!("{}:1", area.files[0]),
-                json!({"file": area.files[0], "start": 1, "end": 1}),
-            ),
+            Some(id) => {
+                let def = graph.definition(id);
+                let shown = if def.location.file == *name {
+                    spot_in_file(def)
+                } else {
+                    spot_under_dir(def, name)
+                };
+                (format!("hub {shown}"), node(def))
+            }
+            None => {
+                let first = area.files[0];
+                let shown = if is_nested_dir(name)
+                    && let Some(rel) = first.strip_prefix(name)
+                {
+                    format!("./{}:1", display_path(rel))
+                } else {
+                    format!("{first}:1")
+                };
+                (shown, json!({"file": first, "start": 1, "end": 1}))
+            }
         };
         section.push(
             format!(
@@ -876,9 +1374,11 @@ fn area_section(graph: &Graph) -> Section {
     section
 }
 
-/// Hubs rank by distinct neighbours, so one busy caller cannot inflate them.
+/// Hubs rank by weighted PageRank centrality so symbols referenced across
+/// multiple areas and by other important hubs outrank single-file utilities.
 fn hub_section(graph: &Graph) -> Section {
     let degrees = &graph.degrees;
+    let centrality = &graph.centrality;
     let mut hubs: Vec<usize> = (0..graph.index.definitions.len())
         .filter(|&id| central(graph.definition(id)) && degrees.rank(id).1 > 0)
         .collect();
@@ -888,18 +1388,18 @@ fn hub_section(graph: &Graph) -> Section {
             graph.rank(id),
         )
     });
-    let mut section = Section::new(
-        "hubs",
-        "Hubs · in = dependents, out = dependencies".into(),
-        5,
-    );
-    section.unlisted = hubs.len().saturating_sub(RANKED);
-    for &id in hubs.iter().take(RANKED) {
+    let mut section = Section::new("hubs", format!("Hubs · {} · in/out", hubs.len()), 6);
+    let limit = graph.ranked_limit;
+    section.unlisted = hubs.len().saturating_sub(limit);
+    for &id in hubs.iter().take(limit) {
         let mut value = node(graph.definition(id));
         value["in"] = json!(degrees.dependents[id]);
         value["out"] = json!(degrees.dependencies[id]);
         value["possible_in"] = json!(degrees.dependents[id] - degrees.certain_dependents[id]);
         value["possible_out"] = json!(degrees.dependencies[id] - degrees.certain_dependencies[id]);
+        value["centrality"] = json!((centrality.score[id] * 1000.0).round() / 1000.0);
+        value["caller_files"] = json!(centrality.caller_files[id]);
+        value["caller_areas"] = json!(centrality.caller_areas[id]);
         section.push(
             format!(
                 "  {} · {}",
@@ -918,18 +1418,16 @@ fn hub_section(graph: &Graph) -> Section {
 fn community_section(graph: &Graph) -> Section {
     let mut groups = communities(graph.index);
     groups.sort_by_key(|members| {
-        let support_only = members
-            .iter()
-            .all(|&id| is_support_file(&graph.definition(id).location.file));
+        let support_only = members.iter().all(|&id| {
+            let def = graph.definition(id);
+            def.test || is_support_file(&def.location.file)
+        });
         (support_only, Reverse(members.len()), members[0])
     });
-    let mut section = Section::new(
-        "communities",
-        format!("Communities · {} groups of linked symbols", groups.len()),
-        3,
-    );
-    section.unlisted = groups.len().saturating_sub(RANKED);
-    for members in groups.iter().take(RANKED) {
+    let mut section = Section::new("communities", format!("Communities · {}", groups.len()), 2);
+    let limit = graph.ranked_limit;
+    section.unlisted = groups.len().saturating_sub(limit);
+    for members in groups.iter().take(limit) {
         let mut files = BTreeMap::<&str, usize>::new();
         for &id in members {
             *files
@@ -947,15 +1445,32 @@ fn community_section(graph: &Graph) -> Section {
         leaders.sort_by_key(|&id| graph.rank(id));
         leaders.truncate(2);
         let title = community_name(&files);
+        let single_file = files.len() == 1;
+        let mut leader_spots = Vec::with_capacity(leaders.len());
+        let mut prev_file: Option<&str> = None;
+        for &id in &leaders {
+            let def = graph.definition(id);
+            let file = def.location.file.as_str();
+            let rendered = if single_file || prev_file == Some(file) {
+                spot_in_file(def)
+            } else if let Some(prev) = prev_file {
+                let prev_dir = directory(prev);
+                if prev_dir != "(root)" && directory(file) == prev_dir {
+                    spot_under_dir(def, &prev_dir)
+                } else {
+                    spot(def)
+                }
+            } else {
+                spot(def)
+            };
+            prev_file = Some(file);
+            leader_spots.push(rendered);
+        }
         section.push(
             format!(
                 "  {title} · {} · {}",
                 plural(members.len(), "symbol"),
-                leaders
-                    .iter()
-                    .map(|&id| spot(graph.definition(id)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                leader_spots.join(", ")
             ),
             json!({
                 "name": title,
@@ -971,32 +1486,40 @@ fn community_section(graph: &Graph) -> Section {
     section
 }
 
-/// Links that cross areas or languages, grouped by direction.
+/// Links that cross areas or languages, grouped by unique `(from_area, to_area)`
+/// pair so multi-language pairs never emit duplicate area-pair rows.
 fn link_section(graph: &Graph) -> Section {
     struct Crossing<'a> {
         count: usize,
         certain: usize,
         kinds: BTreeMap<(bool, &'static str), usize>,
+        language_pairs: BTreeMap<(&'static str, &'static str), usize>,
         example: &'a Edge,
     }
-    let example_rank = |edge: &Edge| (kind_rank(edge.kind), edge.inferred, edge.location.clone());
-    let mut crossings = BTreeMap::<(&str, &str, &str, &str), Crossing>::new();
+    let example_rank = |edge: &Edge| {
+        (
+            kind_rank(edge.kind),
+            edge.inferred,
+            Reverse(graph.centrality.rank_key[edge.to]),
+            edge.location.clone(),
+        )
+    };
+    let mut crossings = BTreeMap::<(&str, &str), Crossing>::new();
     for edge in &graph.index.edges {
         let source = &edge.location.file;
         let target = &graph.definition(edge.to).location.file;
-        let key = (
-            graph.area(source),
-            graph.area(target),
-            language(source).unwrap_or("text"),
-            language(target).unwrap_or("text"),
-        );
-        if key.0 == key.1 && key.2 == key.3 {
+        let from_area = graph.area(source);
+        let to_area = graph.area(target);
+        let from_lang = language(source).unwrap_or("text");
+        let to_lang = language(target).unwrap_or("text");
+        if from_area == to_area && from_lang == to_lang {
             continue;
         }
-        let crossing = crossings.entry(key).or_insert(Crossing {
+        let crossing = crossings.entry((from_area, to_area)).or_insert(Crossing {
             count: 0,
             certain: 0,
             kinds: BTreeMap::new(),
+            language_pairs: BTreeMap::new(),
             example: edge,
         });
         crossing.count += 1;
@@ -1005,15 +1528,23 @@ fn link_section(graph: &Graph) -> Section {
             .kinds
             .entry((edge.inferred, relationship(edge.kind)))
             .or_default() += 1;
+        if from_lang != to_lang {
+            *crossing
+                .language_pairs
+                .entry((from_lang, to_lang))
+                .or_default() += 1;
+        }
         if example_rank(edge) < example_rank(crossing.example) {
             crossing.example = edge;
         }
     }
     let mut crossings: Vec<_> = crossings.into_iter().collect();
-    crossings.sort_by_key(|((from, to, source, target), crossing)| {
+    crossings.sort_by_key(|((from, to), crossing)| {
+        let support_tier = usize::from(is_support_area(from)) + usize::from(is_support_area(to));
         (
-            is_support_area(from) && is_support_area(to),
-            source == target,
+            support_tier,
+            from == to,
+            crossing.language_pairs.is_empty(),
             Reverse(crossing.certain),
             Reverse(crossing.count),
             *from,
@@ -1025,8 +1556,9 @@ fn link_section(graph: &Graph) -> Section {
         format!("Cross-area links · {}", crossings.len()),
         4,
     );
-    section.unlisted = crossings.len().saturating_sub(RANKED);
-    for ((from, to, source, target), crossing) in crossings.iter().take(RANKED) {
+    let limit = graph.ranked_limit;
+    section.unlisted = crossings.len().saturating_sub(limit);
+    for ((from, to), crossing) in crossings.iter().take(limit) {
         let mut kinds: Vec<_> = crossing.kinds.iter().collect();
         kinds.sort_by_key(|((inferred, kind), count)| (Reverse(**count), *inferred, *kind));
         let kinds = kinds
@@ -1036,12 +1568,9 @@ fn link_section(graph: &Graph) -> Section {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let languages = if source == target {
-            String::new()
-        } else {
-            format!(" · {source} → {target}")
-        };
+        let languages = format_language_pairs(&crossing.language_pairs);
         let example = crossing.example;
+        let target_def = graph.definition(example.to);
         let origin = match example.from.map(|id| graph.definition(id)) {
             Some(definition) if definition.kind != "file" => format!(
                 "{} {}",
@@ -1050,26 +1579,45 @@ fn link_section(graph: &Graph) -> Section {
             ),
             _ => example.location.to_string(),
         };
+        let target_spot = if from == to {
+            let origin_dir = directory(&example.location.file);
+            if origin_dir != "(root)" && directory(&target_def.location.file) == origin_dir {
+                spot_under_dir(target_def, &origin_dir)
+            } else {
+                spot(target_def)
+            }
+        } else {
+            spot(target_def)
+        };
+        let example_from_lang = language(&example.location.file).unwrap_or("text");
+        let example_to_lang = language(&target_def.location.file).unwrap_or("text");
+        let mut value = json!({
+            "from_area": from,
+            "to_area": to,
+            "from_language": example_from_lang,
+            "to_language": example_to_lang,
+            "count": crossing.count,
+            "kinds": crossing.kinds.iter().map(|((inferred, kind), count)| json!({"kind": kind, "possible": inferred, "count": count})).collect::<Vec<_>>(),
+            "example": {
+                "at": example.location.to_string(),
+                "kind": relationship(example.kind),
+                "possible": example.inferred,
+                "from": example.from.map(|id| node(graph.definition(id))),
+                "to": node(target_def),
+            },
+        });
+        if crossing.language_pairs.len() > 1 {
+            value["language_pairs"] = json!(
+                crossing
+                    .language_pairs
+                    .iter()
+                    .map(|((src, dst), count)| json!({"from": src, "to": dst, "count": count}))
+                    .collect::<Vec<_>>()
+            );
+        }
         section.push(
-            format!(
-                "  {from} → {to}{languages} · {kinds} · {origin} → {}",
-                spot(graph.definition(example.to))
-            ),
-            json!({
-                "from_area": from,
-                "to_area": to,
-                "from_language": source,
-                "to_language": target,
-                "count": crossing.count,
-                "kinds": crossing.kinds.iter().map(|((inferred, kind), count)| json!({"kind": kind, "possible": inferred, "count": count})).collect::<Vec<_>>(),
-                "example": {
-                    "at": example.location.to_string(),
-                    "kind": relationship(example.kind),
-                    "possible": example.inferred,
-                    "from": example.from.map(|id| node(graph.definition(id))),
-                    "to": node(graph.definition(example.to)),
-                },
-            }),
+            format!("  {from} → {to}{languages} · {kinds} · {origin} → {target_spot}"),
+            value,
         );
     }
     if crossings.is_empty() {
@@ -1078,11 +1626,24 @@ fn link_section(graph: &Graph) -> Section {
     section
 }
 
-/// Main functions, HTTP route handlers, then uncalled symbols with many
-/// dependencies, which are often framework or command handlers.
+/// Main functions, HTTP route handlers, then uncalled orchestrators ranked by
+/// their weighted reach into central symbols.
 fn entry_section(graph: &Graph) -> Section {
     let definitions = &graph.index.definitions;
     let degrees = &graph.degrees;
+    let centrality = &graph.centrality;
+
+    // Track which definitions have at least one cross-file outgoing edge so
+    // secondary uncalled entry points (`out == 2`) surface only true orchestrators.
+    let mut has_cross_file_out = vec![false; definitions.len()];
+    for edge in &graph.index.edges {
+        if let Some(from) = edge.from
+            && definitions[from].location.file != definitions[edge.to].location.file
+        {
+            has_cross_file_out[from] = true;
+        }
+    }
+
     let mut entries: Vec<(u8, usize, String)> = Vec::new();
     for (id, definition) in definitions.iter().enumerate() {
         let last = name(definition).rsplit("::").next().unwrap_or_default();
@@ -1096,22 +1657,34 @@ fn entry_section(graph: &Graph) -> Section {
     for (route, id) in graph.index.routes() {
         entries.push((1, id, format!("HTTP route {}", short(route, NAME_BYTES))));
     }
-    let mut roots: Vec<usize> = (0..definitions.len())
-        .filter(|&id| {
+    let mut roots: Vec<(u8, usize)> = (0..definitions.len())
+        .filter_map(|id| {
             let definition = &definitions[id];
-            central(definition)
-                && matches!(definition.kind.as_str(), "function" | "method")
-                && degrees.dependents[id] == 0
-                && degrees.dependencies[id] >= 3
-                && !is_test_file(&definition.location.file)
+            if !central(definition)
+                || !matches!(definition.kind.as_str(), "function" | "method")
+                || degrees.dependents[id] != 0
+                || is_test_file(&definition.location.file)
+            {
+                return None;
+            }
+            if degrees.dependencies[id] >= 3 {
+                Some((2, id))
+            } else if degrees.dependencies[id] == 2
+                && has_cross_file_out[id]
+                && !is_support_file(&definition.location.file)
+            {
+                Some((3, id))
+            } else {
+                None
+            }
         })
         .collect();
-    roots.sort_by_key(|&id| graph.rank(id));
-    for id in roots {
+    roots.sort_by_key(|&(tier, id)| (tier, Reverse(centrality.out_reach[id]), graph.rank(id)));
+    for (tier, id) in roots {
         entries.push((
-            2,
+            tier,
             id,
-            format!("no indexed callers · out {}", degrees.dependencies[id]),
+            format!("uncalled · out {}", degrees.dependencies[id]),
         ));
     }
     let mut listed = BTreeSet::new();
@@ -1120,16 +1693,18 @@ fn entry_section(graph: &Graph) -> Section {
         (
             is_support_file(&definitions[*id].location.file),
             *order,
+            Reverse(centrality.out_reach[*id]),
             graph.rank(*id),
         )
     });
     let mut section = Section::new(
         "entry_points",
         format!("Entry points · {}", entries.len()),
-        3,
+        4,
     );
-    section.unlisted = entries.len().saturating_sub(RANKED);
-    for (_, id, reason) in entries.iter().take(RANKED) {
+    let limit = graph.ranked_limit;
+    section.unlisted = entries.len().saturating_sub(limit);
+    for (_, id, reason) in entries.iter().take(limit) {
         let mut value = node(&definitions[*id]);
         value["reason"] = json!(reason);
         section.push(format!("  {} · {reason}", label(&definitions[*id])), value);
@@ -1156,7 +1731,19 @@ fn test_section(graph: &Graph) -> Section {
                 .or_default();
             place.files.insert(&definition.location.file);
             place.tests += 1;
-            place.example.get_or_insert(id);
+            // Pick a concise representative test name (tie-break by location) so
+            // long descriptive test names do not consume disproportionate budget.
+            let replace = match place.example {
+                None => true,
+                Some(current) => {
+                    let prev = graph.definition(current);
+                    (name(definition).len(), &definition.location, id)
+                        < (name(prev).len(), &prev.location, current)
+                }
+            };
+            if replace {
+                place.example = Some(id);
+            }
         }
     }
     for file in graph.index.files.keys().filter(|file| is_test_file(file)) {
@@ -1169,25 +1756,32 @@ fn test_section(graph: &Graph) -> Section {
     let mut places: Vec<_> = places.into_iter().collect();
     places.sort_by_key(|(name, place)| {
         (
+            is_fixture_test_dir(name),
             Reverse(place.tests),
             Reverse(place.files.len()),
             name.clone(),
         )
     });
-    let mut section = Section::new(
-        "tests",
-        format!("Tests · {}", plural(places.len(), "location")),
-        3,
-    );
-    section.unlisted = places.len().saturating_sub(RANKED);
-    for (directory, place) in places.iter().take(RANKED) {
+    let mut section = Section::new("tests", format!("Tests · {}", places.len()), 3);
+    let limit = graph.ranked_limit;
+    section.unlisted = places.len().saturating_sub(limit);
+    for (dir, place) in places.iter().take(limit) {
         let first = place.files.first().copied().unwrap_or_default();
         let (example, example_json) = match place.example {
-            Some(id) => (label(graph.definition(id)), node(graph.definition(id))),
-            None => (
-                format!("{first}:1"),
-                json!({"file": first, "start": 1, "end": 1}),
+            Some(id) => (
+                label_under_dir(graph.definition(id), dir),
+                node(graph.definition(id)),
             ),
+            None => {
+                let shown = if is_nested_dir(dir)
+                    && let Some(rel) = first.strip_prefix(dir.as_str())
+                {
+                    format!("./{}:1", display_path(rel))
+                } else {
+                    format!("{first}:1")
+                };
+                (shown, json!({"file": first, "start": 1, "end": 1}))
+            }
         };
         let count = if place.tests > 0 {
             format!(" · {}", plural(place.tests, "test"))
@@ -1196,11 +1790,11 @@ fn test_section(graph: &Graph) -> Section {
         };
         section.push(
             format!(
-                "  {directory} · {}{count} · e.g. {example}",
+                "  {dir} · {}{count} · e.g. {example}",
                 plural(place.files.len(), "file"),
             ),
             json!({
-                "directory": directory,
+                "directory": dir,
                 "files": place.files.len(),
                 "tests": place.tests,
                 "example": example_json,
@@ -1211,4 +1805,340 @@ fn test_section(graph: &Graph) -> Section {
         section.title = "Tests · none detected".into();
     }
     section
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn write_repo(files: &[(&str, &str)]) -> (TempDir, Index) {
+        let dir = TempDir::new().unwrap();
+        for (rel, content) in files {
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, content).unwrap();
+        }
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+        let index = Index::open(&ws).unwrap();
+        (dir, index)
+    }
+
+    fn render_map(index: &Index, budget: usize) -> String {
+        let (header, sections, _) = build(index, budget);
+        let footer = ["Next: justless expand FILE NAME, query NAME or affected NAME".to_owned()];
+        let shown = fit(
+            &header,
+            &sections,
+            &footer,
+            &MAP_ORDER,
+            Fill::RoundRobin,
+            budget,
+        );
+        let mut report = Report::new(budget);
+        render(&header, &sections, &footer, &shown, &mut |line| {
+            report.line(line)
+        });
+        report.into_string()
+    }
+
+    fn hub_names(index: &Index, budget: usize) -> Vec<String> {
+        let (_, sections, _) = build(index, budget);
+        let hubs = sections.iter().find(|s| s.key == "hubs").unwrap();
+        hubs.values
+            .iter()
+            .map(|v| v["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn weighted_centrality_ranks_cross_area_hub_above_single_file_utility() {
+        // One noisy report file calls `fmt_cents` from 50 leaf functions, while
+        // `domain::Order` is used across 3 distinct production areas (api, billing,
+        // storage), and `orchestrate` has high outgoing degree (in 1, out 12).
+        let mut report_src = String::from("from util.fmt import fmt_cents\n");
+        for i in 0..50 {
+            report_src.push_str(&format!(
+                "def render_col_{i:02}(n):\n    return fmt_cents(n)\n"
+            ));
+        }
+        let mut god_src = String::from("from domain.order import Order\n");
+        for i in 0..12 {
+            god_src.push_str(&format!("def step_{i:02}():\n    return {i}\n"));
+        }
+        god_src.push_str("def orchestrate():\n    Order()\n");
+        for i in 0..12 {
+            god_src.push_str(&format!("    step_{i:02}()\n"));
+        }
+
+        let (_dir, index) = write_repo(&[
+            ("util/fmt.py", "def fmt_cents(n):\n    return str(n)\n"),
+            ("reports/render.py", &report_src),
+            ("domain/order.py", "class Order:\n    pass\n"),
+            (
+                "api/orders.py",
+                "from domain.order import Order\ndef create_order():\n    return Order()\n",
+            ),
+            (
+                "billing/charge.py",
+                "from domain.order import Order\nfrom api.orders import create_order\ndef bill_order():\n    create_order()\n    return Order()\n",
+            ),
+            (
+                "storage/repo.py",
+                "from domain.order import Order\nfrom billing.charge import bill_order\ndef save_order():\n    bill_order()\n    return Order()\n",
+            ),
+            ("worker/job.py", &god_src),
+            (
+                "cli/main.py",
+                "from worker.job import orchestrate\nfrom storage.repo import save_order\ndef main():\n    orchestrate()\n    save_order()\n",
+            ),
+        ]);
+
+        let names = hub_names(&index, 2400);
+        let pos_order = names
+            .iter()
+            .position(|n| n == "Order")
+            .expect("Order must appear in hubs");
+        let pos_util = names
+            .iter()
+            .position(|n| n == "fmt_cents")
+            .expect("fmt_cents must appear in hubs");
+        let pos_god = names
+            .iter()
+            .position(|n| n == "orchestrate")
+            .expect("orchestrate must appear in hubs");
+        assert!(
+            pos_order < pos_util,
+            "cross-area hub Order (#{pos_order}) should outrank 50-caller single-file utility fmt_cents (#{pos_util}): {names:?}"
+        );
+        assert!(
+            pos_order < pos_god,
+            "cross-area hub Order (#{pos_order}) should outrank high-out-degree orchestrate (#{pos_god}): {names:?}"
+        );
+    }
+
+    #[test]
+    fn weighted_centrality_propagates_authority_through_hubs() {
+        // `core_target` and `leaf_target` both have exactly 2 callers in the same
+        // area (`svc/`), each from 2 distinct files. `core_target`'s callers are
+        // themselves important hubs referenced across 3 other areas; `leaf_target`'s
+        // callers are unreferenced leaves.
+        let (_dir, index) = write_repo(&[
+            (
+                "svc/targets.py",
+                "def core_target():\n    return 1\ndef leaf_target():\n    return 2\n",
+            ),
+            (
+                "svc/hub_a.py",
+                "from svc.targets import core_target\ndef hub_a():\n    return core_target()\n",
+            ),
+            (
+                "svc/hub_b.py",
+                "from svc.targets import core_target\ndef hub_b():\n    return core_target()\n",
+            ),
+            (
+                "svc/leaf_a.py",
+                "from svc.targets import leaf_target\ndef leaf_a():\n    return leaf_target()\n",
+            ),
+            (
+                "svc/leaf_b.py",
+                "from svc.targets import leaf_target\ndef leaf_b():\n    return leaf_target()\n",
+            ),
+            (
+                "api/routes.py",
+                "from svc.hub_a import hub_a\nfrom svc.hub_b import hub_b\ndef route():\n    return hub_a() + hub_b()\n",
+            ),
+            (
+                "jobs/sync.py",
+                "from svc.hub_a import hub_a\nfrom svc.hub_b import hub_b\ndef sync():\n    return hub_a() + hub_b()\n",
+            ),
+            (
+                "cli/cmd.py",
+                "from svc.hub_a import hub_a\nfrom svc.hub_b import hub_b\ndef main():\n    return hub_a() + hub_b()\n",
+            ),
+        ]);
+
+        let names = hub_names(&index, 2400);
+        let pos_core = names
+            .iter()
+            .position(|n| n == "core_target")
+            .expect("core_target must appear in hubs");
+        let pos_leaf = names
+            .iter()
+            .position(|n| n == "leaf_target")
+            .expect("leaf_target must appear in hubs");
+        assert!(
+            pos_core < pos_leaf,
+            "hub-referenced core_target (#{pos_core}) must outrank leaf-referenced leaf_target (#{pos_leaf}): {names:?}"
+        );
+    }
+
+    #[test]
+    fn same_pair_cross_area_links_collapse_preserving_languages_and_counts() {
+        // Two different languages in `frontend/` (TypeScript + JavaScript) both call
+        // the Python route in `backend/`. They must collapse into ONE `frontend/ → backend/`
+        // row while preserving all language tags, exact counts, and `possible` markers.
+        let (_dir, index) = write_repo(&[
+            (
+                "frontend/orders.ts",
+                "export async function fetchOrders() {\n  return fetch(\"/api/orders\");\n}\n",
+            ),
+            (
+                "frontend/admin.js",
+                "export async function adminOrders() {\n  return fetch(\"/api/orders\");\n}\n",
+            ),
+            (
+                "backend/orders.py",
+                "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get(\"/api/orders\")\ndef list_orders():\n    return database.execute(\"SELECT id FROM purchase_orders\")\n",
+            ),
+            (
+                "db/schema.sql",
+                "CREATE TABLE purchase_orders (\n  id INTEGER PRIMARY KEY\n);\n",
+            ),
+        ]);
+
+        let (_, sections, _) = build(&index, 2400);
+        let links = sections
+            .iter()
+            .find(|s| s.key == "cross_area_links")
+            .unwrap();
+        let fe_to_be: Vec<&String> = links
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("  frontend/ → backend/"))
+            .collect();
+        assert_eq!(
+            fe_to_be.len(),
+            1,
+            "expected deduplicated frontend/ → backend/ row, got:\n{}",
+            links.lines.join("\n")
+        );
+        let row = fe_to_be[0];
+        assert!(row.contains("JavaScript"), "{row}");
+        assert!(row.contains("TypeScript"), "{row}");
+        assert!(row.contains("→ Python"), "{row}");
+        assert!(row.contains("possible HTTP route 2"), "{row}");
+        // Single-pair backend/ → db/ preserves the exact canonical format.
+        let be_to_db = links
+            .lines
+            .iter()
+            .find(|line| line.starts_with("  backend/ → db/"))
+            .expect("missing backend/ → db/");
+        assert!(
+            be_to_db.contains("Python → SQL · possible SQL relation 1"),
+            "{be_to_db}"
+        );
+    }
+
+    #[test]
+    fn tight_and_generous_budgets_pack_high_signal_and_deduplicate_prefixes() {
+        // Multi-area workspace with nested paths, single-file communities, entrypoints,
+        // and many symbols to exercise tight truncation (`… +N more`), nested path
+        // prefix deduplication, and generous budget utilization.
+        let mut billing_core = String::new();
+        for i in 0..10 {
+            billing_core.push_str(&format!(
+                "def calc_tier_{i:02}(x):\n    return calc_base(x) + {i}\n"
+            ));
+        }
+        billing_core.push_str("def calc_base(x):\n    return x * 2\n");
+
+        let mut billing_tests = String::from("from services.billing.core.rates import calc_base\n");
+        for i in 0..6 {
+            billing_tests.push_str(&format!(
+                "def test_rate_{i:02}():\n    assert calc_base({i}) == {}\n",
+                i * 2
+            ));
+        }
+
+        let (_dir, index) = write_repo(&[
+            ("services/billing/core/rates.py", &billing_core),
+            (
+                "services/billing/core/invoice.py",
+                "from services.billing.core.rates import calc_base\ndef build_invoice(n):\n    return calc_base(n)\n",
+            ),
+            ("services/billing/tests/test_rates.py", &billing_tests),
+            (
+                "services/orders/api/handler.py",
+                "from services.billing.core.invoice import build_invoice\nfrom services.orders.db.store import store_order\ndef handle_order(n):\n    return store_order(build_invoice(n))\ndef handle_refund(n):\n    return store_order(build_invoice(-n))\n",
+            ),
+            (
+                "services/orders/db/store.py",
+                "def store_order(total):\n    return total\n",
+            ),
+            (
+                "services/audit/log.py",
+                "def emit_event(kind):\n    return format_event(kind)\ndef format_event(kind):\n    return kind\n",
+            ),
+            (
+                "cli/app.py",
+                "from services.orders.api.handler import handle_order\ndef main():\n    return handle_order(42)\n",
+            ),
+        ]);
+
+        // Tight budget (1200 B): must stay strictly within budget, be deterministic,
+        // surface areas/hubs/entrypoints/links/tests, and report exact `… +N more`.
+        let tight = render_map(&index, 1200);
+        assert_eq!(tight, render_map(&index, 1200), "map must be deterministic");
+        assert!(tight.len() <= 1200, "{} bytes\n{tight}", tight.len());
+        assert!(tight.contains("Areas · "), "{tight}");
+        assert!(tight.contains("Hubs · "), "{tight}");
+        assert!(tight.contains("Entry points · "), "{tight}");
+        assert!(tight.contains("Cross-area links · "), "{tight}");
+        assert!(tight.contains("Tests · "), "{tight}");
+        assert!(
+            tight.contains("  … +"),
+            "expected `… +N more` marker:\n{tight}"
+        );
+        // Nested test directory deduplicates its repeated directory prefix.
+        assert!(
+            tight.contains("./test_rates.py:"),
+            "expected nested test dir prefix deduplication:\n{tight}"
+        );
+
+        // Generous budget (3600 B): utilizes extra room to surface secondary hubs and
+        // cross-file uncalled entry points (`handle_refund` with out = 2).
+        let wide = render_map(&index, 3600);
+        assert!(wide.len() <= 3600, "{} bytes\n{wide}", wide.len());
+        assert!(
+            wide.len() > tight.len(),
+            "generous budget should surface more signal ({} vs {} bytes)",
+            wide.len(),
+            tight.len()
+        );
+        assert!(
+            wide.contains("handle_refund") && wide.contains("uncalled · out 2"),
+            "generous budget should surface cross-file uncalled entry point:\n{wide}"
+        );
+        // Nested areas, single-file community, and same-file multi-file community
+        // leader all deduplicate repeated paths cleanly.
+        assert!(
+            wide.contains("services/billing/core/ · 2 files · 12 symbols · Python · hub calc_base ./rates.py:21-22"),
+            "nested area should deduplicate repeated directory prefix:\n{wide}"
+        );
+        assert!(
+            wide.contains("services/audit/log.py · 2 symbols · format_event :3-4, emit_event :1-2"),
+            "single-file community should deduplicate repeated file path:\n{wide}"
+        );
+        assert!(
+            wide.contains("calc_base services/billing/core/rates.py:21-22, calc_tier_00 :1-2"),
+            "multi-file community should deduplicate same-file second leader:\n{wide}"
+        );
+
+        // Smoke-check format_language_pairs directly for multi-target grouping.
+        let mut pairs = BTreeMap::new();
+        pairs.insert(("Astro", "TypeScript"), 3);
+        pairs.insert(("Svelte", "TypeScript"), 3);
+        pairs.insert(("Vue", "TypeScript"), 3);
+        pairs.insert(("Python", "SQL"), 1);
+        assert_eq!(
+            format_language_pairs(&pairs),
+            " · Astro/Svelte/Vue → TypeScript, Python → SQL"
+        );
+    }
 }
