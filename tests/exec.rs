@@ -1071,7 +1071,11 @@ fn hooks_leave_exec_unwrapped() {
     let decision = claude["hookSpecificOutput"].get("permissionDecision");
     assert!(decision.is_none(), "{claude}");
     assert!(unchanged("hook-codex", mixed));
-    assert!(!overwrites(mixed));
+    let agy_mixed = hook("hook-agy", agy(mixed));
+    assert_eq!(agy_mixed["decision"], "ask", "{agy_mixed}");
+    let agy_cmd = agy_mixed["overwrite"]["CommandLine"].as_str().unwrap();
+    starts(agy_cmd, "justless run --hook ");
+    ends(agy_cmd, &format!("-- {mixed}"));
 }
 
 /// Script output goes through the same pipes as `run`, so `max_run_bytes` caps what

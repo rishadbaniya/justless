@@ -1421,6 +1421,14 @@ fn install_and_run_claude_and_agy_hooks() {
     assert_eq!(command, "justless hook-agy session-start");
     assert_eq!(agy["justless"]["PreToolUse"][0]["matcher"], "^run_command$");
     assert_eq!(
+        agy["justless"]["PreToolUse"][1]["matcher"],
+        "^(read_file|view_file)$"
+    );
+    assert_eq!(
+        agy["justless"]["PreToolUse"][1]["hooks"][0]["command"],
+        "justless hook-agy before-read"
+    );
+    assert_eq!(
         agy["justless"]["PostToolUse"][0]["matcher"],
         "^(read_file|view_file)$"
     );
@@ -1457,6 +1465,20 @@ fn install_and_run_claude_and_agy_hooks() {
     let rewritten =
         json!({"decision":"allow","overwrite":{"CommandLine":"justless run --hook -- git diff"}});
     assert_eq!(dispatch("git diff", &root), rewritten);
+    // Tier 2: mixed chains and non-auto-approvable routed commands rewrite with
+    // `decision: "ask"` so Antigravity CLI still enforces user confirmation.
+    let ask_mixed = dispatch("cargo fmt --all && cargo test", &root);
+    assert_eq!(ask_mixed["decision"], "ask");
+    assert_eq!(
+        ask_mixed["overwrite"]["CommandLine"],
+        "justless run --hook -- cargo fmt --all && justless run --hook -- cargo test"
+    );
+    let ask_routed = dispatch("docker build .", &root);
+    assert_eq!(ask_routed["decision"], "ask");
+    assert_eq!(
+        ask_routed["overwrite"]["CommandLine"],
+        "justless run --hook -- docker build ."
+    );
     // Antigravity CLI has no `Cwd` tool argument and passes top-level `cwd`.
     assert_eq!(cli_dispatch("git diff", &root), rewritten);
     assert_eq!(cli_dispatch("git diff", &root.join("backend")), rewritten);
@@ -1516,7 +1538,52 @@ fn install_and_run_claude_and_agy_hooks() {
     );
     // PostToolUse `after-read` tracks native Antigravity `read_file` and `view_file` ranges
     // for `resume`, `[source changed]` and repeated-read counts in `stats`.
+    // PreToolUse `before-read` outlines large unbounded workspace reads and passes
+    // bounded (`StartLine`/`EndLine`) or small reads through with `decision: "allow"`.
+    let big_rs = root.join("backend/large.rs");
+    let big_src: String = (0..700)
+        .map(|i| format!("pub fn item_{i:03}(x: usize) -> usize {{\n    x + {i}\n}}\n"))
+        .collect();
+    fs::write(&big_rs, &big_src).unwrap();
+    let before_read = |args: Value| {
+        agy_hook(
+            elsewhere.path(),
+            "before-read",
+            json!({
+                "cwd": root,
+                "workspacePaths": [root],
+                "toolCall": {"name": "read_file", "args": args},
+            }),
+        )
+    };
+    let outlined = before_read(json!({"Path": big_rs}));
+    assert_eq!(outlined["decision"], "deny", "{outlined}");
+    let reason = outlined["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("Justless outline of backend/large.rs"),
+        "{reason}"
+    );
+    assert!(reason.contains("function item_000"), "{reason}");
+    // Bounded reads and small files pass straight through.
+    assert_eq!(
+        before_read(json!({"Path": big_rs, "StartLine": 1, "EndLine": 40})),
+        allow
+    );
     let orders = root.join("backend/orders.py");
+    assert_eq!(before_read(json!({"Path": orders})), allow);
+    // SessionStart attaches a zero-token `user_markdown` savings banner once savings exist.
+    let banner = startup()["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        banner.contains("Justless") && banner.contains("saved"),
+        "{banner}"
+    );
+    // Opting out via `agy_read_outline = false` passes unbounded reads through.
+    fs::write(root.join(".justless.toml"), "agy_read_outline = false\n").unwrap();
+    assert_eq!(before_read(json!({"Path": big_rs})), allow);
+    fs::remove_file(root.join(".justless.toml")).unwrap();
     let read_call = |name: &str, args: Value, error: Option<&str>| {
         let mut payload = json!({
             "cwd": root,
@@ -2165,14 +2232,26 @@ fn hooks_without_a_post_run_hook_route_json_reads_left_to_their_reader() {
             assert_eq!(rewrite(agent, command), None, "{agent}: {command}");
         }
     }
-    // A client that approves the rewrite only takes lists made entirely of
-    // supported commands; Gemini CLI checks the rewritten list.
+    // A client that auto-approves the rewrite only takes lists made entirely of
+    // supported commands; Gemini CLI checks the rewritten list, and Antigravity
+    // CLI returns `decision: "ask"` for mixed lists.
     let mixed = "gh pr list --json number && rm -r out";
     for agent in clients {
-        let expected = (agent == "hook-gemini")
+        let expected = matches!(agent, "hook-gemini" | "hook-agy")
             .then(|| "justless run --hook -- gh pr list --json number && rm -r out".to_owned());
         assert_eq!(rewrite(agent, mixed), expected, "{agent}");
     }
+    let agy_mixed = agent_hook(
+        &root,
+        "hook-agy",
+        "before-command",
+        serde_json::json!({
+            "cwd": root,
+            "workspacePaths": [root],
+            "toolCall": {"name": "run_command", "args": {"CommandLine": mixed}},
+        }),
+    );
+    assert_eq!(agy_mixed["decision"], "ask", "{agy_mixed}");
     assert_eq!(
         rewrite("hook-codex", "gh pr list --json number && cargo test").as_deref(),
         Some(
@@ -5946,7 +6025,7 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
         "✓ Hooks: .cursor/hooks.json has both ",
         "✓ Hooks: .gemini/settings.json has both ",
         "✓ Hooks: .github/hooks/justless.json has both ",
-        "✓ Hooks: .agents/hooks.json has all 3 ",
+        "✓ Hooks: .agents/hooks.json has all 4 ",
         "✓ Plugin: .opencode/plugins/justless.js is current",
         "✓ Instructions: CLAUDE.md has the current Justless block",
         "✓ Instructions: AGENTS.md has the current Justless block",
@@ -11684,7 +11763,7 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
             None => (false, expected),
         };
         for (client, rewritten) in rewrites(&root, command) {
-            let wraps = !mixed || matches!(client, "claude" | "gemini");
+            let wraps = !mixed || matches!(client, "claude" | "gemini" | "agy");
             let expected = wraps.then_some(expected);
             assert_eq!(rewritten.as_deref(), expected, "{client}: {command}");
         }

@@ -206,9 +206,10 @@ fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
     let report = rewrite(&["--agent", "agy", "cargo test\ncargo bench"]);
     has(
         &report,
-        "only when every command in it is supported and none is excluded",
+        "Antigravity CLI hook: rewritten\n  justless run --hook -- cargo test\ncargo bench\n",
     );
     has(&report, "Excluded: `cargo bench` matches `cargo bench`");
+    has(&report, "asks Antigravity CLI to confirm the rewrite");
     let report = rewrite(&["git show HEAD"]);
     has(&report, "matches `^git (log|show)` in exclude_commands");
     let report = rewrite(&["ls", "--agent", "codex"]);
@@ -608,6 +609,14 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
         "justless hook-agy before-command --global"
     );
     assert_eq!(
+        hooks["justless"]["PreToolUse"][1]["matcher"],
+        "^(read_file|view_file)$"
+    );
+    assert_eq!(
+        hooks["justless"]["PreToolUse"][1]["hooks"][0]["command"],
+        "justless hook-agy before-read --global"
+    );
+    assert_eq!(
         hooks["justless"]["PostToolUse"][0]["matcher"],
         "^(read_file|view_file)$"
     );
@@ -692,7 +701,7 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
     let doctor =
         |cwd: &Path| String::from_utf8(lab.output(cwd, &["doctor"], None, &[]).stdout).unwrap();
     let report = doctor(&plain);
-    has(&report, "Global hooks for Antigravity CLI: 3 handlers in ");
+    has(&report, "Global hooks for Antigravity CLI: 4 handlers in ");
     has(
         &report,
         "The global Antigravity CLI hooks serve this project",

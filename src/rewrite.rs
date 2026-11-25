@@ -33,7 +33,7 @@ pub fn disabled() -> bool {
 pub fn noop(agent: Agent, mode: &str) -> Option<&'static str> {
     match (agent, mode) {
         (Agent::Claude, "before-compact") => None,
-        (Agent::Agy, "before-command") => Some(r#"{"decision":"allow"}"#),
+        (Agent::Agy, "before-command" | "before-read") => Some(r#"{"decision":"allow"}"#),
         _ => Some("{}"),
     }
 }
@@ -364,6 +364,17 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
         lines.push(permission(workspace, mode, command, answer.as_ref()));
     } else if new.is_some() {
         match agent {
+            Agent::Agy
+                if answer
+                    .as_ref()
+                    .and_then(|a| a["decision"].as_str())
+                    == Some("ask") =>
+            {
+                lines.push(
+                    "Permission: the hook asks Antigravity CLI to confirm the rewrite (respecting Always Allow)."
+                        .into(),
+                )
+            }
             Agent::Codex | Agent::Cursor | Agent::Agy => lines.push(format!(
                 "Permission: the hook allows the rewrite, and {client} runs it without asking."
             )),
@@ -456,7 +467,7 @@ fn left_alone(
         agents::split_compound(command)
     };
     let segments = segments.unwrap_or_default();
-    if !matches!(agent, Agent::Claude | Agent::Gemini) && segments.len() > 1 {
+    if !matches!(agent, Agent::Claude | Agent::Gemini | Agent::Agy) && segments.len() > 1 {
         let routable = segments.iter().any(|range| {
             ask(
                 workspace,

@@ -60,15 +60,20 @@ impl Lab {
         command
     }
 
-    /// What `agent`'s hook makes of `line`: the rewritten command, or `None`.
-    fn rewrite(&self, agent: &str, line: &str) -> Option<String> {
+    /// Full `justless rewrite` report for `agent` on `line`.
+    fn rewrite_report(&self, agent: &str, line: &str) -> String {
         let output = self
             .command(BIN)
             .args(["rewrite", line, "--agent", agent])
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", text(&output.stderr));
-        let report = text(&output.stdout);
+        text(&output.stdout)
+    }
+
+    /// What `agent`'s hook makes of `line`: the rewritten command, or `None`.
+    fn rewrite(&self, agent: &str, line: &str) -> Option<String> {
+        let report = self.rewrite_report(agent, line);
         let (_, rest) = report.split_once(": rewritten\n  ")?;
         Some(rest.split_once("\nWhy: ").unwrap().0.to_owned())
     }
@@ -225,9 +230,72 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
         ("sed -n '1,2p' src/small.rs | nl -ba", None),
         ("nl -ba delim.txt | sed -n '3,3p'", None),
     ];
+    // Safe mixed chains and `known::routes` commands that Codex leaves untouched
+    // because Codex cannot ask, while Antigravity CLI Tier 2 rewrites them with
+    // `decision: "ask"` (never auto-allowing).
+    let agy_ask_cases = [
+        "cargo fmt && git status",
+        "git status && git branch new-branch",
+        "set -o pipefail\ngit status",
+        "set -x\ngit status",
+        "cat notes.md; tail -n 5 src/small.rs",
+        "cat notes.md\npython3 x.py",
+        "git status\nrg -n fn src | wc -l",
+        "rg -n fn src || cd src\ncat small.rs",
+        "rg -n nomatch src && cd src\ncat small.rs",
+    ];
     for (line, expected) in &cases {
         assert_eq!(&lab.rewrite("codex", line), expected, "codex: {line:?}");
-        assert_eq!(&lab.rewrite("agy", line), expected, "agy: {line:?}");
+        let agy_report = lab.rewrite_report("agy", line);
+        let agy_rewritten = agy_report
+            .split_once(": rewritten\n  ")
+            .map(|(_, rest)| rest.split_once("\nWhy: ").unwrap().0.to_owned());
+        if expected.is_some() {
+            assert_eq!(&agy_rewritten, expected, "agy Tier 1: {line:?}");
+            assert!(
+                agy_report.contains(
+                    "Permission: the hook allows the rewrite, and Antigravity CLI runs it without asking."
+                ),
+                "agy Tier 1 should allow: {line:?}\n{agy_report}"
+            );
+        } else if agy_ask_cases.contains(line) {
+            assert!(
+                agy_rewritten.is_some(),
+                "agy Tier 2 should rewrite safe mixed/known list: {line:?}\n{agy_report}"
+            );
+            assert!(
+                agy_report.contains(
+                    "Permission: the hook asks Antigravity CLI to confirm the rewrite (respecting Always Allow)."
+                ),
+                "agy Tier 2 must ask, never auto-allow: {line:?}\n{agy_report}"
+            );
+        } else {
+            assert_eq!(
+                agy_rewritten, None,
+                "agy must reject unsafe/invalid case: {line:?}\n{agy_report}"
+            );
+        }
+    }
+    // Downloading runners (`npx`, `uv run`) route in Antigravity CLI Tier 2 (`ask`)
+    // only when the underlying tool itself is safe; unsafe plugin/config flags stay rejected.
+    for safe_runner in ["npx eslint src", "uv run pytest"] {
+        let report = lab.rewrite_report("agy", safe_runner);
+        assert!(
+            report.contains(": rewritten\n  ")
+                && report.contains("asks Antigravity CLI to confirm"),
+            "agy Tier 2 runner: {safe_runner:?}\n{report}"
+        );
+    }
+    for unsafe_runner in [
+        "npx eslint --plugin evil src",
+        "uv run pytest -p evil",
+        "uv run --with evil pytest",
+    ] {
+        assert_eq!(
+            lab.rewrite("agy", unsafe_runner),
+            None,
+            "agy must reject unsafe runner: {unsafe_runner:?}"
+        );
     }
     // Newline lists and reads inside lists belong to Codex and Antigravity CLI.
     for agent in ["claude", "cursor", "gemini"] {

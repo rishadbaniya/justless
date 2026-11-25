@@ -233,6 +233,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
         });
     }
     let mut outlines = crate::history::OutlinesSummary::default();
+    let mut agy_roots = Vec::new();
     for entry in entries {
         let has_runs = entry.root.join(".justless/runs").is_dir();
         let has_activity = entry.root.join(".justless/activity.json").is_file();
@@ -253,6 +254,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             }
             continue;
         }
+        agy_roots.push(entry.root.clone());
         let Ok(project) = Workspace::discover(Some(&entry.root)) else {
             continue;
         };
@@ -299,6 +301,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             .cloned()
             .unwrap_or_else(|| key.to_path_buf())
     };
+    let agy = crate::agy_sessions::stats_all(&agy_roots, since);
     if matches.is_present("json") {
         let repositories: Vec<_> = groups
             .iter()
@@ -315,7 +318,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
                 })
             })
             .collect();
-        let report = json!({
+        let mut report = json!({
             "days": days,
             "projects": groups.iter().map(|(_, roots, _)| roots.len()).sum::<usize>(),
             "runs": total.runs,
@@ -332,6 +335,9 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             "repositories": repositories,
             "temporary_projects_left_out": skipped,
         });
+        if let Some(agy) = &agy {
+            report["agy"] = agy.json.clone();
+        }
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -372,6 +378,9 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             println!();
         }
         println!("{}", outlines.line());
+    }
+    if let Some(agy) = &agy {
+        println!("{}", agy.line);
     }
     if skipped > 0 {
         println!(

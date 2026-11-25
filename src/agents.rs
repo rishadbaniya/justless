@@ -347,6 +347,7 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
             },
             5,
         ),
+        ("PreToolUse", "before-read", "^(read_file|view_file)$", 5),
         (
             "PostToolUse",
             "after-read",
@@ -375,6 +376,7 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
         ("PreCompact", "before-compact", "^(manual|auto)$", 10),
     ] {
         let supported = match mode {
+            "before-read" => agent == Agent::Agy,
             "after-read" => matches!(agent, Agent::Claude | Agent::Agy),
             "after-search" | "before-compact" | "after-bash" | "after-edit" => {
                 agent == Agent::Claude
@@ -686,6 +688,7 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         mixed: agent == Agent::Gemini,
         claude: false,
         approves: agent == Agent::Cursor,
+        ask_safe: false,
         codex: false,
     };
     let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
@@ -718,7 +721,7 @@ pub(crate) fn answer_hook(
     let workspace = &agent_workspace(workspace, input);
     let output = if agent == Agent::Agy {
         agy_hook(workspace, mode, input).unwrap_or_else(|| {
-            if mode == "before-command" {
+            if matches!(mode, "before-command" | "before-read") {
                 json!({"decision":"allow"})
             } else {
                 json!({})
@@ -1382,7 +1385,7 @@ pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path
     if mode == "before-command" {
         return agy_cwd(&input["toolCall"]["args"], input, paths);
     }
-    if mode == "after-read"
+    if matches!(mode, "before-read" | "after-read")
         && let Some(raw) = agy_read_path(&input["toolCall"]["args"])
     {
         let path = Path::new(strip_file_uri(raw));
@@ -1400,7 +1403,8 @@ pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path
     Some(Path::new(path))
 }
 
-/// Antigravity CLI hook dispatcher for `session-start`, `before-command` and `after-read`.
+/// Antigravity CLI hook dispatcher for `session-start`, `before-command`,
+/// `before-read`, and `after-read`.
 fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     let paths = input["workspacePaths"].as_array()?;
     let mut roots = paths
@@ -1426,9 +1430,15 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
             roots.find(|root| root == &current.root)?
         };
         let workspace = agent_workspace(&Workspace::discover(Some(&root)).ok()?, input);
-        return Some(
-            json!({"injectSteps":[{"systemMessage":{"systemMessage":startup(&workspace)?}}]}),
-        );
+        let message = startup(&workspace)?;
+        let mut sys = json!({"systemMessage": message});
+        if let Some(banner) = agy_savings_banner(&workspace) {
+            sys["metadata"] = json!({"user_markdown": banner});
+        }
+        return Some(json!({"injectSteps":[{"systemMessage": sys}]}));
+    }
+    if mode == "before-read" {
+        return agy_before_read(roots, paths, input);
     }
     if mode == "after-read" {
         agy_read(roots, paths, input);
@@ -1455,22 +1465,198 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         .filter(|root| cwd.starts_with(root))
         .max_by_key(|root| root.components().count())?;
     let workspace = Workspace::discover(Some(&root)).ok()?.working_in(&cwd);
-    // The answer allows the rewrite, so it takes only what Codex's hook approves.
-    // Like Codex, Antigravity has no output-rewriting post-tool hook, so it also
-    // gets Codex's pre-command script lists, read lists and `| head` windows.
-    let rewritten = wrap_event(
+    let command = args["CommandLine"].as_str()?;
+    let session = input["conversationId"].as_str();
+    // Tier 1: every command is safe/approvable -> auto-allow the rewrite.
+    if let Some(rewritten) = wrap_event(
         &workspace,
         &cwd,
-        args["CommandLine"].as_str()?,
-        input["conversationId"].as_str(),
+        command,
+        session,
         Rules {
             mixed: false,
             claude: false,
             approves: true,
+            ask_safe: false,
+            codex: true,
+        },
+    ) {
+        return Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}));
+    }
+    // Tier 2: mixed chains and non-auto-approvable routed commands (such as
+    // `docker build`, `pnpm install`, `terraform plan`, `npx eslint`, or
+    // `cargo fmt && cargo test`) are rewritten with `decision: "ask"` so
+    // Antigravity CLI still enforces user approval (respecting Always Allow)
+    // while compacting the supported segments. `ask_safe: true` ensures we
+    // never wrap a segment that failed `approvable` due to unsafe code-execution
+    // or override flags (`rg --hostname-bin`, `go vet -vettool`, `cargo --config`).
+    let rewritten = wrap_event(
+        &workspace,
+        &cwd,
+        command,
+        session,
+        Rules {
+            mixed: true,
+            claude: false,
+            approves: false,
+            ask_safe: true,
             codex: true,
         },
     )?;
-    Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
+    Some(json!({"decision":"ask","overwrite":{"CommandLine":rewritten}}))
+}
+
+/// Zero-token inline UI banner (`metadata.user_markdown`) summarizing 7-day
+/// measured Justless savings in this workspace for Antigravity CLI `SessionStart`.
+fn agy_savings_banner(ws: &Workspace) -> Option<String> {
+    if !ws.state.is_dir() {
+        return None;
+    }
+    let since = crate::history::now_ms().saturating_sub(7 * 86_400_000);
+    let runs = crate::history::summary(ws, since);
+    let outlines = crate::history::outlines_summary(ws);
+    let cmd_saved = runs.net_saved_bytes.max(0) as u64;
+    let out_saved = outlines.net_saved_bytes().max(0) as u64;
+    if cmd_saved == 0 && out_saved == 0 {
+        return None;
+    }
+    let human = crate::history::human_bytes;
+    let mut parts = Vec::new();
+    if cmd_saved > 0 {
+        parts.push(format!("**{}** command output", human(cmd_saved)));
+    }
+    if out_saved > 0 {
+        parts.push(format!("**{}** source outlines", human(out_saved)));
+    }
+    let est_tokens = runs.estimate.net_tokens().max(0)
+        + crate::tokens::Content::Code
+            .tokens_signed(outlines.net_saved_bytes())
+            .max(0);
+    let est = if est_tokens > 0 {
+        format!(" (≈{est_tokens} est. tokens)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "**Justless** active · saved {} net{est} here in the last 7d.",
+        parts.join(" + ")
+    ))
+}
+
+/// Intercepts large, unbounded `read_file`/`view_file` calls in Antigravity CLI
+/// (`StartLine`, `EndLine` and non-zero `ByteOffset` all omitted) and returns a
+/// structural outline via `decision: "deny"` + `reason` so the agent requests
+/// only the line range or symbol it needs instead of loading up to 46 KB raw.
+fn agy_before_read(
+    roots: impl Iterator<Item = PathBuf>,
+    paths: &[Value],
+    input: &Value,
+) -> Option<Value> {
+    let call = &input["toolCall"];
+    if !matches!(call["name"].as_str(), Some("read_file" | "view_file")) {
+        return None;
+    }
+    let args = &call["args"];
+    let has_bound = |key: &str| {
+        args.get(key)
+            .and_then(explicit_value)
+            .is_some_and(|v| match v {
+                Value::Number(n) => n.as_u64().is_none_or(|n| n > 0),
+                Value::String(s) => !s.trim().is_empty() && s.trim() != "0",
+                _ => true,
+            })
+    };
+    if has_bound("StartLine") || has_bound("EndLine") || has_bound("ByteOffset") {
+        return None;
+    }
+    let raw = strip_file_uri(agy_read_path(args)?);
+    let mut path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        let base = agy_cwd(args, input, paths)?;
+        if !base.is_absolute() {
+            return None;
+        }
+        path = base.join(path);
+    }
+    let resolved = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(path.file_name())
+        .map(|(parent, name)| parent.join(name))?;
+    if !resolved.is_file() {
+        return None;
+    }
+    let root = roots
+        .filter(|root| resolved.starts_with(root))
+        .max_by_key(|root| root.components().count())?;
+    let ws = Workspace::discover(Some(&root)).ok()?;
+    let (ws, file) = read_file(&ws, &path).or_else(|| read_file(&ws, &resolved))?;
+    let settings = ws.settings().ok()?;
+    if !settings.agy_read_outline {
+        return None;
+    }
+    let source_path = ws.source_path(&file).ok()?;
+    let meta = fs::metadata(&source_path).ok()?;
+    if meta.len() > settings.max_file_bytes || meta.len() as usize <= settings.context_budget {
+        return None;
+    }
+    let bytes = fs::read(&source_path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let total_lines = text.lines().count();
+    if total_lines as u64 <= settings.read_outline_lines {
+        return None;
+    }
+    // Never risk exposing a redacted secret in an outline header.
+    if let Some(redactor) = crate::redact::for_run(&ws).ok()?
+        && matches!(redactor.text(&text), std::borrow::Cow::Owned(_))
+    {
+        return None;
+    }
+    let mut source = crate::source::Snapshot::from_text(&file, text.clone());
+    source.index(&file).ok()?;
+    let symbols = source.symbols();
+    if symbols.is_empty() || symbols.iter().any(|(_, kind, ..)| kind == "text") {
+        return None;
+    }
+    let uncovered = uncovered_code(&file, &source)?;
+    if uncovered.len() > 20 {
+        return None;
+    }
+    let page = source.page("", None, 40, settings.context_budget).ok()?;
+    let mut display = page.display();
+    if !uncovered.is_empty() {
+        let lines: Vec<&str> = source.text.lines().collect();
+        let mut code = String::from("Code outside these rows:\n");
+        for index in uncovered {
+            let line = lines[index].trim_end_matches('\r');
+            code.push_str(&format!("L{}: {line}\n", index + 1));
+        }
+        if code.len() > settings.context_budget {
+            return None;
+        }
+        display.push_str(&code);
+    }
+    let size = crate::history::human_bytes(text.len() as u64);
+    let justless = ws.justless();
+    let reason = format!(
+        "Justless outline of {file} ({total_lines} lines, {size}). Use `read_file` with StartLine/EndLine or `{justless} expand {file} 'REV#N'` to read exact spans:\n{display}"
+    );
+    // Antigravity's `read_file` returns at most 46,080 bytes per call.
+    if reason.len() >= text.len().min(46_080) {
+        return None;
+    }
+    let digest = crate::capture::source_digest(text.as_bytes());
+    crate::history::saw_outline_measured(
+        &ws,
+        &file,
+        digest,
+        text.len() as u64,
+        reason.len() as u64,
+    );
+    Some(json!({"decision": "deny", "reason": reason}))
 }
 
 /// Records a workspace text file range that Antigravity's `read_file` or
@@ -1585,6 +1771,7 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -
             mixed: agent != Agent::Codex,
             claude: agent == Agent::Claude,
             approves: agent == Agent::Codex,
+            ask_safe: false,
             codex: agent == Agent::Codex,
         },
     );
@@ -1706,6 +1893,12 @@ struct Rules {
     /// The client runs a rewritten command without asking, so each command must
     /// also pass `filters::approvable`.
     approves: bool,
+    /// Antigravity CLI Tier 2 (`decision: "ask"`): prompts the user (respecting
+    /// Always Allow), so each wrapped segment must pass `filters::approvable`
+    /// (even behind a downloading runner such as `npx` or `uv run`) or be a
+    /// `known::routes` tool — never wrapping unsafe code-execution or override
+    /// flags such as `rg --hostname-bin`, `go vet -vettool`, or `cargo --config`.
+    ask_safe: bool,
     /// Codex: a code-mode script's lines are a list, a file read in a list
     /// becomes a `justless read`, and a supported command piped only into `head`
     /// runs through Justless with `head` kept. See `plan`.
@@ -2445,10 +2638,13 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         (env && literal_command(&segment[..form.command.end]).is_some()
             && supported_command(words, json)
             && !(rules.claude && runs_grep(words))
-            && (!rules.approves
+            && (!rules.approves && !rules.ask_safe
                 || literal_command(words).is_some_and(|words| {
                     let words: Vec<&str> = words.iter().map(String::as_str).collect();
                     crate::filters::approvable(&words)
+                        || (rules.ask_safe
+                            && (crate::filters::approvable(crate::filters::unwrap_tool(&words))
+                                || crate::known::routes(&words)))
                 })))
         .then_some(form.command)
     };
@@ -2717,6 +2913,7 @@ pub fn would_route(command: &str, exclusions: &crate::rewrite::Exclusions) -> bo
         mixed: true,
         claude: true,
         approves: false,
+        ask_safe: false,
         codex: false,
     };
     let mut plan = plan(command, rules, |_| true);
@@ -2755,6 +2952,29 @@ pub(crate) fn codex_would_route(command: &str, exclusions: &crate::rewrite::Excl
         mixed: false,
         claude: false,
         approves: true,
+        ask_safe: false,
+        codex: true,
+    };
+    let mut plan = plan(command, rules, |_| true);
+    plan.exclude(command, rules, exclusions);
+    !plan.wrap.is_empty()
+}
+
+/// Whether the Antigravity CLI hook would route `command`: either Tier 1
+/// (all approvable, `decision: "allow"`) or Tier 2 (mixed chains and
+/// non-auto-approvable routed commands, `decision: "ask"`).
+pub(crate) fn agy_would_route(command: &str, exclusions: &crate::rewrite::Exclusions) -> bool {
+    if codex_would_route(command, exclusions) {
+        return true;
+    }
+    if exclusions.line(command).is_some() {
+        return false;
+    }
+    let rules = Rules {
+        mixed: true,
+        claude: false,
+        approves: false,
+        ask_safe: true,
         codex: true,
     };
     let mut plan = plan(command, rules, |_| true);

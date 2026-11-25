@@ -427,8 +427,7 @@ impl Coverage {
 }
 
 /// Classify each Antigravity CLI `run_command` call by whether it went through
-/// Justless, using the Antigravity CLI hook's rules (the same pre-command rules
-/// as Codex).
+/// Justless, using the Antigravity CLI hook's two-tier rules.
 pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -> Coverage {
     let mut groups: BTreeMap<Route, Group> = BTreeMap::new();
     let exclusions = crate::rewrite::Exclusions::of(workspace).unwrap_or_default();
@@ -438,7 +437,7 @@ pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -
         let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
         let content = Value::String(shell.output);
         let routed = crate::discover::routed(&shell.command, &label, &content)
-            || shell.hook_rewrote && crate::agents::codex_would_route(&shell.command, &exclusions);
+            || shell.hook_rewrote && crate::agents::agy_would_route(&shell.command, &exclusions);
         let route = if routed {
             Route::ThroughJustless
         } else {
@@ -447,7 +446,7 @@ pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -
                 &label,
                 &exclusions,
                 false,
-                crate::agents::codex_would_route,
+                crate::agents::agy_would_route,
             )
         };
         let group = groups.entry(route).or_default();
@@ -458,6 +457,61 @@ pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -
         entry.1 += shell.bytes;
     });
     Coverage { scan, groups }
+}
+
+/// Aggregate Antigravity CLI coverage across several workspaces, counting each
+/// conversation session at most once.
+pub(crate) fn stats_all(roots: &[PathBuf], since_ms: u64) -> Option<Stats> {
+    let mut seen_sessions = BTreeSet::new();
+    let mut commands = 0u64;
+    let mut bytes = 0u64;
+    let mut routed = 0u64;
+    let mut routed_bytes = 0u64;
+    for root in roots {
+        let Ok(workspace) = crate::workspace::Workspace::discover(Some(root)) else {
+            continue;
+        };
+        let exclusions = crate::rewrite::Exclusions::of(&workspace).unwrap_or_default();
+        let mut local_sessions = BTreeSet::new();
+        scan(&workspace.root, since_ms, |shell| {
+            if seen_sessions.contains(&shell.session) {
+                return;
+            }
+            local_sessions.insert(shell.session.clone());
+            let words = crate::agents::command_label(&shell.command);
+            let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
+            let content = Value::String(shell.output);
+            let is_routed = crate::discover::routed(&shell.command, &label, &content)
+                || shell.hook_rewrote
+                    && crate::agents::agy_would_route(&shell.command, &exclusions);
+            commands += 1;
+            bytes += shell.bytes;
+            if is_routed {
+                routed += 1;
+                routed_bytes += shell.bytes;
+            }
+        });
+        seen_sessions.extend(local_sessions);
+    }
+    if commands == 0 {
+        return None;
+    }
+    let human = crate::history::human_bytes;
+    Some(Stats {
+        json: json!({
+            "sessions": seen_sessions.len(),
+            "commands": commands,
+            "output_bytes": bytes,
+            "through_justless_commands": routed,
+            "through_justless_bytes": routed_bytes,
+        }),
+        line: format!(
+            "Antigravity CLI shell commands: {commands} returning {}, {routed} of them ({}) through Justless across {} session(s).",
+            human(bytes),
+            human(routed_bytes),
+            seen_sessions.len()
+        ),
+    })
 }
 
 /// The `agy` part of `stats`: how much Antigravity CLI shell output went through

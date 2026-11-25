@@ -432,6 +432,7 @@ fn cli() -> Command<'static> {
                 .arg(Arg::new("mode").required(true).possible_values([
                     "session-start",
                     "before-command",
+                    "before-read",
                     "after-read",
                     "after-search",
                     "after-bash",

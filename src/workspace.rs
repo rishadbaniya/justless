@@ -119,10 +119,13 @@ pub(crate) const PROJECT_MARKERS: &[&str] = &[
 pub struct Settings {
     pub filters: Vec<crate::filters::Rule>,
     pub context_budget: usize,
-    /// A Claude Code Read that returns at most this many lines is never replaced
-    /// by an outline; 0 outlines any whole Read over the context budget. See
-    /// `agents.rs`.
+    /// A Claude Code or Antigravity CLI read that returns at most this many lines
+    /// is never replaced by an outline; 0 outlines any whole read over the context
+    /// budget. See `agents.rs`.
     pub read_outline_lines: u64,
+    /// Whether Antigravity CLI's `before-read` hook returns an outline for large
+    /// unbounded `read_file`/`view_file` calls. Defaults to true.
+    pub agy_read_outline: bool,
     pub max_output_bytes: usize,
     pub max_file_bytes: u64,
     /// The most captured runs kept under `.justless/runs/`, newest first.
@@ -161,6 +164,7 @@ impl Default for Settings {
             filters: Vec::new(),
             context_budget: 2400,
             read_outline_lines: 600,
+            agy_read_outline: true,
             max_output_bytes: 4096,
             max_file_bytes: 2 * 1024 * 1024,
             max_runs: 200,
