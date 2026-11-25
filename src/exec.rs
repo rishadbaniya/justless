@@ -948,6 +948,13 @@ fn shape_text_preview(
         }
     }
 
+    if stream == "stdout"
+        && text.len() <= crate::tableview::LIMIT
+        && let Some(view) = crate::tableview::format(text, max_bytes)
+    {
+        return ShapedText::Ready(view.into_bytes());
+    }
+
     if text.len() > TEXT_SHAPE_LIMIT as usize {
         return ShapedText::Fallback;
     }

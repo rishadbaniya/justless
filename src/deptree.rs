@@ -21,6 +21,42 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::Path;
 
+/// Whether `words` invoke a supported dependency-tree or dependency-graph command
+/// in a display-oriented mode (unwrapping safe command wrappers and `cargo +toolchain`).
+pub fn is_supported(words: &[&str]) -> bool {
+    unwrap_deptree_command(words).is_some()
+}
+
+/// Command-slice wrapper around [`format`] for `capture.rs` and `postroute.rs`.
+pub fn format_words(words: &[&str], stdout: &str, budget: usize) -> Option<String> {
+    let (tool, args) = unwrap_deptree_command(words)?;
+    format(&tool, &args, stdout, budget)
+}
+
+fn unwrap_deptree_command(words: &[&str]) -> Option<(String, Vec<String>)> {
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let tool_slice = crate::filters::unwrap_tool(&refs);
+    let (&program, mut rest) = tool_slice.split_first()?;
+    let base = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program);
+    if base == "cargo"
+        && let Some((&first, tail)) = rest.split_first()
+        && first.starts_with('+')
+        && first.len() > 1
+    {
+        rest = tail;
+    }
+    let args: Vec<String> = rest.iter().map(|s| (*s).to_owned()).collect();
+    detect_tool(program, &args)?;
+    Some((program.to_owned(), args))
+}
+
 /// Maximum lines allowed in a single input before refusing to allocate unbounded
 /// graph state.
 const MAX_LINES: usize = 250_000;
@@ -29,7 +65,6 @@ const MAX_LINES: usize = 250_000;
 /// within `budget` UTF-8 bytes. Returns `None` if the invocation/output is not
 /// a supported dependency tree/graph or cannot be made strictly smaller than
 /// `stdout` within `budget`.
-#[allow(dead_code)]
 pub fn format(tool: &str, args: &[String], stdout: &str, budget: usize) -> Option<String> {
     if budget == 0 || stdout.is_empty() {
         return None;

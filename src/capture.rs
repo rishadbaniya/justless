@@ -1763,6 +1763,43 @@ impl Capture<'_> {
                         .1
                         .windows("[output clipped.".len())
                         .any(|w| w == "[output clipped.".as_bytes())));
+        let polyglot_report = if run.produced_bytes.is_empty()
+            && selection.profile.is_none()
+            && let Some(runner) = crate::polyglot_tests::runner_for_words(words)
+            && (!merged
+                || matches!(
+                    runner,
+                    crate::polyglot_tests::Runner::Pytest
+                        | crate::polyglot_tests::Runner::Unittest
+                        | crate::polyglot_tests::Runner::GoTest
+                        | crate::polyglot_tests::Runner::Dotnet
+                        | crate::polyglot_tests::Runner::Maven
+                        | crate::polyglot_tests::Runner::Gradle
+                        | crate::polyglot_tests::Runner::Swift
+                        | crate::polyglot_tests::Runner::Ctest
+                        | crate::polyglot_tests::Runner::Mix
+                        | crate::polyglot_tests::Runner::Deno
+                )) {
+            polyglot_test_view(
+                runner,
+                &archive.readers,
+                &lengths,
+                redactor,
+                &secrets,
+                run.status,
+                max_bytes,
+            )
+        } else {
+            None
+        };
+        if let Some(poly) = &polyglot_report {
+            run.summary.kind = "tests".to_owned();
+            run.summary.items = poly
+                .items
+                .iter()
+                .map(crate::polyglot_tests::FailureItem::to_summary_item)
+                .collect();
+        }
         if let Some(prior) = &previous
             && run.unchanged
         {
@@ -1774,6 +1811,19 @@ impl Capture<'_> {
                 }
                 previews[target].1 = format!("Output unchanged since {}.\n", prior.id).into_bytes();
             }
+        } else if let Some(poly) = polyglot_report
+            && previous.is_none()
+            && (poly.covers_stderr && !fit_whole[1]
+                || !stdout_fits
+                || poly.text.len() + 64 < shown
+                || poly.text.len() < covered)
+        {
+            previews[0].1 = fit(poly.text, max_bytes).into_bytes();
+            if poly.covers_stderr {
+                previews[1].1.clear();
+            }
+            report = true;
+            run.replaced = Some(if poly.covers_stderr { "both" } else { "stdout" }.to_owned());
         } else if let Some((findings, _)) = lint {
             // Findings replace both streams: the grouped report names every rule and
             // location, and each group links to its original lines in the full log.
@@ -1843,6 +1893,40 @@ impl Capture<'_> {
             previews[1].1.clear();
             report = true;
             run.replaced = Some("both".to_owned());
+        } else if run.produced_bytes.is_empty()
+            && crate::buildkit::is_build_command(words)
+            && let Some(view) = buildkit_view(
+                words,
+                &archive.readers,
+                &lengths,
+                redactor,
+                &secrets,
+                run.status,
+                max_bytes,
+            )
+            && (fit_whole.contains(&false) || view.len() + 64 < shown)
+        {
+            previews[0].1 = view.into_bytes();
+            previews[1].1.clear();
+            report = true;
+            run.replaced = Some("both".to_owned());
+        } else if !merged
+            && run.produced_bytes.is_empty()
+            && selection.profile.is_none()
+            && run.summary.kind.is_empty()
+            && let Some(view) = deptree_view(
+                words,
+                &archive.readers[0],
+                lengths[0],
+                redactor,
+                secrets[0] > 0,
+                max_bytes,
+            )
+            && (!stdout_fits || view.len() + 64 < previews[0].1.len())
+        {
+            previews[0].1 = view.into_bytes();
+            report = true;
+            run.replaced = Some("stdout".to_owned());
         } else if !merged
             && run.produced_bytes.is_empty()
             && selection.profile.is_none()
@@ -1897,6 +1981,24 @@ impl Capture<'_> {
             && (!stdout_fits || view.len() + 64 < previews[0].1.len())
         {
             previews[0].1 = view;
+            run.replaced = Some("stdout".to_owned());
+        } else if !merged
+            && selection.profile.is_none()
+            && run.summary.kind.is_empty()
+            && run.produced_bytes.is_empty()
+            && origin.is_none_or(|o| o.outline.is_none())
+            && !crate::floor::prints_file(words)
+            && (direct || !stdout_fits)
+            && let Some(view) = table_view(
+                &archive.readers[0],
+                lengths[0],
+                redactor,
+                secrets[0] > 0,
+                max_bytes,
+            )
+            && (!stdout_fits || view.len() + 64 < previews[0].1.len())
+        {
+            previews[0].1 = view.into_bytes();
             run.replaced = Some("stdout".to_owned());
         }
         if let Some(view) = lock_view
@@ -2358,6 +2460,107 @@ fn cli_view(
         None => text,
     };
     crate::cli_views::format(words, &text, max_bytes)
+}
+
+/// Format BuildKit / Docker / Compose / Podman build logs across stdout and
+/// stderr, redacting both streams before compaction.
+fn buildkit_view(
+    words: &[&str],
+    readers: &[File],
+    lengths: &[u64],
+    redactor: Option<&crate::redact::Redactor>,
+    secrets: &[u64],
+    status: i32,
+    max_bytes: usize,
+) -> Option<String> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    if lengths[0] + lengths[1] == 0 || lengths[0] + lengths[1] > LIMIT {
+        return None;
+    }
+    let mut streams = [String::new(), String::new()];
+    for i in 0..2 {
+        if lengths[i] > 0 {
+            let text = read_text(&readers[i], lengths[i], LIMIT)?;
+            streams[i] = match redactor.filter(|_| secrets[i] > 0) {
+                Some(r) => r.text(&text).into_owned(),
+                None => text,
+            };
+        }
+    }
+    crate::buildkit::format_for_command(words, &streams[0], &streams[1], Some(status), max_bytes)
+}
+
+/// Format dependency trees and graphs (`cargo tree`, `npm ls`, `pnpm list`,
+/// `yarn list`, `pipdeptree`, `go mod graph`, `mvn dependency:tree`,
+/// `gradle dependencies`), redacting before formatting.
+fn deptree_view(
+    words: &[&str],
+    reader: &File,
+    length: u64,
+    redactor: Option<&crate::redact::Redactor>,
+    has_secrets: bool,
+    max_bytes: usize,
+) -> Option<String> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    if length == 0 || length > LIMIT || !crate::deptree::is_supported(words) {
+        return None;
+    }
+    let text = read_text(reader, length, LIMIT)?;
+    let text = match redactor.filter(|_| has_secrets) {
+        Some(redactor) => redactor.text(&text).into_owned(),
+        None => text,
+    };
+    crate::deptree::format_words(words, &text, max_bytes)
+}
+
+/// Format structured polyglot test runner output (`pytest`, `unittest`,
+/// `go test`, `dotnet test`, `mvn test`, `gradle test`, `swift test`, `ctest`,
+/// `mix test`, `deno test`), redacting both streams before formatting.
+fn polyglot_test_view(
+    runner: crate::polyglot_tests::Runner,
+    readers: &[File],
+    lengths: &[u64],
+    redactor: Option<&crate::redact::Redactor>,
+    secrets: &[u64],
+    status: i32,
+    max_bytes: usize,
+) -> Option<crate::polyglot_tests::CompactReport> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    if lengths[0] + lengths[1] == 0 || lengths[0] + lengths[1] > LIMIT {
+        return None;
+    }
+    let mut streams = [String::new(), String::new()];
+    for i in 0..2 {
+        if lengths[i] > 0 {
+            let text = read_text(&readers[i], lengths[i], LIMIT)?;
+            streams[i] = match redactor.filter(|_| secrets[i] > 0) {
+                Some(r) => r.text(&text).into_owned(),
+                None => text,
+            };
+        }
+    }
+    crate::polyglot_tests::format(runner, &streams[0], &streams[1], Some(status), max_bytes)
+}
+
+/// Format unambiguous ASCII grid, PostgreSQL aligned, Unicode box-drawing, or
+/// Markdown tables into a lossless or bounded compact view.
+fn table_view(
+    reader: &File,
+    length: u64,
+    redactor: Option<&crate::redact::Redactor>,
+    has_secrets: bool,
+    max_bytes: usize,
+) -> Option<String> {
+    let limit = crate::tableview::LIMIT as u64;
+    if length == 0 || length > limit {
+        return None;
+    }
+    let text = read_text(reader, length, limit)?;
+    let text = match redactor.filter(|_| has_secrets) {
+        Some(redactor) => redactor.text(&text).into_owned(),
+        None => text,
+    };
+    crate::tableview::format(&text, max_bytes)
 }
 
 /// Stdout shown as JSON tables or compact JSON, clipped at whole lines to

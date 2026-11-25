@@ -222,6 +222,143 @@ impl Runner {
     }
 }
 
+/// Identify a supported polyglot test runner from command words, excluding
+/// machine-formatted or non-executing invocations (`--json`, `--help`, etc.).
+pub fn runner_for_words(words: &[&str]) -> Option<Runner> {
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let tool = crate::filters::unwrap_tool(&refs);
+    let (&program, args) = tool.split_first()?;
+    let base = std::path::Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program);
+    let has_flag = |slice: &[&str], blocked: &[&str]| {
+        slice.iter().take_while(|&&a| a != "--").any(|&arg| {
+            let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+            blocked.contains(&flag)
+        })
+    };
+    if has_flag(args, &["-h", "--help", "-V", "--version"]) {
+        return None;
+    }
+    match base {
+        "pytest" | "py.test" => {
+            if has_flag(
+                args,
+                &[
+                    "--collect-only",
+                    "--co",
+                    "--fixtures",
+                    "--markers",
+                    "--junitxml",
+                ],
+            ) {
+                return None;
+            }
+            Some(Runner::Pytest)
+        }
+        "python" | "python3" | "py" => {
+            let ["-m", module, tail @ ..] = args else {
+                return None;
+            };
+            match *module {
+                "pytest" => {
+                    if has_flag(
+                        tail,
+                        &[
+                            "--collect-only",
+                            "--co",
+                            "--fixtures",
+                            "--markers",
+                            "--junitxml",
+                        ],
+                    ) {
+                        return None;
+                    }
+                    Some(Runner::Pytest)
+                }
+                "unittest" => Some(Runner::Unittest),
+                _ => None,
+            }
+        }
+        "go" => {
+            let ["test", tail @ ..] = args else {
+                return None;
+            };
+            if has_flag(tail, &["-json", "-list"]) {
+                return None;
+            }
+            Some(Runner::GoTest)
+        }
+        "dotnet" => {
+            let ["test", tail @ ..] = args else {
+                return None;
+            };
+            if has_flag(tail, &["--list-tests", "-t"])
+                || tail
+                    .iter()
+                    .any(|a| a.starts_with("--logger:trx") || a.starts_with("--logger=trx"))
+            {
+                return None;
+            }
+            Some(Runner::Dotnet)
+        }
+        "mvn" | "mvnd" | "mvnw" => {
+            let runs_test = args.iter().any(|&a| {
+                matches!(
+                    a,
+                    "test" | "verify" | "surefire:test" | "failsafe:integration-test"
+                )
+            });
+            runs_test.then_some(Runner::Maven)
+        }
+        "gradle" | "gradlew" => {
+            let runs_test = args
+                .iter()
+                .any(|&a| a == "test" || a == "check" || a.ends_with(":test"));
+            runs_test.then_some(Runner::Gradle)
+        }
+        "swift" => {
+            let ["test", tail @ ..] = args else {
+                return None;
+            };
+            if has_flag(tail, &["list", "--list-tests", "--xunit-output"]) {
+                return None;
+            }
+            Some(Runner::Swift)
+        }
+        "ctest" => {
+            if has_flag(args, &["-N", "--show-only", "--output-junit"]) {
+                return None;
+            }
+            Some(Runner::Ctest)
+        }
+        "mix" => {
+            let ["test", tail @ ..] = args else {
+                return None;
+            };
+            if has_flag(tail, &["--formatter"]) {
+                return None;
+            }
+            Some(Runner::Mix)
+        }
+        "deno" => {
+            let ["test", tail @ ..] = args else {
+                return None;
+            };
+            if has_flag(tail, &["--junit-path", "--reporter"]) {
+                return None;
+            }
+            Some(Runner::Deno)
+        }
+        _ => None,
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailureItem {

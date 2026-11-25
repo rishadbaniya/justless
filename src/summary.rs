@@ -270,6 +270,26 @@ pub fn family(args: &[OsString]) -> String {
         ["npm", "test", ..] => "npm test",
         ["playwright", "test", ..] if playwright_display() => "playwright test",
         ["pytest", ..] | ["python" | "python3", "-m", "pytest"] => "pytest",
+        ["python" | "python3" | "py", "-m", "unittest"] => "unittest",
+        ["dotnet", "test", ..] => "dotnet test",
+        ["mvn" | "mvnd" | "mvnw", ..]
+            if tool
+                .iter()
+                .any(|&a| matches!(a, "test" | "verify" | "surefire:test")) =>
+        {
+            "mvn test"
+        }
+        ["gradle" | "gradlew", ..]
+            if tool
+                .iter()
+                .any(|&a| a == "test" || a == "check" || a.ends_with(":test")) =>
+        {
+            "gradle test"
+        }
+        ["swift", "test", ..] => "swift test",
+        ["ctest", ..] => "ctest",
+        ["mix", "test", ..] => "mix test",
+        ["deno", "test", ..] => "deno test",
         ["rspec", ..] if rspec_display() => "rspec",
         ["phpunit" | "paratest" | "pest", ..] if phpunit_display(1) => "phpunit",
         ["php", "artisan", "test", ..] if phpunit_display(3) => "phpunit",

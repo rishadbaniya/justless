@@ -414,6 +414,61 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         {
             replacement = Some((view, false));
         }
+        // 2b. BuildKit / Docker / Compose / Podman build logs.
+        if replacement.is_none()
+            && crate::buildkit::is_build_command(&cmd_refs)
+            && let Some(view) = crate::buildkit::format_for_command(
+                &cmd_refs,
+                &redacted_text,
+                "",
+                Some(shown.run.status),
+                budget,
+            )
+            && view.len() <= budget
+            && view.len() < output.len()
+            && (was_clipped || view.len() + 64 < text.len())
+        {
+            replacement = Some((view, false));
+        }
+        // 2c. Dependency trees and graphs (`cargo tree`, `npm ls`, `pnpm list`,
+        //     `yarn list`, `pipdeptree`, `go mod graph`, `mvn`, `gradle`).
+        if replacement.is_none()
+            && let Some(view) = crate::deptree::format_words(&cmd_refs, &redacted_text, budget)
+            && view.len() <= budget
+            && view.len() < output.len()
+            && (was_clipped || view.len() + 64 < text.len())
+        {
+            replacement = Some((view, false));
+        }
+        // 2d. Structured polyglot test runner reports (`pytest`, `unittest`,
+        //     `go test`, `dotnet`, `mvn`, `gradle`, `swift`, `ctest`, `mix`, `deno`).
+        if replacement.is_none()
+            && let Some(runner) = crate::polyglot_tests::runner_for_words(&cmd_refs)
+            && let Some(poly) = crate::polyglot_tests::format(
+                runner,
+                &redacted_text,
+                "",
+                Some(shown.run.status),
+                budget,
+            )
+            && poly.text.len() <= budget
+            && poly.text.len() < output.len()
+            && (was_clipped || poly.text.len() + 64 < text.len())
+        {
+            replacement = Some((poly.text, false));
+        }
+        // 2e. Universal lossless / bounded tables (`psql`, `mysql`, `duckdb`,
+        //     `sqlite3`, `aws --output table`, Markdown tables).
+        if replacement.is_none()
+            && !crate::floor::prints_file(&cmd_refs)
+            && redacted_text.len() <= crate::tableview::LIMIT
+            && let Some(view) = crate::tableview::format(&redacted_text, budget)
+            && view.len() <= budget
+            && view.len() < output.len()
+            && (was_clipped || view.len() + 64 < text.len())
+        {
+            replacement = Some((view, false));
+        }
         // 3. Structured or container/JSON/systemd log streams via `logview`.
         if replacement.is_none()
             && (is_log_cmd
