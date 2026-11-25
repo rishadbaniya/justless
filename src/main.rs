@@ -10,6 +10,7 @@ mod cli_views;
 mod components;
 mod config_outline;
 mod context;
+mod csvview;
 mod deptree;
 mod discover;
 mod doctests;

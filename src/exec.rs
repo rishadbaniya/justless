@@ -913,8 +913,9 @@ fn shape_stdout(
     crate::focus::outline(stdout, max_bytes, justless, run_id).context("could not outline stdout")
 }
 
-/// Shapes UTF-8 stream text using the Wave-1/Wave-2 engines (`jsonview`, `logview`,
-/// `stacktrace`), applying `redactor` first whenever one is provided.
+/// Shapes UTF-8 stream text using the Wave-1/Wave-2 engines (`jsonview`,
+/// `tableview`, `csvview`, `logview`, `stacktrace`), applying `redactor` first
+/// whenever one is provided.
 fn shape_text_preview(
     raw: &str,
     max_bytes: usize,
@@ -951,6 +952,13 @@ fn shape_text_preview(
     if stream == "stdout"
         && text.len() <= crate::tableview::LIMIT
         && let Some(view) = crate::tableview::format(text, max_bytes)
+    {
+        return ShapedText::Ready(view.into_bytes());
+    }
+
+    if stream == "stdout"
+        && text.len() <= crate::csvview::LIMIT
+        && let Some(view) = crate::csvview::format(text, max_bytes)
     {
         return ShapedText::Ready(view.into_bytes());
     }
@@ -3438,5 +3446,195 @@ done
             fs::metadata(run_dir.join("stdout")).unwrap().len(),
             raw_logs
         );
+    }
+
+    #[test]
+    fn csvview_exec_redacts_before_formatting_and_replays_exact_original_csv() {
+        let root = Path::new("/workspace");
+        let redactor = test_redactor();
+        let secret = format!("ghp_{}", "qR7sT8uV9wX0yZ1aB2cD3eF4gH5iJ6kL7mN8");
+
+        // 1. Redaction MUST run before csvview formatting (Tier 1 & Tier 2),
+        // and stderr must never route through csvview.
+        let mut tier1_csv =
+            String::from("\"id\",\"service\",\"env\",\"token\",\"status\",\"amount\"\n");
+        for i in 1..=50 {
+            let status = if i % 20 == 0 { "err" } else { "ok" };
+            tier1_csv.push_str(&format!(
+                "\"{i}\",\"billing\",\"production\",\"{secret}\",\"{status}\",\"{:.2}\"\n",
+                10.0 + (i as f64) * 1.25
+            ));
+        }
+        assert!(matches!(
+            shape_text_preview(&tier1_csv, 4096, root, "stderr", false, Some(redactor)),
+            ShapedText::Fallback
+        ));
+        let shaped_t1 =
+            match shape_text_preview(&tier1_csv, 4096, root, "stdout", false, Some(redactor)) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected redacted Tier 1 csvview"),
+            };
+        assert!(
+            shaped_t1.starts_with("[CSV 50 rows × 6 cols"),
+            "{shaped_t1}"
+        );
+        assert!(shaped_t1.len() <= 4096);
+        assert!(shaped_t1.len() * 2 < tier1_csv.len());
+        assert!(
+            !shaped_t1.contains(&secret),
+            "secret leaked into Tier 1 csvview:\n{shaped_t1}"
+        );
+        assert!(shaped_t1.contains("[redacted:"), "{shaped_t1}");
+
+        let mut tier2_csv = String::from(
+            "id,timestamp,service,env,region,status,api_token,latency_ms,amount_usd,note\n",
+        );
+        let regions = ["us-east-1", "eu-west-1", "us-west-2", "ap-south-1"];
+        for i in 1..=1000 {
+            let status = if i % 25 == 0 { "timeout" } else { "ok" };
+            let tok = if i == 1 || i == 500 || i == 1000 {
+                secret.as_str()
+            } else {
+                "public_key"
+            };
+            tier2_csv.push_str(&format!(
+                "{i},2026-04-01T{:02}:{:02}:00Z,checkout,prod,{},{status},{tok},{},{:.2},trace_span_{i:06}\n",
+                (i / 60) % 24,
+                i % 60,
+                regions[i % 4],
+                12 + (i * 13) % 900,
+                1.50 + (i as f64) * 0.75
+            ));
+        }
+        assert!(tier2_csv.len() > 80_000, "raw={}", tier2_csv.len());
+        let shaped_t2 =
+            match shape_text_preview(&tier2_csv, 4096, root, "stdout", false, Some(redactor)) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected redacted Tier 2 csvview"),
+            };
+        assert!(
+            shaped_t2.starts_with("[CSV 1000 rows × 10 cols · exact data in full log]\n"),
+            "{shaped_t2}"
+        );
+        assert!(shaped_t2.len() <= 4096);
+        assert!(
+            shaped_t2.len() * 20 < tier2_csv.len(),
+            "expected >95% reduction: raw={}, shaped={}",
+            tier2_csv.len(),
+            shaped_t2.len()
+        );
+        assert!(
+            !shaped_t2.contains(&secret),
+            "secret leaked into Tier 2 csvview:\n{shaped_t2}"
+        );
+        assert!(shaped_t2.contains("[redacted:"), "{shaped_t2}");
+        assert!(shaped_t2.contains("[stdout:10-997]"), "{shaped_t2}");
+
+        // 2. End-to-end `exec::run` emitting a 1,000-row ~100 KB CSV: preview shrinks >95%
+        // via csvview while the archive and `capture::log` replay the exact original CSV.
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join(".justless.toml"), "").unwrap();
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+
+        let csv_script = r#"
+printf 'id,timestamp,service,env,region,status,active,latency_ms,amount_usd,request_note\n'
+i=1
+while [ $i -le 1000 ]; do
+  case $((i % 4)) in
+    0) region=us-east-1 ;;
+    1) region=eu-west-1 ;;
+    2) region=us-west-2 ;;
+    *) region=ap-south-1 ;;
+  esac
+  if [ $((i % 25)) -eq 0 ]; then
+    status=timeout
+  elif [ $((i % 50)) -eq 1 ]; then
+    status=err
+  else
+    status=ok
+  fi
+  if [ $((i % 3)) -eq 0 ]; then active=false; else active=true; fi
+  if [ $((i % 100)) -eq 0 ]; then latency=""; else latency=$((4 + (i * 19) % 1847)); fi
+  printf '%d,2026-01-01T%02d:%02d:00Z,checkout,prod,%s,%s,%s,%s,%d.50,checkout_trace_span_%06d_shard_%d\n' \
+    "$i" "$(((i / 60) % 24))" "$((i % 60))" "$region" "$status" "$active" "$latency" "$((1 + (i % 400)))" "$i" "$((i % 16))"
+  i=$((i + 1))
+done
+"#;
+        let matches = command()
+            .try_get_matches_from(["exec", "--lang", "sh", csv_script])
+            .unwrap();
+        let status = run(&ws, &matches).unwrap();
+        assert_eq!(status, 0);
+
+        let run_dir = fs::read_dir(ws.state.join("runs"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.join("record.json").is_file())
+            .expect("recorded CSV run directory");
+        let rec: serde_json::Value =
+            serde_json::from_slice(&fs::read(run_dir.join("record.json")).unwrap()).unwrap();
+        let raw_bytes = rec["raw_bytes"].as_u64().unwrap();
+        let preview_bytes = rec["preview_bytes"].as_u64().unwrap();
+        assert!(raw_bytes >= 95_000, "raw_bytes={raw_bytes}");
+        assert!(
+            preview_bytes <= 4096 && preview_bytes * 20 < raw_bytes,
+            "expected >95% csvview reduction: raw={raw_bytes}, preview={preview_bytes}"
+        );
+
+        let stdout_path = run_dir.join("stdout");
+        let archived = fs::read_to_string(&stdout_path).unwrap();
+        assert_eq!(archived.len() as u64, raw_bytes);
+        let archived_lines: Vec<&str> = archived.lines().collect();
+        assert_eq!(archived_lines.len(), 1001);
+        assert_eq!(
+            archived_lines[0],
+            "id,timestamp,service,env,region,status,active,latency_ms,amount_usd,request_note"
+        );
+        assert!(
+            archived_lines[1].starts_with("1,2026-01-01T00:01:00Z,checkout,prod,eu-west-1,err,")
+        );
+        assert!(
+            archived_lines[1000]
+                .starts_with("1000,2026-01-01T16:40:00Z,checkout,prod,us-east-1,timeout,")
+        );
+
+        // Verify `shape_stdout` produces the Tier 2 CSV schema preview pointing at exact lines.
+        let run_id = run_dir.file_name().unwrap().to_string_lossy().into_owned();
+        let preview = String::from_utf8(
+            shape_stdout(
+                &stdout_path,
+                &run_id,
+                4096,
+                None,
+                &ws.root,
+                "justless",
+                false,
+            )
+            .unwrap()
+            .expect("csvview preview"),
+        )
+        .unwrap();
+        assert!(
+            preview.starts_with("[CSV 1000 rows × 10 cols · exact data in full log]\n"),
+            "{preview}"
+        );
+        assert!(
+            preview.contains("... 988 rows omitted [stdout:10-997] ..."),
+            "{preview}"
+        );
+        assert!(archived_lines[9].starts_with("9,"));
+        assert!(archived_lines[996].starts_with("996,"));
+
+        // Verify `justless log` (`capture::log`) replays exact original bytes and exact omitted range.
+        let replayed_all =
+            crate::capture::log(&run_dir, &[crate::capture::Stream::Stdout], 1, usize::MAX)
+                .unwrap();
+        assert_eq!(replayed_all, raw_bytes);
+        let expected_omitted_bytes: usize =
+            archived_lines[9..=996].iter().map(|l| l.len() + 1).sum();
+        let replayed_slice =
+            crate::capture::log(&run_dir, &[crate::capture::Stream::Stdout], 10, 997).unwrap();
+        assert_eq!(replayed_slice as usize, expected_omitted_bytes);
     }
 }
