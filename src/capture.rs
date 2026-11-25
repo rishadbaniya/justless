@@ -1558,8 +1558,11 @@ impl Capture<'_> {
         if ends_early {
             parser.ends_early();
         }
-        let mut lint = (selection.profile == Some(crate::filters::Profile::Lint))
-            .then(|| crate::lint::Lint::new(&workspace.root));
+        let mut lint = if selection.profile == Some(crate::filters::Profile::Lint) {
+            Some(crate::lint::Lint::new(&workspace.root))
+        } else {
+            known_lint_tool(words).map(|tool| crate::lint::Lint::for_tool(&workspace.root, tool))
+        };
         let mut grouping = match selection.profile {
             Some(crate::filters::Profile::Search) => Some(Grouping::Search(
                 crate::search::Search::new(&workspace.cwd, words),
@@ -2561,6 +2564,72 @@ fn table_view(
         None => text,
     };
     crate::tableview::format(&text, max_bytes)
+}
+
+/// Match the 12 Wave-6 ecosystem linters routed via `known::ROUTED` (so they
+/// keep non-approvable hook behavior while still receiving grouped rule reports
+/// and clean summaries in `capture`).
+fn known_lint_tool(words: &[&str]) -> Option<crate::lint::Tool> {
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let tool = crate::filters::unwrap_tool(&refs);
+    let (&program, args) = tool.split_first()?;
+    let base = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program);
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "-h" | "--help" | "-V" | "--version" | "--json" | "--xml" | "--sarif"
+            | "--checkstyle" | "--watch" | "-w" => return None,
+            "-f" | "--format" | "-format" | "--error-format" | "--formatter" | "--reporter"
+            | "--output-format" => {
+                let val = inline.or_else(|| iter.next()).unwrap_or("");
+                if matches!(
+                    val.to_ascii_lowercase().as_str(),
+                    "json"
+                        | "jsonl"
+                        | "ndjson"
+                        | "sarif"
+                        | "xml"
+                        | "checkstyle"
+                        | "junit"
+                        | "github"
+                        | "gitlab"
+                        | "rdjson"
+                        | "yaml"
+                ) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    match (base, args) {
+        ("phpstan", ["analyse" | "analyze", ..]) => Some(crate::lint::Tool::Phpstan),
+        ("clang-tidy", _) => Some(crate::lint::Tool::ClangTidy),
+        ("cppcheck", _) => Some(crate::lint::Tool::Cppcheck),
+        ("yamllint", _) => Some(crate::lint::Tool::Yamllint),
+        ("markdownlint" | "markdownlint-cli2", _) => Some(crate::lint::Tool::Markdownlint),
+        ("sqlfluff", ["lint", ..]) => Some(crate::lint::Tool::Sqlfluff),
+        ("ktlint", _) => Some(crate::lint::Tool::Ktlint),
+        ("stylelint", _) => Some(crate::lint::Tool::Stylelint),
+        ("deno", ["lint" | "check", ..]) => Some(crate::lint::Tool::Deno),
+        ("ansible-lint", _) => Some(crate::lint::Tool::AnsibleLint),
+        ("actionlint", _) => Some(crate::lint::Tool::Actionlint),
+        ("mix", ["credo", ..]) => Some(crate::lint::Tool::Credo),
+        _ => None,
+    }
 }
 
 /// Stdout shown as JSON tables or compact JSON, clipped at whole lines to

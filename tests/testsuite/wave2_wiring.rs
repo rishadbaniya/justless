@@ -1132,3 +1132,178 @@ fn wave4_cli_views_and_merged_logview_work_end_to_end() {
         merged_logs.len()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn wave6_buildkit_deptree_tableview_polyglot_tests_linters_and_graph_end_to_end() {
+    use std::fmt::Write as _;
+
+    let sb = Sandbox::new();
+
+    // 1) BuildKit clean build via `justless run --hook -- docker build .`
+    let mut bk = String::from(
+        "#0 building with \"default\" instance using docker driver\n\
+         #1 [internal] load build definition from Dockerfile\n\
+         #1 DONE 0.1s\n\
+         #2 [builder 1/3] FROM rust:1.91-slim\n\
+         #2 CACHED\n\
+         #3 [builder 2/3] RUN cargo build --release\n",
+    );
+    for i in 1..=140 {
+        let _ = writeln!(bk, "#3 0.{i:03}    Compiling dep-crate-{i:03} v1.0.{i}");
+    }
+    bk.push_str(
+        "#3 DONE 11.4s\n\
+         #4 exporting to image\n\
+         #4 writing image sha256:abcdef0123456789abcdef0123456789 done\n\
+         #4 naming to docker.io/library/app:latest done\n\
+         #4 DONE 0.5s\n",
+    );
+    let bk_path = sb.base.join("buildkit.err");
+    fs::write(&bk_path, &bk).unwrap();
+    executable(
+        &sb.bin.join("docker"),
+        &format!("#!/bin/sh\ncat '{}' >&2\nexit 0\n", bk_path.display()),
+    );
+    let out = sb.run_hook(&["docker", "build", "."]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let rendered = text(&out.stdout);
+    has(&rendered, "docker.io/library/app:latest");
+    assert!(
+        rendered.len() < bk.len() / 6,
+        "expected BuildKit compaction: {} vs {}\n{rendered}",
+        rendered.len(),
+        bk.len()
+    );
+
+    // 2) Dependency tree (`cargo tree`) collapses deep transitive subtrees & highlights duplicates.
+    let mut tree = String::from("demo v0.1.0 (/app)\n");
+    for i in 0..8 {
+        let _ = writeln!(tree, "├── dep-{i} v1.{i}.0");
+        let _ = writeln!(tree, "│   ├── syn v1.0.109");
+        for j in 0..12 {
+            let _ = writeln!(tree, "│   │   ├── leaf-{i}-{j} v0.1.{j}");
+        }
+        let _ = writeln!(tree, "│   └── proc-macro2 v1.0.86 (*)");
+    }
+    tree.push_str("└── macro-helper v0.2.0\n    └── syn v2.0.87\n");
+    sb.write_fixture_stub("cargo", "cargo_tree.txt", &tree);
+    let out = sb.run_hook(&["cargo", "tree"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let rendered = text(&out.stdout);
+    has(&rendered, "syn");
+    has(&rendered, "v1.0.109");
+    has(&rendered, "v2.0.87");
+    assert!(
+        rendered.len() < tree.len() / 2,
+        "expected deptree compaction: {} vs {}\n{rendered}",
+        rendered.len(),
+        tree.len()
+    );
+
+    // 3) Universal lossless table (`psql` aligned output) via `justless run --hook`.
+    let mut psql = String::from(
+        "  id  |   region   |  status  |       endpoint       \n\
+         ------+------------+----------+----------------------\n",
+    );
+    for i in 1..=60 {
+        let st = if i == 37 { "degraded" } else { "healthy" };
+        let _ = writeln!(
+            psql,
+            " {i:>4} | us-east-1  | {st:<8} | /v1/orders/shard-{i:02} "
+        );
+    }
+    psql.push_str("(60 rows)\n");
+    sb.write_fixture_stub("psql", "psql_out.txt", &psql);
+    let out = sb.run_hook(&["psql", "-c", "SELECT * FROM endpoints"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let rendered = text(&out.stdout);
+    has(&rendered, "us-east-1");
+    has(&rendered, "degraded");
+    has(&rendered, "(60 rows)");
+    assert!(
+        rendered.len() < psql.len() / 2,
+        "expected tableview compaction: {} vs {}\n{rendered}",
+        rendered.len(),
+        psql.len()
+    );
+
+    // 4) Polyglot test runner (`dotnet test`) groups failures & preserves exit 1.
+    let mut dotnet = String::from(
+        "  Determining projects to restore...\n\
+         Test run for /app/bin/Debug/net8.0/App.Tests.dll (.NETCoreApp,Version=v8.0)\n",
+    );
+    for i in 1..=40 {
+        let _ = writeln!(dotnet, "  Passed App.Tests.MathTests.Check_{i} [2 ms]");
+    }
+    dotnet.push_str(
+        "  Failed App.Tests.CheckoutTests.AppliesFee [14 ms]\n\
+           Error Message:\n\
+            Assert.Equal() Failure: Expected: 105, Actual: 106\n\
+           Stack Trace:\n\
+              at App.Tests.CheckoutTests.AppliesFee() in /app/tests/CheckoutTests.cs:line 19\n\
+         Failed!  - Failed:     1, Passed:    40, Skipped:     0, Total:    41, Duration: 210 ms\n",
+    );
+    let dn_path = sb.base.join("dotnet_test.txt");
+    fs::write(&dn_path, &dotnet).unwrap();
+    executable(
+        &sb.bin.join("dotnet"),
+        &format!("#!/bin/sh\ncat '{}'\nexit 1\n", dn_path.display()),
+    );
+    let out = sb.run_hook(&["dotnet", "test"]);
+    assert_eq!(out.status.code(), Some(1));
+    let rendered = text(&out.stdout);
+    has(&rendered, "1 reported failing test(s)");
+    has(&rendered, "AppliesFee");
+    has(&rendered, "Expected: 105, Actual: 106");
+    assert!(
+        rendered.len() < dotnet.len() / 3,
+        "expected dotnet test compaction: {} vs {}\n{rendered}",
+        rendered.len(),
+        dotnet.len()
+    );
+
+    // 5) Wave-6 known linter (`phpstan analyse`) receives grouped rule reports live.
+    let mut phpstan = String::new();
+    for i in 1..=25 {
+        let _ = writeln!(
+            phpstan,
+            "src/Service{i}.php:{}:Method App\\Service{i}::run() has no return type specified. [missingType.return]",
+            10 + i
+        );
+    }
+    phpstan.push_str("[ERROR] Found 25 errors\n");
+    let php_path = sb.base.join("phpstan.txt");
+    fs::write(&php_path, &phpstan).unwrap();
+    executable(
+        &sb.bin.join("phpstan"),
+        &format!("#!/bin/sh\ncat '{}'\nexit 1\n", php_path.display()),
+    );
+    let out = sb.run_hook(&["phpstan", "analyse", "src"]);
+    assert_eq!(out.status.code(), Some(1));
+    let rendered = text(&out.stdout);
+    has(&rendered, "missingType.return");
+    has(&rendered, "25");
+    assert!(
+        rendered.len() < phpstan.len() / 2,
+        "expected phpstan lint grouping: {} vs {}\n{rendered}",
+        rendered.len(),
+        phpstan.len()
+    );
+
+    // 6) `map --explain` on the sandbox repo runs cleanly and reports role & centrality.
+    let out = sb
+        .cmd(&[
+            "--root",
+            sb.root.to_str().unwrap(),
+            "map",
+            "--explain",
+            "ok",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let explain = text(&out.stdout);
+    has(&explain, "Explain ·");
+    has(&explain, "Centrality ·");
+}

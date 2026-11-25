@@ -142,13 +142,21 @@ pub fn family(args: &[OsString]) -> String {
         None => all.clone(),
     };
     let tool = crate::filters::unwrap_tool(&refs);
-    let mut words: Vec<_> = tool.iter().take(3).copied().collect();
+    let mut words: Vec<_> = tool.iter().take(4).copied().collect();
     if let Some(command) = words.first_mut() {
         *command = std::path::Path::new(*command)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
     }
+    if words.first() == Some(&"cargo")
+        && words
+            .get(1)
+            .is_some_and(|w| w.starts_with('+') && w.len() > 1)
+    {
+        words.remove(1);
+    }
+    words.truncate(3);
     // `git log` prints patches only when asked; other logs stay in `git`.
     let patch = || {
         tool.iter().skip(2).take_while(|w| **w != "--").any(|w| {

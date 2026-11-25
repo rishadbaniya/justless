@@ -1060,6 +1060,7 @@ fn parse_buildkit(
             }
 
             // 8. Build-level fatal error lines (`ERROR: failed to solve: ...`, `executor failed...`)
+            //    plus immediately following indented detail lines.
             if is_bk_fatal_line(trimmed) {
                 fatal_lines.push(FatalLine {
                     text: trimmed.to_owned(),
@@ -1067,6 +1068,26 @@ fn parse_buildkit(
                     line_no,
                 });
                 i += 1;
+                let mut detail_count = 0usize;
+                while i < lines.len() && detail_count < 4 {
+                    let (next_stream, next_line_no, ref next_raw) = lines[i];
+                    let next_trimmed = next_raw.trim();
+                    if next_stream != stream
+                        || next_trimmed.is_empty()
+                        || !next_raw.starts_with([' ', '\t'])
+                        || next_trimmed.starts_with('#')
+                        || next_trimmed.starts_with("------")
+                    {
+                        break;
+                    }
+                    fatal_lines.push(FatalLine {
+                        text: next_trimmed.to_owned(),
+                        stream: next_stream,
+                        line_no: next_line_no,
+                    });
+                    i += 1;
+                    detail_count += 1;
+                }
                 continue;
             }
 
@@ -1638,7 +1659,10 @@ fn strip_build_level_warning(trimmed: &str) -> Option<&str> {
 }
 
 fn is_bk_fatal_line(trimmed: &str) -> bool {
-    trimmed.starts_with("ERROR: failed to solve")
+    let lower_prefix = trimmed
+        .get(..22)
+        .is_some_and(|p| p.eq_ignore_ascii_case("error: failed to solve"));
+    lower_prefix
         || trimmed.starts_with("failed to solve:")
         || trimmed.starts_with("executor failed running ")
         || (trimmed.starts_with("target ") && trimmed.contains("failed to solve:"))

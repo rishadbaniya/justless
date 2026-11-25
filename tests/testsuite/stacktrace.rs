@@ -596,7 +596,7 @@ fn persistent_progress_filtering_keeps_clipped_docker_pip_and_xcodebuild_clean()
     let id = run_id(&out);
     let shown = text(&out.stdout);
     assert!(shown.len() <= 4096, "len={}\n{shown}", shown.len());
-    has(&shown, "progress lines omitted]");
+    has(&shown, "docker build FAILED (exit 1)");
     lacks(&shown, "transferring context:");
     lacks(&shown, " CACHED\n");
     lacks(&shown, "exporting layers");
