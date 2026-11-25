@@ -1591,7 +1591,7 @@ impl Capture<'_> {
             let preview = match std::str::from_utf8(&preview)
                 .ok()
                 .filter(|_| direct && fits && !(json && index == 0))
-                .and_then(crate::floor::compact)
+                .and_then(|text| crate::floor::compact_stream(text, &workspace.root, stream.name()))
             {
                 Some(compact) if compact.len() + 64 < preview.len() => compact.into_bytes(),
                 _ => preview,
@@ -1735,7 +1735,11 @@ impl Capture<'_> {
                     && !previews[0]
                         .1
                         .windows("[… full stream in log …]".len())
-                        .any(|w| w == "[… full stream in log …]".as_bytes())));
+                        .any(|w| w == "[… full stream in log …]".as_bytes())
+                    && !previews[0]
+                        .1
+                        .windows("[output clipped.".len())
+                        .any(|w| w == "[output clipped.".as_bytes())));
         if let Some(prior) = &previous
             && run.unchanged
         {
@@ -2260,11 +2264,21 @@ fn scan(
     } = observers;
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
+    const PROGRESS_RESERVE: usize = 48;
     let mut truncated = length > max_bytes as u64;
     // Redaction can bring output under the budget, as when a private key body
     // collapses to one marker, so keep the redacted stream while it still fits.
     let mut whole = (truncated && redactor.is_some()).then(Vec::new);
-    let payload = max_bytes - DIAGNOSTICS.len() - CLIPPED.len();
+    let progress_reserve = if truncated && selection.omit.is_some() {
+        PROGRESS_RESERVE
+    } else {
+        0
+    };
+    let payload = max_bytes.saturating_sub(DIAGNOSTICS.len() + CLIPPED.len() + progress_reserve);
+    let section_budget = payload / 2;
+    // Store headroom so entries that end up omitted because they already appear
+    // verbatim in `head` or `tail` never crowd out mid-stream diagnostics.
+    let section_store_budget = section_budget.saturating_mul(2).saturating_add(payload / 2);
     file.seek(SeekFrom::Start(0))?;
     // Every consumer below sees redacted lines; the digest covers the raw bytes.
     let mut file = crate::redact::Reader::new(
@@ -2278,16 +2292,22 @@ fn scan(
     let mut end = Vec::new();
     let mut preview = Vec::new();
     let mut head = Excerpt::new(payload / 6);
+    let mut head_covered = LineRanges::default();
     let mut section = Section::default();
     let mut failures = Failures::default();
     let tail_limit = payload / 3;
-    let mut tail = VecDeque::new();
+    let mut tail: VecDeque<TailItem> = VecDeque::new();
     let mut tail_bytes = 0;
     let mut line_no = 0;
     let mut filter = crate::filters::LineFilter::new(selection, max_bytes);
-    // Display-only compaction of the head and tail; see `floor`.
+    // Display-only compaction of the head and tail; see `stacktrace` and `floor`.
+    let mut stack_stream =
+        crate::stacktrace::StreamCollapser::new(Some(&workspace.root), Some(stream.name()));
+    let mut stacked = Vec::new();
     let mut floor = crate::floor::Floor::default();
     let mut floored = Vec::new();
+    let mut progress_omitted: usize = 0;
+    let mut progress_context_until: usize = 0;
 
     // A stream that fits is shown whole, including lines that markers made longer.
     let line_limit = if truncated {
@@ -2318,7 +2338,11 @@ fn scan(
         let rendered = structured.as_ref().and_then(rendered_message);
         let shown = rendered.as_deref().unwrap_or(&text);
         let line = shown.trim_end_matches(['\n', '\r']);
-        let failure = failures.observe(line, shown, |block| section.add(block, payload / 2));
+        let failure = failures.observe(line, shown, line_no, |block| {
+            if truncated {
+                section.add(block, &workspace.root, stream.name(), section_store_budget);
+            }
+        });
         let patch = failures.patch;
         let found = if patch {
             Vec::new()
@@ -2345,26 +2369,71 @@ fn scan(
             preview.extend_from_slice(&raw);
         } else {
             let trimmed = line.trim_start();
-            if !failure && !patch && (has_location || trimmed.starts_with("warning")) {
-                section.add(Block::new(Tier::Note, line, shown), payload / 2);
+            let diag_body = crate::filters::log_dedup_key(trimmed);
+            let is_warning = diag_body.starts_with("warning")
+                || diag_body.starts_with("WARNING")
+                || diag_body.starts_with("WARN ")
+                || diag_body.starts_with("WARN:")
+                || diag_body.starts_with("[WARN");
+            if !failure && !patch && (has_location || is_warning) {
+                section.add(
+                    Block::new(Tier::Note, line, shown, line_no),
+                    &workspace.root,
+                    stream.name(),
+                    section_store_budget,
+                );
             }
-            if cut {
-                floor.flush(&mut floored);
-            } else {
-                floor.push(shown, failure, &mut floored);
+            let is_diag = failure || crate::filters::diagnostic(trimmed);
+            if is_diag {
+                progress_context_until = line_no.saturating_add(4);
             }
-            for (line, repeats) in floored.drain(..) {
-                head.push(&line);
-                keep_tail(
+            let omit_as_progress = !cut
+                && !is_diag
+                && !patch
+                && !has_location
+                && line_no > progress_context_until
+                && selection
+                    .omit
+                    .as_ref()
+                    .is_some_and(|re| re.is_match(line.trim()));
+            if omit_as_progress {
+                progress_omitted += 1;
+                stack_stream.flush(&mut stacked);
+                emit_stacked(
+                    &mut stacked,
+                    &mut floor,
+                    &mut floored,
+                    &mut head,
+                    &mut head_covered,
                     &mut tail,
                     &mut tail_bytes,
                     tail_limit,
-                    &line,
-                    false,
-                    repeats,
                 );
-            }
-            if cut {
+            } else if cut {
+                stack_stream.flush(&mut stacked);
+                emit_stacked(
+                    &mut stacked,
+                    &mut floor,
+                    &mut floored,
+                    &mut head,
+                    &mut head_covered,
+                    &mut tail,
+                    &mut tail_bytes,
+                    tail_limit,
+                );
+                floor.flush(&mut floored);
+                for (line, repeats) in floored.drain(..) {
+                    head.push(&line);
+                    keep_tail(
+                        &mut tail,
+                        &mut tail_bytes,
+                        tail_limit,
+                        &line,
+                        false,
+                        repeats,
+                        None,
+                    );
+                }
                 // Only the start of an enormous line was scanned. Show its real end;
                 // the tail ends where the stream ends, even inside such a line.
                 head.push(shown);
@@ -2373,26 +2442,62 @@ fn scan(
                 suffix.extend_from_slice(&end);
                 let suffix = String::from_utf8_lossy(&suffix);
                 let suffix = ANSI.replace_all(&suffix, "");
-                keep_tail(&mut tail, &mut tail_bytes, tail_limit, &suffix, true, false);
+                keep_tail(
+                    &mut tail,
+                    &mut tail_bytes,
+                    tail_limit,
+                    &suffix,
+                    true,
+                    false,
+                    None,
+                );
+            } else {
+                stack_stream.push(shown, line_no, failure, &mut stacked);
+                emit_stacked(
+                    &mut stacked,
+                    &mut floor,
+                    &mut floored,
+                    &mut head,
+                    &mut head_covered,
+                    &mut tail,
+                    &mut tail_bytes,
+                    tail_limit,
+                );
             }
         }
         raw.clear();
         end.clear();
     }
-    if let Some(open) = failures.block.take() {
-        section.add(open, payload / 2);
+    if let Some(open) = failures.block.take()
+        && truncated
+    {
+        section.add(open, &workspace.root, stream.name(), section_store_budget);
     }
-    floor.flush(&mut floored);
-    for (line, repeats) in floored.drain(..) {
-        head.push(&line);
-        keep_tail(
+    if truncated {
+        stack_stream.flush(&mut stacked);
+        emit_stacked(
+            &mut stacked,
+            &mut floor,
+            &mut floored,
+            &mut head,
+            &mut head_covered,
             &mut tail,
             &mut tail_bytes,
             tail_limit,
-            &line,
-            false,
-            repeats,
         );
+        floor.flush(&mut floored);
+        for (line, repeats) in floored.drain(..) {
+            head.push(&line);
+            keep_tail(
+                &mut tail,
+                &mut tail_bytes,
+                tail_limit,
+                &line,
+                false,
+                repeats,
+                None,
+            );
+        }
     }
 
     if let Some(buffer) = whole {
@@ -2400,14 +2505,28 @@ fn scan(
         preview = buffer;
     }
     if truncated {
+        let mut covered = head_covered;
+        for item in &tail {
+            if let Some(range) = item.range {
+                covered.add(range);
+            }
+        }
+        if progress_omitted > 0 {
+            let note = if progress_omitted == 1 {
+                "[1 progress line omitted]\n".to_owned()
+            } else {
+                format!("[{progress_omitted} progress lines omitted]\n")
+            };
+            preview.extend_from_slice(note.as_bytes());
+        }
         preview.extend_from_slice(head.text.as_bytes());
-        let diagnostics = section.render(payload / 2);
+        let diagnostics = section.render(section_budget, stream.name(), &covered);
         if !diagnostics.is_empty() {
             preview.extend_from_slice(DIAGNOSTICS);
             preview.extend_from_slice(diagnostics.as_bytes());
         }
         preview.extend_from_slice(CLIPPED);
-        preview.extend(tail.into_iter().flat_map(String::into_bytes));
+        preview.extend(tail.into_iter().flat_map(|item| item.text.into_bytes()));
     }
     if let Some(found) = run.redaction.as_mut() {
         found.count += file.found().count;
@@ -2416,7 +2535,7 @@ fn scan(
         .push(format!("{:x}", file.into_inner().digest.finalize()));
     // A tool's built-in progress lines only ever shorten a preview: when the
     // other lines still do not fit, the ordinary preview, which puts failures
-    // before warnings, is shown.
+    // before warnings (and now omits progress lines from head/tail too), is shown.
     if let Some((filtered, whole)) = filter.finish()
         && (filtered.len() < preview.len() || truncated && filtered.len() <= max_bytes)
         && (whole || !selection.built_in)
@@ -2426,27 +2545,114 @@ fn scan(
     Ok((preview, !truncated))
 }
 
+/// One entry in the tail ring buffer, carrying the 1-based archive line range
+/// it represents verbatim (or as a collapsed stack summary) when un-cut.
+struct TailItem {
+    text: String,
+    range: Option<(usize, usize)>,
+}
+
+/// Sorted, merged set of 1-based inclusive archive line ranges already shown in
+/// `head` or `tail`, used to suppress duplicate `[diagnostics]` entries.
+#[derive(Default)]
+struct LineRanges {
+    ranges: Vec<(usize, usize)>,
+}
+
+impl LineRanges {
+    fn add(&mut self, (start, end): (usize, usize)) {
+        if start == 0 || end < start {
+            return;
+        }
+        if let Some(last) = self.ranges.last_mut()
+            && start <= last.1.saturating_add(1)
+            && end >= last.0
+        {
+            last.0 = last.0.min(start);
+            last.1 = last.1.max(end);
+            return;
+        }
+        self.ranges.push((start, end));
+    }
+
+    fn covers(&self, start: usize, end: usize) -> bool {
+        if start == 0 || end < start {
+            return false;
+        }
+        let mut cursor = start;
+        // `ranges` is almost always in ascending order (head then tail), but
+        // scan cleanly so overlapping/adjacent ranges always merge logically.
+        loop {
+            let mut advanced = false;
+            for &(a, b) in &self.ranges {
+                if a <= cursor && b >= cursor {
+                    if b >= end {
+                        return true;
+                    }
+                    cursor = b.saturating_add(1);
+                    advanced = true;
+                }
+            }
+            if !advanced {
+                return false;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_stacked(
+    stacked: &mut Vec<crate::stacktrace::OutputLine>,
+    floor: &mut crate::floor::Floor,
+    floored: &mut Vec<crate::floor::Shown>,
+    head: &mut Excerpt,
+    head_covered: &mut LineRanges,
+    tail: &mut VecDeque<TailItem>,
+    tail_bytes: &mut usize,
+    tail_limit: usize,
+) {
+    for st in stacked.drain(..) {
+        floor.push(&st.text, st.marked, floored);
+        let emitted = floored.len();
+        for (idx, (line, repeats)) in floored.drain(..).enumerate() {
+            let range = (!repeats && idx + 1 == emitted && line == st.text).then_some(st.range);
+            if head.push(&line)
+                && let Some(r) = range
+            {
+                head_covered.add(r);
+            }
+            keep_tail(tail, tail_bytes, tail_limit, &line, false, repeats, range);
+        }
+    }
+}
+
 /// Add a line to the tail excerpt, dropping its oldest lines past `limit`. `cut`
 /// marks a line whose start was left out, and `repeats` the floor's count of
 /// repeats of the line before, which leaves the tail with that line.
 fn keep_tail(
-    tail: &mut VecDeque<String>,
+    tail: &mut VecDeque<TailItem>,
     bytes: &mut usize,
     limit: usize,
     line: &str,
     cut: bool,
     repeats: bool,
+    range: Option<(usize, usize)>,
 ) {
     let mut excerpt = Excerpt::new(limit);
     excerpt.push_end(line, cut);
     if !excerpt.text.is_empty() {
+        let verbatim = !cut && line.len() <= limit;
+        let item_range = verbatim.then_some(range).flatten();
         *bytes += excerpt.text.len();
         match tail.back_mut() {
-            Some(last) if repeats => last.push_str(&excerpt.text),
-            _ => tail.push_back(excerpt.text),
+            Some(last) if repeats => last.text.push_str(&excerpt.text),
+            _ => tail.push_back(TailItem {
+                text: excerpt.text,
+                range: item_range,
+            }),
         }
         while *bytes > limit {
-            *bytes -= tail.pop_front().unwrap().len();
+            *bytes -= tail.pop_front().unwrap().text.len();
         }
     }
 }
@@ -2557,20 +2763,37 @@ enum Tier {
 struct Block {
     tier: Tier,
     text: String,
+    first_line: usize,
+    last_line: usize,
     indent: usize,
     kind: Follow,
     lines: usize,
-    frames: VecDeque<String>,
-    skipped: usize,
+    trace: Vec<(usize, String)>,
+    trace_overflow: usize,
+    /// Optional blank line sitting between `panic:` and `goroutine N [running]:`.
+    pending_blank: Option<(usize, String)>,
+    /// Compiler diagnostic carrying an embedded source location (`path:line: error:`
+    /// or `error[E...]` followed by `--> path:line:col`).
+    compiler_located: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Follow {
     /// A Python traceback runs through its first line at the header's indentation.
     Traceback,
-    /// A panic message follows `panicked at path:line:col:` until a blank line.
+    /// A Rust panic message follows `panicked at path:line:col:` until a blank line,
+    /// or upgrades to `RustBacktrace` when `stack backtrace:` appears.
     Panic,
-    /// Indented location and source lines under a compiler error.
+    /// A Rust `stack backtrace:` section collecting numbered frames and `at` lines.
+    RustBacktrace,
+    /// A Go panic (`panic:` / `fatal error:`) and its goroutine stack trace.
+    GoPanic {
+        saw_goroutine: bool,
+    },
+    /// Node/V8/Deno/Bun or Java/Kotlin/Scala stack frames (+ `Caused by:` chains).
+    StackFrames,
+    /// Indented location and source lines under a compiler or runtime error.
+    /// Upgrades to `StackFrames` as soon as an inline stack frame arrives.
     Indented,
     Nothing,
 }
@@ -2583,16 +2806,27 @@ enum Extend {
 
 const FOLLOW_LINES: usize = 4;
 const TRACEBACK_FRAMES: usize = 10;
+/// Upper bound on stack-trace lines collected inside one diagnostic block so
+/// workspace frames sitting behind dozens of runtime/library frames are always
+/// captured before workspace-aware collapsing.
+const MAX_TRACE_LINES: usize = 512;
 
 impl Block {
-    fn new(tier: Tier, line: &str, shown: &str) -> Self {
+    fn new(tier: Tier, line: &str, shown: &str, line_no: usize) -> Self {
         let trimmed = line.trim_start();
+        let body = crate::filters::log_dedup_key(trimmed);
         let kind = if tier == Tier::Note {
             Follow::Nothing
-        } else if trimmed.starts_with("Traceback") {
+        } else if body.starts_with("Traceback") {
             Follow::Traceback
-        } else if trimmed.contains(" panicked at ") && trimmed.ends_with(':') {
+        } else if body.contains(" panicked at ") && body.trim_end().ends_with(':') {
             Follow::Panic
+        } else if body.starts_with("stack backtrace:") {
+            Follow::RustBacktrace
+        } else if body.starts_with("panic:") || body.starts_with("fatal error:") {
+            Follow::GoPanic {
+                saw_goroutine: false,
+            }
         } else if tier == Tier::Failure {
             Follow::Indented
         } else {
@@ -2605,63 +2839,187 @@ impl Block {
         Self {
             tier,
             text,
+            first_line: line_no,
+            last_line: line_no,
             indent: indentation(line),
             kind,
             lines: 0,
-            frames: VecDeque::new(),
-            skipped: 0,
+            trace: Vec::new(),
+            trace_overflow: 0,
+            pending_blank: None,
+            compiler_located: LOCATED_ERROR.is_match(line),
         }
     }
 
-    fn extend(&mut self, line: &str, shown: &str) -> Extend {
+    fn push_trace(&mut self, line_no: usize, shown: &str) {
+        if self.trace.len() < MAX_TRACE_LINES {
+            self.trace.push((line_no, with_newline(shown)));
+        } else {
+            self.trace_overflow += 1;
+        }
+        self.last_line = line_no;
+    }
+
+    fn extend(&mut self, line: &str, shown: &str, line_no: usize) -> Extend {
         let indent = indentation(line);
         let blank = line.trim().is_empty();
-        let next = match self.kind {
-            Follow::Nothing => return Extend::Stop,
-            Follow::Traceback if blank || indent < self.indent => return Extend::Stop,
+        let trimmed = line.trim_start();
+        match self.kind {
+            Follow::Nothing => Extend::Stop,
+            Follow::Traceback if blank || indent < self.indent => Extend::Stop,
             Follow::Traceback if indent > self.indent => {
-                self.frames.push_back(with_newline(shown));
-                if self.frames.len() > TRACEBACK_FRAMES {
-                    self.frames.pop_front();
-                    self.skipped += 1;
-                }
-                return Extend::More;
+                self.push_trace(line_no, shown);
+                Extend::More
             }
             Follow::Traceback => {
                 // The exception line, such as `ValueError: bad input`.
-                self.finish_frames();
-                self.text.push_str(&with_newline(shown));
-                return Extend::Last;
+                self.trace.push((line_no, with_newline(shown)));
+                self.last_line = line_no;
+                Extend::Last
             }
             Follow::Panic => {
-                let trimmed = line.trim_start();
-                !blank
+                if trimmed.starts_with("stack backtrace:") {
+                    self.kind = Follow::RustBacktrace;
+                    self.push_trace(line_no, shown);
+                    return Extend::More;
+                }
+                let next = !blank
                     && !trimmed.starts_with("note:")
-                    && !trimmed.starts_with("stack backtrace:")
                     && !trimmed.starts_with("---- ")
-                    && !trimmed.starts_with("--- ")
+                    && !trimmed.starts_with("--- ");
+                if !next || self.lines >= FOLLOW_LINES {
+                    return Extend::Stop;
+                }
+                self.lines += 1;
+                self.last_line = line_no;
+                self.text.push_str(&with_newline(shown));
+                Extend::More
             }
-            Follow::Indented => !blank && (indent > self.indent || RUST_GUTTER.is_match(line)),
-        };
-        if !next || self.lines >= FOLLOW_LINES {
-            return Extend::Stop;
+            Follow::RustBacktrace => {
+                if !blank
+                    && (crate::stacktrace::is_rust_frame_start(line, true)
+                        || crate::stacktrace::is_rust_at_line(line))
+                {
+                    self.push_trace(line_no, shown);
+                    return Extend::More;
+                }
+                Extend::Stop
+            }
+            Follow::GoPanic { saw_goroutine } => {
+                if !saw_goroutine {
+                    if blank {
+                        if self.pending_blank.is_none() {
+                            self.pending_blank = Some((line_no, with_newline(shown)));
+                            return Extend::More;
+                        }
+                        self.pending_blank = None;
+                        return Extend::Stop;
+                    }
+                    if trimmed.starts_with("goroutine ") {
+                        if let Some(b) = self.pending_blank.take() {
+                            self.trace.push(b);
+                        }
+                        self.kind = Follow::GoPanic {
+                            saw_goroutine: true,
+                        };
+                        self.push_trace(line_no, shown);
+                        return Extend::More;
+                    }
+                    if self.pending_blank.is_some() {
+                        self.pending_blank = None;
+                        return Extend::Stop;
+                    }
+                    if trimmed.starts_with("[signal ") || self.lines < FOLLOW_LINES {
+                        self.lines += 1;
+                        self.push_trace(line_no, shown);
+                        return Extend::More;
+                    }
+                    return Extend::Stop;
+                }
+                if blank {
+                    return Extend::Stop;
+                }
+                if crate::stacktrace::is_go_location_line(line)
+                    || crate::stacktrace::is_go_func_line(line)
+                    || trimmed.starts_with("...")
+                {
+                    self.push_trace(line_no, shown);
+                    return Extend::More;
+                }
+                Extend::Stop
+            }
+            Follow::StackFrames => {
+                if !blank
+                    && (crate::stacktrace::is_inline_frame(line)
+                        || trimmed.starts_with("Caused by:")
+                        || trimmed.starts_with("Suppressed:")
+                        || trimmed.starts_with("[cause]:"))
+                {
+                    self.push_trace(line_no, shown);
+                    return Extend::More;
+                }
+                Extend::Stop
+            }
+            Follow::Indented => {
+                if !blank && crate::stacktrace::is_inline_frame(line) {
+                    self.kind = Follow::StackFrames;
+                    self.compiler_located = false;
+                    self.push_trace(line_no, shown);
+                    return Extend::More;
+                }
+                let next = !blank && (indent > self.indent || RUST_GUTTER.is_match(line));
+                if !next || self.lines >= FOLLOW_LINES {
+                    return Extend::Stop;
+                }
+                if self.lines == 0
+                    && trimmed.starts_with("--> ")
+                    && self.text.trim_start().starts_with("error[")
+                {
+                    self.compiler_located = true;
+                }
+                self.lines += 1;
+                self.last_line = line_no;
+                self.text.push_str(&with_newline(shown));
+                Extend::More
+            }
         }
-        self.lines += 1;
-        self.text.push_str(&with_newline(shown));
-        Extend::More
     }
 
-    fn finish_frames(&mut self) {
-        if self.skipped > 0 {
-            self.text.push_str(&format!(
-                "{}{CUT} {} earlier frame line(s)\n",
-                " ".repeat(self.indent + 2),
-                self.skipped
-            ));
-            self.skipped = 0;
+    fn finish(&mut self, workspace_root: &Path, stream: &str) {
+        self.pending_blank = None;
+        if self.trace.is_empty() {
+            return;
         }
-        for frame in self.frames.drain(..) {
-            self.text.push_str(&frame);
+        if let Some(collapsed) =
+            crate::stacktrace::collapse_numbered(&self.trace, Some(workspace_root), Some(stream))
+        {
+            self.text.push_str(&collapsed);
+            self.trace.clear();
+        } else if self.kind == Follow::Traceback && self.trace.len() > TRACEBACK_FRAMES * 3 {
+            let keep = TRACEBACK_FRAMES + 1;
+            let skip = self.trace.len() - keep;
+            self.text.push_str(&format!(
+                "{}{CUT} {skip} earlier frame line(s)\n",
+                " ".repeat(self.indent + 2)
+            ));
+            for (_, line) in self.trace.drain(skip..) {
+                self.text.push_str(&line);
+            }
+            self.trace.clear();
+        } else {
+            for (_, line) in self.trace.drain(..) {
+                self.text.push_str(&line);
+            }
+        }
+        if self.trace_overflow > 0 {
+            self.text.push_str(&format!(
+                "{}{CUT} {} additional frame line(s) in {stream}:{}-{}\n",
+                " ".repeat(self.indent + 2),
+                self.trace_overflow,
+                self.first_line,
+                self.last_line,
+            ));
+            self.trace_overflow = 0;
         }
     }
 }
@@ -2677,14 +3035,21 @@ struct Failures {
 impl Failures {
     /// Whether `line`, without its line break, starts or continues a failure block. A
     /// block that ends goes to `done`.
-    fn observe(&mut self, line: &str, shown: &str, mut done: impl FnMut(Block)) -> bool {
+    fn observe(
+        &mut self,
+        line: &str,
+        shown: &str,
+        line_no: usize,
+        mut done: impl FnMut(Block),
+    ) -> bool {
         // Lines inside a patch hunk are file content, not diagnostics.
         self.patch = crate::floor::in_hunk(self.patch, line);
         // A failure keeps the lines that explain it: a traceback through its
-        // exception line, a panic's message, or a compiler error's location.
+        // exception line, a panic's message/backtrace, a stack trace, or a
+        // compiler error's location.
         let mut failure = false;
         if let Some(open) = self.block.as_mut() {
-            match open.extend(line, shown) {
+            match open.extend(line, shown, line_no) {
                 Extend::More => failure = true,
                 Extend::Last => {
                     failure = true;
@@ -2698,7 +3063,7 @@ impl Failures {
             && let Some(tier) = failure_tier(line)
         {
             failure = true;
-            if let Some(earlier) = self.block.replace(Block::new(tier, line, shown)) {
+            if let Some(earlier) = self.block.replace(Block::new(tier, line, shown, line_no)) {
                 done(earlier);
             }
         }
@@ -2711,10 +3076,11 @@ impl Failures {
 pub(crate) fn failure_lines(text: &str) -> Vec<bool> {
     let mut failures = Failures::default();
     text.split_inclusive('\n')
-        .map(|raw| {
+        .enumerate()
+        .map(|(idx, raw)| {
             let shown = ANSI.replace_all(raw, "");
             let line = shown.trim_end_matches(['\n', '\r']);
-            failures.observe(line, &shown, drop)
+            failures.observe(line, &shown, idx + 1, drop)
         })
         .collect()
 }
@@ -2731,22 +3097,90 @@ fn indentation(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// Normalize a block's text for `[diagnostics]` deduplication: strip leading
+/// timestamps via `filters::log_dedup_key` and strip archive line ranges on
+/// collapsed stack-trace summary lines.
+fn block_dedup_key(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut stripped = false;
+    for raw in text.split_inclusive('\n') {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        let body = if let Some(norm) = crate::stacktrace::normalize_summary_for_dedup(trimmed) {
+            stripped = true;
+            Cow::Owned(norm)
+        } else {
+            let key = crate::filters::log_dedup_key(trimmed);
+            if key.len() != trimmed.len() {
+                stripped = true;
+            }
+            Cow::Borrowed(key)
+        };
+        out.push_str(indent);
+        out.push_str(&body);
+        if raw.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    (out, stripped)
+}
+
+/// Maximum individual occurrence ranges tracked on a deduplicated entry to
+/// decide whether all occurrences were already shown in `head` / `tail`.
+const MAX_TRACKED_OCCURRENCES: usize = 32;
+
+struct Entry {
+    tier: Tier,
+    text: String,
+    first_line: usize,
+    last_line: usize,
+    count: usize,
+    timestamp_dedup: bool,
+    compiler_located: bool,
+    occurrences: Vec<(usize, usize)>,
+    occurrences_overflow: bool,
+}
+
+impl Entry {
+    fn is_covered_by(&self, covered: &LineRanges) -> bool {
+        !self.occurrences_overflow
+            && !self.occurrences.is_empty()
+            && self
+                .occurrences
+                .iter()
+                .all(|&(start, end)| covered.covers(start, end))
+    }
+}
+
 /// The [diagnostics] section of a clipped stream: failures first, then indented
-/// error lines, then located lines and warnings. Repeated entries are counted
-/// rather than repeated.
+/// error lines, then located lines and warnings. Repeated entries (including
+/// ones differing only by leading timestamps) are counted rather than repeated,
+/// linked to their 1-based archive line range, and omitted when already printed
+/// verbatim in `head` or `tail`.
 #[derive(Default)]
 struct Section {
-    entries: [Vec<(String, usize)>; 3],
+    entries: [Vec<Entry>; 3],
     bytes: [usize; 3],
     index: HashMap<String, (usize, usize)>,
 }
 
 impl Section {
-    fn add(&mut self, mut block: Block, budget: usize) {
-        block.finish_frames();
+    fn add(&mut self, mut block: Block, workspace_root: &Path, stream: &str, budget: usize) {
+        block.finish(workspace_root, stream);
         let tier = block.tier as usize;
-        if let Some(&(tier, position)) = self.index.get(&block.text) {
-            self.entries[tier][position].1 += 1;
+        let (key, stripped) = block_dedup_key(&block.text);
+        if let Some(&(tier, position)) = self.index.get(&key) {
+            let entry = &mut self.entries[tier][position];
+            entry.count += 1;
+            if stripped || block.text != entry.text {
+                entry.timestamp_dedup = true;
+            }
+            if entry.occurrences.len() < MAX_TRACKED_OCCURRENCES {
+                entry.occurrences.push((block.first_line, block.last_line));
+            } else {
+                entry.occurrences_overflow = true;
+            }
             return;
         }
         // An entry past the budget could not be shown, so it is not kept either.
@@ -2754,22 +3188,62 @@ impl Section {
             return;
         }
         self.bytes[tier] += block.text.len();
-        self.index
-            .insert(block.text.clone(), (tier, self.entries[tier].len()));
-        self.entries[tier].push((block.text, 1));
+        self.index.insert(key, (tier, self.entries[tier].len()));
+        self.entries[tier].push(Entry {
+            tier: block.tier,
+            text: block.text,
+            first_line: block.first_line,
+            last_line: block.last_line,
+            count: 1,
+            timestamp_dedup: stripped,
+            compiler_located: block.compiler_located,
+            occurrences: vec![(block.first_line, block.last_line)],
+            occurrences_overflow: false,
+        });
     }
 
-    fn render(&self, budget: usize) -> String {
+    fn render(&self, budget: usize, stream: &str, covered: &LineRanges) -> String {
         let mut out = Excerpt::new(budget);
-        for (text, count) in self.entries.iter().flatten() {
-            let mut lines = text.split_inclusive('\n');
-            let first = lines.next().unwrap_or_default();
-            let first = if *count > 1 {
-                format!("{}  [×{count}]\n", first.trim_end_matches(['\n', '\r']))
-            } else {
-                first.to_owned()
+        for entry in self.entries.iter().flatten() {
+            if entry.is_covered_by(covered) {
+                continue;
+            }
+            let lines: Vec<&str> = entry.text.split_inclusive('\n').collect();
+            let Some((&first, rest)) = lines.split_first() else {
+                continue;
             };
-            for line in std::iter::once(first.as_str()).chain(lines) {
+            let first_trimmed = first.trim_end_matches(['\n', '\r']);
+            let pointer = if entry.first_line == entry.last_line {
+                format!("{stream}:{}", entry.first_line)
+            } else {
+                format!("{stream}:{}-{}", entry.first_line, entry.last_line)
+            };
+            let mut rendered: Vec<Cow<'_, str>> = Vec::with_capacity(lines.len());
+            if entry.count > 1 {
+                if entry.timestamp_dedup || entry.tier != Tier::Indented {
+                    rendered.push(Cow::Owned(format!(
+                        "{first_trimmed}  [×{}, first {stream}:{}]\n",
+                        entry.count, entry.first_line
+                    )));
+                } else {
+                    rendered.push(Cow::Owned(format!("{first_trimmed}  [×{}]\n", entry.count)));
+                }
+                rendered.extend(rest.iter().copied().map(Cow::Borrowed));
+            } else if entry.compiler_located {
+                rendered.push(Cow::Borrowed(first));
+                if rest.len() >= 2 {
+                    let (mid, last) = rest.split_at(rest.len() - 1);
+                    rendered.extend(mid.iter().copied().map(Cow::Borrowed));
+                    let last_trimmed = last[0].trim_end_matches(['\n', '\r']);
+                    rendered.push(Cow::Owned(format!("{last_trimmed}  [{pointer}]\n")));
+                } else {
+                    rendered.extend(rest.iter().copied().map(Cow::Borrowed));
+                }
+            } else {
+                rendered.push(Cow::Owned(format!("{first_trimmed}  [{pointer}]\n")));
+                rendered.extend(rest.iter().copied().map(Cow::Borrowed));
+            }
+            for line in &rendered {
                 if !out.push(line) {
                     return out.text;
                 }
@@ -2782,6 +3256,7 @@ impl Section {
 /// Classify a line that can explain why a command failed.
 fn failure_tier(line: &str) -> Option<Tier> {
     let trimmed = line.trim_start();
+    let body = crate::filters::log_dedup_key(trimmed);
     // These prefixes mean a failure wherever they appear, including in indented
     // build script output.
     if [
@@ -2795,10 +3270,14 @@ fn failure_tier(line: &str) -> Option<Tier> {
         "assertion ",
         "left:",
         "right:",
+        "panic:",
+        "fatal error:",
+        "Exception in thread ",
+        "Caused by:",
     ]
     .iter()
-    .any(|prefix| trimmed.starts_with(prefix))
-        || trimmed.trim_end().ends_with("... FAILED")
+    .any(|prefix| body.starts_with(prefix))
+        || body.trim_end().ends_with("... FAILED")
         || LOCATED_ERROR.is_match(line)
     {
         return Some(Tier::Failure);
@@ -2807,14 +3286,17 @@ fn failure_tier(line: &str) -> Option<Tier> {
         "error:",
         "error[",
         "ERROR",
+        "[ERROR]",
+        "FATAL",
+        "[FATAL]",
         "fatal:",
         "failures:",
         "test result: FAILED",
     ]
     .iter()
-    .any(|prefix| trimmed.starts_with(prefix));
+    .any(|prefix| body.starts_with(prefix));
     if trimmed.len() == line.len() {
-        (error || EXCEPTION.is_match(line)).then_some(Tier::Failure)
+        (error || EXCEPTION.is_match(body)).then_some(Tier::Failure)
     } else {
         // Indented `error:` lines are also struct fields and diff context.
         error.then_some(Tier::Indented)

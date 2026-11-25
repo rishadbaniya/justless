@@ -21,6 +21,7 @@ const KEEP: usize = 12;
 fn kept(line: &str) -> bool {
     let trimmed = line.trim_start();
     crate::filters::diagnostic(trimmed)
+        || crate::stacktrace::is_summary_line(trimmed)
         || ["Traceback", "thread '", "left:", "right:"]
             .iter()
             .any(|prefix| trimmed.starts_with(prefix))
@@ -320,15 +321,36 @@ impl Floor {
 
 /// The floor applied to a whole text, when it changed anything.
 pub fn compact(text: &str) -> Option<String> {
-    let marks = crate::capture::failure_lines(text);
+    compact_with(text, None, None)
+}
+
+/// The floor applied to a captured stream whose workspace root and stream name
+/// are known, collapsing external stack-trace frames with exact archive line
+/// pointers before applying line-level folding.
+pub fn compact_stream(
+    text: &str,
+    workspace_root: &std::path::Path,
+    stream: &str,
+) -> Option<String> {
+    compact_with(text, Some(workspace_root), Some(stream))
+}
+
+fn compact_with(
+    text: &str,
+    workspace_root: Option<&std::path::Path>,
+    stream: Option<&str>,
+) -> Option<String> {
+    let stacked = crate::stacktrace::collapse(text, workspace_root, stream);
+    let source = stacked.as_deref().unwrap_or(text);
+    let marks = crate::capture::failure_lines(source);
     let mut floor = Floor::default();
     let mut lines = Vec::new();
-    for (line, marked) in text.split_inclusive('\n').zip(marks) {
+    for (line, marked) in source.split_inclusive('\n').zip(marks) {
         floor.push(line, marked, &mut lines);
     }
     floor.flush(&mut lines);
     let out: String = lines.into_iter().map(|(line, _)| line).collect();
-    (out != text).then_some(out)
+    (out != text && out.len() < text.len()).then_some(out)
 }
 
 #[cfg(test)]
@@ -478,5 +500,37 @@ mod tests {
         );
         // Errors stay verbatim even when repeated with different timestamps.
         assert_eq!(out.matches("ERROR db down").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn floor_collapses_external_stack_frames_while_preserving_archive_line_numbers() {
+        let mut log = String::new();
+        for _ in 0..20 {
+            log.push_str("waiting\n");
+        }
+        log.push_str("Error: connection lost\n");
+        log.push_str("    at throwSite (node:net:1495:16)\n");
+        for i in 0..8 {
+            log.push_str(&format!(
+                "    at Client.step{i} (/work/node_modules/pg/lib/client.js:{}:10)\n",
+                100 + i
+            ));
+        }
+        log.push_str("    at settle (/work/src/orders.ts:42:9)\n");
+        let out = compact_stream(&log, std::path::Path::new("/work"), "stderr").unwrap();
+        // Repeat folding folded lines 2..20, while stacktrace pointer still
+        // points to exact original archive lines 23..30!
+        assert!(
+            out.contains("[last line repeated 19 more time(s)]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    [… 8 runtime/dependency frames (node_modules/pg) in stderr:23-30]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    at settle (/work/src/orders.ts:42:9)\n"),
+            "{out}"
+        );
     }
 }
