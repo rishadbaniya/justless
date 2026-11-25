@@ -190,16 +190,47 @@ fn a_full_log_is_cut_between_commits() {
     let repo = Repo::with_commits(200);
     let raw = repo.raw(&["log"]);
     let output = repo.run(&["log"]);
+    assert_eq!(output.status.code(), Some(0));
     let shown = text(&output.stdout);
-    assert!(shown.starts_with("commit "), "{shown}");
     let (commits, count) = shown.trim_end().rsplit_once('\n').unwrap();
+    let shown_lines: Vec<&str> = commits.lines().collect();
+    assert!(
+        shown_lines.len() >= 40,
+        "compact log should fit >=40 commits in budget, got {}:\n{shown}",
+        shown_lines.len()
+    );
+    // Every shown commit uses `<short-hash> YYYY-MM-DD Author: subject [stdout:A-B]`
+    // and its `[stdout:A-B]` range replays the full commit header and body verbatim.
+    for (idx, line) in shown_lines.iter().enumerate() {
+        let expected_num = 200 - idx;
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        assert_eq!(parts.len(), 3, "unexpected compact commit line: {line}");
+        assert!(
+            parts[0].len() == 7 && parts[0].bytes().all(|b| b.is_ascii_hexdigit()),
+            "expected 7-char short hash: {line}"
+        );
+        assert!(
+            parts[1].starts_with("2023-11-"),
+            "expected ISO YYYY-MM-DD date: {line}"
+        );
+        assert!(
+            parts[2].starts_with(&format!("t: change {expected_num} [stdout:")),
+            "unexpected compact commit line: {line}"
+        );
+        let replayed = repo.replay(&output, range(line));
+        assert!(replayed.starts_with("commit "), "{line} -> {replayed}");
+        assert!(
+            replayed.contains(&format!("    body line for change {expected_num}\n")),
+            "{line} -> {replayed}"
+        );
+    }
     let (from, to) = range(count);
     assert_eq!(to, raw.lines().count());
-    // The older commits start at a commit header, and every shown one is whole.
+    // The older commits start at a commit header and replay byte for byte.
     let rest = repo.replay(&output, (from, to));
     assert!(rest.starts_with("commit "), "{rest}");
-    assert_eq!(format!("{commits}\n{rest}"), raw);
     let older = rest.lines().filter(|l| l.starts_with("commit ")).count();
+    assert_eq!(shown_lines.len() + older, 200);
     assert!(
         count.starts_with(&format!("+{older} older commits ")),
         "{count}"
@@ -359,4 +390,206 @@ fn porcelain_and_small_statuses_stay_as_git_printed_them() {
     assert!(shown.starts_with("UU conflict.txt\n"), "{shown}");
     let output = repo.run(&["status", "-sb"]);
     assert_eq!(text(&output.stdout), repo.raw(&["status", "-sb"]));
+}
+
+#[test]
+fn a_decorated_log_preserves_refs_and_merge_notes_with_exact_replay() {
+    let repo = Repo::with_commits(10);
+    git(&repo.root, &["checkout", "-q", "-b", "topic"]);
+    repo.file("topic.txt", "topic change\n");
+    git(&repo.root, &["add", "topic.txt"]);
+    git(
+        &repo.root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "topic feature\n\nDetailed topic explanation",
+        ],
+    );
+    git(&repo.root, &["checkout", "-q", "main"]);
+    repo.file("main.txt", "main change\n");
+    git(&repo.root, &["add", "main.txt"]);
+    git(&repo.root, &["commit", "-q", "-m", "main progress"]);
+    let merge = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args([
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            "Merge topic into main",
+            "topic",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+    assert!(merge.status.success());
+    git(&repo.root, &["tag", "v1.0"]);
+
+    let raw = repo.raw(&["log", "--decorate"]);
+    let output = repo
+        .command(&[
+            "run",
+            "--fresh",
+            "--max-bytes",
+            "1024",
+            "--",
+            "git",
+            "log",
+            "--decorate",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let shown = text(&output.stdout);
+    assert!(shown.len() < raw.len(), "{shown}");
+    let first = shown.lines().next().unwrap();
+    assert!(first.contains("HEAD -> main"), "{first}");
+    assert!(first.contains("tag: v1.0"), "{first}");
+    assert!(first.contains("(Merge: "), "{first}");
+    let replayed = repo.replay(&output, range(first));
+    assert!(replayed.starts_with("commit "), "{replayed}");
+    assert!(replayed.contains("Merge: "), "{replayed}");
+}
+
+#[test]
+fn large_branch_tag_and_stash_outputs_compact_and_replay_accurately() {
+    let repo = Repo::with_commits(3);
+    // Create a local bare remote with 40 branches and tracking branches (ahead + gone).
+    let remote = repo.root.parent().unwrap().join("origin.git");
+    git(
+        repo.root.parent().unwrap(),
+        &["init", "--bare", "-q", "origin.git"],
+    );
+    git(
+        &repo.root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo.root, &["push", "-q", "-u", "origin", "main"]);
+    // Create a branch tracked to origin, then delete it on origin so it becomes `[gone]`.
+    git(&repo.root, &["checkout", "-q", "-b", "stale-gone"]);
+    git(&repo.root, &["push", "-q", "-u", "origin", "stale-gone"]);
+    git(&repo.root, &["checkout", "-q", "main"]);
+    git(
+        &repo.root,
+        &["push", "-q", "origin", "--delete", "stale-gone"],
+    );
+    // Advance main locally so it is `[ahead 1]`.
+    repo.file("ahead.txt", "ahead\n");
+    git(&repo.root, &["add", "ahead.txt"]);
+    git(&repo.root, &["commit", "-q", "-m", "local ahead commit"]);
+    // Add 35 local + 35 remote branches directly via update-ref for speed.
+    let head = repo.raw(&["rev-parse", "HEAD"]);
+    let head = head.trim();
+    for i in 0..35 {
+        git(
+            &repo.root,
+            &["update-ref", &format!("refs/heads/feat/local-{i:02}"), head],
+        );
+        git(
+            &repo.root,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/feat/remote-{i:02}"),
+                head,
+            ],
+        );
+    }
+
+    let branch_out = repo
+        .command(&[
+            "run",
+            "--fresh",
+            "--max-bytes",
+            "1024",
+            "--",
+            "git",
+            "branch",
+            "-avv",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(branch_out.status.code(), Some(0));
+    let branch_shown = text(&branch_out.stdout);
+    assert!(branch_shown.len() <= 1024, "{branch_shown}");
+    let pos_main = branch_shown.find("* main ").expect(&branch_shown);
+    let pos_gone = branch_shown.find("stale-gone ").expect(&branch_shown);
+    let pos_remote = branch_shown.find("remotes/origin/ (").expect(&branch_shown);
+    assert!(
+        pos_main < pos_gone && pos_gone < pos_remote,
+        "{branch_shown}"
+    );
+    let remote_line = branch_shown
+        .lines()
+        .find(|l| l.starts_with("remotes/origin/ ("))
+        .unwrap();
+    let replayed = repo.replay(&branch_out, range(remote_line));
+    assert!(
+        replayed.contains("remotes/origin/feat/remote-00"),
+        "{replayed}"
+    );
+
+    // Tags
+    for i in 0..120 {
+        git(
+            &repo.root,
+            &["update-ref", &format!("refs/tags/v0.{i:03}.0"), head],
+        );
+    }
+    let tag_out = repo
+        .command(&["run", "--fresh", "--max-bytes", "600", "--", "git", "tag"])
+        .output()
+        .unwrap();
+    assert_eq!(tag_out.status.code(), Some(0));
+    let tag_shown = text(&tag_out.stdout);
+    assert!(tag_shown.len() <= 600, "{tag_shown}");
+    has(&tag_shown, "git tag: 120 tags\n");
+    has(&tag_shown, "v0.000.0\n");
+    has(&tag_shown, "v0.119.0\n");
+    let fold_line = tag_shown
+        .lines()
+        .find(|l| l.contains("more tags [stdout:"))
+        .unwrap();
+    let tag_replayed = repo.replay(&tag_out, range(fold_line));
+    assert!(tag_replayed.contains("v0.010.0"), "{tag_replayed}");
+
+    // Stashes
+    for i in 0..15 {
+        repo.file("ahead.txt", &format!("stash change {i}\n"));
+        git(
+            &repo.root,
+            &[
+                "stash",
+                "push",
+                "-q",
+                "-m",
+                &format!("work in progress step {i}"),
+            ],
+        );
+    }
+    let stash_out = repo
+        .command(&[
+            "run",
+            "--fresh",
+            "--max-bytes",
+            "600",
+            "--",
+            "git",
+            "stash",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(stash_out.status.code(), Some(0));
+    let stash_shown = text(&stash_out.stdout);
+    assert!(stash_shown.len() <= 600, "{stash_shown}");
+    assert!(stash_shown.starts_with("stash@{0}: "), "{stash_shown}");
+    let stash_fold = stash_shown.lines().last().unwrap();
+    assert!(
+        stash_fold.contains("older stashes [stdout:"),
+        "{stash_fold}"
+    );
+    let stash_replayed = repo.replay(&stash_out, range(stash_fold));
+    assert!(stash_replayed.contains("stash@{14}: "), "{stash_replayed}");
 }
