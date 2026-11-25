@@ -264,12 +264,13 @@ fn definitions(file: &str, text: &str, lines: usize, parsers: &mut Parsers) -> V
         let parsed = rust_syntax::parse(text);
         if let Ok(syntax) = &parsed {
             for symbol in &syntax.symbols {
+                let display = symbol.path.join("::");
                 definitions.push(Definition {
                     start: symbol.start,
                     end: symbol.end,
                     declaration: symbol.declaration,
-                    terms: format!("{} {}", symbol.name, symbol.path.join(" ")),
-                    display: symbol.path.join("::"),
+                    terms: format!("{} {}", symbol.name, display),
+                    display,
                     kind: symbol.kind.clone(),
                     test: symbol.test,
                 });

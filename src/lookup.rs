@@ -14,6 +14,7 @@ mod snippet;
 mod store;
 mod tokens;
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 
@@ -24,7 +25,7 @@ use serde_json::{Value, json};
 use crate::capture::{self, Stream};
 use crate::workspace::{Invocation, Location, Workspace};
 use chunks::Class;
-use score::{Part, Scores};
+use score::{Part, Picked, Scores};
 use tokens::Question;
 
 const MARKER: &str = "[context budget reached]\n";
@@ -216,8 +217,23 @@ fn rank_in(
         Some(digest) => (Some(digest), ""),
         None => (None, file(candidate).0.as_str()),
     };
+    let overlaps = |left: &Candidate, right: &Candidate| {
+        let left_seg = groups[left.group][left.part].segment;
+        let right_seg = groups[right.group][right.part].segment;
+        let left_row = left_seg.row(left.chunk);
+        let right_row = right_seg.row(right.chunk);
+        if left_row.start <= right_row.end && right_row.start <= left_row.end {
+            return true;
+        }
+        let adjacent = left_row.end.saturating_add(1) == right_row.start
+            || right_row.end.saturating_add(1) == left_row.start;
+        adjacent
+            && left_seg.kind(&left_row) == "text"
+            && right_seg.kind(&right_row) == "text"
+            && left_seg.name(&left_row) == right_seg.name(&right_row)
+    };
     let mut total = 0;
-    let mut chosen = Vec::new();
+    let mut chosen = Vec::<Picked<Candidate>>::new();
     let mut logs = None;
     // Log scores use their own statistics, so logs are not ranked against
     // source. The few best log windows come first, because they were asked
@@ -241,6 +257,7 @@ fn rank_in(
                 compare,
                 contents,
                 copy,
+                overlaps,
             ));
             continue;
         }
@@ -251,14 +268,25 @@ fn rank_in(
         }
         logs = Some(found);
         let limit = LOG_RESULTS.min(options.limit);
-        let mut picked = score::select(candidates.clone(), limit, compare, contents, copy);
+        let mut picked = score::select(
+            candidates.clone(),
+            limit,
+            compare,
+            contents,
+            copy,
+            |_, _| false,
+        );
         // A stream whose windows all rank below the other stream's still keeps
         // a place, such as the one stderr line that explains a failure under
         // pages of progress. It takes the place of the other stream's last and
         // is listed second, so a budget that leaves out the last windows still
         // shows both streams.
         for missing in [Stream::Stderr, Stream::Stdout] {
-            if picked.len() < 2 || picked.iter().any(|(pick, _)| stream(pick) == Some(missing)) {
+            if picked.len() < 2
+                || picked
+                    .iter()
+                    .any(|pick| stream(&pick.item) == Some(missing))
+            {
                 continue;
             }
             let Some(best) = candidates
@@ -269,17 +297,58 @@ fn rank_in(
                 continue;
             };
             picked.pop();
-            picked.insert(1, (*best, Vec::new()));
+            picked.insert(
+                1,
+                Picked {
+                    item: *best,
+                    copies: Vec::new(),
+                    merged: Vec::new(),
+                },
+            );
         }
         chosen.extend(picked);
     }
+    let mut seen_snippets = HashMap::<String, (HashSet<usize>, HashSet<String>)>::new();
     let hits = chosen
         .iter()
-        .map(|(candidate, copies)| {
+        .map(|picked| {
+            let candidate = &picked.item;
             let segment = groups[candidate.group][candidate.part].segment;
+            let primary_file = file(candidate).0;
+            let same_file_merged = picked
+                .merged
+                .iter()
+                .filter(|other| {
+                    other.group == candidate.group
+                        && other.part == candidate.part
+                        && file(other).0 == primary_file
+                })
+                .copied()
+                .collect::<Vec<_>>();
             let idf = &scores[candidate.group].idf;
-            let mut hit = hit(workspace, segment, candidate, question, idf);
-            for copy in copies {
+            let empty_nums = HashSet::new();
+            let empty_texts = HashSet::new();
+            let (excluded_numbers, excluded_texts) = seen_snippets
+                .get(primary_file)
+                .map_or((&empty_nums, &empty_texts), |(nums, texts)| (nums, texts));
+            let mut hit = hit(
+                workspace,
+                segment,
+                candidate,
+                &same_file_merged,
+                question,
+                idf,
+                excluded_numbers,
+                excluded_texts,
+            );
+            if hit.run.is_none() {
+                let entry = seen_snippets.entry(hit.location.file.clone()).or_default();
+                for (number, text) in &hit.lines {
+                    entry.0.insert(*number);
+                    entry.1.insert(text.trim().to_owned());
+                }
+            }
+            for copy in &picked.copies {
                 let other = file(copy).0;
                 if *other != hit.location.file && !hit.same.contains(other) {
                     hit.same.push(other.clone());
@@ -312,17 +381,21 @@ fn rank_in(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hit(
     workspace: &Workspace,
     segment: &segment::Segment,
     candidate: &Candidate,
+    merged: &[Candidate],
     question: &Question,
     idf: &[f64],
+    excluded_numbers: &HashSet<usize>,
+    excluded_texts: &HashSet<String>,
 ) -> Hit {
     let row = segment.row(candidate.chunk);
     let class = row.class();
     let file = &segment.files()[row.file as usize];
-    let (start, end) = (row.start as usize, row.end as usize);
+    let (mut start, mut end) = (row.start as usize, row.end as usize);
     let kind = if row.test() {
         "test".to_owned()
     } else {
@@ -371,6 +444,31 @@ fn hit(
         else {
             return hit;
         };
+        // Expand adjacent same-name plain-text continuations (from TEXT_WINDOW splits).
+        if segment.kind(&row) == "text" {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for other in merged {
+                    let other_row = segment.row(other.chunk);
+                    let (os, oe) = (other_row.start as usize, other_row.end as usize);
+                    if segment.kind(&other_row) == "text"
+                        && segment.name(&other_row) == hit.name
+                        && (oe + 1 == start || end + 1 == os)
+                    {
+                        let new_start = start.min(os);
+                        let new_end = end.max(oe);
+                        if (new_start, new_end) != (start, end) {
+                            start = new_start;
+                            end = new_end;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            hit.location.start = start;
+            hit.location.end = end;
+        }
         let others = segment.ranges()[row.file as usize]
             .clone()
             .filter(|&id| id != candidate.chunk)
@@ -378,7 +476,29 @@ fn hit(
                 let other = segment.row(id);
                 (other.start as usize, other.end as usize)
             });
-        let indexed = chunks::indexed_lines(class, (start, end), others);
+        let mut indexed =
+            chunks::indexed_lines(class, (row.start as usize, row.end as usize), others);
+        // Merge candidate lines from absorbed overlapping/adjacent chunks that
+        // fall inside this hit's displayed span so one hit carries the best
+        // evidence without duplicating lines.
+        for other in merged {
+            let other_row = segment.row(other.chunk);
+            let (os, oe) = (other_row.start as usize, other_row.end as usize);
+            let other_others = segment.ranges()[other_row.file as usize]
+                .clone()
+                .filter(|&id| id != other.chunk)
+                .map(|id| {
+                    let sibling = segment.row(id);
+                    (sibling.start as usize, sibling.end as usize)
+                });
+            for line in chunks::indexed_lines(other_row.class(), (os, oe), other_others) {
+                if (start..=end).contains(&line) {
+                    indexed.push(line);
+                }
+            }
+        }
+        indexed.sort_unstable();
+        indexed.dedup();
         hit.bytes = Some(
             text.split_inclusive('\n')
                 .skip(start - 1)
@@ -394,15 +514,33 @@ fn hit(
         .collect::<Vec<_>>();
     // Words the header already shows count as shown.
     let header = format!("{} {} {}", hit.location.file, hit.kind, hit.name);
-    hit.lines = snippet::lines(&lines, question, idf, &header);
+    hit.lines = snippet::lines_excluding(
+        &lines,
+        question,
+        idf,
+        &header,
+        excluded_numbers,
+        excluded_texts,
+    );
     if hit.lines.is_empty() {
         let declaration = row.declaration as usize;
-        let fallback = if class == Class::Code && candidates.contains(&declaration) {
+        let non_blank = |number: usize| {
+            text.get(number.saturating_sub(1))
+                .is_some_and(|line| !line.trim().is_empty())
+        };
+        let fallback = if class == Class::Code
+            && candidates.contains(&declaration)
+            && non_blank(declaration)
+            && !excluded_numbers.contains(&declaration)
+        {
             Some(declaration)
         } else {
             lines
                 .iter()
-                .find(|(_, line)| !line.trim().is_empty())
+                .find(|(number, line)| {
+                    !line.trim().is_empty() && !excluded_numbers.contains(number)
+                })
+                .or_else(|| lines.iter().find(|(_, line)| !line.trim().is_empty()))
                 .map(|(number, _)| *number)
         };
         hit.lines.extend(
@@ -447,34 +585,94 @@ fn next(hit: &Hit, budget: usize, justless: &Invocation) -> String {
     )
 }
 
-fn block(hit: &Hit) -> String {
-    let mut block = match &hit.run {
-        Some((run, stream)) => {
-            let status = hit
-                .status
-                .map(|status| format!(" · exit {status}"))
-                .unwrap_or_default();
-            format!(
-                "{run} {}:{}-{} log {}{status}\n",
-                stream.name(),
-                hit.location.start,
-                hit.location.end,
-                hit.name
-            )
-        }
-        None => {
-            let same = match hit.same.as_slice() {
-                [] => String::new(),
-                [one] => format!(" · same in {one}"),
-                [first, rest @ ..] => format!(" · same in {first} +{} more", rest.len()),
-            };
-            format!("{} {} {}{same}\n", hit.location, hit.kind, hit.name)
-        }
-    };
-    for (line, text) in &hit.lines {
-        block.push_str(&format!("  {line} | {text}\n"));
+/// Shortens a consecutive same-file path to `…/<basename>` when its directory
+/// prefix is longer than `…`, freeing bytes for evidence while keeping the
+/// filename and line range unambiguous.
+fn compact_continuation_path(file: &str) -> String {
+    if let Some((dir, name)) = file.rsplit_once('/')
+        && dir.len() > "…".len()
+    {
+        return format!("…/{name}");
     }
-    block
+    file.to_owned()
+}
+
+fn format_location(file: &str, start: usize, end: usize) -> String {
+    if start == end {
+        format!("{file}:{start}")
+    } else {
+        format!("{file}:{start}-{end}")
+    }
+}
+
+/// Renders every hit in rank order, tightening repeated same-file path prefixes,
+/// repeated `same in` copy annotations, and repeated log exit statuses across
+/// grouped consecutive hits.
+fn render_blocks(hits: &[Hit]) -> Vec<String> {
+    hits.iter()
+        .enumerate()
+        .map(|(index, hit)| {
+            let previous = index.checked_sub(1).map(|prev| &hits[prev]);
+            let mut block = match &hit.run {
+                Some((run, stream)) => {
+                    let repeat_run = previous.is_some_and(|prev| {
+                        prev.run
+                            .as_ref()
+                            .is_some_and(|(prev_run, _)| prev_run == run)
+                            && prev.status == hit.status
+                    });
+                    let status = if repeat_run {
+                        String::new()
+                    } else {
+                        hit.status
+                            .map(|status| format!(" · exit {status}"))
+                            .unwrap_or_default()
+                    };
+                    format!(
+                        "{run} {}:{}-{} log {}{status}\n",
+                        stream.name(),
+                        hit.location.start,
+                        hit.location.end,
+                        hit.name
+                    )
+                }
+                None => {
+                    let same_as_prev = previous.is_some_and(|prev| {
+                        prev.run.is_none() && prev.location.file == hit.location.file
+                    });
+                    let display_file = if same_as_prev {
+                        compact_continuation_path(&hit.location.file)
+                    } else {
+                        hit.location.file.clone()
+                    };
+                    let same_already_shown = !hit.same.is_empty()
+                        && hits[..index].iter().any(|prev| {
+                            prev.run.is_none()
+                                && prev.location.file == hit.location.file
+                                && prev.same == hit.same
+                        });
+                    let same = if same_already_shown {
+                        String::new()
+                    } else {
+                        match hit.same.as_slice() {
+                            [] => String::new(),
+                            [one] => format!(" · same in {one}"),
+                            [first, rest @ ..] => {
+                                format!(" · same in {first} +{} more", rest.len())
+                            }
+                        }
+                    };
+                    let location =
+                        format_location(&display_file, hit.location.start, hit.location.end);
+                    format!("{location} {} {}{same}\n", hit.kind, hit.name)
+                }
+            };
+            for (line, text) in &hit.lines {
+                block.push_str(&format!("  {line} | {text}\n"));
+            }
+            block
+        })
+        .collect()
 }
 
 fn words(words: &[String], limit: usize) -> String {
@@ -534,7 +732,7 @@ fn render_text(ranking: &Ranking, budget: usize) -> String {
             limit -= 8;
         }
     }
-    let blocks = ranking.hits.iter().map(block).collect::<Vec<_>>();
+    let blocks = render_blocks(&ranking.hits);
     let next = format!(
         "Next: {}\n",
         next(&ranking.hits[0], budget, &ranking.justless)
@@ -769,10 +967,10 @@ fn note_log_windows(workspace: &Workspace, ranking: &Ranking, output: &str, json
         }
     } else {
         let mut rest = output;
-        for hit in &ranking.hits {
-            let full = block(hit);
+        let blocks = render_blocks(&ranking.hits);
+        for (hit, full) in ranking.hits.iter().zip(&blocks) {
             let header = full.split_inclusive('\n').next().unwrap_or_default();
-            if let Some(next) = rest.strip_prefix(&full) {
+            if let Some(next) = rest.strip_prefix(full.as_str()) {
                 charge(hit, full.len());
                 rest = next;
             } else {
@@ -1097,5 +1295,143 @@ mod tests {
         found.found(Stream::Stderr, 1);
         ranking.logs = Some(found);
         assert!(!render_text(&ranking, 100_000).contains("log windows"));
+    }
+
+    #[test]
+    fn consecutive_same_file_hits_compact_headers_and_save_bytes() {
+        let path = "packages/billing/src/services/retry/policy_manager.rs";
+        let mut first = hit(path, 10, 25, &[(10, "pub struct RetryPolicy {")]);
+        first.kind = "struct".into();
+        first.name = "RetryPolicy".into();
+        first.same = vec!["vendor/billing/policy_manager.rs".into()];
+
+        let mut second = hit(path, 40, 55, &[(42, "pub fn delay(&self) -> u64 {")]);
+        second.kind = "method".into();
+        second.name = "RetryPolicy::delay".into();
+        second.same = vec!["vendor/billing/policy_manager.rs".into()];
+
+        let ranking = ranking(vec![first, second]);
+        let rendered = render_text(&ranking, 100_000);
+        // First hit has full path and `same in`, second compacts directory and drops duplicate `same in`.
+        assert!(rendered.contains(&format!(
+            "{path}:10-25 struct RetryPolicy · same in vendor/billing/policy_manager.rs\n"
+        )));
+        assert!(rendered.contains("…/policy_manager.rs:40-55 method RetryPolicy::delay\n"));
+        assert_eq!(rendered.matches("same in ").count(), 1, "{rendered}");
+        assert!(rendered.ends_with(&format!("Next: justless expand {path} L10-25\n")));
+
+        // Measure savings vs uncompacted repetition: 33 bytes of dir + 44 bytes of ` · same in ...` = 77 bytes saved.
+        let naive_second_header = format!(
+            "{path}:40-55 method RetryPolicy::delay · same in vendor/billing/policy_manager.rs\n"
+        );
+        let compact_second_header = "…/policy_manager.rs:40-55 method RetryPolicy::delay\n";
+        assert!(
+            naive_second_header.len() - compact_second_header.len() >= 70,
+            "expected >= 70 bytes saved on second header"
+        );
+
+        // Consecutive log hits from the same run drop repeated ` · exit N`.
+        let mut log1 = hit("run-1", 1, 40, &[(3, "error one")]);
+        log1.source = Source::Log;
+        log1.run = Some(("run-1".into(), Stream::Stderr));
+        log1.status = Some(2);
+        let mut log2 = hit("run-1", 41, 80, &[(45, "error two")]);
+        log2.source = Source::Log;
+        log2.run = Some(("run-1".into(), Stream::Stderr));
+        log2.status = Some(2);
+        let log_rendered = render_text(&self::ranking(vec![log1, log2]), 100_000);
+        assert_eq!(
+            log_rendered.matches(" · exit 2").count(),
+            1,
+            "{log_rendered}"
+        );
+    }
+
+    #[test]
+    fn rank_deduplicates_overlapping_class_and_method_and_merges_text_windows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let write = |rel: &str, body: &str| {
+            let full = root.join(rel);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, body).unwrap();
+        };
+        // A class whose method overlaps the class span: both match "quasar" and "beacon".
+        write(
+            "web/beacon.ts",
+            "\
+export class QuasarBeacon {
+  private readonly active = true;
+
+  emitQuasarBeacon(level: number): void {
+    if (this.active) {
+      console.log('quasar beacon', level);
+    }
+  }
+}
+",
+        );
+        // Distinct files that should not be crowded out by the overlapping class/method pair.
+        write(
+            "src/alpha.rs",
+            "/// Quasar beacon sender.\npub fn send_quasar_beacon() {}\n",
+        );
+        write(
+            "src/beta.rs",
+            "/// Quasar beacon receiver.\npub fn recv_quasar_beacon() {}\n",
+        );
+        // Adjacent 60-line text windows in the same section.
+        let mut long_cfg = String::from("[quasar]\n");
+        for line in 2..=90 {
+            if line == 5 {
+                long_cfg.push_str("beacon_alpha = true\n");
+            } else if line == 65 {
+                long_cfg.push_str("beacon_beta = true\n");
+            } else {
+                long_cfg.push_str(&format!("entry_{line} = {line}\n"));
+            }
+        }
+        write("config/quasar.ini", &long_cfg);
+
+        let workspace = Workspace {
+            root: root.clone(),
+            cwd: root.clone(),
+            state: root.join(".justless"),
+            origin: root.clone(),
+        };
+        let ranked = rank(
+            &workspace,
+            "quasar beacon",
+            &Options {
+                limit: 4,
+                logs: false,
+            },
+        )
+        .unwrap();
+        let files = ranked
+            .hits
+            .iter()
+            .map(|h| h.location.file.as_str())
+            .collect::<Vec<_>>();
+        // web/beacon.ts takes only 1 slot (not 2 for class + overlapping method),
+        // and config/quasar.ini merges its adjacent 1-60 & 61-90 windows into 1-90!
+        assert_eq!(
+            files.iter().filter(|&&f| f == "web/beacon.ts").count(),
+            1,
+            "{files:?}"
+        );
+        assert_eq!(
+            files.iter().filter(|&&f| f == "config/quasar.ini").count(),
+            1,
+            "{files:?}"
+        );
+        assert!(files.contains(&"src/alpha.rs"), "{files:?}");
+        assert!(files.contains(&"src/beta.rs"), "{files:?}");
+        let cfg_hit = ranked
+            .hits
+            .iter()
+            .find(|h| h.location.file == "config/quasar.ini")
+            .unwrap();
+        assert_eq!((cfg_hit.location.start, cfg_hit.location.end), (1, 90));
     }
 }

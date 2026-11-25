@@ -27,6 +27,7 @@ pub(crate) fn tokens(text: &str, mut emit: impl FnMut(&str, usize)) {
     words(text, |offset, word| {
         tokenizer.word(word, |token| emit(token, offset))
     });
+    qualified(text, |offset, _, token| emit(token, offset));
 }
 
 /// Calls `visit` with the byte offset and text of each word.
@@ -42,6 +43,66 @@ pub(crate) fn words(text: &str, mut visit: impl FnMut(usize, &str)) {
     if let Some(begin) = start {
         visit(begin, &text[begin..]);
     }
+}
+
+/// Calls `emit` with each adjacent `A::B` qualified identifier pair as a
+/// compact lowercased `a::b` token, together with its `[start, end)` byte
+/// span in `text`.
+pub(crate) fn qualified(text: &str, mut emit: impl FnMut(usize, usize, &str)) {
+    let mut previous: Option<(usize, usize, String)> = None;
+    let mut buffer = String::new();
+    words(text, |start, word| {
+        let end = start + word.len();
+        let norm = compact_ident(word);
+        if let Some((prev_start, prev_end, prev_norm)) = previous.as_ref()
+            && text.get(*prev_end..start) == Some("::")
+            && prev_norm.chars().nth(1).is_some()
+            && norm.chars().nth(1).is_some()
+            && !(prev_norm.bytes().all(|byte| byte.is_ascii_digit())
+                && norm.bytes().all(|byte| byte.is_ascii_digit()))
+            && prev_norm.len() + 2 + norm.len() <= MAX_WHOLE
+        {
+            buffer.clear();
+            buffer.push_str(prev_norm);
+            buffer.push_str("::");
+            buffer.push_str(&norm);
+            emit(*prev_start, end, &buffer);
+        }
+        previous = Some((start, end, norm));
+    });
+}
+
+/// Lowercased alphanumeric form of an identifier, ignoring `_` and `-`, so
+/// `parseHttpHeader`, `parse_http_header`, and `parse-http-header` match.
+pub(crate) fn compact_ident(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_alphanumeric() {
+            if character.is_ascii() {
+                out.push(character.to_ascii_lowercase());
+            } else {
+                out.extend(character.to_lowercase());
+            }
+        }
+    }
+    out
+}
+
+/// Normalizes a qualified symbol path (`Foo::bar_baz` or `Foo.barBaz`) to
+/// `foo::barbaz` for exact/normalized symbol matching.
+pub(crate) fn normalize_qualified(text: &str) -> String {
+    let mut out = String::new();
+    for segment in text.split("::").flat_map(|part| part.split('.')) {
+        let compact = compact_ident(segment);
+        if compact.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("::");
+        }
+        out.push_str(&compact);
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +178,53 @@ impl Tokenizer {
                 }
                 first = last;
             }
+        }
+        // Emit letter+digit compounds (e.g. `v2`, `s3`, `utf8`, `http2`) and
+        // short numeronyms (e.g. `k8s`, `i18n`, `e2e`) inside multi-part
+        // camelCase pieces so `v2Api` and `s3Bucket` meet `v2_api` and `s3_bucket`.
+        let mut first = 0;
+        while first < self.parts.len() {
+            let piece = self.parts[first].0;
+            let last = first
+                + self.parts[first..]
+                    .iter()
+                    .take_while(|(owner, _)| *owner == piece)
+                    .count();
+            if last - first >= 3 {
+                let mut index = first;
+                while index + 1 < last {
+                    let left = &word[self.parts[index].1.clone()];
+                    let mid = &word[self.parts[index + 1].1.clone()];
+                    let left_alpha = !left.is_empty() && left.chars().all(char::is_alphabetic);
+                    let mid_digits = (1..=4).contains(&mid.len())
+                        && mid.bytes().all(|byte| byte.is_ascii_digit());
+                    if left_alpha && mid_digits {
+                        let right = (index + 2 < last)
+                            .then(|| &word[self.parts[index + 2].1.clone()])
+                            .filter(|part| {
+                                left.len() == 1
+                                    && part.len() == 1
+                                    && part.bytes().all(|byte| byte.is_ascii_lowercase())
+                            });
+                        let span_len = if right.is_some() { 3 } else { 2 };
+                        if span_len < last - first {
+                            self.joined.clear();
+                            push_lower(&mut self.joined, left);
+                            self.joined.push_str(mid);
+                            if let Some(right) = right {
+                                push_lower(&mut self.joined, right);
+                            }
+                            if (2..=MAX_WHOLE).contains(&self.joined.len()) {
+                                emit(&self.joined);
+                            }
+                        }
+                        index += span_len;
+                        continue;
+                    }
+                    index += 1;
+                }
+            }
+            first = last;
         }
         for (_, range) in &self.parts {
             let part = &word[range.clone()];
@@ -248,8 +356,96 @@ pub(crate) fn stem(word: &str) -> std::borrow::Cow<'_, str> {
     Cow::Owned(String::from_utf8(stem).expect("ASCII stem"))
 }
 
+/// Known source/config/doc file extensions used to recognize explicit file hints
+/// in questions (like `retry.rs` or `app.toml`) without mistaking qualified
+/// symbols (like `DownloadQueue.retry`) for paths.
+const FILE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "rb", "java", "kt", "kts", "cs",
+    "cpp", "cc", "cxx", "c", "h", "hpp", "md", "markdown", "mdx", "toml", "yaml", "yml", "json",
+    "sql", "sh", "bash", "zsh", "txt", "ini", "cfg", "conf", "xml", "html", "css", "scss", "vue",
+    "svelte", "php", "swift", "scala", "zig", "lua", "ex", "exs", "dart", "hcl", "tf", "ps1",
+    "groovy", "csv", "tsv", "lock",
+];
+
+fn is_path_hint(token: &str) -> bool {
+    if token.contains('/') && token.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+    if let Some((stem, ext)) = token.rsplit_once('.')
+        && !stem.is_empty()
+        && stem.chars().any(char::is_alphanumeric)
+        && !ext.is_empty()
+    {
+        let lower = ext.to_ascii_lowercase();
+        return FILE_EXTENSIONS.contains(&lower.as_str());
+    }
+    false
+}
+
+fn is_identifier_hint(token: &str) -> bool {
+    if token.contains("::") {
+        return token.split("::").filter(|part| !part.is_empty()).count() >= 2;
+    }
+    if token.contains('.') {
+        let parts = token.split('.').collect::<Vec<_>>();
+        return parts.len() >= 2
+            && parts.iter().all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+            })
+            && !is_path_hint(token);
+    }
+    if token.contains('_') && token.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+    if let Some((left, right)) = token.split_once('-')
+        && !left.is_empty()
+        && !right.is_empty()
+        && left.chars().all(char::is_alphanumeric)
+        && right
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '-')
+    {
+        return true;
+    }
+    // Mixed camelCase / PascalCase / SCREAMING acronym: an uppercase letter after
+    // the first character (avoids boosting ordinary capitalized sentence starters).
+    token.chars().skip(1).any(char::is_uppercase) && token.chars().all(char::is_alphanumeric)
+}
+
+fn trim_hint_token(token: &str) -> &str {
+    let trimmed = token.trim_matches([
+        '"', '\'', '`', '(', ')', '[', ']', '{', '}', ',', ';', '?', '!', ':',
+    ]);
+    if let Some((head, _)) = trimmed.split_once('(')
+        && !head.is_empty()
+    {
+        return head;
+    }
+    trimmed
+}
+
+/// Strips a trailing `:LINE` or `:START-END` suffix from a path hint.
+fn strip_line_suffix(token: &str) -> &str {
+    if let Some((path, suffix)) = token.rsplit_once(':')
+        && !path.is_empty()
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    {
+        return path;
+    }
+    token
+}
+
 /// A question split into searchable words and the deduplicated terms they yield.
 pub(crate) struct Question {
+    /// Trimmed raw question without trailing punctuation, for exact symbol/heading match.
+    pub(crate) raw: String,
+    /// Identifier-shaped tokens in the question (`Foo::bar`, `snake_case`, `camelCase`).
+    pub(crate) identifiers: Vec<String>,
+    /// File path or filename hints in the question (`src/net/retry.rs`, `app.toml`).
+    pub(crate) path_hints: Vec<String>,
     /// Searchable words as typed, lowercased, in question order and without repeats.
     pub(crate) words: Vec<Word>,
     /// Query terms in sorted order, at most [`MAX_TERMS`].
@@ -289,19 +485,31 @@ impl Question {
         if candidates.is_empty() {
             return None;
         }
+        let mut qualified_terms = Vec::<String>::new();
+        qualified(question, |_, _, token| {
+            if !qualified_terms.iter().any(|seen| seen == token) {
+                qualified_terms.push(token.to_owned());
+            }
+        });
         let mut ordered = Vec::<String>::new();
         let mut truncated = false;
+        let mut push_term = |token: &str| {
+            if ordered.iter().any(|seen| seen == token) {
+                return;
+            }
+            if ordered.len() == MAX_TERMS {
+                truncated = true;
+            } else {
+                ordered.push(token.to_owned());
+            }
+        };
         for (_, found) in &candidates {
             for token in found {
-                if ordered.contains(token) {
-                    continue;
-                }
-                if ordered.len() == MAX_TERMS {
-                    truncated = true;
-                } else {
-                    ordered.push(token.clone());
-                }
+                push_term(token);
             }
+        }
+        for token in &qualified_terms {
+            push_term(token);
         }
         let mut terms = ordered;
         terms.sort();
@@ -316,7 +524,32 @@ impl Question {
                 .collect();
             words.push(Word { text, terms });
         }
+        let raw = question
+            .trim()
+            .trim_end_matches(['?', '!', '.', ','])
+            .trim()
+            .to_owned();
+        let mut identifiers = Vec::new();
+        let mut path_hints = Vec::new();
+        for piece in question.split_whitespace() {
+            let token = trim_hint_token(piece).trim_end_matches('.');
+            if token.is_empty() {
+                continue;
+            }
+            let path_candidate = strip_line_suffix(token);
+            if is_path_hint(path_candidate) {
+                let normalized = path_candidate.trim_start_matches("./").to_owned();
+                if !path_hints.contains(&normalized) {
+                    path_hints.push(normalized);
+                }
+            } else if is_identifier_hint(token) && !identifiers.iter().any(|seen| seen == token) {
+                identifiers.push(token.to_owned());
+            }
+        }
         Some(Self {
+            raw,
+            identifiers,
+            path_hints,
             words,
             terms,
             truncated,
@@ -359,11 +592,62 @@ mod tests {
         );
         assert_eq!(all("RetryPolicy"), ["retrypolicy", "retri", "polici"]);
         assert_eq!(all("DownloadQueue"), ["downloadqueue", "download", "queu"]);
-        assert_eq!(all("utf8Decoder"), ["utf8decoder", "utf", "decoder"]);
+        assert_eq!(
+            all("utf8Decoder"),
+            ["utf8decoder", "utf8", "utf", "decoder"]
+        );
+        assert_eq!(all("utf8Decoder"), all("utf8_decoder"));
         assert_eq!(all("v2_api"), ["v2api", "v2", "api"]);
+        assert_eq!(all("v2Api"), all("v2_api"));
+        assert_eq!(all("s3Bucket"), all("s3_bucket"));
+        assert_eq!(all("http2Server"), all("http2_server"));
+        assert_eq!(all("k8sClient"), all("k8s_client"));
+        assert_eq!(all("e2eRunner"), all("e2e_runner"));
+        assert_eq!(all("i18nLoader"), all("i18n_loader"));
         assert_eq!(all("__init__"), ["init"]);
         assert_eq!(all("déjà_vu"), ["déjàvu", "déjà", "vu"]);
         assert_eq!(all("IOError"), ["ioerror", "io", "error"]);
+    }
+
+    #[test]
+    fn qualified_symbols_and_question_hints() {
+        assert_eq!(all("Segment::open"), ["segment", "open", "segment::open"]);
+        assert_eq!(
+            all("RetryPolicy::backoff_ms"),
+            [
+                "retrypolicy",
+                "retri",
+                "polici",
+                "backoffms",
+                "backoff",
+                "ms",
+                "retrypolicy::backoffms"
+            ]
+        );
+        assert_eq!(compact_ident("parse-http-header"), "parsehttpheader");
+        assert_eq!(
+            normalize_qualified("DownloadQueue.retry"),
+            "downloadqueue::retry"
+        );
+        assert_eq!(
+            normalize_qualified("RetryPolicy::backoff_ms"),
+            "retrypolicy::backoffms"
+        );
+
+        let question =
+            Question::parse("where is Segment::open(&path) called in src/lookup/store.rs:417?")
+                .unwrap();
+        assert_eq!(question.identifiers, ["Segment::open"]);
+        assert_eq!(question.path_hints, ["src/lookup/store.rs"]);
+        assert!(question.terms.contains(&"segment::open".to_owned()));
+
+        let natural = Question::parse("where are retries configured?").unwrap();
+        assert!(natural.identifiers.is_empty());
+        assert!(natural.path_hints.is_empty());
+
+        let dot = Question::parse("DownloadQueue.retry app.toml").unwrap();
+        assert_eq!(dot.identifiers, ["DownloadQueue.retry"]);
+        assert_eq!(dot.path_hints, ["app.toml"]);
     }
 
     #[test]

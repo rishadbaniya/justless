@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use super::chunks::{Class, FIELDS};
 use super::segment::{Posting, Row, Segment};
-use super::tokens::Question;
+use super::tokens::{Question, compact_ident, normalize_qualified};
 
 /// Field weights: name, signature, doc comments or parent headings, body, path.
 pub(crate) const WEIGHTS: [f64; FIELDS] = [4.0, 3.5, 3.0, 1.0, 0.5];
@@ -115,6 +115,94 @@ pub(crate) fn prior(class: Class, test: bool, tests_wanted: bool) -> f64 {
     }
 }
 
+/// One chosen result together with identical copies in other files and
+/// overlapping or adjacent same-file chunks absorbed into it.
+#[derive(Clone, Debug)]
+pub(crate) struct Picked<T> {
+    pub(crate) item: T,
+    pub(crate) copies: Vec<T>,
+    pub(crate) merged: Vec<T>,
+}
+
+fn strip_extension(path: &str) -> &str {
+    let slash = path.rfind('/').map_or(0, |index| index + 1);
+    match path[slash..].rfind('.') {
+        Some(dot) if dot > 0 => &path[..slash + dot],
+        _ => path,
+    }
+}
+
+fn matches_path_suffix(path: &str, suffix: &str) -> bool {
+    if path.eq_ignore_ascii_case(suffix) {
+        return true;
+    }
+    path.len() > suffix.len()
+        && path.as_bytes()[path.len() - suffix.len() - 1] == b'/'
+        && path[path.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// Multiplies a chunk's score when its symbol/heading name or file path
+/// directly matches the query or an identifier/path token in the query.
+pub(crate) fn exact_boost(name: &str, kind: &str, file: &str, question: &Question) -> f64 {
+    let symbol_or_heading = !matches!(kind, "file" | "data" | "log");
+    let simple = name.rsplit("::").next().unwrap_or(name);
+    let mut boost = 1.0f64;
+
+    if symbol_or_heading && !question.raw.is_empty() {
+        let raw = question.raw.as_str();
+        let single = !raw.contains(char::is_whitespace);
+        if name == raw {
+            boost = boost.max(1.50);
+        } else if name.eq_ignore_ascii_case(raw) || (single && simple == raw) {
+            boost = boost.max(1.35);
+        } else if single && simple.eq_ignore_ascii_case(raw) {
+            boost = boost.max(1.25);
+        } else if single {
+            let norm_raw = normalize_qualified(raw);
+            if norm_raw.len() >= 2 && normalize_qualified(name) == norm_raw {
+                boost = boost.max(1.20);
+            } else {
+                let compact_raw = compact_ident(raw);
+                if compact_raw.len() >= 4 && compact_ident(simple) == compact_raw {
+                    boost = boost.max(1.15);
+                }
+            }
+        }
+    }
+
+    if symbol_or_heading {
+        for ident in &question.identifiers {
+            if name == ident {
+                boost = boost.max(1.45);
+            } else if ident.contains("::") || ident.contains('.') {
+                if normalize_qualified(name) == normalize_qualified(ident) {
+                    boost = boost.max(1.35);
+                }
+            } else if simple == ident {
+                boost = boost.max(1.35);
+            } else {
+                let compact = compact_ident(ident);
+                if compact.len() >= 4 && compact_ident(simple) == compact {
+                    boost = boost.max(1.15);
+                }
+            }
+        }
+    }
+
+    for hint in &question.path_hints {
+        if matches_path_suffix(file, hint) {
+            boost *= 1.30;
+            break;
+        }
+        if hint.contains('/') && matches_path_suffix(strip_extension(file), hint) {
+            boost *= 1.20;
+            break;
+        }
+    }
+
+    boost
+}
+
 /// Scores every live chunk that matches at least one query term.
 pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
     let stats = stats(parts);
@@ -165,9 +253,19 @@ pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
                 continue;
             }
             let row = part.segment.row(chunk as u32);
+            let class = row.class();
+            let boost = if matches!(class, Class::Log | Class::Data) {
+                1.0
+            } else {
+                let name = part.segment.name(&row);
+                let kind = part.segment.kind(&row);
+                let file = &part.segment.files()[row.file as usize];
+                exact_boost(name, kind, file, question)
+            };
             let score = sums[index][chunk]
                 * coordination(usize::from(count), terms)
-                * prior(row.class(), row.test(), tests_wanted);
+                * prior(class, row.test(), tests_wanted)
+                * boost;
             if score > 0.0 {
                 scored.push(Scored {
                     part: index,
@@ -180,16 +278,20 @@ pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
     Ok(Scores { scored, df, idf })
 }
 
-/// The best `limit` items in `compare` order, at most two from one file.
-/// An item with the same `copy` key as a chosen one, such as the same lines
-/// of an identical file, is listed with it instead of taking a place.
+/// The best `limit` items in `compare` order, at most two non-overlapping
+/// results from one file. An item with the same `copy` key as a chosen one,
+/// such as the same lines of an identical file, is listed with it instead of
+/// taking a place. A lower-ranked item from the same file that satisfies
+/// `overlaps` with an already-chosen item is absorbed into `merged` instead
+/// of taking another slot.
 pub(crate) fn select<T: Copy, K: Eq + Hash, C: Eq + Hash>(
     mut items: Vec<T>,
     limit: usize,
     compare: impl Fn(&T, &T) -> Ordering,
     file: impl Fn(&T) -> K,
     copy: impl Fn(&T) -> Option<C>,
-) -> Vec<(T, Vec<T>)> {
+    overlaps: impl Fn(&T, &T) -> bool,
+) -> Vec<Picked<T>> {
     let mut window = limit.saturating_mul(4).max(32);
     loop {
         let take = window.min(items.len());
@@ -200,26 +302,44 @@ pub(crate) fn select<T: Copy, K: Eq + Hash, C: Eq + Hash>(
             items.select_nth_unstable_by(take - 1, &compare);
         }
         items[..take].sort_by(&compare);
-        let mut per_file = HashMap::new();
+        let mut per_file = HashMap::<K, Vec<usize>>::new();
         let mut copies = HashMap::<C, usize>::new();
-        let mut chosen = Vec::<(T, Vec<T>)>::new();
+        let mut chosen = Vec::<Picked<T>>::new();
         for item in &items[..take] {
             let key = copy(item);
             if let Some(&index) = key.as_ref().and_then(|key| copies.get(key)) {
-                chosen[index].1.push(*item);
+                chosen[index].copies.push(*item);
                 continue;
             }
-            // Once full, the rest of the window is read only for copies.
+            let file_key = file(item);
+            if let Some(existing) = per_file.get(&file_key)
+                && let Some(&index) = existing.iter().find(|&&index| {
+                    overlaps(&chosen[index].item, item)
+                        || chosen[index]
+                            .merged
+                            .iter()
+                            .any(|other| overlaps(other, item))
+                })
+            {
+                chosen[index].merged.push(*item);
+                continue;
+            }
+            // Once full, the rest of the window is read only for copies and overlaps.
             if chosen.len() == limit {
                 continue;
             }
-            let count = per_file.entry(file(item)).or_insert(0);
-            if *count < 2 {
-                *count += 1;
+            let slots = per_file.entry(file_key).or_default();
+            if slots.len() < 2 {
+                let index = chosen.len();
+                slots.push(index);
                 if let Some(key) = key {
-                    copies.insert(key, chosen.len());
+                    copies.insert(key, index);
                 }
-                chosen.push((*item, Vec::new()));
+                chosen.push(Picked {
+                    item: *item,
+                    copies: Vec::new(),
+                    merged: Vec::new(),
+                });
             }
         }
         if chosen.len() == limit || take == items.len() {
@@ -393,9 +513,10 @@ mod tests {
                 .then(left.2.cmp(&right.2))
         };
         let none = |_: &(f64, &str, usize)| None::<usize>;
-        let chosen = select(items.clone(), 10, compare, |item| item.1, none);
+        let no_overlap = |_: &(f64, &str, usize), _: &(f64, &str, usize)| false;
+        let chosen = select(items.clone(), 10, compare, |item| item.1, none, no_overlap);
         assert_eq!(
-            chosen.iter().map(|(item, _)| *item).collect::<Vec<_>>(),
+            chosen.iter().map(|picked| picked.item).collect::<Vec<_>>(),
             [
                 (2.0, "c.rs", 1),
                 (1.0, "a.rs", 2),
@@ -403,9 +524,15 @@ mod tests {
                 (1.0, "b.rs", 3)
             ]
         );
-        assert_eq!(select(items, 2, compare, |item| item.1, none).len(), 2);
+        assert_eq!(
+            select(items, 2, compare, |item| item.1, none, no_overlap).len(),
+            2
+        );
         let many = (0..500).map(|n| (f64::from(n), "x", n as usize)).collect();
-        assert_eq!(select(many, 3, compare, |item| item.2, none).len(), 3);
+        assert_eq!(
+            select(many, 3, compare, |item| item.2, none, no_overlap).len(),
+            3
+        );
     }
 
     #[test]
@@ -423,14 +550,123 @@ mod tests {
         let compare = |left: &(f64, &str, usize), right: &(f64, &str, usize)| {
             right.0.total_cmp(&left.0).then(left.1.cmp(right.1))
         };
-        let chosen = select(items, 4, compare, |item| item.1, |item| Some(item.2));
+        let chosen = select(
+            items,
+            4,
+            compare,
+            |item| item.1,
+            |item| Some(item.2),
+            |_, _| false,
+        );
         fn names(items: &[(f64, &'static str, usize)]) -> Vec<&'static str> {
             items.iter().map(|item| item.1).collect()
         }
-        let shown = chosen.iter().map(|(item, _)| item.1).collect::<Vec<_>>();
+        let shown = chosen
+            .iter()
+            .map(|picked| picked.item.1)
+            .collect::<Vec<_>>();
         assert_eq!(shown, ["a.rs", "b.rs", "c.rs", "e.rs"]);
-        assert_eq!(names(&chosen[0].1), ["d.rs"]);
-        assert!(chosen[1].1.is_empty());
-        assert_eq!(names(&chosen[3].1), ["f.rs"]);
+        assert_eq!(names(&chosen[0].copies), ["d.rs"]);
+        assert!(chosen[1].copies.is_empty());
+        assert_eq!(names(&chosen[3].copies), ["f.rs"]);
+    }
+
+    #[test]
+    fn exact_match_ranks_target_symbol_and_path_first() {
+        fn named<'a>(start: usize, name: &str, kind: &str, fields: [&'a str; 4]) -> Chunk<'a> {
+            let mut c = chunk(start, Class::Code, false, fields);
+            c.name = name.to_owned();
+            c.kind = kind.to_owned();
+            c
+        }
+        let segment = collection(&[
+            (
+                "src/a_parser.rs",
+                vec![named(
+                    1,
+                    "Parser::order",
+                    "method",
+                    ["order Parser::order", "fn order(&self)", "", ""],
+                )],
+            ),
+            (
+                "src/b_order.rs",
+                vec![named(
+                    1,
+                    "Order::parse",
+                    "method",
+                    ["parse Order::parse", "fn parse(&self)", "", ""],
+                )],
+            ),
+            (
+                "src/c_camel.ts",
+                vec![named(
+                    1,
+                    "parseHttpHeader",
+                    "function",
+                    ["parseHttpHeader", "function parseHttpHeader()", "", ""],
+                )],
+            ),
+            (
+                "src/d_snake.rs",
+                vec![named(
+                    1,
+                    "parse_http_header",
+                    "function",
+                    ["parse_http_header", "fn parse_http_header()", "", ""],
+                )],
+            ),
+        ]);
+        // Qualified symbol query ranks exact Order::parse above swapped Parser::order.
+        let qualified_order = ranked(&segment, "Order::parse");
+        assert_eq!(qualified_order[0].0, "Order::parse", "{qualified_order:?}");
+        assert!(
+            qualified_order[0].1 > qualified_order[1].1 * 1.4,
+            "{qualified_order:?}"
+        );
+
+        // Exact spelling wins #1 across camelCase / snake_case twins.
+        assert_eq!(ranked(&segment, "parseHttpHeader")[0].0, "parseHttpHeader");
+        assert_eq!(
+            ranked(&segment, "parse_http_header")[0].0,
+            "parse_http_header"
+        );
+
+        // Explicit file path hint boosts chunks in that file.
+        let path_ranked = ranked(&segment, "b_order.rs order");
+        assert_eq!(path_ranked[0].0, "Order::parse", "{path_ranked:?}");
+    }
+
+    #[test]
+    fn overlapping_same_file_items_are_absorbed_freeing_slots_for_other_files() {
+        // (score, file, start, end)
+        let items = vec![
+            (10.0, "a.rs", 12usize, 14usize), // child method
+            (9.0, "a.rs", 9, 20),             // overlapping enclosing class
+            (8.0, "a.rs", 12, 14),            // exact duplicate span
+            (7.0, "b.rs", 1, 10),
+            (6.0, "c.rs", 1, 10),
+            (5.0, "d.rs", 1, 10),
+        ];
+        let compare = |left: &(f64, &str, usize, usize), right: &(f64, &str, usize, usize)| {
+            right.0.total_cmp(&left.0)
+        };
+        let overlaps = |left: &(f64, &str, usize, usize), right: &(f64, &str, usize, usize)| {
+            left.2 <= right.3 && right.2 <= left.3
+        };
+        let chosen = select(
+            items,
+            3,
+            compare,
+            |item| item.1,
+            |_| None::<usize>,
+            overlaps,
+        );
+        let files = chosen
+            .iter()
+            .map(|picked| picked.item.1)
+            .collect::<Vec<_>>();
+        assert_eq!(files, ["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(chosen[0].merged.len(), 2);
     }
 }
