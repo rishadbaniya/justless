@@ -178,29 +178,19 @@ fn lint_display(args: &[&str]) -> bool {
 }
 
 fn lint_tool(program: &str, args: &[&str]) -> bool {
-    matches!(
-        (program, args),
-        ("cargo", ["clippy" | "check" | "build", ..])
-            | ("ruff", ["check", ..])
-            | ("golangci-lint", ["run", ..])
-            | ("go", ["vet", ..])
-            | (
-                "flake8"
-                    | "pylint"
-                    | "mypy"
-                    | "pyright"
-                    | "basedpyright"
-                    | "eslint"
-                    | "tsc"
-                    | "vue-tsc"
-                    | "shellcheck"
-                    | "rubocop"
-                    | "staticcheck"
-                    | "swiftlint"
-                    | "hadolint",
-                _,
-            )
-    )
+    match (program, args) {
+        ("cargo", ["clippy" | "check" | "build", ..]) => true,
+        ("cargo", ["doc", rest @ ..]) => !rest.contains(&"--open"),
+        ("ruff", ["check", ..])
+        | ("golangci-lint", ["run", ..])
+        | ("go", ["vet", ..])
+        | (
+            "flake8" | "pylint" | "mypy" | "pyright" | "basedpyright" | "eslint" | "tsc"
+            | "vue-tsc" | "shellcheck" | "rubocop" | "staticcheck" | "swiftlint" | "hadolint",
+            _,
+        ) => true,
+        _ => false,
+    }
 }
 
 pub fn profile(words: &[&str]) -> Option<Profile> {
@@ -633,13 +623,122 @@ pub fn legacy_hook(words: &[&str]) -> bool {
         | ["go", "test" | "build", ..]
         | ["python" | "python3", "-m", "pytest", ..]
         | ["pytest" | "rg", ..] => true,
+        ["cargo", "doc", rest @ ..] => !rest.contains(&"--open"),
         ["git", rest @ ..] => match git_display_subcommand(rest) {
             ["diff" | "show" | "status" | "log", ..] => true,
             ["branch", branch_args @ ..] => git_branch_display(branch_args),
+            ["tag", tag_args @ ..] => git_tag_display(tag_args),
+            ["stash", "list", stash_args @ ..] => git_stash_list_display(stash_args),
             _ => false,
         },
         _ => false,
     }
+}
+
+/// Whether `git tag` arguments only list tags in display format. Creating,
+/// annotating, signing, verifying, deleting and machine-formatted output
+/// (`--format`) return `false`.
+fn git_tag_display(args: &[&str]) -> bool {
+    let mut list = false;
+    let mut iter = args.iter().copied().peekable();
+    while let Some(arg) = iter.next() {
+        if let Some(short) = arg
+            .strip_prefix('-')
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        {
+            let mut chars = short.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    'l' => list = true,
+                    'i' => {}
+                    'n' => {
+                        let rest: String = chars.collect();
+                        if !rest.is_empty() {
+                            if !rest.bytes().all(|b| b.is_ascii_digit()) {
+                                return false;
+                            }
+                        } else if iter.peek().is_some_and(|next| {
+                            !next.is_empty() && next.bytes().all(|b| b.is_ascii_digit())
+                        }) {
+                            iter.next();
+                        }
+                        break;
+                    }
+                    _ => return false,
+                }
+            }
+            continue;
+        }
+        if arg.starts_with("--") {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg, None), |(f, v)| (f, Some(v)));
+            match flag {
+                "--list" if inline.is_none() => list = true,
+                "--ignore-case" | "--no-color" | "--no-column" if inline.is_none() => {}
+                "--color" | "--column" => {
+                    if inline.is_some_and(str::is_empty) {
+                        return false;
+                    }
+                }
+                "--merged" | "--no-merged" => {
+                    if inline.is_some_and(str::is_empty) {
+                        return false;
+                    }
+                    if inline.is_none() && iter.peek().is_some_and(|next| !next.starts_with('-')) {
+                        iter.next();
+                    }
+                }
+                "--contains" | "--no-contains" | "--points-at" => {
+                    let value = match inline {
+                        Some(v) => Some(v),
+                        None => iter.next(),
+                    };
+                    if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                        return false;
+                    }
+                }
+                "--sort" => {
+                    let value = match inline {
+                        Some(v) => Some(v),
+                        None => iter.next(),
+                    };
+                    if value.is_none_or(|v| v.is_empty() || v.starts_with("--")) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            continue;
+        }
+        // Positional operands create a tag unless `-l`/`--list` puts `git tag` in
+        // pattern-listing mode.
+        if !list {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `git stash list` arguments keep display output without external diff
+/// helpers, file outputs or machine-oriented flags.
+fn git_stash_list_display(args: &[&str]) -> bool {
+    !args.iter().any(|arg| {
+        let flag = arg.split_once('=').map_or(*arg, |(k, _)| k);
+        matches!(
+            flag,
+            "--output"
+                | "--ext-diff"
+                | "--textconv"
+                | "--porcelain"
+                | "-z"
+                | "--null"
+                | "--raw"
+                | "--name-only"
+                | "--name-status"
+                | "--numstat"
+        )
+    })
 }
 
 /// Whether `git branch` arguments only list or inspect branches in display format.
@@ -962,6 +1061,7 @@ pub fn approvable(words: &[&str]) -> bool {
             !args.iter().any(|arg| {
                 arg.starts_with("-Z")
                     || arg.split_once('=').map_or(*arg, |(flag, _)| flag) == "--config"
+                    || (args.first() == Some(&"doc") && *arg == "--open")
             }) && clippy_lint_levels(args)
         }
         // `-vettool` and `-toolexec` run the program they name, `-gccgoflags` and
@@ -1669,15 +1769,59 @@ mod tests {
             ("git -c diff.external=evil diff", false),
             ("git -C /tmp diff", false),
             ("git --paginate diff", false),
+            // Read-only `cargo doc` (without `--open`) is approved and uses the lint profile.
+            ("cargo doc --no-deps", true),
+            ("cargo doc --workspace --no-deps --locked", true),
+            ("cargo doc --open", false),
+            ("cargo doc --no-deps --open", false),
+            ("cargo doc --config net.offline=false", false),
+            ("cargo doc -Z unstable-options", false),
+            // Read-only `git tag` display and `git stash list` are approved; mutating or formatted forms are not.
+            ("git tag", true),
+            ("git tag -l", true),
+            ("git tag -l v1.*", true),
+            ("git tag --list v1.*", true),
+            ("git tag -n", true),
+            ("git tag -n3", true),
+            ("git tag -n 3", true),
+            ("git tag --sort=-v:refname", true),
+            ("git tag --merged main", true),
+            ("git tag --contains HEAD", true),
+            ("git --no-pager tag -l", true),
+            ("git tag v1.0.0", false),
+            ("git tag -a v1.0.0 -m release", false),
+            ("git tag -s v1.0.0", false),
+            ("git tag -d v1.0.0", false),
+            ("git tag -f v1.0.0", false),
+            ("git tag -v v1.0.0", false),
+            ("git tag -n v1.0.0", false),
+            ("git tag --format=%(refname:short)", false),
+            ("git stash list", true),
+            ("git stash list -n 10 --stat", true),
+            ("git --no-pager stash list", true),
+            ("git stash", false),
+            ("git stash push", false),
+            ("git stash pop", false),
+            ("git stash drop", false),
+            ("git stash list --output=/tmp/x", false),
+            ("git stash list --ext-diff", false),
         ] {
             let words: Vec<&str> = command.split(' ').collect();
             assert_eq!(approvable(&words), approved, "{command}");
         }
-        // `legacy_hook` and `approvable` agree on `git branch` forms.
+        // `cargo doc` without `--open` selects the lint profile; `--open` selects none.
+        assert_eq!(profile(&["cargo", "doc", "--no-deps"]), Some(Profile::Lint));
+        assert_eq!(profile(&["cargo", "doc", "--open"]), None);
+        // `legacy_hook` and `approvable` agree on `git branch`, `git tag` and `git stash list`.
         assert!(legacy_hook(&["git", "branch", "-a"]));
         assert!(legacy_hook(&["git", "branch", "--list", "feat/*"]));
         assert!(!legacy_hook(&["git", "branch", "new-branch"]));
         assert!(!legacy_hook(&["git", "branch", "-D", "old"]));
         assert!(!legacy_hook(&["git", "branch", "--format=%(refname)"]));
+        assert!(legacy_hook(&["git", "tag", "-l", "v*"]));
+        assert!(!legacy_hook(&["git", "tag", "v1.0.0"]));
+        assert!(!legacy_hook(&["git", "tag", "-d", "v1.0.0"]));
+        assert!(legacy_hook(&["git", "stash", "list"]));
+        assert!(!legacy_hook(&["git", "stash", "pop"]));
     }
 }

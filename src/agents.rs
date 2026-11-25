@@ -1398,6 +1398,7 @@ pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path
     Some(Path::new(path))
 }
 
+/// Antigravity CLI hook dispatcher for `session-start`, `before-command` and `after-read`.
 fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     let paths = input["workspacePaths"].as_array()?;
     let mut roots = paths

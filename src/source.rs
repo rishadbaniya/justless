@@ -479,15 +479,31 @@ impl Snapshot {
                 vec![filter.as_str()]
             };
         let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let fold_group = |entry: &Entry| -> Option<&'static str> {
+            if entry.kind == "import" {
+                Some("imports")
+            } else if entry.kind == "module"
+                && self.text[entry.bytes.clone()].trim_end().ends_with(';')
+            {
+                Some("modules")
+            } else {
+                None
+            }
+        };
         let mut index = start;
         while index < self.entries.len() {
             let e = &self.entries[index];
-            // Fold runs of 3+ contiguous imports in unfiltered outlines so large
-            // import blocks don't crowd real declarations off page 1. Individual
-            // `#N` entry IDs stay unchanged for `expand` and `edit`.
-            let (row, end_index) = if filter.is_empty() && e.kind == "import" {
+            // Fold runs of 3+ contiguous imports or external `mod name;` declarations
+            // in unfiltered outlines so large preamble blocks don't crowd real
+            // declarations off page 1. Individual `#N` entry IDs stay unchanged for
+            // `expand` and `edit`.
+            let (row, end_index) = if filter.is_empty()
+                && let Some(group) = fold_group(e)
+            {
                 let mut run_end = index + 1;
-                while run_end < self.entries.len() && self.entries[run_end].kind == "import" {
+                while run_end < self.entries.len()
+                    && fold_group(&self.entries[run_end]) == Some(group)
+                {
                     run_end += 1;
                 }
                 let run_len = run_end - index;
@@ -496,7 +512,7 @@ impl Snapshot {
                         id: index + 1,
                         end_id: Some(run_end),
                         name: format!("{run_len} items"),
-                        kind: "imports".into(),
+                        kind: group.into(),
                         first: self.line(e.bytes.start),
                         last: self.line(self.entries[run_end - 1].bytes.end.saturating_sub(1)),
                         signature: String::new(),

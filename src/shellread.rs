@@ -114,14 +114,17 @@ impl LineRange {
 }
 
 /// The object name in `git show REV:path`, `git show REV:./path` or
-/// `git show :path` (the index), also after `git --no-pager`.
+/// `git show :path` (the index), also after safe Git display global flags such
+/// as `--no-pager`, `-P` or `--no-optional-locks`.
 pub(crate) fn show(words: &[String]) -> Option<&str> {
-    let spec = match words {
-        [git, show, spec] if git == "git" && show == "show" => spec,
-        [git, pager, show, spec] if git == "git" && pager == "--no-pager" && show == "show" => spec,
-        _ => return None,
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    let ["git", rest @ ..] = refs.as_slice() else {
+        return None;
     };
-    blob_path(spec).map(|_| spec.as_str())
+    let ["show", spec] = crate::filters::git_display_subcommand(rest) else {
+        return None;
+    };
+    blob_path(spec).map(|_| *spec)
 }
 
 /// The path part of an object name that names a file, such as `src/a.rs` in
@@ -1148,6 +1151,11 @@ mod tests {
                 "cd x && x:a.rs 1-3 nl-ba",
             ),
             ("git show HEAD:a.rs | cat", ":HEAD:a.rs +1 object"),
+            ("git -P show HEAD:a.rs", ":HEAD:a.rs +1 object"),
+            (
+                "git --no-pager --no-optional-locks show HEAD:./a.rs",
+                ":HEAD:./a.rs +1 object",
+            ),
         ] {
             assert_eq!(shown(line).as_deref(), Some(read), "{line}");
         }

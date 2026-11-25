@@ -1180,4 +1180,47 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
         code_before + snippet_bytes,
         "{after_code}"
     );
+
+    // Runs of 3+ external `mod foo;` declarations fold in unfiltered outlines,
+    // leaving inline `mod tests { ... }` blocks unfolded and preserving `--match`
+    // and `#N` expansion.
+    let mut main_rs = String::new();
+    for i in 0..8 {
+        main_rs.push_str(&format!("mod mod_{i};\n"));
+    }
+    main_rs
+        .push_str("\nmod inline_mod {\n    pub fn inside() -> usize { 1 }\n}\n\nfn entry() {}\n");
+    fs::write(root.join("main.rs"), &main_rs).unwrap();
+    let main_outline = String::from_utf8(out(root, &["read", "main.rs", "--outline"])).unwrap();
+    assert!(
+        main_outline.contains("#1..#8 L1-8 modules (8 items)"),
+        "{main_outline}"
+    );
+    assert!(
+        main_outline.contains("#9 L10-12 module inline_mod"),
+        "{main_outline}"
+    );
+    assert!(main_outline.contains("function entry"), "{main_outline}");
+    let matched_mod = String::from_utf8(out(
+        root,
+        &["read", "main.rs", "--outline", "--match", "mod_4"],
+    ))
+    .unwrap();
+    assert!(
+        matched_mod.contains("#5 L5-5 module mod_4"),
+        "{matched_mod}"
+    );
+    assert!(!matched_mod.contains("modules ("), "{matched_mod}");
+    let rev = main_outline
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("revision ")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    let expanded_mod =
+        String::from_utf8(out(root, &["expand", "main.rs", &format!("{rev}#5")])).unwrap();
+    assert_eq!(expanded_mod, "mod mod_4;");
 }
