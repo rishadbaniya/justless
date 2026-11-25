@@ -206,6 +206,17 @@ pub struct Run {
     /// drainer can keep adding its output to the archive.
     #[serde(default, skip_serializing_if = "is_false")]
     pub drained: bool,
+    /// Which stream preview(s) a structured report or view replaced (`"stdout"`
+    /// or `"both"`). Absent when plain previews were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<String>,
+    /// Preview byte budget applied when formatting this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_bytes: Option<usize>,
+    /// Set when the budget was supplied explicitly (such as `run --max-bytes`)
+    /// rather than chosen by the adaptive preview advisor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explicit_budget: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -248,6 +259,9 @@ impl Run {
             produced_bytes: Vec::new(),
             unfinished: true,
             drained: false,
+            replaced: None,
+            budget_bytes: None,
+            explicit_budget: false,
         }
     }
 
@@ -360,6 +374,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         command.args(&args[1..]);
         return Ok(uncaptured(&mut command, &args[0]));
     }
+    let explicit_budget = !crate::adaptive::take_advised(workspace, args, max_bytes);
 
     let settings = workspace.settings()?;
     let selection = crate::filters::Selection::for_run(args, &settings.filters)?;
@@ -406,6 +421,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         words: &words,
         selection: &selection,
         max_bytes,
+        explicit_budget,
         session,
         fresh: fresh || window,
         window,
@@ -579,6 +595,7 @@ pub(crate) fn record_cut(
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+    let explicit_budget = !crate::adaptive::take_advised(workspace, args, max_bytes);
     let mut archive = Archive::create_in(&staging, &family, &origin.label, true)?;
     archive.destination = Some(runs);
     archive.store(output, settings.max_run_bytes)?;
@@ -588,6 +605,7 @@ pub(crate) fn record_cut(
         words: &words,
         selection: &selection,
         max_bytes,
+        explicit_budget,
         session,
         fresh: true,
         window: false,
@@ -1429,6 +1447,8 @@ struct Capture<'a> {
     words: &'a [&'a str],
     selection: &'a crate::filters::Selection,
     max_bytes: usize,
+    /// `max_bytes` was supplied explicitly rather than chosen by `adaptive`.
+    explicit_budget: bool,
     session: &'a str,
     fresh: bool,
     /// Keep no baseline for a later run to compare with (see `Shape::window`).
@@ -1483,6 +1503,7 @@ impl Capture<'_> {
             words,
             selection,
             max_bytes,
+            explicit_budget,
             session,
             fresh,
             window,
@@ -1512,6 +1533,8 @@ impl Capture<'_> {
             produced_bytes: archive.produced(),
             unfinished: false,
             drained: archive.late,
+            budget_bytes: Some(max_bytes),
+            explicit_budget,
             label: origin.map_or_else(|| history::label(words), |o| o.label.clone()),
             note: origin.map(|o| o.note.clone()).unwrap_or_default(),
             argv: if argv_withheld { Vec::new() } else { argv },
@@ -1762,6 +1785,7 @@ impl Capture<'_> {
                 previews[0].1 = lines.into_bytes();
                 previews[1].1.clear();
                 report = true;
+                run.replaced = Some("both".to_owned());
             }
         } else if let Some(line) = clean.filter(|line| line.len() + 64 < shown) {
             // Like findings, the line covers both streams. It saves more than the
@@ -1769,6 +1793,7 @@ impl Capture<'_> {
             previews[0].1 = line.into_bytes();
             previews[1].1.clear();
             report = true;
+            run.replaced = Some("both".to_owned());
         } else if let Some((groups, summary)) = grouped {
             // Search and listing groups replace a large stdout only. Smaller output stays
             // verbatim, and stderr keeps messages such as unreadable directories.
@@ -1778,6 +1803,7 @@ impl Capture<'_> {
             {
                 previews[0].1 = fit(groups, max_bytes).into_bytes();
                 report = true;
+                run.replaced = Some("stdout".to_owned());
             }
         } else if (!merged || whole)
             && (!plan_fits || previous.is_some())
@@ -1805,8 +1831,8 @@ impl Capture<'_> {
                 previews[1].1.clear();
             }
             report = true;
-        } else if !merged
-            && run.produced_bytes.is_empty()
+            run.replaced = Some(if covers_stderr { "both" } else { "stdout" }.to_owned());
+        } else if run.produced_bytes.is_empty()
             && is_log_stream(words, selection.profile)
             && let Some(folded) =
                 log_view(&archive.readers, &lengths, redactor, &secrets, max_bytes)
@@ -1816,6 +1842,7 @@ impl Capture<'_> {
             previews[0].1 = folded.into_bytes();
             previews[1].1.clear();
             report = true;
+            run.replaced = Some("both".to_owned());
         } else if !merged
             && run.produced_bytes.is_empty()
             && selection.profile.is_none()
@@ -1832,6 +1859,7 @@ impl Capture<'_> {
         {
             previews[0].1 = view.into_bytes();
             report = true;
+            run.replaced = Some("stdout".to_owned());
         } else if !merged
             && selection.profile.is_none()
             && run.summary.kind.is_empty()
@@ -1852,6 +1880,7 @@ impl Capture<'_> {
             && (!stdout_fits || view.len() + 64 < previews[0].1.len())
         {
             previews[0].1 = view;
+            run.replaced = Some("stdout".to_owned());
         }
         if let Some(view) = lock_view
             && !run.unchanged
@@ -1860,6 +1889,7 @@ impl Capture<'_> {
             flags_shown = true;
             previews[0].1 = view.into_bytes();
             report = true;
+            run.replaced = Some("stdout".to_owned());
         }
         // A source or checksum that changed on a locked version is always named, also
         // above a verbatim patch or a clipped preview. The flags take at most a
@@ -1896,7 +1926,12 @@ impl Capture<'_> {
                 shape_stdout(&path, &run.id)
             });
             match shaped {
-                Ok(Some(shaped)) if shaped.len() <= max_bytes => previews[0].1 = shaped,
+                Ok(Some(shaped)) if shaped.len() <= max_bytes => {
+                    previews[0].1 = shaped;
+                    if run.replaced.is_none() {
+                        run.replaced = Some("stdout".to_owned());
+                    }
+                }
                 Ok(Some(_)) => eprintln!("justless: the shaped stdout preview exceeded its budget"),
                 Ok(None) => {}
                 Err(error) => eprintln!("justless: {error:#}"),
@@ -1907,6 +1942,7 @@ impl Capture<'_> {
         if let Some(outline) = source_outline {
             previews[0].1 =
                 format!("{}Exact: {justless} log {}\n", outline.text, run.id).into_bytes();
+            run.replaced = Some("stdout".to_owned());
         }
         if let Some(redactor) = redactor {
             // Reports can quote an earlier record, such as a rerun's previous failures.
@@ -4334,5 +4370,290 @@ mod tests {
             failure_lines(log),
             vec![false, true, true, true, true, false]
         );
+    }
+
+    #[cfg(unix)]
+    fn test_workspace(root: &Path) -> Workspace {
+        Workspace {
+            root: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            state: root.join(".justless"),
+            origin: root.to_path_buf(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_docker_logs_gets_logview_folding_and_valid_stdout_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = test_workspace(dir.path());
+        let docker = fake_script(
+            dir.path(),
+            "docker",
+            r#"i=1
+while [ $i -le 45 ]; do
+    echo "2026-11-25T10:00:$(printf '%02d' $((i % 60)))Z INFO api: handled GET /healthz status=200 latency=1ms req_id=req-$i"
+    i=$((i + 1))
+done
+echo "2026-11-25T10:01:00Z ERROR api: ConnectionRefusedError: dial tcp 10.0.0.5:5432 failed" >&2
+echo "    at pool.connect (/app/db.js:42:11)" >&2
+i=46
+while [ $i -le 90 ]; do
+    echo "2026-11-25T10:01:$(printf '%02d' $((i % 60)))Z INFO api: handled GET /healthz status=200 latency=2ms req_id=req-$i"
+    i=$((i + 1))
+done"#,
+        );
+        let args = vec![
+            docker.as_os_str().to_os_string(),
+            OsString::from("logs"),
+            OsString::from("api"),
+            OsString::from("--tail"),
+            OsString::from("500"),
+        ];
+        let words: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        let settings = ws.settings().unwrap();
+        let selection = crate::filters::Selection::for_run(&args, &settings.filters).unwrap();
+        assert_eq!(selection.profile, Some(crate::filters::Profile::Logs));
+        let merged = crate::merge::joins(true, selection.profile);
+        assert!(merged, "docker logs --merge must join streams");
+
+        let budget = crate::adaptive::preview_budget(&ws, &args).unwrap();
+        let explicit_budget = !crate::adaptive::take_advised(&ws, &args, budget);
+        assert!(!explicit_budget);
+
+        let family = family_of(&args, &selection);
+        let mut archive = Archive::create(&ws, &family, &history::label(&words), true).unwrap();
+        let mut cmd = Command::new(&args[0]);
+        cmd.current_dir(&ws.cwd).args(&args[1..]);
+        let status = exit_code(
+            archive
+                .run(&mut cmd, settings.max_run_bytes, merged)
+                .unwrap()
+                .unwrap(),
+        );
+        let capture = Capture {
+            workspace: &ws,
+            args: &args,
+            words: &words,
+            selection: &selection,
+            max_bytes: budget,
+            explicit_budget,
+            session: "merged-log-test",
+            fresh: true,
+            window: false,
+            hook: true,
+            agent_footer: true,
+            merge: true,
+            merged,
+            redactor: None,
+            retention: (settings.max_runs, settings.max_archive_bytes),
+            origin: None,
+            pieces: &[],
+            json_grouping: settings.json_grouping,
+            ends_early: false,
+        };
+        let ((previews, report), _footer, run) =
+            capture.record(&mut archive, family, status, None).unwrap();
+
+        assert!(report, "merged docker logs should use logview report");
+        assert_eq!(run.replaced.as_deref(), Some("both"));
+        assert_eq!(run.budget_bytes, Some(budget));
+        assert!(!run.explicit_budget);
+        assert_eq!(run.stream_bytes.get(1).copied(), Some(0));
+        assert!(previews[1].1.is_empty());
+
+        let shown = String::from_utf8(previews[0].1.clone()).unwrap();
+        assert!(
+            shown.len() * 3 < run.raw_bytes as usize,
+            "expected strong folding, got {} of {} bytes:\n{shown}",
+            shown.len(),
+            run.raw_bytes
+        );
+        assert!(
+            shown.contains("ConnectionRefusedError"),
+            "error from merged stderr must be preserved:\n{shown}"
+        );
+        assert!(
+            !shown.contains("[stderr:"),
+            "merged logview must emit only stdout pointers:\n{shown}"
+        );
+
+        // Verify every [stdout:A] or [stdout:A-B] pointer resolves cleanly in the archived stdout.
+        let archived =
+            fs::read_to_string(ws.state.join("runs").join(&run.id).join("stdout")).unwrap();
+        let archived_lines: Vec<&str> = archived.lines().collect();
+        let ptr_re = Regex::new(r"\[stdout:(\d+)(?:-(\d+))?\]").unwrap();
+        let mut pointer_count = 0;
+        let mut error_replayed = false;
+        for cap in ptr_re.captures_iter(&shown) {
+            pointer_count += 1;
+            let from: usize = cap[1].parse().unwrap();
+            let to: usize = cap.get(2).map_or(from, |m| m.as_str().parse().unwrap());
+            assert!(
+                from >= 1 && to >= from && to <= archived_lines.len(),
+                "invalid pointer [stdout:{from}-{to}] for {} lines",
+                archived_lines.len()
+            );
+            let slice = archived_lines[from - 1..to].join("\n");
+            if slice.contains("ConnectionRefusedError") {
+                error_replayed = true;
+            }
+        }
+        assert!(pointer_count >= 2, "expected stdout pointers:\n{shown}");
+        assert!(
+            error_replayed,
+            "error line pointer must replay exact ConnectionRefusedError line:\n{shown}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_persists_replaced_budget_and_explicit_flag_across_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = test_workspace(dir.path());
+        let latest_run = |ws: &Workspace| -> Run {
+            let mut entries: Vec<_> = fs::read_dir(ws.state.join("runs"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
+                .collect();
+            entries.sort_by_key(|e| {
+                serde_json::from_slice::<Run>(&fs::read(e.path().join("record.json")).unwrap())
+                    .unwrap()
+                    .completed_ms
+            });
+            let path = entries.last().unwrap().path().join("record.json");
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+        };
+
+        // 1. Adaptive vs explicit budget handoff via execute().
+        let noisy = fake_script(
+            dir.path(),
+            "noisy",
+            "i=0; while [ $i -lt 300 ]; do echo \"line $i of verbose output payload\"; i=$((i+1)); done",
+        );
+        let noisy_args = vec![noisy.as_os_str().to_os_string()];
+        let advised = crate::adaptive::preview_budget(&ws, &noisy_args).unwrap();
+        assert_eq!(
+            execute(
+                &ws,
+                &noisy_args,
+                advised,
+                false,
+                "s",
+                (true, false),
+                true,
+                false
+            )
+            .unwrap(),
+            0
+        );
+        let adaptive_run = latest_run(&ws);
+        assert_eq!(adaptive_run.replaced, None);
+        assert_eq!(adaptive_run.budget_bytes, Some(advised));
+        assert!(!adaptive_run.explicit_budget);
+
+        // Calling execute directly (as `run --max-bytes 3500` does) sets explicit_budget = true.
+        assert_eq!(
+            execute(
+                &ws,
+                &noisy_args,
+                3500,
+                false,
+                "s",
+                (true, false),
+                true,
+                false
+            )
+            .unwrap(),
+            0
+        );
+        let explicit_run = latest_run(&ws);
+        assert_eq!(explicit_run.budget_bytes, Some(3500));
+        assert!(explicit_run.explicit_budget);
+
+        // 2. json_view sets replaced = Some("stdout").
+        let mut rows = String::from("[");
+        for i in 0..80 {
+            if i > 0 {
+                rows.push(',');
+            }
+            rows.push_str(&format!(
+                "{{\"id\":{i},\"service\":\"api-{i}\",\"status\":\"running\",\"region\":\"us-east-1\"}}"
+            ));
+        }
+        rows.push(']');
+        let json_cmd = fake_script(
+            dir.path(),
+            "emit_json",
+            &format!("printf '%s\\n' '{}'", rows),
+        );
+        let json_args = vec![json_cmd.as_os_str().to_os_string()];
+        let budget = crate::adaptive::preview_budget(&ws, &json_args).unwrap();
+        assert_eq!(
+            execute(
+                &ws,
+                &json_args,
+                budget,
+                false,
+                "s",
+                (true, false),
+                true,
+                false
+            )
+            .unwrap(),
+            0
+        );
+        let json_run = latest_run(&ws);
+        assert_eq!(json_run.replaced.as_deref(), Some("stdout"));
+        assert_eq!(json_run.budget_bytes, Some(budget));
+        assert!(!json_run.explicit_budget);
+
+        // 3. Stderr-heavy jest summary (covers_stderr == true) sets replaced = Some("both").
+        let mut jest_err = String::new();
+        for i in 0..80 {
+            jest_err.push_str(&format!("PASS src/mod_{i:02}.test.ts\n"));
+        }
+        jest_err.push_str(
+            "\nTest Suites: 80 passed, 80 total\nTests:       240 passed, 240 total\nSnapshots:   0 total\nTime:        2.41 s\n",
+        );
+        let jest_file = dir.path().join("jest.err");
+        fs::write(&jest_file, &jest_err).unwrap();
+        let jest = fake_script(
+            dir.path(),
+            "jest",
+            &format!("cat '{}' >&2", jest_file.display()),
+        );
+        let jest_args = vec![jest.as_os_str().to_os_string()];
+        let budget = crate::adaptive::preview_budget(&ws, &jest_args).unwrap();
+        assert_eq!(
+            execute(
+                &ws,
+                &jest_args,
+                budget,
+                false,
+                "s",
+                (true, false),
+                true,
+                false
+            )
+            .unwrap(),
+            0
+        );
+        let jest_run = latest_run(&ws);
+        assert_eq!(jest_run.replaced.as_deref(), Some("both"));
+        assert_eq!(jest_run.budget_bytes, Some(budget));
+        assert!(!jest_run.explicit_budget);
     }
 }

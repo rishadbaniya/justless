@@ -9,11 +9,12 @@
 //! the budget moves one step at a time. `.justless/budget-runs.json` caches the
 //! few facts it needs from each finished run, so a `run` reads only records it
 //! has not seen.
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,16 @@ struct Brief {
     /// Preview bytes shown for both streams, without the footer.
     shown: u64,
     replaced: Replaced,
+    /// Preview byte budget recorded for this run, when present in `record.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    budget: Option<u64>,
+    /// Whether the run used an explicit budget (such as `--max-bytes`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    explicit: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Brief {
@@ -134,11 +145,18 @@ impl Brief {
         }
     }
 
-    /// Whether the run's preview could have come from `budget`. No stream shows
-    /// more than the budget, so a larger preview came from a larger explicit
-    /// `--max-bytes`. A clipped plain stream shows about half of the budget, so
-    /// one that showed under a quarter came from a much smaller one.
+    /// Whether the run's preview came from `budget`. Newer records persist
+    /// `budget_bytes` and `explicit_budget`, so explicit `--max-bytes` overrides
+    /// and runs made at another step are excluded exactly, while well-compacted
+    /// reports are never falsely dropped. Older records without those fields
+    /// fall back to checking whether `shown` fits what `budget` could produce.
     fn made_at(&self, budget: u64) -> bool {
+        if self.explicit {
+            return false;
+        }
+        if let Some(recorded) = self.budget {
+            return recorded == budget;
+        }
         let fits = |size: u64| size.min(budget);
         let clipped = |size: u64| u64::from(size > budget);
         let (most, clipped) = match self.replaced {
@@ -426,12 +444,28 @@ struct Record {
     unchanged: bool,
     #[serde(default)]
     summary: RecordSummary,
+    #[serde(default)]
+    replaced: Option<String>,
+    #[serde(default)]
+    budget_bytes: Option<u64>,
+    #[serde(default)]
+    explicit_budget: bool,
 }
 
 impl Record {
-    /// What replaced the plain preview, as `capture` decides it: a summary that
-    /// renders replaces stdout, and a lint report replaces both streams.
+    /// What replaced the plain preview: persisted directly by `capture` when
+    /// available, falling back to the legacy summary heuristic for older
+    /// records written before `replaced` and `budget_bytes` existed.
     fn replaced(&self) -> Replaced {
+        match self.replaced.as_deref() {
+            Some("both") => return Replaced::Both,
+            Some("stdout") => return Replaced::Stdout,
+            Some("nothing") => return Replaced::Nothing,
+            _ => {}
+        }
+        if self.budget_bytes.is_some() {
+            return Replaced::Nothing;
+        }
         let summary = &self.summary;
         let renders = !summary.kind.is_empty()
             && (!summary.items.is_empty() || !summary.outcomes.is_empty())
@@ -473,6 +507,8 @@ fn brief(id: &str, directory: &Path, record: &[u8]) -> Option<(String, Brief)> {
             stderr,
             shown: run.preview_bytes,
             replaced,
+            budget: run.budget_bytes,
+            explicit: run.explicit_budget,
         },
     ))
 }
@@ -490,7 +526,7 @@ struct Index {
 }
 
 const INDEX: &str = "budget-runs.json";
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 
 /// Briefs by budget key, newest first. An unfinished run is skipped until its
 /// record exists, and a damaged record silently: this runs before every command,
@@ -841,9 +877,43 @@ fn forget_baselines(workspace: &Workspace, key: &str) -> Result<()> {
     Ok(())
 }
 
+struct Advised {
+    state: PathBuf,
+    args: Vec<OsString>,
+    budget: usize,
+}
+
+thread_local! {
+    static LAST_ADVISED: RefCell<Option<Advised>> = const { RefCell::new(None) };
+}
+
+/// Returns `true` when `preview_budget` just chose `budget` for this workspace
+/// and command on this thread, consuming the handoff. Callers that passed an
+/// explicit budget (such as `run --max-bytes`) bypass `preview_budget` and get
+/// `false`.
+pub(crate) fn take_advised(workspace: &Workspace, args: &[OsString], budget: usize) -> bool {
+    LAST_ADVISED.with(|cell| {
+        cell.borrow_mut().take().is_some_and(|advised| {
+            advised.state == workspace.state && advised.args == args && advised.budget == budget
+        })
+    })
+}
+
 /// The preview budget for a `run` without `--max-bytes`. A settings error stops
 /// the run as before. Any other failure falls back to the saved budget.
 pub fn preview_budget(workspace: &Workspace, args: &[OsString]) -> Result<usize> {
+    let budget = preview_budget_inner(workspace, args)?;
+    LAST_ADVISED.with(|cell| {
+        *cell.borrow_mut() = Some(Advised {
+            state: workspace.state.clone(),
+            args: args.to_vec(),
+            budget,
+        });
+    });
+    Ok(budget)
+}
+
+fn preview_budget_inner(workspace: &Workspace, args: &[OsString]) -> Result<usize> {
     let settings = workspace.settings()?;
     let limits = Limits::new(&settings);
     if !settings.adaptive_previews {
@@ -1027,6 +1097,8 @@ mod tests {
             stderr: 0,
             shown,
             replaced: Replaced::Nothing,
+            budget: None,
+            explicit: false,
         }
     }
 
@@ -1316,5 +1388,244 @@ mod tests {
         // A deleted run makes the caller rebuild the cache.
         fs::remove_dir_all(runs.join("run-small")).unwrap();
         assert!(refresh(runs, index).is_none());
+    }
+
+    #[test]
+    fn well_compacted_views_and_stderr_tests_count_accurately() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runs = temporary.path();
+        let write_run = |id: &str,
+                         family: &str,
+                         label: &str,
+                         stdout_len: usize,
+                         stderr_len: usize,
+                         preview_bytes: usize,
+                         replaced: Option<&str>,
+                         budget_bytes: Option<usize>,
+                         explicit_budget: bool,
+                         summary: serde_json::Value| {
+            let dir = runs.join(id);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("stdout"), "o".repeat(stdout_len)).unwrap();
+            fs::write(dir.join("stderr"), "e".repeat(stderr_len)).unwrap();
+            let mut rec = serde_json::json!({
+                "id": id,
+                "status": 0,
+                "raw_bytes": stdout_len + stderr_len,
+                "preview_bytes": preview_bytes,
+                "completed_ms": 1_000_000,
+                "family": family,
+                "label": label,
+                "summary": summary,
+            });
+            if let Some(r) = replaced {
+                rec["replaced"] = serde_json::json!(r);
+            }
+            if let Some(b) = budget_bytes {
+                rec["budget_bytes"] = serde_json::json!(b);
+            }
+            if explicit_budget {
+                rec["explicit_budget"] = serde_json::json!(true);
+            }
+            let bytes = rec.to_string().into_bytes();
+            brief(id, &dir, &bytes).expect("expected brief")
+        };
+
+        // 1. Compact logview (replaced="both", small preview vs large stdout+stderr)
+        let (_, log_compact) = write_run(
+            "run-log1",
+            "docker logs",
+            "docker logs",
+            40_000,
+            8_000,
+            550,
+            Some("both"),
+            Some(4096),
+            false,
+            serde_json::json!({}),
+        );
+        assert_eq!(log_compact.replaced, Replaced::Both);
+        assert!(log_compact.made_at(4096));
+        assert!(!log_compact.made_at(8192));
+        assert_eq!(log_compact.limited(4096, 4096), [false, false]);
+
+        // 2. Budget-filling logview counts as clipped and raises when reopened
+        let (_, log_filled) = write_run(
+            "run-log2",
+            "docker logs",
+            "docker logs",
+            40_000,
+            8_000,
+            2_800,
+            Some("both"),
+            Some(4096),
+            false,
+            serde_json::json!({}),
+        );
+        assert!(log_filled.made_at(4096));
+        assert_eq!(log_filled.limited(4096, 4096), [true, true]);
+        let log_sample: Vec<_> = (0..6)
+            .map(|i| Brief {
+                id: format!("run-{i}"),
+                completed_ms: 1_000_000 - i as u64,
+                ..log_filled.clone()
+            })
+            .collect();
+        assert_eq!(
+            decide(LIMITS, 0, WINDOW, &log_sample, first(2)).step,
+            Step::Raise
+        );
+
+        // 3. Well-compacted gitview, extra_inventory_view, json_view (replaced="stdout")
+        for (id, family, label, shown) in [
+            ("run-git", "git", "git log", 700),
+            ("run-inv", "other", "kubectl get", 600),
+            ("run-json", "other", "gh api", 800),
+        ] {
+            let (_, b) = write_run(
+                id,
+                family,
+                label,
+                35_000,
+                0,
+                shown,
+                Some("stdout"),
+                Some(4096),
+                false,
+                serde_json::json!({}),
+            );
+            assert_eq!(b.replaced, Replaced::Stdout, "{id}");
+            assert!(b.made_at(4096), "{id} should not be dropped");
+            assert_eq!(b.limited(4096, 4096), [false, false], "{id}");
+        }
+
+        // 4. Clean build / lint line (replaced="both", tiny preview vs large stderr)
+        let (_, clean_build) = write_run(
+            "run-clean",
+            "cargo clippy",
+            "cargo clippy",
+            0,
+            18_000,
+            72,
+            Some("both"),
+            Some(4096),
+            false,
+            serde_json::json!({}),
+        );
+        assert_eq!(clean_build.replaced, Replaced::Both);
+        assert!(clean_build.made_at(4096));
+        assert_eq!(clean_build.limited(4096, 4096), [false, false]);
+
+        // 5. Stderr-heavy jest/vitest/bun test run where summary covers stderr (replaced="both")
+        let (_, jest_compact) = write_run(
+            "run-jest1",
+            "jest",
+            "jest",
+            0,
+            30_000,
+            480,
+            Some("both"),
+            Some(4096),
+            false,
+            serde_json::json!({"kind": "tests", "outcomes": ["10 passed"]}),
+        );
+        assert_eq!(jest_compact.replaced, Replaced::Both);
+        assert!(jest_compact.made_at(4096));
+        assert_eq!(jest_compact.limited(4096, 4096), [false, false]);
+        // Reopening compact jest summaries counts as uncounted, NOT clipped.
+        let jest_sample: Vec<_> = (0..6)
+            .map(|i| Brief {
+                id: format!("run-{i}"),
+                completed_ms: 1_000_000 - i as u64,
+                ..jest_compact.clone()
+            })
+            .collect();
+        let d = decide(LIMITS, 0, WINDOW, &jest_sample, |_: &Brief| [false, true]);
+        assert_eq!((d.step, d.clipped, d.uncounted), (Step::Hold, 0, 6));
+
+        // Budget-filling stderr-heavy jest summary counts stderr as limited.
+        let (_, jest_filled) = write_run(
+            "run-jest2",
+            "jest",
+            "jest",
+            0,
+            30_000,
+            2_400,
+            Some("both"),
+            Some(4096),
+            false,
+            serde_json::json!({"kind": "tests", "outcomes": ["10 failed"]}),
+        );
+        assert!(jest_filled.made_at(4096));
+        assert_eq!(jest_filled.limited(4096, 4096), [false, true]);
+
+        // 6. Newer record with budget_bytes and NO replaced keeps Replaced::Nothing
+        //    even if summary is populated (e.g., plain preview was smaller than summary).
+        let (_, unreplaced) = write_run(
+            "run-plain-new",
+            "cargo test",
+            "cargo test",
+            2_000,
+            0,
+            2_000,
+            None,
+            Some(4096),
+            false,
+            serde_json::json!({"kind": "tests", "outcomes": ["3 passed"]}),
+        );
+        assert_eq!(unreplaced.replaced, Replaced::Nothing);
+
+        // 7. Legacy record without budget_bytes or replaced still uses summary heuristic.
+        let (_, legacy) = write_run(
+            "run-legacy",
+            "cargo test",
+            "cargo test",
+            20_000,
+            0,
+            500,
+            None,
+            None,
+            false,
+            serde_json::json!({"kind": "tests", "outcomes": ["3 passed"]}),
+        );
+        assert_eq!(legacy.replaced, Replaced::Stdout);
+        assert!(legacy.made_at(4096));
+    }
+
+    #[test]
+    fn explicit_budget_runs_near_adaptive_budget_are_excluded() {
+        // Explicit --max-bytes runs anywhere around [0.5x, 2x] of 4096 (including
+        // an exact match at 4096!) must never count toward raises or lowerings.
+        for explicit_bytes in [2048u64, 3000, 3500, 4096, 5500, 8192] {
+            let run = Brief {
+                id: "run-0".into(),
+                completed_ms: 1_000_000,
+                stdout: 40_000,
+                stderr: 0,
+                shown: explicit_bytes / 2,
+                replaced: Replaced::Nothing,
+                budget: Some(explicit_bytes),
+                explicit: true,
+            };
+            assert!(
+                !run.made_at(4096),
+                "explicit --max-bytes {explicit_bytes} must not count at 4096"
+            );
+            let sample: Vec<_> = (0..20)
+                .map(|i| Brief {
+                    id: format!("run-{i}"),
+                    completed_ms: 1_000_000 - i as u64,
+                    ..run.clone()
+                })
+                .collect();
+            let clean = decide(LIMITS, 0, WINDOW, &sample, first(0));
+            assert_eq!((clean.step, clean.clipped, clean.over), (Step::Hold, 0, 0));
+            let reopened = decide(LIMITS, 0, WINDOW, &sample, first(20));
+            assert_eq!(
+                (reopened.step, reopened.clipped, reopened.reopened),
+                (Step::Hold, 0, 0)
+            );
+        }
+        assert_eq!(INDEX_VERSION, 3);
     }
 }

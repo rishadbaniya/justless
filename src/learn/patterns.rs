@@ -20,7 +20,7 @@ use super::privacy;
 /// A correction must follow within this many events of the thread and this long.
 const WINDOW_EVENTS: usize = 6;
 const WINDOW_MS: u64 = 15 * 60 * 1000;
-const MANAGERS: [&str; 3] = ["npm", "pnpm", "yarn"];
+const MANAGERS: [&str; 4] = ["npm", "pnpm", "yarn", "bun"];
 // GNU make reads GNUmakefile, makefile, then Makefile. Makefile comes before makefile
 // here so a case-insensitive file system reports the usual spelling.
 const MAKEFILES: [&str; 3] = ["GNUmakefile", "Makefile", "makefile"];
@@ -333,6 +333,7 @@ enum Hit {
     NoCargoToml,
     NoPackageJson,
     NoPyproject,
+    NoGoMod,
     CargoPackage(String),
     CargoTarget(&'static str, String),
     NoSuchCommand(String),
@@ -351,6 +352,7 @@ impl Hit {
             Self::NoCargoToml => Some("Cargo.toml"),
             Self::NoPackageJson => Some("package.json"),
             Self::NoPyproject => Some("pyproject.toml"),
+            Self::NoGoMod => Some("go.mod"),
             _ => None,
         }
     }
@@ -362,11 +364,12 @@ struct Signatures {
     no_cargo_toml: Regex,
     npm_enoent: Regex,
     no_pyproject: Regex,
+    no_go_mod: Regex,
     cargo_package: Regex,
     cargo_target: Regex,
     cargo_command: Regex,
     git_command: Regex,
-    missing_script: Regex,
+    missing_script: Vec<Regex>,
     options: Vec<Regex>,
     git_option: Regex,
     getopt: Regex,
@@ -392,14 +395,30 @@ static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
         no_pyproject: re(
             r"(?m)No `pyproject\.toml` found in current directory or any parent directory",
         ),
+        // go [here]: `go: go.mod file not found in current directory or any parent directory; see 'go help modules'`,
+        // and `go test ./...` / `go build ./...` outside a module:
+        // `pattern ./...: directory prefix . does not contain main module or its selected dependencies`
+        no_go_mod: re(
+            r"(?m)(?:go\.mod file not found in current directory or any parent directory|directory prefix \. does not contain main module or its selected dependencies)",
+        ),
         // cargo [here]
         cargo_package: re(r"(?m)package ID specification `([^`]+)` did not match any packages"),
         cargo_target: re(r"(?m)no (bin|test|example|bench) target named `([^`]+)`"),
         cargo_command: re(r"(?m)no such command: `([^`]+)`"),
         // git [here]
         git_command: re(r"(?m)git: '([^']+)' is not a git command"),
-        // npm [here; also in the local npm install's source]
-        missing_script: re(r#"(?m)Missing script: "?([^"\s]+)"?"#),
+        missing_script: vec![
+            // npm & pnpm [here]: `npm error Missing script: "test"`,
+            // `ERR_PNPM_NO_SCRIPT  Missing script: nope`
+            re(r#"(?m)Missing script: "?([^"\s]+)"?"#),
+            // yarn v1 & pnpm [here]: `error Command "nope" not found.`,
+            // `ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL  Command "nope" not found`
+            re(r#"(?m)Command "([^"\s]+)" not found\.?"#),
+            // yarn berry [source]: `Usage Error: Couldn't find a script named "nope".`
+            re(r#"(?m)Couldn't find a script named "([^"\s]+)""#),
+            // bun [source]: `error: Script not found "nope"`
+            re(r#"(?m)Script not found "([^"\s]+)""#),
+        ],
         options: vec![
             // clap 4 [here]
             re(r"(?m)unexpected argument '([^']+)' found"),
@@ -426,7 +445,7 @@ static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
         // npm [here; also in the local npm install's source]
         workspace: re(r#"(?m)Unsupported URL Type "workspace:""#),
         // corepack [source: the message template in the local corepack install]
-        corepack: re(r"(?m)This project is configured to use (npm|pnpm|yarn) because"),
+        corepack: re(r"(?m)This project is configured to use (npm|pnpm|yarn|bun) because"),
     }
 });
 
@@ -444,11 +463,14 @@ static SIGNALS: LazyLock<Regex> = LazyLock::new(|| {
         "Cargo.toml",
         "ENOENT",
         "pyproject.toml",
+        "go.mod",
+        "does not contain main module",
         "did not match any packages",
         "target named",
         "no such command",
         "is not a git command",
         "Missing script",
+        "Couldn't find a script named",
         "unexpected argument",
         "which wasn't expected",
         "unrecognized argument",
@@ -493,6 +515,9 @@ fn hits(text: &str) -> Vec<Hit> {
     if s.no_pyproject.is_match(text) {
         add(Hit::NoPyproject);
     }
+    if s.no_go_mod.is_match(text) {
+        add(Hit::NoGoMod);
+    }
     for captures in s.cargo_package.captures_iter(text) {
         add(Hit::CargoPackage(captures[1].to_owned()));
     }
@@ -512,8 +537,10 @@ fn hits(text: &str) -> Vec<Hit> {
     {
         add(Hit::NoSuchCommand(captures[1].to_owned()));
     }
-    for captures in s.missing_script.captures_iter(text) {
-        add(Hit::MissingScript(captures[1].to_owned()));
+    for pattern in &s.missing_script {
+        for captures in pattern.captures_iter(text) {
+            add(Hit::MissingScript(captures[1].to_owned()));
+        }
     }
     for pattern in &s.options {
         for captures in pattern.captures_iter(text) {
@@ -1048,9 +1075,11 @@ fn find<'e>(
 
 fn pair(hit: &Hit, event: &Event, f: &Cmd, code: i32, g: &Cmd) -> Option<Outcome> {
     match hit {
-        Hit::NoMakefile | Hit::NoCargoToml | Hit::NoPackageJson | Hit::NoPyproject => {
-            wrong_directory(hit, f, g)
-        }
+        Hit::NoMakefile
+        | Hit::NoCargoToml
+        | Hit::NoPackageJson
+        | Hit::NoPyproject
+        | Hit::NoGoMod => wrong_directory(hit, f, g),
         Hit::NoRule(_) => wrong_directory(hit, f, g).or_else(|| unknown_target(hit, f, g)),
         Hit::CargoPackage(_)
         | Hit::CargoTarget(..)
@@ -1091,9 +1120,57 @@ fn wrong_directory(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
     })
 }
 
+/// Split a package-manager script invocation (`npm run X ...`, `npm test ...`,
+/// or `pnpm|yarn|bun [run] X ...`) into `(manager, script, trailing_args)`.
+fn script_invocation(argv: &[String]) -> Option<(&str, &str, &[String])> {
+    let manager = basename(argv.first()?.as_str());
+    if !MANAGERS.contains(&manager) {
+        return None;
+    }
+    match argv.get(1).map(String::as_str) {
+        Some("run") => {
+            let script = argv.get(2)?.as_str();
+            (!script.is_empty() && !script.starts_with('-')).then(|| (manager, script, &argv[3..]))
+        }
+        Some(word) if manager == "npm" => matches!(word, "test" | "start" | "stop" | "restart")
+            .then(|| (manager, word, &argv[2..])),
+        Some(word) if !word.is_empty() && !word.starts_with('-') => {
+            Some((manager, word, &argv[2..]))
+        }
+        _ => None,
+    }
+}
+
+fn missing_script(name: &str, f: &Cmd, g: &Cmd) -> Option<Outcome> {
+    let (f_mgr, x, f_tail) = script_invocation(&f.argv)?;
+    let (g_mgr, y, g_tail) = script_invocation(&g.argv)?;
+    if f_mgr != g_mgr || x != name || y == x || f_tail != g_tail {
+        return None;
+    }
+    Some(Outcome {
+        class: Class::UnknownTarget,
+        typo: typo(x, y),
+        key: vec![
+            ("kind", "script".to_owned()),
+            ("stem", format!("{f_mgr} run")),
+            ("name", x.to_owned()),
+            ("replacement", y.to_owned()),
+        ],
+        context: vec![("dir", g.dir.clone())],
+        wrong: Wrong::Command {
+            dir: f.dir.clone(),
+            argv: canonical(&f.argv),
+        },
+        nested: false,
+    })
+}
+
 fn unknown_target(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
     if !f.same_place(g) {
         return None;
+    }
+    if let Hit::MissingScript(name) = hit {
+        return missing_script(name, f, g);
     }
     let (before, after) = (canonical(&f.argv), canonical(&g.argv));
     let (index, wrong, right) = replaced(&before, &after)?;
@@ -1139,20 +1216,6 @@ fn unknown_target(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
             (
                 "subcommand",
                 program.to_owned(),
-                wrong.clone(),
-                right.clone(),
-                vec![],
-            )
-        }
-        Hit::MissingScript(name)
-            if program == "npm"
-                && before.get(1).is_some_and(|word| word == "run")
-                && index == 2
-                && wrong == *name =>
-        {
-            (
-                "script",
-                "npm run".to_owned(),
                 wrong.clone(),
                 right.clone(),
                 vec![],
@@ -1962,10 +2025,14 @@ pub fn check(root: &Path, env: &Env, class: Class, slots: &BTreeMap<String, Stri
         }
         Class::WrongPackageManager => {
             let (wrong, right) = (get("from"), get("to"));
-            let lockfile = |manager: &str| match manager {
-                "npm" => "package-lock.json",
-                "pnpm" => "pnpm-lock.yaml",
-                _ => "yarn.lock",
+            let lockfiles = |manager: &str| -> &'static [&'static str] {
+                match manager {
+                    "npm" => &["package-lock.json"],
+                    "pnpm" => &["pnpm-lock.yaml"],
+                    "yarn" => &["yarn.lock"],
+                    "bun" => &["bun.lock", "bun.lockb"],
+                    _ => &[],
+                }
             };
             let mut dir = get("dir").to_owned();
             loop {
@@ -1981,11 +2048,17 @@ pub fn check(root: &Path, env: &Env, class: Class, slots: &BTreeMap<String, Stri
                 if configured.as_deref() == Some(wrong) {
                     return Check::Stale(format!("package.json names {wrong}"));
                 }
-                if at(&dir).join(lockfile(wrong)).is_file() {
-                    return Check::Stale(format!("{} exists", joined(&dir, lockfile(wrong))));
+                if let Some(lock) = lockfiles(wrong)
+                    .iter()
+                    .find(|lock| at(&dir).join(lock).is_file())
+                {
+                    return Check::Stale(format!("{} exists", joined(&dir, lock)));
                 }
-                if at(&dir).join(lockfile(right)).is_file() {
-                    return Check::Verified(joined(&dir, lockfile(right)));
+                if let Some(lock) = lockfiles(right)
+                    .iter()
+                    .find(|lock| at(&dir).join(lock).is_file())
+                {
+                    return Check::Verified(joined(&dir, lock));
                 }
                 if dir.is_empty() {
                     return Check::Unverified;
@@ -2140,7 +2213,7 @@ pub fn render(class: Class, slots: &BTreeMap<String, String>, check: &Check) -> 
                     safe(&[flag, kind]).then_some(())?;
                     format!("Use `{stem} {flag} {y}`; there is no {kind} target `{x}`.")
                 }
-                "script" => format!("Run `npm run {y}`; there is no `{x}` script."),
+                "script" => format!("Run `{stem} {y}`; there is no `{x}` script."),
                 "make" => format!("Run `make {y}`; there is no `{x}` target."),
                 _ => format!("Use `{stem} {y}`, not `{stem} {x}`; `{stem} {x}` is not available here."),
             }
@@ -2237,6 +2310,7 @@ pub fn example(
                 "Makefile" => "make: no makefile",
                 "Cargo.toml" => "cargo: no Cargo.toml",
                 "package.json" => "npm: no package.json",
+                "go.mod" => "go: no go.mod",
                 _ => "uv: no pyproject.toml",
             };
             (wrong, format!("{command}{}", within(get("to"))), signal)
@@ -2257,11 +2331,15 @@ pub fn example(
                         signal,
                     )
                 }
-                "script" => (
-                    format!("npm run {x}"),
-                    format!("npm run {y}"),
-                    "npm: missing script",
-                ),
+                "script" => {
+                    let signal = match stem.split(' ').next().unwrap_or("npm") {
+                        "pnpm" => "pnpm: missing script",
+                        "yarn" => "yarn: missing script",
+                        "bun" => "bun: missing script",
+                        _ => "npm: missing script",
+                    };
+                    (format!("{stem} {x}"), format!("{stem} {y}"), signal)
+                }
                 "make" => (
                     format!("make {x}"),
                     format!("make {y}"),
@@ -2403,6 +2481,14 @@ mod tests {
                 Hit::NoPyproject,
             ),
             (
+                "go: go.mod file not found in current directory or any parent directory; see 'go help modules'",
+                Hit::NoGoMod,
+            ),
+            (
+                "pattern ./...: directory prefix . does not contain main module or its selected dependencies",
+                Hit::NoGoMod,
+            ),
+            (
                 "error: package ID specification `core` did not match any packages",
                 Hit::CargoPackage("core".into()),
             ),
@@ -2421,6 +2507,26 @@ mod tests {
             (
                 "npm error Missing script: \"test\"",
                 Hit::MissingScript("test".into()),
+            ),
+            (
+                "\u{2009}ERR_PNPM_NO_SCRIPT\u{2009} Missing script: lint",
+                Hit::MissingScript("lint".into()),
+            ),
+            (
+                "\u{2009}ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL\u{2009} Command \"lint\" not found",
+                Hit::MissingScript("lint".into()),
+            ),
+            (
+                "error Command \"lint\" not found.",
+                Hit::MissingScript("lint".into()),
+            ),
+            (
+                "Usage Error: Couldn't find a script named \"lint\".",
+                Hit::MissingScript("lint".into()),
+            ),
+            (
+                "error: Script not found \"lint\"",
+                Hit::MissingScript("lint".into()),
             ),
             (
                 "error: unexpected argument '--nope' found",
@@ -2475,6 +2581,10 @@ mod tests {
             (
                 "Usage Error: This project is configured to use pnpm because /x/package.json has a \"packageManager\" field",
                 Hit::Corepack("pnpm".into()),
+            ),
+            (
+                "Usage Error: This project is configured to use bun because /x/package.json has a \"packageManager\" field",
+                Hit::Corepack("bun".into()),
             ),
         ];
         for (line, expected) in cases {
@@ -2543,5 +2653,210 @@ mod tests {
         assert_eq!(glob_example("--include=*.zz").1, "--include='*.zz'");
         assert_eq!(glob_example("*.py").1, "'*.py'");
         assert_eq!(glob_example("src/**/x").1, "'*.txt'");
+    }
+
+    #[test]
+    fn learns_pnpm_yarn_bun_missing_scripts_bun_manager_and_go_mod_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"check":"echo ok"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::write(root.join("backend/go.mod"), "module example.com/backend\n").unwrap();
+        std::fs::write(root.join("bun.lock"), "{}\n").unwrap();
+
+        let make_event =
+            |thread: &str, time_ms: u64, dir_rel: &str, argv: &[&str], code: i32, body: &str| {
+                let raw = argv.join(" ");
+                let cmd = Cmd {
+                    checkout: String::new(),
+                    dir: dir_rel.to_owned(),
+                    argv: argv.iter().map(|s| (*s).to_owned()).collect(),
+                    masked: false,
+                };
+                Event {
+                    thread: thread.to_owned(),
+                    session: thread.to_owned(),
+                    transcript: false,
+                    codex: false,
+                    time_ms,
+                    raw,
+                    env: Vec::new(),
+                    shape: events::Shape::Simple(cmd),
+                    status: Status::Code(code),
+                    texts: vec![events::Text {
+                        run: Some(format!("run-{time_ms}")),
+                        stream: "stderr",
+                        body: body.to_owned(),
+                    }],
+                    tests: events::Tests::default(),
+                    failure_bytes: body.len() as u64,
+                    pointer: Pointer::Run {
+                        id: format!("run-{time_ms}"),
+                        stream: "stderr",
+                    },
+                }
+            };
+
+        let events = vec![
+            // pnpm missing script (without `run`, paired with `pnpm run check`)
+            make_event(
+                "s1",
+                1_000,
+                "",
+                &["pnpm", "lint"],
+                1,
+                "\u{2009}ERR_PNPM_NO_SCRIPT\u{2009} Missing script: lint\n\nCommand \"lint\" not found.\n",
+            ),
+            make_event("s1", 2_000, "", &["pnpm", "run", "check"], 0, "ok\n"),
+            // yarn v1 missing script
+            make_event(
+                "s2",
+                3_000,
+                "",
+                &["yarn", "lint"],
+                1,
+                "error Command \"lint\" not found.\n",
+            ),
+            make_event("s2", 4_000, "", &["yarn", "check"], 0, "ok\n"),
+            // yarn berry missing script (different script name to keep distinct candidate)
+            make_event(
+                "s3",
+                5_000,
+                "",
+                &["yarn", "run", "format"],
+                1,
+                "Usage Error: Couldn't find a script named \"format\".\n",
+            ),
+            make_event("s3", 6_000, "", &["yarn", "run", "check"], 0, "ok\n"),
+            // bun missing script
+            make_event(
+                "s4",
+                7_000,
+                "",
+                &["bun", "run", "lint"],
+                1,
+                "error: Script not found \"lint\"\n",
+            ),
+            make_event("s4", 8_000, "", &["bun", "run", "check"], 0, "ok\n"),
+            // WrongPackageManager: npm -> bun via workspace protocol
+            make_event(
+                "s5",
+                9_000,
+                "",
+                &["npm", "install"],
+                1,
+                "npm error Unsupported URL Type \"workspace:\": workspace:*\n",
+            ),
+            make_event("s5", 10_000, "", &["bun", "install"], 0, "done\n"),
+            // WrongDirectory: go.mod missing at root, succeeds in backend/
+            make_event(
+                "s6",
+                11_000,
+                "",
+                &["go", "test", "./..."],
+                1,
+                "go: go.mod file not found in current directory or any parent directory; see 'go help modules'\n",
+            ),
+            make_event("s6", 12_000, "backend", &["go", "test", "./..."], 0, "ok\n"),
+        ];
+
+        let analysis = analyze(root, &events);
+        let env = Env {
+            path: None,
+            shell: None,
+        };
+        let rendered: Vec<_> = analysis
+            .candidates
+            .iter()
+            .map(|c| {
+                let chk = check(root, &env, c.class, &c.slots);
+                let text = render(c.class, &c.slots, &chk).expect("renderable");
+                let ex = example(c.class, &c.slots);
+                (c.class, chk, text, ex)
+            })
+            .collect();
+
+        assert!(
+            rendered.iter().any(|(class, chk, text, ex)| {
+                *class == Class::UnknownTarget
+                    && *chk == Check::Verified("package.json scripts".into())
+                    && text == "Run `pnpm run check`; there is no `lint` script."
+                    && ex.as_ref().map(|e| e.2) == Some("pnpm: missing script")
+            }),
+            "missing pnpm script rule: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|(class, chk, text, ex)| {
+                *class == Class::UnknownTarget
+                    && *chk == Check::Verified("package.json scripts".into())
+                    && text == "Run `yarn run check`; there is no `lint` script."
+                    && ex.as_ref().map(|e| e.2) == Some("yarn: missing script")
+            }),
+            "missing yarn v1 script rule: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|(class, chk, text, ex)| {
+                *class == Class::UnknownTarget
+                    && *chk == Check::Verified("package.json scripts".into())
+                    && text == "Run `yarn run check`; there is no `format` script."
+                    && ex.as_ref().map(|e| e.2) == Some("yarn: missing script")
+            }),
+            "missing yarn berry script rule: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|(class, chk, text, ex)| {
+                *class == Class::UnknownTarget
+                    && *chk == Check::Verified("package.json scripts".into())
+                    && text == "Run `bun run check`; there is no `lint` script."
+                    && ex.as_ref().map(|e| e.2) == Some("bun: missing script")
+            }),
+            "missing bun script rule: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|(class, chk, text, _)| {
+                *class == Class::WrongPackageManager
+                    && *chk == Check::Verified("bun.lock".into())
+                    && text == "Use `bun`, not `npm`; this project has bun.lock."
+            }),
+            "missing bun package manager rule: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|(class, chk, text, ex)| {
+                *class == Class::WrongDirectory
+                    && *chk == Check::Verified("backend/go.mod".into())
+                    && text == "Run `go` from `backend/`; the repository root has no go.mod."
+                    && ex.as_ref().map(|e| e.2) == Some("go: no go.mod")
+            }),
+            "missing go.mod wrong directory rule: {rendered:#?}"
+        );
+
+        // bun.lockb also verifies WrongPackageManager for bun, and a root go.mod
+        // makes the WrongDirectory rule stale.
+        std::fs::remove_file(root.join("bun.lock")).unwrap();
+        std::fs::write(root.join("bun.lockb"), b"bin").unwrap();
+        let bun_candidate = analysis
+            .candidates
+            .iter()
+            .find(|c| c.class == Class::WrongPackageManager)
+            .unwrap();
+        assert_eq!(
+            check(root, &env, bun_candidate.class, &bun_candidate.slots),
+            Check::Verified("bun.lockb".into())
+        );
+
+        std::fs::write(root.join("go.mod"), "module example.com/root\n").unwrap();
+        let go_candidate = analysis
+            .candidates
+            .iter()
+            .find(|c| c.class == Class::WrongDirectory)
+            .unwrap();
+        assert_eq!(
+            check(root, &env, go_candidate.class, &go_candidate.slots),
+            Check::Stale("go.mod exists".into())
+        );
     }
 }
