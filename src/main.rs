@@ -47,6 +47,7 @@ mod postroute;
 mod proxy;
 mod redact;
 mod registry;
+mod review;
 mod rewrite;
 mod rollouts;
 mod runners;
@@ -416,6 +417,7 @@ fn cli() -> Command<'static> {
         .subcommand(map::command())
         .subcommand(statusline::command())
         .subcommand(impact::command())
+        .subcommand(review::command())
         .subcommand(testrun::command())
         .subcommand(mcp::command())
         .subcommand(doctor::command())
@@ -608,6 +610,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         ("rewrite", sub) => rewrite::run(&workspace, sub)?,
         ("map", sub) => map::run(&workspace, sub)?,
         ("affected", sub) => impact::run(&workspace, sub)?,
+        ("review", sub) => review::run(&workspace, sub)?,
         ("lookup", sub) => lookup::run(&workspace, sub)?,
         (name @ ("proxy" | "wrap"), sub) => return proxy::run(&workspace, name, sub),
         ("test", sub) => return testrun::run(&workspace, sub),

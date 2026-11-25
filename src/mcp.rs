@@ -58,6 +58,7 @@ evidence for a task, with links, changes and recent failures. `context` shows so
 location, symbol, Git diff or captured run; repeated `context`/`pack` reads in a session return \
 deltas unless fresh=true. `query` and `path` follow symbols and the links between them. \
 `affected` lists what depends on a symbol, file or the Git changes, and the tests to run. \
+`review` builds a blast-radius PR review pack with risk and coverage gaps. \
 `find` searches literal text. `read` (file or files) with outline=true lists symbols so `expand` \
 or `code` can fetch only the lines you need. `log`, `search`, `history`, `recall` and `resume` \
 reopen captured runs, archived tool outputs and recent activity. File paths are relative to the \
@@ -930,6 +931,17 @@ const TOOLS: &[Tool] = &[
         check: Some(affected_input),
     },
     Tool {
+        name: "review",
+        command: "review",
+        description: "PR blast-radius review pack: risk, callers, test gaps.",
+        params: &[
+            BASE,
+            option("depth", "depth", Kind::Count(1, 5), ""),
+            BUDGET,
+        ],
+        check: None,
+    },
+    Tool {
         name: "log",
         command: "log",
         description: "Captured run output (paged, secrets redacted).",
@@ -1586,10 +1598,10 @@ mod tests {
     #[test]
     fn tools_list_schema_is_valid_and_compact() {
         let defs: Vec<Value> = TOOLS.iter().map(Tool::definition).collect();
-        assert_eq!(defs.len(), 17);
+        assert_eq!(defs.len(), 18);
         let serialized = serde_json::to_string(&defs).unwrap();
         assert!(
-            serialized.len() < 6_000,
+            serialized.len() < 6_200,
             "slimmed tools/list should stay compact, got {} bytes",
             serialized.len()
         );
@@ -1650,6 +1662,12 @@ mod tests {
             by_name("map")["inputSchema"]["properties"]["explain"]["type"],
             "string"
         );
+        let review = &by_name("review")["inputSchema"];
+        assert!(review.get("required").is_none());
+        let rev_props = review["properties"].as_object().unwrap();
+        assert_eq!(rev_props["base"]["type"], "string");
+        assert_eq!(rev_props["depth"]["type"], "integer");
+        assert_eq!(rev_props["budget"]["type"], "integer");
     }
 
     #[test]
@@ -1715,6 +1733,15 @@ mod tests {
                 .unwrap(),
             ["map", "--explain=would_route", "--budget=1200"]
         );
+        assert_eq!(
+            tool("review")
+                .argv(&map(json!({"base": "main", "depth": 3, "budget": 2048})))
+                .unwrap(),
+            ["review", "--base=main", "--depth=3", "--budget=2048"]
+        );
+        assert_eq!(tool("review").argv(&map(json!({}))).unwrap(), ["review"]);
+        assert!(tool("review").argv(&map(json!({"depth": 0}))).is_err());
+        assert!(tool("review").argv(&map(json!({"depth": 6}))).is_err());
 
         // Recall filters and list
         assert_eq!(

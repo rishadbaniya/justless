@@ -140,6 +140,7 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
         ["base-target", "affected", {"target": "purchase_orders", "base": "main"}],
         // Only `--base` needs a Git repository, so this error shows it was passed.
         ["base", "affected", {"changes": true, "base": "main"}],
+        ["review-nogit", "review", {"base": "main", "depth": 2}],
         ["run-id", "log", {"run_id": "../../etc"}],
         ["mutating", "run", {"command": ["true"]}]
     ]);
@@ -205,7 +206,7 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
         names,
         BTreeSet::from([
             "affected", "code", "context", "expand", "find", "history", "log", "lookup", "map",
-            "pack", "path", "query", "read", "recall", "resume", "search", "stats",
+            "pack", "path", "query", "read", "recall", "resume", "review", "search", "stats",
         ])
     );
     // The tool list rides along with every model request, so keep it compact.
@@ -275,6 +276,7 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
         ("base-target", "`base` requires `changes: true`"),
         ("base-staged", "`staged` or `base`, not both"),
         ("base", "--base needs a Git repository"),
+        ("review-nogit", "--base needs a Git repository"),
         ("run-id", "run ID"),
     ] {
         has(&failed(by_id(&responses, id)), error);
@@ -333,7 +335,7 @@ fn stateless_requests_declare_their_version() {
 
     let list = &by_id(&responses, "list")["result"];
     assert_eq!(list["resultType"], "complete");
-    assert_eq!(list["tools"].as_array().unwrap().len(), 17);
+    assert_eq!(list["tools"].as_array().unwrap().len(), 18);
     assert!(list["ttlMs"].is_u64());
 
     let call = by_id(&responses, "call");
