@@ -296,3 +296,87 @@ fn a_clean_build_is_one_line_and_anything_else_keeps_its_lines() {
     has(&shown, "warning rustdoc::broken_intra_doc_links ×2");
     has(&shown, "src/lib.rs:3:10, src/parse.rs:12:10");
 }
+
+#[cfg(unix)]
+#[test]
+fn cargo_nextest_run_compacts_stderr_passes_and_keeps_failures_with_pointers() {
+    let sandbox = Sandbox::new();
+    let empty = sandbox.file("empty", "");
+
+    // Passing unmerged `cargo nextest run` writes hundreds of `PASS [...]` lines to stderr.
+    let mut pass_err = String::from(
+        "   Compiling demo v0.1.0 (/work/demo)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s\n    Starting 60 tests across 1 binary\n",
+    );
+    for i in 0..60 {
+        pass_err.push_str(&format!(
+            "        PASS [   0.004s] demo::unit test_{i:03}\n"
+        ));
+    }
+    pass_err
+        .push_str("------------\n     Summary [   0.310s] 60 tests run: 60 passed, 0 skipped\n");
+    let pass_file = sandbox.file("nextest_pass.err", &pass_err);
+    let output = sandbox.justless(
+        &["run", "--hook", "--", "cargo", "nextest", "run"],
+        (&empty, &pass_file),
+        0,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let shown = text(&output.stdout);
+    has(
+        &shown,
+        "Summary [   0.310s] 60 tests run: 60 passed, 0 skipped\n",
+    );
+    has(&shown, "stderr: 2 cargo status line(s) [stderr:1-2]\n");
+    has(
+        &shown,
+        "stderr: 62 nextest pass/status line(s) [stderr:3-64]\n",
+    );
+    assert!(
+        shown.len() * 5 < pass_err.len(),
+        "expected >80% reduction: {shown}"
+    );
+
+    // Failing unmerged `cargo nextest run` keeps failures, panic messages, and `[stderr:...]` pointers.
+    let mut fail_err = String::from("    Starting 40 tests across 1 binary\n");
+    for i in 0..39 {
+        fail_err.push_str(&format!(
+            "        PASS [   0.004s] demo::unit test_{i:03}\n"
+        ));
+    }
+    fail_err.push_str(concat!(
+        "        FAIL [   0.015s] demo::unit test_broken\n",
+        "--- STDERR:              demo::unit test_broken ---\n",
+        "thread 'test_broken' panicked at src/lib.rs:99:5:\n",
+        "assertion `left == right` failed\n",
+        "  left: 42\n",
+        " right: 0\n",
+        "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        "------------\n",
+        "     Summary [   0.520s] 40 tests run: 39 passed, 1 failed, 0 skipped\n",
+        "        FAIL [   0.015s] demo::unit test_broken\n",
+    ));
+    let fail_file = sandbox.file("nextest_fail.err", &fail_err);
+    let output = sandbox.justless(
+        &["run", "--hook", "--fresh", "--", "cargo", "nextest", "run"],
+        (&empty, &fail_file),
+        100,
+    );
+    assert_eq!(output.status.code(), Some(100));
+    let shown = text(&output.stdout);
+    has(&shown, "1 reported failing test(s)\n");
+    has(&shown, "FAIL demo::unit test_broken [stderr:43-46]\n");
+    has(
+        &shown,
+        "  thread 'test_broken' panicked at src/lib.rs:99:5:\n",
+    );
+    has(&shown, "  left: 42\n  right: 0\n");
+    has(
+        &shown,
+        "Summary [   0.520s] 40 tests run: 39 passed, 1 failed, 0 skipped\n",
+    );
+    assert!(!shown.contains("test_000"), "{shown}");
+    assert!(
+        shown.len() * 3 < fail_err.len(),
+        "expected >66% reduction: {shown}"
+    );
+}

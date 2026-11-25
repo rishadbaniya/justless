@@ -1,12 +1,13 @@
-//! Dependency changes in a `Cargo.lock` patch.
+//! Dependency changes in lockfile patches (`Cargo.lock`, `package-lock.json`,
+//! `uv.lock`, and `go.sum`).
 //!
 //! A lockfile hunk says where lines changed, not which packages did. For each
-//! `Cargo.lock` section of a `git diff` or `git show`, both revisions are read by
-//! the blob ids on its `index OLD..NEW` line, and the section is described as
-//! packages added, removed and updated and dependency links changed. A `source` or
-//! `checksum` that changed on a version present in both revisions, or a source added
-//! to or removed from such a version, is flagged on its own line, since that is how a
-//! substituted package looks.
+//! supported lockfile section of a `git diff` or `git show`, both revisions are
+//! read by the blob ids on its `index OLD..NEW` line, and the section is
+//! described as packages added, removed and updated and dependency links changed.
+//! A `source` or `checksum` that changed on a version present in both revisions,
+//! or a source added to or removed from such a version, is flagged on its own
+//! line, since that is how a substituted package looks.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -88,18 +89,41 @@ pub fn applies(words: &[&str]) -> bool {
     matches!(rest.first(), Some(&("diff" | "show")))
 }
 
-/// Describe each `Cargo.lock` section of `patch` whose revisions Git in `cwd` can
-/// read. Line numbers start at 1, as in `justless log`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockFormat {
+    Cargo,
+    Npm,
+    Uv,
+    GoSum,
+}
+
+impl LockFormat {
+    fn of_path(path: &str) -> Option<Self> {
+        match Path::new(path).file_name().and_then(|n| n.to_str())? {
+            "Cargo.lock" => Some(Self::Cargo),
+            "package-lock.json" => Some(Self::Npm),
+            "uv.lock" => Some(Self::Uv),
+            "go.sum" => Some(Self::GoSum),
+            _ => None,
+        }
+    }
+}
+
+/// Describe each supported lockfile section of `patch` whose revisions Git in
+/// `cwd` can read. Line numbers start at 1, as in `justless log`.
 pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
-    if !patch.contains("Cargo.lock") {
+    if !["Cargo.lock", "package-lock.json", "uv.lock", "go.sum"]
+        .iter()
+        .any(|name| patch.contains(name))
+    {
         return Vec::new();
     }
     let mut found = Vec::new();
-    let mut current: Option<(String, usize, usize, Option<String>, bool)> = None;
-    let finish = |section: Option<(String, usize, usize, Option<String>, bool)>,
+    let mut current: Option<(String, LockFormat, usize, usize, Option<String>, bool)> = None;
+    let finish = |section: Option<(String, LockFormat, usize, usize, Option<String>, bool)>,
                   found: &mut Vec<Section>| {
-        if let Some((path, first, last, Some(index), _)) = section
-            && let Some(section) = describe(&path, first, last, &index, cwd)
+        if let Some((path, format, first, last, Some(index), _)) = section
+            && let Some(section) = describe(&path, format, first, last, &index, cwd)
         {
             found.push(section);
         }
@@ -111,15 +135,14 @@ pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
             current = names
                 .rsplit_once(" b/")
                 .map(|(_, path)| path)
-                .filter(|path| {
-                    !path.starts_with('"')
-                        && Path::new(path).file_name().and_then(|n| n.to_str())
-                            == Some("Cargo.lock")
-                })
-                .map(|path| (path.to_owned(), number, number, None, false));
+                .filter(|path| !path.starts_with('"'))
+                .and_then(|path| {
+                    LockFormat::of_path(path)
+                        .map(|format| (path.to_owned(), format, number, number, None, false))
+                });
             continue;
         }
-        let Some((_, _, last, blobs, hunks)) = current.as_mut() else {
+        let Some((_, _, _, last, blobs, hunks)) = current.as_mut() else {
             continue;
         };
         let part = if *hunks {
@@ -143,11 +166,18 @@ pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
     found
 }
 
-fn describe(path: &str, first: usize, last: usize, ids: &str, cwd: &Path) -> Option<Section> {
+fn describe(
+    path: &str,
+    format: LockFormat,
+    first: usize,
+    last: usize,
+    ids: &str,
+    cwd: &Path,
+) -> Option<Section> {
     let (old, new) = ids.split_once("..")?;
     let old = revision(old, None, cwd)?;
     let new = revision(new, Some(path), cwd)?;
-    let changes = compare(&old, &new)?;
+    let changes = compare_format(format, &old, &new)?;
     let (head, body) = changes.render(path, first, last);
     Some(Section {
         path: path.to_owned(),
@@ -225,8 +255,8 @@ struct Changes {
 /// sources, such as the registry and a repository.
 type Key = (String, String, Option<String>);
 
-/// The packages of a lockfile by key, or `None` when one repeats, which Cargo does
-/// not write.
+/// The packages of a `Cargo.lock` by key, or `None` when one repeats, which Cargo
+/// does not write.
 fn packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     if text.is_empty() {
         return Some(BTreeMap::new());
@@ -244,6 +274,245 @@ fn packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         }
     }
     Some(packages)
+}
+
+/// The locked third-party packages of an npm `package-lock.json` (v2/v3 `"packages"`).
+fn npm_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    let entries = root.get("packages")?.as_object()?;
+    let mut packages: BTreeMap<Key, Package> = BTreeMap::new();
+    for (pkg_path, value) in entries {
+        if pkg_path.is_empty()
+            || value.get("link").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some((_, tail)) = pkg_path
+            .strip_prefix("node_modules/")
+            .map(|rest| ("", rest))
+            .or_else(|| pkg_path.rsplit_once("/node_modules/"))
+        else {
+            continue;
+        };
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(tail)
+            .to_owned();
+        let version = value.get("version")?.as_str()?.to_owned();
+        let source = value
+            .get("resolved")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let checksum = value
+            .get("integrity")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let mut deps = BTreeSet::new();
+        for field in ["dependencies", "optionalDependencies"] {
+            if let Some(map) = value.get(field).and_then(serde_json::Value::as_object) {
+                deps.extend(map.keys().cloned());
+            }
+        }
+        let key = (name.clone(), version.clone(), source.clone());
+        match packages.get_mut(&key) {
+            Some(existing) => {
+                if existing.checksum != checksum {
+                    return None;
+                }
+                let mut merged: BTreeSet<String> = existing.dependencies.drain(..).collect();
+                merged.extend(deps);
+                existing.dependencies = merged.into_iter().collect();
+            }
+            None => {
+                packages.insert(
+                    key,
+                    Package {
+                        name,
+                        version,
+                        source,
+                        checksum,
+                        dependencies: deps.into_iter().collect(),
+                    },
+                );
+            }
+        }
+    }
+    Some(packages)
+}
+
+#[derive(Deserialize)]
+struct UvLock {
+    #[serde(default)]
+    package: Vec<UvPackage>,
+}
+
+#[derive(Deserialize)]
+struct UvPackage {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    source: Option<serde_json::Value>,
+    #[serde(default)]
+    dependencies: Vec<UvDep>,
+    #[serde(default)]
+    sdist: Option<UvArtifact>,
+    #[serde(default)]
+    wheels: Vec<UvArtifact>,
+}
+
+#[derive(Deserialize)]
+struct UvDep {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct UvArtifact {
+    #[serde(default)]
+    hash: Option<String>,
+}
+
+fn format_uv_source(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| match v {
+                    serde_json::Value::String(s) => format!("{k}={s}"),
+                    other => format!("{k}={other}"),
+                })
+                .collect();
+            Some(parts.join(", "))
+        }
+        _ => None,
+    }
+}
+
+/// The locked packages of a Python `uv.lock`.
+fn uv_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let lock: UvLock = toml_edit::de::from_str(text).ok()?;
+    let mut packages: BTreeMap<Key, Package> = BTreeMap::new();
+    for pkg in lock.package {
+        let Some(version) = pkg.version.filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let source = pkg.source.as_ref().and_then(format_uv_source);
+        let mut hashes: BTreeSet<String> = BTreeSet::new();
+        if let Some(hash) = pkg.sdist.and_then(|a| a.hash) {
+            hashes.insert(hash);
+        }
+        for wheel in pkg.wheels {
+            if let Some(hash) = wheel.hash {
+                hashes.insert(hash);
+            }
+        }
+        let deps: BTreeSet<String> = pkg.dependencies.into_iter().map(|d| d.name).collect();
+        let key = (pkg.name.clone(), version.clone(), source.clone());
+        match packages.get_mut(&key) {
+            Some(existing) => {
+                let mut merged_hashes: BTreeSet<String> = existing
+                    .checksum
+                    .take()
+                    .map(|c| c.split(", ").map(str::to_owned).collect())
+                    .unwrap_or_default();
+                merged_hashes.extend(hashes);
+                existing.checksum = (!merged_hashes.is_empty())
+                    .then(|| merged_hashes.into_iter().collect::<Vec<_>>().join(", "));
+                let mut merged_deps: BTreeSet<String> = existing.dependencies.drain(..).collect();
+                merged_deps.extend(deps);
+                existing.dependencies = merged_deps.into_iter().collect();
+            }
+            None => {
+                let checksum =
+                    (!hashes.is_empty()).then(|| hashes.into_iter().collect::<Vec<_>>().join(", "));
+                packages.insert(
+                    key,
+                    Package {
+                        name: pkg.name,
+                        version,
+                        source,
+                        checksum,
+                        dependencies: deps.into_iter().collect(),
+                    },
+                );
+            }
+        }
+    }
+    Some(packages)
+}
+
+/// The locked module checksums of a Go `go.sum`.
+fn gosum_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let mut grouped: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(module), Some(raw_version), Some(hash), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return None;
+        };
+        if !hash.contains(':') {
+            return None;
+        }
+        let (version, kind) = match raw_version.strip_suffix("/go.mod") {
+            Some(version) => (version, "go.mod"),
+            None => (raw_version, "zip"),
+        };
+        grouped
+            .entry((module.to_owned(), version.to_owned()))
+            .or_default()
+            .insert(format!("{kind}:{hash}"));
+    }
+    let mut packages = BTreeMap::new();
+    for ((name, version), hashes) in grouped {
+        let checksum = Some(hashes.into_iter().collect::<Vec<_>>().join(", "));
+        packages.insert(
+            (name.clone(), version.clone(), None),
+            Package {
+                name,
+                version,
+                source: None,
+                checksum,
+                dependencies: Vec::new(),
+            },
+        );
+    }
+    Some(packages)
+}
+
+fn parse_format(format: LockFormat, text: &str) -> Option<BTreeMap<Key, Package>> {
+    match format {
+        LockFormat::Cargo => packages(text),
+        LockFormat::Npm => npm_packages(text),
+        LockFormat::Uv => uv_packages(text),
+        LockFormat::GoSum => gosum_packages(text),
+    }
+}
+
+#[cfg(test)]
+fn compare(old: &str, new: &str) -> Option<Changes> {
+    compare_format(LockFormat::Cargo, old, new)
+}
+
+fn compare_format(format: LockFormat, old: &str, new: &str) -> Option<Changes> {
+    let old = parse_format(format, old)?;
+    let new = parse_format(format, new)?;
+    compare_packages(&old, &new)
 }
 
 /// How many sources each name and version is locked from.
@@ -267,16 +536,14 @@ fn links(package: &Package) -> BTreeSet<&str> {
         .collect()
 }
 
-fn compare(old: &str, new: &str) -> Option<Changes> {
-    let old = packages(old)?;
-    let new = packages(new)?;
-    let (before, after) = (versions(&old), versions(&new));
+fn compare_packages(old: &BTreeMap<Key, Package>, new: &BTreeMap<Key, Package>) -> Option<Changes> {
+    let (before, after) = (versions(old), versions(new));
     let mut changes = Changes::default();
     // Packages whose name, version and source the other revision does not lock, by
     // name and version.
     let mut left: BTreeMap<(&str, &str), Vec<&Package>> = BTreeMap::new();
     let mut right: BTreeMap<(&str, &str), Vec<&Package>> = BTreeMap::new();
-    for (key, package) in &old {
+    for (key, package) in old {
         match new.get(key) {
             Some(now) => changes.kept(package, now),
             None => left
@@ -285,7 +552,7 @@ fn compare(old: &str, new: &str) -> Option<Changes> {
                 .push(package),
         }
     }
-    for (key, package) in &new {
+    for (key, package) in new {
         if !old.contains_key(key) {
             right
                 .entry((&package.name, &package.version))
@@ -707,5 +974,132 @@ mod tests {
             "! Cargo.lock: checksum changed on existing version a 1.0.0: x -> y\n\
              ! tool/Cargo.lock: one\n! tool/Cargo.lock: two\n"
         );
+    }
+
+    #[test]
+    fn npm_uv_and_gosum_lockfiles_describe_changes_and_flag_substitutions() {
+        let npm_old = r#"{
+          "name": "app",
+          "lockfileVersion": 3,
+          "packages": {
+            "": { "name": "app", "version": "1.0.0" },
+            "node_modules/react": {
+              "version": "18.2.0",
+              "resolved": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+              "integrity": "sha512-oldreact",
+              "dependencies": { "loose-envify": "^1.1.0" }
+            },
+            "node_modules/loose-envify": {
+              "version": "1.4.0",
+              "resolved": "https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",
+              "integrity": "sha512-aaa"
+            },
+            "node_modules/legacy": {
+              "version": "0.1.0",
+              "resolved": "https://registry.npmjs.org/legacy/-/legacy-0.1.0.tgz",
+              "integrity": "sha512-old"
+            }
+          }
+        }"#;
+        let npm_new = r#"{
+          "name": "app",
+          "lockfileVersion": 3,
+          "packages": {
+            "": { "name": "app", "version": "1.0.0" },
+            "node_modules/react": {
+              "version": "18.3.1",
+              "resolved": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+              "integrity": "sha512-newreact",
+              "dependencies": { "loose-envify": "^1.1.0" }
+            },
+            "node_modules/loose-envify": {
+              "version": "1.4.0",
+              "resolved": "https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",
+              "integrity": "sha512-tampered"
+            },
+            "node_modules/@types/node": {
+              "version": "22.0.0",
+              "resolved": "https://registry.npmjs.org/@types/node/-/node-22.0.0.tgz",
+              "integrity": "sha512-types"
+            }
+          }
+        }"#;
+        let npm = compare_format(LockFormat::Npm, npm_old, npm_new).unwrap();
+        let (head, body) = npm.render("package-lock.json", 1, 200);
+        assert!(head.contains("1 added, 1 removed, 1 updated"), "{head}");
+        assert!(head.contains("1 source or checksum change(s)"), "{head}");
+        assert!(body.contains("added: @types/node 22.0.0"), "{body}");
+        assert!(body.contains("removed: legacy 0.1.0"), "{body}");
+        assert!(body.contains("updated: react 18.2.0 -> 18.3.1"), "{body}");
+        assert_eq!(
+            npm.flags,
+            [
+                "checksum changed on existing version loose-envify 1.4.0: sha512-aaa -> sha512-tampered"
+            ]
+        );
+
+        let uv_old = concat!(
+            "version = 1\n",
+            "[[package]]\nname = \"httpx\"\nversion = \"0.27.0\"\n",
+            "source = { registry = \"https://pypi.org/simple\" }\n",
+            "dependencies = [{ name = \"anyio\" }]\n",
+            "wheels = [{ url = \"u1\", hash = \"sha256:111\" }]\n",
+            "[[package]]\nname = \"anyio\"\nversion = \"4.4.0\"\n",
+            "source = { registry = \"https://pypi.org/simple\" }\n",
+            "wheels = [{ url = \"u2\", hash = \"sha256:222\" }]\n",
+        );
+        let uv_new = concat!(
+            "version = 1\n",
+            "[[package]]\nname = \"httpx\"\nversion = \"0.28.1\"\n",
+            "source = { registry = \"https://pypi.org/simple\" }\n",
+            "dependencies = [{ name = \"anyio\" }, { name = \"idna\" }]\n",
+            "wheels = [{ url = \"u3\", hash = \"sha256:333\" }]\n",
+            "[[package]]\nname = \"anyio\"\nversion = \"4.4.0\"\n",
+            "source = { registry = \"https://evil.example/simple\" }\n",
+            "wheels = [{ url = \"u2\", hash = \"sha256:222\" }]\n",
+            "[[package]]\nname = \"idna\"\nversion = \"3.10\"\n",
+            "source = { registry = \"https://pypi.org/simple\" }\n",
+        );
+        let uv = compare_format(LockFormat::Uv, uv_old, uv_new).unwrap();
+        let (head, body) = uv.render("uv.lock", 1, 150);
+        assert!(
+            head.contains("1 added, 1 updated, 1 with changed dependencies"),
+            "{head}"
+        );
+        assert!(body.contains("added: idna 3.10"), "{body}");
+        assert!(body.contains("updated: httpx 0.27.0 -> 0.28.1"), "{body}");
+        assert!(body.contains("dependencies: httpx +idna"), "{body}");
+        assert!(
+            uv.flags[0].contains("source changed on existing version anyio 4.4.0"),
+            "{:?}",
+            uv.flags
+        );
+
+        let go_old = concat!(
+            "github.com/pkg/errors v0.9.1 h1:oldzip=\n",
+            "github.com/pkg/errors v0.9.1/go.mod h1:mod1=\n",
+            "golang.org/x/sys v0.20.0 h1:sysold=\n",
+        );
+        let go_new = concat!(
+            "github.com/pkg/errors v0.9.1 h1:newzip=\n",
+            "github.com/pkg/errors v0.9.1/go.mod h1:mod1=\n",
+            "golang.org/x/sys v0.25.0 h1:sysnew=\n",
+            "golang.org/x/text v0.18.0 h1:txt=\n",
+        );
+        let gosum = compare_format(LockFormat::GoSum, go_old, go_new).unwrap();
+        let (head, body) = gosum.render("go.sum", 1, 90);
+        assert!(head.contains("1 added, 1 updated"), "{head}");
+        assert!(body.contains("added: golang.org/x/text v0.18.0"), "{body}");
+        assert!(
+            body.contains("updated: golang.org/x/sys v0.20.0 -> v0.25.0"),
+            "{body}"
+        );
+        assert!(
+            gosum.flags[0]
+                .contains("checksum changed on existing version github.com/pkg/errors v0.9.1"),
+            "{:?}",
+            gosum.flags
+        );
+        assert!(compare_format(LockFormat::GoSum, "not a go.sum line", go_new).is_none());
     }
 }

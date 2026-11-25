@@ -43,6 +43,12 @@ pub struct Totals {
     /// a compiler warning's location lines, and has no notes.
     #[serde(default)]
     pub stderr: bool,
+    /// `cargo nextest run` `Summary [...]` line when this run was a nextest run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nextest_summary: Option<String>,
+    /// Rendered `cargo nextest run` failure/timeout lines with stream pointers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nextest_failures: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -98,6 +104,27 @@ struct Other {
     last: Option<(usize, String)>,
 }
 
+struct NextestFailure {
+    kind: &'static str,
+    name: String,
+    stream: Stream,
+    first: usize,
+    last: usize,
+    excerpt: Vec<String>,
+    saw_panic: bool,
+    stopped: bool,
+}
+
+#[derive(Default)]
+struct Nextest {
+    enabled: bool,
+    summary: Option<String>,
+    progress: [Range; 2],
+    failures: Vec<NextestFailure>,
+    in_output: bool,
+    current: Option<(usize, Stream)>,
+}
+
 #[derive(Default)]
 pub struct Scan {
     /// Each binary's name and, for `unittests src/lib.rs`, its crate.
@@ -109,11 +136,27 @@ pub struct Scan {
     section: bool,
     status: [Range; 2],
     other: [Other; 2],
+    nextest: Nextest,
 }
 
 impl Scan {
+    /// Scanner for `cargo nextest run`, which writes `PASS`/`FAIL`/`Summary` to stderr.
+    pub fn nextest() -> Self {
+        Self {
+            nextest: Nextest {
+                enabled: true,
+                ..Nextest::default()
+            },
+            ..Self::default()
+        }
+    }
+
     /// Read one line, without its line break, of `stream`.
     pub fn observe(&mut self, line: &str, n: usize, stream: Stream) {
+        if self.nextest.enabled {
+            self.observe_nextest(line, n, stream);
+            return;
+        }
         if self.broken {
             return;
         }
@@ -216,7 +259,207 @@ impl Scan {
         }
     }
 
+    fn observe_nextest(&mut self, line: &str, n: usize, stream: Stream) {
+        let line = line.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let index = stream as usize;
+        if crate::lint::CARGO_STATUS.is_match(line) {
+            self.nextest.in_output = false;
+            self.nextest.current = None;
+            self.status[index].add(n);
+            return;
+        }
+        if trimmed.starts_with("Summary [")
+            && (trimmed.contains(" tests run:") || trimmed.contains(" test run:"))
+        {
+            self.nextest.in_output = false;
+            self.nextest.current = None;
+            self.nextest.summary = Some(short(trimmed, 220));
+            return;
+        }
+        if let Some(name) = trimmed
+            .strip_prefix("--- STDOUT:")
+            .or_else(|| trimmed.strip_prefix("--- STDERR:"))
+            .and_then(|s| s.strip_suffix(" ---"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let pos = self
+                .nextest
+                .failures
+                .iter()
+                .position(|f| f.name == name)
+                .unwrap_or_else(|| {
+                    self.nextest.failures.push(NextestFailure {
+                        kind: "FAIL",
+                        name: short(name, 200),
+                        stream,
+                        first: n,
+                        last: n,
+                        excerpt: Vec::new(),
+                        saw_panic: false,
+                        stopped: false,
+                    });
+                    self.nextest.failures.len() - 1
+                });
+            self.nextest.in_output = true;
+            self.nextest.current = Some((pos, stream));
+            return;
+        }
+        if let Some((kind, name)) = nextest_failure(trimmed) {
+            self.nextest.in_output = false;
+            self.nextest.current = None;
+            if !self.nextest.failures.iter().any(|f| f.name == name) {
+                self.nextest.failures.push(NextestFailure {
+                    kind,
+                    name: short(name, 200),
+                    stream,
+                    first: n,
+                    last: n,
+                    excerpt: Vec::new(),
+                    saw_panic: false,
+                    stopped: false,
+                });
+            }
+            return;
+        }
+        if trimmed.starts_with("PASS [")
+            || trimmed.starts_with("SKIP [")
+            || trimmed.starts_with("SLOW [")
+            || trimmed.starts_with("RETRY ")
+            || trimmed.starts_with("Starting ")
+            || trimmed.starts_with("Cancelling ")
+            || trimmed.starts_with("Nextest run ID ")
+            || (trimmed.len() >= 6 && trimmed.bytes().all(|b| b == b'-'))
+        {
+            self.nextest.in_output = false;
+            self.nextest.current = None;
+            self.nextest.progress[index].add(n);
+            return;
+        }
+        if self.nextest.in_output
+            && let Some((pos, cur_stream)) = self.nextest.current
+            && cur_stream == stream
+        {
+            let failure = &mut self.nextest.failures[pos];
+            if !failure.stopped {
+                if trimmed.starts_with("note:") || trimmed.starts_with("stack backtrace:") {
+                    failure.stopped = true;
+                } else if trimmed.contains(" panicked at ") {
+                    failure.saw_panic = true;
+                    failure.first = n;
+                    failure.last = n;
+                    failure.excerpt.clear();
+                    failure.excerpt.push(short(trimmed, 200));
+                } else if failure.excerpt.len() < 6
+                    && (failure.saw_panic || failure.excerpt.len() < 3)
+                {
+                    failure.last = n;
+                    failure.excerpt.push(short(trimmed, 200));
+                }
+            }
+            return;
+        }
+        let other = &mut self.other[index];
+        let ordinal = other.range.count;
+        other.range.add(n);
+        let text = short(line.trim_end(), 200);
+        let diagnostic = trimmed.starts_with("--> ")
+            || crate::filters::diagnostic(line) && !trimmed.starts_with(['=', '|']);
+        if other.kept.len() < KEPT_LINES && other.diagnostics == 0
+            || diagnostic && other.diagnostics < KEPT_DIAGNOSTICS
+        {
+            other.diagnostics += usize::from(diagnostic);
+            other.kept.push((ordinal, text));
+            other.last = None;
+        } else {
+            other.last = Some((ordinal, text));
+        }
+    }
+
+    fn finish_nextest(self) -> Option<Totals> {
+        let summary = self.nextest.summary?;
+        let mut notes = Vec::new();
+        let other = &self.other[Stream::Stderr as usize];
+        let stderr = other.kept.len() + usize::from(other.last.is_some()) == other.range.count;
+        for stream in Stream::BOTH {
+            if stream == Stream::Stderr && !stderr {
+                continue;
+            }
+            let name = stream.name();
+            let status = &self.status[stream as usize];
+            if status.count > 0 {
+                notes.push(format!(
+                    "{name}: {} cargo status line(s) [{name}:{}-{}]",
+                    status.count, status.first, status.last
+                ));
+            }
+            let progress = &self.nextest.progress[stream as usize];
+            if progress.count > 0 {
+                notes.push(format!(
+                    "{name}: {} nextest pass/status line(s) [{name}:{}-{}]",
+                    progress.count, progress.first, progress.last
+                ));
+            }
+            let other = &self.other[stream as usize];
+            if other.range.count == 0 {
+                continue;
+            }
+            notes.push(format!(
+                "{name}: {} other line(s) [{name}:{}-{}]",
+                other.range.count, other.range.first, other.range.last
+            ));
+            let mut next = 0;
+            for (ordinal, text) in other.kept.iter().chain(&other.last) {
+                if *ordinal > next {
+                    notes.push("  …".into());
+                }
+                notes.push(format!("  {text}"));
+                next = ordinal + 1;
+            }
+            if other.range.count > next {
+                notes.push("  …".into());
+            }
+        }
+        let nextest_failures = self
+            .nextest
+            .failures
+            .into_iter()
+            .map(|failure| {
+                let range = if failure.first == failure.last {
+                    format!("{}:{}", failure.stream.name(), failure.first)
+                } else {
+                    format!(
+                        "{}:{}-{}",
+                        failure.stream.name(),
+                        failure.first,
+                        failure.last
+                    )
+                };
+                let mut block = format!("{} {} [{range}]", failure.kind, failure.name);
+                for line in failure.excerpt {
+                    block.push_str("\n  ");
+                    block.push_str(&line);
+                }
+                block
+            })
+            .collect();
+        Some(Totals {
+            binaries: Vec::new(),
+            notes,
+            stderr,
+            nextest_summary: Some(summary),
+            nextest_failures,
+        })
+    }
+
     pub fn finish(self) -> Option<Totals> {
+        if self.nextest.enabled {
+            return self.finish_nextest();
+        }
         if self.broken || self.blocks.is_empty() || self.names.len() != self.blocks.len() {
             return None;
         }
@@ -277,14 +520,60 @@ impl Scan {
             binaries,
             notes,
             stderr,
+            nextest_summary: None,
+            nextest_failures: Vec::new(),
         })
     }
+}
+
+fn nextest_failure(trimmed: &str) -> Option<(&'static str, &str)> {
+    let (kind, rest) = if let Some(rest) = trimmed.strip_prefix("FAIL [") {
+        ("FAIL", rest)
+    } else {
+        let rest = trimmed.strip_prefix("TIMEOUT [")?;
+        ("TIMEOUT", rest)
+    };
+    let (_, tail) = rest.split_once("] ")?;
+    let name = tail.trim_start();
+    let name = name
+        .strip_prefix('(')
+        .and_then(|s| s.split_once(") "))
+        .filter(|(tries, _)| {
+            tries.split_once('/').is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            })
+        })
+        .map_or(name, |(_, rest)| rest.trim_start());
+    (!name.is_empty()).then_some((kind, name))
 }
 
 impl Totals {
     /// The total line, one line per binary that ran tests, one for the binaries
     /// that ran none, and the notes.
     pub fn render(&self) -> String {
+        if let Some(summary) = &self.nextest_summary {
+            let mut report = String::new();
+            if !self.nextest_failures.is_empty() {
+                report.push_str(&format!(
+                    "{} reported failing test(s)\n",
+                    self.nextest_failures.len()
+                ));
+                for failure in &self.nextest_failures {
+                    report.push_str(failure);
+                    report.push('\n');
+                }
+            }
+            report.push_str(summary);
+            report.push('\n');
+            for note in &self.notes {
+                report.push_str(note);
+                report.push('\n');
+            }
+            return report;
+        }
         let sum = |count: fn(&Binary) -> usize| self.binaries.iter().map(count).sum::<usize>();
         let failed = sum(|b| b.failed);
         let mut report = format!(
@@ -329,6 +618,21 @@ impl Totals {
                 names.push_str(&format!(" +{} more", idle.len() - NAMED_IDLE));
             }
             report.push_str(&format!("  {} ran no tests: {names}\n", idle.len()));
+        }
+        for note in &self.notes {
+            report.push_str(note);
+            report.push('\n');
+        }
+        report
+    }
+
+    /// Nextest summary line + status/pass range notes without the failure list
+    /// (for merged reruns whose `Compared with` section already listed changes).
+    pub fn render_nextest_summary(&self) -> String {
+        let mut report = String::new();
+        if let Some(summary) = &self.nextest_summary {
+            report.push_str(summary);
+            report.push('\n');
         }
         for note in &self.notes {
             report.push_str(note);

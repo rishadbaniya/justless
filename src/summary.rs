@@ -125,8 +125,11 @@ impl Parser {
             inventory: profile
                 .filter(|p| p.inventory())
                 .map(crate::inventory::Inventory::new),
-            cargo: (family == "cargo test" && profile.is_none())
-                .then(crate::cargo_tests::Scan::default),
+            cargo: match family {
+                "cargo test" if profile.is_none() => Some(crate::cargo_tests::Scan::default()),
+                "cargo nextest" if profile.is_none() => Some(crate::cargo_tests::Scan::nextest()),
+                _ => None,
+            },
             summary: Summary {
                 kind: kind.into(),
                 ..Default::default()
@@ -609,7 +612,22 @@ impl Summary {
                 self.items.len(),
                 self.items[0].name
             )),
-            "tests" => self.failing_outcome().map(str::to_owned),
+            "tests" => self
+                .cargo
+                .as_ref()
+                .filter(|totals| !totals.nextest_failures.is_empty())
+                .map(|totals| {
+                    let first = totals.nextest_failures[0]
+                        .lines()
+                        .next()
+                        .unwrap_or(&totals.nextest_failures[0]);
+                    let first = first.rsplit_once(" [").map_or(first, |(head, _)| head);
+                    format!(
+                        "{} failing test(s), first {first}",
+                        totals.nextest_failures.len()
+                    )
+                })
+                .or_else(|| self.failing_outcome().map(str::to_owned)),
             "lint" => {
                 let total: usize = self
                     .items
@@ -634,6 +652,7 @@ impl Summary {
         if self.kind.is_empty()
             || (self.items.is_empty()
                 && self.outcomes.is_empty()
+                && self.cargo.is_none()
                 && !(self.kind == "diff" && previous.is_some_and(|(_, s)| !s.items.is_empty())))
         {
             return None;
@@ -647,6 +666,21 @@ impl Summary {
             report.push('\n');
         }
         if self.kind == "tests" {
+            if let Some(totals) = self
+                .cargo
+                .as_ref()
+                .filter(|totals| totals.nextest_summary.is_some())
+            {
+                let has_stdout_diff = previous.is_some_and(|(_, old)| {
+                    old.kind == self.kind && (!self.items.is_empty() || !old.items.is_empty())
+                });
+                if !has_stdout_diff {
+                    if status != 0 && totals.nextest_failures.is_empty() && self.items.is_empty() {
+                        return None;
+                    }
+                    return Some(totals.render());
+                }
+            }
             if status != 0 && self.items.is_empty() {
                 return None;
             }
@@ -723,7 +757,11 @@ impl Summary {
             }
         }
         if let Some(totals) = self.cargo.as_ref().filter(|_| self.kind == "tests") {
-            report.push_str(&totals.render());
+            if totals.nextest_summary.is_some() {
+                report.push_str(&totals.render_nextest_summary());
+            } else {
+                report.push_str(&totals.render());
+            }
             return Some(report);
         }
         for line in self
@@ -886,12 +924,12 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
         );
         assert!(
             rendered.contains(
-                "1 test(s): demo::unit test_bad src/lib.rs:42:5: assertion `left == right` failed left: 1 right: 2 [stdout:5-8]"
+                "FAIL demo::unit test_bad [stdout:5-8]\n  thread 'test_bad' panicked at src/lib.rs:42:5:\n  assertion `left == right` failed\n  left: 1\n  right: 2"
             ),
             "{rendered}"
         );
         assert!(
-            rendered.contains("demo::unit test_hang  [stdout:10-10]"),
+            rendered.contains("TIMEOUT demo::unit test_hang [stdout:10]"),
             "{rendered}"
         );
         assert!(
@@ -899,6 +937,34 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
                 "Summary [  60.020s] 3 tests run: 1 passed, 1 failed, 1 timed out, 0 skipped"
             ),
             "{rendered}"
+        );
+        assert!(
+            rendered.contains("stdout: 3 nextest pass/status line(s)"),
+            "{rendered}"
+        );
+
+        // Unmerged nextest output written to stderr compacts with `[stderr:...]` pointers.
+        let mut parser = Parser::new("cargo nextest", None);
+        for (index, line) in failing.split_inclusive('\n').enumerate() {
+            parser.observe_stderr(line, index + 1);
+        }
+        let stderr_summary = parser.finish();
+        let stderr_rendered = stderr_summary.render(None, 100).unwrap();
+        assert!(
+            stderr_rendered.contains("FAIL demo::unit test_bad [stderr:5-8]"),
+            "{stderr_rendered}"
+        );
+        assert!(
+            stderr_rendered.contains("TIMEOUT demo::unit test_hang [stderr:10]"),
+            "{stderr_rendered}"
+        );
+        assert!(
+            stderr_rendered.contains("stderr: 3 nextest pass/status line(s)"),
+            "{stderr_rendered}"
+        );
+        assert_eq!(
+            stderr_summary.headline().as_deref(),
+            Some("2 failing test(s), first FAIL demo::unit test_bad")
         );
 
         let passing = "\
@@ -911,7 +977,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 ";
         let fixed = parse("cargo nextest", passing);
         let delta = fixed.render(Some(("run-1", &summary)), 0).unwrap();
-        assert!(delta.contains("0 reported failing test(s)"), "{delta}");
+        assert!(delta.contains("Compared with run-1:"), "{delta}");
         assert!(delta.contains("- demo::unit test_bad "), "{delta}");
         assert!(delta.contains("- demo::unit test_hang "), "{delta}");
         assert!(
