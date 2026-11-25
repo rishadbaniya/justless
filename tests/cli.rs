@@ -1420,6 +1420,14 @@ fn install_and_run_claude_and_agy_hooks() {
     let command = &agy["justless"]["SessionStart"][0]["command"];
     assert_eq!(command, "justless hook-agy session-start");
     assert_eq!(agy["justless"]["PreToolUse"][0]["matcher"], "^run_command$");
+    assert_eq!(
+        agy["justless"]["PostToolUse"][0]["matcher"],
+        "^(read_file|view_file)$"
+    );
+    assert_eq!(
+        agy["justless"]["PostToolUse"][0]["hooks"][0]["command"],
+        "justless hook-agy after-read"
+    );
     let claude_input = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":"git diff","description":"show changes"}});
     let output = agent_hook(&root, "hook-claude", "before-command", claude_input.clone());
     let hook = &output["hookSpecificOutput"];
@@ -1493,7 +1501,7 @@ fn install_and_run_claude_and_agy_hooks() {
     assert!(root.join(".justless/index.json").is_file());
     success(&root, &["run", "--", "rustc", "--version"]);
     // The hook runs from another directory, so the command names the root.
-    let message = startup()["injectSteps"][0]["ephemeralMessage"].clone();
+    let message = startup()["injectSteps"][0]["systemMessage"]["systemMessage"].clone();
     let resume = format!("`justless --root {} resume`", root.display());
     assert_eq!(message, format!("{resume} lists earlier runs and reads."));
     // When Antigravity CLI reports top-level `cwd` inside the workspace, plain `justless` applies.
@@ -1503,9 +1511,83 @@ fn install_and_run_claude_and_agy_hooks() {
         json!({"cwd":root,"workspacePaths":[elsewhere.path(), root]}),
     );
     assert_eq!(
-        cli_startup["injectSteps"][0]["ephemeralMessage"],
+        cli_startup["injectSteps"][0]["systemMessage"]["systemMessage"],
         "`justless resume` lists earlier runs and reads."
     );
+    // PostToolUse `after-read` tracks native Antigravity `read_file` and `view_file` ranges
+    // for `resume`, `[source changed]` and repeated-read counts in `stats`.
+    let orders = root.join("backend/orders.py");
+    let read_call = |name: &str, args: Value, error: Option<&str>| {
+        let mut payload = json!({
+            "cwd": root,
+            "workspacePaths": [root],
+            "toolCall": {"name": name, "args": args},
+        });
+        if let Some(error) = error {
+            payload["error"] = json!(error);
+        }
+        agy_hook(elsewhere.path(), "after-read", payload)
+    };
+    assert_eq!(
+        read_call(
+            "read_file",
+            json!({"Path": orders, "StartLine": 2, "EndLine": 8}),
+            None
+        ),
+        json!({})
+    );
+    // Failed, outside-workspace and binary reads are ignored.
+    assert_eq!(
+        read_call(
+            "read_file",
+            json!({"Path": root.join("db/schema.sql"), "StartLine": 1, "EndLine": 3}),
+            Some("permission denied")
+        ),
+        json!({})
+    );
+    let outside = elsewhere.path().join("outside.txt");
+    fs::write(&outside, "outside\n").unwrap();
+    assert_eq!(
+        read_call("read_file", json!({"Path": outside}), None),
+        json!({})
+    );
+    let binary = root.join("blob.bin");
+    fs::write(&binary, b"\0binary\n").unwrap();
+    assert_eq!(
+        read_call("read_file", json!({"Path": binary}), None),
+        json!({})
+    );
+    // `view_file` uses `AbsolutePath` and omitting `EndLine` records through EOF (up to 800 lines).
+    assert_eq!(
+        read_call(
+            "view_file",
+            json!({"AbsolutePath": root.join("frontend/orders.ts"), "StartLine": 1}),
+            None
+        ),
+        json!({})
+    );
+    // Reading the same unchanged range again increments `repeated source-range read(s)`.
+    assert_eq!(
+        read_call(
+            "read_file",
+            json!({"Path": orders, "StartLine": 2, "EndLine": 8}),
+            None
+        ),
+        json!({})
+    );
+    let resumed = success(&root, &["resume"]);
+    assert_all_in(
+        &resumed,
+        &["Read backend/orders.py:2-8", "Read frontend/orders.ts:1-"],
+    );
+    assert_none_in(&resumed, &["db/schema.sql", "outside.txt", "blob.bin"]);
+    assert!(success(&root, &["stats"]).contains("1 repeated source-range read(s)"));
+    fs::write(
+        &orders,
+        format!("{}\n# edited\n", fs::read_to_string(&orders).unwrap()),
+    )
+    .unwrap();
+    assert!(success(&root, &["resume"]).contains("Read backend/orders.py:2-8 [source changed]"));
     assert!(!elsewhere.path().join(".justless").exists());
 }
 
@@ -5841,7 +5923,7 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
         "✓ Hooks: .cursor/hooks.json has both ",
         "✓ Hooks: .gemini/settings.json has both ",
         "✓ Hooks: .github/hooks/justless.json has both ",
-        "✓ Hooks: .agents/hooks.json has both ",
+        "✓ Hooks: .agents/hooks.json has all 3 ",
         "✓ Plugin: .opencode/plugins/justless.js is current",
         "✓ Instructions: CLAUDE.md has the current Justless block",
         "✓ Instructions: AGENTS.md has the current Justless block",

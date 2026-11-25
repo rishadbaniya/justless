@@ -347,7 +347,16 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
             },
             5,
         ),
-        ("PostToolUse", "after-read", "^Read$", 5),
+        (
+            "PostToolUse",
+            "after-read",
+            if agent == Agent::Agy {
+                "^(read_file|view_file)$"
+            } else {
+                "^Read$"
+            },
+            5,
+        ),
         ("PostToolUse", "after-search", "^(Grep|Glob)$", 5),
         // Bash output the command hook left alone, such as a pipe or Claude Code's
         // own grep, is archived and compacted after it ran. Codex gets no such hook:
@@ -366,8 +375,10 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
         ("PreCompact", "before-compact", "^(manual|auto)$", 10),
     ] {
         let supported = match mode {
-            "after-read" | "after-search" | "before-compact" => agent == Agent::Claude,
-            "after-bash" | "after-edit" => agent == Agent::Claude,
+            "after-read" => matches!(agent, Agent::Claude | Agent::Agy),
+            "after-search" | "before-compact" | "after-bash" | "after-edit" => {
+                agent == Agent::Claude
+            }
             "after-compact" => matches!(agent, Agent::Claude | Agent::Codex),
             _ => true,
         };
@@ -1349,12 +1360,27 @@ fn agy_cwd<'a>(args: &'a Value, input: &'a Value, paths: &'a [Value]) -> Option<
     Some(Path::new(path))
 }
 
+fn agy_read_path(args: &Value) -> Option<&str> {
+    args.get("Path")
+        .or_else(|| args.get("AbsolutePath"))
+        .and_then(explicit_value)
+        .and_then(Value::as_str)
+}
+
 /// The working directory an Antigravity hook input targets, for `init --global`
 /// to locate the project before invoking `agy_hook`.
 pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path> {
     let paths = input["workspacePaths"].as_array()?;
     if mode == "before-command" {
         return agy_cwd(&input["toolCall"]["args"], input, paths);
+    }
+    if mode == "after-read"
+        && let Some(raw) = agy_read_path(&input["toolCall"]["args"])
+    {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            return path.parent();
+        }
     }
     let path = if let Some(value) = input.get("cwd").and_then(explicit_value) {
         let text = value.as_str()?;
@@ -1392,7 +1418,13 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
             roots.find(|root| root == &current.root)?
         };
         let workspace = agent_workspace(&Workspace::discover(Some(&root)).ok()?, input);
-        return Some(json!({"injectSteps":[{"ephemeralMessage":startup(&workspace)?}]}));
+        return Some(
+            json!({"injectSteps":[{"systemMessage":{"systemMessage":startup(&workspace)?}}]}),
+        );
+    }
+    if mode == "after-read" {
+        agy_read(roots, paths, input);
+        return None;
     }
     let call = &input["toolCall"];
     let args = &call["args"];
@@ -1431,6 +1463,79 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
         },
     )?;
     Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}))
+}
+
+/// Records a workspace text file range that Antigravity's `read_file` or
+/// `view_file` showed, for `resume`, `[source changed]` and repeated-read
+/// counts in `stats`. Antigravity's `PostToolUse` hook cannot modify tool
+/// output, and like Claude Code's read tracker this writes only to a project
+/// that already has `.justless/`.
+fn agy_read(roots: impl Iterator<Item = PathBuf>, paths: &[Value], input: &Value) -> Option<()> {
+    let call = &input["toolCall"];
+    if !matches!(call["name"].as_str(), Some("read_file" | "view_file"))
+        || input.get("error").and_then(explicit_value).is_some()
+    {
+        return None;
+    }
+    let args = &call["args"];
+    let raw = agy_read_path(args)?;
+    let mut path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        let base = agy_cwd(args, input, paths)?;
+        if !base.is_absolute() {
+            return None;
+        }
+        path = base.join(path);
+    }
+    let resolved = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(path.file_name())
+        .map(|(parent, name)| parent.join(name))?;
+    if !resolved.is_file() {
+        return None;
+    }
+    let root = roots
+        .filter(|root| resolved.starts_with(root))
+        .max_by_key(|root| root.components().count())?;
+    let ws = Workspace::discover(Some(&root)).ok()?;
+    let (ws, file) = read_file(&ws, &path).or_else(|| read_file(&ws, &resolved))?;
+    if !ws.state.is_dir() {
+        return None;
+    }
+    let source_path = ws.source_path(&file).ok()?;
+    let cap = ws.settings().ok()?.max_file_bytes;
+    if fs::metadata(&source_path).ok()?.len() > cap {
+        return None;
+    }
+    let bytes = fs::read(&source_path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let total = bytes.iter().filter(|&&byte| byte == b'\n').count()
+        + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
+    if total == 0 {
+        return None;
+    }
+    let number = |key: &str| {
+        args.get(key).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.trim().parse().ok())
+        })
+    };
+    let from = usize::try_from(number("StartLine").unwrap_or(1).max(1)).ok()?;
+    if from > total {
+        return None;
+    }
+    let to = match number("EndLine") {
+        Some(end) => usize::try_from(end).ok()?.min(total).max(from),
+        // Antigravity's `read_file` returns at most 800 lines per call.
+        None => total.min(from.saturating_add(799)),
+    };
+    let digest = crate::capture::source_digest(&bytes);
+    crate::history::saw_range(&ws, &file, from, to, digest, false);
+    Some(())
 }
 
 /// `record` is false for `justless rewrite`, which previews the answer and writes nothing.

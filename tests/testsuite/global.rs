@@ -602,6 +602,14 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
         "justless hook-agy before-command --global"
     );
     assert_eq!(
+        hooks["justless"]["PostToolUse"][0]["matcher"],
+        "^(read_file|view_file)$"
+    );
+    assert_eq!(
+        hooks["justless"]["PostToolUse"][0]["hooks"][0]["command"],
+        "justless hook-agy after-read --global"
+    );
+    assert_eq!(
         hooks["justless"]["SessionStart"][0]["command"],
         "justless hook-agy session-start --global"
     );
@@ -647,14 +655,38 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
     assert!(plain.join(".justless/index.json").is_file());
     run_id(&lab, &plain, "true");
     assert_eq!(
-        start(&plain)["injectSteps"][0]["ephemeralMessage"],
+        start(&plain)["injectSteps"][0]["systemMessage"]["systemMessage"],
         "`justless resume` lists earlier runs and reads."
     );
+
+    // PostToolUse `after-read --global` records reads in served projects and skips opted-out/local-hook ones.
+    for root in [&plain, &opted, &own] {
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    }
+    let after_read = |root: &Path| {
+        ask(
+            "after-read",
+            &json!({
+                "cwd": root,
+                "workspacePaths": [root],
+                "toolCall": {
+                    "name": "read_file",
+                    "args": {"Path": root.join("src/lib.rs"), "StartLine": 1, "EndLine": 1}
+                }
+            }),
+        )
+    };
+    assert_eq!(after_read(&plain), json!({}));
+    assert_eq!(after_read(&opted), json!({}));
+    assert_eq!(after_read(&own), json!({}));
+    has(&lab.run(&plain, &["resume"]), "Read src/lib.rs:1-1");
+    assert!(!opted.join(".justless").exists());
+    lacks(&lab.run(&own, &["resume"]), "Read src/lib.rs:1-1");
 
     let doctor =
         |cwd: &Path| String::from_utf8(lab.output(cwd, &["doctor"], None, &[]).stdout).unwrap();
     let report = doctor(&plain);
-    has(&report, "Global hooks for Antigravity CLI: 2 handlers in ");
+    has(&report, "Global hooks for Antigravity CLI: 3 handlers in ");
     has(
         &report,
         "The global Antigravity CLI hooks serve this project",

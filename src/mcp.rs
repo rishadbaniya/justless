@@ -53,12 +53,12 @@ const INSTRUCTIONS: &str = "Justless indexes this repository's source, docs and 
 Use these tools before reading whole files or grepping. `map` orients you in an unfamiliar \
 repository. For a how or where question, start with `lookup`, which ranks the code, docs and \
 config that best match it. `pack` gathers budgeted evidence for a task, with links, changes and \
-recent failures. `query` and `path` follow \
-symbols and the links between them. `affected` lists what depends on a symbol, file or the Git \
-changes, and the tests to run. `find` searches literal text. \
+recent failures. `context` shows source around a location, Git diff or captured run. \
+`query` and `path` follow symbols and the links between them. `affected` lists what depends on a \
+symbol, file or the Git changes, and the tests to run. `find` searches literal text. \
 `read` with outline=true lists a file's symbols so that `expand` or `code` can fetch \
-only the lines you need. `log`, `search` and `history` reopen output captured by `justless run`. \
-File paths are relative to the repository root.";
+only the lines you need. `log`, `search`, `history` and `resume` reopen captured runs and recent \
+activity. File paths are relative to the repository root.";
 
 pub fn command() -> Command<'static> {
     Command::new("mcp")
@@ -1062,29 +1062,33 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
         return Err(format!("`{name}` must be a string"));
     };
     ensure_text(name, text)?;
-    let valid = match param.kind {
-        Kind::File | Kind::Paths => relative_file(text),
-        Kind::Location => text.rsplit_once(':').is_some_and(|(file, lines)| {
+    let normalized = match param.kind {
+        Kind::File => normalize_relative(text, false),
+        Kind::Paths => normalize_relative(text, true),
+        Kind::Location => text.rsplit_once(':').and_then(|(file, lines)| {
             let mut bounds = lines.splitn(2, '-');
-            relative_file(file)
-                && bounds
-                    .all(|bound| !bound.is_empty() && bound.bytes().all(|b| b.is_ascii_digit()))
+            let file = normalize_relative(file, false)?;
+            bounds
+                .all(|bound| !bound.is_empty() && bound.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| format!("{file}:{lines}"))
         }),
-        Kind::RunId => text.strip_prefix("run-").is_some_and(|suffix| {
-            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        }),
+        Kind::RunId => text
+            .strip_prefix("run-")
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .then(|| text.to_owned()),
         // A 64-character recall ID, or a tool_use ID the proxy archived.
-        Kind::RecallId => {
-            text.len() <= 200
-                && text
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        }
-        Kind::Choice(values) => values.contains(&text),
-        _ => true,
+        Kind::RecallId => (text.len() <= 200
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+        .then(|| text.to_owned()),
+        Kind::Choice(values) => values.contains(&text).then(|| text.to_owned()),
+        _ => Some(text.to_owned()),
     };
-    if valid {
-        return Ok(text.to_owned());
+    if let Some(value) = normalized {
+        return Ok(value);
     }
     Err(match param.kind {
         Kind::File => format!("`{name}` must be a workspace-relative path such as src/main.rs"),
@@ -1112,11 +1116,26 @@ fn ensure_text(name: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn relative_file(text: &str) -> bool {
-    !text.is_empty()
-        && Path::new(text)
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
+/// Normalizes a workspace-relative path by dropping redundant `.` segments
+/// while rejecting absolute paths and `..`. When `allow_dot` is true, `.`
+/// itself resolves to `"."` (for directory scopes such as `find --path`).
+fn normalize_relative(text: &str, allow_dot: bool) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in Path::new(text).components() {
+        match part {
+            Component::Normal(segment) => parts.push(segment.to_str()?),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        allow_dot.then(|| ".".to_owned())
+    } else {
+        Some(parts.join("/"))
+    }
 }
 
 // ---------------------------------------------------------------------------

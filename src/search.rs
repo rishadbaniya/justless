@@ -39,13 +39,20 @@ pub(crate) struct Spec {
 
 const RG: Spec = Spec {
     flags: "-i --ignore-case -s --case-sensitive -S --smart-case -w --word-regexp -x \
-        --line-regexp -F --fixed-strings -n --line-number -N --no-line-number -H \
-        --with-filename --hidden -. -u --unrestricted --no-ignore --no-ignore-vcs \
+        --line-regexp -F --fixed-strings --no-fixed-strings -n --line-number -N --no-line-number \
+        -H --with-filename --hidden --no-hidden -. -u --unrestricted --no-ignore --no-ignore-vcs \
         --no-ignore-parent --no-ignore-dot --no-ignore-global --no-ignore-exclude \
-        --no-ignore-files -L --follow -U --multiline --multiline-dotall -P --pcre2 -o \
-        --only-matching -v --invert-match --column -a --text --no-heading --heading --no-messages \
-        --trim --crlf --sort-files --binary --no-config --one-file-system --vimgrep \
-        --max-columns-preview -l --files-with-matches --files-without-match --files",
+        --no-ignore-files --no-ignore-messages --no-require-git --require-git --ignore \
+        --ignore-dot --ignore-exclude --ignore-files --ignore-global --ignore-messages \
+        --ignore-parent --ignore-vcs --messages --glob-case-insensitive \
+        --ignore-file-case-insensitive -L --follow --no-follow -U --multiline --no-multiline \
+        --multiline-dotall --no-multiline-dotall -P --pcre2 --no-pcre2 --auto-hybrid-regex \
+        --no-auto-hybrid-regex --unicode --no-unicode -o --only-matching --no-only-matching \
+        -v --invert-match --no-invert-match --column -a --text --no-text --no-heading --heading \
+        --no-messages --trim --no-trim --crlf --no-crlf --sort-files --no-sort-files --binary \
+        --no-binary --no-config --one-file-system --no-one-file-system --vimgrep \
+        --max-columns-preview --no-max-columns-preview -l --files-with-matches \
+        --files-without-match --files",
     valued: "-e --regexp -f --file -g --glob --iglob -t --type -T --type-not --type-add -m \
         --max-count -A --after-context -B --before-context -C --context -d --max-depth \
         -M --max-columns -j --threads -E --encoding --engine --max-filesize --sort \
@@ -353,7 +360,10 @@ fn searched<'a>(words: &[&'a str]) -> Option<(&'static Spec, Parsed<'a>)> {
     let (spec, args) = match (basename(program), args) {
         ("rg", _) => (&RG, args),
         ("grep" | "egrep" | "fgrep", _) => (&GREP, args),
-        ("git", ["grep", rest @ ..]) => (&GIT_GREP, rest),
+        ("git", rest) => match crate::filters::git_display_subcommand(rest) {
+            ["grep", tail @ ..] => (&GIT_GREP, tail),
+            _ => return None,
+        },
         ("ag", _) => (&AG, args),
         ("ack" | "ack-grep", _) => (&ACK, args),
         _ => return None,
@@ -1597,6 +1607,55 @@ mod tests {
             }
             let report = search.finish("rg", 4096, None, true);
             assert_eq!(report.map(|(text, _)| text), None, "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn git_display_flags_keep_grep_context_and_every_line_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "p\nx\nq\n").unwrap();
+        for words in [
+            &["git", "--no-pager", "grep", "-n", "-C", "1", "x"][..],
+            &["git", "-P", "--no-optional-locks", "grep", "-n", "-A1", "x"][..],
+        ] {
+            assert!(super::prints_context(words), "{words:?}");
+            let mut search = Search::new(dir.path(), words);
+            for (i, line) in ["a.rs-1-p", "a.rs:2:x", "a.rs-3-q"].iter().enumerate() {
+                search.observe(line, i + 1);
+            }
+            let report = search
+                .finish("git grep", 4096, None, true)
+                .map(|(text, _)| text)
+                .unwrap();
+            assert!(
+                report.contains("1 match in 1 file, 1 block, 2 context lines"),
+                "{words:?}: {report}"
+            );
+        }
+        assert!(super::matches_every_line(&[
+            "git",
+            "--no-pager",
+            "grep",
+            "-n",
+            "",
+            "a.rs"
+        ]));
+        for words in [
+            &[
+                "rg",
+                "--glob-case-insensitive",
+                "--no-require-git",
+                "--no-ignore-messages",
+                "foo",
+            ][..],
+            &["rg", "--no-pcre2", "--no-unicode", "foo"][..],
+        ] {
+            assert_eq!(
+                super::select(words),
+                Some(crate::filters::Profile::Search),
+                "{words:?}"
+            );
+            assert_eq!(super::read_only(words), Some(true), "{words:?}");
         }
     }
 }
