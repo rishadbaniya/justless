@@ -7,6 +7,17 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Default budget for the middle "Compact Diff" tier when `Summary::render` does not
+/// receive an explicit budget from `capture.rs`.
+pub(crate) const COMPACT_DIFF_BUDGET: usize = 4096;
+/// Hard cap on buffered compact diff lines across non-lockfile files so huge multi-MB
+/// diffs stay strictly bounded in memory.
+const COMPACT_BUFFER_CAP: usize = 32 * 1024;
+/// Per-file buffer cap for lockfile hunks before dropping them (lockfiles are replaced
+/// by `lockdiff::summarize` anyway, so an oversized lockfile must not push code files
+/// out of the compact diff tier).
+const LOCKFILE_BUFFER_CAP: usize = 8 * 1024;
+
 /// Text in a summary comes from captured output. Records written before redaction can
 /// hold raw secrets, so code that prints a stored summary must pass it through
 /// `redact::Redactor`.
@@ -23,10 +34,50 @@ pub struct Summary {
     /// accounts for both streams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js: Option<crate::js_tests::Report>,
+    /// Total raw bytes observed for a diff/patch run (in-memory only).
+    #[serde(skip)]
+    pub(crate) diff_raw_bytes: usize,
+    /// Whether non-lockfile compact diff lines exceeded `COMPACT_BUFFER_CAP`.
+    #[serde(skip)]
+    pub(crate) compact_overflowed: bool,
+    /// Structured commit/file entries for tiered diff rendering (in-memory only).
+    #[serde(skip)]
+    pub(crate) diff_entries: Vec<DiffEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum DiffEntry {
+    Commit { item_index: usize },
+    File(DiffFile),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DiffFile {
+    path: String,
+    first: usize,
+    last: usize,
+    added: usize,
+    deleted: usize,
+    meta_lines: Vec<String>,
+    /// Compact hunks (1-line trimmed context), or `None` if dropped due to cap.
+    hunks: Option<Vec<CompactHunk>>,
+    items_start: usize,
+    items_end: usize,
+    generated_folded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CompactHunk {
+    header: String,
+    lines: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +89,12 @@ pub struct Item {
     pub last: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stderr: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub added: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deleted: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub file_first: usize,
 }
 
 pub fn family(args: &[OsString]) -> String {
@@ -85,7 +142,7 @@ pub fn family(args: &[OsString]) -> String {
         true
     };
     match words.as_slice() {
-        ["git", "diff", ..] => "git diff",
+        ["git", "diff", ..] | ["gh", "pr", "diff", ..] | ["glab", "mr", "diff", ..] => "git diff",
         ["git", "show", ..] => "git show",
         ["git", "log", ..] if patch() => "git log",
         ["cargo", "test", ..] => "cargo test",
@@ -138,6 +195,42 @@ pub struct Parser {
     /// Whether every hunk so far held the lines its header announced, as a patch
     /// whose lines no filter removed does.
     whole_hunks: bool,
+    /// Parent count for combined merge diffs (`0` for standard `@@`, `>= 2` for `@@@`).
+    combined_parents: usize,
+    /// Raw bytes observed across a diff/patch stream.
+    diff_raw_bytes: usize,
+    /// Buffered commit and file entries for tiered diff rendering.
+    diff_entries: Vec<DiffEntry>,
+    /// Currently open file section while scanning a diff/patch.
+    current_file: Option<ActiveDiffFile>,
+    /// Total buffered compact diff bytes across non-lockfile files.
+    compact_bytes: usize,
+    /// Whether non-lockfile compact diff lines exceeded `COMPACT_BUFFER_CAP`.
+    compact_overflowed: bool,
+}
+
+struct ActiveDiffFile {
+    path: String,
+    first: usize,
+    last: usize,
+    added: usize,
+    deleted: usize,
+    meta_lines: Vec<String>,
+    saw_mode_header: bool,
+    hunks: Option<Vec<CompactHunk>>,
+    current_hunk: Option<ActiveCompactHunk>,
+    buffered_bytes: usize,
+    items_start: usize,
+    is_generated: bool,
+    is_lockfile: bool,
+    generated_folded: bool,
+}
+
+struct ActiveCompactHunk {
+    header: String,
+    combined_parents: usize,
+    raw_lines: Vec<String>,
+    raw_bytes: usize,
 }
 
 /// Where a line of `git show` or `git log -p` output falls.
@@ -149,7 +242,11 @@ enum Place {
     Fields,
     /// The indented message, after the blank line that ends the fields.
     Message,
-    /// A file's extended header lines, from `diff --git` to its first hunk.
+    /// A `--stat` block between the commit message and its patch.
+    Stat,
+    /// Blank line after a `--stat` block, before `diff --git` / `diff --cc` or the next commit.
+    AfterStat,
+    /// A file's extended header lines, from `diff --git` / `diff --cc` to its first hunk.
     File,
     Hunk,
 }
@@ -203,6 +300,12 @@ impl Parser {
             ends_early: false,
             hunk: None,
             whole_hunks: true,
+            combined_parents: 0,
+            diff_raw_bytes: 0,
+            diff_entries: Vec::new(),
+            current_file: None,
+            compact_bytes: 0,
+            compact_overflowed: false,
         }
     }
 
@@ -215,6 +318,22 @@ impl Parser {
     /// Count `line` against the current hunk's announced lines. A header or any
     /// line outside a hunk ends it, and a hunk header starts the next one.
     fn count_hunk(&mut self, line: &str) {
+        if self.combined_parents >= 2 {
+            if let Some(parents) = combined_hunk_parents(line) {
+                self.combined_parents = parents;
+                self.hunk = None;
+                return;
+            }
+            if hunk_counts(line).is_some() {
+                self.combined_parents = 0;
+                self.hunk = hunk_counts(line);
+                return;
+            }
+            if !line.starts_with([' ', '+', '-', '\\']) {
+                self.combined_parents = 0;
+            }
+            return;
+        }
         let remaining = match (self.hunk, line.as_bytes().first()) {
             (Some((old, new)), Some(b' ')) if old > 0 && new > 0 => Some((old - 1, new - 1)),
             (Some((old, new)), Some(b'-')) if old > 0 => Some((old - 1, new)),
@@ -228,7 +347,14 @@ impl Parser {
             }
             (None, _) => None,
         };
-        self.hunk = remaining.or_else(|| hunk_counts(line));
+        if remaining.is_some() {
+            self.hunk = remaining;
+        } else if let Some(parents) = combined_hunk_parents(line) {
+            self.combined_parents = parents;
+            self.hunk = None;
+        } else {
+            self.hunk = hunk_counts(line);
+        }
     }
 
     pub fn observe(&mut self, text: &str, number: usize) {
@@ -247,6 +373,9 @@ impl Parser {
             self.discarded = !inventory.observe(text, number);
             return;
         }
+        if self.summary.kind == "diff" {
+            self.diff_raw_bytes += text.len();
+        }
         let line = text.trim_end_matches('\n');
         if self.commits {
             self.discarded = !self.commit(line, number);
@@ -255,8 +384,11 @@ impl Parser {
         if self.summary.kind == "diff"
             && self.file.is_empty()
             && !line.is_empty()
-            && !line.starts_with("diff --git ")
+            && diff_header_path(line).is_none()
         {
+            if is_stat_line(line) || is_stat_summary(line) || is_stat_mode_line(line) {
+                return;
+            }
             self.discarded = true;
             return;
         }
@@ -302,10 +434,78 @@ impl Parser {
         }
     }
 
+    fn flush_compact_hunk(
+        file: &mut ActiveDiffFile,
+        compact_bytes: &mut usize,
+        compact_overflowed: &mut bool,
+    ) {
+        let Some(hunk) = file.current_hunk.take() else {
+            return;
+        };
+        if file.generated_folded {
+            return;
+        }
+        let Some(hunks) = file.hunks.as_mut() else {
+            return;
+        };
+        let trimmed = trim_hunk_context(&hunk.raw_lines, hunk.combined_parents);
+        let added_bytes: usize =
+            hunk.header.len() + 1 + trimmed.iter().map(|l| l.len() + 1).sum::<usize>();
+        if file.is_lockfile {
+            if file.buffered_bytes + added_bytes > LOCKFILE_BUFFER_CAP {
+                file.hunks = None;
+                return;
+            }
+            file.buffered_bytes += added_bytes;
+        } else {
+            if *compact_bytes + added_bytes > COMPACT_BUFFER_CAP {
+                *compact_overflowed = true;
+                file.hunks = None;
+                return;
+            }
+            *compact_bytes += added_bytes;
+            file.buffered_bytes += added_bytes;
+        }
+        hunks.push(CompactHunk {
+            header: hunk.header,
+            lines: trimmed,
+        });
+    }
+
+    fn finish_diff_file(&mut self) {
+        self.flush();
+        let Some(mut file) = self.current_file.take() else {
+            return;
+        };
+        Self::flush_compact_hunk(
+            &mut file,
+            &mut self.compact_bytes,
+            &mut self.compact_overflowed,
+        );
+        let items_end = self.summary.items.len();
+        self.diff_entries.push(DiffEntry::File(DiffFile {
+            path: file.path,
+            first: file.first,
+            last: file.last,
+            added: file.added,
+            deleted: file.deleted,
+            meta_lines: file.meta_lines,
+            hunks: if file.generated_folded {
+                None
+            } else {
+                file.hunks
+            },
+            items_start: file.items_start,
+            items_end,
+            generated_folded: file.generated_folded,
+        }));
+    }
+
     /// Read one line of `git show` or `git log -p` output. Each commit header, from
     /// `commit SHA` through its message, is an item before the commit's file and
-    /// hunk items. A line out of place, such as a `--stat` line, a combined
-    /// `diff --cc` or a custom `--format`, returns false.
+    /// hunk items. Supports optional `--stat` blocks before the patch and merge
+    /// commits (`diff --cc` / `diff --combined`). A line out of place, such as a
+    /// `--raw` tree diff or a custom `--format`, returns false.
     fn commit(&mut self, line: &str, n: usize) -> bool {
         const FIELDS: [&str; 6] = [
             "Merge: ",
@@ -315,8 +515,9 @@ impl Parser {
             "CommitDate: ",
             "Date: ",
         ];
-        const HEADERS: [&str; 14] = [
+        const HEADERS: [&str; 16] = [
             "index ",
+            "mode ",
             "--- ",
             "+++ ",
             "old mode ",
@@ -330,32 +531,50 @@ impl Parser {
             "copy from ",
             "copy to ",
             "Binary files ",
+            "GIT binary patch",
         ];
         let place = self.place;
         if let Some(id) = commit_id(line)
             && place != Place::Fields
         {
-            self.flush();
+            self.finish_diff_file();
             self.file.clear();
+            let item_index = self.summary.items.len();
+            self.diff_entries.push(DiffEntry::Commit { item_index });
             let name = format!("commit {}", short(id, 12));
             self.pending = Some(Item::new(&name, NO_MESSAGE, n));
             self.place = Place::Fields;
         } else if line.is_empty() {
-            // A blank line ends the fields, and the patch before the next commit.
-            // It belongs to no item.
+            // A blank line ends the fields, a `--stat` block, or the patch before
+            // the next commit. It belongs to no item.
             self.place = match place {
                 Place::Fields | Place::Message => Place::Message,
+                Place::Stat | Place::AfterStat => Place::AfterStat,
                 _ => Place::Between,
             };
             return true;
-        } else if line.starts_with("diff --git ") && place != Place::Between {
+        } else if diff_header_path(line).is_some() && place != Place::Between {
             self.patched = true;
             self.place = Place::File;
-        } else if line.starts_with("@@ ") && matches!(place, Place::File | Place::Hunk) {
+        } else if is_hunk_header(line) && matches!(place, Place::File | Place::Hunk) {
             self.place = Place::Hunk;
+        } else if place == Place::Message && line == "---" {
+            self.flush();
+            self.place = Place::Stat;
+            return true;
+        } else if matches!(place, Place::Message | Place::Stat)
+            && (is_stat_line(line) || is_stat_summary(line) || is_stat_mode_line(line))
+        {
+            if place == Place::Message {
+                // Keep the commit header's `[stdout:first-last]` scoped to its
+                // message, excluding the `--stat` block.
+                self.flush();
+            }
+            self.place = Place::Stat;
+            return true;
         } else {
             let fits = match place {
-                Place::Between => false,
+                Place::Between | Place::AfterStat | Place::Stat => false,
                 Place::Fields => FIELDS.iter().any(|field| line.starts_with(field)),
                 Place::Message => line.starts_with("    "),
                 Place::File => HEADERS.iter().any(|header| line.starts_with(header)),
@@ -378,14 +597,52 @@ impl Parser {
 
     fn diff(&mut self, line: &str, n: usize) {
         self.count_hunk(line);
-        if let Some(names) = line.strip_prefix("diff --git ") {
-            self.flush();
-            self.file = names
-                .rsplit_once(" b/")
-                .map_or(names, |(_, new)| new)
-                .to_owned();
-            self.pending = Some(Item::new(&self.file, "file metadata", n));
-        } else if line.starts_with("@@ ") && !self.file.is_empty() {
+        if let Some(path) = diff_header_path(line) {
+            self.finish_diff_file();
+            self.file = path.to_owned();
+            let items_start = self.summary.items.len();
+            let is_generated = crate::lockdiff::is_generated_path(&self.file);
+            let is_lockfile = crate::lockdiff::is_lockfile_path(&self.file);
+            let mut item = Item::new(&self.file, "file metadata", n);
+            item.file_first = n;
+            self.pending = Some(item);
+            self.current_file = Some(ActiveDiffFile {
+                path: self.file.clone(),
+                first: n,
+                last: n,
+                added: 0,
+                deleted: 0,
+                meta_lines: Vec::new(),
+                saw_mode_header: false,
+                hunks: if !is_lockfile && self.compact_overflowed {
+                    None
+                } else {
+                    Some(Vec::new())
+                },
+                current_hunk: None,
+                buffered_bytes: 0,
+                items_start,
+                is_generated,
+                is_lockfile,
+                generated_folded: false,
+            });
+        } else if is_hunk_header(line) && !self.file.is_empty() {
+            if let Some(file) = self.current_file.as_mut() {
+                Self::flush_compact_hunk(
+                    file,
+                    &mut self.compact_bytes,
+                    &mut self.compact_overflowed,
+                );
+                file.last = n;
+                if file.hunks.is_some() && !file.generated_folded {
+                    file.current_hunk = Some(ActiveCompactHunk {
+                        header: line.to_owned(),
+                        combined_parents: combined_hunk_parents(line).unwrap_or(0),
+                        raw_lines: Vec::new(),
+                        raw_bytes: 0,
+                    });
+                }
+            }
             // Ordinary index/---/+++ headers contain blob hashes for the entire file.
             // Avoid invalidating independent hunks when just one of them changes.
             if self
@@ -397,20 +654,87 @@ impl Parser {
                 self.hash = Sha256::new();
             }
             self.flush();
-            self.pending = Some(Item::new(&self.file, line, n));
-        } else if (line.starts_with("old mode ")
-            || line.starts_with("rename from ")
-            || line.starts_with("new file mode ")
-            || line.starts_with("deleted file mode ")
-            || line.starts_with("copy from "))
-            && let Some(item) = &mut self.pending
-        {
-            item.detail = short(line, 360);
+            let mut item = Item::new(&self.file, line, n);
+            if let Some(file) = self.current_file.as_ref() {
+                item.file_first = file.first;
+            }
+            self.pending = Some(item);
+        } else {
+            if (line.starts_with("old mode ")
+                || line.starts_with("rename from ")
+                || line.starts_with("new file mode ")
+                || line.starts_with("deleted file mode ")
+                || line.starts_with("copy from "))
+                && let Some(item) = &mut self.pending
+            {
+                item.detail = short(line, 360);
+            }
+            if let Some(file) = self.current_file.as_mut() {
+                file.last = n;
+                if file.is_generated
+                    && !file.generated_folded
+                    && file.last.saturating_sub(file.first) + 1
+                        > crate::lockdiff::GENERATED_FOLD_LINES
+                {
+                    file.generated_folded = true;
+                    file.current_hunk = None;
+                    if !file.is_lockfile {
+                        self.compact_bytes = self.compact_bytes.saturating_sub(file.buffered_bytes);
+                    }
+                    file.buffered_bytes = 0;
+                    file.hunks = None;
+                }
+                let in_hunk = self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|i| is_hunk_header(&i.detail));
+                if in_hunk {
+                    let (add, del) = hunk_line_delta(line, self.combined_parents);
+                    if add {
+                        file.added += 1;
+                        if let Some(item) = &mut self.pending {
+                            item.added += 1;
+                        }
+                    } else if del {
+                        file.deleted += 1;
+                        if let Some(item) = &mut self.pending {
+                            item.deleted += 1;
+                        }
+                    }
+                    if !file.generated_folded
+                        && let Some(active_hunk) = file.current_hunk.as_mut()
+                    {
+                        let cap = if file.is_lockfile {
+                            LOCKFILE_BUFFER_CAP
+                        } else {
+                            COMPACT_BUFFER_CAP
+                        };
+                        if active_hunk.raw_bytes + line.len() < cap * 2 {
+                            active_hunk.raw_bytes += line.len() + 1;
+                            active_hunk.raw_lines.push(line.to_owned());
+                        } else {
+                            file.current_hunk = None;
+                            file.hunks = None;
+                            if !file.is_lockfile {
+                                self.compact_overflowed = true;
+                            }
+                        }
+                    }
+                } else if is_preserved_meta_header(line, file.saw_mode_header) {
+                    if line.starts_with("new file mode ") || line.starts_with("deleted file mode ")
+                    {
+                        file.saw_mode_header = true;
+                    }
+                    if file.meta_lines.len() < 16 {
+                        file.meta_lines.push(line.to_owned());
+                    }
+                }
+            }
         }
         if let Some(item) = &mut self.pending {
             // A hunk is compared by its lines, not by where it starts, so hunks
             // keep their identity when an earlier change shifts them.
-            if !line.starts_with("@@ ") {
+            if !is_hunk_header(line) {
                 self.hash.update(line.as_bytes());
                 self.hash.update(b"\n");
             }
@@ -717,8 +1041,18 @@ impl Parser {
             && let Some(item) = &mut self.pending
         {
             item.detail.push_str(" (cut off)");
+            if let Some(hunk) = self
+                .current_file
+                .as_mut()
+                .and_then(|file| file.current_hunk.as_mut())
+            {
+                hunk.header.push_str(" (cut off)");
+            }
         }
-        self.flush();
+        self.finish_diff_file();
+        self.summary.diff_raw_bytes = self.diff_raw_bytes;
+        self.summary.compact_overflowed = self.compact_overflowed;
+        self.summary.diff_entries = self.diff_entries;
         self.summary.items.extend(self.failures.into_values());
         let go_passed = self.go_ok + self.go_no_tests;
         if go_passed > 4 {
@@ -792,6 +1126,198 @@ fn hunk_counts(line: &str) -> Option<(usize, usize)> {
     Some((count(old)?, count(new)?))
 }
 
+/// Parent count announced by a combined diff hunk header (`@@@ ... @@@` -> 2,
+/// `@@@@ ... @@@@` -> 3, etc.).
+fn combined_hunk_parents(line: &str) -> Option<usize> {
+    let at = line.bytes().take_while(|&b| b == b'@').count();
+    if at < 3 {
+        return None;
+    }
+    let rest = line.get(at..)?;
+    if !rest.starts_with(" -") {
+        return None;
+    }
+    let closing = format!(" {}", "@".repeat(at));
+    rest.contains(&closing).then_some(at - 1)
+}
+
+/// Whether `line` is a standard (`@@ ... @@`) or combined (`@@@ ... @@@`) hunk header.
+fn is_hunk_header(line: &str) -> bool {
+    line.starts_with("@@ ") || combined_hunk_parents(line).is_some()
+}
+
+/// The path named by a `diff --git a/... b/...`, `diff --cc ...` or
+/// `diff --combined ...` header line.
+fn diff_header_path(line: &str) -> Option<&str> {
+    if let Some(names) = line.strip_prefix("diff --git ") {
+        Some(names.rsplit_once(" b/").map_or(names, |(_, new)| new))
+    } else if let Some(path) = line
+        .strip_prefix("diff --cc ")
+        .or_else(|| line.strip_prefix("diff --combined "))
+    {
+        let path = path.trim();
+        (!path.is_empty()).then_some(path)
+    } else {
+        None
+    }
+}
+
+/// A per-file line of Git's `--stat` block, such as ` src/lib.rs | 12 ++++----`
+/// or ` assets/logo.png | Bin 0 -> 1234 bytes`.
+fn is_stat_line(line: &str) -> bool {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let Some(rest) = line.strip_prefix(' ') else {
+        return false;
+    };
+    let Some((path, stats)) = rest.rsplit_once(" | ") else {
+        return false;
+    };
+    if path.trim().is_empty() {
+        return false;
+    }
+    let stats = stats.trim();
+    if stats == "Unmerged" || (stats.starts_with("Bin ") && stats.ends_with(" bytes")) {
+        return true;
+    }
+    let mut parts = stats.split_whitespace();
+    let Some(count) = parts.next() else {
+        return false;
+    };
+    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(graph) => parts.next().is_none() && graph.bytes().all(|b| matches!(b, b'+' | b'-')),
+    }
+}
+
+/// The trailing summary line of Git's `--stat` block, such as
+/// ` 2 files changed, 8 insertions(+), 3 deletions(-)`.
+fn is_stat_summary(line: &str) -> bool {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let Some(rest) = line.strip_prefix(' ') else {
+        return false;
+    };
+    let trimmed = rest.trim();
+    let Some((num, tail)) = trimmed.split_once(' ') else {
+        return false;
+    };
+    !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+        && (tail.starts_with("file changed") || tail.starts_with("files changed"))
+}
+
+/// Mode/rename summary lines emitted by `git --stat --summary`.
+fn is_stat_mode_line(line: &str) -> bool {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let Some(rest) = line.strip_prefix(' ') else {
+        return false;
+    };
+    [
+        "create mode ",
+        "delete mode ",
+        "mode change ",
+        "rename ",
+        "copy ",
+        "rewrite ",
+    ]
+    .iter()
+    .any(|prefix| rest.starts_with(prefix))
+}
+
+/// Whether a file-header line carries semantic metadata (mode/rename/copy/binary)
+/// that must be preserved verbatim in the compact diff tier.
+fn is_preserved_meta_header(line: &str, saw_mode_header: bool) -> bool {
+    if [
+        "old mode ",
+        "new mode ",
+        "deleted file mode ",
+        "new file mode ",
+        "mode ",
+        "similarity index ",
+        "dissimilarity index ",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+        "Binary files ",
+        "GIT binary patch",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+    {
+        return true;
+    }
+    !saw_mode_header && (line == "--- /dev/null" || line == "+++ /dev/null")
+}
+
+/// Whether a hunk body line is an addition or deletion (handling both standard
+/// 2-way hunks and `N`-parent combined merge hunks).
+fn hunk_line_delta(line: &str, combined_parents: usize) -> (bool, bool) {
+    if combined_parents >= 2 {
+        let prefix = line.as_bytes().get(..combined_parents).unwrap_or(&[]);
+        if prefix.contains(&b'+') {
+            (true, false)
+        } else if prefix.contains(&b'-') {
+            (false, true)
+        } else {
+            (false, false)
+        }
+    } else {
+        match line.as_bytes().first() {
+            Some(b'+') => (true, false),
+            Some(b'-') => (false, true),
+            _ => (false, false),
+        }
+    }
+}
+
+/// Keep 100% of `+`/`-` change lines and trim surrounding context from 3 lines down
+/// to 1 line immediately adjacent to any change.
+fn trim_hunk_context(lines: &[String], combined_parents: usize) -> Vec<String> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let changed: Vec<bool> = lines
+        .iter()
+        .map(|line| {
+            let (add, del) = hunk_line_delta(line, combined_parents);
+            add || del
+        })
+        .collect();
+    if !changed.iter().any(|&c| c) {
+        return lines.to_vec();
+    }
+    let len = lines.len();
+    let mut keep = vec![false; len];
+    for i in 0..len {
+        if changed[i]
+            || (i > 0 && changed[i - 1])
+            || (i + 1 < len && changed[i + 1])
+            || (lines[i].starts_with('\\') && i > 0 && (changed[i - 1] || keep[i - 1]))
+        {
+            keep[i] = true;
+        }
+    }
+    let mut out = Vec::with_capacity(len);
+    let mut emitted_any = false;
+    let mut skipped_since_last = false;
+    for (i, line) in lines.iter().enumerate() {
+        if keep[i] {
+            if emitted_any && skipped_since_last {
+                out.push(" ...".to_owned());
+            }
+            out.push(line.clone());
+            emitted_any = true;
+            skipped_since_last = false;
+        } else if emitted_any {
+            skipped_since_last = true;
+        }
+    }
+    out
+}
+
 /// The commit id on a `commit SHA` or `commit SHA (decorations)` line.
 fn commit_id(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("commit ")?;
@@ -804,7 +1330,7 @@ fn commit_id(line: &str) -> Option<&str> {
 
 impl Item {
     /// Whether this is a commit header from `git show` or `git log -p`.
-    fn is_commit(&self) -> bool {
+    pub(crate) fn is_commit(&self) -> bool {
         self.name
             .strip_prefix("commit ")
             .is_some_and(|id| id.len() >= 7 && id.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -827,6 +1353,9 @@ impl Item {
             first: n,
             last: n,
             stderr: matches!(stream, crate::capture::Stream::Stderr),
+            added: 0,
+            deleted: 0,
+            file_first: 0,
         }
     }
 
@@ -836,11 +1365,15 @@ impl Item {
     /// The identity used to compare runs. A patch hunk drops its line ranges,
     /// which shift whenever an earlier hunk grows or shrinks.
     fn key(&self) -> (&str, &str, &str) {
-        let detail = match self.detail.strip_prefix("@@ ") {
-            Some(ranges) => ranges
-                .split_once(" @@")
-                .map_or(ranges, |(_, context)| context),
-            None => &self.detail,
+        let detail = if is_hunk_header(&self.detail) {
+            let at = self.detail.bytes().take_while(|&b| b == b'@').count();
+            let marker = format!(" {}", "@".repeat(at));
+            let after_open = &self.detail[at + 1..];
+            after_open
+                .split_once(&marker)
+                .map_or(after_open, |(_, context)| context)
+        } else {
+            &self.detail
         };
         (&self.name, detail, &self.digest)
     }
@@ -1087,11 +1620,10 @@ impl Summary {
                     }
                 }
             }
+        } else if self.kind == "diff" {
+            return Some(self.render_diff_with(COMPACT_DIFF_BUDGET, "", |_, _, _, _| None));
         } else {
-            if self.kind == "diff" {
-                report.push_str(&self.patch_heading());
-                report.push('\n');
-            } else if self.kind == "plan" && !self.items.is_empty() {
+            if self.kind == "plan" && !self.items.is_empty() {
                 report.push_str(&format!("{} resource change(s)\n", self.items.len()));
             }
             for item in &self.items {
@@ -1120,6 +1652,232 @@ impl Summary {
         }
         Some(report)
     }
+
+    /// Render a diff/patch summary in two tiers:
+    /// 1. **Compact diff** (`<= budget` and strictly smaller than raw): replaces
+    ///    redundant 4-line git headers with `=== path (+A -D) [stdout:first-last]`,
+    ///    preserves mode/rename/binary lines verbatim, folds large generated files,
+    ///    and keeps 100% of `+`/`-` lines with 1 line of context.
+    /// 2. **File-grouped hunk index**: falls back when even the compact diff exceeds
+    ///    `budget`, grouping multi-hunk files with `(+A -D, N hunks)` stats and
+    ///    folding large generated files to 1 line.
+    pub(crate) fn render_diff_with<F>(&self, budget: usize, flags: &str, replace: F) -> String
+    where
+        F: Fn(&str, usize, usize, Option<usize>) -> Option<String>,
+    {
+        let heading = format!("{}\n", self.patch_heading());
+        if !self.diff_entries.is_empty()
+            && !self.compact_overflowed
+            && let Some(compact) = self.try_render_compact(&heading, flags, budget, &replace)
+        {
+            return compact;
+        }
+        self.render_hunk_index(&heading, flags, &replace)
+    }
+
+    fn try_render_compact<F>(
+        &self,
+        heading: &str,
+        flags: &str,
+        budget: usize,
+        replace: &F,
+    ) -> Option<String>
+    where
+        F: Fn(&str, usize, usize, Option<usize>) -> Option<String>,
+    {
+        let mut out = String::new();
+        out.push_str(heading);
+        out.push_str(flags);
+        for entry in &self.diff_entries {
+            match entry {
+                DiffEntry::Commit { item_index } => {
+                    if let Some(item) = self.items.get(*item_index) {
+                        out.push_str(&item.display());
+                        out.push('\n');
+                    }
+                }
+                DiffEntry::File(file) => {
+                    let default = file.render_compact();
+                    let chosen = match replace(
+                        &file.path,
+                        file.first,
+                        file.last,
+                        default.as_ref().map(String::len),
+                    ) {
+                        Some(replaced) => replaced,
+                        None => default?,
+                    };
+                    out.push_str(&chosen);
+                }
+            }
+            if out.len() > budget {
+                return None;
+            }
+        }
+        for line in &self.outcomes {
+            out.push_str(line);
+            out.push('\n');
+        }
+        let smaller = self.diff_raw_bytes == 0 || out.len() < self.diff_raw_bytes;
+        (out.len() <= budget && smaller).then_some(out)
+    }
+
+    fn render_hunk_index<F>(&self, heading: &str, flags: &str, replace: &F) -> String
+    where
+        F: Fn(&str, usize, usize, Option<usize>) -> Option<String>,
+    {
+        let mut out = String::new();
+        out.push_str(heading);
+        out.push_str(flags);
+        if self.diff_entries.is_empty() {
+            let mut i = 0;
+            while i < self.items.len() {
+                let item = &self.items[i];
+                if item.is_commit() {
+                    out.push_str(&item.display());
+                    out.push('\n');
+                    i += 1;
+                    continue;
+                }
+                let mut end = i + 1;
+                while end < self.items.len()
+                    && !self.items[end].is_commit()
+                    && self.items[end].name == item.name
+                {
+                    end += 1;
+                }
+                let group = &self.items[i..end];
+                let first = group[0].first;
+                let last = group.last().map_or(first, |it| it.last);
+                let default_len: usize = group.iter().map(|it| it.display().len() + 1).sum();
+                if let Some(replaced) = replace(&item.name, first, last, Some(default_len)) {
+                    out.push_str(&replaced);
+                } else {
+                    for it in group {
+                        out.push_str(&it.display());
+                        out.push('\n');
+                    }
+                }
+                i = end;
+            }
+        } else {
+            for entry in &self.diff_entries {
+                match entry {
+                    DiffEntry::Commit { item_index } => {
+                        if let Some(item) = self.items.get(*item_index) {
+                            out.push_str(&item.display());
+                            out.push('\n');
+                        }
+                    }
+                    DiffEntry::File(file) => {
+                        let default = file.render_hunk_group(&self.items);
+                        if let Some(replaced) =
+                            replace(&file.path, file.first, file.last, Some(default.len()))
+                        {
+                            out.push_str(&replaced);
+                        } else {
+                            out.push_str(&default);
+                        }
+                    }
+                }
+            }
+        }
+        for line in &self.outcomes {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+impl DiffFile {
+    fn render_folded(&self) -> String {
+        format!(
+            "=== {} (generated, +{} -{}) [stdout:{}-{}]\n",
+            self.path, self.added, self.deleted, self.first, self.last
+        )
+    }
+
+    fn render_compact(&self) -> Option<String> {
+        if self.generated_folded {
+            return Some(self.render_folded());
+        }
+        let hunks = self.hunks.as_ref()?;
+        let mut out = String::new();
+        if self.added > 0 || self.deleted > 0 {
+            out.push_str(&format!(
+                "=== {} (+{} -{}) [stdout:{}-{}]\n",
+                self.path, self.added, self.deleted, self.first, self.last
+            ));
+        } else {
+            out.push_str(&format!(
+                "=== {} [stdout:{}-{}]\n",
+                self.path, self.first, self.last
+            ));
+        }
+        for meta in &self.meta_lines {
+            out.push_str(meta);
+            out.push('\n');
+        }
+        for hunk in hunks {
+            out.push_str(&hunk.header);
+            out.push('\n');
+            for line in &hunk.lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    fn render_hunk_group(&self, items: &[Item]) -> String {
+        if self.generated_folded {
+            return self.render_folded();
+        }
+        let slice = items.get(self.items_start..self.items_end).unwrap_or(&[]);
+        if slice.is_empty() {
+            return String::new();
+        }
+        if slice.len() == 1 {
+            return format!("{}\n", slice[0].display());
+        }
+        let hunk_count = slice.iter().filter(|i| is_hunk_header(&i.detail)).count();
+        let mut out = String::new();
+        if hunk_count > 0 {
+            let noun = if hunk_count == 1 { "hunk" } else { "hunks" };
+            out.push_str(&format!(
+                "{} (+{} -{}, {hunk_count} {noun}) [stdout:{}-{}]\n",
+                self.path, self.added, self.deleted, self.first, self.last
+            ));
+        } else {
+            out.push_str(&format!(
+                "{} [stdout:{}-{}]\n",
+                self.path, self.first, self.last
+            ));
+        }
+        for item in slice {
+            if is_hunk_header(&item.detail) {
+                out.push_str(&format!(
+                    "  {} (+{} -{}) [{}:{}-{}]\n",
+                    item.detail,
+                    item.added,
+                    item.deleted,
+                    item.stream_name(),
+                    item.first,
+                    item.last
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {} [{}:{}-{}]\n",
+                    item.detail,
+                    item.stream_name(),
+                    item.first,
+                    item.last
+                ));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1146,12 +1904,50 @@ mod tests {
             ("git log -U1", "git log"),
             ("git log --oneline -5", "git"),
             ("git log -- -p", "git"),
+            ("gh pr diff 42", "git diff"),
+            ("glab mr diff 17", "git diff"),
         ] {
             assert_eq!(family(&args(line)), expected, "{line}");
         }
         let summary = parse("git show", SHOW);
+        // `SHOW` (~1.6 KB) fits in Tier 1 (Compact Diff): preserves 100% of `+`/`-`
+        // lines, mode/binary headers, and trims context to 1 line.
+        let compact = summary.render(None, 0).unwrap();
+        assert!(
+            compact.len() < SHOW.len(),
+            "{} vs {}",
+            compact.len(),
+            SHOW.len()
+        );
+        assert!(
+            compact.starts_with(
+                "2 commit(s), 4 diff section(s)\n\
+                 commit 0940ff5cd49d build(deps): depend on libc on Unix for signal forwarding [stdout:1-7]\n\
+                 === Cargo.lock (+1 -0) [stdout:9-20]\n"
+            ),
+            "{compact}"
+        );
+        assert!(compact.contains("+ \"libc\",\n"), "{compact}");
+        assert!(compact.contains("+libc = \"0.2\"\n"), "{compact}");
+        assert!(compact.contains("-# Justless\n"), "{compact}");
+        assert!(
+            compact.contains(
+                "=== assets/logo.png [stdout:62-65]\n\
+                 new file mode 100644\n\
+                 Binary files /dev/null and b/assets/logo.png differ\n"
+            ),
+            "{compact}"
+        );
+        // Context trimmed from 3 lines down to 1 adjacent line: `"anyhow"` and `"clap"` are cut, `"ignore"` and `"proc-macro2"` remain.
+        assert!(!compact.contains("\"anyhow\""), "{compact}");
+        assert!(
+            compact.contains("  \"ignore\",\n+ \"libc\",\n  \"proc-macro2\","),
+            "{compact}"
+        );
+        // Tier 2 (Hunk Index) when compact diff does not fit the budget:
+        let index = summary.render_diff_with(10, "", |_, _, _, _| None);
         assert_eq!(
-            summary.render(None, 0).unwrap(),
+            index,
             "2 commit(s), 4 diff section(s)\n\
              commit 0940ff5cd49d build(deps): depend on libc on Unix for signal forwarding [stdout:1-7]\n\
              Cargo.lock @@ -274,6 +274,7 @@ dependencies = [ [stdout:13-20]\n\
@@ -1185,10 +1981,12 @@ mod tests {
     fn commit_output_without_a_plain_patch_keeps_the_preview() {
         let header = SHOW.split("diff --git").next().unwrap();
         for text in [
-            // `--stat`, a combined diff, `--oneline`, a blank inside a hunk,
-            // `git show -s` and `git show REV:path`.
-            SHOW.replacen("\ndiff --git", "\n Cargo.lock | 1 +\n\ndiff --git", 1),
-            SHOW.replace("diff --git a/README.md b/README.md", "diff --cc README.md"),
+            // `--raw`, `--oneline`, a blank inside a hunk, `git show -s`, and `git show REV:path`.
+            SHOW.replacen(
+                "\ndiff --git",
+                "\n:100644 100644 1111111 2222222 M\tCargo.lock\n\ndiff --git",
+                1,
+            ),
             SHOW.replacen(
                 "commit 0940ff5cd49d5b8fc541e004d5dd8e69e793adad",
                 "0940ff5 build(deps)",
@@ -1197,11 +1995,174 @@ mod tests {
             SHOW.replacen("  \"clap\",\n", "\n", 1),
             header.to_owned(),
             "[package]\nname = \"justless\"\n".to_owned(),
+            // `--stat` alone without a patch still keeps the verbatim preview.
+            format!("{header} Cargo.lock | 1 +\n 1 file changed, 1 insertion(+)\n"),
         ] {
             assert!(parse("git show", &text).items.is_empty(), "{text}");
         }
-        // `git diff` output still needs `diff --git` first.
+        // `git diff` output with non-stat prose before `diff --git` is discarded.
         assert!(parse("git diff", SHOW).items.is_empty());
+        // `git diff --stat` alone (no patch) produces no items so raw stat stays verbatim.
+        assert!(
+            parse(
+                "git diff",
+                " src/lib.rs | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)\n"
+            )
+            .items
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stat_blocks_merge_commits_and_tiered_rendering_preserve_all_changes() {
+        // 1. `--stat` alongside `-p` on both `git show` and `git diff` is parsed cleanly.
+        let with_stat = SHOW.replacen(
+            "\ndiff --git",
+            "\n Cargo.lock | 1 +\n Cargo.toml | 3 +++\n 2 files changed, 4 insertions(+)\n\ndiff --git",
+            1,
+        );
+        let parsed_stat = parse("git show", &with_stat);
+        assert_eq!(parsed_stat.items.len(), 6);
+        assert!(
+            parsed_stat
+                .render(None, 0)
+                .unwrap()
+                .contains("+libc = \"0.2\""),
+            "{:?}",
+            parsed_stat.render(None, 0)
+        );
+        let diff_with_stat = concat!(
+            " src/lib.rs | 2 +-\n",
+            " 1 file changed, 1 insertion(+), 1 deletion(-)\n",
+            "\n",
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,5 +1,5 @@ fn f() {\n",
+            " a\n",
+            " b\n",
+            "-c\n",
+            "+d\n",
+            " e\n",
+        );
+        let parsed_diff_stat = parse("git diff", diff_with_stat);
+        let rendered_diff_stat = parsed_diff_stat.render(None, 0).unwrap();
+        assert!(
+            rendered_diff_stat.contains("=== src/lib.rs (+1 -1) [stdout:4-13]"),
+            "{rendered_diff_stat}"
+        );
+        assert!(
+            rendered_diff_stat.contains("-c\n+d\n"),
+            "{rendered_diff_stat}"
+        );
+
+        // 2. Merge commit (`diff --cc` with `@@@` combined hunk and `mode` header).
+        let merge = "\
+commit 1234567890abcdef1234567890abcdef12345678
+Merge: 1111111 2222222
+Author: Dev <dev@example.com>
+Date:   Mon Jan 1 00:00:00 2026 +0000
+
+    Merge branch 'feature'
+
+diff --cc src/lib.rs
+index 1111111,2222222..3333333
+mode 100644,100644..100755
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@@ -1,5 -1,5 +1,7 @@@ fn main() {
+  line1
+  line2
+  line3
+ +from_b
++ from_a
+++merged
+ -old_b
+  line4
+  line5
+  line6
+";
+        let merged = parse("git show", merge);
+        assert_eq!(merged.items.len(), 2);
+        assert_eq!((merged.items[1].added, merged.items[1].deleted), (3, 1));
+        let merged_rendered = merged.render(None, 0).unwrap();
+        assert!(
+            merged_rendered
+                .contains("=== src/lib.rs (+3 -1) [stdout:8-23]\nmode 100644,100644..100755\n"),
+            "{merged_rendered}"
+        );
+        assert!(
+            merged_rendered.contains(" +from_b\n+ from_a\n++merged\n -old_b\n"),
+            "{merged_rendered}"
+        );
+        assert!(!merged_rendered.contains("  line1\n"), "{merged_rendered}");
+        assert!(merged_rendered.contains("  line3\n"), "{merged_rendered}");
+
+        // 3. Large multi-hunk diff exceeds compact tier and falls back to file-grouped hunk index with (+A -D).
+        let mut big = String::new();
+        big.push_str("diff --git a/src/foo.rs b/src/foo.rs\nindex 1111111..2222222 100644\n--- a/src/foo.rs\n+++ b/src/foo.rs\n");
+        for h in 0..3 {
+            let line = 10 + h * 100;
+            big.push_str(&format!("@@ -{line},4 +{line},60 @@ fn f{h}() {{\n ctx\n"));
+            big.push_str(&format!("-old_{h}\n"));
+            for k in 0..57 {
+                big.push_str(&format!(
+                    "+    let value_{h}_{k} = compute_something_long({h}, {k});\n"
+                ));
+            }
+            big.push_str(" end\n");
+        }
+        let big_summary = parse("git diff", &big);
+        let big_rendered = big_summary.render(None, 0).unwrap();
+        assert!(
+            big_rendered.starts_with("3 diff section(s)\n"),
+            "{big_rendered}"
+        );
+        assert!(
+            big_rendered.contains("src/foo.rs (+171 -3, 3 hunks) [stdout:1-"),
+            "{big_rendered}"
+        );
+        assert!(
+            big_rendered.contains("  @@ -10,4 +10,60 @@ fn f0() { (+57 -1) [stdout:"),
+            "{big_rendered}"
+        );
+        assert!(
+            big_rendered.contains("  @@ -210,4 +210,60 @@ fn f2() { (+57 -1) [stdout:"),
+            "{big_rendered}"
+        );
+
+        // 4. Huge generated snapshot section folds to 1 line so real code stays in Tier 1 Compact Diff!
+        let mut snap = String::from(
+            "diff --git a/tests/out.snap b/tests/out.snap\nindex 111..222 100644\n--- a/tests/out.snap\n+++ b/tests/out.snap\n@@ -1,1 +1,200 @@\n-old\n",
+        );
+        for i in 0..200 {
+            snap.push_str(&format!(
+                "+generated snapshot output row {i:03} with payload\n"
+            ));
+        }
+        snap.push_str(
+            "diff --git a/src/real.rs b/src/real.rs\nindex 333..444 100644\n--- a/src/real.rs\n+++ b/src/real.rs\n@@ -1,5 +1,5 @@ fn real() {\n c1\n c2\n-let x = 1;\n+let x = 2;\n c3\n",
+        );
+        let snap_summary = parse("git diff", &snap);
+        let snap_rendered = snap_summary.render(None, 0).unwrap();
+        assert!(
+            snap_rendered.len() < 400,
+            "got {} bytes:\n{snap_rendered}",
+            snap_rendered.len()
+        );
+        assert!(
+            snap_rendered.contains("=== tests/out.snap (generated, +200 -1) [stdout:1-206]\n"),
+            "{snap_rendered}"
+        );
+        assert!(
+            snap_rendered.contains("=== src/real.rs (+1 -1) [stdout:207-216]\n"),
+            "{snap_rendered}"
+        );
+        assert!(
+            snap_rendered.contains("-let x = 1;\n+let x = 2;\n"),
+            "{snap_rendered}"
+        );
     }
 
     #[test]

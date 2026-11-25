@@ -8,6 +8,7 @@ mod common;
 mod compaction;
 mod compare;
 mod delta;
+mod diff_compact;
 mod discover;
 mod git_views;
 mod global;

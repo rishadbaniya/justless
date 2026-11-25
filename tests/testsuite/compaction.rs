@@ -374,8 +374,8 @@ fn cargo_lock_patches_name_dependency_changes_and_flag_substitutions() {
         assert_eq!(replay, patch[from - 1..to].concat());
     }
     // Any other preview still names the flag: a rerun's unchanged notice and a
-    // clipped commit whose `--stat` the summary does not read.
-    let clipped = "run --hook --max-bytes 1024 -- git show --stat --patch HEAD";
+    // clipped commit whose `--raw` header block the summary does not read.
+    let clipped = "run --hook --max-bytes 1024 -- git show --raw --patch HEAD";
     for (line, start) in [(diff, "Output unchanged"), (clipped, "commit ")] {
         starts(
             &stdout(root, line),
