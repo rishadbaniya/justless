@@ -1232,12 +1232,17 @@ impl Parser {
                 })
                 .map_or(name, |(_, rest)| rest.trim_start());
             (!name.is_empty()).then_some((name, ""))
-        } else if let Some(entry) = line
-            .strip_prefix("FAILED ")
-            .or_else(|| line.strip_prefix("ERROR "))
+        } else if self.cargo.is_none()
+            && !self.go_tests
+            && let Some(entry) = line
+                .strip_prefix("FAILED ")
+                .or_else(|| line.strip_prefix("ERROR "))
         {
             Some(entry.split_once(" - ").unwrap_or((entry, "")))
-        } else if let Some(nodeid) = pytest_verbose_failure(line) {
+        } else if self.cargo.is_none()
+            && !self.go_tests
+            && let Some(nodeid) = pytest_verbose_failure(line)
+        {
             Some((nodeid, ""))
         } else {
             line.strip_prefix("--- FAIL: ")
