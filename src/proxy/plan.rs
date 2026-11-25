@@ -203,8 +203,11 @@ impl Request {
         let mut est_prompt = 0;
         for key in ["system", "tools"] {
             if let Some(raw) = body.raw(key) {
-                est_prompt += (raw.get().len() as u64).div_ceil(4);
-                one_hour |= body.value(key).is_some_and(|v| has_one_hour(&v));
+                let text = raw.get();
+                est_prompt += (text.len() as u64).div_ceil(4);
+                if !one_hour && (text.contains("1h") || text.contains("\\u")) {
+                    one_hour |= body.value(key).is_some_and(|v| has_one_hour(&v));
+                }
             }
         }
         one_hour |= has_one_hour(&messages)
@@ -212,6 +215,8 @@ impl Request {
                 .value("cache_control")
                 .is_some_and(|v| v["ttl"] == "1h");
         let messages_tokens = estimate(&messages, raw_messages.get().len() as u64);
+        let non_null_member =
+            |key: &str| body.raw(key).is_some_and(|raw| raw.get().trim() != "null");
         Ok(Self {
             model: body
                 .value("model")
@@ -220,8 +225,8 @@ impl Request {
             est_prompt: est_prompt + messages_tokens,
             messages_tokens,
             one_hour,
-            thread: body.raw("thread").is_some(),
-            compaction: body.raw("compaction").is_some(),
+            thread: non_null_member("thread"),
+            compaction: non_null_member("compaction"),
             context_management: body.value("context_management"),
             messages,
         })
@@ -238,16 +243,17 @@ impl Request {
     }
 
     /// Whether the client already manages context with an edit other than
-    /// thinking clearing. `None` means the field is malformed.
+    /// thinking clearing. Explicit `null` counts as absent; any other non-object
+    /// value is treated as client-managed so malformed fields pass through.
     pub fn client_edits(&self) -> bool {
-        let Some(cm) = &self.context_management else {
+        let Some(cm) = self.context_management.as_ref().filter(|v| !v.is_null()) else {
             return false;
         };
         let Some(object) = cm.as_object() else {
             return true;
         };
         match object.get("edits") {
-            None => false,
+            None | Some(Value::Null) => false,
             Some(Value::Array(edits)) => edits.iter().any(|edit| {
                 !edit["type"]
                     .as_str()
@@ -563,12 +569,18 @@ pub fn edit(uses: usize, boundary: usize, clear_at_least: u64) -> Value {
 
 /// The body with `edit` appended after the client's own edits.
 pub fn splice(body: &Body, existing: Option<&Value>, edit: Value) -> Option<Vec<u8>> {
-    let mut cm = existing.cloned().unwrap_or_else(|| json!({}));
-    cm.as_object_mut()?
+    let mut cm = existing
+        .filter(|v| !v.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let edits = cm
+        .as_object_mut()?
         .entry("edits")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()?
-        .push(edit);
+        .or_insert_with(|| json!([]));
+    if edits.is_null() {
+        *edits = json!([]);
+    }
+    edits.as_array_mut()?.push(edit);
     Some(body.with_member("context_management", &serde_json::to_string(&cm).ok()?))
 }
 
@@ -992,5 +1004,45 @@ mod tests {
         let b: Value = serde_json::from_str(r#"{"timeout":5,"command":"ls"}"#).unwrap();
         assert_eq!(call_hash("Bash", &a), call_hash("Bash", &b));
         assert_ne!(call_hash("Bash", &a), call_hash("Read", &a));
+    }
+
+    #[test]
+    fn treats_explicit_null_optional_fields_as_absent_and_splices_cleanly() {
+        let mut body = conversation(&[100, 100]);
+        body["thread"] = Value::Null;
+        body["compaction"] = Value::Null;
+        body["context_management"] = Value::Null;
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let parsed = Body::parse(&bytes).unwrap();
+        let req = Request::read(&parsed).unwrap();
+        assert!(!req.thread);
+        assert!(!req.compaction);
+        assert!(!req.client_edits());
+
+        let spliced = splice(&parsed, req.context_management.as_ref(), edit(10, 6, 100)).unwrap();
+        let after = Body::parse(&spliced).unwrap();
+        assert_eq!(
+            parsed.raw("messages").map(|r| r.get()),
+            after.raw("messages").map(|r| r.get())
+        );
+        let edits = after.value("context_management").unwrap()["edits"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["type"], EDIT);
+
+        // `{"edits": null}` is also treated as no client edits and splices cleanly.
+        body["context_management"] = json!({"edits": null});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let parsed = Body::parse(&bytes).unwrap();
+        let req = Request::read(&parsed).unwrap();
+        assert!(!req.client_edits());
+        let spliced = splice(&parsed, req.context_management.as_ref(), edit(10, 6, 100)).unwrap();
+        let after = Body::parse(&spliced).unwrap();
+        assert_eq!(
+            after.value("context_management").unwrap()["edits"][0]["type"],
+            EDIT
+        );
     }
 }

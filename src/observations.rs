@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -604,6 +605,382 @@ fn text_kind(value: &Value) -> Option<&str> {
         .then_some(kind)
 }
 
+/// Maximum characters for a standalone diagnostic cue in a retired stub.
+const MAX_CUE_CHARS: usize = 80;
+/// Maximum characters when combining a run/file prefix with a diagnostic cue.
+const MAX_COMBINED_CUE_CHARS: usize = 100;
+/// Bound line scanning so huge outputs stay fast while still catching tail summaries.
+const MAX_HEAD_SCAN_LINES: usize = 1000;
+const MAX_TAIL_SCAN_LINES: usize = 200;
+/// Maximum bytes examined from a single line before redacting (matches redact's HOLD).
+const MAX_CUE_LINE_BYTES: usize = 8 * 1024;
+/// Enriched stubs are emitted only when strictly smaller than this share of the
+/// original serialized JSON value.
+const MAX_ENRICHED_PERCENT: usize = 35;
+
+static ANSI_ESCAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("valid ansi pattern"));
+static RUN_FOOTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[justless (run-[A-Za-z0-9]+)(?:\](.*)| · ([^\]]+)\])")
+        .expect("valid run footer pattern")
+});
+static EXIT_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bexit -?[0-9]+\b").expect("valid exit pattern"));
+static REVISION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^revision [0-9a-f]{12,64} · [0-9]+ lines(?: · window L[0-9]+-[0-9]+)?$")
+        .expect("valid revision header pattern")
+});
+static FILE_REVISION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[^\s]+ \(revision [0-9a-f]{8,64}[^)]*\)$")
+        .expect("valid file revision header pattern")
+});
+static ARCHIVED_READ_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[justless recall [0-9a-f]{64}\] exact original Read result · ([0-9]+ lines)$")
+        .expect("valid archived read header pattern")
+});
+static ARCHIVED_SEARCH_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[justless recall [0-9a-f]{64}\] exact original result$")
+        .expect("valid archived search header pattern")
+});
+
+fn text_content(value: &Value) -> Option<Cow<'_, str>> {
+    text_kind(value)?;
+    if let Some(s) = value.as_str() {
+        return Some(Cow::Borrowed(s));
+    }
+    let parts = value.as_array()?;
+    if parts.len() == 1 {
+        return parts[0]["text"].as_str().map(Cow::Borrowed);
+    }
+    let joined: String = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+    Some(Cow::Owned(joined))
+}
+
+fn content_digest(value: &Value) -> Option<String> {
+    let text = text_content(value)?;
+    Some(source_digest(text.as_bytes()))
+}
+
+fn strip_ansi(text: &str) -> Cow<'_, str> {
+    if !text.as_bytes().contains(&0x1b) {
+        return Cow::Borrowed(text);
+    }
+    ANSI_ESCAPE.replace_all(text, "")
+}
+
+fn clean_single_line(line: &str) -> String {
+    let bounded = &line[..line.floor_char_boundary(MAX_CUE_LINE_BYTES.min(line.len()))];
+    let plain = strip_ansi(bounded);
+    let sanitized: String = plain
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn redact_line(redactor: Option<&crate::redact::Redactor>, line: &str) -> String {
+    let clean = clean_single_line(line);
+    if clean.is_empty() || (clean.contains("-----BEGIN") && clean.contains("PRIVATE KEY")) {
+        return String::new();
+    }
+    match redactor {
+        Some(redactor) => redactor.text(&clean).into_owned(),
+        None => clean,
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => {
+            let mut out = text[..cut].trim_end().to_owned();
+            // Never emit a half-truncated `[redacted:...` marker.
+            if let Some(pos) = out.rfind("[redacted:")
+                && !out[pos..].contains(']')
+            {
+                out.truncate(pos);
+                out = out.trim_end().to_owned();
+            }
+            if out.is_empty() {
+                String::new()
+            } else {
+                out.push('…');
+                out
+            }
+        }
+        None => text.to_owned(),
+    }
+}
+
+fn is_error_line(trimmed: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "error:",
+        "error[",
+        "error TS",
+        "Error:",
+        "ERROR:",
+        "ERROR ",
+        "fatal:",
+        "Fatal:",
+        "FATAL:",
+        "FAIL:",
+        "FAIL ",
+        "FAILED:",
+        "FAILED ",
+        "--- FAIL:",
+        "test result: FAILED",
+        "panic:",
+        "AssertionError:",
+        "TypeError:",
+        "ValueError:",
+        "KeyError:",
+        "RuntimeError:",
+        "ReferenceError:",
+        "SyntaxError:",
+        "RangeError:",
+        "AttributeError:",
+        "ImportError:",
+        "ModuleNotFoundError:",
+        "ZeroDivisionError:",
+        "IndexError:",
+        "FileNotFoundError:",
+        "PermissionError:",
+        "OSError:",
+        "NameError:",
+        "TimeoutError:",
+        "ConnectionError:",
+        "Exception:",
+    ];
+    if PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix)) {
+        return true;
+    }
+    if trimmed.starts_with("thread '") && trimmed.contains("panicked at") {
+        return true;
+    }
+    if trimmed.starts_with("test ") && trimmed.ends_with(" ... FAILED") {
+        return true;
+    }
+    if trimmed.starts_with("Summary ") && trimmed.contains(" failed") {
+        return true;
+    }
+    if trimmed.starts_with("===") && trimmed.contains(" failed") && trimmed.ends_with("===") {
+        return true;
+    }
+    if (trimmed.starts_with("Tests:") || trimmed.starts_with("Test Files"))
+        && trimmed.contains("failed")
+    {
+        return true;
+    }
+    if let Some((before, _)) = trimmed.split_once(": error")
+        && !before.is_empty()
+        && !before.contains(' ')
+        && (trimmed.contains(": error:")
+            || trimmed.contains(": error[")
+            || trimmed.contains(": error TS"))
+    {
+        return true;
+    }
+    false
+}
+
+fn is_pass_summary(trimmed: &str) -> bool {
+    trimmed.starts_with("test result: ok.")
+        || (trimmed.starts_with("Summary ") && trimmed.contains(" passed"))
+        || (trimmed.starts_with("===") && trimmed.contains(" passed") && trimmed.ends_with("==="))
+        || ((trimmed.starts_with("Tests:") || trimmed.starts_with("Test Files"))
+            && trimmed.contains("passed"))
+}
+
+/// Finds the highest-signal diagnostic or test-summary line in `text`, bounded
+/// to head + tail windows so multi-megabyte logs stay fast.
+fn extract_diagnostic(text: &str, redactor: Option<&crate::redact::Redactor>) -> Option<String> {
+    let mut pass_candidate: Option<&str> = None;
+    let mut head_count = 0usize;
+    let mut total_lines = 0usize;
+    for line in text.lines() {
+        total_lines += 1;
+        if head_count < MAX_HEAD_SCAN_LINES {
+            head_count += 1;
+            let trimmed = strip_ansi(line);
+            let trimmed = trimmed.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if is_error_line(trimmed) {
+                let redacted = redact_line(redactor, line);
+                if !redacted.is_empty() {
+                    return Some(redacted);
+                }
+            } else if pass_candidate.is_none() && is_pass_summary(trimmed) {
+                pass_candidate = Some(line);
+            }
+        }
+    }
+    if total_lines > MAX_HEAD_SCAN_LINES {
+        let tail_start = total_lines
+            .saturating_sub(MAX_TAIL_SCAN_LINES)
+            .max(MAX_HEAD_SCAN_LINES);
+        for line in text.lines().skip(tail_start) {
+            let trimmed = strip_ansi(line);
+            let trimmed = trimmed.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if is_error_line(trimmed) {
+                let redacted = redact_line(redactor, line);
+                if !redacted.is_empty() {
+                    return Some(redacted);
+                }
+            } else if pass_candidate.is_none() && is_pass_summary(trimmed) {
+                pass_candidate = Some(line);
+            }
+        }
+    }
+    pass_candidate
+        .map(|line| redact_line(redactor, line))
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_run_footer(text: &str, redactor: Option<&crate::redact::Redactor>) -> Option<String> {
+    let mut non_empty_seen = 0usize;
+    let mut matched: Option<(String, Option<String>)> = None;
+    for line in text.lines().rev() {
+        let plain = strip_ansi(line);
+        let trimmed = plain.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty_seen += 1;
+        if let Some(caps) = RUN_FOOTER.captures(trimmed) {
+            let run_id = caps[1].to_owned();
+            let detail = caps
+                .get(2)
+                .or_else(|| caps.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            let exit = EXIT_CODE.find(detail).map(|m| m.as_str().to_owned());
+            matched = Some((run_id, exit));
+            break;
+        }
+        if non_empty_seen >= 10 {
+            break;
+        }
+    }
+    let (run_id, exit) = matched?;
+    let prefix = match exit {
+        Some(exit) => format!("{run_id} · {exit}"),
+        None => run_id,
+    };
+    if let Some(diag) = extract_diagnostic(text, redactor) {
+        let budget = MAX_COMBINED_CUE_CHARS.saturating_sub(prefix.chars().count() + 3);
+        if budget >= 20 {
+            let short = truncate_chars(&diag, budget);
+            if !short.is_empty() {
+                return Some(format!("{prefix} · {short}"));
+            }
+        }
+    }
+    Some(prefix)
+}
+
+fn extract_outline_header(
+    text: &str,
+    redactor: Option<&crate::redact::Redactor>,
+) -> Option<String> {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let first_raw = lines.next()?;
+    let second_raw = lines.next();
+    let first_plain = strip_ansi(first_raw);
+    let first = first_plain.trim();
+    if REVISION_HEADER.is_match(first) || FILE_REVISION_HEADER.is_match(first) {
+        let clean = redact_line(redactor, first);
+        let bounded = truncate_chars(&clean, MAX_CUE_CHARS);
+        return (!bounded.is_empty()).then_some(bounded);
+    }
+    if let Some(file) = first
+        .strip_prefix("=== ")
+        .and_then(|s| s.strip_suffix(" ==="))
+        .filter(|s| !s.is_empty())
+        && let Some(second_raw) = second_raw
+    {
+        let second_plain = strip_ansi(second_raw);
+        let second = second_plain.trim();
+        if REVISION_HEADER.is_match(second) {
+            let combined = format!("{file} ({second})");
+            let clean = redact_line(redactor, &combined);
+            let bounded = truncate_chars(&clean, MAX_COMBINED_CUE_CHARS);
+            return (!bounded.is_empty()).then_some(bounded);
+        }
+    }
+    if let Some(caps) = ARCHIVED_READ_HEADER.captures(first) {
+        return Some(format!("Read outline · {}", &caps[1]));
+    }
+    if ARCHIVED_SEARCH_HEADER.is_match(first)
+        && let Some(second_raw) = second_raw
+    {
+        let second_plain = strip_ansi(second_raw);
+        let second = second_plain.trim();
+        if second.starts_with("Grep: ") || second.starts_with("Glob in ") {
+            let clean = redact_line(redactor, second);
+            let bounded = truncate_chars(&clean, MAX_CUE_CHARS);
+            return (!bounded.is_empty()).then_some(bounded);
+        }
+    }
+    if first.starts_with("Justless outline of ") {
+        let clean = redact_line(redactor, first);
+        let bounded = truncate_chars(&clean, MAX_CUE_CHARS);
+        return (!bounded.is_empty()).then_some(bounded);
+    }
+    None
+}
+
+/// Extracts a deterministic, redacted, single-line semantic cue purely from a
+/// retired result's text, or `None` for generic plain text.
+fn semantic_cue(text: &str, redactor: Option<&crate::redact::Redactor>) -> Option<String> {
+    if let Some(cue) = extract_run_footer(text, redactor) {
+        return Some(cue);
+    }
+    if let Some(cue) = extract_outline_header(text, redactor) {
+        return Some(cue);
+    }
+    let diag = extract_diagnostic(text, redactor)?;
+    let bounded = truncate_chars(&diag, MAX_CUE_CHARS);
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+fn wrap_stub(kind: &str, text: String) -> Value {
+    if kind.is_empty() {
+        Value::String(text)
+    } else {
+        json!([{"type": kind, "text": text}])
+    }
+}
+
+fn build_stub(
+    original: &Value,
+    kind: &str,
+    id: &str,
+    original_bytes: usize,
+    redactor: Option<&crate::redact::Redactor>,
+) -> Result<Value> {
+    let bare = wrap_stub(kind, format!("{PREFIX}{id}]"));
+    let Some(text) = text_content(original) else {
+        return Ok(bare);
+    };
+    let Some(cue) = semantic_cue(&text, redactor) else {
+        return Ok(bare);
+    };
+    let enriched = wrap_stub(kind, format!("{PREFIX}{id} · {cue}]"));
+    let enriched_bytes = serde_json::to_vec(&enriched)?.len();
+    if enriched_bytes < original_bytes
+        && enriched_bytes.saturating_mul(100) < original_bytes.saturating_mul(MAX_ENRICHED_PERCENT)
+    {
+        debug_assert_eq!(marker(&enriched), Some(id));
+        Ok(enriched)
+    } else {
+        Ok(bare)
+    }
+}
+
 fn marker(value: &Value) -> Option<&str> {
     let text = if let Some(s) = value.as_str() {
         s
@@ -614,9 +991,15 @@ fn marker(value: &Value) -> Option<&str> {
         }
         parts[0]["text"].as_str()?
     };
-    text.strip_prefix(PREFIX)?
-        .strip_suffix(']')
-        .filter(|id| valid_id(id))
+    if text.contains('\n') || text.contains('\r') {
+        return None;
+    }
+    let inner = text.strip_prefix(PREFIX)?.strip_suffix(']')?;
+    if valid_id(inner) {
+        return Some(inner);
+    }
+    let (id, cue) = inner.split_once(" · ")?;
+    (!cue.is_empty() && valid_id(id)).then_some(id)
 }
 
 /// Prints one archived result, by recall ID or tool_use ID. Returns the bytes
@@ -656,6 +1039,124 @@ fn recall(ws: &Workspace, args: &ArgMatches, selection: &Selection) -> Result<(u
     Ok((print_json(&value)?, false))
 }
 
+struct MaskOptions<'a> {
+    keep: usize,
+    minimum: usize,
+    trigger: usize,
+    restore: bool,
+    pins: Vec<&'a str>,
+    keep_tools: Vec<&'a str>,
+}
+
+enum Change {
+    Restore(Value),
+    Retire { kind: String, bytes: usize },
+}
+
+fn mask_request(
+    ws: &Workspace,
+    request: &mut Value,
+    surrogates: Option<&Surrogates>,
+    opts: &MaskOptions<'_>,
+) -> Result<(usize, i128)> {
+    let candidates = outputs(request)?;
+    let cutoff = candidates.len().saturating_sub(opts.keep);
+    let allowed = |c: &Output| {
+        !c.protected
+            && !opts.pins.iter().any(|&s| s == c.call)
+            && !opts.keep_tools.iter().any(|&s| s == c.tool)
+    };
+    let mut digests: Vec<Option<String>> = Vec::new();
+    let mut last_occurrence: HashMap<String, usize> = HashMap::new();
+    if !opts.restore {
+        digests.reserve(candidates.len());
+        for (index, c) in candidates.iter().enumerate() {
+            let digest = request
+                .pointer(&c.path)
+                .filter(|value| marker(value).is_none())
+                .and_then(content_digest);
+            if let Some(d) = &digest {
+                last_occurrence.insert(d.clone(), index);
+            }
+            digests.push(digest);
+        }
+    }
+    let mut changes: Vec<(&str, Change)> = Vec::new();
+    let mut eligible_bytes: usize = 0;
+    let mut saved_bytes: i128 = 0;
+    for (index, c) in candidates.iter().enumerate() {
+        let Some(value) = request.pointer(&c.path) else {
+            continue;
+        };
+        if opts.restore {
+            if !c.protected
+                && let Some(id) = marker(value)
+            {
+                changes.push((&c.path, Change::Restore(recover(ws, id)?)));
+            }
+            continue;
+        }
+        if !allowed(c) || marker(value).is_some() {
+            continue;
+        }
+        // Earlier identical copies are retired even inside the `keep` window
+        // because the exact text remains verbatim at the latest occurrence.
+        let is_duplicate = digests[index]
+            .as_ref()
+            .and_then(|d| last_occurrence.get(d))
+            .is_some_and(|&last| index < last);
+        if index >= cutoff && !is_duplicate {
+            continue;
+        }
+        // The archive holds valid JSON, so a result with a lone surrogate stays.
+        if let Some(surrogates) = surrogates
+            && serde_json::to_string(value)?.contains(surrogates.marker)
+        {
+            continue;
+        }
+        let Some(kind) = text_kind(value) else {
+            continue;
+        };
+        let bytes = serde_json::to_vec(value)?.len();
+        if bytes < opts.minimum {
+            continue;
+        }
+        let bare = wrap_stub(kind, format!("{PREFIX}{}]", "0".repeat(64)));
+        let cost = serde_json::to_vec(&bare)?.len();
+        if cost >= bytes {
+            continue;
+        }
+        eligible_bytes += bytes;
+        changes.push((
+            &c.path,
+            Change::Retire {
+                kind: kind.to_owned(),
+                bytes,
+            },
+        ));
+    }
+    if !opts.restore && eligible_bytes < opts.trigger {
+        changes.clear();
+    }
+    let count = changes.len();
+    let mut redactor: Option<Option<&crate::redact::Redactor>> = None;
+    for (path, change) in changes {
+        let original = request.pointer_mut(path).context("missing result field")?;
+        let next = match change {
+            Change::Restore(value) => value,
+            Change::Retire { kind, bytes } => {
+                let id = archive(ws, original)?;
+                let redactor = *redactor.get_or_insert_with(|| crate::redact::for_workspace(ws));
+                build_stub(original, &kind, &id, bytes, redactor)?
+            }
+        };
+        saved_bytes +=
+            serde_json::to_vec(original)?.len() as i128 - serde_json::to_vec(&next)?.len() as i128;
+        *original = next;
+    }
+    Ok((count, saved_bytes))
+}
+
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     if name == "recall" {
         let selection = Selection::of(args)?;
@@ -675,97 +1176,23 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<()> {
     let mut input = Vec::new();
     io::stdin().lock().read_to_end(&mut input)?;
     let (mut request, surrogates) = decode_request(&input)?;
-    if !args.is_present("restore")
-        && let Some(reason) = held(&request, args.value_of("model"))
-    {
+    let restore = args.is_present("restore");
+    if !restore && let Some(reason) = held(&request, args.value_of("model")) {
         if args.is_present("stats") {
             eprintln!("{}", json!({"changed":0,"bytes_saved":0,"held":reason}));
         }
         // A held request is returned exactly as read.
         return Ok(io::stdout().lock().write_all(&input)?);
     }
-    let candidates = outputs(&request)?;
-    let keep = crate::read_num(args, "keep", 0)?;
-    let minimum = crate::read_num(args, "min-bytes", 0)?;
-    let trigger = crate::read_num(args, "trigger-bytes", 0)?;
-    let cutoff = candidates.len().saturating_sub(keep);
-    let eligible = |index: usize, c: &Output| {
-        index < cutoff
-            && !c.protected
-            && !args
-                .values_of("pin")
-                .into_iter()
-                .flatten()
-                .any(|s| s == c.call)
-            && !args
-                .values_of("keep-tool")
-                .into_iter()
-                .flatten()
-                .any(|s| s == c.tool)
+    let opts = MaskOptions {
+        keep: crate::read_num(args, "keep", 0)?,
+        minimum: crate::read_num(args, "min-bytes", 0)?,
+        trigger: crate::read_num(args, "trigger-bytes", 0)?,
+        restore,
+        pins: args.values_of("pin").into_iter().flatten().collect(),
+        keep_tools: args.values_of("keep-tool").into_iter().flatten().collect(),
     };
-    let mut changes = Vec::new();
-    let mut eligible_bytes: usize = 0;
-    let mut saved_bytes: i128 = 0;
-    for (index, c) in candidates.iter().enumerate() {
-        let Some(value) = request.pointer(&c.path) else {
-            continue;
-        };
-        if args.is_present("restore") {
-            if !c.protected
-                && let Some(id) = marker(value)
-            {
-                changes.push((&c.path, recover(ws, id)?));
-            }
-            continue;
-        }
-        if !eligible(index, c) || marker(value).is_some() {
-            continue;
-        }
-        // The archive holds valid JSON, so a result with a lone surrogate stays.
-        if let Some(surrogates) = &surrogates
-            && serde_json::to_string(value)?.contains(surrogates.marker)
-        {
-            continue;
-        }
-        let Some(kind) = text_kind(value) else {
-            continue;
-        };
-        let bytes = serde_json::to_vec(value)?.len();
-        if bytes < minimum {
-            continue;
-        }
-        let placeholder = format!("{PREFIX}{}]", "0".repeat(64));
-        let replacement = if kind.is_empty() {
-            json!(placeholder)
-        } else {
-            json!([{"type":kind,"text":placeholder}])
-        };
-        let cost = serde_json::to_vec(&replacement)?.len();
-        if cost >= bytes {
-            continue;
-        }
-        eligible_bytes += bytes;
-        changes.push((&c.path, replacement));
-    }
-    if !args.is_present("restore") && eligible_bytes < trigger {
-        changes.clear();
-    }
-    let count = changes.len();
-    for (path, mut value) in changes {
-        let original = request.pointer_mut(path).context("missing result field")?;
-        if !args.is_present("restore") {
-            let id = archive(ws, original)?;
-            let stub = json!(format!("{PREFIX}{id}]"));
-            if value.is_string() {
-                value = stub;
-            } else {
-                value[0]["text"] = stub;
-            }
-        }
-        saved_bytes +=
-            serde_json::to_vec(original)?.len() as i128 - serde_json::to_vec(&value)?.len() as i128;
-        *original = value;
-    }
+    let (count, saved_bytes) = mask_request(ws, &mut request, surrogates.as_ref(), &opts)?;
     if args.is_present("stats") {
         eprintln!(
             "{}",
@@ -973,5 +1400,442 @@ mod tests {
         let all = grep(31);
         assert_eq!(all.lines().count(), 31, "{all}");
         assert!(all.ends_with("31: order-42 FAILED\n"), "{all}");
+    }
+
+    fn test_workspace() -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let ws = Workspace {
+            state: root.join(".justless"),
+            cwd: root.clone(),
+            origin: root.clone(),
+            root,
+        };
+        (dir, ws)
+    }
+
+    fn default_opts(keep: usize) -> MaskOptions<'static> {
+        MaskOptions {
+            keep,
+            minimum: 1024,
+            trigger: 0,
+            restore: false,
+            pins: Vec::new(),
+            keep_tools: Vec::new(),
+        }
+    }
+
+    fn tool_messages(results: &[(&str, &str, Value, bool)]) -> Value {
+        let mut messages = vec![json!({"role":"user","content":"investigate"})];
+        for (call_id, tool, content, is_error) in results {
+            messages.push(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":call_id,"name":tool,"input":{}}
+            ]}));
+            let mut result = json!({"type":"tool_result","tool_use_id":call_id,"content":content});
+            if *is_error {
+                result["is_error"] = json!(true);
+            }
+            messages.push(json!({"role":"user","content":[result]}));
+        }
+        json!({"model":"claude-sonnet-4-6","messages":messages})
+    }
+
+    #[test]
+    fn retires_earlier_duplicate_results_even_inside_keep_window_with_exact_recall() {
+        let (_dir, ws) = test_workspace();
+        let dup = "repeated build output line\n".repeat(100);
+        let unique = "unique diagnostic output\n".repeat(100);
+        let original = tool_messages(&[
+            ("c0", "bash", json!(dup), false),
+            ("c1", "read", json!(unique), false),
+            ("c2", "bash", json!([{"type":"text","text":dup}]), false),
+            ("c3", "bash", json!(dup), false),
+        ]);
+        // keep=5 covers all 4 results, yet earlier identical copies c0 and c2
+        // are retired immediately because c3 holds the exact text verbatim.
+        let mut masked = original.clone();
+        let (changed, saved) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 2);
+        assert!(saved > 4000, "saved={saved}");
+
+        let s0 = &masked["messages"][2]["content"][0]["content"];
+        let s1 = &masked["messages"][4]["content"][0]["content"];
+        let s2 = &masked["messages"][6]["content"][0]["content"];
+        let s3 = &masked["messages"][8]["content"][0]["content"];
+        let id0 = marker(s0).expect("c0 retired");
+        let id2 = marker(s2).expect("c2 retired");
+        assert_eq!(s1, &json!(unique));
+        assert_eq!(s3, &json!(dup));
+        assert_eq!(recover(&ws, id0).unwrap(), json!(dup));
+        assert_eq!(
+            recover(&ws, id2).unwrap(),
+            json!([{"type":"text","text":dup}])
+        );
+
+        // Idempotent when re-masked, and lossless under --restore.
+        let mut remasked = masked.clone();
+        let (again, _) = mask_request(&ws, &mut remasked, None, &default_opts(5)).unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(remasked, masked);
+
+        let mut restored = masked.clone();
+        let mut restore_opts = default_opts(5);
+        restore_opts.restore = true;
+        mask_request(&ws, &mut restored, None, &restore_opts).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn duplicate_early_retirement_respects_protected_pin_keep_tool_and_trigger() {
+        let (_dir, ws) = test_workspace();
+        let dup = "same output line\n".repeat(120);
+        let req = tool_messages(&[
+            ("err_call", "bash", json!(dup), true),
+            ("pinned_call", "bash", json!(dup), false),
+            ("kept_tool_call", "read", json!(dup), false),
+            ("latest_call", "bash", json!(dup), false),
+        ]);
+        let mut masked = req.clone();
+        let opts = MaskOptions {
+            keep: 10,
+            minimum: 1024,
+            trigger: 0,
+            restore: false,
+            pins: vec!["pinned_call"],
+            keep_tools: vec!["read"],
+        };
+        let (changed, _) = mask_request(&ws, &mut masked, None, &opts).unwrap();
+        assert_eq!(changed, 0);
+        assert_eq!(masked, req);
+
+        // Trigger threshold still gates duplicate retirement.
+        let mut high_trigger = req.clone();
+        let opts = MaskOptions {
+            keep: 10,
+            minimum: 1024,
+            trigger: 100_000,
+            restore: false,
+            pins: Vec::new(),
+            keep_tools: Vec::new(),
+        };
+        let (changed, _) = mask_request(&ws, &mut high_trigger, None, &opts).unwrap();
+        assert_eq!(changed, 0);
+        assert_eq!(high_trigger, req);
+    }
+
+    #[test]
+    fn retired_stubs_stay_prefix_cache_identical_as_conversation_grows() {
+        let (_dir, ws) = test_workspace();
+        let run_fail = format!(
+            "{}error[E0425]: cannot find value `tax` in this scope\n\
+             [justless run-Ab12 · 1.8 KB of 9.4 KB shown · exit 101]\n",
+            "   Compiling demo v0.1.0\n".repeat(80)
+        );
+        let outline = format!(
+            "revision 77501e2869cd09afbec6895c · 977 lines\n{}",
+            "#1 L1-10 function foo  fn foo()\n".repeat(60)
+        );
+        let other = "normal output line\n".repeat(100);
+
+        // Turn 1: run_fail appears twice inside keep=3 -> index 0 retires early.
+        let mut turn1 = tool_messages(&[
+            ("c0", "bash", json!(run_fail), false),
+            ("c1", "read", json!(outline), false),
+            ("c2", "bash", json!(run_fail), false),
+        ]);
+        mask_request(&ws, &mut turn1, None, &default_opts(3)).unwrap();
+        let stub0_t1 = turn1["messages"][2]["content"][0]["content"].clone();
+        assert!(marker(&stub0_t1).is_some());
+
+        // Turn 2: append c3 (other). Now c0 is also past cutoff; its stub MUST stay identical.
+        let mut turn2 = tool_messages(&[
+            ("c0", "bash", json!(run_fail), false),
+            ("c1", "read", json!(outline), false),
+            ("c2", "bash", json!(run_fail), false),
+            ("c3", "bash", json!(other), false),
+        ]);
+        mask_request(&ws, &mut turn2, None, &default_opts(3)).unwrap();
+        assert_eq!(turn2["messages"][2]["content"][0]["content"], stub0_t1);
+        // Entire prefix from Turn 1 is unchanged in Turn 2!
+        assert_eq!(
+            turn2["messages"].as_array().unwrap()[..7],
+            turn1["messages"].as_array().unwrap()[..7]
+        );
+
+        // Turn 3: append c4 -> c1 (outline) now retires too; c0 stays identical.
+        let mut turn3 = tool_messages(&[
+            ("c0", "bash", json!(run_fail), false),
+            ("c1", "read", json!(outline), false),
+            ("c2", "bash", json!(run_fail), false),
+            ("c3", "bash", json!(other), false),
+            ("c4", "bash", json!(other), false),
+        ]);
+        mask_request(&ws, &mut turn3, None, &default_opts(3)).unwrap();
+        let stub1_t3 = turn3["messages"][4]["content"][0]["content"].clone();
+        assert_eq!(turn3["messages"][2]["content"][0]["content"], stub0_t1);
+        assert!(marker(&stub1_t3).is_some());
+
+        // Turn 4: append c5 -> c0 and c1 both remain byte-for-byte identical.
+        let mut turn4 = tool_messages(&[
+            ("c0", "bash", json!(run_fail), false),
+            ("c1", "read", json!(outline), false),
+            ("c2", "bash", json!(run_fail), false),
+            ("c3", "bash", json!(other), false),
+            ("c4", "bash", json!(other), false),
+            ("c5", "bash", json!("extra\n".repeat(300)), false),
+        ]);
+        mask_request(&ws, &mut turn4, None, &default_opts(3)).unwrap();
+        assert_eq!(turn4["messages"][2]["content"][0]["content"], stub0_t1);
+        assert_eq!(turn4["messages"][4]["content"][0]["content"], stub1_t3);
+        // c2 had the same run_fail content as c0, so when c2 retires it gets the exact same stub.
+        assert_eq!(turn4["messages"][6]["content"][0]["content"], stub0_t1);
+    }
+
+    #[test]
+    fn semantic_cues_preserve_key_context_and_respect_bounds_and_redaction() {
+        let (_dir, ws) = test_workspace();
+        let run_output = format!(
+            "{}\x1b[1;31merror[E0308]\x1b[0m: mismatched types in checkout\n\
+             [justless run-Zx99 · 2.0 KB of 14.0 KB shown · exit 101]\n",
+            "   Compiling app v0.1.0\n".repeat(80)
+        );
+        let outline_output = format!(
+            "revision 77501e2869cd09afbec6895c · 977 lines\n{}",
+            "#1 L1-10 function helper  fn helper()\n".repeat(60)
+        );
+        let file_header_output = format!(
+            "src/pricing.rs (revision 77501e2869cd09af, 420 lines)\n{}",
+            "pub fn rate() -> u64 { 1 }\n".repeat(80)
+        );
+        let failure_output = format!(
+            "{}test checkout::applies_discount ... FAILED\n\
+             test result: FAILED. 12 passed; 1 failed; 0 ignored\n",
+            "running 13 tests\n".repeat(100)
+        );
+        let plain_output = "plain log line without structure\n".repeat(100);
+        // Secret spanning past the 80-char truncation point must be redacted BEFORE truncation.
+        // Built at runtime so `real_build_and_source_output_have_nothing_to_redact` sees no literal secrets.
+        let secret = format!(
+            "{}_{}{}",
+            "ghp", "7kQ9mN2pR5tV8wX1yZ4", "bC6dF0hJ3lM9nP2qS4rT6"
+        );
+        let secret_error = format!(
+            "{}error: failed to authenticate with upstream registry using token {secret} during push\n",
+            "info: uploading package\n".repeat(100)
+        );
+        let short_secret_error = format!(
+            "{}error: rejected token {secret}\n",
+            "info: calling api\n".repeat(100)
+        );
+        let pem_head = format!("-----{} RSA {}-----", "BEGIN", "PRIVATE KEY");
+        let pem_tail = format!("-----{} RSA {}-----", "END", "PRIVATE KEY");
+        let pem_error = format!(
+            "{}error: {pem_head}MIIEpAIBAAKCAQEA0123456789abcdef0123456789abcdef{pem_tail}\n",
+            "info: loading tls\n".repeat(100)
+        );
+
+        let req = tool_messages(&[
+            ("r_run", "bash", json!(run_output), false),
+            ("r_out", "read", json!(outline_output), false),
+            ("r_hdr", "read", json!(file_header_output), false),
+            ("r_fail", "bash", json!(failure_output), false),
+            ("r_plain", "bash", json!(plain_output), false),
+            ("r_sec", "bash", json!(secret_error), false),
+            ("r_sec_short", "bash", json!(short_secret_error), false),
+            ("r_pem", "bash", json!(pem_error), false),
+        ]);
+        let mut masked = req.clone();
+        mask_request(&ws, &mut masked, None, &default_opts(0)).unwrap();
+
+        let stub_at = |idx: usize| {
+            masked["messages"][2 + idx * 2]["content"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let s_run = stub_at(0);
+        assert!(s_run.starts_with(PREFIX) && s_run.ends_with(']'), "{s_run}");
+        assert!(s_run.contains("run-Zx99 · exit 101"), "{s_run}");
+        assert!(s_run.contains("error[E0308]: mismatched types"), "{s_run}");
+        assert!(!s_run.contains('\x1b'), "{s_run}");
+        assert!(marker(&json!(s_run)).is_some());
+
+        let s_out = stub_at(1);
+        assert!(
+            s_out.contains(" · revision 77501e2869cd09afbec6895c · 977 lines]"),
+            "{s_out}"
+        );
+        assert!(marker(&json!(s_out)).is_some());
+
+        let s_hdr = stub_at(2);
+        assert!(
+            s_hdr.contains(" · src/pricing.rs (revision 77501e2869cd09af, 420 lines)]"),
+            "{s_hdr}"
+        );
+        assert!(marker(&json!(s_hdr)).is_some());
+
+        let s_fail = stub_at(3);
+        assert!(
+            s_fail.contains(" · test checkout::applies_discount ... FAILED]"),
+            "{s_fail}"
+        );
+        assert!(marker(&json!(s_fail)).is_some());
+
+        // Plain output gets the classic bare stub with no extra cue bytes.
+        let s_plain = stub_at(4);
+        assert_eq!(s_plain.len(), PREFIX.len() + 64 + 1, "{s_plain}");
+        assert!(valid_id(
+            s_plain
+                .strip_prefix(PREFIX)
+                .unwrap()
+                .strip_suffix(']')
+                .unwrap()
+        ));
+
+        // Secret-bearing errors never leak the raw secret into the retired stub,
+        // even when the secret straddles the 80-char truncation boundary.
+        let s_sec = stub_at(5);
+        assert!(!s_sec.contains("ghp_"), "leaked secret: {s_sec}");
+        assert!(!s_sec.contains("7kQ9mN"), "leaked secret body: {s_sec}");
+        assert!(!s_sec.contains("[redacted:github-token…"), "{s_sec}");
+        assert!(s_sec.contains("error: failed to authenticate"), "{s_sec}");
+        assert!(marker(&json!(s_sec)).is_some());
+
+        let s_sec_short = stub_at(6);
+        assert!(
+            !s_sec_short.contains("ghp_"),
+            "leaked secret: {s_sec_short}"
+        );
+        assert!(
+            s_sec_short.contains("[redacted:github-token"),
+            "expected redaction marker: {s_sec_short}"
+        );
+        assert!(marker(&json!(s_sec_short)).is_some());
+
+        // PEM private key lines are dropped rather than surfaced in cues.
+        let s_pem = stub_at(7);
+        assert!(!s_pem.contains("PRIVATE KEY"), "{s_pem}");
+        assert!(!s_pem.contains("MIIEpA"), "{s_pem}");
+        assert_eq!(s_pem.len(), PREFIX.len() + 64 + 1, "{s_pem}");
+
+        // Every enriched stub stays strictly under 35% of the original bytes and restores exactly.
+        let mut restored = masked.clone();
+        let mut restore_opts = default_opts(0);
+        restore_opts.restore = true;
+        mask_request(&ws, &mut restored, None, &restore_opts).unwrap();
+        assert_eq!(restored, req);
+
+        // Size guard: on a small result where the enriched stub would exceed 35% of
+        // original bytes, fall back cleanly to the bare stub.
+        let small_err = format!(
+            "error: short failure message with details that make a cue too wide for 35 percent\n{}",
+            "x".repeat(220)
+        );
+        let id = archive(&ws, &json!(small_err)).unwrap();
+        let orig_bytes = serde_json::to_vec(&json!(small_err)).unwrap().len();
+        let stub = build_stub(
+            &json!(small_err),
+            "",
+            &id,
+            orig_bytes,
+            crate::redact::for_workspace(&ws),
+        )
+        .unwrap();
+        assert_eq!(stub, json!(format!("{PREFIX}{id}]")));
+    }
+
+    #[test]
+    fn semantic_cues_cover_multifile_outlines_grouped_search_and_tail_summaries() {
+        let (_dir, ws) = test_workspace();
+        let multi_outline = format!(
+            "=== Cargo.toml ===\nrevision 0123456789abcdef01234567 · 42 lines\n{}",
+            "#1 L1-5 table package\n".repeat(80)
+        );
+        let id_hex = "b".repeat(64);
+        let outside_read = format!(
+            "{PREFIX}{id_hex}] exact original Read result · 298 lines\n{}",
+            "#1 L1-20 function main  fn main()\n".repeat(80)
+        );
+        let grouped_grep = format!(
+            "{PREFIX}{id_hex}] exact original result\nGrep: 150 matches in 31 files\n{}",
+            "src/big.rs ×150\n".repeat(120)
+        );
+        // Error appearing only at the tail of a 1500-line log is still caught.
+        let long_log = format!(
+            "{}=== 2 failed, 148 passed in 3.10s ===\n",
+            "ok step completed cleanly\n".repeat(1500)
+        );
+        let req = tool_messages(&[
+            ("m1", "read", json!(multi_outline), false),
+            ("m2", "read", json!(outside_read), false),
+            ("m3", "grep", json!(grouped_grep), false),
+            ("m4", "bash", json!(long_log), false),
+        ]);
+        let mut masked = req.clone();
+        mask_request(&ws, &mut masked, None, &default_opts(0)).unwrap();
+        let stub_at = |idx: usize| {
+            masked["messages"][2 + idx * 2]["content"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            stub_at(0).contains(" · Cargo.toml (revision 0123456789abcdef01234567 · 42 lines)]"),
+            "{}",
+            stub_at(0)
+        );
+        assert!(
+            stub_at(1).contains(" · Read outline · 298 lines]"),
+            "{}",
+            stub_at(1)
+        );
+        assert!(
+            stub_at(2).contains(" · Grep: 150 matches in 31 files]"),
+            "{}",
+            stub_at(2)
+        );
+        assert!(
+            stub_at(3).contains(" · === 2 failed, 148 passed in 3.10s ===]"),
+            "{}",
+            stub_at(3)
+        );
+        // Round-trip restores exact originals, including hook-archived headers!
+        let mut restored = masked.clone();
+        let mut restore_opts = default_opts(0);
+        restore_opts.restore = true;
+        mask_request(&ws, &mut restored, None, &restore_opts).unwrap();
+        assert_eq!(restored, req);
+    }
+
+    #[test]
+    fn marker_distinguishes_stubs_from_archived_read_and_search_headers() {
+        let id = "a".repeat(64);
+        assert_eq!(marker(&json!(format!("{PREFIX}{id}]"))), Some(id.as_str()));
+        assert_eq!(
+            marker(&json!(format!(
+                "{PREFIX}{id} · run-ab12 · exit 1 · error[E01]]"
+            ))),
+            Some(id.as_str())
+        );
+        // Hook-archived Read and Grep outputs start with `[justless recall ID] exact ...`
+        // and must NOT be confused with retired stubs.
+        assert_eq!(
+            marker(&json!(format!(
+                "{PREFIX}{id}] exact original Read result · 298 lines\n#1 L1-5 fn a()"
+            ))),
+            None
+        );
+        assert_eq!(
+            marker(&json!(format!(
+                "{PREFIX}{id}] exact original result\nGrep: 12 matches in 3 files"
+            ))),
+            None
+        );
+        assert_eq!(marker(&json!(format!("{PREFIX}{id} · ]"))), None);
+        assert_eq!(
+            marker(&json!(format!("{PREFIX}{id} · line1\nline2]"))),
+            None
+        );
     }
 }

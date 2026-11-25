@@ -526,6 +526,9 @@ struct Planned {
     ratio: Option<f64>,
     threshold: Option<f64>,
     cold: bool,
+    /// The `(conversation_key, boundary_tool_use_id)` pushed by this request's
+    /// move, so a refused edit or unreachable upstream can roll it back.
+    moved_boundary: Option<(String, String)>,
     repeats: u64,
     client_new: bool,
 }
@@ -693,13 +696,19 @@ impl Shared {
         }
         // Token counts never touch the prompt cache, so they leave the state alone.
         if endpoint == Endpoint::Messages {
+            let boundary_id = decision
+                .moved
+                .is_some()
+                .then(|| req.uses[decision.boundary - 1].id.clone());
             store.update(key, now, |c| {
                 c.last_start.insert(model.to_owned(), now);
-                if decision.moved.is_some() {
-                    c.boundaries
-                        .push(req.uses[decision.boundary - 1].id.clone());
+                if let Some(id) = &boundary_id {
+                    c.boundaries.push(id.clone());
                 }
             });
+            if let Some(id) = boundary_id {
+                planned.moved_boundary = Some((key.to_owned(), id));
+            }
         }
         drop(store);
         planned.ratio = decision.ratio;
@@ -725,6 +734,20 @@ impl Shared {
             }
             None => planned.reason = Some("unparsed"),
         }
+    }
+
+    /// Undoes a boundary this request pushed before upstream answered when the
+    /// request never reached upstream or the model refused the clearing edit.
+    fn rollback_boundary(&self, planned: &mut Planned, now: u64) {
+        let Some((key, boundary_id)) = planned.moved_boundary.take() else {
+            return;
+        };
+        let mut store = lock(&self.store);
+        store.update(&key, now, |c| {
+            if let Some(pos) = c.boundaries.iter().rposition(|id| id == &boundary_id) {
+                c.boundaries.remove(pos);
+            }
+        });
     }
 
     fn send_failed(&self, writer: &mut TcpStream, error: SendError) -> io::Result<u16> {
@@ -854,6 +877,7 @@ fn handle(
     let response = match sent {
         Ok(response) => response,
         Err(error) => {
+            shared.rollback_boundary(&mut planned, now);
             record.status = shared.send_failed(writer, error)?;
             finish(shared, record, planned, None, false, started);
             return Ok(keep_alive);
@@ -875,6 +899,7 @@ fn handle(
             // edit off for that model from now on.
             let model = planned.model.clone().unwrap_or_default();
             lock(&shared.refused).insert(model.clone());
+            shared.rollback_boundary(&mut planned, now);
             shared.log.line(&format!(
                 "fallback: {model} answered {} to the clearing edit; resent without it",
                 parts.status.as_u16()
@@ -1150,5 +1175,36 @@ mod tests {
         assert_eq!(count_repeats(&mut calls, &request(&later), 4), 1);
         // A call is counted at most once.
         assert_eq!(count_repeats(&mut calls, &request(&later), 4), 0);
+    }
+
+    #[test]
+    fn rollback_boundary_removes_only_the_unapplied_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jobs, _rx) = mpsc::channel();
+        let shared = Shared {
+            options: plan::Options::default(),
+            archive: false,
+            verbose: false,
+            upstream: Upstream::new("http://127.0.0.1:9").unwrap(),
+            store: Mutex::new(state::Store::load(dir.path().join("conversations.json"))),
+            refused: Mutex::new(HashSet::new()),
+            jobs,
+            totals: Arc::new(Mutex::new(Totals::default())),
+            log: Log::open(dir.path().join("proxy.log")),
+            stopping: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+        };
+        lock(&shared.store).update("toolu_00", 10, |c| {
+            c.boundaries.push("toolu_03".into());
+            c.boundaries.push("toolu_07".into());
+        });
+        let mut planned = Planned {
+            moved_boundary: Some(("toolu_00".into(), "toolu_07".into())),
+            ..Default::default()
+        };
+        shared.rollback_boundary(&mut planned, 20);
+        assert!(planned.moved_boundary.is_none());
+        let store = lock(&shared.store);
+        assert_eq!(store.get("toolu_00").unwrap().boundaries, ["toolu_03"]);
     }
 }

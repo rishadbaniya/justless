@@ -65,10 +65,16 @@ pub enum Observer {
 
 impl Observer {
     pub fn new(content_type: Option<&[u8]>, content_encoding: Option<&[u8]>) -> Self {
-        if content_encoding.is_some_and(|e| !e.trim_ascii().eq_ignore_ascii_case(b"identity")) {
+        if content_encoding.is_some_and(|e| {
+            let trimmed = e.trim_ascii();
+            !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(b"identity")
+        }) {
             return Self::Encoded;
         }
-        let kind = content_type.unwrap_or_default().to_ascii_lowercase();
+        let kind = content_type
+            .unwrap_or_default()
+            .trim_ascii()
+            .to_ascii_lowercase();
         if kind.starts_with(b"text/event-stream") {
             Self::Events(Events::default())
         } else if kind.starts_with(b"application/json") {
@@ -95,7 +101,10 @@ impl Observer {
     /// `None` when the response could not be observed.
     pub fn finish(self) -> Option<Observed> {
         match self {
-            Self::Events(events) => Some(events.observed),
+            Self::Events(mut events) => {
+                events.finish();
+                Some(events.observed)
+            }
             Self::Json(body, false) => {
                 let mut observed = Observed::default();
                 if let Ok(value) = serde_json::from_slice::<Value>(&body) {
@@ -179,6 +188,16 @@ impl Events {
             }
             _ => {}
         }
+    }
+
+    /// Flushes any trailing line/event at EOF when a stream ended without a final
+    /// blank line separator.
+    pub fn finish(&mut self) {
+        if !self.line.is_empty() && !std::mem::take(&mut self.overflow) {
+            let line = std::mem::take(&mut self.line);
+            self.line_done(&line);
+        }
+        self.dispatch();
     }
 
     fn dispatch(&mut self) {
@@ -265,5 +284,17 @@ mod tests {
         events.feed(b"\n\nevent: message_delta\ndata: {\"usage\":{\"output_tokens\":5}}\n\n");
         assert_eq!(events.observed.output, Some(5));
         assert!(events.line.capacity() <= MAX_LINE * 2);
+    }
+
+    #[test]
+    fn flushes_trailing_event_at_eof_and_handles_empty_encoding() {
+        let mut observer = Observer::new(Some(b" text/event-stream; charset=utf-8 "), Some(b" "));
+        observer.feed(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42},\"context_management\":{\"applied_edits\":[{\"type\":\"clear_tool_uses_20250919\",\"cleared_tool_uses\":3,\"cleared_input_tokens\":900}]}}",
+        );
+        let observed = observer.finish().expect("observed");
+        assert_eq!(observed.output, Some(42));
+        assert_eq!(observed.cleared_uses, Some(3));
+        assert_eq!(observed.cleared_tokens, Some(900));
     }
 }
