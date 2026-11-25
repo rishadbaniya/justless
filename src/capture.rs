@@ -2617,6 +2617,7 @@ impl Block {
                     && !trimmed.starts_with("note:")
                     && !trimmed.starts_with("stack backtrace:")
                     && !trimmed.starts_with("---- ")
+                    && !trimmed.starts_with("--- ")
             }
             Follow::Indented => !blank && (indent > self.indent || RUST_GUTTER.is_match(line)),
         };
@@ -2764,6 +2765,10 @@ fn failure_tier(line: &str) -> Option<Tier> {
     if [
         "Traceback",
         "FAILED",
+        "FAIL [",
+        "TIMEOUT [",
+        "--- FAIL:",
+        "FAIL\t",
         "thread '",
         "assertion ",
         "left:",
@@ -3635,5 +3640,21 @@ mod tests {
             fit_lines(&mut bytes, 48);
             assert_eq!(String::from_utf8(bytes).unwrap(), expected, "{preview:?}");
         }
+    }
+
+    #[test]
+    fn failure_tier_recognizes_nextest_and_go_test_failures() {
+        let log = concat!(
+            "        PASS [   0.004s] demo::unit test_ok\n",
+            "        FAIL [   0.012s] demo::unit test_bad\n",
+            "     TIMEOUT [  60.001s] demo::unit test_hang\n",
+            "--- FAIL: TestOrder (0.01s)\n",
+            "FAIL\tgithub.com/example/demo\t0.123s\n",
+            "ok  \tgithub.com/example/other\t0.010s\n",
+        );
+        assert_eq!(
+            failure_lines(log),
+            vec![false, true, true, true, true, false]
+        );
     }
 }

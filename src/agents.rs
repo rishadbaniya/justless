@@ -1346,6 +1346,10 @@ fn explicit_value(value: &Value) -> Option<&Value> {
     }
 }
 
+fn strip_file_uri(text: &str) -> &str {
+    text.strip_prefix("file://").unwrap_or(text)
+}
+
 /// The directory an Antigravity `run_command` call executes in.
 /// Antigravity IDE passes `toolCall.args.Cwd`; Antigravity CLI has no `Cwd`
 /// tool argument and reports the agent's working directory in the top-level
@@ -1353,12 +1357,11 @@ fn explicit_value(value: &Value) -> Option<&Value> {
 /// is present.
 fn agy_cwd<'a>(args: &'a Value, input: &'a Value, paths: &'a [Value]) -> Option<&'a Path> {
     let path = if let Some(value) = args.get("Cwd").and_then(explicit_value) {
-        value.as_str()?
+        strip_file_uri(value.as_str()?)
     } else if let Some(value) = input.get("cwd").and_then(explicit_value) {
-        let text = value.as_str()?;
-        text.strip_prefix("file://").unwrap_or(text)
+        strip_file_uri(value.as_str()?)
     } else if paths.len() == 1 {
-        paths[0].as_str()?
+        strip_file_uri(paths[0].as_str()?)
     } else {
         return None;
     };
@@ -1382,16 +1385,15 @@ pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path
     if mode == "after-read"
         && let Some(raw) = agy_read_path(&input["toolCall"]["args"])
     {
-        let path = Path::new(raw);
+        let path = Path::new(strip_file_uri(raw));
         if path.is_absolute() {
             return path.parent();
         }
     }
     let path = if let Some(value) = input.get("cwd").and_then(explicit_value) {
-        let text = value.as_str()?;
-        text.strip_prefix("file://").unwrap_or(text)
+        strip_file_uri(value.as_str()?)
     } else if paths.len() == 1 {
-        paths[0].as_str()?
+        strip_file_uri(paths[0].as_str()?)
     } else {
         return None;
     };
@@ -1484,7 +1486,7 @@ fn agy_read(roots: impl Iterator<Item = PathBuf>, paths: &[Value], input: &Value
         return None;
     }
     let args = &call["args"];
-    let raw = agy_read_path(args)?;
+    let raw = strip_file_uri(agy_read_path(args)?);
     let mut path = PathBuf::from(raw);
     if !path.is_absolute() {
         let base = agy_cwd(args, input, paths)?;

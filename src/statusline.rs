@@ -418,7 +418,7 @@ fn render(tally: &Tally, width: Option<usize>) -> String {
     if tally.runs + tally.reads + tally.searches == 0 {
         return "justless · ready".into();
     }
-    // Tokens are estimated as UTF-8 bytes divided by four, as in `stats`.
+    // Tokens are estimated with the measured bytes-per-token ratio for logs.
     let net = tally.net_bytes();
     let tokens = short_number(estimated_tokens(net.unsigned_abs()));
     let saved = if net < 0 {

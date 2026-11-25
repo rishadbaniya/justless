@@ -491,7 +491,7 @@ impl Status {
     }
 
     fn short_line(&mut self, line: &str, n: usize) -> bool {
-        if n == 1 && line.starts_with("## ") {
+        if self.counts.iter().all(|&count| count == 0) && line.starts_with("## ") {
             self.lead.push(line.to_owned());
             return true;
         }
@@ -804,6 +804,20 @@ mod tests {
         );
         assert!(report.contains("staged: 3 entries"), "{report}");
         assert!(report.contains("[stdout:6-85]"), "{report}");
+
+        // `git status -sb --show-stash` (or `status.showStash = true`) prints a
+        // second `## stash: N` header line before the file entries.
+        let mut with_stash = String::from("## main...origin/main\n## stash: 3\n");
+        for i in 0..80 {
+            with_stash.push_str(&format!(" M src/file{i:03}.rs\n"));
+        }
+        let report = view("git status -sb --show-stash", &with_stash, 1024).unwrap();
+        assert!(
+            report.starts_with(
+                "## main...origin/main\n## stash: 3\n0 conflicted · 0 staged · 80 modified · 0 untracked\n"
+            ),
+            "{report}"
+        );
     }
 
     #[test]
