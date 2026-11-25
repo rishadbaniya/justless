@@ -87,6 +87,25 @@ check clients '[ "$status" -eq 0 ]'
 check clients 'grep -qx "init --hooks --agent claude --agent agy" "$work/clients/fake.log"'
 check clients 'grep -qF "Project hooks configured for claude agy." "$work/clients/out"'
 
+run editor-clients "" windsurf cline roo
+check editor-clients '[ "$status" -eq 0 ]'
+check editor-clients 'grep -qx "init --hooks --agent windsurf --agent cline --agent roo" "$work/editor-clients/fake.log"'
+check editor-clients 'grep -qF "Project hooks configured for windsurf cline roo." "$work/editor-clients/out"'
+
+# Auto-detect windsurf on PATH when no agent arguments are passed (isolated PATH so
+# host agent CLIs do not affect detection).
+mkdir -p "$work/windsurf-bin"
+ln -s "$work/stub/cargo" "$work/windsurf-bin/cargo"
+ln -s "$(command -v mkdir)" "$work/windsurf-bin/mkdir"
+ln -s "$(command -v chmod)" "$work/windsurf-bin/chmod"
+printf '#!/bin/sh\nexit 0\n' > "$work/windsurf-bin/windsurf"
+chmod 755 "$work/windsurf-bin/windsurf"
+run_path="$work/windsurf-bin"
+run auto-windsurf ""
+unset run_path
+check auto-windsurf '[ "$status" -eq 0 ]'
+check auto-windsurf 'grep -qx "init --hooks --agent windsurf" "$work/auto-windsurf/fake.log"'
+
 # From the home directory, install the CLI but configure no hooks.
 run_home="$work/home/project"
 run home "" claude

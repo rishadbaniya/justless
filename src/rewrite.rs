@@ -274,6 +274,9 @@ fn label(agent: Agent) -> &'static str {
         Agent::Gemini => "Gemini CLI",
         Agent::Copilot => "GitHub Copilot CLI",
         Agent::OpenCode => "OpenCode",
+        Agent::Windsurf => "Windsurf",
+        Agent::Cline => "Cline",
+        Agent::Roo => "Roo Code",
     }
 }
 

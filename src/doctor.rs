@@ -217,7 +217,11 @@ fn profiles() -> Vec<Profile> {
                 ),
                 "copilot" => ("GitHub Copilot CLI", &["copilot"], ""),
                 "opencode" => ("OpenCode", &["opencode"], ""),
-                _ => ("Antigravity CLI", &["agy"], ""),
+                "agy" => ("Antigravity CLI", &["agy"], ""),
+                "windsurf" => ("Windsurf", &["windsurf"], ""),
+                "cline" => ("Cline", &[], ""),
+                "roo" => ("Roo Code", &[], ""),
+                _ => unreachable!("known agent"),
             };
             Profile {
                 name,
@@ -360,7 +364,10 @@ impl Doctor<'_> {
         let ready: Vec<&'static str> = candidates
             .iter()
             .copied()
-            .filter(|name| self.setup_error(&[name], true).is_none())
+            .filter(|name| {
+                let hooks = Agent::parse(name).is_ok_and(Agent::has_hooks);
+                self.setup_error(&[name], hooks).is_none()
+            })
             .collect();
         for audit in audits {
             let profile = audit.profile;
@@ -368,32 +375,44 @@ impl Doctor<'_> {
             let mut status = None;
             if set {
                 let mut section = Section::new(profile.name, profile.label);
-                section.checks.push(match &audit.cli {
-                    Some(cli) => Check::new(
-                        Status::Ok,
-                        format!("CLI: {}{}", cli.display(), profile.requirement()),
-                    ),
-                    None => Check::new(
-                        Status::Warn,
-                        format!(
-                            "CLI not found on PATH (looked for {}). That is fine if you start {} another way, such as from its editor.",
-                            profile.programs.join(", "),
-                            profile.label
+                if !profile.programs.is_empty() {
+                    section.checks.push(match &audit.cli {
+                        Some(cli) => Check::new(
+                            Status::Ok,
+                            format!("CLI: {}{}", cli.display(), profile.requirement()),
                         ),
-                    ),
-                });
-                if !audit.hooked {
-                    section.checks.push(
-                        Check::new(
+                        None => Check::new(
                             Status::Warn,
                             format!(
-                                "Hooks: none in {}, so {} gets the instructions but its commands are not routed",
-                                profile.agent.hook_file().display(),
+                                "CLI not found on PATH (looked for {}). That is fine if you start {} another way, such as from its editor.",
+                                profile.programs.join(", "),
                                 profile.label
                             ),
-                        )
-                        .fix(self.init_fix(profile.name, true)),
-                    );
+                        ),
+                    });
+                }
+                if !audit.hooked {
+                    if profile.agent.has_hooks() {
+                        section.checks.push(
+                            Check::new(
+                                Status::Warn,
+                                format!(
+                                    "Hooks: none in {}, so {} gets the instructions but its commands are not routed",
+                                    profile.agent.hook_file().display(),
+                                    profile.label
+                                ),
+                            )
+                            .fix(self.init_fix(profile.name, true)),
+                        );
+                    } else {
+                        section.checks.push(Check::new(
+                            Status::Info,
+                            format!(
+                                "Hooks: {} has no shell hook integration; Justless configures project rules and MCP",
+                                profile.label
+                            ),
+                        ));
+                    }
                 }
                 section.checks.extend(audit.checks);
                 // Claude Code's permission rules decide what its command hook routes.
@@ -415,6 +434,7 @@ impl Doctor<'_> {
                 status = section.worst();
                 sections.push(section);
             } else if let Some(cli) = &audit.cli {
+                let hooks = profile.agent.has_hooks();
                 others.checks.push(if set_up {
                     Check::new(
                         Status::Warn,
@@ -425,7 +445,7 @@ impl Doctor<'_> {
                             profile.requirement()
                         ),
                     )
-                    .fix(self.init_fix(profile.name, true))
+                    .fix(self.init_fix(profile.name, hooks))
                 } else if candidates.contains(&profile.name) && !ready.contains(&profile.name) {
                     Check::new(
                         Status::Warn,
@@ -434,11 +454,11 @@ impl Doctor<'_> {
                             profile.found(cli)
                         ),
                     )
-                    .fix(self.init_fix(profile.name, true))
+                    .fix(self.init_fix(profile.name, hooks))
                 } else {
                     Check::new(Status::Ok, profile.found(cli))
                 });
-            } else {
+            } else if !profile.programs.is_empty() {
                 missing.push(profile.label);
             }
             agents_json.push(json!({
@@ -447,9 +467,12 @@ impl Doctor<'_> {
                 "cli": audit.cli.as_ref().map(|cli| cli.display().to_string()),
                 "set_up": set,
                 "hooks": audit.hooked,
-                "hook_file": profile.agent.hook_file().display().to_string(),
+                "hook_file": profile
+                    .agent
+                    .has_hooks()
+                    .then(|| profile.agent.hook_file().display().to_string()),
                 "global_hook_file": audit.global.as_ref().map(|file| file.display().to_string()),
-                "instructions_file": profile.agent.instructions_name(),
+                "instructions_file": profile.agent.instructions_for(root),
                 "status": status.map(Status::name),
             }));
         }
@@ -465,18 +488,23 @@ impl Doctor<'_> {
             );
             if detected(&profiles, &clis).is_empty() {
                 message.push_str(
-                    ". Replace claude in the fix with your agent: codex, cursor, gemini, copilot, opencode or agy",
+                    ". Replace claude in the fix with your agent: codex, cursor, gemini, copilot, opencode, agy, windsurf, cline or roo",
                 );
             }
+            let any_hooks = |names: &[&str]| {
+                names
+                    .iter()
+                    .any(|name| Agent::parse(name).is_ok_and(Agent::has_hooks))
+            };
             let fix = match candidates.as_slice() {
                 _ if !ready.is_empty() => Fix::Init {
                     agents: ready.clone(),
-                    hooks: true,
+                    hooks: any_hooks(&ready),
                 },
-                [only] => self.init_fix(only, true),
+                [only] => self.init_fix(only, any_hooks(&[only])),
                 _ => Fix::Manual(format!(
                     "Fix what stops setup for each agent above, then run `{}`",
-                    self.init(&candidates, true)
+                    self.init(&candidates, any_hooks(&candidates))
                 )),
             };
             others
@@ -523,7 +551,8 @@ impl Doctor<'_> {
                 Some(cli) => agents
                     .checks
                     .push(Check::new(Status::Ok, profile.found(cli))),
-                None => missing.push(profile.label),
+                None if !profile.programs.is_empty() => missing.push(profile.label),
+                None => {}
             }
             agents_json.push(json!({
                 "agent": profile.name,
@@ -544,6 +573,11 @@ impl Doctor<'_> {
             vec!["claude"]
         } else {
             detected
+        };
+        let any_hooks = |selected: &[&str]| {
+            selected
+                .iter()
+                .any(|name| Agent::parse(name).is_ok_and(Agent::has_hooks))
         };
         let mut project = Section::new("project", "Project");
         project.checks.push(Check::new(
@@ -574,14 +608,15 @@ impl Doctor<'_> {
                 Status::Info,
                 format!(
                     "To set up a project, run this in its folder: {}",
-                    self.init(&names, true)
+                    self.init(&names, any_hooks(&names))
                 ),
             ));
         } else {
             // Name only the agents whose files `init` can read here.
             let mut ready = Vec::new();
             for name in names {
-                match self.setup_error(&[name], true) {
+                let hooks = Agent::parse(name).is_ok_and(Agent::has_hooks);
+                match self.setup_error(&[name], hooks) {
                     None => ready.push(name),
                     Some(error) => project.checks.push(Check::new(
                         Status::Info,
@@ -594,7 +629,7 @@ impl Doctor<'_> {
                     Status::Info,
                     format!(
                         "If this folder is your project, set it up with: {}",
-                        self.init(&ready, true)
+                        self.init(&ready, any_hooks(&ready))
                     ),
                 ));
             }
@@ -677,6 +712,9 @@ impl Doctor<'_> {
     /// What stops `init --hooks` from writing `agent`'s hook file, as the edit
     /// that clears it, when doctor can tell.
     fn hook_blocker(&self, agent: Agent) -> Option<String> {
+        if !agent.has_hooks() {
+            return None;
+        }
         let root = &self.workspace.root;
         let relative = agent.hook_file();
         // Setup writes hooks only into real directories, not through links.
@@ -947,7 +985,15 @@ impl Doctor<'_> {
         // Without hooks, a section in a file only this client reads still shows setup.
         let instructed = !hooked
             && block
-            && matches!(profile.agent, Agent::Claude | Agent::Gemini | Agent::Codex);
+            && matches!(
+                profile.agent,
+                Agent::Claude
+                    | Agent::Gemini
+                    | Agent::Codex
+                    | Agent::Windsurf
+                    | Agent::Cline
+                    | Agent::Roo
+            );
         let mut checks = hooks.checks;
         if let Some(file) = &global {
             checks.push(Check::new(
@@ -1061,6 +1107,9 @@ impl Doctor<'_> {
 
     /// The agent's hook file: whether it holds Justless entries, and its checks.
     fn audit_hooks(&self, profile: &Profile) -> Hooks {
+        if !profile.agent.has_hooks() {
+            return Hooks::none();
+        }
         let relative = profile.agent.hook_file();
         let file = relative.display().to_string();
         let text = match fs::read_to_string(self.workspace.root.join(&relative)) {
@@ -1287,7 +1336,7 @@ impl Doctor<'_> {
     /// check of the section the agent loads.
     fn audit_instructions(&self, profile: &Profile, hooks: bool) -> (bool, Vec<Check>) {
         let root = &self.workspace.root;
-        let name = profile.agent.instructions_name();
+        let name = profile.agent.instructions_for(root);
         let path = root.join(name);
         let init = self.init(&[profile.name], hooks);
         // Setup skips a link that leaves the project.
@@ -3094,7 +3143,7 @@ mod tests {
         // Every fresh hook file is understood and current, as it is or with
         // justless called by path.
         for (name, agent) in AGENTS {
-            if agent == Agent::OpenCode {
+            if agent == Agent::OpenCode || !agent.has_hooks() {
                 continue;
             }
             let fresh = agents::fresh_hooks(agent).unwrap();
@@ -3201,5 +3250,138 @@ mod tests {
         assert!(check.status == Status::Warn, "{}", check.message);
         assert!(check.message.contains("cannot read"), "{}", check.message);
         assert!(!root.join(".justless").exists());
+    }
+
+    #[test]
+    fn doctor_audits_windsurf_cline_and_roo_read_only() {
+        let (_, _, block) = agents::instruction_block();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        fs::create_dir_all(root.join(".windsurf/rules")).unwrap();
+        fs::write(
+            root.join(".windsurf/rules/justless.md"),
+            format!("{block}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".clinerules")).unwrap();
+        fs::write(root.join(".clinerules/justless.md"), format!("{block}\n")).unwrap();
+        fs::create_dir_all(root.join(".cline")).unwrap();
+        fs::write(
+            root.join(".cline/mcp.json"),
+            r#"{"mcpServers":{"justless":{"command":"justless","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".roo/rules")).unwrap();
+        fs::write(root.join(".roo/rules/justless.md"), format!("{block}\n")).unwrap();
+        fs::write(
+            root.join(".roo/mcp.json"),
+            r#"{"mcpServers":{"justless":{"command":"justless","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+
+        let ws = Workspace::discover_from(&root).unwrap();
+        let doctor = Doctor {
+            workspace: &ws,
+            explicit_root: true,
+            at_root: true,
+        };
+        let report = doctor.report(Some(&root));
+        assert!(
+            !root.join(".justless").exists(),
+            "doctor must stay read-only"
+        );
+
+        for (id, rules) in [
+            ("windsurf", ".windsurf/rules/justless.md"),
+            ("cline", ".clinerules/justless.md"),
+            ("roo", ".roo/rules/justless.md"),
+        ] {
+            let section = report
+                .sections
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("missing section {id}"));
+            assert!(
+                section
+                    .checks
+                    .iter()
+                    .any(|c| c.status == Status::Ok && c.message.contains(rules)),
+                "{id}: {:?}",
+                section
+                    .checks
+                    .iter()
+                    .map(|c| &c.message)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !section.checks.iter().any(|c| c.status == Status::Fail),
+                "{id}: {:?}",
+                section
+                    .checks
+                    .iter()
+                    .map(|c| &c.message)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !section
+                    .checks
+                    .iter()
+                    .any(|c| c.message.contains("Hooks: none in")),
+                "{id} must not warn about missing hooks"
+            );
+            if id != "windsurf" {
+                assert!(
+                    !section
+                        .checks
+                        .iter()
+                        .any(|c| c.message.contains("CLI not found on PATH")),
+                    "{id} has no standalone CLI"
+                );
+            }
+        }
+        let mcp = report
+            .sections
+            .iter()
+            .find(|s| s.id == "mcp")
+            .expect("mcp section");
+        assert!(
+            mcp.checks
+                .iter()
+                .any(|c| c.status == Status::Ok && c.message.contains(".cline/mcp.json"))
+        );
+        assert!(
+            mcp.checks
+                .iter()
+                .any(|c| c.status == Status::Ok && c.message.contains(".roo/mcp.json"))
+        );
+
+        // Legacy single-file `.clinerules` is also recognized read-only.
+        let legacy = tempfile::tempdir().unwrap();
+        let legacy_root = legacy.path().canonicalize().unwrap();
+        fs::write(legacy_root.join("package.json"), "{}\n").unwrap();
+        fs::write(
+            legacy_root.join(".clinerules"),
+            format!("# Custom\n\n{block}\n"),
+        )
+        .unwrap();
+        let legacy_ws = Workspace::discover_from(&legacy_root).unwrap();
+        let legacy_doctor = Doctor {
+            workspace: &legacy_ws,
+            explicit_root: true,
+            at_root: true,
+        };
+        let legacy_report = legacy_doctor.report(Some(&legacy_root));
+        assert!(!legacy_root.join(".justless").exists());
+        let cline = legacy_report
+            .sections
+            .iter()
+            .find(|s| s.id == "cline")
+            .expect("cline section for legacy .clinerules");
+        assert!(cline.checks.iter().any(|c| {
+            c.status == Status::Ok
+                && c.message
+                    .contains(".clinerules has the current Justless block")
+        }));
     }
 }

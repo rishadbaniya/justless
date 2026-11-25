@@ -4,7 +4,7 @@ set -eu
 repo=rishadbaniya/justless
 
 usage() {
-    echo "Usage: sh install.sh [codex|claude|agy|opencode|cursor|gemini|copilot ... | --cli-only]"
+    echo "Usage: sh install.sh [codex|claude|agy|opencode|cursor|gemini|copilot|windsurf|cline|roo ... | --cli-only]"
     echo "By default, configure project hooks for supported agents found on PATH."
     echo "Builds Justless from source with Cargo. JUSTLESS_VERSION=X.Y.Z builds tag vX.Y.Z instead of main."
 }
@@ -44,7 +44,7 @@ main() {
         -h|--help) usage; return ;;
     esac
     if [ "$#" -eq 0 ]; then
-        for agent in codex claude agy gemini copilot; do
+        for agent in codex claude agy gemini copilot windsurf; do
             if command -v "$agent" >/dev/null 2>&1; then set -- "$@" "$agent"; fi
         done
         # The Cursor CLI installs as the generic name `agent`, so detect the editor's
@@ -61,7 +61,7 @@ main() {
     agents=
     for agent do
         case "$agent" in
-            codex|claude|agy|opencode|cursor|gemini|copilot) agents="$agents $agent" ;;
+            codex|claude|agy|opencode|cursor|gemini|copilot|windsurf|cline|roo) agents="$agents $agent" ;;
             *) usage >&2; return 2 ;;
         esac
     done

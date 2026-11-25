@@ -374,6 +374,7 @@ fn cli() -> Command<'static> {
                         .multiple_occurrences(true)
                         .possible_values([
                             "codex", "claude", "agy", "opencode", "cursor", "gemini", "copilot",
+                            "windsurf", "cline", "roo",
                         ])
                         .default_value("codex")
                         .help("Agent to configure (repeat to select several)"),

@@ -1304,7 +1304,8 @@ fn normalize_relative(text: &str, allow_dot: bool) -> Option<String> {
 // Client setup
 
 /// MCP clients with a verified config file (project-level, or user-level for
-/// Antigravity CLI's `~/.gemini/config/mcp_config.json`).
+/// Antigravity CLI's `~/.gemini/config/mcp_config.json` and Windsurf's
+/// `~/.codeium/windsurf/mcp_config.json`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Client {
     Claude,
@@ -1313,11 +1314,21 @@ pub enum Client {
     VsCode,
     Codex,
     Agy,
+    Windsurf,
+    Cline,
+    Roo,
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 impl Client {
-    pub(crate) const NAMES: [&'static str; 6] =
-        ["claude", "cursor", "gemini", "vscode", "codex", "agy"];
+    pub(crate) const NAMES: [&'static str; 9] = [
+        "claude", "cursor", "gemini", "vscode", "codex", "agy", "windsurf", "cline", "roo",
+    ];
 
     pub(crate) fn parse(name: &str) -> Result<Self> {
         Ok(match name {
@@ -1327,6 +1338,9 @@ impl Client {
             "vscode" => Self::VsCode,
             "codex" => Self::Codex,
             "agy" => Self::Agy,
+            "windsurf" => Self::Windsurf,
+            "cline" => Self::Cline,
+            "roo" => Self::Roo,
             _ => bail!("unknown MCP client: {name}"),
         })
     }
@@ -1339,16 +1353,20 @@ impl Client {
             Self::VsCode => "VS Code",
             Self::Codex => "Codex",
             Self::Agy => "Antigravity CLI",
+            Self::Windsurf => "Windsurf",
+            Self::Cline => "Cline",
+            Self::Roo => "Roo Code",
         }
     }
 
     /// Whether this client's MCP config is user-level rather than project-local.
     pub(crate) fn is_global(self) -> bool {
-        self == Self::Agy
+        matches!(self, Self::Agy | Self::Windsurf)
     }
 
     /// Project config file, relative to the workspace root (or the global file
-    /// name for `Client::Agy`; use [`Self::path`] for the resolved path).
+    /// name for `Client::Agy` and `Client::Windsurf`; use [`Self::path`] for the
+    /// resolved path).
     ///
     /// Sources, checked 2026-11-18:
     /// - Claude Code `.mcp.json` `mcpServers`, stdio when `type` is absent:
@@ -1363,6 +1381,10 @@ impl Client {
     /// - Codex `.codex/config.toml` `[mcp_servers.NAME]`, trusted projects only:
     ///   <https://learn.chatgpt.com/docs/extend/mcp?surface=cli>
     /// - Antigravity CLI `~/.gemini/config/mcp_config.json` `mcpServers` (global)
+    /// - Windsurf `~/.codeium/windsurf/mcp_config.json` `mcpServers` (global)
+    /// - Cline `.cline/mcp.json` `mcpServers` (portable project-local config,
+    ///   avoiding OS-dependent VS Code `globalStorage` paths)
+    /// - Roo Code `.roo/mcp.json` `mcpServers` (project-local)
     pub fn file(self) -> &'static str {
         match self {
             Self::Claude => ".mcp.json",
@@ -1371,16 +1393,26 @@ impl Client {
             Self::VsCode => ".vscode/mcp.json",
             Self::Codex => ".codex/config.toml",
             Self::Agy => "~/.gemini/config/mcp_config.json",
+            Self::Windsurf => "~/.codeium/windsurf/mcp_config.json",
+            Self::Cline => ".cline/mcp.json",
+            Self::Roo => ".roo/mcp.json",
         }
     }
 
     pub(crate) fn path(self, workspace: &Workspace) -> Result<PathBuf> {
-        if self == Self::Agy {
-            return crate::global::config_dir(crate::agents::Agent::Agy)
+        match self {
+            Self::Agy => crate::global::config_dir(crate::agents::Agent::Agy)
                 .context("no home directory to find Antigravity MCP config in")
-                .map(|dir| dir.join("mcp_config.json"));
+                .map(|dir| dir.join("mcp_config.json")),
+            Self::Windsurf => home_dir()
+                .context("no home directory to find Windsurf MCP config in")
+                .map(|home| {
+                    home.join(".codeium")
+                        .join("windsurf")
+                        .join("mcp_config.json")
+                }),
+            _ => Ok(workspace.root.join(self.file())),
         }
-        Ok(workspace.root.join(self.file()))
     }
 
     pub(crate) fn servers_key(self) -> &'static str {
@@ -1402,7 +1434,13 @@ impl Client {
                 "command": "justless",
                 "args": ["mcp", "--root", "${workspaceFolder}"],
             }),
-            Self::Claude | Self::Gemini | Self::Codex | Self::Agy => {
+            Self::Claude
+            | Self::Gemini
+            | Self::Codex
+            | Self::Agy
+            | Self::Windsurf
+            | Self::Cline
+            | Self::Roo => {
                 json!({"command": "justless", "args": ["mcp"]})
             }
         }
@@ -1890,5 +1928,66 @@ mod tests {
         );
         assert_eq!(listed.len(), 1);
         assert!(listed[0].contains("recall list truncated after 32768 bytes"));
+    }
+
+    #[test]
+    fn windsurf_cline_and_roo_mcp_clients_merge_and_preserve_existing_keys() {
+        assert_eq!(Client::parse("windsurf").unwrap(), Client::Windsurf);
+        assert_eq!(Client::parse("cline").unwrap(), Client::Cline);
+        assert_eq!(Client::parse("roo").unwrap(), Client::Roo);
+
+        assert!(Client::Windsurf.is_global());
+        assert_eq!(
+            Client::Windsurf.file(),
+            "~/.codeium/windsurf/mcp_config.json"
+        );
+        assert_eq!(Client::Windsurf.servers_key(), "mcpServers");
+        assert_eq!(
+            Client::Windsurf.server_entry(),
+            json!({"command": "justless", "args": ["mcp"]})
+        );
+
+        assert!(!Client::Cline.is_global());
+        assert_eq!(Client::Cline.file(), ".cline/mcp.json");
+        assert_eq!(Client::Cline.servers_key(), "mcpServers");
+
+        assert!(!Client::Roo.is_global());
+        assert_eq!(Client::Roo.file(), ".roo/mcp.json");
+        assert_eq!(Client::Roo.servers_key(), "mcpServers");
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        fs::create_dir_all(root.join(".roo")).unwrap();
+        fs::write(
+            root.join(".roo/mcp.json"),
+            r#"{"otherKey":true,"mcpServers":{"docs":{"command":"docs-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let ws = Workspace::discover_from(&root).unwrap();
+        let clients = BTreeSet::from([Client::Cline, Client::Roo]);
+        install(&ws, &clients).unwrap();
+
+        let roo: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".roo/mcp.json")).unwrap()).unwrap();
+        assert_eq!(roo["otherKey"], true);
+        assert_eq!(roo["mcpServers"]["docs"]["command"], "docs-mcp");
+        assert_eq!(
+            roo["mcpServers"]["justless"],
+            json!({"command": "justless", "args": ["mcp"]})
+        );
+
+        let cline: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".cline/mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cline["mcpServers"]["justless"],
+            json!({"command": "justless", "args": ["mcp"]})
+        );
+
+        // Second install is idempotent.
+        let entries = config_entries(&ws, &clients).unwrap();
+        assert!(entries.iter().all(|file| file.contents.is_none()));
     }
 }

@@ -28,8 +28,8 @@ use crate::mcp::Client;
 use crate::workspace::{Workspace, lock_state, write_json, write_text};
 
 /// Every client `init` sets up, by the name `--agent` takes.
-const AGENTS: [&str; 7] = [
-    "codex", "claude", "agy", "opencode", "cursor", "gemini", "copilot",
+const AGENTS: [&str; 10] = [
+    "codex", "claude", "agy", "opencode", "cursor", "gemini", "copilot", "windsurf", "cline", "roo",
 ];
 const RECORD: &str = "setup.json";
 const IGNORE_LINE: &str = "/.justless/";
@@ -387,7 +387,7 @@ pub fn remember_readers(workspace: &Workspace, clients: &[Agent]) {
     for &agent in clients {
         let path = match &imported {
             Some(target) if agent == Agent::Claude => target.clone(),
-            _ => match agents::instructions_file(root, &root.join(agent.instructions())) {
+            _ => match agents::instructions_file(root, &root.join(agent.instructions_for(root))) {
                 Ok(Some(path)) => path,
                 _ => continue,
             },
@@ -464,10 +464,11 @@ fn name(agent: Agent) -> &'static str {
 }
 
 /// The MCP client whose project file belongs to an agent. VS Code's file goes with
-/// Copilot, the agent harness that reads it. Antigravity CLI's MCP config lives at
-/// the machine-wide `~/.gemini/config/mcp_config.json` rather than in a project,
-/// so project-level `init --remove` leaves it alone (`global::remove` prints a
-/// non-destructive note when that user-level file still lists `justless`).
+/// Copilot, the agent harness that reads it. Antigravity CLI's and Windsurf's MCP
+/// configs live in user-level files (`~/.gemini/config/mcp_config.json` and
+/// `~/.codeium/windsurf/mcp_config.json`) rather than in a project, so project-level
+/// `init --remove` leaves them alone (`global::remove` prints a non-destructive note
+/// when Antigravity's user-level file still lists `justless`).
 fn mcp_client(agent: Agent) -> Option<Client> {
     match agent {
         Agent::Claude => Some(Client::Claude),
@@ -475,7 +476,9 @@ fn mcp_client(agent: Agent) -> Option<Client> {
         Agent::Gemini => Some(Client::Gemini),
         Agent::Codex => Some(Client::Codex),
         Agent::Copilot => Some(Client::VsCode),
-        Agent::Agy | Agent::OpenCode => None,
+        Agent::Cline => Some(Client::Cline),
+        Agent::Roo => Some(Client::Roo),
+        Agent::Agy | Agent::OpenCode | Agent::Windsurf => None,
     }
 }
 
@@ -484,22 +487,24 @@ fn mcp_client(agent: Agent) -> Option<Client> {
 fn catalog() -> Vec<(String, Kind, Agent)> {
     let mut files = Vec::new();
     for agent in all_agents() {
-        let (directory, file) = agent.config();
-        let hooks = match agent {
-            Agent::OpenCode => Kind::Plugin,
-            _ => Kind::Json(JsonRules {
-                hooks: true,
-                group: agent == Agent::Agy,
-                status_line: agent == Agent::Claude,
-                servers: None,
-                versioned: matches!(agent, Agent::Cursor | Agent::Copilot),
-                global: false,
-            }),
-        };
-        files.push((format!("{directory}/{file}"), hooks, agent));
-        // A status line can also be a personal setting.
-        if agent == Agent::Claude {
-            files.push((format!("{directory}/settings.local.json"), hooks, agent));
+        if agent.has_hooks() {
+            let (directory, file) = agent.config();
+            let hooks = match agent {
+                Agent::OpenCode => Kind::Plugin,
+                _ => Kind::Json(JsonRules {
+                    hooks: true,
+                    group: agent == Agent::Agy,
+                    status_line: agent == Agent::Claude,
+                    servers: None,
+                    versioned: matches!(agent, Agent::Cursor | Agent::Copilot),
+                    global: false,
+                }),
+            };
+            files.push((format!("{directory}/{file}"), hooks, agent));
+            // A status line can also be a personal setting.
+            if agent == Agent::Claude {
+                files.push((format!("{directory}/settings.local.json"), hooks, agent));
+            }
         }
         if let Some(client) = mcp_client(agent) {
             let kind = match client {
@@ -513,6 +518,15 @@ fn catalog() -> Vec<(String, Kind, Agent)> {
         }
     }
     files
+}
+
+/// Whether `key` is a nested per-agent rules file (such as `.windsurf/rules/justless.md`,
+/// `.clinerules/justless.md`, or `.roo/rules/justless.md`) inside an agent-owned directory.
+fn is_agent_rules_file(key: &str) -> bool {
+    all_agents().into_iter().any(|agent| {
+        let file = agent.instructions();
+        file.contains('/') && file == key
+    })
 }
 
 /// Everything Justless may have put in a file, merged across the clients that
@@ -576,6 +590,9 @@ struct Change {
     whole: bool,
     /// A client config file rather than instructions or `.gitignore`.
     config: bool,
+    /// A file inside a client-owned directory (config or nested rules) whose empty
+    /// parent directories removal may clean up.
+    owned_dir: bool,
     /// An instructions file.
     instructions: bool,
 }
@@ -715,9 +732,21 @@ fn plan(workspace: &Workspace, chosen: &[Agent], purge: bool, record: &Record) -
         readers.push((target.clone(), vec![Agent::Claude]));
     }
     for agent in all_agents() {
-        let filename = agent.instructions();
+        let filename = agent.instructions_for(root);
         let file = root.join(filename);
-        let resolved = agents::instructions_file(root, &file);
+        let resolved = if filename.contains('/') {
+            // Nested rules files live inside agent directories that setup never traverses
+            // through symlinks or non-directory files.
+            match file.parent().map(|parent| real(root, parent)) {
+                Some(Ok(Some(metadata))) if metadata.is_dir() => {
+                    agents::instructions_file(root, &file)
+                }
+                Some(Err(error)) => Err(error),
+                _ => Ok(None),
+            }
+        } else {
+            agents::instructions_file(root, &file)
+        };
         let resolved = if chosen.contains(&agent) {
             resolved.with_context(|| format!("inspect {filename}"))?
         } else {
@@ -842,7 +871,7 @@ fn empty_directories(
 ) -> Vec<PathBuf> {
     let deleted: Vec<&Path> = changes
         .iter()
-        .filter(|change| change.config && change.outcome == Outcome::Delete)
+        .filter(|change| change.owned_dir && change.outcome == Outcome::Delete)
         .map(|change| change.path.as_path())
         .collect();
     let mut candidates: BTreeSet<PathBuf> = deleted
@@ -854,10 +883,14 @@ fn empty_directories(
     let files = catalog();
     for directory in &record.directories {
         let prefix = format!("{directory}/");
-        if files
+        let matches_config = files
             .iter()
-            .any(|(file, _, agent)| chosen.contains(agent) && file.starts_with(&prefix))
-        {
+            .any(|(file, _, agent)| chosen.contains(agent) && file.starts_with(&prefix));
+        let matches_rules = chosen.iter().any(|agent| {
+            let file = agent.instructions();
+            file.contains('/') && file.starts_with(&prefix)
+        });
+        if matches_config || matches_rules {
             candidates.insert(root.join(directory));
         }
     }
@@ -936,14 +969,17 @@ fn plan_file(
     if outcome == Outcome::Write(text) {
         return Ok(None);
     }
+    let config = matches!(kind, Kind::Json(_) | Kind::Toml | Kind::Plugin);
+    let instructions = matches!(kind, Kind::Instructions);
     Ok(Some(Change {
         key: key.to_owned(),
         path: path.to_path_buf(),
         what,
         outcome,
         whole: matches!(kind, Kind::Plugin),
-        config: matches!(kind, Kind::Json(_) | Kind::Toml | Kind::Plugin),
-        instructions: matches!(kind, Kind::Instructions),
+        config,
+        owned_dir: config || instructions && is_agent_rules_file(key),
+        instructions,
     }))
 }
 
@@ -1753,9 +1789,18 @@ mod tests {
             ".cursor/mcp.json",
             ".vscode/mcp.json",
             ".codex/config.toml",
+            ".cline/mcp.json",
+            ".roo/mcp.json",
         ] {
             assert!(keys.iter().any(|key| key == expected), "{expected}");
         }
+        assert!(mcp_client(Agent::Windsurf).is_none());
+        assert_eq!(mcp_client(Agent::Cline), Some(Client::Cline));
+        assert_eq!(mcp_client(Agent::Roo), Some(Client::Roo));
+        assert!(
+            !keys.iter().any(|key| key == "/"),
+            "agents without hooks must not add empty config entries: {keys:?}"
+        );
         assert!(matches!(
             kind_of(".gemini/settings.json"),
             Kind::Json(JsonRules {
@@ -1765,7 +1810,14 @@ mod tests {
             })
         ));
         assert!(matches!(kind_of("docs/AGENTS.md"), Kind::Instructions));
+        assert!(is_agent_rules_file(".windsurf/rules/justless.md"));
+        assert!(is_agent_rules_file(".clinerules/justless.md"));
+        assert!(is_agent_rules_file(".roo/rules/justless.md"));
+        assert!(!is_agent_rules_file("docs/AGENTS.md"));
         assert_eq!(name(Agent::OpenCode), "opencode");
+        assert_eq!(name(Agent::Windsurf), "windsurf");
+        assert_eq!(name(Agent::Cline), "cline");
+        assert_eq!(name(Agent::Roo), "roo");
     }
 
     #[test]
@@ -1820,5 +1872,71 @@ mod tests {
         )
         .unwrap();
         assert!(has_json_mcp_server(&path, "mcpServers"));
+    }
+
+    #[test]
+    fn uninstall_restores_windsurf_cline_and_roo_and_removes_created_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        // Pre-existing `.windsurf` user file must stay; `.windsurf/rules` was created by setup and must go.
+        fs::create_dir_all(root.join(".windsurf")).unwrap();
+        fs::write(root.join(".windsurf/keep.txt"), "keep\n").unwrap();
+        // Pre-existing `.roo/mcp.json` must be restored byte-for-byte.
+        fs::create_dir_all(root.join(".roo")).unwrap();
+        let original_roo_mcp = "{\n    \"mcpServers\": { \"docs\": { \"command\": \"docs\" } }\n}";
+        fs::write(root.join(".roo/mcp.json"), original_roo_mcp).unwrap();
+
+        let ws = Workspace::discover_from(&root).unwrap();
+        crate::agents::init(&ws, &[Agent::Windsurf, Agent::Cline, Agent::Roo], true).unwrap();
+        let clients = std::collections::BTreeSet::from([Client::Cline, Client::Roo]);
+        // Simulate mcp --install for Cline and Roo via config_entries + remember.
+        for file in crate::mcp::config_entries(&ws, &clients).unwrap() {
+            if let Some(contents) = file.contents {
+                remember(&ws, &file.path, &contents);
+                crate::workspace::private_dir(file.path.parent().unwrap()).unwrap();
+                write_text(&file.path, &contents).unwrap();
+            }
+        }
+
+        assert!(root.join(".windsurf/rules/justless.md").is_file());
+        assert!(root.join(".clinerules/justless.md").is_file());
+        assert!(root.join(".cline/mcp.json").is_file());
+        assert!(root.join(".roo/rules/justless.md").is_file());
+
+        remove(&ws, None, false, true).unwrap();
+
+        assert!(!root.join(".windsurf/rules").exists());
+        assert_eq!(
+            fs::read_to_string(root.join(".windsurf/keep.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(!root.join(".clinerules").exists());
+        assert!(!root.join(".cline").exists());
+        assert!(!root.join(".roo/rules").exists());
+        assert_eq!(
+            fs::read_to_string(root.join(".roo/mcp.json")).unwrap(),
+            original_roo_mcp
+        );
+        assert!(!root.join(".justless").exists());
+
+        // Legacy single-file `.clinerules` restores byte-for-byte on removal.
+        let legacy_temp = tempfile::tempdir().unwrap();
+        let legacy_root = legacy_temp.path().canonicalize().unwrap();
+        fs::write(legacy_root.join("package.json"), "{}\n").unwrap();
+        let original_cline = "# Team Cline rules\nUse spaces.";
+        fs::write(legacy_root.join(".clinerules"), original_cline).unwrap();
+        let legacy_ws = Workspace::discover_from(&legacy_root).unwrap();
+        crate::agents::init(&legacy_ws, &[Agent::Cline], true).unwrap();
+        assert!(
+            fs::read_to_string(legacy_root.join(".clinerules"))
+                .unwrap()
+                .contains(START)
+        );
+        remove(&legacy_ws, Some(&[Agent::Cline]), false, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(legacy_root.join(".clinerules")).unwrap(),
+            original_cline
+        );
     }
 }

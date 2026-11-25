@@ -6035,7 +6035,8 @@ fn doctor_reports_an_unset_project_and_changes_nothing() {
 #[test]
 fn doctor_accepts_every_agent_that_init_sets_up() {
     let agents = [
-        "claude", "codex", "cursor", "gemini", "copilot", "opencode", "agy",
+        "claude", "codex", "cursor", "gemini", "copilot", "opencode", "agy", "windsurf", "cline",
+        "roo",
     ];
     let (tools, repo) = doctor_repository(&["claude"], &agents);
     let root = repo.path();
@@ -6053,6 +6054,9 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
         "✓ Instructions: CLAUDE.md has the current Justless block",
         "✓ Instructions: AGENTS.md has the current Justless block",
         "✓ Instructions: GEMINI.md has the current Justless block",
+        "✓ Instructions: .windsurf/rules/justless.md has the current Justless block",
+        "✓ Instructions: .clinerules/justless.md has the current Justless block",
+        "✓ Instructions: .roo/rules/justless.md has the current Justless block",
         // Configured clients that never routed a command say so, recognizably. Claude
         // Code starts in default mode, where the hook routes only allowed commands.
         "! Claude Code has not routed a command through Justless here yet. Your settings start sessions in `default` permission mode, where the command hook routes only commands that allow rules cover",
@@ -6093,7 +6097,7 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
         serde_json::json!({"acceptEdits": 1, "dontAsk": 2})
     );
     let agents = report["agents"].as_array().unwrap();
-    assert_eq!(agents.len(), 7);
+    assert_eq!(agents.len(), 10);
     assert!(agents.iter().all(|agent| agent["set_up"] == true));
     let text = serde_json::to_string(&report["sections"]).unwrap();
     assert!(!text.contains("has not routed"), "{text}");
@@ -17946,4 +17950,79 @@ fn antigravity_cli_transcript_discovery_works() {
             .any(|line| line.contains("tests/integration.rs")),
         "{cli_pack}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn windsurf_cline_and_roo_init_mcp_doctor_and_remove_round_trip() {
+    let (_project, root) = removal_project(&[
+        ("package.json", "{\"name\":\"adapters\"}\n"),
+        (".gitignore", "target/\n"),
+    ]);
+    let original = removal_tree(&root);
+    let tools = doctor_tools(&["windsurf"]);
+    let home = tools.path().join("home");
+    let windsurf_mcp = home.join(".codeium/windsurf/mcp_config.json");
+    fs::create_dir_all(windsurf_mcp.parent().unwrap()).unwrap();
+    fs::write(
+        &windsurf_mcp,
+        r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#,
+    )
+    .unwrap();
+
+    // Install rules (via init --hooks) and project/user MCP configs.
+    let bin = tools.path().join("bin");
+    let path = bin.to_str().unwrap();
+    let run = |line: &str| {
+        let out = doctor_shell(&root, tools.path(), path, line);
+        assert!(
+            out.status.success(),
+            "{line}\nstdout: {}\nstderr: {}",
+            stdout(&out),
+            stderr(&out)
+        );
+        stdout(&out)
+    };
+
+    run("justless init --hooks --agent windsurf --agent cline --agent roo");
+    run("justless mcp --install windsurf cline roo");
+
+    assert!(root.join(".windsurf/rules/justless.md").is_file());
+    assert!(root.join(".clinerules/justless.md").is_file());
+    assert!(root.join(".roo/rules/justless.md").is_file());
+    assert!(root.join(".cline/mcp.json").is_file());
+    assert!(root.join(".roo/mcp.json").is_file());
+
+    let ws_cfg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&windsurf_mcp).unwrap()).unwrap();
+    assert_eq!(ws_cfg["mcpServers"]["other"]["command"], "other-mcp");
+    assert_eq!(
+        ws_cfg["mcpServers"]["justless"],
+        serde_json::json!({"command": "justless", "args": ["mcp"]})
+    );
+
+    // Doctor checks all three rules files and MCP configs read-only and exits 0.
+    let before = doctor_snapshot(&root);
+    let (status, report) = doctor_text(&root, tools.path());
+    assert_eq!(status, Some(0), "{report}");
+    assert_eq!(doctor_snapshot(&root), before);
+    assert_all_in(
+        &report,
+        &[
+            "✓ Instructions: .windsurf/rules/justless.md has the current Justless block",
+            "✓ Instructions: .clinerules/justless.md has the current Justless block",
+            "✓ Instructions: .roo/rules/justless.md has the current Justless block",
+            "✓ Windsurf:",
+            "mcp_config.json runs `justless mcp`",
+            "✓ Cline: .cline/mcp.json runs `justless mcp`",
+            "✓ Roo Code: .roo/mcp.json runs `justless mcp`",
+        ],
+    );
+    assert!(!report.contains('✗'), "{report}");
+
+    // `init --remove --purge` restores the project byte-for-byte, removes created dirs,
+    // and leaves user-level Windsurf MCP config untouched.
+    run("justless init --remove --purge");
+    assert_eq!(removal_tree(&root), original);
+    assert!(windsurf_mcp.is_file());
 }
