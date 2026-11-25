@@ -3,16 +3,25 @@
 //! `rg`, `grep -r`, `git grep`, `ag` and `ack` print one record per line as
 //! `path:line:text` or `path:text`. A path is accepted only when it names an existing
 //! file, so output without paths, such as a single-file grep, keeps the ordinary
-//! preview. Shown lines keep the exact text after the path.
+//! preview. Deep common directory prefixes hoist into the header when strictly
+//! smaller, ultra-long single lines (> 200 bytes) center a window on the match,
+//! identical trimmed lines repeating 3+ times inside a file collapse to
+//! `L12,18,25: <line>`, and pure-boilerplate files sharing an identical line
+//! deduplicate while keeping every path, line number and `[stdout:A-B]` link.
 //!
 //! With context options, matches use `path:line:text`, context lines
 //! `path-line-text`, and blocks of them are separated by `--`. Block mode reads
 //! those, the numbered lines of one file without its name and `rg --heading`, and
 //! reports blocks instead of matching lines.
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::filters::Profile;
 use crate::summary::{Item, Summary, short};
@@ -20,6 +29,14 @@ use crate::workspace::Workspace;
 
 const SHOWN: usize = 8;
 const LINE_BYTES: usize = 200;
+const WINDOW_SNIPPET_BYTES: usize = 168;
+const MAX_SLOTS: usize = 16;
+const MAX_FOLDED_RANGES: usize = 24;
+const MAX_LOC_STR_BYTES: usize = 72;
+const INLINE_KEY_BYTES: usize = 512;
+const INTRA_FOLD_MIN: usize = 3;
+const CROSS_DEDUP_MIN_FILES: usize = 3;
+const CROSS_DEDUP_MIN_LEN: usize = 20;
 const MAX_FILES: usize = 50_000;
 const MAX_CHECKS: usize = 200_000;
 /// Groups kept in a run record for rerun comparisons.
@@ -517,18 +534,379 @@ pub fn exclude_state(words: &[&str]) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct LineMode {
+    /// `Some(true)` when `-n`/`--line-number`/`--vimgrep` or a tool that defaults
+    /// to line numbers is active; `Some(false)` for `-N`/`--no-line-number`; `None`
+    /// when unknown and auto-detected from strictly increasing line numbers.
+    explicit_numbered: Option<bool>,
+    /// `--column` or `--vimgrep`: lines carry `line:col:text`.
+    has_col: bool,
+    /// `-o`/`--only-matching`: the same file line may produce several matches.
+    only_matching: bool,
+}
+
+#[derive(Default)]
+struct PatternMatcher {
+    regexes: Vec<Regex>,
+}
+
+impl PatternMatcher {
+    fn from_tool(tool: &[&str], parsed: &Parsed<'_>) -> Self {
+        let mut matcher = Self::default();
+        if parsed.has(&["-v", "--invert-match"]) {
+            return matcher;
+        }
+        let program = tool.first().map_or("", |p| basename(p));
+        let fixed = parsed.has(&["-F", "--fixed-strings", "-Q", "--literal"]) || program == "fgrep";
+        let ignore_case = parsed.has(&["-i", "--ignore-case", "-y"]);
+        let case_sensitive = parsed.has(&["-s", "--case-sensitive", "--no-ignore-case", "-I"]);
+        let smart_case = !ignore_case
+            && !case_sensitive
+            && (parsed.has(&["-S", "--smart-case"]) || program == "ag");
+        let word = parsed.has(&["-w", "--word-regexp"]);
+
+        let (mut patterns, _) = operands(parsed);
+        if patterns.is_empty() {
+            patterns.extend(
+                parsed
+                    .seen
+                    .iter()
+                    .filter(|(flag, _)| *flag == "--match")
+                    .filter_map(|(_, val)| *val),
+            );
+        }
+        for pat in patterns.into_iter().take(16) {
+            matcher.add(pat, fixed, ignore_case, smart_case, word);
+        }
+        matcher
+    }
+
+    fn add(&mut self, pattern: &str, fixed: bool, ignore_case: bool, smart_case: bool, word: bool) {
+        if self.regexes.len() >= 16 {
+            return;
+        }
+        if let Some(re) = compile_pattern(pattern, fixed, ignore_case, smart_case, word) {
+            self.regexes.push(re);
+        }
+    }
+
+    /// The earliest match span `(start, end)` in `haystack`, optionally preferring
+    /// a match at or after `from_byte`.
+    fn find(&self, haystack: &str, from_byte: Option<usize>) -> Option<(usize, usize)> {
+        if self.regexes.is_empty() {
+            return None;
+        }
+        if let Some(at) = from_byte {
+            let at = haystack.floor_char_boundary(at.min(haystack.len()));
+            let after = self
+                .regexes
+                .iter()
+                .filter_map(|re| {
+                    re.find(&haystack[at..])
+                        .map(|m| (at + m.start(), at + m.end()))
+                })
+                .min_by_key(|&(s, _)| s);
+            if after.is_some() {
+                return after;
+            }
+        }
+        self.regexes
+            .iter()
+            .filter_map(|re| re.find(haystack).map(|m| (m.start(), m.end())))
+            .min_by_key(|&(s, _)| s)
+    }
+}
+
+fn compile_pattern(
+    pattern: &str,
+    fixed: bool,
+    ignore_case: bool,
+    smart_case: bool,
+    word: bool,
+) -> Option<Regex> {
+    if pattern.is_empty() || pattern.len() > 2048 {
+        return None;
+    }
+    let ci = ignore_case || (smart_case && !pattern.chars().any(char::is_uppercase));
+    let build = |expr: &str| {
+        RegexBuilder::new(expr)
+            .case_insensitive(ci)
+            .size_limit(64 * 1024)
+            .dfa_size_limit(64 * 1024)
+            .build()
+            .ok()
+    };
+    let wrap = |expr: String| {
+        if word {
+            format!(r"\b(?:{expr})\b")
+        } else {
+            expr
+        }
+    };
+    if fixed {
+        return build(&wrap(regex::escape(pattern)));
+    }
+    if let Some(re) = build(&wrap(pattern.to_owned())) {
+        return Some(re);
+    }
+    // BRE/PCRE2 fallback: match the longest literal token inside the pattern.
+    let literal = longest_literal_token(pattern)?;
+    build(&regex::escape(literal))
+}
+
+fn longest_literal_token(pattern: &str) -> Option<&str> {
+    let bytes = pattern.as_bytes();
+    let mut best: Option<&str> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // Skip escape sequence (`\d`, `\w`, `\(`, etc.).
+            i += 2;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'/'))
+        {
+            i += 1;
+        }
+        if i > start {
+            let token = &pattern[start..i];
+            if token.len() >= 2 && best.is_none_or(|b| token.len() > b.len()) {
+                best = Some(token);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loc {
+    Range(usize, usize),
+    LineCol(usize, usize),
+}
+
+struct MatchSlot {
+    hash: u64,
+    raw_len: usize,
+    raw_exact: Option<String>,
+    raw_sha: Option<[u8; 32]>,
+    count: usize,
+    /// Up to 2 exact original occurrences: `(seq, display_line, stdout_line, clipped)`.
+    samples: Vec<(usize, String, usize, bool)>,
+    /// File line locations for collapsed `L12,18,25: <body>` rendering (`count >= 3`).
+    locs: Vec<Loc>,
+    last_line: Option<usize>,
+    numbered: bool,
+    /// Trimmed (and windowed if long) body text used when `count >= INTRA_FOLD_MIN`.
+    folded_body: String,
+    first_stdout: usize,
+    first_seq: usize,
+    clipped: bool,
+}
+
+impl MatchSlot {
+    fn matches_raw(&self, hash: u64, raw: &str) -> bool {
+        if self.hash != hash || self.raw_len != raw.len() {
+            return false;
+        }
+        if let Some(exact) = &self.raw_exact {
+            return exact == raw;
+        }
+        self.raw_sha.is_some_and(|sha| sha256_bytes(raw) == sha)
+    }
+
+    fn same_key(&self, other: &Self) -> bool {
+        if self.hash != other.hash || self.raw_len != other.raw_len {
+            return false;
+        }
+        match (&self.raw_exact, &other.raw_exact) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.raw_sha.is_some() && self.raw_sha == other.raw_sha,
+        }
+    }
+
+    fn push_loc(&mut self, line: usize, col: Option<usize>, only_matching: bool) {
+        if !self.numbered {
+            return;
+        }
+        if let Some(prev) = self.last_line
+            && (line < prev || (line == prev && !only_matching))
+        {
+            self.numbered = false;
+            return;
+        }
+        self.last_line = Some(line);
+        if let Some(c) = col {
+            if self.locs.len() < MAX_FOLDED_RANGES {
+                self.locs.push(Loc::LineCol(line, c));
+            }
+            return;
+        }
+        if let Some(Loc::Range(_, end)) = self.locs.last_mut()
+            && *end + 1 == line
+        {
+            *end = line;
+            return;
+        }
+        if self.locs.len() < MAX_FOLDED_RANGES {
+            self.locs.push(Loc::Range(line, line));
+        }
+    }
+
+    fn format_folded(&self, pointers: bool) -> String {
+        let mut line = if self.numbered && !self.locs.is_empty() {
+            let locs = format_locs(&self.locs, self.count);
+            if self.folded_body.is_empty() {
+                format!("L{locs}:")
+            } else {
+                format!("L{locs}: {}", self.folded_body)
+            }
+        } else {
+            // Unnumbered (or duplicate-line-number) fallback: keep exact original text.
+            let body = if self.numbered {
+                self.folded_body.as_str()
+            } else {
+                self.samples
+                    .first()
+                    .map_or(self.folded_body.as_str(), |(_, s, _, _)| s.trim())
+            };
+            if body.is_empty() {
+                format!("×{}:", self.count)
+            } else {
+                format!("×{}: {body}", self.count)
+            }
+        };
+        if pointers && self.clipped {
+            line.push_str(&format!(" [stdout:{}]", self.first_stdout));
+        }
+        line
+    }
+}
+
+fn hash64(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn sha256_bytes(text: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher.finalize().into()
+}
+
+fn format_locs(locs: &[Loc], total_count: usize) -> String {
+    let mut out = String::new();
+    let mut covered = 0usize;
+    for (i, loc) in locs.iter().enumerate() {
+        let (piece, span) = match *loc {
+            Loc::Range(a, b) if a == b => (format!("{a}"), 1),
+            Loc::Range(a, b) if b == a + 1 => (format!("{a},{b}"), 2),
+            Loc::Range(a, b) => (format!("{a}-{b}"), b - a + 1),
+            Loc::LineCol(l, c) => (format!("{l}:{c}"), 1),
+        };
+        if i >= 3 && out.len() + piece.len() + 1 > MAX_LOC_STR_BYTES {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&piece);
+        covered += span;
+    }
+    if covered < total_count {
+        out.push_str(&format!(" (+{} more)", total_count - covered));
+    }
+    out
+}
+
 struct Group {
     path: String,
     matches: usize,
     first: usize,
     last: usize,
-    /// The first matching lines, or in block mode the first block's lines.
+    /// In block mode, the first block's lines.
     shown: Vec<String>,
+    /// In normal search mode, distinct match slots supporting intra-file folding
+    /// and match-centered long-line windows.
+    slots: Vec<MatchSlot>,
+    /// Next sequence number for preserving original occurrence order within `slots`.
+    next_seq: usize,
+    /// Last parsed file line number when auto-detecting numbered output.
+    last_file_line: Option<usize>,
     /// Indexes into `Blocks::list`.
     blocks: Vec<usize>,
     /// The first match's place in `shown`, which keeps only the nearest lines
     /// before it.
     lead: Option<usize>,
+}
+
+impl Group {
+    /// When every match in this file has the exact same trimmed body (captured in slot 0),
+    /// return that slot. Files with any other distinct match return `None`.
+    fn single_body(&self) -> Option<&MatchSlot> {
+        (self.slots.len() == 1 && self.slots[0].count == self.matches).then_some(&self.slots[0])
+    }
+
+    /// Render up to `k` display lines for this file, returning the rendered lines
+    /// and the total number of matches those lines represent.
+    fn render_lines(&self, k: usize, pointers: bool) -> (Vec<String>, usize) {
+        if k == 0 {
+            return (Vec::new(), 0);
+        }
+        let mut items: Vec<(usize, usize, String)> = Vec::new();
+        for slot in &self.slots {
+            if slot.count >= INTRA_FOLD_MIN {
+                items.push((slot.first_seq, slot.count, slot.format_folded(pointers)));
+            } else {
+                for &(seq, ref display, stdout_line, clipped) in &slot.samples {
+                    let line = if pointers && clipped {
+                        format!("{display} [stdout:{stdout_line}]")
+                    } else {
+                        display.clone()
+                    };
+                    items.push((seq, 1, line));
+                }
+            }
+        }
+        items.sort_by_key(|(seq, _, _)| *seq);
+        let mut out = Vec::with_capacity(k.min(items.len()));
+        let mut represented = 0usize;
+        for (_, count, line) in items.into_iter().take(k) {
+            out.push(line);
+            represented += count;
+        }
+        (out, represented)
+    }
+
+    /// Compact inline citation for a pure-boilerplate follower file.
+    fn follower_ref(&self, display_path: &str, pointers: bool) -> String {
+        let ptr = pointer(pointers, self);
+        let Some(slot) = self.single_body() else {
+            return format!("{display_path} ×{}{ptr}", self.matches);
+        };
+        if self.matches == 1 {
+            if slot.numbered
+                && let Some(loc) = slot.locs.first()
+            {
+                return match *loc {
+                    Loc::Range(l, _) => format!("{display_path}:{l}{ptr}"),
+                    Loc::LineCol(l, c) => format!("{display_path}:{l}:{c}{ptr}"),
+                };
+            }
+            return format!("{display_path}{ptr}");
+        }
+        if slot.numbered && !slot.locs.is_empty() {
+            let locs = format_locs(&slot.locs, slot.count);
+            format!("{display_path} ×{} L{locs}{ptr}", self.matches)
+        } else {
+            format!("{display_path} ×{}{ptr}", self.matches)
+        }
+    }
 }
 
 /// Lines a block report shows of each file's first block.
@@ -583,6 +961,8 @@ pub struct Search {
     checks: usize,
     overflow: bool,
     blocks: Option<Blocks>,
+    line_mode: LineMode,
+    matcher: PatternMatcher,
 }
 
 impl Search {
@@ -595,7 +975,36 @@ impl Search {
             None => words.to_vec(),
         };
         let tool = crate::filters::unwrap_tool(&eff_refs);
-        let blocks = searched(tool)
+        let parsed_search = searched(tool);
+        let line_mode = parsed_search
+            .as_ref()
+            .map(|(_, parsed)| {
+                let program = basename(tool[0]);
+                let no_num = parsed.has(&["-N", "--no-line-number"]);
+                let has_num = !no_num
+                    && (parsed.has(&["-n", "--line-number", "--vimgrep", "--numbers"])
+                        || matches!(program, "ag" | "ack" | "ack-grep"));
+                // `grep` and `git grep` only print line numbers when `-n`/`--line-number`
+                // is explicitly passed; without it, leading `8080:` is file content.
+                let never_implicit_num = matches!(program, "grep" | "egrep" | "fgrep" | "git");
+                LineMode {
+                    explicit_numbered: if no_num || (!has_num && never_implicit_num) {
+                        Some(false)
+                    } else if has_num {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    has_col: parsed.has(&["--column", "--vimgrep"]),
+                    only_matching: parsed.has(&["-o", "--only-matching"]),
+                }
+            })
+            .unwrap_or_default();
+        let matcher = parsed_search
+            .as_ref()
+            .map(|(_, parsed)| PatternMatcher::from_tool(tool, parsed))
+            .unwrap_or_default();
+        let blocks = parsed_search
             .filter(|(_, parsed)| parsed.has(CONTEXT))
             .map(|(_, parsed)| {
                 let program = basename(tool[0]);
@@ -637,6 +1046,8 @@ impl Search {
             checks: 0,
             overflow: false,
             blocks,
+            line_mode,
+            matcher,
         }
     }
 
@@ -725,6 +1136,9 @@ impl Search {
             first: n,
             last: n,
             shown: Vec::new(),
+            slots: Vec::new(),
+            next_seq: 0,
+            last_file_line: None,
             blocks: Vec::new(),
             lead: None,
         });
@@ -732,12 +1146,103 @@ impl Search {
     }
 
     fn hit(&mut self, c: usize, text: &str, n: usize) {
+        let line_mode = self.line_mode;
+        let (parsed_line, col, prefix_str, content) = split_line_prefix(text, line_mode);
         let group = &mut self.groups[c];
+        // When `-n` was not explicitly requested, accept `<digits>:` as a line number
+        // only while numbers stay strictly increasing (or non-decreasing with `-o`),
+        // so unnumbered key-value files like `8080: foo` never lose their key.
+        let (line_no, col, prefix_str, content) = match (line_mode.explicit_numbered, parsed_line) {
+            (Some(true), Some(l)) => (Some(l), col, prefix_str, content),
+            (None, Some(l))
+                if group
+                    .last_file_line
+                    .is_none_or(|prev| l > prev || (line_mode.only_matching && l >= prev)) =>
+            {
+                group.last_file_line = Some(l);
+                (Some(l), col, prefix_str, content)
+            }
+            (None, _) => {
+                // Non-increasing or unnumbered line in auto-detect mode: demote any
+                // earlier tentative numbered slots in this group to full-line keys so
+                // identical lines such as `8080: foo` still fold together accurately.
+                for slot in &mut group.slots {
+                    if slot.numbered
+                        && let Some((_, sample, _, _)) = slot.samples.first()
+                    {
+                        let full = sample.trim().to_owned();
+                        slot.hash = hash64(&full);
+                        slot.raw_len = full.len();
+                        if full.len() <= INLINE_KEY_BYTES {
+                            slot.raw_exact = Some(full.clone());
+                            slot.raw_sha = None;
+                        } else {
+                            slot.raw_sha = Some(sha256_bytes(&full));
+                            slot.raw_exact = None;
+                        }
+                        slot.folded_body = full;
+                        slot.numbered = false;
+                        slot.locs.clear();
+                    }
+                }
+                (None, None, "", text)
+            }
+            _ => (None, None, "", text),
+        };
         group.matches += 1;
         group.first = group.first.min(n);
         group.last = group.last.max(n);
-        if group.shown.len() < SHOWN {
-            group.shown.push(clip(text));
+        let seq = group.next_seq;
+        group.next_seq += 1;
+
+        let raw_trimmed = content.trim();
+        let hash = hash64(raw_trimmed);
+        if let Some(slot) = group
+            .slots
+            .iter_mut()
+            .find(|slot| slot.matches_raw(hash, raw_trimmed))
+        {
+            slot.count += 1;
+            if let Some(l) = line_no {
+                slot.push_loc(l, col, line_mode.only_matching);
+            } else {
+                slot.numbered = false;
+            }
+            if slot.samples.len() < INTRA_FOLD_MIN - 1 {
+                let (display, clipped) = window_line(text, prefix_str, content, col, &self.matcher);
+                slot.samples.push((seq, display, n, clipped));
+            }
+        } else if group.slots.len() < MAX_SLOTS {
+            let (display, clipped) = window_line(text, prefix_str, content, col, &self.matcher);
+            let folded_body = if clipped {
+                window_snippet(raw_trimmed, col, &self.matcher, WINDOW_SNIPPET_BYTES)
+            } else {
+                raw_trimmed.to_owned()
+            };
+            let (raw_exact, raw_sha) = if raw_trimmed.len() <= INLINE_KEY_BYTES {
+                (Some(raw_trimmed.to_owned()), None)
+            } else {
+                (None, Some(sha256_bytes(raw_trimmed)))
+            };
+            let mut slot = MatchSlot {
+                hash,
+                raw_len: raw_trimmed.len(),
+                raw_exact,
+                raw_sha,
+                count: 1,
+                samples: vec![(seq, display, n, clipped)],
+                locs: Vec::new(),
+                last_line: None,
+                numbered: line_no.is_some(),
+                folded_body,
+                first_stdout: n,
+                first_seq: seq,
+                clipped,
+            };
+            if let Some(l) = line_no {
+                slot.push_loc(l, col, line_mode.only_matching);
+            }
+            group.slots.push(slot);
         }
         self.matches += 1;
         self.current = Some(c);
@@ -998,7 +1503,13 @@ impl Search {
                 _ => {}
             }
             if group.shown.len() < BLOCK_LINES {
-                group.shown.push(clip(text));
+                let line = if matched && text.len() > LINE_BYTES {
+                    let (_, col, prefix_str, content) = split_line_prefix(text, self.line_mode);
+                    window_line(text, prefix_str, content, col, &self.matcher).0
+                } else {
+                    clip(text)
+                };
+                group.shown.push(line);
             }
         }
         group.matches += usize::from(matched);
@@ -1067,9 +1578,8 @@ impl Search {
                 .collect(),
             ..Summary::default()
         };
-        header.push('\n');
         let current = self.groups.iter().map(|g| (g.path.as_str(), g.matches));
-        header.push_str(&compare(previous, "search", current, "no longer matched"));
+        let compared = compare(previous, "search", current, "no longer matched");
         let other = self.other.as_ref().map_or_else(String::new, |(n, line)| {
             format!(
                 "{} other line(s), first: {}{}\n",
@@ -1116,66 +1626,463 @@ impl Search {
             })
             .chain(std::iter::once(other))
             .collect();
-        let room = budget.saturating_sub(header.len() + other.len() + 96);
-        if let Some(blocks) = &self.blocks {
-            let body = block_body(&order, &blocks.list, room, pointers);
-            return Some((format!("{header}{body}{other}"), summary));
-        }
-        let block = |g: &Group, k: usize| {
-            let mut text = format!("{} ×{}{}\n", g.path, g.matches, pointer(pointers, g));
-            for line in g.shown.iter().take(k) {
-                text.push_str(&format!("  {line}\n"));
+
+        let hoist = choose_prefix_hoist(&order, !collapsed.is_empty());
+        let build_report = |hoist: &PrefixHoist| -> (String, (usize, usize)) {
+            let mut full_header = format!("{header}{}\n", hoist.header_suffix());
+            full_header.push_str(&compared);
+            let room = budget.saturating_sub(full_header.len() + other.len() + 96);
+            if let Some(blocks) = &self.blocks {
+                let (body, tier) = block_body(&order, &blocks.list, room, pointers, hoist);
+                return (format!("{full_header}{body}{other}"), tier);
             }
-            let shown = k.min(g.shown.len());
-            if g.matches > shown {
-                text.push_str(&format!("  +{} more in file\n", g.matches - shown));
-            }
-            text
+            let (body, tier) = search_body(&order, room, pointers, hoist);
+            (format!("{full_header}{body}{other}"), tier)
         };
-        for k in [SHOWN, 5, 3, 2, 1] {
-            let mut body = String::new();
-            for group in &order {
-                body.push_str(&block(group, k));
-                if body.len() > room {
-                    break;
-                }
-            }
-            if body.len() <= room {
-                return Some((format!("{header}{body}{other}"), summary));
+        let (report, hoist_tier) = build_report(&hoist);
+        // Only keep prefix hoisting when it achieves a richer detail tier within budget
+        // or is strictly smaller at the same detail tier.
+        if !matches!(hoist, PrefixHoist::None) {
+            let (plain, plain_tier) = build_report(&PrefixHoist::None);
+            if plain_tier > hoist_tier || (plain_tier == hoist_tier && plain.len() <= report.len())
+            {
+                return Some((plain, summary));
             }
         }
+        Some((report, summary))
+    }
+}
+
+/// Prefix hoisted into the search header when matching files share a deep directory.
+enum PrefixHoist {
+    None,
+    /// Every displayed file starts with `prefix` (ending with `/`). Header appends
+    /// `, under {prefix}` and paths render relative to it.
+    Full(String),
+    /// A majority of displayed files share `prefix` (ending with `/`), while other
+    /// files or collapsed trees sit outside it. Header appends ` (… = {prefix})`
+    /// and matching paths render as `…/{rel}` so non-matching paths stay unambiguous.
+    Partial(String),
+}
+
+impl PrefixHoist {
+    fn header_suffix(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Full(prefix) => format!(", under {prefix}"),
+            Self::Partial(prefix) => format!(" (… = {prefix})"),
+        }
+    }
+
+    fn display_path<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        match self {
+            Self::None => Cow::Borrowed(path),
+            Self::Full(prefix) => Cow::Borrowed(path.strip_prefix(prefix.as_str()).unwrap_or(path)),
+            Self::Partial(prefix) => match path.strip_prefix(prefix.as_str()) {
+                Some(rel) => Cow::Owned(format!("…/{rel}")),
+                None => Cow::Borrowed(path),
+            },
+        }
+    }
+}
+
+fn real_dir_depth(prefix: &str) -> usize {
+    prefix
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .count()
+}
+
+fn common_dir_prefix(paths: &[&str]) -> String {
+    fn dir_of(p: &str) -> &str {
+        p.rfind('/').map_or("", |i| &p[..=i])
+    }
+    let Some((first, rest)) = paths.split_first() else {
+        return String::new();
+    };
+    let mut common = dir_of(first);
+    for path in rest {
+        let dir = dir_of(path);
+        let shared = common
+            .bytes()
+            .zip(dir.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let cut = common[..common.floor_char_boundary(shared)]
+            .rfind('/')
+            .map_or(0, |i| i + 1);
+        common = &common[..cut];
+        if common.is_empty() {
+            break;
+        }
+    }
+    common.to_owned()
+}
+
+fn choose_prefix_hoist(order: &[&Group], has_collapsed: bool) -> PrefixHoist {
+    if order.len() < 2 {
+        return PrefixHoist::None;
+    }
+    if !has_collapsed {
+        let paths: Vec<&str> = order.iter().map(|g| g.path.as_str()).collect();
+        let common = common_dir_prefix(&paths);
+        // Require at least 2 real directory components (ignoring leading `./`) so shallow
+        // roots like `src/` or `./src/` stay inline, and verify net byte savings.
+        if real_dir_depth(&common) >= 2
+            && common.len() >= 10
+            && (order.len() - 1) * common.len() > ", under ".len()
+        {
+            return PrefixHoist::Full(common);
+        }
+    }
+    if order.len() < 3 {
+        return PrefixHoist::None;
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for group in order {
+        for (i, _) in group.path.match_indices('/') {
+            let prefix = &group.path[..=i];
+            if prefix.len() >= 12 && real_dir_depth(prefix) >= 2 {
+                *counts.entry(prefix).or_default() += 1;
+            }
+        }
+    }
+    let marker_len = "…/".len();
+    let header_fixed = " (… = )".len();
+    let mut best: Option<(&str, usize)> = None;
+    for (prefix, count) in counts {
+        if count < 3 || count * 2 < order.len() {
+            continue;
+        }
+        let gross = count.saturating_mul(prefix.len().saturating_sub(marker_len));
+        let cost = header_fixed + prefix.len();
+        let savings = gross.saturating_sub(cost);
+        if savings < 24 {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some((best_prefix, best_savings)) => {
+                savings > best_savings
+                    || (savings == best_savings && prefix.len() > best_prefix.len())
+                    || (savings == best_savings
+                        && prefix.len() == best_prefix.len()
+                        && prefix < best_prefix)
+            }
+        };
+        if replace {
+            best = Some((prefix, savings));
+        }
+    }
+    best.map_or(PrefixHoist::None, |(prefix, _)| {
+        PrefixHoist::Partial(prefix.to_owned())
+    })
+}
+
+enum DisplayUnit {
+    Single(usize),
+    Boilerplate {
+        leader: usize,
+        followers: Vec<usize>,
+    },
+}
+
+impl DisplayUnit {
+    fn group_indices(&self) -> Vec<usize> {
+        match self {
+            Self::Single(i) => vec![*i],
+            Self::Boilerplate { leader, followers } => std::iter::once(*leader)
+                .chain(followers.iter().copied())
+                .collect(),
+        }
+    }
+}
+
+fn build_display_units(order: &[&Group], pointers: bool, hoist: &PrefixHoist) -> Vec<DisplayUnit> {
+    // Group pure single-body files sharing the exact same trimmed line of sufficient length.
+    let mut buckets: Vec<Vec<usize>> = Vec::new();
+    let mut by_hash: HashMap<(u64, usize), Vec<usize>> = HashMap::new();
+    for (idx, group) in order.iter().enumerate() {
+        let Some(slot) = group.single_body() else {
+            continue;
+        };
+        if slot.clipped || slot.folded_body.len() < CROSS_DEDUP_MIN_LEN {
+            continue;
+        }
+        let bucket_list = by_hash.entry((slot.hash, slot.raw_len)).or_default();
+        let found = bucket_list.iter().copied().find(|&b| {
+            let first_idx = buckets[b][0];
+            order[first_idx]
+                .single_body()
+                .is_some_and(|first| first.same_key(slot))
+        });
+        match found {
+            Some(b) => buckets[b].push(idx),
+            None => {
+                let b = buckets.len();
+                buckets.push(vec![idx]);
+                bucket_list.push(b);
+            }
+        }
+    }
+
+    let mut absorbed = vec![false; order.len()];
+    let mut leader_followers: HashMap<usize, Vec<usize>> = HashMap::new();
+    for indices in buckets {
+        if indices.len() < CROSS_DEDUP_MIN_FILES {
+            continue;
+        }
+        let leader = indices[0];
+        let followers = indices[1..].to_vec();
+        let plain_bytes: usize = indices
+            .iter()
+            .map(|&i| render_single(order[i], 1, pointers, hoist).len())
+            .sum();
+        let dedup_bytes =
+            render_boilerplate(order, leader, &followers, 1, None, pointers, hoist).len();
+        if dedup_bytes < plain_bytes {
+            for &f in &followers {
+                absorbed[f] = true;
+            }
+            leader_followers.insert(leader, followers);
+        }
+    }
+
+    let mut units = Vec::with_capacity(order.len());
+    for (i, &was_absorbed) in absorbed.iter().enumerate() {
+        if was_absorbed {
+            continue;
+        }
+        if let Some(followers) = leader_followers.remove(&i) {
+            units.push(DisplayUnit::Boilerplate {
+                leader: i,
+                followers,
+            });
+        } else {
+            units.push(DisplayUnit::Single(i));
+        }
+    }
+    units
+}
+
+fn render_single(g: &Group, k: usize, pointers: bool, hoist: &PrefixHoist) -> String {
+    let path = hoist.display_path(&g.path);
+    let mut text = format!("{path} ×{}{}\n", g.matches, pointer(pointers, g));
+    if k == 0 {
+        return text;
+    }
+    let (lines, represented) = g.render_lines(k, pointers);
+    for line in lines {
+        text.push_str(&format!("  {line}\n"));
+    }
+    if g.matches > represented {
+        text.push_str(&format!("  +{} more in file\n", g.matches - represented));
+    }
+    text
+}
+
+fn render_boilerplate(
+    order: &[&Group],
+    leader: usize,
+    followers: &[usize],
+    k: usize,
+    max_followers: Option<usize>,
+    pointers: bool,
+    hoist: &PrefixHoist,
+) -> String {
+    let mut text = render_single(order[leader], k, pointers, hoist);
+    if followers.is_empty() {
+        return text;
+    }
+    let cap = max_followers
+        .unwrap_or(followers.len())
+        .min(followers.len());
+    let shown: Vec<String> = followers[..cap]
+        .iter()
+        .map(|&i| {
+            let g = order[i];
+            let display = hoist.display_path(&g.path);
+            g.follower_ref(&display, pointers)
+        })
+        .collect();
+    text.push_str(&format!(
+        "  same line in {}: {}",
+        plural(followers.len(), "more file", "more files"),
+        shown.join(", ")
+    ));
+    if cap < followers.len() {
+        let rest: Vec<&Group> = followers[cap..].iter().map(|&i| order[i]).collect();
+        let rest_matches: usize = rest.iter().map(|g| g.matches).sum();
+        text.push_str(&format!(
+            ", +{} ({}){}",
+            plural(rest.len(), "more file", "more files"),
+            plural(rest_matches, "match", "matches"),
+            stdout_span(pointers, &rest),
+        ));
+    }
+    text.push('\n');
+    text
+}
+
+fn render_unit(
+    order: &[&Group],
+    unit: &DisplayUnit,
+    k: usize,
+    max_followers: Option<usize>,
+    pointers: bool,
+    hoist: &PrefixHoist,
+) -> String {
+    match unit {
+        DisplayUnit::Single(i) => render_single(order[*i], k, pointers, hoist),
+        DisplayUnit::Boilerplate { leader, followers } => {
+            render_boilerplate(order, *leader, followers, k, max_followers, pointers, hoist)
+        }
+    }
+}
+
+fn search_body(
+    order: &[&Group],
+    room: usize,
+    pointers: bool,
+    hoist: &PrefixHoist,
+) -> (String, (usize, usize)) {
+    let units = build_display_units(order, pointers, hoist);
+    for k in [SHOWN, 5, 3, 2, 1] {
+        let mut body = String::new();
+        for unit in &units {
+            body.push_str(&render_unit(order, unit, k, None, pointers, hoist));
+            if body.len() > room {
+                break;
+            }
+        }
+        if body.len() <= room {
+            return (body, (k + 1, order.len()));
+        }
+    }
+
+    // Budget-constrained mode: show the busiest units with match lines in up to 2/3 of
+    // `room`, falling back from k=2 to k=1 when k=2 leaves too few files visible.
+    let detail_budget = room * 2 / 3;
+    let fill_detail = |k: usize, cap: usize| {
         let mut body = String::new();
         let mut listed = 0;
-        for group in &order {
-            let text = block(group, 2);
-            if body.len() + text.len() > room * 2 / 3 {
+        for unit in &units {
+            let text = render_unit(order, unit, k, Some(cap), pointers, hoist);
+            if body.len() + text.len() > detail_budget {
                 break;
             }
             body.push_str(&text);
             listed += 1;
         }
-        body.push_str(&fold(&order[listed..], room.saturating_sub(body.len()), ""));
-        Some((format!("{header}{body}{other}"), summary))
+        (body, listed)
+    };
+    let (mut body, mut listed) = fill_detail(2, 8);
+    if listed < 2 && units.len() >= 2 {
+        let (alt_body, alt_listed) = fill_detail(1, 4);
+        if alt_listed > listed {
+            body = alt_body;
+            listed = alt_listed;
+        }
+    }
+
+    let listed_files: usize = units[..listed]
+        .iter()
+        .map(|u| match u {
+            DisplayUnit::Single(_) => 1,
+            DisplayUnit::Boilerplate { followers, .. } => 1 + followers.len(),
+        })
+        .sum();
+    let remaining: Vec<&Group> = units[listed..]
+        .iter()
+        .flat_map(DisplayUnit::group_indices)
+        .map(|i| order[i])
+        .collect();
+    if remaining.is_empty() {
+        return (body, (1, listed_files));
+    }
+
+    // If every remaining file fits as a 1-line header (`path ×N [stdout:A-B]`), list
+    // them all so no filenames are lost.
+    let rem_room = room.saturating_sub(body.len());
+    let mut headers_only = String::new();
+    let mut all_fit = true;
+    for group in &remaining {
+        headers_only.push_str(&render_single(group, 0, pointers, hoist));
+        if headers_only.len() > rem_room {
+            all_fit = false;
+            break;
+        }
+    }
+    if all_fit {
+        body.push_str(&headers_only);
+        return (body, (0, order.len()));
+    }
+
+    // Otherwise list as many 1-line file headers as fit while reserving room for the
+    // directory fold summary with exact omitted counts and `[stdout:A-B]` span.
+    let fold_reserve = rem_room.min(220);
+    let mut rem_listed = 0;
+    for group in &remaining {
+        let line = render_single(group, 0, pointers, hoist);
+        if body.len() + line.len() + fold_reserve > room {
+            break;
+        }
+        body.push_str(&line);
+        rem_listed += 1;
+    }
+    let tail = &remaining[rem_listed..];
+    if !tail.is_empty() {
+        let tag = stdout_span(pointers, tail);
+        body.push_str(&fold(tail, room.saturating_sub(body.len()), &tag, hoist));
+    }
+    (body, (0, listed_files + rem_listed))
+}
+
+fn stdout_span(pointers: bool, groups: &[&Group]) -> String {
+    if !pointers {
+        return String::new();
+    }
+    let (Some(a), Some(b)) = (
+        groups.iter().map(|g| g.first).min(),
+        groups.iter().map(|g| g.last).max(),
+    ) else {
+        return String::new();
+    };
+    if a == b {
+        format!(" [stdout:{a}]")
+    } else {
+        format!(" [stdout:{a}-{b}]")
     }
 }
 
 /// The files that did not fit, summarized by directory, largest first, within
 /// `room` bytes for the directory names, ending with `tag`.
-fn fold(rest: &[&Group], room: usize, tag: &str) -> String {
-    let mut folders: HashMap<&str, (usize, usize)> = HashMap::new();
+fn fold(rest: &[&Group], room: usize, tag: &str, hoist: &PrefixHoist) -> String {
+    let mut folders: HashMap<String, (usize, usize)> = HashMap::new();
     for group in rest {
-        let folder = group.path.rsplit_once('/').map_or(".", |(dir, _)| dir);
-        let entry = folders.entry(folder).or_default();
+        let shown = hoist.display_path(&group.path);
+        let folder = shown.rsplit_once('/').map_or(".", |(dir, _)| dir);
+        let entry = folders.entry(folder.to_owned()).or_default();
         entry.0 += 1;
         entry.1 += group.matches;
     }
     let mut folders: Vec<_> = folders.into_iter().collect();
-    folders.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
+    folders.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(&b.0)));
+    let matches: usize = rest.iter().map(|g| g.matches).sum();
+    let head = format!(
+        "+{} with {}",
+        plural(rest.len(), "more file", "more files"),
+        plural(matches, "match", "matches"),
+    );
+    // Reserve space for `head`, `" in "`, `", …"`, `tag` and `'\n'` so `fold` fits `room`.
+    let fixed = head.len() + " in ".len() + ", …".len() + tag.len() + 1;
+    let names_room = room.saturating_sub(fixed);
     let mut names = String::new();
     let mut named = 0;
     for (folder, (files, matches)) in &folders {
         let item = format!("{folder}/ {} ×{matches}", plural(*files, "file", "files"));
-        if names.len() + item.len() + 2 > room {
+        let sep = if names.is_empty() { 0 } else { 2 };
+        if names.len() + sep + item.len() > names_room {
             break;
         }
         if !names.is_empty() {
@@ -1184,11 +2091,8 @@ fn fold(rest: &[&Group], room: usize, tag: &str) -> String {
         names.push_str(&item);
         named += 1;
     }
-    let matches: usize = rest.iter().map(|g| g.matches).sum();
     format!(
-        "+{} with {}{}{}{}{tag}\n",
-        plural(rest.len(), "more file", "more files"),
-        plural(matches, "match", "matches"),
+        "{head}{}{}{}{tag}\n",
         if named > 0 { " in " } else { "" },
         names,
         if named < folders.len() && named > 0 {
@@ -1202,7 +2106,13 @@ fn fold(rest: &[&Group], room: usize, tag: &str) -> String {
 /// A block report: each file's match and block counts, its first block in full,
 /// then where its other blocks are. Fewer lines, then files alone, then folders
 /// make it fit `room`.
-fn block_body(order: &[&Group], list: &[Block], room: usize, pointers: bool) -> String {
+fn block_body(
+    order: &[&Group],
+    list: &[Block],
+    room: usize,
+    pointers: bool,
+    hoist: &PrefixHoist,
+) -> (String, (usize, usize)) {
     let tag = |a: usize, b: usize| match (pointers, a == b) {
         (false, _) => String::new(),
         (true, true) => format!(" [stdout:{a}]"),
@@ -1214,9 +2124,9 @@ fn block_body(order: &[&Group], list: &[Block], room: usize, pointers: bool) -> 
         _ => tag(block.start, block.end).trim_start().to_owned(),
     };
     let render = |g: &Group, lines: usize, entries: usize| {
+        let path = hoist.display_path(&g.path);
         let mut text = format!(
-            "{} ×{} in {}{}\n",
-            g.path,
+            "{path} ×{} in {}{}\n",
             g.matches,
             plural(g.blocks.len(), "block", "blocks"),
             pointer(pointers, g)
@@ -1273,7 +2183,7 @@ fn block_body(order: &[&Group], list: &[Block], room: usize, pointers: bool) -> 
             }
         }
         if body.len() <= room {
-            return body;
+            return (body, (lines + 1, order.len()));
         }
     }
     // Name files alone while they fit, then fold the rest by directory.
@@ -1292,9 +2202,191 @@ fn block_body(order: &[&Group], list: &[Block], room: usize, pointers: bool) -> 
         rest.iter().map(|g| g.first).min(),
         rest.iter().map(|g| g.last).max(),
     ) {
-        body.push_str(&fold(rest, room.saturating_sub(body.len()), &tag(a, b)));
+        body.push_str(&fold(
+            rest,
+            room.saturating_sub(body.len()),
+            &tag(a, b),
+            hoist,
+        ));
     }
-    body
+    (body, (0, listed))
+}
+
+/// Parse an optional leading `line:` (or `line:col:` when `--column`/`--vimgrep` is
+/// active) prefix from the text after `path:`.
+fn split_line_prefix(text: &str, mode: LineMode) -> (Option<usize>, Option<usize>, &str, &str) {
+    if mode.explicit_numbered == Some(false) {
+        return (None, None, "", text);
+    }
+    let bytes = text.as_bytes();
+    if bytes
+        .first()
+        .is_none_or(|b| !b.is_ascii_digit() || *b == b'0')
+    {
+        return (None, None, "", text);
+    }
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if bytes.get(digits) != Some(&b':') {
+        return (None, None, "", text);
+    }
+    let Ok(line_no) = text[..digits].parse::<usize>() else {
+        return (None, None, "", text);
+    };
+    let after_line = digits + 1;
+    if mode.has_col {
+        let rest = &text[after_line..];
+        let rbytes = rest.as_bytes();
+        if rbytes
+            .first()
+            .is_some_and(|b| b.is_ascii_digit() && *b != b'0')
+        {
+            let cdigits = rbytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            if rbytes.get(cdigits) == Some(&b':')
+                && let Ok(col) = rest[..cdigits].parse::<usize>()
+            {
+                let after_col = after_line + cdigits + 1;
+                return (
+                    Some(line_no),
+                    Some(col),
+                    &text[..after_col],
+                    &text[after_col..],
+                );
+            }
+        }
+    }
+    (
+        Some(line_no),
+        None,
+        &text[..after_line],
+        &text[after_line..],
+    )
+}
+
+/// Keep a normal-length line verbatim; for lines over `LINE_BYTES`, extract a
+/// match-centered window around the query pattern (or `--column` offset, or the
+/// first non-boilerplate region) while preserving any leading `line:` prefix.
+fn window_line(
+    raw: &str,
+    prefix: &str,
+    content: &str,
+    col: Option<usize>,
+    matcher: &PatternMatcher,
+) -> (String, bool) {
+    if raw.len() <= LINE_BYTES {
+        return (raw.to_owned(), false);
+    }
+    let budget = WINDOW_SNIPPET_BYTES.min(LINE_BYTES.saturating_sub(prefix.len()).max(80));
+    let snippet = window_snippet(content, col, matcher, budget);
+    (format!("{prefix}{snippet}"), true)
+}
+
+fn window_snippet(
+    content: &str,
+    col: Option<usize>,
+    matcher: &PatternMatcher,
+    budget: usize,
+) -> String {
+    if content.len() <= budget {
+        return content.to_owned();
+    }
+    let col_byte = col.map(|c| c.saturating_sub(1).min(content.len()));
+    let (m_start, m_end) = if let Some(span) = matcher.find(content, col_byte) {
+        span
+    } else if let Some(at) = col_byte {
+        let at = content.floor_char_boundary(at);
+        (at, at)
+    } else {
+        let nb = skip_boilerplate(content);
+        (nb, nb)
+    };
+
+    // Anchor at byte 0 only when the match sits comfortably inside the leading window
+    // with room after it; otherwise center around the match so it is always visible.
+    let (mut win_start, mut win_end) = if m_start == 0 || m_end.saturating_add(24) <= budget {
+        (0, content.floor_char_boundary(budget.min(content.len())))
+    } else {
+        let m_len = m_end.saturating_sub(m_start);
+        if m_len >= budget {
+            let start = content.floor_char_boundary(m_start);
+            let end = content.floor_char_boundary((start + budget).min(content.len()));
+            (start, end)
+        } else {
+            let slack = budget - m_len;
+            let before = slack * 2 / 5;
+            let after = slack - before;
+            let (raw_start, raw_end) = if m_start < before {
+                (0, (m_end + after + (before - m_start)).min(content.len()))
+            } else if m_end + after > content.len() {
+                let overflow = m_end + after - content.len();
+                (m_start.saturating_sub(before + overflow), content.len())
+            } else {
+                (m_start - before, m_end + after)
+            };
+            let mut start = content.ceil_char_boundary(raw_start);
+            if start > m_start {
+                start = content.floor_char_boundary(m_start);
+            }
+            let min_end = content.ceil_char_boundary(m_end.min(content.len()));
+            let end = content.floor_char_boundary(raw_end).max(min_end);
+            (start, end.min(content.len()))
+        }
+    };
+
+    // Avoid emitting a 3-byte `…` just to elide <= 4 bytes at either edge.
+    if win_start <= 4 {
+        win_start = 0;
+    }
+    if content.len().saturating_sub(win_end) <= 4 {
+        win_end = content.len();
+    }
+
+    let mut out = String::with_capacity((win_end - win_start) + 6);
+    if win_start > 0 {
+        out.push('…');
+    }
+    out.push_str(&content[win_start..win_end]);
+    if win_end < content.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Skip leading whitespace, block/HTML comments (`/* ... */`, `<!-- ... -->`) and
+/// repeated single-character padding runs at the start of an ultra-long line when
+/// no search pattern or column offset is available.
+fn skip_boilerplate(content: &str) -> usize {
+    let mut i = 0;
+    let bytes = content.as_bytes();
+    while i < bytes.len() {
+        let before = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if content[i..].starts_with("/*")
+            && let Some(end) = content[i + 2..].find("*/")
+        {
+            i += 2 + end + 2;
+            continue;
+        }
+        if content[i..].starts_with("<!--")
+            && let Some(end) = content[i + 4..].find("-->")
+        {
+            i += 4 + end + 3;
+            continue;
+        }
+        if i < bytes.len() {
+            let ch = bytes[i];
+            let run = bytes[i..].iter().take_while(|&&b| b == ch).count();
+            if run >= 24 {
+                i += run;
+                continue;
+            }
+        }
+        if i == before {
+            break;
+        }
+    }
+    if i < content.len() { i } else { 0 }
 }
 
 /// The line number at the start of `text` and the separator after it: `12:`
@@ -1459,6 +2551,15 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
             return None;
         }
         let mut search = Search::new(&base, &words);
+        if let Some(pattern) = args["pattern"].as_str() {
+            let ignore_case = args["-i"].as_bool().unwrap_or(false);
+            search
+                .matcher
+                .add(pattern, false, ignore_case, false, false);
+        }
+        if args["-n"].as_bool() == Some(true) {
+            search.line_mode.explicit_numbered = Some(true);
+        }
         for (i, line) in original.lines().enumerate() {
             search.observe(line, i + 1);
         }
@@ -1708,5 +2809,790 @@ mod tests {
             assert_eq!(super::select(words), None, "{words:?}");
             assert_eq!(super::read_only(words), Some(false), "{words:?}");
         }
+    }
+
+    /// Verify every `[stdout:A]` / `[stdout:A-B]` tag in `report` refers to valid
+    /// 1-based lines within `1..=total_lines`.
+    fn assert_valid_stdout_pointers(report: &str, total_lines: usize) {
+        let mut count = 0usize;
+        for range in report.split("[stdout:").skip(1) {
+            let range = range.split(']').next().expect("closing ] on stdout tag");
+            let (a, b) = range.split_once('-').unwrap_or((range, range));
+            let (a, b): (usize, usize) = (
+                a.parse().expect("numeric start"),
+                b.parse().expect("numeric end"),
+            );
+            assert!(
+                1 <= a && a <= b && b <= total_lines,
+                "invalid pointer [stdout:{range}] for {total_lines} lines in:\n{report}"
+            );
+            count += 1;
+        }
+        assert!(
+            count > 0,
+            "expected at least one [stdout:] pointer:\n{report}"
+        );
+    }
+
+    fn run_search(
+        dir: &std::path::Path,
+        words: &[&str],
+        label: &str,
+        lines: &[String],
+        budget: usize,
+        pointers: bool,
+    ) -> (String, crate::summary::Summary) {
+        let mut search = Search::new(dir, words);
+        for (i, line) in lines.iter().enumerate() {
+            search.observe(line, i + 1);
+        }
+        search
+            .finish(label, budget, None, pointers)
+            .expect("recognized search report")
+    }
+
+    #[test]
+    fn deep_monorepo_common_prefix_hoisting_saves_bytes_and_stays_unambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "src/services/billing/v2/";
+        let rel_files = [
+            "mod.rs",
+            "handlers/charge.rs",
+            "handlers/refund.rs",
+            "handlers/invoice.rs",
+            "handlers/subscription.rs",
+            "handlers/webhook.rs",
+            "models/ledger.rs",
+            "models/line_item.rs",
+            "models/currency.rs",
+            "models/tax_rate.rs",
+            "validators/card.rs",
+            "validators/address.rs",
+            "validators/limits.rs",
+            "clients/stripe.rs",
+            "clients/adyen.rs",
+            "clients/paypal.rs",
+            "jobs/reconcile.rs",
+            "jobs/dunning.rs",
+            "jobs/settlement.rs",
+            "jobs/export.rs",
+        ];
+        let mut raw_lines = Vec::new();
+        for (idx, rel) in rel_files.iter().enumerate() {
+            let full = format!("{prefix}{rel}");
+            let path = dir.path().join(&full);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            raw_lines.push(format!(
+                "{full}:{}:    let billing_id = resolve_account_{idx}(ctx);",
+                10 + idx
+            ));
+            raw_lines.push(format!(
+                "{full}:{}:    audit_billing_event_{idx}(billing_id);",
+                30 + idx
+            ));
+        }
+        let raw_bytes: usize = raw_lines.iter().map(|l| l.len() + 1).sum();
+        let words = ["rg", "-n", "billing", "src/services/billing/v2"];
+        let (report, summary) = run_search(dir.path(), &words, "rg", &raw_lines, 8192, true);
+
+        // Header hoists the deep common prefix once, and body uses clean relative paths.
+        let first_line = report.lines().next().unwrap();
+        assert_eq!(
+            first_line,
+            "rg: 40 matches in 20 files, under src/services/billing/v2/"
+        );
+        let body = &report[first_line.len() + 1..];
+        assert!(
+            !body.contains(prefix),
+            "prefix should not repeat in body:\n{report}"
+        );
+        for rel in &rel_files {
+            assert!(
+                body.contains(&format!("{rel} ×2 [stdout:")),
+                "missing relative path {rel} in:\n{report}"
+            );
+        }
+        assert_valid_stdout_pointers(&report, raw_lines.len());
+
+        // Compare real byte savings against unhoisted path rendering and raw output.
+        let unhoisted_extra = rel_files.len() * prefix.len() - (", under ".len() + prefix.len());
+        let unhoisted_len = report.len() + unhoisted_extra;
+        let hoist_pct = (unhoisted_extra * 100) / unhoisted_len;
+        assert!(
+            hoist_pct >= 14,
+            "expected >=14% savings on 2-match files from prefix hoisting, got {hoist_pct}% (saved {unhoisted_extra} of {unhoisted_len} B)"
+        );
+        assert!(
+            report.len() < raw_bytes,
+            "report {} B should be smaller than raw {} B",
+            report.len(),
+            raw_bytes
+        );
+
+        // Single-match files under a deep monorepo prefix save 20-30% of the entire report.
+        let one_per_file: Vec<String> = rel_files
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| format!("{prefix}{rel}:{}:    billing_call_{i}(ctx);", 10 + i))
+            .collect();
+        let (hoisted_one, _) = run_search(dir.path(), &words, "rg", &one_per_file, 8192, true);
+        let unhoisted_one_len = hoisted_one.len() + unhoisted_extra;
+        let one_pct = (unhoisted_extra * 100) / unhoisted_one_len;
+        assert!(
+            one_pct >= 20,
+            "expected >=20% savings on 1-match deep monorepo search, got {one_pct}% (saved {unhoisted_extra} of {unhoisted_one_len} B)"
+        );
+
+        // Summary items keep exact full paths so rerun diffs stay accurate across prefix shifts.
+        assert!(
+            summary
+                .items
+                .iter()
+                .all(|item| item.name.starts_with(prefix)),
+            "summary items must retain full paths"
+        );
+
+        // Partial prefix hoisting: 12 deep monorepo files + 2 top-level outliers stay unambiguous.
+        let dir2 = tempfile::tempdir().unwrap();
+        let deep = "packages/commerce/services/billing/v2/";
+        let mut mixed_lines = Vec::new();
+        for i in 0..12 {
+            let sub = if i < 6 { "handlers" } else { "models" };
+            let full = format!("{deep}{sub}/route_{i:02}.ts");
+            let p = dir2.path().join(&full);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            mixed_lines.push(format!("{full}:14:export function handleBilling{i}() {{}}"));
+        }
+        for outlier in ["docs/billing.md", "tests/billing_e2e.ts"] {
+            let p = dir2.path().join(outlier);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            mixed_lines.push(format!(
+                "{outlier}:3:verify handleBilling flow in {outlier}"
+            ));
+        }
+        let (partial, _) = run_search(
+            dir2.path(),
+            &["rg", "-n", "handleBilling", "."],
+            "rg",
+            &mixed_lines,
+            8192,
+            true,
+        );
+        let partial_header = partial.lines().next().unwrap();
+        assert!(
+            partial_header.contains("(… = packages/commerce/services/billing/v2/)"),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("…/handlers/route_00.ts ×1 [stdout:1]"),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("\ndocs/billing.md ×1 [stdout:13]"),
+            "{partial}"
+        );
+        assert!(
+            partial.contains("\ntests/billing_e2e.ts ×1 [stdout:14]"),
+            "{partial}"
+        );
+        assert_valid_stdout_pointers(&partial, mixed_lines.len());
+
+        // Shallow prefixes (`src/` and `./src/`) are never hoisted.
+        let dir3 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir3.path().join("src")).unwrap();
+        for f in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            std::fs::write(dir3.path().join(f), "").unwrap();
+        }
+        let shallow_lines: Vec<String> = ["src/a.rs", "src/b.rs", "src/c.rs"]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| format!("{f}:{}:let x_{i} = needle();", i + 1))
+            .collect();
+        let (shallow, _) = run_search(
+            dir3.path(),
+            &["rg", "-n", "needle", "src"],
+            "rg",
+            &shallow_lines,
+            4096,
+            true,
+        );
+        assert!(
+            shallow.starts_with("rg: 3 matches in 3 files\nsrc/a.rs ×1"),
+            "{shallow}"
+        );
+
+        // Block/context mode also hoists deep common prefixes cleanly.
+        let ctx_lines: Vec<String> = rel_files[..4]
+            .iter()
+            .enumerate()
+            .flat_map(|(i, rel)| {
+                let full = format!("{prefix}{rel}");
+                vec![
+                    format!("{full}-9-fn before_{i}() {{}}"),
+                    format!("{full}:10:    billing_call_{i}();"),
+                    format!("{full}-11-fn after_{i}() {{}}"),
+                    "--".to_owned(),
+                ]
+            })
+            .collect();
+        let (ctx_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "-C1", "billing_call", "src/services/billing/v2"],
+            "rg",
+            &ctx_lines,
+            8192,
+            true,
+        );
+        assert!(
+            ctx_report
+                .lines()
+                .next()
+                .unwrap()
+                .contains(", under src/services/billing/v2/"),
+            "{ctx_report}"
+        );
+        assert!(
+            ctx_report.contains("\nmod.rs ×1 in 1 block [stdout:"),
+            "{ctx_report}"
+        );
+    }
+
+    #[test]
+    fn minified_long_line_centers_window_around_match_at_offset_2000() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        std::fs::write(dir.path().join("dist/bundle.min.js"), "").unwrap();
+        std::fs::write(dir.path().join("dist/data.json"), "").unwrap();
+
+        // Build a 4.2 KB minified single line with the target match at byte offset ~2,000.
+        let before = format!(
+            "/*! vendor bundle v4.2.0 MIT */{}",
+            "var a=function(e,t){return e+t};".repeat(62)
+        );
+        assert!(before.len() >= 2000 && before.len() <= 2100);
+        let needle =
+            "function calculateInvoiceTotal(items,tax){return items.reduce((s,x)=>s+x,0)*(1+tax)}";
+        let after = "var b=function(r,n){return r*n};".repeat(65);
+        let minified = format!("{before}{needle}{after}");
+        assert!(minified.len() > 4000);
+        let raw_line = format!("dist/bundle.min.js:1:{minified}");
+
+        // Prove naive `clip()` completely hides the match at offset 2,000.
+        let naive = super::clip(&format!("1:{minified}"));
+        assert!(
+            !naive.contains("calculateInvoiceTotal"),
+            "naive clip should have missed offset 2000"
+        );
+
+        // 1. Literal pattern (`rg -n calculateInvoiceTotal dist`).
+        let lines = vec![raw_line.clone()];
+        let (report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "calculateInvoiceTotal", "dist"],
+            "rg",
+            &lines,
+            4096,
+            true,
+        );
+        assert!(
+            report.contains("calculateInvoiceTotal"),
+            "match at offset 2000 must be visible:\n{report}"
+        );
+        assert!(
+            report.contains("\n  1:…") && report.contains("… [stdout:1]\n"),
+            "windowed line must preserve line number, ellipses, and [stdout:1]:\n{report}"
+        );
+        assert!(
+            report.len() * 15 < raw_line.len(),
+            "expected >93% reduction on 4 KB minified line: {} B vs {} B",
+            report.len(),
+            raw_line.len()
+        );
+        assert_valid_stdout_pointers(&report, 1);
+
+        // 2. Regex pattern, case-insensitive `-i`, and fixed-string `-F`.
+        for words in [
+            &["rg", "-n", r"calculate\w+Total", "dist"][..],
+            &["rg", "-ni", "CALCULATEINVOICETOTAL", "dist"][..],
+            &["rg", "-nF", "items.reduce((s,x)", "dist"][..],
+        ] {
+            let (r, _) = run_search(dir.path(), words, "rg", &lines, 4096, true);
+            assert!(
+                r.contains("calculateInvoiceTotal") || r.contains("items.reduce((s,x)"),
+                "{words:?} missed match:\n{r}"
+            );
+            assert!(r.contains("[stdout:1]"), "{words:?}:\n{r}");
+        }
+
+        // 3. `--column` centers on the reported column even when pattern came from `-f`.
+        let col = before.len() + 1;
+        let col_lines = vec![format!("dist/bundle.min.js:1:{col}:{minified}")];
+        let (col_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "--column", "-f", "patterns.txt", "dist"],
+            "rg",
+            &col_lines,
+            4096,
+            true,
+        );
+        assert!(
+            col_report.contains("calculateInvoiceTotal")
+                && col_report.contains(&format!("1:{col}:…")),
+            "{col_report}"
+        );
+
+        // 4. Unknown pattern skips leading license comment boilerplate.
+        let banner = format!(
+            "/*! {} */const ACTIVE_ENTRY=42;{}",
+            "license ".repeat(40),
+            "x".repeat(400)
+        );
+        let banner_lines = vec![format!("dist/bundle.min.js:1:{banner}")];
+        let (fallback, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "-f", "patterns.txt", "dist"],
+            "rg",
+            &banner_lines,
+            4096,
+            true,
+        );
+        assert!(
+            fallback.contains("const ACTIVE_ENTRY=42;") && fallback.contains("[stdout:1]"),
+            "{fallback}"
+        );
+
+        // 5. Multi-byte UTF-8 JSON line (> 4 KB) with match at offset ~2,400 never panics.
+        let utf8_before = "{\"note\":\"日本語—émoji🚀—padding\",".repeat(65);
+        let utf8_needle = "\"targetKey\":\"invoice_₹_9900\"";
+        let utf8_after = ",\"tail\":\"αβγδεζηθ\"".repeat(90);
+        let json_line = format!("dist/data.json:1:{utf8_before}{utf8_needle}{utf8_after}");
+        let (json_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "invoice_₹_9900", "dist"],
+            "rg",
+            std::slice::from_ref(&json_line),
+            4096,
+            true,
+        );
+        assert!(
+            json_report.contains("invoice_₹_9900") && json_report.len() * 10 < json_line.len(),
+            "{json_report}"
+        );
+
+        // 6. Block/context mode (`-C1`) also centers long match lines without extra `[stdout:n]`.
+        let ctx_lines = vec![
+            format!("dist/bundle.min.js:1:{minified}"),
+            "dist/bundle.min.js-2-//# sourceMappingURL=bundle.min.js.map".to_owned(),
+        ];
+        let (ctx_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "-C1", "calculateInvoiceTotal", "dist"],
+            "rg",
+            &ctx_lines,
+            4096,
+            true,
+        );
+        assert!(
+            ctx_report.contains("calculateInvoiceTotal") && !ctx_report.contains("… [stdout:1]"),
+            "{ctx_report}"
+        );
+    }
+
+    #[test]
+    fn intra_file_repeated_identical_match_lines_fold_with_exact_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for f in [
+            "src/billing.ts",
+            "src/assertions.test.ts",
+            "src/two_only.ts",
+            "src/contiguous.txt",
+            "src/ports.yaml",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+
+        // 1. 4 non-contiguous identical trimmed lines (varying indentation) + 2 distinct lines.
+        let lines = vec![
+            "src/billing.ts:5:const header = initBilling();".to_owned(),
+            "src/billing.ts:12:  import { InvoiceClient } from '@acme/billing';".to_owned(),
+            "src/billing.ts:18:import { InvoiceClient } from '@acme/billing';".to_owned(),
+            "src/billing.ts:25:    import { InvoiceClient } from '@acme/billing';".to_owned(),
+            "src/billing.ts:44:  import { InvoiceClient } from '@acme/billing';".to_owned(),
+            "src/billing.ts:60:return finalizeBilling(header);".to_owned(),
+        ];
+        let (report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "billing", "src"],
+            "rg",
+            &lines,
+            4096,
+            true,
+        );
+        assert!(
+            report.contains("  5:const header = initBilling();\n")
+                && report
+                    .contains("  L12,18,25,44: import { InvoiceClient } from '@acme/billing';\n")
+                && report.contains("  60:return finalizeBilling(header);\n")
+                && !report.contains("more in file"),
+            "{report}"
+        );
+
+        // 2. 10 repeated identical assertions collapse to 1 line AND reveal a distinct match at L120.
+        let mut test_lines: Vec<String> = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            .into_iter()
+            .map(|ln| {
+                format!(
+                    "src/assertions.test.ts:{ln}:    expect(calculateTotal(fixtureInvoice)).toEqual(10800);"
+                )
+            })
+            .collect();
+        test_lines.push(
+            "src/assertions.test.ts:120:    expect(calculateTotal(discountInvoice)).toEqual(9720);"
+                .to_owned(),
+        );
+        let raw_bytes: usize = test_lines.iter().map(|l| l.len() + 1).sum();
+        let (folded, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "calculateTotal", "src"],
+            "rg",
+            &test_lines,
+            4096,
+            true,
+        );
+        assert!(
+            folded.contains(
+                "  L10,20,30,40,50,60,70,80,90,100: expect(calculateTotal(fixtureInvoice)).toEqual(10800);\n"
+            ) && folded.contains("120:    expect(calculateTotal(discountInvoice)).toEqual(9720);")
+                && !folded.contains("more in file"),
+            "{folded}"
+        );
+        assert!(
+            folded.len() * 3 < raw_bytes,
+            "expected >66% savings on 10x repeated assertions: {} B vs {} B",
+            folded.len(),
+            raw_bytes
+        );
+
+        // 3. Only 2 identical occurrences stay unfolded in exact original order.
+        let two_lines = vec![
+            "src/two_only.ts:12:  callHelper(needle);".to_owned(),
+            "src/two_only.ts:15:  otherCall(needle);".to_owned(),
+            "src/two_only.ts:18:  callHelper(needle);".to_owned(),
+        ];
+        let (two_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "needle", "src"],
+            "rg",
+            &two_lines,
+            4096,
+            true,
+        );
+        assert!(
+            two_report.contains(
+                "  12:  callHelper(needle);\n  15:  otherCall(needle);\n  18:  callHelper(needle);\n"
+            ),
+            "{two_report}"
+        );
+
+        // 4. 50 contiguous identical lines collapse to `L1-50: <line>`.
+        let contig: Vec<String> = (1..=50)
+            .map(|ln| format!("src/contiguous.txt:{ln}:repeated needle entry in config"))
+            .collect();
+        let (contig_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "needle", "src"],
+            "rg",
+            &contig,
+            4096,
+            true,
+        );
+        assert!(
+            contig_report.contains("  L1-50: repeated needle entry in config\n")
+                && !contig_report.contains("more in file"),
+            "{contig_report}"
+        );
+
+        // 5. Unnumbered search collapses 5 identical lines to `×5: <line>`, and repeated
+        //    YAML `8080: needle` without `-n` never loses `8080:`.
+        let unnum: Vec<String> = (0..5)
+            .map(|_| "src/ports.yaml:8080: needle_service".to_owned())
+            .collect();
+        let (unnum_report, _) = run_search(
+            dir.path(),
+            &["grep", "-r", "needle_service", "src"],
+            "grep",
+            &unnum,
+            4096,
+            true,
+        );
+        assert!(
+            unnum_report.contains("  ×5: 8080: needle_service\n")
+                && !unnum_report.contains("L8080"),
+            "{unnum_report}"
+        );
+    }
+
+    #[test]
+    fn cross_file_boilerplate_dedup_and_tight_budget_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = Vec::new();
+        let import_line = "import { InvoiceClient, TaxEngine } from '@acme/billing/v2/client';";
+
+        // 4 files with real call sites (multi-match: import + real call) stay full blocks.
+        for i in 0..4 {
+            let rel = format!("src/real_{i}.ts");
+            let p = dir.path().join(&rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            lines.push(format!("{rel}:1:{import_line}"));
+            lines.push(format!(
+                "{rel}:42:export const res{i} = InvoiceClient.chargeOrder(order_{i});"
+            ));
+        }
+        // 16 pure-boilerplate files matching ONLY the identical import line.
+        for i in 0..16 {
+            let rel = format!("src/mod_{i:02}.ts");
+            let p = dir.path().join(&rel);
+            std::fs::write(&p, "").unwrap();
+            lines.push(format!("{rel}:{}:{import_line}", (i % 5) + 1));
+        }
+        let raw_bytes: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let (report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "InvoiceClient", "src"],
+            "rg",
+            &lines,
+            8192,
+            true,
+        );
+
+        // All 4 real-call files appear at the top with their actual call sites.
+        for i in 0..4 {
+            assert!(
+                report.contains(&format!("src/real_{i}.ts ×2"))
+                    && report.contains(&format!("InvoiceClient.chargeOrder(order_{i})")),
+                "missing real call site {i}:\n{report}"
+            );
+        }
+        // The 16 pure-boilerplate files collapse onto 1 leader + 15 compact inline refs.
+        assert!(
+            report.contains("  same line in 15 more files: "),
+            "{report}"
+        );
+        for i in 1..16 {
+            let expected_line = (i % 5) + 1;
+            let expected_stdout = 8 + i + 1;
+            assert!(
+                report.contains(&format!(
+                    "src/mod_{i:02}.ts:{expected_line} [stdout:{expected_stdout}]"
+                )),
+                "missing follower ref for mod_{i:02}:\n{report}"
+            );
+        }
+        // Only 5 occurrences of the 67-byte import string (4 multi-match + 1 leader) instead of 20.
+        assert_eq!(report.matches(import_line).count(), 5, "{report}");
+        let un_deduped_extra = 15 * (import_line.len() + 6);
+        assert!(
+            report.len() * 3 < raw_bytes * 2
+                && report.len() * 100 < (report.len() + un_deduped_extra) * 58,
+            "expected substantial reduction via cross-file dedup: {} B vs {} B raw (~{} B un-deduped)",
+            report.len(),
+            raw_bytes,
+            report.len() + un_deduped_extra
+        );
+        assert_valid_stdout_pointers(&report, lines.len());
+
+        // Tight budget on 60 files across 6 subdirectories preserves exact omitted file/match
+        // counts and `[stdout:A-B]` span while fitting strictly within budget.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut many_lines = Vec::new();
+        for d in 0..6 {
+            for f in 0..10 {
+                let rel = format!("src/pkg_{d}/file_{f:02}.rs");
+                let p = dir2.path().join(&rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, "").unwrap();
+                for m in 1..=4 {
+                    many_lines.push(format!(
+                        "{rel}:{}:    process_request_{d}_{f}_{m}(payload);",
+                        m * 10
+                    ));
+                }
+            }
+        }
+        for budget in [700, 1400] {
+            let (tight, _) = run_search(
+                dir2.path(),
+                &["rg", "-n", "process_request", "src"],
+                "rg",
+                &many_lines,
+                budget,
+                true,
+            );
+            assert!(
+                tight.len() <= budget,
+                "budget {budget} exceeded ({} B):\n{tight}",
+                tight.len()
+            );
+            assert!(
+                tight.contains("rg: 240 matches in 60 files\n")
+                    && tight.contains("more files with ")
+                    && tight.contains(" matches"),
+                "budget {budget} missing exact omitted counts:\n{tight}"
+            );
+            let last = tight.lines().last().unwrap();
+            assert!(
+                last.starts_with('+') && last.contains("[stdout:") && last.ends_with(']'),
+                "budget {budget} fold line must include [stdout:A-B]: {last}"
+            );
+            assert_valid_stdout_pointers(&tight, many_lines.len());
+        }
+    }
+
+    #[test]
+    fn large_multifile_rg_and_git_grep_fixtures_measure_end_to_end_savings() {
+        // 1. Large realistic monorepo `rg -n` combining ALL four optimizations:
+        //    deep common prefix + minified bundle + intra-file repeats + cross-file boilerplate.
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "packages/platform/services/orders/v3/";
+        let mut rg_lines = Vec::new();
+        let boilerplate = "import { OrderLedger, OrderStatus } from '@platform/orders/v3/ledger';";
+
+        // 18 boilerplate-only files under the deep monorepo prefix.
+        for i in 0..18 {
+            let full = format!("{prefix}routes/endpoint_{i:02}.ts");
+            let p = dir.path().join(&full);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            rg_lines.push(format!("{full}:2:{boilerplate}"));
+        }
+        // 10 active service files with both repeated assertions and unique calls.
+        for i in 0..10 {
+            let full = format!("{prefix}domain/service_{i:02}.ts");
+            let p = dir.path().join(&full);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            rg_lines.push(format!("{full}:1:{boilerplate}"));
+            for ln in [15, 29, 43, 57, 71] {
+                rg_lines.push(format!(
+                    "{full}:{ln}:    OrderLedger.assertInvariant(state, OrderStatus.Open);"
+                ));
+            }
+            rg_lines.push(format!(
+                "{full}:95:    return OrderLedger.commitOrder_{i:02}(tx);"
+            ));
+        }
+        // 1 minified 4.5 KB bundle inside the same tree (in `assets/`, not collapsed `dist/`)
+        // with match at offset ~2,200.
+        let bundle = format!("{prefix}assets/orders.min.js");
+        let bp = dir.path().join(&bundle);
+        std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
+        std::fs::write(&bp, "").unwrap();
+        let min_line = format!(
+            "{bundle}:1:{}{}{}",
+            "function z(e){return e+1};".repeat(85),
+            "exports.OrderLedger={commit:function(x){return x.id}}",
+            "function y(t){return t-1};".repeat(85),
+        );
+        rg_lines.push(min_line);
+
+        let rg_raw_bytes: usize = rg_lines.iter().map(|l| l.len() + 1).sum();
+        let (rg_report, _) = run_search(
+            dir.path(),
+            &[
+                "rg",
+                "-n",
+                "OrderLedger",
+                "packages/platform/services/orders/v3",
+            ],
+            "rg",
+            &rg_lines,
+            4096,
+            true,
+        );
+        assert!(rg_report.len() <= 4096, "rg report exceeded 4096 B");
+        assert!(
+            rg_report.len() * 4 < rg_raw_bytes,
+            "expected >75% end-to-end byte reduction on monorepo rg: {} B vs {} B",
+            rg_report.len(),
+            rg_raw_bytes
+        );
+        assert!(
+            rg_report
+                .lines()
+                .next()
+                .unwrap()
+                .contains(", under packages/platform/services/orders/v3/")
+                && rg_report.contains("L15,29,43,57,71: OrderLedger.assertInvariant(")
+                && rg_report.contains("same line in 17 more files: ")
+                && rg_report.contains("exports.OrderLedger={commit:function(x){return x.id}}"),
+            "{rg_report}"
+        );
+        assert_valid_stdout_pointers(&rg_report, rg_lines.len());
+
+        // 2. Large multi-file `git grep -n` fixture under a deep crate tree.
+        let dir2 = tempfile::tempdir().unwrap();
+        let crate_prefix = "crates/engine/src/runtime/scheduler/";
+        let mut gg_lines = Vec::new();
+        let use_line = "use crate::runtime::scheduler::queue::TaskQueue;";
+        for i in 0..20 {
+            let full = format!("{crate_prefix}workers/worker_{i:02}.rs");
+            let p = dir2.path().join(&full);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            gg_lines.push(format!("{full}:3:{use_line}"));
+        }
+        for i in 0..8 {
+            let full = format!("{crate_prefix}queues/shard_{i:02}.rs");
+            let p = dir2.path().join(&full);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            for ln in [12, 24, 36, 48] {
+                gg_lines.push(format!(
+                    "{full}:{ln}:    TaskQueue::wake_parked_workers(&self.pool);"
+                ));
+            }
+            gg_lines.push(format!(
+                "{full}:80:    TaskQueue::drain_shard_{i:02}(&mut self.local);"
+            ));
+        }
+        let gg_raw_bytes: usize = gg_lines.iter().map(|l| l.len() + 1).sum();
+        let (gg_report, _) = run_search(
+            dir2.path(),
+            &[
+                "git",
+                "grep",
+                "-n",
+                "TaskQueue",
+                "--",
+                "crates/engine/src/runtime/scheduler",
+            ],
+            "git grep",
+            &gg_lines,
+            4096,
+            true,
+        );
+        assert!(gg_report.len() <= 4096);
+        assert!(
+            gg_report.len() * 2 < gg_raw_bytes,
+            "expected >50% reduction on git grep: {} B vs {} B",
+            gg_report.len(),
+            gg_raw_bytes
+        );
+        assert!(
+            gg_report
+                .lines()
+                .next()
+                .unwrap()
+                .contains(", under crates/engine/src/runtime/scheduler/")
+                && gg_report.contains("L12,24,36,48: TaskQueue::wake_parked_workers(&self.pool);")
+                && gg_report.contains("same line in 19 more files: "),
+            "{gg_report}"
+        );
+        assert_valid_stdout_pointers(&gg_report, gg_lines.len());
     }
 }
