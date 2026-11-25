@@ -22,6 +22,10 @@ const IMAGE_TOKENS: u64 = 1600;
 const PLACEHOLDER_TOKENS: u64 = 10;
 /// A boundary must clear at least this many tool calls.
 pub const MIN_BOUNDARY: usize = 4;
+/// Default minimum byte size for live-zone compaction of newest `tool_result` text blocks.
+pub const DEFAULT_COMPACT_LIVE_MIN_BYTES: usize = 8_192;
+/// Default target maximum byte size (including recall footer) for live-compacted blocks.
+pub const DEFAULT_COMPACT_LIVE_BUDGET: usize = 4_096;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -33,6 +37,12 @@ pub struct Options {
     /// the request's cache TTL plus 15 seconds; `Some(0)` turns cold moves off.
     pub cold_after: Option<u64>,
     pub clear: bool,
+    /// Compact oversized newest `tool_result` text blocks in the uncached final user turn.
+    pub compact_live: bool,
+    /// Smallest live-zone `tool_result` text block (UTF-8 bytes) eligible for compaction.
+    pub compact_live_min_bytes: usize,
+    /// Target maximum UTF-8 bytes for a live-compacted `tool_result` including recall footer.
+    pub compact_live_budget: usize,
 }
 
 impl Default for Options {
@@ -44,6 +54,9 @@ impl Default for Options {
             payback: 12,
             cold_after: None,
             clear: true,
+            compact_live: false,
+            compact_live_min_bytes: DEFAULT_COMPACT_LIVE_MIN_BYTES,
+            compact_live_budget: DEFAULT_COMPACT_LIVE_BUDGET,
         }
     }
 }
@@ -83,13 +96,24 @@ impl<'de> Deserialize<'de> for Members<'de> {
     }
 }
 
+/// Parses a JSON object's top-level members as borrowed `RawValue` slices,
+/// rejecting duplicate keys.
+pub(super) fn parse_members(text: &str) -> Option<Vec<(String, &RawValue)>> {
+    let Members(members) = serde_json::from_str(text).ok()?;
+    Some(members)
+}
+
 impl<'a> Body<'a> {
     /// Parses a JSON object, rejecting duplicate top-level keys, whose meaning
     /// would depend on the parser.
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
-        let Members(members) = serde_json::from_str(text).ok()?;
+        let members = parse_members(text)?;
         Some(Self { text, members })
+    }
+
+    pub fn text(&self) -> &'a str {
+        self.text
     }
 
     pub fn raw(&self, key: &str) -> Option<&'a RawValue> {
@@ -102,7 +126,7 @@ impl<'a> Body<'a> {
         serde_json::from_str(self.raw(key)?.get()).ok()
     }
 
-    fn span(&self, raw: &RawValue) -> (usize, usize) {
+    pub(super) fn span(&self, raw: &RawValue) -> (usize, usize) {
         // A borrowed RawValue is a slice of the body, so its offset is exact.
         let start = raw.get().as_ptr() as usize - self.text.as_ptr() as usize;
         (start, start + raw.get().len())
@@ -659,6 +683,7 @@ mod tests {
             payback: 12,
             cold_after: Some(60),
             clear: true,
+            ..Options::default()
         }
     }
 

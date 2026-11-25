@@ -8,6 +8,7 @@
 //! are archived by tool_use ID for `justless recall --tool-use`. Any parse failure
 //! forwards the original request unchanged.
 
+mod compact;
 mod http;
 mod ledger;
 mod observe;
@@ -30,11 +31,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Arg, ArgMatches, Command};
 use ureq::http::HeaderMap;
 
-use crate::history::now_ms;
+use crate::history::{human_bytes, now_ms};
 use crate::workspace::{Workspace, private_dir};
 use http::{Framing, Head};
 pub(crate) use ledger::report;
-use ledger::{Job, Log, Record, Totals, short};
+use ledger::{Job, LiveCompacted, Log, Record, Totals, short};
 use observe::{Observed, Observer};
 use plan::{Body, Request, Role};
 use upstream::{Outbound, SendError, Upstream};
@@ -75,6 +76,14 @@ fn clearing_args() -> Vec<Arg<'static>> {
         Arg::new("no-archive")
             .long("no-archive")
             .help("Do not archive tool results"),
+        Arg::new("compact-live")
+            .long("compact-live")
+            .help("Compact oversized newest tool_result text blocks in the uncached final user turn (or set JUSTLESS_PROXY_COMPACT_LIVE=1)"),
+        crate::number(
+            "compact-live-min-bytes",
+            "8192",
+            "Smallest newest tool_result text block (bytes) eligible for --compact-live",
+        ),
     ]
 }
 
@@ -119,6 +128,13 @@ struct Settings {
     archive: bool,
 }
 
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "no" | "off")
+    })
+}
+
 fn settings(args: &ArgMatches) -> Result<Settings> {
     let cold_after = args
         .value_of("cold-after")
@@ -128,6 +144,8 @@ fn settings(args: &ArgMatches) -> Result<Settings> {
                 .context("--cold-after expects a number of seconds")
         })
         .transpose()?;
+    let compact_live = args.is_present("compact-live") || env_truthy("JUSTLESS_PROXY_COMPACT_LIVE");
+    let compact_live_min_bytes = crate::read_num(args, "compact-live-min-bytes", 1)?;
     Ok(Settings {
         options: plan::Options {
             keep: crate::read_num(args, "keep", 0)?,
@@ -136,6 +154,9 @@ fn settings(args: &ArgMatches) -> Result<Settings> {
             payback: crate::read_num(args, "payback", 0)? as u64,
             cold_after,
             clear: !args.is_present("no-clear"),
+            compact_live,
+            compact_live_min_bytes,
+            compact_live_budget: plan::DEFAULT_COMPACT_LIVE_BUDGET,
         },
         archive: !args.is_present("no-archive"),
     })
@@ -185,6 +206,13 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches) -> Result<i32> {
         );
     } else {
         println!("Archives tool results without asking the API to clear them. Archive: {archive}");
+    }
+    if options.compact_live && settings.archive {
+        println!(
+            "Live-zone compaction: newest uncached tool results >= {} compacted to <= {} with recall archive.",
+            human_bytes(options.compact_live_min_bytes as u64),
+            human_bytes(options.compact_live_budget as u64),
+        );
     }
     // Claude Code turns these off behind a custom base URL; with them on, its
     // requests match an unproxied session's and carry their request class.
@@ -238,6 +266,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 struct Shared {
+    ws: Workspace,
     options: plan::Options,
     archive: bool,
     verbose: bool,
@@ -300,7 +329,7 @@ impl Proxy {
             panics.line(&format!("panic: {info}"));
         }));
         log.line(&format!(
-            "start {addr} → {} · keep {} · floor {} · clear-at-least {} · payback {} · cold-after {} · clear {} · archive {archive}",
+            "start {addr} → {} · keep {} · floor {} · clear-at-least {} · payback {} · cold-after {} · clear {} · archive {archive} · compact-live {} · compact-live-min-bytes {}",
             upstream.base,
             options.keep,
             options.floor,
@@ -310,24 +339,23 @@ impl Proxy {
                 .cold_after
                 .map_or_else(|| "auto".to_owned(), |s| s.to_string()),
             options.clear,
+            options.compact_live,
+            options.compact_live_min_bytes,
         ));
         let (jobs, receiver) = mpsc::channel();
         let totals = Arc::new(Mutex::new(Totals::default()));
-        let worker = ledger::Worker::new(
-            Workspace {
-                root: ws.root.clone(),
-                cwd: ws.cwd.clone(),
-                state: ws.state.clone(),
-                origin: ws.origin.clone(),
-            },
-            archive,
-            log.clone(),
-            totals.clone(),
-        );
+        let clone_ws = || Workspace {
+            root: ws.root.clone(),
+            cwd: ws.cwd.clone(),
+            state: ws.state.clone(),
+            origin: ws.origin.clone(),
+        };
+        let worker = ledger::Worker::new(clone_ws(), archive, log.clone(), totals.clone());
         thread::Builder::new()
             .name("justless-ledger".into())
             .spawn(move || worker.run(receiver))?;
         let shared = Arc::new(Shared {
+            ws: clone_ws(),
             options,
             archive,
             verbose,
@@ -513,8 +541,12 @@ fn hint(head: &Head, name: &str) -> Option<String> {
 /// The outcome of planning one request.
 #[derive(Default)]
 struct Planned {
-    /// The edited body, when the clearing edit was added.
+    /// The edited body, when clearing and/or live-zone compaction rewrote it.
     body: Option<Vec<u8>>,
+    /// Whether Anthropic's `clear_tool_uses_20250919` edit was spliced into `body`.
+    clearing_added: bool,
+    /// Live-zone compaction stats when newest uncached `tool_result` blocks were compacted.
+    live_compacted: Option<LiveCompacted>,
     request: Option<Request>,
     model: Option<String>,
     mode: &'static str,
@@ -626,15 +658,45 @@ impl Shared {
             mode: "pass",
             ..Default::default()
         };
-        self.decide(head, &parsed, &req, endpoint, now, &mut planned);
+        let live_body = if self.options.compact_live
+            && self.archive
+            && endpoint == Endpoint::Messages
+            && !req.thread
+        {
+            compact::compact_live_zone(&self.ws, &parsed, &self.options).map(|live| {
+                planned.live_compacted = Some(live.stats);
+                live.body
+            })
+        } else {
+            None
+        };
+        self.decide(
+            head,
+            &parsed,
+            live_body.as_deref(),
+            &req,
+            endpoint,
+            now,
+            &mut planned,
+        );
+        if planned.body.is_none()
+            && let Some(compacted_body) = live_body
+        {
+            planned.body = Some(compacted_body);
+            if planned.mode == "pass" {
+                planned.mode = "compact";
+            }
+        }
         planned.request = Some(req);
         planned
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decide(
         &self,
         head: &Head,
         parsed: &Body,
+        live_body: Option<&[u8]>,
         req: &Request,
         endpoint: Endpoint,
         now: u64,
@@ -724,9 +786,16 @@ impl Shared {
             decision.boundary,
             self.options.clear_at_least,
         );
-        match plan::splice(parsed, req.context_management.as_ref(), edit) {
+        let spliced = match live_body {
+            Some(bytes) => Body::parse(bytes).and_then(|live_parsed| {
+                plan::splice(&live_parsed, req.context_management.as_ref(), edit)
+            }),
+            None => plan::splice(parsed, req.context_management.as_ref(), edit),
+        };
+        match spliced {
             Some(body) => {
                 planned.body = Some(body);
+                planned.clearing_added = true;
                 planned.mode = "cleared";
                 planned.boundary = Some(decision.boundary);
                 // Why the boundary stayed where it is, when more could clear.
@@ -849,14 +918,23 @@ fn handle(
             Outbound::Stream(&mut rest, length),
         )
     } else if let Some(edited) = &planned.body {
-        let mut headers = head.headers.clone();
-        plan::merge_beta(&mut headers);
-        shared.upstream.send(
-            &head.method,
-            &head.target,
-            &headers,
-            Outbound::Bytes(edited),
-        )
+        if planned.clearing_added {
+            let mut headers = head.headers.clone();
+            plan::merge_beta(&mut headers);
+            shared.upstream.send(
+                &head.method,
+                &head.target,
+                &headers,
+                Outbound::Bytes(edited),
+            )
+        } else {
+            shared.upstream.send(
+                &head.method,
+                &head.target,
+                &head.headers,
+                Outbound::Bytes(edited),
+            )
+        }
     } else {
         shared.upstream.send(
             &head.method,
@@ -886,7 +964,7 @@ fn handle(
     let (mut parts, response_body) = response.into_parts();
     let mut upstream_body = response_body.into_reader();
     let mut prefix = Vec::new();
-    if planned.body.is_some() && matches!(parts.status.as_u16(), 400 | 422) {
+    if planned.clearing_added && matches!(parts.status.as_u16(), 400 | 422) {
         let _ = (&mut upstream_body)
             .take(MAX_ERROR_BODY)
             .read_to_end(&mut prefix);
@@ -906,6 +984,8 @@ fn handle(
             ));
             planned.mode = "fallback";
             planned.body = None;
+            planned.clearing_added = false;
+            planned.live_compacted = None;
             planned.movement = None;
             planned.boundary = None;
             match shared.upstream.send(
@@ -970,6 +1050,7 @@ fn finish(
     record.role = planned.role.map(|role| role.name().to_owned());
     record.repeats = planned.repeats;
     record.client_managed_new = planned.client_new;
+    record.live_compacted = planned.live_compacted.clone();
     record.uses = planned.uses.map(|u| u as u64);
     let edited = planned.boundary.zip(planned.uses);
     if let Some((boundary, uses)) = edited {
@@ -1050,6 +1131,15 @@ fn verbose_line(record: &Record, planned: &Planned, elapsed: Duration) -> String
         parts.push(format!(
             "API cleared {uses} calls, {} tokens",
             ledger::thousands(tokens)
+        ));
+    }
+    if let Some(live) = &record.live_compacted {
+        parts.push(format!(
+            "live compacted {} ({} → {}, {} saved)",
+            live.results,
+            human_bytes(live.bytes_before),
+            human_bytes(live.bytes_after),
+            human_bytes(live.saved_bytes),
         ));
     }
     parts.push(format!("{:.1}s", elapsed.as_secs_f64()));
@@ -1182,6 +1272,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (jobs, _rx) = mpsc::channel();
         let shared = Shared {
+            ws: Workspace {
+                root: dir.path().to_owned(),
+                cwd: dir.path().to_owned(),
+                state: dir.path().join(".justless"),
+                origin: dir.path().to_owned(),
+            },
             options: plan::Options::default(),
             archive: false,
             verbose: false,

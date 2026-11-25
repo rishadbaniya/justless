@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use super::ledger::{Totals, short, thousands};
 use super::{Proxy, Settings, default_upstream};
+use crate::history::human_bytes;
 use crate::workspace::Workspace;
 
 /// Variables that send Claude Code to a cloud provider instead of the Claude API.
@@ -185,6 +186,17 @@ fn summary(totals: &Totals, archive: Option<&Path>) -> String {
             plural(totals.client_managed, "conversation", "conversations")
         ));
     }
+    if totals.live_compacted > 0 {
+        parts.push(format!(
+            "{} in the live zone ({} saved)",
+            plural(
+                totals.live_compacted,
+                "newest tool result compacted",
+                "newest tool results compacted"
+            ),
+            human_bytes(totals.live_saved_bytes)
+        ));
+    }
     format!("justless: {}", parts.join(" · "))
 }
 
@@ -263,6 +275,11 @@ pub fn run(ws: &Workspace, args: &ArgMatches, settings: Settings) -> Result<i32>
             short(options.floor)
         )
     };
+    let live = if options.compact_live && settings.archive {
+        " · live-zone compaction on"
+    } else {
+        ""
+    };
     let proxy = Proxy::start(ws, 0, &upstream, options, settings.archive, false)?;
     let addr = proxy.addr();
     let archive = if settings.archive {
@@ -271,7 +288,7 @@ pub fn run(ws: &Workspace, args: &ArgMatches, settings: Settings) -> Result<i32>
         "archive off".to_owned()
     };
     eprintln!(
-        "justless: Claude Code → {addr} → {} · {clearing} · {archive} · {} stats shows what changed",
+        "justless: Claude Code → {addr} → {} · {clearing}{live} · {archive} · {} stats shows what changed",
         proxy.upstream(),
         ws.justless()
     );
@@ -321,6 +338,8 @@ mod tests {
             mismatches: 0,
             archived: 512,
             client_managed: 2,
+            live_compacted: 0,
+            live_saved_bytes: 0,
         };
         assert_eq!(
             summary(&totals, Some(Path::new("/repo/.justless"))),
@@ -337,5 +356,12 @@ mod tests {
             ..Totals::default()
         };
         assert!(summary(&probes, None).starts_with("justless: 0 requests"));
+        totals.live_compacted = 3;
+        totals.live_saved_bytes = 48_000;
+        assert!(
+            summary(&totals, None).contains("3 newest tool results compacted in the live zone"),
+            "{}",
+            summary(&totals, None)
+        );
     }
 }

@@ -29,6 +29,16 @@ pub struct Cleared {
     pub est_tokens: u64,
 }
 
+/// Newest `tool_result` text blocks compacted in the uncached live zone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveCompacted {
+    pub results: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub saved_bytes: u64,
+    pub est_tokens: u64,
+}
+
 /// One completed request. It holds no content and no header values; the only
 /// identifiers are Claude Code's session, agent and request-class hints.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -65,6 +75,9 @@ pub struct Record {
     pub archived: u64,
     pub archived_bytes: u64,
     pub archive_skipped: u64,
+    /// Newest `tool_result` text blocks compacted in the uncached live zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_compacted: Option<LiveCompacted>,
     /// Set on the request that first left a conversation to the client's clearing.
     pub client_managed_new: bool,
     pub ms: u64,
@@ -86,6 +99,9 @@ pub struct Totals {
     pub mismatches: u64,
     pub archived: u64,
     pub client_managed: u64,
+    /// Newest `tool_result` text blocks compacted in the live zone and bytes saved.
+    pub live_compacted: u64,
+    pub live_saved_bytes: u64,
 }
 
 pub enum Job {
@@ -262,6 +278,10 @@ impl Worker {
         totals.tokens_not_sent += record.api_cleared_tokens.unwrap_or(0);
         totals.archived += record.archived;
         totals.client_managed += u64::from(record.client_managed_new);
+        if let Some(live) = &record.live_compacted {
+            totals.live_compacted += live.results;
+            totals.live_saved_bytes += live.saved_bytes;
+        }
     }
 }
 
@@ -301,6 +321,7 @@ pub struct Report {
     unobserved: u64,
     archived_results: u64,
     archived_bytes: u64,
+    live_compacted: LiveCompacted,
     usage: Usage,
     token_estimate: &'static str,
     token_source: &'static str,
@@ -400,6 +421,13 @@ impl Report {
         self.unobserved += u64::from(record.observed == Some(false));
         self.archived_results += record.archived;
         self.archived_bytes += record.archived_bytes;
+        if let Some(live) = &record.live_compacted {
+            self.live_compacted.results += live.results;
+            self.live_compacted.bytes_before += live.bytes_before;
+            self.live_compacted.bytes_after += live.bytes_after;
+            self.live_compacted.saved_bytes += live.saved_bytes;
+            self.live_compacted.est_tokens += live.est_tokens;
+        }
         self.usage.input += record.input.unwrap_or(0);
         self.usage.cache_read += record.cache_read.unwrap_or(0);
         self.usage.cache_write += record.cache_write.unwrap_or(0);
@@ -504,6 +532,20 @@ impl Report {
             ),
             human_bytes(self.archived_bytes)
         );
+        if self.live_compacted.results > 0 {
+            println!(
+                "  {} in the uncached live zone ({} → {}, {} saved, about {} tokens estimated)",
+                plural(
+                    self.live_compacted.results,
+                    "newest tool result compacted",
+                    "newest tool results compacted"
+                ),
+                human_bytes(self.live_compacted.bytes_before),
+                human_bytes(self.live_compacted.bytes_after),
+                human_bytes(self.live_compacted.saved_bytes),
+                short(self.live_compacted.est_tokens),
+            );
+        }
     }
 }
 

@@ -1747,3 +1747,452 @@ fn wrap_refuses_unsupported_setups() {
         "archive only, because CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is set",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Live-zone prefix-cache-safe newest-result compaction
+
+fn extract_recall_id(compacted: &str) -> String {
+    let footer = compacted.lines().last().expect("footer line");
+    let rest = footer
+        .strip_prefix("[justless recall ")
+        .unwrap_or_else(|| panic!("missing recall prefix in {footer:?}"));
+    let (id, _) = rest
+        .split_once(" · compacted ")
+        .unwrap_or_else(|| panic!("missing compacted metadata in {footer:?}"));
+    assert_eq!(id.len(), 64, "expected 64-hex observation id, got {id:?}");
+    id.to_owned()
+}
+
+fn live_json_payload() -> String {
+    let rows: Vec<Value> = (0..180)
+        .map(|i| {
+            json!({
+                "id": i,
+                "service": "orders-api",
+                "region": "us-east-1",
+                "environment": "production",
+                "status": if i == 90 { "degraded" } else { "healthy" },
+                "latency_ms": 14 + (i % 45),
+                "version": "3.2.1"
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&rows).unwrap()
+}
+
+fn live_structured_log_payload() -> String {
+    let mut out = String::new();
+    for i in 0..220 {
+        if i == 115 {
+            out.push_str(
+                "api-1 | 2026-11-25T10:01:55Z ERROR database connection refused host=pg-primary:5432 err=ECONNREFUSED\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "api-1 | 2026-11-25T10:{:02}:{:02}Z INFO GET /v1/healthz status=200 request_id=req-{i:05} latency={}ms\n",
+                (i / 60) % 60,
+                i % 60,
+                4 + (i % 6)
+            ));
+        }
+    }
+    out
+}
+
+fn live_ascii_table_payload() -> String {
+    let mut out = String::from(
+        "+----+----------------+-------------+-----------+----------+----------+\n\
+         | id | service        | region      | env       | status   | replicas |\n\
+         +----+----------------+-------------+-----------+----------+----------+\n",
+    );
+    for i in 0..160 {
+        out.push_str(&format!(
+            "| {:<2} | worker-{:<7} | us-east-1   | prod      | running  | 3        |\n",
+            i, i
+        ));
+    }
+    out.push_str("+----+----------------+-------------+-----------+----------+----------+\n");
+    out
+}
+
+fn live_traceback_payload(root: &Path) -> String {
+    let mut out = String::from("Traceback (most recent call last):\n");
+    out.push_str(&format!(
+        "  File \"{}/src/app.py\", line 42, in handle_request\n    return dispatch(payload)\n",
+        root.display()
+    ));
+    for i in 0..95 {
+        out.push_str(&format!(
+            "  File \"/usr/lib/python3.12/site-packages/starlette/middleware/layer_{i:02}.py\", line {}, in __call__\n    await self.app(scope, receive, send)\n",
+            100 + i
+        ));
+    }
+    out.push_str(&format!(
+        "  File \"{}/src/billing.py\", line 118, in charge_invoice\n    raise ValueError('negative invoice total')\n",
+        root.display()
+    ));
+    out.push_str("ValueError: negative invoice total\n");
+    out
+}
+
+fn multi_turn_live_request(older_big: &str, newest_id: &str, newest_payload: &str) -> Value {
+    json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 4096,
+        "system": [{"type": "text", "text": "You are a coding agent.", "cache_control": {"type": "ephemeral"}}],
+        "tools": [{"name": "Bash", "description": "Run command", "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Diagnose the failing service.", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "First inspect the older run output.", "signature": "sig_thinking_preserved_01"},
+                {"type": "redacted_thinking", "data": "opaque_redacted_sig_blob"},
+                {"type": "tool_use", "id": "toolu_older_01", "name": "Bash", "input": {"command": "cat older.log"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_older_01", "content": older_big, "cache_control": {"type": "ephemeral"}}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Now fetch the newest diagnostic payload.", "signature": "sig_thinking_preserved_02"},
+                {"type": "tool_use", "id": newest_id, "name": "Bash", "input": {"command": format!("fetch {newest_id}")}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": newest_id, "content": newest_payload}
+            ]}
+        ]
+    })
+}
+
+#[test]
+fn live_zone_compacts_json_log_table_and_traceback_with_exact_recall_and_untouched_prefix() {
+    let (dir, mock, proxy) = session(|_| ok_json(), "--compact-live");
+    let root = dir.path();
+    let older_big = live_structured_log_payload();
+    let cases = [
+        ("json", "toolu_live_json", live_json_payload()),
+        ("log", "toolu_live_log", live_structured_log_payload()),
+        ("table", "toolu_live_table", live_ascii_table_payload()),
+        ("traceback", "toolu_live_tb", live_traceback_payload(root)),
+    ];
+
+    for (kind, tool_id, payload) in &cases {
+        assert!(payload.len() > 8192, "{kind} must exceed 8 KB");
+        let body = multi_turn_live_request(&older_big, tool_id, payload);
+        // Pretty-print with odd spacing so any unintended re-serialization fails loudly.
+        let raw_text = serde_json::to_string_pretty(&body)
+            .unwrap()
+            .replace("\"role\": ", "\"role\" :   ");
+        let headers = [
+            ("content-type", "application/json"),
+            ("x-api-key", "sk-ant-test"),
+        ];
+        let response = proxy.send("POST", "/v1/messages", &headers, raw_text.as_bytes());
+        assert_eq!(response.status(), 200, "{kind}");
+
+        let forwarded = mock.seen().pop().unwrap();
+        // Live-zone compaction alone must NOT inject Anthropic's context-management beta.
+        assert!(
+            forwarded.header("anthropic-beta").is_none(),
+            "{kind} unexpectedly added anthropic-beta"
+        );
+
+        // Every byte before the final tool_result's content value (system, tools,
+        // cache_control breakpoints, thinking & redacted_thinking blocks, older 22 KB
+        // tool_result) MUST be 100% byte-for-byte identical.
+        let marker = format!("\"tool_use_id\": \"{tool_id}\"");
+        let prefix_end = raw_text.find(&marker).expect("final tool_use_id marker") + marker.len();
+        assert_eq!(
+            &forwarded.body[..prefix_end],
+            &raw_text.as_bytes()[..prefix_end],
+            "{kind}: cached prefix or thinking blocks were modified!"
+        );
+
+        let sent = forwarded.json();
+        // Older messages and thinking blocks are untouched.
+        for idx in 0..4 {
+            assert_eq!(
+                sent["messages"][idx], body["messages"][idx],
+                "{kind} msg {idx}"
+            );
+        }
+        let compacted = sent["messages"][4]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        let reduction_pct = (payload.len() - compacted.len()) * 100 / payload.len();
+        assert!(
+            reduction_pct >= 70,
+            "{kind}: expected >=70% reduction, got {reduction_pct}% ({} -> {})",
+            payload.len(),
+            compacted.len()
+        );
+        assert!(
+            compacted.len() <= 4096,
+            "{kind}: compacted {} B exceeded 4096 B budget",
+            compacted.len()
+        );
+
+        // Semantic checks for structured compactors.
+        if *kind == "log" {
+            contains(compacted, "ECONNREFUSED");
+        }
+        if *kind == "traceback" {
+            contains(compacted, "charge_invoice");
+            contains(compacted, "ValueError: negative invoice total");
+        }
+
+        // Exact byte-for-byte recovery via `justless recall <id>`.
+        let recall_id = extract_recall_id(compacted);
+        let recalled = recall(root, &recall_id);
+        assert!(
+            recalled.status.success(),
+            "{kind}: {}",
+            text(&recalled.stderr)
+        );
+        assert_eq!(
+            recalled.stdout,
+            payload.as_bytes(),
+            "{kind}: recalled bytes did not match original!"
+        );
+    }
+
+    proxy.stop();
+
+    // Exact recovery via `justless recall --tool-use <tool_use_id>` also keeps uncompacted original.
+    let via_tool_use = recall(root, "--tool-use toolu_live_json");
+    assert!(via_tool_use.status.success());
+    assert_eq!(via_tool_use.stdout, cases[0].2.as_bytes());
+
+    // Ledger and stats record live-zone savings cleanly without breaking existing schema.
+    let records = ledger(root);
+    assert_eq!(records.len(), 4);
+    let mut total_saved = 0u64;
+    for (r, (kind, _, payload)) in records.iter().zip(&cases) {
+        assert_eq!(r["mode"], "compact", "{kind}");
+        assert_eq!(r["live_compacted"]["results"], 1, "{kind}");
+        let before = r["live_compacted"]["bytes_before"].as_u64().unwrap();
+        let after = r["live_compacted"]["bytes_after"].as_u64().unwrap();
+        let saved = r["live_compacted"]["saved_bytes"].as_u64().unwrap();
+        assert_eq!(before, payload.len() as u64, "{kind}");
+        assert_eq!(saved, before - after, "{kind}");
+        assert!(
+            saved * 100 / before >= 70,
+            "{kind}: expected >=70% saved in ledger, got {saved}/{before}"
+        );
+        total_saved += saved;
+    }
+    let report = stats(root);
+    assert_eq!(report["proxy"]["live_compacted"]["results"], 4);
+    assert_eq!(
+        report["proxy"]["live_compacted"]["saved_bytes"],
+        total_saved
+    );
+    assert!(total_saved > 50_000, "total_saved={total_saved}");
+    let summary = text(&justless(root, &["stats"]).stdout);
+    contains(
+        &summary,
+        "4 newest tool results compacted in the uncached live zone",
+    );
+}
+
+#[test]
+fn live_zone_leaves_small_already_compacted_cache_control_and_non_text_untouched() {
+    let (dir, mock, proxy) = session(|_| ok_json(), "--compact-live");
+    let big = live_json_payload();
+    let already_compacted = format!("[justless recall {} · prior]\n{}", "a".repeat(64), big);
+    let image_data = "iVBORw0KGgo".repeat(1200);
+
+    let untouched_bodies = [
+        // 1. Small result (< 8192 B)
+        multi_turn_live_request("small older", "toolu_small", &"line\n".repeat(800)),
+        // 2. Already starting with `[justless `
+        multi_turn_live_request("small older", "toolu_already", &already_compacted),
+        // 3. `cache_control` set directly on the final tool_result
+        json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_cc", "name": "Bash", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_cc", "content": big, "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        }),
+        // 4. `cache_control` on a trailing sibling block in the same final user turn
+        json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_trail_cc", "name": "Bash", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_trail_cc", "content": big},
+                    {"type": "text", "text": "checkpoint", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        }),
+        // 5. Image & document blocks only (non-text)
+        json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_img", "name": "Screenshot", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_img", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQ=".repeat(1200)}}
+                    ]}
+                ]}
+            ]
+        }),
+        // 6. Final message is assistant (never touch!)
+        json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_old", "content": big}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "prefill"}]}
+            ]
+        }),
+    ];
+
+    for (idx, body) in untouched_bodies.iter().enumerate() {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let headers = [("content-type", "application/json")];
+        let resp = proxy.send("POST", "/v1/messages", &headers, &bytes);
+        assert_eq!(resp.status(), 200, "case {idx}");
+        let forwarded = mock.seen().pop().unwrap();
+        assert_eq!(
+            forwarded.body, bytes,
+            "case {idx} must stay byte-for-byte untouched"
+        );
+    }
+
+    // Also verify `/v1/messages/count_tokens` stays untouched.
+    let large_req = multi_turn_live_request("ok", "toolu_cnt", &big);
+    proxy.count_tokens(&large_req);
+    let forwarded_count = mock.seen().pop().unwrap();
+    let mut expected_count = large_req.clone();
+    expected_count.as_object_mut().unwrap().remove("stream");
+    assert_eq!(forwarded_count.json(), expected_count);
+
+    proxy.stop();
+    let records = ledger(dir.path());
+    assert!(records.iter().all(|r| r.get("live_compacted").is_none()));
+
+    // Verify `--no-archive` refuses to mutate even with `--compact-live`.
+    let (dir_no_arch, mock_no_arch, proxy_no_arch) =
+        session(|_| ok_json(), "--compact-live --no-archive");
+    let raw = serde_json::to_vec(&large_req).unwrap();
+    let headers = [("content-type", "application/json")];
+    assert_eq!(
+        proxy_no_arch
+            .send("POST", "/v1/messages", &headers, &raw)
+            .status(),
+        200
+    );
+    assert_eq!(mock_no_arch.seen()[0].body, raw);
+    proxy_no_arch.stop();
+    assert!(!dir_no_arch.path().join(".justless/observations").exists());
+    assert!(!dir_no_arch.path().join(".justless/tool-uses").exists());
+}
+
+#[test]
+fn live_zone_env_var_min_bytes_and_clearing_coexist_cleanly() {
+    // 1. JUSTLESS_PROXY_COMPACT_LIVE=1 + --compact-live-min-bytes 2048
+    let dir = tempdir().unwrap();
+    let mock = Mock::start(|_| ok_json());
+    let mut cmd = Command::new(BIN);
+    cmd.current_dir(dir.path())
+        .args([
+            "--root",
+            dir.path().to_str().unwrap(),
+            "proxy",
+            "--port",
+            "0",
+            "--upstream",
+            &mock.url(),
+            "--compact-live-min-bytes",
+            "2048",
+        ])
+        .env("JUSTLESS_PROXY_COMPACT_LIVE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in words(PROXY_VARS) {
+        cmd.env_remove(name);
+    }
+    let mut child = cmd.spawn().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let first = read_line(&mut stdout).unwrap();
+    let port: u16 = first
+        .strip_prefix("justless proxy on 127.0.0.1:")
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    thread::spawn(move || {
+        let mut rest = String::new();
+        let _ = stdout.read_to_string(&mut rest);
+    });
+    let proxy = Proxy {
+        child: Some(child),
+        port,
+    };
+
+    // 4 KB structured log (below default 8 KB, above custom 2048 B threshold)
+    let mut mid_log = String::new();
+    for i in 0..50 {
+        mid_log.push_str(&format!(
+            "api-1 | 2026-11-25T10:00:{:02}Z INFO GET /v1/items status=200 request_id=req-{i:04} latency=5ms\n",
+            i % 60
+        ));
+    }
+    assert!(mid_log.len() > 2048 && mid_log.len() < 8192);
+    let req = multi_turn_live_request("ok", "toolu_env", &mid_log);
+    assert_eq!(proxy.post(&[], &req).status(), 200);
+    let forwarded = mock.seen().pop().unwrap().json();
+    let compacted = forwarded["messages"][4]["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    let recall_id = extract_recall_id(compacted);
+    assert!(compacted.len() * 10 <= mid_log.len() * 7);
+    assert_eq!(recall(dir.path(), &recall_id).stdout, mid_log.as_bytes());
+    proxy.stop();
+
+    // 2. Coexistence of --compact-live and clear_tool_uses_20250919 on one request.
+    let flags = format!("{CLEARING} --compact-live");
+    let (dir, mock, proxy) = session(
+        |_| stream(events("claude-haiku-4-5", Some((4, 2010)), 1500)),
+        &flags,
+    );
+    let mut body = conversation("claude-haiku-4-5", &SIZES);
+    let big_json = live_json_payload();
+    body["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"][0]["content"] =
+        json!(big_json);
+    let raw_bytes = serde_json::to_vec(&body).unwrap();
+    let response = proxy.send(
+        "POST",
+        "/v1/messages",
+        &[("content-type", "application/json")],
+        &raw_bytes,
+    );
+    assert_eq!(response.status(), 200);
+    let forwarded = mock.seen().pop().unwrap();
+    assert_eq!(forwarded.headers_named("anthropic-beta"), [BETA]);
+    let sent = forwarded.json();
+    assert!(our_edit(&sent).is_some());
+    // Every older message before the final user message is untouched.
+    let orig_msgs = body["messages"].as_array().unwrap();
+    let sent_msgs = sent["messages"].as_array().unwrap();
+    assert_eq!(orig_msgs.len(), sent_msgs.len());
+    for i in 0..orig_msgs.len() - 1 {
+        assert_eq!(sent_msgs[i], orig_msgs[i], "msg {i}");
+    }
+    let compacted = sent_msgs.last().unwrap()["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    let recall_id = extract_recall_id(compacted);
+    assert_eq!(recall(dir.path(), &recall_id).stdout, big_json.as_bytes());
+    proxy.stop();
+    let rec = &ledger(dir.path())[0];
+    assert_eq!(rec["mode"], "cleared");
+    assert_eq!(rec["live_compacted"]["results"], 1);
+}
