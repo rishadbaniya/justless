@@ -2100,6 +2100,8 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
         "docker container ls --filter status=exited",
         "kubectl get pods -A",
         "kubectl -n prod get deploy",
+        "kubectl get svc",
+        "kubectl get events",
         "kubectl logs api-1 --tail 50",
         "docker logs --since 10m api",
         "npm test",
@@ -2132,7 +2134,8 @@ fn hooks_route_display_commands_and_leave_machine_formats_alone() {
     for command in [
         "docker ps --format json",
         "docker ps -q",
-        "kubectl get svc",
+        "kubectl get secrets",
+        "kubectl get svc -o yaml",
         "kubectl get pods -o yaml",
         "kubectl logs -f api-1",
         "npm test -- --watch",

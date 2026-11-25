@@ -551,7 +551,7 @@ fn log_pages(
 /// Whether this MCP tool call supports per-process `--session` dedup via `seen::Memory`.
 fn uses_session(tool: &str, arguments: &Map<String, Value>) -> bool {
     match tool {
-        "pack" => true,
+        "pack" | "read" | "expand" => true,
         "context" => {
             arguments.get("at").is_some_and(|v| !v.is_null())
                 || arguments.get("symbol").is_some_and(|v| !v.is_null())
@@ -874,6 +874,7 @@ const TOOLS: &[Tool] = &[
             option("match", "match", Kind::Text, "Filter (a|b)"),
             option("limit", "limit", Kind::Count(1, MAX_LIMIT as u64), ""),
             option("after", "after", Kind::Text, "REV#ROW"),
+            option("fresh", "fresh", Kind::Flag, "Skip dedup"),
             BUDGET,
         ],
         check: Some(read_input),
@@ -886,6 +887,7 @@ const TOOLS: &[Tool] = &[
             FILE,
             positional("selector", Kind::Text, "Symbol, REV#ROW,#ROW or L10-20"),
             option("revision", "revision", Kind::Text, "Rev check"),
+            option("fresh", "fresh", Kind::Flag, "Skip dedup"),
         ],
         check: None,
     },
@@ -1747,7 +1749,12 @@ mod tests {
         assert!(uses_session("context", &map(json!({"at": "a.rs:1"}))));
         assert!(!uses_session("context", &map(json!({"changes": true}))));
         assert!(!uses_session("context", &map(json!({"run_id": "run-1"}))));
-        assert!(!uses_session("read", &map(json!({"file": "a.rs"}))));
+        assert!(uses_session("read", &map(json!({"file": "a.rs"}))));
+        assert!(uses_session(
+            "expand",
+            &map(json!({"file": "a.rs", "selector": "L1-10"}))
+        ));
+        assert!(!uses_session("query", &map(json!({"symbol": "foo"}))));
 
         let a = new_session();
         let b = new_session();

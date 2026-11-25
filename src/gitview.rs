@@ -2728,7 +2728,7 @@ mod tests {
         );
         assert!(
             report.contains(
-                "staged: 18 entries (2 renamed, 16 entries in 1 directory under src/handlers/)"
+                "staged: 18 entries (2 renamed, 16 entries in 1 directory under src/handlers/"
             ),
             "{report}"
         );

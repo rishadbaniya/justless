@@ -109,7 +109,7 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
         ["query", "query", {"symbol": "purchase_orders", "view": "definition"}],
         ["path", "path", {"from": "fetchOrders", "to": "purchase_orders"}],
         ["read", "read", {"file": "frontend/orders.ts", "outline": true}],
-        ["read-dot", "read", {"file": "./frontend/orders.ts", "outline": true}],
+        ["read-dot", "read", {"file": "./frontend/orders.ts", "outline": true, "fresh": true}],
         ["read-curdir", "read", {"file": "."}],
         ["expand", "expand", {"file": "frontend/orders.ts", "selector": "fetchOrders"}],
         ["code", "code", {"file": "db/schema.sql", "from": 1, "to": 2}],

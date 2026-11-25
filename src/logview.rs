@@ -487,8 +487,6 @@ impl Collector {
 ///
 /// Returns `None` if the log has fewer than 8 lines, contains binary bytes,
 /// cannot fit within `max_bytes`, or does not achieve meaningful compaction.
-// Wired into capture.rs during Wave-2 integration.
-#[allow(dead_code)]
 pub fn format(stdout: &str, stderr: &str, max_bytes: usize) -> Option<String> {
     format_streams(&[("stdout", stdout), ("stderr", stderr)], max_bytes)
 }

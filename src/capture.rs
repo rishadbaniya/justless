@@ -1806,6 +1806,33 @@ impl Capture<'_> {
             }
             report = true;
         } else if !merged
+            && run.produced_bytes.is_empty()
+            && is_log_stream(words, selection.profile)
+            && let Some(folded) =
+                log_view(&archive.readers, &lengths, redactor, &secrets, max_bytes)
+            && (fit_whole.contains(&false) || folded.len() + 64 < shown)
+            && (folded.len() < shown || fit_whole.contains(&false))
+        {
+            previews[0].1 = folded.into_bytes();
+            previews[1].1.clear();
+            report = true;
+        } else if !merged
+            && run.produced_bytes.is_empty()
+            && selection.profile.is_none()
+            && run.summary.kind.is_empty()
+            && let Some(view) = extra_inventory_view(
+                words,
+                &archive.readers[0],
+                lengths[0],
+                redactor,
+                secrets[0] > 0,
+                max_bytes,
+            )
+            && (!stdout_fits || view.len() + 64 < previews[0].1.len())
+        {
+            previews[0].1 = view.into_bytes();
+            report = true;
+        } else if !merged
             && selection.profile.is_none()
             && run.summary.kind.is_empty()
             && run.produced_bytes.is_empty()
@@ -2107,6 +2134,153 @@ fn read_text(mut file: &File, length: u64, limit: u64) -> Option<String> {
     let mut bytes = Vec::new();
     file.take(length).read_to_end(&mut bytes).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+/// Whether `words` / `profile` runs a structured container, Kubernetes or
+/// systemd log command eligible for `logview` template folding.
+fn is_log_stream(words: &[&str], profile: Option<crate::filters::Profile>) -> bool {
+    if profile == Some(crate::filters::Profile::Logs) {
+        return true;
+    }
+    let Some(unwrapped) = crate::wrappers::hook_effective(words) else {
+        return false;
+    };
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    let tool = crate::filters::unwrap_tool(&refs);
+    tool.first()
+        .and_then(|p| Path::new(p).file_name()?.to_str())
+        == Some("journalctl")
+}
+
+/// Fold structured container, Kubernetes, JSON/NDJSON or `journalctl` logs via
+/// `logview`, reading redacted stream copies up to 2 MiB each.
+fn log_view(
+    readers: &[File],
+    lengths: &[u64],
+    redactor: Option<&crate::redact::Redactor>,
+    secrets: &[u64; 2],
+    max_bytes: usize,
+) -> Option<String> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    if readers.len() < 2 || lengths.len() < 2 {
+        return None;
+    }
+    let mut streams = [String::new(), String::new()];
+    for i in 0..2 {
+        if lengths[i] == 0 {
+            continue;
+        }
+        let text = read_text(&readers[i], lengths[i], LIMIT)?;
+        streams[i] = match redactor.filter(|_| secrets[i] > 0) {
+            Some(redactor) => redactor.text(&text).into_owned(),
+            None => text,
+        };
+    }
+    crate::logview::format(&streams[0], &streams[1], max_bytes)
+}
+
+/// Format display-table DevOps inventories handled by `inventory::{events,
+/// helm_list, images, resources}` (`kubectl`/`oc get events|svc|ing|pvc|cj`,
+/// `helm list`, `docker`/`podman images`), redacting before formatting.
+fn extra_inventory_view(
+    words: &[&str],
+    reader: &File,
+    length: u64,
+    redactor: Option<&crate::redact::Redactor>,
+    has_secrets: bool,
+    max_bytes: usize,
+) -> Option<String> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    if length == 0 || length > LIMIT {
+        return None;
+    }
+    let unwrapped = crate::wrappers::hook_effective(words)?;
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    let tool = crate::filters::unwrap_tool(&refs);
+    let (&program, mut args) = tool.split_first()?;
+    let program = Path::new(program).file_name()?.to_str()?;
+    let has_machine_flag = |tail: &[&str], blocked: &[&str]| {
+        tail.iter().any(|arg| {
+            let flag = arg.split_once('=').map_or(*arg, |(f, _)| f);
+            blocked.contains(&flag)
+        })
+    };
+    enum Kind<'a> {
+        Events,
+        HelmList,
+        Images,
+        Resource(&'a str),
+    }
+    let kind = match program {
+        "kubectl" | "oc" => {
+            while let Some((&arg, rest)) = args.split_first() {
+                if ["--namespace", "-n", "--context"].contains(&arg)
+                    && rest.first().is_some_and(|v| !v.starts_with('-'))
+                {
+                    args = &rest[1..];
+                } else if arg.starts_with("--namespace=") || arg.starts_with("--context=") {
+                    args = rest;
+                } else {
+                    break;
+                }
+            }
+            let ["get", resource, tail @ ..] = args else {
+                return None;
+            };
+            if has_machine_flag(tail, &["-o", "--output", "-w", "--watch", "--no-headers"]) {
+                return None;
+            }
+            let base = resource.split('.').next().unwrap_or("");
+            match base {
+                "ev" | "event" | "events" => Kind::Events,
+                "svc"
+                | "service"
+                | "services"
+                | "ing"
+                | "ingress"
+                | "ingresses"
+                | "pvc"
+                | "pvcs"
+                | "persistentvolumeclaim"
+                | "persistentvolumeclaims"
+                | "cj"
+                | "cronjob"
+                | "cronjobs" => Kind::Resource(resource),
+                _ => return None,
+            }
+        }
+        "helm" => {
+            let ["list" | "ls", tail @ ..] = args else {
+                return None;
+            };
+            if has_machine_flag(tail, &["-o", "--output", "-q", "--short"]) {
+                return None;
+            }
+            Kind::HelmList
+        }
+        "docker" | "podman" => {
+            let tail = match args {
+                ["images", tail @ ..] | ["image", "ls" | "list", tail @ ..] => tail,
+                _ => return None,
+            };
+            if has_machine_flag(tail, &["--format", "-q", "--quiet"]) {
+                return None;
+            }
+            Kind::Images
+        }
+        _ => return None,
+    };
+    let text = read_text(reader, length, LIMIT)?;
+    let text = match redactor.filter(|_| has_secrets) {
+        Some(redactor) => redactor.text(&text).into_owned(),
+        None => text,
+    };
+    match kind {
+        Kind::Events => crate::inventory::events(&text, max_bytes),
+        Kind::HelmList => crate::inventory::helm_list(&text, max_bytes),
+        Kind::Images => crate::inventory::images(&text, max_bytes),
+        Kind::Resource(resource) => crate::inventory::resources(resource, &text, max_bytes),
+    }
 }
 
 /// Stdout shown as JSON tables or compact JSON, clipped at whole lines to

@@ -558,7 +558,6 @@ fn ratio(value: &str) -> Option<(usize, usize)> {
 /// events verbatim (deduplicating identical `(object, reason, message)` with
 /// counts and `[stdout:...]` pointers) and fold routine `Normal` events by
 /// reason with counts and exact archive line ranges.
-#[allow(dead_code)] // Staged for `filters.rs`/`capture.rs` wiring.
 pub fn events(text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;
@@ -856,7 +855,6 @@ fn split_first_token(s: &str) -> Option<(&str, &str)> {
 /// release (`failed`, `pending-upgrade`, `pending-rollback`, `pending-install`,
 /// `uninstalling`, etc.) verbatim with exact `[stdout:line]`, and summarize
 /// healthy `deployed` releases compactly by namespace and chart.
-#[allow(dead_code)] // Staged for `filters.rs`/`capture.rs` wiring.
 pub fn helm_list(text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;
@@ -1170,7 +1168,6 @@ fn parse_helm_row(
 /// `<none>:<none>` images (showing count, total size and `[stdout:A-B]`), and
 /// group multi-tag repositories compactly while keeping exact image IDs and
 /// sizes retrievable via `[stdout:...]`.
-#[allow(dead_code)] // Staged for `filters.rs`/`capture.rs` wiring.
 pub fn images(text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;
@@ -1624,7 +1621,6 @@ fn format_k8s_quantity(bytes: u64) -> String {
 /// `cronjobs`: highlight Pending/Lost/Terminating PVCs, suspended CronJobs,
 /// pending/external LoadBalancer services, and Ingress endpoints while
 /// collapsing uniform healthy rows cleanly with `[stdout:A-B]` links.
-#[allow(dead_code)] // Staged for `filters.rs`/`capture.rs` wiring.
 pub fn resources(kind: &str, text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;

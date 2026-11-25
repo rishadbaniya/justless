@@ -164,6 +164,42 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["podman", "image", "ls"], &[]),
     (&["podman", "build"], &["--push"]),
     (&["kubectl", "describe"], &[]),
+    (
+        &["kubectl", "get", "events"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "svc"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "services"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "ing"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "ingresses"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "pvc"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "pvcs"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "cj"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
+    (
+        &["kubectl", "get", "cronjobs"],
+        &["-w", "--watch", "-o", "--output"],
+    ),
     (&["oc", "get"], &["-w", "--watch"]),
     (&["oc", "describe"], &[]),
     (&["oc", "status"], &[]),
