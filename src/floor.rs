@@ -210,13 +210,20 @@ fn git_show_object_is_path(arg: &str) -> bool {
 /// `[last line repeated N more time(s)]` marker that counts the line before it.
 pub type Shown = (String, bool);
 
-/// Applies the floor to a stream line by line, folding repeated lines.
+/// Applies the floor to a stream line by line, folding repeated lines (including
+/// consecutive lines that differ only by a leading timestamp).
 #[derive(Default)]
 pub struct Floor {
     patch: bool,
     /// The last line shown and how many identical lines followed it.
     last: Option<String>,
     repeats: usize,
+    /// Timestamp-stripped key of `last` when `last` carried a leading timestamp,
+    /// plus any consecutive lines that matched after stripping their timestamp.
+    last_ts_key: Option<String>,
+    ts_repeats: usize,
+    ts_bytes: usize,
+    ts_buffered: Vec<String>,
 }
 
 impl Floor {
@@ -235,22 +242,70 @@ impl Floor {
         } else {
             self::line(line)
         };
-        if !keep && self.last.as_deref() == Some(&shown) {
+        let newline = if text.ends_with('\n') { "\n" } else { "" };
+        if !keep && self.ts_repeats == 0 && self.last.as_deref() == Some(&shown) {
             self.repeats += 1;
             return;
         }
+        let ts_key = if !keep {
+            let trimmed = plain.trim();
+            let key = crate::filters::log_dedup_key(trimmed);
+            (key != trimmed && !key.is_empty()).then(|| key.to_owned())
+        } else {
+            None
+        };
+        if !keep
+            && let Some(key) = ts_key.as_deref()
+            && self.last_ts_key.as_deref() == Some(key)
+        {
+            if self.repeats > 0 {
+                let exact = std::mem::take(&mut self.repeats);
+                let prev = self.last.as_deref().unwrap_or("");
+                self.ts_repeats += exact;
+                self.ts_bytes += exact * (prev.len() + 1);
+                if self.ts_bytes <= 96 {
+                    self.ts_buffered
+                        .extend(std::iter::repeat_n(format!("{prev}\n"), exact));
+                } else {
+                    self.ts_buffered.clear();
+                }
+            }
+            self.ts_repeats += 1;
+            self.ts_bytes += shown.len() + newline.len();
+            if self.ts_bytes <= 96 {
+                self.ts_buffered.push(format!("{shown}{newline}"));
+            } else {
+                self.ts_buffered.clear();
+            }
+            return;
+        }
         self.flush(out);
-        let newline = if text.ends_with('\n') { "\n" } else { "" };
         out.push((format!("{shown}{newline}"), false));
         self.last = (!keep).then(|| shown.into_owned());
+        self.last_ts_key = ts_key;
     }
 
     /// Show what folding still holds back, as at the end of the stream.
     pub fn flush(&mut self, out: &mut Vec<Shown>) {
         let repeats = std::mem::take(&mut self.repeats);
+        let ts_repeats = std::mem::take(&mut self.ts_repeats);
+        let ts_bytes = std::mem::take(&mut self.ts_bytes);
+        let ts_buffered = std::mem::take(&mut self.ts_buffered);
+        self.last_ts_key = None;
         let Some(last) = self.last.take() else {
             return;
         };
+        if ts_repeats > 0 {
+            let marker = format!(
+                "[similar line repeated {ts_repeats} more time(s) with different timestamps]\n"
+            );
+            if marker.len() < ts_bytes {
+                out.push((marker, true));
+            } else {
+                out.extend(ts_buffered.into_iter().map(|line| (line, false)));
+            }
+            return;
+        }
         if repeats == 0 {
             return;
         }
@@ -404,5 +459,24 @@ mod tests {
         ] {
             assert_eq!(compact(&input), None, "{input:?}");
         }
+    }
+
+    #[test]
+    fn floor_folds_consecutive_timestamped_repeats_without_touching_errors() {
+        let mut log = String::new();
+        for s in 1..=10 {
+            log.push_str(&format!(
+                "2026-11-25T14:01:{s:02}.000Z INFO heartbeat ok worker=1\n"
+            ));
+        }
+        log.push_str("2026-11-25T14:01:11.000Z ERROR db down\n");
+        log.push_str("2026-11-25T14:01:12.000Z ERROR db down\n");
+        let out = compact(&log).unwrap();
+        assert!(
+            out.contains("2026-11-25T14:01:01.000Z INFO heartbeat ok worker=1\n[similar line repeated 9 more time(s) with different timestamps]\n"),
+            "{out}"
+        );
+        // Errors stay verbatim even when repeated with different timestamps.
+        assert_eq!(out.matches("ERROR db down").count(), 2, "{out}");
     }
 }

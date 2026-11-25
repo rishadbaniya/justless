@@ -31,17 +31,26 @@ impl Inventory {
             return true;
         }
         if self.header.is_empty() {
-            if self.kind == Profile::Containers {
+            if matches!(self.kind, Profile::Containers | Profile::ComposeContainers) {
                 self.header = COLUMN
                     .find_iter(line)
                     .map(|m| (m.as_str().to_owned(), m.start()))
                     .collect();
-                return self
-                    .header
-                    .first()
-                    .is_some_and(|(h, _)| h == "CONTAINER ID")
-                    && self.col("STATUS").is_some()
-                    && self.col("NAMES").is_some();
+                return match self.kind {
+                    Profile::Containers => {
+                        self.header
+                            .first()
+                            .is_some_and(|(h, _)| h == "CONTAINER ID")
+                            && self.col("STATUS").is_some()
+                            && self.col("NAMES").is_some()
+                    }
+                    Profile::ComposeContainers => {
+                        self.header.first().is_some_and(|(h, _)| h == "NAME")
+                            && self.col("SERVICE").is_some()
+                            && self.col("STATUS").is_some()
+                    }
+                    _ => false,
+                };
             }
             self.header = line
                 .split_ascii_whitespace()
@@ -51,12 +60,22 @@ impl Inventory {
                 Profile::Pods => &["NAME", "READY", "STATUS", "RESTARTS"],
                 Profile::Deployments => &["NAME", "READY", "UP-TO-DATE", "AVAILABLE"],
                 Profile::StatefulSets => &["NAME", "READY"],
+                Profile::DaemonSets => &[
+                    "NAME",
+                    "DESIRED",
+                    "CURRENT",
+                    "READY",
+                    "UP-TO-DATE",
+                    "AVAILABLE",
+                ],
+                Profile::ReplicaSets => &["NAME", "DESIRED", "CURRENT", "READY"],
+                Profile::Jobs => &["NAME", "COMPLETIONS"],
                 Profile::Nodes => &["NAME", "STATUS"],
                 _ => return false,
             };
             return columns.iter().all(|h| self.col(h).is_some());
         }
-        let row = if self.kind == Profile::Containers {
+        let row = if matches!(self.kind, Profile::Containers | Profile::ComposeContainers) {
             self.container(line)
         } else {
             self.kubernetes(line)
@@ -90,7 +109,12 @@ impl Inventory {
             let end = self.header.get(i + 1).map(|(_, end)| *end);
             slice_cols(line, start, end).map(str::trim)
         };
-        let name = field("NAMES")?;
+        let name_col = if self.kind == Profile::ComposeContainers {
+            "NAME"
+        } else {
+            "NAMES"
+        };
+        let name = field(name_col)?;
         if name.is_empty()
             || !name
                 .bytes()
@@ -163,6 +187,39 @@ impl Inventory {
                 } else {
                     (actual != desired).then(|| format!("ready={ready}"))
                 }
+            }
+            Profile::DaemonSets => {
+                let desired: usize = get("DESIRED")?.parse().ok()?;
+                let current: usize = get("CURRENT")?.parse().ok()?;
+                let ready: usize = get("READY")?.parse().ok()?;
+                let updated: usize = get("UP-TO-DATE")?.parse().ok()?;
+                let available: usize = get("AVAILABLE")?.parse().ok()?;
+                (current != desired
+                    || ready != desired
+                    || updated != desired
+                    || available != desired)
+                    .then(|| {
+                        format!(
+                            "desired={desired} current={current} ready={ready} updated={updated} available={available}"
+                        )
+                    })
+            }
+            Profile::ReplicaSets => {
+                let desired: usize = get("DESIRED")?.parse().ok()?;
+                let current: usize = get("CURRENT")?.parse().ok()?;
+                let ready: usize = get("READY")?.parse().ok()?;
+                (current != desired || ready != desired)
+                    .then(|| format!("desired={desired} current={current} ready={ready}"))
+            }
+            Profile::Jobs => {
+                let completions = get("COMPLETIONS")?;
+                let (done, total) = ratio(completions)?;
+                let status = get("STATUS");
+                let bad_status = status.is_some_and(|s| s != "Complete");
+                (done != total || bad_status).then(|| match status {
+                    Some(s) => format!("{s} completions={completions}"),
+                    None => format!("completions={completions}"),
+                })
             }
             _ => return None,
         };
@@ -275,5 +332,75 @@ mod tests {
         );
         assert_eq!(summary.items[1].name, "prod/cron-0");
         assert_eq!(summary.items[1].detail, "Running ready=1/1 restarts=1");
+    }
+
+    #[test]
+    fn docker_compose_ps_and_kubectl_daemonsets_replicasets_and_jobs_summarize_attention_items() {
+        let compose = [
+            "NAME            IMAGE         COMMAND                  SERVICE   CREATED       STATUS                     PORTS",
+            "app-db-1        postgres:16   \"docker-entrypoint.s…\"   db        2 hours ago   Up 2 hours (healthy)       5432/tcp",
+            "app-web-1       node:22       \"node server.js\"         web       2 hours ago   Exited (1) 5 minutes ago   3000/tcp",
+        ];
+        let mut inv = Inventory::new(Profile::ComposeContainers);
+        for (i, line) in compose.iter().enumerate() {
+            assert!(inv.observe(line, i + 1), "row {}: {line}", i + 1);
+        }
+        let summary = inv.finish();
+        assert_eq!(
+            summary.outcomes[0],
+            "docker compose ps: 2 listed, 1 need attention"
+        );
+        assert_eq!(summary.items[0].name, "app-web-1");
+        assert_eq!(summary.items[0].detail, "Exited (1)");
+
+        let ds = [
+            "NAME        DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   AGE",
+            "fluentbit   5         5         5       5            5           10d",
+            "node-exp    5         5         3       5            3           10d",
+        ];
+        let mut inv = Inventory::new(Profile::DaemonSets);
+        for (i, line) in ds.iter().enumerate() {
+            assert!(inv.observe(line, i + 1));
+        }
+        let summary = inv.finish();
+        assert_eq!(
+            summary.outcomes[0],
+            "kubectl get daemonsets: 2 listed, 1 need attention"
+        );
+        assert_eq!(summary.items[0].name, "node-exp");
+
+        let rs = [
+            "NAME          DESIRED   CURRENT   READY   AGE",
+            "api-old       0         0         0       9d",
+            "api-live      3         3         3       2d",
+            "api-rollout   3         3         1       1m",
+        ];
+        let mut inv = Inventory::new(Profile::ReplicaSets);
+        for (i, line) in rs.iter().enumerate() {
+            assert!(inv.observe(line, i + 1));
+        }
+        let summary = inv.finish();
+        assert_eq!(
+            summary.outcomes[0],
+            "kubectl get replicasets: 3 listed, 1 need attention"
+        );
+        assert_eq!(summary.items[0].name, "api-rollout");
+
+        let jobs = [
+            "NAME         STATUS     COMPLETIONS   DURATION   AGE",
+            "migrate-01   Complete   1/1           12s        3d",
+            "backfill-2   Running    2/5           4m         4m",
+        ];
+        let mut inv = Inventory::new(Profile::Jobs);
+        for (i, line) in jobs.iter().enumerate() {
+            assert!(inv.observe(line, i + 1));
+        }
+        let summary = inv.finish();
+        assert_eq!(
+            summary.outcomes[0],
+            "kubectl get jobs: 2 listed, 1 need attention"
+        );
+        assert_eq!(summary.items[0].name, "backfill-2");
+        assert_eq!(summary.items[0].detail, "Running completions=2/5");
     }
 }

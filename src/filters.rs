@@ -10,9 +10,13 @@ use serde::Deserialize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Containers,
+    ComposeContainers,
     Pods,
     Deployments,
     StatefulSets,
+    DaemonSets,
+    ReplicaSets,
+    Jobs,
     Nodes,
     JsTests,
     Logs,
@@ -25,9 +29,13 @@ impl Profile {
     pub fn label(self) -> &'static str {
         match self {
             Self::Containers => "docker ps",
+            Self::ComposeContainers => "docker compose ps",
             Self::Pods => "kubectl get pods",
             Self::Deployments => "kubectl get deployments",
             Self::StatefulSets => "kubectl get statefulsets",
+            Self::DaemonSets => "kubectl get daemonsets",
+            Self::ReplicaSets => "kubectl get replicasets",
+            Self::Jobs => "kubectl get jobs",
             Self::Nodes => "kubectl get nodes",
             Self::JsTests => "JavaScript tests",
             Self::Logs => "container logs",
@@ -229,6 +237,16 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
         {
             Some(Profile::Containers)
         }
+        ("docker", ["compose", "ps", tail @ ..])
+            if display_options(
+                tail,
+                &["-a", "--all", "--no-trunc", "--orphans"],
+                &["--status", "--filter"],
+                true,
+            ) =>
+        {
+            Some(Profile::ComposeContainers)
+        }
         ("kubectl", ["get", resource, tail @ ..])
             if display_options(
                 tail,
@@ -253,21 +271,34 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
                 "sts" | "statefulset" | "statefulsets" | "statefulsets.apps" => {
                     Some(Profile::StatefulSets)
                 }
+                "ds" | "daemonset" | "daemonsets" | "daemonsets.apps" => Some(Profile::DaemonSets),
+                "rs" | "replicaset" | "replicasets" | "replicasets.apps" => {
+                    Some(Profile::ReplicaSets)
+                }
+                "job" | "jobs" | "jobs.batch" => Some(Profile::Jobs),
                 "no" | "node" | "nodes" => Some(Profile::Nodes),
                 _ => None,
             }
         }
-        ("docker", ["logs", tail @ ..] | ["container", "logs", tail @ ..])
-            if display_options(
-                tail,
-                &["-t", "--timestamps", "--details"],
-                &["--since", "--until", "--tail", "-n"],
-                true,
-            ) =>
+        (
+            "docker",
+            ["logs", tail @ ..] | ["container", "logs", tail @ ..] | ["compose", "logs", tail @ ..],
+        ) if display_options(
+            tail,
+            &[
+                "-t",
+                "--timestamps",
+                "--details",
+                "--no-color",
+                "--no-log-prefix",
+            ],
+            &["--since", "--until", "--tail", "-n"],
+            true,
+        ) =>
         {
             Some(Profile::Logs)
         }
-        ("kubectl", ["logs", tail @ ..])
+        ("kubectl" | "oc", ["logs", tail @ ..])
             if display_options(
                 tail,
                 &[
@@ -1860,7 +1891,7 @@ impl<'a> LineFilter<'a> {
 /// Key used to detect consecutive repeated lines in `Profile::Logs` (`docker logs`
 /// / `kubectl logs`), ignoring a leading timestamp so identical periodic lines
 /// (such as health checks) fold even when each line carries a fresh timestamp.
-fn log_dedup_key(line: &str) -> &str {
+pub(crate) fn log_dedup_key(line: &str) -> &str {
     static LEADING_TIMESTAMP: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(
             r"^(?:\[?(?:\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\]?\s+)+",

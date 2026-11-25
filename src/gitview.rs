@@ -36,6 +36,7 @@ impl View {
         let (subcommand, args) = subcommand(crate::filters::unwrap_tool(&words))?;
         match subcommand {
             "log" => Log::new(args, budget).map(Self::Log),
+            "reflog" => Log::reflog(args, budget).map(Self::Log),
             "status" => status_display(args).then(|| Self::Status(Status::new())),
             _ => None,
         }
@@ -210,6 +211,40 @@ impl Log {
         Some(Self {
             reverse,
             shape,
+            budget,
+            bytes: 0,
+            lines: 0,
+            commits: 0,
+            unknown: false,
+            current: None,
+            kept: VecDeque::new(),
+            kept_bytes: 0,
+            full: false,
+        })
+    }
+
+    fn reflog(args: &[&str], budget: usize) -> Option<Self> {
+        let mut iter = args.iter().copied().take_while(|arg| *arg != "--");
+        if let Some(first) = iter.next() {
+            if matches!(first, "expire" | "delete" | "drop" | "exists" | "write") {
+                return None;
+            }
+            // Reject custom formats, patches, graphs, and NUL-delimited reflog output.
+            for arg in std::iter::once(first).chain(iter) {
+                if arg == "show" || arg == "--oneline" || arg == "--date=relative" {
+                    continue;
+                }
+                if arg.starts_with("--pretty")
+                    || arg.starts_with("--format")
+                    || matches!(arg, "-p" | "-u" | "--patch" | "--graph" | "-z" | "--stat")
+                {
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            reverse: false,
+            shape: Shape::Ids,
             budget,
             bytes: 0,
             lines: 0,
@@ -850,5 +885,23 @@ mod tests {
         let mut status = String::from("On branch main\n\nSubmodule changes to be committed:\n\n");
         status.push_str(&"* sub abc..def (1):\n  > change\n".repeat(100));
         assert_eq!(view("git status", &status, 512), None);
+    }
+
+    #[test]
+    fn large_git_reflog_keeps_newest_entries_with_line_range_for_older_ones() {
+        let mut reflog = String::new();
+        for i in 0..120 {
+            reflog.push_str(&format!(
+                "{i:07x} HEAD@{{{i}}}: commit: update feature step {i}\n"
+            ));
+        }
+        let report = view("git reflog", &reflog, 512).unwrap();
+        assert!(report.len() <= 512, "len={}: {report}", report.len());
+        assert!(
+            report.contains("HEAD@{0}: commit: update feature step 0"),
+            "{report}"
+        );
+        assert!(report.contains("older commits [stdout:"), "{report}");
+        assert_eq!(view("git reflog expire --all", &reflog, 512), None);
     }
 }
