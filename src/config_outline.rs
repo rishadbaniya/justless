@@ -1,6 +1,8 @@
-//! Structural outlines for config, DevOps, stylesheet, IDL, and markup files:
-//! TOML, YAML, JSON/JSONC (including root arrays and large minified JSON),
-//! Makefile/Justfile, Dockerfile/Containerfile, INI/Conf/EditorConfig/Properties,
+//! Structural outlines for config, DevOps, stylesheet, IDL, proxy, and markup files:
+//! TOML, YAML (including GitHub Actions workflows and OpenAPI/Swagger specs),
+//! JSON/JSONC (including OpenAPI/Swagger, root arrays, and large minified JSON),
+//! Nix (`*.nix`), Makefile/Justfile, Dockerfile/Containerfile,
+//! Nginx/Caddy/HAProxy configs, INI/Conf/EditorConfig/Properties,
 //! CSS/SCSS/Less, Proto/GraphQL/Prisma IDL schemas, and XML/HTML/MSBuild files.
 //!
 //! Each section carries exact byte ranges in the original text so `expand`
@@ -26,7 +28,7 @@ pub struct Section {
 }
 
 /// Extract structural sections for supported config, build, schema, stylesheet,
-/// and markup files. `line_starts` holds the 0-based byte offset of each line.
+/// proxy, and markup files. `line_starts` holds the 0-based byte offset of each line.
 pub fn sections(file: &str, text: &str, line_starts: &[usize]) -> Vec<Section> {
     let path = Path::new(file);
     let file_name = path
@@ -55,15 +57,50 @@ pub fn sections(file: &str, text: &str, line_starts: &[usize]) -> Vec<Section> {
     {
         return dockerfile_sections(text, line_starts);
     }
+    if lower_name == "caddyfile"
+        || lower_name.starts_with("caddyfile.")
+        || matches!(ext.as_deref(), Some("caddyfile" | "caddy"))
+    {
+        return caddy_sections(text, line_starts);
+    }
+    if lower_name == "haproxy.cfg"
+        || (lower_name.starts_with("haproxy.") && matches!(ext.as_deref(), Some("cfg" | "conf")))
+        || ext.as_deref() == Some("haproxy")
+    {
+        return haproxy_sections(text, line_starts, true);
+    }
+    if lower_name == "nginx.conf"
+        || (lower_name.starts_with("nginx.") && ext.as_deref() == Some("conf"))
+        || ext.as_deref() == Some("nginx")
+    {
+        return nginx_sections(text, line_starts);
+    }
     if lower_name == ".editorconfig" {
         return ini_sections(text, line_starts);
     }
 
     match ext.as_deref() {
         Some("toml") => toml_sections(text, line_starts),
-        Some("yaml" | "yml") => yaml_sections(text, line_starts),
+        Some("yaml" | "yml") => yaml_sections(file, text, line_starts),
         Some("json" | "jsonc") => json_sections(text, line_starts),
-        Some("ini" | "cfg" | "conf" | "properties") => ini_sections(text, line_starts),
+        Some("nix") => nix_sections(text, line_starts),
+        Some("conf") => {
+            let ini = ini_sections(text, line_starts);
+            if !ini.is_empty() {
+                ini
+            } else {
+                nginx_sections(text, line_starts)
+            }
+        }
+        Some("cfg") => {
+            let ini = ini_sections(text, line_starts);
+            if !ini.is_empty() {
+                ini
+            } else {
+                haproxy_sections(text, line_starts, false)
+            }
+        }
+        Some("ini" | "properties") => ini_sections(text, line_starts),
         Some("css") => css_sections(text, line_starts, false),
         Some("scss" | "less") => css_sections(text, line_starts, true),
         Some("proto") => idl_sections(text, line_starts, IdlKind::Proto),
@@ -345,7 +382,7 @@ fn advance_toml_multiline(line: &str, state: &mut Option<&'static str>) {
 // YAML
 // ---------------------------------------------------------------------------
 
-fn yaml_sections(text: &str, line_starts: &[usize]) -> Vec<Section> {
+fn yaml_sections(file: &str, text: &str, line_starts: &[usize]) -> Vec<Section> {
     if line_starts.len() < 2 {
         return Vec::new();
     }
@@ -354,6 +391,14 @@ fn yaml_sections(text: &str, line_starts: &[usize]) -> Vec<Section> {
         return yaml_multi_doc_sections(text, line_starts, &docs);
     }
     let (start, end) = docs.first().copied().unwrap_or((0, line_starts.len()));
+    if let Some(openapi) = openapi_yaml_sections(text, line_starts, start, end) {
+        return openapi;
+    }
+    if is_github_workflow_path(file)
+        && let Some(workflow) = github_actions_yaml_sections(text, line_starts, start, end)
+    {
+        return workflow;
+    }
     yaml_single_doc_sections(text, line_starts, start, end, None)
 }
 
@@ -692,6 +737,557 @@ fn yaml_opens_block_scalar(trimmed: &str) -> bool {
     tail.len() <= 2 && tail.bytes().all(|b| matches!(b, b'+' | b'-' | b'1'..=b'9'))
 }
 
+fn yaml_block_scalar_parent_indent(indent: usize, trimmed: &str) -> Option<usize> {
+    if yaml_opens_block_scalar(trimmed) {
+        return Some(indent);
+    }
+    let after_dash = trimmed.strip_prefix("- ")?;
+    let key_part = after_dash.trim_start();
+    if yaml_opens_block_scalar(key_part) {
+        let extra = trimmed.len() - key_part.len();
+        Some(indent + extra)
+    } else {
+        None
+    }
+}
+
+fn is_github_workflow_path(file: &str) -> bool {
+    let normalized = file.replace('\\', "/").to_ascii_lowercase();
+    (normalized.starts_with(".github/workflows/") || normalized.contains("/.github/workflows/"))
+        && (normalized.ends_with(".yml") || normalized.ends_with(".yaml"))
+}
+
+struct WorkflowStep {
+    first: usize,
+    next: usize,
+    label: String,
+    has_named_or_uses: bool,
+}
+
+struct WorkflowJob {
+    first: usize,
+    next: usize,
+    name: String,
+    runs_on_line: Option<usize>,
+    uses_line: Option<usize>,
+    steps: Vec<WorkflowStep>,
+}
+
+fn github_actions_yaml_sections(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+) -> Option<Vec<Section>> {
+    let top_keys = yaml_keys_at_indent(text, line_starts, start, end, 0);
+    let jobs_pos = top_keys.iter().position(|(_, k)| k == "jobs")?;
+    let jobs_first = top_keys[jobs_pos].0;
+    let jobs_next = top_keys.get(jobs_pos + 1).map_or(end, |k| k.0);
+    let job_indent = yaml_first_child_indent(text, line_starts, jobs_first + 1, jobs_next)?;
+    let job_keys = yaml_keys_at_indent(text, line_starts, jobs_first + 1, jobs_next, job_indent);
+    if job_keys.is_empty() {
+        return None;
+    }
+
+    let mut jobs = Vec::with_capacity(job_keys.len());
+    for (jpos, (jfirst, jkey)) in job_keys.iter().enumerate() {
+        let jnext = job_keys.get(jpos + 1).map_or(jobs_next, |j| j.0);
+        let mut runs_on_line = None;
+        let mut uses_line = None;
+        let mut steps = Vec::new();
+        if let Some(prop_indent) = yaml_first_child_indent(text, line_starts, *jfirst + 1, jnext) {
+            let props = yaml_keys_at_indent(text, line_starts, *jfirst + 1, jnext, prop_indent);
+            for (ppos, (pfirst, pkey)) in props.iter().enumerate() {
+                let pnext = props.get(ppos + 1).map_or(jnext, |p| p.0);
+                let trimmed = line_text(text, line_starts, *pfirst).trim();
+                match pkey.as_str() {
+                    "runs-on" => {
+                        if let Some((_, val)) = yaml_mapping_key(trimmed) {
+                            let clean = val.split_once(" #").map_or(val, |(h, _)| h).trim();
+                            if !clean.is_empty() && runs_on_line.is_none() {
+                                runs_on_line = Some(*pfirst);
+                            }
+                        }
+                    }
+                    "uses" => {
+                        if let Some((_, val)) = yaml_mapping_key(trimmed) {
+                            let clean = val.split_once(" #").map_or(val, |(h, _)| h).trim();
+                            if !clean.is_empty() && uses_line.is_none() {
+                                uses_line = Some(*pfirst);
+                            }
+                        }
+                    }
+                    "steps" => {
+                        steps = parse_workflow_steps(
+                            text,
+                            line_starts,
+                            *pfirst + 1,
+                            pnext,
+                            prop_indent,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        jobs.push(WorkflowJob {
+            first: *jfirst,
+            next: jnext,
+            name: jkey.clone(),
+            runs_on_line,
+            uses_line,
+            steps,
+        });
+    }
+
+    // Activate enriched job/step outlining for workflows with named or `uses:`
+    // steps, multi-step jobs, reusable workflow calls, or substantial length so
+    // tiny synthetic fixtures keep the compact generic YAML key/section view.
+    let rich = line_starts.len() >= 25
+        || jobs.iter().any(|j| {
+            j.uses_line.is_some()
+                || j.steps.len() >= 2
+                || j.steps.iter().any(|s| s.has_named_or_uses)
+        });
+    if !rich {
+        return None;
+    }
+
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    let mut out = Vec::new();
+    for (pos, (first, key)) in top_keys.iter().enumerate() {
+        let next = top_keys.get(pos + 1).map_or(end, |k| k.0);
+        let has_inline_value = yaml_mapping_key(line_text(text, line_starts, *first).trim())
+            .is_some_and(|(_, rest)| !rest.is_empty());
+        out.push(Section {
+            name: key.clone(),
+            kind: "key",
+            bytes: offset(*first)..offset(next),
+            signature_start: offset(*first),
+            header_end: if has_inline_value {
+                offset(*first + 1)
+            } else {
+                offset(*first)
+            },
+        });
+
+        if key == "jobs" {
+            for job in &jobs {
+                let (sig_start, header_end) = match job.runs_on_line.or(job.uses_line) {
+                    Some(sig_line) => (offset(sig_line), offset(sig_line + 1)),
+                    None => (offset(job.first), offset(job.first)),
+                };
+                out.push(Section {
+                    name: job.name.clone(),
+                    kind: "job",
+                    bytes: offset(job.first)..offset(job.next),
+                    signature_start: sig_start,
+                    header_end,
+                });
+                for step in &job.steps {
+                    out.push(Section {
+                        name: step.label.clone(),
+                        kind: "step",
+                        bytes: offset(step.first)..offset(step.next),
+                        signature_start: offset(step.first),
+                        header_end: offset(step.first),
+                    });
+                }
+            }
+        } else if next.saturating_sub(*first) >= 10
+            && let Some(child_indent) = yaml_first_child_indent(text, line_starts, *first + 1, next)
+        {
+            let children = yaml_keys_at_indent(text, line_starts, *first + 1, next, child_indent);
+            if should_expand_children(children.len(), next, &children) {
+                for (cpos, (cfirst, ckey)) in children.iter().enumerate() {
+                    let cnext = children.get(cpos + 1).map_or(next, |c| c.0);
+                    let child_has_value =
+                        yaml_mapping_key(line_text(text, line_starts, *cfirst).trim())
+                            .is_some_and(|(_, rest)| !rest.is_empty());
+                    out.push(Section {
+                        name: format!("{key}.{ckey}"),
+                        kind: "section",
+                        bytes: offset(*cfirst)..offset(cnext),
+                        signature_start: offset(*cfirst),
+                        header_end: if child_has_value {
+                            offset(*cfirst + 1)
+                        } else {
+                            offset(*cfirst)
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    (out.len() >= 2).then_some(out)
+}
+
+fn parse_workflow_steps(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    min_indent: usize,
+) -> Vec<WorkflowStep> {
+    let mut step_indent: Option<usize> = None;
+    for idx in start..end {
+        let line = line_text(text, line_starts, idx);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if indent >= min_indent && (trimmed == "-" || trimmed.starts_with("- ")) {
+            step_indent = Some(indent);
+        }
+        break;
+    }
+    let Some(step_indent) = step_indent else {
+        return Vec::new();
+    };
+
+    let mut starts = Vec::new();
+    let mut block_indent: Option<usize> = None;
+    for idx in start..end {
+        let line = line_text(text, line_starts, idx);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if let Some(parent) = block_indent {
+            if indent <= parent {
+                block_indent = None;
+            } else {
+                continue;
+            }
+        }
+        if indent == step_indent && (trimmed == "-" || trimmed.starts_with("- ")) {
+            starts.push(idx);
+        }
+        if let Some(parent) = yaml_block_scalar_parent_indent(indent, trimmed) {
+            block_indent = Some(parent);
+        }
+    }
+
+    let mut steps = Vec::with_capacity(starts.len());
+    for (pos, &sfirst) in starts.iter().enumerate() {
+        let snext = starts.get(pos + 1).copied().unwrap_or(end);
+        let (label, has_named_or_uses) =
+            workflow_step_label(text, line_starts, sfirst, snext, pos + 1);
+        steps.push(WorkflowStep {
+            first: sfirst,
+            next: snext,
+            label,
+            has_named_or_uses,
+        });
+    }
+    steps
+}
+
+fn workflow_step_label(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> (String, bool) {
+    let mut name: Option<String> = None;
+    let mut uses: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut run_cmd: Option<String> = None;
+    let mut block_indent: Option<usize> = None;
+    let mut capture_run_block = false;
+    let mut prop_indent: Option<usize> = None;
+
+    let clean_val = |raw: &str| -> String {
+        let stripped = raw.split_once(" #").map_or(raw, |(h, _)| h).trim();
+        unquote(stripped).trim().to_owned()
+    };
+
+    for idx in start..end {
+        let line = line_text(text, line_starts, idx);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if let Some(parent) = block_indent {
+            if indent <= parent {
+                block_indent = None;
+                capture_run_block = false;
+            } else {
+                if capture_run_block && run_cmd.is_none() {
+                    run_cmd = Some(trimmed.to_owned());
+                }
+                continue;
+            }
+        }
+
+        let kv = if idx == start {
+            trimmed
+                .strip_prefix("- ")
+                .and_then(|after| yaml_mapping_key(after.trim_start()))
+        } else {
+            let target = *prop_indent.get_or_insert(indent);
+            if indent == target {
+                yaml_mapping_key(trimmed)
+            } else {
+                None
+            }
+        };
+
+        let block_parent = yaml_block_scalar_parent_indent(indent, trimmed);
+        if let Some((k, v)) = kv {
+            let opens_block = block_parent.is_some();
+            match k {
+                "name" if name.is_none() && !opens_block => {
+                    let val = clean_val(v);
+                    if !val.is_empty() {
+                        name = Some(val);
+                    }
+                }
+                "uses" if uses.is_none() && !opens_block => {
+                    let val = clean_val(v);
+                    if !val.is_empty() {
+                        uses = Some(val);
+                    }
+                }
+                "id" if id.is_none() && !opens_block => {
+                    let val = clean_val(v);
+                    if !val.is_empty() {
+                        id = Some(val);
+                    }
+                }
+                "run" if run_cmd.is_none() => {
+                    if opens_block {
+                        capture_run_block = true;
+                    } else {
+                        let val = clean_val(v);
+                        if !val.is_empty() {
+                            run_cmd = Some(val);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(parent) = block_parent {
+            block_indent = Some(parent);
+        }
+    }
+
+    let has_named_or_uses = name.is_some() || uses.is_some();
+    let raw_label = if let Some(n) = name {
+        n
+    } else if let Some(u) = uses {
+        u
+    } else if let Some(i) = id {
+        i
+    } else if let Some(r) = run_cmd {
+        format!("run: {r}")
+    } else {
+        format!("step-{ordinal}")
+    };
+    (clip_label(&compact_ws(&raw_label), 72), has_named_or_uses)
+}
+
+fn openapi_http_method(key: &str) -> Option<&'static str> {
+    match key.to_ascii_lowercase().as_str() {
+        "get" => Some("GET"),
+        "post" => Some("POST"),
+        "put" => Some("PUT"),
+        "patch" => Some("PATCH"),
+        "delete" => Some("DELETE"),
+        "head" => Some("HEAD"),
+        "options" => Some("OPTIONS"),
+        "trace" => Some("TRACE"),
+        "query" => Some("QUERY"),
+        _ => None,
+    }
+}
+
+fn openapi_yaml_sections(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+) -> Option<Vec<Section>> {
+    let top_keys = yaml_keys_at_indent(text, line_starts, start, end, 0);
+    let has_spec_version = top_keys.iter().any(|(line, key)| {
+        matches!(key.as_str(), "openapi" | "swagger")
+            && yaml_mapping_key(line_text(text, line_starts, *line).trim())
+                .is_some_and(|(_, v)| !v.is_empty())
+    });
+    let has_api_body = top_keys.iter().any(|(_, k)| {
+        matches!(
+            k.as_str(),
+            "paths" | "components" | "definitions" | "webhooks"
+        )
+    });
+    if !has_spec_version || !has_api_body {
+        return None;
+    }
+
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    let mut out = Vec::new();
+    for (pos, (first, key)) in top_keys.iter().enumerate() {
+        let next = top_keys.get(pos + 1).map_or(end, |k| k.0);
+        let has_inline_value = yaml_mapping_key(line_text(text, line_starts, *first).trim())
+            .is_some_and(|(_, rest)| !rest.is_empty());
+        out.push(Section {
+            name: key.clone(),
+            kind: "key",
+            bytes: offset(*first)..offset(next),
+            signature_start: offset(*first),
+            header_end: if has_inline_value {
+                offset(*first + 1)
+            } else {
+                offset(*first)
+            },
+        });
+
+        match key.as_str() {
+            "paths" | "webhooks" => {
+                if let Some(child_indent) =
+                    yaml_first_child_indent(text, line_starts, *first + 1, next)
+                {
+                    let items =
+                        yaml_keys_at_indent(text, line_starts, *first + 1, next, child_indent);
+                    let kind = if key == "paths" { "path" } else { "webhook" };
+                    for (ipos, (ifirst, ikey)) in items.iter().enumerate() {
+                        let inext = items.get(ipos + 1).map_or(next, |c| c.0);
+                        let mut methods = Vec::new();
+                        if let Some(method_indent) =
+                            yaml_first_child_indent(text, line_starts, *ifirst + 1, inext)
+                        {
+                            for (_, mkey) in yaml_keys_at_indent(
+                                text,
+                                line_starts,
+                                *ifirst + 1,
+                                inext,
+                                method_indent,
+                            ) {
+                                if let Some(m) = openapi_http_method(&mkey)
+                                    && !methods.contains(&m)
+                                {
+                                    methods.push(m);
+                                }
+                            }
+                        }
+                        let label = if methods.is_empty() {
+                            ikey.clone()
+                        } else {
+                            format!("{ikey} [{}]", methods.join(", "))
+                        };
+                        out.push(Section {
+                            name: clip_label(&label, 96),
+                            kind,
+                            bytes: offset(*ifirst)..offset(inext),
+                            signature_start: offset(*ifirst),
+                            header_end: offset(*ifirst),
+                        });
+                    }
+                }
+            }
+            "components" => {
+                if let Some(group_indent) =
+                    yaml_first_child_indent(text, line_starts, *first + 1, next)
+                {
+                    let groups =
+                        yaml_keys_at_indent(text, line_starts, *first + 1, next, group_indent);
+                    for (gpos, (gfirst, gkey)) in groups.iter().enumerate() {
+                        let gnext = groups.get(gpos + 1).map_or(next, |g| g.0);
+                        out.push(Section {
+                            name: format!("components.{gkey}"),
+                            kind: "section",
+                            bytes: offset(*gfirst)..offset(gnext),
+                            signature_start: offset(*gfirst),
+                            header_end: offset(*gfirst),
+                        });
+                        if let Some(item_indent) =
+                            yaml_first_child_indent(text, line_starts, *gfirst + 1, gnext)
+                        {
+                            let items = yaml_keys_at_indent(
+                                text,
+                                line_starts,
+                                *gfirst + 1,
+                                gnext,
+                                item_indent,
+                            );
+                            for (ipos, (ifirst, ikey)) in items.iter().enumerate() {
+                                let inext = items.get(ipos + 1).map_or(gnext, |c| c.0);
+                                let (kind, name) = if gkey == "schemas" {
+                                    ("schema", ikey.clone())
+                                } else {
+                                    ("component", format!("{gkey}.{ikey}"))
+                                };
+                                out.push(Section {
+                                    name: clip_label(&name, 96),
+                                    kind,
+                                    bytes: offset(*ifirst)..offset(inext),
+                                    signature_start: offset(*ifirst),
+                                    header_end: offset(*ifirst),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "definitions" => {
+                if let Some(item_indent) =
+                    yaml_first_child_indent(text, line_starts, *first + 1, next)
+                {
+                    let items =
+                        yaml_keys_at_indent(text, line_starts, *first + 1, next, item_indent);
+                    for (ipos, (ifirst, ikey)) in items.iter().enumerate() {
+                        let inext = items.get(ipos + 1).map_or(next, |c| c.0);
+                        out.push(Section {
+                            name: clip_label(ikey, 96),
+                            kind: "schema",
+                            bytes: offset(*ifirst)..offset(inext),
+                            signature_start: offset(*ifirst),
+                            header_end: offset(*ifirst),
+                        });
+                    }
+                }
+            }
+            _ => {
+                if next.saturating_sub(*first) >= 10
+                    && let Some(child_indent) =
+                        yaml_first_child_indent(text, line_starts, *first + 1, next)
+                {
+                    let children =
+                        yaml_keys_at_indent(text, line_starts, *first + 1, next, child_indent);
+                    if should_expand_children(children.len(), next, &children) {
+                        for (cpos, (cfirst, ckey)) in children.iter().enumerate() {
+                            let cnext = children.get(cpos + 1).map_or(next, |c| c.0);
+                            let child_has_value =
+                                yaml_mapping_key(line_text(text, line_starts, *cfirst).trim())
+                                    .is_some_and(|(_, rest)| !rest.is_empty());
+                            out.push(Section {
+                                name: format!("{key}.{ckey}"),
+                                kind: "section",
+                                bytes: offset(*cfirst)..offset(cnext),
+                                signature_start: offset(*cfirst),
+                                header_end: if child_has_value {
+                                    offset(*cfirst + 1)
+                                } else {
+                                    offset(*cfirst)
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (out.len() >= 2).then_some(out)
+}
+
 // ---------------------------------------------------------------------------
 // JSON / JSONC
 // ---------------------------------------------------------------------------
@@ -748,6 +1344,10 @@ fn json_object_sections(text: &str, line_starts: &[usize], members: &[JsonMember
     }
     if minified && members.len() < 2 && !expand_single_minified {
         return Vec::new();
+    }
+
+    if let Some(openapi) = openapi_json_sections(text, line_starts, members, minified) {
+        return openapi;
     }
 
     let mut out = Vec::new();
@@ -808,6 +1408,192 @@ fn json_object_sections(text: &str, line_starts: &[usize], members: &[JsonMember
         return Vec::new();
     }
     out
+}
+
+fn parse_json_object_at(text: &str, start: usize, end: usize) -> Option<Vec<JsonMember>> {
+    let slice = text.get(start..end)?;
+    if !slice.starts_with('{') {
+        return None;
+    }
+    let mut scanner = JsonScanner::new(slice);
+    let mut members = scanner.parse_object(0)?;
+    fn shift(members: &mut [JsonMember], delta: usize) {
+        for member in members {
+            member.key_start += delta;
+            member.val_start += delta;
+            member.val_end += delta;
+            shift(&mut member.children, delta);
+        }
+    }
+    shift(&mut members, start);
+    Some(members)
+}
+
+fn json_member_bytes(
+    text: &str,
+    line_starts: &[usize],
+    siblings: &[JsonMember],
+    idx: usize,
+    minified: bool,
+) -> Range<usize> {
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    let member = &siblings[idx];
+    let first_line = line_of(line_starts, member.key_start);
+    let last_line = line_of(line_starts, member.val_end.saturating_sub(1));
+    let prev_ends_here =
+        idx > 0 && line_of(line_starts, siblings[idx - 1].val_end.saturating_sub(1)) == first_line;
+    let next_starts_here = siblings
+        .get(idx + 1)
+        .is_some_and(|next| line_of(line_starts, next.key_start) == last_line);
+    if !minified && !prev_ends_here && !next_starts_here {
+        offset(first_line)..offset(last_line + 1)
+    } else {
+        member.key_start..member.val_end
+    }
+}
+
+fn openapi_json_sections(
+    text: &str,
+    line_starts: &[usize],
+    members: &[JsonMember],
+    minified: bool,
+) -> Option<Vec<Section>> {
+    let has_spec_version = members.iter().any(|m| {
+        matches!(m.name.as_str(), "openapi" | "swagger")
+            && text.as_bytes().get(m.val_start) == Some(&b'"')
+    });
+    let has_api_body = members.iter().any(|m| {
+        matches!(
+            m.name.as_str(),
+            "paths" | "components" | "definitions" | "webhooks"
+        )
+    });
+    if !has_spec_version || !has_api_body {
+        return None;
+    }
+
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    let mut out = Vec::new();
+    for (idx, member) in members.iter().enumerate() {
+        let first_line = line_of(line_starts, member.key_start);
+        let last_line = line_of(line_starts, member.val_end.saturating_sub(1));
+        let bytes = json_member_bytes(text, line_starts, members, idx, minified);
+        let header_end = if first_line == last_line && member.val_end - member.key_start > 80 {
+            member.val_start.min(bytes.end)
+        } else {
+            offset(first_line + 1).min(bytes.end)
+        };
+        out.push(Section {
+            name: member.name.clone(),
+            kind: "key",
+            bytes,
+            signature_start: member.key_start,
+            header_end,
+        });
+
+        match member.name.as_str() {
+            "paths" | "webhooks" => {
+                let kind = if member.name == "paths" {
+                    "path"
+                } else {
+                    "webhook"
+                };
+                for (cidx, child) in member.children.iter().enumerate() {
+                    let mut methods = Vec::new();
+                    if let Some(ops) = parse_json_object_at(text, child.val_start, child.val_end) {
+                        for op in ops {
+                            if let Some(m) = openapi_http_method(&op.name)
+                                && !methods.contains(&m)
+                            {
+                                methods.push(m);
+                            }
+                        }
+                    }
+                    let label = if methods.is_empty() {
+                        child.name.clone()
+                    } else {
+                        format!("{} [{}]", child.name, methods.join(", "))
+                    };
+                    let cbytes =
+                        json_member_bytes(text, line_starts, &member.children, cidx, minified);
+                    out.push(Section {
+                        name: clip_label(&label, 96),
+                        kind,
+                        bytes: cbytes,
+                        signature_start: child.key_start,
+                        header_end: child.key_start,
+                    });
+                }
+            }
+            "components" => {
+                for (gidx, group) in member.children.iter().enumerate() {
+                    let gbytes =
+                        json_member_bytes(text, line_starts, &member.children, gidx, minified);
+                    out.push(Section {
+                        name: format!("components.{}", group.name),
+                        kind: "section",
+                        bytes: gbytes,
+                        signature_start: group.key_start,
+                        header_end: group.key_start,
+                    });
+                    if let Some(items) = parse_json_object_at(text, group.val_start, group.val_end)
+                    {
+                        for (iidx, item) in items.iter().enumerate() {
+                            let ibytes =
+                                json_member_bytes(text, line_starts, &items, iidx, minified);
+                            let (kind, name) = if group.name == "schemas" {
+                                ("schema", item.name.clone())
+                            } else {
+                                ("component", format!("{}.{}", group.name, item.name))
+                            };
+                            out.push(Section {
+                                name: clip_label(&name, 96),
+                                kind,
+                                bytes: ibytes,
+                                signature_start: item.key_start,
+                                header_end: item.key_start,
+                            });
+                        }
+                    }
+                }
+            }
+            "definitions" => {
+                for (cidx, child) in member.children.iter().enumerate() {
+                    let cbytes =
+                        json_member_bytes(text, line_starts, &member.children, cidx, minified);
+                    out.push(Section {
+                        name: clip_label(&child.name, 96),
+                        kind: "schema",
+                        bytes: cbytes,
+                        signature_start: child.key_start,
+                        header_end: child.key_start,
+                    });
+                }
+            }
+            _ if json_should_expand(member, line_starts) => {
+                for (cidx, child) in member.children.iter().enumerate() {
+                    let cfirst = line_of(line_starts, child.key_start);
+                    let clast = line_of(line_starts, child.val_end.saturating_sub(1));
+                    let cbytes =
+                        json_member_bytes(text, line_starts, &member.children, cidx, minified);
+                    let cheader = if cfirst == clast && child.val_end - child.key_start > 80 {
+                        child.val_start.min(cbytes.end)
+                    } else {
+                        offset(cfirst + 1).min(cbytes.end)
+                    };
+                    out.push(Section {
+                        name: format!("{}.{}", member.name, child.name),
+                        kind: "section",
+                        bytes: cbytes,
+                        signature_start: child.key_start,
+                        header_end: cheader,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (out.len() >= 2).then_some(out)
 }
 
 fn json_array_sections(
@@ -2961,6 +3747,1372 @@ fn find_html_raw_close(text: &str, start: usize, tag: &str) -> Option<usize> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Nix (*.nix flakes, modules, derivations, libraries)
+// ---------------------------------------------------------------------------
+
+struct NixScan<'a> {
+    src: &'a str,
+    bytes: &'a [u8],
+    /// Maps the opening byte of every `{`, `[`, `(`, `"`, `''`, `#`, `/*` to
+    /// its exclusive closing byte (for strings/comments) or exact closing token
+    /// byte index (for `{`, `[`, `(`).
+    pair_end: BTreeMap<usize, usize>,
+    trivia_end: BTreeMap<usize, usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NixFrame {
+    Brace(usize),
+    Bracket(usize),
+    Paren(usize),
+    DoubleQuote(usize),
+    IndentedString(usize),
+    InterpBrace,
+}
+
+impl<'a> NixScan<'a> {
+    fn parse(src: &'a str) -> Option<Self> {
+        let bytes = src.as_bytes();
+        let mut pair_end = BTreeMap::new();
+        let mut trivia_end = BTreeMap::new();
+        let mut stack: Vec<NixFrame> = Vec::new();
+        let mut i = if src.starts_with('\u{feff}') {
+            '\u{feff}'.len_utf8()
+        } else {
+            0
+        };
+
+        while i < bytes.len() {
+            match stack.last().copied() {
+                Some(NixFrame::DoubleQuote(str_start)) => match bytes[i] {
+                    b'\\' => {
+                        i += 2;
+                        if i > bytes.len() {
+                            return None;
+                        }
+                    }
+                    b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                        stack.push(NixFrame::InterpBrace);
+                        i += 2;
+                    }
+                    b'"' => {
+                        stack.pop();
+                        i += 1;
+                        if stack.is_empty()
+                            || matches!(
+                                stack.last(),
+                                Some(
+                                    NixFrame::Brace(_)
+                                        | NixFrame::Bracket(_)
+                                        | NixFrame::Paren(_)
+                                        | NixFrame::InterpBrace
+                                )
+                            )
+                        {
+                            pair_end.insert(str_start, i);
+                        }
+                    }
+                    _ => i += 1,
+                },
+                Some(NixFrame::IndentedString(str_start)) => {
+                    if bytes[i..].starts_with(b"'''") || bytes[i..].starts_with(b"''$") {
+                        i += 3;
+                    } else if bytes[i..].starts_with(b"''\\") {
+                        i += 3;
+                        if i < bytes.len() {
+                            i += 1;
+                        } else {
+                            return None;
+                        }
+                    } else if bytes[i..].starts_with(b"${") {
+                        stack.push(NixFrame::InterpBrace);
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"''") {
+                        stack.pop();
+                        i += 2;
+                        pair_end.insert(str_start, i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    if bytes[i] == b'#' {
+                        let start = i;
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'\n' {
+                            i += 1;
+                        }
+                        trivia_end.insert(start, i);
+                        continue;
+                    }
+                    if bytes[i..].starts_with(b"/*") {
+                        let start = i;
+                        let end = src[i + 2..].find("*/")?;
+                        i += 2 + end + 2;
+                        trivia_end.insert(start, i);
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        stack.push(NixFrame::DoubleQuote(i));
+                        i += 1;
+                        continue;
+                    }
+                    if bytes[i..].starts_with(b"''") {
+                        stack.push(NixFrame::IndentedString(i));
+                        i += 2;
+                        continue;
+                    }
+                    match bytes[i] {
+                        b'{' => {
+                            stack.push(NixFrame::Brace(i));
+                            i += 1;
+                        }
+                        b'}' => match stack.pop()? {
+                            NixFrame::Brace(open) => {
+                                pair_end.insert(open, i);
+                                i += 1;
+                            }
+                            NixFrame::InterpBrace => {
+                                i += 1;
+                            }
+                            _ => return None,
+                        },
+                        b'[' => {
+                            stack.push(NixFrame::Bracket(i));
+                            i += 1;
+                        }
+                        b']' => match stack.pop()? {
+                            NixFrame::Bracket(open) => {
+                                pair_end.insert(open, i);
+                                i += 1;
+                            }
+                            _ => return None,
+                        },
+                        b'(' => {
+                            stack.push(NixFrame::Paren(i));
+                            i += 1;
+                        }
+                        b')' => match stack.pop()? {
+                            NixFrame::Paren(open) => {
+                                pair_end.insert(open, i);
+                                i += 1;
+                            }
+                            _ => return None,
+                        },
+                        _ => i += 1,
+                    }
+                }
+            }
+        }
+
+        if !stack.is_empty() {
+            return None;
+        }
+        Some(Self {
+            src,
+            bytes,
+            pair_end,
+            trivia_end,
+        })
+    }
+
+    fn skip_trivia(&self, mut pos: usize, limit: usize) -> usize {
+        while pos < limit {
+            if self.bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            } else if let Some(&end) = self.trivia_end.get(&pos) {
+                pos = end.min(limit);
+            } else {
+                break;
+            }
+        }
+        pos
+    }
+
+    fn keyword_at(&self, pos: usize, limit: usize, kw: &str) -> Option<usize> {
+        let end = pos + kw.len();
+        if end > limit || !self.bytes[pos..end].eq(kw.as_bytes()) {
+            return None;
+        }
+        if pos > 0 && is_nix_ident_cont(self.bytes[pos - 1]) {
+            return None;
+        }
+        if end < limit && is_nix_ident_cont(self.bytes[end]) {
+            return None;
+        }
+        Some(end)
+    }
+
+    fn read_ident(&self, pos: usize, limit: usize) -> Option<(&'a str, usize)> {
+        if pos >= limit || !is_nix_ident_start(self.bytes[pos]) {
+            return None;
+        }
+        let mut end = pos + 1;
+        while end < limit && is_nix_ident_cont(self.bytes[end]) {
+            end += 1;
+        }
+        Some((&self.src[pos..end], end))
+    }
+
+    /// Advance past one balanced token (comment, string, `{...}`, `[...]`, `(...)`,
+    /// identifier, or single byte).
+    fn step_balanced(&self, pos: usize, limit: usize) -> usize {
+        if pos >= limit {
+            return limit;
+        }
+        if let Some(&end) = self.trivia_end.get(&pos) {
+            return end.min(limit);
+        }
+        match self.bytes[pos] {
+            b'{' | b'[' | b'(' => {
+                if let Some(&close) = self.pair_end.get(&pos) {
+                    return (close + 1).min(limit);
+                }
+            }
+            b'"' => {
+                if let Some(&end) = self.pair_end.get(&pos) {
+                    return end.min(limit);
+                }
+            }
+            b'\'' if self.bytes[pos..].starts_with(b"''") => {
+                if let Some(&end) = self.pair_end.get(&pos) {
+                    return end.min(limit);
+                }
+            }
+            _ => {}
+        }
+        if is_nix_ident_start(self.bytes[pos]) {
+            let mut end = pos + 1;
+            while end < limit && is_nix_ident_cont(self.bytes[end]) {
+                end += 1;
+            }
+            return end;
+        }
+        pos + 1
+    }
+
+    /// Peel one Nix lambda parameter header (`x:`, `{ a, b, ... }:`,
+    /// `{ a, ... }@inputs:`, `inputs@{ a, ... }:`) at `pos`.
+    fn peel_lambda_header(&self, pos: usize, limit: usize) -> Option<usize> {
+        let p = self.skip_trivia(pos, limit);
+        if p >= limit {
+            return None;
+        }
+        if self.bytes[p] == b'{' {
+            let close = *self.pair_end.get(&p)?;
+            if close >= limit {
+                return None;
+            }
+            let mut after = self.skip_trivia(close + 1, limit);
+            if after < limit && self.bytes[after] == b'@' {
+                after = self.skip_trivia(after + 1, limit);
+                let (_, next) = self.read_ident(after, limit)?;
+                after = self.skip_trivia(next, limit);
+            }
+            if after < limit && self.bytes[after] == b':' {
+                return Some(self.skip_trivia(after + 1, limit));
+            }
+            return None;
+        }
+        if let Some((ident, next)) = self.read_ident(p, limit) {
+            if matches!(
+                ident,
+                "let" | "in" | "rec" | "with" | "if" | "then" | "else" | "assert" | "inherit"
+            ) {
+                return None;
+            }
+            let after = self.skip_trivia(next, limit);
+            if after < limit && self.bytes[after] == b':' {
+                // Reject URIs like `https://...` or `github:...` where `:` is
+                // immediately followed by a non-whitespace path character.
+                let next_byte = self.bytes.get(after + 1).copied();
+                if matches!(
+                    next_byte,
+                    None | Some(b' ' | b'\t' | b'\r' | b'\n' | b'#' | b'/' | b'{' | b'(' | b'[')
+                ) && !self.bytes[after..].starts_with(b"://")
+                {
+                    return Some(self.skip_trivia(after + 1, limit));
+                }
+            }
+            if after < limit && self.bytes[after] == b'@' {
+                let brace = self.skip_trivia(after + 1, limit);
+                if brace < limit && self.bytes[brace] == b'{' {
+                    let close = *self.pair_end.get(&brace)?;
+                    if close >= limit {
+                        return None;
+                    }
+                    let colon = self.skip_trivia(close + 1, limit);
+                    if colon < limit && self.bytes[colon] == b':' {
+                        return Some(self.skip_trivia(colon + 1, limit));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn is_lambda(&self, start: usize, end: usize) -> bool {
+        self.peel_lambda_header(start, end).is_some()
+    }
+}
+
+fn is_nix_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_nix_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'\'' | b'-')
+}
+
+struct NixBinding {
+    name: String,
+    start: usize,
+    val_start: usize,
+    val_end: usize,
+    end: usize,
+}
+
+fn parse_nix_attrpath(scan: &NixScan<'_>, mut pos: usize, limit: usize) -> Option<(String, usize)> {
+    let mut parts = Vec::new();
+    loop {
+        pos = scan.skip_trivia(pos, limit);
+        if pos >= limit {
+            return None;
+        }
+        if scan.bytes[pos] == b'"' {
+            let end = *scan.pair_end.get(&pos)?;
+            if end > limit {
+                return None;
+            }
+            parts.push(scan.src[pos + 1..end - 1].to_owned());
+            pos = end;
+        } else if scan.bytes[pos..].starts_with(b"${") {
+            let close = *scan.pair_end.get(&(pos + 1))?;
+            if close >= limit {
+                return None;
+            }
+            parts.push(compact_ws(&scan.src[pos..=close]));
+            pos = close + 1;
+        } else if let Some((ident, next)) = scan.read_ident(pos, limit) {
+            if parts.is_empty() && matches!(ident, "inherit" | "in" | "let") {
+                return None;
+            }
+            parts.push(ident.to_owned());
+            pos = next;
+        } else {
+            return None;
+        }
+        let after = scan.skip_trivia(pos, limit);
+        if after < limit && scan.bytes[after] == b'.' {
+            pos = after + 1;
+        } else {
+            return Some((parts.join("."), pos));
+        }
+    }
+}
+
+fn find_nix_binding_semi(scan: &NixScan<'_>, mut pos: usize, limit: usize) -> Option<usize> {
+    let mut let_depth = 0usize;
+    while pos < limit {
+        pos = scan.skip_trivia(pos, limit);
+        if pos >= limit {
+            break;
+        }
+        if let Some(after) = scan.keyword_at(pos, limit, "let") {
+            let_depth += 1;
+            pos = after;
+            continue;
+        }
+        if let Some(after) = scan.keyword_at(pos, limit, "in") {
+            if let_depth == 0 {
+                return None;
+            }
+            let_depth -= 1;
+            pos = after;
+            continue;
+        }
+        if scan.bytes[pos] == b';' && let_depth == 0 {
+            return Some(pos);
+        }
+        pos = scan.step_balanced(pos, limit);
+    }
+    None
+}
+
+fn parse_nix_bindings_until(
+    scan: &NixScan<'_>,
+    mut pos: usize,
+    limit: usize,
+    stop_on_in: bool,
+) -> Option<(Vec<NixBinding>, usize)> {
+    let mut bindings = Vec::new();
+    loop {
+        pos = scan.skip_trivia(pos, limit);
+        if pos >= limit {
+            return if stop_on_in {
+                None
+            } else {
+                Some((bindings, pos))
+            };
+        }
+        if stop_on_in && let Some(after_in) = scan.keyword_at(pos, limit, "in") {
+            return Some((bindings, after_in));
+        }
+        if scan.bytes[pos] == b';' {
+            pos += 1;
+            continue;
+        }
+        if let Some(after_inherit) = scan.keyword_at(pos, limit, "inherit") {
+            let semi = find_nix_binding_semi(scan, after_inherit, limit)?;
+            pos = semi + 1;
+            continue;
+        }
+        let binding_start = pos;
+        let Some((name, after_path)) = parse_nix_attrpath(scan, pos, limit) else {
+            // Skip unrecognized statement up to next `;` or bail cleanly on `let`.
+            let semi = find_nix_binding_semi(scan, pos, limit)?;
+            pos = semi + 1;
+            continue;
+        };
+        let eq = scan.skip_trivia(after_path, limit);
+        if eq >= limit || scan.bytes[eq] != b'=' || scan.bytes.get(eq + 1) == Some(&b'=') {
+            return None;
+        }
+        let val_start = scan.skip_trivia(eq + 1, limit);
+        let semi = find_nix_binding_semi(scan, val_start, limit)?;
+        let val_end = scan.src[val_start..semi].trim_end().len() + val_start;
+        bindings.push(NixBinding {
+            name,
+            start: binding_start,
+            val_start,
+            val_end,
+            end: semi + 1,
+        });
+        pos = semi + 1;
+    }
+}
+
+fn is_nix_major_section(name: &str) -> bool {
+    let root = name.split('.').next().unwrap_or(name);
+    matches!(
+        root,
+        "description"
+            | "inputs"
+            | "outputs"
+            | "nixConfig"
+            | "options"
+            | "config"
+            | "imports"
+            | "packages"
+            | "devShells"
+            | "nixosConfigurations"
+            | "darwinConfigurations"
+            | "homeConfigurations"
+            | "nixosModules"
+            | "homeModules"
+            | "overlays"
+            | "checks"
+            | "apps"
+            | "formatter"
+            | "lib"
+            | "perSystem"
+    )
+}
+
+fn is_nix_expandable_parent(name: &str) -> bool {
+    if matches!(
+        name,
+        "packages"
+            | "devShells"
+            | "nixosConfigurations"
+            | "darwinConfigurations"
+            | "homeConfigurations"
+            | "nixosModules"
+            | "homeModules"
+            | "overlays"
+            | "checks"
+            | "apps"
+            | "lib"
+            | "options"
+            | "config"
+            | "perSystem"
+            | "services"
+            | "programs"
+    ) {
+        return true;
+    }
+    if let Some((head, tail)) = name.split_once('.') {
+        return matches!(head, "packages" | "devShells" | "checks" | "apps")
+            && !tail.contains('.')
+            && tail.contains('-');
+    }
+    false
+}
+
+fn nix_split_merge_operands(scan: &NixScan<'_>, start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    let mut seg_start = start;
+    let mut pos = start;
+    let mut let_depth = 0usize;
+    while pos < end {
+        pos = scan.skip_trivia(pos, end);
+        if pos >= end {
+            break;
+        }
+        if let Some(after) = scan.keyword_at(pos, end, "let") {
+            let_depth += 1;
+            pos = after;
+            continue;
+        }
+        if let Some(after) = scan.keyword_at(pos, end, "in") {
+            let_depth = let_depth.saturating_sub(1);
+            pos = after;
+            continue;
+        }
+        if let_depth == 0 && pos + 1 < end && &scan.bytes[pos..pos + 2] == b"//" {
+            parts.push((seg_start, pos));
+            pos += 2;
+            seg_start = pos;
+            continue;
+        }
+        pos = scan.step_balanced(pos, end);
+    }
+    if !parts.is_empty() {
+        parts.push((seg_start, end));
+    }
+    parts
+}
+
+fn nix_find_body_expr(scan: &NixScan<'_>, start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut pos = scan.skip_trivia(start, end);
+    let mut last_brace: Option<(usize, usize)> = None;
+    let mut last_paren: Option<(usize, usize)> = None;
+    while pos < end {
+        pos = scan.skip_trivia(pos, end);
+        if pos >= end {
+            break;
+        }
+        if scan.bytes[pos] == b'{'
+            && let Some(&close) = scan.pair_end.get(&pos)
+            && close < end
+        {
+            last_brace = Some((pos, close + 1));
+            pos = close + 1;
+            continue;
+        }
+        if scan.bytes[pos] == b'('
+            && let Some(&close) = scan.pair_end.get(&pos)
+            && close < end
+        {
+            let inner = scan.skip_trivia(pos + 1, close);
+            if scan.is_lambda(inner, close)
+                || scan.keyword_at(inner, close, "let").is_some()
+                || scan.bytes.get(inner) == Some(&b'{')
+            {
+                last_paren = Some((pos + 1, close));
+            }
+            pos = close + 1;
+            continue;
+        }
+        pos = scan.step_balanced(pos, end);
+    }
+    last_paren.or(last_brace)
+}
+
+fn emit_nix_binding(
+    text: &str,
+    line_starts: &[usize],
+    b: &NixBinding,
+    name: String,
+    kind: &'static str,
+    out: &mut Vec<Section>,
+) {
+    let bytes = whole_line_or_exact(text, line_starts, b.start, b.end);
+    let first_line = line_of(line_starts, b.start);
+    let line_end = line_offset(line_starts, text.len(), first_line + 1).min(bytes.end);
+    let first_text = text[b.start..line_end].trim();
+    let redundant_open = first_text == format!("{} = {{", b.name)
+        || first_text == format!("{} = rec {{", b.name)
+        || first_text == format!("{} =", b.name);
+    let header_end = if redundant_open { b.start } else { line_end };
+    out.push(Section {
+        name: clip_label(&name, 96),
+        kind,
+        bytes,
+        signature_start: b.start,
+        header_end,
+    });
+}
+
+fn extract_nix_expr(
+    scan: &NixScan<'_>,
+    line_starts: &[usize],
+    span: Range<usize>,
+    prefix: Option<&str>,
+    depth: usize,
+    emit_lets: bool,
+    out: &mut Vec<Section>,
+) -> Option<()> {
+    if depth > 4 {
+        return Some(());
+    }
+    let (mut start, mut end) = (span.start, span.end);
+    loop {
+        start = scan.skip_trivia(start, end);
+        if start >= end {
+            return Some(());
+        }
+        if let Some(after) = scan.peel_lambda_header(start, end) {
+            start = after;
+            continue;
+        }
+        if let Some(after_let) = scan.keyword_at(start, end, "let") {
+            let (lets, after_in) = parse_nix_bindings_until(scan, after_let, end, true)?;
+            if emit_lets {
+                for b in &lets {
+                    emit_nix_binding(scan.src, line_starts, b, b.name.clone(), "let", out);
+                }
+            }
+            start = after_in;
+            continue;
+        }
+        if let Some(after_with) = scan.keyword_at(start, end, "with") {
+            let semi = find_nix_binding_semi(scan, after_with, end)?;
+            start = semi + 1;
+            continue;
+        }
+        if scan.bytes[start] == b'('
+            && let Some(&close) = scan.pair_end.get(&start)
+            && close < end
+            && scan.skip_trivia(close + 1, end) >= end
+        {
+            start += 1;
+            end = close;
+            continue;
+        }
+        break;
+    }
+
+    let merge_parts = nix_split_merge_operands(scan, start, end);
+    if !merge_parts.is_empty() {
+        for (pstart, pend) in merge_parts {
+            extract_nix_expr(
+                scan,
+                line_starts,
+                pstart..pend,
+                prefix,
+                depth,
+                emit_lets,
+                out,
+            )?;
+        }
+        return Some(());
+    }
+
+    let brace_pos = if let Some(after_rec) = scan.keyword_at(start, end, "rec") {
+        let p = scan.skip_trivia(after_rec, end);
+        (p < end && scan.bytes[p] == b'{').then_some(p)
+    } else if start < end && scan.bytes[start] == b'{' {
+        Some(start)
+    } else {
+        None
+    };
+
+    let Some(open_brace) = brace_pos else {
+        if let Some((inner_start, inner_end)) = nix_find_body_expr(scan, start, end) {
+            extract_nix_expr(
+                scan,
+                line_starts,
+                inner_start..inner_end,
+                prefix,
+                depth,
+                emit_lets,
+                out,
+            )?;
+        }
+        return Some(());
+    };
+
+    let close_brace = *scan.pair_end.get(&open_brace)?;
+    if close_brace >= end {
+        return None;
+    }
+    let (bindings, _) = parse_nix_bindings_until(scan, open_brace + 1, close_brace, false)?;
+    for b in &bindings {
+        let full_name = match prefix {
+            Some(p) => format!("{p}.{}", b.name),
+            None => b.name.clone(),
+        };
+        let is_fn = scan.is_lambda(b.val_start, b.val_end);
+        let kind = if b.name == "outputs" && prefix.is_none() {
+            "section"
+        } else if is_fn {
+            "function"
+        } else if prefix.is_none() && is_nix_major_section(&b.name) && !b.name.contains('.') {
+            "section"
+        } else {
+            "attr"
+        };
+        emit_nix_binding(scan.src, line_starts, b, full_name.clone(), kind, out);
+
+        if b.name == "outputs" && prefix.is_none() {
+            extract_nix_expr(
+                scan,
+                line_starts,
+                b.val_start..b.val_end,
+                None,
+                depth + 1,
+                true,
+                out,
+            )?;
+        } else if depth < 2 && !is_fn {
+            let span_lines = line_of(line_starts, b.end.saturating_sub(1))
+                .saturating_sub(line_of(line_starts, b.start))
+                + 1;
+            let expandable = is_nix_expandable_parent(&full_name) || span_lines >= 8;
+            if expandable {
+                let mut child_out = Vec::new();
+                if extract_nix_expr(
+                    scan,
+                    line_starts,
+                    b.val_start..b.val_end,
+                    Some(&full_name),
+                    depth + 1,
+                    false,
+                    &mut child_out,
+                )
+                .is_some()
+                {
+                    let keep = if is_nix_expandable_parent(&full_name) {
+                        !child_out.is_empty() && child_out.len() <= 64
+                    } else {
+                        (2..=64).contains(&child_out.len())
+                    };
+                    if keep {
+                        out.extend(child_out);
+                    }
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+fn nix_sections(text: &str, line_starts: &[usize]) -> Vec<Section> {
+    if line_starts.len() < 2 {
+        return Vec::new();
+    }
+    let Some(scan) = NixScan::parse(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if extract_nix_expr(&scan, line_starts, 0..text.len(), None, 0, true, &mut out).is_none() {
+        return Vec::new();
+    }
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Nginx (nginx.conf, *.nginx, *.conf fallback)
+// ---------------------------------------------------------------------------
+
+struct BraceBlock {
+    start: usize,
+    open_brace: usize,
+    end: usize,
+    children: Vec<BraceBlock>,
+}
+
+fn parse_nginx_blocks(text: &str) -> Option<Vec<BraceBlock>> {
+    let bytes = text.as_bytes();
+    let mut i = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let mut stack: Vec<(usize, usize, Vec<BraceBlock>)> = Vec::new();
+    let mut roots: Vec<BraceBlock> = Vec::new();
+    let mut stmt_start: Option<usize> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(b, b'"' | b'\'') {
+            stmt_start.get_or_insert(i);
+            i = skip_quoted(bytes, i, b)?;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        match b {
+            b';' => {
+                stmt_start = None;
+                i += 1;
+            }
+            b'{' => {
+                let start = stmt_start.take()?;
+                stack.push((start, i, Vec::new()));
+                i += 1;
+            }
+            b'}' => {
+                let (start, open_brace, children) = stack.pop()?;
+                let block = BraceBlock {
+                    start,
+                    open_brace,
+                    end: i + 1,
+                    children,
+                };
+                if let Some(parent) = stack.last_mut() {
+                    parent.2.push(block);
+                } else {
+                    roots.push(block);
+                }
+                stmt_start = None;
+                i += 1;
+            }
+            _ => {
+                stmt_start.get_or_insert(i);
+                i += 1;
+            }
+        }
+    }
+    if !stack.is_empty() {
+        return None;
+    }
+    Some(roots)
+}
+
+fn nginx_clean_prelude(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        let stripped = strip_hash_comment(line);
+        out.push_str(stripped);
+        out.push(' ');
+    }
+    compact_ws(&out)
+}
+
+/// Scan direct (non-nested) simple directives inside an Nginx block body.
+fn nginx_direct_directives(text: &str, block: &BraceBlock) -> Vec<(usize, String, String)> {
+    let bytes = text.as_bytes();
+    let body_start = block.open_brace + 1;
+    let body_end = block.end.saturating_sub(1);
+    let mut directives = Vec::new();
+    let mut i = body_start;
+    let mut depth = 0usize;
+    let mut stmt_start: Option<usize> = None;
+
+    while i < body_end {
+        let b = bytes[i];
+        if b == b'#' {
+            while i < body_end && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(b, b'"' | b'\'') {
+            if depth == 0 {
+                stmt_start.get_or_insert(i);
+            }
+            let Some(next) = skip_quoted(bytes, i, b) else {
+                break;
+            };
+            i = next.min(body_end);
+            continue;
+        }
+        match b {
+            b'{' => {
+                if depth == 0 {
+                    stmt_start = None;
+                }
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b';' if depth == 0 => {
+                if let Some(start) = stmt_start.take() {
+                    let clean = nginx_clean_prelude(&text[start..i]);
+                    let mut parts = clean.splitn(2, char::is_whitespace);
+                    if let Some(kw) = parts.next()
+                        && !kw.is_empty()
+                    {
+                        let args = parts.next().unwrap_or_default().trim().to_owned();
+                        directives.push((start, kw.to_ascii_lowercase(), args));
+                    }
+                }
+                i += 1;
+            }
+            _ => {
+                if depth == 0 && !b.is_ascii_whitespace() {
+                    stmt_start.get_or_insert(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    directives
+}
+
+fn emit_nginx_blocks(
+    text: &str,
+    line_starts: &[usize],
+    blocks: &[BraceBlock],
+    server_count: &mut usize,
+    out: &mut Vec<Section>,
+) {
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    for block in blocks {
+        let prelude = nginx_clean_prelude(&text[block.start..block.open_brace]);
+        let mut parts = prelude.splitn(2, char::is_whitespace);
+        let kw = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let args = parts.next().unwrap_or_default().trim();
+
+        let bytes = whole_line_or_exact(text, line_starts, block.start, block.end);
+        let mut sig_start = block.start;
+        let mut header_end = block.start;
+
+        let emitted = match kw.as_str() {
+            "http" | "events" | "stream" | "mail" | "types" => Some(("block", kw.clone())),
+            "upstream" if !args.is_empty() => Some(("upstream", clip_label(args, 80))),
+            "server" => {
+                *server_count += 1;
+                let directives = nginx_direct_directives(text, block);
+                let server_name = directives
+                    .iter()
+                    .find(|(_, d, a)| d == "server_name" && !a.is_empty())
+                    .map(|(_, _, a)| a.clone());
+                let listen = directives
+                    .iter()
+                    .find(|(_, d, a)| d == "listen" && !a.is_empty());
+                let name = match (server_name, listen) {
+                    (Some(sn), Some((lpos, _, _))) => {
+                        let lline = line_of(line_starts, *lpos);
+                        let ls = offset(lline);
+                        let le = offset(lline + 1).min(bytes.end);
+                        if ls >= bytes.start && le >= ls {
+                            sig_start = ls;
+                            header_end = le;
+                        }
+                        clip_label(&sn, 72)
+                    }
+                    (Some(sn), None) => clip_label(&sn, 72),
+                    (None, Some((_, _, largs))) => clip_label(largs, 72),
+                    (None, None) => format!("server-{server_count}"),
+                };
+                Some(("server", name))
+            }
+            "location" if !args.is_empty() => {
+                let directives = nginx_direct_directives(text, block);
+                let target = directives
+                    .iter()
+                    .find(|(_, d, _)| {
+                        matches!(
+                            d.as_str(),
+                            "proxy_pass" | "grpc_pass" | "fastcgi_pass" | "uwsgi_pass"
+                        )
+                    })
+                    .or_else(|| directives.iter().find(|(_, d, _)| d == "return"));
+                if let Some((pos, _, _)) = target {
+                    let line = line_of(line_starts, *pos);
+                    let ls = offset(line);
+                    let le = offset(line + 1).min(bytes.end);
+                    if ls >= bytes.start && le >= ls {
+                        sig_start = ls;
+                        header_end = le;
+                    }
+                }
+                Some(("location", clip_label(args, 80)))
+            }
+            "map" | "geo" | "split_clients" | "limit_except" if !args.is_empty() => {
+                Some(("block", clip_label(&prelude, 80)))
+            }
+            _ => None,
+        };
+
+        if let Some((kind, name)) = emitted {
+            out.push(Section {
+                name,
+                kind,
+                bytes,
+                signature_start: sig_start,
+                header_end,
+            });
+        }
+        if !block.children.is_empty() {
+            emit_nginx_blocks(text, line_starts, &block.children, server_count, out);
+        }
+    }
+}
+
+fn nginx_sections(text: &str, line_starts: &[usize]) -> Vec<Section> {
+    if line_starts.len() < 2 {
+        return Vec::new();
+    }
+    let Some(blocks) = parse_nginx_blocks(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut server_count = 0usize;
+    emit_nginx_blocks(text, line_starts, &blocks, &mut server_count, &mut out);
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Caddy (Caddyfile, Caddyfile.*, *.caddyfile, *.caddy)
+// ---------------------------------------------------------------------------
+
+fn skip_caddy_heredoc(text: &str, start: usize) -> Option<usize> {
+    // `<<MARKER\n...\n<indent>MARKER`
+    let after = start + 2;
+    let line_end = text[after..].find('\n').map_or(text.len(), |n| after + n);
+    let marker = text[after..line_end].trim();
+    if marker.is_empty()
+        || !marker
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    let mut pos = (line_end + 1).min(text.len());
+    while pos < text.len() {
+        let next_nl = text[pos..].find('\n').map_or(text.len(), |n| pos + n);
+        let line = text[pos..next_nl].trim_end_matches('\r');
+        if line
+            .trim()
+            .strip_prefix(marker)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return Some((next_nl + 1).min(text.len()));
+        }
+        pos = (next_nl + 1).min(text.len());
+    }
+    None
+}
+
+fn is_caddy_block_brace(bytes: &[u8], idx: usize) -> bool {
+    let prev_ok = idx == 0 || bytes[idx - 1].is_ascii_whitespace();
+    let next_ok = bytes
+        .get(idx + 1)
+        .is_none_or(|&b| b.is_ascii_whitespace() || b == b'#');
+    prev_ok && next_ok
+}
+
+fn parse_caddy_blocks(text: &str) -> Option<Vec<BraceBlock>> {
+    let bytes = text.as_bytes();
+    let mut i = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let mut stack: Vec<(usize, usize, Vec<BraceBlock>)> = Vec::new();
+    let mut roots: Vec<BraceBlock> = Vec::new();
+    let mut stmt_start: Option<usize> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            stmt_start.get_or_insert(i);
+            i = skip_quoted(bytes, i, b'"')?;
+            continue;
+        }
+        if b == b'`' {
+            stmt_start.get_or_insert(i);
+            let close = text[i + 1..].find('`')?;
+            i += 1 + close + 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<<") {
+            stmt_start.get_or_insert(i);
+            i = skip_caddy_heredoc(text, i)?;
+            stmt_start = None;
+            continue;
+        }
+        if b == b'\n' {
+            // In Caddyfile, top-level site lists may continue across lines with a
+            // trailing comma; otherwise a newline without `{` finishes a single-line
+            // directive inside a block.
+            if !stack.is_empty() {
+                stmt_start = None;
+            } else if let Some(start) = stmt_start {
+                let prev = text[start..i].trim_end();
+                if !prev.ends_with(',') && !prev.ends_with('\\') {
+                    // Single-line directive at top level (not a block header) resets
+                    // unless the next non-empty line is `{` (not typical in Caddy).
+                    stmt_start = None;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Inline Caddy placeholder like `{http.request.uri}` or `{$PORT}`:
+        if b == b'{' && !is_caddy_block_brace(bytes, i) {
+            stmt_start.get_or_insert(i);
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'}' && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'}') {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'{' && is_caddy_block_brace(bytes, i) {
+            let start = stmt_start.take().unwrap_or(i);
+            stack.push((start, i, Vec::new()));
+            i += 1;
+            continue;
+        }
+        if b == b'}' && is_caddy_block_brace(bytes, i) {
+            let (start, open_brace, children) = stack.pop()?;
+            let block = BraceBlock {
+                start,
+                open_brace,
+                end: i + 1,
+                children,
+            };
+            if let Some(parent) = stack.last_mut() {
+                parent.2.push(block);
+            } else {
+                roots.push(block);
+            }
+            stmt_start = None;
+            i += 1;
+            continue;
+        }
+        stmt_start.get_or_insert(i);
+        i += 1;
+    }
+
+    if !stack.is_empty() {
+        return None;
+    }
+    Some(roots)
+}
+
+fn caddy_sections(text: &str, line_starts: &[usize]) -> Vec<Section> {
+    if line_starts.len() < 2 {
+        return Vec::new();
+    }
+    let Some(blocks) = parse_caddy_blocks(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in &blocks {
+        let prelude = nginx_clean_prelude(&text[block.start..block.open_brace]);
+        let bytes = whole_line_or_exact(text, line_starts, block.start, block.end);
+        let (kind, name, expand_children) = if prelude.is_empty() {
+            ("section", "global".to_owned(), false)
+        } else if let Some(inner) = prelude.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+            && !inner.trim().is_empty()
+        {
+            ("snippet", clip_label(inner.trim(), 72), false)
+        } else if let Some(inner) = prelude.strip_prefix("&(").and_then(|s| s.strip_suffix(')'))
+            && !inner.trim().is_empty()
+        {
+            ("route", clip_label(inner.trim(), 72), false)
+        } else {
+            ("site", clip_label(&prelude, 80), true)
+        };
+        out.push(Section {
+            name,
+            kind,
+            bytes,
+            signature_start: block.start,
+            header_end: block.start,
+        });
+
+        let span_lines = line_of(line_starts, block.end.saturating_sub(1))
+            .saturating_sub(line_of(line_starts, block.start))
+            + 1;
+        if expand_children && span_lines >= 6 {
+            for child in &block.children {
+                let cprelude = nginx_clean_prelude(&text[child.start..child.open_brace]);
+                let mut parts = cprelude.splitn(2, char::is_whitespace);
+                let head = parts.next().unwrap_or_default();
+                let args = parts.next().unwrap_or_default().trim();
+                let classified = if head.starts_with('@') && head.len() > 1 {
+                    Some(("matcher", head.to_owned()))
+                } else {
+                    match head {
+                        "handle" | "handle_path" => Some((
+                            "handle",
+                            if args.is_empty() {
+                                "(default)".to_owned()
+                            } else {
+                                clip_label(args, 72)
+                            },
+                        )),
+                        "handle_errors" => Some((
+                            "handle",
+                            if args.is_empty() {
+                                "errors".to_owned()
+                            } else {
+                                clip_label(&format!("errors {args}"), 72)
+                            },
+                        )),
+                        "route" => Some((
+                            "route",
+                            if args.is_empty() {
+                                "(default)".to_owned()
+                            } else {
+                                clip_label(args, 72)
+                            },
+                        )),
+                        "reverse_proxy" if !args.is_empty() => {
+                            Some(("proxy", clip_label(args, 72)))
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((ckind, cname)) = classified {
+                    let cbytes = whole_line_or_exact(text, line_starts, child.start, child.end);
+                    out.push(Section {
+                        name: cname,
+                        kind: ckind,
+                        bytes: cbytes,
+                        signature_start: child.start,
+                        header_end: child.start,
+                    });
+                }
+            }
+        }
+    }
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// HAProxy (haproxy.cfg, *.haproxy, *.cfg fallback)
+// ---------------------------------------------------------------------------
+
+fn parse_haproxy_header(trimmed: &str) -> Option<(&'static str, String, bool)> {
+    let clean = strip_hash_comment(trimmed).trim();
+    let mut parts = clean.splitn(2, char::is_whitespace);
+    let kw = parts.next()?;
+    let rest = parts.next().unwrap_or_default().trim();
+    match kw {
+        "global" if rest.is_empty() => Some(("section", "global".to_owned(), true)),
+        "defaults" => {
+            if rest.is_empty() {
+                Some(("section", "defaults".to_owned(), true))
+            } else {
+                Some(("defaults", clip_label(rest, 72), true))
+            }
+        }
+        "frontend" if !rest.is_empty() => Some(("frontend", clip_label(rest, 72), true)),
+        "backend" if !rest.is_empty() => Some(("backend", clip_label(rest, 72), true)),
+        "listen" if !rest.is_empty() => Some(("listen", clip_label(rest, 72), true)),
+        "resolvers" | "peers" | "mailers" | "userlist" | "cache" | "ring" | "fcgi-app"
+        | "program" | "http-errors" | "crt-store"
+            if !rest.is_empty() =>
+        {
+            Some(("section", clip_label(&format!("{kw} {rest}"), 72), false))
+        }
+        "traces" if rest.is_empty() => Some(("section", "traces".to_owned(), false)),
+        _ => None,
+    }
+}
+
+fn haproxy_sections(text: &str, line_starts: &[usize], explicit: bool) -> Vec<Section> {
+    if line_starts.len() < 2 {
+        return Vec::new();
+    }
+    let mut headers: Vec<(usize, &'static str, String, bool)> = Vec::new();
+    let mut saw_first_content = false;
+
+    for idx in 0..line_starts.len() {
+        let line = line_text(text, line_starts, idx);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let is_first = !saw_first_content;
+        saw_first_content = true;
+
+        if !explicit && trimmed.starts_with('[') {
+            return Vec::new();
+        }
+        if !line.starts_with([' ', '\t']) {
+            if let Some((kind, name, is_core)) = parse_haproxy_header(trimmed) {
+                headers.push((idx, kind, name, is_core));
+            } else if !explicit && is_first {
+                return Vec::new();
+            }
+        } else if !explicit && is_first {
+            return Vec::new();
+        }
+    }
+
+    if headers.len() < 2 || !headers.iter().any(|h| h.3) {
+        return Vec::new();
+    }
+
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    let mut out = Vec::with_capacity(headers.len());
+    for (pos, (first, kind, name, _)) in headers.iter().enumerate() {
+        let end_line = headers.get(pos + 1).map_or(line_starts.len(), |h| h.0);
+        let sig_line = match *kind {
+            "frontend" | "listen" => (*first + 1..end_line).find(|&i| {
+                let t = line_text(text, line_starts, i).trim();
+                t.starts_with("bind ") || t.starts_with("bind\t")
+            }),
+            "backend" => (*first + 1..end_line)
+                .find(|&i| {
+                    let t = line_text(text, line_starts, i).trim();
+                    t.starts_with("balance ") || t.starts_with("balance\t")
+                })
+                .or_else(|| {
+                    (*first + 1..end_line).find(|&i| {
+                        let t = line_text(text, line_starts, i).trim();
+                        t.starts_with("mode ") || t.starts_with("mode\t")
+                    })
+                }),
+            _ => None,
+        };
+        let (sig_start, header_end) = match sig_line {
+            Some(l) => (offset(l), offset(l + 1)),
+            None => (offset(*first), offset(*first)),
+        };
+        out.push(Section {
+            name: name.clone(),
+            kind,
+            bytes: offset(*first)..offset(end_line),
+            signature_start: sig_start,
+            header_end,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3689,5 +5841,506 @@ mod tests {
         let page = snap.page("", None, 40, 4096).unwrap().display();
         assert!(page.contains("h1 Overview\n"), "{page}");
         assert!(page.contains("h2 Install\n"), "{page}");
+    }
+
+    fn assert_section_invariants(text: &str, secs: &[Section]) {
+        for s in secs {
+            assert!(!s.name.is_empty(), "empty section name: {s:?}");
+            assert!(
+                s.bytes.start <= s.bytes.end && s.bytes.end <= text.len(),
+                "invalid bytes span: {s:?}"
+            );
+            assert!(
+                s.bytes.start <= s.header_end && s.header_end <= text.len(),
+                "header_end out of range for --match: {s:?}"
+            );
+            assert!(
+                s.signature_start <= s.header_end,
+                "signature_start > header_end: {s:?}"
+            );
+            assert!(text.is_char_boundary(s.bytes.start));
+            assert!(text.is_char_boundary(s.bytes.end));
+            assert!(text.is_char_boundary(s.signature_start));
+            assert!(text.is_char_boundary(s.header_end));
+        }
+    }
+
+    #[test]
+    fn nix_flake_and_module_outlines_preserve_exact_balanced_spans() {
+        let flake = concat!(
+            "{\n",
+            "  description = \"Order service flake\";\n\n",
+            "  inputs = {\n",
+            "    nixpkgs.url = \"github:NixOS/nixpkgs/nixos-unstable\";\n",
+            "    flake-utils.url = \"github:numtide/flake-utils\";\n",
+            "  };\n\n",
+            "  outputs = { self, nixpkgs, flake-utils, ... }@inputs:\n",
+            "    let\n",
+            "      supportedSystems = [ \"x86_64-linux\" \"aarch64-darwin\" ];\n",
+            "      forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems (system: f system);\n",
+            "      scriptText = ''\n",
+            "        echo \"not a { brace } binding = 1;\"\n",
+            "        echo '''escaped quotes'''\n",
+            "      '';\n",
+            "    in\n",
+            "    {\n",
+            "      packages = forAllSystems (system: {\n",
+            "        default = nixpkgs.legacyPackages.${system}.hello;\n",
+            "        cli = nixpkgs.legacyPackages.${system}.ripgrep;\n",
+            "      });\n\n",
+            "      devShells = forAllSystems (system: {\n",
+            "        default = nixpkgs.legacyPackages.${system}.mkShell {\n",
+            "          packages = [ nixpkgs.legacyPackages.${system}.rustc ];\n",
+            "        };\n",
+            "      });\n\n",
+            "      nixosConfigurations.prod = nixpkgs.lib.nixosSystem {\n",
+            "        system = \"x86_64-linux\";\n",
+            "        modules = [ ./configuration.nix ];\n",
+            "      };\n\n",
+            "      lib.mkService = { name, port }: {\n",
+            "        systemd.services.${name} = {\n",
+            "          description = \"Service ${name} on ${toString port}\";\n",
+            "        };\n",
+            "      };\n",
+            "    };\n",
+            "}\n",
+        );
+
+        let found = sections("flake.nix", flake, &line_starts(flake));
+        assert_section_invariants(flake, &found);
+        let names: Vec<_> = found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+        assert_eq!(
+            names,
+            [
+                ("section", "description"),
+                ("section", "inputs"),
+                ("section", "outputs"),
+                ("let", "supportedSystems"),
+                ("let", "forAllSystems"),
+                ("let", "scriptText"),
+                ("section", "packages"),
+                ("attr", "packages.default"),
+                ("attr", "packages.cli"),
+                ("section", "devShells"),
+                ("attr", "devShells.default"),
+                ("attr", "nixosConfigurations.prod"),
+                ("function", "lib.mkService"),
+            ]
+        );
+        let prod = found
+            .iter()
+            .find(|s| s.name == "nixosConfigurations.prod")
+            .unwrap();
+        assert!(flake[prod.bytes.clone()].contains("./configuration.nix"));
+        assert!(flake[prod.bytes.clone()].trim_end().ends_with("};"));
+        let mk_svc = found.iter().find(|s| s.name == "lib.mkService").unwrap();
+        assert!(flake[mk_svc.bytes.clone()].contains("systemd.services.${name}"));
+        assert!(!flake[mk_svc.bytes.clone()].contains("./configuration.nix"));
+
+        // NixOS module with top-level lambda + `let ... in { options; config; }`
+        let module = concat!(
+            "{ config, lib, pkgs, ... }:\n",
+            "let\n",
+            "  cfg = config.services.demo;\n",
+            "  mkPort = p: toString p;\n",
+            "in\n",
+            "{\n",
+            "  options.services.demo = {\n",
+            "    enable = lib.mkEnableOption \"demo\";\n",
+            "    port = lib.mkOption { default = 8080; };\n",
+            "  };\n\n",
+            "  config = lib.mkIf cfg.enable {\n",
+            "    services.demo.port = 9090;\n",
+            "  };\n",
+            "}\n",
+        );
+        let mod_found = sections("modules/demo.nix", module, &line_starts(module));
+        assert_section_invariants(module, &mod_found);
+        let mod_names: Vec<_> = mod_found
+            .iter()
+            .map(|s| (s.kind, s.name.as_str()))
+            .collect();
+        assert!(mod_names.contains(&("let", "cfg")), "{mod_names:?}");
+        assert!(mod_names.contains(&("let", "mkPort")), "{mod_names:?}");
+        assert!(
+            mod_names.contains(&("attr", "options.services.demo")),
+            "{mod_names:?}"
+        );
+        assert!(mod_names.contains(&("section", "config")), "{mod_names:?}");
+
+        // Snapshot outline + `--match` works cleanly.
+        let mut snap = crate::source::Snapshot::from_text("flake.nix", flake.to_owned());
+        snap.index("flake.nix").unwrap();
+        let page = snap.page("mkService", None, 40, 4096).unwrap().display();
+        assert!(page.contains("function lib.mkService"), "{page}");
+
+        // Unbalanced Nix fails closed.
+        let bad = "{\n  description = \"broken\";\n  inputs = {\n    nixpkgs.url = \"a\";\n";
+        assert!(sections("flake.nix", bad, &line_starts(bad)).is_empty());
+        let bad_str = "{\n  a = ''unclosed\n  b = 2;\n}\n";
+        assert!(sections("bad.nix", bad_str, &line_starts(bad_str)).is_empty());
+    }
+
+    #[test]
+    fn github_actions_workflow_outlines_jobs_and_steps() {
+        let wf = concat!(
+            "name: Build and Test\n",
+            "on:\n",
+            "  push:\n",
+            "    branches: [main]\n",
+            "  pull_request:\n",
+            "jobs:\n",
+            "  build:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - name: Checkout\n",
+            "        uses: actions/checkout@v4\n",
+            "      - name: Run tests\n",
+            "        run: |\n",
+            "          # - name: fake step inside script\n",
+            "          cargo test --locked\n",
+            "      - uses: actions/upload-artifact@v4\n",
+            "        with:\n",
+            "          name: logs\n",
+            "      - run: |\n",
+            "          cargo fmt --all -- --check\n",
+            "        name: Format check\n",
+            "  deploy:\n",
+            "    needs: build\n",
+            "    uses: ./.github/workflows/release.yml\n",
+        );
+
+        let mut snap =
+            crate::source::Snapshot::from_text(".github/workflows/ci.yml", wf.to_owned());
+        snap.index(".github/workflows/ci.yml").unwrap();
+        let page = snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            page.contains("job build  runs-on: ubuntu-latest\n"),
+            "{page}"
+        );
+        assert!(page.contains("step Checkout\n"), "{page}");
+        assert!(page.contains("step Run tests\n"), "{page}");
+        assert!(page.contains("step actions/upload-artifact@v4\n"), "{page}");
+        assert!(page.contains("step Format check\n"), "{page}");
+        assert!(
+            page.contains("job deploy  uses: ./.github/workflows/release.yml\n"),
+            "{page}"
+        );
+        assert!(!page.contains("fake step inside script"), "{page}");
+
+        let found = sections(".github/workflows/ci.yml", wf, &line_starts(wf));
+        assert_section_invariants(wf, &found);
+        let run_step = found.iter().find(|s| s.name == "Run tests").unwrap();
+        assert!(wf[run_step.bytes.clone()].contains("cargo test --locked"));
+        assert!(!wf[run_step.bytes.clone()].contains("upload-artifact"));
+
+        // Also supports `.yaml` workflow extension and `--match`.
+        let matched = snap.page("Run tests", None, 40, 4096).unwrap().display();
+        assert!(matched.contains("step Run tests\n"), "{matched}");
+        assert!(!sections(".github/workflows/deploy.yaml", wf, &line_starts(wf)).is_empty());
+    }
+
+    #[test]
+    fn openapi_yaml_and_json_outline_paths_methods_and_schemas() {
+        let spec_yaml = concat!(
+            "openapi: 3.1.0\n",
+            "info:\n",
+            "  title: Orders API\n",
+            "  version: 1.0.0\n",
+            "paths:\n",
+            "  /v1/orders:\n",
+            "    get:\n",
+            "      summary: List orders\n",
+            "    post:\n",
+            "      summary: Create order\n",
+            "  /v1/orders/{id}:\n",
+            "    parameters:\n",
+            "      - name: id\n",
+            "        in: path\n",
+            "    get:\n",
+            "      summary: Fetch order\n",
+            "    delete:\n",
+            "      summary: Cancel order\n",
+            "components:\n",
+            "  schemas:\n",
+            "    OrderResponse:\n",
+            "      type: object\n",
+            "      properties:\n",
+            "        id:\n",
+            "          type: string\n",
+            "    CreateOrderRequest:\n",
+            "      type: object\n",
+            "  responses:\n",
+            "    NotFound:\n",
+            "      description: Missing resource\n",
+        );
+
+        let y_found = sections("api/openapi.yaml", spec_yaml, &line_starts(spec_yaml));
+        assert_section_invariants(spec_yaml, &y_found);
+        let y_names: Vec<_> = y_found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+        assert_eq!(
+            y_names,
+            [
+                ("key", "openapi"),
+                ("key", "info"),
+                ("key", "paths"),
+                ("path", "/v1/orders [GET, POST]"),
+                ("path", "/v1/orders/{id} [GET, DELETE]"),
+                ("key", "components"),
+                ("section", "components.schemas"),
+                ("schema", "OrderResponse"),
+                ("schema", "CreateOrderRequest"),
+                ("section", "components.responses"),
+                ("component", "responses.NotFound"),
+            ]
+        );
+        let orders_path = y_found
+            .iter()
+            .find(|s| s.name == "/v1/orders [GET, POST]")
+            .unwrap();
+        assert!(spec_yaml[orders_path.bytes.clone()].contains("Create order"));
+        assert!(!spec_yaml[orders_path.bytes.clone()].contains("Cancel order"));
+
+        let mut y_snap =
+            crate::source::Snapshot::from_text("api/openapi.yaml", spec_yaml.to_owned());
+        y_snap.index("api/openapi.yaml").unwrap();
+        let y_page = y_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(y_page.contains("path /v1/orders [GET, POST]\n"), "{y_page}");
+        assert!(y_page.contains("schema OrderResponse\n"), "{y_page}");
+
+        // OpenAPI / Swagger JSON (including Swagger 2.0 `definitions`)
+        let spec_json = r#"{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Orders API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/v1/orders": {
+      "get": { "summary": "List" },
+      "post": { "summary": "Create" }
+    },
+    "/v1/health": {
+      "get": { "summary": "Health" }
+    }
+  },
+  "components": {
+    "schemas": {
+      "OrderResponse": {
+        "type": "object",
+        "properties": { "id": { "type": "string" } }
+      },
+      "HealthStatus": {
+        "type": "object"
+      }
+    }
+  }
+}
+"#;
+        let j_found = sections("api/openapi.json", spec_json, &line_starts(spec_json));
+        assert_section_invariants(spec_json, &j_found);
+        let j_names: Vec<_> = j_found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+        assert_eq!(
+            j_names,
+            [
+                ("key", "openapi"),
+                ("key", "info"),
+                ("key", "paths"),
+                ("path", "/v1/orders [GET, POST]"),
+                ("path", "/v1/health [GET]"),
+                ("key", "components"),
+                ("section", "components.schemas"),
+                ("schema", "OrderResponse"),
+                ("schema", "HealthStatus"),
+            ]
+        );
+        let order_schema = j_found.iter().find(|s| s.name == "OrderResponse").unwrap();
+        assert!(spec_json[order_schema.bytes.clone()].contains("\"OrderResponse\""));
+        assert!(!spec_json[order_schema.bytes.clone()].contains("\"HealthStatus\""));
+
+        // Swagger 2.0 YAML with `definitions`
+        let swagger = concat!(
+            "swagger: \"2.0\"\n",
+            "paths:\n",
+            "  /v1/items:\n",
+            "    get:\n",
+            "      summary: List items\n",
+            "definitions:\n",
+            "  Item:\n",
+            "    type: object\n",
+        );
+        let sw_found = sections("swagger.yml", swagger, &line_starts(swagger));
+        assert_section_invariants(swagger, &sw_found);
+        assert!(
+            sw_found
+                .iter()
+                .any(|s| s.kind == "path" && s.name == "/v1/items [GET]")
+        );
+        assert!(
+            sw_found
+                .iter()
+                .any(|s| s.kind == "schema" && s.name == "Item")
+        );
+    }
+
+    #[test]
+    fn nginx_caddy_and_haproxy_config_outlines() {
+        let nginx = concat!(
+            "worker_processes auto;\n\n",
+            "events {\n",
+            "    worker_connections 1024;\n",
+            "}\n\n",
+            "http {\n",
+            "    upstream api_backend {\n",
+            "        server 127.0.0.1:8080;\n",
+            "        server 127.0.0.1:8081;\n",
+            "    }\n\n",
+            "    server {\n",
+            "        listen 443 ssl;\n",
+            "        server_name api.example.com;\n\n",
+            "        location = /health {\n",
+            "            return 200 \"ok\";\n",
+            "        }\n\n",
+            "        location /v1/ {\n",
+            "            # comment with { brace }\n",
+            "            proxy_pass http://api_backend;\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        for file in ["nginx.conf", "conf.d/api.nginx", "sites-enabled/api.conf"] {
+            let found = sections(file, nginx, &line_starts(nginx));
+            assert_section_invariants(nginx, &found);
+            let names: Vec<_> = found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+            assert_eq!(
+                names,
+                [
+                    ("block", "events"),
+                    ("block", "http"),
+                    ("upstream", "api_backend"),
+                    ("server", "api.example.com"),
+                    ("location", "= /health"),
+                    ("location", "/v1/"),
+                ],
+                "{file}"
+            );
+            assert!(nginx[found[5].bytes.clone()].contains("proxy_pass http://api_backend;"));
+        }
+        let mut n_snap = crate::source::Snapshot::from_text("nginx.conf", nginx.to_owned());
+        n_snap.index("nginx.conf").unwrap();
+        let n_page = n_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            n_page.contains("server api.example.com  listen 443 ssl;\n"),
+            "{n_page}"
+        );
+        assert!(
+            n_page.contains("location /v1/  proxy_pass http://api_backend;\n"),
+            "{n_page}"
+        );
+        // Unbalanced nginx fails closed.
+        assert!(
+            sections(
+                "nginx.conf",
+                "http {\n  server {\n    listen 80;\n}\n",
+                &line_starts("http {\n  server {\n    listen 80;\n}\n")
+            )
+            .is_empty()
+        );
+
+        let caddy = concat!(
+            "{\n",
+            "    admin off\n",
+            "}\n\n",
+            "(cors) {\n",
+            "    header Access-Control-Allow-Origin *\n",
+            "}\n\n",
+            "api.example.com {\n",
+            "    import cors\n",
+            "    @health {\n",
+            "        path /health\n",
+            "    }\n",
+            "    handle /v1/* {\n",
+            "        reverse_proxy {$API_UPSTREAM}:8080\n",
+            "    }\n",
+            "    handle {\n",
+            "        respond <<HTML\n",
+            "        <h1>{not a block}</h1>\n",
+            "        HTML 200\n",
+            "    }\n",
+            "}\n",
+        );
+        for file in ["Caddyfile", "Caddyfile.prod", "edge.caddy"] {
+            let found = sections(file, caddy, &line_starts(caddy));
+            assert_section_invariants(caddy, &found);
+            let names: Vec<_> = found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+            assert_eq!(
+                names,
+                [
+                    ("section", "global"),
+                    ("snippet", "cors"),
+                    ("site", "api.example.com"),
+                    ("matcher", "@health"),
+                    ("handle", "/v1/*"),
+                    ("handle", "(default)"),
+                ],
+                "{file}"
+            );
+            assert!(caddy[found[4].bytes.clone()].contains("reverse_proxy {$API_UPSTREAM}:8080"));
+        }
+        // Unbalanced Caddyfile fails closed.
+        assert!(
+            sections(
+                "Caddyfile",
+                "example.com {\n  handle {\n    respond 200\n}\n",
+                &line_starts("example.com {\n  handle {\n    respond 200\n}\n")
+            )
+            .is_empty()
+        );
+
+        let haproxy = concat!(
+            "global\n",
+            "    maxconn 4096\n\n",
+            "defaults\n",
+            "    mode http\n",
+            "    timeout connect 5s\n\n",
+            "frontend https_in\n",
+            "    bind *:443\n",
+            "    default_backend api_nodes\n\n",
+            "backend api_nodes\n",
+            "    balance roundrobin\n",
+            "    server app1 10.0.0.1:8080 check\n\n",
+            "listen stats\n",
+            "    bind *:8404\n",
+            "    stats enable\n",
+        );
+        for file in ["haproxy.cfg", "haproxy.prod.cfg", "lb.cfg"] {
+            let found = sections(file, haproxy, &line_starts(haproxy));
+            assert_section_invariants(haproxy, &found);
+            let names: Vec<_> = found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+            assert_eq!(
+                names,
+                [
+                    ("section", "global"),
+                    ("section", "defaults"),
+                    ("frontend", "https_in"),
+                    ("backend", "api_nodes"),
+                    ("listen", "stats"),
+                ],
+                "{file}"
+            );
+            assert!(haproxy[found[3].bytes.clone()].contains("server app1 10.0.0.1:8080"));
+        }
+        let mut h_snap = crate::source::Snapshot::from_text("haproxy.cfg", haproxy.to_owned());
+        h_snap.index("haproxy.cfg").unwrap();
+        let h_page = h_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            h_page.contains("frontend https_in  bind *:443\n"),
+            "{h_page}"
+        );
+        assert!(
+            h_page.contains("backend api_nodes  balance roundrobin\n"),
+            "{h_page}"
+        );
+        assert!(h_page.contains("listen stats  bind *:8404\n"), "{h_page}");
     }
 }
