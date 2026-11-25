@@ -2196,3 +2196,231 @@ fn live_zone_env_var_min_bytes_and_clearing_coexist_cleanly() {
     assert_eq!(rec["mode"], "cleared");
     assert_eq!(rec["live_compacted"]["results"], 1);
 }
+
+#[test]
+fn live_zone_openai_chat_and_responses_compact_preserve_prefix_and_recall() {
+    let openai_ok = |_: &Message| {
+        Reply::Json(
+            200,
+            json!({"id": "resp_01", "model": "gpt-5.4", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+    };
+    let (dir, mock, proxy) = session(openai_ok, "--compact-live");
+    let root = dir.path();
+    let big_json = live_json_payload();
+    let big_log = live_structured_log_payload();
+    let big_table = {
+        let mut out = String::from(
+            "+-----+----------------+-------------+-----------+----------+----------+\n\
+             | id  | service        | region      | env       | status   | replicas |\n\
+             +-----+----------------+-------------+-----------+----------+----------+\n",
+        );
+        for i in 0..320 {
+            out.push_str(&format!(
+                "| {:<3} | worker-{:<7} | us-east-1   | prod      | running  | 3        |\n",
+                i, i
+            ));
+        }
+        out.push_str("+-----+----------------+-------------+-----------+----------+----------+\n");
+        out
+    };
+    let big_tb = live_traceback_payload(root);
+    let headers = [
+        ("content-type", "application/json"),
+        ("authorization", "Bearer sk-openai-test"),
+    ];
+
+    // 1. OpenAI Chat Completions (`/v1/chat/completions`, trailing `role: "tool"`).
+    let chat_body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Diagnose orders-api."},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_prev", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"cat old.log\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_prev", "content": big_log},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_json", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"curl /orders\"}"}},
+                {"id": "call_log", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"tail api.log\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_json", "content": big_json},
+            {"role": "tool", "tool_call_id": "call_log", "content": big_log}
+        ]
+    });
+    let chat_raw = serde_json::to_string_pretty(&chat_body)
+        .unwrap()
+        .replace("\"role\": ", "\"role\" :   ");
+    let resp = proxy.send(
+        "POST",
+        "/v1/chat/completions",
+        &headers,
+        chat_raw.as_bytes(),
+    );
+    assert_eq!(resp.status(), 200);
+    let forwarded_chat = mock.seen().pop().unwrap();
+    assert!(forwarded_chat.header("anthropic-beta").is_none());
+    let chat_prefix_end = chat_raw.rfind("\"tool_call_id\": \"call_json\"").unwrap();
+    assert_eq!(
+        &forwarded_chat.body[..chat_prefix_end],
+        &chat_raw.as_bytes()[..chat_prefix_end],
+        "earlier assistant and tool prefix must stay byte-for-byte identical"
+    );
+    let sent_chat = forwarded_chat.json();
+    assert!(sent_chat.get("context_management").is_none());
+    for i in 0..5 {
+        assert_eq!(sent_chat["messages"][i], chat_body["messages"][i]);
+    }
+    for (idx, orig) in [(5usize, &big_json), (6usize, &big_log)] {
+        let compacted = sent_chat["messages"][idx]["content"].as_str().unwrap();
+        let pct = (orig.len() - compacted.len()) * 100 / orig.len();
+        assert!(
+            pct > 85,
+            "chat tool {idx}: {pct}% ({} -> {})",
+            orig.len(),
+            compacted.len()
+        );
+        assert!(compacted.len() <= 4096);
+        let id = extract_recall_id(compacted);
+        let recalled = recall(root, &id);
+        assert!(recalled.status.success(), "{}", text(&recalled.stderr));
+        assert_eq!(recalled.stdout, orig.as_bytes());
+    }
+    contains(
+        sent_chat["messages"][6]["content"].as_str().unwrap(),
+        "ECONNREFUSED",
+    );
+
+    // 2. OpenAI Responses API (`/v1/responses`, trailing `type: "function_call_output"`).
+    let resp_body = json!({
+        "model": "gpt-5.4",
+        "instructions": "You are Codex.",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Fix billing crash."}]},
+            {"type": "reasoning", "id": "rs_01", "encrypted_content": "opaque_sig_blob_01"},
+            {"type": "function_call", "call_id": "call_prev", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_prev", "output": big_table},
+            {"type": "function_call", "call_id": "call_tbl", "name": "shell", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_tb", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_tbl", "output": big_table},
+            {"type": "function_call_output", "call_id": "call_tb", "output": big_tb}
+        ]
+    });
+    let resp_raw = serde_json::to_string_pretty(&resp_body)
+        .unwrap()
+        .replace("\"type\": ", "\"type\" :   ");
+    let resp = proxy.send("POST", "/v1/responses", &headers, resp_raw.as_bytes());
+    assert_eq!(resp.status(), 200);
+    let forwarded_resp = mock.seen().pop().unwrap();
+    assert!(forwarded_resp.header("anthropic-beta").is_none());
+    let resp_prefix_end = resp_raw.rfind("\"call_id\": \"call_tbl\"").unwrap();
+    assert_eq!(
+        &forwarded_resp.body[..resp_prefix_end],
+        &resp_raw.as_bytes()[..resp_prefix_end],
+        "earlier responses prefix must stay byte-for-byte identical"
+    );
+    let sent_resp = forwarded_resp.json();
+    assert!(sent_resp.get("context_management").is_none());
+    for i in 0..6 {
+        assert_eq!(sent_resp["input"][i], resp_body["input"][i]);
+    }
+    for (idx, orig) in [(6usize, &big_table), (7usize, &big_tb)] {
+        let compacted = sent_resp["input"][idx]["output"].as_str().unwrap();
+        let pct = (orig.len() - compacted.len()) * 100 / orig.len();
+        assert!(
+            pct > 80,
+            "responses output {idx}: {pct}% ({} -> {})",
+            orig.len(),
+            compacted.len()
+        );
+        assert!(compacted.len() <= 4096);
+        let id = extract_recall_id(compacted);
+        let recalled = recall(root, &id);
+        assert!(recalled.status.success(), "{}", text(&recalled.stderr));
+        assert_eq!(recalled.stdout, orig.as_bytes());
+    }
+    contains(
+        sent_resp["input"][7]["output"].as_str().unwrap(),
+        "ValueError: negative invoice total",
+    );
+
+    proxy.stop();
+    let records = ledger(root);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["path"], "chat_completions");
+    assert_eq!(records[0]["mode"], "compact");
+    assert_eq!(records[0]["model"], "gpt-4o");
+    assert_eq!(records[0]["live_compacted"]["results"], 2);
+    assert_eq!(records[1]["path"], "responses");
+    assert_eq!(records[1]["mode"], "compact");
+    assert_eq!(records[1]["model"], "gpt-5.4");
+    assert_eq!(records[1]["live_compacted"]["results"], 2);
+    let report = stats(root);
+    assert_eq!(report["proxy"]["live_compacted"]["results"], 4);
+    assert!(
+        report["proxy"]["live_compacted"]["saved_bytes"]
+            .as_u64()
+            .unwrap()
+            > 70_000
+    );
+}
+
+#[test]
+fn openai_chat_and_responses_pass_through_verbatim_without_compact_live() {
+    let (dir, mock, proxy) = session(|_| ok_json(), "");
+    let big_json = live_json_payload();
+    let chat_raw = serde_json::to_string_pretty(&json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": big_json}
+        ]
+    }))
+    .unwrap()
+    .replace("\"role\": ", "\"role\" :   ");
+    let resp_raw = serde_json::to_string_pretty(&json!({
+        "model": "gpt-5.4",
+        "input": [
+            {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": big_json}
+        ]
+    }))
+    .unwrap()
+    .replace("\"type\": ", "\"type\" :   ");
+    let headers = [
+        ("content-type", "application/json"),
+        ("authorization", "Bearer sk-openai-test"),
+    ];
+
+    assert_eq!(
+        proxy
+            .send(
+                "POST",
+                "/v1/chat/completions",
+                &headers,
+                chat_raw.as_bytes()
+            )
+            .status(),
+        200
+    );
+    assert_eq!(
+        proxy
+            .send("POST", "/v1/responses", &headers, resp_raw.as_bytes())
+            .status(),
+        200
+    );
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].body, chat_raw.as_bytes());
+    assert_eq!(seen[1].body, resp_raw.as_bytes());
+    assert!(seen.iter().all(|m| m.header("anthropic-beta").is_none()));
+    proxy.stop();
+    let records = ledger(dir.path());
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|r| r["mode"] == "pass" && r.get("live_compacted").is_none())
+    );
+    assert!(!dir.path().join(".justless/observations").exists());
+}

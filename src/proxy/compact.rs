@@ -1,16 +1,18 @@
-//! Live-zone-only, prefix-cache-safe compaction for newest `tool_result` blocks.
+//! Live-zone-only, prefix-cache-safe compaction for newest uncached tool results.
 //!
-//! Mutating any message inside a cached Anthropic Messages prefix invalidates the
-//! prompt cache and breaks preserved-thinking signatures. By contrast, `tool_result`
-//! blocks inside the **very last `user` message** — strictly after any prior
-//! `assistant` turn and strictly after the last `cache_control` breakpoint — have
-//! never been written to the provider's prompt cache and have no subsequent thinking
-//! blocks tied to them.
+//! Mutating any message inside a cached prompt prefix invalidates the provider's
+//! prompt cache (and breaks Anthropic preserved-thinking signatures). By contrast,
+//! the newest uncached tool outputs strictly at the tail of the request — after at
+//! least one prior assistant / call turn and strictly after any `cache_control`
+//! breakpoint — have never been written to the prompt cache:
+//! - Anthropic `/v1/messages`: `tool_result` blocks in the final `user` message.
+//! - OpenAI `/chat/completions`: trailing contiguous run of `role: "tool"` messages.
+//! - OpenAI `/responses`: trailing contiguous run of `type: "function_call_output"` items.
 //!
 //! Each eligible oversized text block is:
-//! 1. Checked against strict safety guards (final `user` turn, prior `assistant`
-//!    turn present, strictly after any `cache_control`, text-only, `>= min_bytes`,
-//!    not already starting with `[justless `).
+//! 1. Checked against strict safety guards (tail-only live zone, prior turn present,
+//!    strictly after any `cache_control`, text-only, `>= min_bytes`, not already
+//!    starting with `[justless `).
 //! 2. Compacted on its redacted text through Justless's structured compactors
 //!    (`jsonview`, `tableview`, `logview`, `stacktrace`, or bounded head+tail).
 //! 3. Replaced **only** when the compacted text plus its exact recall footer fits
@@ -22,6 +24,7 @@
 //! Any parse, archive, or format error fails open and forwards the original block.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -91,39 +94,25 @@ struct Replacement {
 }
 
 /// Attempts to compact eligible oversized `tool_result` text blocks in the final
-/// uncached `user` message of `body`.
+/// uncached `user` message of an Anthropic Messages request `body`.
 ///
 /// Returns `None` if nothing was compacted or on any parse/safety/archive error
 /// (fail-open). All bytes outside the replaced string spans are preserved verbatim.
 pub fn compact_live_zone(ws: &Workspace, body: &Body<'_>, options: &Options) -> Option<LiveResult> {
-    if !options.compact_live || options.compact_live_budget < 256 {
+    if !live_enabled(options) {
         return None;
     }
     let raw_messages = body.raw("messages")?;
     let messages: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
-    if messages.len() < 2 {
-        return None;
-    }
-
-    // Must be strictly after at least one prior assistant turn.
-    let prior_assistant = messages[..messages.len() - 1].iter().any(|raw| {
-        plan::parse_members(raw.get())
-            .and_then(|members| member(&members, "role"))
-            .and_then(|role| serde_json::from_str::<String>(role.get()).ok())
-            .is_some_and(|role| role == "assistant")
-    });
-    if !prior_assistant {
+    if messages.len() < 2 || !has_role(&messages[..messages.len() - 1], "assistant") {
         return None;
     }
 
     let last_msg = *messages.last()?;
     let msg_members = plan::parse_members(last_msg.get())?;
-    let role: String = serde_json::from_str(member(&msg_members, "role")?.get()).ok()?;
-    if role != "user" {
-        return None;
-    }
-    // If the final message object itself carries a non-null cache_control, leave it untouched.
-    if member(&msg_members, "cache_control").is_some_and(|raw| raw.get().trim() != "null") {
+    if !member_str_eq(&msg_members, "role", "user")
+        || has_non_null_member(&msg_members, "cache_control")
+    {
         return None;
     }
 
@@ -132,90 +121,487 @@ pub fn compact_live_zone(ws: &Workspace, body: &Body<'_>, options: &Options) -> 
         return None;
     }
     let blocks: Vec<&RawValue> = serde_json::from_str(raw_content.get()).ok()?;
-    if blocks.is_empty() {
+    let eligible = after_last_cache_control(&blocks);
+    if eligible.is_empty() {
         return None;
     }
 
-    // Find the last block in the final user message that carries a non-null
-    // `cache_control` breakpoint anywhere inside it. Every block at or before
-    // that index is inside the cached prefix and MUST NOT be mutated.
-    let last_cache_breakpoint = blocks
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, raw)| raw_has_cache_control(raw.get()).then_some(idx));
-
-    let start_idx = last_cache_breakpoint.map_or(0, |idx| idx + 1);
-    if start_idx >= blocks.len() {
-        return None;
-    }
-
-    let mut redactor: Option<Option<&crate::redact::Redactor>> = None;
+    let retrieval_ids = anthropic_retrieval_ids(&messages[..messages.len() - 1]);
+    let mut redactor: Option<Option<&'static crate::redact::Redactor>> = None;
     let mut replacements: Vec<Replacement> = Vec::new();
 
-    for raw_block in &blocks[start_idx..] {
+    for raw_block in eligible {
         let Some(block_members) = plan::parse_members(raw_block.get()) else {
             continue;
         };
-        let Some(kind_raw) = member(&block_members, "type") else {
-            continue;
-        };
-        if serde_json::from_str::<String>(kind_raw.get())
-            .ok()
-            .as_deref()
-            != Some("tool_result")
+        if !member_str_eq(&block_members, "type", "tool_result")
+            || has_non_null_member(&block_members, "cache_control")
+            || is_retrieval_result(&block_members, "tool_use_id", &retrieval_ids)
         {
-            continue;
-        }
-        // Double-check the tool_result itself has no cache_control.
-        if member(&block_members, "cache_control").is_some_and(|r| r.get().trim() != "null") {
             continue;
         }
         let Some(content_raw) = member(&block_members, "content") else {
             continue;
         };
-        let trimmed = content_raw.get().trim_start();
-        if trimmed.starts_with('"') {
-            if let Some(rep) = compact_string_raw(ws, body, content_raw, options, &mut redactor) {
-                replacements.push(rep);
-            }
-        } else if trimmed.starts_with('[') {
-            let Ok(inner_blocks) = serde_json::from_str::<Vec<&RawValue>>(content_raw.get()) else {
+        compact_field_raw(
+            ws,
+            body,
+            content_raw,
+            &["text"],
+            options,
+            &mut redactor,
+            &mut replacements,
+        );
+    }
+
+    apply_replacements(body, replacements)
+}
+
+/// Attempts to compact eligible oversized trailing `role: "tool"` messages in an
+/// OpenAI Chat Completions request `body` (`/chat/completions`).
+///
+/// Only the trailing contiguous run of `role: "tool"` messages strictly after at
+/// least one prior `role: "assistant"` message (and after any `cache_control`
+/// breakpoint) is eligible. Every earlier byte is preserved verbatim.
+pub fn compact_openai_chat_live_zone(
+    ws: &Workspace,
+    body: &Body<'_>,
+    options: &Options,
+) -> Option<LiveResult> {
+    if !live_enabled(options) {
+        return None;
+    }
+    let raw_messages = body.raw("messages")?;
+    if !raw_messages.get().trim_start().starts_with('[') {
+        return None;
+    }
+    let messages: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
+    if messages.len() < 2 {
+        return None;
+    }
+
+    let mut run_start = messages.len();
+    while run_start > 0 {
+        let Some(members) = plan::parse_members(messages[run_start - 1].get()) else {
+            break;
+        };
+        if !member_str_eq(&members, "role", "tool") {
+            break;
+        }
+        run_start -= 1;
+    }
+    if run_start == messages.len()
+        || run_start == 0
+        || !has_role(&messages[..run_start], "assistant")
+    {
+        return None;
+    }
+
+    let eligible = after_last_cache_control(&messages[run_start..]);
+    if eligible.is_empty() {
+        return None;
+    }
+
+    let retrieval_ids = openai_chat_retrieval_ids(&messages[..run_start]);
+    let mut redactor: Option<Option<&'static crate::redact::Redactor>> = None;
+    let mut replacements: Vec<Replacement> = Vec::new();
+
+    for raw_msg in eligible {
+        let Some(msg_members) = plan::parse_members(raw_msg.get()) else {
+            continue;
+        };
+        if has_non_null_member(&msg_members, "cache_control")
+            || is_retrieval_result(&msg_members, "tool_call_id", &retrieval_ids)
+        {
+            continue;
+        }
+        let Some(content_raw) = member(&msg_members, "content") else {
+            continue;
+        };
+        compact_field_raw(
+            ws,
+            body,
+            content_raw,
+            &["text"],
+            options,
+            &mut redactor,
+            &mut replacements,
+        );
+    }
+
+    apply_replacements(body, replacements)
+}
+
+/// Attempts to compact eligible oversized trailing `type: "function_call_output"`
+/// items in an OpenAI Responses API request `body` (`/responses`, `input[]`).
+///
+/// Only the trailing contiguous run of `function_call_output` items strictly after
+/// at least one prior `function_call` or `message` item (and after any
+/// `cache_control` breakpoint) is eligible. Every earlier byte is preserved verbatim.
+pub fn compact_openai_responses_live_zone(
+    ws: &Workspace,
+    body: &Body<'_>,
+    options: &Options,
+) -> Option<LiveResult> {
+    if !live_enabled(options) {
+        return None;
+    }
+    let raw_input = body.raw("input")?;
+    if !raw_input.get().trim_start().starts_with('[') {
+        return None;
+    }
+    let items: Vec<&RawValue> = serde_json::from_str(raw_input.get()).ok()?;
+    if items.len() < 2 {
+        return None;
+    }
+
+    let mut run_start = items.len();
+    while run_start > 0 {
+        let Some(members) = plan::parse_members(items[run_start - 1].get()) else {
+            break;
+        };
+        if !member_str_eq(&members, "type", "function_call_output") {
+            break;
+        }
+        run_start -= 1;
+    }
+    if run_start == items.len() || run_start == 0 {
+        return None;
+    }
+
+    let has_prior_turn = items[..run_start].iter().any(|raw| {
+        let Some(members) = plan::parse_members(raw.get()) else {
+            return false;
+        };
+        let kind =
+            member(&members, "type").and_then(|t| serde_json::from_str::<String>(t.get()).ok());
+        match kind.as_deref() {
+            Some("function_call" | "message") => true,
+            None => member(&members, "role")
+                .and_then(|r| serde_json::from_str::<String>(r.get()).ok())
+                .is_some(),
+            _ => false,
+        }
+    });
+    if !has_prior_turn {
+        return None;
+    }
+
+    let eligible = after_last_cache_control(&items[run_start..]);
+    if eligible.is_empty() {
+        return None;
+    }
+
+    let retrieval_ids = openai_responses_retrieval_ids(&items[..run_start]);
+    let mut redactor: Option<Option<&'static crate::redact::Redactor>> = None;
+    let mut replacements: Vec<Replacement> = Vec::new();
+
+    for raw_item in eligible {
+        let Some(item_members) = plan::parse_members(raw_item.get()) else {
+            continue;
+        };
+        if has_non_null_member(&item_members, "cache_control")
+            || is_retrieval_result(&item_members, "call_id", &retrieval_ids)
+        {
+            continue;
+        }
+        let Some(output_raw) = member(&item_members, "output") else {
+            continue;
+        };
+        compact_field_raw(
+            ws,
+            body,
+            output_raw,
+            &["input_text", "text"],
+            options,
+            &mut redactor,
+            &mut replacements,
+        );
+    }
+
+    apply_replacements(body, replacements)
+}
+
+fn member_str(members: &[(String, &RawValue)], key: &str) -> Option<String> {
+    serde_json::from_str::<String>(member(members, key)?.get()).ok()
+}
+
+fn is_retrieval_result(
+    members: &[(String, &RawValue)],
+    id_key: &str,
+    retrieval_ids: &HashSet<String>,
+) -> bool {
+    !retrieval_ids.is_empty()
+        && member_str(members, id_key).is_some_and(|id| retrieval_ids.contains(&id))
+}
+
+/// Collects tool-call IDs from prior Anthropic assistant messages that invoke
+/// `justless recall|log|expand|search` (shell or MCP), preventing recall loops.
+fn anthropic_retrieval_ids(messages: &[&RawValue]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for raw_msg in messages {
+        let Some(msg_members) = plan::parse_members(raw_msg.get()) else {
+            continue;
+        };
+        if !member_str_eq(&msg_members, "role", "assistant") {
+            continue;
+        }
+        let Some(content) = member(&msg_members, "content") else {
+            continue;
+        };
+        let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(content.get()) else {
+            continue;
+        };
+        for block in blocks {
+            let Some(bm) = plan::parse_members(block.get()) else {
                 continue;
             };
-            // Only compact plain text blocks inside `tool_result.content`;
-            // images, documents, and any other block types stay byte-for-byte untouched.
-            for inner in inner_blocks {
-                let Some(inner_members) = plan::parse_members(inner.get()) else {
-                    continue;
-                };
-                if member(&inner_members, "cache_control").is_some_and(|r| r.get().trim() != "null")
-                {
-                    continue;
-                }
-                let Some(inner_kind) = member(&inner_members, "type") else {
-                    continue;
-                };
-                if serde_json::from_str::<String>(inner_kind.get())
-                    .ok()
-                    .as_deref()
-                    != Some("text")
-                {
-                    continue;
-                }
-                let Some(text_raw) = member(&inner_members, "text") else {
-                    continue;
-                };
-                if !text_raw.get().trim_start().starts_with('"') {
-                    continue;
-                }
-                if let Some(rep) = compact_string_raw(ws, body, text_raw, options, &mut redactor) {
-                    replacements.push(rep);
-                }
+            let is_use = member_str(&bm, "type")
+                .is_some_and(|t| matches!(t.as_str(), "tool_use" | "mcp_tool_use"));
+            if !is_use {
+                continue;
+            }
+            let name = member_str(&bm, "name").unwrap_or_default();
+            if is_retrieval_call(&name, member(&bm, "input"))
+                && let Some(id) = member_str(&bm, "id")
+            {
+                ids.insert(id);
             }
         }
     }
+    ids
+}
 
+/// Collects `tool_calls[].id` values from prior OpenAI Chat assistant messages
+/// that invoke `justless recall|log|expand|search`.
+fn openai_chat_retrieval_ids(messages: &[&RawValue]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for raw_msg in messages {
+        let Some(msg_members) = plan::parse_members(raw_msg.get()) else {
+            continue;
+        };
+        if !member_str_eq(&msg_members, "role", "assistant") {
+            continue;
+        }
+        let Some(calls_raw) = member(&msg_members, "tool_calls") else {
+            continue;
+        };
+        let Ok(calls) = serde_json::from_str::<Vec<&RawValue>>(calls_raw.get()) else {
+            continue;
+        };
+        for call in calls {
+            let Some(cm) = plan::parse_members(call.get()) else {
+                continue;
+            };
+            let Some(fn_raw) = member(&cm, "function") else {
+                continue;
+            };
+            let Some(fm) = plan::parse_members(fn_raw.get()) else {
+                continue;
+            };
+            let name = member_str(&fm, "name").unwrap_or_default();
+            if is_retrieval_call(&name, member(&fm, "arguments"))
+                && let Some(id) = member_str(&cm, "id")
+            {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Collects `call_id` values from prior OpenAI Responses `function_call` items
+/// that invoke `justless recall|log|expand|search`.
+fn openai_responses_retrieval_ids(items: &[&RawValue]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for raw_item in items {
+        let Some(im) = plan::parse_members(raw_item.get()) else {
+            continue;
+        };
+        if !member_str_eq(&im, "type", "function_call") {
+            continue;
+        }
+        let name = member_str(&im, "name").unwrap_or_default();
+        if is_retrieval_call(&name, member(&im, "arguments"))
+            && let Some(id) = member_str(&im, "call_id")
+        {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
+fn is_retrieval_call(name: &str, args_raw: Option<&RawValue>) -> bool {
+    is_retrieval_tool_name(name) || args_have_retrieval_cmd(args_raw)
+}
+
+fn is_retrieval_tool_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("justless")
+        && ["recall", "log", "expand", "search"]
+            .iter()
+            .any(|op| lower.ends_with(op))
+}
+
+fn args_have_retrieval_cmd(args_raw: Option<&RawValue>) -> bool {
+    let Some(raw) = args_raw else {
+        return false;
+    };
+    let text = raw.get();
+    if !text.contains("justless") && !text.contains("\\u") {
+        return false;
+    }
+    let Ok(val) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    value_has_retrieval_cmd(&val)
+}
+
+fn value_has_retrieval_cmd(val: &Value) -> bool {
+    match val {
+        Value::String(s) => {
+            if contains_justless_retrieval_cmd(s) {
+                return true;
+            }
+            let trimmed = s.trim_start();
+            (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && serde_json::from_str::<Value>(trimmed)
+                    .ok()
+                    .is_some_and(|inner| value_has_retrieval_cmd(&inner))
+        }
+        Value::Array(items) => {
+            if items.iter().all(Value::is_string) {
+                let joined = items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if contains_justless_retrieval_cmd(&joined) {
+                    return true;
+                }
+            }
+            items.iter().any(value_has_retrieval_cmd)
+        }
+        Value::Object(map) => map.values().any(value_has_retrieval_cmd),
+        _ => false,
+    }
+}
+
+fn contains_justless_retrieval_cmd(cmd: &str) -> bool {
+    const OPS: [&str; 4] = ["recall", "log", "expand", "search"];
+    if !cmd.contains("justless") {
+        return false;
+    }
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        let bin = token.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')'));
+        let name = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
+        if name != "justless" && name != "justless.exe" {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < tokens.len() {
+            let arg = tokens[j].trim_matches(|c| matches!(c, '\'' | '"'));
+            if arg == "--root" {
+                j += 2;
+            } else if arg.starts_with("--root=") {
+                j += 1;
+            } else {
+                if OPS.contains(&arg) {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn live_enabled(options: &Options) -> bool {
+    options.compact_live && options.compact_live_budget >= 256
+}
+
+fn member<'a>(members: &[(String, &'a RawValue)], key: &str) -> Option<&'a RawValue> {
+    members
+        .iter()
+        .find_map(|(name, value)| (name == key).then_some(*value))
+}
+
+fn member_str_eq(members: &[(String, &RawValue)], key: &str, expected: &str) -> bool {
+    member(members, key)
+        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+        .as_deref()
+        == Some(expected)
+}
+
+fn has_non_null_member(members: &[(String, &RawValue)], key: &str) -> bool {
+    member(members, key).is_some_and(|raw| raw.get().trim() != "null")
+}
+
+fn has_role(messages: &[&RawValue], role: &str) -> bool {
+    messages.iter().any(|raw| {
+        plan::parse_members(raw.get()).is_some_and(|members| member_str_eq(&members, "role", role))
+    })
+}
+
+/// Returns the trailing slice strictly after the last item containing a non-null
+/// `cache_control` breakpoint so cached prefixes are never mutated.
+fn after_last_cache_control<'a>(items: &'a [&'a RawValue]) -> &'a [&'a RawValue] {
+    let last_breakpoint = items
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, raw)| raw_has_cache_control(raw.get()).then_some(idx));
+    &items[last_breakpoint.map_or(0, |idx| idx + 1)..]
+}
+
+fn compact_field_raw(
+    ws: &Workspace,
+    body: &Body<'_>,
+    field_raw: &RawValue,
+    text_types: &[&str],
+    options: &Options,
+    redactor: &mut Option<Option<&'static crate::redact::Redactor>>,
+    replacements: &mut Vec<Replacement>,
+) {
+    let trimmed = field_raw.get().trim_start();
+    if trimmed.starts_with('"') {
+        if let Some(rep) = compact_string_raw(ws, body, field_raw, options, redactor) {
+            replacements.push(rep);
+        }
+    } else if trimmed.starts_with('[') {
+        let Ok(inner_blocks) = serde_json::from_str::<Vec<&RawValue>>(field_raw.get()) else {
+            return;
+        };
+        // Only compact plain text parts; images, documents, files, and other
+        // block types stay byte-for-byte untouched.
+        for inner in inner_blocks {
+            let Some(inner_members) = plan::parse_members(inner.get()) else {
+                continue;
+            };
+            if has_non_null_member(&inner_members, "cache_control") {
+                continue;
+            }
+            let is_text = member(&inner_members, "type")
+                .and_then(|k| serde_json::from_str::<String>(k.get()).ok())
+                .is_some_and(|kind| text_types.contains(&kind.as_str()));
+            if !is_text {
+                continue;
+            }
+            let Some(text_raw) = member(&inner_members, "text") else {
+                continue;
+            };
+            if !text_raw.get().trim_start().starts_with('"') {
+                continue;
+            }
+            if let Some(rep) = compact_string_raw(ws, body, text_raw, options, redactor) {
+                replacements.push(rep);
+            }
+        }
+    }
+}
+
+fn apply_replacements(body: &Body<'_>, mut replacements: Vec<Replacement>) -> Option<LiveResult> {
     if replacements.is_empty() {
         return None;
     }
@@ -246,17 +632,11 @@ pub fn compact_live_zone(ws: &Workspace, body: &Body<'_>, options: &Options) -> 
     stats.saved_bytes = stats.bytes_before.saturating_sub(stats.bytes_after);
     stats.est_tokens = stats.saved_bytes.div_ceil(4);
 
-    // Final invariant: outbound JSON body must actually be smaller and valid JSON.
+    // Final invariant: outbound JSON body must actually be smaller.
     if out.len() >= src.len() {
         return None;
     }
     Some(LiveResult { body: out, stats })
-}
-
-fn member<'a>(members: &[(String, &'a RawValue)], key: &str) -> Option<&'a RawValue> {
-    members
-        .iter()
-        .find_map(|(name, value)| (name == key).then_some(*value))
 }
 
 /// Checks whether a raw JSON block contains any non-null `cache_control` key
@@ -315,7 +695,7 @@ fn compact_string_raw(
         return None;
     }
 
-    let compacted_body = compact_text(safe.as_ref(), body_budget, &ws.root)?;
+    let compacted_body = compact_payload(safe.as_ref(), body_budget, &ws.root)?;
     let compacted_body = compacted_body.trim_end_matches('\n');
     if compacted_body.is_empty() {
         return None;
@@ -400,7 +780,7 @@ fn exact_total_len(body_len: usize, before: usize) -> Option<usize> {
 /// 4. Structured text logs → `logview::format`
 /// 5. Multi-language stack traces → `stacktrace::collapse` (bounded if still over budget)
 /// 6. Bounded line-aware head+tail preview (fallback for plain text / code)
-fn compact_text(text: &str, budget: usize, workspace_root: &Path) -> Option<String> {
+fn compact_payload(text: &str, budget: usize, workspace_root: &Path) -> Option<String> {
     if text.is_empty() || budget < 128 {
         return None;
     }
@@ -1203,5 +1583,180 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         assert!(compact_live_zone(&ws, &Body::parse(&bytes).unwrap(), &live_options()).is_none());
+    }
+
+    #[test]
+    fn openai_chat_and_responses_compact_trailing_live_zone_only() {
+        let (_dir, ws) = workspace();
+        let big_json = large_json_array();
+        let big_log = large_structured_log();
+        let big_table = {
+            let mut t = large_ascii_table();
+            for i in 160..320 {
+                t.push_str(&format!(
+                    "| {:<3} | worker-{:<7} | us-east-1   | prod      | running  | 3        |\n",
+                    i, i
+                ));
+            }
+            t
+        };
+        let big_tb = large_python_traceback(&ws.root);
+
+        // 1. OpenAI Chat Completions: trailing contiguous `role: "tool"` run after assistant.
+        let chat_req = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Inspect services."},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "call_old", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call_old", "content": big_log},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_json", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "call_log", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_json", "content": big_json},
+                {"role": "tool", "tool_call_id": "call_log", "content": big_log}
+            ]
+        });
+        let chat_raw = serde_json::to_string_pretty(&chat_req)
+            .unwrap()
+            .replace("\"role\": ", "\"role\" :   ");
+        let chat_parsed = Body::parse(chat_raw.as_bytes()).unwrap();
+        let chat_res = compact_openai_chat_live_zone(&ws, &chat_parsed, &live_options())
+            .expect("chat trailing tools should compact");
+        let chat_prefix_end = chat_raw.find("\"call_json\"").unwrap();
+        assert_eq!(
+            &chat_res.body[..chat_prefix_end],
+            &chat_raw.as_bytes()[..chat_prefix_end]
+        );
+        assert_eq!(chat_res.stats.results, 2);
+        let chat_pct = chat_res.stats.saved_bytes * 100 / chat_res.stats.bytes_before;
+        assert!(chat_pct > 85, "chat saved only {chat_pct}%");
+        let chat_out: Value = serde_json::from_slice(&chat_res.body).unwrap();
+        assert_eq!(chat_out["messages"][3], chat_req["messages"][3]);
+        assert!(
+            chat_out["messages"][6]["content"]
+                .as_str()
+                .unwrap()
+                .contains("ECONNREFUSED")
+        );
+
+        // Chat safety guards: no prior assistant, or ends with user message -> untouched.
+        for skipped in [
+            json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}, {"role": "tool", "tool_call_id": "c1", "content": big_json}]}),
+            json!({"model": "gpt-4o", "messages": [{"role": "assistant", "content": ""}, {"role": "tool", "tool_call_id": "c1", "content": big_json}, {"role": "user", "content": "next"}]}),
+        ] {
+            let raw = serde_json::to_vec(&skipped).unwrap();
+            assert!(
+                compact_openai_chat_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options())
+                    .is_none()
+            );
+        }
+
+        // 2. OpenAI Responses API: trailing contiguous `function_call_output` run in `input[]`.
+        let resp_req = json!({
+            "model": "gpt-5.4",
+            "instructions": "You are a coding agent.",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Debug billing."}]},
+                {"type": "reasoning", "id": "rs_01", "encrypted_content": "opaque_encrypted_blob"},
+                {"type": "function_call", "call_id": "call_old", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_old", "output": big_table},
+                {"type": "function_call", "call_id": "call_tbl", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_tb", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_tbl", "output": big_table},
+                {"type": "function_call_output", "call_id": "call_tb", "output": big_tb}
+            ]
+        });
+        let resp_raw = serde_json::to_string_pretty(&resp_req)
+            .unwrap()
+            .replace("\"type\": ", "\"type\" :   ");
+        let resp_parsed = Body::parse(resp_raw.as_bytes()).unwrap();
+        let resp_res = compact_openai_responses_live_zone(&ws, &resp_parsed, &live_options())
+            .expect("responses trailing outputs should compact");
+        let resp_prefix_end = resp_raw.rfind("\"call_tbl\"").unwrap();
+        assert_eq!(
+            &resp_res.body[..resp_prefix_end],
+            &resp_raw.as_bytes()[..resp_prefix_end]
+        );
+        assert_eq!(resp_res.stats.results, 2);
+        let resp_pct = resp_res.stats.saved_bytes * 100 / resp_res.stats.bytes_before;
+        assert!(resp_pct > 80, "responses saved only {resp_pct}%");
+        let resp_out: Value = serde_json::from_slice(&resp_res.body).unwrap();
+        assert_eq!(resp_out["input"][3], resp_req["input"][3]);
+        assert!(
+            resp_out["input"][7]["output"]
+                .as_str()
+                .unwrap()
+                .contains("ValueError: negative invoice total")
+        );
+
+        // Responses safety guards: no prior function_call/message, or ends with message -> untouched.
+        for skipped in [
+            json!({"model": "gpt-5.4", "input": [{"type": "function_call_output", "call_id": "c1", "output": big_tb}]}),
+            json!({"model": "gpt-5.4", "input": [{"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"}, {"type": "function_call_output", "call_id": "c1", "output": big_tb}, {"type": "message", "role": "user", "content": "ok"}]}),
+        ] {
+            let raw = serde_json::to_vec(&skipped).unwrap();
+            assert!(
+                compact_openai_responses_live_zone(
+                    &ws,
+                    &Body::parse(&raw).unwrap(),
+                    &live_options()
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn skips_justless_recall_and_retrieval_calls_to_prevent_loops() {
+        let (_dir, ws) = workspace();
+        let big = large_json_array();
+        // Anthropic shell `justless recall` + MCP `mcp__justless__recall` stay untouched.
+        let anth = json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t_sh", "name": "Bash", "input": {"command": "justless recall deadbeef"}},
+                    {"type": "tool_use", "id": "t_mcp", "name": "mcp__justless__recall", "input": {"id": "deadbeef"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t_sh", "content": big},
+                    {"type": "tool_result", "tool_use_id": "t_mcp", "content": big}
+                ]}
+            ]
+        });
+        let raw = serde_json::to_vec(&anth).unwrap();
+        assert!(compact_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options()).is_none());
+
+        // OpenAI Chat `justless expand` stays untouched.
+        let chat = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c_rec", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"justless expand src/lib.rs rev#1\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c_rec", "content": big}
+            ]
+        });
+        let raw = serde_json::to_vec(&chat).unwrap();
+        assert!(
+            compact_openai_chat_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options())
+                .is_none()
+        );
+
+        // OpenAI Responses `justless log` stays untouched.
+        let resp = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "function_call", "call_id": "r_log", "name": "shell", "arguments": "{\"cmd\":[\"justless\",\"log\",\"run_1\",\"--from\",\"1\"]}" },
+                {"type": "function_call_output", "call_id": "r_log", "output": big}
+            ]
+        });
+        let raw = serde_json::to_vec(&resp).unwrap();
+        assert!(
+            compact_openai_responses_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options())
+                .is_none()
+        );
     }
 }

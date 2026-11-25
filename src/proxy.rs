@@ -78,7 +78,7 @@ fn clearing_args() -> Vec<Arg<'static>> {
             .help("Do not archive tool results"),
         Arg::new("compact-live")
             .long("compact-live")
-            .help("Compact oversized newest tool_result text blocks in the uncached final user turn (or set JUSTLESS_PROXY_COMPACT_LIVE=1)"),
+            .help("Compact oversized newest tool results in the uncached live zone (Anthropic /v1/messages, OpenAI /chat/completions & /responses; or set JUSTLESS_PROXY_COMPACT_LIVE=1)"),
         crate::number(
             "compact-live-min-bytes",
             "8192",
@@ -505,6 +505,8 @@ fn serve(shared: &Shared, stream: TcpStream) {
 enum Endpoint {
     Messages,
     CountTokens,
+    ChatCompletions,
+    Responses,
     Other,
 }
 
@@ -513,6 +515,8 @@ impl Endpoint {
         match (head.method.as_str(), head.path()) {
             ("POST", "/v1/messages") => Self::Messages,
             ("POST", "/v1/messages/count_tokens") => Self::CountTokens,
+            ("POST", path) if path.ends_with("/chat/completions") => Self::ChatCompletions,
+            ("POST", path) if path.ends_with("/responses") => Self::Responses,
             _ => Self::Other,
         }
     }
@@ -521,8 +525,14 @@ impl Endpoint {
         match self {
             Self::Messages => "messages",
             Self::CountTokens => "count_tokens",
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
             Self::Other => "other",
         }
+    }
+
+    fn is_anthropic(self) -> bool {
+        matches!(self, Self::Messages | Self::CountTokens)
     }
 }
 
@@ -645,6 +655,9 @@ fn count_repeats(calls: &mut state::Calls, req: &Request, boundary: usize) -> u6
 
 impl Shared {
     fn plan(&self, head: &Head, body: &[u8], endpoint: Endpoint, now: u64) -> Planned {
+        if !endpoint.is_anthropic() {
+            return self.plan_openai(body, endpoint);
+        }
         let Some(parsed) = Body::parse(body) else {
             return Planned::pass("unparsed");
         };
@@ -689,6 +702,47 @@ impl Shared {
         }
         planned.request = Some(req);
         planned
+    }
+
+    /// Live-zone-only compaction for OpenAI Chat Completions and Responses APIs.
+    /// Never applies Anthropic clearing edits or `anthropic-beta` headers.
+    fn plan_openai(&self, body: &[u8], endpoint: Endpoint) -> Planned {
+        if !self.options.compact_live {
+            return Planned::pass("compact-live-off");
+        }
+        if !self.archive {
+            return Planned::pass("no-archive");
+        }
+        let Some(parsed) = Body::parse(body) else {
+            return Planned::pass("unparsed");
+        };
+        let model = parsed
+            .value("model")
+            .and_then(|v| v.as_str().map(str::to_owned));
+        let live = match endpoint {
+            Endpoint::ChatCompletions => {
+                compact::compact_openai_chat_live_zone(&self.ws, &parsed, &self.options)
+            }
+            Endpoint::Responses => {
+                compact::compact_openai_responses_live_zone(&self.ws, &parsed, &self.options)
+            }
+            _ => None,
+        };
+        match live {
+            Some(live) => Planned {
+                body: Some(live.body),
+                live_compacted: Some(live.stats),
+                model,
+                mode: "compact",
+                ..Default::default()
+            },
+            None => Planned {
+                model,
+                mode: "pass",
+                reason: Some("no-live-compact"),
+                ..Default::default()
+            },
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1009,7 +1063,8 @@ fn handle(
         }
     }
     let status = parts.status.as_u16();
-    let mut observer = if candidate {
+    let observe = candidate && endpoint.is_anthropic();
+    let mut observer = if observe {
         Observer::new(
             header(&parts.headers, "content-type"),
             header(&parts.headers, "content-encoding"),
@@ -1029,7 +1084,7 @@ fn handle(
     );
     record.status = status;
     let observed = observer.finish();
-    if candidate {
+    if observe {
         record.observed = Some(observed.is_some());
     }
     finish(shared, record, planned, observed, candidate, started);
