@@ -21,6 +21,7 @@ use std::fs;
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command as Process, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Arg, ArgMatches, Command};
@@ -52,13 +53,15 @@ const LIST_TTL_MS: u64 = 3_600_000;
 const INSTRUCTIONS: &str = "Justless indexes this repository's source, docs and configuration. \
 Use these tools before reading whole files or grepping. `map` orients you in an unfamiliar \
 repository. For a how or where question, start with `lookup`, which ranks the code, docs and \
-config that best match it. `pack` gathers budgeted evidence for a task, with links, changes and \
-recent failures. `context` shows source around a location, Git diff or captured run. \
-`query` and `path` follow symbols and the links between them. `affected` lists what depends on a \
-symbol, file or the Git changes, and the tests to run. `find` searches literal text. \
-`read` with outline=true lists a file's symbols so that `expand` or `code` can fetch \
-only the lines you need. `log`, `search`, `history` and `resume` reopen captured runs and recent \
-activity. File paths are relative to the repository root.";
+config that best match it (add logs=true to include captured logs). `pack` gathers budgeted \
+evidence for a task, with links, changes and recent failures. `context` shows source around a \
+location, symbol, Git diff or captured run; repeated `context`/`pack` reads in a session return \
+deltas unless fresh=true. `query` and `path` follow symbols and the links between them. \
+`affected` lists what depends on a symbol, file or the Git changes, and the tests to run. \
+`find` searches literal text. `read` (file or files) with outline=true lists symbols so `expand` \
+or `code` can fetch only the lines you need. `log`, `search`, `history`, `recall` and `resume` \
+reopen captured runs, archived tool outputs and recent activity. File paths are relative to the \
+repository root; `budget` is max output bytes.";
 
 pub fn command() -> Command<'static> {
     Command::new("mcp")
@@ -90,11 +93,35 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
 /// A paged log is accounted for by the server once it knows the delivered size.
 pub(crate) const PAGED_REPLAY: &str = "JUSTLESS_PAGED_REPLAY";
 
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+fn new_session() -> String {
+    let seq = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    let seed = format!(
+        "mcp-{}-{}-{seq}",
+        std::process::id(),
+        crate::history::now_ms()
+    );
+    format!(
+        "mcp-{}",
+        &crate::capture::source_digest(seed.as_bytes())[..24]
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Paged<'a> {
+    Log(&'a Map<String, Value>),
+    Recall(&'a Map<String, Value>),
+}
+
 struct Server {
     root: PathBuf,
     /// The served project, where a run a `log` page replays is looked up first.
     workspace: Workspace,
     exe: PathBuf,
+    /// Stable per-server session key passed to `context` and `pack` so repeated
+    /// reads return `seen::Memory` deltas instead of reprinting unchanged code.
+    session: String,
     initialized: bool,
     /// The revision negotiated through `initialize`.
     version: Option<&'static str>,
@@ -125,6 +152,7 @@ fn serve(workspace: &Workspace) -> Result<()> {
         root: workspace.root.clone(),
         workspace: workspace.clone(),
         exe: std::env::current_exe().context("locate the justless executable")?,
+        session: new_session(),
         initialized: false,
         version: None,
     };
@@ -357,19 +385,30 @@ impl Server {
             Some(_) => return Err(RpcError::params("arguments must be an object")),
         };
         Ok(match tool.argv(arguments) {
-            Ok(argv) => self.execute(&argv, (tool.name == "log").then_some(arguments)),
+            Ok(mut argv) => {
+                if uses_session(tool.name, arguments) {
+                    argv.insert(1, format!("--session={}", self.session));
+                }
+                let paged = match tool.name {
+                    "log" => Some(Paged::Log(arguments)),
+                    "recall" => Some(Paged::Recall(arguments)),
+                    _ => None,
+                };
+                self.execute(&argv, paged)
+            }
             // Invalid arguments are tool execution errors, so the model can
             // correct them and retry.
             Err(message) => tool_result(vec![message], true),
         })
     }
 
-    /// Runs one command. `log` passes its arguments so a long replay is paged.
-    fn execute(&self, argv: &[String], log: Option<&Map<String, Value>>) -> Value {
+    /// Runs one command. `log` and `recall` pass their arguments so long
+    /// outputs are paged on line boundaries.
+    fn execute(&self, argv: &[String], paged: Option<Paged<'_>>) -> Value {
         // The agent's shell may start anywhere, so a command a result prints for it,
         // such as lookup's `Next:` line, names this root.
         let mut command = Process::new(&self.exe);
-        if log.is_some() {
+        if matches!(paged, Some(Paged::Log(_))) {
             command.env(PAGED_REPLAY, "1");
         }
         let output = command
@@ -388,12 +427,18 @@ impl Server {
         };
         let failed = !output.status.success();
         let mut texts = Vec::new();
-        if let Some(arguments) = log.filter(|_| !failed) {
-            texts = log_pages(&output, arguments, &self.root);
-        } else {
-            for stream in [&output.stdout, &output.stderr] {
-                if !stream.is_empty() {
-                    texts.push(String::from_utf8_lossy(stream).into_owned());
+        match paged.filter(|_| !failed) {
+            Some(Paged::Log(arguments)) => {
+                texts = log_pages(&output, arguments, &self.root);
+            }
+            Some(Paged::Recall(arguments)) => {
+                texts = recall_pages(&output, arguments, &self.root);
+            }
+            None => {
+                for stream in [&output.stdout, &output.stderr] {
+                    if !stream.is_empty() {
+                        texts.push(String::from_utf8_lossy(stream).into_owned());
+                    }
                 }
             }
         }
@@ -404,7 +449,7 @@ impl Server {
                 "(no output)".into()
             });
         }
-        if let Some(arguments) = log.filter(|_| !failed) {
+        if let Some(Paged::Log(arguments)) = paged.filter(|_| !failed) {
             self.measure_page(arguments, texts.iter().map(String::len).sum());
         }
         tool_result(texts, failed)
@@ -503,6 +548,115 @@ fn log_pages(
     texts
 }
 
+/// Whether this MCP tool call supports per-process `--session` dedup via `seen::Memory`.
+fn uses_session(tool: &str, arguments: &Map<String, Value>) -> bool {
+    match tool {
+        "pack" => true,
+        "context" => {
+            arguments.get("at").is_some_and(|v| !v.is_null())
+                || arguments.get("symbol").is_some_and(|v| !v.is_null())
+        }
+        _ => false,
+    }
+}
+
+/// Largest byte index <= `limit` that does not split a UTF-8 code point.
+fn floor_utf8_boundary(bytes: &[u8], limit: usize) -> usize {
+    let mut end = limit.min(bytes.len());
+    if end == bytes.len() {
+        return end;
+    }
+    let mut stepped = 0;
+    while end > 0 && stepped < 3 && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+        stepped += 1;
+    }
+    if end == 0 || (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+        limit.min(bytes.len())
+    } else {
+        end
+    }
+}
+
+/// A successful `recall` result, paged to `LOG_PAGE` on line boundaries so
+/// large archived observations cannot flood context in one tool response.
+fn recall_pages(
+    output: &std::process::Output,
+    arguments: &Map<String, Value>,
+    root: &std::path::Path,
+) -> Vec<String> {
+    let mut texts = Vec::new();
+    let bytes = &output.stdout;
+    if !bytes.is_empty() {
+        if bytes.len() <= LOG_PAGE {
+            texts.push(String::from_utf8_lossy(bytes).into_owned());
+        } else {
+            let cut = match bytes[..LOG_PAGE].iter().rposition(|&b| b == b'\n') {
+                Some(newline) => newline + 1,
+                None => floor_utf8_boundary(bytes, LOG_PAGE),
+            };
+            let shown = &bytes[..cut];
+            let lines = shown.iter().filter(|&&b| b == b'\n').count() as u64;
+            let mut text = String::from_utf8_lossy(shown).into_owned();
+            let list = arguments.get("list") == Some(&Value::Bool(true));
+            let grep = arguments.get("grep").and_then(Value::as_str);
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let from = arguments
+                .get("from")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .max(1);
+            let to = arguments.get("to").and_then(Value::as_u64);
+            let to_hint = to.map(|to| format!(", to={to}")).unwrap_or_default();
+            let hint = if list {
+                let prefix = if text.ends_with('\n') { "" } else { "\n" };
+                format!(
+                    "{prefix}[justless: recall list truncated after {LOG_PAGE} bytes. Call recall with list=true and a smaller limit.]"
+                )
+            } else if let Some(needle) = grep {
+                let prefix = if text.ends_with('\n') { "" } else { "\n" };
+                let next_from = text
+                    .lines()
+                    .rev()
+                    .find_map(|line| line.split_once(": ")?.0.parse::<u64>().ok())
+                    .map(|n| n + 1);
+                match next_from {
+                    Some(next) => format!(
+                        "{prefix}[justless: recall grep truncated after {LOG_PAGE} bytes. Call recall with id=\"{id}\", grep={needle:?}, from={next}{to_hint} for more.]"
+                    ),
+                    None => format!(
+                        "{prefix}[justless: recall grep truncated after {LOG_PAGE} bytes. Call recall with id=\"{id}\", grep={needle:?} and a smaller limit.]"
+                    ),
+                }
+            } else if lines == 0 {
+                let root = crate::workspace::shell_quote(root);
+                format!(
+                    "\n[justless: recall line {from} is longer than {LOG_PAGE} bytes and was cut. \
+                     Run `justless --root {root} recall {id} --from {from} --to {from}` in a shell \
+                     for the whole line, or call recall with id=\"{id}\", from={}{to_hint} to continue.]",
+                    from + 1
+                )
+            } else {
+                let last = from + lines - 1;
+                format!(
+                    "[justless: recall page ends at line {last} after {LOG_PAGE} bytes. \
+                     Call recall with id=\"{id}\", from={}{to_hint} for more, or grep=\"TEXT\" to filter.]",
+                    last + 1
+                )
+            };
+            text.push_str(&hint);
+            texts.push(text);
+        }
+    }
+    if !output.stderr.is_empty() {
+        texts.push(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    texts
+}
+
 fn check_request_meta(meta: &Value, version: &Value) -> Result<(), RpcError> {
     let requested = version
         .as_str()
@@ -538,6 +692,8 @@ enum Kind {
     Text,
     /// A workspace-relative file path.
     File,
+    /// One or more workspace-relative file paths passed as positionals.
+    Files,
     /// `PATH:LINE` or `PATH:START-END`.
     Location,
     RunId,
@@ -559,6 +715,8 @@ struct Param {
     flag: Option<&'static str>,
     kind: Kind,
     required: bool,
+    /// Short help text; omitted from the JSON schema when empty and the
+    /// parameter name/type/enum is self-explanatory.
     help: &'static str,
 }
 
@@ -567,7 +725,6 @@ type Check = fn(&Map<String, Value>) -> Result<(), String>;
 
 struct Tool {
     name: &'static str,
-    title: &'static str,
     command: &'static str,
     description: &'static str,
     params: &'static [Param],
@@ -601,31 +758,19 @@ const fn option(name: &'static str, flag: &'static str, kind: Kind, help: &'stat
     }
 }
 
-const BUDGET: Param = option(
-    "budget",
-    "budget",
-    Kind::Count(128, 1_000_000),
-    // The default is the project's `context_budget`, so it is not named here.
-    "Max bytes",
-);
-const FILE: Param = positional("file", Kind::File, "Workspace path");
-const RUN_ID: Param = positional("run_id", Kind::RunId, "Captured run ID");
-const STREAM: Param = option(
-    "stream",
-    "stream",
-    Kind::Choice(STREAMS),
-    "Stream (default both)",
-);
-const BASE: Param = option("base", "base", Kind::Text, "Diff from merge base with ref");
+const BUDGET: Param = option("budget", "budget", Kind::Count(128, 1_000_000), "");
+const FILE: Param = positional("file", Kind::File, "");
+const RUN_ID: Param = positional("run_id", Kind::RunId, "");
+const STREAM: Param = option("stream", "stream", Kind::Choice(STREAMS), "");
+const BASE: Param = option("base", "base", Kind::Text, "Base ref");
 
 const TOOLS: &[Tool] = &[
     Tool {
         name: "query",
-        title: "Find a symbol",
         command: "query",
-        description: "Definition, references, callers, tests or dependencies of a symbol.",
+        description: "Symbol definition, refs, callers, tests or deps.",
         params: &[
-            positional("symbol", Kind::Text, "Symbol name, optionally qualified"),
+            positional("symbol", Kind::Text, ""),
             option(
                 "view",
                 "view",
@@ -637,7 +782,7 @@ const TOOLS: &[Tool] = &[
                     "dependencies",
                     "all",
                 ]),
-                "Relationships to show (default all)",
+                "",
             ),
             BUDGET,
         ],
@@ -645,90 +790,68 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "path",
-        title: "Trace a path between symbols",
         command: "path",
-        description: "Shortest chain of calls, imports or queries linking two symbols, with the file and line of each link.",
+        description: "Shortest call/import/SQL path between symbols.",
         params: &[
-            positional("from", Kind::Text, "Starting symbol"),
-            positional("to", Kind::Text, "Target symbol"),
+            positional("from", Kind::Text, ""),
+            positional("to", Kind::Text, ""),
             BUDGET,
         ],
         check: None,
     },
     Tool {
         name: "find",
-        title: "Search indexed text",
         command: "find",
-        description: "Exact text across indexed source, docs and configuration, as file:line matches.",
+        description: "Exact literal text search (file:line matches).",
         params: &[
-            positional("text", Kind::Text, "Exact text to find"),
-            option(
-                "ignore_case",
-                "ignore-case",
-                Kind::Flag,
-                "Ignore ASCII case",
-            ),
-            option("path", "path", Kind::Paths, "Files or dirs"),
+            positional("text", Kind::Text, ""),
+            option("ignore_case", "ignore-case", Kind::Flag, ""),
+            option("path", "path", Kind::Paths, "Dirs/files"),
             option("glob", "glob", Kind::Texts, "rg -g globs"),
-            option(
-                "limit",
-                "limit",
-                Kind::Count(1, MAX_LIMIT as u64),
-                "Max lines (default 20)",
-            ),
-            option("after", "after", Kind::Text, "Next-page cursor"),
+            option("limit", "limit", Kind::Count(1, MAX_LIMIT as u64), ""),
+            option("after", "after", Kind::Text, "Page cursor"),
             BUDGET,
         ],
         check: None,
     },
     Tool {
         name: "lookup",
-        title: "Ranked search",
         command: "lookup",
-        description: "Ranks the symbols, doc sections and config blocks that best match a question or keywords.",
+        description: "Rank symbols, docs and config for a question.",
         params: &[
-            positional("question", Kind::Text, "Question or keywords"),
-            option(
-                "limit",
-                "limit",
-                Kind::Count(1, 50),
-                "Max results (default 8)",
-            ),
+            positional("question", Kind::Text, ""),
+            option("limit", "limit", Kind::Count(1, 50), ""),
+            option("logs", "logs", Kind::Flag, "Search logs"),
             BUDGET,
         ],
         check: None,
     },
     Tool {
         name: "context",
-        title: "Source around location, diff or run",
         command: "context",
-        description: "Source around `at`, Git `changes` or `run_id`, with enclosing symbols and tests.",
+        description: "Source for at, symbol, Git changes or run_id (deduped).",
         params: &[
-            option("at", "at", Kind::Location, "PATH:LINE or PATH:START-END"),
-            option("changes", "changes", Kind::Flag, "Use Git changes"),
-            option("run_id", "run", Kind::RunId, "Captured run ID"),
-            option("staged", "staged", Kind::Flag, "Staged changes only"),
+            option("at", "at", Kind::Location, "PATH:LINE[-END]"),
+            option("symbol", "symbol", Kind::Text, ""),
+            option("changes", "changes", Kind::Flag, ""),
+            option("run_id", "run", Kind::RunId, ""),
+            option("staged", "staged", Kind::Flag, ""),
             BASE,
+            option("fresh", "fresh", Kind::Flag, "Skip dedup"),
             BUDGET,
         ],
         check: Some(context_input),
     },
     Tool {
         name: "code",
-        title: "Read a line range",
         command: "code",
-        description: "Exact numbered lines from a file. Use when you already know the range.",
+        description: "Exact numbered lines from a known file range.",
         params: &[
             FILE,
-            option(
-                "from",
-                "from",
-                Kind::Count(1, MAX_LINE),
-                "First line (default 1)",
-            ),
+            option("from", "from", Kind::Count(1, MAX_LINE), ""),
             Param {
                 required: true,
-                ..option("to", "to", Kind::Count(1, MAX_LINE), "Last line")
+                ..option("to", "to", Kind::Count(1, MAX_LINE), "")
             },
             BUDGET,
         ],
@@ -736,165 +859,137 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "read",
-        title: "Read a file or its outline",
         command: "read",
-        description: "A small file verbatim, or an outline of a larger file's symbols with a revision for `expand`.",
+        description: "Small file(s) verbatim, or outline with expand rev.",
         params: &[
-            FILE,
-            option(
-                "outline",
-                "outline",
-                Kind::Flag,
-                "Outline even a small file",
-            ),
-            option(
-                "match",
-                "match",
-                Kind::Text,
-                "Filter rows by name/signature (a|b for OR)",
-            ),
-            option(
-                "limit",
-                "limit",
-                Kind::Count(1, MAX_LIMIT as u64),
-                "Rows per page (default 40)",
-            ),
-            option("after", "after", Kind::Text, "Next page after this REV#ROW"),
+            Param {
+                required: false,
+                ..FILE
+            },
+            Param {
+                required: false,
+                ..positional("files", Kind::Files, "")
+            },
+            option("outline", "outline", Kind::Flag, "Force outline"),
+            option("match", "match", Kind::Text, "Filter (a|b)"),
+            option("limit", "limit", Kind::Count(1, MAX_LIMIT as u64), ""),
+            option("after", "after", Kind::Text, "REV#ROW"),
             BUDGET,
         ],
-        check: None,
+        check: Some(read_input),
     },
     Tool {
         name: "expand",
-        title: "Expand symbols",
         command: "expand",
-        description: "Exact source of symbol(s), Markdown section, outline row(s) (REV#ROW,#ROW) or line range (L10-20).",
+        description: "Exact source of symbol, section, REV#ROW or L10-20 range.",
         params: &[
             FILE,
-            positional("selector", Kind::Text, "Symbol, REV#ROW,#ROW or L20-35"),
-            option(
-                "revision",
-                "revision",
-                Kind::Text,
-                "Revision from read; fails if changed",
-            ),
+            positional("selector", Kind::Text, "Symbol, REV#ROW,#ROW or L10-20"),
+            option("revision", "revision", Kind::Text, "Rev check"),
         ],
         check: None,
     },
     Tool {
         name: "pack",
-        title: "Gather evidence for a question",
         command: "pack",
-        description: "Budgeted evidence for a task or question: relevant definitions, links, changes and recent failures.",
+        description: "Budgeted task evidence: defs, links, diff, runs.",
         params: &[
-            positional("question", Kind::Text, "Task or question"),
+            positional("question", Kind::Text, ""),
+            option("fresh", "fresh", Kind::Flag, "Skip dedup"),
             BUDGET,
         ],
         check: None,
     },
     Tool {
         name: "map",
-        title: "Repository map",
         command: "map",
-        description: "Repo overview: areas, hubs, communities, cross-language links, entry points, tests.",
+        description: "Repo map: areas, hubs, cross-lang links, tests.",
         params: &[BUDGET],
         check: None,
     },
     Tool {
         name: "affected",
-        title: "Find dependents",
         command: "affected",
-        description: "Dependents of a symbol, file or Git changes by distance, and the tests that reach it.",
+        description: "Dependents and tests for target or Git changes.",
         params: &[
             Param {
                 required: false,
                 ..positional("target", Kind::Text, "Symbol or file")
             },
-            option("changes", "changes", Kind::Flag, "Use Git changes"),
+            option("changes", "changes", Kind::Flag, ""),
             BASE,
-            option("depth", "depth", Kind::Count(1, 32), "Hops (default 3)"),
+            option("depth", "depth", Kind::Count(1, 32), "Max hops"),
             BUDGET,
         ],
         check: Some(affected_input),
     },
     Tool {
         name: "log",
-        title: "Replay a captured run",
         command: "log",
-        description: "Output of a `justless run` capture, secrets redacted.",
+        description: "Captured run output (paged, secrets redacted).",
         params: &[
             RUN_ID,
             STREAM,
-            option(
-                "from",
-                "from",
-                Kind::Count(1, MAX_LINE),
-                "First line (default 1)",
-            ),
-            option("to", "to", Kind::Count(1, MAX_LINE), "Last line"),
+            option("from", "from", Kind::Count(1, MAX_LINE), ""),
+            option("to", "to", Kind::Count(1, MAX_LINE), ""),
         ],
         check: None,
     },
     Tool {
         name: "search",
-        title: "Search a captured run",
         command: "search",
-        description: "Literal text in one captured run's output, with stream and line numbers.",
+        description: "Search literal text in one captured run log.",
         params: &[
             RUN_ID,
-            positional("text", Kind::Text, "Exact text to find"),
+            positional("text", Kind::Text, ""),
             STREAM,
-            option(
-                "limit",
-                "limit",
-                Kind::Count(1, MAX_LIMIT as u64),
-                "Max lines (default 20)",
-            ),
+            option("limit", "limit", Kind::Count(1, MAX_LIMIT as u64), ""),
         ],
         check: None,
     },
     Tool {
         name: "history",
-        title: "Search earlier runs",
         command: "history",
-        description: "Recent captured runs, or a literal search across every recorded log.",
+        description: "List recent runs, or search text across logs.",
         params: &[
             Param {
                 required: false,
-                ..positional("text", Kind::Text, "Text to find; omit to list recent runs")
+                ..positional("text", Kind::Text, "Omit to list")
             },
-            option("oldest", "oldest", Kind::Flag, "Oldest first"),
-            option(
-                "limit",
-                "limit",
-                Kind::Count(1, MAX_LIMIT as u64),
-                "Max runs or lines (default 12)",
-            ),
+            option("oldest", "oldest", Kind::Flag, ""),
+            option("limit", "limit", Kind::Count(1, MAX_LIMIT as u64), ""),
             BUDGET,
         ],
         check: None,
     },
     Tool {
         name: "recall",
-        title: "Recover an archived tool result",
         command: "recall",
-        description: "Original value of an archived tool result, by recall ID or tool_use ID.",
-        params: &[positional("id", Kind::RecallId, "Recall ID or tool_use ID")],
-        check: None,
+        description: "Recover archived tool result (paged/grep) or list IDs.",
+        params: &[
+            Param {
+                required: false,
+                ..positional("id", Kind::RecallId, "Recall/tool_use ID")
+            },
+            option("from", "from", Kind::Count(1, MAX_LINE), ""),
+            option("to", "to", Kind::Count(1, MAX_LINE), ""),
+            option("grep", "grep", Kind::Text, "Filter lines"),
+            option("limit", "limit", Kind::Count(1, MAX_LIMIT as u64), ""),
+            option("list", "list", Kind::Flag, "List IDs"),
+        ],
+        check: Some(recall_input),
     },
     Tool {
         name: "resume",
-        title: "Resume earlier work",
         command: "resume",
-        description: "Where earlier work left off: recent runs and outcomes, inspected source and stale evidence.",
+        description: "Recent runs, inspected source and stale files.",
         params: &[BUDGET],
         check: None,
     },
     Tool {
         name: "stats",
-        title: "Show savings",
         command: "stats",
-        description: "Bytes and estimated tokens kept out of context, by day and command.",
+        description: "Context bytes/tokens saved by day and command.",
         params: &[],
         check: None,
     },
@@ -904,17 +999,53 @@ fn context_input(arguments: &Map<String, Value>) -> Result<(), String> {
     let changes = base_input(arguments)?;
     let staged = arguments.get("staged") == Some(&Value::Bool(true));
     let at = arguments.get("at").is_some_and(|value| !value.is_null());
+    let symbol = arguments
+        .get("symbol")
+        .is_some_and(|value| !value.is_null());
     let run = arguments
         .get("run_id")
         .is_some_and(|value| !value.is_null());
-    if usize::from(changes) + usize::from(at) + usize::from(run) != 1 {
-        return Err("pass exactly one of `at`, `changes: true` or `run_id`".into());
+    if usize::from(changes) + usize::from(at) + usize::from(symbol) + usize::from(run) != 1 {
+        return Err("pass exactly one of `at`, `symbol`, `changes: true` or `run_id`".into());
     }
     if staged && !changes {
         return Err("`staged` requires `changes: true`".into());
     }
     if staged && arguments.get("base").is_some_and(|value| !value.is_null()) {
         return Err("pass `staged` or `base`, not both".into());
+    }
+    Ok(())
+}
+
+fn read_input(arguments: &Map<String, Value>) -> Result<(), String> {
+    let file = arguments.get("file").is_some_and(|value| !value.is_null());
+    let files = arguments.get("files").is_some_and(|value| !value.is_null());
+    if file == files {
+        return Err(if file {
+            "pass `file` or `files`, not both".into()
+        } else {
+            "missing required argument `file` or `files`".into()
+        });
+    }
+    Ok(())
+}
+
+fn recall_input(arguments: &Map<String, Value>) -> Result<(), String> {
+    let list = arguments.get("list") == Some(&Value::Bool(true));
+    let id = arguments.get("id").is_some_and(|value| !value.is_null());
+    if list == id {
+        return Err("pass exactly one of `id` or `list: true`".into());
+    }
+    let from = arguments.get("from").and_then(Value::as_u64);
+    let to = arguments.get("to").and_then(Value::as_u64);
+    let grep = arguments.get("grep").is_some_and(|value| !value.is_null());
+    if list && (from.is_some() || to.is_some() || grep) {
+        return Err("`from`, `to` and `grep` apply to `id`, not `list: true`".into());
+    }
+    if let (Some(from), Some(to)) = (from, to)
+        && from > to
+    {
+        return Err("`from` must not be after `to`".into());
     }
     Ok(())
 }
@@ -944,7 +1075,8 @@ impl Tool {
         let mut properties = Map::new();
         for param in self.params {
             // The tool list is sent with every model request, so schemas carry only
-            // types, choices and short help. Arguments are validated in full on call.
+            // types, choices and short help where the name/type is not self-evident.
+            // Arguments are validated in full on call.
             let mut schema = match param.kind {
                 Kind::Text | Kind::File | Kind::Location | Kind::RunId | Kind::RecallId => {
                     json!({"type": "string"})
@@ -952,9 +1084,13 @@ impl Tool {
                 Kind::Count(..) => json!({"type": "integer"}),
                 Kind::Flag => json!({"type": "boolean"}),
                 Kind::Choice(values) => json!({"type": "string", "enum": values}),
-                Kind::Paths | Kind::Texts => json!({"type": "array", "items": {"type": "string"}}),
+                Kind::Paths | Kind::Texts | Kind::Files => {
+                    json!({"type": "array", "items": {"type": "string"}})
+                }
             };
-            schema["description"] = json!(param.help);
+            if !param.help.is_empty() {
+                schema["description"] = json!(param.help);
+            }
             properties.insert(param.name.into(), schema);
         }
         let required = self
@@ -969,7 +1105,6 @@ impl Tool {
         }
         json!({
             "name": self.name,
-            "title": self.title,
             "description": self.description,
             "inputSchema": schema,
             "annotations": {"readOnlyHint": true},
@@ -1006,7 +1141,7 @@ impl Tool {
                 }
                 continue;
             };
-            if let Kind::Paths | Kind::Texts = param.kind {
+            if let Kind::Paths | Kind::Texts | Kind::Files = param.kind {
                 let items = match value {
                     Value::String(_) => std::slice::from_ref(value),
                     Value::Array(items) => items.as_slice(),
@@ -1017,9 +1152,15 @@ impl Tool {
                         ));
                     }
                 };
+                if matches!(param.kind, Kind::Files) && items.is_empty() {
+                    return Err(format!("`{}` must not be empty", param.name));
+                }
                 for item in items {
                     let text = validate(param, item)?;
-                    argv.push(format!("--{}={text}", param.flag.unwrap()));
+                    match param.flag {
+                        Some(flag) => argv.push(format!("--{flag}={text}")),
+                        None => positionals.push(text),
+                    }
                 }
                 continue;
             }
@@ -1063,7 +1204,7 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
     };
     ensure_text(name, text)?;
     let normalized = match param.kind {
-        Kind::File => normalize_relative(text, false),
+        Kind::File | Kind::Files => normalize_relative(text, false),
         Kind::Paths => normalize_relative(text, true),
         Kind::Location => text.rsplit_once(':').and_then(|(file, lines)| {
             let mut bounds = lines.splitn(2, '-');
@@ -1092,6 +1233,9 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
     }
     Err(match param.kind {
         Kind::File => format!("`{name}` must be a workspace-relative path such as src/main.rs"),
+        Kind::Files => {
+            format!("`{name}` must be workspace-relative paths such as src/main.rs")
+        }
         Kind::Paths => format!(
             "`{name}` must be a workspace-relative path or a list of them, such as src or src/main.rs"
         ),
@@ -1410,4 +1554,283 @@ fn install(workspace: &Workspace, clients: &BTreeSet<Client>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::ExitStatus;
+
+    fn tool(name: &str) -> &'static Tool {
+        TOOLS.iter().find(|tool| tool.name == name).unwrap()
+    }
+
+    fn map(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    fn ok_output(stdout: Vec<u8>, stderr: Vec<u8>) -> std::process::Output {
+        std::process::Output {
+            status: ExitStatus::default(),
+            stdout,
+            stderr,
+        }
+    }
+
+    #[test]
+    fn tools_list_schema_is_valid_and_compact() {
+        let defs: Vec<Value> = TOOLS.iter().map(Tool::definition).collect();
+        assert_eq!(defs.len(), 17);
+        let serialized = serde_json::to_string(&defs).unwrap();
+        assert!(
+            serialized.len() < 6_000,
+            "slimmed tools/list should stay compact, got {} bytes",
+            serialized.len()
+        );
+        for def in &defs {
+            assert_eq!(def["inputSchema"]["type"], "object", "{def:#}");
+            assert_eq!(def["annotations"]["readOnlyHint"], true, "{def:#}");
+            let desc = def["description"].as_str().unwrap();
+            assert!(
+                (40..=200).contains(&desc.len()),
+                "{}: {} bytes ({desc:?})",
+                def["name"],
+                desc.len()
+            );
+            let props = def["inputSchema"]["properties"].as_object().unwrap();
+            assert!(!props.contains_key("unredacted"), "{def:#}");
+        }
+        let by_name = |name: &str| defs.iter().find(|d| d["name"] == name).unwrap();
+        assert!(
+            by_name("log")["description"]
+                .as_str()
+                .unwrap()
+                .contains("secrets redacted")
+        );
+
+        let recall = &by_name("recall")["inputSchema"];
+        assert!(recall.get("required").is_none());
+        let rprops = recall["properties"].as_object().unwrap();
+        assert_eq!(rprops["id"]["type"], "string");
+        assert_eq!(rprops["from"]["type"], "integer");
+        assert_eq!(rprops["to"]["type"], "integer");
+        assert_eq!(rprops["grep"]["type"], "string");
+        assert_eq!(rprops["limit"]["type"], "integer");
+        assert_eq!(rprops["list"]["type"], "boolean");
+
+        let read = &by_name("read")["inputSchema"];
+        assert!(read.get("required").is_none());
+        assert_eq!(read["properties"]["file"]["type"], "string");
+        assert_eq!(read["properties"]["files"]["type"], "array");
+        assert_eq!(read["properties"]["files"]["items"]["type"], "string");
+
+        let ctx = &by_name("context")["inputSchema"]["properties"];
+        assert_eq!(ctx["symbol"]["type"], "string");
+        assert_eq!(ctx["fresh"]["type"], "boolean");
+
+        assert_eq!(
+            by_name("pack")["inputSchema"]["properties"]["fresh"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            by_name("lookup")["inputSchema"]["properties"]["logs"]["type"],
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn argv_handles_parity_and_recall_options_and_validation() {
+        // Multi-file read
+        assert_eq!(
+            tool("read")
+                .argv(&map(
+                    json!({"files": ["./src/a.rs", "src/b.rs"], "outline": true})
+                ))
+                .unwrap(),
+            ["read", "--outline", "--", "src/a.rs", "src/b.rs"]
+        );
+        assert!(tool("read").argv(&map(json!({}))).is_err());
+        assert!(
+            tool("read")
+                .argv(&map(json!({"file": "a.rs", "files": ["b.rs"]})))
+                .is_err()
+        );
+        assert!(tool("read").argv(&map(json!({"files": []}))).is_err());
+        assert!(
+            tool("read")
+                .argv(&map(json!({"files": ["../outside.rs"]})))
+                .is_err()
+        );
+        assert!(tool("read").argv(&map(json!({"files": ["."]}))).is_err());
+
+        // Context symbol + fresh
+        assert_eq!(
+            tool("context")
+                .argv(&map(json!({"symbol": "foo::bar", "fresh": true})))
+                .unwrap(),
+            ["context", "--symbol=foo::bar", "--fresh"]
+        );
+        assert!(
+            tool("context")
+                .argv(&map(json!({"symbol": "foo", "at": "a.rs:1"})))
+                .is_err()
+        );
+
+        // Pack fresh & Lookup logs
+        assert_eq!(
+            tool("pack")
+                .argv(&map(json!({"question": "how", "fresh": true})))
+                .unwrap(),
+            ["pack", "--fresh", "--", "how"]
+        );
+        assert_eq!(
+            tool("lookup")
+                .argv(&map(json!({"question": "err", "logs": true})))
+                .unwrap(),
+            ["lookup", "--logs", "--", "err"]
+        );
+
+        // Recall filters and list
+        assert_eq!(
+            tool("recall")
+                .argv(&map(
+                    json!({"id": "toolu_01", "from": 2, "to": 10, "grep": "err", "limit": 5})
+                ))
+                .unwrap(),
+            [
+                "recall",
+                "--from=2",
+                "--to=10",
+                "--grep=err",
+                "--limit=5",
+                "--",
+                "toolu_01"
+            ]
+        );
+        assert_eq!(
+            tool("recall")
+                .argv(&map(json!({"list": true, "limit": 5})))
+                .unwrap(),
+            ["recall", "--limit=5", "--list"]
+        );
+        assert!(tool("recall").argv(&map(json!({}))).is_err());
+        assert!(
+            tool("recall")
+                .argv(&map(json!({"id": "toolu_01", "list": true})))
+                .is_err()
+        );
+        assert!(
+            tool("recall")
+                .argv(&map(json!({"list": true, "from": 1})))
+                .is_err()
+        );
+        assert!(
+            tool("recall")
+                .argv(&map(json!({"list": true, "grep": "x"})))
+                .is_err()
+        );
+        assert!(
+            tool("recall")
+                .argv(&map(json!({"id": "toolu_01", "from": 10, "to": 2})))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_selection_and_key_uniqueness() {
+        assert!(uses_session("pack", &map(json!({"question": "x"}))));
+        assert!(uses_session(
+            "pack",
+            &map(json!({"question": "x", "fresh": true}))
+        ));
+        assert!(uses_session("context", &map(json!({"symbol": "foo"}))));
+        assert!(uses_session("context", &map(json!({"at": "a.rs:1"}))));
+        assert!(!uses_session("context", &map(json!({"changes": true}))));
+        assert!(!uses_session("context", &map(json!({"run_id": "run-1"}))));
+        assert!(!uses_session("read", &map(json!({"file": "a.rs"}))));
+
+        let a = new_session();
+        let b = new_session();
+        assert!(a.starts_with("mcp-") && a.len() == 28);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn recall_pages_bounds_multiline_single_line_grep_and_list() {
+        let root = Path::new("/repo");
+
+        // Short output passes through verbatim.
+        let short = recall_pages(
+            &ok_output(b"hello\nworld\n".to_vec(), Vec::new()),
+            &map(json!({"id": "toolu_1"})),
+            root,
+        );
+        assert_eq!(short, ["hello\nworld\n"]);
+
+        // Large multiline output pages cleanly on a line boundary with `from=` + `to=`.
+        let mut rows = String::new();
+        for i in 1..=5000 {
+            rows.push_str(&format!("row {i:05}\n"));
+        }
+        let paged = recall_pages(
+            &ok_output(rows.into_bytes(), Vec::new()),
+            &map(json!({"id": "toolu_big", "from": 10, "to": 4000})),
+            root,
+        );
+        assert_eq!(paged.len(), 1);
+        assert!(paged[0].starts_with("row 00001\n"));
+        assert!(
+            paged[0].contains("recall page ends at line 3285 after 32768 bytes"),
+            "{}",
+            &paged[0][paged[0].len() - 200..]
+        );
+        assert!(
+            paged[0].contains("id=\"toolu_big\", from=3286, to=4000 for more"),
+            "{}",
+            &paged[0][paged[0].len() - 200..]
+        );
+
+        // Single line exceeding LOG_PAGE with multi-byte UTF-8 cuts cleanly at a char boundary.
+        let mut long_line = "a".repeat(LOG_PAGE - 2);
+        long_line.push('🦀');
+        long_line.push_str(&"b".repeat(1000));
+        let cut = recall_pages(
+            &ok_output(long_line.into_bytes(), Vec::new()),
+            &map(json!({"id": "toolu_long"})),
+            root,
+        );
+        assert_eq!(cut.len(), 1);
+        assert!(!cut[0].contains('\u{FFFD}'));
+        assert!(cut[0].contains("recall line 1 is longer than 32768 bytes and was cut"));
+        assert!(cut[0].contains("justless --root /repo recall toolu_long --from 1 --to 1"));
+        assert!(cut[0].contains("id=\"toolu_long\", from=2 to continue"));
+
+        // Large grep output truncates cleanly and hints the next line number.
+        let mut grep_out = String::new();
+        for i in 1..=3000 {
+            grep_out.push_str(&format!("{}: match text here\n", i * 2));
+        }
+        let grepped = recall_pages(
+            &ok_output(grep_out.into_bytes(), Vec::new()),
+            &map(json!({"id": "toolu_g", "grep": "match"})),
+            root,
+        );
+        assert_eq!(grepped.len(), 1);
+        assert!(
+            grepped[0].contains("recall grep truncated after 32768 bytes"),
+            "{}",
+            &grepped[0][grepped[0].len() - 200..]
+        );
+        assert!(grepped[0].contains("from="));
+
+        // Large list output truncates cleanly.
+        let list_out = "toolu_x  Bash  echo hi  1.0 KB  1m ago\n".repeat(1000);
+        let listed = recall_pages(
+            &ok_output(list_out.into_bytes(), Vec::new()),
+            &map(json!({"list": true})),
+            root,
+        );
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].contains("recall list truncated after 32768 bytes"));
+    }
 }

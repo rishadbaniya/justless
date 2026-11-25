@@ -224,7 +224,7 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
     assert!(expand["inputSchema"]["properties"].get("budget").is_none());
     let lookup = find_tool(tools, "lookup");
     assert_eq!(lookup["inputSchema"]["required"], json!(["question"]));
-    assert!(lookup["inputSchema"]["properties"].get("logs").is_none());
+    assert!(lookup["inputSchema"]["properties"]["logs"].is_object());
 
     for (id, shown) in [
         ("query", "db/schema.sql:1-3"),
@@ -888,4 +888,279 @@ fn context_tool_accepts_run_id_for_captured_diagnostics() {
     assert!(stats.status.success(), "{}", text(&stats.stderr));
     let report: Value = serde_json::from_slice(&stats.stdout).unwrap();
     assert_eq!(report["commands"][0]["targeted_lookups"], 1, "{report}");
+}
+
+/// Archives a text result with `justless mask` and returns its 64-char recall ID.
+fn archive_observation(root: &Path, content: &str) -> String {
+    use std::io::Write;
+    let payload = json!({
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": content}]}
+        ]
+    });
+    let mut child = Command::new(BIN)
+        .args(["--root"])
+        .arg(root)
+        .args(["mask", "--keep", "0", "--min-bytes", "1"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let masked: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stub = masked["messages"][1]["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    stub.strip_prefix("[justless recall ")
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn recall_tool_supports_ranges_grep_list_and_pages_large_observations() {
+    let fixture = mixed_fixture();
+    let root = fixture.path();
+    let mut big = String::new();
+    for i in 1..=6000 {
+        big.push_str(&format!("row {i:05}\n"));
+    }
+    let big_id = archive_observation(root, &big);
+    let long_line = format!("{}Z\nsecond line\n", "x".repeat(40_000));
+    let long_id = archive_observation(root, &long_line);
+
+    let responses = exchange(
+        root,
+        &[
+            legacy_initialize(),
+            call("p1", "recall", json!({"id": big_id})),
+            call("p2", "recall", json!({"id": big_id, "from": 3277})),
+            call(
+                "range",
+                "recall",
+                json!({"id": big_id, "from": 10, "to": 12}),
+            ),
+            call(
+                "grep",
+                "recall",
+                json!({"id": big_id, "grep": "row 0500", "limit": 3}),
+            ),
+            call("long", "recall", json!({"id": long_id})),
+            call("long-2", "recall", json!({"id": long_id, "from": 2})),
+            call("list", "recall", json!({"list": true, "limit": 5})),
+            call("empty", "recall", json!({})),
+            call("both", "recall", json!({"id": big_id, "list": true})),
+            call("list-from", "recall", json!({"list": true, "from": 1})),
+            call(
+                "bad-range",
+                "recall",
+                json!({"id": big_id, "from": 20, "to": 10}),
+            ),
+        ],
+    );
+
+    let p1 = succeeded(by_id(&responses, "p1"));
+    starts(&p1, "row 00001\n");
+    has(
+        &p1,
+        &format!(
+            "row 03276\n[justless: recall page ends at line 3276 after 32768 bytes. Call recall with id=\"{big_id}\", from=3277 for more, or grep=\"TEXT\" to filter.]"
+        ),
+    );
+    let p2 = succeeded(by_id(&responses, "p2"));
+    starts(&p2, "row 03277\n");
+    assert!(p2.ends_with("row 06000\n"), "{}", &p2[p2.len() - 80..]);
+
+    assert_eq!(
+        succeeded(by_id(&responses, "range")),
+        "row 00010\nrow 00011\nrow 00012\n"
+    );
+    let grep = succeeded(by_id(&responses, "grep"));
+    has(&grep, "5000: row 05000\n");
+    has(&grep, "5001: row 05001\n");
+    has(&grep, "5002: row 05002\n");
+    has(&grep, "[3 of 10 matching lines shown");
+
+    let long = succeeded(by_id(&responses, "long"));
+    starts(&long, &"x".repeat(32_768));
+    has(
+        &long,
+        "recall line 1 is longer than 32768 bytes and was cut",
+    );
+    has(&long, "from=2 to continue");
+    assert_eq!(succeeded(by_id(&responses, "long-2")), "second line\n");
+
+    has(
+        &succeeded(by_id(&responses, "list")),
+        "No archived tool results yet",
+    );
+    for (id, msg) in [
+        ("empty", "exactly one of `id` or `list: true`"),
+        ("both", "exactly one of `id` or `list: true`"),
+        ("list-from", "not `list: true`"),
+        ("bad-range", "`from` must not be after `to`"),
+    ] {
+        has(&failed(by_id(&responses, id)), msg);
+    }
+}
+
+#[test]
+fn read_multi_file_and_lookup_logs_work_over_mcp() {
+    let fixture = mixed_fixture();
+    let root = fixture.path();
+    let token = format!("{}{}Ab3Cd4Ef5Gh6Ij7Kl8Mn9Op0Qr1St2Uv3Wx4", "gh", "p_");
+    let _ = captured(root, &format!("echo 'unique_mcp_log_needle token={token}'"));
+
+    let responses = exchange(
+        root,
+        &[
+            legacy_initialize(),
+            call(
+                "multi",
+                "read",
+                json!({"files": ["frontend/orders.ts", "db/schema.sql"]}),
+            ),
+            call(
+                "multi-outline",
+                "read",
+                json!({"files": ["frontend/orders.ts", "backend/orders.py"], "outline": true}),
+            ),
+            call("read-none", "read", json!({})),
+            call(
+                "read-both",
+                "read",
+                json!({"file": "db/schema.sql", "files": ["db/schema.sql"]}),
+            ),
+            call("read-empty", "read", json!({"files": []})),
+            call("read-escape", "read", json!({"files": ["../outside.txt"]})),
+            call(
+                "lookup-logs",
+                "lookup",
+                json!({"question": "unique_mcp_log_needle", "logs": true}),
+            ),
+        ],
+    );
+
+    let multi = succeeded(by_id(&responses, "multi"));
+    has(&multi, "=== frontend/orders.ts ===");
+    has(&multi, "=== db/schema.sql ===");
+    has(&multi, "purchase_orders");
+
+    let multi_outline = succeeded(by_id(&responses, "multi-outline"));
+    has(&multi_outline, "=== frontend/orders.ts ===");
+    has(&multi_outline, "=== backend/orders.py ===");
+    has(&multi_outline, "fetchOrders");
+    has(&multi_outline, "list_orders");
+
+    for (id, msg) in [
+        ("read-none", "missing required argument `file` or `files`"),
+        ("read-both", "not both"),
+        ("read-empty", "must not be empty"),
+        ("read-escape", "workspace-relative"),
+    ] {
+        has(&failed(by_id(&responses, id)), msg);
+    }
+
+    let logs = succeeded(by_id(&responses, "lookup-logs"));
+    has(&logs, "unique_mcp_log_needle");
+    assert!(
+        !logs.contains(&token),
+        "secret leaked in lookup logs: {logs}"
+    );
+}
+
+#[test]
+fn mcp_session_dedups_repeated_context_and_pack_calls_until_fresh() {
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn compute_invoice(subtotal_cents: i64, tax_rate_bps: i64, discount_cents: i64) -> i64 {\n\
+         \x20   let step1 = subtotal_cents + 10;\n\
+         \x20   let step2 = step1 * 2;\n\
+         \x20   let step3 = step2 + tax_rate_bps;\n\
+         \x20   let step4 = step3 - discount_cents;\n\
+         \x20   let step5 = step4 + 1;\n\
+         \x20   let step6 = step5 * 3;\n\
+         \x20   let step7 = step6 - 7;\n\
+         \x20   let step8 = step7 + 2;\n\
+         \x20   let step9 = step8 + 4;\n\
+         \x20   let step10 = step9 - 1;\n\
+         \x20   step10\n\
+         }\n",
+    )
+    .unwrap();
+
+    let responses = exchange(
+        root,
+        &[
+            legacy_initialize(),
+            call("sym-1", "context", json!({"symbol": "compute_invoice"})),
+            call("sym-2", "context", json!({"symbol": "compute_invoice"})),
+            call(
+                "sym-fresh",
+                "context",
+                json!({"symbol": "compute_invoice", "fresh": true}),
+            ),
+            call("pack-1", "pack", json!({"question": "compute_invoice"})),
+            call("pack-2", "pack", json!({"question": "compute_invoice"})),
+            call(
+                "pack-fresh",
+                "pack",
+                json!({"question": "compute_invoice", "fresh": true}),
+            ),
+        ],
+    );
+
+    let sym1 = succeeded(by_id(&responses, "sym-1"));
+    has(&sym1, "let step1 = subtotal_cents + 10;");
+    has(&sym1, "let step10 = step9 - 1;");
+
+    let sym2 = succeeded(by_id(&responses, "sym-2"));
+    has(&sym2, "unchanged since you read it");
+    assert!(!sym2.contains("let step5 = step4 + 1;"), "{sym2}");
+
+    let sym_fresh = succeeded(by_id(&responses, "sym-fresh"));
+    has(&sym_fresh, "let step5 = step4 + 1;");
+    assert!(
+        !sym_fresh.contains("unchanged since you read it"),
+        "{sym_fresh}"
+    );
+
+    let pack1 = succeeded(by_id(&responses, "pack-1"));
+    has(&pack1, "pub fn compute_invoice");
+    let pack2 = succeeded(by_id(&responses, "pack-2"));
+    has(&pack2, "unchanged since you read");
+    let pack_fresh = succeeded(by_id(&responses, "pack-fresh"));
+    has(&pack_fresh, "pub fn compute_invoice");
+    assert!(
+        !pack_fresh.contains("unchanged since you read"),
+        "{pack_fresh}"
+    );
+
+    // A separate MCP server process starts a fresh session and prints the whole body.
+    let separate = exchange(
+        root,
+        &[
+            legacy_initialize(),
+            call("sym-new", "context", json!({"symbol": "compute_invoice"})),
+        ],
+    );
+    let sym_new = succeeded(by_id(&separate, "sym-new"));
+    has(&sym_new, "let step5 = step4 + 1;");
+    assert!(
+        !sym_new.contains("unchanged since you read it"),
+        "{sym_new}"
+    );
 }
