@@ -1,5 +1,6 @@
 //! Compact records point back to inclusive line ranges in the original stdout.
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::sync::LazyLock;
 
@@ -141,6 +142,68 @@ pub fn family(args: &[OsString]) -> String {
         }
         true
     };
+    let rspec_display = || {
+        let mut iter = tool.iter().skip(1);
+        while let Some(&arg) = iter.next() {
+            if arg == "--" {
+                break;
+            }
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg, None), |(f, v)| (f, Some(v)));
+            match flag {
+                "-h" | "--help" | "-v" | "--version" | "--dry-run" | "--init" => {
+                    return false;
+                }
+                "-f" | "--format" => {
+                    let val = inline.or_else(|| iter.next().copied()).unwrap_or("");
+                    if !matches!(
+                        val,
+                        "p" | "progress" | "d" | "doc" | "documentation" | "f" | "failures"
+                    ) {
+                        return false;
+                    }
+                }
+                _ if arg.starts_with("-f") && arg.len() > 2 => {
+                    let val = &arg[2..];
+                    if !matches!(
+                        val,
+                        "p" | "progress" | "d" | "doc" | "documentation" | "f" | "failures"
+                    ) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    };
+    let phpunit_display = |skip: usize| {
+        for &arg in tool.iter().skip(skip) {
+            if arg == "--" {
+                break;
+            }
+            let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+            if matches!(
+                flag,
+                "-h" | "--help"
+                    | "--version"
+                    | "--list-tests"
+                    | "--list-suites"
+                    | "--list-groups"
+                    | "--teamcity"
+                    | "--testdox-html"
+                    | "--testdox-xml"
+                    | "--log-junit"
+                    | "--log-teamcity"
+                    | "--log-events-text"
+                    | "--log-events-verbose-text"
+            ) {
+                return false;
+            }
+        }
+        true
+    };
     match words.as_slice() {
         ["git", "diff", ..] | ["gh", "pr", "diff", ..] | ["glab", "mr", "diff", ..] => "git diff",
         ["git", "show", ..] => "git show",
@@ -151,6 +214,9 @@ pub fn family(args: &[OsString]) -> String {
         ["npm", "test", ..] => "npm test",
         ["playwright", "test", ..] if playwright_display() => "playwright test",
         ["pytest", ..] | ["python" | "python3", "-m", "pytest"] => "pytest",
+        ["rspec", ..] if rspec_display() => "rspec",
+        ["phpunit" | "paratest" | "pest", ..] if phpunit_display(1) => "phpunit",
+        ["php", "artisan", "test", ..] if phpunit_display(3) => "phpunit",
         ["terraform" | "tofu", "plan", ..] => "terraform plan",
         [cmd @ ("cargo" | "git" | "go" | "npm" | "rg"), ..] => cmd,
         _ => "other",
@@ -164,6 +230,8 @@ pub struct Parser {
     inventory: Option<crate::inventory::Inventory>,
     cargo: Option<crate::cargo_tests::Scan>,
     js_tests: Option<crate::js_tests::Scan>,
+    rspec: Option<RspecScan>,
+    phpunit: Option<PhpunitScan>,
     summary: Summary,
     hash: Sha256,
     file: String,
@@ -262,7 +330,8 @@ impl Parser {
             "git diff" => "diff",
             _ if commits => "diff",
             "terraform plan" => "plan",
-            "pytest" | "cargo test" | "cargo nextest" | "go test" | "npm test" => "tests",
+            "pytest" | "cargo test" | "cargo nextest" | "go test" | "npm test" | "rspec"
+            | "phpunit" => "tests",
             _ => "",
         };
         Self {
@@ -275,6 +344,8 @@ impl Parser {
                 _ => None,
             },
             js_tests: is_js_tests.then(crate::js_tests::Scan::default),
+            rspec: (family == "rspec" && profile.is_none()).then(RspecScan::default),
+            phpunit: (family == "phpunit" && profile.is_none()).then(PhpunitScan::default),
             summary: Summary {
                 kind: kind.into(),
                 ..Default::default()
@@ -398,6 +469,10 @@ impl Parser {
             self.plan(line, number);
         } else if let Some(js) = &mut self.js_tests {
             js.observe(line, number, crate::capture::Stream::Stdout);
+        } else if let Some(rspec) = &mut self.rspec {
+            rspec.observe(line, number);
+        } else if let Some(phpunit) = &mut self.phpunit {
+            phpunit.observe(line, number);
         } else {
             if let Some(cargo) = &mut self.cargo {
                 cargo.observe(line, number, crate::capture::Stream::Stdout);
@@ -1033,6 +1108,18 @@ impl Parser {
             self.summary.js = Some(report);
             return self.summary;
         }
+        if let Some(rspec) = self.rspec {
+            let (items, outcomes) = rspec.finish();
+            self.summary.items = items;
+            self.summary.outcomes = outcomes;
+            return self.summary;
+        }
+        if let Some(phpunit) = self.phpunit {
+            let (items, outcomes) = phpunit.finish();
+            self.summary.items = items;
+            self.summary.outcomes = outcomes;
+            return self.summary;
+        }
         // A hunk that a filter such as `grep` thinned out tells nothing about where
         // the output stopped.
         if self.ends_early
@@ -1071,6 +1158,357 @@ impl Parser {
         self.summary.cargo = self.cargo.and_then(crate::cargo_tests::Scan::finish);
         self.summary
     }
+}
+
+// ---------------------------------------------------------------------------
+// RSpec and PHPUnit / ParaTest / Pest structured test parsers
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum RspecSection {
+    #[default]
+    None,
+    Failures,
+    FailedExamples,
+    LoadError,
+}
+
+#[derive(Default)]
+struct RspecScan {
+    section: RspecSection,
+    failures: Vec<Item>,
+    by_desc: BTreeMap<String, VecDeque<usize>>,
+    current: Option<usize>,
+    capture_after_error: usize,
+    detail_lines: usize,
+    outcomes: Vec<String>,
+}
+
+impl RspecScan {
+    fn observe(&mut self, raw: &str, n: usize) {
+        let cleaned = strip_ansi_cow(raw);
+        let line = cleaned.as_ref();
+        let trimmed = line.trim();
+
+        if trimmed == "Failures:" {
+            self.section = RspecSection::Failures;
+            self.current = None;
+            return;
+        }
+        if trimmed == "Failed examples:" {
+            self.section = RspecSection::FailedExamples;
+            self.current = None;
+            return;
+        }
+        if trimmed == "Pending:"
+            || trimmed.starts_with("Pending: (Failures listed here")
+            || trimmed.starts_with("Finished in ")
+        {
+            self.section = RspecSection::None;
+            self.current = None;
+            return;
+        }
+        if trimmed.starts_with("An error occurred while loading ") {
+            let name = trimmed.trim_end_matches('.');
+            let idx = self.failures.len();
+            self.failures.push(Item::new(name, "", n));
+            self.section = RspecSection::LoadError;
+            self.current = Some(idx);
+            self.detail_lines = 0;
+            return;
+        }
+        if is_rspec_totals(trimmed) {
+            self.section = RspecSection::None;
+            self.current = None;
+            self.outcomes.push(short(trimmed, 220));
+            return;
+        }
+
+        match self.section {
+            RspecSection::None => {}
+            RspecSection::Failures => {
+                if let Some(desc) = parse_numbered_heading(trimmed) {
+                    let idx = self.failures.len();
+                    self.failures.push(Item::new(desc, "", n));
+                    self.by_desc
+                        .entry(desc.to_owned())
+                        .or_default()
+                        .push_back(idx);
+                    self.current = Some(idx);
+                    self.capture_after_error = 0;
+                    return;
+                }
+                if let Some(idx) = self.current {
+                    let item = &mut self.failures[idx];
+                    if trimmed.is_empty() {
+                        return;
+                    }
+                    item.last = n;
+                    if trimmed.starts_with("Failure/Error:") {
+                        if item.detail.is_empty() {
+                            item.detail = short(trimmed, 360);
+                        } else {
+                            item.detail = short(&format!("{} | {trimmed}", item.detail), 360);
+                        }
+                        item.digest = crate::capture::source_digest(item.detail.as_bytes());
+                        self.capture_after_error = 3;
+                    } else if trimmed.starts_with("# ") || trimmed.starts_with("Diff:") {
+                        self.capture_after_error = 0;
+                    } else if self.capture_after_error > 0
+                        && !trimmed.starts_with("(compared using")
+                        && !trimmed.starts_with("Shared Example Group:")
+                    {
+                        let snippet = short(trimmed, 180);
+                        item.detail = if item.detail.is_empty() {
+                            snippet
+                        } else {
+                            short(&format!("{} {snippet}", item.detail), 360)
+                        };
+                        item.digest = crate::capture::source_digest(item.detail.as_bytes());
+                        self.capture_after_error -= 1;
+                    }
+                }
+            }
+            RspecSection::FailedExamples => {
+                if let Some(rest) = trimmed.strip_prefix("rspec ")
+                    && let Some((loc, desc)) = rest.split_once(" # ")
+                {
+                    let loc = loc.trim();
+                    let desc = desc.trim();
+                    if let Some(queue) = self.by_desc.get_mut(desc)
+                        && let Some(idx) = queue.pop_front()
+                    {
+                        self.failures[idx].name = short(&format!("{loc} {desc}"), 320);
+                    } else {
+                        self.failures
+                            .push(Item::new(&format!("{loc} {desc}"), "", n));
+                    }
+                }
+            }
+            RspecSection::LoadError => {
+                if let Some(idx) = self.current {
+                    let item = &mut self.failures[idx];
+                    if trimmed.is_empty() {
+                        return;
+                    }
+                    item.last = n;
+                    if trimmed.starts_with("# ") {
+                        self.detail_lines = 3;
+                    } else if self.detail_lines < 3 {
+                        let snippet = short(trimmed, 180);
+                        item.detail = if item.detail.is_empty() {
+                            snippet
+                        } else {
+                            short(&format!("{} {snippet}", item.detail), 360)
+                        };
+                        item.digest = crate::capture::source_digest(item.detail.as_bytes());
+                        self.detail_lines += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> (Vec<Item>, Vec<String>) {
+        (self.failures, self.outcomes)
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PhpunitSection {
+    #[default]
+    None,
+    Failure,
+    PestFail,
+}
+
+#[derive(Default)]
+struct PhpunitScan {
+    section: PhpunitSection,
+    current: Option<Item>,
+    detail_lines: usize,
+    saw_blank_after_detail: bool,
+    failures: Vec<Item>,
+    outcomes: Vec<String>,
+    pending_banner: Option<String>,
+}
+
+impl PhpunitScan {
+    fn flush(&mut self) {
+        if let Some(item) = self.current.take() {
+            self.failures.push(item);
+        }
+        self.detail_lines = 0;
+        self.saw_blank_after_detail = false;
+    }
+
+    fn observe(&mut self, raw: &str, n: usize) {
+        let cleaned = strip_ansi_cow(raw);
+        let line = cleaned.as_ref();
+        let trimmed = line.trim();
+
+        if is_phpunit_failure_section(trimmed) {
+            self.flush();
+            self.section = PhpunitSection::Failure;
+            return;
+        }
+        if is_phpunit_other_section(trimmed) {
+            self.flush();
+            self.section = PhpunitSection::None;
+            return;
+        }
+        if trimmed == "--" || trimmed.starts_with("───") {
+            self.flush();
+            self.section = PhpunitSection::None;
+            return;
+        }
+        if trimmed == "FAILURES!" || trimmed == "ERRORS!" {
+            self.flush();
+            self.section = PhpunitSection::None;
+            self.pending_banner = Some(trimmed.to_owned());
+            return;
+        }
+        if trimmed.starts_with("OK (") || trimmed == "No tests executed!" {
+            self.flush();
+            self.section = PhpunitSection::None;
+            self.outcomes.push(short(trimmed, 220));
+            return;
+        }
+        if trimmed.starts_with("Tests:") {
+            self.flush();
+            self.section = PhpunitSection::None;
+            let norm = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+            let line = match self.pending_banner.take() {
+                Some(banner) => format!("{banner} {norm}"),
+                None => norm,
+            };
+            self.outcomes.push(short(&line, 220));
+            return;
+        }
+        if trimmed.starts_with("Duration:") {
+            self.flush();
+            self.section = PhpunitSection::None;
+            return;
+        }
+        if let Some(rest) = trimmed.strip_prefix("FAILED  ").or_else(|| {
+            trimmed
+                .strip_prefix("FAILED ")
+                .filter(|r| r.contains(" > "))
+        }) {
+            let name = rest.trim();
+            if !name.is_empty() {
+                self.flush();
+                self.current = Some(Item::new(name, "", n));
+                self.section = PhpunitSection::PestFail;
+                return;
+            }
+        }
+
+        match self.section {
+            PhpunitSection::None => {}
+            PhpunitSection::Failure => {
+                if !line.starts_with([' ', '\t'])
+                    && let Some(name) = parse_numbered_heading(trimmed)
+                {
+                    self.flush();
+                    self.current = Some(Item::new(name, "", n));
+                    return;
+                }
+                if let Some(item) = self.current.as_mut() {
+                    if trimmed.is_empty() {
+                        if self.detail_lines > 0 {
+                            self.saw_blank_after_detail = true;
+                        }
+                        return;
+                    }
+                    item.last = n;
+                    if !self.saw_blank_after_detail && self.detail_lines < 3 {
+                        let snippet = short(trimmed, 180);
+                        item.detail = if item.detail.is_empty() {
+                            snippet
+                        } else {
+                            short(&format!("{} {snippet}", item.detail), 360)
+                        };
+                        item.digest = crate::capture::source_digest(item.detail.as_bytes());
+                        self.detail_lines += 1;
+                    }
+                }
+            }
+            PhpunitSection::PestFail => {
+                if let Some(item) = self.current.as_mut() {
+                    if trimmed.is_empty() {
+                        if self.detail_lines > 0 {
+                            self.saw_blank_after_detail = true;
+                        }
+                        return;
+                    }
+                    item.last = n;
+                    if !self.saw_blank_after_detail
+                        && self.detail_lines < 3
+                        && !trimmed.starts_with("at ")
+                        && !trimmed.contains('▕')
+                    {
+                        let snippet = short(trimmed, 180);
+                        item.detail = if item.detail.is_empty() {
+                            snippet
+                        } else {
+                            short(&format!("{} {snippet}", item.detail), 360)
+                        };
+                        item.digest = crate::capture::source_digest(item.detail.as_bytes());
+                        self.detail_lines += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) -> (Vec<Item>, Vec<String>) {
+        self.flush();
+        if let Some(banner) = self.pending_banner.take() {
+            self.outcomes.push(banner);
+        }
+        (self.failures, self.outcomes)
+    }
+}
+
+fn strip_ansi_cow(line: &str) -> Cow<'_, str> {
+    if line.contains('\x1b') {
+        crate::capture::ANSI.replace_all(line, "")
+    } else {
+        Cow::Borrowed(line)
+    }
+}
+
+/// Parse a top-level numbered failure heading such as `1) Foo#bar` (requiring
+/// pure digits before `)` so RSpec aggregate sub-items like `1.1)` stay attached
+/// to their parent failure).
+fn parse_numbered_heading(trimmed: &str) -> Option<&str> {
+    let (num, rest) = trimmed.split_once(") ")?;
+    if !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
+        let desc = rest.trim();
+        (!desc.is_empty()).then_some(desc)
+    } else {
+        None
+    }
+}
+
+fn is_rspec_totals(trimmed: &str) -> bool {
+    static RSPEC_TOTALS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\d+ examples?, \d+ failures?(?:, \d+ pending)?(?:, \d+ errors? occurred outside of examples)?$")
+            .unwrap()
+    });
+    RSPEC_TOTALS.is_match(trimmed)
+}
+
+fn is_phpunit_failure_section(trimmed: &str) -> bool {
+    static PHPUNIT_FAIL_SEC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^There (?:was 1|were \d+) (?:error|errors|failure|failures):$").unwrap()
+    });
+    PHPUNIT_FAIL_SEC.is_match(trimmed)
+}
+
+fn is_phpunit_other_section(trimmed: &str) -> bool {
+    trimmed.starts_with("There was ") || trimmed.starts_with("There were ")
 }
 
 /// Parse a Terraform/OpenTofu resource plan header such as
@@ -1408,7 +1846,7 @@ impl Summary {
     fn failing_outcome(&self) -> Option<&str> {
         static FAILED: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(
-                r"\bFAILED\b|\bFAIL\b|(?:^|[^0-9])[1-9][0-9]* (?:failed|failing|timed out)\b",
+                r"\bFAILED\b|\bFAIL\b|\b(?:FAILURES|ERRORS)!|\b(?:Failures|Errors):\s*[1-9][0-9]*\b|(?:^|[^0-9])[1-9][0-9]* (?:failed|failing|failures?|errors?|timed out)\b",
             )
             .expect("failing outcome pattern")
         });
@@ -2454,5 +2892,277 @@ Plan: 2 to add, 1 to change, 1 to destroy.
             "Error: Unsupported argument on main.tf line 12\n",
         );
         assert!(errored.render(None, 1).is_none());
+    }
+
+    #[test]
+    fn rspec_parses_failures_groups_identical_errors_passes_and_diffs_reruns() {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(family(&args("rspec spec/")), "rspec");
+        assert_eq!(family(&args("bundle exec rspec spec/")), "rspec");
+        assert_eq!(family(&args("bundle exec rspec -f doc")), "rspec");
+        assert_eq!(family(&args("rspec --format json")), "other");
+        assert_eq!(family(&args("rspec -fj")), "other");
+
+        // Passing documentation-format run compacts dramatically to clean pass summary.
+        let mut passing = String::new();
+        for i in 1..=80 {
+            passing.push_str(&format!(
+                "OrderCalculator\n  handles billing scenario case #{i:02} with tax and discount\n"
+            ));
+        }
+        passing.push_str(
+            "\nFinished in 1.42 seconds (files took 0.65 seconds to load)\n80 examples, 0 failures\n",
+        );
+        let pass_summary = parse("rspec", &passing);
+        let pass_rendered = pass_summary.render(None, 0).unwrap();
+        assert!(
+            pass_rendered.contains("0 reported failing test(s)\n80 examples, 0 failures\n"),
+            "{pass_rendered}"
+        );
+        assert!(pass_rendered.len() * 40 < passing.len(), "{pass_rendered}");
+
+        // Failing run with two identical failures (grouped!) plus one distinct failure.
+        let run1 = "\
+FF.F.....
+
+Failures:
+
+  1) Api#get returns 200
+     Failure/Error: expect(status).to eq(200)
+
+       expected: 200
+            got: 500
+
+       (compared using ==)
+     # ./spec/api_spec.rb:14:in `block (3 levels) in <top (required)>'
+
+  2) Api#post returns 200
+     Failure/Error: expect(status).to eq(200)
+
+       expected: 200
+            got: 500
+
+       (compared using ==)
+     # ./spec/api_spec.rb:28:in `block (3 levels) in <top (required)>'
+
+  3) UserMailer#welcome sends email
+     Failure/Error: raise RuntimeError, \"SMTP refused\"
+
+     RuntimeError:
+       SMTP refused
+     # ./app/mailers/user_mailer.rb:24:in `welcome'
+
+Finished in 0.45 seconds (files took 0.31 seconds to load)
+9 examples, 3 failures
+
+Failed examples:
+
+rspec ./spec/api_spec.rb:12 # Api#get returns 200
+rspec ./spec/api_spec.rb:26 # Api#post returns 200
+rspec ./spec/mailers/user_mailer_spec.rb:10 # UserMailer#welcome sends email
+";
+        let s1 = parse("rspec", run1);
+        assert_eq!(s1.kind, "tests");
+        assert_eq!(s1.items.len(), 3);
+        let r1 = s1.render(None, 1).unwrap();
+        assert!(r1.contains("3 reported failing test(s)"), "{r1}");
+        assert!(
+            r1.contains("2 test(s): ./spec/api_spec.rb:12 Api#get returns 200 Failure/Error: expect(status).to eq(200) expected: 200 got: 500 [stdout:5-12]"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("  ./spec/api_spec.rb:26 Api#post returns 200 [stdout:14]"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("1 test(s): ./spec/mailers/user_mailer_spec.rb:10 UserMailer#welcome sends email Failure/Error: raise RuntimeError, \"SMTP refused\" RuntimeError: SMTP refused [stdout:23-28]"),
+            "{r1}"
+        );
+        assert!(r1.contains("9 examples, 3 failures"), "{r1}");
+        assert!(r1.len() < run1.len(), "{r1}");
+
+        // Rerun after fixing the two Api specs shows exact `Compared with run-1:` diff.
+        let run2 = "\
+..F......
+
+Failures:
+
+  1) UserMailer#welcome sends email
+     Failure/Error: raise RuntimeError, \"SMTP refused\"
+
+     RuntimeError:
+       SMTP refused
+     # ./app/mailers/user_mailer.rb:24:in `welcome'
+
+Finished in 0.41 seconds (files took 0.30 seconds to load)
+9 examples, 1 failure
+
+Failed examples:
+
+rspec ./spec/mailers/user_mailer_spec.rb:10 # UserMailer#welcome sends email
+";
+        let s2 = parse("rspec", run2);
+        let delta = s2.render(Some(("run-1", &s1)), 1).unwrap();
+        assert!(delta.contains("Compared with run-1:"), "{delta}");
+        assert!(
+            delta.contains("- ./spec/api_spec.rb:12 Api#get returns 200"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("- ./spec/api_spec.rb:26 Api#post returns 200"),
+            "{delta}"
+        );
+        assert!(
+            !delta.contains("+ ./spec/mailers/user_mailer_spec.rb:10"),
+            "{delta}"
+        );
+        assert!(delta.contains("9 examples, 1 failure"), "{delta}");
+
+        // Crash with no parsed examples returns None so error stays verbatim.
+        let crashed = parse("rspec", "LoadError: cannot load such file -- missing\n");
+        assert!(crashed.render(None, 1).is_none());
+    }
+
+    #[test]
+    fn phpunit_paratest_and_pest_parse_pass_fail_and_rerun_diffs() {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(family(&args("vendor/bin/phpunit")), "phpunit");
+        assert_eq!(
+            family(&args("./vendor/bin/paratest --processes=4")),
+            "phpunit"
+        );
+        assert_eq!(family(&args("./vendor/bin/pest")), "phpunit");
+        assert_eq!(family(&args("php artisan test")), "phpunit");
+        assert_eq!(family(&args("phpunit --log-junit out.xml")), "other");
+        assert_eq!(family(&args("phpunit --teamcity")), "other");
+
+        // 1. Passing PHPUnit run with lots of progress dots.
+        let mut ok_php = String::from("PHPUnit 11.4.3 by Sebastian Bergmann and contributors.\n\n");
+        for i in 1..=20 {
+            ok_php.push_str(&format!(
+                "............................................................... {:>4} / 1260 ({:>3}%)\n",
+                i * 63,
+                i * 5
+            ));
+        }
+        ok_php
+            .push_str("\nTime: 00:02.110, Memory: 32.00 MB\n\nOK (1260 tests, 3410 assertions)\n");
+        let ok_summary = parse("phpunit", &ok_php);
+        let ok_rendered = ok_summary.render(None, 0).unwrap();
+        assert!(
+            ok_rendered.contains("0 reported failing test(s)\nOK (1260 tests, 3410 assertions)\n"),
+            "{ok_rendered}"
+        );
+        assert!(ok_rendered.len() * 15 < ok_php.len(), "{ok_rendered}");
+
+        // 2. Failing PHPUnit run with both error and failure sections + rerun diff.
+        let php_fail = "\
+PHPUnit 11.4.3 by Sebastian Bergmann and contributors.
+
+Runtime:       PHP 8.3.12
+
+..F..E...                                                           9 / 9 (100%)
+
+Time: 00:00.142, Memory: 18.00 MB
+
+There was 1 error:
+
+1) Tests\\Unit\\OrderTest::testAppliesTax
+RuntimeException: Tax rate missing
+
+/app/src/Order.php:42
+/app/tests/Unit/OrderTest.php:27
+
+--
+
+There was 1 failure:
+
+1) Tests\\Unit\\CartTest::testComputesTotal
+Failed asserting that 100 matches expected 110.
+
+/app/tests/Unit/CartTest.php:19
+
+ERRORS!
+Tests: 9, Assertions: 14, Errors: 1, Failures: 1.
+";
+        let s1 = parse("phpunit", php_fail);
+        assert_eq!(s1.items.len(), 2);
+        let r1 = s1.render(None, 2).unwrap();
+        assert!(r1.contains("2 reported failing test(s)"), "{r1}");
+        assert!(
+            r1.contains("Tests\\Unit\\OrderTest::testAppliesTax RuntimeException: Tax rate missing [stdout:11-15]"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("Tests\\Unit\\CartTest::testComputesTotal Failed asserting that 100 matches expected 110. [stdout:21-24]"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("ERRORS! Tests: 9, Assertions: 14, Errors: 1, Failures: 1."),
+            "{r1}"
+        );
+
+        // Rerun after fixing OrderTest shows removal of OrderTest in `Compared with run-1:`.
+        let php_fail2 = "\
+PHPUnit 11.4.3 by Sebastian Bergmann and contributors.
+
+There was 1 failure:
+
+1) Tests\\Unit\\CartTest::testComputesTotal
+Failed asserting that 100 matches expected 110.
+
+/app/tests/Unit/CartTest.php:19
+
+FAILURES!
+Tests: 9, Assertions: 14, Failures: 1.
+";
+        let s2 = parse("phpunit", php_fail2);
+        let delta = s2.render(Some(("run-1", &s1)), 1).unwrap();
+        assert!(delta.contains("Compared with run-1:"), "{delta}");
+        assert!(
+            delta.contains("- Tests\\Unit\\OrderTest::testAppliesTax"),
+            "{delta}"
+        );
+        assert!(
+            !delta.contains("+ Tests\\Unit\\CartTest::testComputesTotal"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("FAILURES! Tests: 9, Assertions: 14, Failures: 1."),
+            "{delta}"
+        );
+
+        // 3. Pest output with ANSI colors and snippet lines.
+        let pest_raw = "\
+   \x1b[32mPASS\x1b[0m  Tests\\Unit\\OrderTest
+  ✓ calculates subtotal                                        0.01s
+
+   \x1b[31mFAIL\x1b[0m  Tests\\Unit\\CartTest
+  ⨯ computes total                                             0.03s
+  ────────────────────────────────────────────────────────────────────
+   \x1b[31mFAILED\x1b[0m  Tests\\Unit\\CartTest > computes total
+  Failed asserting that 100 is identical to 110.
+
+  at tests/Unit/CartTest.php:19
+     18▕     expect($cart->total())->toBe(110);
+  ➜  19▕     expect($cart->grandTotal())->toBe(110);
+
+  Tests:    1 failed, 1 passed (4 assertions)
+  Duration: 0.18s
+";
+        let pest_summary = parse("phpunit", pest_raw);
+        let pest_rendered = pest_summary.render(None, 1).unwrap();
+        assert!(
+            pest_rendered.contains("1 reported failing test(s)"),
+            "{pest_rendered}"
+        );
+        assert!(
+            pest_rendered.contains("Tests\\Unit\\CartTest > computes total Failed asserting that 100 is identical to 110. [stdout:7-12]"),
+            "{pest_rendered}"
+        );
+        assert!(
+            pest_rendered.contains("Tests: 1 failed, 1 passed (4 assertions)"),
+            "{pest_rendered}"
+        );
     }
 }

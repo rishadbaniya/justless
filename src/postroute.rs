@@ -403,7 +403,18 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         {
             replacement = Some((view, false));
         }
-        // 2. Structured or container/JSON/systemd log streams via `logview`.
+        // 2. High-frequency CLI raw-dump compactors (`kubectl`/`oc describe`,
+        //    `gh`/`glab` views, security audits, `outdated`/`pip list|freeze`,
+        //    and `terraform`/`tofu state list`).
+        if replacement.is_none()
+            && let Some(view) = crate::cli_views::format(&cmd_refs, &redacted_text, budget)
+            && view.len() <= budget
+            && view.len() < output.len()
+            && (was_clipped || view.len() + 64 < text.len())
+        {
+            replacement = Some((view, false));
+        }
+        // 3. Structured or container/JSON/systemd log streams via `logview`.
         if replacement.is_none()
             && (is_log_cmd
                 || (!plan.strict()
@@ -961,6 +972,7 @@ fn plan(command: &str) -> Option<Plan> {
         Option<crate::filters::Profile>,
         String,
         Option<&'static str>,
+        Option<&'static str>,
         bool,
     );
     let mut found: Option<(Plan, KindKey)> = None;
@@ -1017,8 +1029,13 @@ fn plan(command: &str) -> Option<Plan> {
         let words = strip(&first.words)?;
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         let extra_inv = extra_inventory_kind(&refs).map(ExtraInventory::tag);
+        let cli_view = crate::cli_views::kind_tag(&refs);
         let log_cmd = is_log_command(&refs);
-        if !crate::agents::supported_words(&refs) && extra_inv.is_none() && !log_cmd {
+        if !crate::agents::supported_words(&refs)
+            && extra_inv.is_none()
+            && cli_view.is_none()
+            && !log_cmd
+        {
             return None;
         }
         let args: Vec<OsString> = words.iter().map(OsString::from).collect();
@@ -1026,6 +1043,7 @@ fn plan(command: &str) -> Option<Plan> {
             crate::filters::profile(&refs),
             crate::summary::family(&args),
             extra_inv,
+            cli_view,
             log_cmd,
         );
         // A search whose pattern matches every line, such as `grep -rn "" file`, is
@@ -2954,5 +2972,165 @@ mod tests {
             }
         });
         assert!(claude_bash(&ws, &plain_input).is_none());
+    }
+
+    #[test]
+    fn post_run_cli_views_compact_kubectl_describe_gh_audits_and_tf_state() {
+        let (_dir, ws) = test_workspace("");
+
+        // 1. `kubectl -n prod describe pod ...` (including flag before subcommand & redaction safety)
+        let last_applied = format!(
+            "{{\"apiVersion\":\"v1\",\"spec\":{{\"env\":[{}]}}}}",
+            (0..60)
+                .map(|i| format!("{{\"name\":\"K_{i}\",\"value\":\"v-{i:04}\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut describe = format!(
+            "\
+Name:             api-7f8d9c6b5-abcde
+Namespace:        prod
+Node:             worker-01/10.0.0.12
+Annotations:      kubectl.kubernetes.io/last-applied-configuration: {last_applied}
+                  prometheus.io/scrape: true
+Status:           Running
+Controlled By:    ReplicaSet/api-7f8d9c6b5
+Containers:
+  app:
+    Image:          ghcr.io/acme/api:v2
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+    Ready:          False
+    Restart Count:  5
+    Environment:
+"
+        );
+        for i in 0..45 {
+            describe.push_str(&format!("      APP_VAR_{i:02}:  value-{i:04}\n"));
+        }
+        describe.push_str(
+            "\
+Conditions:
+  Type              Status
+  Initialized       True 
+  Ready             False 
+  PodScheduled      True 
+Events:
+  Type     Reason     Age   From               Message
+  ----     ------     ----  ----               -------
+  Normal   Scheduled  10m   default-scheduler  Successfully assigned prod/api-7f8d9c6b5-abcde
+  Warning  BackOff    1m    kubelet            Back-off restarting failed container app
+",
+        );
+        assert!(describe.len() > 4_096);
+        let shown = post_bash(
+            &ws,
+            "kubectl -n prod describe pod api-7f8d9c6b5-abcde",
+            &describe,
+        )
+        .expect("kubectl describe compacted via postroute");
+        assert!(shown.contains("CrashLoopBackOff"), "{shown}");
+        assert!(shown.contains("OOMKilled"), "{shown}");
+        assert!(shown.contains("Warning  BackOff"), "{shown}");
+        assert!(
+            shown.contains("Annotations: 2 entries (includes last-applied-configuration)"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("[output clipped. Full log retained.]"),
+            "{shown}"
+        );
+        assert!(shown.len() * 3 < describe.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &describe);
+
+        // Redaction safety inside kubectl describe Warning events.
+        let token = format!("{}{}{}", "gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        let secret_describe = describe.replace(
+            "Back-off restarting failed container app",
+            &format!("Back-off restarting failed container app token={token}"),
+        );
+        let shown = post_bash(
+            &ws,
+            "kubectl -n prod describe pod api-7f8d9c6b5-abcde",
+            &secret_describe,
+        )
+        .expect("secret-bearing kubectl describe compacted");
+        assert!(!shown.contains(&token), "secret leaked: {shown}");
+        assert!(shown.contains("[redacted:"), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &secret_describe);
+
+        // 2. `gh pr checks`
+        let mut checks = String::new();
+        for i in 1..=60 {
+            checks.push_str(&format!(
+                "ci / job-check-runner-{i:02}\tpass\t{}s\thttps://github.com/acme/repo/actions/runs/77/job/{i}\n",
+                10 + i
+            ));
+        }
+        checks.push_str(
+            "ci / unit-tests\tfail\t2m10s\thttps://github.com/acme/repo/actions/runs/77/job/61\n",
+        );
+        assert!(checks.len() > 4_096);
+        let shown = post_bash(&ws, "gh pr checks 42", &checks)
+            .expect("gh pr checks compacted via postroute");
+        assert!(shown.contains("60 passed [stdout:1-60]"), "{shown}");
+        assert!(shown.contains("ci / unit-tests  fail"), "{shown}");
+        assert!(shown.len() * 8 < checks.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &checks);
+
+        // 3. `pnpm audit` box-art dump
+        let mut audit = String::new();
+        for i in 0..8 {
+            audit.push_str(&format!(
+                "\
+┌───────────────┬──────────────────────────────────────────────────────────────┐
+│ high          │ Prototype Pollution in lodash                                │
+├───────────────┼──────────────────────────────────────────────────────────────┤
+│ Package       │ lodash                                                       │
+├───────────────┼──────────────────────────────────────────────────────────────┤
+│ Patched in    │ >=4.17.21                                                    │
+├───────────────┼──────────────────────────────────────────────────────────────┤
+│ Dependency of │ pkg-{i:02}                                                       │
+├───────────────┼──────────────────────────────────────────────────────────────┤
+│ More info     │ https://github.com/advisories/GHSA-jf85-cpcp-j695            │
+└───────────────┴──────────────────────────────────────────────────────────────┘
+"
+            ));
+        }
+        audit.push_str("8 vulnerabilities found\n");
+        assert!(audit.len() > 8_000);
+        let shown = post_bash(&ws, "pnpm audit", &audit).expect("pnpm audit compacted");
+        assert!(
+            shown.contains("[high] lodash (GHSA-jf85-cpcp-j695)"),
+            "{shown}"
+        );
+        assert!(shown.contains("(×8 paths)"), "{shown}");
+        assert!(shown.len() * 15 < audit.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &audit);
+
+        // 4. `terraform state list`
+        let mut tf_state = String::new();
+        for i in 0..120 {
+            tf_state.push_str(&format!("module.network.aws_subnet.private[{i}]\n"));
+        }
+        for i in 0..40 {
+            tf_state.push_str(&format!("aws_instance.worker[{i}]\n"));
+        }
+        assert!(tf_state.len() > 4_096);
+        let shown = post_bash(&ws, "terraform state list", &tf_state)
+            .expect("terraform state list compacted");
+        assert!(
+            shown.contains("module.network.aws_subnet ×120 [stdout:1-120]"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("aws_instance ×40 [stdout:121-160]"),
+            "{shown}"
+        );
+        assert!(shown.len() * 15 < tf_state.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &tf_state);
     }
 }

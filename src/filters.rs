@@ -1072,6 +1072,7 @@ pub fn legacy_hook(words: &[&str]) -> bool {
             ["tag", tag_args @ ..] => git_tag_display(tag_args),
             ["stash", "list", stash_args @ ..] => git_stash_list_display(stash_args),
             ["reflog", reflog_args @ ..] => git_reflog_display(reflog_args),
+            ["blame", blame_args @ ..] => git_blame_display(blame_args),
             _ => false,
         },
         _ => false,
@@ -1182,6 +1183,56 @@ fn git_stash_list_display(args: &[&str]) -> bool {
                 | "--numstat"
         )
     })
+}
+
+/// Whether `git blame` arguments keep human-readable display output without
+/// porcelain, incremental, raw, or file-reading options.
+fn git_blame_display(args: &[&str]) -> bool {
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if matches!(
+            arg,
+            "-L" | "-S" | "--ignore-rev" | "--ignore-revs-file" | "--since"
+        ) {
+            let _ = iter.next();
+            continue;
+        }
+        if arg.starts_with("-L")
+            || arg.starts_with("-S")
+            || arg.starts_with("-C")
+            || arg.starts_with("-M")
+        {
+            continue;
+        }
+        if arg.starts_with("--") {
+            let flag = arg.split_once('=').map_or(arg, |(k, _)| k);
+            if matches!(
+                flag,
+                "--porcelain"
+                    | "--line-porcelain"
+                    | "--incremental"
+                    | "--raw"
+                    | "--null"
+                    | "--output"
+                    | "--ext-diff"
+                    | "--textconv"
+                    | "--contents"
+                    | "--help"
+            ) {
+                return false;
+            }
+            continue;
+        }
+        if let Some(short) = arg.strip_prefix('-').filter(|s| !s.is_empty())
+            && short.chars().any(|c| matches!(c, 'p' | 'z' | 'h'))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `git reflog` arguments only list reflog entries in display format.
@@ -3042,6 +3093,35 @@ mod tests {
         assert!(!legacy_hook(&["cargo", "nextest", "archive"]));
         assert!(legacy_hook(&["git", "reflog", "-n", "10"]));
         assert!(!legacy_hook(&["git", "reflog", "expire", "--all"]));
+        assert!(legacy_hook(&["git", "blame", "src/main.rs"]));
+        assert!(legacy_hook(&[
+            "git",
+            "blame",
+            "-L",
+            "1,50",
+            "-w",
+            "src/main.rs"
+        ]));
+        assert!(!legacy_hook(&[
+            "git",
+            "blame",
+            "--porcelain",
+            "src/main.rs"
+        ]));
+        assert!(!legacy_hook(&[
+            "git",
+            "blame",
+            "--line-porcelain",
+            "src/main.rs"
+        ]));
+        assert!(!legacy_hook(&[
+            "git",
+            "blame",
+            "--incremental",
+            "src/main.rs"
+        ]));
+        assert!(!legacy_hook(&["git", "blame", "-p", "src/main.rs"]));
+        assert!(!legacy_hook(&["git", "blame", "--raw", "src/main.rs"]));
         // Biome, oxlint and ty check route as linters and auto-approve only when read-only.
         assert_eq!(profile(&["biome", "check", "."]), Some(Profile::Lint));
         assert_eq!(profile(&["oxlint", "src"]), Some(Profile::Lint));

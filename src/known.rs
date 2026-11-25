@@ -19,10 +19,13 @@ const FOLLOW: &[&str] = &["-f", "--follow"];
 /// options that keep it as written.
 const ROUTED: &[(&[&str], &[&str])] = &[
     // Rust
+    (&["cargo", "audit"], &["fix"]),
     (&["cargo", "fmt"], &[]),
     (&["cargo", "install"], &[]),
+    (&["cargo", "outdated"], &[]),
     (&["rustfmt"], &[]),
     // JavaScript and TypeScript
+    (&["npm", "audit"], &["fix"]),
     (&["npm", "install"], &[]),
     (&["npm", "i"], &[]),
     (&["npm", "ci"], &[]),
@@ -30,6 +33,7 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["npm", "run", "build"], &[]),
     (&["npm", "run", "lint"], &[]),
     (&["npm", "run", "typecheck"], &[]),
+    (&["pnpm", "audit"], &["--fix"]),
     (&["pnpm", "install"], &[]),
     (&["pnpm", "i"], &[]),
     (&["pnpm", "add"], &[]),
@@ -42,6 +46,7 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["pnpm", "run", "build"], &[]),
     (&["pnpm", "run", "lint"], &[]),
     (&["pnpm", "run", "typecheck"], &[]),
+    (&["yarn", "audit"], &[]),
     (&["yarn", "install"], &[]),
     (&["yarn", "build"], &[]),
     (&["yarn", "lint"], &[]),
@@ -208,10 +213,12 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["helm", "history"], &[]),
     (&["helm", "lint"], &[]),
     (&["terraform", "plan"], &[]),
+    (&["terraform", "state", "list"], &[]),
     (&["terraform", "validate"], &[]),
     (&["terraform", "fmt"], &[]),
     (&["terraform", "init"], &[]),
     (&["tofu", "plan"], &[]),
+    (&["tofu", "state", "list"], &[]),
     (&["tofu", "validate"], &[]),
     (&["tofu", "fmt"], &[]),
     (&["tofu", "init"], &[]),
@@ -510,6 +517,12 @@ mod tests {
             "git push",
             "gh pr merge 1",
             "gh pr view 1 --web",
+            "npm audit fix",
+            "pnpm audit --fix",
+            "cargo audit fix",
+            "terraform state rm aws_instance.web",
+            "terraform state show aws_instance.web",
+            "tofu state pull",
         ] {
             let words: Vec<&str> = line.split(' ').collect();
             assert!(!crate::agents::supported_words(&words), "{line}");

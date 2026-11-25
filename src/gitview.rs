@@ -1,6 +1,6 @@
 //! Compact, lossless-link views for display-oriented Git commands:
-//! `git log`, `git reflog`, `git status`, `git branch`, `git tag`, and
-//! `git stash list`.
+//! `git log`, `git reflog`, `git status`, `git branch`, `git tag`,
+//! `git stash list`, and `git blame`.
 //!
 //! - `git log` in default multi-line format compacts commits into dense single
 //!   lines (`<short-hash> YYYY-MM-DD Author: subject [stdout:A-B]`), keeping
@@ -40,6 +40,7 @@ pub enum View {
     Branch(Box<Branch>),
     Tag(Box<Tag>),
     Stash(Box<Stash>),
+    Blame(Box<Blame>),
 }
 
 impl View {
@@ -59,6 +60,7 @@ impl View {
             "branch" => Branch::new(args).map(Box::new).map(Self::Branch),
             "tag" => Tag::new(args).map(Box::new).map(Self::Tag),
             "stash" => Stash::new(args, budget).map(Box::new).map(Self::Stash),
+            "blame" => Blame::new(args).map(Box::new).map(Self::Blame),
             _ => None,
         }
     }
@@ -70,6 +72,7 @@ impl View {
             Self::Branch(branch) => branch.observe(text, n),
             Self::Tag(tag) => tag.observe(text, n),
             Self::Stash(stash) => stash.observe(text, n),
+            Self::Blame(blame) => blame.observe(text, n),
         }
     }
 
@@ -82,6 +85,7 @@ impl View {
             Self::Branch(branch) => (*branch).finish(budget),
             Self::Tag(tag) => (*tag).finish(budget),
             Self::Stash(stash) => (*stash).finish(budget),
+            Self::Blame(blame) => (*blame).finish(budget),
         }
     }
 }
@@ -2240,6 +2244,341 @@ fn stash_list_display(args: &[&str]) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// git blame
+// ---------------------------------------------------------------------------
+
+const MAX_BLAME_LINES: usize = 50_000;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BlameCommitKey {
+    sha: String,
+    orig_file: Option<String>,
+    meta: String,
+}
+
+struct BlameEntry {
+    commit_id: usize,
+    orig_line: Option<String>,
+    lineno: usize,
+    raw_line: usize,
+    code: String,
+}
+
+/// Lossless `git blame` view that deduplicates repeated `<sha> (<Author> <timestamp> <line>)`
+/// prefixes into a compact commit-metadata legend plus contiguous blame runs.
+pub struct Blame {
+    bytes: usize,
+    commits: Vec<BlameCommitKey>,
+    commit_ids: BTreeMap<BlameCommitKey, usize>,
+    entries: Vec<BlameEntry>,
+    unknown: bool,
+}
+
+impl Blame {
+    fn new(args: &[&str]) -> Option<Self> {
+        if !blame_display(args) {
+            return None;
+        }
+        Some(Self {
+            bytes: 0,
+            commits: Vec::new(),
+            commit_ids: BTreeMap::new(),
+            entries: Vec::new(),
+            unknown: false,
+        })
+    }
+
+    fn observe(&mut self, text: &str, n: usize) {
+        self.bytes += text.len();
+        if self.unknown {
+            return;
+        }
+        if self.entries.len() >= MAX_BLAME_LINES {
+            self.unknown = true;
+            return;
+        }
+        let line = text.trim_end_matches(['\n', '\r']);
+        let Some(parsed) = parse_blame_line(line) else {
+            self.unknown = true;
+            return;
+        };
+        let key = BlameCommitKey {
+            sha: parsed.sha.to_owned(),
+            orig_file: parsed.orig_file.map(str::to_owned),
+            meta: parsed.meta,
+        };
+        let commit_id = if let Some(&id) = self.commit_ids.get(&key) {
+            id
+        } else {
+            let id = self.commits.len() + 1;
+            self.commits.push(key.clone());
+            self.commit_ids.insert(key, id);
+            id
+        };
+        self.entries.push(BlameEntry {
+            commit_id,
+            orig_line: parsed.orig_line.map(str::to_owned),
+            lineno: parsed.lineno,
+            raw_line: n,
+            code: parsed.code.to_owned(),
+        });
+    }
+
+    fn render_prefix(&self, count: usize) -> String {
+        let slice = &self.entries[..count];
+        let mut used = vec![false; self.commits.len()];
+        for entry in slice {
+            used[entry.commit_id - 1] = true;
+        }
+        let used_count = used.iter().filter(|&&u| u).count();
+
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "git blame: {}, {}",
+            plural(self.entries.len(), "line", "lines"),
+            plural(self.commits.len(), "commit", "commits")
+        );
+        for (idx, commit) in self.commits.iter().enumerate() {
+            if !used[idx] {
+                continue;
+            }
+            let id = idx + 1;
+            match &commit.orig_file {
+                Some(file) => {
+                    let _ = writeln!(out, "#{id} {} {} [{file}]", commit.sha, commit.meta);
+                }
+                None => {
+                    let _ = writeln!(out, "#{id} {} {}", commit.sha, commit.meta);
+                }
+            }
+        }
+        out.push_str("---\n");
+
+        let mut i = 0;
+        while i < slice.len() {
+            let commit_id = slice[i].commit_id;
+            let mut j = i + 1;
+            while j < slice.len()
+                && slice[j].commit_id == commit_id
+                && slice[j].lineno == slice[j - 1].lineno + 1
+            {
+                j += 1;
+            }
+            if j == i + 1 {
+                let entry = &slice[i];
+                match &entry.orig_line {
+                    Some(orig) => {
+                        let _ =
+                            writeln!(out, "#{commit_id} {orig}->{}|{}", entry.lineno, entry.code);
+                    }
+                    None => {
+                        let _ = writeln!(out, "#{commit_id} {}|{}", entry.lineno, entry.code);
+                    }
+                }
+            } else {
+                let _ = writeln!(
+                    out,
+                    "#{commit_id} L{}-{}",
+                    slice[i].lineno,
+                    slice[j - 1].lineno
+                );
+                for entry in &slice[i..j] {
+                    match &entry.orig_line {
+                        Some(orig) => {
+                            let _ = writeln!(out, "{orig}->{}|{}", entry.lineno, entry.code);
+                        }
+                        None => {
+                            let _ = writeln!(out, "{}|{}", entry.lineno, entry.code);
+                        }
+                    }
+                }
+            }
+            i = j;
+        }
+
+        if count < self.entries.len() {
+            let rem = self.entries.len() - count;
+            let extra_commits = self.commits.len().saturating_sub(used_count);
+            let from = self.entries[count].raw_line;
+            let to = self.entries.last().map_or(from, |e| e.raw_line);
+            if extra_commits > 0 {
+                let _ = writeln!(
+                    out,
+                    "+{} (+{}) {}",
+                    plural(rem, "more line", "more lines"),
+                    plural(extra_commits, "other commit", "other commits"),
+                    line_range_tag(from, to)
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "+{} {}",
+                    plural(rem, "more line", "more lines"),
+                    line_range_tag(from, to)
+                );
+            }
+        }
+        out
+    }
+
+    fn finish(self, budget: usize) -> Option<String> {
+        if self.unknown || self.entries.is_empty() {
+            return None;
+        }
+        let full = self.render_prefix(self.entries.len());
+        if full.len() <= budget {
+            let over_budget = self.bytes > budget;
+            let compact_all = self.entries.len() >= 4 && full.len() * 4 <= self.bytes * 3;
+            if (over_budget || compact_all) && full.len() < self.bytes {
+                return Some(full);
+            }
+            return None;
+        }
+        if self.entries.len() == 1 {
+            return None;
+        }
+        // Binary-search the maximum prefix of blame lines that fits within `budget`.
+        let mut lo = 1usize;
+        let mut hi = self.entries.len() - 1;
+        let mut best: Option<String> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let candidate = self.render_prefix(mid);
+            if candidate.len() <= budget {
+                best = Some(candidate);
+                lo = mid + 1;
+            } else {
+                if mid == 1 {
+                    break;
+                }
+                hi = mid - 1;
+            }
+        }
+        best.filter(|out| out.len() < self.bytes)
+    }
+}
+
+struct ParsedBlameLine<'a> {
+    sha: &'a str,
+    orig_file: Option<&'a str>,
+    orig_line: Option<&'a str>,
+    meta: String,
+    lineno: usize,
+    code: &'a str,
+}
+
+fn parse_blame_line(line: &str) -> Option<ParsedBlameLine<'_>> {
+    let (sha, after_sha) = line.split_once(char::is_whitespace)?;
+    let hex = sha.strip_prefix('^').unwrap_or(sha);
+    if !(4..=64).contains(&hex.len()) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rest = after_sha.trim_start();
+    let (extra, meta_start) = if let Some(after_open) = rest.strip_prefix('(') {
+        ("", after_open)
+    } else {
+        let (before, after_open) = rest.split_once(" (")?;
+        (before.trim(), after_open)
+    };
+    let (orig_file, orig_line) = if extra.is_empty() {
+        (None, None)
+    } else if let Some((head, tail)) = extra.rsplit_once(char::is_whitespace)
+        && !tail.is_empty()
+        && tail.bytes().all(|b| b.is_ascii_digit())
+    {
+        let file = head.trim();
+        ((!file.is_empty()).then_some(file), Some(tail))
+    } else if extra.bytes().all(|b| b.is_ascii_digit()) {
+        (None, Some(extra))
+    } else {
+        (Some(extra), None)
+    };
+
+    for (pos, ch) in meta_start.char_indices() {
+        if ch != ')' {
+            continue;
+        }
+        let after_close = &meta_start[pos + 1..];
+        if !after_close.is_empty() && !after_close.starts_with(' ') {
+            continue;
+        }
+        let inside = &meta_start[..pos];
+        let Some((meta_raw, lineno_str)) = inside.rsplit_once(char::is_whitespace) else {
+            continue;
+        };
+        if lineno_str.is_empty() || !lineno_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let meta = meta_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if meta.is_empty() {
+            continue;
+        }
+        let lineno = lineno_str.parse::<usize>().ok()?;
+        let code = after_close.strip_prefix(' ').unwrap_or(after_close);
+        return Some(ParsedBlameLine {
+            sha,
+            orig_file,
+            orig_line,
+            meta,
+            lineno,
+            code,
+        });
+    }
+    None
+}
+
+fn blame_display(args: &[&str]) -> bool {
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if matches!(
+            arg,
+            "-L" | "-S" | "--ignore-rev" | "--ignore-revs-file" | "--since"
+        ) {
+            let _ = iter.next();
+            continue;
+        }
+        if arg.starts_with("-L")
+            || arg.starts_with("-S")
+            || arg.starts_with("-C")
+            || arg.starts_with("-M")
+        {
+            continue;
+        }
+        if arg.starts_with("--") {
+            let flag = arg.split_once('=').map_or(arg, |(k, _)| k);
+            if matches!(
+                flag,
+                "--porcelain"
+                    | "--line-porcelain"
+                    | "--incremental"
+                    | "--raw"
+                    | "--null"
+                    | "--output"
+                    | "--ext-diff"
+                    | "--textconv"
+                    | "--contents"
+                    | "--score-debug"
+                    | "--show-stats"
+                    | "--help"
+            ) {
+                return false;
+            }
+            continue;
+        }
+        if let Some(short) = arg.strip_prefix('-').filter(|s| !s.is_empty())
+            && short.chars().any(|c| matches!(c, 'p' | 's' | 'z' | 'h'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2292,10 +2631,18 @@ mod tests {
             "git stash list -n 20",
             "git reflog",
             "git reflog show main",
+            "git blame src/main.rs",
+            "git blame -L 1,50 -w src/main.rs",
+            "git --no-pager blame --date=short src/main.rs",
         ] {
             assert!(selected(command), "{command}");
         }
         for command in [
+            "git blame --porcelain src/main.rs",
+            "git blame --line-porcelain src/main.rs",
+            "git blame --incremental src/main.rs",
+            "git blame -p src/main.rs",
+            "git blame --raw src/main.rs",
             "git log -p",
             "git log --patch",
             "git log -U1",
@@ -3020,5 +3367,92 @@ mod tests {
         );
         assert!(report.contains("older commits [stdout:"), "{report}");
         assert_eq!(view("git reflog expire --all", &reflog, 512), None);
+    }
+
+    #[test]
+    fn git_blame_deduplicates_prefixes_losslessly_with_contiguous_runs() {
+        let commits = [
+            (
+                "^4f11c3d8",
+                "Alice Developer  ",
+                "2026-01-10 14:22:05 +0000",
+            ),
+            ("8af83112", "Bob Smith        ", "2026-02-14 09:15:33 -0500"),
+            ("cd26de39", "Carol Engineer   ", "2026-03-01 18:40:12 +0000"),
+            ("00000000", "Not Committed Yet", "2026-11-25 16:00:00 +0000"),
+        ];
+        let mut raw = String::new();
+        for i in 1..=120 {
+            let (sha, author, ts) = commits[(i - 1) / 30];
+            let code = match i % 5 {
+                0 => String::new(),
+                1 => format!("fn step_{i:03}() {{"),
+                2 => format!("    let v = {i};"),
+                3 => "    v + 1".to_owned(),
+                _ => "}".to_owned(),
+            };
+            let _ = writeln!(raw, "{sha} ({author} {ts} {i:>3}) {code}");
+        }
+
+        // Lossless view fits well within budget and cuts raw size by >3x.
+        let report = view("git blame src/lib.rs", &raw, 8192).expect("blame compacted");
+        let ratio_x10 = raw.len() * 10 / report.len();
+        assert!(
+            ratio_x10 >= 30,
+            "expected >=3.0x reduction on git blame, got {:.2}x ({} -> {})\n{report}",
+            raw.len() as f64 / report.len() as f64,
+            raw.len(),
+            report.len()
+        );
+        assert!(
+            report.starts_with("git blame: 120 lines, 4 commits\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("#1 ^4f11c3d8 Alice Developer 2026-01-10 14:22:05 +0000\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("#2 8af83112 Bob Smith 2026-02-14 09:15:33 -0500\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("#3 cd26de39 Carol Engineer 2026-03-01 18:40:12 +0000\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("#4 00000000 Not Committed Yet 2026-11-25 16:00:00 +0000\n"),
+            "{report}"
+        );
+        assert!(report.contains("#1 L1-30\n1|fn step_001() {\n"), "{report}");
+        assert!(
+            report.contains("#2 L31-60\n31|fn step_031() {\n"),
+            "{report}"
+        );
+        assert!(report.contains("#4 L91-120\n"), "{report}");
+        assert!(report.contains("120|\n"), "blank line preserved: {report}");
+
+        // Tighter budget folds tail runs cleanly with exact `[stdout:A-B]` range.
+        let tight = view("git blame src/lib.rs", &raw, 900).expect("tight blame compacted");
+        assert!(tight.len() <= 900, "len={}: {tight}", tight.len());
+        assert!(tight.contains("more lines"), "{tight}");
+        assert!(tight.contains("-120]\n"), "{tight}");
+
+        // `-f -n` moved-file & original line numbers stay 100% lossless too.
+        let moved = "\
+4f11c3d8 src/old.rs 10 (Alice (Bot) 2026-01-10 14:22:05 +0000 1) fn moved(x: i32) {
+4f11c3d8 src/old.rs 11 (Alice (Bot) 2026-01-10 14:22:05 +0000 2)     x + 1
+4f11c3d8 src/old.rs 12 (Alice (Bot) 2026-01-10 14:22:05 +0000 3) }
+4f11c3d8 src/old.rs 13 (Alice (Bot) 2026-01-10 14:22:05 +0000 4) // end
+";
+        let moved_view = view("git blame -f -n src/new.rs", moved, 2048).unwrap();
+        assert!(
+            moved_view.contains("#1 4f11c3d8 Alice (Bot) 2026-01-10 14:22:05 +0000 [src/old.rs]"),
+            "{moved_view}"
+        );
+        assert!(
+            moved_view.contains("10->1|fn moved(x: i32) {"),
+            "{moved_view}"
+        );
     }
 }

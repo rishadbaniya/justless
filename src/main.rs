@@ -5,6 +5,7 @@ mod batch;
 mod capture;
 mod cargo_tests;
 mod claude_permissions;
+mod cli_views;
 mod components;
 mod config_outline;
 mod context;
