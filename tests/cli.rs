@@ -13970,15 +13970,30 @@ pub fn inherent(v: &Y) -> u8 {\n    v.value()\n}\n";
 
 #[test]
 fn no_remaining_references_says_mentions_outside_definitions_were_not_read() {
-    // The only call is in a `macro_rules!` body, which is outside every definition.
-    let lib = "//- src/lib.rs\npub mod legacy;\nmacro_rules! old {\n    () => {\n        $crate::legacy::value()\n    };\n}\n\
-pub fn a() -> u8 {\n    old!()\n}\n";
+    // A mention inside an opaque top-level macro invocation is outside every indexed definition.
+    let lib = "//- src/lib.rs\npub mod legacy;\nregister! {\n    route => $crate::legacy::value()\n}\n\
+pub fn a() -> u8 {\n    1\n}\n";
     let impact = deletion_impact(&[PROBE_TOML, lib, LEGACY_RS], "src/legacy.rs", UNTOUCHED);
     text_has(
         &impact,
         &[
-            "1 mention of value outside indexed definitions, such as src/lib.rs:4 · not followed",
+            "1 mention of value outside indexed definitions, such as src/lib.rs:3 · not followed",
             "no remaining references to legacy::value found inside indexed definitions",
+        ],
+    );
+
+    // A `macro_rules!` item is indexed as a definition, so mentions inside it are attributed.
+    let macro_lib = "//- src/lib.rs\npub mod legacy;\nmacro_rules! old {\n    () => {\n        $crate::legacy::value()\n    };\n}\n\
+pub fn a() -> u8 {\n    old!()\n}\n";
+    let macro_impact = deletion_impact(
+        &[PROBE_TOML, macro_lib, LEGACY_RS],
+        "src/legacy.rs",
+        UNTOUCHED,
+    );
+    text_has(
+        &macro_impact,
+        &[
+            "old [macro] src/lib.rs:2-6 · possibly references deleted value at src/lib.rs:4 (name match only)",
         ],
     );
 }

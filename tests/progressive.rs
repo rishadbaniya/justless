@@ -1506,3 +1506,137 @@ fn config_files_get_structural_outlines_expand_and_verified_edits() {
     assert_eq!(files[0]["file"], "Cargo.toml");
     assert_eq!(files[1]["file"], "ci.yml");
 }
+
+#[test]
+fn expanded_structural_outlines_round_trip_exact_bytes_via_expand() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let payload = "p".repeat(1200);
+    let minified_obj =
+        format!("{{\"alpha\":{{\"blob\":\"{payload}\"}},\"beta\":{{\"blob\":\"{payload}\"}}}}");
+    let minified_arr = format!(
+        "[{{\"id\":\"first\",\"blob\":\"{payload}\"}},{{\"id\":\"second\",\"blob\":\"{payload}\"}}]"
+    );
+
+    let expected_alpha = format!("\"alpha\":{{\"blob\":\"{payload}\"}}");
+    let expected_second = format!("{{\"id\":\"second\",\"blob\":\"{payload}\"}}");
+    let cases: Vec<(&str, String, &str, &str)> = vec![
+        (
+            "bundle.json",
+            minified_obj.clone(),
+            "key alpha",
+            &expected_alpha,
+        ),
+        (
+            "records.json",
+            minified_arr.clone(),
+            "item second",
+            &expected_second,
+        ),
+        (
+            "guide.mdx",
+            "import { Box } from './ui';\n\n# Intro\n\n<Box />\n\n## Usage\n\nUse it.\n".into(),
+            "heading Usage",
+            "## Usage\n\nUse it.\n",
+        ),
+        (
+            "Makefile",
+            "CC := cc\n\nbuild: main.c\n\t$(CC) main.c\n\nclean:\n\trm -f a.out\n".into(),
+            "target clean",
+            "clean:\n\trm -f a.out\n",
+        ),
+        (
+            "justfile",
+            "version := \"1\"\n\n[group('dev')]\ntest:\n    cargo test\n\nclean:\n    rm -rf target\n"
+                .into(),
+            "recipe test",
+            "[group('dev')]\ntest:\n    cargo test\n\n",
+        ),
+        (
+            "Dockerfile",
+            "ARG V=1\n\nFROM rust:1.91 AS builder\nRUN cargo build\n\nFROM debian:slim AS runtime\nENTRYPOINT [\"app\"]\n"
+                .into(),
+            "stage runtime",
+            "FROM debian:slim AS runtime\nENTRYPOINT [\"app\"]\n",
+        ),
+        (
+            ".editorconfig",
+            "root = true\n\n[*]\nindent_size = 4\n\n[*.rs]\nmax_line_length = 100\n".into(),
+            "section *.rs",
+            "[*.rs]\nmax_line_length = 100\n",
+        ),
+        (
+            "app.scss",
+            "@mixin btn($c) {\n  color: $c;\n}\n\n@media (max-width: 768px) {\n  .a { display: none; }\n}\n"
+                .into(),
+            "mixin btn",
+            "@mixin btn($c) {\n  color: $c;\n}\n",
+        ),
+        (
+            "api.proto",
+            "syntax = \"proto3\";\n\nmessage Order {\n  oneof pay {\n    string card = 1;\n  }\n}\n\nservice Api {\n  rpc Get(Order) returns (Order);\n}\n"
+                .into(),
+            "oneof Order.pay",
+            "  oneof pay {\n    string card = 1;\n  }\n",
+        ),
+        (
+            "schema.graphql",
+            "type User {\n  id: ID!\n}\n\nunion Result = User | Error\n".into(),
+            "union Result",
+            "union Result = User | Error\n",
+        ),
+        (
+            "schema.prisma",
+            "datasource db {\n  provider = \"sqlite\"\n}\n\nmodel User {\n  id Int @id\n}\n"
+                .into(),
+            "model User",
+            "model User {\n  id Int @id\n}\n",
+        ),
+        (
+            "App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n  <ItemGroup Label=\"Deps\">\n    <PackageReference Include=\"A\" />\n  </ItemGroup>\n</Project>\n"
+                .into(),
+            "element ItemGroup:Deps",
+            "  <ItemGroup Label=\"Deps\">\n    <PackageReference Include=\"A\" />\n  </ItemGroup>\n",
+        ),
+        (
+            "items.rs",
+            "macro_rules! check {\n    ($e:expr) => { assert!($e) };\n}\n\npub union Val {\n    pub a: u32,\n}\n\npub trait S {\n    type Out;\n    const N: usize = 1;\n}\n"
+                .into(),
+            "macro check",
+            "macro_rules! check {\n    ($e:expr) => { assert!($e) };\n}",
+        ),
+    ];
+
+    for (file, content, expected_row, expected_expand) in cases {
+        fs::write(root.join(file), &content).unwrap();
+        let outline = String::from_utf8(out(root, &["read", file, "--outline"])).unwrap();
+        assert!(
+            outline.contains(expected_row),
+            "{file}: missing `{expected_row}` in:\n{outline}"
+        );
+        let rev = outline
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("revision ")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let row_id = outline
+            .lines()
+            .find(|line| line.contains(expected_row))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let selector = format!("{rev}{row_id}");
+        let expanded = String::from_utf8(out(root, &["expand", file, &selector])).unwrap();
+        assert_eq!(
+            expanded, expected_expand,
+            "{file}: expand {selector} mismatch"
+        );
+    }
+}

@@ -252,7 +252,7 @@ impl Extractor {
             && let Some(name) = owner.last()
         {
             path.push(name.clone());
-        } else if kind == "function"
+        } else if matches!(kind, "function" | "macro")
             && let Some(parent) = self.symbol
             && self.syntax.symbols[parent].kind != "module"
         {
@@ -447,12 +447,31 @@ impl<'ast> Visit<'ast> for Extractor {
                     visit::visit_item_enum(this, value)
                 })
             }
+            Item::Union(value) => {
+                self.with_symbol(&value.ident, "union", item.span(), false, |this| {
+                    visit::visit_item_union(this, value)
+                })
+            }
             Item::Trait(value) => {
                 self.with_symbol(&value.ident, "trait", item.span(), false, |this| {
                     let previous = this.owner.replace(vec![identifier(&value.ident)]);
                     visit::visit_item_trait(this, value);
                     this.owner = previous;
                 })
+            }
+            Item::TraitAlias(value) => {
+                self.with_symbol(&value.ident, "trait alias", item.span(), false, |this| {
+                    visit::visit_item_trait_alias(this, value)
+                })
+            }
+            Item::Macro(value) => {
+                if let Some(ident) = &value.ident {
+                    self.with_symbol(ident, "macro", item.span(), false, |this| {
+                        visit::visit_item_macro(this, value)
+                    });
+                } else {
+                    visit::visit_item_macro(self, value);
+                }
             }
             Item::Type(value) => {
                 self.with_symbol(&value.ident, "type", item.span(), false, |this| {
@@ -489,10 +508,42 @@ impl<'ast> Visit<'ast> for Extractor {
         );
     }
 
+    fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+        self.with_symbol(&item.ident, "associated type", item.span(), false, |this| {
+            visit::visit_impl_item_type(this, item)
+        });
+    }
+
+    fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
+        self.with_symbol(
+            &item.ident,
+            "associated constant",
+            item.span(),
+            false,
+            |this| visit::visit_impl_item_const(this, item),
+        );
+    }
+
     fn visit_trait_item_fn(&mut self, method: &'ast syn::TraitItemFn) {
         self.with_symbol(&method.sig.ident, "method", method.span(), false, |this| {
             this.signature(&method.sig, |this| visit::visit_trait_item_fn(this, method));
         });
+    }
+
+    fn visit_trait_item_type(&mut self, item: &'ast syn::TraitItemType) {
+        self.with_symbol(&item.ident, "associated type", item.span(), false, |this| {
+            visit::visit_trait_item_type(this, item)
+        });
+    }
+
+    fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
+        self.with_symbol(
+            &item.ident,
+            "associated constant",
+            item.span(),
+            false,
+            |this| visit::visit_trait_item_const(this, item),
+        );
     }
 
     fn visit_block(&mut self, block: &'ast syn::Block) {
@@ -684,4 +735,76 @@ fn is_test(attributes: &[syn::Attribute]) -> bool {
             )
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_macros_unions_trait_aliases_and_associated_items() {
+        let src = concat!(
+            "#[macro_export]\n",
+            "macro_rules! check {\n",
+            "    ($e:expr) => { assert!($e) };\n",
+            "}\n\n",
+            "some_item_macro!(ignored);\n\n",
+            "pub union Payload {\n",
+            "    pub int_val: i64,\n",
+            "    pub float_val: f64,\n",
+            "}\n\n",
+            "pub trait SendSync = Send + Sync;\n\n",
+            "pub trait Service {\n",
+            "    type Output;\n",
+            "    const VERSION: u32 = 1;\n",
+            "    fn run(&self) -> Self::Output;\n",
+            "}\n\n",
+            "pub struct Worker;\n\n",
+            "impl Service for Worker {\n",
+            "    type Output = String;\n",
+            "    const VERSION: u32 = 2;\n",
+            "    fn run(&self) -> Self::Output {\n",
+            "        String::new()\n",
+            "    }\n",
+            "}\n\n",
+            "impl Worker {\n",
+            "    pub const LIMIT: usize = 64;\n",
+            "}\n",
+        );
+        let syntax = parse(src).unwrap();
+        let found: Vec<_> = syntax
+            .symbols
+            .iter()
+            .map(|s| (s.kind.as_str(), s.path.join("::")))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("macro", "check".into()),
+                ("union", "Payload".into()),
+                ("trait alias", "SendSync".into()),
+                ("trait", "Service".into()),
+                ("associated type", "Service::Output".into()),
+                ("associated constant", "Service::VERSION".into()),
+                ("method", "Service::run".into()),
+                ("struct", "Worker".into()),
+                ("associated type", "Worker::Output".into()),
+                ("associated constant", "Worker::VERSION".into()),
+                ("method", "Worker::run".into()),
+                ("associated constant", "Worker::LIMIT".into()),
+            ]
+        );
+        assert!(
+            src[syntax.symbols[0].bytes.clone()].starts_with("#[macro_export]\nmacro_rules! check")
+        );
+        assert!(src[syntax.symbols[0].bytes.clone()].ends_with('}'));
+        assert_eq!(
+            &src[syntax.symbols[2].bytes.clone()],
+            "pub trait SendSync = Send + Sync;"
+        );
+        assert_eq!(
+            &src[syntax.symbols[11].bytes.clone()],
+            "pub const LIMIT: usize = 64;"
+        );
+    }
 }

@@ -342,8 +342,10 @@ impl Snapshot {
         let markdown = matches!(
             std::path::Path::new(file)
                 .extension()
-                .and_then(|x| x.to_str()),
-            Some("md" | "markdown")
+                .and_then(|x| x.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("md" | "markdown" | "mdx")
         );
         if markdown {
             let lines: Vec<&str> = (0..self.lines.len())

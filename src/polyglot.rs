@@ -41,13 +41,90 @@ pub enum Grammar {
 const SQL_TAGS: &str = "
 (create_table (object_reference) @name) @definition.table
 (create_view (object_reference) @name) @definition.view
+(create_materialized_view (object_reference) @name) @definition.view
+(create_function (keyword_function) . (object_reference) @name) @definition.function
+(create_procedure [(keyword_procedure) (keyword_exists)] . (object_reference) @name) @definition.procedure
+(create_trigger [(keyword_trigger) (keyword_exists)] . (object_reference) @name) @definition.trigger
+(create_type (keyword_type) . (object_reference) @name) @definition.type
+(create_schema [(keyword_schema) (keyword_exists)] . (identifier) @name) @definition.schema
+(create_schema (keyword_schema) . (keyword_authorization) . (identifier) @name) @definition.schema
 (relation (object_reference) @name) @reference.table
 (insert (object_reference) @name) @reference.table
 (from (object_reference) @name) @reference.table
 (alter_table (object_reference) @name) @reference.table
 (drop_table (object_reference) @name) @reference.table
 (create_index (object_reference) @name) @reference.table
+(create_trigger (keyword_on) . (object_reference) @name) @reference.table
 ";
+
+// Jest/Vitest/Mocha/Playwright suites and test blocks, including modifier and
+// table-driven `.each`/`.for` forms.
+const JS_TEST_TAGS: &str = r#"
+((call_expression
+  function: (identifier) @_test
+  arguments: (arguments . [(string) (template_string)] @name . (_))) @definition.test
+  (#any-of? @_test "describe" "it" "test"))
+((call_expression
+  function: (member_expression
+    object: (identifier) @_test
+    property: (property_identifier) @_mod)
+  arguments: (arguments . [(string) (template_string)] @name)) @definition.test
+  (#any-of? @_test "describe" "it" "test")
+  (#any-of? @_mod "only" "skip" "todo" "concurrent" "sequential" "fails" "describe"))
+((call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (identifier) @_test
+      property: (property_identifier) @_sub)
+    property: (property_identifier) @_mod)
+  arguments: (arguments . [(string) (template_string)] @name)) @definition.test
+  (#any-of? @_test "describe" "it" "test")
+  (#any-of? @_sub "describe" "only" "skip" "concurrent" "sequential")
+  (#any-of? @_mod "only" "skip" "todo" "concurrent" "sequential" "fails" "serial" "parallel"))
+((call_expression
+  function: (call_expression
+    function: (member_expression
+      object: (identifier) @_test
+      property: (property_identifier) @_each))
+  arguments: (arguments . [(string) (template_string)] @name)) @definition.test
+  (#any-of? @_test "describe" "it" "test")
+  (#any-of? @_each "each" "for"))
+((call_expression
+  function: (call_expression
+    function: (member_expression
+      object: (member_expression
+        object: (identifier) @_test
+        property: (property_identifier) @_mod)
+      property: (property_identifier) @_each))
+  arguments: (arguments . [(string) (template_string)] @name)) @definition.test
+  (#any-of? @_test "describe" "it" "test")
+  (#any-of? @_mod "only" "skip" "concurrent" "sequential" "describe")
+  (#any-of? @_each "each" "for"))
+"#;
+
+// RSpec example groups and examples (`describe`, `context`, `it`, `specify`),
+// both bare and under `RSpec.describe`.
+const RUBY_TEST_TAGS: &str = r#"
+((call
+  !receiver
+  method: (identifier) @_test
+  arguments: (argument_list . [(string) (constant) (scope_resolution)] @name)
+  block: [(do_block) (block)]) @definition.test
+  (#any-of? @_test
+    "describe" "context" "it" "specify"
+    "xdescribe" "fdescribe" "xcontext" "fcontext"
+    "xit" "fit" "xspecify" "fspecify"))
+((call
+  receiver: [
+    (constant) @_rspec
+    (scope_resolution name: (constant) @_rspec)
+  ]
+  method: (identifier) @_test
+  arguments: (argument_list . [(string) (constant) (scope_resolution)] @name)
+  block: [(do_block) (block)]) @definition.test
+  (#eq? @_rspec "RSpec")
+  (#any-of? @_test "describe" "fdescribe" "xdescribe" "shared_examples" "shared_context"))
+"#;
 
 // Member patterns are anchored to a type body or the file so that locals
 // inside function bodies never become outline rows or resolution targets.
@@ -610,6 +687,12 @@ impl Grammar {
                 (enum_declaration name: (_) @name) @definition.enum
                 (class_declaration name: (type_identifier) @name) @definition.class\n",
             );
+        }
+        if self.family() == Self::JavaScript {
+            tags.push_str(JS_TEST_TAGS);
+        }
+        if self == Self::Ruby {
+            tags.push_str(RUBY_TEST_TAGS);
         }
         if matches!(self, Self::C | Self::Cpp | Self::ObjectiveC) {
             tags.push_str("\n(call_expression function: (identifier) @name) @reference.call\n");
@@ -1691,5 +1774,225 @@ mod tests {
             sig(&kt_facts, kt_src, "DEFAULT_RULES"),
             "val DEFAULT_RULES: List<String>"
         );
+    }
+
+    #[test]
+    fn js_ts_tsx_test_blocks_extract_suites_tests_modifiers_and_each() {
+        let mut parsers = Parsers::default();
+        let ts_src = concat!(
+            "import { describe, it, test, expect, beforeEach } from 'vitest';\n\n",
+            "describe('OrderService', () => {\n",
+            "  beforeEach(() => {});\n",
+            "  it('creates an order', async () => {\n",
+            "    expect(1).toBe(1);\n",
+            "  });\n",
+            "  it.skip('handles timeout', () => {\n",
+            "    expect(true).toBe(true);\n",
+            "  });\n",
+            "  test.only(`retries ${3} times`, () => {\n",
+            "    expect(3).toBe(3);\n",
+            "  });\n",
+            "  test.each([1, 2, 3])('handles %i', (n) => {\n",
+            "    expect(n).toBeGreaterThan(0);\n",
+            "  });\n",
+            "  it.each`\n",
+            "    a | b\n",
+            "    ${1} | ${2}\n",
+            "  `('adds $a and $b', ({ a, b }) => {\n",
+            "    expect(a + b).toBeGreaterThan(0);\n",
+            "  });\n",
+            "});\n\n",
+            "test.describe.only('Playwright suite', () => {\n",
+            "  test('renders page', async () => {\n",
+            "    expect(1).toBe(1);\n",
+            "  });\n",
+            "});\n",
+        );
+        for grammar in [Grammar::JavaScript, Grammar::TypeScript, Grammar::Tsx] {
+            let facts = parsers.parse(grammar, ts_src).unwrap();
+            let tests: Vec<_> = facts
+                .definitions
+                .iter()
+                .filter(|d| d.kind == "test")
+                .map(|d| (d.path.as_str(), d.test))
+                .collect();
+            assert_eq!(
+                tests,
+                [
+                    ("\"OrderService\"", true),
+                    ("\"OrderService\"::\"creates an order\"", true),
+                    ("\"OrderService\"::\"handles timeout\"", true),
+                    ("\"OrderService\"::\"retries ${3} times\"", true),
+                    ("\"OrderService\"::\"handles %i\"", true),
+                    ("\"OrderService\"::\"adds $a and $b\"", true),
+                    ("\"Playwright suite\"", true),
+                    ("\"Playwright suite\"::\"renders page\"", true),
+                ],
+                "{grammar:?}"
+            );
+            for def in facts.definitions.iter().filter(|d| d.kind == "test") {
+                let slice = &ts_src[def.bytes.clone()];
+                assert!(
+                    slice.ends_with(')'),
+                    "expected exact call_expression bytes for {}: {slice:?}",
+                    def.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_vitest_file_has_zero_uncovered_code() {
+        let mut src = String::from(
+            "import { describe, it, test, expect, beforeEach } from 'vitest';\nimport { calc } from './calc';\n\n",
+        );
+        for suite in 0..12 {
+            src.push_str(&format!("describe('suite {suite}', () => {{\n"));
+            src.push_str("  beforeEach(() => {\n    calc(0);\n  });\n");
+            for case in 0..8 {
+                src.push_str(&format!(
+                    "  it('case {suite}-{case}', () => {{\n    const a = calc({case});\n    const b = a + 1;\n    const c = b * 2;\n    const d = c - 1;\n    expect(d).toBeGreaterThan(0);\n  }});\n"
+                ));
+            }
+            src.push_str(&format!(
+                "  test.each([1, 2, 3])('table {suite} %i', (n) => {{\n    expect(calc(n)).toBeDefined();\n  }});\n"
+            ));
+            src.push_str("});\n\n");
+        }
+        assert!(
+            src.lines().count() >= 700,
+            "expected >= 700 lines, got {}",
+            src.lines().count()
+        );
+        let mut snap = crate::source::Snapshot::from_text("src/calc.test.ts", src.clone());
+        snap.index("src/calc.test.ts").unwrap();
+        let uncovered = crate::agents::uncovered_code("src/calc.test.ts", &snap).unwrap();
+        assert!(
+            uncovered.is_empty(),
+            "expected zero uncovered lines in 700-line Vitest file, got: {uncovered:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_rspec_blocks_extract_describe_context_it_specify() {
+        let mut parsers = Parsers::default();
+        let src = concat!(
+            "require 'spec_helper'\n\n",
+            "RSpec.describe MyApp::OrderService do\n",
+            "  describe '#total' do\n",
+            "    context 'when discounted' do\n",
+            "      it 'applies discount' do\n",
+            "        expect(1).to eq(1)\n",
+            "      end\n\n",
+            "      specify('handles zero') { expect(0).to eq(0) }\n",
+            "    end\n",
+            "  end\n",
+            "end\n\n",
+            "other.describe('not rspec') do\n",
+            "  puts 'ignored'\n",
+            "end\n",
+        );
+        let facts = parsers.parse(Grammar::Ruby, src).unwrap();
+        let tests: Vec<_> = facts
+            .definitions
+            .iter()
+            .filter(|d| d.kind == "test")
+            .map(|d| (d.path.as_str(), d.test))
+            .collect();
+        assert_eq!(
+            tests,
+            [
+                ("\"MyApp::OrderService\"", true),
+                ("\"MyApp::OrderService\"::\"#total\"", true),
+                (
+                    "\"MyApp::OrderService\"::\"#total\"::\"when discounted\"",
+                    true
+                ),
+                (
+                    "\"MyApp::OrderService\"::\"#total\"::\"when discounted\"::\"applies discount\"",
+                    true
+                ),
+                (
+                    "\"MyApp::OrderService\"::\"#total\"::\"when discounted\"::\"handles zero\"",
+                    true
+                ),
+            ]
+        );
+        let rspec_only = src.split("\nother.describe").next().unwrap().to_owned() + "\n";
+        let mut snap = crate::source::Snapshot::from_text("spec/order_spec.rb", rspec_only);
+        snap.index("spec/order_spec.rb").unwrap();
+        let uncovered = crate::agents::uncovered_code("spec/order_spec.rb", &snap).unwrap();
+        assert!(uncovered.is_empty(), "uncovered: {uncovered:?}");
+    }
+
+    #[test]
+    fn sql_extended_ddl_extracts_functions_procedures_triggers_types_views_and_schemas() {
+        let mut parsers = Parsers::default();
+        let sql = concat!(
+            "CREATE SCHEMA IF NOT EXISTS app;\n",
+            "CREATE SCHEMA billing AUTHORIZATION admin_role;\n",
+            "CREATE SCHEMA AUTHORIZATION solo_role;\n\n",
+            "CREATE TYPE app.order_status AS ENUM ('pending', 'paid');\n\n",
+            "CREATE TABLE app.orders (\n",
+            "  id INT PRIMARY KEY,\n",
+            "  status app.order_status\n",
+            ");\n\n",
+            "CREATE VIEW app.open_orders AS\n",
+            "SELECT id FROM app.orders;\n\n",
+            "CREATE MATERIALIZED VIEW app.daily_totals AS\n",
+            "SELECT COUNT(*) AS cnt FROM app.orders;\n\n",
+            "CREATE OR REPLACE FUNCTION app.order_status_of(p_id INT)\n",
+            "RETURNS app.order_status\n",
+            "LANGUAGE plpgsql AS $$\n",
+            "BEGIN\n",
+            "  RETURN 'paid';\n",
+            "END;\n",
+            "$$;\n\n",
+            "CREATE PROCEDURE app.close_order(p_id INT)\n",
+            "LANGUAGE plpgsql AS $$\n",
+            "BEGIN\n",
+            "  UPDATE app.orders SET status = 'paid' WHERE id = p_id;\n",
+            "END;\n",
+            "$$;\n\n",
+            "CREATE TRIGGER trg_orders_audit\n",
+            "AFTER INSERT ON app.orders\n",
+            "FOR EACH ROW\n",
+            "EXECUTE FUNCTION app.order_status_of();\n",
+        );
+        let facts = parsers.parse(Grammar::Sql, sql).unwrap();
+        let defs: Vec<_> = facts
+            .definitions
+            .iter()
+            .map(|d| (d.kind.as_str(), d.name.as_str()))
+            .collect();
+        assert_eq!(
+            defs,
+            [
+                ("schema", "app"),
+                ("schema", "billing"),
+                ("schema", "solo_role"),
+                ("type", "app.order_status"),
+                ("table", "app.orders"),
+                ("view", "app.open_orders"),
+                ("view", "app.daily_totals"),
+                ("function", "app.order_status_of"),
+                ("procedure", "app.close_order"),
+                ("trigger", "trg_orders_audit"),
+            ]
+        );
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.kind == Kind::Data && r.name == "app.orders")
+        );
+        for def in &facts.definitions {
+            let slice = &sql[def.bytes.clone()];
+            assert!(
+                slice.starts_with("CREATE"),
+                "expected exact CREATE statement bytes for {}: {slice:?}",
+                def.name
+            );
+        }
     }
 }

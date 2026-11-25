@@ -12,7 +12,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, display_path, lock_state, write_json};
 
-pub(crate) const VERSION: u32 = 9;
+pub(crate) const VERSION: u32 = 10;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -1626,7 +1626,7 @@ impl Resolver<'_> {
                     .filter(|&&id| {
                         matches!(
                             self.definitions[id].kind.as_str(),
-                            "struct" | "enum" | "trait" | "type"
+                            "struct" | "enum" | "union" | "trait" | "trait alias" | "type"
                         )
                     })
                     .map(|&id| (id, kind, inferred)),
