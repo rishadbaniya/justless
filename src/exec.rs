@@ -5,21 +5,27 @@
 //! This isolates output, not code: scripts run with the caller's permissions.
 
 use std::cell::{Cell, RefCell};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Arg, ArgMatches};
+use regex::Regex;
 
 use crate::capture::{self, Shape};
 use crate::workspace::Workspace;
 
 /// Largest script read from stdin. Data belongs in `--file`.
 const STDIN_LIMIT: u64 = 1024 * 1024;
+/// Largest stdout read into memory for `logview` / `stacktrace` shaping.
+const TEXT_SHAPE_LIMIT: u64 = 2 * 1024 * 1024;
 /// Time between SIGINT and SIGKILL once the limit passes.
 const GRACE: Duration = Duration::from_secs(2);
 /// How long processes the script left running, such as the reader of `> >(sort)`, may
@@ -378,6 +384,9 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
     };
     let session = std::env::var("JUSTLESS_SESSION").unwrap_or_else(|_| "terminal".into());
     let justless = workspace.justless();
+    let workspace_root = workspace.root.clone();
+    let json_grouping = workspace.settings()?.json_grouping;
+    let intent_owned = intent.map(str::to_owned);
     let status = capture::execute_shaped(
         workspace,
         &key,
@@ -395,14 +404,19 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             agent_footer: true,
             family: Some(format!("exec {}", lang.label())),
             merge: false,
-            // Script output is mostly data, so a long stdout keeps whole lines and names
-            // the ones left out, or is ranked against the intent.
-            stdout_preview: Some(Box::new(move |stdout: &Path, id: &str| match intent {
-                Some(intent) => crate::focus::preview(stdout, intent, max_bytes, &justless, id)
-                    .map(Some)
-                    .context("could not rank stdout for --intent"),
-                None => crate::focus::outline(stdout, max_bytes, &justless, id)
-                    .context("could not outline stdout"),
+            // Shape long redacted stdout via lossless deep-schema `jsonview`,
+            // workspace-aware `stacktrace` collapsing, structured `logview` folding,
+            // dedup-aware `--intent` ranking, or whole-line `focus::outline`.
+            stdout_preview: Some(Box::new(move |stdout: &Path, id: &str| {
+                shape_stdout(
+                    stdout,
+                    id,
+                    max_bytes,
+                    intent_owned.as_deref(),
+                    &workspace_root,
+                    &justless,
+                    json_grouping,
+                )
             })),
             spawn: Some(Box::new(spawn)),
         },
@@ -783,6 +797,1825 @@ fn wait(
     })
 }
 
+/// Leading ISO-8601 / RFC3339 timestamp, optionally bracketed.
+static LOG_ISO_TS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?(?:\s+|$)",
+    )
+    .expect("iso log timestamp pattern")
+});
+/// Leading syslog / journalctl timestamp (`Mar 10 12:34:56 `).
+static LOG_SYSLOG_TS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+",
+    )
+    .expect("syslog timestamp pattern")
+});
+/// Leading clock timestamp (`12:34:56.789 ` or `[12:34:56] `).
+static LOG_CLOCK_TS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[?\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]?\s+").expect("clock timestamp pattern")
+});
+/// Leading klog/glog header (`I1125 10:00:01.123456 1 `).
+static LOG_KLOG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+").expect("klog pattern")
+});
+/// Explicit log level prefix (`[INFO]`, `ERROR:`, `WARN `, etc.).
+static LOG_LEVEL_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:\[(?i:trace|trc|debug|dbg|info|inf|notice|warn|warning|wrn|error|err|erro|fatal|fata|crit|critical|severe)\]|(?:TRACE|TRC|DEBUG|DBG|INFO|INF|NOTICE|WARN|WARNING|WRN|ERROR|ERR|ERRO|FATAL|FATA|CRIT|CRITICAL|SEVERE)(?:\s*[:|\-]\s*|\s+))",
+    )
+    .expect("log level prefix pattern")
+});
+/// Logfmt severity field (`level=info`, `lvl=warn`, `severity=ERROR`).
+static LOG_LOGFMT_LEVEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\s)(?:level|lvl|severity)=[A-Za-z]+").expect("logfmt level pattern")
+});
+/// Kubernetes `--prefix` pod/container prefix (`[pod/container] ...`).
+static LOG_K8S_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\]\s+(.*)$").expect("k8s prefix pattern")
+});
+/// Docker Compose prefix (`service-1 | ...`).
+static LOG_COMPOSE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([A-Za-z0-9._-]{1,48})\s*\|\s+(.*)$").expect("compose prefix pattern")
+});
+/// Ruby backtrace continuation frame (`\tfrom path:line:in \`method'`).
+static RUBY_FRAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([ \t]+)from ([^\r\n]+?):(\d+):in [`'].*").expect("ruby frame pattern")
+});
+
+/// Outcome of shaping a captured text stream for `justless exec`.
+enum ShapedText {
+    /// Compacted preview ready to display (guaranteed `<= max_bytes`).
+    Ready(Vec<u8>),
+    /// Native `crate::stacktrace` collapsed frames but the result still exceeds
+    /// `max_bytes`, so `capture`'s stacktrace-collapsed `head + [diagnostics] + tail`
+    /// preview should be kept instead of overwriting with a plain outline.
+    UseCaptureStacktrace,
+    /// Ruby stacktrace collapsed frames, still exceeding `max_bytes`, ready to outline.
+    OutlineCollapsed(String),
+    /// Output is not JSON, structured logs, or a collapsible stack trace.
+    Fallback,
+}
+
+/// Shapes a long redacted stdout archive for `justless exec`.
+///
+/// With `--intent`, ranks matching lines and windows with boilerplate and window
+/// deduplication. Without `--intent`, tries lossless deep-schema `jsonview` (routing
+/// NDJSON structured logs to `logview` first), structured `logview` folding, and
+/// workspace-aware `stacktrace` collapsing before falling back to `focus::outline`.
+fn shape_stdout(
+    stdout: &Path,
+    run_id: &str,
+    max_bytes: usize,
+    intent: Option<&str>,
+    workspace_root: &Path,
+    justless: &str,
+    json_grouping: bool,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(intent) = intent {
+        return intent_preview(stdout, intent, max_bytes, justless, run_id)
+            .map(Some)
+            .context("could not rank stdout for --intent");
+    }
+
+    let size = fs::metadata(stdout)?.len();
+    if size > 0 && size <= crate::jsonview::LIMIT as u64 {
+        let head = read_prefix(stdout, 64)?;
+        let can_read = size <= TEXT_SHAPE_LIMIT || could_be_json_prefix(&head);
+        if can_read {
+            let bytes = fs::read(stdout)?;
+            if let Ok(text) = String::from_utf8(bytes) {
+                match shape_text_preview(
+                    &text,
+                    max_bytes,
+                    workspace_root,
+                    "stdout",
+                    json_grouping,
+                    None,
+                ) {
+                    ShapedText::Ready(preview) if preview.len() <= max_bytes => {
+                        return Ok(Some(preview));
+                    }
+                    ShapedText::UseCaptureStacktrace => return Ok(None),
+                    ShapedText::OutlineCollapsed(collapsed) => {
+                        if let Some(outlined) =
+                            outline_collapsed_text(&collapsed, max_bytes, justless, run_id)
+                        {
+                            return Ok(Some(outlined));
+                        }
+                    }
+                    ShapedText::Ready(_) | ShapedText::Fallback => {}
+                }
+            }
+        }
+    }
+
+    crate::focus::outline(stdout, max_bytes, justless, run_id).context("could not outline stdout")
+}
+
+/// Shapes UTF-8 stream text using the Wave-1/Wave-2 engines (`jsonview`, `logview`,
+/// `stacktrace`), applying `redactor` first whenever one is provided.
+fn shape_text_preview(
+    raw: &str,
+    max_bytes: usize,
+    workspace_root: &Path,
+    stream: &str,
+    json_grouping: bool,
+    redactor: Option<&crate::redact::Redactor>,
+) -> ShapedText {
+    let text = match redactor {
+        Some(redactor) => redactor.text(raw),
+        None => std::borrow::Cow::Borrowed(raw),
+    };
+    let text = text.as_ref();
+    if text.is_empty() || text.contains('\0') {
+        return ShapedText::Fallback;
+    }
+
+    let json_candidate =
+        could_be_json_prefix(text.as_bytes()) && !text.contains("\"compiler-message\"");
+    if json_candidate {
+        // NDJSON structured logs fold routine lines into templates and keep 100% of
+        // errors/warnings visible instead of clipping mid-table.
+        if text.len() <= TEXT_SHAPE_LIMIT as usize
+            && looks_like_json_logs(text)
+            && let Some(folded) = format_logview(stream, text, max_bytes)
+        {
+            return ShapedText::Ready(folded.into_bytes());
+        }
+        if let Some(view) = shape_json_view(text, max_bytes, json_grouping) {
+            return ShapedText::Ready(view);
+        }
+    }
+
+    if text.len() > TEXT_SHAPE_LIMIT as usize {
+        return ShapedText::Fallback;
+    }
+
+    if looks_like_structured_logs(text)
+        && let Some(folded) = format_logview(stream, text, max_bytes)
+    {
+        return ShapedText::Ready(folded.into_bytes());
+    }
+
+    if let Some((collapsed, native)) = collapse_stacktrace(text, Some(workspace_root), Some(stream))
+    {
+        if collapsed.len() <= max_bytes {
+            return ShapedText::Ready(collapsed.into_bytes());
+        }
+        return if native {
+            ShapedText::UseCaptureStacktrace
+        } else {
+            ShapedText::OutlineCollapsed(collapsed)
+        };
+    }
+
+    ShapedText::Fallback
+}
+
+fn read_prefix(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut buf = Vec::with_capacity(limit);
+    file.take(limit as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Cheap prefix guard so non-JSON text such as `[2026-01-01] INFO` or `[pod/web]`
+/// never triggers a full multi-megabyte JSON parse.
+fn could_be_json_prefix(bytes: &[u8]) -> bool {
+    let trimmed = bytes.trim_ascii_start();
+    let Some((&first, rest)) = trimmed.split_first() else {
+        return false;
+    };
+    let next = rest.trim_ascii_start();
+    match first {
+        b'{' => matches!(next.first(), Some(b'"' | b'}') | None),
+        b'[' => match next.first() {
+            Some(b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b']') | None => true,
+            Some(b'-' | b'0'..=b'9') => {
+                let after_digits = next
+                    .iter()
+                    .skip(usize::from(next[0] == b'-'))
+                    .skip_while(|b| b.is_ascii_digit())
+                    .copied()
+                    .next();
+                !matches!(after_digits, Some(b'-' | b':'))
+            }
+            Some(_) => false,
+        },
+        _ => false,
+    }
+}
+
+/// Lossless deep-schema `jsonview` (table or compact JSON), clipped at whole lines
+/// when larger than `max_bytes`, only when strictly smaller than `text`.
+fn shape_json_view(text: &str, max_bytes: usize, group: bool) -> Option<Vec<u8>> {
+    crate::jsonview::views(text, group)
+        .into_iter()
+        .find_map(|view| clip_json_view(view, max_bytes))
+        .filter(|view| view.len() < text.len() && view.len() <= max_bytes)
+}
+
+/// Clips a `jsonview` rendering at whole lines to `max_bytes`, keeping the legend,
+/// header, and whole rows unless too little would fit.
+fn clip_json_view(view: String, max_bytes: usize) -> Option<Vec<u8>> {
+    if view.len() <= max_bytes {
+        return Some(view.into_bytes());
+    }
+    let lines = view.split_inclusive('\n').count();
+    let mut shown = String::new();
+    for (index, line) in view.split_inclusive('\n').enumerate() {
+        let marker = format!(
+            "[{} more lines of this view in the full log]\n",
+            lines - index
+        );
+        if shown.len() + line.len() + marker.len() > max_bytes {
+            if index < 3 || shown.len() < max_bytes / 2 {
+                return None;
+            }
+            shown.push_str(&marker);
+            break;
+        }
+        shown.push_str(line);
+    }
+    (shown.len() <= max_bytes).then(|| shown.into_bytes())
+}
+
+fn format_logview(stream: &str, text: &str, max_bytes: usize) -> Option<String> {
+    let folded = if stream == "stderr" {
+        crate::logview::format("", text, max_bytes)?
+    } else {
+        crate::logview::format(text, "", max_bytes)?
+    };
+    (folded.len() <= max_bytes && folded.len() < text.len()).then_some(folded)
+}
+
+fn has_json_key(line: &str, key: &str) -> bool {
+    let pattern = format!("\"{key}\"");
+    let mut offset = 0;
+    while let Some(pos) = line[offset..].find(&pattern) {
+        let after = &line[offset + pos + pattern.len()..];
+        if after.trim_start().starts_with(':') {
+            return true;
+        }
+        offset += pos + pattern.len();
+    }
+    false
+}
+
+fn is_json_log_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let candidate = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        trimmed
+    } else {
+        let rest = strip_leading_timestamp(trimmed).trim();
+        if rest.starts_with('{') && rest.ends_with('}') {
+            rest
+        } else {
+            return false;
+        }
+    };
+    let has_level = ["level", "lvl", "severity", "levelname", "log.level"]
+        .iter()
+        .any(|k| has_json_key(candidate, k));
+    if has_level {
+        return true;
+    }
+    let has_ts = ["ts", "timestamp", "time", "@timestamp", "datetime"]
+        .iter()
+        .any(|k| has_json_key(candidate, k));
+    let has_msg = ["msg", "message", "event", "error", "err"]
+        .iter()
+        .any(|k| has_json_key(candidate, k));
+    has_ts && has_msg
+}
+
+/// Whether `text` is NDJSON structured logs (at least 8 non-empty lines, mostly JSON
+/// objects carrying log keys such as `level`/`ts`/`msg`) rather than structured data.
+fn looks_like_json_logs(text: &str) -> bool {
+    let mut sampled = 0usize;
+    let mut json_objects = 0usize;
+    let mut json_logs = 0usize;
+    for raw in text.lines() {
+        let clean = crate::capture::ANSI.replace_all(raw, "");
+        let line = clean.trim();
+        if line.is_empty() {
+            continue;
+        }
+        sampled += 1;
+        let body = strip_leading_timestamp(line).trim();
+        if body.starts_with('{') && body.ends_with('}') {
+            json_objects += 1;
+            if is_json_log_line(line) {
+                json_logs += 1;
+            }
+        }
+        if sampled >= 64 {
+            break;
+        }
+    }
+    sampled >= 8 && json_objects * 4 >= sampled * 3 && json_logs * 2 >= json_objects
+}
+
+fn is_level_word_upper(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "TRACE"
+            | "TRC"
+            | "DEBUG"
+            | "DBG"
+            | "INFO"
+            | "INF"
+            | "LOG"
+            | "NOTICE"
+            | "WARN"
+            | "WARNING"
+            | "WRN"
+            | "ERROR"
+            | "ERR"
+            | "ERRO"
+            | "FATAL"
+            | "FATA"
+            | "CRIT"
+            | "CRITICAL"
+            | "PANIC"
+            | "SEVERE"
+    )
+}
+
+/// Whether `text` looks like repetitive timestamped, JSON, level-prefixed, or
+/// container-prefixed structured logs eligible for `logview` folding. Plain numbered
+/// lines, CSV rows, and data exports return `false`.
+fn looks_like_structured_logs(text: &str) -> bool {
+    let mut non_empty = 0usize;
+    let mut sampled = 0usize;
+    let mut structured = 0usize;
+    for raw in text.lines() {
+        let clean = crate::capture::ANSI.replace_all(raw, "");
+        let line = clean.trim();
+        if line.is_empty() {
+            continue;
+        }
+        non_empty += 1;
+        if sampled < 64 {
+            sampled += 1;
+            let body = if let Some(caps) = LOG_K8S_PREFIX.captures(line) {
+                caps.get(2).map_or(line, |m| m.as_str()).trim_start()
+            } else if let Some(caps) = LOG_COMPOSE_PREFIX.captures(line) {
+                let svc = caps.get(1).map_or("", |m| m.as_str());
+                if svc.bytes().any(|b| b.is_ascii_alphabetic()) && !is_level_word_upper(svc) {
+                    caps.get(2).map_or(line, |m| m.as_str()).trim_start()
+                } else {
+                    line
+                }
+            } else {
+                line
+            };
+            let is_structured = is_json_log_line(body)
+                || LOG_KLOG.is_match(body)
+                || LOG_ISO_TS.is_match(body)
+                || LOG_SYSLOG_TS.is_match(body)
+                || LOG_CLOCK_TS.is_match(body)
+                || LOG_LEVEL_PREFIX.is_match(body)
+                || LOG_LOGFMT_LEVEL.is_match(body);
+            if is_structured {
+                structured += 1;
+            }
+        }
+        if non_empty >= 8 && sampled >= 64 {
+            break;
+        }
+    }
+    non_empty >= 8 && structured >= 4 && structured * 5 >= sampled * 2
+}
+
+/// Collapses external runtime/package stack frames across Python, Node/V8/Deno/Bun,
+/// Java/Kotlin/Scala, Go, Rust (via `crate::stacktrace`), and Ruby, keeping 100% of
+/// error headers, throw-site frames, workspace/script frames, and redacted frames.
+/// Returns `(collapsed, used_native_stacktrace)`.
+fn collapse_stacktrace(
+    text: &str,
+    workspace_root: Option<&Path>,
+    stream: Option<&str>,
+) -> Option<(String, bool)> {
+    if let Some(collapsed) = crate::stacktrace::collapse(text, workspace_root, stream) {
+        return Some((collapsed, true));
+    }
+    collapse_ruby_stacktrace(text, workspace_root, stream).map(|collapsed| (collapsed, false))
+}
+
+fn ruby_workspace_roots(workspace_root: Option<&Path>) -> Vec<String> {
+    let mut roots = Vec::new();
+    if let Some(root) = workspace_root {
+        let norm = root.to_string_lossy().replace('\\', "/");
+        if !norm.is_empty() {
+            roots.push(norm);
+        }
+        if let Ok(canon) = root.canonicalize() {
+            let canon_norm = canon.to_string_lossy().replace('\\', "/");
+            if !canon_norm.is_empty() && !roots.contains(&canon_norm) {
+                roots.push(canon_norm);
+            }
+        }
+    }
+    roots
+}
+
+fn classify_ruby_frame(raw_path: &str, roots: &[String]) -> (bool, String) {
+    let path = raw_path.trim().replace('\\', "/");
+    if path.starts_with("<internal:") || path.starts_with("(eval") {
+        return (false, "ruby:internal".to_owned());
+    }
+    if let Some(after) = path.rsplit_once("/gems/").map(|(_, rest)| rest) {
+        let seg = after.split('/').next().unwrap_or("ruby");
+        let pkg = strip_gem_version(seg);
+        return (false, pkg.to_owned());
+    }
+    let external_markers = [
+        "/ruby/",
+        "/site_ruby/",
+        "/vendor_ruby/",
+        "/vendor/bundle/",
+        "/bundler/",
+        "/.rbenv/",
+        "/.rvm/",
+        "/.asdf/",
+        "/.mise/",
+    ];
+    if external_markers.iter().any(|m| path.contains(m)) {
+        return (false, "ruby".to_owned());
+    }
+    let is_abs = path.starts_with('/')
+        || (path.len() >= 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+            && path.as_bytes()[2] == b'/');
+    if is_abs {
+        for root in roots {
+            let root = root.trim_end_matches('/');
+            if let Some(rest) = path.strip_prefix(root)
+                && let Some(rel) = rest.strip_prefix('/')
+            {
+                if rel.starts_with("vendor/") || rel.contains("/vendor/bundle/") {
+                    return (false, "ruby".to_owned());
+                }
+                return (true, String::new());
+            }
+        }
+        return (false, "ruby".to_owned());
+    }
+    if path.starts_with("vendor/") {
+        return (false, "ruby".to_owned());
+    }
+    (true, String::new())
+}
+
+fn strip_gem_version(segment: &str) -> &str {
+    for (idx, _) in segment.match_indices('-') {
+        if segment[idx + 1..]
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_digit())
+        {
+            return &segment[..idx];
+        }
+    }
+    segment
+}
+
+fn collapse_ruby_stacktrace(
+    text: &str,
+    workspace_root: Option<&Path>,
+    stream: Option<&str>,
+) -> Option<String> {
+    let roots = ruby_workspace_roots(workspace_root);
+    let mut out = String::with_capacity(text.len());
+    let mut run: Vec<(usize, &str, String, String)> = Vec::new();
+    let mut collapsed_any = false;
+
+    let flush_run =
+        |run: &mut Vec<(usize, &str, String, String)>, out: &mut String, collapsed: &mut bool| {
+            if run.is_empty() {
+                return;
+            }
+            if run.len() >= crate::stacktrace::MIN_COLLAPSE_FRAMES {
+                let first_line = run.first().map_or(0, |r| r.0);
+                let last_line = run.last().map_or(0, |r| r.0);
+                let indent = run.first().map_or("", |r| r.2.as_str());
+                let orig_bytes: usize = run.iter().map(|r| r.1.len()).sum();
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for (_, _, _, pkg) in run.iter() {
+                    if !pkg.is_empty() {
+                        *counts.entry(pkg.as_str()).or_insert(0) += 1;
+                    }
+                }
+                let mut pkgs: Vec<(&str, usize)> = counts.into_iter().collect();
+                pkgs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                let pkg_list: Vec<&str> = pkgs.into_iter().take(2).map(|(p, _)| p).collect();
+                let pkg_part = if pkg_list.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", pkg_list.join(", "))
+                };
+                let loc_part = match stream {
+                    Some(stream) => format!(" in {stream}:{first_line}-{last_line}"),
+                    None => String::new(),
+                };
+                let summary = format!(
+                    "{indent}[… {} runtime/dependency frames{pkg_part}{loc_part}]\n",
+                    run.len()
+                );
+                if summary.len() < orig_bytes {
+                    out.push_str(&summary);
+                    *collapsed = true;
+                    run.clear();
+                    return;
+                }
+            }
+            for (_, raw, _, _) in run.drain(..) {
+                out.push_str(raw);
+            }
+        };
+
+    for (idx, raw) in text.split_inclusive('\n').enumerate() {
+        let line_no = idx + 1;
+        let stripped_nl = raw.strip_suffix('\n').unwrap_or(raw);
+        let plain_cow = crate::capture::ANSI.replace_all(stripped_nl, "");
+        let plain = plain_cow.trim_end_matches('\r');
+
+        if let Some(caps) = RUBY_FRAME.captures(plain) {
+            let indent = caps.get(1).map_or("", |m| m.as_str()).to_owned();
+            let path = caps.get(2).map_or("", |m| m.as_str());
+            let has_redacted = plain.contains("[redacted:");
+            let (is_workspace, pkg) = classify_ruby_frame(path, &roots);
+            if !is_workspace && !has_redacted {
+                run.push((line_no, raw, indent, pkg));
+                continue;
+            }
+        }
+        flush_run(&mut run, &mut out, &mut collapsed_any);
+        out.push_str(raw);
+    }
+    flush_run(&mut run, &mut out, &mut collapsed_any);
+
+    (collapsed_any && out.len() < text.len()).then_some(out)
+}
+
+/// Outlines already-collapsed text (such as a very large Ruby backtrace) to fit
+/// within `max_bytes`, keeping whole lines from both ends and a pointer to the log.
+fn outline_collapsed_text(
+    text: &str,
+    max_bytes: usize,
+    justless: &str,
+    run_id: &str,
+) -> Option<Vec<u8>> {
+    let marker =
+        format!("[justless] stdout trace clipped · {justless} log {run_id} --stream stdout\n");
+    let body = max_bytes.saturating_sub(marker.len());
+    if body < 64 {
+        return None;
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut head = String::new();
+    let mut head_count = 0usize;
+    for &line in &lines {
+        if head.len() + line.len() > body / 2 {
+            break;
+        }
+        head.push_str(line);
+        head_count += 1;
+    }
+    let tail_budget = body - head.len();
+    let mut tail_lines = Vec::new();
+    let mut tail_bytes = 0usize;
+    for &line in lines[head_count..].iter().rev() {
+        if tail_bytes + line.len() > tail_budget {
+            break;
+        }
+        tail_bytes += line.len();
+        tail_lines.push(line);
+    }
+    tail_lines.reverse();
+    if head.is_empty() && tail_lines.is_empty() {
+        return None;
+    }
+    let mut out = head;
+    out.push_str(&marker);
+    for line in tail_lines {
+        out.push_str(line);
+    }
+    (out.len() <= max_bytes).then(|| out.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Dedup-aware `--intent` preview for `justless exec`
+// ---------------------------------------------------------------------------
+
+const INTENT_LINE_LIMIT: usize = 4 * 1024 * 1024;
+const INTENT_LINE_LIMIT_SHOWN: &str = "4 MiB";
+const INTENT_MAX_TERMS: usize = 16;
+const INTENT_SPAN_LIMIT: usize = 4096;
+const INTENT_RANGE_LIMIT: usize = 1024;
+const INTENT_RANGES_SHOWN: usize = 3;
+const INTENT_NEARBY: usize = 8;
+const INTENT_EXCERPT: usize = 240;
+const INTENT_ANCHOR: usize = 160;
+const INTENT_LEAD: usize = 80;
+const INTENT_ROOMY: usize = 200;
+const INTENT_SHOWN: usize = 60;
+const INTENT_MAX_DEDUP_KEYS: usize = 8192;
+const INTENT_K1: f64 = 1.2;
+const INTENT_B: f64 = 0.75;
+const INTENT_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "of", "to", "in", "for", "and", "or", "is", "are", "was", "were", "be",
+    "been", "what", "which", "who", "how", "many", "much", "show", "me", "find", "all", "any",
+    "each", "with", "by", "on", "at", "from", "that", "this", "these", "those", "it", "its", "i",
+    "my", "we", "our", "where", "why", "when", "does", "do", "did", "get", "give", "list", "per",
+    "please", "there", "their",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IntentTerm {
+    text: String,
+    phrase: bool,
+}
+
+fn intent_terms(intent: &str) -> Vec<IntentTerm> {
+    let mut terms = Vec::new();
+    let mut add = |term: IntentTerm| {
+        if terms.len() < INTENT_MAX_TERMS && !terms.contains(&term) {
+            terms.push(term);
+        }
+    };
+    let parts: Vec<&str> = intent.split('"').collect();
+    let unclosed = parts.len().is_multiple_of(2);
+    for (index, part) in parts.iter().enumerate() {
+        let quoted = index % 2 == 1 && !(unclosed && index == parts.len() - 1);
+        if quoted {
+            let phrase = part.trim();
+            if !phrase.is_empty() {
+                add(IntentTerm {
+                    text: phrase.to_ascii_lowercase(),
+                    phrase: true,
+                });
+            }
+            continue;
+        }
+        intent_tokens(part, |_, token| {
+            let word = token.to_lowercase();
+            let single = word.chars().count() == 1 && !word.chars().all(|c| c.is_ascii_digit());
+            if !single && !INTENT_STOPWORDS.contains(&word.as_str()) {
+                add(IntentTerm {
+                    text: intent_stem(&word),
+                    phrase: false,
+                });
+            }
+        });
+    }
+    terms
+}
+
+fn intent_tokens(text: &str, mut emit: impl FnMut(usize, &str)) {
+    let mut start = None;
+    let mut lower = false;
+    for (index, c) in text.char_indices() {
+        if c.is_alphanumeric() {
+            match start {
+                None => start = Some(index),
+                Some(first) if lower && c.is_uppercase() => {
+                    emit(first, &text[first..index]);
+                    start = Some(index);
+                }
+                Some(_) => {}
+            }
+            lower = c.is_lowercase();
+        } else {
+            if let Some(first) = start.take() {
+                emit(first, &text[first..index]);
+            }
+            lower = false;
+        }
+    }
+    if let Some(first) = start {
+        emit(first, &text[first..]);
+    }
+}
+
+fn intent_stem(word: &str) -> String {
+    let mut word = word.to_owned();
+    if word.bytes().any(|b| b.is_ascii_digit()) {
+        return word;
+    }
+    if word.len() > 4 && word.ends_with("ies") {
+        word.truncate(word.len() - 3);
+        word.push('y');
+    } else if ["sses", "ches", "shes", "xes", "zes"]
+        .iter()
+        .any(|suffix| word.ends_with(suffix))
+    {
+        word.truncate(word.len() - 2);
+    } else if word.len() > 3
+        && word.ends_with('s')
+        && !["ss", "us", "is"]
+            .iter()
+            .any(|suffix| word.ends_with(suffix))
+    {
+        word.pop();
+    }
+    if word.len() >= 6 && word.ends_with("ing") {
+        word.truncate(word.len() - 3);
+    } else if word.len() >= 5 && word.ends_with("ed") {
+        word.truncate(word.len() - 2);
+    }
+    if word.len() > 3 && word.ends_with('e') {
+        word.pop();
+    }
+    word
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IntentSpan {
+    start: usize,
+    len: usize,
+    term: usize,
+}
+
+struct IntentAnalysis {
+    counts: Vec<u32>,
+    spans: Vec<IntentSpan>,
+    words: usize,
+    shortest: usize,
+    longest: usize,
+}
+
+impl IntentAnalysis {
+    fn new(terms: &[IntentTerm]) -> Self {
+        let words = terms.iter().filter(|term| !term.phrase);
+        Self {
+            counts: vec![0; terms.len()],
+            spans: Vec::new(),
+            words: 0,
+            shortest: words.clone().map(|term| term.text.len()).min().unwrap_or(0),
+            longest: words.map(|term| term.text.len() + 5).max().unwrap_or(0),
+        }
+    }
+
+    fn run(&mut self, line: &str, terms: &[IntentTerm]) {
+        self.counts.fill(0);
+        self.spans.clear();
+        self.words = 0;
+        let has_words = terms.iter().any(|term| !term.phrase);
+        let (shortest, longest) = (self.shortest, self.longest);
+        intent_tokens(line, |start, token| {
+            self.words += 1;
+            if !has_words || token.is_ascii() && !(shortest..=longest).contains(&token.len()) {
+                return;
+            }
+            let word = intent_stem(&token.to_lowercase());
+            for (index, term) in terms.iter().enumerate() {
+                if !term.phrase && term.text == word {
+                    self.counts[index] += 1;
+                    if self.spans.len() < INTENT_SPAN_LIMIT {
+                        self.spans.push(IntentSpan {
+                            start,
+                            len: token.len(),
+                            term: index,
+                        });
+                    }
+                }
+            }
+        });
+        if terms.iter().any(|term| term.phrase) {
+            let lower = line.to_ascii_lowercase();
+            for (index, term) in terms.iter().enumerate() {
+                if term.phrase {
+                    for (start, _) in lower.match_indices(&term.text) {
+                        self.counts[index] += 1;
+                        if self.spans.len() < INTENT_SPAN_LIMIT {
+                            self.spans.push(IntentSpan {
+                                start,
+                                len: term.text.len(),
+                                term: index,
+                            });
+                        }
+                    }
+                }
+            }
+            self.spans.sort_by_key(|span| span.start);
+        }
+    }
+
+    fn distinct(&self) -> usize {
+        self.counts.iter().filter(|&&count| count > 0).count()
+    }
+
+    fn mask(&self) -> u32 {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| count > 0)
+            .fold(0, |mask, (index, _)| mask | 1 << index)
+    }
+
+    fn matches(&self) -> usize {
+        self.counts.iter().map(|&count| count as usize).sum()
+    }
+}
+
+#[derive(Clone)]
+struct IntentExcerpt {
+    text: String,
+    focus: usize,
+    before: bool,
+    after: bool,
+}
+
+impl IntentExcerpt {
+    fn render(&self, cap: usize) -> (String, usize, usize) {
+        if !self.before && !self.after && self.text.len() <= cap {
+            return (self.text.clone(), 0, self.text.len());
+        }
+        let room = cap.saturating_sub(2 * '…'.len_utf8());
+        let text = &self.text;
+        let lead = INTENT_LEAD.min(room / 3);
+        let start = text.floor_char_boundary(
+            self.focus
+                .saturating_sub(lead)
+                .min(text.len().saturating_sub(room)),
+        );
+        let end = text.floor_char_boundary((start + room).min(text.len()));
+        let mut excerpt = String::new();
+        if self.before || start > 0 {
+            excerpt.push('…');
+        }
+        excerpt.push_str(&text[start..end]);
+        if self.after || end < text.len() {
+            excerpt.push('…');
+        }
+        (excerpt, start, end)
+    }
+}
+
+#[derive(Clone)]
+struct IntentWindow {
+    start: usize,
+    end: usize,
+    excerpt: IntentExcerpt,
+    spans: Vec<(usize, usize)>,
+}
+
+impl IntentWindow {
+    fn at(line: &str, start: usize, spans: &[IntentSpan]) -> Self {
+        let end = line.floor_char_boundary((start + INTENT_EXCERPT).min(line.len()));
+        let inside: Vec<(usize, usize)> = spans
+            .iter()
+            .filter(|span| span.start >= start && span.start + span.len <= end)
+            .map(|span| (span.start - start, span.len))
+            .collect();
+        Self {
+            start,
+            end,
+            excerpt: IntentExcerpt {
+                text: line[start..end].to_owned(),
+                focus: inside.first().map_or(0, |&(offset, _)| offset),
+                before: start > 0,
+                after: end < line.len(),
+            },
+            spans: inside,
+        }
+    }
+}
+
+fn strip_leading_timestamp(line: &str) -> &str {
+    for re in [&*LOG_ISO_TS, &*LOG_SYSLOG_TS, &*LOG_CLOCK_TS] {
+        if let Some(m) = re.find(line) {
+            return &line[m.end()..];
+        }
+    }
+    line
+}
+
+/// Normalizes a line or window excerpt for boilerplate deduplication: strips window
+/// ellipses, leading timestamps, and redundant ASCII whitespace while preserving IDs,
+/// numbers, and payload values so distinct records never collapse together.
+fn intent_dedup_key(text: &str) -> String {
+    let trimmed = text.trim_matches(|c: char| c == '…' || c.is_whitespace());
+    let without_ts = strip_leading_timestamp(trimmed).trim();
+    let mut out = String::with_capacity(without_ts.len());
+    let mut prev_ws = false;
+    for ch in without_ts.chars() {
+        if ch.is_ascii_whitespace() {
+            if !prev_ws {
+                out.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            out.push(ch);
+            prev_ws = false;
+        }
+    }
+    out
+}
+
+/// Trims incomplete partial fragments at cut (`…`) window boundaries so periodic
+/// boilerplate comparisons ignore mid-token slices at the left/right edges.
+fn trim_window_edges(key: &str, before: bool, after: bool) -> &str {
+    let mut slice = key;
+    if before && slice.len() > 64 {
+        let probe = &slice[..slice.floor_char_boundary(32)];
+        if let Some(pos) = probe.find(|c: char| c.is_ascii_whitespace() || c == ',' || c == '{') {
+            let cut = if slice.as_bytes()[pos] == b'{' {
+                pos
+            } else {
+                pos + 1
+            };
+            slice = slice[cut..].trim_start();
+        }
+    }
+    if after && slice.len() > 64 {
+        let tail_start = slice.ceil_char_boundary(slice.len().saturating_sub(32));
+        let probe = &slice[tail_start..];
+        if let Some(pos) = probe.rfind(|c: char| c.is_ascii_whitespace() || c == ',' || c == '}') {
+            let cut = tail_start
+                + if probe.as_bytes()[pos] == b'}' {
+                    pos + 1
+                } else {
+                    pos
+                };
+            slice = slice[..cut].trim_end();
+        }
+    }
+    slice
+}
+
+/// If `s` is strictly periodic with unit length `p` in `16..=s.len()/2`, returns that
+/// repeating unit so phase-shifted boilerplate windows on the same line deduplicate
+/// without ever colliding with distinct records.
+fn periodic_unit(s: &str) -> Option<&str> {
+    if s.len() < 48 {
+        return None;
+    }
+    let anchor_end = s.floor_char_boundary(16);
+    if anchor_end < 8 {
+        return None;
+    }
+    let anchor = &s[..anchor_end];
+    let mut search_from = anchor_end;
+    while let Some(rel) = s[search_from..].find(anchor) {
+        let period = search_from + rel;
+        if period * 2 > s.len() {
+            break;
+        }
+        if s.as_bytes()[period..] == s.as_bytes()[..s.len() - period] {
+            return Some(&s[..period]);
+        }
+        search_from = period + 1;
+        while search_from < s.len() && !s.is_char_boundary(search_from) {
+            search_from += 1;
+        }
+    }
+    None
+}
+
+fn is_redundant_window(
+    key: &str,
+    inner: &str,
+    seen_keys: &HashSet<String>,
+    seen_windows: &[(String, Option<String>)],
+) -> bool {
+    if seen_keys.contains(key) {
+        return true;
+    }
+    if inner.len() < 40 {
+        return false;
+    }
+    for (prev_inner, unit) in seen_windows {
+        if prev_inner.contains(inner) {
+            return true;
+        }
+        if let Some(unit) = unit {
+            let repeats = inner.len() / unit.len() + 2;
+            let repeated = unit.repeat(repeats);
+            if repeated.contains(inner) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Up to `limit` non-overlapping, deduplicated windows of `line`, ranked best first.
+fn intent_windows(
+    line: &str,
+    spans: &[IntentSpan],
+    idf: &[f64],
+    limit: usize,
+) -> Vec<IntentWindow> {
+    if line.len() <= INTENT_EXCERPT || spans.is_empty() {
+        return vec![IntentWindow::at(line, 0, spans)];
+    }
+    let last = line.len() - INTENT_EXCERPT;
+    // `(window_start, origin_span_start, distinct_terms, weight, tightest, inside_len)`
+    let mut scored: Vec<(usize, usize, u32, f64, usize, usize)> = Vec::new();
+    for span in spans {
+        let start = line.floor_char_boundary(span.start.saturating_sub(INTENT_LEAD).min(last));
+        if start < last
+            && scored
+                .last()
+                .is_some_and(|&(previous, ..)| previous == start)
+        {
+            continue;
+        }
+        let end = line.floor_char_boundary((start + INTENT_EXCERPT).min(line.len()));
+        let first = spans.partition_point(|inner| inner.start < start);
+        let inside: Vec<IntentSpan> = spans[first..]
+            .iter()
+            .take_while(|inner| inner.start < end)
+            .filter(|inner| inner.start + inner.len <= end)
+            .copied()
+            .collect();
+        let (mut seen, mut weight) = (0u32, 0.0);
+        for inner in &inside {
+            if seen & (1 << inner.term) == 0 {
+                seen |= 1 << inner.term;
+                weight += idf[inner.term];
+            }
+        }
+        scored.push((
+            start,
+            span.start,
+            seen.count_ones(),
+            weight,
+            intent_tightest(&inside, seen),
+            inside.len(),
+        ));
+    }
+    scored.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then(b.3.total_cmp(&a.3))
+            .then(a.4.cmp(&b.4))
+            .then(b.5.cmp(&a.5))
+            .then(a.0.cmp(&b.0))
+    });
+    let mut chosen: Vec<IntentWindow> = Vec::new();
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut seen_windows: Vec<(String, Option<String>)> = Vec::new();
+    for (mut start, origin_span, ..) in scored {
+        if chosen.len() == limit {
+            break;
+        }
+        // If `start` dipped back into an already-chosen window (for example due to
+        // `LEAD` or `.min(last)` near the end of the line) while `origin_span` itself
+        // is uncovered, advance `start` to the end of that window instead of dropping
+        // the uncovered tail match.
+        if let Some(prev_end) = chosen
+            .iter()
+            .filter(|other| start < other.end && other.start <= origin_span)
+            .map(|other| other.end)
+            .max()
+        {
+            if origin_span < prev_end {
+                continue;
+            }
+            start = line.ceil_char_boundary(prev_end).min(line.len());
+        }
+        // When an earlier window already captured a periodic boilerplate unit, skip
+        // past any repeated boilerplate prefix at the start of this window so novel
+        // content gets the full excerpt budget.
+        for (_, unit) in &seen_windows {
+            let Some(unit) = unit.as_deref() else {
+                continue;
+            };
+            if let Some(first_hit) = line[start..].find(unit)
+                && first_hit < unit.len()
+            {
+                let mut cursor = start + first_hit;
+                let mut skipped = 0usize;
+                while line[cursor..].starts_with(unit) {
+                    cursor += unit.len();
+                    skipped += 1;
+                }
+                if skipped >= 1 && cursor < line.len() {
+                    start = line.ceil_char_boundary(cursor).min(line.len());
+                }
+            }
+        }
+        if start >= line.len() {
+            continue;
+        }
+        let candidate = IntentWindow::at(line, start, spans);
+        if candidate.spans.is_empty() {
+            continue;
+        }
+        if chosen
+            .iter()
+            .any(|other| candidate.start < other.end && other.start < candidate.end)
+        {
+            continue;
+        }
+        let key = intent_dedup_key(&candidate.excerpt.text);
+        let inner = trim_window_edges(&key, candidate.excerpt.before, candidate.excerpt.after);
+        if is_redundant_window(&key, inner, &seen_keys, &seen_windows) {
+            continue;
+        }
+        let unit = periodic_unit(inner).map(str::to_owned);
+        let inner_owned = inner.to_owned();
+        seen_keys.insert(key);
+        seen_windows.push((inner_owned, unit));
+        chosen.push(candidate);
+    }
+    if chosen.is_empty() {
+        chosen.push(IntentWindow::at(line, 0, spans));
+    }
+    chosen
+}
+
+fn intent_tightest(spans: &[IntentSpan], terms: u32) -> usize {
+    let mut counts = [0u32; INTENT_MAX_TERMS];
+    let mut covered = 0u32;
+    let mut best = usize::MAX;
+    let mut left = 0;
+    for right in spans {
+        counts[right.term] += 1;
+        covered |= 1 << right.term;
+        while covered == terms && left < spans.len() {
+            let first = spans[left];
+            best = best.min((right.start + right.len).saturating_sub(first.start));
+            counts[first.term] -= 1;
+            if counts[first.term] == 0 {
+                covered &= !(1 << first.term);
+            }
+            left += 1;
+        }
+    }
+    best
+}
+
+struct IntentCandidate {
+    line: usize,
+    distinct: usize,
+    score: f64,
+    matches: usize,
+    first: IntentWindow,
+}
+
+fn intent_rank(
+    (distinct, score, line): (usize, f64, usize),
+    (other_distinct, other_score, other_line): (usize, f64, usize),
+) -> Ordering {
+    distinct
+        .cmp(&other_distinct)
+        .then(score.total_cmp(&other_score))
+        .then(other_line.cmp(&line))
+}
+
+impl IntentCandidate {
+    fn key(&self) -> (usize, f64, usize) {
+        (self.distinct, self.score, self.line)
+    }
+}
+
+impl PartialEq for IntentCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for IntentCandidate {}
+impl PartialOrd for IntentCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for IntentCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        intent_rank(self.key(), other.key())
+    }
+}
+
+#[derive(Default)]
+struct IntentRuns(Vec<(usize, usize)>);
+
+impl IntentRuns {
+    fn add(&mut self, line: usize) {
+        if let Some((_, end)) = self.0.last_mut()
+            && *end + 1 == line
+        {
+            *end = line;
+        } else if self.0.len() < INTENT_RANGE_LIMIT {
+            self.0.push((line, line));
+        }
+    }
+
+    fn without(&self, shown: &[usize], wanted: usize) -> Vec<(usize, usize)> {
+        let mut left = Vec::new();
+        for &(first, last) in &self.0 {
+            let mut start = first;
+            let from = shown.partition_point(|&line| line < first);
+            for &line in shown[from..].iter().take_while(|&&line| line <= last) {
+                if line > start {
+                    left.push((start, line - 1));
+                }
+                start = line + 1;
+            }
+            if start <= last {
+                left.push((start, last));
+            }
+            if left.len() >= wanted {
+                left.truncate(wanted);
+                break;
+            }
+        }
+        left
+    }
+}
+
+struct IntentShown {
+    line: usize,
+    start: usize,
+    end: usize,
+    distinct: usize,
+    matches: usize,
+    entry: String,
+}
+
+struct IntentLayout {
+    body: usize,
+    used: usize,
+    shown: Vec<IntentShown>,
+    shown_keys: HashSet<String>,
+}
+
+impl IntentLayout {
+    fn has(&self, line: usize) -> bool {
+        self.shown.iter().any(|shown| shown.line == line)
+    }
+
+    fn place(
+        &mut self,
+        line: usize,
+        distinct: usize,
+        window: &IntentWindow,
+        limit: usize,
+        anchor: bool,
+    ) -> bool {
+        if self.shown.iter().any(|shown| {
+            shown.line == line && (anchor || (window.start < shown.end && shown.start < window.end))
+        }) {
+            return false;
+        }
+        let marker = format!("stdout:{line}: ");
+        let cap = limit.min(self.body.saturating_sub(marker.len() + 1));
+        if cap == 0 {
+            return false;
+        }
+        let (text, from, to) = window.excerpt.render(cap);
+        let dedup_key = (distinct > 0).then(|| intent_dedup_key(&text));
+        if let Some(ref key) = dedup_key
+            && self.shown_keys.contains(key)
+        {
+            return false;
+        }
+        let entry = format!("{marker}{text}\n");
+        if self.used + entry.len() > self.body {
+            return false;
+        }
+        self.used += entry.len();
+        if let Some(key) = dedup_key {
+            self.shown_keys.insert(key);
+        }
+        let matches = window
+            .spans
+            .iter()
+            .filter(|&&(start, len)| start >= from && start + len <= to)
+            .count();
+        self.shown.push(IntentShown {
+            line,
+            start: window.start,
+            end: window.end,
+            distinct,
+            matches,
+            entry,
+        });
+        true
+    }
+}
+
+struct IntentTrailer<'a> {
+    several: bool,
+    every: usize,
+    some: usize,
+    duplicates: usize,
+    inside: usize,
+    cut: bool,
+    runs: &'a str,
+    log: &'a str,
+}
+
+impl IntentTrailer<'_> {
+    fn render(&self) -> String {
+        let mut text = String::from("[focus] ");
+        if self.every == 0 && self.some == 0 {
+            if self.cut {
+                // A cut line may match past the part that was read.
+            } else if self.inside == 0 {
+                return "[focus] every match is shown\n".to_owned();
+            } else {
+                text.push_str("every matching line is shown");
+            }
+        } else if self.several {
+            let (every_runs, some_runs) = if self.every > 0 {
+                (self.runs, "")
+            } else {
+                ("", self.runs)
+            };
+            text.push_str(&format!(
+                "{} more match every term{every_runs}, {} more match some{some_runs}",
+                self.every, self.some
+            ));
+        } else {
+            text.push_str(&format!("{} more match{}", self.every, self.runs));
+        }
+        let mut clauses = Vec::new();
+        if self.duplicates > 0 && (self.every > 0 || self.some > 0) {
+            let plural = if self.duplicates == 1 { "" } else { "s" };
+            clauses.push(format!("{} duplicate{plural} collapsed", self.duplicates));
+        }
+        if self.inside > 0 {
+            clauses.push(format!(
+                "{} more matches inside shown lines; print one record per line to rank them",
+                self.inside
+            ));
+        }
+        if self.cut {
+            clauses.push(format!(
+                "lines over {INTENT_LINE_LIMIT_SHOWN} were ranked on their first {INTENT_LINE_LIMIT_SHOWN}"
+            ));
+        }
+        for clause in clauses {
+            if !text.ends_with(' ') {
+                text.push_str("; ");
+            }
+            text.push_str(&clause);
+        }
+        text.push_str(self.log);
+        text.push('\n');
+        text
+    }
+}
+
+fn intent_log_clause(justless: &str, run_id: &str, (first, last): (usize, usize)) -> String {
+    format!(" · {justless} log {run_id} --stream stdout --from {first} --to {last}")
+}
+
+fn intent_show(intent: &str) -> String {
+    let flat: String = intent
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clipped = if flat.len() <= INTENT_SHOWN {
+        flat
+    } else {
+        format!("{}…", &flat[..flat.floor_char_boundary(INTENT_SHOWN)])
+    };
+    if clipped.contains('"') {
+        clipped
+    } else {
+        format!("\"{clipped}\"")
+    }
+}
+
+fn intent_each_line(path: &Path, mut visit: impl FnMut(usize, &str, bool)) -> io::Result<()> {
+    let mut file = BufReader::new(File::open(path)?);
+    let mut raw = Vec::new();
+    let mut number = 0;
+    while let Some(cut) = intent_read_line(&mut file, &mut raw)? {
+        number += 1;
+        let text = String::from_utf8_lossy(&raw);
+        let text = crate::capture::ANSI.replace_all(&text, "");
+        visit(number, text.trim_end_matches(['\n', '\r']), cut);
+        raw.clear();
+    }
+    Ok(())
+}
+
+fn intent_read_line(file: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<Option<bool>> {
+    let mut read = false;
+    let mut cut = false;
+    loop {
+        let chunk = file.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(read.then_some(cut));
+        }
+        read = true;
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let length = newline.map_or(chunk.len(), |index| index + 1);
+        let kept = length.min(INTENT_LINE_LIMIT.saturating_sub(line.len()));
+        cut |= chunk[..length][kept..].iter().any(|&byte| byte != b'\n');
+        line.extend_from_slice(&chunk[..kept]);
+        file.consume(length);
+        if newline.is_some() {
+            return Ok(Some(cut));
+        }
+    }
+}
+
+/// Ranks stdout lines and windows against `intent` within `max_bytes`, collapsing
+/// duplicate boilerplate lines and redundant/overlapping windows so distinct matches
+/// maximize the preview budget.
+fn intent_preview(
+    stdout: &Path,
+    intent: &str,
+    max_bytes: usize,
+    justless: &str,
+    run_id: &str,
+) -> Result<Vec<u8>> {
+    let terms = intent_terms(intent);
+    ensure!(!terms.is_empty(), "the intent has no search terms");
+    let mut analysis = IntentAnalysis::new(&terms);
+
+    let mut lines = 0usize;
+    let mut words = 0usize;
+    let mut cut = false;
+    let mut frequency = vec![0usize; terms.len()];
+    intent_each_line(stdout, |_, line, clipped| {
+        analysis.run(line, &terms);
+        lines += 1;
+        words += analysis.words;
+        cut |= clipped;
+        for (count, &n) in frequency.iter_mut().zip(&analysis.counts) {
+            *count += usize::from(n > 0);
+        }
+    })?;
+    if frequency.iter().all(|&count| count == 0) {
+        return crate::focus::preview(stdout, intent, max_bytes, justless, run_id);
+    }
+
+    let shown_intent = intent_show(intent);
+    let average = if words == 0 {
+        1.0
+    } else {
+        words as f64 / lines as f64
+    };
+    let idf: Vec<f64> = frequency
+        .iter()
+        .map(|&df| (1.0 + (lines as f64 - df as f64 + 0.5) / (df as f64 + 0.5)).ln())
+        .collect();
+    let all = (1u32 << terms.len()) - 1;
+    let several = terms.len() > 1;
+    let keep = max_bytes / 24 + 1;
+    let mut key_best: HashMap<String, IntentCandidate> = HashMap::new();
+    let mut overflow_best: BinaryHeap<Reverse<IntentCandidate>> = BinaryHeap::new();
+    let (mut every, mut some, mut total) = (0usize, 0usize, 0usize);
+    let mut duplicate_matches = 0usize;
+    let (mut every_runs, mut some_runs) = (IntentRuns::default(), IntentRuns::default());
+    let (mut distinct_every_runs, mut distinct_some_runs) =
+        (IntentRuns::default(), IntentRuns::default());
+    let mut recent: VecDeque<(usize, u32)> = VecDeque::new();
+    let mut nearby = false;
+    let mut anchors: Vec<(usize, usize, usize, IntentWindow)> = Vec::new();
+
+    intent_each_line(stdout, |number, line, _| {
+        analysis.run(line, &terms);
+        let distinct = analysis.distinct();
+        let anchor = (number == 1 || number == lines) && !line.trim().is_empty();
+        if distinct == 0 {
+            if anchor {
+                anchors.push((number, 0, 0, IntentWindow::at(line, 0, &[])));
+            }
+            return;
+        }
+        let matches = analysis.matches();
+        total += matches;
+        if distinct == terms.len() {
+            every += 1;
+            every_runs.add(number);
+        } else {
+            some += 1;
+            some_runs.add(number);
+            let mask = analysis.mask();
+            while recent
+                .front()
+                .is_some_and(|&(line_no, _)| line_no + INTENT_NEARBY <= number)
+            {
+                recent.pop_front();
+            }
+            nearby |= recent.iter().fold(mask, |union, &(_, other)| union | other) == all;
+            recent.push_back((number, mask));
+        }
+        let length = analysis.words as f64 / average;
+        let score: f64 = analysis
+            .counts
+            .iter()
+            .zip(&idf)
+            .filter(|&(&count, _)| count > 0)
+            .map(|(&count, idf)| {
+                let tf = f64::from(count);
+                idf * tf * (INTENT_K1 + 1.0)
+                    / (tf + INTENT_K1 * (1.0 - INTENT_B + INTENT_B * length))
+            })
+            .sum();
+
+        let (key, computed_first) = if line.len() <= INTENT_EXCERPT {
+            (intent_dedup_key(line), None)
+        } else {
+            let first = intent_windows(line, &analysis.spans, &idf, 1).remove(0);
+            (intent_dedup_key(&first.excerpt.text), Some(first))
+        };
+
+        if let Some(existing) = key_best.get_mut(&key) {
+            duplicate_matches += 1;
+            if intent_rank((distinct, score, number), existing.key()).is_gt() {
+                let first = computed_first
+                    .unwrap_or_else(|| intent_windows(line, &analysis.spans, &idf, 1).remove(0));
+                *existing = IntentCandidate {
+                    line: number,
+                    distinct,
+                    score,
+                    matches,
+                    first,
+                };
+            }
+            return;
+        }
+
+        if distinct == terms.len() {
+            distinct_every_runs.add(number);
+        } else {
+            distinct_some_runs.add(number);
+        }
+
+        if key_best.len() >= INTENT_MAX_DEDUP_KEYS {
+            let dropped = overflow_best.len() >= keep
+                && overflow_best.peek().is_some_and(|Reverse(worst)| {
+                    intent_rank((distinct, score, number), worst.key()).is_le()
+                });
+            if dropped && !anchor {
+                return;
+            }
+            let first = computed_first
+                .unwrap_or_else(|| intent_windows(line, &analysis.spans, &idf, 1).remove(0));
+            if anchor {
+                anchors.push((number, distinct, matches, first.clone()));
+            }
+            if !dropped {
+                overflow_best.push(Reverse(IntentCandidate {
+                    line: number,
+                    distinct,
+                    score,
+                    matches,
+                    first,
+                }));
+                if overflow_best.len() > keep {
+                    overflow_best.pop();
+                }
+            }
+            return;
+        }
+
+        let first = computed_first
+            .unwrap_or_else(|| intent_windows(line, &analysis.spans, &idf, 1).remove(0));
+        if anchor {
+            anchors.push((number, distinct, matches, first.clone()));
+        }
+        key_best.insert(
+            key,
+            IntentCandidate {
+                line: number,
+                distinct,
+                score,
+                matches,
+                first,
+            },
+        );
+    })?;
+
+    let mut ranked: Vec<IntentCandidate> = key_best
+        .into_values()
+        .chain(overflow_best.into_iter().map(|Reverse(c)| c))
+        .collect();
+    ranked.sort_by(|a, b| b.cmp(a));
+    ranked.truncate(keep);
+
+    let mut header = if several {
+        format!(
+            "[focus] {shown_intent}: {every} of {lines} lines match every term, {some} match some\n"
+        )
+    } else {
+        format!("[focus] {shown_intent}: {every} of {lines} lines match\n")
+    };
+    if several && every == 0 && nearby {
+        header.push_str(
+            "[focus] no line has every term, but neighboring lines do; print one record per line\n",
+        );
+    }
+
+    let widest = "9".repeat(lines.to_string().len());
+    let widest_runs = format!(" ({widest}-{widest}, {widest}-{widest}, {widest}-{widest}, …)");
+    let widest_log = intent_log_clause(justless, run_id, (lines, lines));
+    let reserve = |runs: &str, log: &str, duplicates: usize| {
+        [(every, some), (0, 0)]
+            .into_iter()
+            .map(|(every, some)| {
+                IntentTrailer {
+                    several,
+                    every,
+                    some,
+                    duplicates,
+                    inside: total,
+                    cut,
+                    runs,
+                    log,
+                }
+                .render()
+                .len()
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let full = max_bytes
+        .saturating_sub(header.len() + reserve(&widest_runs, &widest_log, duplicate_matches));
+    let roomy = full >= INTENT_ROOMY;
+    let body = if roomy {
+        full
+    } else {
+        max_bytes.saturating_sub(header.len() + reserve("", "", 0))
+    };
+
+    let mut layout = IntentLayout {
+        body,
+        used: 0,
+        shown: Vec::new(),
+        shown_keys: HashSet::new(),
+    };
+    if let Some(top) = ranked.first() {
+        layout.place(top.line, top.distinct, &top.first, INTENT_EXCERPT, false);
+    }
+    for (line, distinct, _, window) in anchors.iter().rev() {
+        layout.place(*line, *distinct, window, INTENT_ANCHOR, true);
+    }
+    for candidate in ranked.iter().skip(1) {
+        layout.place(
+            candidate.line,
+            candidate.distinct,
+            &candidate.first,
+            INTENT_EXCERPT,
+            false,
+        );
+    }
+
+    let room = layout.body.saturating_sub(layout.used) / INTENT_EXCERPT;
+    let mut longer: Vec<&IntentCandidate> = ranked
+        .iter()
+        .filter(|candidate| {
+            candidate.matches > candidate.first.spans.len() && layout.has(candidate.line)
+        })
+        .collect();
+    if room > 0 && !longer.is_empty() {
+        let each = room / longer.len() + 2;
+        let mut wanted: Vec<usize> = longer.iter().map(|candidate| candidate.line).collect();
+        wanted.sort_unstable();
+        let mut found: Vec<(usize, Vec<IntentWindow>)> = Vec::new();
+        intent_each_line(stdout, |number, line, _| {
+            if wanted.binary_search(&number).is_ok() {
+                analysis.run(line, &terms);
+                found.push((number, intent_windows(line, &analysis.spans, &idf, each)));
+            }
+        })?;
+        for index in 1..each {
+            let mut placed = false;
+            longer.retain(|candidate| {
+                let window = found
+                    .iter()
+                    .find(|(line, _)| *line == candidate.line)
+                    .and_then(|(_, windows)| windows.get(index));
+                let Some(window) = window else {
+                    return false;
+                };
+                placed |= layout.place(
+                    candidate.line,
+                    candidate.distinct,
+                    window,
+                    INTENT_EXCERPT,
+                    false,
+                );
+                true
+            });
+            if !placed {
+                break;
+            }
+        }
+    }
+
+    let mut shown = layout.shown;
+    shown.sort_by_key(|shown| (shown.line, shown.start));
+
+    let mut lines_shown: Vec<(usize, usize)> = Vec::new();
+    let mut inside = 0usize;
+    for entry in &shown {
+        if lines_shown
+            .last()
+            .is_none_or(|&(line, _)| line != entry.line)
+        {
+            lines_shown.push((entry.line, entry.distinct));
+            let matches = ranked
+                .iter()
+                .find(|candidate| candidate.line == entry.line)
+                .map(|candidate| candidate.matches)
+                .or_else(|| {
+                    anchors
+                        .iter()
+                        .find(|anchor| anchor.0 == entry.line)
+                        .map(|anchor| anchor.2)
+                })
+                .unwrap_or(0);
+            let visible: usize = shown
+                .iter()
+                .filter(|other| other.line == entry.line)
+                .map(|other| other.matches)
+                .sum();
+            inside += matches.saturating_sub(visible);
+        }
+    }
+    let shown_every = lines_shown
+        .iter()
+        .filter(|&&(_, distinct)| distinct == terms.len())
+        .count();
+    let shown_some = lines_shown
+        .iter()
+        .filter(|&&(_, distinct)| distinct > 0 && distinct < terms.len())
+        .count();
+    let (every_left, some_left) = (every - shown_every, some - shown_some);
+
+    let numbers: Vec<usize> = lines_shown.iter().map(|&(line, _)| line).collect();
+    let (primary_runs, fallback_runs, left) = if every_left > 0 {
+        (&distinct_every_runs, &every_runs, every_left)
+    } else {
+        (&distinct_some_runs, &some_runs, some_left)
+    };
+    let next = if roomy {
+        let distinct_next = primary_runs.without(&numbers, INTENT_RANGES_SHOWN);
+        if distinct_next.is_empty() {
+            fallback_runs.without(&numbers, INTENT_RANGES_SHOWN)
+        } else {
+            distinct_next
+        }
+    } else {
+        Vec::new()
+    };
+    let listed: usize = next.iter().map(|&(first, last)| last - first + 1).sum();
+    let runs_text = if next.is_empty() {
+        String::new()
+    } else {
+        let mut parts: Vec<String> = next
+            .iter()
+            .map(|&(first, last)| {
+                if first == last {
+                    first.to_string()
+                } else {
+                    format!("{first}-{last}")
+                }
+            })
+            .collect();
+        if listed < left {
+            parts.push("…".to_owned());
+        }
+        format!(" ({})", parts.join(", "))
+    };
+    let log = next
+        .first()
+        .map(|&range| intent_log_clause(justless, run_id, range))
+        .unwrap_or_default();
+
+    let mut output = header;
+    for shown in &shown {
+        output.push_str(&shown.entry);
+    }
+    let shown_duplicates = if roomy {
+        duplicate_matches.min(every_left + some_left)
+    } else {
+        0
+    };
+    output.push_str(
+        &IntentTrailer {
+            several,
+            every: every_left,
+            some: some_left,
+            duplicates: shown_duplicates,
+            inside,
+            cut,
+            runs: &runs_text,
+            log: &log,
+        }
+        .render(),
+    );
+    ensure!(
+        output.len() <= max_bytes,
+        "the focused preview needs more than {max_bytes} bytes"
+    );
+    Ok(output.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,5 +2774,662 @@ mod tests {
         assert_eq!(Lang::parse("js"), Some(Lang::Node));
         assert_eq!(Lang::Bun.extension(), "ts");
         assert_eq!(Lang::Python3.candidates(), ["python3", "python"]);
+    }
+
+    #[test]
+    fn json_exec_uses_deep_schema_jsonview_and_saves_bytes() {
+        let root = Path::new("/workspace");
+        let rows: Vec<String> = (1..=120)
+            .map(|i| {
+                format!(
+                    r#"  {{"id": {i}, "service": "payments", "user": {{"name": "user{i}", "tier": "pro"}}, "metrics": {{"latency_ms": {}, "retries": {}}}, "status": "ok"}}"#,
+                    10 + (i % 50),
+                    i % 3
+                )
+            })
+            .collect();
+        let raw = format!("[\n{}\n]\n", rows.join(",\n"));
+        assert!(raw.len() > 15_000, "raw={}", raw.len());
+
+        let shaped = match shape_text_preview(&raw, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected deep-schema jsonview for large JSON array"),
+        };
+        assert!(shaped.len() <= 4096, "shaped={}", shaped.len());
+        assert!(
+            shaped.len() * 3 < raw.len(),
+            "expected >66% reduction: raw={}, shaped={}",
+            raw.len(),
+            shaped.len()
+        );
+        assert!(shaped.starts_with("[JSON array as a table:"), "{shaped}");
+        assert!(shaped.contains("user{name,tier=\"pro\"}"), "{shaped}");
+        assert!(shaped.contains("metrics{latency_ms,retries}"), "{shaped}");
+        assert!(shaped.contains("user120"), "{shaped}");
+    }
+
+    fn test_redactor() -> &'static crate::redact::Redactor {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+        crate::redact::for_workspace(&ws).expect("default redactor enabled")
+    }
+
+    #[test]
+    fn json_exec_redacts_secrets_before_jsonview() {
+        let root = Path::new("/workspace");
+        let redactor = test_redactor();
+        let secret = format!("ghp_{}", "aB3dE6gH9jK2mN5pQ8rS1tU4vW7xY0zC3eF6");
+        let rows: Vec<String> = (1..=80)
+            .map(|i| {
+                format!(
+                    r#"  {{"id": {i}, "token": "{secret}", "user": {{"name": "u{i}", "role": "svc"}}, "ok": true}}"#
+                )
+            })
+            .collect();
+        let raw = format!("[\n{}\n]\n", rows.join(",\n"));
+        assert!(raw.len() > 8_000);
+
+        let shaped = match shape_text_preview(&raw, 4096, root, "stdout", false, Some(redactor)) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected redacted jsonview"),
+        };
+        assert!(shaped.len() <= 4096, "shaped={}", shaped.len());
+        assert!(shaped.len() < raw.len());
+        assert!(!shaped.contains(&secret), "secret leaked:\n{shaped}");
+        assert!(shaped.contains("[redacted:"), "{shaped}");
+    }
+
+    #[test]
+    fn ndjson_data_uses_jsonview_while_ndjson_logs_use_logview() {
+        let root = Path::new("/workspace");
+
+        // Pure NDJSON data records -> lossless jsonview.
+        let data_ndjson: String = (1..=80)
+            .map(|i| {
+                format!(
+                    r#"{{"id":{i},"sku":"SKU-{i:04}","warehouse":{{"region":"us-east","bin":{}}},"qty":{}}}"#,
+                    i % 10,
+                    i * 2
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(data_ndjson.len() > 4096);
+        assert!(!looks_like_json_logs(&data_ndjson));
+        let data_shaped = match shape_text_preview(&data_ndjson, 4096, root, "stdout", false, None)
+        {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected jsonview for NDJSON data"),
+        };
+        assert!(
+            data_shaped.starts_with("[JSON lines as a table:"),
+            "{data_shaped}"
+        );
+        assert!(data_shaped.len() <= 4096);
+        assert!(data_shaped.len() < data_ndjson.len() / 2);
+
+        // NDJSON structured logs with late errors -> logview folds chatter & keeps errors.
+        let mut log_lines = Vec::new();
+        for i in 1..=200 {
+            log_lines.push(format!(
+                r#"{{"ts":"2026-04-01T10:00:{:02}.{:03}Z","level":"INFO","service":"api","msg":"GET /health 200 ok req_id={i}"}}"#,
+                i % 60,
+                i % 1000
+            ));
+        }
+        log_lines.push(
+            r#"{"ts":"2026-04-01T10:04:01.000Z","level":"ERROR","service":"api","msg":"database pool exhausted on shard-7"}"#
+                .to_owned(),
+        );
+        log_lines.push(
+            r#"{"ts":"2026-04-01T10:04:02.000Z","level":"WARN","service":"api","msg":"circuit breaker opened for payments"}"#
+                .to_owned(),
+        );
+        let log_ndjson = log_lines.join("\n") + "\n";
+        assert!(log_ndjson.len() > 18_000);
+        assert!(looks_like_json_logs(&log_ndjson));
+
+        let log_shaped = match shape_text_preview(&log_ndjson, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected logview for NDJSON structured logs"),
+        };
+        assert!(log_shaped.len() <= 4096);
+        assert!(
+            log_shaped.len() * 10 < log_ndjson.len(),
+            "expected >90% reduction on NDJSON logs: raw={}, shaped={}",
+            log_ndjson.len(),
+            log_shaped.len()
+        );
+        assert!(
+            log_shaped.contains("database pool exhausted on shard-7"),
+            "{log_shaped}"
+        );
+        assert!(
+            log_shaped.contains("circuit breaker opened for payments"),
+            "{log_shaped}"
+        );
+        assert!(log_shaped.contains("[stdout:201]"), "{log_shaped}");
+    }
+
+    #[test]
+    fn stacktrace_collapsing_preserves_workspace_and_redacted_frames() {
+        let root = Path::new("/workspace");
+
+        // 1. Python traceback (> 4096 raw) collapsing to fit in budget.
+        let mut py = String::from("Traceback (most recent call last):\n");
+        py.push_str(
+            "  File \".justless/runs/run-1/script.py\", line 14, in main\n    fetch_orders()\n",
+        );
+        py.push_str(
+            "  File \"/workspace/src/worker.py\", line 88, in fetch_orders\n    client.get(url)\n",
+        );
+        for i in 0..45 {
+            py.push_str(&format!(
+                "  File \"/usr/lib/python3.12/site-packages/urllib3/connectionpool.py\", line {}, in urlopen\n    response = self._make_request(conn, method, url, timeout=timeout, chunked=chunked)\n",
+                100 + i
+            ));
+        }
+        py.push_str("  File \"/workspace/src/retry.py\", line 22, in on_error\n    raise RuntimeError('upstream 503')\n");
+        py.push_str("RuntimeError: upstream 503\n");
+        assert!(py.len() > 4096, "py.len()={}", py.len());
+
+        let py_shaped = match shape_text_preview(&py, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected collapsed Python stacktrace"),
+        };
+        assert!(py_shaped.len() <= 4096);
+        assert!(
+            py_shaped.len() * 4 < py.len(),
+            "expected >75% reduction on Python trace: raw={}, shaped={}",
+            py.len(),
+            py_shaped.len()
+        );
+        assert!(
+            py_shaped.contains(".justless/runs/run-1/script.py"),
+            "{py_shaped}"
+        );
+        assert!(
+            py_shaped.contains("/workspace/src/worker.py"),
+            "{py_shaped}"
+        );
+        assert!(py_shaped.contains("/workspace/src/retry.py"), "{py_shaped}");
+        assert!(
+            py_shaped.contains("RuntimeError: upstream 503"),
+            "{py_shaped}"
+        );
+        assert!(
+            py_shaped.contains("runtime/dependency frames"),
+            "{py_shaped}"
+        );
+        assert!(py_shaped.contains("in stdout:"), "{py_shaped}");
+
+        // 2. Node.js stack trace (> 4096 raw).
+        let mut node = String::from("Error: ECONNREFUSED 127.0.0.1:5432\n");
+        node.push_str("    at connect (/workspace/src/db.js:42:11)\n");
+        for i in 0..55 {
+            node.push_str(&format!(
+                "    at Layer.handle (/workspace/node_modules/express/lib/router/layer.js:{}:5)\n",
+                90 + i
+            ));
+        }
+        for i in 0..20 {
+            node.push_str(&format!(
+                "    at processTicksAndRejections (node:internal/process/task_queues:{}:5)\n",
+                50 + i
+            ));
+        }
+        node.push_str("    at Object.<anonymous> (.justless/runs/run-2/script.js:8:1)\n");
+        assert!(node.len() > 4096, "node.len()={}", node.len());
+
+        let node_shaped = match shape_text_preview(&node, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected collapsed Node stacktrace"),
+        };
+        assert!(node_shaped.len() <= 4096);
+        assert!(
+            node_shaped.len() * 5 < node.len(),
+            "expected >80% reduction on Node trace: raw={}, shaped={}",
+            node.len(),
+            node_shaped.len()
+        );
+        assert!(
+            node_shaped.contains("/workspace/src/db.js:42:11"),
+            "{node_shaped}"
+        );
+        assert!(
+            node_shaped.contains(".justless/runs/run-2/script.js:8:1"),
+            "{node_shaped}"
+        );
+        assert!(node_shaped.contains("in stdout:"), "{node_shaped}");
+
+        // 3. Ruby backtrace (> 4096 raw).
+        let mut ruby = String::from(
+            ".justless/runs/run-3/script.rb:12:in `process': connection reset (RuntimeError)\n",
+        );
+        ruby.push_str("\tfrom /workspace/lib/client.rb:44:in `fetch'\n");
+        for i in 0..60 {
+            ruby.push_str(&format!(
+                "\tfrom /usr/lib/ruby/gems/3.2.0/gems/activerecord-7.1.3/lib/active_record/connection_adapters/abstract_adapter.rb:{}:in `exec_query'\n",
+                200 + i
+            ));
+        }
+        ruby.push_str("\tfrom .justless/runs/run-3/script.rb:20:in `<main>'\n");
+        assert!(ruby.len() > 4096, "ruby.len()={}", ruby.len());
+
+        let ruby_shaped = match shape_text_preview(&ruby, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected collapsed Ruby stacktrace"),
+        };
+        assert!(ruby_shaped.len() <= 4096);
+        assert!(
+            ruby_shaped.len() * 10 < ruby.len(),
+            "expected >90% reduction on Ruby trace: raw={}, shaped={}",
+            ruby.len(),
+            ruby_shaped.len()
+        );
+        assert!(
+            ruby_shaped.contains("/workspace/lib/client.rb:44"),
+            "{ruby_shaped}"
+        );
+        assert!(
+            ruby_shaped.contains(".justless/runs/run-3/script.rb:20"),
+            "{ruby_shaped}"
+        );
+        assert!(ruby_shaped.contains("activerecord"), "{ruby_shaped}");
+        assert!(ruby_shaped.contains("in stdout:3-62"), "{ruby_shaped}");
+
+        // 4. Go, Rust, and Java stack traces collapse external frames while keeping workspace frames.
+        let mut go = String::from("panic: nil pointer dereference\n\ngoroutine 1 [running]:\n");
+        go.push_str("main.handleOrder(0x0)\n\t/workspace/cmd/server/main.go:42 +0x1a\n");
+        for i in 0..35 {
+            go.push_str(&format!(
+                "net/http.(*conn).serve(0xc00012a000)\n\t/usr/local/go/src/net/http/server.go:{} +0x3c\n",
+                1900 + i
+            ));
+        }
+        go.push_str("main.main()\n\t/workspace/cmd/server/main.go:12 +0x20\n");
+        let go_shaped = match shape_text_preview(&go, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected collapsed Go stacktrace"),
+        };
+        assert!(
+            go_shaped.len() * 4 < go.len(),
+            "raw={}, shaped={}",
+            go.len(),
+            go_shaped.len()
+        );
+        assert!(
+            go_shaped.contains("/workspace/cmd/server/main.go:42"),
+            "{go_shaped}"
+        );
+        assert!(go_shaped.contains("in stdout:"), "{go_shaped}");
+
+        let mut rust =
+            String::from("thread 'main' panicked at src/worker.rs:19:5:\nboom\nstack backtrace:\n");
+        rust.push_str("   0: my_app::worker::run\n             at /workspace/src/worker.rs:19:5\n");
+        for i in 1..=35 {
+            rust.push_str(&format!(
+                "  {i:2}: std::rt::lang_start_internal\n             at /rustc/abcdef/library/std/src/rt.rs:{}:13\n",
+                120 + i
+            ));
+        }
+        rust.push_str("  36: my_app::main\n             at /workspace/src/main.rs:7:5\n");
+        let rust_shaped = match shape_text_preview(&rust, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected collapsed Rust backtrace"),
+        };
+        assert!(
+            rust_shaped.len() * 4 < rust.len(),
+            "raw={}, shaped={}",
+            rust.len(),
+            rust_shaped.len()
+        );
+        assert!(
+            rust_shaped.contains("/workspace/src/worker.rs:19:5"),
+            "{rust_shaped}"
+        );
+        assert!(
+            rust_shaped.contains("/workspace/src/main.rs:7:5"),
+            "{rust_shaped}"
+        );
+        assert!(rust_shaped.contains("in stdout:"), "{rust_shaped}");
+
+        let mut java = String::from("java.lang.IllegalStateException: ledger locked\n");
+        java.push_str("\tat com.acme.billing.Ledger.commit(Ledger.java:88)\n");
+        for i in 0..55 {
+            java.push_str(&format!(
+                "\tat org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:{})\n",
+                100 + i
+            ));
+        }
+        java.push_str("\tat com.acme.billing.App.main(App.java:14)\n");
+        let java_shaped = match shape_text_preview(&java, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected collapsed Java stacktrace"),
+        };
+        assert!(
+            java_shaped.len() * 5 < java.len(),
+            "raw={}, shaped={}",
+            java.len(),
+            java_shaped.len()
+        );
+        assert!(
+            java_shaped.contains("com.acme.billing.Ledger.commit"),
+            "{java_shaped}"
+        );
+        assert!(
+            java_shaped.contains("com.acme.billing.App.main"),
+            "{java_shaped}"
+        );
+        assert!(java_shaped.contains("in stdout:"), "{java_shaped}");
+
+        // 5. Redaction safety: a secret in a stack trace is redacted before collapsing and never leaks.
+        let redactor = test_redactor();
+        let secret = format!("ghp_{}", "zY9xW8vU7tS6rQ5pO4nM3lK2jI1hG0fE9dC8");
+        let ruby_secret = ruby.replace("connection reset", &format!("token={secret}"));
+        let redacted_trace =
+            match shape_text_preview(&ruby_secret, 4096, root, "stdout", false, Some(redactor)) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected collapsed redacted Ruby trace"),
+            };
+        assert!(!redacted_trace.contains(&secret), "{redacted_trace}");
+        assert!(redacted_trace.contains("[redacted:"), "{redacted_trace}");
+    }
+
+    #[test]
+    fn structured_logview_folds_repetitive_chatter_and_skips_plain_exports() {
+        let root = Path::new("/workspace");
+
+        // Plain numbered output must NOT be routed to logview.
+        let numbered: String = (1..=500).map(|i| format!("line {i} ok\n")).collect();
+        assert!(!looks_like_structured_logs(&numbered));
+        assert!(matches!(
+            shape_text_preview(&numbered, 1024, root, "stdout", false, None),
+            ShapedText::Fallback
+        ));
+
+        // Timestamped / level-prefixed repetitive logs with embedded warnings/errors -> logview.
+        let mut logs = String::new();
+        for i in 1..=300 {
+            logs.push_str(&format!(
+                "2026-04-01T12:00:{:02}.{:03}Z INFO worker polling queue batch={} latency={}ms\n",
+                i % 60,
+                i % 1000,
+                i,
+                3 + (i % 5)
+            ));
+            if i == 150 {
+                logs.push_str(
+                    "2026-04-01T12:02:30.000Z ERROR worker failed to commit order_id=ORD-991: deadlock detected\n",
+                );
+            }
+            if i == 250 {
+                logs.push_str(
+                    "2026-04-01T12:04:10.000Z WARN worker retry queue depth exceeded 500\n",
+                );
+            }
+        }
+        assert!(logs.len() > 20_000, "logs.len()={}", logs.len());
+        assert!(looks_like_structured_logs(&logs));
+
+        let folded = match shape_text_preview(&logs, 4096, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected logview folding for repetitive timestamped logs"),
+        };
+        assert!(folded.len() <= 4096);
+        assert!(
+            folded.len() * 10 < logs.len(),
+            "expected >90% reduction on timestamped logs: raw={}, folded={}",
+            logs.len(),
+            folded.len()
+        );
+        assert!(folded.contains("deadlock detected"), "{folded}");
+        assert!(
+            folded.contains("retry queue depth exceeded 500"),
+            "{folded}"
+        );
+        assert!(folded.contains("[stdout:151]"), "{folded}");
+
+        // Secrets in structured logs are redacted before folding and never leak.
+        let redactor = test_redactor();
+        let secret = format!("ghp_{}", "mN1oP2qR3sT4uV5wX6yZ7aB8cD9eF0gH1iJ2");
+        let logs_with_secret = logs.replace("deadlock detected", &format!("auth={secret}"));
+        let safe = match shape_text_preview(
+            &logs_with_secret,
+            4096,
+            root,
+            "stdout",
+            false,
+            Some(redactor),
+        ) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected redacted logview"),
+        };
+        assert!(!safe.contains(&secret), "{safe}");
+        assert!(safe.contains("[redacted:"), "{safe}");
+    }
+
+    #[test]
+    fn intent_dedup_surfaces_distinct_matches_past_boilerplate_and_periodic_windows() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Case 1: 250 timestamp-varying boilerplate matches before 10 distinct matches.
+        let mut lines = String::new();
+        for i in 1..=250 {
+            lines.push_str(&format!(
+                "2026-04-01T10:{:02}:{:02}Z WARN payments timeout retrying\n",
+                (i / 60) % 60,
+                i % 60
+            ));
+        }
+        let distinct_reasons = [
+            "stripe_eu_504",
+            "adyen_tls_reset",
+            "card_vault_eof",
+            "ledger_deadlock",
+            "fx_quote_stale",
+            "fraud_rpc_timeout",
+            "bank_ach_rejected",
+            "webhook_dns_nxdomain",
+            "kms_sign_throttled",
+            "redis_cluster_failover",
+        ];
+        for reason in distinct_reasons {
+            lines.push_str(&format!(
+                "2026-04-01T10:15:00Z ERROR payments timeout fatal cause={reason} detail=checkout_pipeline_v2\n"
+            ));
+        }
+        let path = dir.path().join("boilerplate.log");
+        fs::write(&path, &lines).unwrap();
+
+        // Baseline focus::preview gets swamped by boilerplate and misses the distinct causes.
+        let baseline = String::from_utf8(
+            crate::focus::preview(&path, "payments timeout", 2048, "justless", "run-1").unwrap(),
+        )
+        .unwrap();
+        let baseline_distinct = distinct_reasons
+            .iter()
+            .filter(|&&r| baseline.contains(r))
+            .count();
+
+        let deduped = String::from_utf8(
+            intent_preview(&path, "payments timeout", 2048, "justless", "run-1").unwrap(),
+        )
+        .unwrap();
+        assert!(deduped.len() <= 2048, "len={}", deduped.len());
+        let deduped_distinct = distinct_reasons
+            .iter()
+            .filter(|&&r| deduped.contains(r))
+            .count();
+        assert_eq!(
+            deduped_distinct,
+            distinct_reasons.len(),
+            "expected all {} distinct causes (baseline got {baseline_distinct}):\n{deduped}",
+            distinct_reasons.len()
+        );
+        assert!(deduped.contains("duplicates collapsed"), "{deduped}");
+        assert!(deduped.len() < lines.len() / 8);
+
+        // Case 2: One long line with periodic boilerplate chunks followed by distinct records.
+        let mut long_line =
+            r#"{"service":"payments","status":"timeout","reason":"retry"}, "#.repeat(90);
+        for tag in [
+            "vault_unreachable",
+            "stripe_504",
+            "ledger_deadlock",
+            "kms_eof",
+        ] {
+            long_line.push_str(&format!(
+                r#"{{"service":"payments","status":"timeout","reason":"{tag}","unique":true}}, "#
+            ));
+        }
+        long_line.push('\n');
+        let long_path = dir.path().join("long.log");
+        fs::write(&long_path, &long_line).unwrap();
+
+        let long_preview = String::from_utf8(
+            intent_preview(&long_path, "payments timeout", 2048, "justless", "run-2").unwrap(),
+        )
+        .unwrap();
+        assert!(long_preview.len() <= 2048, "len={}", long_preview.len());
+        for tag in [
+            "vault_unreachable",
+            "stripe_504",
+            "ledger_deadlock",
+            "kms_eof",
+        ] {
+            assert!(
+                long_preview.contains(tag),
+                "missing distinct window {tag} in:\n{long_preview}"
+            );
+        }
+        // Only one boilerplate window should appear, not a flood of identical repeats.
+        let retry_windows = long_preview
+            .lines()
+            .filter(|l| {
+                l.starts_with("stdout:1:")
+                    && l.contains("\"reason\":\"retry\"")
+                    && !l.contains("vault_unreachable")
+            })
+            .count();
+        assert!(
+            retry_windows <= 1,
+            "expected at most 1 boilerplate window, got {retry_windows}:\n{long_preview}"
+        );
+    }
+
+    #[test]
+    fn exec_run_end_to_end_shapes_json_logs_and_stacktraces_with_exact_archive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join(".justless.toml"), "").unwrap();
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+
+        let run_case = |args: &[&str]| -> (i32, serde_json::Value, PathBuf) {
+            let before: HashSet<String> = fs::read_dir(ws.state.join("runs"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let argv: Vec<&str> = std::iter::once("exec")
+                .chain(args.iter().copied())
+                .collect();
+            let matches = command().try_get_matches_from(argv).unwrap();
+            let status = run(&ws, &matches).unwrap();
+            let new_dir = fs::read_dir(ws.state.join("runs"))
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| {
+                    p.join("record.json").is_file()
+                        && !before.contains(&p.file_name().unwrap().to_string_lossy().into_owned())
+                })
+                .expect("new run directory");
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(new_dir.join("record.json")).unwrap()).unwrap();
+            (status, record, new_dir)
+        };
+
+        // 1. JSON-emitting script: shrinks dramatically and archives exact raw JSON.
+        let json_script = r#"
+printf '[\n'
+i=1
+while [ $i -le 120 ]; do
+  sep=","
+  if [ $i -eq 120 ]; then sep=""; fi
+  printf '  {"id": %d, "service": "orders", "user": {"name": "user%d", "tier": "pro"}, "ok": true}%s\n' "$i" "$i" "$sep"
+  i=$((i + 1))
+done
+printf ']\n'
+"#;
+        let (status, rec, run_dir) = run_case(&["--lang", "sh", json_script]);
+        assert_eq!(status, 0);
+        let raw_json = rec["raw_bytes"].as_u64().unwrap();
+        let preview_json = rec["preview_bytes"].as_u64().unwrap();
+        assert!(raw_json > 10_000, "raw_json={raw_json}");
+        assert!(
+            preview_json <= 4096 && preview_json * 3 < raw_json,
+            "expected deep-schema jsonview shrinkage: raw={raw_json}, preview={preview_json}"
+        );
+        let archived_json = fs::read_to_string(run_dir.join("stdout")).unwrap();
+        assert_eq!(archived_json.len() as u64, raw_json);
+        let parsed: serde_json::Value = serde_json::from_str(&archived_json).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 120);
+
+        // 2. Failing script with deep Python traceback on stdout (exit 7 preserved + archived exact).
+        let trace_script = r#"
+echo "Traceback (most recent call last):"
+echo '  File ".justless/runs/run-x/script.py", line 9, in main'
+echo "    sync()"
+i=1
+while [ $i -le 45 ]; do
+  printf '  File "/usr/lib/python3.12/site-packages/urllib3/connectionpool.py", line %d, in urlopen\n' "$((100 + i))"
+  echo "    response = self._make_request(conn, method, url, timeout=timeout, chunked=chunked)"
+  i=$((i + 1))
+done
+echo '  File "src/sync.py", line 31, in sync'
+echo "    raise RuntimeError('upstream 503')"
+echo "RuntimeError: upstream 503"
+exit 7
+"#;
+        let (status, rec, run_dir) = run_case(&["--lang", "sh", trace_script]);
+        assert_eq!(status, 7);
+        let raw_trace = rec["raw_bytes"].as_u64().unwrap();
+        let preview_trace = rec["preview_bytes"].as_u64().unwrap();
+        assert!(raw_trace > 4096, "raw_trace={raw_trace}");
+        assert!(
+            preview_trace * 4 < raw_trace,
+            "expected >75% trace reduction: raw={raw_trace}, preview={preview_trace}"
+        );
+        assert_eq!(
+            fs::metadata(run_dir.join("stdout")).unwrap().len(),
+            raw_trace
+        );
+
+        // 3. Repetitive structured-log script (> 15 KB -> folded under 1 KB).
+        let log_script = r#"
+i=1
+while [ $i -le 260 ]; do
+  printf '2026-04-01T12:00:%02d.%03dZ INFO worker polling batch=%d latency=4ms\n' "$((i % 60))" "$((i % 1000))" "$i"
+  if [ $i -eq 130 ]; then
+    echo "2026-04-01T12:02:10.000Z ERROR worker commit failed: deadlock on orders"
+  fi
+  i=$((i + 1))
+done
+"#;
+        let (status, rec, run_dir) = run_case(&["--lang", "sh", log_script]);
+        assert_eq!(status, 0);
+        let raw_logs = rec["raw_bytes"].as_u64().unwrap();
+        let preview_logs = rec["preview_bytes"].as_u64().unwrap();
+        assert!(raw_logs > 15_000, "raw_logs={raw_logs}");
+        assert!(
+            preview_logs * 10 < raw_logs,
+            "expected >90% logview reduction: raw={raw_logs}, preview={preview_logs}"
+        );
+        assert_eq!(
+            fs::metadata(run_dir.join("stdout")).unwrap().len(),
+            raw_logs
+        );
     }
 }
