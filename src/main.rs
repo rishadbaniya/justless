@@ -9,6 +9,7 @@ mod cli_views;
 mod components;
 mod config_outline;
 mod context;
+mod deptree;
 mod discover;
 mod doctests;
 mod doctor;
