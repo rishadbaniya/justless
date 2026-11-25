@@ -168,6 +168,8 @@ pub struct Snapshot {
     is_rust: bool,
     /// Whether this snapshot was indexed as a Markdown source file.
     is_markdown: bool,
+    /// Tree-sitter grammar used when indexed as a polyglot source file.
+    grammar: Option<Grammar>,
 }
 
 pub(crate) fn revision_for(file: &str, bytes: &[u8]) -> String {
@@ -206,6 +208,7 @@ impl Snapshot {
             parse_error: None,
             is_rust: false,
             is_markdown: false,
+            grammar: None,
         })
     }
 
@@ -227,6 +230,7 @@ impl Snapshot {
             parse_error: None,
             is_rust: false,
             is_markdown: false,
+            grammar: None,
         }
     }
 
@@ -333,6 +337,7 @@ impl Snapshot {
                 }
             }
         } else if let Some(grammar) = Grammar::detect(file, &self.text) {
+            self.grammar = Some(grammar);
             let facts = Parsers::default().parse(grammar, &self.text)?;
             imports = facts.import_ranges;
             for def in facts.definitions {
@@ -642,11 +647,28 @@ impl Snapshot {
             .collect()
     }
 
-    /// Trims strictly redundant outline signatures: Markdown blocks whose kind
-    /// and name already convey their heading level or anchor label, and plain
-    /// Rust type declarations where the header repeats only `{kind} {name}`
-    /// with no visibility, generics, bounds or tuple fields.
+    /// Trims strictly redundant outline signatures while preserving all semantic
+    /// details (visibility, modifiers, generics, parameters, extends/implements,
+    /// return types, and receivers):
+    /// - Imports strip a redundant leading `import ` / `use ` / `from ` keyword
+    ///   (preserving modifiers such as `pub use` and distinct directives like
+    ///   `alias`, `#import`, `#include`, or `using`).
+    /// - Markdown blocks drop signatures already conveyed by their kind and name.
+    /// - Plain Rust types drop `{kind} {name}` when no modifiers or generics follow.
+    /// - Polyglot declarations strip only the redundant leading `{kw} {name}`
+    ///   (preserving `export`, `export default`, `async`, and all other modifiers).
     fn slim_signature(&self, entry: &Entry, signature: String) -> String {
+        if entry.kind == "import" {
+            for kw in ["import ", "use ", "from "] {
+                if let Some(rest) = signature.strip_prefix(kw) {
+                    let trimmed = rest.trim_start();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_owned();
+                    }
+                }
+            }
+            return signature;
+        }
         if self.is_markdown
             && matches!(
                 entry.kind.as_str(),
@@ -655,13 +677,55 @@ impl Snapshot {
         {
             return String::new();
         }
+        let short = entry.name.rsplit("::").next().unwrap_or(&entry.name);
         if self.is_rust && matches!(entry.kind.as_str(), "struct" | "enum" | "trait" | "union") {
-            let short = entry.name.rsplit("::").next().unwrap_or(&entry.name);
             if signature == format!("{} {short}", entry.kind) {
                 return String::new();
             }
+            return signature;
+        }
+        if let Some(grammar) = self.grammar
+            && !short.is_empty()
+        {
+            return slim_polyglot_signature(grammar, &entry.kind, short, signature);
         }
         signature
+    }
+
+    fn fold_group(&self, entry: &Entry) -> Option<(&'static str, usize)> {
+        if entry.kind == "import" {
+            Some(("imports", 3))
+        } else if entry.kind == "module" && self.text[entry.bytes.clone()].trim_end().ends_with(';')
+        {
+            Some(("modules", 3))
+        } else if matches!(
+            entry.kind.as_str(),
+            "constant" | "const" | "static" | "variable"
+        ) && self.line(entry.bytes.start)
+            == self.line(entry.bytes.end.saturating_sub(1).max(entry.bytes.start))
+        {
+            Some(("constants", 5))
+        } else {
+            None
+        }
+    }
+
+    fn row_for(&self, index: usize, entry: &Entry, raw_signature: String) -> Row {
+        let signature = self.slim_signature(entry, raw_signature);
+        let name = if entry.kind == "import" && entry.name == "import" {
+            String::new()
+        } else {
+            clipped(&entry.name, 100)
+        };
+        Row {
+            id: index + 1,
+            end_id: None,
+            name,
+            kind: entry.kind.clone(),
+            first: self.line(entry.bytes.start),
+            last: self.line(entry.bytes.end.saturating_sub(1)),
+            signature: clipped(&signature, 160),
+        }
     }
 
     pub fn page(
@@ -715,27 +779,6 @@ impl Snapshot {
                 vec![filter.as_str()]
             };
         let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        fn scope_prefix(entry: &Entry) -> Option<&str> {
-            entry.name.rsplit_once("::").map(|(prefix, _)| prefix)
-        }
-        let fold_group = |entry: &Entry| -> Option<(&'static str, usize)> {
-            if entry.kind == "import" {
-                Some(("imports", 3))
-            } else if entry.kind == "module"
-                && self.text[entry.bytes.clone()].trim_end().ends_with(';')
-            {
-                Some(("modules", 3))
-            } else if matches!(
-                entry.kind.as_str(),
-                "constant" | "const" | "static" | "variable"
-            ) && self.line(entry.bytes.start)
-                == self.line(entry.bytes.end.saturating_sub(1).max(entry.bytes.start))
-            {
-                Some(("constants", 5))
-            } else {
-                None
-            }
-        };
         let mut index = start;
         while index < self.entries.len() {
             let e = &self.entries[index];
@@ -745,13 +788,13 @@ impl Snapshot {
             // Individual `#N` entry IDs stay unchanged for `expand` and `edit`, and
             // folded blocks expand directly with `#A..#B`.
             let (row, end_index) = if filter.is_empty()
-                && let Some((group, min_run)) = fold_group(e)
+                && let Some((group, min_run)) = self.fold_group(e)
             {
                 let mut run_end = index + 1;
                 while run_end < self.entries.len()
-                    && fold_group(&self.entries[run_end]) == Some((group, min_run))
+                    && self.fold_group(&self.entries[run_end]) == Some((group, min_run))
                     && (group != "constants"
-                        || scope_prefix(e) == scope_prefix(&self.entries[run_end]))
+                        || entry_scope_prefix(e) == entry_scope_prefix(&self.entries[run_end]))
                 {
                     run_end += 1;
                 }
@@ -768,17 +811,8 @@ impl Snapshot {
                     };
                     (row, run_end - 1)
                 } else {
-                    let signature =
-                        self.slim_signature(e, words(&self.text[e.signature_start..e.header_end]));
-                    let row = Row {
-                        id: index + 1,
-                        end_id: None,
-                        name: clipped(&e.name, 100),
-                        kind: e.kind.clone(),
-                        first: self.line(e.bytes.start),
-                        last: self.line(e.bytes.end.saturating_sub(1)),
-                        signature: clipped(&signature, 160),
-                    };
+                    let row =
+                        self.row_for(index, e, words(&self.text[e.signature_start..e.header_end]));
                     (row, index)
                 }
             } else {
@@ -795,16 +829,7 @@ impl Snapshot {
                         continue;
                     }
                 }
-                let signature = self.slim_signature(e, signature);
-                let row = Row {
-                    id: index + 1,
-                    end_id: None,
-                    name: clipped(&e.name, 100),
-                    kind: e.kind.clone(),
-                    first: self.line(e.bytes.start),
-                    last: self.line(e.bytes.end.saturating_sub(1)),
-                    signature: clipped(&signature, 160),
-                };
+                let row = self.row_for(index, e, signature);
                 (row, index)
             };
             let mut row = row;
@@ -854,8 +879,7 @@ impl Snapshot {
         {
             return None;
         }
-        let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        let rows: Vec<Row> = self
+        let overlapping: Vec<(usize, usize, usize)> = self
             .entries
             .iter()
             .enumerate()
@@ -864,34 +888,70 @@ impl Snapshot {
                     self.line(entry.bytes.start),
                     self.line(entry.bytes.end.saturating_sub(1)),
                 );
-                (lines.0 <= last && lines.1 >= first).then(|| {
-                    let signature = self.slim_signature(
-                        entry,
-                        words(&self.text[entry.signature_start..entry.header_end]),
-                    );
-                    Row {
-                        id: index + 1,
-                        end_id: None,
-                        kind: entry.kind.clone(),
-                        name: clipped(&entry.name, 100),
-                        first: lines.0,
-                        last: lines.1,
-                        signature: clipped(&signature, 160),
-                    }
-                })
+                (lines.0 <= last && lines.1 >= first).then_some((index, lines.0, lines.1))
             })
             .collect();
-        let mut held = vec![0; rows.len()];
+        if overlapping.is_empty() {
+            return None;
+        }
+        // Judge whether one individual declaration holds more than half the
+        // window BEFORE folding runs of imports/modules/constants so a large
+        // import preamble folds cleanly instead of falling back to raw text.
+        let mut held = vec![0; overlapping.len()];
         for line in first..=last {
-            let narrowest = (0..rows.len())
-                .filter(|&index| rows[index].first <= line && line <= rows[index].last)
-                .min_by_key(|&index| rows[index].last - rows[index].first);
-            if let Some(index) = narrowest {
-                held[index] += 1;
+            let narrowest = (0..overlapping.len())
+                .filter(|&pos| overlapping[pos].1 <= line && line <= overlapping[pos].2)
+                .min_by_key(|&pos| overlapping[pos].2 - overlapping[pos].1);
+            if let Some(pos) = narrowest {
+                held[pos] += 1;
             }
         }
         let span = last - first + 1;
-        (!rows.is_empty() && held.iter().all(|&count| count * 2 <= span)).then(|| Window {
+        if !held.iter().all(|&count| count * 2 <= span) {
+            return None;
+        }
+        let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut rows = Vec::with_capacity(overlapping.len());
+        let mut pos = 0;
+        while pos < overlapping.len() {
+            let (entry_index, first_line, _) = overlapping[pos];
+            let entry = &self.entries[entry_index];
+            if let Some((group, min_run)) = self.fold_group(entry) {
+                let mut run_end = pos + 1;
+                while run_end < overlapping.len()
+                    && overlapping[run_end].0 == overlapping[run_end - 1].0 + 1
+                    && self.fold_group(&self.entries[overlapping[run_end].0])
+                        == Some((group, min_run))
+                    && (group != "constants"
+                        || entry_scope_prefix(entry)
+                            == entry_scope_prefix(&self.entries[overlapping[run_end].0]))
+                {
+                    run_end += 1;
+                }
+                let run_len = run_end - pos;
+                if run_len >= min_run {
+                    let (last_entry_index, _, last_line) = overlapping[run_end - 1];
+                    rows.push(Row {
+                        id: entry_index + 1,
+                        end_id: Some(last_entry_index + 1),
+                        name: format!("{run_len} items"),
+                        kind: group.into(),
+                        first: first_line,
+                        last: last_line,
+                        signature: String::new(),
+                    });
+                    pos = run_end;
+                    continue;
+                }
+            }
+            rows.push(self.row_for(
+                entry_index,
+                entry,
+                words(&self.text[entry.signature_start..entry.header_end]),
+            ));
+            pos += 1;
+        }
+        Some(Window {
             revision: self.revision.clone(),
             lines: self.lines.len(),
             first,
@@ -919,17 +979,116 @@ impl Window {
             self.revision, self.lines, self.first, self.last
         );
         for row in &self.rows {
-            if signatures {
-                out.push_str(&row.display());
-            } else {
-                out.push_str(&format!(
-                    "#{} L{}-{} {} {}\n",
-                    row.id, row.first, row.last, row.kind, row.name
-                ));
-            }
+            out.push_str(&row.display_with_signatures(signatures));
         }
         out
     }
+}
+
+fn entry_scope_prefix(entry: &Entry) -> Option<&str> {
+    entry.name.rsplit_once("::").map(|(prefix, _)| prefix)
+}
+
+fn is_signature_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '$' | '.' | '?' | '!')
+}
+
+fn polyglot_keywords(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "class" => &["class"],
+        "interface" => &["interface"],
+        "struct" => &["struct"],
+        "enum" => &["enum"],
+        "trait" => &["trait"],
+        "protocol" => &["protocol", "defprotocol"],
+        "module" => &["module", "defmodule"],
+        "object" => &["object"],
+        "mixin" => &["mixin"],
+        "extension" => &["extension"],
+        "actor" => &["actor"],
+        "function" | "method" => &["function", "def", "func", "fun", "fn"],
+        "macro" => &["macro", "defmacro"],
+        "type" => &["type", "typealias"],
+        _ => &[],
+    }
+}
+
+/// Strips strictly redundant leading `{kw} {short}` from Tree-sitter outline
+/// signatures while keeping visibility/modifiers (`export`, `export default`,
+/// `async`, `pub`, `final`, `abstract`, `case`, `defp`, `local`, `static`, …),
+/// generics, parameters, extends/implements, receivers, and return types intact.
+fn slim_polyglot_signature(grammar: Grammar, kind: &str, short: &str, signature: String) -> String {
+    // Go `type_spec` headers start with the type name (`Server struct`, `Handler interface`,
+    // `Cache[K comparable, V any] struct`, `UserID string`). Strip only the repeated name,
+    // preserving `struct`/`interface`/generics/underlying type.
+    if grammar == Grammar::Go
+        && kind == "type"
+        && let Some(rest) = signature.strip_prefix(short)
+        && rest
+            .chars()
+            .next()
+            .is_none_or(|c| !is_signature_ident_char(c))
+    {
+        return rest.trim_start().to_owned();
+    }
+    if matches!(kind, "struct" | "interface") && signature == format!("type {short} {kind}") {
+        return String::new();
+    }
+    if kind == "test" && signature == format!("test {short}") {
+        return String::new();
+    }
+    let keywords = polyglot_keywords(kind);
+    if keywords.is_empty() {
+        return signature;
+    }
+    const PRESERVED_PREFIXES: &[&str] = &[
+        "export default async ",
+        "export default ",
+        "export async ",
+        "export ",
+        "async ",
+        "",
+    ];
+    for &prefix in PRESERVED_PREFIXES {
+        let Some(after_prefix) = signature.strip_prefix(prefix) else {
+            continue;
+        };
+        for &kw in keywords {
+            let Some(after_kw) = after_prefix
+                .strip_prefix(kw)
+                .and_then(|s| s.strip_prefix(' '))
+            else {
+                continue;
+            };
+            let Some(after_name) = after_kw.strip_prefix(short) else {
+                continue;
+            };
+            if !after_name
+                .chars()
+                .next()
+                .is_none_or(|c| !is_signature_ident_char(c))
+            {
+                continue;
+            }
+            let tail = after_name.trim_start();
+            // A bare Python block colon (`class Foo:`) adds no info once `class Foo` is shown.
+            let tail = if tail == ":" { "" } else { tail };
+            if prefix.is_empty() {
+                return tail.to_owned();
+            }
+            // Never turn `export type X = Y` into `export = Y` (distinct CommonJS syntax).
+            if tail.starts_with('=') {
+                return signature;
+            }
+            let kept = prefix.trim_end();
+            return if tail.is_empty() {
+                kept.to_owned()
+            } else {
+                format!("{kept} {tail}")
+            };
+        }
+    }
+    signature
 }
 
 /// Offsets within a Rust declaration where its signature starts, after outer
@@ -1222,12 +1381,25 @@ struct Row {
 }
 impl Row {
     fn display(&self) -> String {
+        self.display_with_signatures(true)
+    }
+
+    fn display_with_signatures(&self, signatures: bool) -> String {
         if let Some(end_id) = self.end_id {
             format!(
                 "#{}..#{} L{}-{} {} ({})\n",
                 self.id, end_id, self.first, self.last, self.kind, self.name
             )
-        } else if self.signature.is_empty() {
+        } else if self.name.is_empty() {
+            if !signatures || self.signature.is_empty() {
+                format!("#{} L{}-{} {}\n", self.id, self.first, self.last, self.kind)
+            } else {
+                format!(
+                    "#{} L{}-{} {} {}\n",
+                    self.id, self.first, self.last, self.kind, self.signature
+                )
+            }
+        } else if !signatures || self.signature.is_empty() {
             format!(
                 "#{} L{}-{} {} {}\n",
                 self.id, self.first, self.last, self.kind, self.name
@@ -1340,6 +1512,59 @@ fn workspace_file(ws: &Workspace, file: &str, root_given: bool) -> Result<String
     )
 }
 
+fn common_dir_prefix(paths: &[&str]) -> String {
+    fn dir_of(path: &str) -> &str {
+        path.rfind('/').map_or("", |i| &path[..=i])
+    }
+    let Some((first, rest)) = paths.split_first() else {
+        return String::new();
+    };
+    let mut common = dir_of(first);
+    for path in rest {
+        let dir = dir_of(path);
+        let shared = common
+            .bytes()
+            .zip(dir.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let cut = common[..common.floor_char_boundary(shared)]
+            .rfind('/')
+            .map_or(0, |i| i + 1);
+        common = &common[..cut];
+        if common.is_empty() {
+            break;
+        }
+    }
+    common.to_owned()
+}
+
+/// Returns a hoistable `base: <dir>/` prefix for multi-file `read_many` output
+/// when >= 2 files share a >= 2-segment directory prefix and hoisting strictly
+/// saves bytes over repeating the prefix in every `=== FILE ===` header.
+fn hoistable_read_prefix(paths: &[String]) -> Option<String> {
+    if paths.len() < 2 {
+        return None;
+    }
+    if paths
+        .iter()
+        .any(|path| crate::workspace::display_path(path) != *path)
+    {
+        return None;
+    }
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let common = common_dir_prefix(&refs);
+    let depth = common
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .count();
+    if depth < 2 {
+        return None;
+    }
+    let base_line_bytes = "base: ".len() + common.len() + 1;
+    let repeated_bytes = paths.len() * common.len();
+    (base_line_bytes < repeated_bytes).then_some(common)
+}
+
 fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool) -> Result<()> {
     ensure!(
         args.value_of("shell-range").is_none(),
@@ -1363,28 +1588,46 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
         && args.occurrences_of("limit") == 0
         && args.occurrences_of("budget") == 0;
 
+    let resolved: Vec<String> = files
+        .iter()
+        .map(|raw| workspace_file(ws, raw, root_given))
+        .collect::<Result<_>>()?;
+    let base_prefix = if json_mode {
+        None
+    } else {
+        hoistable_read_prefix(&resolved)
+    };
+
     let mut remaining = total_budget;
     let mut json_files = Vec::new();
     let mut text_out = String::new();
+    if let Some(base) = &base_prefix {
+        let line = format!("base: {base}\n");
+        remaining = remaining.saturating_sub(line.len());
+        text_out.push_str(&line);
+    }
 
-    for (idx, raw) in files.iter().enumerate() {
-        let left = files.len() - idx;
+    for (idx, file) in resolved.iter().enumerate() {
+        let left = resolved.len() - idx;
         let share = (remaining / left).max(256);
-        let file = workspace_file(ws, raw, root_given)?;
-        let mut source = Snapshot::open(ws, &file)?;
+        let header_name = base_prefix
+            .as_deref()
+            .and_then(|base| file.strip_prefix(base))
+            .unwrap_or(file.as_str());
+        let mut source = Snapshot::open(ws, file)?;
         let digest = crate::capture::source_digest(source.text.as_bytes());
         if !json_mode && !outline_forced && source.text.len() <= share {
-            let header = format!("=== {file} ===\n");
+            let header = format!("=== {header_name} ===\n");
             let full_hint = format!(
                 "full: {} read {} --fresh",
                 ws.invocation().files,
-                crate::workspace::shell_text(&file)
+                crate::workspace::shell_text(file)
             );
             let deduped = if let Some(mem) = memory.as_mut()
                 && !source.text.is_empty()
             {
                 mem.show_range(
-                    &file,
+                    file,
                     &source.revision,
                     &source.text,
                     1,
@@ -1409,7 +1652,7 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
                 if lines > 0 {
                     crate::history::saw_expand(
                         ws,
-                        &file,
+                        file,
                         1,
                         lines,
                         digest,
@@ -1420,7 +1663,7 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
             }
             continue;
         }
-        source.index(&file)?;
+        source.index(file)?;
         let page = source.page(filter, None, limit, share)?;
         if json_mode {
             let mut value = serde_json::to_value(&page)?;
@@ -1430,7 +1673,7 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
             let shown_bytes = serde_json::to_vec(&value)?.len() as u64;
             crate::history::saw_outline_measured(
                 ws,
-                &file,
+                file,
                 digest,
                 source.text.len() as u64,
                 shown_bytes,
@@ -1438,15 +1681,15 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
             remaining = remaining.saturating_sub(shown_bytes as usize);
             json_files.push(value);
         } else {
-            let header = format!("=== {file} ===\n");
+            let header = format!("=== {header_name} ===\n");
             let rendered = page.display();
             let full_hint = format!(
                 "full outline: {} read {} --outline --fresh",
                 ws.invocation().files,
-                crate::workspace::shell_text(&file)
+                crate::workspace::shell_text(file)
             );
             let deduped = if can_dedup_outline && let Some(mem) = memory.as_mut() {
-                mem.saw_outline(&file, &source.revision, &rendered, fresh, &full_hint)
+                mem.saw_outline(file, &source.revision, &rendered, fresh, &full_hint)
             } else {
                 None
             };
@@ -1459,7 +1702,7 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
                 text_out.push_str(&rendered);
                 crate::history::saw_outline_measured(
                     ws,
-                    &file,
+                    file,
                     digest,
                     source.text.len() as u64,
                     rendered.len() as u64,
@@ -2679,5 +2922,278 @@ mod tests {
             "{rs_window}"
         );
         assert!(!rs_window.contains("  struct Local1"), "{rs_window}");
+    }
+
+    #[test]
+    fn window_folds_imports_modules_and_constants_with_exact_expand() {
+        let mut src = String::new();
+        for i in 1..=6 {
+            src.push_str(&format!("use std::collections::Type{i};\n"));
+        }
+        src.push('\n');
+        for i in 1..=4 {
+            src.push_str(&format!("mod part_{i};\n"));
+        }
+        src.push('\n');
+        for i in 1..=6 {
+            src.push_str(&format!("const LIMIT_{i}: usize = {i};\n"));
+        }
+        src.push('\n');
+        for i in 1..=6 {
+            src.push_str(&format!(
+                "pub fn worker_{i}(v: usize) -> usize {{\n    let a = v + {i};\n    a * 2\n}}\n\n"
+            ));
+        }
+
+        let mut snap = Snapshot::from_text("src/lib.rs", src);
+        snap.index("src/lib.rs").unwrap();
+        let rev = snap.revision.clone();
+        let win = snap.window(1, 50).expect("window should succeed");
+        let with_sigs = win.display(true);
+        let without_sigs = win.display(false);
+
+        for rendered in [&with_sigs, &without_sigs] {
+            assert!(
+                rendered.contains("#1..#6 L1-6 imports (6 items)\n"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("#7..#10 L8-11 modules (4 items)\n"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("#11..#16 L13-18 constants (6 items)\n"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("#2 L2-2"), "{rendered}");
+            assert!(!rendered.contains("#12 L14-14"), "{rendered}");
+        }
+        assert!(
+            with_sigs
+                .contains("#17 L20-23 function worker_1  pub fn worker_1(v: usize) -> usize\n"),
+            "{with_sigs}"
+        );
+        assert!(
+            without_sigs.contains("#17 L20-23 function worker_1\n"),
+            "{without_sigs}"
+        );
+
+        // `#A..#B` from the folded window resolves exact source bytes.
+        let import_span = snap.resolve(&format!("{rev}#1..#6"), None, true).unwrap();
+        assert!(snap.text[import_span.clone()].starts_with("use std::collections::Type1;"));
+        assert!(snap.text[import_span].ends_with("use std::collections::Type6;"));
+        let const_span = snap.resolve(&format!("{rev}#11..#16"), None, true).unwrap();
+        assert!(snap.text[const_span.clone()].starts_with("const LIMIT_1: usize = 1;"));
+        assert!(snap.text[const_span].ends_with("const LIMIT_6: usize = 6;"));
+
+        // A large import preamble covering >50% of the window still folds cleanly
+        // instead of tripping the single-long-declaration guard.
+        let mut heavy_imports = String::new();
+        for i in 1..=30 {
+            heavy_imports.push_str(&format!("use crate::mod_{i}::Item{i};\n"));
+        }
+        heavy_imports.push_str("\npub fn run() {\n    let x = 1;\n    let y = x + 1;\n}\n");
+        let mut heavy = Snapshot::from_text("src/heavy.rs", heavy_imports);
+        heavy.index("src/heavy.rs").unwrap();
+        let heavy_win = heavy
+            .window(1, 35)
+            .expect("folded preamble should not reject window")
+            .display(true);
+        assert!(
+            heavy_win.contains("#1..#30 L1-30 imports (30 items)\n"),
+            "{heavy_win}"
+        );
+    }
+
+    #[test]
+    fn unfolded_imports_drop_doubled_label_and_preserve_modifiers() {
+        // Rust: 2 imports (below fold threshold of 3).
+        let rs = "use std::fs::File;\npub use crate::model::Order;\n\npub fn run() {}\n";
+        let mut rs_snap = Snapshot::from_text("src/lib.rs", rs.into());
+        rs_snap.index("src/lib.rs").unwrap();
+        let rs_page = rs_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            rs_page.contains("#1 L1-1 import std::fs::File;\n"),
+            "{rs_page}"
+        );
+        assert!(
+            rs_page.contains("#2 L2-2 import pub use crate::model::Order;\n"),
+            "{rs_page}"
+        );
+        assert!(!rs_page.contains("import import"), "{rs_page}");
+
+        // TypeScript: 2 imports.
+        let ts = "import { tax } from './tax';\nimport type { Order } from './types';\n\nexport function run() {}\n";
+        let mut ts_snap = Snapshot::from_text("src/app.ts", ts.into());
+        ts_snap.index("src/app.ts").unwrap();
+        let ts_page = ts_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            ts_page.contains("#1 L1-1 import { tax } from './tax';\n"),
+            "{ts_page}"
+        );
+        assert!(
+            ts_page.contains("#2 L2-2 import type { Order } from './types';\n"),
+            "{ts_page}"
+        );
+        assert!(!ts_page.contains("import import"), "{ts_page}");
+
+        // Python: `from ...` and `import ...`.
+        let py = "import os\nfrom pathlib import Path\n\ndef run():\n    return os.name\n";
+        let mut py_snap = Snapshot::from_text("app.py", py.into());
+        py_snap.index("app.py").unwrap();
+        let py_page = py_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(py_page.contains("#1 L1-1 import os\n"), "{py_page}");
+        assert!(
+            py_page.contains("#2 L2-2 import pathlib import Path\n"),
+            "{py_page}"
+        );
+        assert!(!py_page.contains("import import"), "{py_page}");
+
+        // Window without signatures renders `#1 L1-1 import` instead of `import import`.
+        let mut win_src = String::from("use std::io;\n\n");
+        for i in 1..=6 {
+            win_src.push_str(&format!("pub fn f{i}() {{\n    let _ = {i};\n}}\n"));
+        }
+        let mut win_snap = Snapshot::from_text("src/w.rs", win_src);
+        win_snap.index("src/w.rs").unwrap();
+        let win_nosig = win_snap.window(1, 20).expect("window").display(false);
+        assert!(win_nosig.contains("#1 L1-1 import\n"), "{win_nosig}");
+        assert!(!win_nosig.contains("import import"), "{win_nosig}");
+    }
+
+    #[test]
+    fn polyglot_slim_signature_trims_redundant_keywords_without_losing_semantics() {
+        // TypeScript: class, interface, enum, function, export, async, type alias.
+        let ts = concat!(
+            "class Foo extends Bar {\n  run(): void {}\n}\n",
+            "export class Service<T> implements Runner {\n  go(): void {}\n}\n",
+            "interface Baz {\n  id: string;\n}\n",
+            "export interface Config extends Base {\n  url: string;\n}\n",
+            "enum Mode {\n  Fast,\n}\n",
+            "export enum State {\n  Open,\n}\n",
+            "function qux(a: number, b: string): boolean {\n  return a > b.length;\n}\n",
+            "export async function fetchItem(id: string): Promise<void> {}\n",
+            "export type UserId = string;\n",
+            "export type ComplexConfig = {\n  a: string;\n  b: string;\n  c: string;\n};\n",
+        );
+        let mut ts_snap = Snapshot::from_text("src/app.ts", ts.into());
+        ts_snap.index("src/app.ts").unwrap();
+        let ts_rev = ts_snap.revision.clone();
+        let ts_out = ts_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(ts_out.contains("class Foo  extends Bar\n"), "{ts_out}");
+        assert!(
+            ts_out.contains("class Service  export <T> implements Runner\n"),
+            "{ts_out}"
+        );
+        assert!(ts_out.contains("interface Baz\n"), "{ts_out}");
+        assert!(
+            ts_out.contains("interface Config  export extends Base\n"),
+            "{ts_out}"
+        );
+        assert!(ts_out.contains("enum Mode\n"), "{ts_out}");
+        assert!(ts_out.contains("enum State  export\n"), "{ts_out}");
+        assert!(
+            ts_out.contains("function qux  (a: number, b: string): boolean\n"),
+            "{ts_out}"
+        );
+        assert!(
+            ts_out.contains("function fetchItem  export async (id: string): Promise<void>\n"),
+            "{ts_out}"
+        );
+        // Never turn `export type UserId = string;` into `export = string;`.
+        assert!(
+            ts_out.contains("type UserId  export type UserId = string;\n"),
+            "{ts_out}"
+        );
+        assert!(ts_out.contains("type ComplexConfig  export\n"), "{ts_out}");
+        // `expand` still returns exact source bytes.
+        let qux_span = ts_snap.resolve(&format!("{ts_rev}#1"), None, true).unwrap();
+        assert!(ts_snap.text[qux_span].starts_with("class Foo extends Bar {"));
+
+        // Python: class, subclass, def, async def.
+        let py = concat!(
+            "class Plain:\n    pass\n\n",
+            "class Child(Plain):\n    def calc(self, x: int) -> int:\n        return x\n\n",
+            "async def load(url: str) -> bytes:\n    return b''\n",
+        );
+        let mut py_snap = Snapshot::from_text("app.py", py.into());
+        py_snap.index("app.py").unwrap();
+        let py_out = py_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(py_out.contains("#1 L1-2 class Plain\n"), "{py_out}");
+        assert!(py_out.contains("class Child  (Plain):\n"), "{py_out}");
+        assert!(
+            py_out.contains("function Child::calc  (self, x: int) -> int:\n"),
+            "{py_out}"
+        );
+        assert!(
+            py_out.contains("function load  async (url: str) -> bytes:\n"),
+            "{py_out}"
+        );
+
+        // Go: struct, interface, generic struct, free function, receiver method.
+        let go = concat!(
+            "package demo\n\n",
+            "type Item struct {\n\tID string\n}\n\n",
+            "type Store interface {\n\tGet(id string) Item\n}\n\n",
+            "type Cache[K comparable, V any] struct {\n\tm map[K]V\n}\n\n",
+            "func run(id string) error {\n\treturn nil\n}\n\n",
+            "func (i *Item) Save() error {\n\treturn nil\n}\n",
+        );
+        let mut go_snap = Snapshot::from_text("demo.go", go.into());
+        go_snap.index("demo.go").unwrap();
+        let go_out = go_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(go_out.contains("type Item  struct\n"), "{go_out}");
+        assert!(go_out.contains("type Store  interface\n"), "{go_out}");
+        assert!(
+            go_out.contains("type Cache  [K comparable, V any] struct\n"),
+            "{go_out}"
+        );
+        assert!(
+            go_out.contains("function run  (id string) error\n"),
+            "{go_out}"
+        );
+        // Receiver `(i *Item)` is preserved untouched.
+        assert!(
+            go_out.contains("method Save  func (i *Item) Save() error\n"),
+            "{go_out}"
+        );
+    }
+
+    #[test]
+    fn read_many_hoists_common_prefix_only_when_deep_and_strictly_smaller() {
+        assert_eq!(
+            hoistable_read_prefix(&["packages/billing/src/a.ts".into()]),
+            None
+        );
+        assert_eq!(
+            hoistable_read_prefix(&["src/a.rs".into(), "src/b.rs".into()]),
+            None,
+            "1-segment prefix should not hoist"
+        );
+        assert_eq!(
+            hoistable_read_prefix(&["a/b/x.rs".into(), "a/b/y.rs".into()]),
+            None,
+            "2 files with 4-byte prefix: `base: a/b/\\n` (11 B) is not smaller than 8 B"
+        );
+        assert_eq!(
+            hoistable_read_prefix(&["a/b/x.rs".into(), "a/b/y.rs".into(), "a/b/z.rs".into()]),
+            Some("a/b/".into()),
+            "3 files with 4-byte prefix: 11 B < 12 B"
+        );
+        assert_eq!(
+            hoistable_read_prefix(&[
+                "packages/billing/src/a.ts".into(),
+                "packages/billing/src/b.ts".into(),
+            ]),
+            Some("packages/billing/src/".into())
+        );
+        assert_eq!(
+            hoistable_read_prefix(&[
+                "packages/billing/src/a.ts".into(),
+                "packages/auth/src/b.ts".into(),
+            ]),
+            None,
+            "only 1 common directory segment (`packages/`)"
+        );
     }
 }

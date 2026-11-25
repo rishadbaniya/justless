@@ -438,12 +438,12 @@ fn language_outlines_link_calls_and_tests() {
             language: "kotlin",
             file: "Billing.kt",
             rows: &[
-                "#3 L7-9 interface Ledger  interface Ledger",
-                "#5 L11-23 class InvoiceService  class InvoiceService(private val ledger: Ledger) : Ledger by ledger",
+                "#3 L7-9 interface Ledger",
+                "#5 L11-23 class InvoiceService  (private val ledger: Ledger) : Ledger by ledger",
                 "#6 L12-12 property InvoiceService::currency  val currency = \"EUR\"",
-                "#7 L14-18 method InvoiceService::total  fun total(items: List<Cents>): Cents",
-                "#8 L21-21 method InvoiceService::create  fun create(ledger: Ledger): InvoiceService",
-                "#9 L25-25 function applyTax  fun applyTax(amount: Cents): Cents",
+                "#7 L14-18 method InvoiceService::total  (items: List<Cents>): Cents",
+                "#8 L21-21 method InvoiceService::create  (ledger: Ledger): InvoiceService",
+                "#9 L25-25 function applyTax  (amount: Cents): Cents",
             ],
             expand: (
                 "applyTax",
@@ -465,13 +465,13 @@ fn language_outlines_link_calls_and_tests() {
             language: "swift",
             file: "Billing.swift",
             rows: &[
-                "#3 L5-7 protocol Ledger  protocol Ledger",
-                "#5 L9-12 struct Invoice  struct Invoice",
+                "#3 L5-7 protocol Ledger",
+                "#5 L9-12 struct Invoice",
                 "#8 L14-26 class InvoiceService  final class InvoiceService",
                 "#10 L17-19 constructor InvoiceService::init  init(ledger: Ledger)",
-                "#11 L21-25 method InvoiceService::total  func total(_ items: [Cents]) -> Cents",
-                "#12 L29-29 method InvoiceService::reset  func reset()",
-                "#13 L32-34 function applyTax  func applyTax(_ amount: Cents) -> Cents",
+                "#11 L21-25 method InvoiceService::total  (_ items: [Cents]) -> Cents",
+                "#12 L29-29 method InvoiceService::reset  ()",
+                "#13 L32-34 function applyTax  (_ amount: Cents) -> Cents",
             ],
             expand: ("InvoiceService::reset", "func reset() {}"),
             caller: (
@@ -493,12 +493,12 @@ fn language_outlines_link_calls_and_tests() {
             language: "scala",
             file: "Billing.scala",
             rows: &[
-                "#3 L7-9 trait Ledger  trait Ledger",
+                "#3 L7-9 trait Ledger",
                 "#5 L11-11 class Invoice  case class Invoice(id: String, total: Cents)",
-                "#6 L13-21 class InvoiceService  class InvoiceService(ledger: Ledger)",
-                "#8 L16-20 method InvoiceService::total  def total(items: List[Cents]): Cents =",
-                "#9 L24-24 method InvoiceService::create  def create(ledger: Ledger): InvoiceService =",
-                "#10 L27-27 function applyTax  def applyTax(amount: Cents): Cents =",
+                "#6 L13-21 class InvoiceService  (ledger: Ledger)",
+                "#8 L16-20 method InvoiceService::total  (items: List[Cents]): Cents =",
+                "#9 L24-24 method InvoiceService::create  (ledger: Ledger): InvoiceService =",
+                "#10 L27-27 function applyTax  (amount: Cents): Cents =",
             ],
             expand: (
                 "InvoiceService::create",
@@ -578,8 +578,8 @@ fn language_outlines_link_calls_and_tests() {
             rows: &[
                 "#2 L3-9 struct Invoice  pub const Invoice = struct",
                 "#3 L6-8 function Invoice::add  pub fn add(self: *Invoice, amount: u64) void",
-                "#4 L11-13 function applyTax  fn applyTax(amount: u64) u64",
-                "#5 L15-19 test \"adds tax\"  test \"adds tax\"",
+                "#4 L11-13 function applyTax  (amount: u64) u64",
+                "#5 L15-19 test \"adds tax\"",
                 "#6 L21-23 test \"applyTax\"  test applyTax",
             ],
             expand: (
@@ -601,13 +601,13 @@ fn language_outlines_link_calls_and_tests() {
             language: "elixir",
             file: "billing.ex",
             rows: &[
-                "#1 L1-26 module Shop.Billing  defmodule Shop.Billing",
-                "#2 L4-4 import import  alias Shop.Ledger",
+                "#1 L1-26 module Shop.Billing",
+                "#2 L4-4 import alias Shop.Ledger",
                 "#4 L9-9 type Shop.Billing::cents  @type cents :: non_neg_integer()",
-                "#5 L12-17 function Shop.Billing::total  def total(%__MODULE__{items: items})",
+                "#5 L12-17 function Shop.Billing::total  (%__MODULE__{items: items})",
                 "#7 L23-23 function Shop.Billing::apply_tax  defp apply_tax(amount) when is_integer(amount), do: amount * 2",
-                "#8 L25-25 macro Shop.Billing::cents  defmacro cents(value), do: value",
-                "#10 L29-29 function Shop.Printable::print  def print(document)",
+                "#8 L25-25 macro Shop.Billing::cents  (value), do: value",
+                "#10 L29-29 function Shop.Printable::print  (document)",
             ],
             expand: (
                 "Shop.Billing::apply_tax",
@@ -629,7 +629,7 @@ fn language_outlines_link_calls_and_tests() {
             language: "objc",
             file: "SHPBilling.m",
             rows: &[
-                "#1 L1-1 import import  #import \"SHPBilling.h\"",
+                "#1 L1-1 import #import \"SHPBilling.h\"",
                 "#3 L4-6 function SHPApplyTax  static NSInteger SHPApplyTax(NSInteger amount)",
                 "#4 L9-9 property SHPInvoiceService::ledger  @property (nonatomic, strong) id<SHPLedger> ledger;",
                 "#6 L22-29 method SHPInvoiceService::totalOfItems  - (NSInteger)totalOfItems:(NSArray<NSNumber *> *)items",
@@ -668,11 +668,11 @@ fn language_outlines_link_calls_and_tests() {
             language: "powershell",
             file: "Billing.psm1",
             rows: &[
-                "#1 L1-1 import import  using namespace System.Collections.Generic",
-                "#3 L4-11 class InvoiceService  class InvoiceService",
+                "#1 L1-1 import using namespace System.Collections.Generic",
+                "#3 L4-11 class InvoiceService",
                 "#4 L5-5 property InvoiceService::Currency  [string] $Currency = 'EUR'",
                 "#5 L7-10 method InvoiceService::Total  [int] Total([int[]] $Items)",
-                "#7 L22-25 function Get-InvoiceTotal  function Get-InvoiceTotal([int[]] $Items)",
+                "#7 L22-25 function Get-InvoiceTotal  ([int[]] $Items)",
             ],
             expand: (
                 "Invoke-ApplyTax",
@@ -696,12 +696,12 @@ fn language_outlines_link_calls_and_tests() {
             language: "julia",
             file: "Billing.jl",
             rows: &[
-                "#1 L1-33 module Billing  module Billing",
-                "#5 L10-13 struct Billing::Invoice  struct Invoice",
+                "#1 L1-33 module Billing",
+                "#5 L10-13 struct Billing::Invoice",
                 "#6 L15-15 constant Billing::CURRENCY  const CURRENCY = \"EUR\"",
                 "#7 L17-17 function Billing::apply_tax  apply_tax(amount::Integer) = amount * 2",
-                "#8 L19-25 function Billing::total  function total(invoice::Invoice)",
-                "#9 L27-29 macro Billing::cents  macro cents(value)",
+                "#8 L19-25 function Billing::total  (invoice::Invoice)",
+                "#9 L27-29 macro Billing::cents  (value)",
             ],
             expand: (
                 "Billing::apply_tax",
@@ -722,7 +722,7 @@ fn language_outlines_link_calls_and_tests() {
             language: "groovy",
             file: "Billing.groovy",
             rows: &[
-                "#3 L6-8 interface Ledger  interface Ledger",
+                "#3 L6-8 interface Ledger",
                 "#5 L10-28 class InvoiceService  @CompileStatic class InvoiceService",
                 "#8 L15-17 constructor InvoiceService::new  InvoiceService(Ledger ledger)",
                 "#9 L19-23 method InvoiceService::total  long total(List<Long> items)",
@@ -858,21 +858,21 @@ fn vue_svelte_and_astro_scripts_are_indexed_at_their_own_lines() {
         (
             "InvoiceTotal.vue",
             &[
-                "#2 L10-10 import import  import { applyTax } from './billing'\n",
-                "#3 L15-18 function total  function total(): number\n",
+                "#2 L10-10 import { applyTax } from './billing'\n",
+                "#3 L15-18 function total  (): number\n",
                 "#4 L20-22 function reset  const reset = () =>\n",
             ][..],
         ),
         (
             "InvoiceRow.svelte",
-            &["#2 L10-12 function taxed  function taxed(value: number): string\n"][..],
+            &["#2 L10-12 function taxed  (value: number): string\n"][..],
         ),
         (
             "Invoice.astro",
             &[
-                "#3 L5-7 interface Props  interface Props\n",
-                "#4 L11-13 function grandTotal  function grandTotal(values: number[]): number\n",
-                "#5 L20-22 function printInvoice  function printInvoice()\n",
+                "#3 L5-7 interface Props\n",
+                "#4 L11-13 function grandTotal  (values: number[]): number\n",
+                "#5 L20-22 function printInvoice  ()\n",
             ][..],
         ),
     ] {
@@ -947,7 +947,7 @@ fn extensionless_scripts_take_the_language_of_their_shebang() {
         );
     }
     let outline = success(root, &["read", "bin/deploy", "--outline"]);
-    assert!(outline.contains("#1 L2-3 function deploy_release  def deploy_release(tag):\n"));
+    assert!(outline.contains("#1 L2-3 function deploy_release  (tag):\n"));
     let map = success(root, &["map"]);
     assert!(
         map.contains("Bash 1 · JavaScript 1 · Python 1 · Ruby 1"),
@@ -4084,7 +4084,7 @@ pub fn long() -> u8 {\n    let a = 1;\n    let b = 2;\n    a + b\n}\n";
     assert!(!impact.contains("checks_kept"), "{impact}");
     let context = success(root, &["context", "--changes"]);
     assert!(
-        context.starts_with("Deleted 1 line after src/lib.rs:8 (previously line 9)\n  -9 |     let b = 2;\nprobe::long [function] at src/lib.rs:7-10\n")
+        context.starts_with("Deleted 1 line after src/lib.rs:8 (previously line 9)\n  -9 | let b = 2;\nprobe::long [function] at src/lib.rs:7-10\n")
             && !context.contains("· removed"),
         "{context}"
     );
@@ -5335,7 +5335,7 @@ fn changes_show_every_symbol_of_a_new_file_and_name_deletions() {
     fs::remove_file(root.join("old.py")).unwrap();
     let changes = success(root, &["context", "--changes", "--budget", "6000"]);
     for expected in [
-        "Deleted 2 lines after main.py:1 (previously lines 2-3)\n  -2 |     x = 1\n  -3 |     y = 2\n",
+        "Deleted 2 lines after main.py:1 (previously lines 2-3)\n  -2 | x = 1\n  -3 | y = 2\n",
         "old.py · deleted\n",
         "Changed src/engine.rs:1-29\nsrc/engine.rs:1-29 · 6 symbols: LIMIT, Engine, new, step, reset, drive\n",
         "multi::engine::drive [function] at src/engine.rs:24-29\n  calls multi::engine::Engine::step [method]",
@@ -15268,7 +15268,7 @@ fn claude_reads_outside_the_workspace_become_outlines_with_a_recall() {
         first,
         format!("[justless recall {id}] exact original Read result · 298 lines")
     );
-    assert!(rows.starts_with("#1 L1-4 function step_1  def step_1(value):\n"));
+    assert!(rows.starts_with("#1 L1-4 function step_1  (value):\n"));
     assert!(rows.ends_with("More rows start at L241; Read from offset 241 for them."));
     assert!(!content.contains("next --after") && content.len() * 2 < native.len());
     let context = output["additionalContext"].as_str().unwrap();

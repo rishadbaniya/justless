@@ -1067,7 +1067,7 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
     ))
     .unwrap();
     assert!(
-        matched.contains("#4 L4-4 import import  use std::path::PathBuf;\n"),
+        matched.contains("#4 L4-4 import std::path::PathBuf;\n"),
         "{matched}"
     );
 
@@ -1079,7 +1079,7 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
     ))
     .unwrap();
     assert!(
-        multi.contains("#4 L4-4 import import  use std::path::PathBuf;\n"),
+        multi.contains("#4 L4-4 import std::path::PathBuf;\n"),
         "{multi}"
     );
     assert!(

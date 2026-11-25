@@ -1421,4 +1421,38 @@ mod tests {
         );
         assert!(!short2.contains("unchanged since you read it"), "{short2}");
     }
+
+    #[test]
+    fn pack_excerpts_trim_deep_indentation_and_preserve_line_numbers() {
+        let src = concat!(
+            "pub mod outer {\n",
+            "    pub mod inner {\n",
+            "        pub fn compute_tariff_rate(amount: u64) -> u64 {\n",
+            "            let base = amount * 2;\n",
+            "            base + 10\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        let (_dir, workspace) = temp_workspace(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"indentdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", src),
+        ]);
+        let index = Index::open(&workspace).unwrap();
+        let out = pack_report(&workspace, &index, "compute_tariff_rate", 8000, None)
+            .unwrap()
+            .0
+            .into_string();
+        assert!(
+            out.contains("    3 | pub fn compute_tariff_rate(amount: u64) -> u64 {\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("    3 |         pub fn"),
+            "deep leading indent should be trimmed:\n{out}"
+        );
+    }
 }

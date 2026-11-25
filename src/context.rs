@@ -87,8 +87,8 @@ fn describe(definition: &Definition) -> String {
     )
 }
 
-fn format_line_spans(file: &str, spans: &BTreeSet<(usize, usize)>) -> String {
-    let list: Vec<String> = spans
+fn format_span_list(spans: &BTreeSet<(usize, usize)>) -> String {
+    spans
         .iter()
         .map(|&(start, end)| {
             if start == end {
@@ -97,8 +97,16 @@ fn format_line_spans(file: &str, spans: &BTreeSet<(usize, usize)>) -> String {
                 format!("{start}-{end}")
             }
         })
-        .collect();
-    format!("{}:{}", display_path(file), list.join(","))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_line_spans(file: &str, spans: &BTreeSet<(usize, usize)>) -> String {
+    format!("{}:{}", display_path(file), format_span_list(spans))
+}
+
+fn format_same_file_spans(spans: &BTreeSet<(usize, usize)>) -> String {
+    format!(":{}", format_span_list(spans))
 }
 
 struct QuerySection {
@@ -294,14 +302,19 @@ fn query_report(index: &Index, name: &str, view: &str, cap: usize) -> Result<Rep
                 .1
                 .insert((edge.location.start, edge.location.end));
         }
+        let def_file = index.definitions[id].location.file.as_str();
         let lines = groups
             .into_iter()
             .map(|((to, kind, inferred, file), spans)| {
                 let confidence = if inferred { "possible " } else { "" };
-                format!(
-                    "  {confidence}{kind} → {} (from {})",
-                    describe(&index.definitions[to]),
+                let origin = if file == def_file {
+                    format_same_file_spans(&spans)
+                } else {
                     format_line_spans(file, &spans)
+                };
+                format!(
+                    "  {confidence}{kind} → {} (from {origin})",
+                    describe(&index.definitions[to]),
                 )
             })
             .collect();
@@ -394,6 +407,17 @@ pub fn path(index: &Index, from: &str, to: &str, cap: usize) -> Result<()> {
 }
 
 pub fn code(workspace: &Workspace, file: &str, from: usize, to: usize, cap: usize) -> Result<()> {
+    code_with_indent(workspace, file, from, to, cap, MIN_TRIM_INDENT)
+}
+
+fn code_with_indent(
+    workspace: &Workspace,
+    file: &str,
+    from: usize,
+    to: usize,
+    cap: usize,
+    min_indent: usize,
+) -> Result<()> {
     ensure!(
         from > 0 && from <= to,
         "expected a positive, ordered line range"
@@ -402,11 +426,75 @@ pub fn code(workspace: &Workspace, file: &str, from: usize, to: usize, cap: usiz
     let shown = to.min(lines);
     let mut report = Report::new(cap);
     report.line(format!("{}:{from}-{shown}", display_path(file)));
-    snippet(workspace, file, from, shown, &mut report)?;
+    snippets_trimmed(workspace, file, &[(from, shown)], min_indent, &mut report)?;
     if shown < to && !report.clipped {
         report.line(format!("  (file ends at line {lines})"));
     }
     report.finish()
+}
+
+/// Minimum shared leading indentation width (in columns: `' '` = 1, `'\t'` = 4)
+/// trimmed from displayed code snippets in `context` / `code` reports.
+const MIN_TRIM_INDENT: usize = 4;
+/// Minimum shared leading indentation width for plain `context --at`/`--symbol`
+/// views that pair with `seen::Memory::show` (preserves parity on 1-level 4-space
+/// function bodies while still trimming deeply nested blocks).
+const SESSION_MIN_TRIM_INDENT: usize = 8;
+
+/// Leading ASCII indentation slice (`' '` and `'\t'`) of `line`.
+fn leading_indent(line: &str) -> &str {
+    let end = line
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    &line[..end]
+}
+
+/// Visual column width of an ASCII indentation slice (`' '` = 1, `'\t'` = 4).
+fn indent_width(ws: &str) -> usize {
+    ws.bytes()
+        .map(|byte| if byte == b'\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// Longest common leading ASCII indentation byte length across all non-empty
+/// lines when its visual width is at least `min_width`, or `0`.
+fn shared_indent_strip(lines: &[&str], min_width: usize) -> usize {
+    let mut shared: Option<&[u8]> = None;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let ws = leading_indent(line).as_bytes();
+        shared = Some(match shared {
+            None => ws,
+            Some(current) => {
+                let common = current
+                    .iter()
+                    .zip(ws)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                &current[..common]
+            }
+        });
+    }
+    let Some(prefix) = shared else {
+        return 0;
+    };
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    if indent_width(prefix_str) >= min_width {
+        prefix.len()
+    } else {
+        0
+    }
+}
+
+fn strip_leading_indent(line: &str, strip: usize) -> &str {
+    if strip == 0 {
+        return line;
+    }
+    let drop = strip.min(leading_indent(line).len());
+    &line[drop..]
 }
 
 /// Lines in a workspace file. A range that starts past the end is an error,
@@ -433,13 +521,14 @@ fn snippet(
     to: usize,
     report: &mut Report,
 ) -> Result<()> {
-    snippets(workspace, file, &[(from, to)], report)
+    snippets_trimmed(workspace, file, &[(from, to)], MIN_TRIM_INDENT, report)
 }
 
-fn snippets(
+fn snippets_trimmed(
     workspace: &Workspace,
     file: &str,
     windows: &[(usize, usize)],
+    min_indent: usize,
     report: &mut Report,
 ) -> Result<()> {
     if windows.is_empty() {
@@ -460,17 +549,22 @@ fn snippets(
         }
         let before = report.left();
         let mut last = None;
-        for (offset, content) in lines
+        let window_lines: Vec<(usize, &str)> = lines
             .iter()
             .enumerate()
             .skip(from.saturating_sub(1))
             .take(to.saturating_sub(from) + 1)
-        {
+            .map(|(offset, &content)| (offset + 1, content))
+            .collect();
+        let raw: Vec<&str> = window_lines.iter().map(|&(_, content)| content).collect();
+        let strip = shared_indent_strip(&raw, min_indent);
+        for (line_no, content) in window_lines {
             if report.clipped {
                 break;
             }
-            report.line(format!("  {} | {content}", offset + 1));
-            last = Some(offset + 1);
+            let shown = strip_leading_indent(content, strip);
+            report.line(format!("  {line_no} | {shown}"));
+            last = Some(line_no);
         }
         if let Some(last) = last {
             let printed = before.saturating_sub(report.left()) as u64;
@@ -526,11 +620,25 @@ pub fn symbol(
     let definition = &index.definitions[id];
     let location = &definition.location;
     let Some(memory) = memory else {
-        return code(workspace, &location.file, location.start, location.end, cap);
+        return code_with_indent(
+            workspace,
+            &location.file,
+            location.start,
+            location.end,
+            cap,
+            SESSION_MIN_TRIM_INDENT,
+        );
     };
     let text = fs::read_to_string(workspace.source_path(&location.file)?)?;
     if location.start == 0 || location.start > text.lines().count() {
-        return code(workspace, &location.file, location.start, location.end, cap);
+        return code_with_indent(
+            workspace,
+            &location.file,
+            location.start,
+            location.end,
+            cap,
+            SESSION_MIN_TRIM_INDENT,
+        );
     }
     let mut report = Report::new(cap);
     memory.show(
@@ -856,7 +964,7 @@ fn from_run_report(
                         &locations,
                         &overlapping,
                         &mut report,
-                        None,
+                        SnippetView::Report,
                     )?;
                     source += room.saturating_sub(report.left());
                 }
@@ -986,6 +1094,16 @@ fn at_location(
     }
 }
 
+enum SnippetView<'a> {
+    /// `context --at` with an active session (`seen::Memory::show` renders deltas).
+    Session(&'a mut Memory),
+    /// `context --at` without a session: trims deep shared indent (`>= 8` cols)
+    /// so single-level 4-space windows match `seen::Memory::show`.
+    AtPlain,
+    /// `context --run` and `context --changes`: trims shared indent (`>= 4` cols).
+    Report,
+}
+
 /// One symbol around a location: its calls, related tests, the other symbols
 /// the range overlaps, and source from the location.
 fn detail(
@@ -1002,6 +1120,10 @@ fn detail(
     } else {
         &[]
     };
+    let view = match memory {
+        Some(mem) => SnippetView::Session(mem),
+        None => SnippetView::AtPlain,
+    };
     detail_multi(
         workspace,
         index,
@@ -1009,7 +1131,7 @@ fn detail(
         std::slice::from_ref(location),
         keep,
         report,
-        memory,
+        view,
     )
 }
 
@@ -1022,7 +1144,7 @@ fn detail_multi(
     locations: &[Location],
     overlapping: &[usize],
     report: &mut Report,
-    memory: Option<&mut Memory>,
+    view: SnippetView<'_>,
 ) -> Result<()> {
     let definition = &index.definitions[best];
     report.line(describe(definition));
@@ -1055,10 +1177,18 @@ fn detail_multi(
             } else {
                 ""
             };
+            let origin = if edge.location.file == definition.location.file {
+                if edge.location.start == edge.location.end {
+                    format!(":{}", edge.location.start)
+                } else {
+                    format!(":{}-{}", edge.location.start, edge.location.end)
+                }
+            } else {
+                edge.location.to_string()
+            };
             report.line(format!(
-                "  {confidence}{description} {} (from {})",
+                "  {confidence}{description} {} (from {origin})",
                 describe(&index.definitions[edge.to]),
-                edge.location
             ));
             if referenced.len() >= 4 {
                 break;
@@ -1102,8 +1232,8 @@ fn detail_multi(
     let file = locations
         .first()
         .map_or(definition.location.file.as_str(), |loc| loc.file.as_str());
-    match (memory, windows.as_slice()) {
-        (Some(memory), &[(from, to)]) => {
+    match (view, windows.as_slice()) {
+        (SnippetView::Session(memory), &[(from, to)]) => {
             let text = fs::read_to_string(workspace.source_path(file)?)?;
             memory.show(
                 workspace,
@@ -1120,7 +1250,12 @@ fn detail_multi(
                 report,
             );
         }
-        _ => snippets(workspace, file, &windows, report)?,
+        (SnippetView::AtPlain | SnippetView::Session(_), _) => {
+            snippets_trimmed(workspace, file, &windows, SESSION_MIN_TRIM_INDENT, report)?
+        }
+        (SnippetView::Report, _) => {
+            snippets_trimmed(workspace, file, &windows, MIN_TRIM_INDENT, report)?
+        }
     }
     if let Some(&(first_from, _)) = windows.first()
         && definition.declaration < first_from
@@ -1519,8 +1654,16 @@ fn emit_deletion_header(file: &str, deletion: &Deletion, report: &mut Report) {
         format!(" · removed {}", symbols.join(", "))
     };
     report.line(format!("Deleted {lines} {place} ({previously}){removed}"));
-    for (offset, line) in deletion.lines.iter().take(SHOWN).enumerate() {
-        report.line(format!("  -{} | {line}", first + offset));
+    let shown: Vec<&str> = deletion
+        .lines
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect();
+    let strip = shared_indent_strip(&shown, MIN_TRIM_INDENT);
+    for (offset, line) in shown.into_iter().enumerate() {
+        let trimmed = strip_leading_indent(line, strip);
+        report.line(format!("  -{} | {trimmed}", first + offset));
     }
     if deletion.lines.len() > SHOWN {
         report.line(format!(
@@ -1592,7 +1735,15 @@ fn emit_deletions(
                 if !report.clipped {
                     let locations: Vec<Location> =
                         items.into_iter().map(|(_, location)| location).collect();
-                    detail_multi(workspace, index, id, &locations, &[], report, None)?;
+                    detail_multi(
+                        workspace,
+                        index,
+                        id,
+                        &locations,
+                        &[],
+                        report,
+                        SnippetView::Report,
+                    )?;
                 }
             }
         }
@@ -1693,7 +1844,7 @@ fn emit_changed_ranges(
                         &locations,
                         &overlapping,
                         report,
-                        None,
+                        SnippetView::Report,
                     )?;
                 }
             }
@@ -2247,8 +2398,12 @@ mod tests {
             .unwrap()
             .into_string();
         assert!(
-            deps.contains("  call → hubdemo::core_fn [function] at src/lib.rs:4-6 (from src/callers.rs:5,6,7,8,9,10,11,12)\n"),
+            deps.contains("  call → hubdemo::core_fn [function] at src/lib.rs:4-6 (from :5,6,7,8,9,10,11,12)\n"),
             "{deps}"
+        );
+        assert!(
+            !deps.contains("(from src/callers.rs:"),
+            "same-file origin should omit redundant defining path:\n{deps}"
         );
         assert_eq!(
             deps.matches("hubdemo::core_fn [function]").count(),
@@ -2524,6 +2679,141 @@ mod tests {
         assert!(
             source_bytes * 10 < ungrouped_source * 6,
             "expected >40% source byte reduction: grouped={source_bytes} vs ungrouped={ungrouped_source}\n{out}"
+        );
+    }
+
+    #[test]
+    fn shared_indent_trimming_preserves_line_numbers_and_relative_indent() {
+        let lines_4 = [
+            "    if cond {",
+            "        work();",
+            "",
+            "        done();",
+            "    }",
+        ];
+        assert_eq!(shared_indent_strip(&lines_4, MIN_TRIM_INDENT), 4);
+        assert_eq!(strip_leading_indent(lines_4[0], 4), "if cond {");
+        assert_eq!(strip_leading_indent(lines_4[1], 4), "    work();");
+        assert_eq!(strip_leading_indent(lines_4[2], 4), "");
+
+        // Fewer than 4 leading spaces stay untouched.
+        let lines_2 = ["  let a = 1;", "    let b = 2;"];
+        assert_eq!(shared_indent_strip(&lines_2, MIN_TRIM_INDENT), 0);
+
+        // Tab indentation (1 tab = 4 visual columns) trims cleanly while keeping relative tabs.
+        let lines_tab = ["\t\tif ok {", "\t\t\treturn nil", "\t\t}"];
+        assert_eq!(shared_indent_strip(&lines_tab, MIN_TRIM_INDENT), 2);
+        assert_eq!(strip_leading_indent(lines_tab[0], 2), "if ok {");
+        assert_eq!(strip_leading_indent(lines_tab[1], 2), "\treturn nil");
+
+        // End-to-end `snippets_trimmed` trims shared indent on deeply nested code
+        // while keeping exact line numbers and relative indentation.
+        let src = concat!(
+            "pub mod outer {\n",
+            "    pub mod inner {\n",
+            "        pub fn run(x: i32) -> i32 {\n",
+            "            if x > 0 {\n",
+            "                let y = x * 2;\n",
+            "\n",
+            "                y + 1\n",
+            "            } else {\n",
+            "                0\n",
+            "            }\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        let (_dir, workspace) = temp_workspace(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"indentctx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", src),
+        ]);
+        let mut trimmed = Report::new(8000);
+        snippets_trimmed(
+            &workspace,
+            "src/lib.rs",
+            &[(4, 10)],
+            MIN_TRIM_INDENT,
+            &mut trimmed,
+        )
+        .unwrap();
+        let shown = trimmed.into_string();
+        assert!(shown.contains("  4 | if x > 0 {\n"), "{shown}");
+        assert!(shown.contains("  5 |     let y = x * 2;\n"), "{shown}");
+        assert!(shown.contains("  6 | \n"), "{shown}");
+        assert!(shown.contains("  7 |     y + 1\n"), "{shown}");
+        assert!(shown.contains("  8 | } else {\n"), "{shown}");
+        assert!(shown.contains("  9 |     0\n"), "{shown}");
+        assert!(shown.contains("  10 | }\n"), "{shown}");
+        assert!(!shown.contains("  4 |             if"), "{shown}");
+
+        // `context --at` also trims deeply nested (8+ space) blocks while keeping
+        // single-level 4-space bodies aligned with `seen::Memory::show`.
+        let index = Index::open(&workspace).unwrap();
+        let mut at_report = Report::new(8000);
+        at_location(
+            &workspace,
+            &index,
+            &Location {
+                file: "src/lib.rs".into(),
+                start: 7,
+                end: 7,
+            },
+            &mut at_report,
+            None,
+        )
+        .unwrap();
+        let at_out = at_report.into_string();
+        assert!(at_out.contains("  4 | if x > 0 {\n"), "{at_out}");
+        assert!(at_out.contains("  5 |     let y = x * 2;\n"), "{at_out}");
+    }
+
+    #[test]
+    fn query_report_dedups_same_file_origin_and_keeps_cross_file_origin() {
+        let manifest =
+            "[package]\nname = \"origindemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lib = concat!(
+            "pub mod sub;\n\n",
+            "pub fn leaf(x: u32) -> u32 {\n",
+            "    x + 1\n",
+            "}\n",
+        );
+        let sub = concat!(
+            "use crate::leaf;\n\n",
+            "pub fn caller(x: u32) -> u32 {\n",
+            "    let a = leaf(x);\n",
+            "    let b = leaf(a);\n",
+            "    b\n",
+            "}\n",
+        );
+        let (_dir, workspace) = temp_workspace(&[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", lib),
+            ("src/deep/nested/sub.rs", sub),
+        ]);
+        // Wire `#[path = "deep/nested/sub.rs"] pub mod sub;` to test long path savings.
+        fs::write(
+            workspace.root.join("src/lib.rs"),
+            format!("#[path = \"deep/nested/sub.rs\"]\n{lib}"),
+        )
+        .unwrap();
+        let index = Index::open(&workspace).unwrap();
+        let deps = query_report(&index, "caller", "dependencies", 8000)
+            .unwrap()
+            .into_string();
+        assert!(deps.contains("at src/deep/nested/sub.rs:3-7\n"), "{deps}");
+        assert!(
+            deps.contains("  call → origindemo::sub::leaf")
+                || deps.contains(
+                    "  call → origindemo::leaf [function] at src/lib.rs:4-6 (from :4,5)\n"
+                ),
+            "{deps}"
+        );
+        assert!(
+            !deps.contains("(from src/deep/nested/sub.rs:"),
+            "same-file origin must not repeat long path:\n{deps}"
         );
     }
 }
