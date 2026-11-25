@@ -614,6 +614,7 @@ pub(crate) fn git_display_subcommand<'a, 'b>(mut args: &'a [&'b str]) -> &'a [&'
 pub fn legacy_hook(words: &[&str]) -> bool {
     match unwrap_tool(words) {
         ["cargo", "build" | "check" | "clippy" | "test" | "tree", ..]
+        | ["cargo", "nextest", "run", ..]
         | ["make" | "gmake" | "ninja", ..]
         | ["cmake", "--build", ..]
         | ["gradle" | "gradlew" | "./gradlew", ..]
@@ -1059,10 +1060,25 @@ pub fn approvable(words: &[&str]) -> bool {
         ),
         "cargo" => {
             !args.iter().any(|arg| {
+                let flag = arg.split_once('=').map_or(*arg, |(flag, _)| flag);
                 arg.starts_with("-Z")
-                    || arg.split_once('=').map_or(*arg, |(flag, _)| flag) == "--config"
+                    || flag == "--config"
                     || (args.first() == Some(&"doc") && *arg == "--open")
-            }) && clippy_lint_levels(args)
+                    || (args.first() == Some(&"nextest")
+                        && matches!(
+                            flag,
+                            "--config-file"
+                                | "--user-config-file"
+                                | "--tool-config-file"
+                                | "--archive-file"
+                                | "--cargo-metadata"
+                                | "--workspace-remap"
+                                | "--target-dir-remap"
+                                | "--remap-path-prefix"
+                                | "--target-runner"
+                        ))
+            }) && (args.first() != Some(&"nextest") || args.get(1) == Some(&"run"))
+                && clippy_lint_levels(args)
         }
         // `-vettool` and `-toolexec` run the program they name, `-gccgoflags` and
         // an `-extld` or `-extldflags` in `-ldflags` choose the compiler's or
@@ -1776,6 +1792,17 @@ mod tests {
             ("cargo doc --no-deps --open", false),
             ("cargo doc --config net.offline=false", false),
             ("cargo doc -Z unstable-options", false),
+            // `cargo nextest run` is approved with local paths and without config/archive overrides.
+            ("cargo nextest run", true),
+            ("cargo nextest run --workspace --locked -E test(foo)", true),
+            ("cargo nextest archive --archive-file out.tar.zst", false),
+            ("cargo nextest run --config-file nextest.toml", false),
+            ("cargo nextest run --user-config-file=user.toml", false),
+            ("cargo nextest run --archive-file tests.tar.zst", false),
+            ("cargo nextest run --cargo-metadata meta.json", false),
+            ("cargo nextest run --target-runner sh", false),
+            ("cargo nextest run --config net.offline=false", false),
+            ("cargo nextest run -Z unstable-options", false),
             // Read-only `git tag` display and `git stash list` are approved; mutating or formatted forms are not.
             ("git tag", true),
             ("git tag -l", true),
@@ -1823,5 +1850,7 @@ mod tests {
         assert!(!legacy_hook(&["git", "tag", "-d", "v1.0.0"]));
         assert!(legacy_hook(&["git", "stash", "list"]));
         assert!(!legacy_hook(&["git", "stash", "pop"]));
+        assert!(legacy_hook(&["cargo", "nextest", "run", "--workspace"]));
+        assert!(!legacy_hook(&["cargo", "nextest", "archive"]));
     }
 }

@@ -74,8 +74,13 @@ pub fn applies(words: &[&str]) -> bool {
         return false;
     }
     while let Some((first, tail)) = rest.split_first() {
+        let stripped = crate::filters::git_display_subcommand(rest);
+        if stripped.len() != rest.len() {
+            rest = stripped;
+            continue;
+        }
         match *first {
-            "--no-pager" | "-p" | "--paginate" | "--no-optional-locks" => rest = tail,
+            "-p" | "--paginate" => rest = tail,
             "-c" if !tail.is_empty() => rest = &tail[1..],
             _ => break,
         }
@@ -601,6 +606,8 @@ mod tests {
         for (words, applies_to) in [
             (&["git", "diff", "HEAD~1"][..], true),
             (&["git", "--no-pager", "show"][..], true),
+            (&["git", "-P", "diff"][..], true),
+            (&["git", "--no-optional-locks", "show"][..], true),
             (&["git", "-c", "color.ui=never", "diff"][..], true),
             (&["git", "-C", "elsewhere", "diff"][..], false),
             (&["git", "log", "-p"][..], false),

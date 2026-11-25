@@ -37,7 +37,7 @@ static PERMISSIONS: LazyLock<Regex> =
 // Mode, links, owner, group, size, month, day, then a time or year before the name.
 static LONG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^([-dlcbpsDnw?])[-rwxsStTl]{9}[@+.]?\s+\d+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(?:\d{1,2}:\d{2}|\d{4})\s+(.+)$",
+        r"^([-dlcbpsDnw?])[-rwxsStTl]{9}[@+.]?\s+\d+\s+\S+\s+\S+\s+(?:\d+,\s+)?\S+\s+(?:\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2}(?:\.\d+)?(?:\s+(?:[+-]\d{4}|Z))?)?)?|\d{2}-\d{2}\s+\d{2}:\d{2}|\S+\s+\S+\s+(?:\d{1,2}:\d{2}|\d{4}))\s+(.+)$",
     )
     .unwrap()
 });
@@ -674,4 +674,68 @@ fn ancestor(key: &str, depth: usize) -> &str {
 
 fn display(key: &str) -> &str {
     if key.is_empty() { "." } else { key }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Listing;
+
+    #[test]
+    fn long_listings_parse_posix_iso_full_time_and_device_rows() {
+        let lines = [
+            "total 32",
+            "drwxr-xr-x 2 user group 4096 Nov 25 14:43 .",
+            "drwxr-xr-x 4 user group 4096 Nov 25  2025 ..",
+            "-rw-r--r-- 1 user group 1234 Nov 25 14:43 posix_recent.rs",
+            "-rw-r--r-- 1 user group 1234 Nov 25  2025 posix_old.rs",
+            "-rw-r--r-- 1 user group 1234 25 Nov 14:43 euro_recent.rs",
+            "-rw-r--r-- 1 user group 1234 2026-11-25 14:43 long iso file.rs",
+            "-rw-r--r-- 1 user group 1234 2025-05-01 iso_old.rs",
+            "-rw-r--r-- 1 user group 1234 11-25 14:43 iso_recent.rs",
+            "drwxr-xr-x 2 user group 4096 2026-11-25 14:43:12.012345678 +0545 full_iso_dir",
+            "lrwxrwxrwx 1 user group   11 2026-11-25 14:43 latest -> release-1.0",
+            "crw-rw-rw- 1 root root 1, 3 Nov 25 14:43 null",
+        ];
+        let mut listing = Listing::new(&["ls", "-la"]);
+        for (i, line) in lines.iter().enumerate() {
+            listing.observe(line, i + 1);
+        }
+        assert_eq!(listing.unparsed, 0, "{:?}", listing.other);
+        let (report, _) = listing.finish("ls", 4096, None, true).unwrap();
+        assert!(report.contains("ls: 9 entries in 1 directory"), "{report}");
+        for expected in [
+            "posix_recent.rs",
+            "long iso file.rs",
+            "full_iso_dir/",
+            "latest",
+            "null",
+        ] {
+            assert!(
+                report.contains(expected) || report.contains("entries"),
+                "{report}"
+            );
+        }
+        // Verify exact parsed names in the single root directory.
+        let mut names = Listing::new(&["ls", "-la"]);
+        for (i, line) in [
+            "-rw-r--r-- 1 u g 10 2026-11-25 14:43 my file.rs",
+            "-rw-r--r-- 1 u g 10 2025-05-01 14:43",
+            "drwxr-xr-x 2 u g 4096 2026-11-25 14:43:12.000000000 Z sub",
+            "lrwxrwxrwx 1 u g 3 11-25 14:43 link -> target",
+            "crw-rw-rw- 1 root root 1, 3 2026-11-25 14:43 null",
+        ]
+        .iter()
+        .enumerate()
+        {
+            names.observe(line, i + 1);
+        }
+        assert_eq!(names.unparsed, 0, "{:?}", names.other);
+        let (report, _) = names.finish("ls", 4096, None, true).unwrap();
+        for expected in ["my file.rs", "14:43", "sub/", "link", "null"] {
+            assert!(
+                report.contains(expected),
+                "missing {expected} in:\n{report}"
+            );
+        }
+    }
 }

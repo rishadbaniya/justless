@@ -151,7 +151,8 @@ const ACK: Spec = Spec {
 
 pub(crate) const LS: Spec = Spec {
     flags: "-a -A -l -R -h -F -p -t -S -r -1 -U -c -u -G -d -n --all --almost-all \
-        --recursive --human-readable --classify --group-directories-first",
+        --recursive --human-readable --classify --reverse --full-time \
+        --group-directories-first",
     valued: "--sort",
     optional: "--color",
     lists: "",
@@ -465,7 +466,7 @@ pub fn route(words: &[&str]) -> Option<bool> {
     let words = crate::filters::unwrap_tool(words);
     select(words)?;
     if basename(words[0]) == "ls" {
-        return Some(parse(&words[1..], &LS)?.has(&["-l", "-R", "--recursive"]));
+        return Some(parse(&words[1..], &LS)?.has(&["-l", "--full-time", "-R", "--recursive"]));
     }
     Some(true)
 }
@@ -1657,5 +1658,10 @@ mod tests {
             );
             assert_eq!(super::read_only(words), Some(true), "{words:?}");
         }
+        assert_eq!(
+            super::route(&["ls", "--full-time", "--reverse", "src"]),
+            Some(true)
+        );
+        assert_eq!(super::route(&["ls", "--reverse", "src"]), Some(false));
     }
 }

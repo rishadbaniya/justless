@@ -96,14 +96,21 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
             }
             "stdbuf" => {
                 let mut i = 1;
-                while refs
-                    .get(i)
-                    .is_some_and(|w| w.starts_with('-') && *w != "--")
-                {
-                    i += 1;
-                }
-                if refs.get(i) == Some(&"--") {
-                    i += 1;
+                while let Some(word) = refs.get(i) {
+                    if *word == "--" {
+                        i += 1;
+                        break;
+                    }
+                    if matches!(
+                        *word,
+                        "-i" | "-o" | "-e" | "--input" | "--output" | "--error"
+                    ) {
+                        i += 2;
+                    } else if word.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
                 }
                 tail(&refs, i)?
             }
@@ -222,6 +229,14 @@ mod tests {
         assert_eq!(effective_words("command -p cat f").unwrap(), ["cat", "f"]);
         assert_eq!(effective_words("time -p cat f").unwrap(), ["cat", "f"]);
         assert_eq!(effective_words("stdbuf -oL cat f").unwrap(), ["cat", "f"]);
+        assert_eq!(
+            effective_words("stdbuf -o L -e 0 cat f").unwrap(),
+            ["cat", "f"]
+        );
+        assert_eq!(
+            effective_words("stdbuf --output L -- cat f").unwrap(),
+            ["cat", "f"]
+        );
         assert_eq!(effective_words("bash -lc 'cat f'").unwrap(), ["cat", "f"]);
         assert_eq!(
             effective_words("git --no-pager -C . diff").unwrap(),

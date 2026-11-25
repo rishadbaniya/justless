@@ -58,6 +58,7 @@ pub fn family(args: &[OsString]) -> String {
         ["git", "show", ..] => "git show",
         ["git", "log", ..] if patch() => "git log",
         ["cargo", "test", ..] => "cargo test",
+        ["cargo", "nextest", "run", ..] => "cargo nextest",
         ["go", "test", ..] => "go test",
         ["npm", "test", ..] => "npm test",
         ["pytest", ..] | ["python" | "python3", "-m", "pytest"] => "pytest",
@@ -117,7 +118,7 @@ impl Parser {
             _ if profile.is_some() => "",
             "git diff" => "diff",
             _ if commits => "diff",
-            "pytest" | "cargo test" | "go test" | "npm test" => "tests",
+            "pytest" | "cargo test" | "cargo nextest" | "go test" | "npm test" => "tests",
             _ => "",
         };
         Self {
@@ -347,6 +348,26 @@ impl Parser {
             .and_then(|s| s.strip_suffix(" ... FAILED"))
         {
             Some((name, ""))
+        } else if let Some(rest) = line
+            .strip_prefix("FAIL [")
+            .or_else(|| line.strip_prefix("TIMEOUT ["))
+            && let Some((_, tail)) = rest.split_once("] ")
+        {
+            let name = tail.trim_start();
+            // Nextest retry lines prefix the test name with `(1/2) `.
+            let name = name
+                .strip_prefix('(')
+                .and_then(|s| s.split_once(") "))
+                .filter(|(tries, _)| {
+                    tries.split_once('/').is_some_and(|(a, b)| {
+                        !a.is_empty()
+                            && !b.is_empty()
+                            && a.bytes().all(|c| c.is_ascii_digit())
+                            && b.bytes().all(|c| c.is_ascii_digit())
+                    })
+                })
+                .map_or(name, |(_, rest)| rest.trim_start());
+            (!name.is_empty()).then_some((name, ""))
         } else if let Some(entry) = line
             .strip_prefix("FAILED ")
             .or_else(|| line.strip_prefix("ERROR "))
@@ -370,6 +391,13 @@ impl Parser {
         if let Some(name) = line
             .strip_prefix("---- ")
             .and_then(|s| s.strip_suffix(" stdout ----"))
+            .or_else(|| {
+                line.strip_prefix("--- STDOUT:")
+                    .or_else(|| line.strip_prefix("--- STDERR:"))
+                    .and_then(|s| s.strip_suffix(" ---"))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
         {
             self.current_test = short(name, 240);
         }
@@ -381,6 +409,7 @@ impl Parser {
                 || line.starts_with("note:")
                 || line.starts_with("stack backtrace:")
                 || line.starts_with("---- ")
+                || line.starts_with("--- ")
             {
                 self.panic_lines = 0;
             } else if let Some(item) = self.failures.get_mut(&self.current_test) {
@@ -417,6 +446,8 @@ impl Parser {
             || line.starts_with("Tests:")
             || line.starts_with("Test Suites:")
             || line.starts_with("ok  \t")
+            || (line.starts_with("Summary [")
+                && (line.contains(" tests run:") || line.contains(" test run:")))
             || ((line.contains(" passed") || line.contains(" failed"))
                 && line.contains(" in ")
                 && line
@@ -533,8 +564,10 @@ impl Summary {
     /// lose the names of the failing tests.
     fn failing_outcome(&self) -> Option<&str> {
         static FAILED: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"\bFAILED\b|\bFAIL\b|(?:^|[^0-9])[1-9][0-9]* (?:failed|failing)\b")
-                .expect("failing outcome pattern")
+            Regex::new(
+                r"\bFAILED\b|\bFAIL\b|(?:^|[^0-9])[1-9][0-9]* (?:failed|failing|timed out)\b",
+            )
+            .expect("failing outcome pattern")
         });
         (self.kind == "tests")
             .then(|| self.outcomes.iter().find(|line| FAILED.is_match(line)))
@@ -818,5 +851,72 @@ mod tests {
             let summary = parser.finish();
             assert_eq!(summary.items.last().unwrap().detail, last, "{text}");
         }
+    }
+
+    #[test]
+    fn cargo_nextest_failures_panics_and_summaries_are_parsed() {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            family(&args("cargo nextest run --workspace")),
+            "cargo nextest"
+        );
+        assert_eq!(family(&args("cargo nextest list")), "cargo");
+
+        let failing = "\
+    Starting 3 tests across 1 binary
+        PASS [   0.004s] demo::unit test_ok
+        FAIL [   0.012s] (1/2) demo::unit test_bad
+--- STDERR:              demo::unit test_bad ---
+thread 'test_bad' panicked at src/lib.rs:42:5:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+     TIMEOUT [  60.001s] demo::unit test_hang
+------------
+     Summary [  60.020s] 3 tests run: 1 passed, 1 failed, 1 timed out, 0 skipped
+        FAIL [   0.012s] demo::unit test_bad
+     TIMEOUT [  60.001s] demo::unit test_hang
+";
+        let summary = parse("cargo nextest", failing);
+        let rendered = summary.render(None, 100).unwrap();
+        assert!(
+            rendered.contains("2 reported failing test(s)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "1 test(s): demo::unit test_bad src/lib.rs:42:5: assertion `left == right` failed left: 1 right: 2 [stdout:5-8]"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("demo::unit test_hang  [stdout:10-10]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Summary [  60.020s] 3 tests run: 1 passed, 1 failed, 1 timed out, 0 skipped"
+            ),
+            "{rendered}"
+        );
+
+        let passing = "\
+    Starting 3 tests across 1 binary
+        PASS [   0.004s] demo::unit test_ok
+        PASS [   0.005s] demo::unit test_bad
+        PASS [   0.006s] demo::unit test_hang
+------------
+     Summary [   0.015s] 3 tests run: 3 passed, 0 skipped
+";
+        let fixed = parse("cargo nextest", passing);
+        let delta = fixed.render(Some(("run-1", &summary)), 0).unwrap();
+        assert!(delta.contains("0 reported failing test(s)"), "{delta}");
+        assert!(delta.contains("- demo::unit test_bad "), "{delta}");
+        assert!(delta.contains("- demo::unit test_hang "), "{delta}");
+        assert!(
+            delta.contains("Summary [   0.015s] 3 tests run: 3 passed, 0 skipped"),
+            "{delta}"
+        );
     }
 }
