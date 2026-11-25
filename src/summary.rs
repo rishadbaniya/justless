@@ -81,6 +81,15 @@ pub struct Parser {
     current_test: String,
     /// Message lines still expected after `panicked at path:line:col:`.
     panic_lines: usize,
+    /// `go test` package and per-test diagnostic state.
+    go_tests: bool,
+    go_ok: usize,
+    go_no_tests: usize,
+    go_ok_first: usize,
+    go_ok_last: usize,
+    go_ok_samples: Vec<String>,
+    go_active: Option<(String, Vec<(usize, String)>)>,
+    go_after_fail: Option<(String, usize)>,
     /// `git show` and `git log -p` output: a commit header before each patch.
     commits: bool,
     place: Place,
@@ -140,6 +149,14 @@ impl Parser {
             failures: BTreeMap::new(),
             current_test: String::new(),
             panic_lines: 0,
+            go_tests: family == "go test" && profile.is_none(),
+            go_ok: 0,
+            go_no_tests: 0,
+            go_ok_first: 0,
+            go_ok_last: 0,
+            go_ok_samples: Vec::new(),
+            go_active: None,
+            go_after_fail: None,
             commits,
             place: Place::Between,
             patched: false,
@@ -344,8 +361,97 @@ impl Parser {
         }
     }
 
-    fn test(&mut self, line: &str, n: usize) {
-        let line = line.trim();
+    fn test(&mut self, raw: &str, n: usize) {
+        let indented = raw.starts_with([' ', '\t']);
+        let line = raw.trim();
+        if self.go_tests {
+            if line.starts_with("ok  \t") || line.starts_with("ok\t") {
+                self.go_active = None;
+                self.go_after_fail = None;
+                if self.go_ok_first == 0 {
+                    self.go_ok_first = n;
+                }
+                self.go_ok_last = n;
+                if line.contains("[no tests to run]") {
+                    self.go_no_tests += 1;
+                } else {
+                    self.go_ok += 1;
+                }
+                if self.go_ok_samples.len() < 4 {
+                    self.go_ok_samples.push(short(line, 220));
+                }
+                return;
+            }
+            if line.starts_with("?\t") && line.contains("[no test files]") {
+                self.go_active = None;
+                self.go_after_fail = None;
+                if self.go_ok_first == 0 {
+                    self.go_ok_first = n;
+                }
+                self.go_ok_last = n;
+                self.go_no_tests += 1;
+                if self.go_ok_samples.len() < 4 {
+                    self.go_ok_samples.push(short(line, 220));
+                }
+                return;
+            }
+            if line.starts_with("FAIL\t") {
+                self.go_active = None;
+                self.go_after_fail = None;
+                self.summary.outcomes.push(short(line, 220));
+                return;
+            }
+            if let Some(rest) = line
+                .strip_prefix("=== RUN")
+                .or_else(|| line.strip_prefix("=== CONT"))
+                .map(str::trim_start)
+                && !rest.is_empty()
+            {
+                self.go_after_fail = None;
+                let name = rest.split_whitespace().next().unwrap_or(rest);
+                self.go_active = Some((short(name, 240), Vec::new()));
+                return;
+            }
+            if line.starts_with("=== PAUSE")
+                || line.starts_with("--- PASS:")
+                || line.starts_with("--- SKIP:")
+                || line == "PASS"
+                || line == "FAIL"
+            {
+                self.go_active = None;
+                self.go_after_fail = None;
+                return;
+            }
+            if indented && !line.is_empty() && !line.starts_with("--- FAIL:") {
+                if let Some((name, left)) = self.go_after_fail.as_mut() {
+                    if let Some(item) = self.failures.get_mut(name.as_str()) {
+                        let snippet = short(line, 200);
+                        item.digest = crate::capture::source_digest(
+                            format!("{}{}", item.digest, snippet).as_bytes(),
+                        );
+                        item.detail = if item.detail.is_empty() {
+                            snippet
+                        } else {
+                            short(&format!("{} {}", item.detail, snippet), 440)
+                        };
+                        item.last = n;
+                    }
+                    *left -= 1;
+                    if *left == 0 {
+                        self.go_after_fail = None;
+                    }
+                    return;
+                }
+                if let Some((_, lines)) = self.go_active.as_mut() {
+                    if lines.len() < 3 {
+                        lines.push((n, short(line, 200)));
+                    }
+                    return;
+                }
+            } else if !line.starts_with("--- FAIL:") {
+                self.go_after_fail = None;
+            }
+        }
         let failed = if let Some(name) = line
             .strip_prefix("test ")
             .and_then(|s| s.strip_suffix(" ... FAILED"))
@@ -376,6 +482,8 @@ impl Parser {
             .or_else(|| line.strip_prefix("ERROR "))
         {
             Some(entry.split_once(" - ").unwrap_or((entry, "")))
+        } else if let Some(nodeid) = pytest_verbose_failure(line) {
+            Some((nodeid, ""))
         } else {
             line.strip_prefix("--- FAIL: ")
                 .map(|entry| (entry.split_whitespace().next().unwrap_or(entry), ""))
@@ -389,6 +497,32 @@ impl Parser {
                 item.digest = crate::capture::source_digest(detail.as_bytes());
                 item.detail = short(detail, 320);
                 item.last = n;
+            }
+        }
+        if self.go_tests
+            && let Some(entry) = line.strip_prefix("--- FAIL: ")
+        {
+            let name = short(entry.split_whitespace().next().unwrap_or(entry), 240);
+            if let Some((active, lines)) = self.go_active.take()
+                && active == name
+                && !lines.is_empty()
+                && let Some(item) = self.failures.get_mut(&name)
+            {
+                item.first = lines[0].0;
+                item.last = n;
+                let joined = lines
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                item.digest = crate::capture::source_digest(joined.as_bytes());
+                item.detail = short(&joined, 440);
+            } else if self
+                .failures
+                .get(&name)
+                .is_some_and(|item| item.detail.is_empty())
+            {
+                self.go_after_fail = Some((name, 3));
             }
         }
         if let Some(name) = line
@@ -451,7 +585,11 @@ impl Parser {
             || line.starts_with("ok  \t")
             || (line.starts_with("Summary [")
                 && (line.contains(" tests run:") || line.contains(" test run:")))
-            || ((line.contains(" passed") || line.contains(" failed"))
+            || ((line.contains(" passed")
+                || line.contains(" failed")
+                || line.contains(" error")
+                || line.contains(" skipped")
+                || line.contains(" xfailed"))
                 && line.contains(" in ")
                 && line
                     .trim_start_matches(['=', ' '])
@@ -483,9 +621,35 @@ impl Parser {
         }
         self.flush();
         self.summary.items.extend(self.failures.into_values());
+        let go_passed = self.go_ok + self.go_no_tests;
+        if go_passed > 4 {
+            let mut note = format!("go test: {} passed package(s)", self.go_ok);
+            if self.go_no_tests > 0 {
+                note.push_str(&format!(", {} without tests", self.go_no_tests));
+            }
+            note.push_str(&format!(
+                " [stdout:{}-{}]",
+                self.go_ok_first, self.go_ok_last
+            ));
+            self.summary.outcomes.push(note);
+        } else {
+            self.summary.outcomes.extend(self.go_ok_samples);
+        }
         self.summary.cargo = self.cargo.and_then(crate::cargo_tests::Scan::finish);
         self.summary
     }
+}
+
+/// Verbose pytest failure line (`tests/test_a.py::test_x FAILED [ 50%]`) when
+/// `--no-summary` / `-rN` omits the short test summary block.
+fn pytest_verbose_failure(line: &str) -> Option<&str> {
+    let rest = line.strip_suffix(" FAILED").or_else(|| {
+        let (before, pct) = line.rsplit_once(" [")?;
+        pct.ends_with("%]")
+            .then(|| before.strip_suffix(" FAILED"))?
+    })?;
+    let nodeid = rest.trim();
+    (nodeid.contains("::") && !nodeid.contains(' ')).then_some(nodeid)
 }
 
 /// The detail of a commit header whose message is empty.
@@ -984,5 +1148,98 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
             delta.contains("Summary [   0.015s] 3 tests run: 3 passed, 0 skipped"),
             "{delta}"
         );
+    }
+
+    #[test]
+    fn go_test_extracts_failure_diagnostics_and_compacts_many_passing_packages() {
+        // Default non-verbose `go test ./...` prints diagnostic lines after `--- FAIL:`.
+        let non_verbose = "\
+--- FAIL: TestAdd (0.00s)
+    math_test.go:18: got 3, want 4
+FAIL
+FAIL\texample.com/math\t0.004s
+ok  \texample.com/util\t0.002s
+";
+        let summary = parse("go test", non_verbose);
+        let rendered = summary.render(None, 1).unwrap();
+        assert!(
+            rendered.contains("1 test(s): TestAdd math_test.go:18: got 3, want 4 [stdout:1-2]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("FAIL\texample.com/math\t0.004s"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("ok  \texample.com/util\t0.002s"),
+            "{rendered}"
+        );
+
+        // Verbose `go test -v ./...` prints diagnostic lines between `=== RUN` and `--- FAIL:` (including subtests).
+        let verbose = "\
+=== RUN   TestParent
+=== RUN   TestParent/sub
+    parent_test.go:42: unexpected empty response
+    --- FAIL: TestParent/sub (0.00s)
+--- FAIL: TestParent (0.00s)
+FAIL
+FAIL\texample.com/api\t0.010s
+";
+        let verbose_summary = parse("go test", verbose);
+        let verbose_rendered = verbose_summary.render(None, 1).unwrap();
+        assert!(
+            verbose_rendered.contains(
+                "TestParent/sub parent_test.go:42: unexpected empty response [stdout:3-4]"
+            ),
+            "{verbose_rendered}"
+        );
+
+        // 150 passing/no-test packages never hit the 128-outcome cap and collapse to one range line.
+        let mut many = String::new();
+        for i in 1..=145 {
+            many.push_str(&format!("ok  \texample.com/pkg{i}\t0.00{i}s\n"));
+        }
+        for i in 1..=5 {
+            many.push_str(&format!("?\texample.com/empty{i}\t[no test files]\n"));
+        }
+        let many_summary = parse("go test", &many);
+        let many_rendered = many_summary.render(None, 0).unwrap();
+        assert!(
+            many_rendered
+                .contains("go test: 145 passed package(s), 5 without tests [stdout:1-150]"),
+            "{many_rendered}"
+        );
+        assert!(many_rendered.len() < 150, "{many_rendered}");
+    }
+
+    #[test]
+    fn pytest_verbose_failures_and_error_or_skipped_outcomes_are_captured() {
+        let verbose_no_summary = "\
+tests/test_a.py::test_ok PASSED [ 50%]
+tests/test_a.py::test_bad FAILED [100%]
+========================= 1 failed, 1 passed in 0.12s =========================
+";
+        let summary = parse("pytest", verbose_no_summary);
+        let rendered = summary.render(None, 1).unwrap();
+        assert!(
+            rendered.contains("1 reported failing test(s)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("tests/test_a.py::test_bad"), "{rendered}");
+
+        // When both verbose FAILED and short-summary FAILED appear, they merge into one entry.
+        let both = "\
+tests/test_a.py::test_bad FAILED [100%]
+FAILED tests/test_a.py::test_bad - AssertionError: assert 1 == 2
+========================= 1 failed in 0.05s =========================
+";
+        let merged = parse("pytest", both);
+        assert_eq!(merged.items.len(), 1);
+        assert_eq!(merged.items[0].detail, "AssertionError: assert 1 == 2");
+
+        // Error-only and skipped-only summary lines are captured.
+        let skipped = "========================= 5 skipped in 0.08s =========================\n";
+        let skipped_summary = parse("pytest", skipped);
+        assert_eq!(skipped_summary.outcomes, ["5 skipped in 0.08s"]);
     }
 }

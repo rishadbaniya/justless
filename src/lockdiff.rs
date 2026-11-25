@@ -1,5 +1,5 @@
 //! Dependency changes in lockfile patches (`Cargo.lock`, `package-lock.json`,
-//! `uv.lock`, and `go.sum`).
+//! `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `uv.lock`, and `go.sum`).
 //!
 //! A lockfile hunk says where lines changed, not which packages did. For each
 //! supported lockfile section of a `git diff` or `git show`, both revisions are
@@ -93,6 +93,9 @@ pub fn applies(words: &[&str]) -> bool {
 enum LockFormat {
     Cargo,
     Npm,
+    Yarn,
+    Pnpm,
+    Bun,
     Uv,
     GoSum,
 }
@@ -102,6 +105,9 @@ impl LockFormat {
         match Path::new(path).file_name().and_then(|n| n.to_str())? {
             "Cargo.lock" => Some(Self::Cargo),
             "package-lock.json" => Some(Self::Npm),
+            "yarn.lock" => Some(Self::Yarn),
+            "pnpm-lock.yaml" => Some(Self::Pnpm),
+            "bun.lock" => Some(Self::Bun),
             "uv.lock" => Some(Self::Uv),
             "go.sum" => Some(Self::GoSum),
             _ => None,
@@ -112,9 +118,17 @@ impl LockFormat {
 /// Describe each supported lockfile section of `patch` whose revisions Git in
 /// `cwd` can read. Line numbers start at 1, as in `justless log`.
 pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
-    if !["Cargo.lock", "package-lock.json", "uv.lock", "go.sum"]
-        .iter()
-        .any(|name| patch.contains(name))
+    if ![
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "uv.lock",
+        "go.sum",
+    ]
+    .iter()
+    .any(|name| patch.contains(name))
     {
         return Vec::new();
     }
@@ -495,10 +509,549 @@ fn gosum_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     Some(packages)
 }
 
+/// Insert a parsed package, merging dependency sets when the same
+/// `(name, version, source)` appears in several locations with matching checksums.
+/// Returns `None` if checksums conflict for the same key.
+fn insert_merged(
+    packages: &mut BTreeMap<Key, Package>,
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+    deps: BTreeSet<String>,
+) -> Option<()> {
+    let key = (name.clone(), version.clone(), source.clone());
+    match packages.get_mut(&key) {
+        Some(existing) => {
+            if existing.checksum != checksum {
+                return None;
+            }
+            let mut merged: BTreeSet<String> = existing.dependencies.drain(..).collect();
+            merged.extend(deps);
+            existing.dependencies = merged.into_iter().collect();
+        }
+        None => {
+            packages.insert(
+                key,
+                Package {
+                    name,
+                    version,
+                    source,
+                    checksum,
+                    dependencies: deps.into_iter().collect(),
+                },
+            );
+        }
+    }
+    Some(())
+}
+
+fn unquote_lock_scalar(value: &str) -> &str {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn split_npm_descriptor(spec: &str) -> Option<(&str, &str)> {
+    let spec = unquote_lock_scalar(spec);
+    if spec.len() < 3 {
+        return None;
+    }
+    let at = spec[1..].find('@')? + 1;
+    let name = &spec[..at];
+    let rest = &spec[at + 1..];
+    (!name.is_empty() && !rest.is_empty()).then_some((name, rest))
+}
+
+fn first_unquoted_item(header: &str) -> &str {
+    let mut quote = None;
+    for (idx, ch) in header.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == ',' => return &header[..idx],
+            _ => {}
+        }
+    }
+    header
+}
+
+fn yaml_key(line: &str) -> Option<&str> {
+    let mut quote = None;
+    for (idx, ch) in line.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == ':' => return Some(unquote_lock_scalar(&line[..idx])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn yarn_dep_name(line: &str) -> Option<&str> {
+    if let Some(key) = yaml_key(line)
+        && !key.is_empty()
+    {
+        return Some(key);
+    }
+    let mut quote = None;
+    for (idx, ch) in line.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch.is_ascii_whitespace() => {
+                let name = unquote_lock_scalar(&line[..idx]);
+                return (!name.is_empty()).then_some(name);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The locked packages of a Yarn lockfile (Classic v1 or Berry v2+ YAML).
+fn yarn_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    #[derive(Default)]
+    struct Entry {
+        header_name: String,
+        version: Option<String>,
+        source: Option<String>,
+        checksum: Option<String>,
+        deps: BTreeSet<String>,
+        sub: Option<&'static str>,
+        skip: bool,
+    }
+    let flush = |entry: Entry, packages: &mut BTreeMap<Key, Package>| -> Option<()> {
+        if entry.skip {
+            return Some(());
+        }
+        let version = entry.version?;
+        let name = entry
+            .source
+            .as_deref()
+            .filter(|s| !s.contains("://") && !s.contains(' '))
+            .and_then(|s| split_npm_descriptor(s).map(|(n, _)| n.to_owned()))
+            .unwrap_or(entry.header_name);
+        insert_merged(
+            packages,
+            name,
+            version,
+            entry.source,
+            entry.checksum,
+            entry.deps,
+        )
+    };
+    let mut packages = BTreeMap::new();
+    let mut current: Option<Entry> = None;
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if indent == 0 {
+            if let Some(entry) = current.take() {
+                flush(entry, &mut packages)?;
+            }
+            let header = line.trim_end().strip_suffix(':')?;
+            if unquote_lock_scalar(header) == "__metadata" {
+                current = Some(Entry {
+                    skip: true,
+                    ..Entry::default()
+                });
+                continue;
+            }
+            let first = first_unquoted_item(header);
+            let (name, _) = split_npm_descriptor(first)?;
+            current = Some(Entry {
+                header_name: name.to_owned(),
+                ..Entry::default()
+            });
+            continue;
+        }
+        let entry = current.as_mut()?;
+        if entry.skip {
+            continue;
+        }
+        if indent == 2 {
+            entry.sub = None;
+            if matches!(trimmed, "dependencies:" | "optionalDependencies:") {
+                entry.sub = Some("deps");
+            } else if trimmed.ends_with(':') {
+                entry.sub = Some("other");
+            } else if let Some((k, v)) = trimmed.split_once(':')
+                && !k.contains(' ')
+            {
+                let v = unquote_lock_scalar(v);
+                if !v.is_empty() {
+                    match k {
+                        "version" => entry.version = Some(v.to_owned()),
+                        "resolution" | "resolved" => entry.source = Some(v.to_owned()),
+                        "checksum" | "integrity" => entry.checksum = Some(v.to_owned()),
+                        _ => {}
+                    }
+                }
+            } else if let Some((k, v)) = trimmed.split_once(' ') {
+                let v = unquote_lock_scalar(v);
+                if !v.is_empty() {
+                    match k {
+                        "version" => entry.version = Some(v.to_owned()),
+                        "resolved" => entry.source = Some(v.to_owned()),
+                        "integrity" => entry.checksum = Some(v.to_owned()),
+                        _ => {}
+                    }
+                }
+            }
+        } else if indent >= 4
+            && entry.sub == Some("deps")
+            && let Some(dep) = yarn_dep_name(trimmed)
+        {
+            entry.deps.insert(dep.to_owned());
+        }
+    }
+    if let Some(entry) = current {
+        flush(entry, &mut packages)?;
+    }
+    Some(packages)
+}
+
+fn parse_pnpm_key(raw: &str) -> Option<(String, String)> {
+    let key = unquote_lock_scalar(raw.trim().strip_suffix(':')?).trim_start_matches('/');
+    let base = key.split('(').next().unwrap_or(key);
+    let (name, version) = split_npm_descriptor(base)?;
+    Some((name.to_owned(), version.to_owned()))
+}
+
+fn parse_inline_yaml_map(map: &str) -> Vec<(String, String)> {
+    let inner = map
+        .trim()
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or("");
+    let mut pairs = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    for (idx, ch) in inner.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == ',' => {
+                if let Some((k, v)) = inner[start..idx].split_once(':') {
+                    pairs.push((
+                        unquote_lock_scalar(k).to_owned(),
+                        unquote_lock_scalar(v).to_owned(),
+                    ));
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < inner.len()
+        && let Some((k, v)) = inner[start..].split_once(':')
+    {
+        pairs.push((
+            unquote_lock_scalar(k).to_owned(),
+            unquote_lock_scalar(v).to_owned(),
+        ));
+    }
+    pairs
+}
+
+/// The locked packages of a pnpm `pnpm-lock.yaml` (v6 and v9).
+fn pnpm_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        Other,
+        Packages,
+        Snapshots,
+    }
+    struct PkgEntry {
+        name: String,
+        version: String,
+        source: Option<String>,
+        repo: Option<String>,
+        commit: Option<String>,
+        checksum: Option<String>,
+        deps: BTreeSet<String>,
+        sub: Option<&'static str>,
+    }
+    let flush_pkg = |entry: PkgEntry, packages: &mut BTreeMap<Key, Package>| -> Option<()> {
+        let source = entry.source.or_else(|| match (entry.repo, entry.commit) {
+            (Some(repo), Some(commit)) => Some(format!("{repo}@{commit}")),
+            (Some(repo), None) => Some(repo),
+            _ => None,
+        });
+        insert_merged(
+            packages,
+            entry.name,
+            entry.version,
+            source,
+            entry.checksum,
+            entry.deps,
+        )
+    };
+    let mut packages = BTreeMap::new();
+    let mut snapshot_deps: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    let mut section = Section::Other;
+    let mut saw_header = false;
+    let mut current_pkg: Option<PkgEntry> = None;
+    let mut current_snap: Option<(String, String, Option<&'static str>)> = None;
+
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if indent == 0 {
+            if let Some(pkg) = current_pkg.take() {
+                flush_pkg(pkg, &mut packages)?;
+            }
+            current_snap = None;
+            if trimmed.starts_with("lockfileVersion:") {
+                saw_header = true;
+                section = Section::Other;
+            } else if trimmed == "packages:" {
+                saw_header = true;
+                section = Section::Packages;
+            } else if trimmed == "packages: {}" {
+                saw_header = true;
+                section = Section::Other;
+            } else if trimmed == "snapshots:" {
+                section = Section::Snapshots;
+            } else {
+                section = Section::Other;
+            }
+            continue;
+        }
+        match section {
+            Section::Packages => {
+                if indent == 2 {
+                    if let Some(pkg) = current_pkg.take() {
+                        flush_pkg(pkg, &mut packages)?;
+                    }
+                    let (name, version) = parse_pnpm_key(trimmed)?;
+                    current_pkg = Some(PkgEntry {
+                        name,
+                        version,
+                        source: None,
+                        repo: None,
+                        commit: None,
+                        checksum: None,
+                        deps: BTreeSet::new(),
+                        sub: None,
+                    });
+                } else if indent == 4
+                    && let Some(pkg) = current_pkg.as_mut()
+                {
+                    pkg.sub = None;
+                    if let Some(rest) = trimmed.strip_prefix("resolution:") {
+                        let rest = rest.trim();
+                        if rest.starts_with('{') && rest.ends_with('}') {
+                            for (k, v) in parse_inline_yaml_map(rest) {
+                                if v.is_empty() {
+                                    continue;
+                                }
+                                match k.as_str() {
+                                    "integrity" => pkg.checksum = Some(v),
+                                    "tarball" | "directory" => pkg.source = Some(v),
+                                    "repo" => pkg.repo = Some(v),
+                                    "commit" => pkg.commit = Some(v),
+                                    _ => {}
+                                }
+                            }
+                        } else if rest.is_empty() {
+                            pkg.sub = Some("resolution");
+                        }
+                    } else if matches!(trimmed, "dependencies:" | "optionalDependencies:") {
+                        pkg.sub = Some("deps");
+                    } else if trimmed.ends_with(':') {
+                        pkg.sub = Some("other");
+                    }
+                } else if indent >= 6
+                    && let Some(pkg) = current_pkg.as_mut()
+                {
+                    match pkg.sub {
+                        Some("resolution") => {
+                            if let Some((k, v)) = trimmed.split_once(':') {
+                                let v = unquote_lock_scalar(v);
+                                if !v.is_empty() {
+                                    match unquote_lock_scalar(k) {
+                                        "integrity" => pkg.checksum = Some(v.to_owned()),
+                                        "tarball" | "directory" => pkg.source = Some(v.to_owned()),
+                                        "repo" => pkg.repo = Some(v.to_owned()),
+                                        "commit" => pkg.commit = Some(v.to_owned()),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        Some("deps") => {
+                            if let Some(dep) = yaml_key(trimmed)
+                                && !dep.is_empty()
+                            {
+                                pkg.deps.insert(dep.to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Section::Snapshots => {
+                if indent == 2 {
+                    current_snap = parse_pnpm_key(trimmed).map(|(n, v)| (n, v, None));
+                } else if indent == 4
+                    && let Some((_, _, sub)) = current_snap.as_mut()
+                {
+                    *sub = matches!(trimmed, "dependencies:" | "optionalDependencies:")
+                        .then_some("deps");
+                } else if indent >= 6
+                    && let Some((name, version, Some("deps"))) = current_snap.as_ref()
+                    && let Some(dep) = yaml_key(trimmed)
+                    && !dep.is_empty()
+                {
+                    snapshot_deps
+                        .entry((name.clone(), version.clone()))
+                        .or_default()
+                        .insert(dep.to_owned());
+                }
+            }
+            Section::Other => {}
+        }
+    }
+    if let Some(pkg) = current_pkg {
+        flush_pkg(pkg, &mut packages)?;
+    }
+    if !saw_header {
+        return None;
+    }
+    for ((name, version), deps) in snapshot_deps {
+        for pkg in packages.values_mut() {
+            if pkg.name == name && pkg.version == version {
+                let mut merged: BTreeSet<String> = pkg.dependencies.drain(..).collect();
+                merged.extend(deps.iter().cloned());
+                pkg.dependencies = merged.into_iter().collect();
+            }
+        }
+    }
+    Some(packages)
+}
+
+/// Remove trailing commas before `]` or `}` outside JSON strings so Bun's JSONC
+/// `bun.lock` parses as standard JSON.
+fn strip_jsonc_trailing_commas(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let ch = text[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += len;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            i += len;
+            continue;
+        }
+        if ch == ',' {
+            let mut j = i + len;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if matches!(bytes.get(j), Some(b']' | b'}')) {
+                i += len;
+                continue;
+            }
+        }
+        out.push(ch);
+        i += len;
+    }
+    out
+}
+
+/// The locked third-party packages of a Bun `bun.lock` (text JSONC format).
+fn bun_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let clean = strip_jsonc_trailing_commas(text);
+    let root: serde_json::Value = serde_json::from_str(&clean).ok()?;
+    root.get("lockfileVersion")?;
+    let entries = root.get("packages")?.as_object()?;
+    let mut packages = BTreeMap::new();
+    for value in entries.values() {
+        let arr = value.as_array()?;
+        let ident = arr.first()?.as_str()?;
+        let (name, version) = split_npm_descriptor(ident)?;
+        if version.starts_with("workspace:") {
+            continue;
+        }
+        let source = arr
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let mut deps = BTreeSet::new();
+        if let Some(meta) = arr.get(2).and_then(serde_json::Value::as_object) {
+            for field in ["dependencies", "optionalDependencies"] {
+                if let Some(map) = meta.get(field).and_then(serde_json::Value::as_object) {
+                    deps.extend(map.keys().cloned());
+                }
+            }
+        }
+        let checksum = arr
+            .get(3)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        insert_merged(
+            &mut packages,
+            name.to_owned(),
+            version.to_owned(),
+            source,
+            checksum,
+            deps,
+        )?;
+    }
+    Some(packages)
+}
+
 fn parse_format(format: LockFormat, text: &str) -> Option<BTreeMap<Key, Package>> {
     match format {
         LockFormat::Cargo => packages(text),
         LockFormat::Npm => npm_packages(text),
+        LockFormat::Yarn => yarn_packages(text),
+        LockFormat::Pnpm => pnpm_packages(text),
+        LockFormat::Bun => bun_packages(text),
         LockFormat::Uv => uv_packages(text),
         LockFormat::GoSum => gosum_packages(text),
     }
@@ -1101,5 +1654,173 @@ mod tests {
             gosum.flags
         );
         assert!(compare_format(LockFormat::GoSum, "not a go.sum line", go_new).is_none());
+    }
+
+    #[test]
+    fn yarn_pnpm_and_bun_lockfiles_describe_changes_and_flag_substitutions() {
+        // Yarn Classic v1
+        let yarn_v1_old = concat!(
+            "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n",
+            "# yarn lockfile v1\n\n",
+            "\"lodash@^4.17.20\", lodash@^4.17.21:\n",
+            "  version \"4.17.21\"\n",
+            "  resolved \"https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz#aaa\"\n",
+            "  integrity sha512-oldlodash\n\n",
+            "react@^18.2.0:\n",
+            "  version \"18.2.0\"\n",
+            "  resolved \"https://registry.yarnpkg.com/react/-/react-18.2.0.tgz#bbb\"\n",
+            "  integrity sha512-react182\n",
+            "  dependencies:\n",
+            "    loose-envify \"^1.1.0\"\n\n",
+            "old-pkg@^0.1.0:\n",
+            "  version \"0.1.0\"\n",
+            "  resolved \"https://registry.yarnpkg.com/old-pkg/-/old-pkg-0.1.0.tgz\"\n",
+            "  integrity sha512-oldpkg\n",
+        );
+        let yarn_v1_new = concat!(
+            "# yarn lockfile v1\n\n",
+            "\"lodash@^4.17.20\", lodash@^4.17.21:\n",
+            "  version \"4.17.21\"\n",
+            "  resolved \"https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz#aaa\"\n",
+            "  integrity sha512-tampered\n\n",
+            "react@^18.3.0:\n",
+            "  version \"18.3.1\"\n",
+            "  resolved \"https://registry.yarnpkg.com/react/-/react-18.3.1.tgz#ccc\"\n",
+            "  integrity sha512-react183\n",
+            "  dependencies:\n",
+            "    loose-envify \"^1.1.0\"\n",
+            "    scheduler \"^0.23.0\"\n\n",
+            "\"@types/node@^22.0.0\":\n",
+            "  version \"22.0.0\"\n",
+            "  resolved \"https://registry.yarnpkg.com/@types/node/-/node-22.0.0.tgz\"\n",
+            "  integrity sha512-types\n",
+        );
+        let y1 = compare_format(LockFormat::Yarn, yarn_v1_old, yarn_v1_new).unwrap();
+        let (head, body) = y1.render("yarn.lock", 1, 200);
+        assert!(
+            head.contains("1 added, 1 removed, 1 updated, 1 with changed dependencies"),
+            "{head}"
+        );
+        assert!(body.contains("added: @types/node 22.0.0"), "{body}");
+        assert!(body.contains("removed: old-pkg 0.1.0"), "{body}");
+        assert!(body.contains("updated: react 18.2.0 -> 18.3.1"), "{body}");
+        assert!(body.contains("dependencies: react +scheduler"), "{body}");
+        assert_eq!(
+            y1.flags,
+            [
+                "checksum changed on existing version lodash 4.17.21: sha512-oldlodash -> sha512-tampered"
+            ]
+        );
+        assert!(compare_format(LockFormat::Yarn, "not a yarn stanza", yarn_v1_new).is_none());
+
+        // Yarn Berry v2+ YAML
+        let berry_old = concat!(
+            "__metadata:\n",
+            "  version: 8\n",
+            "  cacheKey: 10c0\n\n",
+            "\"@scope/pkg@npm:^1.0.0\":\n",
+            "  version: 1.0.0\n",
+            "  resolution: \"@scope/pkg@npm:1.0.0\"\n",
+            "  checksum: 10c0/aaa\n",
+            "  dependencies:\n",
+            "    dep-a: \"npm:^1.0.0\"\n",
+        );
+        let berry_new = concat!(
+            "__metadata:\n",
+            "  version: 8\n",
+            "  cacheKey: 10c0\n\n",
+            "\"@scope/pkg@npm:^1.0.0\":\n",
+            "  version: 1.0.0\n",
+            "  resolution: \"@scope/pkg@npm:1.0.0\"\n",
+            "  checksum: 10c0/bbb\n",
+            "  dependencies:\n",
+            "    dep-a: \"npm:^1.0.0\"\n",
+            "    dep-b: \"npm:^2.0.0\"\n",
+        );
+        let yb = compare_format(LockFormat::Yarn, berry_old, berry_new).unwrap();
+        assert_eq!(
+            yb.flags,
+            ["checksum changed on existing version @scope/pkg 1.0.0: 10c0/aaa -> 10c0/bbb"]
+        );
+        assert_eq!(yb.links, ["@scope/pkg +dep-b"]);
+
+        // pnpm-lock.yaml v9 (`packages:` + `snapshots:`)
+        let pnpm_old = concat!(
+            "lockfileVersion: '9.0'\n\n",
+            "packages:\n",
+            "  zod@3.23.0:\n",
+            "    resolution: {integrity: sha512-zodold}\n",
+            "  '@scope/core@1.2.0':\n",
+            "    resolution: {integrity: sha512-core1}\n\n",
+            "snapshots:\n",
+            "  zod@3.23.0: {}\n",
+            "  '@scope/core@1.2.0':\n",
+            "    dependencies:\n",
+            "      zod: 3.23.0\n",
+        );
+        let pnpm_new = concat!(
+            "lockfileVersion: '9.0'\n\n",
+            "packages:\n",
+            "  zod@3.23.8:\n",
+            "    resolution: {integrity: sha512-zodnew}\n",
+            "  '@scope/core@1.2.0':\n",
+            "    resolution: {integrity: sha512-coretampered}\n",
+            "  ms@2.1.3:\n",
+            "    resolution: {integrity: sha512-ms}\n\n",
+            "snapshots:\n",
+            "  zod@3.23.8: {}\n",
+            "  '@scope/core@1.2.0':\n",
+            "    dependencies:\n",
+            "      zod: 3.23.8\n",
+            "      ms: 2.1.3\n",
+        );
+        let pnpm = compare_format(LockFormat::Pnpm, pnpm_old, pnpm_new).unwrap();
+        let (head, body) = pnpm.render("pnpm-lock.yaml", 1, 180);
+        assert!(
+            head.contains("1 added, 1 updated, 1 with changed dependencies"),
+            "{head}"
+        );
+        assert!(body.contains("added: ms 2.1.3"), "{body}");
+        assert!(body.contains("updated: zod 3.23.0 -> 3.23.8"), "{body}");
+        assert!(body.contains("dependencies: @scope/core +ms"), "{body}");
+        assert_eq!(
+            pnpm.flags,
+            [
+                "checksum changed on existing version @scope/core 1.2.0: sha512-core1 -> sha512-coretampered"
+            ]
+        );
+        assert!(compare_format(LockFormat::Pnpm, "random: yaml\n", pnpm_new).is_none());
+
+        // bun.lock (JSONC with trailing commas)
+        let bun_old = r#"{
+          "lockfileVersion": 1,
+          "packages": {
+            "app": ["app@workspace:.", {}],
+            "hono": ["hono@4.6.0", "", { "dependencies": { "a": "^1.0.0" } }, "sha512-hono1"],
+            "a": ["a@1.0.0", "", {}, "sha512-a1"],
+          },
+        }"#;
+        let bun_new = r#"{
+          "lockfileVersion": 1,
+          "packages": {
+            "app": ["app@workspace:.", {}],
+            "hono": ["hono@4.7.0", "", { "dependencies": { "a": "^1.0.0", "b": "^2.0.0" } }, "sha512-hono2"],
+            "a": ["a@1.0.0", "", {}, "sha512-a-tampered"],
+            "b": ["b@2.0.0", "", {}, "sha512-b1"],
+          },
+        }"#;
+        let bun = compare_format(LockFormat::Bun, bun_old, bun_new).unwrap();
+        let (head, body) = bun.render("bun.lock", 1, 120);
+        assert!(
+            head.contains("1 added, 1 updated, 1 with changed dependencies"),
+            "{head}"
+        );
+        assert!(body.contains("added: b 2.0.0"), "{body}");
+        assert!(body.contains("updated: hono 4.6.0 -> 4.7.0"), "{body}");
+        assert!(body.contains("dependencies: hono +b"), "{body}");
+        assert_eq!(
+            bun.flags,
+            ["checksum changed on existing version a 1.0.0: sha512-a1 -> sha512-a-tampered"]
+        );
     }
 }

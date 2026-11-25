@@ -899,7 +899,9 @@ impl Parsers {
                 header_end: header_end.unwrap_or_else(|| {
                     body.or_else(|| extent.child_by_field_name("body"))
                         .or_else(|| header_boundary(grammar, extent))
-                        .map_or(extent.end_byte(), |body| body.start_byte())
+                        .map(|boundary| boundary.start_byte())
+                        .or_else(|| value_initializer_end(*node, *name_node, extent, kind, source))
+                        .unwrap_or(extent.end_byte())
                 }),
                 name,
                 path,
@@ -1093,6 +1095,22 @@ fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 fn header_boundary(grammar: Grammar, node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     match grammar {
+        Grammar::Go => match node.kind() {
+            "type_spec" => {
+                let ty = node.child_by_field_name("type")?;
+                let mut ty_cursor = ty.walk();
+                match ty.kind() {
+                    "struct_type" => ty
+                        .named_children(&mut ty_cursor)
+                        .find(|child| child.kind() == "field_declaration_list"),
+                    "interface_type" => ty
+                        .children(&mut ty_cursor)
+                        .find(|child| child.kind() == "{"),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
         Grammar::Elixir => node
             .named_children(&mut cursor)
             .find(|child| child.kind() == "do_block"),
@@ -1146,6 +1164,47 @@ fn header_block(grammar: Grammar, node: Node<'_>) -> Option<Node<'_>> {
         }
         _ => None,
     }
+}
+
+/// For multi-line or long (>80-byte) value/type-alias declarations without a
+/// block body, stop the outline header before the top-level `=` so large object,
+/// array, or union initializers don't flood outlines while short single-line
+/// constants and aliases keep their value.
+fn value_initializer_end(
+    node: Node<'_>,
+    name_node: Node<'_>,
+    extent: Node<'_>,
+    kind: &str,
+    source: &str,
+) -> Option<usize> {
+    if !matches!(
+        kind,
+        "type" | "constant" | "variable" | "property" | "field" | "local"
+    ) {
+        return None;
+    }
+    let fragment = source.get(extent.start_byte()..extent.end_byte())?;
+    if !fragment.contains('\n') && fragment.len() <= 80 {
+        return None;
+    }
+    let find_eq = |container: Node<'_>| {
+        let mut cursor = container.walk();
+        container
+            .children(&mut cursor)
+            .find(|child| child.kind() == "=" && child.start_byte() >= name_node.end_byte())
+            .map(|eq| eq.start_byte())
+    };
+    let mut current = Some(name_node);
+    while let Some(ancestor) = current {
+        if let Some(pos) = find_eq(ancestor) {
+            return Some(pos);
+        }
+        if ancestor == extent || ancestor == node {
+            break;
+        }
+        current = ancestor.parent();
+    }
+    find_eq(node).or_else(|| (extent != node).then(|| find_eq(extent)).flatten())
 }
 
 // Swift extensions and Scala companion objects add members to a type declared
@@ -1566,6 +1625,71 @@ mod tests {
         assert_eq!(
             blanked.split_whitespace().collect::<Vec<_>>(),
             ["FOO_BAR(x);", "@end"]
+        );
+    }
+
+    #[test]
+    fn outline_headers_trim_go_struct_bodies_and_long_polyglot_initializers() {
+        let mut parsers = Parsers::default();
+
+        let go_src = concat!(
+            "package server\n\n",
+            "type Server struct {\n",
+            "    addr string\n",
+            "    port int\n",
+            "}\n\n",
+            "type Handler interface {\n",
+            "    Serve(req string) error\n",
+            "}\n",
+        );
+        let go_facts = parsers.parse(Grammar::Go, go_src).unwrap();
+        let sig = |facts: &Facts, src: &str, name: &str| {
+            let def = facts.definitions.iter().find(|d| d.name == name).unwrap();
+            src[def.signature_start..def.header_end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(sig(&go_facts, go_src, "Server"), "Server struct");
+        assert_eq!(sig(&go_facts, go_src, "Handler"), "Handler interface");
+
+        let ts_src = concat!(
+            "export type UserId = string;\n",
+            "export type ComplexConfig = {\n",
+            "  endpoint: string;\n",
+            "  retries: number;\n",
+            "  timeoutMs: number;\n",
+            "};\n",
+            "export const handle = (id: UserId): Promise<void> => {\n",
+            "  return Promise.resolve();\n",
+            "};\n",
+        );
+        let ts_facts = parsers.parse(Grammar::TypeScript, ts_src).unwrap();
+        assert_eq!(
+            sig(&ts_facts, ts_src, "UserId"),
+            "export type UserId = string;"
+        );
+        assert_eq!(
+            sig(&ts_facts, ts_src, "ComplexConfig"),
+            "export type ComplexConfig"
+        );
+        assert_eq!(
+            sig(&ts_facts, ts_src, "handle"),
+            "export const handle = (id: UserId): Promise<void> =>"
+        );
+
+        let kt_src = concat!(
+            "val LIMIT = 42\n",
+            "val DEFAULT_RULES: List<String> = listOf(\n",
+            "    \"rule-one\",\n",
+            "    \"rule-two\",\n",
+            ")\n",
+        );
+        let kt_facts = parsers.parse(Grammar::Kotlin, kt_src).unwrap();
+        assert_eq!(sig(&kt_facts, kt_src, "LIMIT"), "val LIMIT = 42");
+        assert_eq!(
+            sig(&kt_facts, kt_src, "DEFAULT_RULES"),
+            "val DEFAULT_RULES: List<String>"
         );
     }
 }
