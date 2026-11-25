@@ -890,7 +890,7 @@ mod tests {
 
         let view = compact_list("cat index.html docs.mdx");
         assert!(view.contains("index.html lines"), "{view}");
-        assert!(view.contains("heading Section "), "{view}");
+        assert!(view.contains("h2 Section "), "{view}");
 
         // Even under the default 600-line `read_outline_lines` threshold, a huge
         // 1-line minified JSON file in a mixed read list compacts and outlines its keys.

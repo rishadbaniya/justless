@@ -3684,10 +3684,10 @@ mod tests {
             syms.iter()
                 .map(|(n, k, ..)| (k.as_str(), n.as_str()))
                 .collect::<Vec<_>>(),
-            [("heading", "Overview"), ("heading", "Install")]
+            [("h1", "Overview"), ("h2", "Install")]
         );
         let page = snap.page("", None, 40, 4096).unwrap().display();
-        assert!(page.contains("heading Overview"), "{page}");
-        assert!(page.contains("heading Install"), "{page}");
+        assert!(page.contains("h1 Overview\n"), "{page}");
+        assert!(page.contains("h2 Install\n"), "{page}");
     }
 }

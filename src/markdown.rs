@@ -14,6 +14,9 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+const MIN_CODE_LINES: usize = 15;
+const MIN_TABLE_ROWS: usize = 8;
+
 /// A heading outside any block quote or list item. Lines are 0-based.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heading {
@@ -29,11 +32,52 @@ pub struct Heading {
 
 /// A heading and its section, which runs until the next heading of the same
 /// or a higher level.
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Section {
     pub heading: Heading,
     /// The line after the section: the next such heading's first line, or the
     /// line count.
+    pub end: usize,
+}
+
+/// The kind of structural block emitted in a Markdown outline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    FrontMatter,
+    Heading(usize),
+    Code,
+    Table,
+}
+
+impl BlockKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FrontMatter => "frontmatter",
+            Self::Heading(1) => "h1",
+            Self::Heading(2) => "h2",
+            Self::Heading(3) => "h3",
+            Self::Heading(4) => "h4",
+            Self::Heading(5) => "h5",
+            Self::Heading(6) | Self::Heading(_) => "h6",
+            Self::Code => "code",
+            Self::Table => "table",
+        }
+    }
+}
+
+/// A structural block in a Markdown outline. Line indices are 0-based.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlineBlock {
+    pub kind: BlockKind,
+    /// Compact label for the outline row (heading title, frontmatter keys,
+    /// fenced code language, or table header columns and row count).
+    pub name: String,
+    /// First 0-based line of the block.
+    pub first: usize,
+    /// Last 0-based line of the block's header (for `--match` searching).
+    pub header_last: usize,
+    /// Exclusive 0-based end line of the block (`first < end <= lines.len()`).
     pub end: usize,
 }
 
@@ -51,10 +95,8 @@ pub fn headings<S: AsRef<str>>(lines: &[S]) -> Vec<Heading> {
     scanner.headings
 }
 
-/// The sections of a Markdown file, in heading order.
-pub fn sections<S: AsRef<str>>(lines: &[S]) -> Vec<Section> {
-    let headings = headings(lines);
-    let mut ends = vec![lines.len(); headings.len()];
+fn section_ends(headings: &[Heading], total_lines: usize) -> Vec<usize> {
+    let mut ends = vec![total_lines; headings.len()];
     let mut open = Vec::<usize>::new();
     for (index, heading) in headings.iter().enumerate() {
         while let Some(&outer) = open.last()
@@ -65,11 +107,64 @@ pub fn sections<S: AsRef<str>>(lines: &[S]) -> Vec<Section> {
         }
         open.push(index);
     }
+    ends
+}
+
+/// The sections of a Markdown file, in heading order.
+#[allow(dead_code)]
+pub fn sections<S: AsRef<str>>(lines: &[S]) -> Vec<Section> {
+    let headings = headings(lines);
+    let ends = section_ends(&headings, lines.len());
     headings
         .into_iter()
         .zip(ends)
         .map(|(heading, end)| Section { heading, end })
         .collect()
+}
+
+/// The structural blocks of a Markdown file for `read --outline`: YAML
+/// frontmatter (when present), top-level headings (`h1`..`h6`) with their full
+/// section spans, large top-level fenced code blocks (`>= 15` lines), and large
+/// top-level GFM pipe tables (`>= 8` data rows), sorted in document order.
+pub fn outline_blocks<S: AsRef<str>>(lines: &[S]) -> Vec<OutlineBlock> {
+    let fm_end = front_matter(lines);
+    let mut scanner = Scanner {
+        collect_blocks: true,
+        ..Scanner::default()
+    };
+    for (number, line) in lines.iter().enumerate().skip(fm_end) {
+        let mut line = line.as_ref();
+        if number == 0 {
+            line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        }
+        scanner.line(number, line);
+    }
+    scanner.finish(lines.len());
+
+    let mut blocks =
+        Vec::with_capacity(usize::from(fm_end > 0) + scanner.headings.len() + scanner.blocks.len());
+    if fm_end > 0 {
+        blocks.push(OutlineBlock {
+            kind: BlockKind::FrontMatter,
+            name: front_matter_label(&lines[..fm_end]),
+            first: 0,
+            header_last: fm_end - 1,
+            end: fm_end,
+        });
+    }
+    let ends = section_ends(&scanner.headings, lines.len());
+    for (heading, end) in scanner.headings.into_iter().zip(ends) {
+        blocks.push(OutlineBlock {
+            kind: BlockKind::Heading(heading.level),
+            name: heading.title,
+            first: heading.first,
+            header_last: heading.last,
+            end,
+        });
+    }
+    blocks.extend(scanner.blocks);
+    blocks.sort_by_key(|block| (block.first, std::cmp::Reverse(block.end)));
+    blocks
 }
 
 /// The lines a YAML front matter block takes at the top of a file: `---`
@@ -100,6 +195,9 @@ struct Scanner<'a> {
     /// The open leaf block, inside the innermost container.
     leaf: Leaf<'a>,
     headings: Vec<Heading>,
+    /// Whether to also collect large top-level fenced code blocks and GFM tables.
+    collect_blocks: bool,
+    blocks: Vec<OutlineBlock>,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +225,16 @@ enum Leaf<'a> {
     Fence {
         marker: u8,
         width: usize,
+        first: usize,
+        label: String,
+        top_level: bool,
+    },
+    /// A top-level GFM pipe table.
+    Table {
+        header_line: usize,
+        headers: Vec<String>,
+        data_rows: usize,
+        last_line: usize,
     },
     /// An indented code block.
     Code,
@@ -229,15 +337,60 @@ impl<'a> Scanner<'a> {
         }
         let continued = matched == self.containers.len();
         let blank = indentation(text, at).1 == text.len();
-        // The open code or HTML block takes the line when its containers do.
+        // The open code, table or HTML block takes the line when its containers do.
         if continued {
             match self.leaf {
-                Leaf::Fence { marker, width } => {
+                Leaf::Fence {
+                    marker,
+                    width,
+                    first,
+                    ref label,
+                    top_level,
+                } => {
                     let (indent, next) = indentation(text, at);
                     if indent <= 3 && closes_fence(&text[next..], marker, width) {
+                        let end = number + 1;
+                        if self.collect_blocks && top_level && end - first >= MIN_CODE_LINES {
+                            let name = label.clone();
+                            self.blocks.push(OutlineBlock {
+                                kind: BlockKind::Code,
+                                name,
+                                first,
+                                header_last: first,
+                                end,
+                            });
+                        }
                         self.leaf = Leaf::None;
                     }
                     return;
+                }
+                Leaf::Table { .. } => {
+                    if blank {
+                        self.finish_table();
+                        return;
+                    }
+                    let (indent, next) = indentation(text, at);
+                    let rest = &text[next..];
+                    let interrupts = indent <= 3
+                        && (rest.starts_with('>')
+                            || atx(rest).is_some()
+                            || fence(rest).is_some()
+                            || html(rest, true).is_some()
+                            || thematic_break(rest)
+                            || list_marker(rest, true).is_some());
+                    if !interrupts && has_unescaped_pipe(rest) {
+                        if let Leaf::Table {
+                            data_rows,
+                            last_line,
+                            ..
+                        } = &mut self.leaf
+                        {
+                            *data_rows += 1;
+                            *last_line = number;
+                        }
+                        return;
+                    }
+                    self.finish_table();
                 }
                 Leaf::Code if blank || indentation(text, at).0 >= 4 => return,
                 Leaf::Code => self.leaf = Leaf::None,
@@ -307,7 +460,20 @@ impl<'a> Scanner<'a> {
                 return;
             }
             if let Some((marker, width)) = fence(rest) {
-                self.start(&mut matched, Leaf::Fence { marker, width });
+                self.start(&mut matched, Leaf::None);
+                let top_level = self.containers.is_empty();
+                let label = if self.collect_blocks && top_level {
+                    fence_label(line.slice(next + width..text.len()))
+                } else {
+                    String::new()
+                };
+                self.leaf = Leaf::Fence {
+                    marker,
+                    width,
+                    first: number,
+                    label,
+                    top_level,
+                };
                 return;
             }
             if let Some(end) = html(rest, paragraph || lazy) {
@@ -326,6 +492,14 @@ impl<'a> Scanner<'a> {
             }
             if thematic_break(rest) {
                 self.start(&mut matched, Leaf::None);
+                return;
+            }
+            if self.collect_blocks
+                && paragraph
+                && self.containers.is_empty()
+                && let Some(cols) = table_delimiter_columns(rest)
+                && self.start_table(number, cols)
+            {
                 return;
             }
             if let Some((padding, empty)) = list_marker(rest, paragraph) {
@@ -415,6 +589,315 @@ impl<'a> Scanner<'a> {
         }
         self.leaf = Leaf::None;
         true
+    }
+
+    /// Promotes the open paragraph's last line into a top-level GFM pipe table
+    /// when its cell count matches the delimiter row's `cols`.
+    fn start_table(&mut self, number: usize, cols: usize) -> bool {
+        let Leaf::Paragraph { lines, definitions } = &self.leaf else {
+            return false;
+        };
+        if lines.len() <= *definitions {
+            return false;
+        }
+        let Some(&(header_line, header_text)) = lines.last() else {
+            return false;
+        };
+        let Some(headers) = split_table_cells(header_text) else {
+            return false;
+        };
+        if headers.len() != cols {
+            return false;
+        }
+        self.leaf = Leaf::Table {
+            header_line,
+            headers,
+            data_rows: 0,
+            last_line: number,
+        };
+        true
+    }
+
+    fn finish_table(&mut self) {
+        if let Leaf::Table {
+            header_line,
+            headers,
+            data_rows,
+            last_line,
+        } = std::mem::take(&mut self.leaf)
+            && self.collect_blocks
+            && data_rows >= MIN_TABLE_ROWS
+        {
+            self.blocks.push(OutlineBlock {
+                kind: BlockKind::Table,
+                name: table_label(&headers, data_rows),
+                first: header_line,
+                header_last: header_line,
+                end: last_line + 1,
+            });
+        }
+    }
+
+    /// Flushes any top-level fenced code block or table that reaches EOF.
+    fn finish(&mut self, total_lines: usize) {
+        match std::mem::take(&mut self.leaf) {
+            Leaf::Fence {
+                first,
+                label,
+                top_level,
+                ..
+            } if self.collect_blocks
+                && top_level
+                && total_lines.saturating_sub(first) >= MIN_CODE_LINES =>
+            {
+                self.blocks.push(OutlineBlock {
+                    kind: BlockKind::Code,
+                    name: label,
+                    first,
+                    header_last: first,
+                    end: total_lines,
+                });
+            }
+            Leaf::Table {
+                header_line,
+                headers,
+                data_rows,
+                last_line,
+            } if self.collect_blocks && data_rows >= MIN_TABLE_ROWS => {
+                self.blocks.push(OutlineBlock {
+                    kind: BlockKind::Table,
+                    name: table_label(&headers, data_rows),
+                    first: header_line,
+                    header_last: header_line,
+                    end: last_line + 1,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn clip_label(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    if max < 3 {
+        return String::new();
+    }
+    let mut end = max - 3;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// Extracts a top-level (column-0) YAML mapping key from a frontmatter line.
+fn yaml_top_level_key(line: &str) -> Option<&str> {
+    let line = line.trim_end_matches('\r');
+    let first = *line.as_bytes().first()?;
+    if matches!(first, b' ' | b'\t' | b'#' | b'-' | b'?' | b':') {
+        return None;
+    }
+    if first == b'"' || first == b'\'' {
+        let bytes = line.as_bytes();
+        let mut i = 1;
+        while i < bytes.len() {
+            if first == b'"' && bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == first {
+                if first == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                let after = line[i + 1..].trim_start_matches([' ', '\t']);
+                if after
+                    .strip_prefix(':')
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+                {
+                    let key = line[1..i].trim();
+                    return (!key.is_empty()).then_some(key);
+                }
+                return None;
+            }
+            i += 1;
+        }
+        return None;
+    }
+    for (idx, _) in line.match_indices(':') {
+        let after = line.as_bytes().get(idx + 1);
+        if after.is_none_or(|&byte| byte == b' ' || byte == b'\t') {
+            let key = line[..idx].trim();
+            return (!key.is_empty()).then_some(key);
+        }
+    }
+    None
+}
+
+fn front_matter_label<S: AsRef<str>>(lines: &[S]) -> String {
+    let body = lines
+        .get(1..lines.len().saturating_sub(1))
+        .unwrap_or_default();
+    let mut keys: Vec<&str> = Vec::new();
+    for line in body {
+        if let Some(key) = yaml_top_level_key(line.as_ref())
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return "yaml".to_owned();
+    }
+    let mut shown: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for (idx, key) in keys.iter().enumerate() {
+        if idx == 0 {
+            let first = clip_label(key, 48);
+            len = first.len();
+            shown.push(first);
+            continue;
+        }
+        if shown.len() >= 6 || len + 2 + key.len() > 72 {
+            break;
+        }
+        len += 2 + key.len();
+        shown.push((*key).to_owned());
+    }
+    let remaining = keys.len().saturating_sub(shown.len());
+    if remaining == 0 {
+        format!("keys: {}", shown.join(", "))
+    } else {
+        format!("keys: {}, +{remaining} more", shown.join(", "))
+    }
+}
+
+fn fence_label(info: &str) -> String {
+    let token = info.split_whitespace().next().unwrap_or("");
+    let lang = if let Some(inner) = token.strip_prefix('{') {
+        inner
+            .trim_end_matches('}')
+            .strip_prefix('.')
+            .and_then(|rest| rest.split([',', ' ', '\t']).next())
+            .unwrap_or("")
+    } else {
+        token.split([',', '{']).next().unwrap_or("")
+    };
+    let lang = lang.trim();
+    if lang.is_empty() {
+        "block".to_owned()
+    } else {
+        clip_label(lang, 32)
+    }
+}
+
+fn has_unescaped_pipe(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'\\' | b'|') {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'|' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn unescape_table_cell(raw: &str) -> String {
+    let trimmed = raw.trim_matches([' ', '\t']);
+    if !trimmed.contains(r"\|") {
+        return trimmed.to_owned();
+    }
+    trimmed.replace(r"\|", "|")
+}
+
+/// Splits a GFM table row on unescaped `|`, stripping optional outer pipes.
+fn split_table_cells(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim_matches([' ', '\t', '\r']);
+    let bytes = trimmed.as_bytes();
+    let mut pipes = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'\\' | b'|') {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'|' {
+            pipes.push(i);
+        }
+        i += 1;
+    }
+    if pipes.is_empty() || trimmed == "|" {
+        return None;
+    }
+    let leading_pipe = pipes.first() == Some(&0);
+    let trailing_pipe =
+        pipes.last() == Some(&(bytes.len() - 1)) && !(leading_pipe && pipes.len() == 1);
+    let start = usize::from(leading_pipe);
+    let end = if trailing_pipe {
+        bytes.len() - 1
+    } else {
+        bytes.len()
+    };
+    let inner_pipes = &pipes[usize::from(leading_pipe)..pipes.len() - usize::from(trailing_pipe)];
+    let mut cells = Vec::with_capacity(inner_pipes.len() + 1);
+    let mut pos = start;
+    for &pipe in inner_pipes {
+        cells.push(unescape_table_cell(&trimmed[pos..pipe]));
+        pos = pipe + 1;
+    }
+    cells.push(unescape_table_cell(&trimmed[pos..end]));
+    Some(cells)
+}
+
+/// Column count of a GFM table delimiter row (e.g. `| --- | ---: |`), or `None`.
+fn table_delimiter_columns(line: &str) -> Option<usize> {
+    let cells = split_table_cells(line)?;
+    let valid = !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let inner = cell.trim_matches([' ', '\t']);
+            let inner = inner.strip_prefix(':').unwrap_or(inner);
+            let inner = inner.strip_suffix(':').unwrap_or(inner);
+            !inner.is_empty() && inner.bytes().all(|byte| byte == b'-')
+        });
+    valid.then_some(cells.len())
+}
+
+fn table_label(headers: &[String], data_rows: usize) -> String {
+    let non_empty: Vec<String> = headers
+        .iter()
+        .map(|cell| cell.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        let noun = if headers.len() == 1 { "col" } else { "cols" };
+        return format!("{} {noun} ({data_rows} rows)", headers.len());
+    }
+    let mut shown: Vec<String> = Vec::new();
+    let mut len = 0usize;
+    for (idx, cell) in non_empty.iter().enumerate() {
+        if idx == 0 {
+            let first = clip_label(cell, 48);
+            len = first.len();
+            shown.push(first);
+            continue;
+        }
+        if shown.len() >= 5 || len + 3 + cell.len() > 64 {
+            break;
+        }
+        len += 3 + cell.len();
+        shown.push(cell.clone());
+    }
+    let remaining = non_empty.len().saturating_sub(shown.len());
+    if remaining == 0 {
+        format!("{} ({data_rows} rows)", shown.join(" | "))
+    } else {
+        format!("{} | +{remaining} ({data_rows} rows)", shown.join(" | "))
     }
 }
 
@@ -856,6 +1339,253 @@ mod tests {
                 ("D".to_owned(), 7, 8),
                 ("E".to_owned(), 8, 9)
             ]
+        );
+    }
+
+    fn blocks(text: &str) -> Vec<(&'static str, String, usize, usize)> {
+        let lines: Vec<&str> = text.lines().collect();
+        outline_blocks(&lines)
+            .into_iter()
+            .map(|b| (b.kind.as_str(), b.name, b.first + 1, b.end))
+            .collect()
+    }
+
+    #[test]
+    fn outline_blocks_extracts_frontmatter_keys_and_spans() {
+        let doc = concat!(
+            "---\n",
+            "title: Guide\n",
+            "# ignored: comment\n",
+            "description: |\n",
+            "  indented: ignored\n",
+            "tags:\n",
+            "  - rust\n",
+            "\"og:title\": Social\n",
+            "'author': Ada\n",
+            "---\n",
+            "# Overview\n",
+            "Body.\n",
+        );
+        assert_eq!(
+            blocks(doc),
+            [
+                (
+                    "frontmatter",
+                    "keys: title, description, tags, og:title, author".to_owned(),
+                    1,
+                    10
+                ),
+                ("h1", "Overview".to_owned(), 11, 12),
+            ]
+        );
+
+        // `...` closes frontmatter, and empty frontmatter falls back to `yaml`.
+        assert_eq!(
+            blocks("---\n---\n# After\n"),
+            [
+                ("frontmatter", "yaml".to_owned(), 1, 2),
+                ("h1", "After".to_owned(), 3, 3),
+            ]
+        );
+        assert_eq!(
+            blocks("---\na: 1\nb: 2\nc: 3\nd: 4\ne: 5\nf: 6\ng: 7\nh: 8\n...\n# Done\n"),
+            [
+                (
+                    "frontmatter",
+                    "keys: a, b, c, d, e, f, +2 more".to_owned(),
+                    1,
+                    10
+                ),
+                ("h1", "Done".to_owned(), 11, 11),
+            ]
+        );
+        // Thematic break followed by blank line is not frontmatter.
+        assert_eq!(
+            blocks("---\n\n# Project\n"),
+            [("h1", "Project".to_owned(), 3, 3)]
+        );
+    }
+
+    #[test]
+    fn outline_blocks_emits_heading_levels_for_atx_and_setext() {
+        let doc = concat!(
+            "Setext One\n",
+            "==========\n",
+            "Intro.\n",
+            "\n",
+            "Setext Two\n",
+            "----------\n",
+            "### Three\n",
+            "#### Four\n",
+            "##### Five\n",
+            "###### Six\n",
+        );
+        assert_eq!(
+            blocks(doc),
+            [
+                ("h1", "Setext One".to_owned(), 1, 10),
+                ("h2", "Setext Two".to_owned(), 5, 10),
+                ("h3", "Three".to_owned(), 7, 10),
+                ("h4", "Four".to_owned(), 8, 10),
+                ("h5", "Five".to_owned(), 9, 10),
+                ("h6", "Six".to_owned(), 10, 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn outline_blocks_emits_large_fenced_code_blocks_at_least_15_lines() {
+        let make_fence = |open: &str, close: &str, body_lines: usize| {
+            let mut out = format!("{open}\n");
+            for i in 1..=body_lines {
+                out.push_str(&format!("line_{i}\n"));
+            }
+            out.push_str(&format!("{close}\n"));
+            out
+        };
+        // 14 total lines (12 body + 2 fences) is omitted; 15 total lines is emitted.
+        let doc = format!(
+            "# Code\n{}\n{}\n{}\n{}\n{}\n{}\n- item\n  ```rust\n{}\n  ```\n\n> ```yaml\n{}\n> ```\n",
+            make_fence("```rust", "```", 12),
+            make_fence("```yaml title=\"cfg\"", "```", 13),
+            make_fence("~~~rust,no_run", "~~~", 14),
+            make_fence("```ts{1,3-5}", "```", 13),
+            make_fence("```{.python}", "```", 13),
+            make_fence("```", "```", 13),
+            (1..=16)
+                .map(|i| format!("  let x_{i} = {i};"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (1..=16)
+                .map(|i| format!("> k{i}: v{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let found = blocks(&doc);
+        let codes: Vec<_> = found
+            .iter()
+            .filter(|(kind, ..)| *kind == "code")
+            .map(|(_, name, first, end)| (name.as_str(), end - first + 1))
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                ("yaml", 15),
+                ("rust", 16),
+                ("ts", 15),
+                ("python", 15),
+                ("block", 15),
+            ]
+        );
+
+        // Unclosed >= 15-line fence at EOF and `{1-3}` highlight-only info string.
+        let unclosed = format!(
+            "# EOF\n```{{1-3}}\n{}",
+            (1..=15).map(|i| format!("x{i}\n")).collect::<String>()
+        );
+        assert_eq!(
+            blocks(&unclosed),
+            [
+                ("h1", "EOF".to_owned(), 1, 17),
+                ("code", "block".to_owned(), 2, 17),
+            ]
+        );
+    }
+
+    #[test]
+    fn outline_blocks_emits_large_gfm_tables_at_least_8_rows() {
+        let make_rows = |n: usize, piped: bool| {
+            (1..=n)
+                .map(|i| {
+                    if piped {
+                        format!("| k{i} | v{i} |\n")
+                    } else {
+                        format!("k{i} | v{i}\n")
+                    }
+                })
+                .collect::<String>()
+        };
+        let doc = format!(
+            concat!(
+                "# Tables\n",
+                "| Short | Val |\n",
+                "| --- | --- |\n",
+                "{short}",
+                "\n",
+                "| | Flag | Effect |\n",
+                "| --- | :--- | ---: |\n",
+                "{eight}",
+                "## Next Without Blank\n",
+                "Col A\\|1 | Col B\n",
+                ":---: | ---\n",
+                "{nine}",
+                "Trailing prose ends table.\n",
+                "```md\n",
+                "| Inside | Fence |\n",
+                "| --- | --- |\n",
+                "{nine}",
+                "```\n",
+                "| C1 | C2 | C3 | C4 | C5 | C6 | C7 |\n",
+                "| - | - | - | - | - | - | - |\n",
+                "{wide}",
+            ),
+            short = make_rows(7, true),
+            eight = (1..=8)
+                .map(|i| format!("| {i} | --f{i} | desc {i} |\n"))
+                .collect::<String>(),
+            nine = make_rows(9, false),
+            wide = (1..=8)
+                .map(|i| format!("| {i} | b | c | d | e | f | g |\n"))
+                .collect::<String>(),
+        );
+        let found = blocks(&doc);
+        let tables: Vec<_> = found
+            .iter()
+            .filter(|(kind, ..)| *kind == "table")
+            .map(|(_, name, first, end)| (name.as_str(), *first, *end))
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                ("Flag | Effect (8 rows)", 12, 21),
+                ("Col A|1 | Col B (9 rows)", 23, 33),
+                ("C1 | C2 | C3 | C4 | C5 | +2 (8 rows)", 48, 57),
+            ]
+        );
+        // The heading immediately following the 8-row table without a blank line is preserved.
+        assert!(
+            found.iter().any(|(kind, name, first, _)| *kind == "h2"
+                && name == "Next Without Blank"
+                && *first == 22),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn headings_and_sections_stay_unchanged_with_tables_fences_and_frontmatter() {
+        let mut doc = String::from("---\ntitle: Doc\n---\n# One\n| A | B |\n| --- | --- |\n");
+        for i in 1..=9 {
+            doc.push_str(&format!("| {i} | x |\n"));
+        }
+        doc.push_str("## Two\n```rust\n");
+        for i in 1..=15 {
+            doc.push_str(&format!("let v_{i} = {i};\n"));
+        }
+        doc.push_str("```\n");
+        let lines: Vec<&str> = doc.lines().collect();
+        assert_eq!(
+            headings(&lines)
+                .into_iter()
+                .map(|h| (h.level, h.title, h.first + 1))
+                .collect::<Vec<_>>(),
+            [(1, "One".to_owned(), 4), (2, "Two".to_owned(), 16)]
+        );
+        assert_eq!(
+            sections(&lines)
+                .into_iter()
+                .map(|s| (s.heading.title, s.heading.first + 1, s.end))
+                .collect::<Vec<_>>(),
+            [("One".to_owned(), 4, 33), ("Two".to_owned(), 16, 33)]
         );
     }
 }

@@ -15660,8 +15660,9 @@ fn markdown_section_edits_touch_only_their_own_bytes() {
         "   ## Flags",
         "Pass --help.",
     ];
-    // Each heading's name and section lines, written out rather than read back.
-    let expected: [(&str, usize, usize); 5] = [
+    // Each outline entry's name and lines, written out rather than read back.
+    let expected: [(&str, usize, usize); 6] = [
+        ("keys: title", 1, 4),
         ("Guide", 7, 41),
         ("Install", 18, 41),
         ("Linux", 37, 41),
@@ -16277,7 +16278,7 @@ fn git_show_reads_outline_the_blob_at_their_revision() {
             "git --no-pager show HEAD:sub/prices.py",
             "function price_0",
         ),
-        (&root, "git show HEAD:guide.md", "heading Part 0"),
+        (&root, "git show HEAD:guide.md", "h2 Part 0"),
     ] {
         let (real, _) = native(cwd, command);
         let text = std::str::from_utf8(&real).unwrap();
@@ -17353,8 +17354,8 @@ fn claude_read_outlines_ranged_windows_across_line_endings_languages_and_offsets
     );
     let output = content(&hook("guide.md", &guide, Some(20), Some(300)));
     let rows: Vec<&str> = output.lines().skip(1).collect();
-    assert_eq!(rows[0], "#1 L1-452 heading Guide  # Guide");
-    assert_eq!(rows[1], "#3 L18-32 heading Section 2  ## Section 2");
+    assert_eq!(rows[0], "#1 L1-452 h1 Guide");
+    assert_eq!(rows[1], "#3 L18-32 h2 Section 2");
     assert_eq!(rows.len(), 22, "{output}");
 
     // Top-level code in the window that no row covers follows the rows verbatim, up

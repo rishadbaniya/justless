@@ -166,6 +166,8 @@ pub struct Snapshot {
     parse_error: Option<String>,
     /// Whether this snapshot was indexed as a Rust source file.
     is_rust: bool,
+    /// Whether this snapshot was indexed as a Markdown source file.
+    is_markdown: bool,
 }
 
 pub(crate) fn revision_for(file: &str, bytes: &[u8]) -> String {
@@ -203,6 +205,7 @@ impl Snapshot {
             entries: Vec::new(),
             parse_error: None,
             is_rust: false,
+            is_markdown: false,
         })
     }
 
@@ -223,6 +226,7 @@ impl Snapshot {
             entries: Vec::new(),
             parse_error: None,
             is_rust: false,
+            is_markdown: false,
         }
     }
 
@@ -388,20 +392,21 @@ impl Snapshot {
             Some("md" | "markdown" | "mdx")
         );
         if markdown {
+            self.is_markdown = true;
             let lines: Vec<&str> = (0..self.lines.len())
                 .map(|line| {
                     let text = &self.text[offset(line)..offset(line + 1)];
                     text.strip_suffix('\n').unwrap_or(text)
                 })
                 .collect();
-            let entries: Vec<Entry> = crate::markdown::sections(&lines)
+            let entries: Vec<Entry> = crate::markdown::outline_blocks(&lines)
                 .into_iter()
-                .map(|section| Entry {
-                    name: section.heading.title,
-                    kind: "heading".into(),
-                    signature_start: offset(section.heading.first),
-                    bytes: offset(section.heading.first)..offset(section.end),
-                    header_end: offset(section.heading.last + 1),
+                .map(|block| Entry {
+                    name: block.name,
+                    kind: block.kind.as_str().into(),
+                    signature_start: offset(block.first),
+                    bytes: offset(block.first)..offset(block.end),
+                    header_end: offset(block.header_last + 1),
                 })
                 .collect();
             self.entries.extend(entries);
@@ -637,9 +642,19 @@ impl Snapshot {
             .collect()
     }
 
-    /// Trims strictly redundant Rust signatures where the header repeats only
-    /// `{kind} {name}` with no visibility, generics, bounds or tuple fields.
+    /// Trims strictly redundant outline signatures: Markdown blocks whose kind
+    /// and name already convey their heading level or anchor label, and plain
+    /// Rust type declarations where the header repeats only `{kind} {name}`
+    /// with no visibility, generics, bounds or tuple fields.
     fn slim_signature(&self, entry: &Entry, signature: String) -> String {
+        if self.is_markdown
+            && matches!(
+                entry.kind.as_str(),
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "frontmatter" | "code" | "table"
+            )
+        {
+            return String::new();
+        }
         if self.is_rust && matches!(entry.kind.as_str(), "struct" | "enum" | "trait" | "union") {
             let short = entry.name.rsplit("::").next().unwrap_or(&entry.name);
             if signature == format!("{} {short}", entry.kind) {
@@ -849,17 +864,20 @@ impl Snapshot {
                     self.line(entry.bytes.start),
                     self.line(entry.bytes.end.saturating_sub(1)),
                 );
-                (lines.0 <= last && lines.1 >= first).then(|| Row {
-                    id: index + 1,
-                    end_id: None,
-                    kind: entry.kind.clone(),
-                    name: clipped(&entry.name, 100),
-                    first: lines.0,
-                    last: lines.1,
-                    signature: clipped(
-                        &words(&self.text[entry.signature_start..entry.header_end]),
-                        160,
-                    ),
+                (lines.0 <= last && lines.1 >= first).then(|| {
+                    let signature = self.slim_signature(
+                        entry,
+                        words(&self.text[entry.signature_start..entry.header_end]),
+                    );
+                    Row {
+                        id: index + 1,
+                        end_id: None,
+                        kind: entry.kind.clone(),
+                        name: clipped(&entry.name, 100),
+                        first: lines.0,
+                        last: lines.1,
+                        signature: clipped(&signature, 160),
+                    }
                 })
             })
             .collect();
@@ -2406,5 +2424,260 @@ mod tests {
             matched_struct.contains("#7 L7-9 struct Local\n"),
             "{matched_struct}"
         );
+    }
+
+    #[test]
+    fn markdown_outline_eliminates_heading_duplication_on_docs_reference() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/reference.md");
+        let text = fs::read_to_string(&path).unwrap();
+        let mut snap = Snapshot::from_text("docs/reference.md", text.clone());
+        snap.index("docs/reference.md").unwrap();
+
+        // Compute the legacy redundant heading-only outline bytes for apples-to-apples comparison.
+        let lines: Vec<&str> = text.lines().collect();
+        let legacy_sections = crate::markdown::sections(&lines);
+        let mut legacy_heading_bytes = 0usize;
+        let mut legacy_page1_rows = 0usize;
+        let mut legacy_page1_bytes =
+            format!("revision {} · {} lines\n", snap.revision, snap.lines.len()).len();
+        let reserve = 80;
+        for (idx, sec) in legacy_sections.iter().enumerate() {
+            let raw = lines[sec.heading.first..=sec.heading.last]
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let row = format!(
+                "#{} L{}-{} heading {}  {}\n",
+                idx + 1,
+                sec.heading.first + 1,
+                sec.end,
+                clipped(&sec.heading.title, 100),
+                clipped(&raw, 160)
+            );
+            legacy_heading_bytes += row.len();
+            if legacy_page1_rows < 40 && legacy_page1_bytes + reserve + row.len() <= 2400 {
+                legacy_page1_bytes += row.len();
+                legacy_page1_rows += 1;
+            }
+        }
+
+        let full_page = snap.page("", None, 500, 100_000).unwrap();
+        let full_display = full_page.display();
+        let new_heading_bytes: usize = full_page
+            .entries
+            .iter()
+            .filter(|row| matches!(row.kind.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
+            .map(|row| {
+                assert!(
+                    row.signature.is_empty(),
+                    "redundant signature on {}",
+                    row.display()
+                );
+                row.display().len()
+            })
+            .sum();
+        // Eliminating `heading ...  ## ...` cuts heading bytes by >40% (~45%).
+        assert!(
+            new_heading_bytes * 100 <= legacy_heading_bytes * 60,
+            "expected >=40% heading byte reduction: before={legacy_heading_bytes}, after={new_heading_bytes}"
+        );
+        // Even with new table and code anchors included, the full outline is smaller than legacy headings alone.
+        assert!(
+            full_display.len() < legacy_heading_bytes,
+            "expected full outline ({}) < legacy headings ({legacy_heading_bytes})",
+            full_display.len()
+        );
+        assert!(!full_display.contains(" heading "), "{full_display}");
+
+        // Default page 1 (limit=40, budget=2400) fits more entries in fewer bytes than legacy.
+        let page1 = snap.page("", None, 40, 2400).unwrap();
+        assert!(
+            page1.entries.len() > legacy_page1_rows,
+            "expected page 1 to fit more entries: new={} vs legacy={legacy_page1_rows}",
+            page1.entries.len()
+        );
+        assert!(
+            page1.display().len() < legacy_page1_bytes,
+            "expected page 1 bytes ({}) < legacy ({legacy_page1_bytes})",
+            page1.display().len()
+        );
+
+        // Verify real `table` and `code` anchors exist in `docs/reference.md` and expand cleanly.
+        let rev = snap.revision.clone();
+        let tables: Vec<_> = full_page
+            .entries
+            .iter()
+            .filter(|row| row.kind == "table")
+            .collect();
+        let codes: Vec<_> = full_page
+            .entries
+            .iter()
+            .filter(|row| row.kind == "code")
+            .collect();
+        assert!(
+            !tables.is_empty(),
+            "expected large tables in docs/reference.md"
+        );
+        assert!(
+            !codes.is_empty(),
+            "expected large fenced code blocks in docs/reference.md"
+        );
+        for row in tables {
+            let span = snap
+                .resolve(&format!("{rev}#{}", row.id), None, false)
+                .unwrap();
+            let expanded = &snap.text[span];
+            assert!(expanded.trim_start().starts_with('|'), "{expanded}");
+            assert!(row.signature.is_empty());
+        }
+        for row in codes {
+            let span = snap
+                .resolve(&format!("{rev}#{}", row.id), None, false)
+                .unwrap();
+            let expanded = &snap.text[span];
+            let trimmed = expanded.trim_start();
+            assert!(
+                trimmed.starts_with("```") || trimmed.starts_with("~~~"),
+                "{expanded}"
+            );
+            assert!(row.signature.is_empty());
+        }
+    }
+
+    #[test]
+    fn markdown_frontmatter_setext_code_and_table_anchors_expand_and_edit_exact_bytes() {
+        let mut fence = String::from("```yaml title=\"pipeline\"\n");
+        for i in 1..=13 {
+            fence.push_str(&format!("step_{i}: run_{i}\n"));
+        }
+        fence.push_str("```\n");
+
+        let mut table = String::from("| Flag | Effect |\n| --- | --- |\n");
+        for i in 1..=8 {
+            table.push_str(&format!("| --opt-{i} | sets {i} |\n"));
+        }
+
+        let frontmatter = "---\ntitle: Spec\ndescription: Exact bytes\ntags:\n  - md\n---\n";
+        let setext = "Overview\n========\n\nIntro paragraph.\n\n";
+        let section2 = "## Details\n\n";
+        let doc = format!("{frontmatter}{setext}{section2}{fence}\n{table}");
+
+        let mut snap = Snapshot::from_text("guide.md", doc.clone());
+        snap.index("guide.md").unwrap();
+        let rev = snap.revision.clone();
+        let page = snap.page("", None, 40, 4096).unwrap().display();
+
+        assert!(
+            page.contains("#1 L1-6 frontmatter keys: title, description, tags\n"),
+            "{page}"
+        );
+        assert!(page.contains("#2 L7-39 h1 Overview\n"), "{page}");
+        assert!(page.contains("#3 L12-39 h2 Details\n"), "{page}");
+        assert!(page.contains("#4 L14-28 code yaml\n"), "{page}");
+        assert!(
+            page.contains("#5 L30-39 table Flag | Effect (8 rows)\n"),
+            "{page}"
+        );
+        // Setext underline and redundant fence/table/heading headers must never leak.
+        assert!(!page.contains("========"), "{page}");
+        assert!(!page.contains("## Details  ##"), "{page}");
+        assert!(!page.contains("```yaml"), "{page}");
+
+        // `--match` still finds blocks via their raw header text.
+        assert!(
+            snap.page("Exact bytes", None, 40, 4096)
+                .unwrap()
+                .display()
+                .contains("frontmatter")
+        );
+        assert!(
+            snap.page("pipeline", None, 40, 4096)
+                .unwrap()
+                .display()
+                .contains("code yaml")
+        );
+        assert!(
+            snap.page("## Details", None, 40, 4096)
+                .unwrap()
+                .display()
+                .contains("h2 Details")
+        );
+        assert!(
+            snap.page("Effect", None, 40, 4096)
+                .unwrap()
+                .display()
+                .contains("table Flag | Effect")
+        );
+
+        // Exact byte expand round-trips for frontmatter, code block, and table.
+        let fm_span = snap.resolve(&format!("{rev}#1"), None, true).unwrap();
+        assert_eq!(&snap.text[fm_span.clone()], frontmatter);
+        let code_span = snap.resolve(&format!("{rev}#4"), None, true).unwrap();
+        assert_eq!(&snap.text[code_span.clone()], fence);
+        let table_span = snap.resolve(&format!("{rev}#5"), None, true).unwrap();
+        assert_eq!(&snap.text[table_span.clone()], table);
+
+        // Simulated verified edit on frontmatter and table anchors replaces exact bytes.
+        let new_fm = "---\ntitle: Updated\n---\n";
+        let edited_fm = format!("{}{new_fm}{}", &doc[..fm_span.start], &doc[fm_span.end..]);
+        assert!(edited_fm.starts_with("---\ntitle: Updated\n---\nOverview\n========\n"));
+
+        let new_table = "| Flag | Effect |\n| --- | --- |\n| --all | done |\n";
+        let edited_table = format!(
+            "{}{new_table}{}",
+            &doc[..table_span.start],
+            &doc[table_span.end..]
+        );
+        assert!(edited_table.ends_with(&format!("{fence}\n{new_table}")));
+    }
+
+    #[test]
+    fn window_applies_slim_signature_to_markdown_and_rust() {
+        // Markdown ranged window: headings, code, and table have no duplicate signatures.
+        let mut md = String::new();
+        for i in 1..=6 {
+            md.push_str(&format!("## Section {i}\n\n"));
+            for j in 1..=10 {
+                md.push_str(&format!("Paragraph {i}.{j}.\n"));
+            }
+            md.push('\n');
+        }
+        let mut md_snap = Snapshot::from_text("doc.md", md);
+        md_snap.index("doc.md").unwrap();
+        let md_window = md_snap
+            .window(1, 70)
+            .expect("markdown window")
+            .display(true);
+        assert!(md_window.contains("#1 L1-13 h2 Section 1\n"), "{md_window}");
+        assert!(
+            md_window.contains("#2 L14-26 h2 Section 2\n"),
+            "{md_window}"
+        );
+        assert!(!md_window.contains("  ## Section"), "{md_window}");
+
+        // Rust ranged window: plain types slimmed, `pub` types keep their signature.
+        let mut rs = String::new();
+        for i in 1..=6 {
+            rs.push_str(&format!("struct Local{i} {{\n"));
+            for f in 1..=4 {
+                rs.push_str(&format!("    f{f}: usize,\n"));
+            }
+            rs.push_str("}\n");
+            rs.push_str(&format!("pub struct Exported{i} {{\n"));
+            for f in 1..=4 {
+                rs.push_str(&format!("    pub f{f}: usize,\n"));
+            }
+            rs.push_str("}\n");
+        }
+        let mut rs_snap = Snapshot::from_text("src/types.rs", rs);
+        rs_snap.index("src/types.rs").unwrap();
+        let rs_window = rs_snap.window(1, 70).expect("rust window").display(true);
+        assert!(rs_window.contains("#1 L1-6 struct Local1\n"), "{rs_window}");
+        assert!(
+            rs_window.contains("#2 L7-12 struct Exported1  pub struct Exported1\n"),
+            "{rs_window}"
+        );
+        assert!(!rs_window.contains("  struct Local1"), "{rs_window}");
     }
 }

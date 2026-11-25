@@ -1537,7 +1537,7 @@ fn expanded_structural_outlines_round_trip_exact_bytes_via_expand() {
         (
             "guide.mdx",
             "import { Box } from './ui';\n\n# Intro\n\n<Box />\n\n## Usage\n\nUse it.\n".into(),
-            "heading Usage",
+            "h2 Usage",
             "## Usage\n\nUse it.\n",
         ),
         (
