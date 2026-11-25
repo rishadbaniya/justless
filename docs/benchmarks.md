@@ -1,5 +1,18 @@
 # Benchmarks
 
+- [Agent benchmark (four arms)](#agent-benchmark-four-arms) — paid Messages API campaign and large-output family
+- [Compactor suite (18 reproducible offline workloads)](#compactor-suite-18-reproducible-offline-workloads) — offline release suite (`5e96988`)
+- [Earlier single-task illustrations](#earlier-single-task-illustrations) — paid single-task replays, local replay, scripted repair, progressive reads and tool history
+- [Script runner](#script-runner) — `justless exec` on multi-megabyte files
+- [Secret redaction](#secret-redaction) — 200 MiB CPU overhead
+- [Affected tests](#affected-tests) — mutation testing on `justless test --affected`
+- [Assignments and a final `2>&1`](#assignments-and-a-final-21) — transcript routing audit
+- [Ranged Read outlines](#ranged-read-outlines) — transcript replay and follow-up reads
+- [Code questions](#code-questions) — `justless query` vs grep + Read
+- [Tree-sitter, archive latency and live-zone proxy compaction](#tree-sitter-archive-latency-and-live-zone-proxy-compaction) — query caching, archive speed and `--compact-live`
+- [Token estimates](#token-estimates) — calibrated byte-to-token ratios
+- [Where the prompt tokens go](#where-the-prompt-tokens-go) — session spend breakdown
+
 ## Agent benchmark (four arms)
 
 This benchmark measures whether Justless reduces the cost of real coding-agent work without reducing task success. A model works on 32 frozen tasks from the owner's repositories through a reimplementation of Claude Code 2.1.327's default macOS setup over the Messages API. Arms differ only in the Justless install and in Anthropic's server-side context editing. The harness lives in `scripts/agent_bench/`. Its tasks, snapshots, ground truth, hidden tests, transcripts and the Claude Code capture stay outside Git in `$AGENT_BENCH_HOME`.
@@ -212,6 +225,40 @@ Run on 2026-11-20: 96 runs over the 8 frozen tasks × 3 repetitions × 4 arms, $
 
 **What it shows.** The model did not take the scripted path. Where the scripted plain path saw 59 to 192 KB of tool output, a plain Sonnet run saw a median of 9.1 KB (10.9 KB with Justless): it filtered its own commands, searched 24 times and never used Read. So this family did not put large output in front of Justless either. In the 48 runs with Justless, the hooks changed 34 of 343 Bash and Read results: 6 commands rewritten before they ran, 27 Bash results and 1 Read compacted after. The agent typed `justless` itself 28 times in arm b, and that arm resent more of the conversation from cache, 2.40M tokens in all against 1.51M. On these tasks, with this model, Justless again neither saved nor clearly cost, and the campaign is too small to tell an 11% difference from none. It ran before reads of at most 600 lines kept their text (see "What the agent read next"), so it measured the earlier thresholds.
 
+## Compactor suite (18 reproducible offline workloads)
+
+`scripts/suite_benchmark.py` exercises 18 real Justless compactors, source outlines, code-graph queries and tool-history retirement in a single offline pass. It requires zero network or model API calls, runs every workload inside an isolated temporary workspace (never touching the checkout's `.justless/`), produces deterministic UTF-8 byte counts, and verifies each contract under `--check`: preserved child exit codes (`0`, `1`, `101`), exact `[stdout/stderr:A-B]` byte-for-byte replay from the local archive, lossless JSON / table / blame round-trips, and lossless `mask --restore`.
+
+```sh
+cargo build --release --locked && python3 scripts/suite_benchmark.py --binary ./target/release/justless --check --markdown
+```
+
+Measured on 2026-11-26 at commit `5e96988` on Linux x86_64 with a release build (`1,185,309 → 50,560` UTF-8 bytes, or `1,157.5 KB → 49.4 KB`, `95.7%` cut, `23.4×` overall; `1.64 s` total elapsed across all 18 workloads). Figures below are measured UTF-8 bytes (`1 KB = 1,024 bytes`), not provider token counts (see [Token estimates](#token-estimates) for calibrated byte-to-token ratios).
+
+| # | Workload | Category | Raw | Justless | Cut | Ratio |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | `cargo test` (failing fixture) | tests | 17.6 KB | 517 B | 97.1% | 34.9× |
+| 2 | `vitest run` (80 files · 2 fail) | tests | 4.7 KB | 518 B | 89.3% | 9.3× |
+| 3 | `pytest` (50 parametrized + err) | tests | 19.7 KB | 741 B | 96.3% | 27.2× |
+| 4 | `dotnet test` (40 pass + 1 fail) | tests | 3.0 KB | 406 B | 86.7% | 7.5× |
+| 5 | `phpstan analyse` (60 findings · 3 rules) | lint | 7.2 KB | 930 B | 87.4% | 7.9× |
+| 6 | `docker build` (350-line BuildKit) | build | 18.4 KB | 498 B | 97.4% | 37.8× |
+| 7 | `kubectl logs` (500 interleaved lines) | logs | 45.9 KB | 1.1 KB | 97.6% | 41.2× |
+| 8 | `kubectl pods + desc` (120 pods + describe) | infra | 18.3 KB | 1.6 KB | 91.5% | 11.8× |
+| 9 | `gh checks + audit` (61 checks + 13 vuln) | cli_views | 33.0 KB | 564 B | 98.3% | 59.8× |
+| 10 | `terraform plan` (120 refresh + 12 res) | infra | 14.6 KB | 1.3 KB | 91.0% | 11.1× |
+| 11 | `cargo tree` (400 lines · syn dupes) | deps | 15.7 KB | 1.5 KB | 90.5% | 10.5× |
+| 12 | `psql table` (500 rows · Tier 1+2) | tables | 27.5 KB | 4.0 KB | 85.3% | 6.8× |
+| 13 | `gh api JSON` (80 nested objects) | json | 30.2 KB | 3.6 KB | 87.9% | 8.3× |
+| 14 | `git diff` (semantic + lockfile) | git | 12.2 KB | 490 B | 96.1% | 25.5× |
+| 15 | `git status + blame` (60 files + 60L blame) | git | 8.7 KB | 2.8 KB | 68.2% | 3.1× |
+| 16 | `rg -n "fn " src` (live repo search) | search | 349.0 KB | 4.0 KB | 98.9% | 88.2× |
+| 17 | `read --outline` (reference.md + expand) | source | 267.2 KB | 2.3 KB | 99.1% | 114.4× |
+| 18 | `query + map + mask` (graph + NL + retire) | code_graph | 264.9 KB | 22.6 KB | 91.5% | 11.7× |
+| | **Total (18 workloads)** | | **1,157.5 KB** | **49.4 KB** | **95.7%** | **23.4×** |
+
+Every grouped or folded case verifies exact archive replay of a `[stdout/stderr:A-B]` span against the raw stream. Row 12 (`psql table`) verifies both Tier 1 lossless table compaction (`28,123 → 13,589` bytes, all 500 rows with constant/default column hoisting) and Tier 2 bounded output (`4,134` bytes, shown in the table). Row 13 (`gh api JSON`) verifies lossless deep-schema `jsonview` round-trip decoding back to the exact original JSON. Row 18 combines `query would_route` (`207,789 → 1,560` B), `map --explain` (`2,325` B), `lookup` across TypeScript → Python → SQL (`1,079` B), and `mask` + `--restore` (`62,798 → 18,176` B).
+
 ## Earlier single-task illustrations
 
 The results below come from single pairs on a vendor-written fixture. They illustrate the mechanism and are not evidence of task-level savings.
@@ -266,14 +313,23 @@ The CLI tests cover Rust and Python diagnostics, archive replay, multi-language 
 
 `scripts/replay.py` replays stored Claude Code Bash results through `justless hook-claude after-bash` and reports measured bytes. On the local transcripts it replayed 1,867 results, 164 eligible, 26 compacted, and saved 278,084 of 314,460 bytes (88.4%). The 1,593 results under 4 KiB, 138 pass-through results and 86 results whose directory no longer existed were left alone.
 
-The original single-task benchmark on macOS arm64 with Rust 1.93.0 produced these medians over three local replays per variant. Cargo compilation was warmed before the timed commands.
+Measured on 2026-11-26 at commit `5e96988` on Linux x86_64 with a release build, three local replays per variant produced these medians (Cargo compilation was warmed before the timed commands):
 
-| Local replay | Successful runs | Tool output | Estimated output tokens | Elapsed |
+| Local replay | Successful runs | Tool output | Estimated output tokens (`bytes / 4`) | Elapsed (median) |
 | --- | ---: | ---: | ---: | ---: |
-| Direct Cargo and source reads | 3/3 | 18,531 bytes | 4,634 | 0.926 s |
-| Justless and targeted retrieval | 3/3 | 1,889 bytes | 475 | 0.964 s |
+| Direct Cargo and source reads | 3/3 | 18,532 bytes | 4,634 | — |
+| Justless and targeted retrieval | 3/3 | 1,541 bytes | 387 | 0.060 s |
 
-Justless delivered 89.8% fewer bytes in this local replay.
+Justless delivered **91.7% fewer bytes (12.0×)** in this local replay, improved from the original macOS arm64 (Rust 1.93.0) baseline of `18,531 → 1,889` bytes (`89.8%` fewer, `4,634 → 475` estimated tokens, `0.926 s` vs `0.964 s`). Token counts in this table are rough estimates (`bytes / 4` rounded up per result, as printed by `benchmark.py`), not provider counts.
+
+In scripted offline mode (`python3 scripts/repair_benchmark.py --binary ./target/release/justless`), measured on 2026-11-26 at commit `5e96988` on Linux x86_64 (release build, no model calls):
+
+| Scripted 3-turn repair | Fix verified | Tool output | Tool calls | Elapsed |
+| --- | --- | ---: | ---: | ---: |
+| Plain | Yes (`task_success: true`) | 19,424 bytes | 7 | — |
+| Justless | Yes (`task_success: true`) | 2,158 bytes | 5 | 0.282 s |
+
+Justless reduced tool output by **88.9% (9.0×)** and cut tool calls from `7` to `5` (`task_success: true`).
 
 On a separate synthetic corpus of 950 source and text files, a release build indexed from scratch in 0.795 s and refreshed the unchanged index in 0.191 s. A query after one TypeScript edit returned the new definition in 0.211 s.
 
@@ -292,17 +348,17 @@ The Justless replay used 85.0% fewer input tokens. The direct replay identified 
 
 ### Progressive reads, edits and tool history
 
-Build with `cargo build --release --locked` and run `python3 scripts/context_benchmark.py`. The local fixture has 451 Python functions. The runner browses the first outline page, filters for the function that needs fixing, expands it, submits one revision-bound replacement and checks the result with an independent Python assertion.
+Build with `cargo build --release --locked` and run `python3 scripts/context_benchmark.py --binary ./target/release/justless`. The local fixture has 451 Python functions. The runner browses the first outline page, filters for the function that needs fixing, expands it, submits one revision-bound replacement and checks the result with an independent Python assertion. Measured on 2026-11-26 at commit `5e96988` on Linux x86_64 (release build):
 
 | Source operation | Bytes |
 | --- | ---: |
 | Whole source file | 20,991 |
-| First outline page | 2,068 |
-| Filtered JSON outline | 203 |
+| First outline page | 1,671 |
+| Filtered JSON outline | 205 |
 | Exact function | 60 |
 | Edit reference plus replacement | 88 |
 
-The same run generates an outbound request with six build results. Retiring the oldest three reduced the serialized request from 38,306 to 19,952 bytes. Restoring the references reproduced the original JSON values. These measurements count local UTF-8 bytes. Provider token counts and prompt-cache effects depend on the model and client.
+The first outline page is **12.6×** smaller than the whole file (improved from `2,068` bytes in the earlier macOS measurement). The same run generates an outbound request with six build results. Retiring the oldest three reduced the serialized request from 38,306 to 19,952 bytes. Restoring the references with `--restore` reproduced the original JSON values losslessly. These measurements count local UTF-8 bytes. Provider token counts and prompt-cache effects depend on the model and client.
 
 ## Script runner
 
@@ -313,16 +369,18 @@ python3 scripts/exec_benchmark.py --binary ./target/release/justless
 
 The script generates seeded data locally, runs a short analysis script over each file through `justless exec`, and compares what the agent receives with the input, with `justless run -- cat FILE`, and with the same script run directly. It makes no network or model calls.
 
+Measured on 2026-11-26 at commit `5e96988` on Linux x86_64 (release build):
+
 | Task | Input | `justless run -- cat` | Script run directly | `justless exec` |
 | --- | ---: | ---: | ---: | ---: |
-| List 2,176 slow requests, 61 of them payment timeouts | 19,051,254 bytes | 2,121 bytes, no answer | 119,694 bytes | 4,100 bytes, 2 of the 61; with `--intent "payments timeouts"`, 4,044 bytes, 56 of the 61 |
-| Summarize an 8,000-issue JSON export | 5,953,169 bytes | 2,143 bytes, no answer | 257 bytes | 257 bytes |
-| Count log errors by service and code | 19,051,254 bytes | 2,121 bytes, no answer | 310 bytes | 310 bytes |
+| List 2,176 slow requests, 61 of them payment timeouts | 19,051,254 bytes | 4,157 bytes, no answer | 119,694 bytes | 4,100 bytes, 2 of the 61; with `--intent "payments timeouts"`, 4,044 bytes, 56 of the 61 |
+| Summarize an 8,000-issue JSON export | 5,953,169 bytes | 4,001 bytes, no answer | 257 bytes | 257 bytes |
+| Count log errors by service and code | 19,051,254 bytes | 4,157 bytes, no answer | 334 bytes | 334 bytes |
 | Revenue and refunds by region from a CSV | 4,395,204 bytes | 2,149 bytes, no answer | 186 bytes | 186 bytes |
 
 Each column is everything the agent received, footer included. When a script's output is large, `exec` bounds it: the first row's listing would put 119,694 bytes in context, and `exec` shows whole lines from both ends with the range left out, or with `--intent` the matching lines. When the output fits, `exec` prints exactly what the script prints and adds no footer to a success, so the last three rows match the direct run; there `exec` adds the archive under a run ID and the time limit, and the bytes saved come from writing a script instead of reading the input. `run -- cat` stays bounded, but its head and tail do not contain the answer.
 
-Measured on macOS arm64. Spacing from `uniq -c` differs on Linux, so the log errors row can change by a few bytes.
+Spacing from `uniq -c` differs between GNU coreutils on Linux (`334` bytes for the log-errors row) and BSD on macOS arm64 (`310` bytes in the earlier run).
 
 ## Secret redaction
 
@@ -349,15 +407,15 @@ python3 scripts/affected_benchmark.py --binary ./target/release/justless --proje
 python3 scripts/affected_benchmark.py --binary ./target/release/justless --project . --edits scripts/affected_edits.json --no-fallback
 ```
 
-Measured on 2026-11-18 on macOS arm64 with Rust 1.93.0 and a release build, after the selection rules for helpers behind `Display`, crate-level and included doc examples, example binaries and unmentioned SQL were added. Single timings vary by about a second. Medians are over the mutants or edits in each row.
+The two `fixtures/affected` rows below were refreshed on 2026-11-26 at commit `5e96988` on Linux x86_64 with a release build (collapsing empty test binaries and Cargo status lines cut affected output from `3,409 → 1,977` bytes on panics and `1,475 → 1,026` bytes on no-ops; full-suite output fell from `2,222 → 1,106` and `2,145 → 800` bytes). The three repository/library rows below them are from the 2026-11-18 macOS arm64 (Rust 1.93.0, release build) run, after the selection rules for helpers behind `Display`, crate-level and included doc examples, example binaries and unmentioned SQL were added. Single timings vary with machine load. Medians are over the mutants or edits in each row.
 
 | Project and edits | Missed failures | Ran as a subset | Selected tests (median) | Subset time | Full-suite time | Bytes, affected | Bytes, full suite |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fixtures/affected`, a panic in each of 13 functions | 0 of 12 | 10 of 13 | 10% of 20 | 1.42 s | 0.95 s | 3,409 | 2,222 |
-| `fixtures/affected`, a no-op in each of 13 functions | none failed | 10 of 13 | 10% of 20 | 1.38 s | 2.09 s | 1,475 | 2,145 |
-| This repository, 4 edits: a `fixtures/failing` fee, a `fixtures/mixed` table name, one test in `tests/progressive.rs`, one `src/` function | 0 of 2 | 2 of 4 | 16% of 143 | 2.27 s | 10.77 s | 1,509 | 1,415 |
-| A single-crate Rust library from a private codebase, with 87 unit tests and crates.io dependencies, a panic in 12 sampled functions | 0 of 3 | 2 of 12 | 7% of 87 | 1.48 s | 2.63 s | 1,792 | 1,576 |
-| The same library, a no-op in the same 12 functions | none failed | 2 of 12 | 7% of 87 | 1.36 s | 3.24 s | 1,213 | 991 |
+| `fixtures/affected`, a panic in each of 13 functions (`5e96988`, Linux x86_64) | 0 of 12 | 10 of 13 | 10% of 20 | 0.25 s | 0.19 s | 1,977 | 1,106 |
+| `fixtures/affected`, a no-op in each of 13 functions (`5e96988`, Linux x86_64) | none failed | 10 of 13 | 10% of 20 | 0.31 s | 0.33 s | 1,026 | 800 |
+| This repository, 4 edits: a `fixtures/failing` fee, a `fixtures/mixed` table name, one test in `tests/progressive.rs`, one `src/` function (2026-11-18, macOS arm64) | 0 of 2 | 2 of 4 | 16% of 143 | 2.27 s | 10.77 s | 1,509 | 1,415 |
+| A single-crate Rust library from a private codebase, with 87 unit tests and crates.io dependencies, a panic in 12 sampled functions (2026-11-18, macOS arm64) | 0 of 3 | 2 of 12 | 7% of 87 | 1.48 s | 2.63 s | 1,792 | 1,576 |
+| The same library, a no-op in the same 12 functions (2026-11-18, macOS arm64) | none failed | 2 of 12 | 7% of 87 | 1.36 s | 3.24 s | 1,213 | 991 |
 
 The time columns are for the edits that ran as a subset, compared with the full suite on the same edits; the byte columns are medians over every edit in the row, fallbacks included. A fallback costs a full suite plus the planning, which took 0.1 s on `fixtures/affected` and 0.2 s on this repository with a warm index; the fallback rows differ from their full suites by less than the timing noise.
 
@@ -422,30 +480,52 @@ An outlined Read of at most 600 lines was read again about four times in five, a
 
 ## Code questions
 
-An agent without an index answers "where is `X` defined and what calls it" by searching and then reading the file that defines it. `justless query X` answers it with the definition, its callers and callees, each with a file and line. Measured on 2026-11-19 at commit 6ee090d of this repository, macOS arm64, a debug build, on 14 functions whose names are unique:
+An agent without an index answers "where is `X` defined and what calls it" by searching and then reading the file that defines it. `justless query X` answers it with the definition, its callers and callees, each with a file and line. Measured on 2026-11-26 at commit `5e96988` of this repository, Linux x86_64, release build, on 13 functions in `src/` whose names are unique (`left_by_permissions` from the earlier 2026-11-19 measurement at commit `6ee090d` is omitted because it is now defined in both `agents` and `history`, so `query` lists both candidates instead of answering one):
 
 - **Without Justless:** the bytes of `rg -n -w X src`, plus the defining file as Claude Code's Read returns it, at most 2,000 lines with a line-number prefix.
 - **With Justless:** the bytes `justless query X` prints, within its default 2,400-byte budget.
 
 | Function | Defining file | Search + read | `query` | Ratio |
 | --- | --- | ---: | ---: | ---: |
-| `would_route` | `src/agents.rs` | 98,599 | 665 | 148.3× |
-| `left_by_permissions` | `src/agents.rs` | 98,407 | 817 | 120.4× |
-| `saw_source` | `src/history.rs` | 68,003 | 580 | 117.2× |
-| `imported_instructions` | `src/agents.rs` | 98,770 | 870 | 113.5× |
-| `with_seen_session` | `src/agents.rs` | 98,401 | 1,091 | 90.2× |
-| `read_persisted` | `src/postroute.rs` | 54,250 | 687 | 79.0× |
-| `sessions_json` | `src/tokens.rs` | 32,509 | 528 | 61.6× |
-| `run_content` | `src/tokens.rs` | 32,364 | 612 | 52.9× |
-| `merge_hooks` | `src/agents.rs` | 98,638 | 2,027 | 48.7× |
-| `strip_section` | `src/uninstall.rs` | 74,175 | 1,609 | 46.1× |
-| `split_compound` | `src/agents.rs` | 99,170 | 2,400 | 41.3× |
-| `bash_hook` | `src/agents.rs` | 98,597 | 2,400 | 41.1× |
-| `machine_section` | `src/doctor.rs` | 94,754 | 2,400 | 39.5× |
-| `global_checks` | `src/doctor.rs` | 94,681 | 2,400 | 39.5× |
-| **Total** | | **1,141,318** | **19,086** | **59.8×** |
+| `imported_instructions` | `src/agents.rs` | 94,820 | 616 | 153.9× |
+| `with_seen_session` | `src/agents.rs` | 94,949 | 846 | 112.2× |
+| `merge_hooks` | `src/agents.rs` | 94,688 | 861 | 110.0× |
+| `saw_source` | `src/history.rs` | 86,218 | 937 | 92.0× |
+| `strip_section` | `src/uninstall.rs` | 79,552 | 929 | 85.6× |
+| `read_persisted` | `src/postroute.rs` | 95,025 | 1,219 | 78.0× |
+| `sessions_json` | `src/tokens.rs` | 36,801 | 516 | 71.3× |
+| `global_checks` | `src/doctor.rs` | 95,714 | 1,380 | 69.4× |
+| `machine_section` | `src/doctor.rs` | 95,787 | 1,408 | 68.0× |
+| `would_route` | `src/agents.rs` | 95,239 | 1,560 | 61.1× |
+| `bash_hook` | `src/agents.rs` | 94,674 | 1,631 | 58.0× |
+| `run_content` | `src/tokens.rs` | 36,679 | 742 | 49.4× |
+| `split_compound` | `src/agents.rs` | 95,130 | 2,285 | 41.6× |
+| **Total** | | **1,095,276** | **14,930** | **73.4×** |
 
-The median ratio is 57×. The ratio grows with the size of the defining file, and this repository's files are large: the median defining file here is about 95 KB. In a project of small files the search and the read are smaller, and so is the ratio. Names that several definitions share were left out, because `query` then lists the candidates with their locations instead of answering.
+The total ratio is **73.4×** and the median ratio is **71.3×** — up from `59.8×` total (`1,141,318 → 19,086`) and `57×` median on 2026-11-19 at commit `6ee090d` (macOS arm64), after grouped edge formatting and same-file `(from :LINE)` deduplication shrank dense `query` results. Against reading the full defining file with `cat` instead of Claude Code's 2,000-line Read cap, `would_route` reaches **133×** (`207,789 → 1,560` bytes). The ratio grows with the size of the defining file, and this repository's files are large: the median defining file here is about 95 KB. In a project of small files the search and the read are smaller, and so is the ratio. Names that several definitions share are left out, because `query` then lists the candidates with their locations instead of answering.
+
+## Tree-sitter, archive latency and live-zone proxy compaction
+
+### Tree-sitter query caching and archive read latency
+
+Caching compiled Tree-sitter queries in per-grammar `LazyLock` statics (`src/polyglot.rs`) and eliminating redundant archive reads in `stats` (`src/history.rs`) produced these wall-clock speedups on Linux x86_64 (release build, commits `24049f9` / `5e96988`, 2026-11-26):
+
+| Workload | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| `read --outline` across 40 TypeScript + SQL files | >15 s | 159 ms | >100× |
+| `read --outline` across 10 TypeScript files | 3.31 s | 102 ms | 32× |
+| `stats --json` across 500 archived runs | 202 ms | 21.6 ms | 9.3× |
+
+### Live-zone proxy compaction (`--compact-live`)
+
+`justless proxy --compact-live` (and `justless wrap --compact-live`, commit `d02390c`) compacts only the newest uncached tool results at the request boundary, leaving every earlier message untouched so prompt-cache prefixes stay intact while archiving originals locally for exact recovery via `justless recall`. Measured UTF-8 byte reductions across four representative tool-result payloads (release build, Linux x86_64, 2026-11-26):
+
+| Payload kind | Measured byte reduction | Prefix-cache invalidation | Recovery |
+| --- | ---: | ---: | --- |
+| JSON | −95.2% | 0% | Exact via `justless recall` |
+| Logs | −96.3% | 0% | Exact via `justless recall` |
+| Tables | −79.8% | 0% | Exact via `justless recall` |
+| Tracebacks | −96.6% | 0% | Exact via `justless recall` |
 
 ## Token estimates
 
