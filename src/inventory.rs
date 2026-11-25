@@ -87,11 +87,8 @@ impl Inventory {
                 return line.split('\t').nth(i).map(str::trim);
             }
             let start = self.header[i].1;
-            let end = self
-                .header
-                .get(i + 1)
-                .map_or(line.len(), |(_, end)| (*end).min(line.len()));
-            line.get(start..end).map(str::trim)
+            let end = self.header.get(i + 1).map(|(_, end)| *end);
+            slice_cols(line, start, end).map(str::trim)
         };
         let name = field("NAMES")?;
         if name.is_empty()
@@ -114,6 +111,7 @@ impl Inventory {
             "restarting",
             "dead",
             "removing",
+            "removal",
             "paused",
         ]
         .iter()
@@ -193,7 +191,89 @@ impl Inventory {
     }
 }
 
+/// Slice `line` by character column offsets so UTF-8 ellipsis truncation (`…`)
+/// in earlier columns of `docker ps` does not shift later columns.
+fn slice_cols(line: &str, start_col: usize, end_col: Option<usize>) -> Option<&str> {
+    if line.is_ascii() {
+        let end = end_col.map_or(line.len(), |end| end.min(line.len()));
+        return line.get(start_col..end);
+    }
+    let start = line.char_indices().nth(start_col).map(|(byte, _)| byte)?;
+    let end = match end_col {
+        Some(col) => line
+            .char_indices()
+            .nth(col)
+            .map_or(line.len(), |(byte, _)| byte),
+        None => line.len(),
+    };
+    line.get(start..end)
+}
+
 fn ratio(value: &str) -> Option<(usize, usize)> {
     let (a, b) = value.split_once('/')?;
     Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Inventory;
+    use crate::filters::Profile;
+
+    #[test]
+    fn docker_ps_handles_utf8_command_ellipsis_and_removal_status() {
+        let table = [
+            "CONTAINER ID   IMAGE         COMMAND                  CREATED       STATUS                      PORTS      NAMES",
+            "a1b2c3d4e5f6   postgres:16   \"docker-entrypoint.s…\"   2 hours ago   Up 2 hours (healthy)        5432/tcp   app-db-1",
+            "b2c3d4e5f6a1   node:22       \"docker-entrypoint.s…\"   2 hours ago   Up 3 minutes (unhealthy)    3000/tcp   app-web-1",
+            "c3d4e5f6a1b2   redis:7       \"docker-entrypoint.s…\"   2 hours ago   Up 1 hour (Paused)          6379/tcp   app-cache-1",
+            "d4e5f6a1b2c3   alpine:3      \"/bin/sh -c 'sleep 1…\"   2 hours ago   Removal In Progress                    app-old-1",
+        ];
+        let mut inv = Inventory::new(Profile::Containers);
+        for (i, line) in table.iter().enumerate() {
+            assert!(inv.observe(line, i + 1), "row {}: {line}", i + 1);
+        }
+        let summary = inv.finish();
+        assert_eq!(summary.outcomes[0], "docker ps: 4 listed, 3 need attention");
+        assert_eq!(summary.outcomes[1], "Other examples: app-db-1");
+        let issues: Vec<_> = summary
+            .items
+            .iter()
+            .map(|item| (item.name.as_str(), item.detail.as_str()))
+            .collect();
+        assert_eq!(
+            issues,
+            [
+                ("app-web-1", "unhealthy"),
+                ("app-cache-1", "paused"),
+                ("app-old-1", "Removal In Progress"),
+            ]
+        );
+    }
+
+    #[test]
+    fn kubectl_pods_handles_restart_age_parentheticals() {
+        let table = [
+            "NAMESPACE   NAME        READY   STATUS             RESTARTS        AGE",
+            "prod        api-0       1/1     Running            0               3d",
+            "prod        worker-0    0/1     CrashLoopBackOff   5 (3m12s ago)   12m",
+            "prod        cron-0      1/1     Running            1 (2h ago)      5d",
+        ];
+        let mut inv = Inventory::new(Profile::Pods);
+        for (i, line) in table.iter().enumerate() {
+            assert!(inv.observe(line, i + 1), "row {}: {line}", i + 1);
+        }
+        let summary = inv.finish();
+        assert_eq!(
+            summary.outcomes[0],
+            "kubectl get pods: 3 listed, 2 need attention"
+        );
+        assert_eq!(summary.outcomes[1], "Other examples: prod/api-0");
+        assert_eq!(summary.items[0].name, "prod/worker-0");
+        assert_eq!(
+            summary.items[0].detail,
+            "CrashLoopBackOff ready=0/1 restarts=5"
+        );
+        assert_eq!(summary.items[1].name, "prod/cron-0");
+        assert_eq!(summary.items[1].detail, "Running ready=1/1 restarts=1");
+    }
 }

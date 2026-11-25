@@ -630,6 +630,7 @@ pub fn legacy_hook(words: &[&str]) -> bool {
             ["branch", branch_args @ ..] => git_branch_display(branch_args),
             ["tag", tag_args @ ..] => git_tag_display(tag_args),
             ["stash", "list", stash_args @ ..] => git_stash_list_display(stash_args),
+            ["reflog", reflog_args @ ..] => git_reflog_display(reflog_args),
             _ => false,
         },
         _ => false,
@@ -742,6 +743,36 @@ fn git_stash_list_display(args: &[&str]) -> bool {
     })
 }
 
+/// Whether `git reflog` arguments only list reflog entries in display format.
+/// Mutating subcommands (`expire`, `delete`) and `exists` return `false`.
+fn git_reflog_display(args: &[&str]) -> bool {
+    let mut subcommand_checked = false;
+    for arg in args.iter().copied().take_while(|a| *a != "--") {
+        let flag = arg.split_once('=').map_or(arg, |(k, _)| k);
+        if matches!(
+            flag,
+            "--output"
+                | "--ext-diff"
+                | "--textconv"
+                | "--porcelain"
+                | "-z"
+                | "--null"
+                | "--raw"
+                | "--format"
+                | "--pretty"
+        ) {
+            return false;
+        }
+        if !subcommand_checked && !arg.starts_with('-') {
+            subcommand_checked = true;
+            if matches!(arg, "expire" | "delete" | "exists") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Whether `git branch` arguments only list or inspect branches in display format.
 /// Creating, deleting, renaming, copying, tracking, editing descriptions and
 /// machine-formatted output (`--format`) return `false`.
@@ -809,6 +840,173 @@ fn git_branch_display(args: &[&str]) -> bool {
         }
     }
     true
+}
+
+/// Whether `words` runs a formatter in a strictly read-only check/diff mode with
+/// local paths and display/selection options only (no writes, plugins or config
+/// overrides). Bare formatter invocations stay unapproved.
+fn format_check_only(words: &[&str]) -> bool {
+    cargo_fmt_check(words)
+        || ruff_format_check(words)
+        || prettier_check(words)
+        || deno_fmt_check(words)
+}
+
+/// Whether `words` is a read-only `ruff format --check` or `ruff format --diff`
+/// invocation with local paths and no `--config` override.
+fn ruff_format_check(words: &[&str]) -> bool {
+    let ["ruff", "format", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut check = false;
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if positional_only {
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--check" | "--diff" if inline.is_none() => check = true,
+            "-q"
+            | "--quiet"
+            | "-v"
+            | "--verbose"
+            | "-s"
+            | "--silent"
+            | "--no-cache"
+            | "--respect-gitignore"
+            | "--no-respect-gitignore"
+            | "--force-exclude"
+            | "--no-force-exclude"
+            | "--isolated"
+            | "--preview"
+            | "--no-preview"
+                if inline.is_none() => {}
+            "--color" | "--line-length" | "--target-version" | "--exclude" | "--extend-exclude"
+            | "--range" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    check
+}
+
+/// Whether `words` is a read-only `prettier --check` or `--list-different`
+/// invocation with local paths and no writes, plugins or config overrides.
+fn prettier_check(words: &[&str]) -> bool {
+    let ["prettier", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut check = false;
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if positional_only {
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--check" | "-c" | "--list-different" | "-l" if inline.is_none() => check = true,
+            "--no-color"
+            | "--no-error-on-unmatched-pattern"
+            | "--ignore-unknown"
+            | "-u"
+            | "--cache"
+            | "--no-config"
+            | "--no-editorconfig"
+            | "--with-node-modules"
+                if inline.is_none() => {}
+            "--log-level" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    check
+}
+
+/// Whether `words` is a read-only `deno fmt --check` invocation with local paths
+/// and no `--config` override.
+fn deno_fmt_check(words: &[&str]) -> bool {
+    let ["deno", "fmt", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut check = false;
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if positional_only {
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--check" if inline.is_none() => check = true,
+            "-q" | "--quiet" | "--use-tabs" | "--single-quote" | "--no-semicolons"
+            | "--no-config"
+                if inline.is_none() => {}
+            "--ignore" | "--line-width" | "--indent-width" | "--prose-wrap" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    check
 }
 
 /// Whether `words` is a read-only `cargo fmt --check` invocation with local paths
@@ -908,9 +1106,10 @@ pub fn approvable(words: &[&str]) -> bool {
     }
     // A command routed for its preview alone installs, builds or reaches a
     // service, so it runs only when the client asks — except read-only
-    // `cargo fmt --check`, which only reports formatting diffs.
+    // format-check modes (`cargo fmt --check`, `ruff format --check`/`--diff`,
+    // `prettier --check`/`--list-different` and `deno fmt --check`).
     if crate::known::listed(tool) {
-        return cargo_fmt_check(tool);
+        return format_check_only(tool);
     }
     if !args.iter().all(|arg| local_argument(arg)) || runs_code(program, args) {
         return false;
@@ -1832,6 +2031,33 @@ mod tests {
             ("git stash drop", false),
             ("git stash list --output=/tmp/x", false),
             ("git stash list --ext-diff", false),
+            // Read-only `git reflog` is approved; `expire`, `delete`, `exists` and machine formats are not.
+            ("git reflog", true),
+            ("git reflog -n 20", true),
+            ("git reflog show main", true),
+            ("git --no-pager reflog --oneline", true),
+            ("git reflog expire --all", false),
+            ("git reflog delete HEAD@{0}", false),
+            ("git reflog exists HEAD", false),
+            ("git reflog --format=%H", false),
+            // Read-only format-check modes are approved; bare formatters and config/plugin overrides are not.
+            ("ruff format --check", true),
+            ("ruff format --diff src", true),
+            ("ruff format --check --line-length 100 src", true),
+            ("ruff format", false),
+            ("ruff format --check --config ruff.toml", false),
+            ("ruff format --check ../other", false),
+            ("prettier --check .", true),
+            ("prettier --list-different src", true),
+            ("prettier -c --ignore-unknown src", true),
+            ("prettier src", false),
+            ("prettier --check --write src", false),
+            ("prettier --check --plugin ./p.js src", false),
+            ("prettier --check --config .prettierrc src", false),
+            ("deno fmt --check", true),
+            ("deno fmt --check --single-quote src", true),
+            ("deno fmt", false),
+            ("deno fmt --check --config deno.json", false),
         ] {
             let words: Vec<&str> = command.split(' ').collect();
             assert_eq!(approvable(&words), approved, "{command}");
@@ -1852,5 +2078,7 @@ mod tests {
         assert!(!legacy_hook(&["git", "stash", "pop"]));
         assert!(legacy_hook(&["cargo", "nextest", "run", "--workspace"]));
         assert!(!legacy_hook(&["cargo", "nextest", "archive"]));
+        assert!(legacy_hook(&["git", "reflog", "-n", "10"]));
+        assert!(!legacy_hook(&["git", "reflog", "expire", "--all"]));
     }
 }

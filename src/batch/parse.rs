@@ -255,11 +255,11 @@ pub(super) fn search_paths(words: &[String]) -> Option<&[String]> {
         let Some(flags) = word.strip_prefix('-') else {
             break;
         };
-        if flags.is_empty() || !flags.bytes().all(|c| b"nHhiFvwxslE".contains(&c)) {
+        if flags.is_empty() || !flags.bytes().all(|c| b"nHhiFvwxslES".contains(&c)) {
             return None;
         }
-        // rg uses -E for encoding, which takes a value.
-        if words[0] == "rg" && flags.contains('E') {
+        // rg uses -E for encoding (valued) and -S for smart-case (boolean); grep has no -S.
+        if (words[0] == "rg" && flags.contains('E')) || (words[0] != "rg" && flags.contains('S')) {
             return None;
         }
         i += 1;
@@ -1091,6 +1091,7 @@ mod tests {
     fn only_a_tilde_inside_a_word_is_literal() {
         assert!(super::list("git show HEAD~1:a.rs; sed -n 1,2p b").is_some());
         assert!(super::single("timeout 5 git show main~2:a.rs", false).is_some());
+        assert!(super::list("rg -nS foo src; cat a").is_some());
         for list in [
             "cat ~/a; cat b",
             "cat a; cat x=~/b",

@@ -203,6 +203,12 @@ fn kill_switches_leave_commands_alone_and_rewrite_explains_the_hook() {
         "only when every command in it is supported and none is excluded",
     );
     has(&report, "Excluded: `cargo bench` matches `cargo bench`");
+    let report = rewrite(&["--agent", "agy", "cargo test\ncargo bench"]);
+    has(
+        &report,
+        "only when every command in it is supported and none is excluded",
+    );
+    has(&report, "Excluded: `cargo bench` matches `cargo bench`");
     let report = rewrite(&["git show HEAD"]);
     has(&report, "matches `^git (log|show)` in exclude_commands");
     let report = rewrite(&["ls", "--agent", "codex"]);

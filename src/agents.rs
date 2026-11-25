@@ -1404,7 +1404,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     let mut roots = paths
         .iter()
         .filter_map(Value::as_str)
-        .map(Path::new)
+        .map(|raw| Path::new(raw.strip_prefix("file://").unwrap_or(raw)))
         .filter(|path| path.is_absolute())
         .filter_map(|path| path.canonicalize().ok());
     if mode == "session-start" {

@@ -343,8 +343,13 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
         }
     }
     // A list's own exclusions; a whole excluded line is the reason above.
+    let list_segments = if matches!(agent, Agent::Codex | Agent::Agy) {
+        agents::split_script(command)
+    } else {
+        agents::split_compound(command)
+    };
     if exclusions.line(command).is_none()
-        && let Some(segments) = agents::split_compound(command)
+        && let Some(segments) = list_segments
     {
         for range in segments {
             if let Some(entry) = exclusions.matching(&command[range.clone()]) {
@@ -445,7 +450,7 @@ fn left_alone(
             );
         }
     }
-    let segments = if agent == Agent::Codex {
+    let segments = if matches!(agent, Agent::Codex | Agent::Agy) {
         agents::split_script(command)
     } else {
         agents::split_compound(command)
