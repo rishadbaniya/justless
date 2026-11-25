@@ -2,6 +2,7 @@ mod adaptive;
 mod agents;
 mod agy_sessions;
 mod batch;
+mod buildkit;
 mod capture;
 mod cargo_tests;
 mod claude_permissions;
