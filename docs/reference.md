@@ -28,7 +28,7 @@
 | `justless context --symbol NAME` | The symbol's location and numbered source. In a session, a symbol read before prints only what changed since. [Details](#reading-a-symbol-again) |
 | `justless code src/lib.rs --from 1 --to 8` | A numbered excerpt of original source. A range that starts past the end of the file is an error, and one that runs past it ends at the last line with a note. |
 | `justless read FILE --outline` | Revision, signatures and line ranges. Small files are returned verbatim when called without outline options. |
-| `justless expand FILE SELECTOR` | Exact bytes for a symbol, entry, section or inclusive line range |
+| `justless expand FILE SELECTOR` | Exact bytes for a symbol, entry, section, inclusive line range, or comma-separated list (`REV#1,#5`) |
 | `justless edit FILE SELECTOR --revision REV` | Apply the replacement supplied on stdin after verifying the snapshot and that the file still parses |
 | `justless mask` / `justless recall ID` | Retire older tool outputs from an outbound JSON request or retrieve the original result |
 | `justless wrap claude [ARGS…]` | Claude Code through a local proxy that asks the API to clear old tool results in rare, large steps and archives tool results |

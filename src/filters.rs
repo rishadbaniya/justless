@@ -1770,9 +1770,11 @@ impl<'a> LineFilter<'a> {
         if error {
             self.evidence_until = n.saturating_add(4);
         }
+        let log_key = (self.config.profile == Some(Profile::Logs)).then(|| log_dedup_key(line));
         if !error && !context {
             let success = js
                 && (line.starts_with("PASS ")
+                    || line.starts_with("(pass) ")
                     || line.starts_with("✓ ")
                     || line.starts_with("✔ ")
                     || line.starts_with("√ ")
@@ -1783,13 +1785,17 @@ impl<'a> LineFilter<'a> {
                 self.last.clear();
                 return;
             }
-            if self.config.profile == Some(Profile::Logs) && !line.is_empty() && text == self.last {
+            if let Some(key) = log_key
+                && !key.is_empty()
+                && key == self.last
+            {
                 self.duplicate += 1;
                 return;
             }
         }
-        if self.config.profile == Some(Profile::Logs) {
-            self.last = text.to_owned();
+        if let Some(key) = log_key {
+            self.last.clear();
+            self.last.push_str(key);
         }
         self.retained += 1;
         if !self.clipped && self.prefix.len() + text.len() <= self.limit {
@@ -1834,6 +1840,25 @@ impl<'a> LineFilter<'a> {
         }
         Some((report.into_bytes(), whole))
     }
+}
+
+/// Key used to detect consecutive repeated lines in `Profile::Logs` (`docker logs`
+/// / `kubectl logs`), ignoring a leading timestamp so identical periodic lines
+/// (such as health checks) fold even when each line carries a fresh timestamp.
+fn log_dedup_key(line: &str) -> &str {
+    static LEADING_TIMESTAMP: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"^(?:\[?(?:\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\]?\s+)+",
+        )
+        .unwrap()
+    });
+    if let Some(found) = LEADING_TIMESTAMP.find(line) {
+        let rest = &line[found.end()..];
+        if !rest.is_empty() {
+            return rest;
+        }
+    }
+    line
 }
 
 pub(crate) fn diagnostic(line: &str) -> bool {
@@ -2080,5 +2105,66 @@ mod tests {
         assert!(!legacy_hook(&["cargo", "nextest", "archive"]));
         assert!(legacy_hook(&["git", "reflog", "-n", "10"]));
         assert!(!legacy_hook(&["git", "reflog", "expire", "--all"]));
+    }
+
+    #[test]
+    fn logs_profile_folds_timestamped_repeats_and_js_filters_bun_passes() {
+        let log_args: Vec<OsString> = ["docker", "logs", "web"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let selection = Selection::for_run(&log_args, &[]).unwrap();
+        assert_eq!(selection.profile, Some(Profile::Logs));
+        let mut filter = LineFilter::new(&selection, 4096);
+        let lines = [
+            "2026-11-25T14:01:01.100Z INFO healthcheck ok\n",
+            "2026-11-25T14:01:02.200Z INFO healthcheck ok\n",
+            "2026-11-25T14:01:03.300Z INFO healthcheck ok\n",
+            "[2026-11-25 14:01:04] INFO healthcheck ok\n",
+            "2026/11/25 14:01:05 worker idle\n",
+            "2026/11/25 14:01:06 worker idle\n",
+            "Nov 25 14:01:07 worker idle\n",
+            "2026-11-25T14:01:08.000Z ERROR database connection refused\n",
+            "2026-11-25T14:01:09.000Z ERROR database connection refused\n",
+        ];
+        for (i, line) in lines.iter().enumerate() {
+            filter.observe(line, i + 1);
+        }
+        let (bytes, whole) = filter.finish().unwrap();
+        assert!(whole);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("[4 retained lines, 0 filtered, 5 repeats]"),
+            "{text}"
+        );
+        // Both ERROR lines stay verbatim even though their messages match.
+        assert_eq!(
+            text.matches("ERROR database connection refused").count(),
+            2,
+            "{text}"
+        );
+        // Only the first timestamped healthcheck and worker-idle lines are kept.
+        assert_eq!(text.matches("INFO healthcheck ok").count(), 1, "{text}");
+        assert_eq!(text.matches("worker idle").count(), 1, "{text}");
+
+        let bun_args: Vec<OsString> = ["bun", "test"].into_iter().map(OsString::from).collect();
+        let selection = Selection::for_run(&bun_args, &[]).unwrap();
+        assert_eq!(selection.profile, Some(Profile::JsTests));
+        let mut filter = LineFilter::new(&selection, 4096);
+        let bun_lines = [
+            "(pass) auth > verifies token [0.42ms]\n",
+            "(pass) auth > refreshes session [0.18ms]\n",
+            "(fail) billing > charges card [1.05ms]\n",
+            " 2 pass\n",
+            " 1 fail\n",
+        ];
+        for (i, line) in bun_lines.iter().enumerate() {
+            filter.observe(line, i + 1);
+        }
+        let (bytes, _) = filter.finish().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("2 filtered"), "{text}");
+        assert!(text.contains("(fail) billing > charges card"), "{text}");
+        assert!(!text.contains("verifies token"), "{text}");
     }
 }

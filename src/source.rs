@@ -700,16 +700,50 @@ fn rust_header(fragment: &str) -> (usize, usize) {
     let start = tokens
         .get(first)
         .map_or(0, |token| token.span().byte_range().start);
+    let body = &fragment[start..];
+    // For multi-line or long `const`/`static` items, stop before the top-level `=`
+    // so outlines keep the name and type without dumping 160 bytes of regex/array/
+    // query initializer noise. Short single-line scalars keep their `= value`.
+    let trim_initializer =
+        is_const_or_static(&tokens[first..]) && (body.contains('\n') || body.len() > 80);
     let end = tokens[first..]
         .iter()
         .find_map(|token| match token {
             TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
                 Some(group.span_open().byte_range().start)
             }
+            TokenTree::Punct(punct) if trim_initializer && punct.as_char() == '=' => {
+                Some(punct.span().byte_range().start)
+            }
             _ => None,
         })
         .unwrap_or(fragment.len());
     (start, end.max(start))
+}
+
+/// Whether `tokens` (after outer attributes) begin a `const` or `static` value
+/// declaration rather than a `const fn` / `const unsafe fn` / `const extern fn`.
+fn is_const_or_static(tokens: &[proc_macro2::TokenTree]) -> bool {
+    use proc_macro2::{Delimiter, TokenTree};
+    let mut i = 0;
+    if matches!(tokens.get(i), Some(TokenTree::Ident(id)) if id == "pub") {
+        i += 1;
+        if matches!(tokens.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+        {
+            i += 1;
+        }
+    }
+    if matches!(tokens.get(i), Some(TokenTree::Ident(id)) if id == "unsafe") {
+        i += 1;
+    }
+    match tokens.get(i) {
+        Some(TokenTree::Ident(id)) if id == "static" => true,
+        Some(TokenTree::Ident(id)) if id == "const" => !matches!(
+            tokens.get(i + 1),
+            Some(TokenTree::Ident(next)) if next == "fn" || next == "unsafe" || next == "extern"
+        ),
+        _ => false,
+    }
 }
 
 /// A selector's embedded revision, if any, and its target.
@@ -733,8 +767,44 @@ fn line_range(target: &str) -> Option<&str> {
     })
 }
 
+/// Split a comma-separated list of selectors (`REV#10,#11,#20`, `L1-5,L20-25`,
+/// `foo,bar`) while leaving prose selectors such as Markdown headings containing
+/// commas (`"Setup, usage, and tips"`) intact.
+fn split_expand_selectors<'a>(source: &Snapshot, selector: &'a str) -> Vec<&'a str> {
+    if !selector.contains(',') {
+        return vec![selector];
+    }
+    let parts: Vec<&str> = selector.split(',').map(str::trim).collect();
+    if parts.len() < 2
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || part.contains(char::is_whitespace))
+    {
+        return vec![selector];
+    }
+    let has_ref_syntax = parts
+        .iter()
+        .any(|part| part.contains('#') || line_range(split_selector(part).1).is_some());
+    if !has_ref_syntax && source.entries.iter().any(|entry| entry.name == selector) {
+        return vec![selector];
+    }
+    parts
+}
+
 /// Line ranges resolve without the outline, so they skip the parser.
 fn needs_outline(selector: &str) -> bool {
+    if selector.contains(',') {
+        let parts: Vec<&str> = selector.split(',').map(str::trim).collect();
+        if parts.len() >= 2
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && !part.contains(char::is_whitespace))
+        {
+            return parts
+                .iter()
+                .any(|part| line_range(split_selector(part).1).is_none());
+        }
+    }
     line_range(split_selector(selector).1).is_none()
 }
 
@@ -960,34 +1030,90 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
         if needs_outline(selector) {
             source.index(file)?;
         }
-        let span = source.resolve(selector, args.value_of("revision"), false)?;
-        let first = source.line(span.start);
-        let last = source.line(span.end.saturating_sub(1));
-        let content = &source.text[span.clone()];
-        let shown_bytes = if args.is_present("json") {
-            let anchor = source
-                .entries
-                .iter()
-                .position(|entry| entry.bytes == span)
-                .map(|index| source.reference(index))
-                .unwrap_or_else(|| format!("{}#L{first}-{last}", source.revision));
-            let encoded = serde_json::to_vec(&serde_json::json!({
-                "file": file, "revision": source.revision, "selector": anchor, "first": first, "last": last, "content": content,
-            }))?;
-            io::stdout().lock().write_all(&encoded)?;
-            encoded.len() as u64
+        let parts = split_expand_selectors(&source, selector);
+        let digest = crate::capture::source_digest(source.text.as_bytes());
+        if parts.len() == 1 {
+            let span = source.resolve(parts[0], args.value_of("revision"), false)?;
+            let first = source.line(span.start);
+            let last = source.line(span.end.saturating_sub(1));
+            let content = &source.text[span.clone()];
+            let shown_bytes = if args.is_present("json") {
+                let anchor = source
+                    .entries
+                    .iter()
+                    .position(|entry| entry.bytes == span)
+                    .map(|index| source.reference(index))
+                    .unwrap_or_else(|| format!("{}#L{first}-{last}", source.revision));
+                let encoded = serde_json::to_vec(&serde_json::json!({
+                    "file": file, "revision": source.revision, "selector": anchor, "first": first, "last": last, "content": content,
+                }))?;
+                io::stdout().lock().write_all(&encoded)?;
+                encoded.len() as u64
+            } else {
+                io::stdout().lock().write_all(content.as_bytes())?;
+                content.len() as u64
+            };
+            crate::history::saw_expand(ws, file, first, last, digest, shown_bytes);
         } else {
-            io::stdout().lock().write_all(content.as_bytes())?;
-            content.len() as u64
-        };
-        crate::history::saw_expand(
-            ws,
-            file,
-            first,
-            last,
-            crate::capture::source_digest(source.text.as_bytes()),
-            shown_bytes,
-        );
+            // Inherit an embedded revision from the first selector so callers can
+            // write `REV#10,#11,#20` without repeating the 24-hex revision.
+            let inherited = split_selector(parts[0]).0;
+            let explicit = args.value_of("revision");
+            let mut resolved = Vec::with_capacity(parts.len());
+            for part in parts {
+                let rev = explicit.or_else(|| split_selector(part).0.or(inherited));
+                let span = source.resolve(part, rev, false)?;
+                let first = source.line(span.start);
+                let last = source.line(span.end.saturating_sub(1));
+                let entry_id = source.entries.iter().position(|entry| entry.bytes == span);
+                let anchor = entry_id
+                    .map(|index| source.reference(index))
+                    .unwrap_or_else(|| format!("{}#L{first}-{last}", source.revision));
+                let label = match entry_id {
+                    Some(index) => format!("#{} L{first}-{last}", index + 1),
+                    None => format!("L{first}-{last}"),
+                };
+                resolved.push((span, first, last, anchor, label));
+            }
+            let shown_bytes = if args.is_present("json") {
+                let spans: Vec<_> = resolved
+                    .iter()
+                    .map(|(span, first, last, anchor, _)| {
+                        serde_json::json!({
+                            "selector": anchor,
+                            "first": first,
+                            "last": last,
+                            "content": &source.text[span.clone()],
+                        })
+                    })
+                    .collect();
+                let encoded = serde_json::to_vec(&serde_json::json!({
+                    "file": file,
+                    "revision": source.revision,
+                    "spans": spans,
+                }))?;
+                io::stdout().lock().write_all(&encoded)?;
+                encoded.len() as u64
+            } else {
+                let mut out = String::new();
+                for (span, _, _, _, label) in &resolved {
+                    out.push_str("--- ");
+                    out.push_str(label);
+                    out.push_str(" ---\n");
+                    let content = &source.text[span.clone()];
+                    out.push_str(content);
+                    if !content.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                io::stdout().lock().write_all(out.as_bytes())?;
+                out.len() as u64
+            };
+            for (index, (_, first, last, _, _)) in resolved.iter().enumerate() {
+                let charged = if index == 0 { shown_bytes } else { 0 };
+                crate::history::saw_expand(ws, file, *first, *last, digest.clone(), charged);
+            }
+        }
     }
     Ok(())
 }

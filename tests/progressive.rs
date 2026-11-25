@@ -1223,4 +1223,94 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
     let expanded_mod =
         String::from_utf8(out(root, &["expand", "main.rs", &format!("{rev}#5")])).unwrap();
     assert_eq!(expanded_mod, "mod mod_4;");
+
+    // Multi-selector `expand` resolves several spans in one call (inheriting the
+    // first revision), returns `--json` spans, rejects stale revisions, and keeps
+    // Markdown headings containing commas intact.
+    let multi = String::from_utf8(out(
+        root,
+        &["expand", "main.rs", &format!("{rev}#5,#9,L14-14")],
+    ))
+    .unwrap();
+    assert!(multi.contains("--- #5 L5-5 ---\nmod mod_4;\n"), "{multi}");
+    assert!(
+        multi.contains("--- #9 L10-12 ---\nmod inline_mod {\n"),
+        "{multi}"
+    );
+    assert!(multi.contains("--- L14-14 ---\nfn entry() {}\n"), "{multi}");
+
+    let multi_json: Value = serde_json::from_slice(&out(
+        root,
+        &["expand", "main.rs", &format!("{rev}#5,#9"), "--json"],
+    ))
+    .unwrap();
+    assert_eq!(multi_json["spans"].as_array().unwrap().len(), 2);
+    assert_eq!(multi_json["spans"][0]["content"], "mod mod_4;");
+    assert_eq!(multi_json["spans"][1]["first"], 10);
+
+    let stale = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "expand",
+            "main.rs",
+            &format!("{rev}#5,000000000000000000000000#9"),
+        ])
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("stale revision"),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+
+    fs::write(
+        root.join("guide.md"),
+        "# Setup, usage, and tips\nBody line.\n# Next\nMore.\n",
+    )
+    .unwrap();
+    let heading =
+        String::from_utf8(out(root, &["expand", "guide.md", "Setup, usage, and tips"])).unwrap();
+    assert_eq!(heading, "# Setup, usage, and tips\nBody line.\n");
+
+    // Multi-line or long Rust `const`/`static` initializers trim at `=` in outlines
+    // while short single-line scalars and `const fn` signatures keep their text.
+    fs::write(
+        root.join("consts.rs"),
+        concat!(
+            "const LIMIT: usize = 2048;\n",
+            "const LONG_QUERY: &str = \"\n",
+            "    (function_item name: (identifier) @name) @definition.function\n",
+            "    (struct_item name: (type_identifier) @name) @definition.struct\n",
+            "\";\n",
+            "pub static PATTERN: &[&str] = &[\n",
+            "    \"alpha\",\n",
+            "    \"beta\",\n",
+            "];\n",
+            "pub const fn compute(x: usize) -> usize {\n",
+            "    x + 1\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let const_outline = String::from_utf8(out(root, &["read", "consts.rs", "--outline"])).unwrap();
+    assert!(
+        const_outline.contains("const LIMIT: usize = 2048;"),
+        "{const_outline}"
+    );
+    assert!(
+        const_outline.contains("const LONG_QUERY: &str\n"),
+        "{const_outline}"
+    );
+    assert!(!const_outline.contains("function_item"), "{const_outline}");
+    assert!(
+        const_outline.contains("pub static PATTERN: &[&str]\n"),
+        "{const_outline}"
+    );
+    assert!(!const_outline.contains("\"alpha\""), "{const_outline}");
+    assert!(
+        const_outline.contains("pub const fn compute(x: usize) -> usize"),
+        "{const_outline}"
+    );
 }

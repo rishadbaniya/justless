@@ -766,12 +766,12 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "expand",
-        title: "Expand one symbol",
+        title: "Expand symbols",
         command: "expand",
-        description: "Exact source of one symbol, Markdown section, outline row (REV#ROW) or line range (L10-20).",
+        description: "Exact source of symbol(s), Markdown section, outline row(s) (REV#ROW,#ROW) or line range (L10-20).",
         params: &[
             FILE,
-            positional("selector", Kind::Text, "Symbol, REV#ROW or L20-35"),
+            positional("selector", Kind::Text, "Symbol, REV#ROW,#ROW or L20-35"),
             option(
                 "revision",
                 "revision",
