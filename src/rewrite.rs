@@ -33,7 +33,9 @@ pub fn disabled() -> bool {
 pub fn noop(agent: Agent, mode: &str) -> Option<&'static str> {
     match (agent, mode) {
         (Agent::Claude, "before-compact") => None,
-        (Agent::Agy, "before-command" | "before-read") => Some(r#"{"decision":"allow"}"#),
+        (Agent::Agy, "before-command" | "before-read" | "before-edit") => {
+            Some(r#"{"decision":"allow"}"#)
+        }
         _ => Some("{}"),
     }
 }
@@ -99,10 +101,17 @@ impl Exclusions {
         }
         let text = segment.trim();
         let words = crate::shell_form::parse(text).and_then(|form| text.get(form.command));
+        let unwrapped = words
+            .and_then(crate::agents::literal_command)
+            .and_then(|args| {
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                crate::wrappers::hook_effective(&refs)
+            })
+            .map(|args| args.join(" "));
         self.0
             .iter()
             .find(|entry| {
-                [Some(text), words]
+                [Some(text), words, unwrapped.as_deref()]
                     .into_iter()
                     .flatten()
                     .any(|candidate| matches(entry, candidate))
@@ -128,7 +137,7 @@ impl Exclusions {
 
     /// The entry that matches the command of `line` whose words are at `words`.
     pub fn within(&self, line: &str, words: &Range<usize>) -> Option<&str> {
-        let segment = agents::split_compound(line)
+        let segment = agents::split_script(line)
             .and_then(|segments| {
                 segments
                     .into_iter()
@@ -315,9 +324,15 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
             } else if runs == 0 {
                 "Why: the hook names the session, so a symbol read again prints only what changed.".into()
             } else if new.contains(" run --hook --window") {
-                format!(
-                    "Why: {commands} through `justless run`, which archives the full output and prints a compact preview, and the `head` after it keeps the start of that preview."
-                )
+                if new.contains("| tail") || new.contains("|tail") {
+                    format!(
+                        "Why: {commands} through `justless run`, which archives the full output and prints a compact preview, and the `tail` after it keeps the end of that preview."
+                    )
+                } else {
+                    format!(
+                        "Why: {commands} through `justless run`, which archives the full output and prints a compact preview, and the `head` after it keeps the start of that preview."
+                    )
+                }
             } else {
                 format!(
                     "Why: {commands} through `justless run`, which archives the full output and prints a compact preview."
@@ -343,11 +358,7 @@ pub fn explain(workspace: &Workspace, agent: Agent, mode: &str, command: &str) -
         }
     }
     // A list's own exclusions; a whole excluded line is the reason above.
-    let list_segments = if matches!(agent, Agent::Codex | Agent::Agy) {
-        agents::split_script(command)
-    } else {
-        agents::split_compound(command)
-    };
+    let list_segments = agents::split_for_agent(agent, command);
     if exclusions.line(command).is_none()
         && let Some(segments) = list_segments
     {
@@ -461,12 +472,7 @@ fn left_alone(
             );
         }
     }
-    let segments = if matches!(agent, Agent::Codex | Agent::Agy) {
-        agents::split_script(command)
-    } else {
-        agents::split_compound(command)
-    };
-    let segments = segments.unwrap_or_default();
+    let segments = agents::split_for_agent(agent, command).unwrap_or_default();
     if !matches!(agent, Agent::Claude | Agent::Gemini | Agent::Agy) && segments.len() > 1 {
         let routable = segments.iter().any(|range| {
             ask(

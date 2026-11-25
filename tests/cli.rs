@@ -1429,12 +1429,32 @@ fn install_and_run_claude_and_agy_hooks() {
         "justless hook-agy before-read"
     );
     assert_eq!(
+        agy["justless"]["PreToolUse"][2]["matcher"],
+        "^(edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content)$"
+    );
+    assert_eq!(
+        agy["justless"]["PreToolUse"][2]["hooks"][0]["command"],
+        "justless hook-agy before-edit"
+    );
+    assert_eq!(
         agy["justless"]["PostToolUse"][0]["matcher"],
         "^(read_file|view_file)$"
     );
     assert_eq!(
         agy["justless"]["PostToolUse"][0]["hooks"][0]["command"],
         "justless hook-agy after-read"
+    );
+    assert_eq!(
+        agy["justless"]["PostToolUse"][1]["matcher"],
+        "^(edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content)$"
+    );
+    assert_eq!(
+        agy["justless"]["PostToolUse"][1]["hooks"][0]["command"],
+        "justless hook-agy after-edit"
+    );
+    assert_eq!(
+        agy["justless"]["PostInvocation"][0]["command"],
+        "justless hook-agy post-invocation"
     );
     let claude_input = json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd":root,"tool_input":{"command":"git diff","description":"show changes"}});
     let output = agent_hook(&root, "hook-claude", "before-command", claude_input.clone());
@@ -6025,7 +6045,7 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
         "✓ Hooks: .cursor/hooks.json has both ",
         "✓ Hooks: .gemini/settings.json has both ",
         "✓ Hooks: .github/hooks/justless.json has both ",
-        "✓ Hooks: .agents/hooks.json has all 4 ",
+        "✓ Hooks: .agents/hooks.json has all 7 ",
         "✓ Plugin: .opencode/plugins/justless.js is current",
         "✓ Instructions: CLAUDE.md has the current Justless block",
         "✓ Instructions: AGENTS.md has the current Justless block",
@@ -11797,7 +11817,6 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         "export DYLD_INSERT_LIBRARIES=./x.dylib; cargo test",
         "cargo fmt && PATH=/x; cargo test",
         // Other redirections, and a `2>&1` anywhere but last.
-        "cargo test 2>&1 | tail -50",
         "cargo test >&2",
         "cargo test 1>&2",
         "cargo test 2>err.txt",
@@ -11821,11 +11840,10 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         " 2>&1 cd /tmp && cargo test",
         "git status && builtin 2>&1 cd /tmp && cargo test",
         "cd 2>&1 && cargo test",
-        // Assignments the shell would expand, and words that are not assignments.
-        "env RUST_BACKTRACE=1 cargo test",
+        // Steering env wrappers, shell wrappers, and words that are not assignments.
         "env PATH=/tmp/bin cargo test",
         "env -u PATH cargo test",
-        "env -i cargo test",
+        "env -S 'cargo test'",
         "bash -c 'cargo test; rm -rf /'",
         "RUST_BACKTRACE=$LEVEL cargo test",
         "FOO=`id` cargo test",
@@ -11840,6 +11858,27 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         for (client, rewritten) in rewrites(&root, command) {
             assert_eq!(rewritten, None, "{client}: {command}");
         }
+    }
+    // `2>&1 | tail -50` routes with `--window --merge` (absorbing `2>&1`) on all
+    // non-Claude clients; Claude leaves piped commands to `after-bash`.
+    for (client, rewritten) in rewrites(&root, "cargo test 2>&1 | tail -50") {
+        let expected = (client != "claude")
+            .then_some("justless run --hook --window --merge -- cargo test | tail -50");
+        assert_eq!(rewritten.as_deref(), expected, "{client}");
+    }
+    // Safe `env` wrappers: display assignments route everywhere; `-i` routes in
+    // Claude, Gemini, Copilot, and Agy Tier 2 (`ask`) only (never auto-approved).
+    for (client, rewritten) in rewrites(&root, "env RUST_BACKTRACE=1 cargo test") {
+        assert_eq!(
+            rewritten.as_deref(),
+            Some("justless run --hook -- env RUST_BACKTRACE=1 cargo test"),
+            "{client}"
+        );
+    }
+    for (client, rewritten) in rewrites(&root, "env -i cargo test") {
+        let expected = matches!(client, "claude" | "gemini" | "copilot" | "agy")
+            .then_some("justless run --hook -- env -i cargo test");
+        assert_eq!(rewritten.as_deref(), expected, "{client}");
     }
     // Claude Code leaves `grep` to its own shell behind an assignment too.
     let grep = rewrites(&root, "LC_ALL=C grep -r needle .");

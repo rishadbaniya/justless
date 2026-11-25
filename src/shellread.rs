@@ -93,12 +93,28 @@ impl LineRange {
         }
     }
 
-    /// A `sed -n` script of `A,Bp` addresses, one or several joined by `;`,
-    /// such as `12,107p;209,260p`.
+    /// A `sed -n` script of `A,Bp` or `A,$p` addresses, one or several joined by `;`,
+    /// such as `12,107p;209,260p` or `10,$p`.
     fn sed(script: &str) -> Option<Self> {
-        let spans = script
-            .split(';')
-            .map(|part| Span::closed(part.strip_suffix('p')?, ','))
+        let parts: Vec<&str> = script.split(';').collect();
+        let last_index = parts.len().checked_sub(1)?;
+        let spans = parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let body = part.strip_suffix('p')?;
+                if let Some(first) = body.strip_suffix(",$") {
+                    (index == last_index).then(|| {
+                        Some(Span {
+                            first: decimal(first)?,
+                            last: None,
+                            from_end: false,
+                        })
+                    })?
+                } else {
+                    Span::closed(body, ',')
+                }
+            })
             .collect::<Option<Vec<_>>>()?;
         Some(Self::new(spans))
     }
@@ -290,13 +306,40 @@ fn split(command: &str) -> Option<Vec<(Range<usize>, &'static str)>> {
     Some(parts)
 }
 
-/// `head -N …` as the same `head -n N …`.
+/// Normalize `head -N`, `head`/`tail` attached `-nN`, `-n+N`, `--lines=N`,
+/// `--lines=+N` and `--lines N`/`+N` into `head|tail -n ARG …`.
 fn head_count(mut words: Vec<String>) -> Vec<String> {
-    if let [head, count, ..] = words.as_slice()
-        && head == "head"
-        && let Some(count) = count.strip_prefix('-').and_then(decimal)
-    {
-        words.splice(1..2, ["-n".to_owned(), count.to_string()]);
+    let valid_tail = |arg: &str| {
+        arg.strip_prefix('+')
+            .map_or_else(|| decimal(arg).is_some(), |n| decimal(n).is_some())
+    };
+    match words.as_slice() {
+        [head, opt, ..] if head == "head" => {
+            if let Some(arg) = opt
+                .strip_prefix("-n")
+                .or_else(|| opt.strip_prefix("--lines="))
+                .or_else(|| opt.strip_prefix('-'))
+                && decimal(arg).is_some()
+            {
+                let arg = arg.to_owned();
+                words.splice(1..2, ["-n".to_owned(), arg]);
+            } else if opt == "--lines" && words.get(2).is_some_and(|arg| decimal(arg).is_some()) {
+                words[1] = "-n".to_owned();
+            }
+        }
+        [tail, opt, ..] if tail == "tail" => {
+            if let Some(arg) = opt
+                .strip_prefix("-n")
+                .or_else(|| opt.strip_prefix("--lines="))
+                && valid_tail(arg)
+            {
+                let arg = arg.to_owned();
+                words.splice(1..2, ["-n".to_owned(), arg]);
+            } else if opt == "--lines" && words.get(2).is_some_and(|arg| valid_tail(arg)) {
+                words[1] = "-n".to_owned();
+            }
+        }
+        _ => {}
     }
     words
 }
@@ -1141,6 +1184,22 @@ mod tests {
             ("cat -n a.rs | head -n 40", ":a.rs 1-40 cat-n"),
             ("cat a.rs | head -40", ":a.rs 1-40"),
             ("head -25 a.rs", ":a.rs 1-25"),
+            ("head -n5 a.rs", ":a.rs 1-5"),
+            ("cat a | head -n5", ":a 1-5"),
+            ("head --lines=12 a.rs", ":a.rs 1-12"),
+            ("head --lines 12 a.rs", ":a.rs 1-12"),
+            ("cat a.rs | head --lines=12", ":a.rs 1-12"),
+            ("tail -n20 a.rs", ":a.rs -20"),
+            ("tail -n+30 a.rs", ":a.rs +30"),
+            ("tail --lines=20 a.rs", ":a.rs -20"),
+            ("tail --lines=+30 a.rs", ":a.rs +30"),
+            ("tail --lines +30 a.rs", ":a.rs +30"),
+            ("cat a.rs | tail -n+10", ":a.rs +10"),
+            ("cat a.rs | tail -n10", ":a.rs -10"),
+            ("sed -n '10,$p' a.rs", ":a.rs +10"),
+            ("sed -n '1,5p;10,$p' a.rs", ":a.rs 1-5,+10"),
+            ("cat a.rs | sed -n '10,$p'", ":a.rs +10"),
+            ("nl -ba a.rs | sed -n '10,$p'", ":a.rs +10 nl-ba"),
             ("cat -n a.rs | head -7", ":a.rs 1-7 cat-n"),
             (
                 "nl -ba a.rs | sed -n '5,9p;20,30p'",
@@ -1169,7 +1228,13 @@ mod tests {
             "cat <<EOF",
             "cat a | head",
             "cat a | head -05",
-            "cat a | head -n5",
+            "head -n05 a.rs",
+            "head -n+5 a.rs",
+            "head --lines=-5 a.rs",
+            "tail -n+0 a.rs",
+            "tail -c5 a.rs",
+            "sed -n '10,$p;20,30p' a.rs",
+            "sed -n '0,$p' a.rs",
             "cat a | grep -n x",
             "cat a | head -n 5 | tail -n 2",
             "cat a b | head -n 1",

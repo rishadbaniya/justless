@@ -36,12 +36,16 @@ pub fn merge_at(bytes: &[u8], at: usize) -> bool {
         .iter()
         .position(|byte| !blank(byte))
         .unwrap_or(rest.len())..];
+    let single_pipe = |slice: &[u8]| {
+        slice.first() == Some(&b'|') && !slice.starts_with(b"||") && !slice.starts_with(b"|&")
+    };
     rest.first()
-        .is_none_or(|byte| blank(byte) || matches!(byte, b';' | b'\n'))
+        .is_none_or(|byte| blank(byte) || matches!(byte, b';' | b'\n') || single_pipe(rest))
         && (next.is_empty()
             || matches!(next[0], b';' | b'\n')
             || next.starts_with(b"&&")
-            || next.starts_with(b"||"))
+            || next.starts_with(b"||")
+            || single_pipe(next))
 }
 
 /// Whether the text that follows a wrapped command's words starts with the final
@@ -49,7 +53,11 @@ pub fn merge_at(bytes: &[u8], at: usize) -> bool {
 pub fn merges(rest: &str) -> bool {
     rest.trim_start_matches([' ', '\t'])
         .strip_prefix(MERGE)
-        .is_some_and(|after| after.is_empty() || after.starts_with([' ', '\t', ';', '\n']))
+        .is_some_and(|after| {
+            after.is_empty()
+                || after.starts_with([' ', '\t', ';', '\n'])
+                || (after.starts_with('|') && !after.starts_with("||") && !after.starts_with("|&"))
+        })
 }
 
 /// Whether a command of a list may change, for the commands after it, a variable
@@ -123,13 +131,22 @@ const SPECIAL: &[&str] = &[
 /// `PATH`, and `path`, which zsh ties to it, `LD_*` and `DYLD_*`, which load code
 /// into it, and `JUSTLESS_*`, which configure it. An empty name stands for an
 /// assignment the shell would not take literally.
-fn steers(name: &str) -> bool {
+pub(crate) fn steers(name: &str) -> bool {
     name.is_empty()
         || name == "PATH"
         || name == "path"
         || name.starts_with("LD_")
         || name.starts_with("DYLD_")
         || name.starts_with("JUSTLESS_")
+}
+
+/// Whether `name=value` is a display/diagnostic assignment with a plain value,
+/// safe for a client that auto-approves rewritten commands (outside `make`).
+pub(crate) fn display_assignment(name: &str, value: &str) -> bool {
+    (DISPLAY.contains(&name) || name.starts_with("LC_"))
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.,:=@%+-".contains(c))
 }
 
 /// Split a trimmed simple command into its assignments and command words, leaving
@@ -172,7 +189,11 @@ impl Form {
         let make = || {
             shlex::split(&segment[self.command.clone()]).is_none_or(|words| {
                 let words: Vec<&str> = words.iter().map(String::as_str).collect();
-                crate::filters::unwrap_tool(&words)
+                let Some(unwrapped) = crate::wrappers::hook_effective(&words) else {
+                    return true;
+                };
+                let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+                crate::filters::unwrap_tool(&refs)
                     .first()
                     .is_some_and(|program| {
                         let name = std::path::Path::new(program).file_name();
@@ -181,12 +202,9 @@ impl Form {
             })
         };
         (self.assignments.is_empty() || !make())
-            && self.variables(segment).all(|(name, value)| {
-                (DISPLAY.contains(&name.as_str()) || name.starts_with("LC_"))
-                    && value
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "_.,:=@%+-".contains(c))
-            })
+            && self
+                .variables(segment)
+                .all(|(name, value)| display_assignment(&name, &value))
     }
 
     /// Each assignment's name and its value after quote removal. An assignment the

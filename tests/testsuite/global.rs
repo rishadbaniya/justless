@@ -312,13 +312,9 @@ fn discover_reports_excluded_commands_in_their_own_group() {
             &["cargo build ×1", "cargo test ×1"],
         ),
         (claude, "passed_through", &["cargo test ×1"]),
-        (codex, "excluded", &["cargo build ×2", "git log ×1"]),
-        (
-            codex,
-            "passed_through",
-            &["cargo build ×3", "cargo test ×1"],
-        ),
-        (codex, "supported_not_routed", &["cargo test ×1"]),
+        (codex, "excluded", &["cargo build ×5", "git log ×1"]),
+        (codex, "passed_through", &[]),
+        (codex, "supported_not_routed", &["cargo test ×2"]),
     ] {
         assert_eq!(labels(groups, route), expected, "{route}");
     }
@@ -617,12 +613,32 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
         "justless hook-agy before-read --global"
     );
     assert_eq!(
+        hooks["justless"]["PreToolUse"][2]["matcher"],
+        "^(edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content)$"
+    );
+    assert_eq!(
+        hooks["justless"]["PreToolUse"][2]["hooks"][0]["command"],
+        "justless hook-agy before-edit --global"
+    );
+    assert_eq!(
         hooks["justless"]["PostToolUse"][0]["matcher"],
         "^(read_file|view_file)$"
     );
     assert_eq!(
         hooks["justless"]["PostToolUse"][0]["hooks"][0]["command"],
         "justless hook-agy after-read --global"
+    );
+    assert_eq!(
+        hooks["justless"]["PostToolUse"][1]["matcher"],
+        "^(edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content)$"
+    );
+    assert_eq!(
+        hooks["justless"]["PostToolUse"][1]["hooks"][0]["command"],
+        "justless hook-agy after-edit --global"
+    );
+    assert_eq!(
+        hooks["justless"]["PostInvocation"][0]["command"],
+        "justless hook-agy post-invocation --global"
     );
     assert_eq!(
         hooks["justless"]["SessionStart"][0]["command"],
@@ -701,7 +717,7 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
     let doctor =
         |cwd: &Path| String::from_utf8(lab.output(cwd, &["doctor"], None, &[]).stdout).unwrap();
     let report = doctor(&plain);
-    has(&report, "Global hooks for Antigravity CLI: 4 handlers in ");
+    has(&report, "Global hooks for Antigravity CLI: 7 handlers in ");
     has(
         &report,
         "The global Antigravity CLI hooks serve this project",
@@ -709,6 +725,51 @@ fn global_agy_hooks_serve_each_project_once_and_remove_cleanly() {
     has(&report, "✓ Hooks: the global Antigravity CLI hooks in ");
     has(&doctor(&own), "own Antigravity CLI hooks take precedence");
     has(&doctor(&opted), "sets global_hooks = false");
+
+    // Global `before-edit` -> `after-edit` -> `post-invocation` bridge serves `plain`
+    // and skips opted-out and local-hook projects.
+    let target = plain.join("src/lib.rs");
+    let edit_event = |root: &Path, file: &Path| {
+        json!({
+            "conversationId": "conv-global-1",
+            "cwd": root,
+            "workspacePaths": [root],
+            "toolCall": {
+                "id": "call-global-1",
+                "name": "edit_file",
+                "args": {"Path": file}
+            }
+        })
+    };
+    assert_eq!(
+        ask("before-edit", &edit_event(&plain, &target)),
+        json!({"decision": "allow"})
+    );
+    fs::write(&target, "pub fn answer( -> u32 {\n").unwrap();
+    assert_eq!(ask("after-edit", &edit_event(&plain, &target)), json!({}));
+    let post = ask(
+        "post-invocation",
+        &json!({"conversationId": "conv-global-1", "cwd": &plain, "workspacePaths": [&plain]}),
+    );
+    let injected = post["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .unwrap_or("");
+    has(injected, "Justless parse check: after this edit_file");
+    assert_eq!(
+        ask(
+            "post-invocation",
+            &json!({"conversationId": "conv-global-1", "cwd": &plain, "workspacePaths": [&plain]})
+        ),
+        json!({})
+    );
+    assert_eq!(
+        ask(
+            "before-edit",
+            &edit_event(&opted, &opted.join("src/lib.rs"))
+        ),
+        json!({"decision": "allow"})
+    );
+    assert!(!opted.join(".justless").exists());
 
     // Unedited file restores byte for byte.
     lab.run(&lab.base, &words("init --remove --global --agent agy"));

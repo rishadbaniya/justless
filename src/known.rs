@@ -390,8 +390,12 @@ pub fn listed(words: &[&str]) -> bool {
 /// Whether the hooks may route this invocation: a listed command with none of
 /// the options that keep it as written.
 pub fn routes(words: &[&str]) -> bool {
-    longest(ROUTED, words).is_some_and(|except| {
-        !words
+    let Some(unwrapped) = crate::wrappers::hook_effective(words) else {
+        return false;
+    };
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    longest(ROUTED, &refs).is_some_and(|except| {
+        !refs
             .iter()
             .any(|word| except.contains(&word.split_once('=').map_or(*word, |(flag, _)| flag)))
     })

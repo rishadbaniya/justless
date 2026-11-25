@@ -215,12 +215,65 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
         // A `cd` the shell may skip leaves a read after it as written.
         ("rg -n fn src || cd src\ncat small.rs", None),
         ("rg -n nomatch src && cd src\ncat small.rs", None),
-        // `head` with a file, without a count or after `2>&1`, another filter, two
-        // pipes, an option that runs a program, and a JSON read.
+        // `head` with a file, `2>&1` on Search/Listing, disallowed `tail` targets/flags,
+        // `grep` filters, two pipes, an option that runs a program, and a JSON read.
         ("rg -n fn src | head -n 5 src/small.rs", None),
-        ("rg -n fn src | head", None),
+        (
+            "rg -n fn src | head",
+            Some("justless run --hook --window -- rg -n fn src | head".into()),
+        ),
+        (
+            "rg -n fn src | head -n20",
+            Some("justless run --hook --window -- rg -n fn src | head -n20".into()),
+        ),
+        (
+            "rg -n fn src | head --lines=20",
+            Some("justless run --hook --window -- rg -n fn src | head --lines=20".into()),
+        ),
+        (
+            "rg -n fn src | head --lines 20",
+            Some("justless run --hook --window -- rg -n fn src | head --lines 20".into()),
+        ),
+        (
+            "cargo test 2>&1 | head -n 20",
+            Some("justless run --hook --window --merge -- cargo test | head -n 20".into()),
+        ),
+        (
+            "cargo test | tail",
+            Some("justless run --hook --window -- cargo test | tail".into()),
+        ),
+        (
+            "cargo test | tail -n 50",
+            Some("justless run --hook --window -- cargo test | tail -n 50".into()),
+        ),
+        (
+            "cargo test | tail -n50",
+            Some("justless run --hook --window -- cargo test | tail -n50".into()),
+        ),
+        (
+            "cargo test | tail -50",
+            Some("justless run --hook --window -- cargo test | tail -50".into()),
+        ),
+        (
+            "cargo test | tail --lines=50",
+            Some("justless run --hook --window -- cargo test | tail --lines=50".into()),
+        ),
+        (
+            "cargo test 2>&1 | tail -n 50",
+            Some("justless run --hook --window --merge -- cargo test | tail -n 50".into()),
+        ),
         ("rg -n fn src 2>&1 | head -n 5", None),
         ("rg -n fn src | tail -n 5", None),
+        ("git log | tail -n 20", None),
+        ("docker logs web | tail -n 20", None),
+        ("docker ps | tail -n 5", None),
+        ("cargo test | tail -f", None),
+        ("cargo test | tail --follow", None),
+        ("cargo test | tail -c 100", None),
+        ("cargo test | tail -n +5", None),
+        ("cargo test | tail -n 10 src/small.rs", None),
+        ("cargo test | grep ok", None),
+        ("rg -n fn src | grep pub", None),
         ("rg -n fn src | sed -n '1,5p'", None),
         ("rg -n fn src | head -n 5 | cat", None),
         ("rg --pre cat fn src | head -n 5", None),
@@ -297,10 +350,29 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
             "agy must reject unsafe runner: {unsafe_runner:?}"
         );
     }
-    // Newline lists and reads inside lists belong to Codex and Antigravity CLI.
-    for agent in ["claude", "cursor", "gemini"] {
+    // Newline lists and reads inside lists belong to Codex and Antigravity CLI,
+    // while Cursor, Gemini CLI and Copilot also get safe `| head` and scoped `| tail`.
+    for agent in ["claude", "cursor", "gemini", "copilot"] {
         assert_eq!(lab.rewrite(agent, "git status\ngit diff"), None, "{agent}");
     }
+    for agent in ["cursor", "gemini", "copilot"] {
+        assert_eq!(
+            lab.rewrite(agent, "rg -n fn src | head").as_deref(),
+            Some("justless run --hook --window -- rg -n fn src | head"),
+            "{agent}"
+        );
+        assert_eq!(
+            lab.rewrite(agent, "cargo test 2>&1 | tail -n 20")
+                .as_deref(),
+            Some("justless run --hook --window --merge -- cargo test | tail -n 20"),
+            "{agent}"
+        );
+        assert_eq!(lab.rewrite(agent, "git log | tail -n 20"), None, "{agent}");
+        assert_eq!(lab.rewrite(agent, "cargo test | grep ok"), None, "{agent}");
+    }
+    // Claude Code leaves piped commands to its post-run `after-bash` hook.
+    assert_eq!(lab.rewrite("claude", "cargo test 2>&1 | tail -n 20"), None);
+    assert_eq!(lab.rewrite("claude", "rg -n fn src | head"), None);
     assert_eq!(
         lab.rewrite("cursor", "cat notes.md && git status"),
         None,
@@ -363,19 +435,22 @@ fn a_window_keeps_head_and_the_exit_status_and_is_never_compared() {
         let stderr = text(&after.stderr);
         assert!(stderr.contains("[justless run-"), "{stderr}");
         assert!(
-            !format!("{stdout}{stderr}").contains("as run-"),
+            !format!("{stdout}{stderr}").contains("as run-")
+                && !format!("{stdout}{stderr}").contains("since run-"),
             "{stdout}{stderr}"
         );
     }
     // A plain run after them compares with none of them, and then with itself.
     let plain = || lab.sh("justless run --hook -- rg -n fn src");
     let first = plain();
-    assert!(!text(&first.stdout).contains("as run-"));
-    let second = plain();
     assert!(
-        text(&second.stdout).contains("as run-"),
-        "{}",
-        text(&second.stdout)
+        !text(&first.stdout).contains("as run-") && !text(&first.stdout).contains("since run-")
+    );
+    let second = plain();
+    let second_out = text(&second.stdout);
+    assert!(
+        second_out.contains("as run-") || second_out.contains("since run-"),
+        "{second_out}"
     );
     // `head` sets the status, with or without Justless.
     let missing = "rg -n fn nowhere | head -n 4";

@@ -425,14 +425,22 @@ fn cli() -> Command<'static> {
                 .arg(Arg::new("room").required(true)),
         )
         .subcommands(["hook-codex", "hook-claude", "hook-agy"].map(|name| {
-            Command::new(name)
-                .hide(true)
-                .arg(
-                    Arg::new("global")
-                        .long("global")
-                        .help("Installed by init --global: find the project from the input's cwd"),
-                )
-                .arg(Arg::new("mode").required(true).possible_values([
+            let modes: &[&str] = if name == "hook-agy" {
+                &[
+                    "session-start",
+                    "before-command",
+                    "before-read",
+                    "before-edit",
+                    "after-read",
+                    "after-search",
+                    "after-bash",
+                    "after-edit",
+                    "post-invocation",
+                    "after-compact",
+                    "before-compact",
+                ]
+            } else {
+                &[
                     "session-start",
                     "before-command",
                     "before-read",
@@ -442,7 +450,16 @@ fn cli() -> Command<'static> {
                     "after-edit",
                     "after-compact",
                     "before-compact",
-                ]))
+                ]
+            };
+            Command::new(name)
+                .hide(true)
+                .arg(
+                    Arg::new("global")
+                        .long("global")
+                        .help("Installed by init --global: find the project from the input's cwd"),
+                )
+                .arg(Arg::new("mode").required(true).possible_values(modes))
         }))
         // No value list here: an unknown mode must still reach the no-op handler.
         .subcommands(["hook-cursor", "hook-gemini", "hook-copilot"].map(|name| {

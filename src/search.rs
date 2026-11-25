@@ -463,7 +463,9 @@ fn find_display(args: &[&str]) -> bool {
 /// Whether a command hook should route this command, or `None` when it is not a
 /// search or listing. A plain `ls` is usually short, so only `ls -l` and `ls -R` go.
 pub fn route(words: &[&str]) -> Option<bool> {
-    let words = crate::filters::unwrap_tool(words);
+    let unwrapped = crate::wrappers::hook_effective(words)?;
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    let words = crate::filters::unwrap_tool(&refs);
     select(words)?;
     if basename(words[0]) == "ls" {
         return Some(parse(&words[1..], &LS)?.has(&["-l", "--full-time", "-R", "--recursive"]));
@@ -587,7 +589,12 @@ impl Search {
     /// `base` is the directory relative paths in the output resolve against.
     /// Dependency and build directories named in `words` are not collapsed.
     pub fn new(base: &Path, words: &[&str]) -> Self {
-        let tool = crate::filters::unwrap_tool(words);
+        let unwrapped = crate::wrappers::hook_effective(words);
+        let eff_refs: Vec<&str> = match &unwrapped {
+            Some(eff) => eff.iter().map(String::as_str).collect(),
+            None => words.to_vec(),
+        };
+        let tool = crate::filters::unwrap_tool(&eff_refs);
         let blocks = searched(tool)
             .filter(|(_, parsed)| parsed.has(CONTEXT))
             .map(|(_, parsed)| {

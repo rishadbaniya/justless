@@ -588,7 +588,9 @@ fn mvn_build_args(args: &[&str]) -> bool {
 }
 
 pub fn profile(words: &[&str]) -> Option<Profile> {
-    let words = unwrap_tool(words);
+    let unwrapped = crate::wrappers::hook_effective(words)?;
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    let words = unwrap_tool(&refs);
     if let Some(profile) = crate::search::select(words) {
         return Some(profile);
     }
@@ -775,7 +777,11 @@ fn js_display(args: &[&str]) -> bool {
 /// read, so a request that writes, waits, filters the JSON or names a file
 /// elsewhere keeps its own form.
 pub fn json_output(words: &[&str]) -> bool {
-    let words = unwrap_tool(words);
+    let Some(unwrapped) = crate::wrappers::hook_effective(words) else {
+        return false;
+    };
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    let words = unwrap_tool(&refs);
     let Some((&program, args)) = words.split_first() else {
         return false;
     };
@@ -1043,7 +1049,11 @@ pub(crate) fn git_display_subcommand<'a, 'b>(mut args: &'a [&'b str]) -> &'a [&'
 }
 
 pub fn legacy_hook(words: &[&str]) -> bool {
-    match unwrap_tool(words) {
+    let Some(unwrapped) = crate::wrappers::hook_effective(words) else {
+        return false;
+    };
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    match unwrap_tool(&refs) {
         ["cargo", "build" | "check" | "clippy" | "test" | "tree", ..]
         | ["cargo", "nextest", "run", ..]
         | ["make" | "gmake" | "ninja", ..]
@@ -1783,13 +1793,33 @@ fn cargo_fmt_check(words: &[&str]) -> bool {
 /// the command line, or load a plugin or module they name, also fail, such as
 /// `go vet -vettool`, `pylint --init-hook` or `node --test --import`.
 pub fn approvable(words: &[&str]) -> bool {
-    let (tool, fetches) = runners(words);
+    let Some(effective) = crate::wrappers::hook_effective_detail(words) else {
+        return false;
+    };
+    if effective.env_clears {
+        return false;
+    }
+    let eff_refs: Vec<&str> = effective.words.iter().map(String::as_str).collect();
+    let (tool, fetches) = runners(&eff_refs);
     if fetches {
         return false;
     }
     let Some((&program, args)) = tool.split_first() else {
         return false;
     };
+    if !effective.env_assignments.is_empty() {
+        let is_make = Path::new(program)
+            .file_name()
+            .is_some_and(|name| name == "make" || name == "gmake");
+        if is_make
+            || !effective
+                .env_assignments
+                .iter()
+                .all(|(name, value)| crate::shell_form::display_assignment(name, value))
+        {
+            return false;
+        }
+    }
     // Searches and listings take only the options their spec lists, which only
     // read, so `rg --pre`, `--hostname-bin` and `-z`, which run other programs,
     // fail like any option the spec does not know.
@@ -2395,7 +2425,12 @@ pub struct Selection {
 
 impl Selection {
     pub fn for_run(args: &[OsString], rules: &[Rule]) -> Result<Self> {
-        let mut words: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+        let raw: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+        let unwrapped = crate::wrappers::hook_effective(&raw);
+        let mut words: Vec<_> = match &unwrapped {
+            Some(words) => words.iter().map(String::as_str).collect(),
+            None => raw,
+        };
         if let Some(program) = words.first_mut() {
             *program = Path::new(*program)
                 .file_name()
@@ -2857,9 +2892,32 @@ mod tests {
             ("podman build .", false),
             ("podman images", false),
             ("podman image ls", false),
+            // Safe shell wrappers unwrap for approval, while `env` auto-approves only
+            // display/LC_* plain assignments (never before `make`, never `-i`/`-u`).
+            ("timeout 60 cargo test", true),
+            ("timeout -s KILL 30s cargo clippy -- -D warnings", true),
+            ("nice -n 10 cargo test", true),
+            ("stdbuf -oL cargo test", true),
+            ("env RUST_BACKTRACE=1 cargo test", true),
+            ("env LC_ALL=C rg -n foo src", true),
+            ("env RUST_BACKTRACE=1 make test", false),
+            ("env RUST_BACKTRACE=1 gmake test", false),
+            ("env FOO=bar cargo test", false),
+            ("env -i cargo test", false),
+            ("env -u HOME cargo test", false),
+            ("env PATH=/tmp/bin cargo test", false),
+            ("env -S cargo test", false),
+            ("timeout 60 rg --hostname-bin=./evil.sh foo", false),
+            ("timeout --unknown 60 cargo test", false),
         ] {
             let words: Vec<&str> = command.split(' ').collect();
             assert_eq!(approvable(&words), approved, "{command}");
+        }
+        // Shell (`bash -c`, `sh -c`) and `time` wrappers are never unwrapped for hooks.
+        for command in ["bash -c cargo", "sh -c cargo", "time cargo test"] {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert!(!legacy_hook(&words), "{command}");
+            assert_eq!(profile(&words), None, "{command}");
         }
         // Multi-ecosystem build/compile invocations route to `Profile::Lint`, while
         // test commands, non-build targets, bare `make`, and machine formats stay out.

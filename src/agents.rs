@@ -7,10 +7,11 @@ use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::index::Index;
-use crate::workspace::{Workspace, lock_state, private_dir, write_text};
+use crate::workspace::{Workspace, lock_state, private_dir, write_json, write_text};
 
 pub(crate) const START: &str = "<!-- justless:begin -->";
 pub(crate) const END: &str = "<!-- justless:end -->";
@@ -349,6 +350,12 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
         ),
         ("PreToolUse", "before-read", "^(read_file|view_file)$", 5),
         (
+            "PreToolUse",
+            "before-edit",
+            "^(edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content)$",
+            5,
+        ),
+        (
             "PostToolUse",
             "after-read",
             if agent == Agent::Agy {
@@ -368,7 +375,19 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
         ("PostToolUse", "after-bash", "^Bash$", 10),
         // An edit that leaves a file unparseable gets a note, and its result stays.
         // Claude Code 2.1.327 has no MultiEdit tool; earlier versions had one.
-        ("PostToolUse", "after-edit", "^(Edit|MultiEdit|Write)$", 5),
+        (
+            "PostToolUse",
+            "after-edit",
+            if agent == Agent::Agy {
+                "^(edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content)$"
+            } else {
+                "^(Edit|MultiEdit|Write)$"
+            },
+            5,
+        ),
+        // Antigravity CLI PostToolUse cannot inject context directly, so `after-edit`
+        // queues any parse-error note and `PostInvocation` delivers it on the next step.
+        ("PostInvocation", "post-invocation", "", 5),
         // Compaction drops earlier tool results. Restore the run IDs and source ranges
         // that recover them. This handler stays synchronous so its context is applied
         // before the next model request.
@@ -376,11 +395,9 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
         ("PreCompact", "before-compact", "^(manual|auto)$", 10),
     ] {
         let supported = match mode {
-            "before-read" => agent == Agent::Agy,
-            "after-read" => matches!(agent, Agent::Claude | Agent::Agy),
-            "after-search" | "before-compact" | "after-bash" | "after-edit" => {
-                agent == Agent::Claude
-            }
+            "before-read" | "before-edit" | "post-invocation" => agent == Agent::Agy,
+            "after-read" | "after-edit" => matches!(agent, Agent::Claude | Agent::Agy),
+            "after-search" | "before-compact" | "after-bash" => agent == Agent::Claude,
             "after-compact" => matches!(agent, Agent::Claude | Agent::Codex),
             _ => true,
         };
@@ -393,7 +410,11 @@ pub(crate) fn merge_hooks(path: &Path, agent: Agent, suffix: &str) -> Result<Opt
             .as_array_mut()
             .with_context(|| format!("{event} must contain an array"))?;
         let command = format!("{}{suffix}", agent.command(mode));
-        let flat = agent == Agent::Agy && event == "SessionStart";
+        let flat = agent == Agent::Agy
+            && matches!(
+                event,
+                "SessionStart" | "PreInvocation" | "PostInvocation" | "Stop"
+            );
         let present = entries.iter().any(|entry| {
             if flat {
                 entry["command"] == command
@@ -689,7 +710,8 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         claude: false,
         approves: agent == Agent::Cursor,
         ask_safe: false,
-        codex: false,
+        script: false,
+        pipes: true,
     };
     let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
     args["command"] = Value::String(rewritten);
@@ -721,7 +743,7 @@ pub(crate) fn answer_hook(
     let workspace = &agent_workspace(workspace, input);
     let output = if agent == Agent::Agy {
         agy_hook(workspace, mode, input).unwrap_or_else(|| {
-            if matches!(mode, "before-command" | "before-read") {
+            if matches!(mode, "before-command" | "before-read" | "before-edit") {
                 json!({"decision":"allow"})
             } else {
                 json!({})
@@ -1371,8 +1393,28 @@ fn agy_cwd<'a>(args: &'a Value, input: &'a Value, paths: &'a [Value]) -> Option<
     Some(Path::new(path))
 }
 
+const AGY_EDIT_TOOLS: &[&str] = &[
+    "edit_file",
+    "write_file",
+    "write_to_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+];
+const AGY_READ_MAX_ENTRIES: usize = 64;
+const AGY_REPEAT_WINDOW_STEPS: u64 = 15;
+const AGY_STATE_MAX_FILES: usize = 64;
+const AGY_MAX_NOTES: usize = 8;
+
 fn agy_read_path(args: &Value) -> Option<&str> {
     args.get("Path")
+        .or_else(|| args.get("AbsolutePath"))
+        .and_then(explicit_value)
+        .and_then(Value::as_str)
+}
+
+fn agy_edit_path(args: &Value) -> Option<&str> {
+    args.get("Path")
+        .or_else(|| args.get("TargetFile"))
         .or_else(|| args.get("AbsolutePath"))
         .and_then(explicit_value)
         .and_then(Value::as_str)
@@ -1389,8 +1431,21 @@ pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path
         && let Some(raw) = agy_read_path(&input["toolCall"]["args"])
     {
         let path = Path::new(strip_file_uri(raw));
-        if path.is_absolute() {
-            return path.parent();
+        if path.is_absolute()
+            && let Some(parent) = path.parent()
+            && parent.is_dir()
+        {
+            return Some(parent);
+        }
+    }
+    if matches!(mode, "before-edit" | "after-edit")
+        && let Some(raw) = agy_edit_path(&input["toolCall"]["args"])
+    {
+        let path = Path::new(strip_file_uri(raw));
+        if path.is_absolute()
+            && let Some(existing) = path.ancestors().skip(1).find(|dir| dir.is_dir())
+        {
+            return Some(existing);
         }
     }
     let path = if let Some(value) = input.get("cwd").and_then(explicit_value) {
@@ -1403,32 +1458,42 @@ pub(crate) fn agy_input_cwd<'a>(mode: &str, input: &'a Value) -> Option<&'a Path
     Some(Path::new(path))
 }
 
+fn agy_session_root(
+    current: &Workspace,
+    roots: impl Iterator<Item = PathBuf>,
+    paths: &[Value],
+    input: &Value,
+) -> Option<PathBuf> {
+    let mut roots = roots;
+    if paths.len() == 1 {
+        roots.next()
+    } else if let Some(value) = input.get("cwd").and_then(explicit_value) {
+        let text = value.as_str()?;
+        let cwd = Path::new(strip_file_uri(text));
+        if !cwd.is_absolute() {
+            return None;
+        }
+        let cwd = cwd.canonicalize().ok()?;
+        roots
+            .filter(|root| cwd.starts_with(root))
+            .max_by_key(|root| root.components().count())
+    } else {
+        roots.find(|root| root == &current.root)
+    }
+}
+
 /// Antigravity CLI hook dispatcher for `session-start`, `before-command`,
-/// `before-read`, and `after-read`.
+/// `before-read`, `after-read`, `before-edit`, `after-edit`, and `post-invocation`.
 fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     let paths = input["workspacePaths"].as_array()?;
-    let mut roots = paths
+    let roots = paths
         .iter()
         .filter_map(Value::as_str)
         .map(|raw| Path::new(raw.strip_prefix("file://").unwrap_or(raw)))
         .filter(|path| path.is_absolute())
         .filter_map(|path| path.canonicalize().ok());
     if mode == "session-start" {
-        let root = if paths.len() == 1 {
-            roots.next()?
-        } else if let Some(value) = input.get("cwd").and_then(explicit_value) {
-            let text = value.as_str()?;
-            let cwd = Path::new(text.strip_prefix("file://").unwrap_or(text));
-            if !cwd.is_absolute() {
-                return None;
-            }
-            let cwd = cwd.canonicalize().ok()?;
-            roots
-                .filter(|root| cwd.starts_with(root))
-                .max_by_key(|root| root.components().count())?
-        } else {
-            roots.find(|root| root == &current.root)?
-        };
+        let root = agy_session_root(current, roots, paths, input)?;
         let workspace = agent_workspace(&Workspace::discover(Some(&root)).ok()?, input);
         let message = startup(&workspace)?;
         let mut sys = json!({"systemMessage": message});
@@ -1443,6 +1508,17 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     if mode == "after-read" {
         agy_read(roots, paths, input);
         return None;
+    }
+    if mode == "before-edit" {
+        agy_before_edit(roots, paths, input);
+        return None;
+    }
+    if mode == "after-edit" {
+        agy_after_edit(roots, paths, input);
+        return None;
+    }
+    if mode == "post-invocation" {
+        return agy_post_invocation(current, roots, paths, input);
     }
     let call = &input["toolCall"];
     let args = &call["args"];
@@ -1478,7 +1554,8 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
             claude: false,
             approves: true,
             ask_safe: false,
-            codex: true,
+            script: true,
+            pipes: true,
         },
     ) {
         return Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}));
@@ -1490,7 +1567,7 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
     // while compacting the supported segments. `ask_safe: true` ensures we
     // never wrap a segment that failed `approvable` due to unsafe code-execution
     // or override flags (`rg --hostname-bin`, `go vet -vettool`, `cargo --config`).
-    let rewritten = wrap_event(
+    if let Some(rewritten) = wrap_event(
         &workspace,
         &cwd,
         command,
@@ -1500,10 +1577,20 @@ fn agy_hook(current: &Workspace, mode: &str, input: &Value) -> Option<Value> {
             claude: false,
             approves: false,
             ask_safe: true,
-            codex: true,
+            script: true,
+            pipes: true,
         },
-    )?;
-    Some(json!({"decision":"ask","overwrite":{"CommandLine":rewritten}}))
+    ) {
+        return Some(json!({"decision":"ask","overwrite":{"CommandLine":rewritten}}));
+    }
+    if !cfg!(windows)
+        && crate::rewrite::Exclusions::of(&workspace)
+            .is_ok_and(|exclusions| exclusions.line(command).is_none())
+        && let Some(rewritten) = with_seen_session(command, input)
+    {
+        return Some(json!({"decision":"allow","overwrite":{"CommandLine":rewritten}}));
+    }
+    None
 }
 
 /// Zero-token inline UI banner (`metadata.user_markdown`) summarizing 7-day
@@ -1543,10 +1630,151 @@ fn agy_savings_banner(ws: &Workspace) -> Option<String> {
     ))
 }
 
-/// Intercepts large, unbounded `read_file`/`view_file` calls in Antigravity CLI
-/// (`StartLine`, `EndLine` and non-zero `ByteOffset` all omitted) and returns a
-/// structural outline via `decision: "deny"` + `reason` so the agent requests
-/// only the line range or symbol it needs instead of loading up to 46 KB raw.
+#[derive(Default, Serialize, Deserialize)]
+struct AgyReadState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_denied: Option<AgyDenied>,
+    #[serde(default)]
+    reads: Vec<AgyReadEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AgyDenied {
+    file: String,
+    from: usize,
+    to: usize,
+    ranged: bool,
+    digest: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AgyReadEntry {
+    file: String,
+    from: usize,
+    to: usize,
+    digest: String,
+    step_idx: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AgyEditSnapshot {
+    file: String,
+    before: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct AgyNotes {
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+fn agy_key(text: &str) -> String {
+    crate::capture::source_digest(text.as_bytes())[..24].to_owned()
+}
+
+fn prune_dir_oldest(dir: &Path, max_files: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() < max_files {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| *modified);
+    let remove = files.len().saturating_sub(max_files.saturating_sub(1));
+    for (_, path) in files.into_iter().take(remove) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn agy_read_state_path(ws: &Workspace, conv_id: &str) -> PathBuf {
+    ws.state
+        .join("agy-reads")
+        .join(format!("{}.json", agy_key(conv_id)))
+}
+
+fn load_agy_read_state(ws: &Workspace, conv_id: &str) -> AgyReadState {
+    fs::read(agy_read_state_path(ws, conv_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_agy_read_state(ws: &Workspace, conv_id: &str, state: &AgyReadState) {
+    let path = agy_read_state_path(ws, conv_id);
+    if ws.prepare_state().is_err() {
+        return;
+    }
+    let dir = path.parent().unwrap();
+    if private_dir(dir).is_err() {
+        return;
+    }
+    if !path.exists() {
+        prune_dir_oldest(dir, AGY_STATE_MAX_FILES);
+    }
+    let _ = write_json(&path, state);
+}
+
+fn upsert_agy_read(state: &mut AgyReadState, entry: AgyReadEntry) {
+    if let Some(pos) = state
+        .reads
+        .iter()
+        .position(|r| r.file == entry.file && r.from == entry.from && r.to == entry.to)
+    {
+        state.reads.remove(pos);
+    }
+    state.reads.insert(0, entry);
+    state.reads.truncate(AGY_READ_MAX_ENTRIES);
+}
+
+fn parse_agy_bound(args: &Value, key: &str) -> Result<Option<u64>, ()> {
+    let Some(value) = args.get(key).and_then(explicit_value) else {
+        return Ok(None);
+    };
+    let parsed = match value {
+        Value::Number(n) => n.as_u64().ok_or(())?,
+        Value::String(s) => s.trim().parse::<u64>().map_err(|_| ())?,
+        _ => return Err(()),
+    };
+    Ok((parsed > 0).then_some(parsed))
+}
+
+fn agy_step_idx(input: &Value) -> Option<u64> {
+    input.get("stepIdx").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str()?.trim().parse().ok())
+    })
+}
+
+fn slice_byte_len(text: &str, first: usize, last: usize) -> usize {
+    text.as_bytes()
+        .split_inclusive(|&byte| byte == b'\n')
+        .skip(first.saturating_sub(1))
+        .take(last.saturating_sub(first) + 1)
+        .map(<[u8]>::len)
+        .sum()
+}
+
+/// Intercepts large unbounded or large ranged `read_file`/`view_file` calls in
+/// Antigravity CLI, outside-workspace unbounded structured reads, and unchanged
+/// repeat large reads within 15 steps in the same conversation. Always allows
+/// an immediate exact retry after any `before-read` deny (1-shot retry bypass)
+/// so the agent can never deadlock.
 fn agy_before_read(
     roots: impl Iterator<Item = PathBuf>,
     paths: &[Value],
@@ -1557,22 +1785,17 @@ fn agy_before_read(
         return None;
     }
     let args = &call["args"];
-    let has_bound = |key: &str| {
-        args.get(key)
-            .and_then(explicit_value)
-            .is_some_and(|v| match v {
-                Value::Number(n) => n.as_u64().is_none_or(|n| n > 0),
-                Value::String(s) => !s.trim().is_empty() && s.trim() != "0",
-                _ => true,
-            })
-    };
-    if has_bound("StartLine") || has_bound("EndLine") || has_bound("ByteOffset") {
+    if parse_agy_bound(args, "ByteOffset").ok()?.is_some() {
         return None;
     }
+    let start_arg = parse_agy_bound(args, "StartLine").ok()?;
+    let end_arg = parse_agy_bound(args, "EndLine").ok()?;
+    let ranged = start_arg.is_some() || end_arg.is_some();
     let raw = strip_file_uri(agy_read_path(args)?);
+    let base_cwd = agy_cwd(args, input, paths);
     let mut path = PathBuf::from(raw);
     if !path.is_absolute() {
-        let base = agy_cwd(args, input, paths)?;
+        let base = base_cwd?;
         if !base.is_absolute() {
             return None;
         }
@@ -1586,18 +1809,35 @@ fn agy_before_read(
     if !resolved.is_file() {
         return None;
     }
-    let root = roots
+    let roots_vec: Vec<PathBuf> = roots.collect();
+    let conv_id = input
+        .get("conversationId")
+        .and_then(explicit_value)
+        .and_then(Value::as_str);
+    let step_idx = agy_step_idx(input);
+    let in_root = roots_vec
+        .iter()
         .filter(|root| resolved.starts_with(root))
-        .max_by_key(|root| root.components().count())?;
-    let ws = Workspace::discover(Some(&root)).ok()?;
-    let (ws, file) = read_file(&ws, &path).or_else(|| read_file(&ws, &resolved))?;
+        .max_by_key(|root| root.components().count())
+        .cloned();
+    let Some(root) = in_root else {
+        if ranged {
+            return None;
+        }
+        return agy_before_read_outside(&roots_vec, base_cwd, &path, &resolved, conv_id);
+    };
+    let cwd = base_cwd
+        .and_then(|c| c.canonicalize().ok())
+        .unwrap_or_else(|| root.clone());
+    let base_ws = Workspace::discover(Some(&root)).ok()?.working_in(&cwd);
+    let (ws, file) = read_file(&base_ws, &path).or_else(|| read_file(&base_ws, &resolved))?;
     let settings = ws.settings().ok()?;
     if !settings.agy_read_outline {
         return None;
     }
     let source_path = ws.source_path(&file).ok()?;
     let meta = fs::metadata(&source_path).ok()?;
-    if meta.len() > settings.max_file_bytes || meta.len() as usize <= settings.context_budget {
+    if meta.len() > settings.max_file_bytes {
         return None;
     }
     let bytes = fs::read(&source_path).ok()?;
@@ -1606,26 +1846,207 @@ fn agy_before_read(
     }
     let text = String::from_utf8(bytes).ok()?;
     let total_lines = text.lines().count();
-    if total_lines as u64 <= settings.read_outline_lines {
+    if total_lines == 0 {
         return None;
+    }
+    let (first, last) = if ranged {
+        let first = usize::try_from(start_arg.unwrap_or(1).max(1)).ok()?;
+        if first > total_lines {
+            return None;
+        }
+        let last = match end_arg {
+            Some(end) => usize::try_from(end).ok()?.min(total_lines),
+            None => total_lines.min(first.saturating_add(799)),
+        };
+        if last < first {
+            return None;
+        }
+        (first, last)
+    } else {
+        (1, total_lines.min(800))
+    };
+    let span_lines = (last - first + 1) as u64;
+    let slice_bytes = slice_byte_len(&text, first, last).min(46_080);
+    let digest = crate::capture::source_digest(text.as_bytes());
+    let denied_key = AgyDenied {
+        file: file.clone(),
+        from: first,
+        to: last,
+        ranged,
+        digest: digest.clone(),
+    };
+    let mut state = conv_id
+        .map(|id| load_agy_read_state(&base_ws, id))
+        .unwrap_or_default();
+    let mut state_dirty = false;
+    if state.last_denied.as_ref() == Some(&denied_key) {
+        state.last_denied = None;
+        if let Some(conv) = conv_id {
+            if slice_bytes > settings.context_budget
+                && let Some(step) = step_idx
+            {
+                upsert_agy_read(
+                    &mut state,
+                    AgyReadEntry {
+                        file,
+                        from: first,
+                        to: last,
+                        digest,
+                        step_idx: step,
+                    },
+                );
+            }
+            save_agy_read_state(&base_ws, conv, &state);
+        }
+        return None;
+    }
+    if state.last_denied.is_some() {
+        state.last_denied = None;
+        state_dirty = true;
+    }
+    // Safe repeat-read guard: unchanged large read repeated within 15 steps.
+    if let (Some(conv), Some(step)) = (conv_id, step_idx)
+        && slice_bytes > settings.context_budget
+        && let Some(prev) = state.reads.iter().find(|r| {
+            r.file == file
+                && r.from == first
+                && r.to == last
+                && r.digest == digest
+                && step >= r.step_idx
+                && step - r.step_idx <= AGY_REPEAT_WINDOW_STEPS
+        })
+    {
+        let prev_step = prev.step_idx;
+        state.last_denied = Some(denied_key);
+        save_agy_read_state(&base_ws, conv, &state);
+        let target = if ranged {
+            format!("{file}:{first}-{last}")
+        } else {
+            file
+        };
+        let reason = format!(
+            "Justless: {target} is unchanged since step {prev_step} (already in context). Retry this exact `read_file` call to load it again."
+        );
+        return Some(json!({"decision": "deny", "reason": reason}));
+    }
+    let finish_allow = |mut state: AgyReadState, mut dirty: bool| -> Option<Value> {
+        if let Some(conv) = conv_id {
+            if slice_bytes > settings.context_budget
+                && let Some(step) = step_idx
+            {
+                upsert_agy_read(
+                    &mut state,
+                    AgyReadEntry {
+                        file: file.clone(),
+                        from: first,
+                        to: last,
+                        digest: digest.clone(),
+                        step_idx: step,
+                    },
+                );
+                dirty = true;
+            }
+            if dirty {
+                save_agy_read_state(&base_ws, conv, &state);
+            }
+        }
+        None
+    };
+    if ranged {
+        if span_lines <= READ_WINDOW_LINES
+            || span_lines <= settings.read_outline_lines
+            || slice_bytes <= settings.context_budget
+        {
+            return finish_allow(state, state_dirty);
+        }
+        // Never risk exposing a redacted secret in an outline header.
+        let Ok(redactor) = crate::redact::for_run(&ws) else {
+            return finish_allow(state, state_dirty);
+        };
+        if let Some(redactor) = redactor
+            && matches!(redactor.text(&text), std::borrow::Cow::Owned(_))
+        {
+            return finish_allow(state, state_dirty);
+        }
+        let mut source = crate::source::Snapshot::from_text(&file, text.clone());
+        if source.index(&file).is_err() {
+            return finish_allow(state, state_dirty);
+        }
+        let Some(outline) = source.window(first, last) else {
+            return finish_allow(state, state_dirty);
+        };
+        let Some(uncovered) = uncovered_code(&file, &source) else {
+            return finish_allow(state, state_dirty);
+        };
+        let uncovered: Vec<usize> = uncovered
+            .into_iter()
+            .filter(|index| (first - 1..last).contains(index))
+            .collect();
+        if uncovered.len() > 20 {
+            return finish_allow(state, state_dirty);
+        }
+        let mut code = String::new();
+        if !uncovered.is_empty() {
+            let lines: Vec<&str> = source.text.lines().collect();
+            code.push_str("Code outside these rows:\n");
+            for index in uncovered {
+                let line = lines[index].trim_end_matches('\r');
+                code.push_str(&format!("L{}: {line}\n", index + 1));
+            }
+        }
+        let quoted = crate::workspace::shell_path(&file);
+        let justless = ws.invocation().files;
+        let hint = format!(
+            "Justless outline of {file} lines {first}-{last} ({span_lines} lines, {}). Use `read_file` with a range of at most {READ_WINDOW_LINES} lines, `{justless} expand {quoted} 'REV#N'` for a row, or retry this exact `read_file` call for the raw lines:\n",
+            crate::history::human_bytes(slice_bytes as u64)
+        );
+        let Some(content) = [true, false]
+            .into_iter()
+            .map(|signatures| outline.display(signatures) + &code)
+            .find(|content| content.len() <= settings.context_budget)
+        else {
+            return finish_allow(state, state_dirty);
+        };
+        if (content.len() + hint.len()) * 2 > slice_bytes {
+            return finish_allow(state, state_dirty);
+        }
+        let reason = format!("{hint}{content}");
+        if let Some(conv) = conv_id {
+            state.last_denied = Some(denied_key);
+            save_agy_read_state(&base_ws, conv, &state);
+        }
+        crate::history::saw_range(&ws, &file, first, last, digest, true);
+        return Some(json!({"decision": "deny", "reason": reason}));
+    }
+    if text.len() <= settings.context_budget || total_lines as u64 <= settings.read_outline_lines {
+        return finish_allow(state, state_dirty);
     }
     // Never risk exposing a redacted secret in an outline header.
-    if let Some(redactor) = crate::redact::for_run(&ws).ok()?
+    let Ok(redactor) = crate::redact::for_run(&ws) else {
+        return finish_allow(state, state_dirty);
+    };
+    if let Some(redactor) = redactor
         && matches!(redactor.text(&text), std::borrow::Cow::Owned(_))
     {
-        return None;
+        return finish_allow(state, state_dirty);
     }
     let mut source = crate::source::Snapshot::from_text(&file, text.clone());
-    source.index(&file).ok()?;
+    if source.index(&file).is_err() {
+        return finish_allow(state, state_dirty);
+    }
     let symbols = source.symbols();
     if symbols.is_empty() || symbols.iter().any(|(_, kind, ..)| kind == "text") {
-        return None;
+        return finish_allow(state, state_dirty);
     }
-    let uncovered = uncovered_code(&file, &source)?;
+    let Some(uncovered) = uncovered_code(&file, &source) else {
+        return finish_allow(state, state_dirty);
+    };
     if uncovered.len() > 20 {
-        return None;
+        return finish_allow(state, state_dirty);
     }
-    let page = source.page("", None, 40, settings.context_budget).ok()?;
+    let Ok(page) = source.page("", None, 40, settings.context_budget) else {
+        return finish_allow(state, state_dirty);
+    };
     let mut display = page.display();
     if !uncovered.is_empty() {
         let lines: Vec<&str> = source.text.lines().collect();
@@ -1635,20 +2056,24 @@ fn agy_before_read(
             code.push_str(&format!("L{}: {line}\n", index + 1));
         }
         if code.len() > settings.context_budget {
-            return None;
+            return finish_allow(state, state_dirty);
         }
         display.push_str(&code);
     }
     let size = crate::history::human_bytes(text.len() as u64);
-    let justless = ws.justless();
+    let quoted = crate::workspace::shell_path(&file);
+    let justless = ws.invocation().files;
     let reason = format!(
-        "Justless outline of {file} ({total_lines} lines, {size}). Use `read_file` with StartLine/EndLine or `{justless} expand {file} 'REV#N'` to read exact spans:\n{display}"
+        "Justless outline of {file} ({total_lines} lines, {size}). Use `read_file` with StartLine/EndLine or `{justless} expand {quoted} 'REV#N'` to read exact spans:\n{display}"
     );
     // Antigravity's `read_file` returns at most 46,080 bytes per call.
     if reason.len() >= text.len().min(46_080) {
-        return None;
+        return finish_allow(state, state_dirty);
     }
-    let digest = crate::capture::source_digest(text.as_bytes());
+    if let Some(conv) = conv_id {
+        state.last_denied = Some(denied_key);
+        save_agy_read_state(&base_ws, conv, &state);
+    }
     crate::history::saw_outline_measured(
         &ws,
         &file,
@@ -1656,6 +2081,136 @@ fn agy_before_read(
         text.len() as u64,
         reason.len() as u64,
     );
+    Some(json!({"decision": "deny", "reason": reason}))
+}
+
+/// Outlines an unbounded `read_file`/`view_file` of a structured file outside
+/// the workspace without opening `.justless/index.json` or taking any lock.
+/// Blocks dotfiles, `$HOME/.*`, `tool-results`, and symlinks.
+fn agy_before_read_outside(
+    roots: &[PathBuf],
+    base_cwd: Option<&Path>,
+    path: &Path,
+    resolved: &Path,
+    conv_id: Option<&str>,
+) -> Option<Value> {
+    let ws_root = base_cwd
+        .and_then(|c| c.canonicalize().ok())
+        .and_then(|cwd| {
+            roots
+                .iter()
+                .filter(|root| cwd.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+        })
+        .or_else(|| (roots.len() == 1).then(|| roots[0].clone()))?;
+    let cwd = base_cwd
+        .and_then(|c| c.canonicalize().ok())
+        .unwrap_or_else(|| ws_root.clone());
+    let ws = Workspace::discover(Some(&ws_root)).ok()?.working_in(&cwd);
+    let settings = ws.settings().ok()?;
+    if !settings.agy_read_outline {
+        return None;
+    }
+    if fs::symlink_metadata(path).ok()?.file_type().is_symlink()
+        || fs::symlink_metadata(resolved)
+            .ok()?
+            .file_type()
+            .is_symlink()
+    {
+        return None;
+    }
+    if !outside_file(&ws.root, path) || !outside_file(&ws.root, resolved) {
+        return None;
+    }
+    let meta = fs::metadata(resolved).ok()?;
+    if meta.len() > settings.max_file_bytes || meta.len() as usize <= settings.context_budget {
+        return None;
+    }
+    let bytes = fs::read(resolved).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let total_lines = text.lines().count();
+    if total_lines as u64 <= settings.read_outline_lines {
+        return None;
+    }
+    let digest = crate::capture::source_digest(text.as_bytes());
+    let name = resolved.to_str()?;
+    let denied_key = AgyDenied {
+        file: name.to_owned(),
+        from: 1,
+        to: total_lines.min(800),
+        ranged: false,
+        digest,
+    };
+    if let Some(conv) = conv_id {
+        let mut state = load_agy_read_state(&ws, conv);
+        if state.last_denied.as_ref() == Some(&denied_key) {
+            state.last_denied = None;
+            save_agy_read_state(&ws, conv, &state);
+            return None;
+        }
+        if state.last_denied.is_some() {
+            state.last_denied = None;
+            save_agy_read_state(&ws, conv, &state);
+        }
+    }
+    if let Some(redactor) = crate::redact::for_run(&ws).ok()?
+        && matches!(redactor.text(&text), std::borrow::Cow::Owned(_))
+    {
+        return None;
+    }
+    let mut source = crate::source::Snapshot::from_text(name, text.clone());
+    source.index(name).ok()?;
+    let symbols = source.symbols();
+    if symbols.is_empty() || symbols.iter().any(|(_, kind, ..)| kind == "text") {
+        return None;
+    }
+    let uncovered = uncovered_code(name, &source)?;
+    if uncovered.len() > 20 {
+        return None;
+    }
+    let page = source.page("", None, 40, settings.context_budget).ok()?;
+    let next_entry = page.next_index();
+    let display = page.display();
+    let (_, rows) = display.split_once('\n')?;
+    let (mut body, cursor): (String, String) = rows
+        .split_inclusive('\n')
+        .partition(|line| !line.starts_with("next --after ") && !line.starts_with("… "));
+    if let Some((_, _, first, _)) = next_entry
+        .and_then(|index| symbols.get(index))
+        .filter(|_| !cursor.is_empty())
+    {
+        body.push_str(&format!(
+            "More rows start at L{first}; use `read_file` with StartLine: {first} for them.\n"
+        ));
+    }
+    if !uncovered.is_empty() {
+        let source_lines: Vec<&str> = text.lines().collect();
+        let mut code = String::from("Code outside these rows:\n");
+        for index in uncovered {
+            let line = source_lines[index].trim_end_matches('\r');
+            code.push_str(&format!("L{}: {line}\n", index + 1));
+        }
+        if code.len() > settings.context_budget {
+            return None;
+        }
+        body.push_str(&code);
+    }
+    let size = crate::history::human_bytes(text.len() as u64);
+    let reason = format!(
+        "Justless outline of outside file {name} ({total_lines} lines, {size}). Use `read_file` with StartLine/EndLine (at most {READ_WINDOW_LINES} lines) or retry this exact `read_file` call for the raw file:\n{body}"
+    );
+    if reason.len() >= text.len().min(46_080) {
+        return None;
+    }
+    if let Some(conv) = conv_id {
+        let mut state = load_agy_read_state(&ws, conv);
+        state.last_denied = Some(denied_key);
+        save_agy_read_state(&ws, conv, &state);
+    }
     Some(json!({"decision": "deny", "reason": reason}))
 }
 
@@ -1692,13 +2247,14 @@ fn agy_read(roots: impl Iterator<Item = PathBuf>, paths: &[Value], input: &Value
     let root = roots
         .filter(|root| resolved.starts_with(root))
         .max_by_key(|root| root.components().count())?;
-    let ws = Workspace::discover(Some(&root)).ok()?;
-    let (ws, file) = read_file(&ws, &path).or_else(|| read_file(&ws, &resolved))?;
+    let base_ws = Workspace::discover(Some(&root)).ok()?;
+    let (ws, file) = read_file(&base_ws, &path).or_else(|| read_file(&base_ws, &resolved))?;
     if !ws.state.is_dir() {
         return None;
     }
     let source_path = ws.source_path(&file).ok()?;
-    let cap = ws.settings().ok()?.max_file_bytes;
+    let settings = ws.settings().ok()?;
+    let cap = settings.max_file_bytes;
     if fs::metadata(&source_path).ok()?.len() > cap {
         return None;
     }
@@ -1735,8 +2291,291 @@ fn agy_read(roots: impl Iterator<Item = PathBuf>, paths: &[Value], input: &Value
         .sum::<usize>()
         .min(46_080) as u64;
     let digest = crate::capture::source_digest(&bytes);
-    crate::history::saw_expand(&ws, &file, from, to, digest, slice_bytes);
+    crate::history::saw_expand(&ws, &file, from, to, digest.clone(), slice_bytes);
+    if let (Some(conv), Some(step)) = (
+        input
+            .get("conversationId")
+            .and_then(explicit_value)
+            .and_then(Value::as_str),
+        agy_step_idx(input),
+    ) && slice_bytes as usize > settings.context_budget
+        && parse_agy_bound(args, "ByteOffset").ok().flatten().is_none()
+    {
+        let mut state = load_agy_read_state(&base_ws, conv);
+        upsert_agy_read(
+            &mut state,
+            AgyReadEntry {
+                file,
+                from,
+                to,
+                digest,
+                step_idx: step,
+            },
+        );
+        save_agy_read_state(&base_ws, conv, &state);
+    }
     Some(())
+}
+
+/// Resolves the session workspace, file workspace, and workspace-relative file
+/// path for an Antigravity edit/write tool call, handling both existing files
+/// and new files about to be created (rejecting symlinks and `..`).
+fn agy_edit_target(
+    roots: impl Iterator<Item = PathBuf>,
+    paths: &[Value],
+    input: &Value,
+) -> Option<(Workspace, Workspace, String, bool)> {
+    let args = &input["toolCall"]["args"];
+    let raw = strip_file_uri(agy_edit_path(args)?);
+    let mut path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        let base = agy_cwd(args, input, paths)?;
+        if !base.is_absolute() {
+            return None;
+        }
+        path = base.join(path);
+    }
+    let roots_vec: Vec<PathBuf> = roots.collect();
+    if let Some(resolved) = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(path.file_name())
+        .map(|(parent, name)| parent.join(name))
+        && resolved.is_file()
+    {
+        let root = roots_vec
+            .iter()
+            .filter(|root| resolved.starts_with(root))
+            .max_by_key(|root| root.components().count())?;
+        let base_ws = Workspace::discover(Some(root)).ok()?;
+        let (ws, file) = read_file(&base_ws, &path).or_else(|| read_file(&base_ws, &resolved))?;
+        return Some((base_ws, ws, file, true));
+    }
+    // New file: resolve the nearest existing ancestor and verify no symlink or `..`.
+    let existing = path.ancestors().skip(1).find(|dir| dir.is_dir())?;
+    let canonical_ancestor = existing.canonicalize().ok()?;
+    let suffix = path.strip_prefix(existing).ok()?;
+    if suffix.as_os_str().is_empty()
+        || !suffix
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let full = canonical_ancestor.join(suffix);
+    let root = roots_vec
+        .iter()
+        .filter(|root| full.starts_with(root))
+        .max_by_key(|root| root.components().count())?;
+    let base_ws = Workspace::discover(Some(root)).ok()?;
+    let relative = full.strip_prefix(&base_ws.root).ok()?;
+    // Reject any existing symlink component between root and target.
+    let mut current = base_ws.root.clone();
+    for part in relative.components() {
+        let std::path::Component::Normal(seg) = part else {
+            return None;
+        };
+        current.push(seg);
+        if fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return None;
+        }
+    }
+    let file = relative.to_str()?.to_owned();
+    let nested = Path::new(&file)
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| !dir.as_os_str().is_empty())
+        .find(|dir| base_ws.root.join(dir).join(".git").exists());
+    let (ws, file) = match nested {
+        Some(dir) => {
+            let nested_ws = base_ws.nested(base_ws.root.join(dir));
+            let rel = full
+                .strip_prefix(&nested_ws.root)
+                .ok()?
+                .to_str()?
+                .to_owned();
+            (nested_ws, rel)
+        }
+        None => (base_ws.clone(), file),
+    };
+    Some((base_ws, ws, file, false))
+}
+
+/// PreToolUse (`before-edit`): snapshots pre-edit text keyed by `toolCall.id`
+/// for workspace files checked by `syntax_check::blocks`, within `max_file_bytes`.
+fn agy_before_edit(
+    roots: impl Iterator<Item = PathBuf>,
+    paths: &[Value],
+    input: &Value,
+) -> Option<()> {
+    let call = &input["toolCall"];
+    let tool = call["name"].as_str()?;
+    if !AGY_EDIT_TOOLS.contains(&tool) {
+        return None;
+    }
+    let call_id = call["id"].as_str().filter(|id| !id.is_empty())?;
+    let (base_ws, ws, file, exists) = agy_edit_target(roots, paths, input)?;
+    if !crate::syntax_check::blocks(&file) {
+        return None;
+    }
+    crate::syntax_check::parser_name(&file)?;
+    let cap = ws.settings().ok()?.max_file_bytes;
+    let before = if exists {
+        let source_path = ws.source_path(&file).ok()?;
+        if fs::metadata(&source_path).ok()?.len() > cap {
+            return None;
+        }
+        let bytes = fs::read(&source_path).ok()?;
+        if bytes.contains(&0) {
+            return None;
+        }
+        Some(String::from_utf8(bytes).ok()?)
+    } else {
+        None
+    };
+    base_ws.prepare_state().ok()?;
+    let dir = base_ws.state.join("agy-edits");
+    private_dir(&dir).ok()?;
+    let snap_path = dir.join(format!("{}.json", agy_key(call_id)));
+    if !snap_path.exists() {
+        prune_dir_oldest(&dir, AGY_STATE_MAX_FILES);
+    }
+    write_json(&snap_path, &AgyEditSnapshot { file, before }).ok()
+}
+
+/// PostToolUse (`after-edit`): judges syntax against the `before-edit` snapshot,
+/// deletes the snapshot, and queues any redacted `Verdict::Introduced` note for
+/// `PostInvocation` in `.justless/agy-notes/<conv-digest>.json`.
+fn agy_after_edit(
+    roots: impl Iterator<Item = PathBuf>,
+    paths: &[Value],
+    input: &Value,
+) -> Option<()> {
+    use crate::syntax_check::{Change, Verdict};
+    let call = &input["toolCall"];
+    let tool = call["name"].as_str()?;
+    if !AGY_EDIT_TOOLS.contains(&tool) {
+        return None;
+    }
+    let call_id = call["id"].as_str().filter(|id| !id.is_empty())?;
+    let (base_ws, ws, file, exists) = agy_edit_target(roots, paths, input)?;
+    let snap_path = base_ws
+        .state
+        .join("agy-edits")
+        .join(format!("{}.json", agy_key(call_id)));
+    let raw = fs::read(&snap_path).ok();
+    let _ = fs::remove_file(&snap_path);
+    if !exists || input.get("error").and_then(explicit_value).is_some() {
+        return None;
+    }
+    let snap: AgyEditSnapshot = serde_json::from_slice(&raw?).ok()?;
+    if snap.file != file || !crate::syntax_check::blocks(&file) {
+        return None;
+    }
+    crate::syntax_check::parser_name(&file)?;
+    let after = crate::source::Snapshot::open(&ws, &file).ok()?.text;
+    let cap = ws.settings().ok()?.max_file_bytes;
+    if snap
+        .before
+        .as_deref()
+        .is_some_and(|text| text.len() as u64 > cap)
+    {
+        return None;
+    }
+    let change = Change::between(snap.before.as_deref().unwrap_or_default(), &after);
+    let Verdict::Introduced {
+        problem,
+        parsed_before,
+        certain,
+        ..
+    } = crate::syntax_check::judge(
+        &ws.root,
+        &file,
+        snap.before.as_deref(),
+        &after,
+        &[change],
+        false,
+    )?
+    else {
+        return None;
+    };
+    let note = format!(
+        "Justless parse check: after this {tool}, {}. {}{}",
+        crate::syntax_check::located(&file, &after, &problem),
+        match (snap.before.as_deref(), parsed_before) {
+            (None, _) => "The file is new.",
+            (Some(_), true) => "The file parsed before it.",
+            (Some(_), false) => "The file had other parse errors, and this one is in the new text.",
+        },
+        if certain || !parsed_before {
+            ""
+        } else {
+            " The parser may not know newer syntax, so check the line before changing it."
+        }
+    );
+    let note = match crate::redact::for_workspace(&ws) {
+        Some(redactor) => redactor.text(&note).into_owned(),
+        None => note,
+    };
+    let conv_id = input
+        .get("conversationId")
+        .and_then(explicit_value)
+        .and_then(Value::as_str)?;
+    base_ws.prepare_state().ok()?;
+    let dir = base_ws.state.join("agy-notes");
+    private_dir(&dir).ok()?;
+    let note_path = dir.join(format!("{}.json", agy_key(conv_id)));
+    let mut queued: AgyNotes = fs::read(&note_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if queued.notes.len() < AGY_MAX_NOTES {
+        queued.notes.push(note);
+    }
+    if !note_path.exists() {
+        prune_dir_oldest(&dir, AGY_STATE_MAX_FILES);
+    }
+    write_json(&note_path, &queued).ok()
+}
+
+/// PostInvocation (`post-invocation`): fast `NotFound` check; when a parse-error
+/// note was queued by `after-edit` for this conversation, removes it and injects
+/// it as a system message step.
+fn agy_post_invocation(
+    current: &Workspace,
+    roots: impl Iterator<Item = PathBuf>,
+    paths: &[Value],
+    input: &Value,
+) -> Option<Value> {
+    let conv_id = input
+        .get("conversationId")
+        .and_then(explicit_value)
+        .and_then(Value::as_str)?;
+    let root = agy_session_root(current, roots, paths, input)?;
+    let base_ws = Workspace::discover(Some(&root)).ok()?;
+    let note_path = base_ws
+        .state
+        .join("agy-notes")
+        .join(format!("{}.json", agy_key(conv_id)));
+    let bytes = fs::read(&note_path).ok()?;
+    let _ = fs::remove_file(&note_path);
+    let queued: AgyNotes = serde_json::from_slice(&bytes).ok()?;
+    let notes: Vec<&str> = queued
+        .notes
+        .iter()
+        .map(String::as_str)
+        .filter(|note| !note.is_empty())
+        .collect();
+    if notes.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "injectSteps": [{
+            "systemMessage": {
+                "systemMessage": notes.join("\n")
+            }
+        }]
+    }))
 }
 
 /// `record` is false for `justless rewrite`, which previews the answer and writes nothing.
@@ -1772,15 +2611,16 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -
             claude: agent == Agent::Claude,
             approves: agent == Agent::Codex,
             ask_safe: false,
-            codex: agent == Agent::Codex,
+            script: agent == Agent::Codex,
+            pipes: agent == Agent::Codex,
         },
     );
     updated["command"] = Value::String(match routed {
         Some(routed) => routed,
-        // Only with a reported mode, so the rules below always judge it.
-        None if agent == Agent::Claude
-            && !cfg!(windows)
-            && crate::claude_permissions::mode(input).is_some()
+        // Only with a reported mode for Claude Code, so the rules below always judge it.
+        None if !cfg!(windows)
+            && (agent == Agent::Codex
+                || agent == Agent::Claude && crate::claude_permissions::mode(input).is_some())
             && crate::rewrite::Exclusions::of(workspace)
                 .is_ok_and(|exclusions| exclusions.line(command).is_none()) =>
         {
@@ -1871,9 +2711,13 @@ fn with_seen_session(command: &str, input: &Value) -> Option<String> {
 }
 
 /// The `--session` value for the agent whose hook sent `input`: a digest of
-/// Claude Code's `session_id` with, inside a subagent, its `agent_id`.
+/// Claude Code / Codex `session_id` (or Antigravity CLI `conversationId`) with,
+/// inside a subagent, its `agent_id`.
 fn seen_session(input: &Value) -> Option<String> {
-    let session = input["session_id"].as_str().filter(|id| !id.is_empty())?;
+    let session = input["session_id"]
+        .as_str()
+        .or_else(|| input["conversationId"].as_str())
+        .filter(|id| !id.is_empty())?;
     let key = match input["agent_id"].as_str().filter(|id| !id.is_empty()) {
         Some(agent) => format!("{session}\0{agent}"),
         None => session.to_owned(),
@@ -1895,14 +2739,18 @@ struct Rules {
     approves: bool,
     /// Antigravity CLI Tier 2 (`decision: "ask"`): prompts the user (respecting
     /// Always Allow), so each wrapped segment must pass `filters::approvable`
-    /// (even behind a downloading runner such as `npx` or `uv run`) or be a
-    /// `known::routes` tool — never wrapping unsafe code-execution or override
-    /// flags such as `rg --hostname-bin`, `go vet -vettool`, or `cargo --config`.
+    /// (even behind a downloading runner such as `npx` or `uv run` or safe `env`)
+    /// or be a `known::routes` tool — never wrapping unsafe code-execution or
+    /// override flags such as `rg --hostname-bin`, `go vet -vettool`, or
+    /// `cargo --config`.
     ask_safe: bool,
-    /// Codex: a code-mode script's lines are a list, a file read in a list
-    /// becomes a `justless read`, and a supported command piped only into `head`
-    /// runs through Justless with `head` kept. See `plan`.
-    codex: bool,
+    /// Codex and Antigravity CLI: newline-separated script lines are a list, and
+    /// a file read in a list becomes a `justless read`. See `plan`.
+    script: bool,
+    /// Clients without a post-run Bash hook (all except Claude Code): a supported
+    /// command piped into `head` or scoped `tail` runs through Justless with the
+    /// filter kept. See `plan`.
+    pipes: bool,
 }
 
 /// What the Claude Code hook appends after a routed last command whose exit status
@@ -2060,12 +2908,13 @@ fn wrap_event(
     let mut reads = reads.into_iter();
     for Wrap {
         words: range,
+        replace,
         entered,
         step,
     } in plan.wrap
     {
-        rewritten.push_str(&command[copied..range.start]);
-        copied = range.end;
+        rewritten.push_str(&command[copied..replace.start]);
+        copied = replace.end;
         if step == Step::Read {
             rewritten.push_str(&reads.next()?);
             continue;
@@ -2076,15 +2925,18 @@ fn wrap_event(
             .unwrap_or_default();
         // A final `2>&1` joins Justless's own streams, and `--merge` joins the
         // command's, so its archive and preview keep the order it wrote them in.
-        let merge = if crate::shell_form::merges(&command[range.end..]) {
-            " --merge"
-        } else if step == Step::Window {
-            " --window"
-        } else {
-            ""
+        // For `WindowMerged` (`CMD 2>&1 | head`/`tail`), `2>&1` is absorbed into
+        // `--merge` so stderr+stdout merge into the filter while Justless's footer
+        // prints unclipped on stderr.
+        let flags = match step {
+            Step::Run if crate::shell_form::merges(&command[replace.end..]) => " --merge",
+            Step::Run => "",
+            Step::Window => " --window",
+            Step::WindowMerged => " --window --merge",
+            Step::Read => unreachable!(),
         };
         rewritten.push_str(&format!(
-            "justless{root} run --hook{merge}{session} -- {}",
+            "justless{root} run --hook{flags}{session} -- {}",
             &command[range.clone()]
         ));
     }
@@ -2491,20 +3343,26 @@ fn module_binding(language: TopLevel, lines: &[&str], start: usize) -> Option<us
 /// How a hook rewrites one command of a line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
-    /// `justless run --hook -- WORDS`.
+    /// `justless run --hook [--merge] -- WORDS` (including `| cat` which keeps all lines).
     Run,
-    /// For Codex, a command piped only into `head -n N`: `justless run --hook
-    /// --window -- WORDS | head -n N`, so `head` keeps the start of the report.
+    /// A command piped into `head` or scoped `tail`: `justless run --hook
+    /// --window -- WORDS | ...`, so the filter keeps its slice of the report.
     Window,
-    /// For Codex, a file read in a list, replaced whole by a `justless read`.
+    /// A command with `2>&1` piped into `head` or scoped `tail`: `2>&1` is absorbed
+    /// into `--merge` (`justless run --hook --window --merge -- WORDS | ...`) so
+    /// stderr+stdout merge into the filter while Justless's footer stays on stderr.
+    WindowMerged,
+    /// For Codex and Antigravity CLI, a file read in a list, replaced whole by a `justless read`.
     Read,
 }
 
-/// One command a hook rewrites: the words it replaces, the number of `cd`
-/// commands accepted before it, and how.
+/// One command a hook rewrites: the words it passes after `-- `, the full byte
+/// span it replaces in the line, the number of `cd` commands accepted before it,
+/// and how.
 #[derive(Clone, Debug)]
 struct Wrap {
     words: Range<usize>,
+    replace: Range<usize>,
     entered: usize,
     step: Step,
 }
@@ -2586,15 +3444,95 @@ fn safe_shell_set(segment: &str) -> bool {
 }
 
 /// Whether a filter after a pipe only keeps the first lines of what it reads:
-/// `head -n N` or `head -N`, with no file operand.
+/// `head`, `head -n N`, `head -nN`, `head -N`, `head --lines=N` or `head --lines N`,
+/// with no file operand.
 fn keeps_head(filter: &str) -> bool {
     let count =
         |n: &str| !n.is_empty() && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit());
     literal_command(filter).is_some_and(|words| match words.as_slice() {
-        [head, n, count_word] => head == "head" && n == "-n" && count(count_word),
-        [head, option] => head == "head" && option.strip_prefix('-').is_some_and(count),
+        [head] => head == "head",
+        [head, flag, count_word] => {
+            head == "head" && matches!(flag.as_str(), "-n" | "--lines") && count(count_word)
+        }
+        [head, option] => {
+            head == "head"
+                && option
+                    .strip_prefix("-n")
+                    .or_else(|| option.strip_prefix("--lines="))
+                    .or_else(|| option.strip_prefix('-'))
+                    .is_some_and(count)
+        }
         _ => false,
     })
+}
+
+/// Whether a filter after a pipe only keeps the last lines of what it reads:
+/// `tail`, `tail -n N`, `tail -nN`, `tail -N`, `tail --lines=N` or `tail --lines N`,
+/// never `-f`/`--follow`, `-c`, `+N`, or file operands.
+fn keeps_tail(filter: &str) -> bool {
+    let count =
+        |n: &str| !n.is_empty() && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit());
+    literal_command(filter).is_some_and(|words| match words.as_slice() {
+        [tail] => tail == "tail",
+        [tail, flag, count_word] => {
+            tail == "tail" && matches!(flag.as_str(), "-n" | "--lines") && count(count_word)
+        }
+        [tail, option] => {
+            tail == "tail"
+                && option
+                    .strip_prefix("-n")
+                    .or_else(|| option.strip_prefix("--lines="))
+                    .or_else(|| option.strip_prefix('-'))
+                    .is_some_and(count)
+        }
+        _ => false,
+    })
+}
+
+/// Whether `justless run --merge` merges stderr into stdout for this command
+/// (non-Search/Listing commands, where `merge::joins(true, profile)` is true).
+fn can_join_merge(command: &str) -> bool {
+    literal_command(command).is_some_and(|args| {
+        let words: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::merge::joins(true, crate::filters::profile(&words))
+    })
+}
+
+/// Whether a command may be pre-wrapped behind `| tail` / `2>&1 | tail`:
+/// ONLY build, test, lint, and `known::routes` commands — NEVER Search,
+/// Listing, Git, Logs, Inventory, or JSON reads.
+fn allows_tail(command: &str) -> bool {
+    let Some(args) = literal_command(command) else {
+        return false;
+    };
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    if crate::search::route(&words).is_some() || crate::filters::json_output(&words) {
+        return false;
+    }
+    match crate::filters::profile(&words) {
+        Some(crate::filters::Profile::Lint | crate::filters::Profile::JsTests) => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    if crate::known::routes(&words) {
+        return true;
+    }
+    if !crate::filters::legacy_hook(&words) {
+        return false;
+    }
+    let Some(unwrapped) = crate::wrappers::hook_effective(&words) else {
+        return false;
+    };
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    crate::filters::unwrap_tool(&refs)
+        .first()
+        .is_some_and(|program| {
+            let name = Path::new(program)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(program);
+            !matches!(name, "git" | "rg")
+        })
 }
 
 /// The command before and the filter after the one `|` outside quotes in `segment`,
@@ -2643,38 +3581,58 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
                     let words: Vec<&str> = words.iter().map(String::as_str).collect();
                     crate::filters::approvable(&words)
                         || (rules.ask_safe
-                            && (crate::filters::approvable(crate::filters::unwrap_tool(&words))
-                                || crate::known::routes(&words)))
+                            && crate::wrappers::hook_effective(&words).is_some_and(|inner| {
+                                let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
+                                crate::filters::approvable(crate::filters::unwrap_tool(&inner))
+                                    || crate::known::routes(&words)
+                            }))
                 })))
         .then_some(form.command)
     };
     let within = |range: &Range<usize>, words: Range<usize>| {
         range.start + words.start..range.start + words.end
     };
-    // How Codex rewrites one command of a line: a file read becomes a `justless
-    // read`, and a `git show REV:path` blob takes the run route, as in a list it
-    // is not outlined. A supported command piped only into `head` runs through
-    // Justless with `head` kept, which then cuts its display report. JSON reads
-    // are left out there, since `head` is meant to show the JSON as printed.
-    let codex = |range: &Range<usize>| {
-        let segment = &command[range.clone()];
-        if crate::shellread::parse_script(segment).is_some() {
-            return Some((range.clone(), Step::Read));
-        }
-        if let Some(words) = supported(segment, true) {
-            return Some((within(range, words), Step::Run));
-        }
+    // How a piped segment is rewritten for clients without a post-run Bash hook:
+    // - `| head ...` keeps the start -> `Step::Window` (and `2>&1 | head` absorbs
+    //   `2>&1` into `--merge` when `merge::joins` merges stderr into stdout).
+    // - Scoped `| tail ...` / `2>&1 | tail ...` for build/test/lint/`known::routes`
+    //   commands only -> `Step::Window` / `Step::WindowMerged`.
+    // JSON reads and `| cat` (which stays raw except for `shellread` reads) are
+    // left out here.
+    let pipe_step = |range: &Range<usize>, segment: &str| {
         let (producer, filter) = pipe_parts(segment)?;
-        let words = supported(&segment[producer.clone()], false)?;
-        let rest = &segment[producer.start + words.end..producer.end];
-        (keeps_head(&segment[filter]) && !crate::shell_form::merges(rest)).then(|| {
-            let words = within(&producer, words);
-            (within(range, words), Step::Window)
-        })
+        let prod_str = &segment[producer.clone()];
+        let words = supported(prod_str, false)?;
+        let cmd_str = &prod_str[words.clone()];
+        let rest = &prod_str[words.end..];
+        let has_merge = crate::shell_form::merges(rest);
+        let filter_str = &segment[filter];
+        let abs_words = within(range, within(&producer, words));
+        if keeps_head(filter_str) {
+            return if has_merge {
+                can_join_merge(cmd_str).then(|| {
+                    let replace = abs_words.start..range.start + producer.end;
+                    (abs_words, replace, Step::WindowMerged)
+                })
+            } else {
+                Some((abs_words.clone(), abs_words, Step::Window))
+            };
+        }
+        if keeps_tail(filter_str) && allows_tail(cmd_str) {
+            return if has_merge {
+                can_join_merge(cmd_str).then(|| {
+                    let replace = abs_words.start..range.start + producer.end;
+                    (abs_words, replace, Step::WindowMerged)
+                })
+            } else {
+                Some((abs_words.clone(), abs_words, Step::Window))
+            };
+        }
+        None
     };
     let mut plan = Plan::default();
-    let segments = if rules.codex {
-        split_list(command, true)
+    let segments = if rules.script || rules.pipes {
+        split_list(command, rules.script, rules.pipes)
     } else {
         split_compound(command).filter(|s| s.len() > 1)
     };
@@ -2683,11 +3641,15 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         let range = start..command.trim_end_matches(SHELL_BLANKS).len().max(start);
         plan.last = Some(range.clone());
         match supported(&command[range.clone()], !rules.claude) {
-            Some(words) => plan.wrap.push(Wrap {
-                words: within(&range, words),
-                entered: 0,
-                step: Step::Run,
-            }),
+            Some(words) => {
+                let words = within(&range, words);
+                plan.wrap.push(Wrap {
+                    replace: words.clone(),
+                    words,
+                    entered: 0,
+                    step: Step::Run,
+                });
+            }
             None => plan.other.push(range),
         }
         return plan;
@@ -2711,16 +3673,22 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         } else {
             directory_change(segment)
         };
-        let step = if rules.codex {
-            codex(range).filter(|(_, step)| !(skippable && *step == Step::Read))
+        let step = if rules.script && crate::shellread::parse_script(segment).is_some() {
+            (!skippable).then(|| (range.clone(), range.clone(), Step::Read))
+        } else if let Some(words) = supported(segment, !rules.claude) {
+            let abs = within(range, words);
+            Some((abs.clone(), abs, Step::Run))
+        } else if rules.pipes {
+            pipe_step(range, segment)
         } else {
-            supported(segment, !rules.claude).map(|words| (within(range, words), Step::Run))
+            None
         };
         match change {
             None if safe_shell_set(segment) => {}
             None => match step {
-                Some((words, step)) => plan.wrap.push(Wrap {
+                Some((words, replace, step)) => plan.wrap.push(Wrap {
                     words,
+                    replace,
                     entered,
                     step,
                 }),
@@ -2813,20 +3781,32 @@ fn descends(directory: &str) -> bool {
 /// grouping, background jobs and comments return `None` so the whole command passes
 /// through unchanged.
 pub(crate) fn split_compound(command: &str) -> Option<Vec<Range<usize>>> {
-    split_list(command, false)
+    split_list(command, false, false)
 }
 
-/// The commands of a Codex command line, as its hook splits them (see `split_list`).
+/// The commands of a Codex or Antigravity CLI command line, as their hooks split
+/// them (see `split_list`).
 pub(crate) fn split_script(command: &str) -> Option<Vec<Range<usize>>> {
-    split_list(command, true)
+    split_list(command, true, true)
 }
 
-/// `split_compound`, and with `script`, as Codex writes a code-mode script's
+/// The commands of `command` as `agent`'s command hook splits them.
+pub(crate) fn split_for_agent(agent: Agent, command: &str) -> Option<Vec<Range<usize>>> {
+    match agent {
+        Agent::Codex | Agent::Agy => split_list(command, true, true),
+        Agent::Cursor | Agent::Gemini | Agent::Copilot => split_list(command, false, true),
+        _ => split_compound(command),
+    }
+}
+
+/// `split_compound`, and with `script`, as Codex and Antigravity write a script's
 /// commands, also at a newline outside quotes, as at `;`, skipping blank lines. A
 /// line that ends in `&&`, `||` or `|` goes on at the next one, so it passes the
-/// command through, as does a newline inside quotes. A single `|` stays inside its
-/// command for `plan` to judge.
-fn split_list(command: &str, script: bool) -> Option<Vec<Range<usize>>> {
+/// command through, as does a newline inside quotes. With `pipes`, a single `|`
+/// stays inside its command for `plan` to judge. Inside POSIX single quotes,
+/// `$`, `\` and `` ` `` are literal (rejecting `\'` so non-POSIX shells cannot
+/// disagree on quote termination).
+fn split_list(command: &str, script: bool, pipes: bool) -> Option<Vec<Range<usize>>> {
     let bytes = command.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
@@ -2852,10 +3832,14 @@ fn split_list(command: &str, script: bool) -> Option<Vec<Range<usize>>> {
             start = i;
             continue;
         }
-        if c.is_ascii_control() && c != b'\t' || matches!(c, b'$' | b'\\' | b'`') {
+        if c.is_ascii_control() && c != b'\t' {
+            return None;
+        }
+        if quote != Some(b'\'') && matches!(c, b'$' | b'\\' | b'`') {
             return None;
         }
         match quote {
+            Some(b'\'') if c == b'\\' && bytes.get(i + 1) == Some(&b'\'') => return None,
             Some(active) if c == active => quote = None,
             Some(_) => {}
             None => match c {
@@ -2875,7 +3859,7 @@ fn split_list(command: &str, script: bool) -> Option<Vec<Range<usize>>> {
                     i += 3;
                     continue;
                 }
-                b'|' if script && bytes.get(i + 1) != Some(&b'&') => {}
+                b'|' if pipes && bytes.get(i + 1) != Some(&b'&') => {}
                 b'&' | b'|' | b';' | b'<' | b'>' | b'(' | b')' | b'{' | b'}' | b'#' | b'!' => {
                     return None;
                 }
@@ -2914,7 +3898,8 @@ pub fn would_route(command: &str, exclusions: &crate::rewrite::Exclusions) -> bo
         claude: true,
         approves: false,
         ask_safe: false,
-        codex: false,
+        script: false,
+        pipes: false,
     };
     let mut plan = plan(command, rules, |_| true);
     plan.exclude(command, rules, exclusions);
@@ -2953,7 +3938,8 @@ pub(crate) fn codex_would_route(command: &str, exclusions: &crate::rewrite::Excl
         claude: false,
         approves: true,
         ask_safe: false,
-        codex: true,
+        script: true,
+        pipes: true,
     };
     let mut plan = plan(command, rules, |_| true);
     plan.exclude(command, rules, exclusions);
@@ -2975,7 +3961,8 @@ pub(crate) fn agy_would_route(command: &str, exclusions: &crate::rewrite::Exclus
         claude: false,
         approves: false,
         ask_safe: true,
-        codex: true,
+        script: true,
+        pipes: true,
     };
     let mut plan = plan(command, rules, |_| true);
     plan.exclude(command, rules, exclusions);
@@ -3018,13 +4005,17 @@ pub fn command_label(command: &str) -> String {
     crate::filters::tool_label_words(&words)
 }
 
-/// Whether a command runs plain `grep`, possibly behind a package runner.
+/// Whether a command runs plain `grep`, possibly behind a safe wrapper or package runner.
 fn runs_grep(command: &str) -> bool {
     let Some(words) = literal_command(command) else {
         return false;
     };
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
-    crate::filters::unwrap_tool(&words)
+    let Some(unwrapped) = crate::wrappers::hook_effective(&words) else {
+        return false;
+    };
+    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
+    crate::filters::unwrap_tool(&refs)
         .first()
         .is_some_and(|program| {
             let name = Path::new(program).file_name().and_then(|n| n.to_str());
@@ -3044,6 +4035,10 @@ fn supported_command(command: &str, json: bool) -> bool {
         return false;
     };
     let words: Vec<_> = args.iter().map(String::as_str).collect();
+    let Some(unwrapped) = crate::wrappers::hook_effective(&words) else {
+        return false;
+    };
+    let inner: Vec<_> = unwrapped.iter().map(String::as_str).collect();
     // Searches and listings accept only display options, so they skip the list below.
     if let Some(route) = crate::search::route(&words) {
         return route;
@@ -3056,7 +4051,7 @@ fn supported_command(command: &str, json: bool) -> bool {
         || crate::filters::profile(&words).is_some()
         || crate::known::routes(&words);
     if !supported
-        || words.iter().any(|word| {
+        || inner.iter().any(|word| {
             let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
             matches!(
                 flag,
@@ -3118,12 +4113,16 @@ pub(crate) fn supported_words(words: &[&str]) -> bool {
 pub(crate) fn literal_command(command: &str) -> Option<Vec<String>> {
     let mut quote = None;
     let mut previous = None;
-    for character in command.chars() {
-        if character.is_control() && character != '\t' || matches!(character, '$' | '\\' | '\u{60}')
-        {
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character.is_control() && character != '\t' {
+            return None;
+        }
+        if quote != Some('\'') && matches!(character, '$' | '\\' | '\u{60}') {
             return None;
         }
         match quote {
+            Some('\'') if character == '\\' && chars.peek() == Some(&'\'') => return None,
             Some(active) if character == active => quote = None,
             Some(_) => {}
             None if matches!(character, '\'' | '"') => quote = Some(character),
@@ -3293,6 +4292,46 @@ mod tests {
             ("cat a.md && rg -n x src | head -n 20\ngit status", true),
             ("cd src\nnl -ba a.rs | sed -n '5,9p'", true),
             ("rg -n x src | head -30", true),
+            ("rg -n x src | head", true),
+            ("rg -n x src | head -n20", true),
+            ("rg -n x src | head --lines=20", true),
+            ("rg -n x src | head --lines 20", true),
+            ("cargo test 2>&1 | head -n 20", true),
+            ("cargo test | tail", true),
+            ("cargo test | tail -n 50", true),
+            ("cargo test | tail -n50", true),
+            ("cargo test | tail -50", true),
+            ("cargo test | tail --lines=50", true),
+            ("cargo test 2>&1 | tail -n 50", true),
+            ("rg '\\bfoo\\b' src", true),
+            ("rg 'fn\\s+main' src", true),
+            ("rg 'foo$' src", true),
+            ("git grep '\\bTODO\\b'", true),
+            ("go test ./... -run '^TestFoo$'", true),
+            ("sed -n '10,$p' a.rs", true),
+            ("timeout 60 cargo test", true),
+            ("nice -n 5 cargo test", true),
+            ("stdbuf -oL cargo test", true),
+            ("env RUST_BACKTRACE=1 cargo test", true),
+            ("rg 'foo\\'bar' src", false),
+            ("rg 'foo\\' src", false),
+            ("rg \"$FOO\" src", false),
+            ("rg \"`id`\" src", false),
+            ("git log | tail -n 20", false),
+            ("rg -n x src | tail -n 20", false),
+            ("docker logs web | tail -n 20", false),
+            ("docker ps | tail -n 5", false),
+            ("cargo test | tail -f", false),
+            ("cargo test | tail --follow", false),
+            ("cargo test | tail -c 100", false),
+            ("cargo test | tail -n +5", false),
+            ("cargo test | tail -n 10 a.rs", false),
+            ("cargo test | grep ok", false),
+            ("env -i cargo test", false),
+            ("env PATH=/tmp/bin cargo test", false),
+            ("env -S 'cargo test'", false),
+            ("bash -c 'cargo test'", false),
+            ("time cargo test", false),
             (
                 "cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test",
                 true,
