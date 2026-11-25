@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator};
@@ -627,56 +628,80 @@ impl Grammar {
 
     /// The Tree-sitter language alone, without compiling the tags query.
     pub fn language(self) -> Language {
-        self.parser().0
+        match self {
+            Self::JavaScript => tree_sitter_javascript::LANGUAGE,
+            // Components are parsed as the TypeScript in their scripts.
+            Self::TypeScript | Self::Vue | Self::Svelte | Self::Astro => {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT
+            }
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
+            Self::Python => tree_sitter_python::LANGUAGE,
+            Self::Go => tree_sitter_go::LANGUAGE,
+            Self::Java => tree_sitter_java::LANGUAGE,
+            Self::C => tree_sitter_c::LANGUAGE,
+            Self::Cpp => tree_sitter_cpp::LANGUAGE,
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE,
+            Self::Ruby => tree_sitter_ruby::LANGUAGE,
+            Self::Php => tree_sitter_php::LANGUAGE_PHP,
+            Self::Bash => tree_sitter_bash::LANGUAGE,
+            Self::Sql => tree_sitter_sequel::LANGUAGE,
+            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
+            Self::Swift => tree_sitter_swift::LANGUAGE,
+            Self::Scala => tree_sitter_scala::LANGUAGE,
+            Self::Dart => tree_sitter_dart::LANGUAGE,
+            Self::Hcl => tree_sitter_hcl::LANGUAGE,
+            Self::Lua => tree_sitter_lua::LANGUAGE,
+            Self::Zig => tree_sitter_zig::LANGUAGE,
+            Self::Elixir => tree_sitter_elixir::LANGUAGE,
+            Self::ObjectiveC => tree_sitter_objc::LANGUAGE,
+            Self::PowerShell => tree_sitter_powershell::LANGUAGE,
+            Self::Julia => tree_sitter_julia::LANGUAGE,
+            Self::Groovy => dekobon_tree_sitter_groovy::LANGUAGE,
+        }
+        .into()
     }
 
-    fn parser(self) -> (Language, String) {
-        let (language, tags) = match self {
-            Self::JavaScript => (
-                tree_sitter_javascript::LANGUAGE,
-                tree_sitter_javascript::TAGS_QUERY,
-            ),
-            // Components are parsed as the TypeScript in their scripts.
-            Self::TypeScript | Self::Vue | Self::Svelte | Self::Astro => (
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-                tree_sitter_typescript::TAGS_QUERY,
-            ),
-            Self::Tsx => (
-                tree_sitter_typescript::LANGUAGE_TSX,
-                tree_sitter_typescript::TAGS_QUERY,
-            ),
-            Self::Python => (tree_sitter_python::LANGUAGE, tree_sitter_python::TAGS_QUERY),
-            Self::Go => (tree_sitter_go::LANGUAGE, tree_sitter_go::TAGS_QUERY),
-            Self::Java => (tree_sitter_java::LANGUAGE, tree_sitter_java::TAGS_QUERY),
-            Self::C => (tree_sitter_c::LANGUAGE, tree_sitter_c::TAGS_QUERY),
-            Self::Cpp => (tree_sitter_cpp::LANGUAGE, tree_sitter_cpp::TAGS_QUERY),
-            Self::CSharp => (
-                tree_sitter_c_sharp::LANGUAGE,
-                tree_sitter_c_sharp::TAGS_QUERY,
-            ),
-            Self::Ruby => (tree_sitter_ruby::LANGUAGE, tree_sitter_ruby::TAGS_QUERY),
-            Self::Php => (tree_sitter_php::LANGUAGE_PHP, tree_sitter_php::TAGS_QUERY),
-            Self::Bash => (
-                tree_sitter_bash::LANGUAGE,
+    fn canonical_query(self) -> Self {
+        match self {
+            Self::Vue | Self::Svelte | Self::Astro => Self::TypeScript,
+            other => other,
+        }
+    }
+
+    fn tags_source(self) -> String {
+        let base = match self {
+            Self::JavaScript => tree_sitter_javascript::TAGS_QUERY,
+            Self::TypeScript | Self::Tsx | Self::Vue | Self::Svelte | Self::Astro => {
+                tree_sitter_typescript::TAGS_QUERY
+            }
+            Self::Python => tree_sitter_python::TAGS_QUERY,
+            Self::Go => tree_sitter_go::TAGS_QUERY,
+            Self::Java => tree_sitter_java::TAGS_QUERY,
+            Self::C => tree_sitter_c::TAGS_QUERY,
+            Self::Cpp => tree_sitter_cpp::TAGS_QUERY,
+            Self::CSharp => tree_sitter_c_sharp::TAGS_QUERY,
+            Self::Ruby => tree_sitter_ruby::TAGS_QUERY,
+            Self::Php => tree_sitter_php::TAGS_QUERY,
+            Self::Bash => {
                 "
                 (function_definition name: (word) @name) @definition.function
-                (command name: (command_name (word) @name)) @reference.call",
-            ),
-            Self::Sql => (tree_sitter_sequel::LANGUAGE, SQL_TAGS),
-            Self::Kotlin => (tree_sitter_kotlin_ng::LANGUAGE, KOTLIN_TAGS),
-            Self::Swift => (tree_sitter_swift::LANGUAGE, SWIFT_TAGS),
-            Self::Scala => (tree_sitter_scala::LANGUAGE, SCALA_TAGS),
-            Self::Dart => (tree_sitter_dart::LANGUAGE, DART_TAGS),
-            Self::Hcl => (tree_sitter_hcl::LANGUAGE, HCL_TAGS),
-            Self::Lua => (tree_sitter_lua::LANGUAGE, LUA_TAGS),
-            Self::Zig => (tree_sitter_zig::LANGUAGE, ZIG_TAGS),
-            Self::Elixir => (tree_sitter_elixir::LANGUAGE, ELIXIR_TAGS),
-            Self::ObjectiveC => (tree_sitter_objc::LANGUAGE, OBJECTIVE_C_TAGS),
-            Self::PowerShell => (tree_sitter_powershell::LANGUAGE, POWERSHELL_TAGS),
-            Self::Julia => (tree_sitter_julia::LANGUAGE, JULIA_TAGS),
-            Self::Groovy => (dekobon_tree_sitter_groovy::LANGUAGE, GROOVY_TAGS),
+                (command name: (command_name (word) @name)) @reference.call"
+            }
+            Self::Sql => SQL_TAGS,
+            Self::Kotlin => KOTLIN_TAGS,
+            Self::Swift => SWIFT_TAGS,
+            Self::Scala => SCALA_TAGS,
+            Self::Dart => DART_TAGS,
+            Self::Hcl => HCL_TAGS,
+            Self::Lua => LUA_TAGS,
+            Self::Zig => ZIG_TAGS,
+            Self::Elixir => ELIXIR_TAGS,
+            Self::ObjectiveC => OBJECTIVE_C_TAGS,
+            Self::PowerShell => POWERSHELL_TAGS,
+            Self::Julia => JULIA_TAGS,
+            Self::Groovy => GROOVY_TAGS,
         };
-        let mut tags = tags.to_owned();
+        let mut tags = base.to_owned();
         if matches!(
             self,
             Self::TypeScript | Self::Tsx | Self::Vue | Self::Svelte | Self::Astro
@@ -700,7 +725,50 @@ impl Grammar {
         if self == Self::ObjectiveC {
             tags.push_str(tree_sitter_c::TAGS_QUERY);
         }
-        (language.into(), tags)
+        tags
+    }
+
+    /// Compiled Tree-sitter language and tags query, cached once per grammar
+    /// for the life of the process so repeated `Parsers::default()` calls never
+    /// recompile queries.
+    fn compiled(self) -> anyhow::Result<&'static CompiledQuery> {
+        macro_rules! cached {
+            ($variant:ident) => {{
+                static CACHE: LazyLock<Result<CompiledQuery, String>> =
+                    LazyLock::new(|| CompiledQuery::compile(Grammar::$variant));
+                &*CACHE
+            }};
+        }
+        let entry = match self {
+            Self::JavaScript => cached!(JavaScript),
+            Self::TypeScript | Self::Vue | Self::Svelte | Self::Astro => {
+                cached!(TypeScript)
+            }
+            Self::Tsx => cached!(Tsx),
+            Self::Python => cached!(Python),
+            Self::Go => cached!(Go),
+            Self::Java => cached!(Java),
+            Self::C => cached!(C),
+            Self::Cpp => cached!(Cpp),
+            Self::CSharp => cached!(CSharp),
+            Self::Ruby => cached!(Ruby),
+            Self::Php => cached!(Php),
+            Self::Bash => cached!(Bash),
+            Self::Sql => cached!(Sql),
+            Self::Kotlin => cached!(Kotlin),
+            Self::Swift => cached!(Swift),
+            Self::Scala => cached!(Scala),
+            Self::Dart => cached!(Dart),
+            Self::Hcl => cached!(Hcl),
+            Self::Lua => cached!(Lua),
+            Self::Zig => cached!(Zig),
+            Self::Elixir => cached!(Elixir),
+            Self::ObjectiveC => cached!(ObjectiveC),
+            Self::PowerShell => cached!(PowerShell),
+            Self::Julia => cached!(Julia),
+            Self::Groovy => cached!(Groovy),
+        };
+        entry.as_ref().map_err(|error| anyhow::anyhow!("{error}"))
     }
 }
 
@@ -754,28 +822,35 @@ struct RawTag<'a> {
     name: &'a str,
     node: Node<'a>,
     name_node: Node<'a>,
-    label: String,
+    label: &'static str,
 }
 
-struct Compiled {
-    parser: Parser,
+struct CompiledQuery {
+    language: Language,
     query: Query,
+    name_index: Option<u32>,
 }
 
-impl Compiled {
-    fn new(grammar: Grammar) -> anyhow::Result<Self> {
-        let (language, tags) = grammar.parser();
-        let mut parser = Parser::new();
-        parser.set_language(&language)?;
+impl CompiledQuery {
+    fn compile(grammar: Grammar) -> Result<Self, String> {
+        let language = grammar.language();
+        let tags = grammar.tags_source();
+        let query = Query::new(&language, &tags).map_err(|error| error.to_string())?;
+        let name_index = query.capture_index_for_name("name");
         Ok(Self {
-            parser,
-            query: Query::new(&language, &tags)?,
+            language,
+            query,
+            name_index,
         })
     }
 }
 
 #[derive(Default)]
-pub struct Parsers(BTreeMap<Grammar, Compiled>);
+pub struct Parsers {
+    parser: Option<Parser>,
+    language: Option<Grammar>,
+    cursor: Option<QueryCursor>,
+}
 
 impl Parsers {
     pub fn parse(&mut self, grammar: Grammar, source: &str) -> anyhow::Result<Facts> {
@@ -800,42 +875,49 @@ impl Parsers {
     }
 
     fn parse_text(&mut self, grammar: Grammar, source: &str) -> anyhow::Result<Facts> {
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.0.entry(grammar) {
-            entry.insert(Compiled::new(grammar)?);
+        let compiled = grammar.compiled()?;
+        let canonical = grammar.canonical_query();
+        let parser = self.parser.get_or_insert_with(Parser::new);
+        if self.language != Some(canonical) {
+            self.language = None;
+            parser.set_language(&compiled.language)?;
+            self.language = Some(canonical);
         }
-        let Compiled { parser, query } = self.0.get_mut(&grammar).unwrap();
         let tree = parser
             .parse(source, None)
             .ok_or_else(|| anyhow::anyhow!("parse cancelled"))?;
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+        let query = &compiled.query;
+        let captures = query.capture_names();
         let mut definitions = Vec::new();
         let mut references = Vec::new();
-        while let Some(matched) = matches.next() {
-            let captures = query.capture_names();
-            let Some(name) = matched
-                .captures
-                .iter()
-                .find(|cap| captures[cap.index as usize] == "name")
-            else {
-                continue;
-            };
-            let name_text = text(name.node, source);
-            if name_text.is_empty() {
-                continue;
-            }
-            for capture in matched.captures {
-                let label = captures[capture.index as usize];
-                let tag = RawTag {
-                    name: name_text,
-                    node: capture.node,
-                    name_node: name.node,
-                    label: label.to_owned(),
+        if let Some(name_index) = compiled.name_index {
+            let cursor = self.cursor.get_or_insert_with(QueryCursor::new);
+            let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+            while let Some(matched) = matches.next() {
+                let Some(name) = matched.captures.iter().find(|cap| cap.index == name_index) else {
+                    continue;
                 };
-                if label.starts_with("definition.") {
-                    definitions.push(tag);
-                } else if label.starts_with("reference.") {
-                    references.push(tag);
+                let name_text = text(name.node, source);
+                if name_text.is_empty() {
+                    continue;
+                }
+                for capture in matched.captures {
+                    let label = captures[capture.index as usize];
+                    if label.starts_with("definition.") {
+                        definitions.push(RawTag {
+                            name: name_text,
+                            node: capture.node,
+                            name_node: name.node,
+                            label,
+                        });
+                    } else if label.starts_with("reference.") {
+                        references.push(RawTag {
+                            name: name_text,
+                            node: capture.node,
+                            name_node: name.node,
+                            label,
+                        });
+                    }
                 }
             }
         }
@@ -1008,7 +1090,7 @@ impl Parsers {
             {
                 continue;
             }
-            let kind = match tag.label.as_str() {
+            let kind = match tag.label {
                 "reference.call" | "reference.send" => Kind::Call,
                 "reference.table" => Kind::Data,
                 _ => Kind::Reference,
@@ -1553,11 +1635,12 @@ fn embedded_sql<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
         return None;
     }
     let body = literal(text(node, source))?;
-    let first = body.split_whitespace().next()?.to_ascii_uppercase();
-    matches!(
-        first.as_str(),
-        "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE"
-    )
+    let first = body.split_whitespace().next()?;
+    (first.eq_ignore_ascii_case("SELECT")
+        || first.eq_ignore_ascii_case("WITH")
+        || first.eq_ignore_ascii_case("INSERT")
+        || first.eq_ignore_ascii_case("UPDATE")
+        || first.eq_ignore_ascii_case("DELETE"))
     .then_some(body)
 }
 
@@ -1994,5 +2077,46 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    #[test]
+    fn compiled_queries_are_cached_across_parsers_and_component_grammars() {
+        let ts = Grammar::TypeScript.compiled().unwrap();
+        let ts_again = Grammar::TypeScript.compiled().unwrap();
+        assert!(std::ptr::eq(ts, ts_again));
+        for component in [Grammar::Vue, Grammar::Svelte, Grammar::Astro] {
+            assert!(
+                std::ptr::eq(component.compiled().unwrap(), ts),
+                "{component:?} should share TypeScript's cached query"
+            );
+        }
+        assert!(!std::ptr::eq(Grammar::Tsx.compiled().unwrap(), ts));
+
+        // Reusing one `Parsers` across languages (including embedded SQL switches)
+        // must produce identical definitions and references to fresh instances.
+        let ts_src =
+            "export function fetchOrders() {\n  return \"SELECT id FROM app.orders\";\n}\n";
+        let py_src = "def total(items):\n    return sum(items)\n";
+        let mut shared = Parsers::default();
+        let shared_ts = shared.parse(Grammar::TypeScript, ts_src).unwrap();
+        let shared_py = shared.parse(Grammar::Python, py_src).unwrap();
+        let shared_ts2 = shared.parse(Grammar::TypeScript, ts_src).unwrap();
+
+        let fresh_ts = Parsers::default()
+            .parse(Grammar::TypeScript, ts_src)
+            .unwrap();
+        let fresh_py = Parsers::default().parse(Grammar::Python, py_src).unwrap();
+
+        assert_eq!(shared_ts.definitions.len(), fresh_ts.definitions.len());
+        assert_eq!(shared_ts.references.len(), fresh_ts.references.len());
+        assert_eq!(shared_ts2.definitions.len(), fresh_ts.definitions.len());
+        assert_eq!(shared_ts2.references.len(), fresh_ts.references.len());
+        assert_eq!(shared_py.definitions.len(), fresh_py.definitions.len());
+        assert!(
+            shared_ts
+                .references
+                .iter()
+                .any(|r| r.kind == Kind::Data && r.name == "app.orders")
+        );
     }
 }

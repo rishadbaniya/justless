@@ -169,6 +169,16 @@ fn skipped(id: &str, error: &anyhow::Error) {
     eprintln!("justless: skipped run {id}: {error:#}");
 }
 
+/// A run record is written once, when its command finishes. Records modified
+/// this long before a `since_ms` window are skipped without being read.
+const RECORD_SLACK_MS: u64 = 60_000;
+
+fn valid_run_id(id: &str) -> bool {
+    id.strip_prefix("run-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
 /// Recorded runs ordered by completion time, newest first unless `oldest`.
 /// A record that cannot be read is skipped with a warning naming its run, so
 /// the others stay readable. The iterator never yields an error.
@@ -182,6 +192,13 @@ pub fn records(
         #[serde(default)]
         completed_ms: u64,
     }
+    enum Source {
+        /// Raw `record.json` bytes already read from disk, decoded lazily when
+        /// the caller consumes this entry so each file is read at most once.
+        Json(Vec<u8>),
+        /// Unfinished run directory that has `stdout` but no `record.json`.
+        Unfinished,
+    }
     let path = workspace.state.join("runs");
     let mut entries = Vec::new();
     if path.exists() {
@@ -193,55 +210,80 @@ pub fn records(
             let id = entry.file_name().to_string_lossy().into_owned();
             let directory = entry.path();
             let record = directory.join("record.json");
-            let stamp = match fs::read(&record) {
-                Ok(bytes) => serde_json::from_slice::<Stamp>(&bytes).context("decode run record"),
+            let bytes = match fs::read(&record) {
+                Ok(bytes) => bytes,
                 // A run that Justless could not finish has streams but may lack a
                 // record. It sorts by the last write to its output.
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     if let Ok(modified) =
                         fs::metadata(directory.join("stdout")).and_then(|meta| meta.modified())
                     {
-                        entries.push((millis(modified), id));
+                        entries.push((millis(modified), id, Source::Unfinished));
                     }
                     continue;
                 }
-                Err(e) => Err(e).context("read run record"),
-            };
-            // Records stored before completion times existed sort by modification time.
-            let completed = match stamp {
-                Ok(stamp) if stamp.completed_ms > 0 => stamp.completed_ms,
-                Ok(_) => fs::metadata(&record)
-                    .and_then(|meta| meta.modified())
-                    .map_or(0, millis),
-                Err(error) => {
-                    skipped(&id, &error);
+                Err(e) => {
+                    skipped(&id, &anyhow::Error::new(e).context("read run record"));
                     continue;
                 }
             };
-            entries.push((completed, id));
+            // Records stored before completion times existed sort by modification time.
+            let completed =
+                match serde_json::from_slice::<Stamp>(&bytes).context("decode run record") {
+                    Ok(stamp) if stamp.completed_ms > 0 => stamp.completed_ms,
+                    Ok(_) => fs::metadata(&record)
+                        .and_then(|meta| meta.modified())
+                        .map_or(0, millis),
+                    Err(error) => {
+                        skipped(&id, &error);
+                        continue;
+                    }
+                };
+            entries.push((completed, id, Source::Json(bytes)));
         }
     }
-    entries.sort_unstable();
-    if !oldest {
-        entries.reverse();
-    }
-    Ok(entries
-        .into_iter()
-        .filter_map(|(completed, id)| match capture::load(workspace, &id) {
-            Ok((_, mut run)) => {
+    entries.sort_unstable_by(|a, b| {
+        let order = a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1));
+        if oldest { order } else { order.reverse() }
+    });
+    Ok(entries.into_iter().filter_map(|(completed, id, source)| {
+        let loaded = match source {
+            Source::Json(bytes) => decode_run(&id, &bytes, completed),
+            Source::Unfinished => capture::load(workspace, &id).map(|(_, mut run)| {
                 if run.completed_ms == 0 {
                     run.completed_ms = completed;
                 }
                 if run.family.is_empty() {
                     run.family = "legacy".into();
                 }
-                Some(Ok(run))
-            }
+                run
+            }),
+        };
+        match loaded {
+            Ok(run) => Some(Ok(run)),
             Err(error) => {
                 skipped(&id, &error);
                 None
             }
-        }))
+        }
+    }))
+}
+
+fn decode_run(id: &str, bytes: &[u8], completed: u64) -> Result<Run> {
+    if !valid_run_id(id) {
+        anyhow::bail!("invalid run ID");
+    }
+    let mut run: Run = serde_json::from_slice(bytes).context("decode run record")?;
+    if run.id != id {
+        anyhow::bail!("run record does not match its directory");
+    }
+    if run.completed_ms == 0 {
+        run.completed_ms = completed;
+    }
+    if run.family.is_empty() {
+        run.family = "legacy".into();
+    }
+    Ok(run)
 }
 
 /// A later request that printed part of a run's output again.
@@ -1151,26 +1193,131 @@ impl Summary {
     }
 }
 
+/// Lightweight projection of `capture::Run` for `summary`, validating all
+/// required `Run` fields while skipping unused collections with zero allocations.
+#[derive(Deserialize)]
+struct SummaryRecord {
+    id: String,
+    #[serde(rename = "status")]
+    _status: serde::de::IgnoredAny,
+    raw_bytes: u64,
+    preview_bytes: usize,
+    #[serde(default)]
+    completed_ms: u64,
+    #[serde(default)]
+    footer_bytes: usize,
+    #[serde(rename = "diagnostics")]
+    _diagnostics: serde::de::IgnoredAny,
+    #[serde(rename = "source_digests")]
+    _source_digests: serde::de::IgnoredAny,
+}
+
+/// Lightweight projection of `capture::Run` for `stats`, validating all
+/// required `Run` fields while skipping unused collections with zero allocations.
+#[derive(Deserialize)]
+struct StatsRecord {
+    id: String,
+    #[serde(rename = "status")]
+    _status: serde::de::IgnoredAny,
+    raw_bytes: u64,
+    preview_bytes: usize,
+    #[serde(default)]
+    completed_ms: u64,
+    #[serde(default)]
+    family: String,
+    #[serde(default)]
+    unchanged: bool,
+    #[serde(default)]
+    footer_bytes: usize,
+    #[serde(default)]
+    redaction: Option<crate::redact::Found>,
+    #[serde(rename = "diagnostics")]
+    _diagnostics: serde::de::IgnoredAny,
+    #[serde(rename = "source_digests")]
+    _source_digests: serde::de::IgnoredAny,
+}
+
+fn add_run_estimate(
+    estimate: &mut crate::tokens::Estimate,
+    directory: &Path,
+    raw_bytes: u64,
+    shown: u64,
+    replayed_bytes: u64,
+) {
+    let initial = net_bytes(raw_bytes, shown, 0);
+    let net = net_bytes(raw_bytes, shown, replayed_bytes);
+    // An uncompacted run with zero initial and zero net savings adds (0, 0) to
+    // its bucket, so skip opening and classifying its archived streams.
+    if initial != 0 || net != 0 {
+        estimate.add(crate::tokens::run_content(directory), initial, net);
+    }
+}
+
 /// The totals of the runs in a project's archive that finished at or after
 /// `since_ms`, as the `stats` timeline counts them, quietly skipping unreadable runs.
 pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
     let mut totals = Totals::default();
     let mut estimate = crate::tokens::Estimate::default();
     let mut runs = 0;
-    for run in records(workspace, false).into_iter().flatten().flatten() {
-        if run.completed_ms < since_ms || run.completed_ms == 0 {
+    let Ok(entries) = fs::read_dir(workspace.state.join("runs")) else {
+        return Summary::default();
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        let directory = workspace.state.join("runs").join(&run.id);
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !valid_run_id(&id) {
+            continue;
+        }
+        let directory = entry.path();
+        let record_path = directory.join("record.json");
+        let (raw_bytes, preview_bytes, footer_bytes, completed_ms) =
+            match fs::metadata(&record_path) {
+                Ok(meta) => {
+                    let modified = meta.modified().map_or(u64::MAX, millis);
+                    if since_ms > 0 && modified.saturating_add(RECORD_SLACK_MS) < since_ms {
+                        continue;
+                    }
+                    let Ok(bytes) = fs::read(&record_path) else {
+                        continue;
+                    };
+                    let Ok(record) = serde_json::from_slice::<SummaryRecord>(&bytes) else {
+                        continue;
+                    };
+                    if record.id != id {
+                        continue;
+                    }
+                    let completed = if record.completed_ms > 0 {
+                        record.completed_ms
+                    } else {
+                        meta.modified().map_or(0, millis)
+                    };
+                    (
+                        record.raw_bytes,
+                        record.preview_bytes,
+                        record.footer_bytes,
+                        completed,
+                    )
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    let Ok(modified) =
+                        fs::metadata(directory.join("stdout")).and_then(|meta| meta.modified())
+                    else {
+                        continue;
+                    };
+                    (0, 0, 0, millis(modified))
+                }
+                Err(_) => continue,
+            };
+        if completed_ms < since_ms || completed_ms == 0 {
+            continue;
+        }
         let recalls: Recalls = get(&directory.join("recalls.json")).unwrap_or_default();
-        let shown = (run.preview_bytes + run.footer_bytes) as u64;
+        let shown = (preview_bytes + footer_bytes) as u64;
         let later = recalls.replayed(&directory);
-        totals.add(run.raw_bytes, shown, later);
-        estimate.add(
-            crate::tokens::run_content(&directory),
-            net_bytes(run.raw_bytes, shown, 0),
-            net_bytes(run.raw_bytes, shown, later.bytes()),
-        );
+        totals.add(raw_bytes, shown, later);
+        add_run_estimate(&mut estimate, &directory, raw_bytes, shown, later.bytes());
         runs += 1;
     }
     Summary {
@@ -1192,40 +1339,105 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
     let (mut secrets, mut unredacted) = (0u64, 0u64);
     let mut families: BTreeMap<String, FamilyStats> = BTreeMap::new();
     let mut timeline: BTreeMap<String, DayStats> = BTreeMap::new();
-    for run in records(workspace, false)? {
-        let run = run?;
-        // Count everything the agent received, including the footer.
-        let shown = (run.preview_bytes + run.footer_bytes) as u64;
-        count += 1;
-        secrets += run.redaction.as_ref().map_or(0, |found| found.count);
-        let directory = workspace.state.join("runs").join(&run.id);
-        let c: Recalls = get_or_warn(&directory.join("recalls.json"));
-        let later = c.replayed(&directory);
-        totals.add(run.raw_bytes, shown, later);
-        estimate.add(
-            crate::tokens::run_content(&directory),
-            net_bytes(run.raw_bytes, shown, 0),
-            net_bytes(run.raw_bytes, shown, later.bytes()),
-        );
-        replayed.add(later);
-        unredacted += c.unredacted;
-        let f = families.entry(run.family.clone()).or_default();
-        f.family = run.family;
-        f.runs += 1;
-        f.totals.add(run.raw_bytes, shown, later);
-        f.reopened_runs += u64::from(c.full > 0);
-        f.full_reads += c.full;
-        f.targeted_lookups += c.range + c.search + c.context;
-        f.excerpts += c.excerpts;
-        f.unchanged_runs += u64::from(run.unchanged);
-        f.grown_runs += u64::from(shown > run.raw_bytes);
-        // Retrievals are not timed, so they count on the day their run completed.
-        if run.completed_ms >= since && run.completed_ms > 0 {
-            let date = utc_date(run.completed_ms);
-            let d = timeline.entry(date.clone()).or_default();
-            d.date = date;
-            d.runs += 1;
-            d.totals.add(run.raw_bytes, shown, later);
+    let runs_path = workspace.state.join("runs");
+    if runs_path.exists() {
+        for entry in fs::read_dir(&runs_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let directory = entry.path();
+            let record_path = directory.join("record.json");
+            let (raw_bytes, preview_bytes, footer_bytes, completed_ms, family, unchanged, found) =
+                match fs::read(&record_path) {
+                    Ok(bytes) => match serde_json::from_slice::<StatsRecord>(&bytes)
+                        .context("decode run record")
+                    {
+                        Ok(record) => {
+                            if !valid_run_id(&id) {
+                                skipped(&id, &anyhow::anyhow!("invalid run ID"));
+                                continue;
+                            }
+                            if record.id != id {
+                                skipped(
+                                    &id,
+                                    &anyhow::anyhow!("run record does not match its directory"),
+                                );
+                                continue;
+                            }
+                            let completed = if record.completed_ms > 0 {
+                                record.completed_ms
+                            } else {
+                                fs::metadata(&record_path)
+                                    .and_then(|meta| meta.modified())
+                                    .map_or(0, millis)
+                            };
+                            let family = if record.family.is_empty() {
+                                "legacy".into()
+                            } else {
+                                record.family
+                            };
+                            (
+                                record.raw_bytes,
+                                record.preview_bytes,
+                                record.footer_bytes,
+                                completed,
+                                family,
+                                record.unchanged,
+                                record.redaction.map_or(0, |found| found.count),
+                            )
+                        }
+                        Err(error) => {
+                            skipped(&id, &error);
+                            continue;
+                        }
+                    },
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        let Ok(modified) =
+                            fs::metadata(directory.join("stdout")).and_then(|meta| meta.modified())
+                        else {
+                            continue;
+                        };
+                        if !valid_run_id(&id) {
+                            skipped(&id, &anyhow::anyhow!("invalid run ID"));
+                            continue;
+                        }
+                        (0, 0, 0, millis(modified), "unknown".into(), false, 0)
+                    }
+                    Err(e) => {
+                        skipped(&id, &anyhow::Error::new(e).context("read run record"));
+                        continue;
+                    }
+                };
+            // Count everything the agent received, including the footer.
+            let shown = (preview_bytes + footer_bytes) as u64;
+            count += 1;
+            secrets += found;
+            let c: Recalls = get_or_warn(&directory.join("recalls.json"));
+            let later = c.replayed(&directory);
+            totals.add(raw_bytes, shown, later);
+            add_run_estimate(&mut estimate, &directory, raw_bytes, shown, later.bytes());
+            replayed.add(later);
+            unredacted += c.unredacted;
+            let f = families.entry(family.clone()).or_default();
+            f.family = family;
+            f.runs += 1;
+            f.totals.add(raw_bytes, shown, later);
+            f.reopened_runs += u64::from(c.full > 0);
+            f.full_reads += c.full;
+            f.targeted_lookups += c.range + c.search + c.context;
+            f.excerpts += c.excerpts;
+            f.unchanged_runs += u64::from(unchanged);
+            f.grown_runs += u64::from(shown > raw_bytes);
+            // Retrievals are not timed, so they count on the day their run completed.
+            if completed_ms >= since && completed_ms > 0 {
+                let date = utc_date(completed_ms);
+                let d = timeline.entry(date.clone()).or_default();
+                d.date = date;
+                d.runs += 1;
+                d.totals.add(raw_bytes, shown, later);
+            }
         }
     }
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
@@ -1766,9 +1978,44 @@ pub fn resume_text(workspace: &Workspace, cap: usize) -> Result<String> {
 /// Whether `resume` has recorded runs, reads or a pack to show.
 pub(crate) fn has_activity(workspace: &Workspace) -> bool {
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
-    !activity.reads.is_empty()
-        || !activity.last_pack.is_empty()
-        || records(workspace, false).is_ok_and(|mut runs| runs.any(|run| run.is_ok()))
+    !activity.reads.is_empty() || !activity.last_pack.is_empty() || has_any_run(workspace)
+}
+
+/// Checks whether at least one readable run exists, stopping at the first match
+/// instead of reading and sorting the whole run archive.
+fn has_any_run(workspace: &Workspace) -> bool {
+    let Ok(entries) = fs::read_dir(workspace.state.join("runs")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !valid_run_id(&id) {
+            continue;
+        }
+        let directory = entry.path();
+        match fs::read(directory.join("record.json")) {
+            Ok(bytes) => {
+                if serde_json::from_slice::<SummaryRecord>(&bytes)
+                    .is_ok_and(|record| record.id == id)
+                {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if fs::metadata(directory.join("stdout"))
+                    .and_then(|meta| meta.modified())
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    false
 }
 
 /// Recent runs, inspected source and the last pack, with stale source marked.
@@ -1778,6 +2025,8 @@ fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
     let justless = workspace.justless();
     let mut has_runs = false;
+    let mut redactor: Option<Option<&'static crate::redact::Redactor>> = None;
+    let mut digests: HashMap<String, Option<String>> = HashMap::new();
     for run in records(workspace, false)?.take(5) {
         let run = run?;
         has_runs = true;
@@ -1793,9 +2042,11 @@ fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
             },
             run.summary
                 .headline()
-                .map(|h| match crate::redact::for_workspace(workspace) {
-                    Some(redactor) => redactor.text(&h).into_owned(),
-                    None => h,
+                .map(|h| {
+                    match *redactor.get_or_insert_with(|| crate::redact::for_workspace(workspace)) {
+                        Some(redactor) => redactor.text(&h).into_owned(),
+                        None => h,
+                    }
                 })
                 .map(|h| format!(" · {}", crate::summary::short(&h, 160)))
                 .unwrap_or_default()
@@ -1804,7 +2055,7 @@ fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
             let stale = run
                 .source_digests
                 .get(&d.location.file)
-                .is_some_and(|old| !current(workspace, &d.location.file, old));
+                .is_some_and(|old| !current_cached(workspace, &mut digests, &d.location.file, old));
             report.line(format!(
                 "  {}:{} -> {}{}",
                 d.stream.name(),
@@ -1827,7 +2078,7 @@ fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
         }
         let line = format!(
             "Last pack: {file}{}",
-            if current(workspace, file, digest) {
+            if current_cached(workspace, &mut digests, file, digest) {
                 ""
             } else {
                 " [source changed]"
@@ -1846,7 +2097,6 @@ fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
     if report.left() <= reserve {
         dropped |= !activity.reads.is_empty();
     } else {
-        let mut digests: HashMap<&str, Option<String>> = HashMap::new();
         let items = coalesce_reads(workspace, &activity.reads, &mut digests);
         for item in items {
             if report.clipped {
@@ -1929,7 +2179,7 @@ enum ResumeRead<'a> {
 fn coalesce_reads<'a>(
     workspace: &Workspace,
     reads: &'a [Read],
-    digests: &mut HashMap<&'a str, Option<String>>,
+    digests: &mut HashMap<String, Option<String>>,
 ) -> Vec<ResumeRead<'a>> {
     let mut items: Vec<ResumeRead<'a>> = Vec::new();
     let mut groups: HashMap<(&'a str, bool), usize> = HashMap::new();
@@ -1975,23 +2225,23 @@ fn format_read_ranges(file: &str, ranges: &[(usize, usize)], stale: bool) -> Str
     format!("Read {file}:{}{suffix}", spans.join(", "))
 }
 
-fn current_cached<'a>(
+fn current_cached(
     workspace: &Workspace,
-    cache: &mut HashMap<&'a str, Option<String>>,
-    file: &'a str,
+    cache: &mut HashMap<String, Option<String>>,
+    file: &str,
     old: &str,
 ) -> bool {
-    cache
-        .entry(file)
-        .or_insert_with(|| {
-            workspace
-                .source_path(file)
-                .ok()
-                .and_then(|p| fs::read(p).ok())
-                .map(|b| capture::source_digest(&b))
-        })
-        .as_deref()
-        == Some(old)
+    if let Some(cached) = cache.get(file) {
+        return cached.as_deref() == Some(old);
+    }
+    let digest = workspace
+        .source_path(file)
+        .ok()
+        .and_then(|p| fs::read(p).ok())
+        .map(|b| capture::source_digest(&b));
+    let matches = digest.as_deref() == Some(old);
+    cache.insert(file.to_owned(), digest);
+    matches
 }
 
 /// `justless` starts the command that replays an unfinished run.
@@ -2003,14 +2253,6 @@ fn outcome(run: &Run, justless: &str) -> String {
         // whole line's status, and says so.
         format!("exit {}", crate::postroute::exit_status(run))
     }
-}
-
-fn current(workspace: &Workspace, file: &str, old: &str) -> bool {
-    workspace
-        .source_path(file)
-        .ok()
-        .and_then(|p| fs::read(p).ok())
-        .is_some_and(|b| capture::source_digest(&b) == old)
 }
 
 /// How long a run directory without a record or a lock can still be starting.
@@ -2312,5 +2554,113 @@ mod tests {
         assert!(obs_line.contains("1.0 KB recalled (5.0 KB net)"));
         assert!(obs_line.contains("estimated at"));
         assert!(!obs_line.contains("÷ 4"));
+    }
+
+    #[test]
+    fn summary_has_activity_and_records_honor_windows_and_skip_corrupt_runs() {
+        let (_dir, ws) = temp_workspace();
+        assert!(!has_activity(&ws));
+
+        let runs_dir = ws.state.join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        // Corrupt and partial records alone must not count as activity.
+        for (id, body) in [
+            ("run-empty", ""),
+            (
+                "run-partial",
+                r#"{"id":"run-partial","status":0,"completed_ms":99999999999999}"#,
+            ),
+        ] {
+            let d = runs_dir.join(id);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("record.json"), body).unwrap();
+        }
+        assert!(!has_activity(&ws));
+
+        let now = now_ms();
+        let since = now.saturating_sub(7 * 86_400_000);
+        let write_run = |id: &str, completed_ms: u64, raw: u64, preview: usize, stdout: &str| {
+            let d = runs_dir.join(id);
+            fs::create_dir_all(&d).unwrap();
+            let rec = serde_json::json!({
+                "id": id,
+                "status": 0,
+                "raw_bytes": raw,
+                "preview_bytes": preview,
+                "footer_bytes": 0,
+                "completed_ms": completed_ms,
+                "family": "cargo test",
+                "diagnostics": [],
+                "source_digests": {},
+            });
+            let path = d.join("record.json");
+            fs::write(&path, rec.to_string()).unwrap();
+            fs::write(d.join("stdout"), stdout).unwrap();
+            fs::write(d.join("stderr"), "").unwrap();
+            path
+        };
+
+        // 1. Synthetic old completed_ms with fresh mtime: must still be excluded by since_ms.
+        write_run("run-synthold", 1_000, 10_000, 500, "old\n");
+
+        // 2. Old run with old mtime (> 14 days ago): skipped by mtime pre-filter.
+        let old_path = write_run(
+            "run-aged",
+            now.saturating_sub(14 * 86_400_000),
+            10_000,
+            500,
+            "aged\n",
+        );
+        let aged_time = SystemTime::now() - std::time::Duration::from_secs(14 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_modified(aged_time)
+            .unwrap();
+
+        // 3. Recent uncompacted run (zero saved, zero net).
+        write_run("run-small", now - 2_000, 128, 128, "small\n");
+
+        // 4. Recent compacted code run (newest completed_ms, but backdated mtime by 100s).
+        let code_sample = "pub fn value() -> usize { 42 }\n".repeat(40);
+        let newest_path = write_run(
+            "run-newest",
+            now - 1_000,
+            code_sample.len() as u64,
+            100,
+            &code_sample,
+        );
+        let backdated = SystemTime::now() - std::time::Duration::from_secs(100);
+        fs::File::options()
+            .write(true)
+            .open(&newest_path)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+
+        assert!(has_activity(&ws));
+
+        // `records` must still order strictly by completed_ms despite backdated mtime.
+        let ordered: Vec<String> = records(&ws, false)
+            .unwrap()
+            .map(|r| r.unwrap().id)
+            .collect();
+        assert_eq!(
+            ordered,
+            vec!["run-newest", "run-small", "run-aged", "run-synthold"]
+        );
+
+        // `summary` must count only the 2 in-window runs and classify code savings accurately.
+        let sum = summary(&ws, since);
+        assert_eq!(sum.runs, 2);
+        assert_eq!(sum.raw_bytes, 128 + code_sample.len() as u64);
+        assert_eq!(sum.preview_bytes, 128 + 100);
+        assert_eq!(sum.saved_bytes(), code_sample.len() as u64 - 100);
+        assert_eq!(
+            sum.estimate.json()["code"]["saved_bytes"],
+            code_sample.len() as u64 - 100
+        );
     }
 }
