@@ -1,87 +1,137 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 736" width="880" height="736" role="img" aria-labelledby="t d">
-<title id="t">Bytes an agent received: 1,171 KB raw versus 115 KB with justless, 90% smaller, across 77 real commands.</title>
-<desc id="d">Paired horizontal bars for 12 command types, sorted by raw size, on a linear 0 to 300 KB axis. git diff (older revisions): 274.3 KB raw, 13.5 KB with justless; find .: 267.4 KB raw, 9.4 KB with justless; grep -rn: 200.1 KB raw, 16.4 KB with justless; git log: 143.1 KB raw, 24.9 KB with justless; git ls-files: 67.3 KB raw, 9.2 KB with justless; rg: 63.1 KB raw, 8.4 KB with justless; ls: 42.4 KB raw, 12.1 KB with justless; cargo test: 34.4 KB raw, 4.0 KB with justless; cat (large file): 32.9 KB raw, 5.2 KB with justless; cargo check (successful builds): 26.5 KB raw, 0.5 KB with justless; git show: 10.0 KB raw, 3.3 KB with justless; cargo clippy: 3.8 KB raw, 0.5 KB with justless. Source: 77 real commands across four Rust and Python repositories; the total covers all 77.</desc>
-<rect x="0.5" y="0.5" width="879" height="735" rx="14" fill="#ffffff" stroke="#d0d7de"/>
-<text x="28" y="50" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="27" font-weight="700" fill="#1f2328">1,171 KB → 115 KB (90% smaller)</text>
-<text x="28" y="77" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="400" fill="#59636e" text-anchor="start">What an agent received per command type, raw and with justless</text>
-<rect x="28" y="94" width="14" height="11" rx="2" fill="#8c959f"/>
-<text x="49" y="104" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">Raw output</text>
-<rect x="141" y="94" width="14" height="11" rx="2" fill="#7c4dff"/>
-<text x="162" y="104" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">With justless</text>
-<line x1="262" y1="128" x2="262" y2="636" stroke="#afb8c1" stroke-width="1"/>
-<text x="262" y="656" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">0</text>
-<line x1="354" y1="128" x2="354" y2="636" stroke="#eaeef2" stroke-width="1"/>
-<text x="354" y="656" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">50</text>
-<line x1="446" y1="128" x2="446" y2="636" stroke="#eaeef2" stroke-width="1"/>
-<text x="446" y="656" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">100</text>
-<line x1="538" y1="128" x2="538" y2="636" stroke="#eaeef2" stroke-width="1"/>
-<text x="538" y="656" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">150</text>
-<line x1="630" y1="128" x2="630" y2="636" stroke="#eaeef2" stroke-width="1"/>
-<text x="630" y="656" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">200</text>
-<line x1="722" y1="128" x2="722" y2="636" stroke="#eaeef2" stroke-width="1"/>
-<text x="722" y="656" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">250</text>
-<line x1="814" y1="128" x2="814" y2="636" stroke="#eaeef2" stroke-width="1"/>
-<text x="814" y="656" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">300 KB</text>
-<text x="28" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">git diff<tspan font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#59636e"> (older revisions)</tspan></text>
-<path d="M262.00 136.00H762.71A4.00 4.00 0 0 1 766.71 140.00V146.00A4.00 4.00 0 0 1 762.71 150.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 152.00H282.84A4.00 4.00 0 0 1 286.84 156.00V162.00A4.00 4.00 0 0 1 282.84 166.00H262.00z" fill="#7c4dff"/>
-<text x="772.71" y="148" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">274.3 KB</text>
-<text x="292.84" y="164" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">13.5 KB</text>
-<text x="28" y="198" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">find .</text>
-<path d="M262.00 178.00H750.02A4.00 4.00 0 0 1 754.02 182.00V188.00A4.00 4.00 0 0 1 750.02 192.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 194.00H275.30A4.00 4.00 0 0 1 279.30 198.00V204.00A4.00 4.00 0 0 1 275.30 208.00H262.00z" fill="#7c4dff"/>
-<text x="760.02" y="190" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">267.4 KB</text>
-<text x="285.3" y="206" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">9.4 KB</text>
-<text x="28" y="240" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">grep -rn</text>
-<path d="M262.00 220.00H626.18A4.00 4.00 0 0 1 630.18 224.00V230.00A4.00 4.00 0 0 1 626.18 234.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 236.00H288.18A4.00 4.00 0 0 1 292.18 240.00V246.00A4.00 4.00 0 0 1 288.18 250.00H262.00z" fill="#7c4dff"/>
-<text x="636.18" y="232" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">200.1 KB</text>
-<text x="298.18" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">16.4 KB</text>
-<text x="28" y="282" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">git log</text>
-<path d="M262.00 262.00H521.30A4.00 4.00 0 0 1 525.30 266.00V272.00A4.00 4.00 0 0 1 521.30 276.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 278.00H303.82A4.00 4.00 0 0 1 307.82 282.00V288.00A4.00 4.00 0 0 1 303.82 292.00H262.00z" fill="#7c4dff"/>
-<text x="531.3" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">143.1 KB</text>
-<text x="313.82" y="290" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">24.9 KB</text>
-<text x="28" y="324" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">git ls-files</text>
-<path d="M262.00 304.00H381.83A4.00 4.00 0 0 1 385.83 308.00V314.00A4.00 4.00 0 0 1 381.83 318.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 320.00H274.93A4.00 4.00 0 0 1 278.93 324.00V330.00A4.00 4.00 0 0 1 274.93 334.00H262.00z" fill="#7c4dff"/>
-<text x="391.83" y="316" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">67.3 KB</text>
-<text x="284.93" y="332" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">9.2 KB</text>
-<text x="28" y="366" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">rg</text>
-<path d="M262.00 346.00H374.10A4.00 4.00 0 0 1 378.10 350.00V356.00A4.00 4.00 0 0 1 374.10 360.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 362.00H273.46A4.00 4.00 0 0 1 277.46 366.00V372.00A4.00 4.00 0 0 1 273.46 376.00H262.00z" fill="#7c4dff"/>
-<text x="384.1" y="358" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">63.1 KB</text>
-<text x="283.46" y="374" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">8.4 KB</text>
-<text x="28" y="408" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">ls</text>
-<path d="M262.00 388.00H336.02A4.00 4.00 0 0 1 340.02 392.00V398.00A4.00 4.00 0 0 1 336.02 402.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 404.00H280.26A4.00 4.00 0 0 1 284.26 408.00V414.00A4.00 4.00 0 0 1 280.26 418.00H262.00z" fill="#7c4dff"/>
-<text x="346.02" y="400" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">42.4 KB</text>
-<text x="290.26" y="416" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">12.1 KB</text>
-<text x="28" y="450" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">cargo test</text>
-<path d="M262.00 430.00H321.30A4.00 4.00 0 0 1 325.30 434.00V440.00A4.00 4.00 0 0 1 321.30 444.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 446.00H265.36A4.00 4.00 0 0 1 269.36 450.00V456.00A4.00 4.00 0 0 1 265.36 460.00H262.00z" fill="#7c4dff"/>
-<text x="331.3" y="442" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">34.4 KB</text>
-<text x="275.36" y="458" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">4.0 KB</text>
-<text x="28" y="492" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">cat<tspan font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#59636e"> (large file)</tspan></text>
-<path d="M262.00 472.00H318.54A4.00 4.00 0 0 1 322.54 476.00V482.00A4.00 4.00 0 0 1 318.54 486.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 488.00H267.57A4.00 4.00 0 0 1 271.57 492.00V498.00A4.00 4.00 0 0 1 267.57 502.00H262.00z" fill="#7c4dff"/>
-<text x="328.54" y="484" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">32.9 KB</text>
-<text x="277.57" y="500" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">5.2 KB</text>
-<text x="28" y="534" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">cargo check<tspan font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#59636e"> (successful builds)</tspan></text>
-<path d="M262.00 514.00H306.76A4.00 4.00 0 0 1 310.76 518.00V524.00A4.00 4.00 0 0 1 306.76 528.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 530.00H262.00A0.92 0.92 0 0 1 262.92 530.92V543.08A0.92 0.92 0 0 1 262.00 544.00H262.00z" fill="#7c4dff"/>
-<text x="316.76" y="526" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">26.5 KB</text>
-<text x="268.92" y="542" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">0.5 KB</text>
-<text x="28" y="576" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">git show</text>
-<path d="M262.00 556.00H276.40A4.00 4.00 0 0 1 280.40 560.00V566.00A4.00 4.00 0 0 1 276.40 570.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 572.00H264.07A4.00 4.00 0 0 1 268.07 576.00V582.00A4.00 4.00 0 0 1 264.07 586.00H262.00z" fill="#7c4dff"/>
-<text x="286.4" y="568" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">10.0 KB</text>
-<text x="274.07" y="584" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">3.3 KB</text>
-<text x="28" y="618" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="500" fill="#1f2328">cargo clippy</text>
-<path d="M262.00 598.00H264.99A4.00 4.00 0 0 1 268.99 602.00V608.00A4.00 4.00 0 0 1 264.99 612.00H262.00z" fill="#8c959f"/>
-<path d="M262.00 614.00H262.00A0.92 0.92 0 0 1 262.92 614.92V627.08A0.92 0.92 0 0 1 262.00 628.00H262.00z" fill="#7c4dff"/>
-<text x="274.99" y="610" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#59636e" text-anchor="start">3.8 KB</text>
-<text x="268.92" y="626" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">0.5 KB</text>
-<text x="28" y="690" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">77 real commands across four Rust and Python repositories. 12 command types shown; the total covers all 77.</text>
-<text x="28" y="710" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#59636e" text-anchor="start">Rows sorted by raw size.</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 780" width="900" height="780" role="img" aria-labelledby="t d">
+<title id="t">Bytes an agent received: 1,157.5 KB raw versus 49.4 KB with justless (95.7% smaller, 23.4x) across 18 reproducible workloads.</title>
+<desc id="d">Paired horizontal bars for the 14 largest workloads of 18 reproducible Wave 1-6 benchmarks on a linear 0 to 400 KB axis. rg -n &quot;fn &quot; src: 349.0 KB raw, 4.0 KB with justless (99%, 88.2x); read --outline: 267.2 KB raw, 2.3 KB with justless (99%, 114.4x); query + map + mask: 264.9 KB raw, 22.6 KB with justless (92%, 11.7x); kubectl logs: 45.9 KB raw, 1.1 KB with justless (98%, 41.2x); gh checks + audit: 33.0 KB raw, 564 B with justless (98%, 59.8x); gh api JSON: 30.2 KB raw, 3.6 KB with justless (88%, 8.3x); psql table: 27.5 KB raw, 4.0 KB with justless (85%, 6.8x); pytest: 19.7 KB raw, 741 B with justless (96%, 27.2x); docker build: 18.4 KB raw, 498 B with justless (97%, 37.8x); kubectl pods + desc: 18.3 KB raw, 1.6 KB with justless (92%, 11.8x); cargo test: 17.6 KB raw, 517 B with justless (97%, 34.9x); cargo tree: 15.7 KB raw, 1.5 KB with justless (90%, 10.5x); terraform plan: 14.6 KB raw, 1.3 KB with justless (91%, 11.1x); git diff: 12.2 KB raw, 490 B with justless (96%, 25.5x).</desc>
+<rect x="0.5" y="0.5" width="899" height="779" rx="14" fill="#ffffff" stroke="#d0d7de"/>
+<text x="28" y="48" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="25" font-weight="700" fill="#1f2328">1,157.5 KB → 49.4 KB (96% smaller · 23.4×)</text>
+<text x="28" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="14.5" fill="#59636e">Measured output bytes across 18 reproducible Wave 1–6 workloads — raw vs. Justless</text>
+<rect x="28" y="92" width="14" height="11" rx="2" fill="#8c959f"/>
+<text x="49" y="102" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Raw output</text>
+<rect x="142" y="92" width="14" height="11" rx="2" fill="#7c4dff"/>
+<text x="163" y="102" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">With justless</text>
+<rect x="268" y="90" width="54" height="15" rx="7.5" fill="#ede7ff"/>
+<text x="295" y="101.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#7c4dff" text-anchor="middle">cut · ×</text>
+<text x="330" y="102" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Reduction &amp; compression ratio</text>
+<line x1="216.0" y1="122.0" x2="216.0" y2="710.0" stroke="#afb8c1" stroke-width="1"/>
+<text x="216.0" y="729.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">0</text>
+<line x1="331.5" y1="122.0" x2="331.5" y2="710.0" stroke="#eaeef2" stroke-width="1"/>
+<text x="331.5" y="729.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">100</text>
+<line x1="447.0" y1="122.0" x2="447.0" y2="710.0" stroke="#eaeef2" stroke-width="1"/>
+<text x="447.0" y="729.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">200</text>
+<line x1="562.5" y1="122.0" x2="562.5" y2="710.0" stroke="#eaeef2" stroke-width="1"/>
+<text x="562.5" y="729.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">300</text>
+<line x1="678.0" y1="122.0" x2="678.0" y2="710.0" stroke="#eaeef2" stroke-width="1"/>
+<text x="678.0" y="729.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="middle" style="font-variant-numeric:tabular-nums">400 KB</text>
+<text x="28" y="140.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">rg -n &quot;fn &quot; src</text>
+<text x="28" y="155.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">live repo search</text>
+<path d="M216.00 128.00H615.60A3.50 3.50 0 0 1 619.10 131.50V137.50A3.50 3.50 0 0 1 615.60 141.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 143.00H218.29A2.29 2.29 0 0 1 220.57 145.29V153.71A2.29 2.29 0 0 1 218.29 156.00H216.00z" fill="#7c4dff"/>
+<text x="626.1" y="138.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">349.0 KB</text>
+<text x="227.6" y="154.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">4.0 KB</text>
+<rect x="762.0" y="131.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="147.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">99% · 88×</text>
+<text x="28" y="182.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">read --outline</text>
+<text x="28" y="197.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">reference.md + expand</text>
+<path d="M216.00 170.00H521.09A3.50 3.50 0 0 1 524.59 173.50V179.50A3.50 3.50 0 0 1 521.09 183.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 185.00H217.35A1.35 1.35 0 0 1 218.70 186.35V196.65A1.35 1.35 0 0 1 217.35 198.00H216.00z" fill="#7c4dff"/>
+<text x="531.6" y="180.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">267.2 KB</text>
+<text x="225.7" y="196.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">2.3 KB</text>
+<rect x="762.0" y="173.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="189.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">99% · 114×</text>
+<text x="28" y="224.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">query + map + mask</text>
+<text x="28" y="239.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">graph + NL + retire</text>
+<path d="M216.00 212.00H518.42A3.50 3.50 0 0 1 521.92 215.50V221.50A3.50 3.50 0 0 1 518.42 225.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 227.00H238.60A3.50 3.50 0 0 1 242.10 230.50V236.50A3.50 3.50 0 0 1 238.60 240.00H216.00z" fill="#7c4dff"/>
+<text x="528.9" y="222.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">264.9 KB</text>
+<text x="249.1" y="238.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">22.6 KB</text>
+<rect x="762.0" y="215.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="231.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">92% · 12×</text>
+<text x="28" y="266.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">kubectl logs</text>
+<text x="28" y="281.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">500 interleaved lines</text>
+<path d="M216.00 254.00H265.47A3.50 3.50 0 0 1 268.97 257.50V263.50A3.50 3.50 0 0 1 265.47 267.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 269.00H217.25A1.25 1.25 0 0 1 218.50 270.25V280.75A1.25 1.25 0 0 1 217.25 282.00H216.00z" fill="#7c4dff"/>
+<text x="276.0" y="264.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">45.9 KB</text>
+<text x="225.5" y="280.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">1.1 KB</text>
+<rect x="762.0" y="257.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="273.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">98% · 41×</text>
+<text x="28" y="308.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">gh checks + audit</text>
+<text x="28" y="323.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">61 checks + 13 vuln</text>
+<path d="M216.00 296.00H250.56A3.50 3.50 0 0 1 254.06 299.50V305.50A3.50 3.50 0 0 1 250.56 309.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 311.00H217.25A1.25 1.25 0 0 1 218.50 312.25V322.75A1.25 1.25 0 0 1 217.25 324.00H216.00z" fill="#7c4dff"/>
+<text x="261.1" y="306.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">33.0 KB</text>
+<text x="225.5" y="322.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">564 B</text>
+<rect x="762.0" y="299.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="315.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">98% · 60×</text>
+<text x="28" y="350.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">gh api JSON</text>
+<text x="28" y="365.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">80 nested objects</text>
+<path d="M216.00 338.00H247.33A3.50 3.50 0 0 1 250.83 341.50V347.50A3.50 3.50 0 0 1 247.33 351.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 353.00H218.10A2.10 2.10 0 0 1 220.20 355.10V363.90A2.10 2.10 0 0 1 218.10 366.00H216.00z" fill="#7c4dff"/>
+<text x="257.8" y="348.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">30.2 KB</text>
+<text x="227.2" y="364.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">3.6 KB</text>
+<rect x="762.0" y="341.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="357.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">88% · 8.3×</text>
+<text x="28" y="392.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">psql table</text>
+<text x="28" y="407.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">500 rows · Tier 1+2</text>
+<path d="M216.00 380.00H244.22A3.50 3.50 0 0 1 247.72 383.50V389.50A3.50 3.50 0 0 1 244.22 393.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 395.00H218.33A2.33 2.33 0 0 1 220.66 397.33V405.67A2.33 2.33 0 0 1 218.33 408.00H216.00z" fill="#7c4dff"/>
+<text x="254.7" y="390.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">27.5 KB</text>
+<text x="227.7" y="406.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">4.0 KB</text>
+<rect x="762.0" y="383.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="399.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">85% · 6.8×</text>
+<text x="28" y="434.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">pytest</text>
+<text x="28" y="449.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">50 parametrized + err</text>
+<path d="M216.00 422.00H235.20A3.50 3.50 0 0 1 238.70 425.50V431.50A3.50 3.50 0 0 1 235.20 435.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 437.00H217.25A1.25 1.25 0 0 1 218.50 438.25V448.75A1.25 1.25 0 0 1 217.25 450.00H216.00z" fill="#7c4dff"/>
+<text x="245.7" y="432.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">19.7 KB</text>
+<text x="225.5" y="448.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">741 B</text>
+<rect x="762.0" y="425.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="441.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">96% · 27×</text>
+<text x="28" y="476.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">docker build</text>
+<text x="28" y="491.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">350-line BuildKit</text>
+<path d="M216.00 464.00H233.72A3.50 3.50 0 0 1 237.22 467.50V473.50A3.50 3.50 0 0 1 233.72 477.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 479.00H217.25A1.25 1.25 0 0 1 218.50 480.25V490.75A1.25 1.25 0 0 1 217.25 492.00H216.00z" fill="#7c4dff"/>
+<text x="244.2" y="474.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">18.4 KB</text>
+<text x="225.5" y="490.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">498 B</text>
+<rect x="762.0" y="467.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="483.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">97% · 38×</text>
+<text x="28" y="518.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">kubectl pods + desc</text>
+<text x="28" y="533.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">120 pods + describe</text>
+<path d="M216.00 506.00H233.63A3.50 3.50 0 0 1 237.13 509.50V515.50A3.50 3.50 0 0 1 233.63 519.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 521.00H217.25A1.25 1.25 0 0 1 218.50 522.25V532.75A1.25 1.25 0 0 1 217.25 534.00H216.00z" fill="#7c4dff"/>
+<text x="244.1" y="516.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">18.3 KB</text>
+<text x="225.5" y="532.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">1.6 KB</text>
+<rect x="762.0" y="509.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="525.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">92% · 12×</text>
+<text x="28" y="560.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">cargo test</text>
+<text x="28" y="575.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">failing fixture</text>
+<path d="M216.00 548.00H232.85A3.50 3.50 0 0 1 236.35 551.50V557.50A3.50 3.50 0 0 1 232.85 561.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 563.00H217.25A1.25 1.25 0 0 1 218.50 564.25V574.75A1.25 1.25 0 0 1 217.25 576.00H216.00z" fill="#7c4dff"/>
+<text x="243.3" y="558.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">17.6 KB</text>
+<text x="225.5" y="574.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">517 B</text>
+<rect x="762.0" y="551.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="567.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">97% · 35×</text>
+<text x="28" y="602.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">cargo tree</text>
+<text x="28" y="617.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">400 lines · syn dupes</text>
+<path d="M216.00 590.00H230.58A3.50 3.50 0 0 1 234.08 593.50V599.50A3.50 3.50 0 0 1 230.58 603.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 605.00H217.25A1.25 1.25 0 0 1 218.50 606.25V616.75A1.25 1.25 0 0 1 217.25 618.00H216.00z" fill="#7c4dff"/>
+<text x="241.1" y="600.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">15.7 KB</text>
+<text x="225.5" y="616.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">1.5 KB</text>
+<rect x="762.0" y="593.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="609.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">90% · 10×</text>
+<text x="28" y="644.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">terraform plan</text>
+<text x="28" y="659.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">120 refresh + 12 res</text>
+<path d="M216.00 632.00H229.40A3.50 3.50 0 0 1 232.90 635.50V641.50A3.50 3.50 0 0 1 229.40 645.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 647.00H217.25A1.25 1.25 0 0 1 218.50 648.25V658.75A1.25 1.25 0 0 1 217.25 660.00H216.00z" fill="#7c4dff"/>
+<text x="239.9" y="642.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">14.6 KB</text>
+<text x="225.5" y="658.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">1.3 KB</text>
+<rect x="762.0" y="635.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="651.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">91% · 11×</text>
+<text x="28" y="686.0" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12.5" font-weight="600" fill="#1f2328">git diff</text>
+<text x="28" y="701.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="11.5" fill="#59636e">semantic + lockfile</text>
+<path d="M216.00 674.00H226.59A3.50 3.50 0 0 1 230.09 677.50V683.50A3.50 3.50 0 0 1 226.59 687.00H216.00z" fill="#8c959f"/>
+<path d="M216.00 689.00H217.25A1.25 1.25 0 0 1 218.50 690.25V700.75A1.25 1.25 0 0 1 217.25 702.00H216.00z" fill="#7c4dff"/>
+<text x="237.1" y="684.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e" style="font-variant-numeric:tabular-nums">12.2 KB</text>
+<text x="225.5" y="700.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#1f2328" style="font-variant-numeric:tabular-nums">490 B</text>
+<rect x="762.0" y="677.0" width="112.0" height="24" rx="12" fill="#ede7ff"/>
+<text x="818.0" y="693.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#7c4dff" text-anchor="middle" style="font-variant-numeric:tabular-nums">96% · 25×</text>
+<text x="28" y="758" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#59636e">Top 14 of 18 reproducible workloads from scripts/suite_benchmark.py · totals cover all 18 · sorted by raw size.</text>
 </svg>

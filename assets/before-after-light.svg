@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 716" width="1000" height="716" role="img" aria-label="The same failing cargo test run twice. Without justless the agent receives 380 lines (18,038 bytes), 351 of them trace lines the test prints. With justless, which the hook routes the command through, it receives 9 lines (700 bytes): the failing test, its assertion and location, exit code 101 and a run ID. justless log then replays the original assertion lines exactly.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 716" width="1000" height="716" role="img" aria-label="The same failing cargo test run twice. Without justless the agent receives 380 lines (18,038 bytes). With justless, routed by the hook, it receives 9 lines (517 bytes, 97% smaller): the failing test, its assertion, collapsed empty target, exit code 101 and run ID run-pHKV4nNjVk9q. justless log then replays the original assertion lines exactly.">
 <title>Before and after justless: cargo test</title>
-<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:13.5px}.m{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;font-size:12px;white-space:pre}</style>
+<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif;font-size:13.5px}.m{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-size:12px;white-space:pre}</style>
 <g xml:space="preserve">
 <rect x="4" y="4" width="472" height="708" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
 <circle cx="24" cy="24" r="5.5" fill="#d0d7de"/>
@@ -8,89 +8,84 @@
 <circle cx="56" cy="24" r="5.5" fill="#d0d7de"/>
 <text x="80" y="29" class="s"><tspan font-weight="600" fill="#1f2328">Without justless</tspan><tspan fill="#59636e"> · 380 lines · 17.6 KB</tspan></text>
 <line x1="4" y1="44" x2="476" y2="44" stroke="#d0d7de"/>
-<rect x="12" y="444" width="456" height="80" rx="4" fill="#ede7ff"/>
-<text x="20" y="70" class="m" data-prompt="raw"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">cargo test</tspan></text>
-<text x="20" y="90" class="m" fill="#1f2328" data-src="raw:1:0">    Finished `test` profile [unoptimized + debuginfo] </text>
-<text x="63.2" y="106" class="m" fill="#1f2328" data-src="raw:1:1">target(s) in 0.00s</text>
-<text x="20" y="122" class="m" fill="#1f2328" data-src="raw:2:0">     Running unittests src/lib.rs </text>
-<text x="70.4" y="138" class="m" fill="#1f2328" data-src="raw:2:1">(target/debug/deps/checkout_fixture-4b58a8d3c9315df3)</text>
-<text x="20" y="154" class="m" fill="#1f2328" data-src="raw:3:0"></text>
-<text x="20" y="170" class="m" fill="#1f2328" data-src="raw:4:0">running 0 tests</text>
-<text x="20" y="186" class="m" fill="#1f2328" data-src="raw:5:0"></text>
-<text x="20" y="202" class="m" fill="#1f2328" data-src="raw:6:0">test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; </text>
-<text x="34.4" y="218" class="m" fill="#1f2328" data-src="raw:6:1">0 filtered out; finished in 0.00s</text>
-<text x="20" y="234" class="m" fill="#1f2328" data-src="raw:7:0"></text>
-<text x="20" y="250" class="m" fill="#1f2328" data-src="raw:8:0">     Running tests/checkout.rs </text>
-<text x="70.4" y="266" class="m" fill="#1f2328" data-src="raw:8:1">(target/debug/deps/checkout-08b118bf0c4a4cc2)</text>
-<text x="20" y="282" class="m" fill="#1f2328" data-src="raw:9:0"></text>
-<text x="20" y="298" class="m" fill="#1f2328" data-src="raw:10:0">running 1 test</text>
-<text x="20" y="314" class="m" fill="#1f2328" data-src="raw:11:0">test total_includes_fee ... FAILED</text>
-<text x="20" y="330" class="m" fill="#1f2328" data-src="raw:12:0"></text>
-<text x="20" y="346" class="m" fill="#1f2328" data-src="raw:13:0">failures:</text>
-<text x="20" y="362" class="m" fill="#1f2328" data-src="raw:14:0"></text>
-<text x="20" y="378" class="m" fill="#1f2328" data-src="raw:15:0">---- total_includes_fee stdout ----</text>
-<line x1="20" y1="396" x2="168.48" y2="396" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<line x1="311.52" y1="396" x2="460" y2="396" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<rect x="168.48" y="385" width="143.04" height="22" rx="11" fill="#ede7ff"/>
-<text x="240" y="400.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600" data-elided="350">… 350 more lines</text>
-<text x="20" y="422" class="m" fill="#1f2328" data-src="raw:366:0">billing-trace step=349 customer=demo state=ready</text>
-<text x="20" y="438" class="m" fill="#1f2328" data-src="raw:367:0"></text>
-<text x="20" y="454" class="m" fill="#1f2328" data-src="raw:368:0">thread 'total_includes_fee' (3278099) panicked at </text>
-<text x="34.4" y="470" class="m" fill="#1f2328" data-src="raw:368:1">tests/checkout.rs:11:5:</text>
-<text x="20" y="486" class="m" fill="#1f2328" data-src="raw:369:0">assertion `left == right` failed</text>
-<text x="20" y="502" class="m" fill="#1f2328" data-src="raw:370:0">  left: 106</text>
-<text x="20" y="518" class="m" fill="#1f2328" data-src="raw:371:0"> right: 105</text>
-<text x="20" y="534" class="m" fill="#1f2328" data-src="raw:372:0">note: run with `RUST_BACKTRACE=1` environment variable to </text>
-<text x="34.4" y="550" class="m" fill="#1f2328" data-src="raw:372:1">display a backtrace</text>
-<text x="20" y="566" class="m" fill="#1f2328" data-src="raw:373:0"></text>
-<text x="20" y="582" class="m" fill="#1f2328" data-src="raw:374:0"></text>
-<text x="20" y="598" class="m" fill="#1f2328" data-src="raw:375:0">failures:</text>
-<text x="20" y="614" class="m" fill="#1f2328" data-src="raw:376:0">    total_includes_fee</text>
-<text x="20" y="630" class="m" fill="#1f2328" data-src="raw:377:0"></text>
-<text x="20" y="646" class="m" fill="#1f2328" data-src="raw:378:0">test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 </text>
-<text x="34.4" y="662" class="m" fill="#1f2328" data-src="raw:378:1">measured; 0 filtered out; finished in 0.00s</text>
-<text x="20" y="678" class="m" fill="#1f2328" data-src="raw:379:0"></text>
-<text x="20" y="694" class="m" fill="#1f2328" data-src="raw:380:0">error: test failed, to rerun pass `--test checkout`</text>
-<rect x="496" y="4" width="500" height="328" rx="12" fill="#f6f8fa" stroke="#7c4dff" stroke-width="1.5"/>
+<rect x="12" y="443.0" width="456" height="80.0" rx="4" fill="#ede7ff"/>
+<text x="20" y="70" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">cargo test</tspan></text>
+<text x="20.0" y="90.0" class="m" fill="#1f2328">    Finished `test` profile [unoptimized + debuginfo] </text>
+<text x="34.4" y="106.0" class="m" fill="#1f2328">target(s) in 0.00s</text>
+<text x="20.0" y="122.0" class="m" fill="#1f2328">     Running unittests src/lib.rs </text>
+<text x="34.4" y="138.0" class="m" fill="#1f2328">(target/debug/deps/checkout_fixture-2e642d1de6b79dd7)</text>
+<text x="20.0" y="154.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="170.0" class="m" fill="#1f2328">running 0 tests</text>
+<text x="20.0" y="186.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="202.0" class="m" fill="#1f2328">test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; </text>
+<text x="34.4" y="218.0" class="m" fill="#1f2328">0 filtered out; finished in 0.00s</text>
+<text x="20.0" y="234.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="250.0" class="m" fill="#1f2328">     Running tests/checkout.rs </text>
+<text x="34.4" y="266.0" class="m" fill="#1f2328">(target/debug/deps/checkout-e2b047b639cca54b)</text>
+<text x="20.0" y="282.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="298.0" class="m" fill="#1f2328">running 1 test</text>
+<text x="20.0" y="314.0" class="m" fill="#1f2328">test total_includes_fee ... FAILED</text>
+<text x="20.0" y="330.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="346.0" class="m" fill="#1f2328">failures:</text>
+<text x="20.0" y="362.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="378.0" class="m" fill="#1f2328">---- total_includes_fee stdout ----</text>
+<line x1="20.0" y1="396.0" x2="169.4" y2="396.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<line x1="310.6" y1="396.0" x2="460.0" y2="396.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<rect x="169.4" y="385.0" width="141.2" height="22" rx="11" fill="#ede7ff"/>
+<text x="240.0" y="400.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600">… 350 more lines</text>
+<text x="20.0" y="422.0" class="m" fill="#1f2328">billing-trace step=349 customer=demo state=ready</text>
+<text x="20.0" y="438.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="454.0" class="m" fill="#1f2328">thread 'total_includes_fee' (3760864) panicked at </text>
+<text x="34.4" y="470.0" class="m" fill="#1f2328">tests/checkout.rs:11:5:</text>
+<text x="20.0" y="486.0" class="m" fill="#1f2328">assertion `left == right` failed</text>
+<text x="20.0" y="502.0" class="m" fill="#1f2328">  left: 106</text>
+<text x="20.0" y="518.0" class="m" fill="#1f2328"> right: 105</text>
+<text x="20.0" y="534.0" class="m" fill="#1f2328">note: run with `RUST_BACKTRACE=1` environment variable to </text>
+<text x="34.4" y="550.0" class="m" fill="#1f2328">display a backtrace</text>
+<text x="20.0" y="566.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="582.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="598.0" class="m" fill="#1f2328">failures:</text>
+<text x="20.0" y="614.0" class="m" fill="#1f2328">    total_includes_fee</text>
+<text x="20.0" y="630.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="646.0" class="m" fill="#1f2328">test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 </text>
+<text x="34.4" y="662.0" class="m" fill="#1f2328">measured; 0 filtered out; finished in 0.00s</text>
+<text x="20.0" y="678.0" class="m" fill="#1f2328"></text>
+<text x="20.0" y="694.0" class="m" fill="#1f2328">error: test failed, to rerun pass `--test checkout`</text>
+<rect x="496" y="4" width="500" height="278" rx="12" fill="#f6f8fa" stroke="#7c4dff" stroke-width="1.5"/>
 <circle cx="516" cy="24" r="5.5" fill="#d0d7de"/>
 <circle cx="532" cy="24" r="5.5" fill="#d0d7de"/>
 <circle cx="548" cy="24" r="5.5" fill="#d0d7de"/>
-<text x="572" y="29" class="s"><tspan font-weight="600" fill="#7c4dff">With justless</tspan><tspan fill="#59636e"> · 9 lines · 0.7 KB</tspan></text>
+<text x="572" y="29" class="s"><tspan font-weight="600" fill="#7c4dff">With justless</tspan><tspan fill="#59636e"> · 9 lines · 517 B</tspan></text>
 <line x1="496" y1="44" x2="996" y2="44" stroke="#d0d7de"/>
-<rect x="504" y="96" width="484" height="32" rx="4" fill="#ede7ff"/>
-<text x="512" y="70" class="m" data-prompt="jl"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">cargo test</tspan></text>
-<rect x="718.3" y="57" width="267.7" height="19" rx="9.5" fill="#ede7ff"/>
-<text x="852.15" y="70.5" class="s" text-anchor="middle" style="font-size:12px" font-weight="600" fill="#1f2328" data-note="1">routed by the hook through justless run</text>
-<text x="512" y="90" class="m" fill="#1f2328" data-src="jl:1:0">1 reported failing test(s)</text>
-<text x="512" y="106" class="m" fill="#1f2328" data-src="jl:2:0">1 test(s): total_includes_fee tests/checkout.rs:11:5: assertion </text>
-<text x="526.4" y="122" class="m" fill="#1f2328" data-src="jl:2:1">`left == right` failed left: 106 right: 105 [stdout:365-368]</text>
-<text x="512" y="138" class="m" fill="#1f2328" data-src="jl:3:0">test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 </text>
-<text x="526.4" y="154" class="m" fill="#1f2328" data-src="jl:3:1">filtered out; finished in 0.00s</text>
-<text x="512" y="170" class="m" fill="#1f2328" data-src="jl:4:0">test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; </text>
-<text x="526.4" y="186" class="m" fill="#1f2328" data-src="jl:4:1">0 filtered out; finished in 0.00s</text>
-<text x="512" y="202" class="m" fill="#1f2328" data-src="jl:5:0">    Finished `test` profile [unoptimized + debuginfo] target(s) </text>
-<text x="555.2" y="218" class="m" fill="#1f2328" data-src="jl:5:1">in 0.00s</text>
-<text x="512" y="234" class="m" fill="#1f2328" data-src="jl:6:0">     Running unittests src/lib.rs </text>
-<text x="562.4" y="250" class="m" fill="#1f2328" data-src="jl:6:1">(target/debug/deps/checkout_fixture-4b58a8d3c9315df3)</text>
-<text x="512" y="266" class="m" fill="#1f2328" data-src="jl:7:0">     Running tests/checkout.rs </text>
-<text x="562.4" y="282" class="m" fill="#1f2328" data-src="jl:7:1">(target/debug/deps/checkout-08b118bf0c4a4cc2)</text>
-<text x="512" y="298" class="m" fill="#1f2328" data-src="jl:8:0">error: test failed, to rerun pass `--test checkout`</text>
-<text x="512" y="314" class="m" fill="#1f2328" data-src="jl:9:0">[justless run-5JrBaF3zTLSD · 634 B of 17.6 KB shown · exit 101]</text>
-<rect x="496" y="350" width="500" height="164" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1" stroke-dasharray="5 4"/>
-<text x="512" y="373" class="s"><tspan font-weight="600" fill="#7c4dff">Exact on demand</tspan><tspan fill="#59636e"> · all 17.6 KB archived in .justless/</tspan></text>
-<text x="512" y="396" class="m" data-prompt="log"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">justless log run-5JrBaF3zTLSD --stream stdout --from 365 --to</tspan></text>
-<text x="512" y="412" class="m" fill="#1f2328" font-weight="600" data-prompt-cont="log">  368</text>
-<text x="512" y="432" class="m" fill="#1f2328" data-src="log:1:0">thread 'total_includes_fee' (3306235) panicked at </text>
-<text x="526.4" y="448" class="m" fill="#1f2328" data-src="log:1:1">tests/checkout.rs:11:5:</text>
-<text x="512" y="464" class="m" fill="#1f2328" data-src="log:2:0">assertion `left == right` failed</text>
-<text x="512" y="480" class="m" fill="#1f2328" data-src="log:3:0">  left: 106</text>
-<text x="512" y="496" class="m" fill="#1f2328" data-src="log:4:0"> right: 105</text>
-<text x="512" y="557" class="s" style="font-size:15px" font-weight="600" fill="#1f2328" data-note="lead">In this example: 380 → 9 lines, 18,038 → 700 bytes</text>
-<text x="512" y="579" class="s" style="font-size:13px" fill="#59636e" data-note="1">Same exit code 101 · same assertion · full output kept</text>
-<line x1="512" y1="593" x2="980" y2="593" stroke="#d0d7de"/>
-<text x="512" y="615" class="s" style="font-size:13px" fill="#59636e" data-note="1">Synthetic fixture: the test prints 351 trace lines, then fails.</text>
-<text x="512" y="635" class="s" style="font-size:13px" fill="#59636e" data-note="1">In the 77-command real-repo measurement: cargo test 34.4 KB → 4.0 KB.</text>
-<text x="512" y="655" class="s" style="font-size:13px" fill="#59636e" data-note="1">Separate runs, so thread IDs differ. Long lines wrap for display.</text>
-<text x="512" y="675" class="s" style="font-size:13px" fill="#59636e" data-note="1">The 700 bytes include the 66-byte footer line.</text>
+<rect x="504" y="95.0" width="484" height="32.0" rx="4" fill="#ede7ff"/>
+<text x="512" y="70" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">cargo test</tspan></text>
+<rect x="718" y="57" width="268" height="19" rx="9.5" fill="#ede7ff"/>
+<text x="852" y="70.5" class="s" text-anchor="middle" style="font-size:12px" font-weight="600" fill="#1f2328">routed by the hook through justless run</text>
+<text x="512.0" y="90.0" class="m" fill="#1f2328">1 reported failing test(s)</text>
+<text x="512.0" y="106.0" class="m" fill="#1f2328">1 test(s): total_includes_fee tests/checkout.rs:11:5: assertion </text>
+<text x="526.4" y="122.0" class="m" fill="#1f2328">`left == right` failed left: 106 right: 105 [stdout:365-368]</text>
+<text x="512.0" y="138.0" class="m" fill="#1f2328">test result: FAILED. 0 passed; 1 failed; 0 ignored · 2 test </text>
+<text x="526.4" y="154.0" class="m" fill="#1f2328">binaries</text>
+<text x="512.0" y="170.0" class="m" fill="#1f2328">  0 passed, 1 failed  tests/checkout.rs [stdout:7-375]</text>
+<text x="512.0" y="186.0" class="m" fill="#1f2328">  1 ran no tests: unittests src/lib.rs</text>
+<text x="512.0" y="202.0" class="m" fill="#1f2328">stderr: 3 cargo status line(s) [stderr:1-3]</text>
+<text x="512.0" y="218.0" class="m" fill="#1f2328">stderr: 1 other line(s) [stderr:4-4]</text>
+<text x="512.0" y="234.0" class="m" fill="#1f2328">  error: test failed, to rerun pass `--test checkout`</text>
+<text x="512.0" y="250.0" class="m" fill="#59636e">[justless run-pHKV4nNjVk9q · 451 B of 17.6 KB shown · exit 101]</text>
+<rect x="496" y="300" width="500" height="180" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="512" y="323" class="s"><tspan font-weight="600" fill="#7c4dff">Exact on demand</tspan><tspan fill="#59636e"> · all 17.6 KB archived in .justless/</tspan></text>
+<text x="512" y="346.0" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">justless log run-pHKV4nNjVk9q --stream stdout --from 365 --to </tspan></text>
+<text x="540.8" y="362.0" class="m" fill="#1f2328" font-weight="600">368</text>
+<text x="512.0" y="382.0" class="m" fill="#1f2328">thread 'total_includes_fee' (3760864) panicked at </text>
+<text x="526.4" y="398.0" class="m" fill="#1f2328">tests/checkout.rs:11:5:</text>
+<text x="512.0" y="414.0" class="m" fill="#1f2328">assertion `left == right` failed</text>
+<text x="512.0" y="430.0" class="m" fill="#1f2328">  left: 106</text>
+<text x="512.0" y="446.0" class="m" fill="#1f2328"> right: 105</text>
+<text x="512" y="514" class="s" style="font-size:15px" font-weight="600" fill="#1f2328">In this example: 380 → 9 lines, 18,038 → 517 bytes (35×)</text>
+<text x="512" y="536" class="s" style="font-size:13px" fill="#59636e">Same exit code 101 · same assertion · full output kept</text>
+<line x1="512" y1="550" x2="980" y2="550" stroke="#d0d7de"/>
+<text x="512" y="572" class="s" style="font-size:13px" fill="#59636e">Fixture: test prints 351 trace lines, then fails; empty unit binary folds.</text>
+<text x="512" y="592" class="s" style="font-size:13px" fill="#59636e">Across all 18 suite workloads: 1,157.5 KB → 49.4 KB (95.7% · 23.4×).</text>
+<text x="512" y="612" class="s" style="font-size:13px" fill="#59636e">The 517 bytes include the 66-byte footer. Long lines wrap for display.</text>
 </g>
 </svg>

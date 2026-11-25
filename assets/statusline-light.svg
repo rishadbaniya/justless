@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 132" width="1000" height="132" role="img" aria-label="Claude Code's status line in a real session, with justless installed: justless, initially about 2.5 million tokens saved, net about 1.8 million tokens saved this session, 519 runs, 29 reads.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 132" width="1000" height="132" role="img" aria-label="Claude Code's status line in a real session, with justless installed: justless, initially about 2.5 million tokens saved, net about 1.8 million tokens saved (72%) this session, 519 runs, 29 reads.">
 <title>justless in Claude Code's status line</title>
-<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:13.5px}.m{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;font-size:13px;white-space:pre}</style>
+<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif;font-size:13.5px}.m{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-size:13px;white-space:pre}</style>
 <g xml:space="preserve">
 <rect x="4" y="4" width="992" height="124" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
 <circle cx="24" cy="24" r="5.5" fill="#d0d7de"/>
@@ -11,6 +11,6 @@
 <text x="20" y="72" class="m"><tspan fill="#7c4dff" font-weight="700">&gt; </tspan></text>
 <rect x="38" y="60" width="8" height="16" fill="#7c4dff" opacity="0.7"/>
 <line x1="12" y1="88" x2="988" y2="88" stroke="#d0d7de"/>
-<text x="20" y="112" class="m"><tspan fill="#7c4dff" font-weight="700">justless</tspan><tspan fill="#59636e"> · initially </tspan><tspan fill="#1f2328" font-weight="600">≈2.5M tokens saved</tspan><tspan fill="#59636e"> · net </tspan><tspan fill="#1f2328" font-weight="600">≈1.8M tokens saved</tspan><tspan fill="#59636e"> this session · 519 runs · 29 reads</tspan></text>
+<text x="20" y="112" class="m"><tspan fill="#7c4dff" font-weight="700">justless</tspan><tspan fill="#59636e"> · initially </tspan><tspan fill="#1f2328" font-weight="600">≈2.5M tokens saved</tspan><tspan fill="#59636e"> · net </tspan><tspan fill="#1f2328" font-weight="600">≈1.8M tokens saved </tspan><tspan fill="#7c4dff" font-weight="700">(72%)</tspan><tspan fill="#59636e"> this session · 519 runs · 29 reads</tspan></text>
 </g>
 </svg>

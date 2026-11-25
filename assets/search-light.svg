@@ -1,104 +1,106 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 773" width="1000" height="773" role="img" aria-label="A search with lots of output. Without justless, rg -n &quot;fn &quot; src prints 2,512 lines (185,877 bytes), one per match. With justless run, the agent receives 64 lines (2,837 bytes): rg: 2512 matches in 79 files, then 15 files ordered by match count, each with its match count, two sample lines and the range of its lines in the archived output, then one line summarizing the other 64 files, and a footer with the run ID. This picture leaves out 48 lines of the grouped report and most of the raw output. justless log run-y4HDejPf3RCk --stream stdout --from 245 --to 247 then returns lines 245 to 247 of the original output exactly, including a match the report did not show. 66 times fewer bytes.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 804" width="1000" height="804" role="img" aria-label="A search with lots of output. Without justless, rg -n &quot;fn &quot; src prints 4,661 lines (357,380 bytes). With justless run, the agent receives 93 lines (4,058 bytes): grouped by file with match counts, sample lines and archived line ranges. justless log run-O9hfiUbLOlPn --stream stdout --from 3324 --to 3326 then returns those lines verbatim. 88× fewer bytes.">
 <title>Before and after justless: a search with lots of output</title>
-<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:13.5px}.m,.r text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;font-size:12px;white-space:pre}</style>
+<style>.s{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif;font-size:13.5px}.m,.r text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-size:12px;white-space:pre}</style>
 <g xml:space="preserve">
-<rect x="4" y="4" width="472" height="736" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<rect x="4" y="4" width="472" height="788" rx="12" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
 <circle cx="24" cy="24" r="5.5" fill="#d0d7de"/>
 <circle cx="40" cy="24" r="5.5" fill="#d0d7de"/>
 <circle cx="56" cy="24" r="5.5" fill="#d0d7de"/>
-<text x="80" y="29" class="s"><tspan font-weight="600" fill="#1f2328">Without justless</tspan><tspan fill="#59636e"> · 2,512 lines · 181.5 KB</tspan></text>
+<text x="80" y="29" class="s"><tspan font-weight="600" fill="#1f2328">Without justless</tspan><tspan fill="#59636e"> · 4,661 lines · 349.0 KB</tspan></text>
 <line x1="4" y1="44" x2="476" y2="44" stroke="#d0d7de"/>
-<rect x="496" y="4" width="500" height="420" rx="12" fill="#f6f8fa" stroke="#7c4dff" stroke-width="1.5"/>
+<text x="20" y="70" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">rg -n &quot;fn &quot; src</tspan></text>
+<text x="20.0" y="90.0" class="m" fill="#1f2328">src/registry.rs:54:pub fn home() -&gt; Option&lt;PathBuf&gt; {</text>
+<text x="20.0" y="106.0" class="m" fill="#1f2328">src/registry.rs:67:fn load(directory: &amp;Path) -&gt; Registry {</text>
+<text x="20.0" y="122.0" class="m" fill="#1f2328">src/registry.rs:75:pub fn projects() -&gt; Vec&lt;Entry&gt; {</text>
+<text x="20.0" y="138.0" class="m" fill="#1f2328">src/registry.rs:84:pub fn touch(workspace: &amp;Workspace) {</text>
+<text x="20.0" y="154.0" class="m" fill="#1f2328">src/registry.rs:126:pub fn forget(root: &amp;Path) {</text>
+<text x="20.0" y="170.0" class="m" fill="#1f2328">src/registry.rs:137:fn update(directory: &amp;Path, change: </text>
+<text x="34.4" y="186.0" class="m" fill="#1f2328">impl FnOnce(&amp;mut Registry) -&gt; bool) -&gt; Result&lt;()&gt; {</text>
+<text x="20.0" y="202.0" class="m" fill="#1f2328">src/registry.rs:160:fn repository(root: &amp;Path) -&gt; </text>
+<text x="34.4" y="218.0" class="m" fill="#1f2328">Option&lt;PathBuf&gt; {</text>
+<text x="20.0" y="234.0" class="m" fill="#1f2328">src/registry.rs:177:fn temporary_folders() -&gt; Vec&lt;PathBuf&gt; </text>
+<text x="34.4" y="250.0" class="m" fill="#1f2328">{</text>
+<text x="20.0" y="266.0" class="m" fill="#1f2328">src/registry.rs:194:pub fn locate(workspace: &amp;Workspace, </text>
+<text x="34.4" y="282.0" class="m" fill="#1f2328">id: &amp;str) -&gt; Result&lt;(Option&lt;Workspace&gt;, PathBuf, Run)&gt; {</text>
+<text x="20.0" y="298.0" class="m" fill="#1f2328">src/registry.rs:216:fn has_project_state(root: &amp;Path) -&gt; </text>
+<text x="34.4" y="314.0" class="m" fill="#1f2328">bool {</text>
+<text x="20.0" y="330.0" class="m" fill="#1f2328">src/registry.rs:243:    fn add_report(&amp;mut self, report: </text>
+<text x="34.4" y="346.0" class="m" fill="#1f2328">&amp;serde_json::Value) {</text>
+<text x="20.0" y="362.0" class="m" fill="#1f2328">src/registry.rs:263:    fn json(&amp;self) -&gt; </text>
+<text x="34.4" y="378.0" class="m" fill="#1f2328">serde_json::Value {</text>
+<text x="20.0" y="394.0" class="m" fill="#1f2328">src/registry.rs:283:    fn line(&amp;self, days: u64) -&gt; </text>
+<text x="34.4" y="410.0" class="m" fill="#1f2328">String {</text>
+<text x="20.0" y="426.0" class="m" fill="#1f2328">src/registry.rs:299:pub fn stats(matches: &amp;ArgMatches, </text>
+<text x="34.4" y="442.0" class="m" fill="#1f2328">workspace: &amp;Workspace, days: u64) -&gt; Result&lt;()&gt; {</text>
+<text x="20.0" y="458.0" class="m" fill="#1f2328">src/registry.rs:534:fn percent(part: u64, whole: u64) -&gt; </text>
+<text x="34.4" y="474.0" class="m" fill="#1f2328">f64 {</text>
+<text x="20.0" y="490.0" class="m" fill="#1f2328">src/registry.rs:544:pub fn hooked_projects() -&gt; </text>
+<text x="34.4" y="506.0" class="m" fill="#1f2328">Vec&lt;(PathBuf, Vec&lt;String&gt;)&gt; {</text>
+<text x="20.0" y="522.0" class="m" fill="#1f2328">src/registry.rs:570:    fn proxy_all_summary_aggregates_pr</text>
+<text x="34.4" y="538.0" class="m" fill="#1f2328">ojects_and_computes_net_cleared() {</text>
+<line x1="20.0" y1="558.0" x2="162.2" y2="558.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<line x1="317.8" y1="558.0" x2="460.0" y2="558.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<rect x="162.2" y="547.0" width="155.6" height="22" rx="11" fill="#ede7ff"/>
+<text x="240.0" y="562.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600">… 3,306 more lines</text>
+<rect x="12" y="573.0" width="456" height="68.0" rx="4" fill="#ede7ff"/>
+<text x="20.0" y="584.0" class="m" fill="#1f2328">src/capture.rs:60:    pub fn name(self) -&gt; &amp;'static str {</text>
+<text x="20.0" y="600.0" class="m" fill="#1f2328">src/capture.rs:67:    pub fn select(name: &amp;str) -&gt; </text>
+<text x="34.4" y="616.0" class="m" fill="#1f2328">&amp;'static [Self] {</text>
+<text x="20.0" y="632.0" class="m" fill="#1f2328">src/capture.rs:75:    fn index(self) -&gt; usize {</text>
+<line x1="20.0" y1="654.0" x2="162.2" y2="654.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<line x1="317.8" y1="654.0" x2="460.0" y2="654.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<rect x="162.2" y="643.0" width="155.6" height="22" rx="11" fill="#ede7ff"/>
+<text x="240.0" y="658.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600">… 1,332 more lines</text>
+<text x="20.0" y="680.0" class="m" fill="#1f2328">src/logview.rs:2545:    fn http_5xx_in_info_access_log_esc</text>
+<text x="34.4" y="696.0" class="m" fill="#1f2328">alates_and_never_merges_with_200() {</text>
+<text x="20.0" y="712.0" class="m" fill="#1f2328">src/logview.rs:2566:    fn timestamped_k8s_and_journalctl_</text>
+<text x="34.4" y="728.0" class="m" fill="#1f2328">stack_traces_stay_attached() {</text>
+<text x="20.0" y="744.0" class="m" fill="#1f2328">src/logview.rs:2621:    fn klog_ansi_and_binary_safety() {</text>
+<rect x="496" y="4" width="500" height="468" rx="12" fill="#f6f8fa" stroke="#7c4dff" stroke-width="1.5"/>
 <circle cx="516" cy="24" r="5.5" fill="#d0d7de"/>
 <circle cx="532" cy="24" r="5.5" fill="#d0d7de"/>
 <circle cx="548" cy="24" r="5.5" fill="#d0d7de"/>
-<text x="572" y="29" class="s"><tspan font-weight="600" fill="#7c4dff">With justless</tspan><tspan fill="#59636e"> · 64 lines · 2,837 B</tspan></text>
+<text x="572" y="29" class="s"><tspan font-weight="600" fill="#7c4dff">With justless</tspan><tspan fill="#59636e"> · 93 lines · 4,058 B</tspan></text>
 <line x1="496" y1="44" x2="996" y2="44" stroke="#d0d7de"/>
-<text x="512" y="70" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">justless run -- rg -n "fn " src</tspan></text>
-<g class="r" fill="#1f2328" transform="translate(512 0)"><text y="90">rg: 2512 matches in 79 files</text></g>
-<rect x="504" y="96" width="484" height="64" rx="4" fill="#ede7ff"/>
-<g class="r" fill="#1f2328" transform="translate(512 0)"><text y="106">src/capture.rs ×121 [stdout:245-365]</text>
-<text y="122">  60:    pub fn name(self) -&gt; &amp;'static str {</text>
-<text y="138">  67:    pub fn select(name: &amp;str) -&gt; &amp;'static [Self] {</text>
-<text y="154">  +119 more in file</text>
-<text y="170">src/redact.rs ×111 [stdout:2010-2120]</text>
-<text y="186">  280:fn compile(pattern: &amp;str) -&gt; Regex {</text>
-<text y="202">  383:    pub fn new(rules: &amp;str) -&gt; Self {</text>
-<text y="218">  +109 more in file</text>
-<text y="234">src/selection.rs ×94 [stdout:2296-2389]</text>
-<text y="250">  225:    pub fn changed_files(&amp;self) -&gt; usize {</text>
-<text y="266">  272:    fn new(workspace: &amp;'a Workspace) -&gt; Self {</text>
-<text y="282">  +92 more in file</text></g>
-<line x1="512" y1="300" x2="678" y2="300" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<line x1="814" y1="300" x2="980" y2="300" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<rect x="678" y="289" width="136" height="22" rx="11" fill="#ede7ff"/>
-<text x="746" y="304.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600">… 48 more lines</text>
-<g class="r" fill="#1f2328" transform="translate(512 0)"><text y="326">+64 more files with 1469 matches in src/ 45 files ×1115, </text>
-<text x="14.4" y="342">src/lookup/ 6 files ×133, src/proxy/ 6 files ×85, src/learn/ 3 </text>
-<text x="14.4" y="358">files ×78, src/batch/ 3 files ×29, src/testrun/ 1 file ×29</text>
-<text y="390">[justless run-y4HDejPf3RCk] exit 0 · 2737 of 185877 output bytes </text>
-<text x="14.4" y="406">· justless log run-y4HDejPf3RCk</text></g>
-<rect x="496" y="442" width="500" height="148" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1" stroke-dasharray="5 4"/>
-<text x="512" y="465" class="s"><tspan font-weight="600" fill="#7c4dff">Exact on demand</tspan><tspan fill="#59636e"> · all 181.5 KB archived in .justless/</tspan></text>
-<text x="512" y="488" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">justless log run-y4HDejPf3RCk --stream stdout --from 245 --to </tspan></text>
-<text x="526.4" y="504" class="m" fill="#1f2328" font-weight="600">247</text>
-<g class="r" fill="#1f2328" transform="translate(512 0)"><text y="524">src/capture.rs:60:    pub fn name(self) -&gt; &amp;'static str {</text>
-<text y="540">src/capture.rs:67:    pub fn select(name: &amp;str) -&gt; &amp;'static </text>
-<text x="14.4" y="556">[Self] {</text>
-<text y="572">src/capture.rs:75:    fn index(self) -&gt; usize {</text></g>
-<text x="512" y="633" class="s" style="font-size:15px" font-weight="600" fill="#1f2328">In this example: 2,512 → 64 lines, 185,877 → 2,837 bytes</text>
-<text x="512" y="655" class="s" style="font-size:13px" fill="#59636e">Grouped by file; every group points at its archived lines</text>
-<line x1="512" y1="669" x2="980" y2="669" stroke="#d0d7de"/>
-<text x="512" y="691" class="s" style="font-size:13px" fill="#59636e">Line 247 was not in the report; log returns it exactly.</text>
-<text x="512" y="711" class="s" style="font-size:13px" fill="#59636e">Gaps mark lines left out of this picture, 48 on the right.</text>
-<text x="512" y="731" class="s" style="font-size:13px" fill="#59636e">The 2,837 bytes include 100 bytes of footer and blank line.</text>
-<text x="512" y="751" class="s" style="font-size:13px" fill="#59636e">Long lines wrap for display.</text>
-<text x="20" y="70" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">rg -n "fn " src</tspan></text>
-<g class="r" fill="#1f2328" transform="translate(20 0)"><text y="90">src/learn.rs:30:pub(crate) fn withhold_command(argv: </text>
-<text x="14.4" y="106">&amp;[String]) -&gt; bool {</text>
-<text y="122">src/learn.rs:35:pub fn command() -&gt; Command&lt;'static&gt; {</text>
-<text y="138">src/learn.rs:101:    fn name(self) -&gt; &amp;'static str {</text>
-<text y="154">src/learn.rs:122:fn number(matches: &amp;ArgMatches, name: &amp;str, </text>
-<text x="14.4" y="170">minimum: u64, maximum: u64) -&gt; Result&lt;u64&gt; {</text>
-<text y="186">src/learn.rs:135:pub fn run(workspace: &amp;Workspace, matches: </text>
-<text x="14.4" y="202">&amp;ArgMatches) -&gt; Result&lt;()&gt; {</text>
-<text y="218">src/learn.rs:418:fn removals(</text>
-<text y="234">src/learn.rs:456:fn count(rules: &amp;[Rule], reason: Reason) -&gt; </text>
-<text x="14.4" y="250">u64 {</text>
-<text y="266">src/learn.rs:483:    fn json(&amp;self) -&gt; Value {</text>
-<text y="282">src/learn.rs:611:    fn skipped_targets(&amp;self) -&gt; Vec&lt;Value&gt; </text>
-<text x="14.4" y="298">{</text>
-<text y="314">src/learn.rs:619:    fn text(&amp;self) -&gt; String {</text>
-<text y="330">src/learn.rs:770:    fn held_line(&amp;self) -&gt; String {</text>
-<text y="346">src/learn.rs:802:    fn apply_text(&amp;self) -&gt; String {</text>
-<text y="362">src/learn.rs:852:fn stats_line(rule: &amp;Rule) -&gt; String {</text>
-<text y="378">src/learn.rs:875:fn unique&lt;'a&gt;(ids: impl Iterator&lt;Item = &amp;'a </text>
-<text x="14.4" y="394">String&gt;) -&gt; Vec&lt;&amp;'a String&gt; {</text>
-<text y="410">src/learn.rs:880:fn thousands(value: u64) -&gt; String {</text>
-<text y="426">src/summary.rs:29:pub fn family(args: &amp;[OsString]) -&gt; String </text>
-<text x="14.4" y="442">{</text>
-<text y="458">src/summary.rs:101:    pub fn new(family: &amp;str, profile: </text>
-<text x="14.4" y="474">Option&lt;crate::filters::Profile&gt;) -&gt; Self {</text>
-<text y="490">src/summary.rs:131:    pub fn observe(&amp;mut self, text: &amp;str, </text>
-<text x="14.4" y="506">number: usize) {</text>
-<text y="522">src/summary.rs:167:    fn flush(&amp;mut self) {</text></g>
-<line x1="20" y1="540" x2="168.4" y2="540" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<line x1="311.6" y1="540" x2="460" y2="540" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<rect x="168.4" y="529" width="143.2" height="22" rx="11" fill="#ede7ff"/>
-<text x="240" y="544.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600">… 225 more lines</text>
-<rect x="12" y="556" width="456" height="64" rx="4" fill="#ede7ff"/>
-<g class="r" fill="#1f2328" transform="translate(20 0)"><text y="566">src/capture.rs:60:    pub fn name(self) -&gt; &amp;'static str {</text>
-<text y="582">src/capture.rs:67:    pub fn select(name: &amp;str) -&gt; &amp;'static </text>
-<text x="14.4" y="598">[Self] {</text>
-<text y="614">src/capture.rs:75:    fn index(self) -&gt; usize {</text></g>
-<line x1="20" y1="632" x2="161.2" y2="632" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<line x1="318.8" y1="632" x2="460" y2="632" stroke="#d0d7de" stroke-dasharray="4 4"/>
-<rect x="161.2" y="621" width="157.6" height="22" rx="11" fill="#ede7ff"/>
-<text x="240" y="636.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600">… 2,262 more lines</text>
-<g class="r" fill="#1f2328" transform="translate(20 0)"><text y="658">src/learn/events.rs:1276:    fn </text>
-<text x="14.4" y="674">normalizes_directories_wrappers_and_filters() {</text>
-<text y="690">src/learn/events.rs:1325:    fn </text>
-<text x="14.4" y="706">refuses_what_it_cannot_read() {</text>
-<text y="722">src/learn/events.rs:1349:    fn parses_utc_timestamps() {</text></g>
+<text x="512" y="70" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">justless run -- rg -n &quot;fn &quot; src</tspan></text>
+<rect x="504" y="95.0" width="484" height="64.0" rx="4" fill="#ede7ff"/>
+<text x="512.0" y="90.0" class="m" fill="#1f2328">rg: 4661 matches in 95 files</text>
+<text x="512.0" y="106.0" class="m" fill="#1f2328">src/capture.rs ×146 [stdout:3324-3469]</text>
+<text x="512.0" y="122.0" class="m" fill="#1f2328">  60:    pub fn name(self) -&gt; &amp;'static str {</text>
+<text x="512.0" y="138.0" class="m" fill="#1f2328">  67:    pub fn select(name: &amp;str) -&gt; &amp;'static [Self] {</text>
+<text x="512.0" y="154.0" class="m" fill="#1f2328">  +144 more in file</text>
+<text x="512.0" y="170.0" class="m" fill="#1f2328">src/summary.rs ×124 [stdout:3611-3734]</text>
+<text x="512.0" y="186.0" class="m" fill="#1f2328">  112:fn is_false(value: &amp;bool) -&gt; bool {</text>
+<text x="512.0" y="202.0" class="m" fill="#1f2328">  116:fn is_zero(value: &amp;usize) -&gt; bool {</text>
+<text x="512.0" y="218.0" class="m" fill="#1f2328">  +122 more in file</text>
+<text x="512.0" y="234.0" class="m" fill="#1f2328">src/agents.rs ×119 [stdout:3040-3158]</text>
+<text x="512.0" y="250.0" class="m" fill="#1f2328">  42:    pub fn parse(name: &amp;str) -&gt; Result&lt;Self&gt; {</text>
+<text x="512.0" y="266.0" class="m" fill="#1f2328">  55:    pub(crate) fn config(self) -&gt; (&amp;'static str, &amp;'static </text>
+<text x="540.8" y="282.0" class="m" fill="#1f2328">str) {</text>
+<text x="512.0" y="298.0" class="m" fill="#1f2328">  +117 more in file</text>
+<line x1="512.0" y1="320.0" x2="679.0" y2="320.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<line x1="813.0" y1="320.0" x2="980.0" y2="320.0" stroke="#d0d7de" stroke-dasharray="4 4"/>
+<rect x="679.0" y="309.0" width="134.0" height="22" rx="11" fill="#ede7ff"/>
+<text x="746.0" y="324.5" class="m" text-anchor="middle" fill="#1f2328" font-weight="600">… 77 more lines</text>
+<text x="512.0" y="346.0" class="m" fill="#1f2328">+51 more files with 1272 matches in src/ 29 files ×781, </text>
+<text x="526.4" y="362.0" class="m" fill="#1f2328">src/lookup/ 7 files ×184, src/proxy/ 7 files ×119, </text>
+<text x="526.4" y="378.0" class="m" fill="#1f2328">src/learn/ 3 files ×79, src/batch/ 4 files ×78, src/testrun/ </text>
+<text x="526.4" y="394.0" class="m" fill="#1f2328">1 file ×31 [stdout:1-4594]</text>
+<text x="512.0" y="426.0" class="m" fill="#59636e">[justless run-O9hfiUbLOlPn] exit 0 · 3958 of 357380 output </text>
+<text x="526.4" y="442.0" class="m" fill="#59636e">bytes · justless log run-O9hfiUbLOlPn</text>
+<rect x="496" y="490" width="500" height="164" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="512" y="513" class="s"><tspan font-weight="600" fill="#7c4dff">Exact on demand</tspan><tspan fill="#59636e"> · all 349.0 KB archived in .justless/</tspan></text>
+<text x="512" y="536.0" class="m"><tspan fill="#7c4dff" font-weight="700">$ </tspan><tspan fill="#1f2328" font-weight="600">justless log run-O9hfiUbLOlPn --stream stdout --from 3324 </tspan></text>
+<text x="540.8" y="552.0" class="m" fill="#1f2328" font-weight="600">--to 3326</text>
+<text x="512.0" y="572.0" class="m" fill="#1f2328">src/capture.rs:60:    pub fn name(self) -&gt; &amp;'static str {</text>
+<text x="512.0" y="588.0" class="m" fill="#1f2328">src/capture.rs:67:    pub fn select(name: &amp;str) -&gt; &amp;'static </text>
+<text x="526.4" y="604.0" class="m" fill="#1f2328">[Self] {</text>
+<text x="512.0" y="620.0" class="m" fill="#1f2328">src/capture.rs:75:    fn index(self) -&gt; usize {</text>
+<text x="512" y="690" class="s" style="font-size:15px" font-weight="600" fill="#1f2328">In this example: 4,661 → 93 lines, 357,380 → 4,058 bytes (88×)</text>
+<text x="512" y="712" class="s" style="font-size:13px" fill="#59636e">Grouped by file; every group points at its archived lines</text>
+<line x1="512" y1="726" x2="980" y2="726" stroke="#d0d7de"/>
+<text x="512" y="748" class="s" style="font-size:13px" fill="#59636e">Line 3326 was not in the report; justless log returns it verbatim.</text>
+<text x="512" y="768" class="s" style="font-size:13px" fill="#59636e">Gaps mark lines left out of this picture, 77 on the right.</text>
+<text x="512" y="788" class="s" style="font-size:13px" fill="#59636e">The 4,058 bytes include the 100-byte footer. Long lines wrap for display.</text>
 </g>
 </svg>

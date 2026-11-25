@@ -1,59 +1,62 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 550" width="1040" height="550" role="img" aria-label="How Justless works">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 550" width="1140" height="550" role="img" aria-labelledby="t d">
+<title id="t">How Justless works</title>
+<desc id="d">How Justless works: Claude Code, Codex, Cursor, Gemini CLI, OpenCode, Copilot CLI, and Antigravity connect via hooks, MCP, or CLI to the local offline justless binary, which compacts commands (tests, lint, BuildKit, diffs, logs, tables, JSON), code (26 graph langs, 43 outline formats, map --explain, lookup --graph), and history (duplicates, semantic cues, compaction). Full output is archived locally in .justless/ and replayable byte-for-byte on demand via log, expand, and recall.</desc>
 <defs>
   <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#6e7681"/></marker>
   <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#9b7bff"/></marker>
 </defs>
-<rect x="20" y="40" width="170" height="340" rx="14" fill="#161b22" stroke="#30363d"/>
-<text x="40" y="78" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="start">Your agent</text>
-<text x="40" y="132" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">Claude Code</text>
-<text x="40" y="162" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">Codex</text>
-<text x="40" y="192" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">Cursor</text>
-<text x="40" y="222" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">Gemini CLI</text>
-<text x="40" y="252" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">OpenCode</text>
-<text x="40" y="282" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">Antigravity</text>
-<rect x="290" y="40" width="460" height="340" rx="16" fill="#161b22" stroke="#9b7bff" stroke-width="1.5"/>
-<text x="314" y="78" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700" fill="#e6edf3" text-anchor="start">justless</text>
-<text x="726" y="77" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198a1" text-anchor="end">local · offline · one binary</text>
-<rect x="314" y="128" width="96" height="28" rx="14" fill="#2a2150"/>
-<text x="362" y="147" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#9b7bff" text-anchor="middle">Commands</text>
-<text x="430" y="140" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="500" fill="#e6edf3" text-anchor="start">tests · lint · builds · git diff · kubectl</text>
-<text x="430" y="162" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">grouped by failure, rule and hunk</text>
-<line x1="310" y1="194" x2="730" y2="194" stroke="#30363d"/>
-<rect x="314" y="218" width="96" height="28" rx="14" fill="#2a2150"/>
-<text x="362" y="237" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#9b7bff" text-anchor="middle">Code</text>
-<text x="430" y="230" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="500" fill="#e6edf3" text-anchor="start">26 languages through syn and Tree-sitter</text>
-<text x="430" y="252" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">definitions, callers, paths and task packs</text>
-<line x1="310" y1="284" x2="730" y2="284" stroke="#30363d"/>
-<rect x="314" y="308" width="96" height="28" rx="14" fill="#2a2150"/>
-<text x="362" y="327" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#9b7bff" text-anchor="middle">History</text>
-<text x="430" y="320" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="500" fill="#e6edf3" text-anchor="start">old tool results and compaction</text>
-<text x="430" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">retired by ID and handed across sessions</text>
-<rect x="850" y="40" width="170" height="340" rx="14" fill="#161b22" stroke="#30363d"/>
-<text x="870" y="78" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="start">Context window</text>
-<rect x="866" y="124" width="138" height="50" rx="8" fill="#0d1117" stroke="#30363d"/>
-<text x="878" y="145" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400" fill="#e6edf3" text-anchor="start">3 failing tests</text>
-<text x="878" y="162" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#9198a1" text-anchor="start">run-7Gq2 · exit 1</text>
-<path d="M756 149 L842 149" stroke="#9b7bff" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>
-<rect x="866" y="214" width="138" height="50" rx="8" fill="#0d1117" stroke="#30363d"/>
-<text x="878" y="235" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400" fill="#e6edf3" text-anchor="start">outline</text>
-<text x="878" y="252" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#9198a1" text-anchor="start">40 rows · rev#12</text>
-<path d="M756 239 L842 239" stroke="#9b7bff" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>
-<rect x="866" y="304" width="138" height="50" rx="8" fill="#0d1117" stroke="#30363d"/>
-<text x="878" y="325" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400" fill="#e6edf3" text-anchor="start">recall 9f3c…</text>
-<text x="878" y="342" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="400" fill="#9198a1" text-anchor="start">archived result</text>
-<path d="M756 329 L842 329" stroke="#9b7bff" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>
-<path d="M196 210 L282 210" stroke="#6e7681" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>
-<text x="240" y="198" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198a1" text-anchor="middle">hooks · MCP</text>
-<text x="240" y="232" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198a1" text-anchor="middle">CLI</text>
-<text x="800" y="119" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9b7bff" text-anchor="middle">compact</text>
-<text x="800" y="135" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9b7bff" text-anchor="middle">by default</text>
-<path d="M520 386 L520 422" stroke="#6e7681" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>
-<text x="532" y="410" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198a1" text-anchor="start">full output, archived</text>
-<rect x="290" y="430" width="460" height="90" rx="14" fill="#0d1117" stroke="#30363d" stroke-dasharray="5 4"/>
-<text x="314" y="466" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3" text-anchor="start">.justless/</text>
-<text x="420" y="466" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">runs/ · index.json · observations/</text>
-<text x="314" y="494" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#9198a1" text-anchor="start">Every byte kept locally, replayable exactly.</text>
-<path d="M756 475 L923 475 Q935 475 935 463 L935 388" stroke="#9b7bff" stroke-width="1.6" stroke-dasharray="6 5" fill="none" marker-end="url(#arrow-accent)"/>
-<text x="778" y="465" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9b7bff" text-anchor="start">exact on demand</text>
-<text x="778" y="495" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="400" fill="#9198a1" text-anchor="start">log · expand · recall</text>
+<rect x="20" y="40" width="168" height="340" rx="14" fill="#161b22" stroke="#30363d"/>
+<text x="40" y="78" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="start">Your agent</text>
+<text x="40" y="120" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">Claude Code</text>
+<text x="40" y="154" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">Codex</text>
+<text x="40" y="188" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">Cursor</text>
+<text x="40" y="222" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">Gemini CLI</text>
+<text x="40" y="256" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">OpenCode</text>
+<text x="40" y="290" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">Copilot CLI</text>
+<text x="40" y="324" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">Antigravity</text>
+<rect x="282" y="40" width="570" height="340" rx="16" fill="#161b22" stroke="#9b7bff" stroke-width="1.5"/>
+<text x="306" y="78" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="20" font-weight="700" fill="#e6edf3" text-anchor="start">justless</text>
+<text x="828" y="77" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="end">local · offline · one binary</text>
+<rect x="306" y="128" width="96" height="28" rx="14" fill="#2a2150"/>
+<text x="354" y="147" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#9b7bff" text-anchor="middle">Commands</text>
+<text x="418" y="140" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#e6edf3" text-anchor="start">tests · lint · BuildKit · diffs · logs · tables · JSON</text>
+<text x="418" y="162" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#9198a1" text-anchor="start">grouped by failure, rule, hunk and log template</text>
+<line x1="302" y1="194" x2="832" y2="194" stroke="#30363d"/>
+<rect x="306" y="218" width="96" height="28" rx="14" fill="#2a2150"/>
+<text x="354" y="237" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#9b7bff" text-anchor="middle">Code</text>
+<text x="418" y="230" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#e6edf3" text-anchor="start">26 graph langs · 43 outline formats</text>
+<text x="418" y="252" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#9198a1" text-anchor="start">map --explain · lookup --graph · query · expand</text>
+<line x1="302" y1="284" x2="832" y2="284" stroke="#30363d"/>
+<rect x="306" y="308" width="96" height="28" rx="14" fill="#2a2150"/>
+<text x="354" y="327" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#9b7bff" text-anchor="middle">History</text>
+<text x="418" y="320" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#e6edf3" text-anchor="start">duplicates · semantic cues · compaction</text>
+<text x="418" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12.5" fill="#9198a1" text-anchor="start">old tool results retired by ID across sessions</text>
+<rect x="948" y="40" width="172" height="340" rx="14" fill="#161b22" stroke="#30363d"/>
+<text x="968" y="78" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="start">Context window</text>
+<rect x="964" y="124" width="140" height="50" rx="8" fill="#0d1117" stroke="#30363d"/>
+<text x="976" y="145" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12" fill="#e6edf3" text-anchor="start">3 failing tests</text>
+<text x="976" y="162" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="11" fill="#9198a1" text-anchor="start">run-7Gq2 · exit 1</text>
+<path d="M858 149 L940 149" stroke="#9b7bff" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>
+<rect x="964" y="214" width="140" height="50" rx="8" fill="#0d1117" stroke="#30363d"/>
+<text x="976" y="235" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12" fill="#e6edf3" text-anchor="start">outline</text>
+<text x="976" y="252" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="11" fill="#9198a1" text-anchor="start">40 rows · rev#12</text>
+<path d="M858 239 L940 239" stroke="#9b7bff" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>
+<rect x="964" y="304" width="140" height="50" rx="8" fill="#0d1117" stroke="#30363d"/>
+<text x="976" y="325" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12" fill="#e6edf3" text-anchor="start">recall 9f3c…</text>
+<text x="976" y="342" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="11" fill="#9198a1" text-anchor="start">archived result</text>
+<path d="M858 329 L940 329" stroke="#9b7bff" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>
+<path d="M194 210 L274 210" stroke="#6e7681" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>
+<text x="235" y="198" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="middle">hooks · MCP</text>
+<text x="235" y="232" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="middle">CLI</text>
+<text x="900" y="119" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9b7bff" text-anchor="middle">compact</text>
+<text x="900" y="135" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9b7bff" text-anchor="middle">by default</text>
+<path d="M567 386 L567 422" stroke="#6e7681" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>
+<text x="580" y="410" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">full output, archived</text>
+<rect x="282" y="430" width="570" height="90" rx="14" fill="#0d1117" stroke="#30363d" stroke-dasharray="5 4"/>
+<text x="306" y="466" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="15" font-weight="600" fill="#e6edf3" text-anchor="start">.justless/</text>
+<text x="414" y="466" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="13" fill="#9198a1" text-anchor="start">runs/ · index.json · observations/</text>
+<text x="306" y="494" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" text-anchor="start">Every byte kept locally, replayable exactly.</text>
+<path d="M858 475 L1022 475 Q1034 475 1034 463 L1034 388" stroke="#9b7bff" stroke-width="1.6" stroke-dasharray="6 5" fill="none" marker-end="url(#arrow-accent)"/>
+<text x="876" y="465" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Liberation Sans', 'DejaVu Sans', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#9b7bff" text-anchor="start">exact on demand</text>
+<text x="876" y="495" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace" font-size="12" fill="#9198a1" text-anchor="start">log · expand · recall</text>
 </svg>
