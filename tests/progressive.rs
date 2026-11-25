@@ -1165,4 +1165,19 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
         expanded + func1.len() as u64,
         "{outlines}"
     );
+
+    // Follow-up `code` reads on an outlined unchanged file also count toward
+    // `expanded_bytes` so net outline savings stay honest across read paths.
+    let code_before = outlines["expanded_bytes"].as_u64().unwrap();
+    let code_out = out(root, &["code", "lib.rs", "--from", "1", "--to", "5"]);
+    let code_text = String::from_utf8(code_out).unwrap();
+    // `snippet()` measures the numbered lines it printed (excluding the header).
+    let header_len = code_text.find('\n').unwrap() + 1;
+    let snippet_bytes = (code_text.len() - header_len) as u64;
+    let after_code: Value = serde_json::from_slice(&out(root, &["stats", "--json"])).unwrap();
+    assert_eq!(
+        after_code["source_outlines"]["expanded_bytes"],
+        code_before + snippet_bytes,
+        "{after_code}"
+    );
 }

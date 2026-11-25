@@ -1575,6 +1575,29 @@ fn install_and_run_claude_and_agy_hooks() {
         ),
         json!({})
     );
+    // Outlining a file and then reading lines via Antigravity's native `read_file`
+    // subtracts those follow-up bytes from `source_outlines.expanded_bytes`.
+    success(&root, &["read", "frontend/orders.ts", "--outline"]);
+    assert_eq!(
+        read_call(
+            "read_file",
+            json!({"Path": root.join("frontend/orders.ts"), "StartLine": 1, "EndLine": 3}),
+            None
+        ),
+        json!({})
+    );
+    let stats_json: Value = serde_json::from_str(&success(&root, &["stats", "--json"])).unwrap();
+    let expected_slice: usize = fs::read(root.join("frontend/orders.ts"))
+        .unwrap()
+        .split_inclusive(|&b| b == b'\n')
+        .take(3)
+        .map(<[u8]>::len)
+        .sum();
+    assert_eq!(
+        stats_json["source_outlines"]["expanded_bytes"],
+        json!(expected_slice as u64),
+        "{stats_json}"
+    );
     let resumed = success(&root, &["resume"]);
     assert_all_in(
         &resumed,

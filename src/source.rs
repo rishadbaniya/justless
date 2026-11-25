@@ -909,7 +909,7 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
             // The whole file, recorded as `expand FILE L1-N` would record it.
             let lines = source.text.lines().count();
             if lines > 0 {
-                crate::history::saw_source(ws, file, 1, lines, digest);
+                crate::history::saw_expand(ws, file, 1, lines, digest, source.text.len() as u64);
             }
             return Ok(());
         }

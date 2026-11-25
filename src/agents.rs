@@ -1221,7 +1221,12 @@ fn saw_claude_read(ws: &Workspace, input: &Value, outlined: bool) -> Option<()> 
     let total = bytes.iter().filter(|&&byte| byte == b'\n').count()
         + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
     let to = from.checked_add(lines - 1)?.min(total.max(from));
-    crate::history::saw_range(ws, &file, from, to, digest, outlined);
+    if outlined {
+        crate::history::saw_range(ws, &file, from, to, digest, true);
+    } else {
+        let returned = result["content"].as_str().map_or(0, str::len) as u64;
+        crate::history::saw_expand(ws, &file, from, to, digest, returned);
+    }
     Some(())
 }
 
@@ -1533,8 +1538,15 @@ fn agy_read(roots: impl Iterator<Item = PathBuf>, paths: &[Value], input: &Value
         // Antigravity's `read_file` returns at most 800 lines per call.
         None => total.min(from.saturating_add(799)),
     };
+    let slice_bytes = bytes
+        .split_inclusive(|&byte| byte == b'\n')
+        .skip(from - 1)
+        .take(to - from + 1)
+        .map(<[u8]>::len)
+        .sum::<usize>()
+        .min(46_080) as u64;
     let digest = crate::capture::source_digest(&bytes);
-    crate::history::saw_range(&ws, &file, from, to, digest, false);
+    crate::history::saw_expand(&ws, &file, from, to, digest, slice_bytes);
     Some(())
 }
 

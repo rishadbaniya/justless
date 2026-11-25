@@ -226,6 +226,7 @@ fn snippet(
     report: &mut Report,
 ) -> Result<()> {
     let text = fs::read_to_string(workspace.source_path(file)?)?;
+    let before = report.left();
     let mut last = None;
     for (line, content) in text.lines().enumerate().skip(from - 1).take(to - from + 1) {
         if report.clipped {
@@ -235,12 +236,14 @@ fn snippet(
         last = Some(line + 1);
     }
     if let Some(last) = last {
-        crate::history::saw_source(
+        let printed = before.saturating_sub(report.left()) as u64;
+        crate::history::saw_expand(
             workspace,
             file,
             from,
             last,
             capture::source_digest(text.as_bytes()),
+            printed,
         );
     }
     Ok(())

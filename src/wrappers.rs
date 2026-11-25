@@ -48,8 +48,16 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
             words.remove(0);
         }
         let first = words.first()?.clone();
+        let program = if std::path::Path::new(&first).is_absolute() || !first.contains('/') {
+            std::path::Path::new(&first)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(first.as_str())
+        } else {
+            first.as_str()
+        };
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-        let rest = match first.as_str() {
+        let rest = match program {
             "env" => env_rest(&refs)?,
             "time" | "nohup" | "command" => match refs.get(1).copied() {
                 Some("-p") | Some("--") => tail(&refs, 2)?,
@@ -218,6 +226,24 @@ mod tests {
         assert_eq!(
             effective_words("git --no-pager -C . diff").unwrap(),
             ["git", "diff"]
+        );
+        assert_eq!(
+            effective_words("/usr/bin/git --no-pager diff").unwrap(),
+            ["git", "diff"]
+        );
+        assert_eq!(
+            effective_words("/usr/bin/env -u HOME /usr/bin/timeout 5 /usr/bin/git -P show")
+                .unwrap(),
+            ["git", "show"]
+        );
+        // Relative scripts with wrapper names are never unwrapped.
+        assert_eq!(
+            effective_words("./git --no-pager diff").unwrap(),
+            ["./git", "--no-pager", "diff"]
+        );
+        assert_eq!(
+            effective_words("scripts/env cat f").unwrap(),
+            ["scripts/env", "cat", "f"]
         );
         assert_eq!(effective_words("LC_ALL=C cat f").unwrap(), ["cat", "f"]);
     }
