@@ -1,18 +1,29 @@
 //! Group compiler and linter findings by rule across both output streams.
 //!
 //! Recognized shapes:
-//! - rustc, Clippy and Ruff blocks: a `warning:`/`error[E0308]:`/`F401` header followed
-//!   by a ` --> path:line:col` location and indented detail lines.
+//! - rustc, Clippy, Ruff, Deno (`deno lint` / `deno check`), Oxlint and Biome blocks:
+//!   a `warning:`/`error[E0308]:`/`F401`/`TS2322 [ERROR]:` header followed by a
+//!   ` --> path:line:col` or `    at file:///path:line:col` location and detail lines.
 //! - ShellCheck's default `In path line N:` blocks with `^-- SC2086 (info): message` rows.
 //! - One finding per line: `path:line[:col]: message` (Ruff and flake8 concise output,
 //!   pylint, mypy, rustc `--message-format=short`, ShellCheck `-f gcc`, golangci-lint,
-//!   go vet, go build, staticcheck, RuboCop, SwiftLint, swiftc, gcc and clang),
-//!   TypeScript's `path(line,col): error TS2322: message`, MSBuild/`dotnet`'s
+//!   go vet, go build, staticcheck, RuboCop, SwiftLint, swiftc, gcc, clang, clang-tidy,
+//!   cppcheck, yamllint `-f parsable`, ktlint, ansible-lint `-p`, actionlint, and Credo
+//!   `--format flycheck`), PHPStan raw (`path.php:line:message [id]`), cppcheck classic
+//!   (`[path:line]: (severity) message [id]`), markdownlint/markdownlint-cli2
+//!   (`path:line[:col] MD013/line-length message`), stylelint compact
+//!   (`path: line N, col M, error - message (rule)`), TypeScript's
+//!   `path(line,col): error TS2322: message`, MSBuild/`dotnet`'s
 //!   `path(line,col): error CS0103: message [project.csproj]`, Maven's
 //!   `[ERROR] path:[line,col] message`, and Kotlin/Gradle's
-//!   `e: file://path:line:col message`. Indented lines that follow one of these,
-//!   such as a TypeScript, Maven, gcc or Go elaboration, are kept as its detail.
-//! - ESLint's default formatter: a file name line followed by `line:col  severity  message  rule`.
+//!   `e: file://path:line:col message`. Indented lines and snippet rows that follow one
+//!   of these are kept as its detail; follow-up `note:` lines extend only the archive
+//!   range `[stream:A-B]` without being counted as findings.
+//! - File-header tables and blocks: ESLint, stylelint default (`✖`/`⚠` rows), yamllint
+//!   standard (`(rule-name)` rows), PHPStan tables (`Line   path` + `🪪  id`),
+//!   SQLFluff (`== [path] FAIL` + `L: N | P: M | RULE | message`), Ansible-lint two-line
+//!   blocks (`rule[sub]: message` + `path:line`), and Credo (`[W] ↗ message` +
+//!   `┃   path:line:col` and `--format oneline`).
 //! - Pyright's `  path:line:col - error: message (rule)` rows and hadolint's
 //!   `path:line DL3008 warning: message`.
 //!
@@ -30,6 +41,80 @@ use sha2::{Digest, Sha256};
 use crate::capture::Stream;
 use crate::summary::{Item, Summary, short};
 
+/// Named ecosystem linters supported by [`Lint`].
+///
+/// [`Lint::new`] auto-detects every recognized shape without a hint; callers that
+/// already know the invoked tool may pass a [`Tool`] via [`Lint::for_tool`].
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tool {
+    Phpstan,
+    ClangTidy,
+    Cppcheck,
+    Yamllint,
+    Markdownlint,
+    Sqlfluff,
+    Ktlint,
+    Stylelint,
+    Deno,
+    AnsibleLint,
+    Actionlint,
+    Credo,
+}
+
+#[allow(dead_code)]
+impl Tool {
+    pub const ALL: &[Self] = &[
+        Self::Phpstan,
+        Self::ClangTidy,
+        Self::Cppcheck,
+        Self::Yamllint,
+        Self::Markdownlint,
+        Self::Sqlfluff,
+        Self::Ktlint,
+        Self::Stylelint,
+        Self::Deno,
+        Self::AnsibleLint,
+        Self::Actionlint,
+        Self::Credo,
+    ];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "phpstan" => Some(Self::Phpstan),
+            "clang-tidy" => Some(Self::ClangTidy),
+            "cppcheck" => Some(Self::Cppcheck),
+            "yamllint" => Some(Self::Yamllint),
+            "markdownlint" | "markdownlint-cli2" => Some(Self::Markdownlint),
+            "sqlfluff" => Some(Self::Sqlfluff),
+            "ktlint" => Some(Self::Ktlint),
+            "stylelint" => Some(Self::Stylelint),
+            "deno" => Some(Self::Deno),
+            "ansible-lint" => Some(Self::AnsibleLint),
+            "actionlint" => Some(Self::Actionlint),
+            "credo" | "mix credo" => Some(Self::Credo),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Phpstan => "phpstan",
+            Self::ClangTidy => "clang-tidy",
+            Self::Cppcheck => "cppcheck",
+            Self::Yamllint => "yamllint",
+            Self::Markdownlint => "markdownlint",
+            Self::Sqlfluff => "sqlfluff",
+            Self::Ktlint => "ktlint",
+            Self::Stylelint => "stylelint",
+            Self::Deno => "deno",
+            Self::AnsibleLint => "ansible-lint",
+            Self::Actionlint => "actionlint",
+            Self::Credo => "credo",
+        }
+    }
+}
+
 const MAX_FINDINGS: usize = 20_000;
 const EXCERPT_LINES: usize = 10;
 const SHOWN_LOCATIONS: usize = 4;
@@ -39,7 +124,9 @@ const SHOWN_PACKAGES: usize = 6;
 const SHOWN_TARGETS: usize = 4;
 
 static RUST_HEADER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_-]+)\])?: (.+)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_/-]+)\])?: (.+)$").unwrap());
+static DENO_CHECK_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(TS\d+)\s+\[(ERROR|WARNING)\]:\s+(.+)$").unwrap());
 static CODE_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Z]{1,4}[0-9]{2,5}) (?:\[\*\] )?(.+)$").unwrap());
 static OXLINT_HEADER: LazyLock<Regex> =
@@ -54,6 +141,9 @@ static ARROW: LazyLock<Regex> = LazyLock::new(|| {
         r"^\s*(?:(?:-->|╭▸|┌─)\s*(.+?):(\d+)(?::(\d+))?\s*|╭─\[(.+?):(\d+)(?::(\d+))?\]\s*)$",
     )
     .unwrap()
+});
+static AT_LOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+at\s+(?:file://)?([^()\r\n]+?\.[A-Za-z0-9]+):(\d+)(?::(\d+))?\s*$").unwrap()
 });
 static ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -81,6 +171,65 @@ static KOTLIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([ew]): (?:file://)?(.+?):(\d+):(\d+):?\s+(.+)$").unwrap());
 static GO_PACKAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^# [A-Za-z0-9_./-]+(?: \[[A-Za-z0-9_./-]+\])?$").unwrap());
+static CPPCHECK_BRACKET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:\[.+?:\d+(?::\d+)?\]\s*->\s*)?\[([^\[\]]+?):(\d+)(?::(\d+))?\]:\s+\((error|warning|style|performance|portability|information)\)\s+(.+)$",
+    )
+    .unwrap()
+});
+static MARKDOWNLINT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(\S.*?):(\d+)(?::(\d+))?:?\s+(?:(error|warning)\s+)?(MD\d{3}(?:/[a-z0-9-]+)*)\s+(.+)$",
+    )
+    .unwrap()
+});
+static STYLELINT_COMPACT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(\S.*?):\s+line\s+(\d+),\s+col\s+(\d+),\s+(error|warning)\s+-\s+(.+?)(?:\s+\((@?[\w./-]+)\))?\s*$",
+    )
+    .unwrap()
+});
+static SQLFLUFF_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^== \[(.+?)\] (FAIL|WARNING|PASS|SKIP)\s*$").unwrap());
+static SQLFLUFF_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^L:\s*(\d+)\s*\|\s*P:\s*(\d+)\s*\|\s*([A-Z][A-Z0-9]{1,5})\s*\|\s*(.+?)\s*$")
+        .unwrap()
+});
+static PHPSTAN_BORDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*-{3,}\s+-{3,}\s*$").unwrap());
+static PHPSTAN_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+Line\s{2,}(\S.*?)\s*$").unwrap());
+static PHPSTAN_GENERAL_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+Error\s*$").unwrap());
+static PHPSTAN_ROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+(\d+|-)\s{2,}(.+?)\s*$").unwrap());
+static PHPSTAN_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*🪪\s+([A-Za-z][A-Za-z0-9_.-]*)\s*$").unwrap());
+static PHPSTAN_RAW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^([^\s:](?:[^:]|:[^\s\d])*?\.(?:php|phtml|inc|module|install|theme)):(\d+):([^\s:].*)$",
+    )
+    .unwrap()
+});
+static CREDO_ONELINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:[┃|]\s*)?\[([WDRFC])\]\s+[↑↗→↘↓]\s+([^\s:](?:[^:]|:[^\s\d])*?\.[A-Za-z0-9]+):(\d+)(?::(\d+))?\s+(.+?)\s*$",
+    )
+    .unwrap()
+});
+static CREDO_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:[┃|]\s*)?\[([WDRFC])\]\s+[↑↗→↘↓]\s+(.+?)\s*$").unwrap());
+static CREDO_LOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:[┃|]\s*|\s+)([^\s:](?:[^:]|:[^\s\d])*?\.[A-Za-z0-9]+):(\d+)(?::(\d+))?(?:\s+#\([^)]*\))?\s*$",
+    )
+    .unwrap()
+});
+static ANSIBLE_BLOCK_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([a-z][a-z0-9_-]*(?:\[[a-z0-9_.-]+\])?):\s+(.+)$").unwrap());
+static ANSIBLE_LOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([^\s:](?:[^:]|:[^\s\d])*?\.[A-Za-z0-9]+):(\d+)(?::(\d+))?(?:$|\s+.*)$").unwrap()
+});
 // A path may contain spaces and a colon that is not followed by whitespace or a digit,
 // such as a Windows drive, so `note: see a.rs:3: x` and `warning: …` never match.
 static LOCATED: LazyLock<Regex> = LazyLock::new(|| {
@@ -88,26 +237,45 @@ static LOCATED: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SEVERITY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?i)(fatal error|error|warning|note|info|style|hint|refactor|convention)(?:\[([A-Za-z0-9_]+)\])?:\s*(.+)$",
+        r"^(?i)(fatal error|error|warning|note|info|information|style|performance|portability|hint|refactor|convention)(?:\[([A-Za-z0-9_]+)\])?:\s*(.+)$",
     )
     .unwrap()
 });
+static BRACKET_SEVERITY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?i)\[(error|warning)\]\s+(.+)$").unwrap());
 static RUBOCOP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([CWEFR]): (?:\[Correctable\] )?([A-Z][A-Za-z]+/[A-Za-z0-9]+): (.+)$").unwrap()
 });
+static CREDO_FLYCHECK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([WDRFC]):\s+(.+)$").unwrap());
+static ANSIBLE_SUB_RULE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([a-z][a-z0-9_-]*\[[a-z0-9_.-]+\]):\s+(.+)$").unwrap());
+static ANSIBLE_KEBAB_RULE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([a-z][a-z0-9]*-[a-z0-9-]+):\s+(.+)$").unwrap());
+static ANSIBLE_YAML_RULE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([a-z][a-z0-9_-]+):\s+(.+)$").unwrap());
 static LEADING_CODE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Z]{1,4}[0-9]{2,5})(:?) (?:\[\*\] )?(.+)$").unwrap());
 static TRAILING_BRACKET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+?)\s+\[(-?[A-Za-z][\w.:/=-]*)\]$").unwrap());
-static TRAILING_PAREN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+?)\s+\(([a-z][a-z0-9_-]*|[A-Z]{1,4}[0-9]{2,5})\)$").unwrap());
-// ESLint prints absolute file names, which may contain spaces. Relative names stay
-// strict so source lines such as ShellCheck's `ls $DIR/*.txt` are never headers.
+    LazyLock::new(|| Regex::new(r"^(.+?)\s+\[(-?[A-Za-z][\w.:/,=-]*)\]$").unwrap());
+static TRAILING_PAREN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(.+?)\s+\(([a-z][a-z0-9_-]*(?::[a-z][a-z0-9_-]+)?|[A-Z]{1,4}[0-9]{2,5})\)$")
+        .unwrap()
+});
+// ESLint, stylelint and yamllint print file headers. Absolute names may contain spaces;
+// relative names stay strict so source lines such as ShellCheck's `ls $DIR/*.txt` are never headers.
 static ESLINT_FILE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:(?:/|[A-Za-z]:[\\/])[^:]*?|(?:\.{0,2}/)?[^\s:]+)\.[A-Za-z0-9]+$").unwrap()
 });
+static YAMLLINT_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+(\d+):(\d+)\s+(error|warning)\s+(.+?)\s{2,}\(([a-z][a-z0-9_-]+)\)\s*$")
+        .unwrap()
+});
+static STYLELINT_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+(\d+):(\d+)\s+(✖|×|⚠|‼|!)\s+(.+?)(?:\s{2,}(@?[\w./-]+))?\s*$").unwrap()
+});
 static ESLINT_ROW: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s+(\d+):(\d+)\s+(error|warning)\s+(.+?)(?:\s{2,}(@?[\w./-]+))?$").unwrap()
+    Regex::new(r"^\s+(\d+):(\d+)\s+(error|warning)\s+(.+?)(?:\s{2,}(@?[\w./-]+))?\s*$").unwrap()
 });
 static PYRIGHT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s+(\S.*?):(\d+):(\d+) - (error|warning|information): (.*)$").unwrap()
@@ -125,7 +293,51 @@ static SHELLCHECK_ROW: LazyLock<Regex> =
 // A tool's own count, kept so a mismatch with the grouped header stays visible.
 static TOTAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?:Found \d+ (?:errors?|warnings?|problems?|issues?|diagnostics?)\b|\d+ (?:errors?|problems?|issues?|offenses?)\b|\d+ files? inspected\b)",
+        r"^(?:Found \d+ (?:errors?|warnings?|problems?|issues?|diagnostics?)\b|\d+ (?:errors?|problems?|issues?|offenses?)\b|\d+ files? inspected\b|Summary: [1-9]\d* error\(s\)|Failed: \d+ failure\(s\)|\d+ mods/funs, found [1-9]\d* |\d+ (?:warnings? and \d+ )?errors? generated\.?$)",
+    )
+    .unwrap()
+});
+static CLANG_TIDY_GENERATED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+) warnings? generated\.?$").unwrap());
+static CLANG_TIDY_SUPPRESSED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Suppressed (\d+) warnings? \([^)]*\)\.?$").unwrap());
+static CLANG_TIDY_HEADER_FILTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Use -header-filter=\S+ to display ").unwrap());
+static PHPSTAN_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:Note: Using configuration file \S|\s*\d+/\d+\s+\[[▓░= >#-]+\]\s+\d+%\s*$|\s*\[OK\] No errors\s*$)",
+    )
+    .unwrap()
+});
+static CPPCHECK_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:Checking \S.* \.\.\.$|\d+/\d+ files? checked \d+% done$|nofile:0:0: information: Active checkers: .*\[checkersReport\]$)",
+    )
+    .unwrap()
+});
+static MARKDOWNLINT_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:markdownlint-cli2 v\S+|Finding: \S|Linting: \d+ file\(s\)$|Summary: 0 error\(s\)$)",
+    )
+    .unwrap()
+});
+static SQLFLUFF_CLEAN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:== \[.+?\] (?:PASS|SKIP)\s*$|All Finished\b)").unwrap());
+static DENO_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:Checked \d+ files?(?: (?:in \S+|\([^)]+\)))?\.?$|Check (?:file|https?)://\S+$|Download https?://\S+$)",
+    )
+    .unwrap()
+});
+static ANSIBLE_CLEAN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:Passed(?: with [^:]+)?: 0 failure\(s\), 0 warning\(s\)(?:$|\s|\.)|WARNING\s+Listing 0 violation\(s\)(?:$|\s|\.))",
+    )
+    .unwrap()
+});
+static CREDO_CLEAN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:Checking \d+ source files? \.\.\.$|Please report incorrect results: https://github\.com/rrrene/credo/issues$|Analysis took \S+ seconds? \(.+\)$|\d+ mods/funs, found no issues\.$|Use `mix credo explain` to explain issues\b)",
     )
     .unwrap()
 });
@@ -198,24 +410,28 @@ static BUILD_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
 enum StatusKind {
     Cargo,
     Build,
+    Lint,
 }
 
-/// Recognize a clean build status line and whether it carries the final
-/// completion notice for the one-line clean summary.
-fn build_status(line: &str) -> Option<(StatusKind, bool)> {
+/// Recognize a clean build or linter status line, whether it carries the final
+/// completion notice for the one-line clean summary, and whether it requires a
+/// completion notice before [`Lint::clean`] may succeed.
+fn build_status(line: &str) -> Option<(StatusKind, bool, bool)> {
     if CARGO_STATUS.is_match(line) {
         return Some((
             StatusKind::Cargo,
             line.trim_start().starts_with("Finished "),
+            false,
         ));
     }
     if CMAKE_PROGRESS.is_match(line) {
-        return Some((StatusKind::Build, CMAKE_BUILT_FINAL.is_match(line)));
+        return Some((StatusKind::Build, CMAKE_BUILT_FINAL.is_match(line), false));
     }
     if CMAKE_DONE.is_match(line) {
         return Some((
             StatusKind::Build,
             line.starts_with("-- Build files have been written to:"),
+            false,
         ));
     }
     if STEP_PROGRESS.is_match(line)
@@ -223,37 +439,87 @@ fn build_status(line: &str) -> Option<(StatusKind, bool)> {
         && !line.contains("error:")
         && !line.contains("warning:")
     {
-        return Some((StatusKind::Build, false));
+        return Some((StatusKind::Build, false, false));
     }
     if NINJA_STATUS.is_match(line) {
-        return Some((StatusKind::Build, line == "ninja: no work to do."));
+        return Some((StatusKind::Build, line == "ninja: no work to do.", false));
     }
     if MAKE_STATUS.is_match(line) {
         return Some((
             StatusKind::Build,
             line.contains("Nothing to be done for ") || line.ends_with(" is up to date."),
+            false,
         ));
     }
     if GRADLE_STATUS.is_match(line) {
-        return Some((StatusKind::Build, line.starts_with("BUILD SUCCESSFUL")));
+        return Some((
+            StatusKind::Build,
+            line.starts_with("BUILD SUCCESSFUL"),
+            false,
+        ));
     }
     if (line == "[INFO]" || line.starts_with("[INFO] "))
         && !line.starts_with("[INFO] Tests run:")
         && !line.contains("BUILD FAILURE")
     {
-        return Some((StatusKind::Build, line.trim() == "[INFO] BUILD SUCCESS"));
+        return Some((
+            StatusKind::Build,
+            line.trim() == "[INFO] BUILD SUCCESS",
+            false,
+        ));
     }
     if DOTNET_STATUS.is_match(line) {
-        return Some((StatusKind::Build, line.starts_with("Build succeeded")));
+        return Some((
+            StatusKind::Build,
+            line.starts_with("Build succeeded"),
+            false,
+        ));
     }
     if SWIFT_STATUS.is_match(line) {
         return Some((
             StatusKind::Build,
             line.starts_with("Build ") && line.contains("complete!"),
+            false,
         ));
     }
     if GO_STATUS.is_match(line) {
-        return Some((StatusKind::Build, false));
+        return Some((StatusKind::Build, false, false));
+    }
+    if PHPSTAN_STATUS.is_match(line) {
+        let finished = line.trim() == "[OK] No errors";
+        return Some((StatusKind::Lint, finished, !finished));
+    }
+    if let Some(c) = CLANG_TIDY_GENERATED.captures(line) {
+        let count: usize = c[1].parse().unwrap_or(1);
+        return Some((StatusKind::Lint, count == 0, count > 0));
+    }
+    if CLANG_TIDY_SUPPRESSED.is_match(line) {
+        return Some((StatusKind::Lint, true, false));
+    }
+    if CLANG_TIDY_HEADER_FILTER.is_match(line) {
+        return Some((StatusKind::Lint, false, true));
+    }
+    if CPPCHECK_STATUS.is_match(line) {
+        return Some((StatusKind::Lint, line.ends_with("100% done"), false));
+    }
+    if MARKDOWNLINT_STATUS.is_match(line) {
+        let finished = line == "Summary: 0 error(s)";
+        return Some((StatusKind::Lint, finished, !finished));
+    }
+    if SQLFLUFF_CLEAN.is_match(line) {
+        let finished = line.starts_with("All Finished");
+        return Some((StatusKind::Lint, finished, false));
+    }
+    if DENO_STATUS.is_match(line) {
+        return Some((StatusKind::Lint, line.starts_with("Checked "), false));
+    }
+    if ANSIBLE_CLEAN.is_match(line) {
+        let finished = line.starts_with("Passed");
+        return Some((StatusKind::Lint, finished, !finished));
+    }
+    if CREDO_CLEAN.is_match(line) {
+        let finished = line.ends_with("found no issues.");
+        return Some((StatusKind::Lint, finished, !finished));
     }
     None
 }
@@ -422,13 +688,39 @@ impl Other {
     }
 }
 
+/// Pending two-line Ansible-lint finding header awaiting its `path:line` location.
+struct AnsiblePending {
+    rule: String,
+    message: String,
+    severity: Severity,
+    line_no: usize,
+    stream: Stream,
+    raw: String,
+}
+
 pub struct Lint {
     root: String,
+    tool: Option<Tool>,
     findings: Vec<Finding>,
     block: Option<Finding>,
+    /// Active Credo multi-line issue block (`[W] ↗ msg` + `┃   file:line:col`).
+    credo_block: Option<Finding>,
     /// The last one-line finding, which indented detail lines extend.
     open: Option<usize>,
-    eslint_file: Option<String>,
+    /// Follow-up `note:` lines and their snippets extend only the preceding finding's
+    /// archive span `[stream:A-B]` without adding to its excerpt or finding count.
+    note_open: Option<usize>,
+    last_located: Option<(usize, Stream)>,
+    /// Active file header for ESLint, stylelint and yamllint standard rows.
+    file_header: Option<String>,
+    /// Active PHPStan file table: `(path, seen_header_separator)`.
+    phpstan_file: Option<(String, bool)>,
+    /// Active PHPStan general (unlocated) Error table: `0 = none, 1 = saw border, 2 = saw Error, 3 = in body`.
+    phpstan_general: u8,
+    /// Active SQLFluff `== [path] FAIL` file header.
+    sqlfluff_file: Option<String>,
+    /// Pending Ansible-lint `rule[sub]: message` header awaiting `path:line`.
+    ansible_pending: Option<AnsiblePending>,
     shellcheck_line: Option<(String, String)>,
     /// Whether a `# pkg/path` Go compiler header was seen on this run.
     go_package: bool,
@@ -441,13 +733,20 @@ pub struct Lint {
     uncompiled_at: String,
     unlocated_errors: usize,
     other: [Other; 2],
-    /// Recognized build status lines among `other`, per stream: count, first and last line.
+    /// Recognized build/lint status lines among `other`, per stream: count, first and last line.
     status: [(usize, usize, usize); 2],
     /// Whether every recognized status line so far came from Cargo.
     cargo_status_only: bool,
+    /// Whether every recognized status line so far came from a linter.
+    lint_status_only: bool,
+    /// Whether a seen status line requires a completion notice before [`Self::clean`] fires.
+    needs_completion: bool,
+    /// Counts from `clang-tidy` `N warnings generated.` and `Suppressed M warnings (...)` lines.
+    clang_generated: usize,
+    clang_suppressed: usize,
     /// Non-blank lines per stream, whatever shape read them.
     lines: [usize; 2],
-    /// The last completion status line (such as Cargo's `Finished` or Gradle's `BUILD SUCCESSFUL`).
+    /// The last completion status line (such as Cargo's `Finished` or PHPStan's `[OK] No errors`).
     finished: String,
     overflow: bool,
 }
@@ -460,10 +759,18 @@ impl Lint {
         }
         Self {
             root,
+            tool: None,
             findings: Vec::new(),
             block: None,
+            credo_block: None,
             open: None,
-            eslint_file: None,
+            note_open: None,
+            last_located: None,
+            file_header: None,
+            phpstan_file: None,
+            phpstan_general: 0,
+            sqlfluff_file: None,
+            ansible_pending: None,
             shellcheck_line: None,
             go_package: false,
             outcomes: Vec::new(),
@@ -475,10 +782,21 @@ impl Lint {
             other: Default::default(),
             status: [(0, 0, 0); 2],
             cargo_status_only: true,
+            lint_status_only: true,
+            needs_completion: false,
+            clang_generated: 0,
+            clang_suppressed: 0,
             lines: [0; 2],
             finished: String::new(),
             overflow: false,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn for_tool(root: &Path, tool: Tool) -> Self {
+        let mut lint = Self::new(root);
+        lint.tool = Some(tool);
+        lint
     }
 
     pub fn observe(&mut self, text: &str, n: usize, stream: Stream) {
@@ -495,11 +813,22 @@ impl Lint {
         }
         if !self.classify(line, n, stream) && !line.trim().is_empty() {
             self.other[stream as usize].note(n, line);
-            if let Some((kind, finished)) = build_status(line) {
+            if let Some((kind, finished, requires_completion)) = build_status(line) {
                 let status = &mut self.status[stream as usize];
                 *status = (status.0 + 1, if status.0 == 0 { n } else { status.1 }, n);
                 if kind != StatusKind::Cargo {
                     self.cargo_status_only = false;
+                }
+                if kind != StatusKind::Lint {
+                    self.lint_status_only = false;
+                }
+                if requires_completion {
+                    self.needs_completion = true;
+                }
+                if let Some(c) = CLANG_TIDY_GENERATED.captures(line) {
+                    self.clang_generated += c[1].parse::<usize>().unwrap_or(0);
+                } else if let Some(c) = CLANG_TIDY_SUPPRESSED.captures(line) {
+                    self.clang_suppressed += c[1].parse::<usize>().unwrap_or(0);
                 }
                 if finished {
                     self.finished = short(line.trim(), 200);
@@ -508,10 +837,11 @@ impl Lint {
         }
     }
 
-    /// One line for a run that printed only recognized build status lines (Cargo,
-    /// CMake, Ninja, Make, Gradle, Maven, dotnet, Swift or Go), with the range of
-    /// those lines on each stream and any completion line. `None` when the run
-    /// printed anything else.
+    /// One line for a run that printed only recognized build or lint status lines
+    /// (Cargo, CMake, Ninja, Make, Gradle, Maven, dotnet, Swift, Go, PHPStan,
+    /// clang-tidy, cppcheck, markdownlint-cli2, SQLFluff, Deno, Ansible-lint or
+    /// Credo), with the range of those lines on each stream and any completion
+    /// line. `None` when the run printed anything else.
     pub fn clean(&self, label: &str) -> Option<String> {
         // A shape can take a line without a finding, as a warning without a
         // location, so every line counts.
@@ -519,16 +849,22 @@ impl Lint {
         if self.overflow
             || !only_status
             || self.block.is_some()
+            || self.credo_block.is_some()
+            || self.ansible_pending.is_some()
             || !self.findings.is_empty()
             || !self.outcomes.is_empty()
             || !self.uncompiled.is_empty()
             || self.hidden_outcomes > 0
+            || self.clang_generated != self.clang_suppressed
+            || (self.needs_completion && self.finished.is_empty())
             || self.status.iter().all(|status| status.0 == 0)
         {
             return None;
         }
         let kind = if self.cargo_status_only {
             "cargo"
+        } else if self.lint_status_only {
+            "lint"
         } else {
             "build"
         };
@@ -551,29 +887,95 @@ impl Lint {
 
     /// Record a line and return whether it belonged to a recognized shape.
     fn classify(&mut self, line: &str, n: usize, stream: Stream) -> bool {
+        // Two-line Ansible-lint block: a pending `rule[sub]: message` header promotes to
+        // a finding only when the immediately following line on the same stream is `path:line`.
+        if let Some(pending) = self.ansible_pending.take()
+            && pending.stream == stream
+            && let Some(c) = ANSIBLE_LOC.captures(line)
+        {
+            let mut finding = Finding::new(
+                pending.severity,
+                Some(pending.rule),
+                &pending.message,
+                stream,
+            )
+            .at(&self.root, &c[1], &c[2], c.get(3))
+            .lines(pending.line_no, &pending.raw);
+            finding.last = n;
+            finding.excerpt.push(short(line.trim(), 240));
+            self.push(finding, false);
+            return true;
+        }
+        // Active Credo multi-line issue block (`[W] ↗ msg` + `┃   path:line:col`).
+        if let Some(credo) = self.credo_block.as_mut().filter(|b| b.stream == stream) {
+            let ends = line.trim().is_empty()
+                || CREDO_HEADER.is_match(line)
+                || CREDO_ONELINE.is_match(line)
+                || TOTAL.is_match(line.trim())
+                || build_status(line).is_some()
+                || (!credo.file.is_empty() && !line.starts_with('┃') && !line.starts_with('|'));
+            if !ends {
+                if credo.file.is_empty()
+                    && let Some(c) = CREDO_LOC.captures(line)
+                {
+                    (credo.file, credo.line, credo.column) =
+                        position(&self.root, &c[1], &c[2], c.get(3));
+                    credo.last = n;
+                    if credo.excerpt.len() < EXCERPT_LINES {
+                        credo.excerpt.push(short(line.trim(), 240));
+                    }
+                    return true;
+                }
+                if credo.file.is_empty() && (line.starts_with('┃') || line.starts_with('|')) {
+                    let body = line.trim_start_matches(['┃', '|']).trim();
+                    if !body.is_empty() {
+                        let combined = format!("{} {body}", credo.message);
+                        credo.message = short(&combined, 300);
+                        credo.last = n;
+                        if credo.excerpt.len() < EXCERPT_LINES {
+                            credo.excerpt.push(short(line.trim(), 240));
+                        }
+                        return true;
+                    }
+                }
+                if !credo.file.is_empty() && (line.starts_with('┃') || line.starts_with('|')) {
+                    credo.last = n;
+                    if credo.excerpt.len() < EXCERPT_LINES {
+                        credo.excerpt.push(short(line.trim(), 240));
+                    }
+                    return true;
+                }
+            }
+            self.close_credo();
+        }
         if let Some(block) = self.block.as_mut().filter(|b| b.stream == stream) {
             let ends = RUST_HEADER.is_match(line)
+                || DENO_CHECK_HEADER.is_match(line)
                 || CODE_HEADER.is_match(line)
                 || OXLINT_HEADER.is_match(line)
                 || BIOME_HEADER.is_match(line)
                 || MAVEN.is_match(line)
                 || KOTLIN.is_match(line)
                 || MSBUILD.is_match(line)
-                || TOTAL.is_match(line)
+                || TOTAL.is_match(line.trim())
                 || build_status(line).is_some();
             if line.is_empty() && !ends {
                 return true;
             }
             if !ends {
                 block.last = n;
-                if block.file.is_empty()
-                    && let Some(c) = ARROW.captures(line)
-                {
-                    let (file, row, col) = match (c.get(1), c.get(2)) {
-                        (Some(f), Some(r)) => (f.as_str(), r.as_str(), c.get(3)),
-                        _ => (&c[4], &c[5], c.get(6)),
-                    };
-                    (block.file, block.line, block.column) = position(&self.root, file, row, col);
+                if block.file.is_empty() {
+                    if let Some(c) = ARROW.captures(line) {
+                        let (file, row, col) = match (c.get(1), c.get(2)) {
+                            (Some(f), Some(r)) => (f.as_str(), r.as_str(), c.get(3)),
+                            _ => (&c[4], &c[5], c.get(6)),
+                        };
+                        (block.file, block.line, block.column) =
+                            position(&self.root, file, row, col);
+                    } else if let Some(c) = AT_LOC.captures(line) {
+                        (block.file, block.line, block.column) =
+                            position(&self.root, &c[1], &c[2], c.get(3));
+                    }
                 }
                 if block.message.is_empty()
                     && let Some(c) = BIOME_MSG.captures(line)
@@ -597,52 +999,227 @@ impl Lint {
                 return true;
             }
         }
-        if let Some(index) = self.open.take()
+        if let Some(index) = self.note_open.take()
             && self.findings[index].stream == stream
-            && line.starts_with(char::is_whitespace)
+            && (line.starts_with(char::is_whitespace) || SNIPPET.is_match(line))
             && !line.trim().is_empty()
             && !ESLINT_ROW.is_match(line)
+            && !STYLELINT_ROW.is_match(line)
+            && !YAMLLINT_ROW.is_match(line)
             && !PYRIGHT.is_match(line)
             && !SHELLCHECK_ROW.is_match(line)
             && !OXLINT_HEADER.is_match(line)
             && !MSBUILD.is_match(line)
+            && !CREDO_HEADER.is_match(line)
+            && !CREDO_ONELINE.is_match(line)
+            && !PHPSTAN_HEADER.is_match(line)
+            && !PHPSTAN_BORDER.is_match(line)
+            && !is_build_outcome(line.trim())
+            && !TOTAL.is_match(line.trim())
+            && build_status(line).is_none()
+        {
+            self.findings[index].last = n;
+            self.note_open = Some(index);
+            return true;
+        }
+        if let Some(index) = self.open.take()
+            && self.findings[index].stream == stream
+            && (line.starts_with(char::is_whitespace) || SNIPPET.is_match(line))
+            && !line.trim().is_empty()
+            && !ESLINT_ROW.is_match(line)
+            && !STYLELINT_ROW.is_match(line)
+            && !YAMLLINT_ROW.is_match(line)
+            && !PYRIGHT.is_match(line)
+            && !SHELLCHECK_ROW.is_match(line)
+            && !OXLINT_HEADER.is_match(line)
+            && !MSBUILD.is_match(line)
+            && !CREDO_HEADER.is_match(line)
+            && !CREDO_ONELINE.is_match(line)
+            && !PHPSTAN_HEADER.is_match(line)
+            && !PHPSTAN_BORDER.is_match(line)
+            && !(self.phpstan_file.is_some() && PHPSTAN_ROW.is_match(line))
+            && !is_build_outcome(line.trim())
+            && !TOTAL.is_match(line.trim())
             && build_status(line).is_none()
         {
             let finding = &mut self.findings[index];
             finding.last = n;
-            if finding.rule.is_none()
-                && let Some(c) = PYRIGHT_RULE.captures(line)
-            {
-                finding.rule = Some(c[2].to_owned());
-            }
-            if finding.excerpt.len() < EXCERPT_LINES {
-                finding.excerpt.push(short(line, 240));
+            if self.phpstan_file.is_some() {
+                if let Some(c) = PHPSTAN_ID.captures(line) {
+                    finding.rule = Some(c[1].to_owned());
+                } else {
+                    let trimmed = line.trim();
+                    let is_meta = trimmed.starts_with(['💡', '✏', '⏰']);
+                    let has_meta = finding
+                        .excerpt
+                        .iter()
+                        .skip(1)
+                        .any(|l| l.trim_start().starts_with(['💡', '✏', '⏰']));
+                    if !is_meta && !has_meta && finding.rule.is_none() {
+                        let combined = format!("{} {trimmed}", finding.message);
+                        finding.message = short(&combined, 300);
+                    } else if finding.excerpt.len() < EXCERPT_LINES {
+                        finding.excerpt.push(short(trimmed, 240));
+                    }
+                }
+            } else {
+                if finding.rule.is_none()
+                    && let Some(c) = PYRIGHT_RULE.captures(line)
+                {
+                    finding.rule = Some(c[2].to_owned());
+                }
+                if finding.excerpt.len() < EXCERPT_LINES {
+                    finding.excerpt.push(short(line, 240));
+                }
             }
             self.open = Some(index);
             return true;
         }
         self.close();
         if build_status(line).is_some() {
-            self.eslint_file = None;
+            self.file_header = None;
+            self.sqlfluff_file = None;
+            self.last_located = None;
             return false;
+        }
+        if PHPSTAN_BORDER.is_match(line) {
+            self.last_located = None;
+            if let Some((_, seen_sep)) = &mut self.phpstan_file {
+                if *seen_sep {
+                    self.phpstan_file = None;
+                } else {
+                    *seen_sep = true;
+                }
+                return true;
+            }
+            match self.phpstan_general {
+                0 => {
+                    self.phpstan_general = 1;
+                }
+                2 => {
+                    self.phpstan_general = 3;
+                    return true;
+                }
+                3 => {
+                    self.phpstan_general = 0;
+                    return true;
+                }
+                _ => {
+                    self.phpstan_general = 1;
+                }
+            }
+            return false;
+        }
+        if let Some(c) = PHPSTAN_HEADER.captures(line) {
+            let raw = c[1].trim();
+            let file = raw.split(" (in context of ").next().unwrap_or(raw).trim();
+            self.phpstan_file = Some((file.to_owned(), false));
+            self.phpstan_general = 0;
+            self.file_header = None;
+            self.last_located = None;
+            return true;
+        }
+        if self.phpstan_general == 1 && PHPSTAN_GENERAL_HEADER.is_match(line) {
+            self.phpstan_general = 2;
+            self.last_located = None;
+            return true;
+        }
+        if self.phpstan_general == 3 {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                self.unlocated_errors += 1;
+                self.outcome(trimmed, &[], stream, n);
+                return true;
+            }
+            self.phpstan_general = 0;
+        } else if self.phpstan_general > 0 {
+            self.phpstan_general = 0;
+        }
+        if let Some((file, _)) = &self.phpstan_file
+            && let Some(c) = PHPSTAN_ROW.captures(line)
+        {
+            let row = if &c[1] == "-" { "0" } else { &c[1] };
+            let (message, rule) = match TRAILING_BRACKET.captures(c[2].trim()) {
+                Some(t) => (t[1].trim().to_owned(), Some(t[2].to_owned())),
+                None => (c[2].trim().to_owned(), None),
+            };
+            let finding = Finding::new(Severity::Error, rule, &message, stream)
+                .at(&self.root, file, row, None)
+                .lines(n, line.trim());
+            self.push(finding, true);
+            return true;
+        }
+        if let Some(c) = SQLFLUFF_HEADER.captures(line) {
+            self.file_header = None;
+            self.last_located = None;
+            return match &c[2] {
+                "FAIL" | "WARNING" => {
+                    self.sqlfluff_file = Some(c[1].to_owned());
+                    true
+                }
+                _ => {
+                    self.sqlfluff_file = None;
+                    false
+                }
+            };
+        }
+        if let Some(file) = &self.sqlfluff_file
+            && let Some(c) = SQLFLUFF_ROW.captures(line)
+        {
+            let code = &c[3];
+            let severity = if matches!(code, "PRS" | "TMP" | "LXR") {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            let finding = Finding::new(severity, Some(code.to_owned()), &c[4], stream)
+                .at(&self.root, file, &c[1], c.get(2))
+                .lines(n, line.trim());
+            self.push(finding, true);
+            return true;
+        }
+        if let Some(c) = CREDO_ONELINE.captures(line) {
+            let finding = Finding::new(Severity::Warning, None, &c[5], stream)
+                .at(&self.root, &c[2], &c[3], c.get(4))
+                .lines(n, line.trim());
+            self.push(finding, false);
+            return true;
+        }
+        if let Some(c) = CREDO_HEADER.captures(line) {
+            self.last_located = None;
+            self.credo_block =
+                Some(Finding::new(Severity::Warning, None, &c[2], stream).lines(n, line.trim()));
+            return true;
         }
         if GO_PACKAGE.is_match(line) {
             self.go_package = true;
-            self.eslint_file = None;
+            self.file_header = None;
+            self.last_located = None;
             return true;
         }
         if let Some(c) = RUST_HEADER.captures(line) {
+            self.last_located = None;
             let rule = c.get(2).map(|m| m.as_str().to_owned());
             self.block =
                 Some(Finding::new(Severity::parse(&c[1]), rule, &c[3], stream).lines(n, line));
             return true;
         }
+        if let Some(c) = DENO_CHECK_HEADER.captures(line) {
+            self.last_located = None;
+            self.block = Some(
+                Finding::new(Severity::parse(&c[2]), Some(c[1].to_owned()), &c[3], stream)
+                    .lines(n, line),
+            );
+            return true;
+        }
         if let Some(c) = CODE_HEADER.captures(line) {
+            self.last_located = None;
             let rule = Some(c[1].to_owned());
             self.block = Some(Finding::new(Severity::Warning, rule, &c[2], stream).lines(n, line));
             return true;
         }
         if let Some(c) = OXLINT_HEADER.captures(line) {
+            self.last_located = None;
             let severity = match &c[1] {
                 "×" | "✖" => Severity::Error,
                 _ => Severity::Warning,
@@ -653,6 +1230,7 @@ impl Lint {
             return true;
         }
         if let Some(c) = BIOME_HEADER.captures(line) {
+            self.last_located = None;
             let finding = Finding::new(Severity::Error, Some(c[4].to_owned()), "", stream)
                 .at(&self.root, &c[1], &c[2], c.get(3))
                 .lines(n, line);
@@ -693,8 +1271,37 @@ impl Lint {
             self.push(finding, false);
             return true;
         }
+        if let Some(c) = CPPCHECK_BRACKET.captures(line) {
+            let (message, rule) = match TRAILING_BRACKET.captures(c[5].trim()) {
+                Some(t) => (t[1].trim().to_owned(), Some(t[2].to_owned())),
+                None => (c[5].trim().to_owned(), None),
+            };
+            let finding = Finding::new(Severity::parse(&c[4]), rule, &message, stream)
+                .at(&self.root, &c[1], &c[2], c.get(3))
+                .lines(n, line);
+            self.push(finding, true);
+            return true;
+        }
+        if let Some(c) = MARKDOWNLINT.captures(line) {
+            let severity = c
+                .get(4)
+                .map_or(Severity::Error, |m| Severity::parse(m.as_str()));
+            let finding = Finding::new(severity, Some(c[5].to_owned()), &c[6], stream)
+                .at(&self.root, &c[1], &c[2], c.get(3))
+                .lines(n, line);
+            self.push(finding, false);
+            return true;
+        }
+        if let Some(c) = STYLELINT_COMPACT.captures(line) {
+            let rule = c.get(6).map(|m| m.as_str().to_owned());
+            let finding = Finding::new(Severity::parse(&c[4]), rule, &c[5], stream)
+                .at(&self.root, &c[1], &c[2], c.get(3))
+                .lines(n, line);
+            self.push(finding, false);
+            return true;
+        }
         if let Some(c) = LOCATED.captures(line) {
-            if let Some(mut finding) = located(&c[4], stream) {
+            if let Some(mut finding) = located(&c[1], &c[4], stream, self.tool) {
                 if self.go_package
                     && c[1].ends_with(".go")
                     && finding.rule.is_none()
@@ -706,8 +1313,39 @@ impl Lint {
                     .at(&self.root, &c[1], &c[2], c.get(3))
                     .lines(n, line);
                 self.push(finding, true);
+                self.last_located = Some((self.findings.len() - 1, stream));
+            } else if let Some((idx, prev_stream)) = self.last_located
+                && prev_stream == stream
+            {
+                // Preserve follow-up `note:` lines via the preceding finding's archive
+                // span `[stream:A-B]` without counting them as separate findings.
+                self.findings[idx].last = n;
+                self.note_open = Some(idx);
             }
             return true;
+        }
+        if let Some(c) = PHPSTAN_RAW.captures(line) {
+            let rest = c[3].trim();
+            let looks_like_col = rest.chars().all(|ch| ch.is_ascii_digit())
+                || rest.split_once(':').is_some_and(|(head, _)| {
+                    !head.is_empty() && head.chars().all(|ch| ch.is_ascii_digit())
+                });
+            if !looks_like_col {
+                let (severity, text) = if let Some(s) = SEVERITY.captures(rest) {
+                    (Severity::parse(&s[1]), s.get(3).unwrap().as_str())
+                } else {
+                    (Severity::Error, rest)
+                };
+                let (message, rule) = match TRAILING_BRACKET.captures(text) {
+                    Some(t) => (t.get(1).unwrap().as_str().trim(), Some(t[2].to_owned())),
+                    None => (text, None),
+                };
+                let finding = Finding::new(severity, rule, message, stream)
+                    .at(&self.root, &c[1], &c[2], None)
+                    .lines(n, line);
+                self.push(finding, false);
+                return true;
+            }
         }
         if let Some(c) = PYRIGHT.captures(line) {
             let (message, rule) = match PYRIGHT_RULE.captures(&c[5]) {
@@ -729,6 +1367,7 @@ impl Lint {
             return true;
         }
         if let Some(c) = SHELLCHECK_FILE.captures(line) {
+            self.last_located = None;
             self.shellcheck_line = Some((c[1].to_owned(), c[2].to_owned()));
             return true;
         }
@@ -742,27 +1381,51 @@ impl Lint {
             self.push(finding, false);
             return true;
         }
-        if let Some(c) = ESLINT_ROW.captures(line)
-            && let Some(file) = &self.eslint_file
-        {
-            let rule = c.get(5).map(|m| m.as_str().to_owned());
-            let finding = Finding::new(Severity::parse(&c[3]), rule, &c[4], stream)
-                .at(&self.root, file, &c[1], c.get(2))
-                .lines(n, line.trim());
-            self.push(finding, false);
-            return true;
-        }
-        // ESLint rows belong to the file named since the last blank or other line.
-        if line.trim().is_empty() {
-            self.eslint_file = None;
-            return false;
-        }
-        if !line.starts_with(char::is_whitespace) {
-            if ESLINT_FILE.is_match(line) {
-                self.eslint_file = Some(line.to_owned());
+        if let Some(file) = &self.file_header {
+            if let Some(c) = YAMLLINT_ROW.captures(line) {
+                let finding =
+                    Finding::new(Severity::parse(&c[3]), Some(c[5].to_owned()), &c[4], stream)
+                        .at(&self.root, file, &c[1], c.get(2))
+                        .lines(n, line.trim());
+                self.push(finding, false);
                 return true;
             }
-            self.eslint_file = None;
+            if let Some(c) = STYLELINT_ROW.captures(line) {
+                let severity = match &c[3] {
+                    "✖" | "×" => Severity::Error,
+                    _ => Severity::Warning,
+                };
+                let rule = c.get(5).map(|m| m.as_str().to_owned());
+                let finding = Finding::new(severity, rule, &c[4], stream)
+                    .at(&self.root, file, &c[1], c.get(2))
+                    .lines(n, line.trim());
+                self.push(finding, false);
+                return true;
+            }
+            if let Some(c) = ESLINT_ROW.captures(line) {
+                let rule = c.get(5).map(|m| m.as_str().to_owned());
+                let finding = Finding::new(Severity::parse(&c[3]), rule, &c[4], stream)
+                    .at(&self.root, file, &c[1], c.get(2))
+                    .lines(n, line.trim());
+                self.push(finding, false);
+                return true;
+            }
+        }
+        // ESLint, stylelint and yamllint rows belong to the file named since the last blank or other line.
+        if line.trim().is_empty() {
+            self.file_header = None;
+            self.sqlfluff_file = None;
+            self.last_located = None;
+            return false;
+        }
+        self.last_located = None;
+        if !line.starts_with(char::is_whitespace) {
+            let trimmed_end = line.trim_end();
+            if ESLINT_FILE.is_match(trimmed_end) {
+                self.file_header = Some(trimmed_end.to_owned());
+                return true;
+            }
+            self.file_header = None;
         }
         let text = line.trim();
         let lower = text.to_ascii_lowercase();
@@ -779,6 +1442,42 @@ impl Lint {
         {
             self.outcome(text, &[], stream, n);
             return true;
+        }
+        // Hold a candidate Ansible-lint `rule[sub]: message` line until the next line
+        // confirms it with `path:line`; return `false` so unrecognized lines stay in `other`.
+        if let Some(c) = ANSIBLE_BLOCK_HEADER.captures(line) {
+            let rule = &c[1];
+            let is_severity_word = matches!(
+                rule,
+                "error"
+                    | "warning"
+                    | "note"
+                    | "info"
+                    | "information"
+                    | "hint"
+                    | "help"
+                    | "fatal"
+                    | "style"
+                    | "performance"
+                    | "portability"
+                    | "refactor"
+                    | "convention"
+            );
+            if !is_severity_word {
+                let raw_msg = c[2].trim();
+                let (severity, message) = match raw_msg.strip_suffix(" (warning)") {
+                    Some(msg) => (Severity::Warning, msg.trim()),
+                    None => (Severity::Error, raw_msg),
+                };
+                self.ansible_pending = Some(AnsiblePending {
+                    rule: rule.to_owned(),
+                    message: message.to_owned(),
+                    severity,
+                    line_no: n,
+                    stream,
+                    raw: line.to_owned(),
+                });
+            }
         }
         false
     }
@@ -825,7 +1524,17 @@ impl Lint {
         self.outcomes.push((format!("{head}{at}"), detail.to_vec()));
     }
 
+    fn close_credo(&mut self) {
+        let Some(block) = self.credo_block.take() else {
+            return;
+        };
+        if !block.file.is_empty() {
+            self.findings.push(block);
+        }
+    }
+
     fn close(&mut self) {
+        self.close_credo();
         let Some(block) = self.block.take() else {
             return;
         };
@@ -836,6 +1545,7 @@ impl Lint {
             // step, stays visible as a general outcome with its detail lines.
             if !UNCOMPILED.is_match(&block.excerpt[0])
                 && !block.excerpt[0].starts_with("error: aborting due to")
+                && block.excerpt[0] != "error: Type checking failed."
             {
                 self.unlocated_errors += 1;
             }
@@ -1204,8 +1914,12 @@ fn attribute(line: &str) -> Option<String> {
     Some(format!("clippy::{}", &c[3]))
 }
 
-fn located(message: &str, stream: Stream) -> Option<Finding> {
-    let (mut severity, mut text) = (Severity::Warning, message.trim());
+fn located(file: &str, message: &str, stream: Stream, tool: Option<Tool>) -> Option<Finding> {
+    let default_severity = match tool {
+        Some(Tool::Phpstan) => Severity::Error,
+        _ => Severity::Warning,
+    };
+    let (mut severity, mut text) = (default_severity, message.trim());
     let mut explicit = None;
     let mut rule = None;
     if let Some(c) = SEVERITY.captures(text) {
@@ -1214,6 +1928,11 @@ fn located(message: &str, stream: Stream) -> Option<Finding> {
         rule = c.get(2).map(|m| m.as_str().to_owned());
         text = c.get(3).unwrap().as_str();
         explicit = Some(level);
+    } else if let Some(c) = BRACKET_SEVERITY.captures(text) {
+        let level = c.get(1).unwrap().as_str().to_ascii_lowercase();
+        severity = Severity::parse(&level);
+        text = c.get(2).unwrap().as_str();
+        explicit = Some(level);
     }
     if rule.is_some() {
         // rustc's short format names the error code in the level: `error[E0308]:`.
@@ -1221,6 +1940,9 @@ fn located(message: &str, stream: Stream) -> Option<Finding> {
         severity = Severity::parse(&c[1]);
         rule = Some(c[2].to_owned());
         text = c.get(3).unwrap().as_str();
+    } else if let Some(c) = CREDO_FLYCHECK.captures(text) {
+        severity = Severity::Warning;
+        text = c.get(2).unwrap().as_str();
     } else if let Some(c) = LEADING_CODE.captures(text) {
         // pylint's `E0602:` and `F0001:` are errors. flake8's `E302` and Ruff's `F401`
         // have no colon and stay warnings.
@@ -1230,6 +1952,31 @@ fn located(message: &str, stream: Stream) -> Option<Finding> {
         }
         rule = Some(code.to_owned());
         text = c.get(3).unwrap().as_str();
+    } else if explicit.is_none() {
+        let is_yaml = file.ends_with(".yml") || file.ends_with(".yaml");
+        let has_trailing_rule = TRAILING_BRACKET.is_match(text) || TRAILING_PAREN.is_match(text);
+        let ansible = ANSIBLE_SUB_RULE.captures(text).or_else(|| {
+            (!has_trailing_rule)
+                .then(|| {
+                    ANSIBLE_KEBAB_RULE.captures(text).or_else(|| {
+                        (is_yaml || tool == Some(Tool::AnsibleLint))
+                            .then(|| ANSIBLE_YAML_RULE.captures(text))
+                            .flatten()
+                    })
+                })
+                .flatten()
+        });
+        if let Some(c) = ansible {
+            rule = Some(c[1].to_owned());
+            let rest = c.get(2).unwrap().as_str().trim();
+            if let Some(msg) = rest.strip_suffix(" (warning)") {
+                severity = Severity::Warning;
+                text = msg.trim();
+            } else {
+                severity = Severity::Error;
+                text = rest;
+            }
+        }
     }
     // rustc's short format appends its help and notes to the message.
     if let Some(end) = text.find(": help: ").or_else(|| text.find(": note: "))
@@ -1247,15 +1994,19 @@ fn located(message: &str, stream: Stream) -> Option<Finding> {
     }
     if rule.is_none() {
         if let Some(c) = TRAILING_BRACKET.captures(text) {
-            rule = Some(c[2].to_owned());
+            let raw_rule = &c[2];
+            let cleaned = raw_rule
+                .strip_suffix(",-warnings-as-errors")
+                .unwrap_or(raw_rule);
+            rule = Some(cleaned.to_owned());
             text = c.get(1).unwrap().as_str();
         } else if let Some(c) = TRAILING_PAREN.captures(text) {
             rule = Some(c[2].to_owned());
             text = c.get(1).unwrap().as_str();
         }
     }
-    // mypy and compilers print follow-up notes at the same location. Count a note
-    // only when it names a rule, as ShellCheck notes do.
+    // mypy, clang-tidy, cppcheck and compilers print follow-up notes at the same
+    // location. Count a note only when it names a rule, as ShellCheck notes do.
     if explicit.as_deref() == Some("note") && rule.is_none() {
         return None;
     }
@@ -1281,6 +2032,18 @@ fn position(
     column: Option<regex::Match>,
 ) -> (String, usize, Option<usize>) {
     let file = file.trim();
+    let file = match file.strip_prefix("file://") {
+        Some(rest)
+            if rest.len() >= 3
+                && rest.as_bytes()[0] == b'/'
+                && rest.as_bytes()[1].is_ascii_alphabetic()
+                && rest.as_bytes()[2] == b':' =>
+        {
+            &rest[1..]
+        }
+        Some(rest) => rest,
+        None => file,
+    };
     let file = file.strip_prefix(root).unwrap_or(file);
     let file = file.strip_prefix("./").unwrap_or(file).to_owned();
     let column = column.and_then(|c| c.as_str().parse().ok());
@@ -1721,6 +2484,1370 @@ cmd/server/main.go:8:2: undefined: secretKey
             ("empty", "", ""),
         ] {
             assert_eq!(feed(out, err).clean(label), None, "{label}: {out}{err}");
+        }
+    }
+
+    #[test]
+    fn tool_dispatch_names_round_trip() {
+        assert_eq!(Tool::ALL.len(), 12);
+        let expected = [
+            ("phpstan", Tool::Phpstan),
+            ("clang-tidy", Tool::ClangTidy),
+            ("cppcheck", Tool::Cppcheck),
+            ("yamllint", Tool::Yamllint),
+            ("markdownlint", Tool::Markdownlint),
+            ("sqlfluff", Tool::Sqlfluff),
+            ("ktlint", Tool::Ktlint),
+            ("stylelint", Tool::Stylelint),
+            ("deno", Tool::Deno),
+            ("ansible-lint", Tool::AnsibleLint),
+            ("actionlint", Tool::Actionlint),
+            ("credo", Tool::Credo),
+        ];
+        for (name, tool) in expected {
+            assert_eq!(Tool::from_name(name), Some(tool), "{name}");
+            assert_eq!(tool.name(), name);
+        }
+        assert_eq!(
+            Tool::from_name("markdownlint-cli2"),
+            Some(Tool::Markdownlint)
+        );
+        assert_eq!(Tool::from_name("mix credo"), Some(Tool::Credo));
+        assert_eq!(Tool::from_name("unknown-tool"), None);
+
+        let mut lint = Lint::for_tool(Path::new("/repo"), Tool::Phpstan);
+        lint.observe(
+            "src/Foo.php:42: Method App\\Foo::bar() should return int. [return.type]\n",
+            1,
+            Stream::Stdout,
+        );
+        let (report, _) = lint.finish("phpstan", 4096, None).unwrap();
+        assert!(report.contains("error return.type ×1"), "{report}");
+    }
+
+    #[test]
+    fn phpstan_table_and_raw_diagnostics_group_by_identifier() {
+        let table_out = "\
+Note: Using configuration file /repo/phpstan.neon.
+ 12/12 [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓] 100%
+
+ ------ --------------------------------------------------------------------- 
+  Line   src/Foo.php                                                          
+ ------ --------------------------------------------------------------------- 
+  42     Method App\\Foo::bar() should return int but returns string.          
+         🪪  return.type                                                       
+  57     Method App\\Foo::baz() should return int but returns string.          
+         🪪  return.type                                                       
+  71     Variable $baz might not be defined.                                  
+         💡 Consider initializing it before use.                              
+         🪪  variable.undefined                                                
+ ------ --------------------------------------------------------------------- 
+
+ ------ --------------------------------------------------------------------- 
+  Line   src/Bar.php (in context of class App\\ConcreteBar)                    
+ ------ --------------------------------------------------------------------- 
+  10     Method App\\Bar::qux() should return int                              
+         but returns string.                                                  
+         🪪  return.type                                                       
+  24     Call to an undefined method App\\Bar::missing().                      
+         🪪  method.notFound                                                   
+ ------ --------------------------------------------------------------------- 
+
+ ------ --------------------------------------------------------------------- 
+  Error                                                                       
+ ------ --------------------------------------------------------------------- 
+  Ignored error pattern #^Foo$# was not matched in reported errors.           
+ ------ --------------------------------------------------------------------- 
+
+ [ERROR] Found 6 errors                                                       
+";
+        let (report, _) = feed(table_out, "")
+            .finish("phpstan analyse", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < table_out.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            table_out.len()
+        );
+        assert!(
+            report.contains(
+                "phpstan analyse: 5 finding(s), 5 error(s), 0 warning(s) · 3 rule(s) · 2 file(s) · 1 error(s) without a location"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error return.type ×3"), "{report}");
+        assert!(
+            report.contains("src/Bar.php:10, src/Foo.php:42, 57 [stdout:7-8]"),
+            "{report}"
+        );
+        assert!(report.contains("error variable.undefined ×1"), "{report}");
+        assert!(
+            report.contains("💡 Consider initializing it before use."),
+            "{report}"
+        );
+        assert!(report.contains("src/Foo.php:71 [stdout:11-13]"), "{report}");
+        assert!(report.contains("error method.notFound ×1"), "{report}");
+        assert!(
+            report.contains("Ignored error pattern #^Foo$# was not matched"),
+            "{report}"
+        );
+        assert!(
+            report.contains("[ERROR] Found 6 errors [stdout:32]"),
+            "{report}"
+        );
+
+        let raw_out = "\
+/repo/src/Foo.php:42:Method App\\Foo::bar() should return int but returns string. [return.type]
+/repo/src/Foo.php:57:Method App\\Foo::baz() should return int but returns string. [return.type]
+/repo/src/Bar.php:10:Method App\\Bar::qux() should return int but returns string. [return.type]
+/repo/src/Bar.php:24:Variable $baz might not be defined. [variable.undefined]
+/repo/src/Baz.php:8:Variable $qux might not be defined. [variable.undefined]
+";
+        let (report, _) = feed(raw_out, "")
+            .finish("phpstan analyse", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < raw_out.len(),
+            "expected raw byte reduction: {} >= {}",
+            report.len(),
+            raw_out.len()
+        );
+        assert!(
+            report.contains(
+                "phpstan analyse: 5 finding(s), 5 error(s), 0 warning(s) · 2 rule(s) · 3 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error return.type ×3"), "{report}");
+        assert!(
+            report.contains("src/Bar.php:10, src/Foo.php:42, 57 [stdout:1-1]"),
+            "{report}"
+        );
+        assert!(report.contains("error variable.undefined ×2"), "{report}");
+        assert!(
+            report.contains("src/Bar.php:24, src/Baz.php:8 [stdout:4-4]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn clang_tidy_groups_by_check_and_preserves_notes_via_span_only() {
+        let out = "\
+/repo/src/math.cpp:42:10: warning: 42 is a magic number; consider replacing it with a named constant [readability-magic-numbers]
+   42 |   return x * 42;
+      |              ^
+/repo/src/math.cpp:58:14: warning: 100 is a magic number; consider replacing it with a named constant [readability-magic-numbers]
+   58 |   return y + 100;
+      |              ^
+/repo/src/math.cpp:72:14: warning: 256 is a magic number; consider replacing it with a named constant [readability-magic-numbers]
+   72 |   return z + 256;
+      |              ^
+/repo/src/net.cpp:25:12: error: narrowing conversion from 'double' to 'int' [bugprone-narrowing-conversions,-warnings-as-errors]
+   25 |   int n = d;
+      |           ^
+/repo/src/net.cpp:10:3: note: 'n' declared here
+   10 |   int n;
+      |   ^
+/repo/src/net.cpp:31:12: error: narrowing conversion from 'float' to 'int' [bugprone-narrowing-conversions,-warnings-as-errors]
+   31 |   int m = f;
+      |           ^
+/repo/src/net.cpp:44:5: warning: use auto when initializing with a cast [modernize-use-auto]
+   44 |   int* p = static_cast<int*>(buf);
+      |   ^~~~
+";
+        let err = "\
+5 warnings and 2 errors generated.
+Suppressed 2 warnings (2 in non-user code).
+";
+        let (report, _) = feed(out, err).finish("clang-tidy", 4096, None).unwrap();
+        assert!(
+            report.len() < out.len() + err.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            out.len() + err.len()
+        );
+        assert!(
+            report.contains(
+                "clang-tidy: 6 finding(s), 2 error(s), 4 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("error bugprone-narrowing-conversions ×2"),
+            "{report}"
+        );
+        // Archive span covers lines 10-15 (the error, its snippet, AND the follow-up note + snippet),
+        // while the note text itself is NOT duplicated into the report.
+        assert!(
+            report.contains("src/net.cpp:25:12, 31:12 [stdout:10-15]"),
+            "{report}"
+        );
+        assert!(!report.contains("note: 'n' declared here"), "{report}");
+        assert!(
+            report.contains("warning readability-magic-numbers ×3"),
+            "{report}"
+        );
+        assert!(
+            report.contains("src/math.cpp:42:10, 58:14, 72:14 [stdout:1-3]"),
+            "{report}"
+        );
+        assert!(report.contains("warning modernize-use-auto ×1"), "{report}");
+        assert!(
+            report.contains("5 warnings and 2 errors generated. [stderr:1]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn cppcheck_modern_and_bracket_formats_group_by_id() {
+        let modern_err = "\
+/repo/src/net.c:42:10: error: Null pointer dereference: ptr [nullPointer]
+ return *ptr;
+         ^
+/repo/src/net.c:38:15: note: Assignment 'ptr=NULL', assigned value is 0
+ int *ptr = NULL;
+               ^
+/repo/src/net.c:64:10: error: Null pointer dereference: other [nullPointer]
+ return *other;
+         ^
+/repo/src/util.c:19:5: style: Condition 'x==0' is always true [knownConditionTrueFalse]
+ if (x == 0)
+     ^
+/repo/src/util.c:25:1: performance: Function parameter 's' should be passed by const reference. [passedByValue]
+/repo/src/util.c:33:1: performance: Function parameter 't' should be passed by const reference. [passedByValue]
+/repo/src/util.c:40:1: portability: Casting between integer* and float* has incompatible representation. [invalidPointerCast]
+nofile:0:0: information: Active checkers: 113/592 (use --checkers-report=<filename> to see details) [checkersReport]
+";
+        let (report, _) = feed("", modern_err).finish("cppcheck", 4096, None).unwrap();
+        assert!(
+            report.len() < modern_err.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            modern_err.len()
+        );
+        assert!(
+            report.contains(
+                "cppcheck: 6 finding(s), 2 error(s), 4 warning(s) · 4 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error nullPointer ×2"), "{report}");
+        assert!(
+            report.contains("src/net.c:42:10, 64:10 [stderr:1-6]"),
+            "{report}"
+        );
+        assert!(report.contains("warning passedByValue ×2"), "{report}");
+        assert!(
+            report.contains("warning knownConditionTrueFalse ×1"),
+            "{report}"
+        );
+        assert!(report.contains("warning invalidPointerCast ×1"), "{report}");
+
+        let bracket_err = "\
+[src/net.c:38] -> [src/net.c:42]: (error) Possible null pointer dereference: ptr [nullPointer]
+[src/net.c:64]: (error) Null pointer dereference: other [nullPointer]
+[src/util.c:19]: (warning) Uninitialized variable: a [uninitvar]
+[src/util.c:28]: (warning) Uninitialized variable: b [uninitvar]
+[src/util.c:35:4]: (style) Unused variable: tmp [unusedVariable]
+";
+        let (report, _) = feed("", bracket_err)
+            .finish("cppcheck", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < bracket_err.len(),
+            "expected bracket byte reduction: {} >= {}",
+            report.len(),
+            bracket_err.len()
+        );
+        assert!(
+            report.contains(
+                "cppcheck: 5 finding(s), 2 error(s), 3 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error nullPointer ×2"), "{report}");
+        assert!(report.contains("src/net.c:42, 64 [stderr:1-1]"), "{report}");
+        assert!(report.contains("warning uninitvar ×2"), "{report}");
+        assert!(
+            report.contains("src/util.c:19, 28 [stderr:3-3]"),
+            "{report}"
+        );
+        assert!(report.contains("warning unusedVariable ×1"), "{report}");
+        assert!(report.contains("src/util.c:35:4 [stderr:5-5]"), "{report}");
+    }
+
+    #[test]
+    fn yamllint_standard_and_parsable_formats_group_by_rule() {
+        let standard_out = "\
+.github/workflows/ci.yml
+  12:1      error    too many blank lines (2 > 1)  (empty-lines)
+  42:81     warning  line too long (94 > 80 characters)  (line-length)
+  55:10     error    trailing spaces  (trailing-spaces)
+  61:10     error    trailing spaces  (trailing-spaces)
+
+config/app.yaml
+  4:1       warning  missing document start \"---\"  (document-start)
+  19:81     warning  line too long (102 > 80 characters)  (line-length)
+  25:81     warning  line too long (115 > 80 characters)  (line-length)
+";
+        let (report, _) = feed(standard_out, "")
+            .finish("yamllint", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < standard_out.len(),
+            "expected standard byte reduction: {} >= {}",
+            report.len(),
+            standard_out.len()
+        );
+        assert!(
+            report.contains(
+                "yamllint: 7 finding(s), 3 error(s), 4 warning(s) · 4 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error trailing-spaces ×2"), "{report}");
+        assert!(
+            report.contains(".github/workflows/ci.yml:55:10, 61:10 [stdout:4-4]"),
+            "{report}"
+        );
+        assert!(
+            report.contains("error empty-lines ×1  too many blank lines (2 > 1)"),
+            "{report}"
+        );
+        assert!(report.contains("warning line-length ×3"), "{report}");
+        assert!(
+            report.contains(
+                ".github/workflows/ci.yml:42:81, config/app.yaml:19:81, 25:81 [stdout:3-3]"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("warning document-start ×1"), "{report}");
+
+        let parsable_out = "\
+.github/workflows/ci.yml:12:1: [error] trailing spaces (trailing-spaces)
+.github/workflows/ci.yml:42:10: [error] trailing spaces (trailing-spaces)
+.github/workflows/ci.yml:55:81: [warning] line too long (94 > 80 characters) (line-length)
+config/app.yaml:19:81: [warning] line too long (102 > 80 characters) (line-length)
+config/app.yaml:25:81: [warning] line too long (115 > 80 characters) (line-length)
+";
+        let (report, _) = feed(parsable_out, "")
+            .finish("yamllint", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < parsable_out.len(),
+            "expected parsable byte reduction: {} >= {}",
+            report.len(),
+            parsable_out.len()
+        );
+        assert!(
+            report.contains(
+                "yamllint: 5 finding(s), 2 error(s), 3 warning(s) · 2 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("error trailing-spaces ×2  trailing spaces"),
+            "{report}"
+        );
+        assert!(
+            report.contains(".github/workflows/ci.yml:12:1, 42:10 [stdout:1-1]"),
+            "{report}"
+        );
+        assert!(report.contains("warning line-length ×3"), "{report}");
+    }
+
+    #[test]
+    fn markdownlint_and_cli2_group_by_rule_code() {
+        let cli1_err = "\
+README.md:42:10 MD013/line-length Line length [Expected: 80; Actual: 112]
+README.md:58:10 MD013/line-length Line length [Expected: 80; Actual: 104]
+README.md:70 MD033/no-inline-html Inline HTML [Element: br]
+docs/guide.md:12:1 MD013/line-length Line length [Expected: 80; Actual: 95]
+docs/guide.md:18 MD033/no-inline-html Inline HTML [Element: details]
+docs/guide.md:25:1 MD022/blanks-around-headings/blanks-around-headers Headings should be surrounded by blank lines [Expected: 1; Actual: 0; Below]
+";
+        let (report, _) = feed("", cli1_err)
+            .finish("markdownlint", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < cli1_err.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            cli1_err.len()
+        );
+        assert!(
+            report.contains(
+                "markdownlint: 6 finding(s), 6 error(s), 0 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error MD013/line-length ×3"), "{report}");
+        assert!(
+            report.contains("README.md:42:10, 58:10, docs/guide.md:12:1 [stderr:1-1]"),
+            "{report}"
+        );
+        assert!(report.contains("error MD033/no-inline-html ×2"), "{report}");
+        assert!(
+            report.contains("README.md:70, docs/guide.md:18 [stderr:3-3]"),
+            "{report}"
+        );
+        assert!(
+            report.contains("error MD022/blanks-around-headings/blanks-around-headers ×1"),
+            "{report}"
+        );
+
+        let cli2_out = "\
+markdownlint-cli2 v0.15.0 (markdownlint v0.35.0)
+Finding: **/*.md
+Linting: 12 file(s)
+Summary: 3 error(s)
+";
+        let cli2_err = "\
+README.md:42:10 error MD013/line-length Line length [Expected: 80; Actual: 112]
+README.md:58 error MD013/line-length Line length [Expected: 80; Actual: 98]
+docs/guide.md:12:1 warning MD009/no-trailing-spaces Trailing spaces [Expected: 0 or 2; Actual: 3]
+";
+        let (report, _) = feed(cli2_out, cli2_err)
+            .finish("markdownlint-cli2", 4096, None)
+            .unwrap();
+        assert!(
+            report.contains(
+                "markdownlint-cli2: 3 finding(s), 2 error(s), 1 warning(s) · 2 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error MD013/line-length ×2"), "{report}");
+        assert!(
+            report.contains("warning MD009/no-trailing-spaces ×1"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Summary: 3 error(s) [stdout:4]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn sqlfluff_groups_by_rule_code_and_preserves_parse_errors() {
+        let out = "\
+== [models/orders.sql] FAIL
+L:   1 | P:   1 | CP01 | Keywords must be consistently upper case. [capitalisation.keywords]
+L:  14 | P:   8 | LT01 | Expected single whitespace between comma and next token. [layout.spacing]
+L:  42 | P:   5 | LT01 | Unnecessary trailing whitespace. [layout.spacing]
+L:  48 | P:   5 | LT01 | Unnecessary trailing whitespace. [layout.spacing]
+== [models/users.sql] PASS
+== [models/billing.sql] FAIL
+L:   7 | P:  12 | CP01 | Keywords must be consistently upper case. [capitalisation.keywords]
+L:  11 | P:   4 | CP01 | Keywords must be consistently upper case. [capitalisation.keywords]
+L:  19 | P:   1 |  PRS | Line 19, Position 1: Found unparsable section: 'SELECT * FROM'
+                       | unexpected end of file
+All Finished 📜 🎉!
+";
+        let (report, _) = feed(out, "").finish("sqlfluff lint", 4096, None).unwrap();
+        assert!(
+            report.len() < out.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            out.len()
+        );
+        assert!(
+            report.contains(
+                "sqlfluff lint: 7 finding(s), 1 error(s), 6 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error PRS ×1"), "{report}");
+        assert!(
+            report.contains("models/billing.sql:19:1 [stdout:10-11]"),
+            "{report}"
+        );
+        assert!(report.contains("warning CP01 ×3"), "{report}");
+        assert!(
+            report.contains("models/billing.sql:7:12, 11:4, models/orders.sql:1:1 [stdout:2-2]"),
+            "{report}"
+        );
+        assert!(report.contains("warning LT01 ×3"), "{report}");
+        assert!(
+            report.contains("models/orders.sql:14:8, 42:5, 48:5 [stdout:3-3]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn ktlint_groups_standard_and_plain_rules() {
+        let out = "\
+/repo/src/main/kotlin/App.kt:42:10: Wildcard import (cannot be auto-corrected) (standard:no-wildcard-imports)
+/repo/src/main/kotlin/App.kt:43:10: Wildcard import (cannot be auto-corrected) (standard:no-wildcard-imports)
+/repo/src/main/kotlin/Util.kt:12:5: Unexpected indentation (2) (should be 4) (standard:indent)
+/repo/src/main/kotlin/Util.kt:18:5: Unexpected indentation (6) (should be 4) (standard:indent)
+/repo/src/main/kotlin/Util.kt:24:10: Wildcard import (standard:no-wildcard-imports)
+src/test/kotlin/AppTest.kt:7:1: Missing newline at end of file (final-newline)
+src/test/kotlin/UtilTest.kt:9:1: Missing newline at end of file (final-newline)
+";
+        let (report, _) = feed(out, "").finish("ktlint", 4096, None).unwrap();
+        assert!(
+            report.len() < out.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            out.len()
+        );
+        assert!(
+            report
+                .contains("ktlint: 7 finding(s), 0 error(s), 7 warning(s) · 3 rule(s) · 4 file(s)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning standard:no-wildcard-imports ×3"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "src/main/kotlin/App.kt:42:10, 43:10, src/main/kotlin/Util.kt:24:10 [stdout:1-1]"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning standard:indent ×2  Unexpected indentation (2) (should be 4)"),
+            "{report}"
+        );
+        assert!(report.contains("warning final-newline ×2"), "{report}");
+    }
+
+    #[test]
+    fn stylelint_block_and_compact_formats_group_by_rule() {
+        let block_out = "\
+src/styles/app.css
+ 12:5   ✖  Expected \"#FFFFFF\" to be \"#ffffff\"         color-hex-case
+ 24:5   ✖  Expected \"#AABBCC\" to be \"#aabbcc\"         color-hex-case
+ 42:10  ✖  Unexpected duplicate selector \".btn\"       no-duplicate-selectors
+ 49:10  ✖  Unexpected duplicate selector \".card\"      no-duplicate-selectors
+ 54:10  ✖  Unexpected duplicate selector \".modal\"     no-duplicate-selectors
+ 58:3   ⚠  Expected empty line before comment         comment-empty-line-before
+
+src/styles/theme.scss
+  4:1   ✖  Expected \"#000000\" to be \"#000\"           color-hex-case
+  9:12  ×  Unexpected unknown at-rule \"@bad\"          scss/at-rule-no-unknown
+ 14:3   ⚠  Expected empty line before comment         comment-empty-line-before
+ 22:3   ⚠  Expected empty line before comment         comment-empty-line-before
+
+✖ 10 problems (7 errors, 3 warnings)
+";
+        let (report, _) = feed(block_out, "").finish("stylelint", 4096, None).unwrap();
+        assert!(
+            report.len() < block_out.len(),
+            "expected block byte reduction: {} >= {}",
+            report.len(),
+            block_out.len()
+        );
+        assert!(
+            report.contains(
+                "stylelint: 10 finding(s), 7 error(s), 3 warning(s) · 4 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error color-hex-case ×3"), "{report}");
+        assert!(
+            report
+                .contains("src/styles/app.css:12:5, 24:5, src/styles/theme.scss:4:1 [stdout:2-2]"),
+            "{report}"
+        );
+        assert!(
+            report.contains("error no-duplicate-selectors ×3"),
+            "{report}"
+        );
+        assert!(
+            report.contains("error scss/at-rule-no-unknown ×1"),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning comment-empty-line-before ×3"),
+            "{report}"
+        );
+        assert!(
+            report.contains("✖ 10 problems (7 errors, 3 warnings) [stdout:15]"),
+            "{report}"
+        );
+
+        let compact_out = "\
+src/styles/app.css: line 12, col 5, error - Expected \"#FFFFFF\" to be \"#ffffff\" (color-hex-case)
+src/styles/app.css: line 24, col 5, error - Expected \"#AABBCC\" to be \"#aabbcc\" (color-hex-case)
+src/styles/app.css: line 42, col 10, error - Unexpected duplicate selector \".btn\" (no-duplicate-selectors)
+src/styles/app.css: line 49, col 10, error - Unexpected duplicate selector \".card\" (no-duplicate-selectors)
+src/styles/app.css: line 58, col 3, warning - Expected empty line before comment (comment-empty-line-before)
+src/styles/theme.scss: line 4, col 1, error - Expected \"#000000\" to be \"#000\" (color-hex-case)
+src/styles/theme.scss: line 9, col 12, error - Unexpected unknown at-rule \"@bad\" (scss/at-rule-no-unknown)
+src/styles/theme.scss: line 14, col 3, warning - Expected empty line before comment (comment-empty-line-before)
+src/styles/theme.scss: line 22, col 1, error - Expected \"#EFEFEF\" to be \"#efefef\" (color-hex-case)
+";
+        let (report, _) = feed(compact_out, "")
+            .finish("stylelint", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < compact_out.len(),
+            "expected compact byte reduction: {} >= {}",
+            report.len(),
+            compact_out.len()
+        );
+        assert!(
+            report.contains(
+                "stylelint: 9 finding(s), 7 error(s), 2 warning(s) · 4 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error color-hex-case ×4"), "{report}");
+        assert!(
+            report.contains(
+                "src/styles/app.css:12:5, 24:5, src/styles/theme.scss:4:1, 22:1 [stdout:1-1]"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning comment-empty-line-before ×2"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn deno_lint_and_deno_check_group_by_rule_with_file_uris() {
+        let lint_err = "\
+error[no-unused-vars]: `unused` is never used
+    at file:///repo/src/app.ts:42:10
+  |
+42 | const unused = 123;
+  |       ^^^^^^
+  = hint: If this is intentional, prefix it with an underscore like `_unused`
+  = help: for further information visit https://docs.deno.com/lint/rules/no-unused-vars
+
+error[no-unused-vars]: `other` is never used
+    at file:///repo/src/util.ts:7:7
+  |
+7 | const other = 456;
+  |       ^^^^^
+  = hint: If this is intentional, prefix it with an underscore like `_other`
+
+error[no-unused-vars]: `third` is never used
+    at file:///repo/src/util.ts:19:7
+  |
+19 | const third = 789;
+  |       ^^^^^
+
+error[no-explicit-any]: `any` type is not allowed
+    at file:///repo/src/api.ts:15:20
+  |
+15 | export function run(x: any) {}
+  |                        ^^^
+
+Found 4 problems
+Checked 12 files
+";
+        let (report, _) = feed("", lint_err).finish("deno lint", 4096, None).unwrap();
+        assert!(
+            report.len() < lint_err.len(),
+            "expected deno lint byte reduction: {} >= {}",
+            report.len(),
+            lint_err.len()
+        );
+        assert!(
+            report.contains(
+                "deno lint: 4 finding(s), 4 error(s), 0 warning(s) · 2 rule(s) · 3 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error no-unused-vars ×3"), "{report}");
+        assert!(
+            report.contains("src/app.ts:42:10, src/util.ts:7:7, 19:7 [stderr:1-7]"),
+            "{report}"
+        );
+        assert!(report.contains("error no-explicit-any ×1"), "{report}");
+        assert!(
+            report.contains("src/api.ts:15:20 [stderr:22-26]"),
+            "{report}"
+        );
+        assert!(report.contains("Found 4 problems [stderr:28]"), "{report}");
+
+        let check_err = "\
+Check file:///repo/src/app.ts
+TS2322 [ERROR]: Type 'string' is not assignable to type 'number'.
+const count: number = \"hello\";
+      ~~~~~
+    at file:///repo/src/app.ts:12:7
+
+TS2322 [ERROR]: Type 'boolean' is not assignable to type 'number'.
+const total: number = true;
+      ~~~~~
+    at file:///repo/src/app.ts:20:7
+
+TS2322 [ERROR]: Type 'null' is not assignable to type 'number'.
+const retries: number = null;
+      ~~~~~~~
+    at file:///repo/src/app.ts:28:7
+
+TS2339 [ERROR]: Property 'missing' does not exist on type 'User'.
+console.log(user.missing);
+                 ~~~~~~~
+    at file:///repo/src/api.ts:8:18
+
+Found 4 errors.
+error: Type checking failed.
+";
+        let (report, _) = feed("", check_err)
+            .finish("deno check", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < check_err.len(),
+            "expected deno check byte reduction: {} >= {}",
+            report.len(),
+            check_err.len()
+        );
+        assert!(
+            report.contains(
+                "deno check: 4 finding(s), 4 error(s), 0 warning(s) · 2 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(!report.contains("error(s) without a location"), "{report}");
+        assert!(report.contains("error TS2322 ×3"), "{report}");
+        assert!(
+            report.contains("src/app.ts:12:7, 20:7, 28:7 [stderr:2-5]"),
+            "{report}"
+        );
+        assert!(report.contains("error TS2339 ×1"), "{report}");
+        assert!(
+            report.contains("src/api.ts:8:18 [stderr:17-20]"),
+            "{report}"
+        );
+        assert!(report.contains("Found 4 errors. [stderr:22]"), "{report}");
+        assert!(
+            report.contains("error: Type checking failed. [stderr:23]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn ansible_lint_block_and_single_line_formats_group_by_rule() {
+        let block_out = "\
+WARNING  Listing 5 violation(s) that are fatal
+yaml[line-length]: Line too long (185 > 160 characters)
+playbooks/deploy.yml:42
+
+fqcn[action-core]: Use FQCN for builtin module actions (copy).
+playbooks/deploy.yml:18 Use `ansible.builtin.copy` or `ansible.legacy.copy` instead.
+
+fqcn[action-core]: Use FQCN for builtin module actions (template).
+roles/web/tasks/main.yml:9 Task/Handler: Render nginx config
+
+fqcn[action-core]: Use FQCN for builtin module actions (file).
+roles/web/tasks/main.yml:27 Task/Handler: Ensure directory exists
+
+yaml[comments]: Too few spaces before comment (warning)
+playbooks/deploy.yml:50
+
+Read documentation for instructions on how to ignore specific rule violations.
+
+Failed: 4 failure(s), 1 warning(s) on 6 files. Last profile that met the validation criteria was 'min'.
+";
+        let (report, _) = feed(block_out, "")
+            .finish("ansible-lint", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < block_out.len(),
+            "expected block byte reduction: {} >= {}",
+            report.len(),
+            block_out.len()
+        );
+        assert!(
+            report.contains(
+                "ansible-lint: 5 finding(s), 4 error(s), 1 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error fqcn[action-core] ×3"), "{report}");
+        assert!(
+            report.contains("playbooks/deploy.yml:18, roles/web/tasks/main.yml:9, 27 [stdout:5-6]"),
+            "{report}"
+        );
+        assert!(report.contains("error yaml[line-length] ×1"), "{report}");
+        assert!(
+            report.contains("playbooks/deploy.yml:42 [stdout:2-3]"),
+            "{report}"
+        );
+        assert!(report.contains("warning yaml[comments] ×1"), "{report}");
+        assert!(
+            report.contains("Failed: 4 failure(s), 1 warning(s) on 6 files."),
+            "{report}"
+        );
+
+        let pep8_out = "\
+playbooks/deploy.yml:18: fqcn[action-core]: Use FQCN for builtin module actions (copy).
+roles/web/tasks/main.yml:9: fqcn[action-core]: Use FQCN for builtin module actions (template).
+roles/web/tasks/main.yml:27: fqcn[action-core]: Use FQCN for builtin module actions (file).
+playbooks/deploy.yml:42: risky-shell-pipe: Shells that use pipes should set the pipefail option.
+roles/web/tasks/main.yml:33: risky-shell-pipe: Shells that use pipes should set the pipefail option.
+playbooks/deploy.yml:50: yaml[comments]: Too few spaces before comment (warning)
+";
+        let (report, _) = feed(pep8_out, "")
+            .finish("ansible-lint", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < pep8_out.len(),
+            "expected pep8 byte reduction: {} >= {}",
+            report.len(),
+            pep8_out.len()
+        );
+        assert!(
+            report.contains(
+                "ansible-lint: 6 finding(s), 5 error(s), 1 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error fqcn[action-core] ×3"), "{report}");
+        assert!(report.contains("error risky-shell-pipe ×2"), "{report}");
+        assert!(report.contains("warning yaml[comments] ×1"), "{report}");
+    }
+
+    #[test]
+    fn actionlint_groups_by_rule_and_captures_full_snippet_ranges() {
+        let out = "\
+.github/workflows/ci.yml:14:9: label \"ubuntu-18.04\" is unknown. available labels are \"ubuntu-latest\", \"macos-latest\" [runner-label]
+   |
+14 |     runs-on: ubuntu-18.04
+   |         ^~~~~~~~~~~~
+.github/workflows/ci.yml:28:22: property \"foo\" is not defined in object type {bar: string} [expression]
+   |
+28 |       if: ${{ github.foo == 'bar' }}
+   |                      ^~~
+.github/workflows/ci.yml:42:10: shellcheck reported issue in this script: SC2086:info:1:6: Double quote to prevent globbing and word splitting [shellcheck]
+   |
+42 |         run: echo $FOO
+   |          ^~~~~~~~~~~~
+.github/workflows/release.yml:19:9: label \"macos-11\" is unknown. available labels are \"ubuntu-latest\", \"macos-latest\" [runner-label]
+   |
+19 |     runs-on: macos-11
+   |         ^~~~~~~~
+.github/workflows/release.yml:31:5: run-step: shellcheck reported issue in this script: SC2046:warning:1:1: Quote this to prevent word splitting [shellcheck]
+   |
+31 |         run: rm $(ls)
+   |     ^~~~~~~~~~~~~~~~~
+";
+        let (report, _) = feed(out, "").finish("actionlint", 4096, None).unwrap();
+        assert!(
+            report.len() < out.len(),
+            "expected byte reduction: {} >= {}",
+            report.len(),
+            out.len()
+        );
+        assert!(
+            report.contains(
+                "actionlint: 5 finding(s), 0 error(s), 5 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("warning runner-label ×2"), "{report}");
+        assert!(
+            report.contains(
+                ".github/workflows/ci.yml:14:9, .github/workflows/release.yml:19:9 [stdout:1-4]"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("warning shellcheck ×2"), "{report}");
+        assert!(
+            report.contains(
+                ".github/workflows/ci.yml:42:10, .github/workflows/release.yml:31:5 [stdout:9-12]"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("warning expression ×1"), "{report}");
+        assert!(
+            report.contains(".github/workflows/ci.yml:28:22 [stdout:5-8]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn credo_default_oneline_and_flycheck_formats_group_findings() {
+        let default_out = "\
+Checking 24 source files ...
+
+  Software Design
+┃ 
+┃ [D] ↗ Modules should have a @moduledoc tag.
+┃       lib/my_app/accounts.ex:1:11 #(MyApp.Accounts)
+┃ [D] ↗ Modules should have a @moduledoc tag.
+┃       lib/my_app/billing.ex:1:11 #(MyApp.Billing)
+
+  Warnings - please take a look
+┃ 
+┃ [W] ↗ `IO.inspect/1` should not be used in production code.
+┃       lib/my_app/orders.ex:42:10 #(MyApp.Orders.create)
+┃ [W] ↗ `IO.inspect/2` should not be used in
+┃       production code.
+┃       lib/my_app/orders.ex:58:10 #(MyApp.Orders.update)
+┃ [W] → Unused operation: `Enum.map/2` result is ignored.
+┃       lib/my_app/worker.ex:19:5 #(MyApp.Worker.run)
+
+Please report incorrect results: https://github.com/rrrene/credo/issues
+
+Analysis took 0.1 seconds (0.04s to load, 0.06s running 52 checks on 24 files)
+142 mods/funs, found 2 software design suggestions, 3 warnings.
+
+Use `mix credo explain` to explain issues, `mix credo --help` for options.
+";
+        let (report, _) = feed(default_out, "")
+            .finish("mix credo", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < default_out.len(),
+            "expected default byte reduction: {} >= {}",
+            report.len(),
+            default_out.len()
+        );
+        assert!(
+            report.contains(
+                "mix credo: 5 finding(s), 0 error(s), 5 warning(s) · 3 rule(s) · 4 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning Modules should have a @moduledoc tag. ×2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("lib/my_app/accounts.ex:1:11, lib/my_app/billing.ex:1:11 [stdout:5-6]"),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning … should not be used in production code. ×2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("lib/my_app/orders.ex:42:10, 58:10 [stdout:12-13]"),
+            "{report}"
+        );
+        assert!(
+            report.contains("142 mods/funs, found 2 software design suggestions, 3 warnings."),
+            "{report}"
+        );
+
+        // Plain `[W] ↗ message` without leading `┃` followed by `┃   path:line:col`.
+        let plain_block = "\
+[W] ↗ `IO.inspect/1` should not be used in production code.
+┃   lib/app.ex:42:10
+[W] ↗ `IO.inspect/2` should not be used in production code.
+┃   lib/app.ex:55:10
+";
+        let (report, _) = feed(plain_block, "")
+            .finish("mix credo", 4096, None)
+            .unwrap();
+        assert!(
+            report.contains("warning … should not be used in production code. ×2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("lib/app.ex:42:10, 55:10 [stdout:1-2]"),
+            "{report}"
+        );
+
+        // `--format oneline` and `--format flycheck`.
+        let oneline_out = "\
+[W] ↗ lib/app.ex:42:10 `IO.inspect/1` should not be used in production code.
+[W] ↗ lib/app.ex:58:10 `IO.inspect/2` should not be used in production code.
+[R] → lib/util.ex:14:7 Function names should use snake_case.
+";
+        let (report, _) = feed(oneline_out, "")
+            .finish("mix credo", 4096, None)
+            .unwrap();
+        assert!(
+            report.contains("warning … should not be used in production code. ×2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("lib/app.ex:42:10, 58:10 [stdout:1-1]"),
+            "{report}"
+        );
+
+        let flycheck_out = "\
+lib/app.ex:42:10: W: `IO.inspect/1` should not be used in production code.
+lib/app.ex:58:10: W: `IO.inspect/2` should not be used in production code.
+lib/orders.ex:14:5: W: `IO.inspect/1` should not be used in production code.
+lib/orders.ex:29:5: W: `IO.inspect/1` should not be used in production code.
+lib/worker.ex:88:7: W: `IO.inspect/2` should not be used in production code.
+lib/accounts.ex:1: D: Modules should have a @moduledoc tag.
+lib/billing.ex:1: D: Modules should have a @moduledoc tag.
+lib/orders.ex:1: D: Modules should have a @moduledoc tag.
+lib/shipping.ex:1: D: Modules should have a @moduledoc tag.
+lib/worker.ex:1: D: Modules should have a @moduledoc tag.
+lib/parser.ex:102:7: F: Function is too complex (cyclomatic complexity is 12, max is 9).
+";
+        let (report, _) = feed(flycheck_out, "")
+            .finish("mix credo", 4096, None)
+            .unwrap();
+        assert!(
+            report.len() < flycheck_out.len(),
+            "expected flycheck byte reduction: {} >= {}",
+            report.len(),
+            flycheck_out.len()
+        );
+        assert!(
+            report.contains(
+                "mix credo: 11 finding(s), 0 error(s), 11 warning(s) · 3 rule(s) · 7 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning … should not be used in production code. ×5"),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning Modules should have a @moduledoc tag. ×5"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn clean_lint_summaries_and_fail_closed_guards_cover_new_ecosystems() {
+        let cases: [(&str, &str, &str, &str); 9] = [
+            (
+                "phpstan analyse",
+                "Note: Using configuration file /repo/phpstan.neon.\n\
+                 \x2012/12 [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓] 100%\n\
+                 \n\
+                 \x20[OK] No errors\n",
+                "",
+                "phpstan analyse: 0 findings · 3 lint status line(s) [stdout:1-4] · [OK] No errors\n",
+            ),
+            (
+                "clang-tidy",
+                "",
+                "5 warnings generated.\n\
+                 Suppressed 5 warnings (5 in non-user code).\n\
+                 Use -header-filter=.* to display errors from all non-system headers.\n",
+                "clang-tidy: 0 findings · 3 lint status line(s) [stderr:1-3] · Suppressed 5 warnings (5 in non-user code).\n",
+            ),
+            (
+                "cppcheck",
+                "Checking src/a.c ...\n\
+                 1/2 files checked 50% done\n\
+                 Checking src/b.c ...\n\
+                 2/2 files checked 100% done\n",
+                "nofile:0:0: information: Active checkers: 113/592 (use --checkers-report=<filename> to see details) [checkersReport]\n",
+                "cppcheck: 0 findings · 4 lint status line(s) [stdout:1-4] · 1 lint status line(s) [stderr:1-1] · 2/2 files checked 100% done\n",
+            ),
+            (
+                "markdownlint-cli2",
+                "markdownlint-cli2 v0.15.0 (markdownlint v0.35.0)\n\
+                 Finding: **/*.md\n\
+                 Linting: 12 file(s)\n\
+                 Summary: 0 error(s)\n",
+                "",
+                "markdownlint-cli2: 0 findings · 4 lint status line(s) [stdout:1-4] · Summary: 0 error(s)\n",
+            ),
+            (
+                "sqlfluff lint",
+                "== [models/a.sql] PASS\n\
+                 == [models/b.sql] PASS\n\
+                 All Finished 📜 🎉!\n",
+                "",
+                "sqlfluff lint: 0 findings · 3 lint status line(s) [stdout:1-3] · All Finished 📜 🎉!\n",
+            ),
+            (
+                "deno lint",
+                "Checked 14 files\n",
+                "",
+                "deno lint: 0 findings · 1 lint status line(s) [stdout:1-1] · Checked 14 files\n",
+            ),
+            (
+                "deno check",
+                "",
+                "Check file:///repo/src/main.ts\n\
+                 Check file:///repo/src/util.ts\n",
+                "deno check: 0 findings · 2 lint status line(s) [stderr:1-2]\n",
+            ),
+            (
+                "ansible-lint",
+                "Passed: 0 failure(s), 0 warning(s) on 12 files. Last profile that met the validation criteria was 'production'.\n",
+                "",
+                "ansible-lint: 0 findings · 1 lint status line(s) [stdout:1-1] · Passed: 0 failure(s), 0 warning(s) on 12 files. Last profile that met the validation criteria was 'production'.\n",
+            ),
+            (
+                "mix credo",
+                "Checking 24 source files ...\n\
+                 \n\
+                 Please report incorrect results: https://github.com/rrrene/credo/issues\n\
+                 \n\
+                 Analysis took 0.1 seconds (0.04s to load, 0.06s running 52 checks on 24 files)\n\
+                 142 mods/funs, found no issues.\n\
+                 \n\
+                 Use `mix credo explain` to explain issues, `mix credo --help` for options.\n",
+                "",
+                "mix credo: 0 findings · 5 lint status line(s) [stdout:1-8] · 142 mods/funs, found no issues.\n",
+            ),
+        ];
+        for (label, out, err, expected) in cases {
+            assert_eq!(
+                feed(out, err).clean(label).as_deref(),
+                Some(expected),
+                "{label}"
+            );
+        }
+
+        // Fail closed: any missing completion, mismatched warning count, nonzero total,
+        // or unrecognized failure with 0 parsed findings MUST abort both `clean()` and `finish()`.
+        for (label, out, err) in [
+            (
+                "phpstan incomplete",
+                "Note: Using configuration file /repo/phpstan.neon.\n",
+                "",
+            ),
+            (
+                "phpstan crash",
+                "Internal error: Out of memory\n [ERROR] Found 1 error\n",
+                "",
+            ),
+            ("clang-tidy unsuppressed", "", "5 warnings generated.\n"),
+            (
+                "markdownlint-cli2 nonzero",
+                "markdownlint-cli2 v0.15.0\nSummary: 2 error(s)\n",
+                "",
+            ),
+            (
+                "sqlfluff fail without rows",
+                "== [models/broken.sql] FAIL\nAll Finished 📜 🎉!\n",
+                "",
+            ),
+            (
+                "ansible-lint warnings",
+                "Passed: 0 failure(s), 2 warning(s) on 12 files.\n",
+                "",
+            ),
+            (
+                "credo nonzero",
+                "Checking 24 source files ...\n142 mods/funs, found 1 warning.\n",
+                "",
+            ),
+            (
+                "non-ansible colon line",
+                "my-setting: some ordinary value\nnot a location line\n",
+                "",
+            ),
+        ] {
+            assert_eq!(feed(out, err).clean(label), None, "clean({label})");
+            assert!(
+                feed(out, err).finish(label, 4096, None).is_none(),
+                "finish({label})"
+            );
+        }
+    }
+
+    #[test]
+    fn measured_byte_reductions_across_all_12_linters() {
+        let mut phpstan = String::from(
+            "Note: Using configuration file /repo/phpstan.neon.\n 12/12 [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓] 100%\n\n",
+        );
+        for f in ["src/Orders.php", "src/Billing.php", "src/Users.php"] {
+            phpstan.push_str(&format!(
+                " ------ ---------------------------------------------------------------------\n  Line   {f}\n ------ ---------------------------------------------------------------------\n"
+            ));
+            for line in [14, 28, 42, 65] {
+                phpstan.push_str(&format!(
+                    "  {line}     Method App\\Service::handle() should return int but returns string.\n         🪪  return.type\n"
+                ));
+            }
+            phpstan.push_str(
+                " ------ ---------------------------------------------------------------------\n\n",
+            );
+        }
+        phpstan.push_str(" [ERROR] Found 12 errors\n");
+
+        let mut clang_tidy = String::new();
+        for (f, line) in [
+            ("src/math.cpp", 12),
+            ("src/math.cpp", 24),
+            ("src/math.cpp", 36),
+            ("src/math.cpp", 48),
+            ("src/net.cpp", 15),
+            ("src/net.cpp", 30),
+            ("src/net.cpp", 45),
+            ("src/net.cpp", 60),
+        ] {
+            clang_tidy.push_str(&format!(
+                "/repo/{f}:{line}:10: warning: {line} is a magic number; consider replacing it with a named constant [readability-magic-numbers]\n   {line} |   return x * {line};\n      |              ^\n"
+            ));
+        }
+
+        let mut cppcheck = String::new();
+        for (f, line) in [
+            ("src/net.c", 14),
+            ("src/net.c", 28),
+            ("src/net.c", 42),
+            ("src/net.c", 56),
+            ("src/buf.c", 10),
+            ("src/buf.c", 22),
+            ("src/buf.c", 34),
+            ("src/buf.c", 46),
+        ] {
+            cppcheck.push_str(&format!(
+                "/repo/{f}:{line}:10: error: Null pointer dereference: ptr [nullPointer]\n return *ptr;\n         ^\n/repo/{f}:8:15: note: Assignment 'ptr=NULL', assigned value is 0\n int *ptr = NULL;\n               ^\n"
+            ));
+        }
+
+        let mut yamllint = String::new();
+        for f in [
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+            "config/app.yaml",
+        ] {
+            yamllint.push_str(&format!("{f}\n"));
+            for line in [12, 24, 36, 48] {
+                yamllint.push_str(&format!(
+                    "  {line}:81     warning  line too long (104 > 80 characters)  (line-length)\n"
+                ));
+            }
+            yamllint.push('\n');
+        }
+
+        let mut markdownlint = String::new();
+        for f in ["README.md", "docs/guide.md", "docs/reference.md"] {
+            for line in [10, 22, 34, 46] {
+                markdownlint.push_str(&format!(
+                    "{f}:{line}:81 MD013/line-length Line length [Expected: 80; Actual: 112]\n"
+                ));
+            }
+        }
+
+        let mut sqlfluff = String::new();
+        for f in [
+            "models/orders.sql",
+            "models/billing.sql",
+            "models/users.sql",
+        ] {
+            sqlfluff.push_str(&format!("== [{f}] FAIL\n"));
+            for line in [5, 14, 29, 42] {
+                sqlfluff.push_str(&format!(
+                    "L:  {line:2} | P:   5 | LT01 | Expected single whitespace between comma and next token. [layout.spacing]\n"
+                ));
+            }
+        }
+        sqlfluff.push_str("All Finished 📜 🎉!\n");
+
+        let mut ktlint = String::new();
+        for f in [
+            "/repo/src/main/kotlin/App.kt",
+            "/repo/src/main/kotlin/Service.kt",
+            "/repo/src/main/kotlin/Repo.kt",
+        ] {
+            for line in [4, 5, 6, 7] {
+                ktlint.push_str(&format!(
+                    "{f}:{line}:1: Wildcard import (cannot be auto-corrected) (standard:no-wildcard-imports)\n"
+                ));
+            }
+        }
+
+        let mut stylelint = String::new();
+        for f in [
+            "src/styles/app.css",
+            "src/styles/theme.css",
+            "src/styles/forms.css",
+        ] {
+            stylelint.push_str(&format!("{f}\n"));
+            for line in [12, 24, 36, 48] {
+                stylelint.push_str(&format!(
+                    " {line}:5   ✖  Expected \"#FFFFFF\" to be \"#ffffff\"         color-hex-case\n"
+                ));
+            }
+            stylelint.push('\n');
+        }
+        stylelint.push_str("✖ 12 problems (12 errors, 0 warnings)\n");
+
+        let mut deno = String::new();
+        for (f, line) in [
+            ("src/app.ts", 10),
+            ("src/app.ts", 22),
+            ("src/util.ts", 8),
+            ("src/util.ts", 19),
+            ("src/api.ts", 14),
+            ("src/api.ts", 28),
+        ] {
+            deno.push_str(&format!(
+                "error[no-unused-vars]: `tmp_{line}` is never used\n    at file:///repo/{f}:{line}:7\n  |\n{line} | const tmp_{line} = 1;\n  |       ^^^^^^\n  = hint: If this is intentional, prefix it with an underscore\n\n"
+            ));
+        }
+        deno.push_str("Found 6 problems\nChecked 12 files\n");
+
+        let mut ansible = String::from("WARNING  Listing 8 violation(s) that are fatal\n");
+        for (f, line) in [
+            ("playbooks/deploy.yml", 12),
+            ("playbooks/deploy.yml", 24),
+            ("playbooks/deploy.yml", 36),
+            ("playbooks/deploy.yml", 48),
+            ("roles/web/tasks/main.yml", 9),
+            ("roles/web/tasks/main.yml", 18),
+            ("roles/web/tasks/main.yml", 27),
+            ("roles/web/tasks/main.yml", 36),
+        ] {
+            ansible.push_str(&format!(
+                "fqcn[action-core]: Use FQCN for builtin module actions (copy).\n{f}:{line} Use `ansible.builtin.copy` instead.\n\n"
+            ));
+        }
+        ansible.push_str("Failed: 8 failure(s), 0 warning(s) on 6 files.\n");
+
+        let mut actionlint = String::new();
+        for (f, line) in [
+            (".github/workflows/ci.yml", 14),
+            (".github/workflows/ci.yml", 28),
+            (".github/workflows/ci.yml", 42),
+            (".github/workflows/release.yml", 19),
+            (".github/workflows/release.yml", 33),
+            (".github/workflows/deploy.yml", 22),
+        ] {
+            actionlint.push_str(&format!(
+                "{f}:{line}:9: label \"ubuntu-18.04\" is unknown. available labels are \"ubuntu-latest\", \"macos-latest\" [runner-label]\n   |\n{line} |     runs-on: ubuntu-18.04\n   |         ^~~~~~~~~~~~\n"
+            ));
+        }
+
+        let mut credo =
+            String::from("Checking 24 source files ...\n\n  Warnings - please take a look\n┃ \n");
+        for (f, line) in [
+            ("lib/my_app/orders.ex", 14),
+            ("lib/my_app/orders.ex", 28),
+            ("lib/my_app/orders.ex", 42),
+            ("lib/my_app/billing.ex", 19),
+            ("lib/my_app/billing.ex", 33),
+            ("lib/my_app/worker.ex", 11),
+            ("lib/my_app/worker.ex", 25),
+            ("lib/my_app/worker.ex", 39),
+        ] {
+            credo.push_str(&format!(
+                "┃ [W] ↗ `IO.inspect/1` should not be used in production code.\n┃       {f}:{line}:10 #(MyApp.Worker.run)\n"
+            ));
+        }
+        credo.push_str("\nPlease report incorrect results: https://github.com/rrrene/credo/issues\n\nAnalysis took 0.1 seconds (0.04s to load, 0.06s running 52 checks on 24 files)\n142 mods/funs, found 8 warnings.\n");
+
+        let cases: [(&str, &str, &str); 12] = [
+            ("phpstan", &phpstan, ""),
+            ("clang-tidy", &clang_tidy, ""),
+            ("cppcheck", "", &cppcheck),
+            ("yamllint", &yamllint, ""),
+            ("markdownlint", "", &markdownlint),
+            ("sqlfluff", &sqlfluff, ""),
+            ("ktlint", &ktlint, ""),
+            ("stylelint", &stylelint, ""),
+            ("deno", "", &deno),
+            ("ansible-lint", &ansible, ""),
+            ("actionlint", &actionlint, ""),
+            ("credo", &credo, ""),
+        ];
+        for (name, out, err) in cases {
+            let raw = out.len() + err.len();
+            let (report, _) = feed(out, err).finish(name, 4096, None).unwrap();
+            let saved = raw.saturating_sub(report.len());
+            let pct = (saved as f64 / raw as f64) * 100.0;
+            println!("{name:14} {raw:4} B -> {:4} B (-{pct:.1}%)", report.len());
+            assert!(
+                report.len() < raw,
+                "{name}: expected byte reduction, got {} >= {raw}",
+                report.len()
+            );
         }
     }
 }
