@@ -472,12 +472,646 @@ fn reasoning_present(request: &Value) -> bool {
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ReadRange {
+    Whole,
+    OffsetLimit(Option<u64>, Option<u64>),
+    LineSpan(Option<u64>, Option<u64>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TargetKey {
+    Read {
+        path: String,
+        range: ReadRange,
+    },
+    Bash {
+        command: String,
+        cwd: String,
+    },
+    Grep {
+        pattern: String,
+        path: String,
+        scope: String,
+    },
+    Glob {
+        pattern: String,
+        path: String,
+        scope: String,
+    },
+}
+
+impl TargetKey {
+    fn cue_label(&self) -> String {
+        match self {
+            Self::Read { path, range } => match range {
+                ReadRange::Whole
+                | ReadRange::OffsetLimit(None, None)
+                | ReadRange::LineSpan(None, None) => format!("Read {path}"),
+                ReadRange::OffsetLimit(Some(o), Some(l)) => {
+                    format!("Read {path} (offset {o}, limit {l})")
+                }
+                ReadRange::OffsetLimit(Some(o), None) => format!("Read {path} (offset {o})"),
+                ReadRange::OffsetLimit(None, Some(l)) => format!("Read {path} (limit {l})"),
+                ReadRange::LineSpan(Some(s), Some(e)) => format!("Read {path} (L{s}-{e})"),
+                ReadRange::LineSpan(Some(s), None) => format!("Read {path} (L{s}+)"),
+                ReadRange::LineSpan(None, Some(e)) => format!("Read {path} (L1-{e})"),
+            },
+            Self::Bash { command, .. } => format!("Bash {command}"),
+            Self::Grep { pattern, path, .. } => {
+                if path.is_empty() {
+                    format!("Grep {pattern}")
+                } else {
+                    format!("Grep {pattern} in {path}")
+                }
+            }
+            Self::Glob { pattern, path, .. } => {
+                if path.is_empty() {
+                    format!("Glob {pattern}")
+                } else {
+                    format!("Glob {pattern} in {path}")
+                }
+            }
+        }
+    }
+}
+
+fn normalize_target_path(raw: &str) -> Option<String> {
+    let mut s = raw.trim();
+    if let Some(rest) = s.strip_prefix("file://") {
+        s = rest;
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let mut collapsed = String::with_capacity(s.len());
+    let mut prev_slash = false;
+    for ch in s.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+                prev_slash = true;
+            }
+        } else {
+            prev_slash = false;
+            collapsed.push(ch);
+        }
+    }
+    let mut view = collapsed.as_str();
+    while let Some(rest) = view.strip_prefix("./") {
+        if rest.is_empty() {
+            break;
+        }
+        view = rest;
+    }
+    if view.len() > 1 {
+        view = view.trim_end_matches('/');
+    }
+    (!view.is_empty()).then(|| view.to_owned())
+}
+
+fn normalize_command(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut pending_space = false;
+    for ch in trimmed.chars() {
+        if escaped {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if !in_single && ch == '\\' {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+            escaped = true;
+            continue;
+        }
+        if !in_double && ch == '\'' {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+                pending_space = false;
+            }
+            in_single = !in_single;
+            out.push(ch);
+            continue;
+        }
+        if !in_single && ch == '"' {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+                pending_space = false;
+            }
+            in_double = !in_double;
+            out.push(ch);
+            continue;
+        }
+        if !in_single && !in_double && ch.is_ascii_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn is_supersedable_bash_command(cmd: &str) -> bool {
+    let Some(tokens) = shlex::split(cmd) else {
+        return false;
+    };
+    if tokens.is_empty() {
+        return false;
+    }
+    // Check unquoted redirections in raw command (reject file writes/appends, allow 2>&1 & /dev/null).
+    {
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+        let bytes = cmd.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if !in_single && b == b'\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if !in_double && b == b'\'' {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if !in_single && b == b'"' {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+            if !in_single && !in_double && b == b'>' {
+                let rest = &cmd[i + 1..];
+                if rest.starts_with('>') {
+                    return false;
+                }
+                let after = rest.trim_start();
+                let safe_dup = rest.starts_with("&1") || rest.starts_with("&2");
+                let safe_null = after.starts_with("/dev/null");
+                if !safe_dup && !safe_null {
+                    return false;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Split on shell control operators (&&, ||, ;, |) and validate each segment.
+    let mut segments: Vec<Vec<&str>> = vec![Vec::new()];
+    for tok in &tokens {
+        if matches!(tok.as_str(), "&&" | "||" | ";" | "|") {
+            if !segments.last().is_some_and(Vec::is_empty) {
+                segments.push(Vec::new());
+            }
+        } else {
+            segments.last_mut().unwrap().push(tok.as_str());
+        }
+    }
+    for seg in segments {
+        if seg.is_empty() {
+            continue;
+        }
+        // Skip leading env assignments (`KEY=VAL`) and common transparent wrappers.
+        let mut idx = 0;
+        while idx < seg.len() {
+            let w = seg[idx];
+            if w.contains('=') && !w.starts_with('-') && !w.starts_with('=') {
+                idx += 1;
+                continue;
+            }
+            if matches!(w, "env" | "command" | "nice" | "nohup" | "time") {
+                idx += 1;
+                continue;
+            }
+            if w == "justless" && seg.get(idx + 1) == Some(&"run") {
+                idx += 2;
+                while idx < seg.len() && seg[idx] != "--" {
+                    idx += 1;
+                }
+                if idx < seg.len() && seg[idx] == "--" {
+                    idx += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        let words = &seg[idx..];
+        let Some(&first) = words.first() else {
+            continue;
+        };
+        let prog = std::path::Path::new(first)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first);
+        let rest = &words[1..];
+        if matches!(
+            prog,
+            "rm" | "rmdir"
+                | "mv"
+                | "cp"
+                | "chmod"
+                | "chown"
+                | "touch"
+                | "mkdir"
+                | "ln"
+                | "dd"
+                | "kill"
+                | "pkill"
+                | "killall"
+                | "tee"
+                | "truncate"
+        ) {
+            return false;
+        }
+        let sub = rest.iter().copied().find(|w| !w.starts_with('-'));
+        match prog {
+            "git" => {
+                if matches!(
+                    sub,
+                    Some(
+                        "commit"
+                            | "push"
+                            | "pull"
+                            | "fetch"
+                            | "merge"
+                            | "rebase"
+                            | "reset"
+                            | "checkout"
+                            | "switch"
+                            | "cherry-pick"
+                            | "revert"
+                            | "stash"
+                            | "tag"
+                            | "apply"
+                            | "am"
+                            | "clean"
+                            | "add"
+                            | "rm"
+                            | "mv"
+                            | "init"
+                            | "clone"
+                    )
+                ) {
+                    return false;
+                }
+            }
+            "kubectl" | "oc" => {
+                if matches!(
+                    sub,
+                    Some(
+                        "apply"
+                            | "create"
+                            | "delete"
+                            | "patch"
+                            | "replace"
+                            | "scale"
+                            | "rollout"
+                            | "edit"
+                            | "drain"
+                            | "cordon"
+                            | "uncordon"
+                            | "taint"
+                            | "label"
+                            | "annotate"
+                            | "exec"
+                            | "cp"
+                    )
+                ) {
+                    return false;
+                }
+            }
+            "terraform" | "tofu" => {
+                if matches!(
+                    sub,
+                    Some("apply" | "destroy" | "import" | "taint" | "untaint" | "force-unlock")
+                ) {
+                    return false;
+                }
+                if sub == Some("state") {
+                    let sub2 = rest.iter().copied().filter(|w| !w.starts_with('-')).nth(1);
+                    if !matches!(sub2, Some("list" | "show" | "pull")) {
+                        return false;
+                    }
+                }
+            }
+            "helm" => {
+                if matches!(sub, Some("install" | "upgrade" | "uninstall" | "rollback")) {
+                    return false;
+                }
+            }
+            "docker" | "podman" => {
+                if matches!(
+                    sub,
+                    Some(
+                        "rm" | "rmi"
+                            | "kill"
+                            | "stop"
+                            | "start"
+                            | "restart"
+                            | "push"
+                            | "exec"
+                            | "run"
+                    )
+                ) {
+                    return false;
+                }
+            }
+            "npm" | "pnpm" | "yarn" => {
+                if matches!(sub, Some("publish" | "unpublish" | "version" | "init")) {
+                    return false;
+                }
+            }
+            "cargo" => {
+                if matches!(sub, Some("publish" | "yank" | "owner" | "login")) {
+                    return false;
+                }
+            }
+            "gh" | "glab" => {
+                let mut pos = rest.iter().copied().filter(|w| !w.starts_with('-'));
+                let _noun = pos.next();
+                let verb = pos.next();
+                if matches!(
+                    verb,
+                    Some(
+                        "create"
+                            | "edit"
+                            | "delete"
+                            | "close"
+                            | "reopen"
+                            | "merge"
+                            | "comment"
+                            | "review"
+                            | "approve"
+                    )
+                ) {
+                    return false;
+                }
+            }
+            "curl" | "wget" => {
+                for (i, &arg) in rest.iter().enumerate() {
+                    if matches!(
+                        arg,
+                        "-d" | "--data"
+                            | "--data-raw"
+                            | "--data-binary"
+                            | "--data-urlencode"
+                            | "-F"
+                            | "--form"
+                            | "-T"
+                            | "--upload-file"
+                            | "--json"
+                    ) || arg.starts_with("--data=")
+                        || arg.starts_with("--json=")
+                    {
+                        return false;
+                    }
+                    if matches!(arg, "-X" | "--request")
+                        && let Some(&method) = rest.get(i + 1)
+                        && !method.eq_ignore_ascii_case("GET")
+                        && !method.eq_ignore_ascii_case("HEAD")
+                    {
+                        return false;
+                    }
+                    if let Some(method) = arg
+                        .strip_prefix("-X")
+                        .filter(|m| !m.is_empty())
+                        .or_else(|| arg.strip_prefix("--request="))
+                        && !method.eq_ignore_ascii_case("GET")
+                        && !method.eq_ignore_ascii_case("HEAD")
+                    {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn parse_input_map(input: Option<&Value>) -> Option<Cow<'_, serde_json::Map<String, Value>>> {
+    match input? {
+        Value::Object(map) => Some(Cow::Borrowed(map)),
+        Value::String(s) => match serde_json::from_str::<Value>(s).ok()? {
+            Value::Object(map) => Some(Cow::Owned(map)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn first_str_field<'a>(map: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|k| map.get(*k).and_then(Value::as_str))
+}
+
+fn has_non_null_field(map: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|k| map.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+fn opt_u64_field(
+    map: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> std::result::Result<Option<u64>, ()> {
+    for key in keys {
+        if let Some(val) = map.get(*key)
+            && !val.is_null()
+        {
+            if let Some(n) = val.as_u64() {
+                return Ok(Some(n));
+            }
+            if let Some(s) = val.as_str()
+                && let Ok(n) = s.trim().parse::<u64>()
+            {
+                return Ok(Some(n));
+            }
+            return Err(());
+        }
+    }
+    Ok(None)
+}
+
+fn scope_fingerprint(map: &serde_json::Map<String, Value>, keys: &[&str]) -> String {
+    let mut out = String::new();
+    for key in keys {
+        if let Some(val) = map.get(*key)
+            && !val.is_null()
+        {
+            if !out.is_empty() {
+                out.push('\0');
+            }
+            out.push_str(key);
+            out.push('=');
+            if let Ok(encoded) = serde_json::to_string(val) {
+                out.push_str(&encoded);
+            }
+        }
+    }
+    out
+}
+
+fn extract_target_key(tool: &str, input: Option<&Value>) -> Option<TargetKey> {
+    let map = parse_input_map(input)?;
+    let name = tool.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "read" | "read_file" | "view_file" => {
+            if has_non_null_field(&map, &["pages", "ByteOffset", "byte_offset"]) {
+                return None;
+            }
+            let raw_path = first_str_field(
+                &map,
+                &[
+                    "file_path",
+                    "filePath",
+                    "path",
+                    "Path",
+                    "AbsolutePath",
+                    "file",
+                ],
+            )?;
+            let path = normalize_target_path(raw_path)?;
+            let range = if has_non_null_field(
+                &map,
+                &[
+                    "StartLine",
+                    "start_line",
+                    "startLine",
+                    "EndLine",
+                    "end_line",
+                    "endLine",
+                ],
+            ) {
+                let start = opt_u64_field(&map, &["StartLine", "start_line", "startLine"]).ok()?;
+                let end = opt_u64_field(&map, &["EndLine", "end_line", "endLine"]).ok()?;
+                if start.is_none() && end.is_none() {
+                    ReadRange::Whole
+                } else {
+                    ReadRange::LineSpan(start, end)
+                }
+            } else {
+                let offset = opt_u64_field(&map, &["offset", "Offset"]).ok()?;
+                let limit = opt_u64_field(&map, &["limit", "Limit"]).ok()?;
+                if offset.is_none() && limit.is_none() {
+                    ReadRange::Whole
+                } else {
+                    ReadRange::OffsetLimit(offset, limit)
+                }
+            };
+            Some(TargetKey::Read { path, range })
+        }
+        "bash" | "run_command" | "exec_command" | "shell" | "sh" | "terminal" => {
+            let raw_cmd = first_str_field(&map, &["command", "CommandLine", "cmd", "script"])?;
+            let command = normalize_command(raw_cmd)?;
+            if !is_supersedable_bash_command(&command) {
+                return None;
+            }
+            let cwd = first_str_field(&map, &["cwd", "workdir", "Cwd", "working_directory"])
+                .and_then(normalize_target_path)
+                .unwrap_or_default();
+            Some(TargetKey::Bash { command, cwd })
+        }
+        "grep" | "grep_search" | "ripgrep" | "rg" => {
+            let pattern = first_str_field(&map, &["pattern", "Query", "query", "regex"])?
+                .trim()
+                .to_owned();
+            if pattern.is_empty() {
+                return None;
+            }
+            let path = first_str_field(
+                &map,
+                &["path", "SearchPath", "directory", "dir", "cwd", "file"],
+            )
+            .and_then(normalize_target_path)
+            .unwrap_or_default();
+            let scope = scope_fingerprint(
+                &map,
+                &[
+                    "-A",
+                    "-B",
+                    "-C",
+                    "-i",
+                    "-n",
+                    "CaseInsensitive",
+                    "FixedStrings",
+                    "Includes",
+                    "MatchPerLine",
+                    "context",
+                    "glob",
+                    "head_limit",
+                    "include",
+                    "multiline",
+                    "offset",
+                    "output_mode",
+                    "type",
+                ],
+            );
+            Some(TargetKey::Grep {
+                pattern,
+                path,
+                scope,
+            })
+        }
+        "glob" | "find_by_name" | "list_files" => {
+            let pattern = first_str_field(&map, &["pattern", "Pattern", "glob"])?
+                .trim()
+                .to_owned();
+            if pattern.is_empty() {
+                return None;
+            }
+            let path = first_str_field(
+                &map,
+                &["path", "SearchDirectory", "directory", "dir", "cwd"],
+            )
+            .and_then(normalize_target_path)
+            .unwrap_or_default();
+            let scope = scope_fingerprint(
+                &map,
+                &["Excludes", "Extensions", "MaxDepth", "Type", "type"],
+            );
+            Some(TargetKey::Glob {
+                pattern,
+                path,
+                scope,
+            })
+        }
+        _ => None,
+    }
+}
+
 // JSON pointers refer only to array indices and fixed field names; no user-provided keys.
 struct Output {
     path: String,
     call: String,
     tool: String,
     protected: bool,
+    target: Option<TargetKey>,
 }
 
 fn outputs(request: &Value) -> Result<Vec<Output>> {
@@ -490,30 +1124,39 @@ fn outputs(request: &Value) -> Result<Vec<Output>> {
     } else {
         anyhow::bail!("expected a request with messages or input");
     };
-    let mut names = HashMap::new();
+    let mut calls: HashMap<Option<&str>, (&Value, Option<&Value>)> = HashMap::new();
     let mut out = vec![];
     for (i, m) in messages.iter().enumerate() {
         let base = format!("/{key}/{i}");
-        let mut add = |path: String, call: &Value, tool: &Value, protected: bool| {
-            if let Some(id) = call.as_str() {
-                out.push(Output {
-                    path,
-                    call: id.to_owned(),
-                    tool: tool.as_str().unwrap_or("").to_owned(),
-                    protected,
-                });
-            }
-        };
+        let mut add =
+            |path: String, call: &Value, tool: &Value, protected: bool, input: Option<&Value>| {
+                if let Some(id) = call.as_str() {
+                    let tool_name = tool.as_str().unwrap_or("").to_owned();
+                    let target = if !tool_name.is_empty() {
+                        extract_target_key(&tool_name, input)
+                    } else {
+                        None
+                    };
+                    out.push(Output {
+                        path,
+                        call: id.to_owned(),
+                        tool: tool_name,
+                        protected,
+                        target,
+                    });
+                }
+            };
         if key == "input" {
             match m["type"].as_str() {
                 Some("function_call") => {
-                    names.insert(m["call_id"].as_str(), &m["name"]);
+                    calls.insert(m["call_id"].as_str(), (&m["name"], m.get("arguments")));
                 }
                 Some("function_call_output") => add(
                     format!("{base}/output"),
                     &m["call_id"],
                     &Value::Null,
                     m["status"] == "incomplete",
+                    None,
                 ),
                 _ => {}
             }
@@ -536,13 +1179,17 @@ fn outputs(request: &Value) -> Result<Vec<Output>> {
                         &p["callID"],
                         &p["tool"],
                         attached || state["status"] == "error",
+                        state.get("input").or_else(|| p.get("input")),
                     );
                 }
             }
         }
         if m["role"] == "assistant" {
             for call in m["tool_calls"].as_array().into_iter().flatten() {
-                names.insert(call["id"].as_str(), &call["function"]["name"]);
+                calls.insert(
+                    call["id"].as_str(),
+                    (&call["function"]["name"], call["function"].get("arguments")),
+                );
             }
             for block in m["content"]
                 .as_array()
@@ -550,7 +1197,7 @@ fn outputs(request: &Value) -> Result<Vec<Output>> {
                 .flatten()
                 .filter(|b| b["type"] == "tool_use")
             {
-                names.insert(block["id"].as_str(), &block["name"]);
+                calls.insert(block["id"].as_str(), (&block["name"], block.get("input")));
             }
         } else if m["role"] == "tool" {
             add(
@@ -558,6 +1205,7 @@ fn outputs(request: &Value) -> Result<Vec<Output>> {
                 &m["tool_call_id"],
                 &m["name"],
                 false,
+                None,
             );
         } else if m["role"] == "user"
             && let Some(blocks) = m["content"].as_array()
@@ -572,15 +1220,21 @@ fn outputs(request: &Value) -> Result<Vec<Output>> {
                     &b["tool_use_id"],
                     &Value::Null,
                     b["is_error"] == true,
+                    None,
                 );
             }
         }
     }
     for o in &mut out {
-        if o.tool.is_empty()
-            && let Some(name) = names.get(&Some(o.call.as_str())).and_then(|v| v.as_str())
-        {
-            o.tool = name.to_owned();
+        if let Some(&(name, input)) = calls.get(&Some(o.call.as_str())) {
+            if o.tool.is_empty()
+                && let Some(name) = name.as_str()
+            {
+                o.tool = name.to_owned();
+            }
+            if o.target.is_none() && !o.tool.is_empty() {
+                o.target = extract_target_key(&o.tool, input);
+            }
         }
     }
     Ok(out)
@@ -955,18 +1609,120 @@ fn wrap_stub(kind: &str, text: String) -> Value {
     }
 }
 
+static NONZERO_EXIT_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:command exited with (?:code|status)|exit (?:code|status):?)\s+(-?[1-9][0-9]*)\b",
+    )
+    .expect("valid nonzero exit pattern")
+});
+
+fn looks_like_error_result(text: &str, target: Option<&TargetKey>) -> bool {
+    if let Some(first) = text
+        .lines()
+        .map(strip_ansi)
+        .map(|l| l.trim().to_owned())
+        .find(|l| !l.is_empty())
+        && (first.starts_with("<tool_use_error>")
+            || first.starts_with("Encountered error in tool execution:")
+            || first.starts_with("Error: ENOENT")
+            || first.starts_with("Error: EACCES")
+            || first.starts_with("Error: EISDIR")
+            || first.starts_with("File does not exist")
+            || first.starts_with("No such file or directory")
+            || (text.len() < 512 && (first.starts_with("Error:") || first.starts_with("error:"))))
+    {
+        return true;
+    }
+    if !matches!(target, Some(TargetKey::Bash { .. })) {
+        return false;
+    }
+    let mut seen = 0usize;
+    for line in text.lines().rev() {
+        let plain = strip_ansi(line);
+        let trimmed = plain.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        seen += 1;
+        if let Some(caps) = RUN_FOOTER.captures(trimmed) {
+            let detail = caps
+                .get(2)
+                .or_else(|| caps.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            if let Some(m) = EXIT_CODE.find(detail)
+                && m.as_str() != "exit 0"
+            {
+                return true;
+            }
+            if seen <= 10 {
+                return false;
+            }
+        }
+        if NONZERO_EXIT_LINE.is_match(trimmed) {
+            return true;
+        }
+        if trimmed.starts_with("test result: FAILED")
+            || trimmed.starts_with("error: could not compile")
+            || trimmed.starts_with("error: test failed")
+            || trimmed.starts_with("FAIL\t")
+            || (trimmed.starts_with("===")
+                && trimmed.contains(" failed")
+                && trimmed.ends_with("==="))
+            || ((trimmed.starts_with("Tests:") || trimmed.starts_with("Test Files"))
+                && trimmed.contains("failed"))
+        {
+            return true;
+        }
+        if seen >= 20 {
+            break;
+        }
+    }
+    false
+}
+
 fn build_stub(
     original: &Value,
     kind: &str,
     id: &str,
     original_bytes: usize,
     redactor: Option<&crate::redact::Redactor>,
+    superseded_target: Option<&TargetKey>,
 ) -> Result<Value> {
     let bare = wrap_stub(kind, format!("{PREFIX}{id}]"));
     let Some(text) = text_content(original) else {
         return Ok(bare);
     };
-    let Some(cue) = semantic_cue(&text, redactor) else {
+    let cue = if let Some(target) = superseded_target {
+        let detail = match target {
+            TargetKey::Read { .. } | TargetKey::Grep { .. } | TargetKey::Glob { .. } => {
+                extract_outline_header(&text, redactor)
+            }
+            TargetKey::Bash { .. } => semantic_cue(&text, redactor),
+        }
+        .or_else(|| {
+            let raw = target.cue_label();
+            let clean = redact_line(redactor, &raw);
+            let bounded = truncate_chars(&clean, MAX_CUE_CHARS);
+            (!bounded.is_empty()).then_some(bounded)
+        });
+        let combined = match detail {
+            Some(detail) => {
+                let budget = MAX_COMBINED_CUE_CHARS.saturating_sub("superseded ".len());
+                let short = truncate_chars(&detail, budget);
+                if short.is_empty() {
+                    "superseded".to_owned()
+                } else {
+                    format!("superseded {short}")
+                }
+            }
+            None => "superseded".to_owned(),
+        };
+        Some(combined)
+    } else {
+        semantic_cue(&text, redactor)
+    };
+    let Some(cue) = cue else {
         return Ok(bare);
     };
     let enriched = wrap_stub(kind, format!("{PREFIX}{id} · {cue}]"));
@@ -975,10 +1731,20 @@ fn build_stub(
         && enriched_bytes.saturating_mul(100) < original_bytes.saturating_mul(MAX_ENRICHED_PERCENT)
     {
         debug_assert_eq!(marker(&enriched), Some(id));
-        Ok(enriched)
-    } else {
-        Ok(bare)
+        return Ok(enriched);
     }
+    if superseded_target.is_some() && cue != "superseded" {
+        let compact = wrap_stub(kind, format!("{PREFIX}{id} · superseded]"));
+        let compact_bytes = serde_json::to_vec(&compact)?.len();
+        if compact_bytes < original_bytes
+            && compact_bytes.saturating_mul(100)
+                < original_bytes.saturating_mul(MAX_ENRICHED_PERCENT)
+        {
+            debug_assert_eq!(marker(&compact), Some(id));
+            return Ok(compact);
+        }
+    }
+    Ok(bare)
 }
 
 fn marker(value: &Value) -> Option<&str> {
@@ -1050,7 +1816,11 @@ struct MaskOptions<'a> {
 
 enum Change {
     Restore(Value),
-    Retire { kind: String, bytes: usize },
+    Retire {
+        kind: String,
+        bytes: usize,
+        superseded: Option<TargetKey>,
+    },
 }
 
 fn mask_request(
@@ -1068,17 +1838,58 @@ fn mask_request(
     };
     let mut digests: Vec<Option<String>> = Vec::new();
     let mut last_occurrence: HashMap<String, usize> = HashMap::new();
+    let mut superseded: Vec<bool> = Vec::new();
     if !opts.restore {
         digests.reserve(candidates.len());
+        let mut valid_superseder = vec![false; candidates.len()];
         for (index, c) in candidates.iter().enumerate() {
-            let digest = request
+            let value = request
                 .pointer(&c.path)
-                .filter(|value| marker(value).is_none())
-                .and_then(content_digest);
+                .filter(|value| marker(value).is_none());
+            let digest = value.and_then(content_digest);
             if let Some(d) = &digest {
                 last_occurrence.insert(d.clone(), index);
             }
             digests.push(digest);
+            if !c.protected
+                && c.target.is_some()
+                && let Some(text) = value.and_then(text_content)
+                && !looks_like_error_result(&text, c.target.as_ref())
+            {
+                valid_superseder[index] = true;
+            }
+        }
+        // Scan backward to find the earliest later non-error call superseding each target.
+        // Requiring `earliest - index <= opts.keep` retires every in-window superseded result
+        // while keeping stubs for already-past-cutoff turns byte-identical across future turns.
+        superseded = vec![false; candidates.len()];
+        let mut next_exact: HashMap<&TargetKey, usize> = HashMap::new();
+        let mut next_whole_read: HashMap<&str, usize> = HashMap::new();
+        for index in (0..candidates.len()).rev() {
+            if let Some(target) = &candidates[index].target {
+                let exact_j = next_exact.get(target).copied();
+                let whole_j = match target {
+                    TargetKey::Read { path, .. } => next_whole_read.get(path.as_str()).copied(),
+                    _ => None,
+                };
+                let earliest_j = match (exact_j, whole_j) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if earliest_j.is_some_and(|j| j - index <= opts.keep) {
+                    superseded[index] = true;
+                }
+                if valid_superseder[index] {
+                    next_exact.insert(target, index);
+                    if let TargetKey::Read {
+                        path,
+                        range: ReadRange::Whole,
+                    } = target
+                    {
+                        next_whole_read.insert(path.as_str(), index);
+                    }
+                }
+            }
         }
     }
     let mut changes: Vec<(&str, Change)> = Vec::new();
@@ -1099,13 +1910,14 @@ fn mask_request(
         if !allowed(c) || marker(value).is_some() {
             continue;
         }
-        // Earlier identical copies are retired even inside the `keep` window
-        // because the exact text remains verbatim at the latest occurrence.
+        // Earlier identical copies and superseded same-target results are retired
+        // even inside the `keep` window because the latest occurrence stays verbatim.
         let is_duplicate = digests[index]
             .as_ref()
             .and_then(|d| last_occurrence.get(d))
             .is_some_and(|&last| index < last);
-        if index >= cutoff && !is_duplicate {
+        let is_superseded = superseded[index];
+        if index >= cutoff && !is_duplicate && !is_superseded {
             continue;
         }
         // The archive holds valid JSON, so a result with a lone surrogate stays.
@@ -1132,6 +1944,7 @@ fn mask_request(
             Change::Retire {
                 kind: kind.to_owned(),
                 bytes,
+                superseded: is_superseded.then(|| c.target.clone()).flatten(),
             },
         ));
     }
@@ -1144,10 +1957,14 @@ fn mask_request(
         let original = request.pointer_mut(path).context("missing result field")?;
         let next = match change {
             Change::Restore(value) => value,
-            Change::Retire { kind, bytes } => {
+            Change::Retire {
+                kind,
+                bytes,
+                superseded,
+            } => {
                 let id = archive(ws, original)?;
                 let redactor = *redactor.get_or_insert_with(|| crate::redact::for_workspace(ws));
-                build_stub(original, &kind, &id, bytes, redactor)?
+                build_stub(original, &kind, &id, bytes, redactor, superseded.as_ref())?
             }
         };
         saved_bytes +=
@@ -1740,6 +2557,7 @@ mod tests {
             &id,
             orig_bytes,
             crate::redact::for_workspace(&ws),
+            None,
         )
         .unwrap();
         assert_eq!(stub, json!(format!("{PREFIX}{id}]")));
@@ -1836,6 +2654,643 @@ mod tests {
         assert_eq!(
             marker(&json!(format!("{PREFIX}{id} · line1\nline2]"))),
             None
+        );
+    }
+
+    fn tool_messages_with_inputs(results: &[(&str, &str, Value, Value, bool)]) -> Value {
+        let mut messages = vec![json!({"role":"user","content":"investigate"})];
+        for (call_id, tool, input, content, is_error) in results {
+            messages.push(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":call_id,"name":tool,"input":input}
+            ]}));
+            let mut result = json!({"type":"tool_result","tool_use_id":call_id,"content":content});
+            if *is_error {
+                result["is_error"] = json!(true);
+            }
+            messages.push(json!({"role":"user","content":[result]}));
+        }
+        json!({"model":"claude-sonnet-4-6","messages":messages})
+    }
+
+    #[test]
+    fn retires_superseded_same_file_read_after_edit_inside_keep_window_and_restores_exact() {
+        let (_dir, ws) = test_workspace();
+        let pre_edit =
+            "pub fn handle_agent_hook() -> usize {\n    let count = 1;\n    count\n}\n".repeat(600);
+        let post_edit =
+            "pub fn handle_agent_hook() -> usize {\n    let count = 2;\n    count\n}\n".repeat(600);
+        assert_ne!(pre_edit, post_edit);
+        assert!(pre_edit.len() > 35_000);
+
+        let original = tool_messages_with_inputs(&[
+            (
+                "r1",
+                "Read",
+                json!({"file_path": "src/agents.rs"}),
+                json!(pre_edit),
+                false,
+            ),
+            (
+                "e1",
+                "Edit",
+                json!({"file_path": "src/agents.rs"}),
+                json!("edited src/agents.rs"),
+                false,
+            ),
+            (
+                "r2",
+                "Read",
+                json!({"file_path": "./src//agents.rs"}),
+                json!(post_edit),
+                false,
+            ),
+        ]);
+
+        // All 3 results sit inside keep=3, yet r1 is superseded by r2.
+        let mut masked = original.clone();
+        let (changed, saved) = mask_request(&ws, &mut masked, None, &default_opts(3)).unwrap();
+        assert_eq!(changed, 1);
+        assert!(saved > 35_000, "saved={saved}");
+
+        let s0 = masked["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        let s1 = &masked["messages"][4]["content"][0]["content"];
+        let s2 = &masked["messages"][6]["content"][0]["content"];
+
+        assert!(
+            s0.starts_with(PREFIX) && s0.contains(" · superseded Read src/agents.rs]"),
+            "unexpected superseded stub: {s0}"
+        );
+        let id0 = marker(&masked["messages"][2]["content"][0]["content"]).expect("r1 stub marker");
+        assert_eq!(s1, &json!("edited src/agents.rs"));
+        assert_eq!(s2, &json!(post_edit), "latest read must stay verbatim");
+        assert_eq!(recover(&ws, id0).unwrap(), json!(pre_edit));
+
+        // Idempotent when re-masked, and lossless under --restore.
+        let mut remasked = masked.clone();
+        let (again, _) = mask_request(&ws, &mut remasked, None, &default_opts(3)).unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(remasked, masked);
+
+        let mut restored = masked.clone();
+        let mut restore_opts = default_opts(3);
+        restore_opts.restore = true;
+        mask_request(&ws, &mut restored, None, &restore_opts).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn ranged_read_supersession_respects_offsets_and_whole_file_coverage() {
+        let (_dir, ws) = test_workspace();
+        let chunk_a = "line in chunk A\n".repeat(120);
+        let chunk_b = "line in chunk B\n".repeat(120);
+        let chunk_a_v2 = "updated line in chunk A\n".repeat(120);
+        let whole_v1 = "whole file v1\n".repeat(140);
+        let whole_v2 = "whole file v2\n".repeat(140);
+
+        // 1. Different line ranges are NEVER superseded by each other.
+        let diff_ranges = tool_messages_with_inputs(&[
+            (
+                "r1",
+                "Read",
+                json!({"file_path": "src/lib.rs", "offset": 1, "limit": 50}),
+                json!(chunk_a),
+                false,
+            ),
+            (
+                "r2",
+                "Read",
+                json!({"file_path": "src/lib.rs", "offset": 51, "limit": 50}),
+                json!(chunk_b),
+                false,
+            ),
+        ]);
+        let mut masked = diff_ranges.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 0);
+        assert_eq!(masked, diff_ranges);
+
+        // 2. Partial read NEVER supersedes an earlier whole-file read.
+        let whole_then_partial = tool_messages_with_inputs(&[
+            (
+                "r1",
+                "Read",
+                json!({"file_path": "src/lib.rs"}),
+                json!(whole_v1),
+                false,
+            ),
+            (
+                "r2",
+                "Read",
+                json!({"file_path": "src/lib.rs", "offset": 10, "limit": 50}),
+                json!(chunk_a),
+                false,
+            ),
+        ]);
+        let mut masked = whole_then_partial.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 0);
+
+        // 3. Same (path, offset, limit) supersedes the earlier read.
+        let same_range = tool_messages_with_inputs(&[
+            (
+                "r1",
+                "Read",
+                json!({"file_path": "src/lib.rs", "offset": 10, "limit": 50}),
+                json!(chunk_a),
+                false,
+            ),
+            (
+                "r2",
+                "Read",
+                json!({"file_path": "src/lib.rs", "offset": 10, "limit": 50}),
+                json!(chunk_a_v2),
+                false,
+            ),
+        ]);
+        let mut masked = same_range.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        let s0 = masked["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(s0.contains(" · superseded Read src/lib.rs"), "{s0}");
+        assert_eq!(
+            masked["messages"][4]["content"][0]["content"],
+            json!(chunk_a_v2)
+        );
+
+        // 4. Later whole-file read supersedes earlier partial reads of the same path.
+        let partial_then_whole = tool_messages_with_inputs(&[
+            (
+                "r1",
+                "read_file",
+                json!({"Path": "src/lib.rs", "StartLine": 10, "EndLine": 60}),
+                json!(chunk_a),
+                false,
+            ),
+            (
+                "r2",
+                "read_file",
+                json!({"Path": "src/lib.rs"}),
+                json!(whole_v2),
+                false,
+            ),
+        ]);
+        let mut masked = partial_then_whole.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        let s0 = masked["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            s0.contains(" · superseded Read src/lib.rs (L10-60)]"),
+            "{s0}"
+        );
+        assert_eq!(
+            masked["messages"][4]["content"][0]["content"],
+            json!(whole_v2)
+        );
+    }
+
+    #[test]
+    fn superseded_bash_grep_glob_error_guards_and_secret_redaction() {
+        let (_dir, ws) = test_workspace();
+        let fail_a = format!(
+            "{}error[E0308]: mismatched types\n\
+             test result: FAILED. 10 passed; 1 failed\n\
+             [justless run-Aa11 · 1.2 KB of 8.0 KB shown · exit 101]\n",
+            "   Compiling app v0.1.0\n".repeat(80)
+        );
+        let fail_b = format!(
+            "{}error[E0425]: cannot find value `x`\n\
+             test result: FAILED. 10 passed; 1 failed\n\
+             [justless run-Bb22 · 1.2 KB of 8.0 KB shown · exit 101]\n",
+            "   Compiling app v0.1.0\n".repeat(80)
+        );
+        let pass_run = format!(
+            "{}test result: ok. 11 passed; 0 failed\n\
+             [justless run-Cc33 · 1.1 KB of 7.0 KB shown · exit 0]\n",
+            "   Compiling app v0.1.0\n".repeat(80)
+        );
+
+        // 1. Two different failing runs: later error must NOT supersede earlier error.
+        let two_errors = tool_messages_with_inputs(&[
+            (
+                "b1",
+                "Bash",
+                json!({"command": "cargo test"}),
+                json!(fail_a),
+                false,
+            ),
+            (
+                "b2",
+                "Bash",
+                json!({"command": "cargo test"}),
+                json!(fail_b),
+                false,
+            ),
+        ]);
+        let mut masked = two_errors.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 0);
+
+        // 2. Failing run followed by passing run of same command: earlier failing run retires!
+        let fail_then_pass = tool_messages_with_inputs(&[
+            (
+                "b1",
+                "Bash",
+                json!({"command": "cargo   test"}),
+                json!(fail_a),
+                false,
+            ),
+            (
+                "b2",
+                "Bash",
+                json!({"command": "cargo test"}),
+                json!(pass_run),
+                false,
+            ),
+        ]);
+        let mut masked = fail_then_pass.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        let s0 = masked["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            s0.contains(" · superseded run-Aa11 · exit 101 · error[E0308]"),
+            "{s0}"
+        );
+        assert_eq!(
+            masked["messages"][4]["content"][0]["content"],
+            json!(pass_run)
+        );
+
+        // 3. `is_error: true` result stays protected even when followed by a passing run.
+        let protected_err = tool_messages_with_inputs(&[
+            (
+                "b1",
+                "Bash",
+                json!({"command": "cargo test"}),
+                json!(fail_a),
+                true,
+            ),
+            (
+                "b2",
+                "Bash",
+                json!({"command": "cargo test"}),
+                json!(pass_run),
+                false,
+            ),
+        ]);
+        let mut masked = protected_err.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 0);
+
+        // 4. Mutating bash commands are never superseded.
+        let mutating = tool_messages_with_inputs(&[
+            (
+                "m1",
+                "Bash",
+                json!({"command": "curl -X POST https://api.example.com/jobs -d '{}'"}),
+                json!("job-1 created\n".repeat(120)),
+                false,
+            ),
+            (
+                "m2",
+                "Bash",
+                json!({"command": "curl -X POST https://api.example.com/jobs -d '{}'"}),
+                json!("job-2 created\n".repeat(120)),
+                false,
+            ),
+        ]);
+        let mut masked = mutating.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 0);
+
+        // 5. Grep & Glob retire same target, but keep differing scopes separate.
+        let grep_a = "src/a.rs:10:needle match v1\n".repeat(80);
+        let grep_b = "src/a.rs:10:needle match v2\n".repeat(80);
+        let grep_ts = "src/a.ts:10:needle match ts\n".repeat(80);
+        let grep_req = tool_messages_with_inputs(&[
+            (
+                "g1",
+                "Grep",
+                json!({"pattern": "needle", "path": "src", "glob": "*.rs"}),
+                json!(grep_a),
+                false,
+            ),
+            (
+                "g2",
+                "Grep",
+                json!({"pattern": "needle", "path": "src", "glob": "*.ts"}),
+                json!(grep_ts),
+                false,
+            ),
+            (
+                "g3",
+                "Grep",
+                json!({"pattern": "needle", "path": "src", "glob": "*.rs"}),
+                json!(grep_b),
+                false,
+            ),
+        ]);
+        let mut masked = grep_req.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        let s0 = masked["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(s0.contains(" · superseded Grep needle in src]"), "{s0}");
+        assert_eq!(
+            masked["messages"][4]["content"][0]["content"],
+            json!(grep_ts)
+        );
+        assert_eq!(
+            masked["messages"][6]["content"][0]["content"],
+            json!(grep_b)
+        );
+
+        let glob_req = tool_messages_with_inputs(&[
+            (
+                "gl1",
+                "Glob",
+                json!({"pattern": "**/*.rs", "path": "src"}),
+                json!("src/old.rs\n".repeat(150)),
+                false,
+            ),
+            (
+                "gl2",
+                "Glob",
+                json!({"pattern": "**/*.rs", "path": "src"}),
+                json!("src/new.rs\n".repeat(150)),
+                false,
+            ),
+        ]);
+        let mut masked = glob_req.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        let s0 = masked["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(s0.contains(" · superseded Glob **/*.rs in src]"), "{s0}");
+
+        // 6. Secrets in a read-only bash command are redacted in the superseded cue.
+        let secret = format!(
+            "{}_{}{}",
+            "ghp", "7kQ9mN2pR5tV8wX1yZ4", "bC6dF0hJ3lM9nP2qS4rT6"
+        );
+        let secret_cmd = format!("curl -H 'Authorization: Bearer {secret}' https://example.com");
+        let secret_req = tool_messages_with_inputs(&[
+            (
+                "sc1",
+                "Bash",
+                json!({"command": secret_cmd}),
+                json!("response body v1\n".repeat(120)),
+                false,
+            ),
+            (
+                "sc2",
+                "Bash",
+                json!({"command": secret_cmd}),
+                json!("response body v2\n".repeat(120)),
+                false,
+            ),
+        ]);
+        let mut masked = secret_req.clone();
+        let (changed, _) = mask_request(&ws, &mut masked, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        let s0 = masked["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(!s0.contains("ghp_"), "leaked secret: {s0}");
+        assert!(!s0.contains("7kQ9mN"), "leaked secret body: {s0}");
+        assert!(s0.contains(" · superseded "), "{s0}");
+
+        // 7. Preserved-thinking hold-back is unaffected.
+        assert_eq!(
+            held(&fail_then_pass, Some("claude-opus-5-5")),
+            Some("preserved-thinking")
+        );
+    }
+
+    #[test]
+    fn superseded_retirement_works_across_api_shapes_and_stays_prefix_cache_stable() {
+        let (_dir, ws) = test_workspace();
+        let v1 = "version one source line\n".repeat(120);
+        let v2 = "version two source line\n".repeat(120);
+        let other = "other output line\n".repeat(120);
+
+        // OpenAI Chat Completions (`arguments` as JSON string)
+        let mut chat_req = json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_1", "function": {"name": "read_file", "arguments": "{\"file_path\":\"src/app.rs\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": v1},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "call_2", "function": {"name": "read_file", "arguments": "{\"file_path\":\"src/app.rs\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_2", "name": "read_file", "content": v2}
+            ]
+        });
+        let chat_orig = chat_req.clone();
+        let (changed, _) = mask_request(&ws, &mut chat_req, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        assert!(
+            chat_req["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains(" · superseded Read src/app.rs]")
+        );
+        assert_eq!(chat_req["messages"][3]["content"], json!(v2));
+        let mut restore_opts = default_opts(5);
+        restore_opts.restore = true;
+        mask_request(&ws, &mut chat_req, None, &restore_opts).unwrap();
+        assert_eq!(chat_req, chat_orig);
+
+        // OpenAI Responses API (`input` with `function_call` + `function_call_output`)
+        let mut resp_req = json!({
+            "input": [
+                {"type": "function_call", "call_id": "fc_1", "name": "read_file", "arguments": "{\"path\":\"src/app.rs\"}"},
+                {"type": "function_call_output", "call_id": "fc_1", "output": v1},
+                {"type": "function_call", "call_id": "fc_2", "name": "read_file", "arguments": "{\"path\":\"src/app.rs\"}"},
+                {"type": "function_call_output", "call_id": "fc_2", "output": v2}
+            ]
+        });
+        let (changed, _) = mask_request(&ws, &mut resp_req, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        assert!(
+            resp_req["input"][1]["output"]
+                .as_str()
+                .unwrap()
+                .contains(" · superseded Read src/app.rs]")
+        );
+
+        // OpenCode format (`parts` with `state.input`)
+        let mut oc_req = json!({
+            "messages": [{
+                "info": {"role": "assistant"},
+                "parts": [
+                    {"type": "tool", "callID": "oc_1", "tool": "read", "state": {"status": "completed", "input": {"filePath": "src/app.rs"}, "output": v1}},
+                    {"type": "tool", "callID": "oc_2", "tool": "read", "state": {"status": "completed", "input": {"filePath": "src/app.rs"}, "output": v2}}
+                ]
+            }]
+        });
+        let (changed, _) = mask_request(&ws, &mut oc_req, None, &default_opts(5)).unwrap();
+        assert_eq!(changed, 1);
+        assert!(
+            oc_req["messages"][0]["parts"][0]["state"]["output"]
+                .as_str()
+                .unwrap()
+                .contains(" · superseded Read src/app.rs]")
+        );
+
+        // Prefix-cache stability across growing turns:
+        // (a) Superseded in-window stub stays identical once it later falls past cutoff.
+        let mut t1 = tool_messages_with_inputs(&[
+            (
+                "c0",
+                "Read",
+                json!({"file_path": "src/a.rs"}),
+                json!(v1),
+                false,
+            ),
+            (
+                "c1",
+                "Edit",
+                json!({"file_path": "src/a.rs"}),
+                json!("ok"),
+                false,
+            ),
+            (
+                "c2",
+                "Read",
+                json!({"file_path": "src/a.rs"}),
+                json!(v2),
+                false,
+            ),
+        ]);
+        mask_request(&ws, &mut t1, None, &default_opts(3)).unwrap();
+        let stub0_t1 = t1["messages"][2]["content"][0]["content"].clone();
+        assert!(
+            stub0_t1
+                .as_str()
+                .unwrap()
+                .contains(" · superseded Read src/a.rs]")
+        );
+
+        let mut t2 = tool_messages_with_inputs(&[
+            (
+                "c0",
+                "Read",
+                json!({"file_path": "src/a.rs"}),
+                json!(v1),
+                false,
+            ),
+            (
+                "c1",
+                "Edit",
+                json!({"file_path": "src/a.rs"}),
+                json!("ok"),
+                false,
+            ),
+            (
+                "c2",
+                "Read",
+                json!({"file_path": "src/a.rs"}),
+                json!(v2),
+                false,
+            ),
+            (
+                "c3",
+                "Bash",
+                json!({"command": "cargo test"}),
+                json!(other),
+                false,
+            ),
+        ]);
+        mask_request(&ws, &mut t2, None, &default_opts(3)).unwrap();
+        assert_eq!(t2["messages"][2]["content"][0]["content"], stub0_t1);
+
+        // (b) A read that already fell past cutoff before any re-read keeps its original stub.
+        let mut before_reread = tool_messages_with_inputs(&[
+            (
+                "d0",
+                "Read",
+                json!({"file_path": "src/b.rs"}),
+                json!(v1),
+                false,
+            ),
+            (
+                "d1",
+                "Bash",
+                json!({"command": "echo 1"}),
+                json!(other),
+                false,
+            ),
+            (
+                "d2",
+                "Bash",
+                json!({"command": "echo 2"}),
+                json!(other),
+                false,
+            ),
+            (
+                "d3",
+                "Bash",
+                json!({"command": "echo 3"}),
+                json!(other),
+                false,
+            ),
+        ]);
+        mask_request(&ws, &mut before_reread, None, &default_opts(2)).unwrap();
+        let stub_d0 = before_reread["messages"][2]["content"][0]["content"].clone();
+
+        let mut after_reread = tool_messages_with_inputs(&[
+            (
+                "d0",
+                "Read",
+                json!({"file_path": "src/b.rs"}),
+                json!(v1),
+                false,
+            ),
+            (
+                "d1",
+                "Bash",
+                json!({"command": "echo 1"}),
+                json!(other),
+                false,
+            ),
+            (
+                "d2",
+                "Bash",
+                json!({"command": "echo 2"}),
+                json!(other),
+                false,
+            ),
+            (
+                "d3",
+                "Bash",
+                json!({"command": "echo 3"}),
+                json!(other),
+                false,
+            ),
+            (
+                "d4",
+                "Read",
+                json!({"file_path": "src/b.rs"}),
+                json!(v2),
+                false,
+            ),
+        ]);
+        mask_request(&ws, &mut after_reread, None, &default_opts(2)).unwrap();
+        assert_eq!(
+            after_reread["messages"][2]["content"][0]["content"],
+            stub_d0
         );
     }
 }
