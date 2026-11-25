@@ -116,6 +116,28 @@ static FAILURE_LINE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("test failure pattern")
 });
+/// Leading structured-log indicators used to recognize noisy multi-line log
+/// streams from unrouted commands (e.g. app servers, workers, scripts) without
+/// matching code search output, diffs or plain progress messages.
+static STRUCTURED_LOG_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^(?:",
+        r"\[pod/[^\]]+\]\s+",
+        r"|[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+",
+        r"|\[?\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?(?:\s|$)",
+        r"|\[?\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]?\s+",
+        r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+",
+        r"|\[?(?:TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|CRITICAL|NOTICE)\]?(?::|\s)\s*\S",
+        r"|(?:ts|time|timestamp|level|lvl|severity)=\S+",
+        r")",
+    ))
+    .expect("structured log line pattern")
+});
+/// Compose-style service prefix (`api-1  | ...`) followed by a structured log
+/// payload (timestamp, level, JSON object, or HTTP request/status).
+static COMPOSE_LOG_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z][A-Za-z0-9._-]{0,31}\s+\|\s+(.+)$").expect("compose log line pattern")
+});
 /// Programs whose own messages, such as `find: x: Permission denied`, can sit among
 /// the records of a search or listing in merged output.
 const TOOLS: &[&str] = &[
@@ -235,11 +257,13 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     // A line no rule above reads, such as a script, a loop or a tool no hook
     // knows, gets the clipped preview of a run, unless it prints file content.
-    // Claude Code already shows a result it saved to a file as a short preview.
-    let plan = match plan(command) {
-        Some(plan) => plan,
-        None if persisted.is_none() => unknown_plan(command)?,
-        None => return None,
+    // For a result Claude Code saved to a file, an unknown command is replaced
+    // only when a structured view (JSON tables, logview, inventory, or stack
+    // trace collapsing) compacts it within Claude Code's preview budget.
+    let (plan, unknown_persisted) = match plan(command) {
+        Some(plan) => (plan, false),
+        None if persisted.is_none() => (unknown_plan(command)?, false),
+        None => (unknown_plan(command)?, true),
     };
     // A window of the lines, such as `| sed -n 'A,Bp'`, is compacted only from the
     // text Claude Code shows inline.
@@ -345,36 +369,123 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     };
     let mut shown = record(budget)?;
     let mut archive = ws.state.join("runs").join(&shown.run.id);
+    let mut text: String = shown
+        .previews
+        .iter()
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes))
+        .collect();
+    // Redact the full output once up front so post-run formatters (DevOps
+    // inventories, logview, stacktrace collapsing, and unshown error scans)
+    // never leak secrets while keeping exact 1-based archive line numbers.
+    let redacted_bytes = redactor.map_or(Cow::Borrowed(output.as_slice()), |r| r.bytes(&output));
+    let redacted_text = String::from_utf8_lossy(&redacted_bytes);
+    let archive_complete = shown.run.produced_bytes.is_empty();
+    let is_json_view = text.starts_with("[JSON ");
+    let was_clipped = text.contains("[output clipped. Full log retained.]");
+    let cmd_refs: Vec<&str> = plan.source_words().iter().map(String::as_str).collect();
+    let is_log_cmd = is_log_command(&cmd_refs);
+    let clipped_columns = plan
+        .columns()
+        .is_some_and(|width| shown_text.lines().any(|line| line.len() >= width));
+    let mut replaced = false;
+    let mut used_logview =
+        is_log_cmd && shown.report && shown.run.summary.kind.is_empty() && !is_json_view;
+    if archive_complete && !shown.report && !is_json_view && !clipped_columns {
+        let mut replacement: Option<(String, bool)> = None;
+        // 1. Extended DevOps inventories (`kubectl get events|svc|ing|pvc|cj`,
+        //    `helm list|ls`, `docker|podman images`) when capture did not match
+        //    them directly (e.g. flags before subcommands, aliases, or pipes).
+        if let Some(kind) = extra_inventory_kind(&cmd_refs)
+            && let Some(view) = format_extra_inventory(kind, &redacted_text, budget)
+            && view.len() <= budget
+            && view.len() < output.len()
+            && (was_clipped || view.len() + 64 < text.len())
+        {
+            replacement = Some((view, false));
+        }
+        // 2. Structured or container/JSON/systemd log streams via `logview`.
+        if replacement.is_none()
+            && (is_log_cmd
+                || (!plan.strict()
+                    && plan.profile.is_none()
+                    && looks_like_structured_logs(&redacted_text)))
+            && let Some(folded) = crate::logview::format(&redacted_text, "", budget)
+            && folded.len() <= budget
+            && folded.len() < output.len()
+            && (was_clipped || folded.len() + 64 < text.len())
+            && (is_log_cmd || folded.len() * 4 <= output.len() * 3)
+        {
+            replacement = Some((folded, true));
+        }
+        // 3. Traceback-heavy outputs: collapse external runtime frames while
+        //    keeping 100% of workspace frames & errors verbatim with `[stdout:A-B]`
+        //    links, avoiding blind head/tail clipping whenever the result fits.
+        if replacement.is_none()
+            && let Some(collapsed) =
+                crate::stacktrace::collapse(&redacted_text, Some(&run_ws.root), Some("stdout"))
+        {
+            let candidate = if collapsed.len() <= budget {
+                Some(collapsed)
+            } else {
+                crate::floor::compact_stream(&redacted_text, &run_ws.root, "stdout")
+                    .filter(|floored| floored.len() <= budget)
+            };
+            if let Some(candidate) = candidate
+                && candidate.len() < output.len()
+                && (was_clipped || candidate.len() < text.len())
+            {
+                replacement = Some((candidate, false));
+            }
+        }
+        if let Some((mut body, logview)) = replacement {
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            if let Some(redactor) = redactor
+                && let Cow::Owned(redacted) = redactor.text(&body)
+            {
+                body = redacted;
+            }
+            text = body;
+            shown.run.preview_bytes = text.len();
+            shown.footer = rebuild_footer(&shown.run, text.len());
+            shown.run.footer_bytes = shown.footer.len();
+            shown.report = true;
+            replaced = true;
+            used_logview = logview;
+        }
+    }
+    if unknown_persisted && !shown.report && !is_json_view {
+        let _ = fs::remove_dir_all(&archive);
+        return None;
+    }
     // A window with no report gets the floor, when that alone saves enough, and is
     // otherwise left as it is.
     if plan.strict() && !shown.report {
         let _ = fs::remove_dir_all(&archive);
-        let floor = crate::floor::compact(&shown_text)?;
+        let floor = crate::floor::compact(&redacted_text)?;
         if output.len().saturating_sub(floor.len()) < (output.len() / 4).max(512) {
             return None;
         }
         // Within this budget the stream is shown whole, so it gets the floor.
         shown = record(output.len().saturating_mul(2))?;
         archive = ws.state.join("runs").join(&shown.run.id);
+        text = shown
+            .previews
+            .iter()
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes))
+            .collect();
     }
-    let mut text: String = shown
-        .previews
-        .iter()
-        .map(|(_, bytes)| String::from_utf8_lossy(bytes))
-        .collect();
-    // A lint report covers both streams by design. Other reports were written for
-    // stdout alone, so error lines from the interleaved stderr that they left out
-    // follow them, and so do the failure lines a test report could not attribute.
+    // A lint report or logview report covers both streams by design. Other reports
+    // were written for stdout alone, so error lines from the interleaved stderr that
+    // they left out follow them, and so do the failure lines a test report could not
+    // attribute.
     let summary = &shown.run.summary;
-    let errors = if shown.footer.is_empty() || summary.kind == "lint" {
+    let errors = if shown.footer.is_empty() || summary.kind == "lint" || used_logview {
         String::new()
     } else {
         let failures =
             summary.kind.is_empty() || summary.kind == "tests" && summary.items.is_empty();
-        // The previews are redacted, so the error lines come from a redacted copy,
-        // whose line numbers match the archive. A line clipped to fit then never
-        // keeps part of a secret.
-        let redacted = redactor.map_or(Cow::Borrowed(output.as_slice()), |r| r.bytes(&output));
         // Past `max_run_bytes` the archive holds no lines, so `log` could not replay
         // an error line listed there by its number.
         let archived = shown.run.stream_bytes.first().map_or(usize::MAX, |&bytes| {
@@ -389,7 +500,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
                 .count()
         };
         unshown_errors(
-            &redacted,
+            &redacted_bytes,
             &text,
             &plan.program,
             failures,
@@ -431,7 +542,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         let _ = fs::remove_dir_all(&archive);
         return None;
     }
-    if !errors.is_empty() || !note.is_empty() || preview.is_some() {
+    if replaced || !errors.is_empty() || !note.is_empty() || preview.is_some() {
         shown.run.footer_bytes += errors.len() + note.len();
         // Savings count against what Claude Code would have shown.
         if let Some(preview) = preview {
@@ -637,8 +748,10 @@ pub(crate) fn after_run(
         })
     };
     let mut handled = false;
-    // Shown whole and at most `read_outline_lines` lines.
-    let few = persisted.is_none() && lines as u64 <= outline_lines;
+    // Shown whole and at most `read_outline_lines` lines, unless minified onto
+    // one or two huge lines.
+    let minified = persisted.is_none() && lines <= 2 && output.len() > crate::batch::FLOOR;
+    let few = persisted.is_none() && !minified && lines as u64 <= outline_lines;
     if !cfg!(windows) {
         // As the hook reads it, with the variables the line sets filled in and
         // one file standing for each glob.
@@ -698,6 +811,10 @@ pub(crate) fn after_run(
 struct Plan {
     /// Its words after assignments and wrappers such as `env` or `timeout`.
     words: Vec<String>,
+    /// The original first-command words when [`loose`] collapsed `words` to a
+    /// single program name, used for post-run inventory and log detection
+    /// without altering the recorded run family.
+    command_words: Vec<String>,
     /// The program's file name, which prefixes its own error messages.
     program: String,
     /// How lists name the run: the command label, and the filters after a pipe.
@@ -713,6 +830,16 @@ struct Plan {
 }
 
 impl Plan {
+    /// The full words of the underlying command, preserving subcommands and
+    /// flags even when [`loose`] records the run under its program name alone.
+    fn source_words(&self) -> &[String] {
+        if self.command_words.is_empty() {
+            &self.words
+        } else {
+            &self.command_words
+        }
+    }
+
     /// Whether a filter windowed or clipped the lines, as `sed -n 'A,Bp'` or
     /// `cut -c1-N` does. Such output is replaced only by a report or the floor, never
     /// by a clipped preview of the lines the agent picked.
@@ -830,7 +957,13 @@ pub(crate) fn read_list(command: &str) -> Option<crate::batch::Batch<'_>> {
 fn plan(command: &str) -> Option<Plan> {
     let segments = parse(command)?;
     let mut cd = PathBuf::new();
-    let mut found: Option<(Plan, (Option<crate::filters::Profile>, String))> = None;
+    type KindKey = (
+        Option<crate::filters::Profile>,
+        String,
+        Option<&'static str>,
+        bool,
+    );
+    let mut found: Option<(Plan, KindKey)> = None;
     let (mut after, mut moved) = (false, false);
     for segment in &segments {
         if segment.iter().any(|stage| {
@@ -883,13 +1016,17 @@ fn plan(command: &str) -> Option<Plan> {
             .collect::<Option<Vec<_>>>()?;
         let words = strip(&first.words)?;
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-        if !crate::agents::supported_words(&refs) {
+        let extra_inv = extra_inventory_kind(&refs).map(ExtraInventory::tag);
+        let log_cmd = is_log_command(&refs);
+        if !crate::agents::supported_words(&refs) && extra_inv.is_none() && !log_cmd {
             return None;
         }
         let args: Vec<OsString> = words.iter().map(OsString::from).collect();
-        let kind = (
+        let kind: KindKey = (
             crate::filters::profile(&refs),
             crate::summary::family(&args),
+            extra_inv,
+            log_cmd,
         );
         // A search whose pattern matches every line, such as `grep -rn "" file`, is
         // how an agent reads code, and a report grouped by file would show only a few
@@ -933,6 +1070,7 @@ fn plan(command: &str) -> Option<Plan> {
                 }
                 let plan = Plan {
                     words: words.to_vec(),
+                    command_words: Vec::new(),
                     program: basename(tool.first().copied().unwrap_or("")).to_owned(),
                     label,
                     cd: cd.clone(),
@@ -988,6 +1126,7 @@ fn lone(command: &str) -> Option<Plan> {
     }
     Some(Plan {
         words: words.to_vec(),
+        command_words: Vec::new(),
         program: program.to_owned(),
         label: crate::history::label(&refs),
         cd: PathBuf::new(),
@@ -1033,6 +1172,7 @@ fn loose(commands: &Commands, alone: bool) -> Option<Plan> {
     let recorded = if reported { "sh" } else { program.as_str() };
     Some(Plan {
         words: vec![recorded.to_owned()],
+        command_words: words.to_vec(),
         program,
         label,
         cd: PathBuf::new(),
@@ -1242,6 +1382,368 @@ fn basename(program: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(program)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtraInventory<'a> {
+    Events,
+    HelmList,
+    Images,
+    Resource(&'a str),
+}
+
+impl ExtraInventory<'_> {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Events => "events",
+            Self::HelmList => "helm_list",
+            Self::Images => "images",
+            Self::Resource(resource) => match resource.split('.').next().unwrap_or("") {
+                "svc" | "service" | "services" => "services",
+                "ing" | "ingress" | "ingresses" => "ingresses",
+                "pvc" | "pvcs" | "persistentvolumeclaim" | "persistentvolumeclaims" => "pvcs",
+                "cj" | "cronjob" | "cronjobs" => "cronjobs",
+                _ => "resource",
+            },
+        }
+    }
+}
+
+/// Skip leading global CLI options (`-f val`, `--flag=val`, boolean flags)
+/// before a subcommand.
+fn skip_global_flags<'a>(
+    mut args: &'a [&'a str],
+    valued: &[&str],
+    boolean: &[&str],
+) -> &'a [&'a str] {
+    while let Some((&arg, rest)) = args.split_first() {
+        if valued.contains(&arg) && rest.first().is_some_and(|v| !v.starts_with('-')) {
+            args = &rest[1..];
+        } else if let Some((flag, _)) = arg.split_once('=')
+            && valued.contains(&flag)
+        {
+            args = rest;
+        } else if boolean.contains(&arg) {
+            args = rest;
+        } else {
+            break;
+        }
+    }
+    args
+}
+
+/// Whether `tail` carries any machine-output, watch, quiet, or help option that
+/// disqualifies table formatting.
+fn has_blocked_flag(tail: &[&str], blocked: &[&str], reject_attached_o: bool) -> bool {
+    tail.iter().any(|&arg| {
+        let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+        blocked.contains(&flag)
+            || (reject_attached_o
+                && arg.starts_with("-o")
+                && arg.len() > 2
+                && !arg.starts_with("--"))
+    })
+}
+
+/// Recognize DevOps inventory commands formatted by
+/// `crate::inventory::{events, helm_list, images, resources}`:
+/// `kubectl`/`oc get events|svc|ing|pvc|cj`, `helm list|ls`, and
+/// `docker`/`podman images|image ls|image list`.
+fn extra_inventory_kind<'a>(words: &'a [&'a str]) -> Option<ExtraInventory<'a>> {
+    let tool = crate::filters::unwrap_tool(words);
+    let (&program, args) = tool.split_first()?;
+    let program = basename(program);
+    match program {
+        "kubectl" | "oc" => {
+            let args = skip_global_flags(
+                args,
+                &[
+                    "-n",
+                    "--namespace",
+                    "--context",
+                    "--kubeconfig",
+                    "--cluster",
+                    "--user",
+                    "--as",
+                    "--as-group",
+                    "--request-timeout",
+                    "-v",
+                    "--v",
+                ],
+                &["--insecure-skip-tls-verify"],
+            );
+            let ["get", resource, tail @ ..] = args else {
+                return None;
+            };
+            if has_blocked_flag(
+                tail,
+                &[
+                    "-o",
+                    "--output",
+                    "-w",
+                    "--watch",
+                    "--watch-only",
+                    "--no-headers",
+                    "--raw",
+                    "-h",
+                    "--help",
+                ],
+                true,
+            ) {
+                return None;
+            }
+            let base = resource.split('.').next().unwrap_or("");
+            match base {
+                "ev" | "event" | "events" => Some(ExtraInventory::Events),
+                "svc"
+                | "service"
+                | "services"
+                | "ing"
+                | "ingress"
+                | "ingresses"
+                | "pvc"
+                | "pvcs"
+                | "persistentvolumeclaim"
+                | "persistentvolumeclaims"
+                | "cj"
+                | "cronjob"
+                | "cronjobs" => Some(ExtraInventory::Resource(resource)),
+                _ => None,
+            }
+        }
+        "helm" => {
+            let args = skip_global_flags(
+                args,
+                &[
+                    "-n",
+                    "--namespace",
+                    "--kube-context",
+                    "--kubeconfig",
+                    "--kube-apiserver",
+                    "--registry-config",
+                    "--repository-config",
+                    "--repository-cache",
+                ],
+                &["--debug"],
+            );
+            let ["list" | "ls", tail @ ..] = args else {
+                return None;
+            };
+            if has_blocked_flag(
+                tail,
+                &["-o", "--output", "-q", "--short", "-h", "--help"],
+                true,
+            ) {
+                return None;
+            }
+            Some(ExtraInventory::HelmList)
+        }
+        "docker" | "podman" => {
+            let args = skip_global_flags(
+                args,
+                &["-H", "--host", "--context", "-c", "--config"],
+                &["-D", "--debug"],
+            );
+            let tail = match args {
+                ["images", tail @ ..] | ["image", "ls" | "list", tail @ ..] => tail,
+                _ => return None,
+            };
+            if has_blocked_flag(tail, &["--format", "-q", "--quiet", "-h", "--help"], false) {
+                return None;
+            }
+            Some(ExtraInventory::Images)
+        }
+        _ => None,
+    }
+}
+
+fn format_extra_inventory(
+    kind: ExtraInventory<'_>,
+    text: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    match kind {
+        ExtraInventory::Events => crate::inventory::events(text, max_bytes),
+        ExtraInventory::HelmList => crate::inventory::helm_list(text, max_bytes),
+        ExtraInventory::Images => crate::inventory::images(text, max_bytes),
+        ExtraInventory::Resource(resource) => {
+            crate::inventory::resources(resource, text, max_bytes)
+        }
+    }
+}
+
+/// Whether `words` runs a container, Kubernetes, systemd or cloud log stream
+/// command eligible for `crate::logview::format` post-run compaction.
+fn is_log_command(words: &[&str]) -> bool {
+    let tool = crate::filters::unwrap_tool(words);
+    let Some((&program, args)) = tool.split_first() else {
+        return false;
+    };
+    if args
+        .iter()
+        .any(|&a| matches!(a, "-h" | "--help" | "--version"))
+    {
+        return false;
+    }
+    let compose_logs = |rest: &[&str]| {
+        let rest = skip_global_flags(
+            rest,
+            &[
+                "-f",
+                "--file",
+                "-p",
+                "--project-name",
+                "--env-file",
+                "--project-directory",
+                "--profile",
+                "--ansi",
+            ],
+            &["--compatibility"],
+        );
+        matches!(rest, ["logs", ..])
+    };
+    match basename(program) {
+        "docker" | "podman" => {
+            let args = skip_global_flags(
+                args,
+                &["-H", "--host", "--context", "-c", "--config"],
+                &["-D", "--debug"],
+            );
+            match args {
+                ["logs", ..] | ["container", "logs", ..] => true,
+                ["compose", rest @ ..] => compose_logs(rest),
+                _ => false,
+            }
+        }
+        "docker-compose" | "podman-compose" => compose_logs(args),
+        "kubectl" | "oc" => {
+            let args = skip_global_flags(
+                args,
+                &[
+                    "-n",
+                    "--namespace",
+                    "--context",
+                    "--kubeconfig",
+                    "--cluster",
+                    "--user",
+                    "--request-timeout",
+                    "-v",
+                    "--v",
+                ],
+                &["--insecure-skip-tls-verify"],
+            );
+            matches!(args, ["logs", ..])
+        }
+        "journalctl" => {
+            let mut iter = args.iter();
+            while let Some(&arg) = iter.next() {
+                let format = match arg {
+                    "-o" | "--output" => iter.next().copied(),
+                    _ => arg
+                        .strip_prefix("--output=")
+                        .or_else(|| arg.strip_prefix("-o").filter(|v| !v.is_empty())),
+                };
+                if format.is_some_and(|v| v.starts_with("json") || v == "export") {
+                    return false;
+                }
+            }
+            true
+        }
+        "stern" | "kubetail" => true,
+        "pm2" | "heroku" | "fly" | "flyctl" | "railway" => matches!(args, ["logs", ..]),
+        "aws" => {
+            let args = skip_global_flags(args, &["--profile", "--region", "--endpoint-url"], &[]);
+            matches!(args, ["logs", "tail", ..])
+                && !args.windows(2).any(|w| {
+                    matches!(w[0], "--format" | "--output") && w[1].eq_ignore_ascii_case("json")
+                })
+                && !args.iter().any(|a| {
+                    a.eq_ignore_ascii_case("--format=json")
+                        || a.eq_ignore_ascii_case("--output=json")
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether `text` is predominantly structured multi-line log output (timestamps,
+/// syslog/klog headers, container/compose prefixes, log-level prefixes, or
+/// structured JSON log records), suitable for `crate::logview::format`.
+fn looks_like_structured_logs(text: &str) -> bool {
+    let mut non_empty = 0usize;
+    let mut structured = 0usize;
+    let is_json_log = |trimmed: &str| {
+        trimmed.starts_with('{')
+            && trimmed.ends_with('}')
+            && [
+                "\"level\"",
+                "\"severity\"",
+                "\"lvl\"",
+                "\"msg\"",
+                "\"message\"",
+                "\"timestamp\"",
+                "\"ts\"",
+                "\"time\"",
+            ]
+            .iter()
+            .any(|key| trimmed.contains(key))
+    };
+    for raw in text.lines() {
+        let cleaned = if raw.contains('\x1b') {
+            crate::capture::ANSI.replace_all(raw, "")
+        } else {
+            Cow::Borrowed(raw)
+        };
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("diff --git ") || trimmed.starts_with("@@ -") {
+            return false;
+        }
+        non_empty += 1;
+        let matched = STRUCTURED_LOG_LINE.is_match(trimmed)
+            || is_json_log(trimmed)
+            || COMPOSE_LOG_LINE.captures(trimmed).is_some_and(|caps| {
+                let body = caps.get(1).map_or("", |m| m.as_str()).trim();
+                STRUCTURED_LOG_LINE.is_match(body)
+                    || is_json_log(body)
+                    || body.contains("HTTP/")
+                    || ["GET ", "POST ", "PUT ", "DELETE ", "PATCH "]
+                        .iter()
+                        .any(|m| body.contains(m))
+            });
+        if matched {
+            structured += 1;
+        }
+        if non_empty >= 200 {
+            break;
+        }
+    }
+    non_empty >= 8 && structured * 2 >= non_empty
+}
+
+/// Rebuild the agent run marker footer after replacing the preview body on a
+/// complete (untruncated) archive, keeping `preview_bytes + footer_bytes` exact
+/// for `record.json` and `stats`.
+fn rebuild_footer(run: &crate::capture::Run, preview_bytes: usize) -> String {
+    let secrets = run.redaction.as_ref().map_or(0, |found| found.count);
+    let redacted = match secrets {
+        0 => String::new(),
+        1 => " · 1 secret redacted".to_owned(),
+        n => format!(" · {n} secrets redacted"),
+    };
+    let exit = if run.status == 0 {
+        String::new()
+    } else {
+        format!(" · exit {}", run.status)
+    };
+    format!(
+        "[justless {} · {} of {} shown{redacted}{exit}]\n",
+        run.id,
+        crate::history::human_bytes(preview_bytes as u64),
+        crate::history::human_bytes(run.raw_bytes),
+    )
 }
 
 /// A command in a list whose output needs no compaction.
@@ -1977,6 +2479,7 @@ mod tests {
         ] {
             let plan = Plan {
                 words: Vec::new(),
+                command_words: Vec::new(),
                 program: String::new(),
                 label: String::new(),
                 cd: PathBuf::new(),
@@ -1994,5 +2497,462 @@ mod tests {
                 "{command} with {lines} lines"
             );
         }
+    }
+
+    fn test_workspace(config: &str) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join(".justless.toml"), config).unwrap();
+        let ws = Workspace {
+            state: root.join(".justless"),
+            origin: root.clone(),
+            cwd: root.clone(),
+            root,
+        };
+        (dir, ws)
+    }
+
+    fn post_bash(ws: &Workspace, command: &str, stdout: &str) -> Option<String> {
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "session_id": "unit-postroute",
+            "cwd": ws.root,
+            "tool_input": { "command": command },
+            "tool_response": {
+                "stdout": stdout,
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            }
+        });
+        claude_bash(ws, &input)?["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    fn run_id_from(shown: &str) -> String {
+        shown
+            .rsplit("[justless ")
+            .next()
+            .and_then(|tail| tail.split([' ', ']']).next())
+            .unwrap_or_else(|| panic!("missing run marker in:\n{shown}"))
+            .to_owned()
+    }
+
+    fn assert_archive_exact_and_accounted(ws: &Workspace, shown: &str, raw: &str) {
+        let id = run_id_from(shown);
+        let dir = ws.state.join("runs").join(&id);
+        let archived = fs::read(dir.join("stdout")).unwrap();
+        assert_eq!(archived, raw.as_bytes(), "exact archive replay mismatch");
+        let record: Value =
+            serde_json::from_slice(&fs::read(dir.join("record.json")).unwrap()).unwrap();
+        let accounted =
+            record["preview_bytes"].as_u64().unwrap() + record["footer_bytes"].as_u64().unwrap();
+        assert_eq!(
+            accounted,
+            shown.len() as u64,
+            "record.json bytes ({accounted}) != shown len ({})\n{record:#}",
+            shown.len()
+        );
+        let total_lines = raw.lines().count();
+        for prefix in ["[stdout:", "in stdout:"] {
+            for span in shown.split(prefix).skip(1) {
+                let range = span.split(']').next().unwrap();
+                let (a, b) = range.split_once('-').unwrap_or((range, range));
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                assert!(
+                    1 <= a && a <= b && b <= total_lines,
+                    "pointer {prefix}{range}] out of bounds (1..={total_lines})\n{shown}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classifiers_recognize_devops_inventories_and_log_commands() {
+        assert_eq!(
+            extra_inventory_kind(&["kubectl", "-n", "prod", "get", "events"]),
+            Some(ExtraInventory::Events)
+        );
+        assert_eq!(
+            extra_inventory_kind(&["kubectl", "get", "ev", "-A"]),
+            Some(ExtraInventory::Events)
+        );
+        assert_eq!(
+            extra_inventory_kind(&["oc", "--context=prod", "get", "svc"]),
+            Some(ExtraInventory::Resource("svc"))
+        );
+        assert_eq!(
+            extra_inventory_kind(&["kubectl", "get", "ingresses.networking.k8s.io"]),
+            Some(ExtraInventory::Resource("ingresses.networking.k8s.io"))
+        );
+        assert_eq!(
+            extra_inventory_kind(&["kubectl", "get", "pvc", "-A"]),
+            Some(ExtraInventory::Resource("pvc"))
+        );
+        assert_eq!(
+            extra_inventory_kind(&["kubectl", "get", "cronjobs"]),
+            Some(ExtraInventory::Resource("cronjobs"))
+        );
+        assert_eq!(
+            extra_inventory_kind(&["helm", "-n", "apps", "ls", "-a"]),
+            Some(ExtraInventory::HelmList)
+        );
+        assert_eq!(
+            extra_inventory_kind(&["docker", "image", "list"]),
+            Some(ExtraInventory::Images)
+        );
+        assert_eq!(
+            extra_inventory_kind(&["podman", "images"]),
+            Some(ExtraInventory::Images)
+        );
+        // Machine formats, watches, and quiet modes stay out of table inventories.
+        for rejected in [
+            &["kubectl", "get", "events", "-o", "json"][..],
+            &["kubectl", "get", "events", "-ojson"][..],
+            &["kubectl", "get", "svc", "--output=yaml"][..],
+            &["kubectl", "get", "events", "-w"][..],
+            &["kubectl", "get", "svc", "--no-headers"][..],
+            &["helm", "ls", "-o", "json"][..],
+            &["helm", "list", "-q"][..],
+            &["docker", "images", "--format", "{{json .}}"][..],
+            &["podman", "images", "-q"][..],
+        ] {
+            assert_eq!(extra_inventory_kind(rejected), None, "{rejected:?}");
+        }
+
+        // Log command recognition, including flags before subcommands.
+        for log_cmd in [
+            &["docker", "logs", "api"][..],
+            &["docker", "compose", "-f", "compose.prod.yml", "logs", "api"][..],
+            &["docker-compose", "-p", "shop", "logs", "--tail=500"][..],
+            &["podman", "container", "logs", "web"][..],
+            &["kubectl", "-n", "prod", "logs", "deploy/api"][..],
+            &["oc", "-n", "prod", "logs", "pod/api-1"][..],
+            &["journalctl", "-u", "nginx", "-n", "500"][..],
+            &["aws", "logs", "tail", "/aws/lambda/fn"][..],
+            &["stern", "api-"][..],
+        ] {
+            assert!(is_log_command(log_cmd), "{log_cmd:?}");
+        }
+        for not_log in [
+            &["journalctl", "-o", "json"][..],
+            &["journalctl", "--output=json-pretty"][..],
+            &["aws", "logs", "get-log-events", "--log-group-name", "g"][..],
+            &["aws", "logs", "tail", "g", "--format", "json"][..],
+            &["docker", "ps"][..],
+            &["kubectl", "get", "pods"][..],
+        ] {
+            assert!(!is_log_command(not_log), "{not_log:?}");
+        }
+    }
+
+    #[test]
+    fn post_run_logview_compacts_container_and_unrouted_logs_with_redaction() {
+        let (_dir, ws) = test_workspace("");
+        let mut compose_logs = String::new();
+        for i in 0..180 {
+            compose_logs.push_str(&format!(
+                "api-1  | 2026-11-25T10:00:{:02}.{:03}Z INFO  GET /api/orders/{i} 200 1{}ms req=req-{i:04}\n",
+                i % 60,
+                i % 1000,
+                i % 9
+            ));
+        }
+        compose_logs.push_str(
+            "api-1  | 2026-11-25T10:03:01.000Z ERROR database connection refused host=db-primary:5432\n",
+        );
+        for i in 180..260 {
+            compose_logs.push_str(&format!(
+                "api-1  | 2026-11-25T10:04:{:02}.{:03}Z INFO  GET /api/orders/{i} 200 1{}ms req=req-{i:04}\n",
+                i % 60,
+                i % 1000,
+                i % 9
+            ));
+        }
+
+        // 1. Docker compose with `-f` before `logs` (not matched by filters::profile).
+        let shown = post_bash(
+            &ws,
+            "docker compose -f compose.prod.yml logs api",
+            &compose_logs,
+        )
+        .expect("compose logs compacted via logview");
+        assert!(shown.contains("database connection refused"), "{shown}");
+        assert!(shown.contains("[stdout:181]"), "{shown}");
+        assert!(shown.len() * 4 < compose_logs.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &compose_logs);
+
+        // 2. Unrouted `python3 server.py` emitting noisy timestamped multi-line logs.
+        let mut app_logs = String::new();
+        for i in 0..220 {
+            app_logs.push_str(&format!(
+                "2026-11-25T11:00:{:02}.{:03}Z INFO worker processed job_id=job-{i:04} latency={}ms\n",
+                i % 60,
+                i % 1000,
+                5 + (i % 7)
+            ));
+        }
+        app_logs.push_str(
+            "2026-11-25T11:04:01.100Z ERROR worker failed to charge card: gateway timeout\n",
+        );
+        let shown = post_bash(&ws, "python3 server.py", &app_logs)
+            .expect("unrouted structured logs compacted via logview");
+        assert!(shown.contains("gateway timeout"), "{shown}");
+        assert!(shown.contains("[stdout:221]"), "{shown}");
+        assert!(!shown.contains("[output clipped"), "{shown}");
+        assert!(shown.len() * 4 < app_logs.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &app_logs);
+
+        // 3. Redaction safety: secret in a log line is never shown, archive keeps raw bytes.
+        let token = format!("{}{}{}", "gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        let secret_logs =
+            app_logs.replace("gateway timeout", &format!("gateway timeout auth={token}"));
+        let shown = post_bash(&ws, "python3 server.py", &secret_logs)
+            .expect("secret-bearing logs compacted");
+        assert!(
+            !shown.contains(&token),
+            "secret leaked into preview: {shown}"
+        );
+        assert!(shown.contains("[redacted:"), "{shown}");
+        assert!(shown.contains("secret redacted"), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &secret_logs);
+    }
+
+    #[test]
+    fn post_run_devops_inventories_compact_events_helm_images_and_resources() {
+        let (_dir, ws) = test_workspace("");
+
+        // 1. `kubectl -n prod get events | head -n 500` (global flag before `get`).
+        let mut events =
+            String::from("LAST SEEN   TYPE      REASON      OBJECT             MESSAGE\n");
+        for i in 0..140 {
+            events.push_str(&format!(
+                "{}m          Normal    Scheduled   pod/web-{i:03}        Successfully assigned prod/web-{i:03} to node-{}\n",
+                i % 59 + 1,
+                i % 4
+            ));
+        }
+        events.push_str(
+            "2m          Warning   BackOff     pod/checkout-7     Back-off restarting failed container api\n",
+        );
+        let shown = post_bash(&ws, "kubectl -n prod get events | head -n 500", &events)
+            .expect("kubectl events compacted");
+        assert!(shown.contains("BackOff"), "{shown}");
+        assert!(shown.contains("pod/checkout-7"), "{shown}");
+        assert!(shown.contains("Normal"), "{shown}");
+        assert!(shown.len() * 4 < events.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &events);
+
+        // Redaction safety inside Warning event message.
+        let token = format!("{}{}{}", "gh", "p_", "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2");
+        let secret_events = events.replace(
+            "restarting failed container api",
+            &format!("token={token} failed container api"),
+        );
+        let shown = post_bash(&ws, "kubectl -n prod get events", &secret_events)
+            .expect("secret-bearing events compacted");
+        assert!(!shown.contains(&token), "secret leaked: {shown}");
+        assert!(shown.contains("[redacted:"), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &secret_events);
+
+        // 2. `helm ls -A | head -n 500` (`ls` alias not in known::ROUTED).
+        let mut helm =
+            String::from("NAME\tNAMESPACE\tREVISION\tUPDATED\tSTATUS\tCHART\tAPP VERSION\n");
+        for i in 0..120 {
+            helm.push_str(&format!(
+                "svc-{i:03}\tprod\t3\t2026-11-25 10:00:00 +0000 UTC\tdeployed\tservice-1.2.0\t1.2.0\n"
+            ));
+        }
+        helm.push_str(
+            "billing\tprod\t7\t2026-11-25 10:05:00 +0000 UTC\tfailed\tbilling-2.0.1\t2.0.1\n",
+        );
+        let shown = post_bash(&ws, "helm ls -A | head -n 500", &helm).expect("helm ls compacted");
+        assert!(shown.contains("billing"), "{shown}");
+        assert!(shown.contains("failed"), "{shown}");
+        assert!(shown.len() * 4 < helm.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &helm);
+
+        // 3. `docker image list | head -n 500` (`image list` alias).
+        let mut images =
+            String::from("REPOSITORY              TAG       IMAGE ID       CREATED        SIZE\n");
+        for i in 0..120 {
+            images.push_str(&format!(
+                "<none>                  <none>    {:012x}   {} days ago    48.2MB\n",
+                0xabc000000000u64 + i as u64,
+                i % 30 + 1
+            ));
+        }
+        for i in 0..15 {
+            images.push_str(&format!(
+                "ghcr.io/acme/api        v1.0.{i}    {:012x}   2 days ago     120MB\n",
+                0xdef000000000u64 + i as u64
+            ));
+        }
+        let shown = post_bash(&ws, "docker image list | head -n 500", &images)
+            .expect("docker images compacted");
+        assert!(
+            shown.contains("dangling") || shown.contains("<none>"),
+            "{shown}"
+        );
+        assert!(shown.contains("ghcr.io/acme/api"), "{shown}");
+        assert!(shown.len() * 4 < images.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &images);
+
+        // 4. `kubectl get pvc -A | head -n 500` (`inventory::resources`).
+        let mut pvcs = String::from(
+            "NAMESPACE   NAME        STATUS    VOLUME      CAPACITY   ACCESS MODES   STORAGECLASS   AGE\n",
+        );
+        for i in 0..120 {
+            pvcs.push_str(&format!(
+                "prod        data-{i:03}    Bound     pv-{i:04}     50Gi       RWO            gp3            12d\n"
+            ));
+        }
+        pvcs.push_str(
+            "prod        wal-000     Pending                                         gp3            4m\n",
+        );
+        let shown = post_bash(&ws, "kubectl get pvc -A | head -n 500", &pvcs)
+            .expect("kubectl pvc compacted");
+        assert!(shown.contains("wal-000"), "{shown}");
+        assert!(shown.contains("Pending"), "{shown}");
+        assert!(shown.len() * 4 < pvcs.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &pvcs);
+    }
+
+    #[test]
+    fn post_run_stacktrace_collapses_external_frames_and_keeps_workspace_verbatim() {
+        let (_dir, ws) = test_workspace("");
+        let root_str = ws.root.display().to_string();
+        let mut trace = String::from("Traceback (most recent call last):\n");
+        trace.push_str(&format!(
+            "  File \"{root_str}/src/cli.py\", line 14, in main\n    run_server()\n"
+        ));
+        for i in 0..70 {
+            trace.push_str(&format!(
+                "  File \"/usr/lib/python3.12/site-packages/uvicorn/middleware/layer_{i:02}.py\", line {}, in dispatch_{i}\n    return await self.app(scope, receive, send)\n",
+                10 + i
+            ));
+        }
+        trace.push_str(&format!(
+            "  File \"{root_str}/src/checkout.py\", line 88, in compute_total\n    raise ValueError(\"negative subtotal\")\n"
+        ));
+        trace.push_str("ValueError: negative subtotal\n");
+        assert!(trace.len() > 8_000, "trace len = {}", trace.len());
+
+        let shown =
+            post_bash(&ws, "python3 src/cli.py", &trace).expect("traceback-heavy output compacted");
+        assert!(shown.contains("src/cli.py"), "{shown}");
+        assert!(shown.contains("src/checkout.py"), "{shown}");
+        assert!(shown.contains("ValueError: negative subtotal"), "{shown}");
+        assert!(shown.contains("in stdout:4-143]"), "{shown}");
+        assert!(
+            !shown.contains("[output clipped. Full log retained.]"),
+            "should collapse frames without clipping: {shown}"
+        );
+        assert!(shown.len() * 4 < trace.len(), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &trace);
+
+        // Redaction safety in stacktrace output.
+        let token = format!("{}{}{}", "gh", "p_", "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8");
+        let secret_trace = trace.replace("negative subtotal", &format!("bad token {token}"));
+        let shown = post_bash(&ws, "python3 src/cli.py", &secret_trace)
+            .expect("secret-bearing trace compacted");
+        assert!(!shown.contains(&token), "secret leaked: {shown}");
+        assert!(shown.contains("[redacted:"), "{shown}");
+        assert_archive_exact_and_accounted(&ws, &shown, &secret_trace);
+    }
+
+    #[test]
+    fn post_run_deep_json_payloads_compact_inline_and_persisted() {
+        let (_dir, ws) = test_workspace("");
+        let items: Vec<String> = (0..180)
+            .map(|i| {
+                format!(
+                    r#"{{"id":{i},"status":"active","owner":{{"login":"dev{}","role":"member"}},"tags":[{{"name":"backend","priority":1}}]}}"#,
+                    i % 4
+                )
+            })
+            .collect();
+        let payload = format!("[{}]\n", items.join(","));
+        assert!(payload.len() > 15_000);
+
+        for command in [
+            "curl -s https://api.example.com/v1/items",
+            "gh api repos/acme/widget/items",
+            "aws ec2 describe-instances",
+            "kubectl get pods -o json | jq '.items'",
+        ] {
+            let shown = post_bash(&ws, command, &payload)
+                .unwrap_or_else(|| panic!("{command} should compact via jsonview"));
+            assert!(
+                shown.starts_with("[JSON array as a table:"),
+                "{command}: {shown}"
+            );
+            assert!(shown.contains("{..} nested"), "{command}: {shown}");
+            assert!(shown.len() * 2 < payload.len(), "{command}: {shown}");
+            assert_archive_exact_and_accounted(&ws, &shown, &payload);
+        }
+
+        // Persisted large JSON payload (>30 KB) from an unknown command compacts inline
+        // when jsonview fits inside Claude Code's 2,000-character preview.
+        let results = ws.root.join("tool-results");
+        fs::create_dir_all(&results).unwrap();
+        let big_items: Vec<String> = (0..40)
+            .map(|i| {
+                let pad = " ".repeat(700);
+                format!(
+                    "  {{\n{pad}\"id\": {i},\n{pad}\"status\": \"ok\",\n{pad}\"meta\": {{\"team\": \"core\", \"tier\": 1}}\n  }}"
+                )
+            })
+            .collect();
+        let big_json = format!("[\n{}\n]\n", big_items.join(",\n"));
+        assert!(big_json.len() > 30_000);
+        let saved = results.join("gh-api.txt");
+        fs::write(&saved, &big_json).unwrap();
+        let input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "session_id": "unit-persisted-json",
+            "cwd": ws.root,
+            "tool_input": { "command": "gh api repos/acme/widget/items" },
+            "tool_response": {
+                "stdout": &big_json[..2000],
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+                "persistedOutputPath": saved,
+                "persistedOutputSize": big_json.len(),
+            }
+        });
+        let reply = claude_bash(&ws, &input).expect("persisted JSON compacted");
+        let updated = &reply["hookSpecificOutput"]["updatedToolOutput"];
+        assert!(updated.get("persistedOutputPath").is_none());
+        let shown = updated["stdout"].as_str().unwrap();
+        assert!(shown.starts_with("[JSON array as a table:"), "{shown}");
+        assert!(shown.len() <= PREVIEW_CHARS, "len={}: {shown}", shown.len());
+
+        // Persisted unstructured unknown output still stays untouched (returns None).
+        let unstructured: String = (0..600)
+            .map(|i| format!("row-{i:04} payload-alpha-{i} payload-beta-{i} payload-gamma-{i}\n"))
+            .collect();
+        let saved_plain = results.join("plain.txt");
+        fs::write(&saved_plain, &unstructured).unwrap();
+        let plain_input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "session_id": "unit-persisted-plain",
+            "cwd": ws.root,
+            "tool_input": { "command": "python3 dump.py" },
+            "tool_response": {
+                "stdout": &unstructured[..2000],
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+                "persistedOutputPath": saved_plain,
+                "persistedOutputSize": unstructured.len(),
+            }
+        });
+        assert!(claude_bash(&ws, &plain_input).is_none());
     }
 }

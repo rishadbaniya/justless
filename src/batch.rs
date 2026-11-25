@@ -459,20 +459,26 @@ impl<'a> Batch<'a> {
             }
         }
         // File reads of at most `read_outline_lines` lines in all stay as
-        // printed, as one such read does, unless another piece is large or the
-        // client saved the result to a file and shows only its start.
+        // printed, as one such read does, unless another piece is large, a file
+        // is minified onto one or two huge lines, or the client saved the
+        // result to a file and shows only its start.
         if persisted.is_none() {
             let (mut lines, mut other) = (0, 0);
+            let mut minified = false;
             for item in &verified {
                 let text = &actual[item.range.start_byte..item.range.end_byte];
                 match item.piece.source {
                     Source::File { .. } | Source::Files(_) | Source::Object(_) => {
-                        lines += text.lines().count() as u64;
+                        let count = text.lines().count() as u64;
+                        lines += count;
+                        if count <= 2 && text.len() > FLOOR {
+                            minified = true;
+                        }
                     }
                     _ => other += text.len(),
                 }
             }
-            if lines > 0 && lines <= settings.read_outline_lines && other <= FLOOR {
+            if !minified && lines > 0 && lines <= settings.read_outline_lines && other <= FLOOR {
                 return None;
             }
         }
@@ -723,5 +729,200 @@ mod tests {
         assert!(Batch::parse_list("rg -n x src && cd sub; git diff").is_none());
         assert!(Batch::parse_list("git diff && cd sub && git diff").is_some());
         assert!(Batch::parse_list("cd /repo && rm -rf x && git diff").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_batch_compacts_sed_tail_attached_counts_and_config_outline_formats() {
+        use std::fs;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join(".justless.toml"), "read_outline_lines = 0\n").unwrap();
+
+        let makefile: String = (0..30)
+            .map(|i| {
+                format!(
+                    "target_{i:02}:\n\t@echo building target_{i:02}\n\t@echo step 1 for target_{i:02}\n\t@echo step 2 for target_{i:02}\n\n"
+                )
+            })
+            .collect();
+        let dockerfile: String = (0..18)
+            .map(|i| {
+                format!(
+                    "FROM alpine:3.20 AS stage_{i:02}\nWORKDIR /app/stage_{i:02}\nRUN echo step 1 in stage_{i:02}\nRUN echo step 2 in stage_{i:02}\nCOPY . /app/stage_{i:02}\n\n"
+                )
+            })
+            .collect();
+        let css: String = (0..35)
+            .map(|i| {
+                format!(
+                    ".component-{i:02} {{\n  display: flex;\n  padding: {i}px;\n  color: #222222;\n}}\n\n"
+                )
+            })
+            .collect();
+        let proto: String = std::iter::once("syntax = \"proto3\";\npackage acme;\n\n".to_owned())
+            .chain((0..30).map(|i| {
+                format!(
+                    "message Order{i:02} {{\n  string id = 1;\n  int64 amount_cents = 2;\n  string currency = 3;\n}}\n\n"
+                )
+            }))
+            .collect();
+        let graphql: String = (0..30)
+            .map(|i| {
+                format!(
+                    "type Record{i:02} {{\n  id: ID!\n  title: String!\n  createdAt: String!\n}}\n\n"
+                )
+            })
+            .collect();
+        let prisma: String = std::iter::once(
+            "datasource db {\n  provider = \"postgresql\"\n  url = env(\"DATABASE_URL\")\n}\n\n"
+                .to_owned(),
+        )
+        .chain((0..25).map(|i| {
+            format!(
+                "model Entity{i:02} {{\n  id Int @id @default(autoincrement())\n  name String\n  active Boolean @default(true)\n}}\n\n"
+            )
+        }))
+        .collect();
+        let html: String = format!(
+            "<!doctype html>\n<html>\n<head>\n  <title>App</title>\n</head>\n<body>\n{}\n</body>\n</html>\n",
+            (0..30)
+                .map(|i| format!(
+                    "  <section id=\"panel-{i:02}\">\n    <h2>Panel {i:02}</h2>\n    <p>Details for panel {i:02} in dashboard.</p>\n  </section>"
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let mdx: String = (0..25)
+            .map(|i| {
+                format!(
+                    "## Section {i:02}\n\nimport {{ Widget{i:02} }} from './w';\n\nDetailed documentation paragraph for section {i:02}.\n\n"
+                )
+            })
+            .collect();
+        let big_payload = "x".repeat(1600);
+        let minified_json = format!(
+            "{{\"alpha\":{{\"blob\":\"{big_payload}\"}},\"beta\":{{\"blob\":\"{big_payload}\"}},\"gamma\":{{\"blob\":\"{big_payload}\"}},\"delta\":{{\"blob\":\"{big_payload}\"}}}}\n"
+        );
+        assert!(minified_json.len() > 6000);
+
+        for (name, content) in [
+            ("Makefile", &makefile),
+            ("Dockerfile", &dockerfile),
+            ("styles.css", &css),
+            ("api.proto", &proto),
+            ("schema.graphql", &graphql),
+            ("schema.prisma", &prisma),
+            ("index.html", &html),
+            ("docs.mdx", &mdx),
+            ("bundle.json", &minified_json),
+        ] {
+            fs::write(root.join(name), content).unwrap();
+        }
+        fs::write(root.join("note.txt"), "ok\n").unwrap();
+
+        let ws = crate::workspace::Workspace {
+            state: root.join(".justless"),
+            origin: root.clone(),
+            cwd: root.clone(),
+            root: root.clone(),
+        };
+
+        let sh = |script: &str| {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{script}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        let compact_list = |script: &str| {
+            let raw = sh(script);
+            let batch = Batch::parse(script).unwrap_or_else(|| panic!("did not parse: {script}"));
+            let input = serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "session_id": "unit-batch",
+                "cwd": root,
+                "tool_input": { "command": script },
+                "tool_response": {
+                    "stdout": raw,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }
+            });
+            let reply = batch
+                .compact(&ws, &input)
+                .unwrap_or_else(|| panic!("did not compact: {script}"));
+            let view = reply["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(view.len() < raw.len(), "{script}: {view}");
+            let exact = view.lines().find(|l| l.starts_with("Exact: ")).unwrap();
+            let id = exact.split_whitespace().last().unwrap();
+            assert_eq!(
+                fs::read(ws.state.join("runs").join(id).join("stdout")).unwrap(),
+                raw.as_bytes(),
+                "archive replay mismatch for {script}"
+            );
+            view
+        };
+
+        // `sed -n 'A,$p'`, attached `head -n50`, `tail -n+50`, and `config_outline` formats.
+        let view = compact_list(
+            "sed -n '10,$p' Makefile; head -n90 Dockerfile; tail -n+15 styles.css; cat note.txt",
+        );
+        assert!(view.contains("target target_"), "{view}");
+        assert!(view.contains("stage stage_"), "{view}");
+        assert!(view.contains("styles.css lines"), "{view}");
+
+        let view = compact_list(
+            "sed -ne '5,$p' api.proto; head --lines=100 schema.graphql; tail --lines=+5 schema.prisma",
+        );
+        assert!(view.contains("Order"), "{view}");
+        assert!(view.contains("Record"), "{view}");
+        assert!(view.contains("Entity"), "{view}");
+
+        let view = compact_list("cat index.html docs.mdx");
+        assert!(view.contains("index.html lines"), "{view}");
+        assert!(view.contains("heading Section "), "{view}");
+
+        // Even under the default 600-line `read_outline_lines` threshold, a huge
+        // 1-line minified JSON file in a mixed read list compacts and outlines its keys.
+        fs::remove_file(root.join(".justless.toml")).unwrap();
+        let view = compact_list("cat bundle.json; cat note.txt");
+        assert!(view.contains("key alpha"), "{view}");
+        assert!(view.contains("key beta"), "{view}");
+        assert!(view.contains("key delta"), "{view}");
+
+        // Redaction safety: a secret in a batch read keeps the output uncompacted.
+        let token = format!("{}{}{}", "gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        fs::write(
+            root.join("secret.json"),
+            minified_json.replace("alpha", &token),
+        )
+        .unwrap();
+        let script = "cat secret.json; cat note.txt";
+        let raw = sh(script);
+        let batch = Batch::parse(script).unwrap();
+        let input = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "session_id": "unit-batch-secret",
+            "cwd": root,
+            "tool_input": { "command": script },
+            "tool_response": {
+                "stdout": raw,
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            }
+        });
+        assert!(batch.compact(&ws, &input).is_none());
     }
 }

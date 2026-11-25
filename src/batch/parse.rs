@@ -162,37 +162,75 @@ fn address(s: &str) -> Option<usize> {
 }
 
 fn count(program: &str, args: &[String]) -> Option<Filter> {
-    let value = match args {
-        [] => "10",
-        [n] => n.strip_prefix('-')?,
-        [flag, n] if flag == "-n" => n,
+    let (value, allow_plus) = match args {
+        [] => ("10", false),
+        [opt] => {
+            if let Some(v) = opt
+                .strip_prefix("-n")
+                .or_else(|| opt.strip_prefix("--lines="))
+            {
+                (v, true)
+            } else {
+                (opt.strip_prefix('-')?, false)
+            }
+        }
+        [flag, n] if matches!(flag.as_str(), "-n" | "--lines") => (n.as_str(), true),
         _ => return None,
     };
     if program == "head" {
         return Some(Filter::First(number(value)?));
     }
-    match value.strip_prefix('+') {
-        Some(n) => Some(Filter::From(address(n)?)),
-        None => Some(Filter::Last(number(value)?)),
+    if allow_plus && let Some(n) = value.strip_prefix('+') {
+        return Some(Filter::From(address(n)?));
     }
+    Some(Filter::Last(number(value)?))
 }
 
 fn sed(args: &[String]) -> Option<Filter> {
-    let [flag, script] = args else { return None };
-    if flag != "-n" {
+    let mut quiet = false;
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut positional = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            "-e" | "--expression" if !positional => scripts.push(iter.next()?.as_str()),
+            "-ne" | "-en" if !positional => {
+                quiet = true;
+                scripts.push(iter.next()?.as_str());
+            }
+            _ if !positional && arg.starts_with("--expression=") => {
+                scripts.push(arg.strip_prefix("--expression=")?);
+            }
+            _ if !positional && arg.starts_with("-e") && arg.len() > 2 => {
+                scripts.push(&arg[2..]);
+            }
+            _ if !arg.starts_with('-') && scripts.is_empty() => {
+                scripts.push(arg.as_str());
+                positional = true;
+            }
+            _ => return None,
+        }
+    }
+    if !quiet || scripts.is_empty() {
         return None;
     }
-    let ranges = script
-        .split(';')
-        .map(|item| {
-            let span = item.trim().strip_suffix('p')?;
+    let mut ranges = Vec::new();
+    for script in scripts {
+        let script = script.trim().trim_end_matches(';');
+        if script.is_empty() {
+            return None;
+        }
+        for item in script.split(';') {
+            let span = item.trim().strip_suffix('p')?.trim_end();
             let (a, b) = span.split_once(',').unwrap_or((span, span));
-            let first = address(a)?;
+            let first = address(a.trim())?;
+            let b = b.trim();
             let last = if b == "$" { usize::MAX } else { address(b)? };
-            Some((first, last.max(first)))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    (ranges.len() <= 32).then_some(Filter::Sed(ranges))
+            ranges.push((first, last.max(first)));
+        }
+    }
+    (!ranges.is_empty() && ranges.len() <= 32).then_some(Filter::Sed(ranges))
 }
 
 /// The lines an awk program prints when it is only a range of line numbers:
@@ -728,8 +766,17 @@ pub(super) fn single(command: &str, plain: bool) -> Option<Vec<Piece<'_>>> {
     let differs =
         effective.len() != refs.len() || effective.iter().zip(&refs).any(|(a, b)| a.as_str() != *b);
     let program = effective.first().map(String::as_str);
-    // The single-file read takes neither several files nor an awk range.
-    if !plain && !differs && !matches!(program, Some("cat" | "awk")) {
+    // The single-file read takes neither several files, nor an awk range, nor
+    // sed expressions written with `-ne`/`-e`/`--quiet`/`--silent`.
+    let extra_sed = program == Some("sed")
+        && effective[1..].iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "-ne" | "-en" | "-e" | "--expression" | "--quiet" | "--silent"
+            ) || a.starts_with("-e")
+                || a.starts_with("--expression=")
+        });
+    if !plain && !differs && !extra_sed && !matches!(program, Some("cat" | "awk")) {
         return None;
     }
     // Only a list mixes in other pieces.
@@ -1099,6 +1146,52 @@ mod tests {
             "cat a;~/b",
         ] {
             assert!(super::list(list).is_none(), "{list}");
+        }
+    }
+
+    #[test]
+    fn sed_tail_ranges_and_attached_head_tail_counts_parse() {
+        for command in [
+            "sed -n '10,$p' a.rs; cat b.rs",
+            "sed -n '1,20p;100,$p' a.rs; cat b.rs",
+            "sed -n '10, $p' a.rs; cat b.rs",
+            "sed -ne '10,$p' a.rs; cat b.rs",
+            "sed -n -e '1,20p' -e '50,$p' a.rs; cat b.rs",
+            "sed --quiet '10,$p' a.rs; cat b.rs",
+            "sed --silent --expression='10,$p' a.rs; cat b.rs",
+            "cat a.rs | sed -n '10,$p'",
+            "cat a.rs | sed -ne '10,$p'",
+            "head -n50 a.rs; tail -n50 b.rs",
+            "head -n50 a.rs; tail -n+50 b.rs",
+            "head --lines=50 a.rs; tail --lines=+50 b.rs",
+            "head --lines 50 a.rs; tail --lines +50 b.rs",
+            "cat a.rs | head -n50; cat b.rs | tail -n+50",
+            "nl -ba a.rs | sed -n '10,$p' | head -n50",
+        ] {
+            assert!(super::list(command).is_some(), "should parse: {command}");
+        }
+        // Single-command forms accepted directly by `single`.
+        assert!(super::single("sed -ne '10,$p' a.rs", false).is_some());
+        assert!(super::single("sed -n -e '1,20p' -e '50,$p' a.rs", false).is_some());
+        assert!(super::single("head -n50 a.rs", true).is_some());
+        assert!(super::single("tail -n+50 a.rs", true).is_some());
+        // Plain `sed -n '10,$p' a.rs` stays with `shellread` for workspace reads,
+        // and parses with `plain = true` for outside-workspace fallback.
+        assert!(super::single("sed -n '10,$p' a.rs", false).is_none());
+        assert!(super::single("sed -n '10,$p' a.rs", true).is_some());
+
+        // Invalid or non-portable forms are rejected.
+        for rejected in [
+            "sed '10,$p' a.rs; cat b.rs",
+            "sed -n '0,$p' a.rs; cat b.rs",
+            "sed -n '1,10p' -e '20,30p' a.rs; cat b.rs",
+            "head -n+50 a.rs; cat b.rs",
+            "head --lines=+50 a.rs; cat b.rs",
+            "tail -+50 a.rs; cat b.rs",
+            "tail -n+0 a.rs; cat b.rs",
+            "head -n-5 a.rs; cat b.rs",
+        ] {
+            assert!(super::list(rejected).is_none(), "should reject: {rejected}");
         }
     }
 }
