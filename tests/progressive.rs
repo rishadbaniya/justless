@@ -1458,4 +1458,51 @@ fn config_files_get_structural_outlines_expand_and_verified_edits() {
         String::from_utf8(out(root, &["expand", "project.json", "targets.build"])).unwrap();
     assert!(build_target.contains("vite:build"), "{build_target}");
     assert!(!build_target.contains("vitest:run"), "{build_target}");
+
+    // Deduped TOML/YAML signatures omit redundant `[table]` / `key:` repetition while
+    // keeping scalar values like `name: CI`.
+    assert!(toml_outline.contains("table package\n"), "{toml_outline}");
+    assert!(yaml_outline.contains("key jobs\n"), "{yaml_outline}");
+    assert!(
+        yaml_outline.contains("key name  name: CI\n"),
+        "{yaml_outline}"
+    );
+
+    // Multi-file `read FILE1 FILE2 ... --outline` outlines several files in one call
+    // in both text and `--json` modes.
+    let batch_outline = String::from_utf8(out(
+        root,
+        &["read", "Cargo.toml", "ci.yml", "project.json", "--outline"],
+    ))
+    .unwrap();
+    assert!(
+        batch_outline.contains("=== Cargo.toml ===\n"),
+        "{batch_outline}"
+    );
+    assert!(
+        batch_outline.contains("=== ci.yml ===\n"),
+        "{batch_outline}"
+    );
+    assert!(
+        batch_outline.contains("=== project.json ===\n"),
+        "{batch_outline}"
+    );
+    assert!(
+        batch_outline.contains("section jobs.test"),
+        "{batch_outline}"
+    );
+    assert!(
+        batch_outline.contains("section targets.build"),
+        "{batch_outline}"
+    );
+
+    let batch_json: Value = serde_json::from_slice(&out(
+        root,
+        &["read", "Cargo.toml", "ci.yml", "--outline", "--json"],
+    ))
+    .unwrap();
+    let files = batch_json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["file"], "Cargo.toml");
+    assert_eq!(files[1]["file"], "ci.yml");
 }

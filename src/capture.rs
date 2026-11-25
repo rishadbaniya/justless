@@ -1715,6 +1715,14 @@ impl Capture<'_> {
         let mut flags_shown = false;
         let mut notice = false;
         let mut report = false;
+        let plan_fits = run.summary.kind == "plan"
+            && (stdout_fits
+                || (selection.built_in
+                    && previews[0].1.starts_with(b"[")
+                    && !previews[0]
+                        .1
+                        .windows("[… full stream in log …]".len())
+                        .any(|w| w == "[… full stream in log …]".as_bytes())));
         if let Some(prior) = &previous
             && run.unchanged
         {
@@ -1755,6 +1763,7 @@ impl Capture<'_> {
                 report = true;
             }
         } else if (!merged || whole)
+            && (!plan_fits || previous.is_some())
             && let Some(summary) = run.summary.render(
                 previous.as_ref().map(|r| (r.id.as_str(), &r.summary)),
                 run.status,
@@ -1762,7 +1771,7 @@ impl Capture<'_> {
             && (covers_stderr && !fit_whole[1]
                 || !stdout_fits
                 || previous.is_some()
-                || summary.len() < covered)
+                || (run.summary.kind != "plan" && summary.len() < covered))
         {
             // A merged stdout also holds the command's stderr, which a test, diff or
             // inventory summary of stdout would drop, so that run keeps its preview,

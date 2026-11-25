@@ -62,6 +62,7 @@ pub fn family(args: &[OsString]) -> String {
         ["go", "test", ..] => "go test",
         ["npm", "test", ..] => "npm test",
         ["pytest", ..] | ["python" | "python3", "-m", "pytest"] => "pytest",
+        ["terraform" | "tofu", "plan", ..] => "terraform plan",
         [cmd @ ("cargo" | "git" | "go" | "npm" | "rg"), ..] => cmd,
         _ => "other",
     }
@@ -127,6 +128,7 @@ impl Parser {
             _ if profile.is_some() => "",
             "git diff" => "diff",
             _ if commits => "diff",
+            "terraform plan" => "plan",
             "pytest" | "cargo test" | "cargo nextest" | "go test" | "npm test" => "tests",
             _ => "",
         };
@@ -223,6 +225,8 @@ impl Parser {
         }
         if self.summary.kind == "diff" {
             self.diff(line, number);
+        } else if self.summary.kind == "plan" {
+            self.plan(line, number);
         } else {
             if let Some(cargo) = &mut self.cargo {
                 cargo.observe(line, number, crate::capture::Stream::Stdout);
@@ -357,6 +361,38 @@ impl Parser {
                 self.hash.update(line.as_bytes());
                 self.hash.update(b"\n");
             }
+            item.last = n;
+        }
+    }
+
+    fn plan(&mut self, line: &str, n: usize) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("# ")
+            && let Some((glyph, address, action)) = terraform_action(rest)
+        {
+            self.flush();
+            self.pending = Some(Item::new(&format!("{glyph} {address}"), action, n));
+            return;
+        }
+        if trimmed.starts_with("Plan: ") || trimmed.starts_with("No changes.") {
+            self.flush();
+            self.summary.outcomes.push(short(trimmed, 220));
+            return;
+        }
+        if trimmed.starts_with("Changes to Outputs:")
+            || trimmed.starts_with("Note:")
+            || trimmed.starts_with("Saved the plan to:")
+            || trimmed.starts_with("Error:")
+            || trimmed.starts_with("────")
+        {
+            self.flush();
+            return;
+        }
+        if let Some(item) = &mut self.pending
+            && !trimmed.is_empty()
+        {
+            self.hash.update(trimmed.as_bytes());
+            self.hash.update(b"\n");
             item.last = n;
         }
     }
@@ -640,6 +676,32 @@ impl Parser {
     }
 }
 
+/// Parse a Terraform/OpenTofu resource plan header such as
+/// `aws_instance.web[0] will be created` or `module.net.aws_subnet.a must be replaced`.
+fn terraform_action(rest: &str) -> Option<(&'static str, &str, &str)> {
+    const ACTIONS: &[(&str, &str)] = &[
+        (" must be replaced", "-/+"),
+        (" is tainted, so it must be replaced", "-/+"),
+        (" will be created", "+"),
+        (" will be updated in-place", "~"),
+        (" will be destroyed", "-"),
+        (" will be read during apply", "<="),
+        (" has moved to ", "->"),
+        (" will be forgotten", "x"),
+        (" will no longer be managed", "x"),
+    ];
+    for &(phrase, glyph) in ACTIONS {
+        if let Some(pos) = rest.find(phrase) {
+            let address = rest[..pos].trim();
+            let action = rest[pos..].trim();
+            if !address.is_empty() && !address.contains(' ') {
+                return Some((glyph, address, action));
+            }
+        }
+    }
+    None
+}
+
 /// Verbose pytest failure line (`tests/test_a.py::test_x FAILED [ 50%]`) when
 /// `--no-summary` / `-rN` omits the short test summary block.
 fn pytest_verbose_failure(line: &str) -> Option<&str> {
@@ -807,6 +869,11 @@ impl Summary {
                 ))
             }
             "diff" if !self.items.is_empty() => Some(self.patch_heading()),
+            "plan" if !self.items.is_empty() => self
+                .outcomes
+                .last()
+                .cloned()
+                .or_else(|| Some(format!("{} resource change(s)", self.items.len()))),
             "inventory" | "search" | "listing" => self.outcomes.first().cloned(),
             _ => None,
         }
@@ -828,6 +895,9 @@ impl Summary {
             }
             report.push_str(self.outcomes.first()?);
             report.push('\n');
+        }
+        if self.kind == "plan" && status != 0 && self.items.is_empty() {
+            return None;
         }
         if self.kind == "tests" {
             if let Some(totals) = self
@@ -915,6 +985,8 @@ impl Summary {
             if self.kind == "diff" {
                 report.push_str(&self.patch_heading());
                 report.push('\n');
+            } else if self.kind == "plan" && !self.items.is_empty() {
+                report.push_str(&format!("{} resource change(s)\n", self.items.len()));
             }
             for item in &self.items {
                 report.push_str(&format!("{}\n", item.display()));
@@ -1241,5 +1313,75 @@ FAILED tests/test_a.py::test_bad - AssertionError: assert 1 == 2
         let skipped = "========================= 5 skipped in 0.08s =========================\n";
         let skipped_summary = parse("pytest", skipped);
         assert_eq!(skipped_summary.outcomes, ["5 skipped in 0.08s"]);
+    }
+
+    #[test]
+    fn terraform_plan_summarizes_resource_changes_and_reruns() {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            family(&args("terraform plan -out=tfplan")),
+            "terraform plan"
+        );
+        assert_eq!(family(&args("tofu plan")), "terraform plan");
+
+        let plan1 = "\
+Terraform will perform the following actions:
+
+  # aws_instance.web[0] will be created
+  + resource \"aws_instance\" \"web\" {
+      + ami           = \"ami-111\"
+      + instance_type = \"t3.micro\"
+    }
+
+  # aws_security_group.api will be updated in-place
+  ~ resource \"aws_security_group\" \"api\" {
+      ~ description = \"old\" -> \"new\"
+    }
+
+  # aws_launch_template.worker must be replaced
+-/+ resource \"aws_launch_template\" \"worker\" {
+      ~ image_id = \"ami-1\" -> \"ami-2\" # forces replacement
+    }
+
+Plan: 2 to add, 1 to change, 1 to destroy.
+";
+        let summary = parse("terraform plan", plan1);
+        let rendered = summary.render(None, 0).unwrap();
+        assert!(rendered.contains("3 resource change(s)"), "{rendered}");
+        assert!(
+            rendered.contains("+ aws_instance.web[0] will be created [stdout:3-7]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("~ aws_security_group.api will be updated in-place [stdout:9-12]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("-/+ aws_launch_template.worker must be replaced [stdout:14-17]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Plan: 2 to add, 1 to change, 1 to destroy."),
+            "{rendered}"
+        );
+        assert_eq!(
+            summary.headline().as_deref(),
+            Some("Plan: 2 to add, 1 to change, 1 to destroy.")
+        );
+
+        // Rerun reports only the resource whose attribute changed.
+        let plan2 = plan1.replace("\"t3.micro\"", "\"t3.small\"");
+        let summary2 = parse("terraform plan", &plan2);
+        let delta = summary2.render(Some(("run-1", &summary)), 0).unwrap();
+        assert!(delta.contains("Compared with run-1:"), "{delta}");
+        assert!(delta.contains("+ + aws_instance.web[0]"), "{delta}");
+        assert!(!delta.contains("aws_security_group.api"), "{delta}");
+
+        // A failing plan with no resource items returns None so error preview stays verbatim.
+        let errored = parse(
+            "terraform plan",
+            "Error: Unsupported argument on main.tf line 12\n",
+        );
+        assert!(errored.render(None, 1).is_none());
     }
 }

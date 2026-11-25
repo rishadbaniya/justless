@@ -27,8 +27,8 @@ fn revision() -> Arg<'static> {
 pub fn commands() -> Vec<Cli<'static>> {
     vec![
         Cli::new("read")
-            .about("Read a small file or page through a large file's outline")
-            .arg(file())
+            .about("Read a small file or page through one or more files' outlines")
+            .arg(Arg::new("file").required(true).multiple_values(true))
             .arg(Arg::new("outline").long("outline"))
             .arg(
                 Arg::new("shell-range")
@@ -863,6 +863,11 @@ impl Row {
                 "#{}..#{} L{}-{} {} ({})\n",
                 self.id, end_id, self.first, self.last, self.kind, self.name
             )
+        } else if self.signature.is_empty() {
+            format!(
+                "#{} L{}-{} {} {}\n",
+                self.id, self.first, self.last, self.kind, self.name
+            )
         } else {
             format!(
                 "#{} L{}-{} {} {}  {}\n",
@@ -971,7 +976,97 @@ fn workspace_file(ws: &Workspace, file: &str, root_given: bool) -> Result<String
     )
 }
 
+fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool) -> Result<()> {
+    ensure!(
+        args.value_of("shell-range").is_none(),
+        "--shell-range applies to a single file"
+    );
+    ensure!(
+        args.value_of("after").is_none(),
+        "--after applies to a single file"
+    );
+    let total_budget = crate::context_budget(ws, args)?;
+    let outline_forced = ["outline", "json", "match", "limit"]
+        .iter()
+        .any(|id| args.occurrences_of(id) > 0);
+    let filter = args.value_of("match").unwrap_or("");
+    let limit = crate::read_num(args, "limit", 1)?;
+    let json_mode = args.is_present("json");
+
+    let mut remaining = total_budget;
+    let mut json_files = Vec::new();
+    let mut text_out = String::new();
+
+    for (idx, raw) in files.iter().enumerate() {
+        let left = files.len() - idx;
+        let share = (remaining / left).max(256);
+        let file = workspace_file(ws, raw, root_given)?;
+        let mut source = Snapshot::open(ws, &file)?;
+        let digest = crate::capture::source_digest(source.text.as_bytes());
+        if !json_mode && !outline_forced && source.text.len() <= share {
+            let header = format!("=== {file} ===\n");
+            text_out.push_str(&header);
+            text_out.push_str(&source.text);
+            if !source.text.ends_with('\n') {
+                text_out.push('\n');
+            }
+            let lines = source.text.lines().count();
+            if lines > 0 {
+                crate::history::saw_expand(ws, &file, 1, lines, digest, source.text.len() as u64);
+            }
+            remaining = remaining.saturating_sub(header.len() + source.text.len());
+            continue;
+        }
+        source.index(&file)?;
+        let page = source.page(filter, None, limit, share)?;
+        if json_mode {
+            let mut value = serde_json::to_value(&page)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("file".into(), serde_json::Value::String(file.clone()));
+            }
+            let shown_bytes = serde_json::to_vec(&value)?.len() as u64;
+            crate::history::saw_outline_measured(
+                ws,
+                &file,
+                digest,
+                source.text.len() as u64,
+                shown_bytes,
+            );
+            remaining = remaining.saturating_sub(shown_bytes as usize);
+            json_files.push(value);
+        } else {
+            let header = format!("=== {file} ===\n");
+            let rendered = page.display();
+            let used = header.len() + rendered.len();
+            text_out.push_str(&header);
+            text_out.push_str(&rendered);
+            crate::history::saw_outline_measured(
+                ws,
+                &file,
+                digest,
+                source.text.len() as u64,
+                rendered.len() as u64,
+            );
+            remaining = remaining.saturating_sub(used);
+        }
+    }
+
+    if json_mode {
+        let encoded = serde_json::to_vec(&serde_json::json!({ "files": json_files }))?;
+        io::stdout().lock().write_all(&encoded)?;
+    } else {
+        print!("{text_out}");
+    }
+    Ok(())
+}
+
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> Result<()> {
+    if name == "read" {
+        let files: Vec<&str> = args.values_of("file").unwrap().collect();
+        if files.len() > 1 {
+            return read_many(ws, &files, args, root_given);
+        }
+    }
     let argument = args.value_of("file").unwrap();
     if name == "read"
         && let Some(range) = args.value_of("shell-range")

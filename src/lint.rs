@@ -36,11 +36,22 @@ const SHOWN_PACKAGES: usize = 6;
 const SHOWN_TARGETS: usize = 4;
 
 static RUST_HEADER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_]+)\])?: (.+)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Za-z0-9_-]+)\])?: (.+)$").unwrap());
 static CODE_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Z]{1,4}[0-9]{2,5}) (?:\[\*\] )?(.+)$").unwrap());
-static ARROW: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:-->|╭▸|┌─)\s*(.+?):(\d+)(?::(\d+))?\s*$").unwrap());
+static OXLINT_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*([×✖!⚠])\s+([a-z0-9_-]+\([a-z0-9_/-]+\)):\s+(.+)$").unwrap());
+static BIOME_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\S.*?):(\d+):(\d+)\s+((?:lint|format|organizeImports|assist|parse)[/\w-]+)\s+━+")
+        .unwrap()
+});
+static BIOME_MSG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+([×✖!⚠ℹ])\s+(.+)$").unwrap());
+static ARROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*(?:(?:-->|╭▸|┌─)\s*(.+?):(\d+)(?::(\d+))?\s*|╭─\[(.+?):(\d+)(?::(\d+))?\]\s*)$",
+    )
+    .unwrap()
+});
 static ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"#\[(?:warn|deny|forbid|allow|expect)\(([A-Za-z0-9_:]+)\)\]|`-[DWF] ([A-Za-z0-9_:-]+)` implied by|index\.html#([a-z0-9_]+)",
@@ -97,7 +108,7 @@ static SHELLCHECK_ROW: LazyLock<Regex> =
 // A tool's own count, kept so a mismatch with the grouped header stays visible.
 static TOTAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?:Found \d+ (?:errors?|problems?|issues?)\b|\d+ (?:errors?|problems?|issues?|offenses?)\b|\d+ files? inspected\b)",
+        r"^(?:Found \d+ (?:errors?|warnings?|problems?|issues?|diagnostics?)\b|\d+ (?:errors?|problems?|issues?|offenses?)\b|\d+ files? inspected\b)",
     )
     .unwrap()
 });
@@ -379,6 +390,8 @@ impl Lint {
         if let Some(block) = self.block.as_mut().filter(|b| b.stream == stream) {
             let ends = RUST_HEADER.is_match(line)
                 || CODE_HEADER.is_match(line)
+                || OXLINT_HEADER.is_match(line)
+                || BIOME_HEADER.is_match(line)
                 || TOTAL.is_match(line)
                 || CARGO_STATUS.is_match(line);
             if line.is_empty() && !ends {
@@ -389,8 +402,20 @@ impl Lint {
                 if block.file.is_empty()
                     && let Some(c) = ARROW.captures(line)
                 {
-                    (block.file, block.line, block.column) =
-                        position(&self.root, &c[1], &c[2], c.get(3));
+                    let (file, row, col) = match (c.get(1), c.get(2)) {
+                        (Some(f), Some(r)) => (f.as_str(), r.as_str(), c.get(3)),
+                        _ => (&c[4], &c[5], c.get(6)),
+                    };
+                    (block.file, block.line, block.column) = position(&self.root, file, row, col);
+                }
+                if block.message.is_empty()
+                    && let Some(c) = BIOME_MSG.captures(line)
+                {
+                    block.severity = match &c[1] {
+                        "×" | "✖" => Severity::Error,
+                        _ => Severity::Warning,
+                    };
+                    block.message = short(c[2].trim(), 240);
                 }
                 if let Some(rule) = attribute(line) {
                     block.rule.get_or_insert(rule);
@@ -412,6 +437,7 @@ impl Lint {
             && !ESLINT_ROW.is_match(line)
             && !PYRIGHT.is_match(line)
             && !SHELLCHECK_ROW.is_match(line)
+            && !OXLINT_HEADER.is_match(line)
             && !CARGO_STATUS.is_match(line)
         {
             let finding = &mut self.findings[index];
@@ -437,6 +463,23 @@ impl Lint {
         if let Some(c) = CODE_HEADER.captures(line) {
             let rule = Some(c[1].to_owned());
             self.block = Some(Finding::new(Severity::Warning, rule, &c[2], stream).lines(n, line));
+            return true;
+        }
+        if let Some(c) = OXLINT_HEADER.captures(line) {
+            let severity = match &c[1] {
+                "×" | "✖" => Severity::Error,
+                _ => Severity::Warning,
+            };
+            self.block = Some(
+                Finding::new(severity, Some(c[2].to_owned()), &c[3], stream).lines(n, line.trim()),
+            );
+            return true;
+        }
+        if let Some(c) = BIOME_HEADER.captures(line) {
+            let finding = Finding::new(Severity::Error, Some(c[4].to_owned()), "", stream)
+                .at(&self.root, &c[1], &c[2], c.get(3))
+                .lines(n, line);
+            self.block = Some(finding);
             return true;
         }
         if let Some(c) = TSC.captures(line) {
@@ -1062,4 +1105,74 @@ fn locations(findings: &[Finding]) -> String {
         first.last
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn biome_oxlint_and_ty_check_group_findings_by_rule() {
+        let biome_out = "\
+src/app.ts:12:5 lint/style/useConst ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × This let declares a variable that is only assigned once.
+
+src/util.ts:4:3 lint/style/useConst ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × This let declares a variable that is only assigned once.
+
+src/api.ts:9:1 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Unexpected any. Specify a different type.
+
+Checked 12 files in 8ms.
+Found 2 errors.
+";
+        let mut biome = Lint::new(Path::new("/repo"));
+        for (i, line) in biome_out.split_inclusive('\n').enumerate() {
+            biome.observe(line, i + 1, Stream::Stderr);
+        }
+        let (report, _) = biome.finish("biome check", 4096, None).unwrap();
+        assert!(report.contains("lint/style/useConst ×2"), "{report}");
+        assert!(
+            report.contains("lint/suspicious/noExplicitAny ×1"),
+            "{report}"
+        );
+        assert!(report.contains("src/app.ts:12:5"), "{report}");
+
+        let oxlint_out = "\
+  × eslint(no-unused-vars): Variable 'x' is declared but never used.
+   ╭─[src/app.ts:10:7]
+  × eslint(no-unused-vars): Variable 'y' is declared but never used.
+   ╭─[src/app.ts:14:7]
+  ! eslint(no-console): Unexpected console statement.
+   ╭─[src/log.ts:3:1]
+Found 1 warning and 2 errors.
+";
+        let mut oxlint = Lint::new(Path::new("/repo"));
+        for (i, line) in oxlint_out.split_inclusive('\n').enumerate() {
+            oxlint.observe(line, i + 1, Stream::Stdout);
+        }
+        let (report, _) = oxlint.finish("oxlint", 4096, None).unwrap();
+        assert!(report.contains("eslint(no-unused-vars) ×2"), "{report}");
+        assert!(report.contains("eslint(no-console) ×1"), "{report}");
+        assert!(report.contains("src/app.ts:10:7"), "{report}");
+
+        let ty_out = "\
+error[invalid-assignment]: Object of type `str` is not assignable to `int`
+ --> src/models.py:22:9
+  |
+22 | x: int = \"bad\"
+  |          ^^^^^
+Found 1 diagnostic
+";
+        let mut ty = Lint::new(Path::new("/repo"));
+        for (i, line) in ty_out.split_inclusive('\n').enumerate() {
+            ty.observe(line, i + 1, Stream::Stderr);
+        }
+        let (report, _) = ty.finish("ty check", 4096, None).unwrap();
+        assert!(report.contains("invalid-assignment ×1"), "{report}");
+        assert!(report.contains("src/models.py:22:9"), "{report}");
+    }
 }

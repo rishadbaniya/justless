@@ -51,11 +51,7 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["bun", "build"], &[]),
     (&["bun", "run", "build"], &[]),
     (&["bun", "run", "lint"], &[]),
-    (&["biome", "check"], &[]),
-    (&["biome", "lint"], &[]),
-    (&["biome", "ci"], &[]),
     (&["biome", "format"], &[]),
-    (&["oxlint"], &[]),
     (&["prettier"], &[]),
     (&["ng", "build"], &[]),
     (&["ng", "lint"], &[]),
@@ -84,7 +80,6 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     // Python
     (&["ruff", "format"], &[]),
     (&["sqlfluff", "lint"], &[]),
-    (&["ty", "check"], &[]),
     (&["pip", "install"], &[]),
     (&["pip", "list"], &[]),
     (&["pip", "show"], &[]),
@@ -301,6 +296,66 @@ const PROGRESS: &[(&[&str], &str)] = &[
         &["sbt"],
         r"^\[info\] (welcome to sbt|loading |set current project to|[Rr]esolving |Fetching |Fetched |Updating |Updated |[Cc]ompiling \d+ |done compiling)",
     ),
+    (
+        &["docker", "build"],
+        r"^(?:#\d+ (?:CACHED|DONE \d|\[internal\] |transferring |load (?:build|metadata|transfer)|sha256:[0-9a-f]|exporting (?:layers|manifest|config))|---> (?:Using cache|[0-9a-f]{12})$)",
+    ),
+    (
+        &["docker", "compose", "build"],
+        r"^(?:#\d+ (?:CACHED|DONE \d|\[internal\] |transferring |load (?:build|metadata|transfer)|sha256:[0-9a-f]|exporting (?:layers|manifest|config))|---> (?:Using cache|[0-9a-f]{12})$)",
+    ),
+    (
+        &["uv", "sync"],
+        r"^(?:Downloading |Building |Prepared \d+ packages?|Fetching |Unpacking )",
+    ),
+    (
+        &["uv", "pip", "install"],
+        r"^(?:Downloading |Building |Prepared \d+ packages?|Fetching |Unpacking )",
+    ),
+    (
+        &["uv", "add"],
+        r"^(?:Downloading |Building |Prepared \d+ packages?|Fetching |Unpacking )",
+    ),
+    (
+        &["uv", "lock"],
+        r"^(?:Downloading |Building |Prepared \d+ packages?|Fetching |Unpacking )",
+    ),
+    (
+        &["yarn", "install"],
+        r"^(?:\[[1-4]/4\] (?:Resolving|Fetching|Linking|Building) |info Fetching |➤ YN0000: [┌│└] (?:Resolution|Fetch|Link) step)",
+    ),
+    (
+        &["bun", "install"],
+        r"^(?:Resolving dependencies|Resolved, downloaded and extracted \[\d+\]|Saved lockfile)$",
+    ),
+    (
+        &["bun", "add"],
+        r"^(?:Resolving dependencies|Resolved, downloaded and extracted \[\d+\]|Saved lockfile)$",
+    ),
+    (
+        &["xcodebuild"],
+        r"^(?:Compile(?:Swift|C|AssetCatalog|Storyboard|XIB)|Swift(?:Compile|Driver|EmitModule|MergeGeneratedHeaders)|Ld |ProcessInfoPlistFile |CpResource |CopySwiftLibs |Touch |WriteAuxiliaryFile |MkDir |CreateBuildDirectory |PhaseScriptExecution |CodeSign |Validate |RegisterExecutionPolicyException |SymLink |Libtool |Ditto )",
+    ),
+    (
+        &["mix", "compile"],
+        r"^(?:Compiling \d+ files? \(|Generated \S+ app$)",
+    ),
+    (
+        &["mix", "deps.get"],
+        r"^(?:\* Getting |Resolving Hex dependencies)",
+    ),
+    (
+        &["next", "build"],
+        r"^(?:Creating an optimized production build|Collecting page data|Generating static pages \(\d+/\d+\)|Finalizing page optimization|Collecting build traces)",
+    ),
+    (
+        &["turbo", "build"],
+        r"^(?:• Packages in scope:|• Running \S+ in \d+ packages?|• Remote caching |.+: cache hit, replaying logs )",
+    ),
+    (
+        &["turbo", "run", "build"],
+        r"^(?:• Packages in scope:|• Running \S+ in \d+ packages?|• Remote caching |.+: cache hit, replaying logs )",
+    ),
 ];
 
 /// The entry with the longest command that `words` start with, reading the
@@ -411,7 +466,7 @@ mod tests {
     fn a_package_runner_or_a_path_selects_the_same_command() {
         for line in [
             "npx prettier --check .",
-            "pnpm exec biome check .",
+            "pnpm exec biome format .",
             "bundle exec rspec",
             "poetry run sqlfluff lint .",
             "vendor/bin/phpunit",
@@ -526,6 +581,46 @@ mod tests {
                 "sbt test",
                 "[info] welcome to sbt 1.10.2 (Eclipse Adoptium Java 21.0.4)",
                 "[info] Passed: Total 12, Failed 0, Errors 0, Passed 12",
+            ),
+            (
+                "docker build .",
+                "#8 CACHED",
+                "#12 naming to docker.io/library/app:latest",
+            ),
+            (
+                "uv sync",
+                "Downloading httpx (76.2 KiB)",
+                "Installed 14 packages in 28ms",
+            ),
+            (
+                "yarn install",
+                "[2/4] Fetching packages...",
+                "Done in 3.12s.",
+            ),
+            (
+                "bun install",
+                "Resolving dependencies",
+                "42 packages installed [180.00ms]",
+            ),
+            (
+                "xcodebuild build",
+                "CompileSwift normal arm64 /src/App.swift",
+                "** BUILD SUCCEEDED **",
+            ),
+            (
+                "mix compile",
+                "Compiling 42 files (.ex)",
+                "warning: unused variable x",
+            ),
+            (
+                "next build",
+                "Generating static pages (12/40)",
+                "Route (app)  Size  First Load JS",
+            ),
+            (
+                "turbo build",
+                "web:build: cache hit, replaying logs 8a7b6c",
+                "Tasks:    4 successful, 4 total",
             ),
         ] {
             assert!(omitted(command, dropped), "{command}: {dropped}");

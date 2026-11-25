@@ -226,3 +226,40 @@ fn a_clipped_run_keeps_the_ordinary_preview_with_its_failure_first() {
     has(&preview, "Error: Unsupported argument on main.tf line 12");
     lacks(&preview, "filtered");
 }
+
+#[test]
+fn a_large_terraform_plan_summarizes_every_resource_change_with_line_pointers() {
+    let lab = Lab::new();
+    let big_plan = r#"#!/bin/sh
+echo "Terraform will perform the following actions:"
+echo
+i=0
+while [ "$i" -lt 25 ]; do
+  echo "  # aws_instance.web[$i] will be created"
+  echo "  + resource \"aws_instance\" \"web\" {"
+  j=0
+  while [ "$j" -lt 10 ]; do
+    echo "      + attr_$j = \"value-for-instance-$i-field-$j\""
+    j=$((j + 1))
+  done
+  echo "    }"
+  echo
+  i=$((i + 1))
+done
+echo "Plan: 25 to add, 0 to change, 0 to destroy."
+"#;
+    executable(&lab.tools.join("terraform"), big_plan);
+    let output = lab
+        .command(BIN)
+        .args(["run", "--hook", "--", "terraform", "plan"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let preview = text(&output.stdout);
+    has(&preview, "25 resource change(s)");
+    has(&preview, "+ aws_instance.web[0] will be created [stdout:");
+    has(&preview, "+ aws_instance.web[12] will be created [stdout:");
+    has(&preview, "+ aws_instance.web[24] will be created [stdout:");
+    has(&preview, "Plan: 25 to add, 0 to change, 0 to destroy.");
+    assert!(preview.len() < 2500, "len={}: {preview}", preview.len());
+}

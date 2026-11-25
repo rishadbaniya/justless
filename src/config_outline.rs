@@ -123,19 +123,21 @@ fn toml_sections(text: &str, line_starts: &[usize]) -> Vec<Section> {
 
     for (pos, (first, raw_name, is_array)) in headers.iter().enumerate() {
         let end_line = headers.get(pos + 1).map_or(line_starts.len(), |h| h.0);
-        let name = if *is_array {
-            toml_array_label(text, line_starts, *first + 1, end_line)
+        let (name, header_end) = if *is_array {
+            let label = toml_array_label(text, line_starts, *first + 1, end_line)
                 .map(|label| format!("{raw_name}:{label}"))
-                .unwrap_or_else(|| raw_name.clone())
+                .unwrap_or_else(|| raw_name.clone());
+            (label, offset(*first + 1))
         } else {
-            raw_name.clone()
+            // `[table]` header text already equals `name`; leave signature empty to avoid duplication.
+            (raw_name.clone(), offset(*first))
         };
         out.push(Section {
             name,
             kind: "table",
             bytes: offset(*first)..offset(end_line),
             signature_start: offset(*first),
-            header_end: offset(*first + 1),
+            header_end,
         });
     }
     out
@@ -428,12 +430,18 @@ fn yaml_single_doc_sections(
             Some(p) => format!("{p}.{key}"),
             None => key.clone(),
         };
+        let has_inline_value = yaml_mapping_key(line_text(text, line_starts, *first).trim())
+            .is_some_and(|(_, rest)| !rest.is_empty());
         out.push(Section {
             name: full_name.clone(),
             kind: if prefix.is_some() { "section" } else { "key" },
             bytes: offset(*first)..offset(next),
             signature_start: offset(*first),
-            header_end: offset(*first + 1),
+            header_end: if has_inline_value {
+                offset(*first + 1)
+            } else {
+                offset(*first)
+            },
         });
 
         // Expand nested mapping sections (such as GitHub Actions `jobs.*`,
@@ -447,12 +455,19 @@ fn yaml_single_doc_sections(
             if should_expand_children(children.len(), next, &children) {
                 for (cpos, (cfirst, ckey)) in children.iter().enumerate() {
                     let cnext = children.get(cpos + 1).map_or(next, |c| c.0);
+                    let child_has_value =
+                        yaml_mapping_key(line_text(text, line_starts, *cfirst).trim())
+                            .is_some_and(|(_, rest)| !rest.is_empty());
                     out.push(Section {
                         name: format!("{full_name}.{ckey}"),
                         kind: "section",
                         bytes: offset(*cfirst)..offset(cnext),
                         signature_start: offset(*cfirst),
-                        header_end: offset(*cfirst + 1),
+                        header_end: if child_has_value {
+                            offset(*cfirst + 1)
+                        } else {
+                            offset(*cfirst)
+                        },
                     });
                 }
             }

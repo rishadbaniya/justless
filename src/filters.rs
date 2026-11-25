@@ -182,10 +182,12 @@ fn lint_tool(program: &str, args: &[&str]) -> bool {
         ("cargo", ["clippy" | "check" | "build", ..]) => true,
         ("cargo", ["doc", rest @ ..]) => !rest.contains(&"--open"),
         ("ruff", ["check", ..])
+        | ("biome", ["check" | "lint" | "ci", ..])
+        | ("ty", ["check", ..])
         | ("golangci-lint", ["run", ..])
         | ("go", ["vet", ..])
         | (
-            "flake8" | "pylint" | "mypy" | "pyright" | "basedpyright" | "eslint" | "tsc"
+            "flake8" | "pylint" | "mypy" | "pyright" | "basedpyright" | "eslint" | "oxlint" | "tsc"
             | "vue-tsc" | "shellcheck" | "rubocop" | "staticcheck" | "swiftlint" | "hadolint",
             _,
         ) => true,
@@ -1317,6 +1319,18 @@ pub fn approvable(words: &[&str]) -> bool {
         "mypy" | "dmypy" => !args
             .iter()
             .any(|arg| arg.split('=').next() == Some("--install-types")),
+        // Biome check/lint/ci and oxlint auto-approve only in read-only mode.
+        "biome" => !args.iter().any(|arg| {
+            matches!(
+                arg.split('=').next(),
+                Some("--write" | "--unsafe" | "--fix" | "--config-path")
+            )
+        }),
+        "oxlint" => !args.iter().any(|arg| {
+            arg.split('=')
+                .next()
+                .is_some_and(|f| f.starts_with("--fix"))
+        }),
         _ => true,
     }
 }
@@ -1373,6 +1387,7 @@ fn runs_code(program: &str, args: &[&str]) -> bool {
         "pylint" => named(&["--init-hook", "--load-plugins"]),
         "mypy" | "dmypy" => named(&["--python-executable"]),
         "pyright" | "basedpyright" => named(&["--pythonpath"]),
+        "ty" => named(&["--python", "--venv"]),
         "rubocop" => named(&["-r", "--require"]),
         "npm" | "pnpm" | "yarn" | "bun" => named(&[
             "--script-shell",
@@ -2105,6 +2120,21 @@ mod tests {
         assert!(!legacy_hook(&["cargo", "nextest", "archive"]));
         assert!(legacy_hook(&["git", "reflog", "-n", "10"]));
         assert!(!legacy_hook(&["git", "reflog", "expire", "--all"]));
+        // Biome, oxlint and ty check route as linters and auto-approve only when read-only.
+        assert_eq!(profile(&["biome", "check", "."]), Some(Profile::Lint));
+        assert_eq!(profile(&["oxlint", "src"]), Some(Profile::Lint));
+        assert_eq!(profile(&["ty", "check", "."]), Some(Profile::Lint));
+        assert!(approvable(&["biome", "check", "."]));
+        assert!(!approvable(&["biome", "check", "--write", "."]));
+        assert!(approvable(&["oxlint", "src"]));
+        assert!(!approvable(&["oxlint", "--fix", "src"]));
+        assert!(approvable(&["ty", "check", "."]));
+        assert!(!approvable(&[
+            "ty",
+            "check",
+            "--python",
+            "/usr/bin/python3"
+        ]));
     }
 
     #[test]
