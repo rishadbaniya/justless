@@ -1314,3 +1314,148 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
         "{const_outline}"
     );
 }
+
+#[test]
+fn config_files_get_structural_outlines_expand_and_verified_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // TOML: tables + [[array]] disambiguation + exact expand + verified edit
+    fs::write(
+        root.join("Cargo.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"demo\"\n",
+            "version = \"0.1.0\"\n\n",
+            "[dependencies]\n",
+            "serde = \"1\"\n\n",
+            "[[bin]]\n",
+            "name = \"worker\"\n",
+            "path = \"src/worker.rs\"\n",
+        ),
+    )
+    .unwrap();
+    let toml_outline = String::from_utf8(out(root, &["read", "Cargo.toml", "--outline"])).unwrap();
+    assert!(toml_outline.contains("table package"), "{toml_outline}");
+    assert!(
+        toml_outline.contains("table dependencies"),
+        "{toml_outline}"
+    );
+    assert!(toml_outline.contains("table bin:worker"), "{toml_outline}");
+    let deps = String::from_utf8(out(root, &["expand", "Cargo.toml", "dependencies"])).unwrap();
+    assert_eq!(deps, "[dependencies]\nserde = \"1\"\n\n");
+
+    let rev = toml_outline
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("revision ")
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    let edit_status = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "edit",
+            "Cargo.toml",
+            &format!("{rev}#2"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"[dependencies]\nserde = \"1\"\nanyhow = \"1\"\n\n")?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        edit_status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&edit_status.stderr)
+    );
+    assert!(
+        fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap()
+            .contains("anyhow = \"1\"")
+    );
+
+    // YAML: nested `jobs.*` sections, `--match`, and exact `expand`
+    fs::write(
+        root.join("ci.yml"),
+        concat!(
+            "name: CI\n",
+            "on:\n",
+            "  push:\n",
+            "    branches: [main]\n",
+            "jobs:\n",
+            "  lint:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - run: |\n",
+            "          echo \"fake: value\"\n",
+            "          cargo clippy\n",
+            "  test:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - run: cargo test\n",
+        ),
+    )
+    .unwrap();
+    let yaml_outline = String::from_utf8(out(root, &["read", "ci.yml", "--outline"])).unwrap();
+    assert!(yaml_outline.contains("section jobs.lint"), "{yaml_outline}");
+    assert!(yaml_outline.contains("section jobs.test"), "{yaml_outline}");
+    let test_job = String::from_utf8(out(root, &["expand", "ci.yml", "jobs.test"])).unwrap();
+    assert!(test_job.contains("cargo test"), "{test_job}");
+    assert!(!test_job.contains("cargo clippy"), "{test_job}");
+
+    // JSON/JSONC: top-level keys + multi-line nested objects expanded while flat scalar map stays compact
+    fs::write(
+        root.join("project.json"),
+        r#"{
+  "name": "web",
+  "dependencies": {
+    "react": "19.0.0",
+    "vite": "6.0.0"
+  },
+  "targets": {
+    "build": {
+      "executor": "vite:build",
+      "options": {}
+    },
+    "test": {
+      "executor": "vitest:run",
+      "options": {}
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let json_outline =
+        String::from_utf8(out(root, &["read", "project.json", "--outline"])).unwrap();
+    assert!(json_outline.contains("key dependencies"), "{json_outline}");
+    assert!(
+        !json_outline.contains("dependencies.react"),
+        "{json_outline}"
+    );
+    assert!(
+        json_outline.contains("section targets.build"),
+        "{json_outline}"
+    );
+    assert!(
+        json_outline.contains("section targets.test"),
+        "{json_outline}"
+    );
+    let build_target =
+        String::from_utf8(out(root, &["expand", "project.json", "targets.build"])).unwrap();
+    assert!(build_target.contains("vite:build"), "{build_target}");
+    assert!(!build_target.contains("vitest:run"), "{build_target}");
+}

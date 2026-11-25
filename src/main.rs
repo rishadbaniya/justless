@@ -6,6 +6,7 @@ mod capture;
 mod cargo_tests;
 mod claude_permissions;
 mod components;
+mod config_outline;
 mod context;
 mod discover;
 mod doctests;

@@ -337,31 +337,42 @@ impl Snapshot {
     }
 
     fn sections(&mut self, file: &str) {
+        // Where a 0-based line starts, or the end of the text past the last line.
+        let offset = |line: usize| self.lines.get(line).copied().unwrap_or(self.text.len());
         let markdown = matches!(
             std::path::Path::new(file)
                 .extension()
                 .and_then(|x| x.to_str()),
             Some("md" | "markdown")
         );
-        if !markdown {
+        if markdown {
+            let lines: Vec<&str> = (0..self.lines.len())
+                .map(|line| {
+                    let text = &self.text[offset(line)..offset(line + 1)];
+                    text.strip_suffix('\n').unwrap_or(text)
+                })
+                .collect();
+            let entries: Vec<Entry> = crate::markdown::sections(&lines)
+                .into_iter()
+                .map(|section| Entry {
+                    name: section.heading.title,
+                    kind: "heading".into(),
+                    signature_start: offset(section.heading.first),
+                    bytes: offset(section.heading.first)..offset(section.end),
+                    header_end: offset(section.heading.last + 1),
+                })
+                .collect();
+            self.entries.extend(entries);
             return;
         }
-        // Where a 0-based line starts, or the end of the text past the last line.
-        let offset = |line: usize| self.lines.get(line).copied().unwrap_or(self.text.len());
-        let lines: Vec<&str> = (0..self.lines.len())
-            .map(|line| {
-                let text = &self.text[offset(line)..offset(line + 1)];
-                text.strip_suffix('\n').unwrap_or(text)
-            })
-            .collect();
-        let entries: Vec<Entry> = crate::markdown::sections(&lines)
+        let entries: Vec<Entry> = crate::config_outline::sections(file, &self.text, &self.lines)
             .into_iter()
             .map(|section| Entry {
-                name: section.heading.title,
-                kind: "heading".into(),
-                signature_start: offset(section.heading.first),
-                bytes: offset(section.heading.first)..offset(section.end),
-                header_end: offset(section.heading.last + 1),
+                name: section.name,
+                kind: section.kind.into(),
+                signature_start: section.signature_start,
+                bytes: section.bytes,
+                header_end: section.header_end,
             })
             .collect();
         self.entries.extend(entries);
