@@ -6,9 +6,12 @@
 //! - ShellCheck's default `In path line N:` blocks with `^-- SC2086 (info): message` rows.
 //! - One finding per line: `path:line[:col]: message` (Ruff and flake8 concise output,
 //!   pylint, mypy, rustc `--message-format=short`, ShellCheck `-f gcc`, golangci-lint,
-//!   go vet, staticcheck, RuboCop, SwiftLint, gcc and clang) and TypeScript's
-//!   `path(line,col): error TS2322: message`. Indented lines that follow one of these,
-//!   such as a TypeScript elaboration, are kept as its detail.
+//!   go vet, go build, staticcheck, RuboCop, SwiftLint, swiftc, gcc and clang),
+//!   TypeScript's `path(line,col): error TS2322: message`, MSBuild/`dotnet`'s
+//!   `path(line,col): error CS0103: message [project.csproj]`, Maven's
+//!   `[ERROR] path:[line,col] message`, and Kotlin/Gradle's
+//!   `e: file://path:line:col message`. Indented lines that follow one of these,
+//!   such as a TypeScript, Maven, gcc or Go elaboration, are kept as its detail.
 //! - ESLint's default formatter: a file name line followed by `line:col  severity  message  rule`.
 //! - Pyright's `  path:line:col - error: message (rule)` rows and hadolint's
 //!   `path:line DL3008 warning: message`.
@@ -64,6 +67,20 @@ static SNIPPET: LazyLock<Regex> =
 static TSC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\S.*?)\((\d+),(\d+)\): (error|warning) (TS\d+): (.+)$").unwrap()
 });
+static MSBUILD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*(\S.*?)\((\d+),(\d+)\): (error|warning) ([A-Z]{1,6}\d+): (.+?)(?: \[[^\]]+\])?$",
+    )
+    .unwrap()
+});
+static MAVEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[(ERROR|WARNING)\] (.+?):\[(\d+)(?:,(\d+))?\] (.+)$").unwrap());
+static JAVAC_LINT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[([a-z][a-z0-9_-]*)\]\s+(.+)$").unwrap());
+static KOTLIN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([ew]): (?:file://)?(.+?):(\d+):(\d+):?\s+(.+)$").unwrap());
+static GO_PACKAGE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^# [A-Za-z0-9_./-]+(?: \[[A-Za-z0-9_./-]+\])?$").unwrap());
 // A path may contain spaces and a colon that is not followed by whitespace or a digit,
 // such as a Windows drive, so `note: see a.rs:3: x` and `warning: …` never match.
 static LOCATED: LazyLock<Regex> = LazyLock::new(|| {
@@ -81,7 +98,7 @@ static RUBOCOP: LazyLock<Regex> = LazyLock::new(|| {
 static LEADING_CODE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Z]{1,4}[0-9]{2,5})(:?) (?:\[\*\] )?(.+)$").unwrap());
 static TRAILING_BRACKET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+?)\s+\[(-?[A-Za-z][\w.:/-]*)\]$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(.+?)\s+\[(-?[A-Za-z][\w.:/=-]*)\]$").unwrap());
 static TRAILING_PAREN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+?)\s+\(([a-z][a-z0-9_-]*|[A-Z]{1,4}[0-9]{2,5})\)$").unwrap());
 // ESLint prints absolute file names, which may contain spaces. Relative names stay
@@ -121,6 +138,138 @@ pub(crate) static CARGO_STATUS: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+static CMAKE_PROGRESS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\[\s*\d{1,3}%\] (?:Building|Linking|Built target|Generating|Scanning dependencies|Consolidate compiler generated dependencies|Automatic (?:MOC|UIC|RCC)|Creating library|Copying|Updating) \S",
+    )
+    .unwrap()
+});
+static CMAKE_DONE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^-- (?:Configuring done|Generating done|Build files have been written to:)")
+        .unwrap()
+});
+static CMAKE_BUILT_FINAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[\s*100%\] Built target \S").unwrap());
+static STEP_PROGRESS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[\d+/\d+\] \S").unwrap());
+static NINJA_STATUS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^ninja: (?:no work to do\.|Entering directory )").unwrap());
+static MAKE_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^g?make(?:\[\d+\])?: (?:Entering directory |Leaving directory |Nothing to be done for |.+ is up to date\.$)",
+    )
+    .unwrap()
+});
+static GRADLE_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:> Task :[A-Za-z0-9_.:-]+(?: (?:UP-TO-DATE|NO-SOURCE|FROM-CACHE|SKIPPED))?|> Configure project :[A-Za-z0-9_.:-]*|BUILD SUCCESSFUL(?: in .+)?|\d+ actionable tasks?: (?:\d+ (?:executed|up-to-date|from cache)(?:, )?)+)$",
+    )
+    .unwrap()
+});
+static DOTNET_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:MSBuild version \S|\s*Determining projects to restore\.\.\.|\s*All projects are up-to-date for restore\.|\s*Nothing to do\. None of the projects specified contain packages to restore\.|\s*Restored \S|\s*Restore complete\b|  +\S+ -> \S|  +\S+ succeeded \(\S+\)(?: → \S+)?$|Build succeeded(?:\.| in \S+)$|\s*0 Warning\(s\)$|\s*0 Error\(s\)$|Time Elapsed \d{2}:\d{2}:\d{2})",
+    )
+    .unwrap()
+});
+static SWIFT_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:Building for (?:debugging|release)\.\.\.|Planning build|Build (?:of product '[^']+' )?complete!(?: \(\S+\))?)$",
+    )
+    .unwrap()
+});
+static GO_STATUS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^go: downloading \S+ \S+$").unwrap());
+// Unlocated linker and compiler/project errors that must stay visible even when
+// the same stream also contains located warnings or errors.
+static UNLOCATED_ERROR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:(?:[^\s:]*[/\\])?(?:ld(?:\.(?:lld|gold|bfd))?|lld|collect2|clang(?:\+\+)?|gcc|g\+\+|cc|c\+\+|link(?:\.exe)?|ar|ranlib|swiftc|swift-frontend|javac|kotlinc):.*?(?:\berror\b|undefined reference|undefined symbol|multiple definition|cannot find -l|returned \d+ exit status|linker command failed)|(?i:undefined (?:reference to|symbols? for)\b)|(?i:(?:csc|vbc|fsc|msbuild)\s*:\s*error\s+[A-Z]{1,6}\d+:)|\S+\.(?:csproj|fsproj|vbproj|vcxproj|sln|props|targets)\s*:\s*error\s+[A-Z]{1,6}\d+:)",
+    )
+    .unwrap()
+});
+static BUILD_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:g?make(?:\[\d+\])?: \*\*\*|ninja: build stopped:|FAILED: |FAILURE: |BUILD FAILED\b|Build FAILED\.)",
+    )
+    .unwrap()
+});
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    Cargo,
+    Build,
+}
+
+/// Recognize a clean build status line and whether it carries the final
+/// completion notice for the one-line clean summary.
+fn build_status(line: &str) -> Option<(StatusKind, bool)> {
+    if CARGO_STATUS.is_match(line) {
+        return Some((
+            StatusKind::Cargo,
+            line.trim_start().starts_with("Finished "),
+        ));
+    }
+    if CMAKE_PROGRESS.is_match(line) {
+        return Some((StatusKind::Build, CMAKE_BUILT_FINAL.is_match(line)));
+    }
+    if CMAKE_DONE.is_match(line) {
+        return Some((
+            StatusKind::Build,
+            line.starts_with("-- Build files have been written to:"),
+        ));
+    }
+    if STEP_PROGRESS.is_match(line)
+        && !line.contains("FAILED")
+        && !line.contains("error:")
+        && !line.contains("warning:")
+    {
+        return Some((StatusKind::Build, false));
+    }
+    if NINJA_STATUS.is_match(line) {
+        return Some((StatusKind::Build, line == "ninja: no work to do."));
+    }
+    if MAKE_STATUS.is_match(line) {
+        return Some((
+            StatusKind::Build,
+            line.contains("Nothing to be done for ") || line.ends_with(" is up to date."),
+        ));
+    }
+    if GRADLE_STATUS.is_match(line) {
+        return Some((StatusKind::Build, line.starts_with("BUILD SUCCESSFUL")));
+    }
+    if (line == "[INFO]" || line.starts_with("[INFO] "))
+        && !line.starts_with("[INFO] Tests run:")
+        && !line.contains("BUILD FAILURE")
+    {
+        return Some((StatusKind::Build, line.trim() == "[INFO] BUILD SUCCESS"));
+    }
+    if DOTNET_STATUS.is_match(line) {
+        return Some((StatusKind::Build, line.starts_with("Build succeeded")));
+    }
+    if SWIFT_STATUS.is_match(line) {
+        return Some((
+            StatusKind::Build,
+            line.starts_with("Build ") && line.contains("complete!"),
+        ));
+    }
+    if GO_STATUS.is_match(line) {
+        return Some((StatusKind::Build, false));
+    }
+    None
+}
+
+fn is_build_outcome(text: &str) -> bool {
+    if let Some(rest) = text.strip_prefix("[ERROR]") {
+        let rest = rest.trim();
+        return !rest.is_empty()
+            && !rest.chars().all(|c| c == '-' || c == '=')
+            && !rest.starts_with("-> [Help ")
+            && !rest.starts_with("To see the full stack trace")
+            && !rest.starts_with("Re-run Maven")
+            && !rest.starts_with("For more information");
+    }
+    BUILD_OUTCOME.is_match(text)
+}
 // rustc names a lint only on its first diagnostic, and the wording of later ones
 // varies with the item kind and plural forms. `--message-format=short` names none.
 static RUSTC_LINTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
@@ -281,6 +430,8 @@ pub struct Lint {
     open: Option<usize>,
     eslint_file: Option<String>,
     shellcheck_line: Option<(String, String)>,
+    /// Whether a `# pkg/path` Go compiler header was seen on this run.
+    go_package: bool,
     outcomes: Vec<(String, Vec<String>)>,
     hidden_outcomes: usize,
     /// Packages that failed to compile, each with its failed targets in order. An
@@ -290,11 +441,13 @@ pub struct Lint {
     uncompiled_at: String,
     unlocated_errors: usize,
     other: [Other; 2],
-    /// Cargo's status lines among `other`, per stream: count, first and last line.
+    /// Recognized build status lines among `other`, per stream: count, first and last line.
     status: [(usize, usize, usize); 2],
+    /// Whether every recognized status line so far came from Cargo.
+    cargo_status_only: bool,
     /// Non-blank lines per stream, whatever shape read them.
     lines: [usize; 2],
-    /// The last `Finished` status line.
+    /// The last completion status line (such as Cargo's `Finished` or Gradle's `BUILD SUCCESSFUL`).
     finished: String,
     overflow: bool,
 }
@@ -312,6 +465,7 @@ impl Lint {
             open: None,
             eslint_file: None,
             shellcheck_line: None,
+            go_package: false,
             outcomes: Vec::new(),
             hidden_outcomes: 0,
             uncompiled: Vec::new(),
@@ -320,6 +474,7 @@ impl Lint {
             unlocated_errors: 0,
             other: Default::default(),
             status: [(0, 0, 0); 2],
+            cargo_status_only: true,
             lines: [0; 2],
             finished: String::new(),
             overflow: false,
@@ -340,19 +495,23 @@ impl Lint {
         }
         if !self.classify(line, n, stream) && !line.trim().is_empty() {
             self.other[stream as usize].note(n, line);
-            if CARGO_STATUS.is_match(line) {
+            if let Some((kind, finished)) = build_status(line) {
                 let status = &mut self.status[stream as usize];
                 *status = (status.0 + 1, if status.0 == 0 { n } else { status.1 }, n);
-                if line.trim_start().starts_with("Finished ") {
+                if kind != StatusKind::Cargo {
+                    self.cargo_status_only = false;
+                }
+                if finished {
                     self.finished = short(line.trim(), 200);
                 }
             }
         }
     }
 
-    /// One line for a run that printed only Cargo's status lines, such as a clean
-    /// `cargo clippy`, with the range of those lines on each stream and the last
-    /// `Finished` line. `None` when the run printed anything else.
+    /// One line for a run that printed only recognized build status lines (Cargo,
+    /// CMake, Ninja, Make, Gradle, Maven, dotnet, Swift or Go), with the range of
+    /// those lines on each stream and any completion line. `None` when the run
+    /// printed anything else.
     pub fn clean(&self, label: &str) -> Option<String> {
         // A shape can take a line without a finding, as a warning without a
         // location, so every line counts.
@@ -368,13 +527,18 @@ impl Lint {
         {
             return None;
         }
+        let kind = if self.cargo_status_only {
+            "cargo"
+        } else {
+            "build"
+        };
         let mut line = format!("{label}: 0 findings");
         for stream in [Stream::Stdout, Stream::Stderr] {
             let (count, first, last) = self.status[stream as usize];
             if count > 0 {
                 let name = stream.name();
                 line.push_str(&format!(
-                    " · {count} cargo status line(s) [{name}:{first}-{last}]"
+                    " · {count} {kind} status line(s) [{name}:{first}-{last}]"
                 ));
             }
         }
@@ -392,8 +556,11 @@ impl Lint {
                 || CODE_HEADER.is_match(line)
                 || OXLINT_HEADER.is_match(line)
                 || BIOME_HEADER.is_match(line)
+                || MAVEN.is_match(line)
+                || KOTLIN.is_match(line)
+                || MSBUILD.is_match(line)
                 || TOTAL.is_match(line)
-                || CARGO_STATUS.is_match(line);
+                || build_status(line).is_some();
             if line.is_empty() && !ends {
                 return true;
             }
@@ -438,7 +605,8 @@ impl Lint {
             && !PYRIGHT.is_match(line)
             && !SHELLCHECK_ROW.is_match(line)
             && !OXLINT_HEADER.is_match(line)
-            && !CARGO_STATUS.is_match(line)
+            && !MSBUILD.is_match(line)
+            && build_status(line).is_none()
         {
             let finding = &mut self.findings[index];
             finding.last = n;
@@ -454,6 +622,15 @@ impl Lint {
             return true;
         }
         self.close();
+        if build_status(line).is_some() {
+            self.eslint_file = None;
+            return false;
+        }
+        if GO_PACKAGE.is_match(line) {
+            self.go_package = true;
+            self.eslint_file = None;
+            return true;
+        }
         if let Some(c) = RUST_HEADER.captures(line) {
             let rule = c.get(2).map(|m| m.as_str().to_owned());
             self.block =
@@ -482,6 +659,24 @@ impl Lint {
             self.block = Some(finding);
             return true;
         }
+        if let Some(c) = MAVEN.captures(line) {
+            let (rule, message) = match JAVAC_LINT.captures(c[5].trim()) {
+                Some(j) => (Some(j[1].to_owned()), j.get(2).unwrap().as_str()),
+                None => (None, c[5].trim()),
+            };
+            let finding = Finding::new(Severity::parse(&c[1]), rule, message, stream)
+                .at(&self.root, &c[2], &c[3], c.get(4))
+                .lines(n, line);
+            self.push(finding, true);
+            return true;
+        }
+        if let Some(c) = KOTLIN.captures(line) {
+            let finding = Finding::new(Severity::parse(&c[1]), None, &c[5], stream)
+                .at(&self.root, &c[2], &c[3], c.get(4))
+                .lines(n, line);
+            self.push(finding, true);
+            return true;
+        }
         if let Some(c) = TSC.captures(line) {
             let finding =
                 Finding::new(Severity::parse(&c[4]), Some(c[5].to_owned()), &c[6], stream)
@@ -490,8 +685,23 @@ impl Lint {
             self.push(finding, true);
             return true;
         }
+        if let Some(c) = MSBUILD.captures(line) {
+            let finding =
+                Finding::new(Severity::parse(&c[4]), Some(c[5].to_owned()), &c[6], stream)
+                    .at(&self.root, &c[1], &c[2], c.get(3))
+                    .lines(n, line.trim());
+            self.push(finding, false);
+            return true;
+        }
         if let Some(c) = LOCATED.captures(line) {
-            if let Some(finding) = located(&c[4], stream) {
+            if let Some(mut finding) = located(&c[4], stream) {
+                if self.go_package
+                    && c[1].ends_with(".go")
+                    && finding.rule.is_none()
+                    && !SEVERITY.is_match(c[4].trim())
+                {
+                    finding.severity = Severity::Error;
+                }
                 let finding = finding
                     .at(&self.root, &c[1], &c[2], c.get(3))
                     .lines(n, line);
@@ -556,10 +766,16 @@ impl Lint {
         }
         let text = line.trim();
         let lower = text.to_ascii_lowercase();
+        if UNLOCATED_ERROR.is_match(text) {
+            self.unlocated_errors += 1;
+            self.outcome(text, &[], stream, n);
+            return true;
+        }
         if lower.starts_with("error")
             || lower.starts_with("fatal")
             || text.starts_with('✖')
             || TOTAL.is_match(text)
+            || is_build_outcome(text)
         {
             self.outcome(text, &[], stream, n);
             return true;
@@ -1174,5 +1390,337 @@ Found 1 diagnostic
         let (report, _) = ty.finish("ty check", 4096, None).unwrap();
         assert!(report.contains("invalid-assignment ×1"), "{report}");
         assert!(report.contains("src/models.py:22:9"), "{report}");
+    }
+
+    fn feed(out: &str, err: &str) -> Lint {
+        let mut lint = Lint::new(Path::new("/repo"));
+        for (i, line) in out.split_inclusive('\n').enumerate() {
+            lint.observe(line, i + 1, Stream::Stdout);
+        }
+        for (i, line) in err.split_inclusive('\n').enumerate() {
+            lint.observe(line, i + 1, Stream::Stderr);
+        }
+        lint
+    }
+
+    #[test]
+    fn maven_kotlin_msbuild_gcc_and_go_build_diagnostics_group_cleanly() {
+        // Maven errors (with indented elaboration), deprecation warnings, and outcomes.
+        let mvn_out = "\
+[INFO] --- compiler:3.11.0:compile (default-compile) @ demo ---
+[INFO] Compiling 4 source files with javac
+[ERROR] /repo/src/main/java/App.java:[14,23] cannot find symbol
+  symbol:   variable foo
+  location: class App
+[ERROR] /repo/src/main/java/App.java:[28,11] cannot find symbol
+  symbol:   variable bar
+  location: class App
+[WARNING] /repo/src/main/java/Util.java:[8,12] [deprecation] oldCall() in Legacy has been deprecated
+[WARNING] /repo/src/main/java/Util.java:[19,5] [deprecation] otherCall() in Legacy has been deprecated
+[INFO] 2 errors
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.11.0:compile (default-compile) on project demo: Compilation failure
+[ERROR] -> [Help 1]
+[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
+";
+        let (report, _) = feed(mvn_out, "").finish("mvn compile", 4096, None).unwrap();
+        assert!(
+            report.contains(
+                "mvn compile: 4 finding(s), 2 error(s), 2 warning(s) · 2 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("error cannot find symbol ×2"), "{report}");
+        assert!(report.contains("    symbol:   variable foo"), "{report}");
+        assert!(
+            report.contains("src/main/java/App.java:14:23, 28:11 [stdout:3-5]"),
+            "{report}"
+        );
+        assert!(report.contains("warning deprecation ×2"), "{report}");
+        assert!(
+            report.contains("src/main/java/Util.java:8:12, 19:5 [stdout:9-9]"),
+            "{report}"
+        );
+        assert!(
+            report.contains("[ERROR] Failed to execute goal"),
+            "{report}"
+        );
+        assert!(!report.contains("-> [Help 1]"), "{report}");
+
+        // Kotlin / Gradle with file:// URIs and plain paths.
+        let kotlin_err = "\
+> Task :app:compileKotlin FAILED
+e: file:///repo/src/main/kotlin/App.kt:12:5 Unresolved reference: foo
+e: file:///repo/src/main/kotlin/App.kt:20:9 Unresolved reference: foo
+w: /repo/src/main/kotlin/Util.kt:4:10 Parameter 'x' is never used
+w: /repo/src/main/kotlin/Util.kt:8:10 Parameter 'y' is never used
+FAILURE: Build failed with an exception.
+";
+        let (report, _) = feed("", kotlin_err)
+            .finish("gradlew build", 4096, None)
+            .unwrap();
+        assert!(
+            report.contains(
+                "gradlew build: 4 finding(s), 2 error(s), 2 warning(s) · 2 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("error Unresolved reference: foo ×2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("src/main/kotlin/App.kt:12:5, 20:9 [stderr:2-2]"),
+            "{report}"
+        );
+        assert!(
+            report.contains("warning Parameter … is never used ×2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("FAILURE: Build failed with an exception."),
+            "{report}"
+        );
+
+        // MSBuild / dotnet (both flush and 2-space indented lines, plus unlocated error).
+        let dotnet_out = "\
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+/repo/src/Program.cs(12,5): error CS0103: The name 'foo' does not exist in the current context [/repo/src/App.csproj]
+  /repo/src/Program.cs(18,9): error CS0103: The name 'bar' does not exist in the current context [/repo/src/App.csproj]
+  src/Helper.cs(4,1): warning CS0168: The variable 'x' is declared but never used [/repo/src/App.csproj]
+  src/Helper.cs(9,1): warning CS0168: The variable 'y' is declared but never used [/repo/src/App.csproj]
+CSC : error CS5001: Program does not contain a static 'Main' method suitable for an entry point
+Build FAILED.
+";
+        let (report, _) = feed(dotnet_out, "")
+            .finish("dotnet build", 4096, None)
+            .unwrap();
+        assert!(
+            report.contains("dotnet build: 4 finding(s), 2 error(s), 2 warning(s) · 2 rule(s) · 2 file(s) · 1 error(s) without a location"),
+            "{report}"
+        );
+        assert!(report.contains("error CS0103 ×2"), "{report}");
+        assert!(
+            report.contains("src/Program.cs:12:5, 18:9 [stdout:3-3]"),
+            "{report}"
+        );
+        assert!(report.contains("warning CS0168 ×2"), "{report}");
+        assert!(
+            report.contains("src/Helper.cs:4:1, 9:1 [stdout:5-5]"),
+            "{report}"
+        );
+        assert!(report.contains("CSC : error CS5001:"), "{report}");
+        assert!(report.contains("Build FAILED."), "{report}");
+
+        // gcc/clang warnings + unlocated linker failure hoisted above warnings.
+        let gcc_err = "\
+src/main.c: In function 'main':
+src/main.c:12:9: warning: unused variable 'a' [-Wunused-variable]
+   12 |     int a = 1;
+      |         ^
+src/main.c:15:9: warning: unused variable 'b' [-Wunused-variable]
+src/main.c:20:5: note: in expansion of macro 'FOO'
+/usr/bin/ld: main.o: undefined reference to 'missing_symbol'
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:12: app] Error 1
+";
+        let (report, _) = feed("", gcc_err).finish("make", 4096, None).unwrap();
+        assert!(
+            report.contains(
+                "make: 2 finding(s), 0 error(s), 2 warning(s) · 1 rule(s) · 1 file(s) · 2 error(s) without a location\n"
+            ),
+            "{report}"
+        );
+        // Unlocated linker errors come right after the header when there are 0 located errors.
+        let ld_pos = report
+            .find("/usr/bin/ld: main.o: undefined reference")
+            .unwrap();
+        let warn_pos = report.find("warning -Wunused-variable ×2").unwrap();
+        assert!(ld_pos < warn_pos, "{report}");
+        assert!(
+            report.contains("collect2: error: ld returned 1 exit status"),
+            "{report}"
+        );
+        assert!(
+            report.contains("make: *** [Makefile:12: app] Error 1"),
+            "{report}"
+        );
+
+        // gcc `-Werror=...` extracts the full bracketed rule name.
+        let werror = "src/net.c:8:5: error: unused variable 'x' [-Werror=unused-variable]\n\
+                      src/net.c:9:5: error: unused variable 'y' [-Werror=unused-variable]\n";
+        let (report, _) = feed("", werror).finish("make", 4096, None).unwrap();
+        assert!(
+            report.contains("error -Werror=unused-variable ×2"),
+            "{report}"
+        );
+
+        // Go build with `# pkg/path` headers, error severity, and indented detail lines.
+        let go_err = "\
+# example.com/app/internal/auth
+internal/auth/token.go:14:9: imported and not used: \"fmt\"
+internal/auth/token.go:15:9: imported and not used: \"os\"
+internal/auth/token.go:22:15: cannot use x (variable of type int) as string value in assignment
+\thave (int)
+\twant (string)
+# example.com/app/cmd/server
+cmd/server/main.go:8:2: undefined: secretKey
+";
+        let (report, _) = feed("", go_err).finish("go build", 4096, None).unwrap();
+        assert!(
+            report.contains(
+                "go build: 4 finding(s), 4 error(s), 0 warning(s) · 3 rule(s) · 2 file(s)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("error imported and not used: … ×2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("internal/auth/token.go:14:9, 15:9 [stderr:2-2]"),
+            "{report}"
+        );
+        assert!(report.contains("    \thave (int)"), "{report}");
+        assert!(
+            report.contains("cmd/server/main.go:8:2 [stderr:8-8]"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn clean_build_summaries_cover_each_ecosystem_and_abort_on_unrecognized_lines() {
+        // Cargo preserves exact `cargo status line(s)` wording.
+        let cargo = feed(
+            "",
+            "   Compiling demo v0.1.0 (/repo)\n    Finished `dev` profile in 0.42s\n",
+        );
+        assert_eq!(
+            cargo.clean("cargo build").as_deref(),
+            Some(
+                "cargo build: 0 findings · 2 cargo status line(s) [stderr:1-2] · Finished `dev` profile in 0.42s\n"
+            )
+        );
+
+        let cases: [(&str, &str, &str, &str); 8] = [
+            (
+                "cmake",
+                "-- Configuring done (0.2s)\n\
+                 -- Generating done (0.1s)\n\
+                 -- Build files have been written to: /repo/build\n\
+                 [ 50%] Building CXX object CMakeFiles/app.dir/src/main.cpp.o\n\
+                 [100%] Linking CXX executable app\n\
+                 [100%] Built target app\n",
+                "",
+                "cmake: 0 findings · 6 build status line(s) [stdout:1-6] · [100%] Built target app\n",
+            ),
+            (
+                "ninja",
+                "[1/3] Building C object src/error_handler.c.o\n\
+                 [2/3] Building C object src/main.c.o\n\
+                 [3/3] Linking C executable app\n",
+                "",
+                "ninja: 0 findings · 3 build status line(s) [stdout:1-3]\n",
+            ),
+            (
+                "make",
+                "make[1]: Entering directory '/repo/sub'\n\
+                 make[1]: Nothing to be done for 'all'.\n\
+                 make[1]: Leaving directory '/repo/sub'\n",
+                "",
+                "make: 0 findings · 3 build status line(s) [stdout:1-3] · make[1]: Nothing to be done for 'all'.\n",
+            ),
+            (
+                "gradlew build",
+                "> Task :compileJava UP-TO-DATE\n\
+                 > Task :processResources NO-SOURCE\n\
+                 > Task :classes FROM-CACHE\n\
+                 \n\
+                 BUILD SUCCESSFUL in 1s\n\
+                 3 actionable tasks: 3 up-to-date\n",
+                "",
+                "gradlew build: 0 findings · 5 build status line(s) [stdout:1-6] · BUILD SUCCESSFUL in 1s\n",
+            ),
+            (
+                "mvn compile",
+                "[INFO] Scanning for projects...\n\
+                 [INFO]\n\
+                 [INFO] Building demo 1.0.0\n\
+                 [INFO] Nothing to compile - all classes are up to date\n\
+                 [INFO] BUILD SUCCESS\n",
+                "",
+                "mvn compile: 0 findings · 5 build status line(s) [stdout:1-5] · [INFO] BUILD SUCCESS\n",
+            ),
+            (
+                "dotnet build",
+                concat!(
+                    "  Determining projects to restore...\n",
+                    "  Restored /repo/App.csproj (in 120 ms).\n",
+                    "  App -> /repo/bin/Debug/net8.0/App.dll\n",
+                    "\n",
+                    "Build succeeded.\n",
+                    "    0 Warning(s)\n",
+                    "    0 Error(s)\n",
+                    "\n",
+                    "Time Elapsed 00:00:01.42\n",
+                ),
+                "",
+                "dotnet build: 0 findings · 7 build status line(s) [stdout:1-9] · Build succeeded.\n",
+            ),
+            (
+                "swift build",
+                "Building for debugging...\n\
+                 [1/3] Compiling MyLib Helper.swift\n\
+                 [2/3] Compiling MyApp main.swift\n\
+                 [3/3] Linking MyApp\n\
+                 Build complete! (1.42s)\n",
+                "",
+                "swift build: 0 findings · 5 build status line(s) [stdout:1-5] · Build complete! (1.42s)\n",
+            ),
+            (
+                "go build",
+                "",
+                "go: downloading github.com/pkg/errors v0.9.1\n\
+                 go: downloading golang.org/x/sys v0.20.0\n",
+                "go build: 0 findings · 2 build status line(s) [stderr:1-2]\n",
+            ),
+        ];
+        for (label, out, err, expected) in cases {
+            assert_eq!(
+                feed(out, err).clean(label).as_deref(),
+                Some(expected),
+                "{label}"
+            );
+        }
+
+        // Any unrecognized line, warning, test summary, or failed task MUST abort `clean()`.
+        for (label, out, err) in [
+            (
+                "cmake",
+                "[ 50%] Building CXX object a.o\ncustom notice\n",
+                "",
+            ),
+            ("ninja", "[1/2] Compiling a.c\n[2/2] FAILED: a.o\n", ""),
+            ("gradlew", "> Task :compileJava FAILED\n", ""),
+            (
+                "mvn",
+                "[INFO] Building demo\n[WARNING] deprecated plugin\n[INFO] BUILD SUCCESS\n",
+                "",
+            ),
+            (
+                "mvn",
+                "[INFO] Tests run: 5, Failures: 0, Errors: 0\n[INFO] BUILD SUCCESS\n",
+                "",
+            ),
+            (
+                "dotnet",
+                "Build succeeded.\n    1 Warning(s)\n    0 Error(s)\n",
+                "",
+            ),
+            ("go", "", "# example.com/app\ngo: downloading foo v1.0.0\n"),
+            ("empty", "", ""),
+        ] {
+            assert_eq!(feed(out, err).clean(label), None, "{label}: {out}{err}");
+        }
     }
 }

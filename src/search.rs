@@ -150,18 +150,18 @@ const ACK: Spec = Spec {
 };
 
 pub(crate) const LS: Spec = Spec {
-    flags: "-a -A -l -R -h -F -p -t -S -r -1 -U -c -u -G -d -n --all --almost-all \
+    flags: "-a -A -l -R -h -F -p -t -S -r -1 -U -c -u -G -d -n -L -s -i --all --almost-all \
         --recursive --human-readable --classify --reverse --full-time \
         --group-directories-first",
-    valued: "--sort",
+    valued: "--sort --time-style",
     optional: "--color",
     lists: "",
 };
 
 const TREE: Spec = Spec {
-    flags: "-a -d -f -F -C -n -l -x -v -t -r -c -U --dirsfirst --filesfirst --noreport \
+    flags: "-a -d -f -F -C -n -l -x -v -t -r -c -U -h -s --dirsfirst --filesfirst --noreport \
         --gitignore --prune --matchdirs --ignore-case",
-    valued: "-L -I -P --filelimit --charset",
+    valued: "-L -I -P --filelimit --charset --sort",
     optional: "",
     lists: "",
 };
@@ -1663,5 +1663,43 @@ mod tests {
             Some(true)
         );
         assert_eq!(super::route(&["ls", "--reverse", "src"]), Some(false));
+        for words in [
+            &["ls", "-l", "--time-style=long-iso", "src"][..],
+            &["ls", "-la", "--time-style", "long-iso", "src"][..],
+            &["ls", "-lLsi", "src"][..],
+            &["tree", "-h", "-s", "--sort=size", "src"][..],
+            &["tree", "-hs", "--sort", "mtime", "-L", "2", "src"][..],
+        ] {
+            assert_eq!(
+                super::select(words),
+                Some(crate::filters::Profile::Listing),
+                "{words:?}"
+            );
+            assert_eq!(super::route(words), Some(true), "{words:?}");
+            assert_eq!(super::read_only(words), Some(true), "{words:?}");
+        }
+        // Plain `ls` with display flags but no `-l`/`-R`/`--full-time` stays unrouted yet read-only.
+        for words in [
+            &["ls", "--time-style=long-iso", "src"][..],
+            &["ls", "-L", "-s", "-i", "src"][..],
+        ] {
+            assert_eq!(
+                super::select(words),
+                Some(crate::filters::Profile::Listing),
+                "{words:?}"
+            );
+            assert_eq!(super::route(words), Some(false), "{words:?}");
+            assert_eq!(super::read_only(words), Some(true), "{words:?}");
+        }
+        // Unsafe or unknown flags on `ls` and `tree` remain rejected.
+        for words in [
+            &["ls", "--time-style"][..],
+            &["tree", "-o", "out.txt"][..],
+            &["tree", "--sort"][..],
+            &["tree", "-J", "src"][..],
+        ] {
+            assert_eq!(super::select(words), None, "{words:?}");
+            assert_eq!(super::read_only(words), Some(false), "{words:?}");
+        }
     }
 }

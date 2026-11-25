@@ -99,7 +99,9 @@ fn runners<'a, 'b>(mut words: &'a [&'b str]) -> (&'a [&'b str], bool) {
             ["pnpm" | "yarn" | "bun", "exec", rest @ ..]
             | ["poetry" | "pipenv", "run", rest @ ..]
             | ["bundle", "exec", rest @ ..] => (rest, false),
-            ["python" | "python3", "-m", tool, ..] if *tool != "pytest" => (&words[2..], false),
+            ["python" | "python3", "-m", tool, ..] if !matches!(*tool, "pytest" | "unittest") => {
+                (&words[2..], false)
+            }
             _ => return (words, fetches),
         };
         let rest = match rest {
@@ -193,14 +195,396 @@ fn lint_tool(program: &str, args: &[&str]) -> bool {
         | ("biome", ["check" | "lint" | "ci", ..])
         | ("ty", ["check", ..])
         | ("golangci-lint", ["run", ..])
-        | ("go", ["vet", ..])
+        | ("go", ["vet" | "build", ..])
+        | ("dotnet", ["build" | "restore", ..])
+        | ("swift", ["build", ..])
         | (
             "flake8" | "pylint" | "mypy" | "pyright" | "basedpyright" | "eslint" | "oxlint" | "tsc"
             | "vue-tsc" | "shellcheck" | "rubocop" | "staticcheck" | "swiftlint" | "hadolint",
             _,
         ) => true,
+        // Bare `make` keeps no profile so adaptive budgets still treat `make` without
+        // a target label (such as `make -j8 lint`) as a generic runner.
+        ("make", []) => false,
+        ("make" | "gmake", _) => make_build_args(args),
+        ("ninja", _) => ninja_build_args(args),
+        ("cmake", ["--build", rest @ ..]) => cmake_build_args(rest),
+        ("gradle" | "gradlew" | "./gradlew", _) => gradle_build_args(args),
+        ("mvn" | "mvnw" | "./mvnw", _) => mvn_build_args(args),
         _ => false,
     }
+}
+
+/// Whether a build target name runs tests or another non-compile action rather
+/// than compiling code.
+fn is_non_build_target(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "test"
+            | "tests"
+            | "check"
+            | "checks"
+            | "ctest"
+            | "bench"
+            | "benchmark"
+            | "benchmarks"
+            | "install"
+            | "uninstall"
+            | "deploy"
+            | "publish"
+            | "serve"
+            | "server"
+            | "run"
+            | "dev"
+            | "start"
+            | "stop"
+            | "restart"
+            | "watch"
+            | "fmt"
+            | "format"
+            | "help"
+            | "version"
+            | "info"
+            | "list"
+            | "doc"
+            | "docs"
+            | "man"
+            | "distclean"
+            | "mrproper"
+            | "clobber"
+            | "migrate"
+            | "seed"
+            | "shell"
+            | "repl"
+            | "console"
+            | "experimental"
+            | "nightly"
+            | "continuous"
+    ) {
+        return true;
+    }
+    lower.split(['-', '_', '/', ':', '.']).any(|part| {
+        matches!(
+            part,
+            "test"
+                | "tests"
+                | "unittest"
+                | "unittests"
+                | "ctest"
+                | "e2e"
+                | "spec"
+                | "specs"
+                | "bench"
+                | "benchmark"
+                | "benchmarks"
+        )
+    })
+}
+
+fn make_build_args(args: &[&str]) -> bool {
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let mut targets = Vec::new();
+    let mut iter = args.iter().copied().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            targets.extend(iter.filter(|a| !a.contains('=')));
+            break;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        if matches!(
+            flag,
+            "-n" | "--just-print"
+                | "--dry-run"
+                | "--recon"
+                | "-q"
+                | "--question"
+                | "-p"
+                | "--print-data-base"
+                | "-v"
+                | "--version"
+                | "-h"
+                | "--help"
+        ) {
+            return false;
+        }
+        if matches!(
+            flag,
+            "-j" | "--jobs" | "-l" | "--load-average" | "--max-load"
+        ) {
+            if inline.is_none() && iter.peek().is_some_and(|next| number(next)) {
+                iter.next();
+            }
+            continue;
+        }
+        if matches!(
+            flag,
+            "-C" | "--directory"
+                | "-f"
+                | "--file"
+                | "--makefile"
+                | "-I"
+                | "--include-dir"
+                | "-o"
+                | "--old-file"
+                | "--assume-old"
+                | "-W"
+                | "--what-if"
+                | "--new-file"
+                | "--assume-new"
+                | "--eval"
+                | "-O"
+                | "--output-sync"
+        ) {
+            if inline.is_none() {
+                iter.next();
+            }
+            continue;
+        }
+        if arg.starts_with('-') || arg.contains('=') {
+            continue;
+        }
+        targets.push(arg);
+    }
+    if targets.is_empty() {
+        return true;
+    }
+    let has_non_clean = targets.iter().any(|t| !t.eq_ignore_ascii_case("clean"));
+    has_non_clean && targets.iter().all(|t| !is_non_build_target(t))
+}
+
+fn ninja_build_args(args: &[&str]) -> bool {
+    let mut targets = Vec::new();
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            targets.extend(iter);
+            break;
+        }
+        if matches!(arg, "-n" | "-h" | "--help" | "--version") || arg.starts_with("-t") {
+            return false;
+        }
+        if matches!(arg, "-C" | "-f" | "-j" | "-k" | "-l" | "-d" | "-w") {
+            iter.next();
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        targets.push(arg);
+    }
+    if targets.is_empty() {
+        return true;
+    }
+    let has_non_clean = targets.iter().any(|t| !t.eq_ignore_ascii_case("clean"));
+    has_non_clean && targets.iter().all(|t| !is_non_build_target(t))
+}
+
+fn cmake_build_args(rest: &[&str]) -> bool {
+    let Some((&dir, tail)) = rest.split_first() else {
+        return false;
+    };
+    if dir.starts_with('-') {
+        return false;
+    }
+    let mut targets = Vec::new();
+    let mut iter = tail.iter().copied().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            let native: Vec<_> = iter.collect();
+            return native
+                .iter()
+                .filter(|a| !a.starts_with('-') && !a.contains('='))
+                .all(|t| !t.eq_ignore_ascii_case("clean") && !is_non_build_target(t));
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        if matches!(flag, "--target" | "-t") {
+            if let Some(value) = inline {
+                targets.push(value);
+            } else {
+                while let Some(next) = iter.next_if(|a| !a.starts_with('-')) {
+                    targets.push(next);
+                }
+            }
+            continue;
+        }
+        if matches!(flag, "--config" | "-j" | "--parallel") && inline.is_none() {
+            iter.next();
+        }
+    }
+    if targets.is_empty() {
+        return true;
+    }
+    let has_non_clean = targets.iter().any(|t| !t.eq_ignore_ascii_case("clean"));
+    has_non_clean && targets.iter().all(|t| !is_non_build_target(t))
+}
+
+fn gradle_build_args(args: &[&str]) -> bool {
+    const VALUED: &[&str] = &[
+        "-x",
+        "--exclude-task",
+        "--console",
+        "--warning-mode",
+        "--max-workers",
+        "-b",
+        "--build-file",
+        "-c",
+        "--settings-file",
+        "-p",
+        "--project-dir",
+        "-I",
+        "--init-script",
+        "-g",
+        "--gradle-user-home",
+        "-P",
+        "--project-prop",
+        "-D",
+        "--system-prop",
+        "--include-build",
+        "--priority",
+        "--configuration-cache-problems",
+        "--dependency-verification",
+        "--write-verification-metadata",
+    ];
+    let mut has_build = false;
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        if matches!(
+            flag,
+            "--tests"
+                | "--continuous"
+                | "-t"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-v"
+                | "--dry-run"
+                | "-m"
+        ) {
+            return false;
+        }
+        if VALUED.contains(&flag) {
+            if inline.is_none() {
+                iter.next();
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        let task = arg.rsplit(':').next().unwrap_or(arg);
+        if task == "clean" {
+            continue;
+        }
+        let is_build = matches!(
+            task,
+            "build"
+                | "assemble"
+                | "classes"
+                | "testClasses"
+                | "jar"
+                | "war"
+                | "ear"
+                | "bootJar"
+                | "bootWar"
+                | "shadowJar"
+        ) || task.starts_with("compile")
+            || task.starts_with("assemble");
+        if !is_build {
+            return false;
+        }
+        has_build = true;
+    }
+    has_build
+}
+
+fn mvn_build_args(args: &[&str]) -> bool {
+    const VALUED: &[&str] = &[
+        "-T",
+        "--threads",
+        "-pl",
+        "--projects",
+        "-rf",
+        "--resume-from",
+        "-f",
+        "--file",
+        "-s",
+        "--settings",
+        "-gs",
+        "--global-settings",
+        "-P",
+        "--activate-profiles",
+        "-l",
+        "--log-file",
+        "-t",
+        "--toolchains",
+        "-gt",
+        "--global-toolchains",
+        "-D",
+        "--define",
+    ];
+    let mut has_build = false;
+    let mut iter = args.iter().copied();
+    while let Some(arg) = iter.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        if matches!(flag, "--help" | "-h" | "--version" | "-v") {
+            return false;
+        }
+        if let Some(prop) = arg.strip_prefix("-D") {
+            let key = prop.split_once('=').map_or(prop, |(k, _)| k);
+            if matches!(key, "test" | "it.test") {
+                return false;
+            }
+        }
+        if VALUED.contains(&flag) {
+            if inline.is_none() {
+                if matches!(flag, "-D" | "--define")
+                    && iter.next().is_some_and(|v| {
+                        matches!(v.split_once('=').map_or(v, |(k, _)| k), "test" | "it.test")
+                    })
+                {
+                    return false;
+                } else if !matches!(flag, "-D" | "--define") {
+                    iter.next();
+                }
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        if arg == "clean" {
+            continue;
+        }
+        if !matches!(
+            arg,
+            "validate"
+                | "compile"
+                | "test-compile"
+                | "package"
+                | "generate-sources"
+                | "process-sources"
+                | "process-resources"
+                | "process-classes"
+                | "generate-test-sources"
+                | "process-test-sources"
+                | "process-test-resources"
+                | "prepare-package"
+        ) {
+            return false;
+        }
+        has_build = true;
+    }
+    has_build
 }
 
 pub fn profile(words: &[&str]) -> Option<Profile> {
@@ -227,13 +611,15 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
         }
     }
     match (program, args) {
-        ("docker", ["ps", tail @ ..] | ["container", "ls" | "list" | "ps", tail @ ..])
-            if display_options(
-                tail,
-                &["-a", "--all", "--no-trunc", "--latest", "-l"],
-                &["-f", "--filter", "-n", "--last"],
-                false,
-            ) =>
+        (
+            "docker" | "podman",
+            ["ps", tail @ ..] | ["container", "ls" | "list" | "ps", tail @ ..],
+        ) if display_options(
+            tail,
+            &["-a", "--all", "--no-trunc", "--latest", "-l"],
+            &["-f", "--filter", "-n", "--last"],
+            false,
+        ) =>
         {
             Some(Profile::Containers)
         }
@@ -281,7 +667,7 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
             }
         }
         (
-            "docker",
+            "docker" | "podman",
             ["logs", tail @ ..] | ["container", "logs", tail @ ..] | ["compose", "logs", tail @ ..],
         ) if display_options(
             tail,
@@ -330,6 +716,18 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
         | ("vitest", ["run", ..])
         | ("node", ["--test", ..])
             if js_display(args) =>
+        {
+            Some(Profile::JsTests)
+        }
+        ("vitest", rest)
+            if !matches!(
+                rest.first().copied(),
+                Some("watch" | "dev" | "bench" | "init" | "list")
+            ) && rest
+                .iter()
+                .take_while(|a| **a != "--")
+                .any(|a| *a == "--run")
+                && js_display(args) =>
         {
             Some(Profile::JsTests)
         }
@@ -883,6 +1281,275 @@ fn format_check_only(words: &[&str]) -> bool {
         || ruff_format_check(words)
         || prettier_check(words)
         || deno_fmt_check(words)
+        || biome_format_check(words)
+        || gofmt_check(words)
+        || shfmt_check(words)
+        || black_check(words)
+        || rustfmt_check(words)
+}
+
+/// Whether `words` is a read-only `biome format` invocation with local target
+/// paths (or `--changed`/`--staged`) and no `--write`, `--fix`, `--unsafe` or
+/// `--config-path`. Bare `biome format` stays unapproved.
+fn biome_format_check(words: &[&str]) -> bool {
+    let ["biome", "format", args @ ..] = words else {
+        return false;
+    };
+    if args.is_empty() || !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut target = false;
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if positional_only {
+            target = true;
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            target = true;
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--changed" | "--staged" if inline.is_none() => target = true,
+            "--verbose"
+            | "--no-errors-on-unmatched"
+            | "--error-on-warnings"
+            | "--skip-parse-errors"
+            | "--vcs-enabled"
+            | "--vcs-use-ignore-file"
+            | "--files-ignore-unknown"
+                if inline.is_none() => {}
+            "--colors" | "--indent-style" | "--indent-width" | "--line-ending" | "--line-width"
+            | "--quote-style" | "--jsx-quote-style" | "--semicolons" | "--trailing-commas"
+            | "--max-diagnostics" | "--since" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    target
+}
+
+/// Whether `words` is a read-only `gofmt -l` or `gofmt -d` invocation with
+/// local paths and no `-w` write flag.
+fn gofmt_check(words: &[&str]) -> bool {
+    let ["gofmt", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut check = false;
+    let mut positional_only = false;
+    for &arg in args {
+        if positional_only {
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        match arg {
+            "-l" | "-d" => check = true,
+            "-s" | "-e" => {}
+            _ => return false,
+        }
+    }
+    check
+}
+
+/// Whether `words` is a read-only `shfmt -d` or `shfmt -l` invocation with
+/// local paths and no `-w`/`--write` flag.
+fn shfmt_check(words: &[&str]) -> bool {
+    let ["shfmt", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut check = false;
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if positional_only {
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "-d" | "--diff" | "-l" | "--list" if inline.is_none() => check = true,
+            "-s" | "--simplify" | "-p" | "--posix" | "-f" | "--find" | "-bn"
+            | "--binary-next-line" | "-ci" | "--case-indent" | "-sr" | "--space-redirects"
+            | "-kp" | "--keep-padding" | "-fn" | "--func-next-line" | "-mn" | "--minify"
+            | "--apply-ignore"
+                if inline.is_none() => {}
+            "-i" | "--indent" | "-ln" | "--language-dialect" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => {
+                if inline.is_none()
+                    && let Some(rest) = arg.strip_prefix("-i")
+                    && !rest.is_empty()
+                    && rest.bytes().all(|b| b.is_ascii_digit())
+                {
+                    continue;
+                }
+                if inline.is_none()
+                    && let Some(cluster) = arg
+                        .strip_prefix('-')
+                        .filter(|s| !s.is_empty() && !s.starts_with('-'))
+                    && cluster
+                        .chars()
+                        .all(|c| matches!(c, 'd' | 'l' | 's' | 'p' | 'f'))
+                {
+                    check |= cluster.contains(['d', 'l']);
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    check
+}
+
+/// Whether `words` is a read-only `black --check` or `black --diff` invocation
+/// with local paths and no `--config` override.
+fn black_check(words: &[&str]) -> bool {
+    let ["black", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut check = false;
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if positional_only {
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--check" | "--diff" if inline.is_none() => check = true,
+            "-q"
+            | "--quiet"
+            | "-v"
+            | "--verbose"
+            | "--color"
+            | "--no-color"
+            | "--fast"
+            | "--safe"
+            | "--preview"
+            | "--unstable"
+            | "-S"
+            | "--skip-string-normalization"
+            | "-C"
+            | "--skip-magic-trailing-comma"
+            | "-x"
+            | "--skip-source-first-line"
+            | "--pyi"
+            | "--ipynb"
+                if inline.is_none() => {}
+            "-l" | "--line-length" | "-t" | "--target-version" | "--include" | "--exclude"
+            | "--extend-exclude" | "--force-exclude" | "--required-version" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    check
+}
+
+/// Whether `words` is a read-only `rustfmt --check` invocation with local paths
+/// and no `--config-path`, `--config`, or `--emit` override.
+fn rustfmt_check(words: &[&str]) -> bool {
+    let ["rustfmt", args @ ..] = words else {
+        return false;
+    };
+    if !args.iter().all(|arg| local_argument(arg)) {
+        return false;
+    }
+    let mut check = false;
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if positional_only {
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "--check" if inline.is_none() => check = true,
+            "-l" | "--files-with-diff" | "-v" | "--verbose" | "-q" | "--quiet"
+            | "--skip-children"
+                if inline.is_none() => {}
+            "--edition" | "--color" | "--style-edition" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().copied(),
+                };
+                if value.is_none_or(|v| v.is_empty() || v.starts_with('-')) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    check
 }
 
 /// Whether `words` is a read-only `ruff format --check` or `ruff format --diff`
@@ -2129,9 +2796,175 @@ mod tests {
             ("deno fmt --check --single-quote src", true),
             ("deno fmt", false),
             ("deno fmt --check --config deno.json", false),
+            ("biome format .", true),
+            ("biome format src/app.ts", true),
+            ("biome format --changed", true),
+            ("pnpm exec biome format .", true),
+            ("biome format", false),
+            ("biome format --write .", false),
+            ("biome format --unsafe .", false),
+            ("biome format --config-path biome.json .", false),
+            ("biome format ../other", false),
+            ("gofmt -l .", true),
+            ("gofmt -d src", true),
+            ("gofmt -s -l .", true),
+            ("gofmt", false),
+            ("gofmt -w .", false),
+            ("gofmt -l -w .", false),
+            ("gofmt -l ../other", false),
+            ("gofmt -l -cpuprofile prof .", false),
+            ("shfmt -d .", true),
+            ("shfmt -l scripts/", true),
+            ("shfmt -sd -i 2 -ci scripts/", true),
+            ("shfmt", false),
+            ("shfmt -w scripts/", false),
+            ("shfmt -d -w scripts/", false),
+            ("shfmt -d ../other", false),
+            ("black --check .", true),
+            ("black --diff src", true),
+            ("black --check --line-length 100 src", true),
+            ("python3 -m black --check .", true),
+            ("black", false),
+            ("black src", false),
+            ("black --check --config pyproject.toml .", false),
+            ("black --check ../other", false),
+            ("rustfmt --check src/main.rs", true),
+            ("rustfmt --check --edition 2024 src/main.rs", true),
+            ("rustfmt", false),
+            ("rustfmt src/main.rs", false),
+            (
+                "rustfmt --check --config-path rustfmt.toml src/main.rs",
+                false,
+            ),
+            ("rustfmt --check --emit=stdout src/main.rs", false),
+            ("rustfmt --check ../other.rs", false),
+            // `vitest --run` matches `vitest run` for approval and safety checks.
+            ("vitest --run", true),
+            ("vitest --run src/app.test.ts", true),
+            ("vitest --run --browser.enabled", false),
+            // `podman ps` and `podman logs` mirror `docker`.
+            ("podman ps", true),
+            ("podman ps -a", true),
+            ("podman logs --tail 50 web", true),
+            // Newly routed `known::ROUTED` commands stay unapproved.
+            ("python3 -m unittest", false),
+            ("python -m unittest discover", false),
+            ("bun run typecheck", false),
+            ("bazel build //...", false),
+            ("bazel test //...", false),
+            ("zig build", false),
+            ("zig test src/main.zig", false),
+            ("podman build .", false),
+            ("podman images", false),
+            ("podman image ls", false),
         ] {
             let words: Vec<&str> = command.split(' ').collect();
             assert_eq!(approvable(&words), approved, "{command}");
+        }
+        // Multi-ecosystem build/compile invocations route to `Profile::Lint`, while
+        // test commands, non-build targets, bare `make`, and machine formats stay out.
+        for command in [
+            "make build",
+            "make all",
+            "make -j8",
+            "make -j 4 all",
+            "make clean build",
+            "gmake",
+            "gmake -j4 all",
+            "ninja",
+            "ninja -C build",
+            "cmake --build build",
+            "cmake --build build -j 8 --target app",
+            "gradle build",
+            "gradlew assemble",
+            "./gradlew clean build",
+            "./gradlew build -x test",
+            "./gradlew :app:compileKotlin",
+            "mvn compile",
+            "mvnw clean compile",
+            "./mvnw -B -ntp -T 4 clean package -DskipTests",
+            "dotnet build",
+            "dotnet build -c Release",
+            "dotnet restore",
+            "swift build",
+            "go build ./...",
+        ] {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert_eq!(profile(&words), Some(Profile::Lint), "{command}");
+            assert!(legacy_hook(&words), "{command}");
+        }
+        for command in [
+            "make",
+            "make test",
+            "make -j test",
+            "make -j8 test",
+            "make check",
+            "make clean",
+            "make install",
+            "make deploy",
+            "make serve",
+            "make -n build",
+            "gmake test",
+            "ninja test",
+            "ninja -t compdb",
+            "cmake --build build --target test",
+            "cmake --build build -t install",
+            "cmake -S . -B build",
+            "gradle",
+            "gradle test",
+            "./gradlew :app:test --tests Foo",
+            "./gradlew check",
+            "./gradlew clean",
+            "./gradlew bootRun",
+            "mvn",
+            "mvn test",
+            "mvn clean test",
+            "mvn clean verify",
+            "mvn verify -Dtest=FooTest",
+            "mvn deploy",
+            "mvn clean",
+            "dotnet test",
+            "swift test",
+            "go test ./...",
+            "go build --json ./...",
+        ] {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert_eq!(profile(&words), None, "{command}");
+        }
+        // `vitest --run` routes to `Profile::JsTests`, respecting `js_display`.
+        for command in [
+            "vitest --run",
+            "vitest --run src/app.test.ts",
+            "vitest src/app.test.ts --run",
+        ] {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert_eq!(profile(&words), Some(Profile::JsTests), "{command}");
+        }
+        for command in [
+            "vitest",
+            "vitest --run --watch",
+            "vitest --run --json",
+            "vitest bench --run",
+        ] {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert_eq!(profile(&words), None, "{command}");
+        }
+        // `podman ps` / `podman container ls|list|ps` and `podman logs` mirror `docker`.
+        for (command, expected) in [
+            ("podman ps", Some(Profile::Containers)),
+            ("podman ps -a", Some(Profile::Containers)),
+            ("podman container ls", Some(Profile::Containers)),
+            ("podman container list -a", Some(Profile::Containers)),
+            ("podman container ps", Some(Profile::Containers)),
+            ("podman logs web", Some(Profile::Logs)),
+            ("podman logs --tail 50 -t web", Some(Profile::Logs)),
+            ("podman container logs web", Some(Profile::Logs)),
+            ("podman compose logs web", Some(Profile::Logs)),
+            ("podman logs -f web", None),
+            ("podman ps --format json", None),
+        ] {
+            let words: Vec<&str> = command.split(' ').collect();
+            assert_eq!(profile(&words), expected, "{command}");
         }
         // `cargo doc` without `--open` selects the lint profile; `--open` selects none.
         assert_eq!(profile(&["cargo", "doc", "--no-deps"]), Some(Profile::Lint));
