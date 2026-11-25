@@ -26,6 +26,10 @@ pub const LIMIT: u64 = 8 * 1024 * 1024;
 /// Minimum patch section length (in lines) before a generated/snapshot file is folded.
 pub(crate) const GENERATED_FOLD_LINES: usize = 25;
 
+/// Minimum changed (`+` plus `-`) lines before a `.svg` file is folded as a
+/// large generated/exported graphic; small hand-edited SVGs stay inline.
+pub(crate) const SVG_FOLD_CHANGED_LINES: usize = 100;
+
 /// One lockfile or folded generated section of a patch.
 pub struct Section {
     /// The file as the patch names it, such as `Cargo.lock` or `tool/Cargo.lock`.
@@ -162,13 +166,31 @@ pub(crate) fn is_generated_path(path: &str) -> bool {
     let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    name.ends_with(".snap")
+    name == ".terraform.lock.hcl"
+        || name.ends_with(".snap")
+        || name.ends_with(".snap.new")
         || name.ends_with(".min.js")
         || name.ends_with(".min.css")
         || name.ends_with(".pb.go")
+        || name.ends_with(".pb.rs")
+        || name.ends_with(".pb.ts")
+        || name.ends_with(".pb.js")
         || name.ends_with("_pb2.py")
         || name.ends_with(".g.dart")
+        || name.ends_with(".freezed.dart")
+        || name.ends_with(".Designer.cs")
+        || name.ends_with(".g.cs")
+        || name.ends_with(".g.i.cs")
         || name.contains(".generated.")
+}
+
+/// Whether `path` names an SVG file, which only folds when its diff changes
+/// more than [`SVG_FOLD_CHANGED_LINES`] lines.
+pub(crate) fn is_svg_path(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(".svg") || name.ends_with(".SVG"))
 }
 
 fn diff_section_path(line: &str) -> Option<&str> {
@@ -217,6 +239,7 @@ enum ActiveKind<'a> {
         added: usize,
         deleted: usize,
         parents: usize,
+        svg: bool,
     },
 }
 
@@ -246,13 +269,23 @@ pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
         "flake.lock",
         "Package.resolved",
         "mix.lock",
+        ".terraform.lock.hcl",
         ".snap",
         ".min.js",
         ".min.css",
         ".pb.go",
+        ".pb.rs",
+        ".pb.ts",
+        ".pb.js",
         ".generated.",
         "_pb2.py",
         ".g.dart",
+        ".freezed.dart",
+        ".Designer.cs",
+        ".g.cs",
+        ".g.i.cs",
+        ".svg",
+        ".SVG",
     ];
     if !NEEDLES.iter().any(|name| patch.contains(name)) {
         return Vec::new();
@@ -291,8 +324,18 @@ pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
                     found.push(sec);
                 }
             }
-            ActiveKind::Generated { added, deleted, .. } => {
-                if section.last.saturating_sub(section.first) + 1 > GENERATED_FOLD_LINES {
+            ActiveKind::Generated {
+                added,
+                deleted,
+                svg,
+                ..
+            } => {
+                let should_fold = if svg {
+                    added + deleted > SVG_FOLD_CHANGED_LINES
+                } else {
+                    section.last.saturating_sub(section.first) + 1 > GENERATED_FOLD_LINES
+                };
+                if should_fold {
                     let head = format!(
                         "=== {} (generated, +{added} -{deleted}) [stdout:{}-{}]\n",
                         section.path, section.first, section.last
@@ -328,7 +371,7 @@ pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
                         hunk_lines: Vec::new(),
                     },
                 })
-            } else if is_generated_path(path) {
+            } else if is_generated_path(path) || is_svg_path(path) {
                 Some(ActiveSection {
                     path: path.to_owned(),
                     first: number,
@@ -338,6 +381,7 @@ pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
                         added: 0,
                         deleted: 0,
                         parents: 0,
+                        svg: !is_generated_path(path),
                     },
                 })
             } else {
@@ -382,6 +426,7 @@ pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
                         added,
                         deleted,
                         parents,
+                        ..
                     } => {
                         if let Some(p) = combined_parents(line) {
                             *parents = p;
@@ -3601,20 +3646,106 @@ mod tests {
             found[2].head
         );
 
-        // Generated-path matcher covers all 7 documented patterns and ignores ordinary code.
+        // Generated-path matcher covers all documented patterns and ignores ordinary code & plain SVGs.
         for path in [
             "a/b.snap",
+            "tests/out.snap.new",
             "dist/app.min.js",
             "dist/site.min.css",
             "proto/api.pb.go",
+            "proto/service_grpc.pb.go",
+            "proto/api.pb.rs",
+            "web/proto/api.pb.ts",
+            "web/proto/api.pb.js",
             "src/schema.generated.ts",
             "proto/api_pb2.py",
             "lib/model.g.dart",
+            "lib/model.freezed.dart",
+            "ui/Form1.Designer.cs",
+            "obj/App.g.cs",
+            "obj/MainWindow.g.i.cs",
+            ".terraform.lock.hcl",
+            "infra/prod/.terraform.lock.hcl",
         ] {
             assert!(is_generated_path(path), "{path}");
         }
-        for code in ["src/lib.rs", "src/app.js", "src/api.go", "tests/test.py"] {
+        for code in [
+            "src/lib.rs",
+            "src/app.js",
+            "src/api.go",
+            "tests/test.py",
+            "assets/icon.svg",
+            "ui/Form1.cs",
+            "infra/main.tf",
+        ] {
             assert!(!is_generated_path(code), "{code}");
         }
+        assert!(is_svg_path("assets/icon.svg"));
+        assert!(is_svg_path("assets/LOGO.SVG"));
+        assert!(!is_svg_path("assets/icon.png"));
+    }
+
+    #[test]
+    fn expanded_generated_paths_and_large_svg_threshold_fold_accurately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut big_svg_lines = String::new();
+        for i in 0..105 {
+            big_svg_lines.push_str(&format!("+<path d=\"M{i} 0 L{i} 10\"/>\n"));
+        }
+        let mut small_svg_lines = String::new();
+        for i in 0..40 {
+            small_svg_lines.push_str(&format!("+<path d=\"M{i} 0 L{i} 5\"/>\n"));
+        }
+        let mut tf_lock_lines = String::new();
+        for i in 0..30 {
+            tf_lock_lines.push_str(&format!("+  \"h1:hash{i:02}=\",\n"));
+        }
+        let patch = format!(
+            concat!(
+                "diff --git a/infra/.terraform.lock.hcl b/infra/.terraform.lock.hcl\n",
+                "index 111..222 100644\n",
+                "--- a/infra/.terraform.lock.hcl\n",
+                "+++ b/infra/.terraform.lock.hcl\n",
+                "@@ -1,1 +1,31 @@\n",
+                " hashes = [\n",
+                "{}",
+                "diff --git a/assets/icon.svg b/assets/icon.svg\n",
+                "index 333..444 100644\n",
+                "--- a/assets/icon.svg\n",
+                "+++ b/assets/icon.svg\n",
+                "@@ -1,1 +1,41 @@\n",
+                " <svg>\n",
+                "{}",
+                "diff --git a/assets/diagram.svg b/assets/diagram.svg\n",
+                "index 555..666 100644\n",
+                "--- a/assets/diagram.svg\n",
+                "+++ b/assets/diagram.svg\n",
+                "@@ -1,2 +1,106 @@\n",
+                "-<old/>\n",
+                "{}",
+            ),
+            tf_lock_lines, small_svg_lines, big_svg_lines
+        );
+        let found = sections(&patch, dir.path());
+        // `.terraform.lock.hcl` (>25 lines) and `diagram.svg` (+105 -1 = 106 > 100 changed lines) fold;
+        // `icon.svg` (+40 -0 <= 100 changed lines) must NOT fold!
+        assert_eq!(
+            found.len(),
+            2,
+            "{:?}",
+            found.iter().map(|s| &s.path).collect::<Vec<_>>()
+        );
+        assert_eq!(found[0].path, "infra/.terraform.lock.hcl");
+        assert!(found[0].generated);
+        assert_eq!(
+            found[0].head,
+            "=== infra/.terraform.lock.hcl (generated, +30 -0) [stdout:1-36]\n"
+        );
+        assert_eq!(found[1].path, "assets/diagram.svg");
+        assert!(found[1].generated);
+        assert_eq!(
+            found[1].head,
+            "=== assets/diagram.svg (generated, +105 -1) [stdout:83-193]\n"
+        );
     }
 }

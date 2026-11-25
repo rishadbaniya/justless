@@ -18,6 +18,34 @@ const COMPACT_BUFFER_CAP: usize = 32 * 1024;
 /// by `lockdiff::summarize` anyway, so an oversized lockfile must not push code files
 /// out of the compact diff tier).
 const LOCKFILE_BUFFER_CAP: usize = 8 * 1024;
+/// Buffer cap for a single contiguous `-`/`+` block while verifying whether a large
+/// hunk is pure whitespace/reindent noise.
+const WS_BLOCK_BUFFER_CAP: usize = 512 * 1024;
+
+/// Structured details for Terraform, OpenTofu and Pulumi plan summaries.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PlanDetails {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pulumi: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refreshed: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refreshed_first: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refreshed_last: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unchanged: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unchanged_first: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unchanged_last: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
 
 /// Text in a summary comes from captured output. Records written before redaction can
 /// hold raw secrets, so code that prints a stored summary must pass it through
@@ -35,6 +63,10 @@ pub struct Summary {
     /// accounts for both streams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js: Option<crate::js_tests::Report>,
+    /// Structured Terraform, OpenTofu or Pulumi plan details (refreshes,
+    /// unchanged counts, output changes and diagnostics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanDetails>,
     /// Total raw bytes observed for a diff/patch run (in-memory only).
     #[serde(skip)]
     pub(crate) diff_raw_bytes: usize,
@@ -65,6 +97,10 @@ pub(crate) struct DiffFile {
     items_start: usize,
     items_end: usize,
     generated_folded: bool,
+    /// `(old_path, new_path)` for a 100% pure file rename with no content or mode edits.
+    pure_rename: Option<(String, String)>,
+    /// First stdout line number of each hunk confirmed to be whitespace/indent only.
+    whitespace_hunk_firsts: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +240,26 @@ pub fn family(args: &[OsString]) -> String {
         }
         true
     };
+    let terraform_plan_display = || {
+        !tool.iter().skip(2).take_while(|&&a| a != "--").any(|&arg| {
+            matches!(
+                arg,
+                "-json" | "-h" | "-help" | "--help" | "-version" | "--version"
+            )
+        })
+    };
+    let pulumi_display = || {
+        !tool.iter().skip(2).take_while(|&&a| a != "--").any(|&arg| {
+            let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+            matches!(flag, "-j" | "--json" | "-h" | "--help" | "--version")
+        })
+    };
+    let pulumi_dry_run = || {
+        tool.iter()
+            .skip(2)
+            .take_while(|&&arg| arg != "--")
+            .any(|&arg| arg == "--dry-run" || arg == "--dry-run=true")
+    };
     match words.as_slice() {
         ["git", "diff", ..] | ["gh", "pr", "diff", ..] | ["glab", "mr", "diff", ..] => "git diff",
         ["git", "show", ..] => "git show",
@@ -217,7 +273,9 @@ pub fn family(args: &[OsString]) -> String {
         ["rspec", ..] if rspec_display() => "rspec",
         ["phpunit" | "paratest" | "pest", ..] if phpunit_display(1) => "phpunit",
         ["php", "artisan", "test", ..] if phpunit_display(3) => "phpunit",
-        ["terraform" | "tofu", "plan", ..] => "terraform plan",
+        ["terraform" | "tofu", "plan", ..] if terraform_plan_display() => "terraform plan",
+        ["pulumi", "preview", ..] if pulumi_display() => "pulumi preview",
+        ["pulumi", "up", ..] if pulumi_dry_run() && pulumi_display() => "pulumi preview",
         [cmd @ ("cargo" | "git" | "go" | "npm" | "rg"), ..] => cmd,
         _ => "other",
     }
@@ -232,6 +290,7 @@ pub struct Parser {
     js_tests: Option<crate::js_tests::Scan>,
     rspec: Option<RspecScan>,
     phpunit: Option<PhpunitScan>,
+    plan: Option<PlanScan>,
     summary: Summary,
     hash: Sha256,
     file: String,
@@ -285,20 +344,39 @@ struct ActiveDiffFile {
     deleted: usize,
     meta_lines: Vec<String>,
     saw_mode_header: bool,
+    saw_sim_100: bool,
+    rename_from: Option<String>,
+    rename_to: Option<String>,
+    saw_non_rename_meta: bool,
+    saw_hunk: bool,
     hunks: Option<Vec<CompactHunk>>,
     current_hunk: Option<ActiveCompactHunk>,
     buffered_bytes: usize,
     items_start: usize,
     is_generated: bool,
+    is_svg: bool,
     is_lockfile: bool,
     generated_folded: bool,
+    svg_overflowed: bool,
+    indent_significant: bool,
+    whitespace_hunk_firsts: Vec<usize>,
 }
 
 struct ActiveCompactHunk {
     header: String,
+    first: usize,
+    last: usize,
     combined_parents: usize,
     raw_lines: Vec<String>,
     raw_bytes: usize,
+    raw_overflowed: bool,
+    cut_off: bool,
+    ws_eligible: bool,
+    ws_block_bytes: usize,
+    ws_block_rem: Vec<String>,
+    ws_block_add: Vec<String>,
+    ws_added: usize,
+    ws_deleted: usize,
 }
 
 /// Where a line of `git show` or `git log -p` output falls.
@@ -329,7 +407,7 @@ impl Parser {
             _ if profile.is_some() => "",
             "git diff" => "diff",
             _ if commits => "diff",
-            "terraform plan" => "plan",
+            "terraform plan" | "pulumi preview" => "plan",
             "pytest" | "cargo test" | "cargo nextest" | "go test" | "npm test" | "rspec"
             | "phpunit" => "tests",
             _ => "",
@@ -346,6 +424,15 @@ impl Parser {
             js_tests: is_js_tests.then(crate::js_tests::Scan::default),
             rspec: (family == "rspec" && profile.is_none()).then(RspecScan::default),
             phpunit: (family == "phpunit" && profile.is_none()).then(PhpunitScan::default),
+            plan: if profile.is_none() {
+                match family {
+                    "terraform plan" => Some(PlanScan::terraform()),
+                    "pulumi preview" => Some(PlanScan::pulumi()),
+                    _ => None,
+                }
+            } else {
+                None
+            },
             summary: Summary {
                 kind: kind.into(),
                 ..Default::default()
@@ -465,8 +552,8 @@ impl Parser {
         }
         if self.summary.kind == "diff" {
             self.diff(line, number);
-        } else if self.summary.kind == "plan" {
-            self.plan(line, number);
+        } else if let Some(plan) = &mut self.plan {
+            plan.observe(line, number);
         } else if let Some(js) = &mut self.js_tests {
             js.observe(line, number, crate::capture::Stream::Stdout);
         } else if let Some(rspec) = &mut self.rspec {
@@ -481,8 +568,8 @@ impl Parser {
         }
     }
 
-    /// Read a line of stderr, where `cargo test` and JS runners such as Jest,
-    /// Vitest and Bun print test output.
+    /// Read a line of stderr, where `cargo test`, JS runners and Terraform/Pulumi
+    /// plans print test output or diagnostics.
     pub fn observe_stderr(&mut self, text: &str, number: usize) {
         if let Some(cargo) = &mut self.cargo {
             cargo.observe(text, number, crate::capture::Stream::Stderr);
@@ -500,6 +587,15 @@ impl Parser {
                 crate::capture::Stream::Stderr,
             );
         }
+        if let Some(plan) = &mut self.plan
+            && !self.discarded
+        {
+            if text.len() >= 256 * 1024 || text.contains('\0') {
+                self.discarded = true;
+                return;
+            }
+            plan.observe_stderr(text.trim_end_matches('\n'), number);
+        }
     }
 
     fn flush(&mut self) {
@@ -514,15 +610,74 @@ impl Parser {
         compact_bytes: &mut usize,
         compact_overflowed: &mut bool,
     ) {
-        let Some(hunk) = file.current_hunk.take() else {
+        let Some(mut hunk) = file.current_hunk.take() else {
             return;
         };
         if file.generated_folded {
             return;
         }
+        let ws_only = !hunk.cut_off
+            && hunk.combined_parents == 0
+            && (hunk.ws_added > 0 || hunk.ws_deleted > 0)
+            && hunk.ws_eligible
+            && is_ws_only_block(
+                &hunk.ws_block_rem,
+                &hunk.ws_block_add,
+                file.indent_significant,
+            );
+        if ws_only {
+            file.whitespace_hunk_firsts.push(hunk.first);
+            let Some(hunks) = file.hunks.as_mut() else {
+                return;
+            };
+            let folded_header = format!(
+                "{} (whitespace/indent only, -{} +{} lines) [stdout:{}-{}]",
+                hunk.header, hunk.ws_deleted, hunk.ws_added, hunk.first, hunk.last
+            );
+            let added_bytes = folded_header.len() + 1;
+            if file.is_lockfile {
+                if file.buffered_bytes + added_bytes > LOCKFILE_BUFFER_CAP {
+                    file.hunks = None;
+                    return;
+                }
+                file.buffered_bytes += added_bytes;
+            } else if file.is_svg {
+                if *compact_bytes + added_bytes > COMPACT_BUFFER_CAP {
+                    file.svg_overflowed = true;
+                    file.hunks = None;
+                    return;
+                }
+                *compact_bytes += added_bytes;
+                file.buffered_bytes += added_bytes;
+            } else {
+                if *compact_bytes + added_bytes > COMPACT_BUFFER_CAP {
+                    *compact_overflowed = true;
+                    file.hunks = None;
+                    return;
+                }
+                *compact_bytes += added_bytes;
+                file.buffered_bytes += added_bytes;
+            }
+            hunks.push(CompactHunk {
+                header: folded_header,
+                lines: Vec::new(),
+            });
+            return;
+        }
+        if hunk.raw_overflowed {
+            file.hunks = None;
+            if file.is_svg {
+                file.svg_overflowed = true;
+            } else if !file.is_lockfile {
+                *compact_overflowed = true;
+            }
+            return;
+        }
         let Some(hunks) = file.hunks.as_mut() else {
             return;
         };
+        hunk.ws_block_rem.clear();
+        hunk.ws_block_add.clear();
         let trimmed = trim_hunk_context(&hunk.raw_lines, hunk.combined_parents);
         let added_bytes: usize =
             hunk.header.len() + 1 + trimmed.iter().map(|l| l.len() + 1).sum::<usize>();
@@ -531,6 +686,14 @@ impl Parser {
                 file.hunks = None;
                 return;
             }
+            file.buffered_bytes += added_bytes;
+        } else if file.is_svg {
+            if *compact_bytes + added_bytes > COMPACT_BUFFER_CAP {
+                file.svg_overflowed = true;
+                file.hunks = None;
+                return;
+            }
+            *compact_bytes += added_bytes;
             file.buffered_bytes += added_bytes;
         } else {
             if *compact_bytes + added_bytes > COMPACT_BUFFER_CAP {
@@ -557,6 +720,20 @@ impl Parser {
             &mut self.compact_bytes,
             &mut self.compact_overflowed,
         );
+        if file.is_svg && !file.generated_folded && file.svg_overflowed {
+            self.compact_overflowed = true;
+        }
+        let pure_rename = if file.saw_sim_100
+            && !file.saw_hunk
+            && file.added == 0
+            && file.deleted == 0
+            && !file.saw_non_rename_meta
+            && let (Some(old), Some(new)) = (file.rename_from, file.rename_to)
+        {
+            Some((old, new))
+        } else {
+            None
+        };
         let items_end = self.summary.items.len();
         self.diff_entries.push(DiffEntry::File(DiffFile {
             path: file.path,
@@ -573,6 +750,8 @@ impl Parser {
             items_start: file.items_start,
             items_end,
             generated_folded: file.generated_folded,
+            pure_rename,
+            whitespace_hunk_firsts: file.whitespace_hunk_firsts,
         }));
     }
 
@@ -677,7 +856,9 @@ impl Parser {
             self.file = path.to_owned();
             let items_start = self.summary.items.len();
             let is_generated = crate::lockdiff::is_generated_path(&self.file);
+            let is_svg = !is_generated && crate::lockdiff::is_svg_path(&self.file);
             let is_lockfile = crate::lockdiff::is_lockfile_path(&self.file);
+            let indent_significant = is_indent_significant_path(&self.file);
             let mut item = Item::new(&self.file, "file metadata", n);
             item.file_first = n;
             self.pending = Some(item);
@@ -689,6 +870,11 @@ impl Parser {
                 deleted: 0,
                 meta_lines: Vec::new(),
                 saw_mode_header: false,
+                saw_sim_100: false,
+                rename_from: None,
+                rename_to: None,
+                saw_non_rename_meta: false,
+                saw_hunk: false,
                 hunks: if !is_lockfile && self.compact_overflowed {
                     None
                 } else {
@@ -698,8 +884,12 @@ impl Parser {
                 buffered_bytes: 0,
                 items_start,
                 is_generated,
+                is_svg,
                 is_lockfile,
                 generated_folded: false,
+                svg_overflowed: false,
+                indent_significant,
+                whitespace_hunk_firsts: Vec::new(),
             });
         } else if is_hunk_header(line) && !self.file.is_empty() {
             if let Some(file) = self.current_file.as_mut() {
@@ -709,12 +899,24 @@ impl Parser {
                     &mut self.compact_overflowed,
                 );
                 file.last = n;
-                if file.hunks.is_some() && !file.generated_folded {
+                file.saw_hunk = true;
+                if !file.generated_folded {
+                    let combined = combined_hunk_parents(line).unwrap_or(0);
                     file.current_hunk = Some(ActiveCompactHunk {
                         header: line.to_owned(),
-                        combined_parents: combined_hunk_parents(line).unwrap_or(0),
+                        first: n,
+                        last: n,
+                        combined_parents: combined,
                         raw_lines: Vec::new(),
                         raw_bytes: 0,
+                        raw_overflowed: file.hunks.is_none(),
+                        cut_off: false,
+                        ws_eligible: combined == 0,
+                        ws_block_bytes: 0,
+                        ws_block_rem: Vec::new(),
+                        ws_block_add: Vec::new(),
+                        ws_added: 0,
+                        ws_deleted: 0,
                     });
                 }
             }
@@ -746,19 +948,6 @@ impl Parser {
             }
             if let Some(file) = self.current_file.as_mut() {
                 file.last = n;
-                if file.is_generated
-                    && !file.generated_folded
-                    && file.last.saturating_sub(file.first) + 1
-                        > crate::lockdiff::GENERATED_FOLD_LINES
-                {
-                    file.generated_folded = true;
-                    file.current_hunk = None;
-                    if !file.is_lockfile {
-                        self.compact_bytes = self.compact_bytes.saturating_sub(file.buffered_bytes);
-                    }
-                    file.buffered_bytes = 0;
-                    file.hunks = None;
-                }
                 let in_hunk = self
                     .pending
                     .as_ref()
@@ -776,32 +965,114 @@ impl Parser {
                             item.deleted += 1;
                         }
                     }
+                }
+                let should_fold_generated = !file.generated_folded
+                    && ((file.is_generated
+                        && file.last.saturating_sub(file.first) + 1
+                            > crate::lockdiff::GENERATED_FOLD_LINES)
+                        || (file.is_svg
+                            && file.added + file.deleted
+                                > crate::lockdiff::SVG_FOLD_CHANGED_LINES));
+                if should_fold_generated {
+                    file.generated_folded = true;
+                    file.current_hunk = None;
+                    if !file.is_lockfile {
+                        self.compact_bytes = self.compact_bytes.saturating_sub(file.buffered_bytes);
+                    }
+                    file.buffered_bytes = 0;
+                    file.hunks = None;
+                }
+                if in_hunk {
                     if !file.generated_folded
                         && let Some(active_hunk) = file.current_hunk.as_mut()
                     {
-                        let cap = if file.is_lockfile {
-                            LOCKFILE_BUFFER_CAP
-                        } else {
-                            COMPACT_BUFFER_CAP
-                        };
-                        if active_hunk.raw_bytes + line.len() < cap * 2 {
-                            active_hunk.raw_bytes += line.len() + 1;
-                            active_hunk.raw_lines.push(line.to_owned());
-                        } else {
-                            file.current_hunk = None;
-                            file.hunks = None;
-                            if !file.is_lockfile {
-                                self.compact_overflowed = true;
+                        active_hunk.last = n;
+                        if active_hunk.ws_eligible {
+                            if let Some(rest) = line.strip_prefix('-') {
+                                active_hunk.ws_deleted += 1;
+                                if active_hunk.ws_block_bytes + rest.len() <= WS_BLOCK_BUFFER_CAP {
+                                    active_hunk.ws_block_bytes += rest.len() + 1;
+                                    active_hunk.ws_block_rem.push(rest.to_owned());
+                                } else {
+                                    active_hunk.ws_eligible = false;
+                                    active_hunk.ws_block_rem.clear();
+                                    active_hunk.ws_block_add.clear();
+                                }
+                            } else if let Some(rest) = line.strip_prefix('+') {
+                                active_hunk.ws_added += 1;
+                                if active_hunk.ws_block_bytes + rest.len() <= WS_BLOCK_BUFFER_CAP {
+                                    active_hunk.ws_block_bytes += rest.len() + 1;
+                                    active_hunk.ws_block_add.push(rest.to_owned());
+                                } else {
+                                    active_hunk.ws_eligible = false;
+                                    active_hunk.ws_block_rem.clear();
+                                    active_hunk.ws_block_add.clear();
+                                }
+                            } else if line.starts_with(' ') {
+                                if !active_hunk.ws_block_rem.is_empty()
+                                    || !active_hunk.ws_block_add.is_empty()
+                                {
+                                    if !is_ws_only_block(
+                                        &active_hunk.ws_block_rem,
+                                        &active_hunk.ws_block_add,
+                                        file.indent_significant,
+                                    ) {
+                                        active_hunk.ws_eligible = false;
+                                    }
+                                    active_hunk.ws_block_rem.clear();
+                                    active_hunk.ws_block_add.clear();
+                                    active_hunk.ws_block_bytes = 0;
+                                }
+                            } else {
+                                // `\` ("\ No newline at end of file") or unexpected line is semantic.
+                                active_hunk.ws_eligible = false;
+                                active_hunk.ws_block_rem.clear();
+                                active_hunk.ws_block_add.clear();
+                            }
+                        }
+                        if !active_hunk.raw_overflowed {
+                            let cap = if file.is_lockfile {
+                                LOCKFILE_BUFFER_CAP
+                            } else {
+                                COMPACT_BUFFER_CAP
+                            };
+                            if active_hunk.raw_bytes + line.len() < cap * 2 {
+                                active_hunk.raw_bytes += line.len() + 1;
+                                active_hunk.raw_lines.push(line.to_owned());
+                            } else {
+                                active_hunk.raw_overflowed = true;
+                                active_hunk.raw_lines.clear();
                             }
                         }
                     }
-                } else if is_preserved_meta_header(line, file.saw_mode_header) {
-                    if line.starts_with("new file mode ") || line.starts_with("deleted file mode ")
+                } else {
+                    if line == "similarity index 100%" {
+                        file.saw_sim_100 = true;
+                    } else if let Some(old) = line.strip_prefix("rename from ") {
+                        file.rename_from = Some(old.to_owned());
+                    } else if let Some(new) = line.strip_prefix("rename to ") {
+                        file.rename_to = Some(new.to_owned());
+                    } else if line.starts_with("old mode ")
+                        || line.starts_with("new mode ")
+                        || line.starts_with("deleted file mode ")
+                        || line.starts_with("new file mode ")
+                        || line.starts_with("mode ")
+                        || line.starts_with("Binary files ")
+                        || line.starts_with("GIT binary patch")
+                        || line.starts_with("copy from ")
+                        || line.starts_with("copy to ")
                     {
-                        file.saw_mode_header = true;
+                        file.saw_non_rename_meta = true;
                     }
-                    if file.meta_lines.len() < 16 {
-                        file.meta_lines.push(line.to_owned());
+                    if is_preserved_meta_header(line, file.saw_mode_header) {
+                        if line.starts_with("new file mode ")
+                            || line.starts_with("deleted file mode ")
+                        {
+                            file.saw_mode_header = true;
+                        }
+                        if file.meta_lines.len() < 16 {
+                            file.meta_lines.push(line.to_owned());
+                        }
                     }
                 }
             }
@@ -813,38 +1084,6 @@ impl Parser {
                 self.hash.update(line.as_bytes());
                 self.hash.update(b"\n");
             }
-            item.last = n;
-        }
-    }
-
-    fn plan(&mut self, line: &str, n: usize) {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("# ")
-            && let Some((glyph, address, action)) = terraform_action(rest)
-        {
-            self.flush();
-            self.pending = Some(Item::new(&format!("{glyph} {address}"), action, n));
-            return;
-        }
-        if trimmed.starts_with("Plan: ") || trimmed.starts_with("No changes.") {
-            self.flush();
-            self.summary.outcomes.push(short(trimmed, 220));
-            return;
-        }
-        if trimmed.starts_with("Changes to Outputs:")
-            || trimmed.starts_with("Note:")
-            || trimmed.starts_with("Saved the plan to:")
-            || trimmed.starts_with("Error:")
-            || trimmed.starts_with("────")
-        {
-            self.flush();
-            return;
-        }
-        if let Some(item) = &mut self.pending
-            && !trimmed.is_empty()
-        {
-            self.hash.update(trimmed.as_bytes());
-            self.hash.update(b"\n");
             item.last = n;
         }
     }
@@ -1120,6 +1359,13 @@ impl Parser {
             self.summary.outcomes = outcomes;
             return self.summary;
         }
+        if let Some(plan) = self.plan {
+            let (items, outcomes, details) = plan.finish();
+            self.summary.items = items;
+            self.summary.outcomes = outcomes;
+            self.summary.plan = details;
+            return self.summary;
+        }
         // A hunk that a filter such as `grep` thinned out tells nothing about where
         // the output stopped.
         if self.ends_early
@@ -1134,6 +1380,7 @@ impl Parser {
                 .and_then(|file| file.current_hunk.as_mut())
             {
                 hunk.header.push_str(" (cut off)");
+                hunk.cut_off = true;
             }
         }
         self.finish_diff_file();
@@ -1537,6 +1784,1186 @@ fn terraform_action(rest: &str) -> Option<(&'static str, &str, &str)> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Terraform / OpenTofu and Pulumi structured plan parser
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanEngine {
+    Terraform,
+    Pulumi,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PulumiSection {
+    Header,
+    Tree,
+    Diff,
+    Outputs,
+    Diagnostics,
+    Resources,
+}
+
+struct ActiveTfResource {
+    glyph: &'static str,
+    address: String,
+    action: String,
+    first: usize,
+    last: usize,
+    depth: usize,
+    block_stack: Vec<(usize, String)>,
+    changed_attrs: Vec<String>,
+    changed_extra: usize,
+    forces_attrs: Vec<String>,
+    forces_extra: usize,
+    is_update: bool,
+    is_replace: bool,
+}
+
+struct ActiveTfDiag {
+    first: usize,
+    last: usize,
+    headline: String,
+    location: Vec<String>,
+    detail: Option<String>,
+}
+
+#[derive(Default)]
+struct TfDiagState {
+    pending_box_start: Option<usize>,
+    active: Option<ActiveTfDiag>,
+}
+
+impl TfDiagState {
+    fn flush(&mut self, stream: &str, out: &mut Vec<String>) {
+        let Some(diag) = self.active.take() else {
+            return;
+        };
+        if out.len() >= LIMIT {
+            return;
+        }
+        let range = format_line_range(diag.first, diag.last);
+        let line = if !diag.location.is_empty() {
+            format!(
+                "{} ({}) [{stream}:{range}]",
+                diag.headline,
+                diag.location.join(" ")
+            )
+        } else if let Some(detail) = diag.detail {
+            format!("{} — {detail} [{stream}:{range}]", diag.headline)
+        } else {
+            format!("{} [{stream}:{range}]", diag.headline)
+        };
+        out.push(line);
+    }
+
+    fn starts_diag(trimmed: &str) -> bool {
+        if trimmed == "╷" || trimmed.starts_with("Warning:") || trimmed.starts_with("Error:") {
+            return true;
+        }
+        if let Some(inner) = trimmed.strip_prefix('│').map(str::trim) {
+            return inner.starts_with("Warning:") || inner.starts_with("Error:");
+        }
+        false
+    }
+
+    fn observe(&mut self, raw: &str, n: usize, stream: &str, out: &mut Vec<String>) -> bool {
+        let trimmed = raw.trim();
+        if trimmed == "╷" {
+            self.flush(stream, out);
+            self.pending_box_start = Some(n);
+            return true;
+        }
+        if trimmed == "╵" {
+            if let Some(diag) = self.active.as_mut() {
+                diag.last = n;
+            }
+            self.flush(stream, out);
+            self.pending_box_start = None;
+            return true;
+        }
+        let (is_bar, inner) = match trimmed.strip_prefix('│') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, trimmed),
+        };
+        if inner.starts_with("Warning:") || inner.starts_with("Error:") {
+            self.flush(stream, out);
+            if is_bar {
+                let first = self.pending_box_start.take().unwrap_or(n);
+                self.active = Some(ActiveTfDiag {
+                    first,
+                    last: n,
+                    headline: short(inner, 240),
+                    location: Vec::new(),
+                    detail: None,
+                });
+            } else {
+                self.pending_box_start = None;
+                if out.len() < LIMIT {
+                    out.push(format!("{} [{stream}:{n}]", short(inner, 240)));
+                }
+            }
+            return true;
+        }
+        if is_bar && let Some(diag) = self.active.as_mut() {
+            diag.last = n;
+            if inner.starts_with("with ") || inner.starts_with("on ") {
+                if diag.location.len() < 2 {
+                    diag.location.push(short(inner.trim_end_matches(':'), 120));
+                }
+            } else if diag.detail.is_none()
+                && !inner.is_empty()
+                && !inner.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                diag.detail = Some(short(inner, 120));
+            }
+            return true;
+        }
+        self.pending_box_start = None;
+        self.flush(stream, out);
+        false
+    }
+}
+
+struct ActivePulumiDiff {
+    glyph: &'static str,
+    res_type: String,
+    res_name: Option<String>,
+    action: String,
+    first: usize,
+    last: usize,
+    depth: usize,
+    changed_fields: Vec<String>,
+    changed_extra: usize,
+    track_fields: bool,
+}
+
+struct PlanScan {
+    engine: PlanEngine,
+    items: Vec<Item>,
+    outcomes: Vec<String>,
+    details: PlanDetails,
+    hash: Sha256,
+    tf_active: Option<ActiveTfResource>,
+    tf_in_outputs: bool,
+    tf_stdout_diag: TfDiagState,
+    tf_stderr_diag: TfDiagState,
+    pulumi_section: PulumiSection,
+    pulumi_active: Option<ActivePulumiDiff>,
+    pulumi_in_same_block: bool,
+    pulumi_resources: Vec<String>,
+    pulumi_diag_subject: Option<(String, usize)>,
+    pulumi_stderr_diag_subject: Option<(String, usize)>,
+    pulumi_in_stderr_diag: bool,
+}
+
+impl PlanScan {
+    fn terraform() -> Self {
+        Self::new(PlanEngine::Terraform)
+    }
+
+    fn pulumi() -> Self {
+        let mut scan = Self::new(PlanEngine::Pulumi);
+        scan.details.pulumi = true;
+        scan
+    }
+
+    fn new(engine: PlanEngine) -> Self {
+        Self {
+            engine,
+            items: Vec::new(),
+            outcomes: Vec::new(),
+            details: PlanDetails::default(),
+            hash: Sha256::new(),
+            tf_active: None,
+            tf_in_outputs: false,
+            tf_stdout_diag: TfDiagState::default(),
+            tf_stderr_diag: TfDiagState::default(),
+            pulumi_section: PulumiSection::Header,
+            pulumi_active: None,
+            pulumi_in_same_block: false,
+            pulumi_resources: Vec::new(),
+            pulumi_diag_subject: None,
+            pulumi_stderr_diag_subject: None,
+            pulumi_in_stderr_diag: false,
+        }
+    }
+
+    fn observe(&mut self, raw: &str, n: usize) {
+        let clean = strip_ansi_cow(raw);
+        let line = clean.strip_suffix('\r').unwrap_or(&clean);
+        match self.engine {
+            PlanEngine::Terraform => self.observe_terraform(line, n),
+            PlanEngine::Pulumi => self.observe_pulumi(line, n),
+        }
+    }
+
+    fn observe_stderr(&mut self, raw: &str, n: usize) {
+        let clean = strip_ansi_cow(raw);
+        let line = clean.strip_suffix('\r').unwrap_or(&clean);
+        match self.engine {
+            PlanEngine::Terraform => {
+                self.tf_stderr_diag
+                    .observe(line, n, "stderr", &mut self.details.diagnostics);
+            }
+            PlanEngine::Pulumi => {
+                let trimmed = line.trim();
+                if trimmed == "Diagnostics:" {
+                    self.pulumi_in_stderr_diag = true;
+                    self.pulumi_stderr_diag_subject = None;
+                } else if self.pulumi_in_stderr_diag {
+                    if trimmed.is_empty() {
+                        self.pulumi_stderr_diag_subject = None;
+                    } else {
+                        observe_pulumi_diag_line(
+                            trimmed,
+                            n,
+                            "stderr",
+                            &mut self.pulumi_stderr_diag_subject,
+                            &mut self.details.diagnostics,
+                        );
+                    }
+                } else if starts_with_diag_level(trimmed) && self.details.diagnostics.len() < LIMIT
+                {
+                    self.details
+                        .diagnostics
+                        .push(format!("{} [stderr:{n}]", short(trimmed, 240)));
+                }
+            }
+        }
+    }
+
+    fn flush_tf(&mut self) {
+        let Some(res) = self.tf_active.take() else {
+            return;
+        };
+        let detail = if !res.forces_attrs.is_empty() {
+            format!(
+                "{} (replace: {})",
+                res.action,
+                format_attr_list(&res.forces_attrs, res.forces_extra)
+            )
+        } else if res.is_update && !res.changed_attrs.is_empty() {
+            format!(
+                "{} ({})",
+                res.action,
+                format_attr_list(&res.changed_attrs, res.changed_extra)
+            )
+        } else {
+            res.action
+        };
+        let mut item = Item::new(
+            &format!("{} {}", res.glyph, res.address),
+            &detail,
+            res.first,
+        );
+        item.last = res.last;
+        item.digest = format!("{:x}", self.hash.finalize_reset());
+        if self.items.len() < LIMIT {
+            self.items.push(item);
+        }
+    }
+
+    fn observe_terraform(&mut self, raw: &str, n: usize) {
+        let trimmed = raw.trim();
+        if TfDiagState::starts_diag(trimmed) {
+            self.flush_tf();
+            self.tf_in_outputs = false;
+        }
+        if self
+            .tf_stdout_diag
+            .observe(raw, n, "stdout", &mut self.details.diagnostics)
+        {
+            return;
+        }
+        if self.tf_active.is_none() && !self.tf_in_outputs && is_tf_refresh_line(trimmed) {
+            self.details.refreshed += 1;
+            if self.details.refreshed_first == 0 {
+                self.details.refreshed_first = n;
+            }
+            self.details.refreshed_last = n;
+            return;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# ")
+            && let Some((glyph, address, action)) = terraform_action(rest)
+        {
+            self.flush_tf();
+            self.tf_in_outputs = false;
+            self.hash = Sha256::new();
+            self.tf_active = Some(ActiveTfResource {
+                glyph,
+                address: address.to_owned(),
+                action: action.to_owned(),
+                first: n,
+                last: n,
+                depth: 0,
+                block_stack: Vec::new(),
+                changed_attrs: Vec::new(),
+                changed_extra: 0,
+                forces_attrs: Vec::new(),
+                forces_extra: 0,
+                is_update: glyph == "~",
+                is_replace: glyph == "-/+",
+            });
+            return;
+        }
+        if trimmed.starts_with("Plan: ") || trimmed.starts_with("No changes.") {
+            self.flush_tf();
+            self.tf_in_outputs = false;
+            if self.outcomes.len() < 128 {
+                self.outcomes.push(short(trimmed, 220));
+            }
+            return;
+        }
+        if trimmed == "Changes to Outputs:" {
+            self.flush_tf();
+            self.tf_in_outputs = true;
+            return;
+        }
+        if trimmed.starts_with("Note:")
+            || trimmed.starts_with("Saved the plan to:")
+            || trimmed.starts_with("────")
+        {
+            self.flush_tf();
+            self.tf_in_outputs = false;
+            return;
+        }
+        if self.tf_in_outputs {
+            if trimmed.is_empty() {
+                return;
+            }
+            if raw.starts_with([' ', '\t']) {
+                if self.details.outputs.len() < LIMIT {
+                    self.details
+                        .outputs
+                        .push(format!("{} [stdout:{n}]", short(trimmed, 240)));
+                }
+            } else {
+                self.tf_in_outputs = false;
+            }
+            return;
+        }
+        if let Some(res) = &mut self.tf_active {
+            if trimmed.is_empty() {
+                return;
+            }
+            self.hash.update(trimmed.as_bytes());
+            self.hash.update(b"\n");
+            res.last = n;
+            if res.depth == 0 {
+                if res.is_replace && trimmed.starts_with("+/- ") {
+                    res.glyph = "+/-";
+                }
+                scan_tf_delimiters(trimmed, &mut res.depth, &mut res.block_stack, None);
+                return;
+            }
+            let (has_change, attr_name) = parse_tf_attr_line(trimmed);
+            if res.is_update
+                && res.depth == 1
+                && has_change
+                && let Some(key) = attr_name
+            {
+                push_unique_capped(&mut res.changed_attrs, &mut res.changed_extra, key, 5);
+            }
+            if trimmed.contains("# forces replacement") {
+                let forced = format_forced_attr(&res.block_stack, attr_name);
+                if let Some(key) = forced {
+                    push_unique_capped(&mut res.forces_attrs, &mut res.forces_extra, &key, 8);
+                }
+            }
+            scan_tf_delimiters(trimmed, &mut res.depth, &mut res.block_stack, attr_name);
+        }
+    }
+
+    fn flush_pulumi_active(&mut self) {
+        let Some(active) = self.pulumi_active.take() else {
+            return;
+        };
+        let name = match active.res_name {
+            Some(rn) => format!("{} {} {rn}", active.glyph, active.res_type),
+            None => format!("{} {}", active.glyph, active.res_type),
+        };
+        let detail = if active.changed_fields.is_empty() {
+            active.action
+        } else {
+            format!(
+                "{} ({})",
+                active.action,
+                format_attr_list(&active.changed_fields, active.changed_extra)
+            )
+        };
+        let mut item = Item::new(&name, &detail, active.first);
+        item.last = active.last;
+        item.digest = format!("{:x}", self.hash.finalize_reset());
+        if self.items.len() < LIMIT {
+            self.items.push(item);
+        }
+    }
+
+    fn flush_pulumi_resources(&mut self) {
+        if self.pulumi_resources.is_empty() {
+            return;
+        }
+        let parts = std::mem::take(&mut self.pulumi_resources);
+        let mut actions = Vec::new();
+        let mut totals = Vec::new();
+        for part in parts {
+            if part.starts_with(['+', '~', '-']) {
+                actions.push(part);
+            } else {
+                totals.push(part);
+            }
+        }
+        let line = match (actions.is_empty(), totals.is_empty()) {
+            (false, false) => format!("Resources: {}; {}", actions.join(", "), totals.join(", ")),
+            (false, true) => format!("Resources: {}", actions.join(", ")),
+            (true, false) => format!("Resources: {}", totals.join(", ")),
+            (true, true) => return,
+        };
+        if self.outcomes.len() < 128 {
+            self.outcomes.push(short(&line, 220));
+        }
+    }
+
+    fn observe_pulumi(&mut self, raw: &str, n: usize) {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("Previewing update ") {
+            self.flush_pulumi_active();
+            self.flush_pulumi_resources();
+            self.pulumi_in_same_block = false;
+            self.details.header = Some(short(trimmed.trim_end_matches(':'), 220));
+            self.pulumi_section = PulumiSection::Header;
+            return;
+        }
+        if trimmed == "Outputs:" || trimmed == "--outputs:--" {
+            self.flush_pulumi_active();
+            self.flush_pulumi_resources();
+            self.pulumi_in_same_block = false;
+            self.pulumi_section = PulumiSection::Outputs;
+            return;
+        }
+        if trimmed == "Diagnostics:" {
+            self.flush_pulumi_active();
+            self.flush_pulumi_resources();
+            self.pulumi_in_same_block = false;
+            self.pulumi_diag_subject = None;
+            self.pulumi_section = PulumiSection::Diagnostics;
+            return;
+        }
+        if trimmed == "Resources:" {
+            self.flush_pulumi_active();
+            self.flush_pulumi_resources();
+            self.pulumi_in_same_block = false;
+            self.pulumi_section = PulumiSection::Resources;
+            return;
+        }
+        if trimmed.starts_with("Permalink:") || trimmed.starts_with("View in Browser") {
+            return;
+        }
+        if trimmed.starts_with("Duration:") {
+            self.flush_pulumi_active();
+            self.flush_pulumi_resources();
+            self.pulumi_in_same_block = false;
+            self.pulumi_section = PulumiSection::Header;
+            return;
+        }
+        if trimmed.starts_with("Type") && trimmed.contains("Name") && trimmed.contains("Plan") {
+            self.flush_pulumi_active();
+            self.flush_pulumi_resources();
+            self.pulumi_in_same_block = false;
+            self.pulumi_section = PulumiSection::Tree;
+            return;
+        }
+
+        match self.pulumi_section {
+            PulumiSection::Resources => {
+                if trimmed.is_empty() {
+                    self.flush_pulumi_resources();
+                    self.pulumi_section = PulumiSection::Header;
+                } else {
+                    self.pulumi_resources.push(trimmed.to_owned());
+                }
+            }
+            PulumiSection::Outputs => {
+                if trimmed.is_empty() {
+                    self.pulumi_section = PulumiSection::Header;
+                } else if self.details.outputs.len() < LIMIT {
+                    self.details
+                        .outputs
+                        .push(format!("{} [stdout:{n}]", short(trimmed, 240)));
+                }
+            }
+            PulumiSection::Diagnostics => {
+                if trimmed.is_empty() {
+                    self.pulumi_diag_subject = None;
+                } else {
+                    observe_pulumi_diag_line(
+                        trimmed,
+                        n,
+                        "stdout",
+                        &mut self.pulumi_diag_subject,
+                        &mut self.details.diagnostics,
+                    );
+                }
+            }
+            PulumiSection::Tree => {
+                if trimmed.is_empty() {
+                    self.pulumi_section = PulumiSection::Header;
+                    return;
+                }
+                match parse_pulumi_tree_row(raw) {
+                    Some(PulumiTreeRow::Unchanged) => {
+                        self.details.unchanged += 1;
+                        if self.details.unchanged_first == 0 {
+                            self.details.unchanged_first = n;
+                        }
+                        self.details.unchanged_last = n;
+                    }
+                    Some(PulumiTreeRow::Changed {
+                        glyph,
+                        res_type,
+                        res_name,
+                        action,
+                        info,
+                    }) => {
+                        let detail = if info.is_empty() {
+                            action.to_owned()
+                        } else {
+                            format!("{action} {info}")
+                        };
+                        let mut item =
+                            Item::new(&format!("{glyph} {res_type} {res_name}"), &detail, n);
+                        item.last = n;
+                        let mut h = Sha256::new();
+                        h.update(glyph.as_bytes());
+                        h.update(b"\0");
+                        h.update(res_type.as_bytes());
+                        h.update(b"\0");
+                        h.update(res_name.as_bytes());
+                        h.update(b"\0");
+                        h.update(detail.as_bytes());
+                        item.digest = format!("{:x}", h.finalize());
+                        if self.items.len() < LIMIT {
+                            self.items.push(item);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            PulumiSection::Header | PulumiSection::Diff => {
+                if let Some(header) = parse_pulumi_diff_header(raw) {
+                    self.flush_pulumi_active();
+                    self.pulumi_section = PulumiSection::Diff;
+                    match header {
+                        PulumiDiffHeader::Same => {
+                            self.pulumi_in_same_block = true;
+                            self.details.unchanged += 1;
+                            if self.details.unchanged_first == 0 {
+                                self.details.unchanged_first = n;
+                            }
+                            self.details.unchanged_last = n;
+                        }
+                        PulumiDiffHeader::Changed {
+                            glyph,
+                            res_type,
+                            action,
+                        } => {
+                            self.pulumi_in_same_block = false;
+                            self.hash = Sha256::new();
+                            let track_fields = matches!(glyph, "~" | "+-" | "++" | "--")
+                                || matches!(action, "update" | "replace");
+                            self.pulumi_active = Some(ActivePulumiDiff {
+                                glyph,
+                                res_type: res_type.to_owned(),
+                                res_name: None,
+                                action: action.to_owned(),
+                                first: n,
+                                last: n,
+                                depth: 0,
+                                changed_fields: Vec::new(),
+                                changed_extra: 0,
+                                track_fields,
+                            });
+                        }
+                    }
+                    return;
+                }
+                if self.pulumi_in_same_block {
+                    if trimmed.is_empty() {
+                        self.pulumi_in_same_block = false;
+                    } else {
+                        self.details.unchanged_last = n;
+                    }
+                    return;
+                }
+                if let Some(active) = &mut self.pulumi_active {
+                    if trimmed.is_empty() {
+                        return;
+                    }
+                    self.hash.update(trimmed.as_bytes());
+                    self.hash.update(b"\n");
+                    active.last = n;
+                    if let Some(urn) = trimmed
+                        .strip_prefix("[urn=")
+                        .and_then(|s| s.strip_suffix(']'))
+                    {
+                        if let Some(name) = urn.rsplit("::").next()
+                            && !name.is_empty()
+                        {
+                            active.res_name = Some(name.to_owned());
+                        }
+                        return;
+                    }
+                    if trimmed.starts_with("[id=") && trimmed.ends_with(']') {
+                        return;
+                    }
+                    if active.track_fields
+                        && active.depth == 0
+                        && let Some(field) = parse_pulumi_diff_field(trimmed)
+                    {
+                        push_unique_capped(
+                            &mut active.changed_fields,
+                            &mut active.changed_extra,
+                            field,
+                            5,
+                        );
+                    }
+                    update_bracket_depth(trimmed, &mut active.depth);
+                    return;
+                }
+                if starts_with_diag_level(trimmed) && self.details.diagnostics.len() < LIMIT {
+                    self.details
+                        .diagnostics
+                        .push(format!("{} [stdout:{n}]", short(trimmed, 240)));
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) -> (Vec<Item>, Vec<String>, Option<PlanDetails>) {
+        self.flush_tf();
+        self.tf_stdout_diag
+            .flush("stdout", &mut self.details.diagnostics);
+        self.tf_stderr_diag
+            .flush("stderr", &mut self.details.diagnostics);
+        self.flush_pulumi_active();
+        self.flush_pulumi_resources();
+        let details = (!self.details.is_empty()).then_some(self.details);
+        (self.items, self.outcomes, details)
+    }
+}
+
+impl PlanDetails {
+    fn is_empty(&self) -> bool {
+        self.header.is_none()
+            && self.refreshed == 0
+            && self.unchanged == 0
+            && self.outputs.is_empty()
+            && self.diagnostics.is_empty()
+    }
+
+    fn render_extras(&self, report: &mut String) {
+        if !self.outputs.is_empty() {
+            report.push_str(if self.pulumi {
+                "Outputs:\n"
+            } else {
+                "Changes to Outputs:\n"
+            });
+            for line in &self.outputs {
+                report.push_str("  ");
+                report.push_str(line);
+                report.push('\n');
+            }
+        }
+        if !self.diagnostics.is_empty() {
+            if self.pulumi {
+                report.push_str("Diagnostics:\n");
+                for line in &self.diagnostics {
+                    report.push_str("  ");
+                    report.push_str(line);
+                    report.push('\n');
+                }
+            } else {
+                for line in &self.diagnostics {
+                    report.push_str(line);
+                    report.push('\n');
+                }
+            }
+        }
+    }
+}
+
+fn format_line_range(first: usize, last: usize) -> String {
+    if first == last || last == 0 {
+        first.to_string()
+    } else {
+        format!("{first}-{last}")
+    }
+}
+
+fn is_tf_refresh_line(trimmed: &str) -> bool {
+    trimmed.contains(": Refreshing state...")
+        || trimmed.contains(": Reading...")
+        || trimmed.contains(": Still reading...")
+        || trimmed.contains(": Read complete after ")
+}
+
+fn push_unique_capped(list: &mut Vec<String>, extra: &mut usize, key: &str, max: usize) {
+    if list.iter().any(|existing| existing == key) {
+        return;
+    }
+    if list.len() < max {
+        list.push(key.to_owned());
+    } else {
+        *extra += 1;
+    }
+}
+
+fn format_attr_list(list: &[String], extra: usize) -> String {
+    if extra == 0 {
+        list.join(", ")
+    } else {
+        format!("{}, +{extra} more", list.join(", "))
+    }
+}
+
+fn is_hcl_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+fn parse_tf_attr_line(trimmed: &str) -> (bool, Option<&str>) {
+    let (has_change, rest) = if let Some(r) = trimmed
+        .strip_prefix("-/+ ")
+        .or_else(|| trimmed.strip_prefix("+/- "))
+        .or_else(|| trimmed.strip_prefix("<= "))
+        .or_else(|| trimmed.strip_prefix("~ "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .or_else(|| trimmed.strip_prefix("- "))
+    {
+        (true, r.trim_start())
+    } else {
+        (false, trimmed)
+    };
+    if rest.starts_with('#') {
+        return (has_change, None);
+    }
+    if let Some((left, _)) = rest.split_once('=') {
+        let key = left.trim();
+        let unquoted = key
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(key);
+        if !unquoted.is_empty()
+            && !unquoted.contains(' ')
+            && !matches!(unquoted, "resource" | "data" | "output" | "module")
+        {
+            return (has_change, Some(unquoted));
+        }
+    }
+    let before_comment = rest.split(" # ").next().unwrap_or(rest).trim_end();
+    if let Some(before_brace) = before_comment.strip_suffix('{') {
+        let key = before_brace.trim();
+        if is_hcl_ident(key) && !matches!(key, "resource" | "data" | "output" | "module") {
+            return (has_change, Some(key));
+        }
+    }
+    (has_change, None)
+}
+
+fn format_forced_attr(stack: &[(usize, String)], attr: Option<&str>) -> Option<String> {
+    if stack.is_empty() {
+        return attr.map(str::to_owned);
+    }
+    let prefix: Vec<&str> = stack.iter().map(|(_, name)| name.as_str()).collect();
+    match attr {
+        Some(key) if stack.last().map(|(_, n)| n.as_str()) != Some(key) => {
+            Some(format!("{}.{key}", prefix.join(".")))
+        }
+        _ => Some(prefix.join(".")),
+    }
+}
+
+fn scan_tf_delimiters(
+    trimmed: &str,
+    depth: &mut usize,
+    stack: &mut Vec<(usize, String)>,
+    attr_name: Option<&str>,
+) {
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut pushed_for_line = false;
+    for ch in trimmed.chars() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quote = true,
+            '#' => break,
+            '{' | '[' | '(' => {
+                if !pushed_for_line
+                    && *depth >= 1
+                    && let Some(name) = attr_name
+                {
+                    stack.push((*depth, name.to_owned()));
+                    pushed_for_line = true;
+                }
+                *depth += 1;
+            }
+            '}' | ']' | ')' => {
+                *depth = depth.saturating_sub(1);
+                while stack.last().is_some_and(|(d, _)| *d >= *depth) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn update_bracket_depth(trimmed: &str, depth: &mut usize) {
+    let mut in_quote = false;
+    let mut escaped = false;
+    for ch in trimmed.chars() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quote = true,
+            '{' | '[' => *depth += 1,
+            '}' | ']' => *depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+}
+
+fn starts_with_diag_level(trimmed: &str) -> bool {
+    let lower = trimmed.get(..8).unwrap_or(trimmed).to_ascii_lowercase();
+    lower.starts_with("error:") || lower.starts_with("warning:")
+}
+
+fn observe_pulumi_diag_line(
+    trimmed: &str,
+    n: usize,
+    stream: &str,
+    subject: &mut Option<(String, usize)>,
+    diagnostics: &mut Vec<String>,
+) {
+    if trimmed.ends_with(':') && !starts_with_diag_level(trimmed) && trimmed != "Diagnostics:" {
+        *subject = Some((short(trimmed.trim_end_matches(':'), 120), n));
+        return;
+    }
+    if diagnostics.len() >= LIMIT {
+        return;
+    }
+    if starts_with_diag_level(trimmed) {
+        let line = if let Some((subj, first)) = subject.as_ref() {
+            format!("{subj}: {} [{stream}:{first}-{n}]", short(trimmed, 240))
+        } else {
+            format!("{} [{stream}:{n}]", short(trimmed, 240))
+        };
+        diagnostics.push(line);
+    } else {
+        diagnostics.push(format!("  {} [{stream}:{n}]", short(trimmed, 240)));
+    }
+}
+
+fn is_pulumi_action(word: &str) -> bool {
+    matches!(
+        word,
+        "create"
+            | "update"
+            | "delete"
+            | "replace"
+            | "create-replacement"
+            | "delete-original"
+            | "delete-replaced"
+            | "read"
+            | "import"
+            | "refresh"
+            | "discard"
+            | "same"
+    )
+}
+
+fn pulumi_glyph_for_action(action: &str) -> &'static str {
+    match action {
+        "create" | "import" => "+",
+        "update" | "refresh" => "~",
+        "delete" | "discard" => "-",
+        "replace" => "+-",
+        "create-replacement" => "++",
+        "delete-original" | "delete-replaced" => "--",
+        "read" => "<=",
+        _ => "~",
+    }
+}
+
+enum PulumiTreeRow<'a> {
+    Unchanged,
+    Changed {
+        glyph: &'static str,
+        res_type: &'a str,
+        res_name: &'a str,
+        action: &'a str,
+        info: &'a str,
+    },
+}
+
+fn parse_pulumi_tree_row(raw: &str) -> Option<PulumiTreeRow<'_>> {
+    let leading_spaces = raw.bytes().take_while(|&b| b == b' ').count();
+    let trimmed = raw.trim_start();
+    let (glyph, after_glyph) = if leading_spaces <= 2 {
+        let mut found = None;
+        for g in ["+-", "++", "--", "+", "~", "-"] {
+            if let Some(rest) = trimmed.strip_prefix(g)
+                && rest.starts_with([' ', '\t', '├', '└', '│'])
+            {
+                found = Some((g, rest));
+                break;
+            }
+        }
+        match found {
+            Some((g, r)) => (Some(g), r),
+            None => (None, trimmed),
+        }
+    } else {
+        (None, trimmed)
+    };
+    let rest = after_glyph.trim_start_matches([' ', '\t', '├', '└', '─', '│', '|', '`']);
+    // Also strip ASCII tree connectors like `|-` or `+-` when indented past column 2.
+    let rest = if glyph.is_none() {
+        rest.strip_prefix("|-")
+            .or_else(|| rest.strip_prefix("+-"))
+            .or_else(|| rest.strip_prefix("`-"))
+            .map(str::trim_start)
+            .unwrap_or(rest)
+    } else {
+        rest
+    };
+    let mut parts = rest.split_whitespace();
+    let res_type = parts.next()?;
+    if !res_type.contains(':') {
+        return None;
+    }
+    let res_name = parts.next()?;
+    let after_name = rest
+        .strip_prefix(res_type)?
+        .trim_start()
+        .strip_prefix(res_name)?
+        .trim();
+    let (plan_action, info) = if after_name.is_empty() {
+        (None, "")
+    } else {
+        let first = after_name.split_whitespace().next().unwrap_or("");
+        if is_pulumi_action(first) {
+            (
+                Some(first),
+                after_name.strip_prefix(first).unwrap_or("").trim(),
+            )
+        } else {
+            (None, after_name)
+        }
+    };
+    if glyph.is_none() && matches!(plan_action, None | Some("same")) {
+        return Some(PulumiTreeRow::Unchanged);
+    }
+    let action = plan_action.unwrap_or(match glyph {
+        Some("+") => "create",
+        Some("~") => "update",
+        Some("-") => "delete",
+        Some("+-") => "replace",
+        Some("++") => "create-replacement",
+        Some("--") => "delete-original",
+        _ => "change",
+    });
+    let glyph = glyph.unwrap_or_else(|| pulumi_glyph_for_action(action));
+    Some(PulumiTreeRow::Changed {
+        glyph,
+        res_type,
+        res_name,
+        action,
+        info,
+    })
+}
+
+enum PulumiDiffHeader<'a> {
+    Same,
+    Changed {
+        glyph: &'static str,
+        res_type: &'a str,
+        action: &'a str,
+    },
+}
+
+fn parse_pulumi_diff_header(raw: &str) -> Option<PulumiDiffHeader<'_>> {
+    let trimmed = raw.trim();
+    let (left, action_paren) = trimmed.rsplit_once(": (")?;
+    let action = action_paren.strip_suffix(')')?;
+    if !is_pulumi_action(action) {
+        return None;
+    }
+    let mut glyph = None;
+    let mut rest = left;
+    for g in ["+-", "++", "--", "+", "~", "-"] {
+        if let Some(after) = left.strip_prefix(g) {
+            glyph = Some(g);
+            rest = after.trim_start();
+            break;
+        }
+    }
+    if rest.is_empty() || !rest.contains(':') || rest.contains(' ') {
+        return None;
+    }
+    if action == "same" && glyph.is_none() {
+        return Some(PulumiDiffHeader::Same);
+    }
+    let glyph = glyph.unwrap_or_else(|| pulumi_glyph_for_action(action));
+    Some(PulumiDiffHeader::Changed {
+        glyph,
+        res_type: rest,
+        action,
+    })
+}
+
+fn parse_pulumi_diff_field(trimmed: &str) -> Option<&str> {
+    let rest = trimmed
+        .strip_prefix("+-")
+        .or_else(|| trimmed.strip_prefix("~ "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .or_else(|| trimmed.strip_prefix("- "))?
+        .trim_start();
+    let (key, _) = rest.split_once(':')?;
+    let key = key.trim().trim_matches('"');
+    (!key.is_empty() && !key.contains(' ')).then_some(key)
+}
+
+// ---------------------------------------------------------------------------
+// Semantic whitespace / reindent diff helpers
+// ---------------------------------------------------------------------------
+
+/// Files where leading indentation is semantically significant: only trailing
+/// whitespace differences may be folded, NEVER leading indentation changes.
+fn is_indent_significant_path(path: &str) -> bool {
+    let Some(name) = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+    else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "makefile"
+        || lower == "gnumakefile"
+        || lower.starts_with("makefile.")
+        || [
+            ".py", ".pyi", ".yml", ".yaml", ".mk", ".haml", ".pug", ".nim", ".hs", ".lhs",
+        ]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+fn is_ws_only_block(rem: &[String], add: &[String], indent_significant: bool) -> bool {
+    if rem.is_empty() && add.is_empty() {
+        return true;
+    }
+    if indent_significant {
+        return rem.len() == add.len()
+            && rem.iter().zip(add.iter()).all(|(r, a)| {
+                r.trim_end_matches([' ', '\t', '\r']) == a.trim_end_matches([' ', '\t', '\r'])
+            });
+    }
+    let mut r_iter = rem
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim_matches([' ', '\t', '\r']).is_empty());
+    let mut a_iter = add
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim_matches([' ', '\t', '\r']).is_empty());
+    loop {
+        match (r_iter.next(), a_iter.next()) {
+            (Some(r), Some(a)) => {
+                if !ws_only_line_eq(r, a) {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn ws_only_line_eq(r: &str, a: &str) -> bool {
+    let rt = r.trim_matches([' ', '\t', '\r']);
+    let at = a.trim_matches([' ', '\t', '\r']);
+    if rt == at {
+        return true;
+    }
+    normalize_ws_outside_quotes(rt) == normalize_ws_outside_quotes(at)
+}
+
+/// Collapse runs of horizontal whitespace (`' '`, `'\t'`) outside quoted literals
+/// into a single space while preserving exact characters inside `"..."`, `'...'`
+/// and `` `...` `` so string-literal whitespace edits are never folded.
+fn normalize_ws_outside_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut pending_space = false;
+    let mut prev: Option<char> = None;
+    for (idx, c) in s.char_indices() {
+        if let Some(q) = quote {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q != '`' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else if matches!(c, ' ' | '\t' | '\r') {
+            pending_space = true;
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(c);
+            if matches!(c, '"' | '`') {
+                quote = Some(c);
+            } else if c == '\'' {
+                let rest = &s[idx + 1..];
+                if let Some(next_sq) = rest.find('\'') {
+                    let inside = &rest[..next_sq];
+                    if !(matches!(prev, Some('&' | '<')) && inside.contains(['>', '&', '('])) {
+                        quote = Some('\'');
+                    }
+                }
+            }
+        }
+        prev = Some(c);
+    }
+    out
+}
+
 /// Verbose pytest failure line (`tests/test_a.py::test_x FAILED [ 50%]`) when
 /// `--no-summary` / `-rN` omits the short test summary block.
 fn pytest_verbose_failure(line: &str) -> Option<&str> {
@@ -1921,7 +3348,7 @@ impl Summary {
                 ))
             }
             "diff" if !self.items.is_empty() => Some(self.patch_heading()),
-            "plan" if !self.items.is_empty() => self
+            "plan" if !self.items.is_empty() || !self.outcomes.is_empty() => self
                 .outcomes
                 .last()
                 .cloned()
@@ -1937,6 +3364,7 @@ impl Summary {
                 && self.outcomes.is_empty()
                 && self.cargo.is_none()
                 && self.js.is_none()
+                && self.plan.is_none()
                 && !(self.kind == "diff" && previous.is_some_and(|(_, s)| !s.items.is_empty())))
         {
             return None;
@@ -2029,6 +3457,11 @@ impl Summary {
                     "Indexed items unchanged; raw output may differ.\n"
                 });
             }
+            if self.kind == "plan"
+                && let Some(plan) = &self.plan
+            {
+                plan.render_extras(&mut report);
+            }
         } else if self.kind == "tests" {
             let mut groups: BTreeMap<(&str, &str), Vec<&Item>> = BTreeMap::new();
             for item in &self.items {
@@ -2060,10 +3493,37 @@ impl Summary {
             }
         } else if self.kind == "diff" {
             return Some(self.render_diff_with(COMPACT_DIFF_BUDGET, "", |_, _, _, _| None));
-        } else {
-            if self.kind == "plan" && !self.items.is_empty() {
+        } else if self.kind == "plan" {
+            if let Some(plan) = &self.plan {
+                if let Some(header) = &plan.header {
+                    report.push_str(header);
+                    report.push('\n');
+                }
+                if plan.refreshed > 0 {
+                    report.push_str(&format!(
+                        "Refreshed/read {} resource(s) [stdout:{}]\n",
+                        plan.refreshed,
+                        format_line_range(plan.refreshed_first, plan.refreshed_last)
+                    ));
+                }
+            }
+            if !self.items.is_empty() {
                 report.push_str(&format!("{} resource change(s)\n", self.items.len()));
             }
+            for item in &self.items {
+                report.push_str(&format!("{}\n", item.display()));
+            }
+            if let Some(plan) = &self.plan {
+                if plan.unchanged > 0 {
+                    report.push_str(&format!(
+                        "{} unchanged [stdout:{}]\n",
+                        plan.unchanged,
+                        format_line_range(plan.unchanged_first, plan.unchanged_last)
+                    ));
+                }
+                plan.render_extras(&mut report);
+            }
+        } else {
             for item in &self.items {
                 report.push_str(&format!("{}\n", item.display()));
             }
@@ -2236,9 +3696,20 @@ impl DiffFile {
         )
     }
 
+    fn render_pure_rename(&self) -> Option<String> {
+        let (old, new) = self.pure_rename.as_ref()?;
+        Some(format!(
+            "rename {old} -> {new} (100%) [stdout:{}-{}]\n",
+            self.first, self.last
+        ))
+    }
+
     fn render_compact(&self) -> Option<String> {
         if self.generated_folded {
             return Some(self.render_folded());
+        }
+        if let Some(renamed) = self.render_pure_rename() {
+            return Some(renamed);
         }
         let hunks = self.hunks.as_ref()?;
         let mut out = String::new();
@@ -2272,12 +3743,28 @@ impl DiffFile {
         if self.generated_folded {
             return self.render_folded();
         }
+        if let Some(renamed) = self.render_pure_rename() {
+            return renamed;
+        }
         let slice = items.get(self.items_start..self.items_end).unwrap_or(&[]);
         if slice.is_empty() {
             return String::new();
         }
         if slice.len() == 1 {
-            return format!("{}\n", slice[0].display());
+            let item = &slice[0];
+            if is_hunk_header(&item.detail) && self.whitespace_hunk_firsts.contains(&item.first) {
+                return format!(
+                    "{} {} (whitespace/indent only, -{} +{} lines) [{}:{}-{}]\n",
+                    item.name,
+                    item.detail,
+                    item.deleted,
+                    item.added,
+                    item.stream_name(),
+                    item.first,
+                    item.last
+                );
+            }
+            return format!("{}\n", item.display());
         }
         let hunk_count = slice.iter().filter(|i| is_hunk_header(&i.detail)).count();
         let mut out = String::new();
@@ -2295,15 +3782,27 @@ impl DiffFile {
         }
         for item in slice {
             if is_hunk_header(&item.detail) {
-                out.push_str(&format!(
-                    "  {} (+{} -{}) [{}:{}-{}]\n",
-                    item.detail,
-                    item.added,
-                    item.deleted,
-                    item.stream_name(),
-                    item.first,
-                    item.last
-                ));
+                if self.whitespace_hunk_firsts.contains(&item.first) {
+                    out.push_str(&format!(
+                        "  {} (whitespace/indent only, -{} +{} lines) [{}:{}-{}]\n",
+                        item.detail,
+                        item.deleted,
+                        item.added,
+                        item.stream_name(),
+                        item.first,
+                        item.last
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  {} (+{} -{}) [{}:{}-{}]\n",
+                        item.detail,
+                        item.added,
+                        item.deleted,
+                        item.stream_name(),
+                        item.first,
+                        item.last
+                    ));
+                }
             } else {
                 out.push_str(&format!(
                     "  {} [{}:{}-{}]\n",
@@ -2862,11 +4361,15 @@ Plan: 2 to add, 1 to change, 1 to destroy.
             "{rendered}"
         );
         assert!(
-            rendered.contains("~ aws_security_group.api will be updated in-place [stdout:9-12]"),
+            rendered.contains(
+                "~ aws_security_group.api will be updated in-place (description) [stdout:9-12]"
+            ),
             "{rendered}"
         );
         assert!(
-            rendered.contains("-/+ aws_launch_template.worker must be replaced [stdout:14-17]"),
+            rendered.contains(
+                "-/+ aws_launch_template.worker must be replaced (replace: image_id) [stdout:14-17]"
+            ),
             "{rendered}"
         );
         assert!(
@@ -3164,5 +4667,638 @@ Tests: 9, Assertions: 14, Failures: 1.
             pest_rendered.contains("Tests: 1 failed, 1 passed (4 assertions)"),
             "{pest_rendered}"
         );
+    }
+
+    #[test]
+    fn whitespace_reindent_hunks_fold_safely_and_never_fold_semantic_edits() {
+        // 1. Large pure-reindent hunk in Rust folds to 1 line while real logic hunk stays verbatim.
+        let mut patch = String::from(concat!(
+            "diff --git a/src/service.rs b/src/service.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/service.rs\n",
+            "+++ b/src/service.rs\n",
+            "@@ -10,42 +10,43 @@ fn reindented() {\n",
+            "     // header\n",
+        ));
+        for i in 0..40 {
+            patch.push_str(&format!("-  let v_{i} = compute(a,   b, {i});\n"));
+        }
+        for i in 0..40 {
+            patch.push_str(&format!("+    let v_{i} = compute(a, b, {i});\n"));
+        }
+        patch.push_str("+\n"); // pure blank-line insertion inside non-indent-significant file
+        patch.push_str("     // footer\n");
+        patch.push_str(concat!(
+            "@@ -100,5 +101,5 @@ fn real_logic() {\n",
+            "     let a = 1;\n",
+            "-    let b = a + 2;\n",
+            "+    let b = a * 2;\n",
+            "     b\n",
+            " }\n",
+        ));
+        let summary = parse("git diff", &patch);
+        let rendered = summary.render(None, 0).unwrap();
+        assert!(
+            rendered.contains(
+                "@@ -10,42 +10,43 @@ fn reindented() { (whitespace/indent only, -40 +41 lines) [stdout:5-88]\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("-    let b = a + 2;\n+    let b = a * 2;\n"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("let v_0"),
+            "folded reindent lines should not appear inline:\n{rendered}"
+        );
+        assert!(
+            rendered.len() * 6 < patch.len(),
+            "expected >83% reduction: {} vs {}\n{rendered}",
+            rendered.len(),
+            patch.len()
+        );
+
+        // 2. Zero-semantic-loss guards: MUST NOT fold non-whitespace change, string-literal
+        //    whitespace change, moved statement across context, or EOF newline change.
+        let semantic_cases = [
+            (
+                "string literal whitespace",
+                concat!(
+                    "diff --git a/src/msg.rs b/src/msg.rs\n",
+                    "--- a/src/msg.rs\n+++ b/src/msg.rs\n",
+                    "@@ -1,3 +1,3 @@\n",
+                    " fn msg() {\n",
+                    "-    let s = \"hello  world\";\n",
+                    "+    let s = \"hello world\";\n",
+                    " }\n",
+                ),
+                "-    let s = \"hello  world\";\n+    let s = \"hello world\";\n",
+            ),
+            (
+                "moved line across context",
+                concat!(
+                    "diff --git a/src/flow.rs b/src/flow.rs\n",
+                    "--- a/src/flow.rs\n+++ b/src/flow.rs\n",
+                    "@@ -1,4 +1,4 @@\n",
+                    "-    return early();\n",
+                    "     side_effect();\n",
+                    "+    return early();\n",
+                    "     done();\n",
+                ),
+                "-    return early();\n",
+            ),
+            (
+                "missing eof newline",
+                concat!(
+                    "diff --git a/src/eof.rs b/src/eof.rs\n",
+                    "--- a/src/eof.rs\n+++ b/src/eof.rs\n",
+                    "@@ -1,2 +1,2 @@\n",
+                    " line1\n",
+                    "-line2\n",
+                    "\\ No newline at end of file\n",
+                    "+line2\n",
+                ),
+                "\\ No newline at end of file\n",
+            ),
+        ];
+        for (label, diff, expected) in semantic_cases {
+            let s = parse("git diff", diff);
+            let r = s.render(None, 0).unwrap();
+            assert!(
+                !r.contains("(whitespace/indent only"),
+                "{label} MUST NOT fold:\n{r}"
+            );
+            assert!(r.contains(expected), "{label}:\n{r}");
+        }
+
+        // 3. Indentation-significant files (.py, .yml, .yaml, .mk, Makefile, .haml, .pug, .nim, .hs):
+        //    NEVER fold leading-indent changes, ONLY fold trailing-whitespace-only changes.
+        for (path, old_line, new_line) in [
+            ("app/main.py", "  return x", "    return x"),
+            ("deploy/ci.yml", "  run: test", "    run: test"),
+            ("k8s/spec.yaml", "  replicas: 2", "    replicas: 2"),
+            ("build/rules.mk", "\tcc main.c", "    cc main.c"),
+            ("Makefile", "\t@echo hi", "  @echo hi"),
+            ("views/index.haml", "  %p hi", "    %p hi"),
+            ("views/home.pug", "  p hi", "    p hi"),
+            ("src/calc.nim", "  echo x", "    echo x"),
+            ("src/Lib.hs", "  where x = 1", "    where x = 1"),
+        ] {
+            let diff = format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,3 +1,3 @@\n ctx\n-{old_line}\n+{new_line}\n end\n"
+            );
+            let s = parse("git diff", &diff);
+            let r = s.render(None, 0).unwrap();
+            assert!(
+                !r.contains("(whitespace/indent only"),
+                "leading indent in {path} MUST NOT fold:\n{r}"
+            );
+            assert!(
+                r.contains(&format!("-{old_line}\n+{new_line}\n")),
+                "{path}:\n{r}"
+            );
+        }
+
+        // Trailing-whitespace-only in Python/YAML IS safely folded!
+        let py_trailing = concat!(
+            "diff --git a/app/main.py b/app/main.py\n",
+            "--- a/app/main.py\n+++ b/app/main.py\n",
+            "@@ -1,5 +1,5 @@\n",
+            " def run():\n",
+            "-    x = 1   \n",
+            "-    return x\t \n",
+            "+    x = 1\n",
+            "+    return x\n",
+            " # end\n",
+        );
+        let py_sum = parse("git diff", py_trailing);
+        let py_ren = py_sum.render(None, 0).unwrap();
+        assert!(
+            py_ren
+                .contains("@@ -1,5 +1,5 @@ (whitespace/indent only, -2 +2 lines) [stdout:4-10]\n"),
+            "{py_ren}"
+        );
+    }
+
+    #[test]
+    fn pure_renames_fold_to_one_line_while_edited_or_chmod_renames_stay_lossless() {
+        let diff = concat!(
+            "diff --git a/src/legacy/auth.rs b/src/core/auth.rs\n",
+            "similarity index 100%\n",
+            "rename from src/legacy/auth.rs\n",
+            "rename to src/core/auth.rs\n",
+            "diff --git a/src/legacy/util.rs b/src/core/util.rs\n",
+            "similarity index 88%\n",
+            "rename from src/legacy/util.rs\n",
+            "rename to src/core/util.rs\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/legacy/util.rs\n",
+            "+++ b/src/core/util.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " pub fn id() -> u32 {\n",
+            "-    1\n",
+            "+    2\n",
+            " }\n",
+            "diff --git a/bin/old.sh b/bin/new.sh\n",
+            "old mode 100644\n",
+            "new mode 100755\n",
+            "similarity index 100%\n",
+            "rename from bin/old.sh\n",
+            "rename to bin/new.sh\n",
+        );
+        let summary = parse("git diff", diff);
+        let compact = summary.render(None, 0).unwrap();
+        assert!(
+            compact.contains("rename src/legacy/auth.rs -> src/core/auth.rs (100%) [stdout:1-4]\n"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("=== src/core/util.rs (+1 -1) [stdout:5-16]\n")
+                && compact.contains("rename from src/legacy/util.rs\nrename to src/core/util.rs\n")
+                && compact.contains("-    1\n+    2\n"),
+            "rename with content edits must preserve hunks:\n{compact}"
+        );
+        assert!(
+            compact.contains("old mode 100644\nnew mode 100755\n")
+                && compact.contains("rename from bin/old.sh\nrename to bin/new.sh\n"),
+            "rename with mode change must preserve mode metadata:\n{compact}"
+        );
+
+        // Tier 2 hunk index ALSO uses the 1-line pure rename format!
+        let tier2 = summary.render_diff_with(10, "", |_, _, _, _| None);
+        assert!(
+            tier2.contains("rename src/legacy/auth.rs -> src/core/auth.rs (100%) [stdout:1-4]\n"),
+            "{tier2}"
+        );
+    }
+
+    #[test]
+    fn expanded_generated_paths_and_large_svgs_fold_while_small_svgs_stay_inline() {
+        let mut diff = String::new();
+        // Large exported SVG (>100 changed lines) folds to 1 line.
+        diff.push_str(concat!(
+            "diff --git a/docs/architecture.svg b/docs/architecture.svg\n",
+            "index 111..222 100644\n--- a/docs/architecture.svg\n+++ b/docs/architecture.svg\n",
+            "@@ -1,2 +1,122 @@\n",
+            "-<rect id=\"old\"/>\n",
+        ));
+        for i in 0..120 {
+            diff.push_str(&format!(
+                "+<path id=\"p{i:03}\" d=\"M{i} 10 L{i} 90 C10 20 30 40 50 60\"/>\n"
+            ));
+        }
+        // Small hand-edited SVG (<=100 changed lines) stays inline!
+        diff.push_str(concat!(
+            "diff --git a/assets/icon.svg b/assets/icon.svg\n",
+            "index 333..444 100644\n--- a/assets/icon.svg\n+++ b/assets/icon.svg\n",
+            "@@ -1,3 +1,3 @@\n",
+            " <svg>\n",
+            "-  <circle r=\"4\"/>\n",
+            "+  <circle r=\"6\"/>\n",
+            " </svg>\n",
+        ));
+        // `.terraform.lock.hcl` (>25 lines) folds to 1 line.
+        diff.push_str(concat!(
+            "diff --git a/.terraform.lock.hcl b/.terraform.lock.hcl\n",
+            "index 555..666 100644\n--- a/.terraform.lock.hcl\n+++ b/.terraform.lock.hcl\n",
+            "@@ -1,1 +1,31 @@\n",
+            " hashes = [\n",
+        ));
+        for i in 0..30 {
+            diff.push_str(&format!("+  \"h1:providerhash{i:02}=\",\n"));
+        }
+        // Real code file stays verbatim in Tier 1!
+        diff.push_str(concat!(
+            "diff --git a/src/main.rs b/src/main.rs\n",
+            "index 777..888 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " fn main() {\n",
+            "-    old();\n",
+            "+    new();\n",
+            " }\n",
+        ));
+        let summary = parse("git diff", &diff);
+        let rendered = summary.render(None, 0).unwrap();
+        assert!(
+            rendered.contains("=== docs/architecture.svg (generated, +120 -1) [stdout:1-126]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("=== .terraform.lock.hcl (generated, +30 -0) [stdout:136-171]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("=== assets/icon.svg (+1 -1) [stdout:127-135]\n")
+                && rendered.contains("-  <circle r=\"4\"/>\n+  <circle r=\"6\"/>\n"),
+            "small SVG must not fold:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("=== src/main.rs (+1 -1) [stdout:172-180]\n")
+                && rendered.contains("-    old();\n+    new();\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.len() * 10 < diff.len(),
+            "expected >90% reduction: {} vs {}\n{rendered}",
+            rendered.len(),
+            diff.len()
+        );
+    }
+
+    #[test]
+    fn rich_terraform_and_opentofu_plan_preserves_forces_replacement_attrs_outputs_and_diagnostics()
+    {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(family(&args("terraform plan")), "terraform plan");
+        assert_eq!(
+            family(&args("tofu plan -var-file=prod.tfvars")),
+            "terraform plan"
+        );
+        assert_eq!(family(&args("terraform plan -json")), "other");
+
+        let mut raw = String::new();
+        for i in 0..40 {
+            raw.push_str(&format!(
+                "aws_subnet.priv[{i}]: Refreshing state... [id=subnet-{i:04}]\n"
+            ));
+        }
+        raw.push_str("data.aws_ami.ubuntu: Reading...\n");
+        raw.push_str("data.aws_ami.ubuntu: Read complete after 1s [id=ami-0999]\n\n");
+        raw.push_str(concat!(
+            "Terraform will perform the following actions:\n\n",
+            "  # aws_instance.web must be replaced\n",
+            "-/+ resource \"aws_instance\" \"web\" {\n",
+            "      ~ ami           = \"ami-old\" -> \"ami-new\" # forces replacement\n",
+            "      ~ subnet_id     = \"subnet-1\" -> \"subnet-2\" # forces replacement\n",
+            "      ~ root_block_device {\n",
+            "          ~ volume_type = \"gp2\" -> \"gp3\" # forces replacement\n",
+            "        }\n",
+            "      ~ instance_type = \"t3.micro\" -> \"t3.small\"\n",
+            "    }\n\n",
+            "  # aws_launch_template.edge must be replaced\n",
+            "+/- resource \"aws_launch_template\" \"edge\" {\n",
+            "      ~ name = \"edge-v1\" -> \"edge-v2\" # forces replacement\n",
+            "    }\n\n",
+            "  # aws_security_group.api will be updated in-place\n",
+            "  ~ resource \"aws_security_group\" \"api\" {\n",
+            "        id          = \"sg-12345\"\n",
+            "      ~ description = \"old\" -> \"new\"\n",
+            "      ~ tags        = {\n",
+            "          ~ \"Env\" = \"staging\" -> \"prod\"\n",
+            "          + \"Team\" = \"core\"\n",
+            "        }\n",
+            "      + ingress {\n",
+            "          + from_port = 443\n",
+            "          + to_port   = 443\n",
+            "        }\n",
+            "      - egress {\n",
+            "          - from_port = 80\n",
+            "        }\n",
+            "      ~ revoke_rules_on_delete = false -> true\n",
+            "      ~ name_prefix            = \"a-\" -> \"b-\"\n",
+            "    }\n\n",
+            "  # aws_s3_bucket.old will be destroyed\n",
+            "  - resource \"aws_s3_bucket\" \"old\" {\n",
+            "      - bucket = \"legacy-bucket\" -> null\n",
+            "    }\n\n",
+            "  # data.aws_caller_identity.current will be read during apply\n",
+            " <= data \"aws_caller_identity\" \"current\" {\n",
+            "      + account_id = (known after apply)\n",
+            "    }\n\n",
+            "Plan: 2 to add, 1 to change, 3 to destroy.\n\n",
+            "Changes to Outputs:\n",
+            "  + endpoint = \"https://api.example.com\"\n",
+            "  ~ url      = \"http://old\" -> \"https://new\"\n",
+            "  - old_arn  = \"arn:aws:s3:::legacy-bucket\" -> null\n\n",
+            "Warning: Value for undeclared variable \"legacy_flag\"\n",
+        ));
+
+        let stderr = concat!(
+            "╷\n",
+            "│ Warning: Argument is deprecated\n",
+            "│\n",
+            "│   with aws_s3_bucket.old,\n",
+            "│   on main.tf line 42, in resource \"aws_s3_bucket\" \"old\":\n",
+            "│   42:   acl = \"private\"\n",
+            "╵\n",
+        );
+
+        let mut parser = Parser::new("terraform plan", None);
+        for (i, line) in raw.split_inclusive('\n').enumerate() {
+            parser.observe(line, i + 1);
+        }
+        for (i, line) in stderr.split_inclusive('\n').enumerate() {
+            parser.observe_stderr(line, i + 1);
+        }
+        let summary = parser.finish();
+        let rendered = summary.render(None, 0).unwrap();
+
+        assert!(
+            rendered.contains("Refreshed/read 42 resource(s) [stdout:1-42]\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("5 resource change(s)\n"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "-/+ aws_instance.web must be replaced (replace: ami, subnet_id, root_block_device.volume_type) [stdout:"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("+/- aws_launch_template.edge must be replaced (replace: name) [stdout:"),
+            "{rendered}"
+        );
+        // Up to 5 top-level changed attributes on `~` update (nested `"Env"`/`"Team"` excluded!), +1 more for the 6th.
+        assert!(
+            rendered.contains(
+                "~ aws_security_group.api will be updated in-place (description, tags, ingress, egress, revoke_rules_on_delete, +1 more) [stdout:"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- aws_s3_bucket.old will be destroyed [stdout:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("<= data.aws_caller_identity.current will be read during apply [stdout:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Changes to Outputs:\n")
+                && rendered.contains("  + endpoint = \"https://api.example.com\" [stdout:")
+                && rendered.contains("  ~ url      = \"http://old\" -> \"https://new\" [stdout:")
+                && rendered
+                    .contains("  - old_arn  = \"arn:aws:s3:::legacy-bucket\" -> null [stdout:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Warning: Value for undeclared variable \"legacy_flag\" [stdout:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Warning: Argument is deprecated (with aws_s3_bucket.old, on main.tf line 42, in resource \"aws_s3_bucket\" \"old\") [stderr:1-7]"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Plan: 2 to add, 1 to change, 3 to destroy.\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.len() * 3 < raw.len(),
+            "expected strong plan compaction: {} vs {}\n{rendered}",
+            rendered.len(),
+            raw.len()
+        );
+    }
+
+    #[test]
+    fn pulumi_preview_tree_diff_outputs_diagnostics_and_reruns() {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(family(&args("pulumi preview")), "pulumi preview");
+        assert_eq!(
+            family(&args("pulumi preview --stack prod --diff")),
+            "pulumi preview"
+        );
+        assert_eq!(family(&args("pulumi up --dry-run")), "pulumi preview");
+        assert_eq!(
+            family(&args("pulumi up --stack dev --dry-run=true")),
+            "pulumi preview"
+        );
+        assert_eq!(family(&args("pulumi up")), "other");
+        assert_eq!(family(&args("pulumi preview --json")), "other");
+        assert_eq!(family(&args("pulumi preview -j")), "other");
+        assert_eq!(family(&args("pulumi up --dry-run --json")), "other");
+
+        // 1. Standard tree view with 80 unchanged resources + creates/updates/replaces/deletes.
+        let mut tree = String::from(concat!(
+            "Previewing update (prod)\n\n",
+            "View in Browser (Ctrl+O): https://app.pulumi.com/org/app/prod/previews/12345\n\n",
+            "     Type                         Name               Plan                Info\n",
+            "     pulumi:pulumi:Stack          my-app-prod\n",
+            " +   ├─ aws:ec2:Vpc               main-vpc           create\n",
+            " ~   ├─ aws:s3:Bucket             assets-bucket      update              [diff: ~tags,+versioning]\n",
+            " +-  ├─ aws:ec2:Instance          web-server         replace             [diff: ~ami]\n",
+            " ++  ├─ aws:ec2:Instance          api-server         create-replacement\n",
+            " --  ├─ aws:ec2:Instance          api-server-old     delete-original\n",
+            " -   ├─ aws:rds:Instance          legacy-db          delete\n",
+        ));
+        for i in 0..80 {
+            let connector = if i == 79 { "└─" } else { "├─" };
+            tree.push_str(&format!(
+                "     {connector} aws:iam:RolePolicy         worker-policy-{i:02}\n"
+            ));
+        }
+        tree.push_str(concat!(
+            "\nOutputs:\n",
+            "  + vpcId       : \"vpc-0123456\"\n",
+            "  ~ bucketArn   : \"arn:aws:s3:::old\" => \"arn:aws:s3:::new\"\n",
+            "  - legacyDbUrl : \"postgres://old\"\n\n",
+            "Diagnostics:\n",
+            "  aws:ec2:Instance (web-server):\n",
+            "    warning: ami-123 is deprecated\n\n",
+            "Resources:\n",
+            "    + 1 to create\n",
+            "    ~ 1 to update\n",
+            "    - 1 to delete\n",
+            "    +-1 to replace\n",
+            "    4 changes. 81 unchanged\n",
+        ));
+
+        let s1 = parse("pulumi preview", &tree);
+        assert_eq!(s1.kind, "plan");
+        assert_eq!(s1.items.len(), 6);
+        let r1 = s1.render(None, 0).unwrap();
+        assert!(r1.contains("Previewing update (prod)\n"), "{r1}");
+        assert!(r1.contains("6 resource change(s)\n"), "{r1}");
+        assert!(
+            r1.contains("+ aws:ec2:Vpc main-vpc create [stdout:7-7]\n"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains(
+                "~ aws:s3:Bucket assets-bucket update [diff: ~tags,+versioning] [stdout:8-8]\n"
+            ),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("+- aws:ec2:Instance web-server replace [diff: ~ami] [stdout:9-9]\n"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("++ aws:ec2:Instance api-server create-replacement [stdout:10-10]\n"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("-- aws:ec2:Instance api-server-old delete-original [stdout:11-11]\n"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains("- aws:rds:Instance legacy-db delete [stdout:12-12]\n"),
+            "{r1}"
+        );
+        assert!(r1.contains("81 unchanged [stdout:6-92]\n"), "{r1}");
+        assert!(!r1.contains("worker-policy-40"), "{r1}");
+        assert!(
+            r1.contains("Outputs:\n")
+                && r1.contains("  + vpcId       : \"vpc-0123456\" [stdout:")
+                && r1.contains(
+                    "  ~ bucketArn   : \"arn:aws:s3:::old\" => \"arn:aws:s3:::new\" [stdout:"
+                )
+                && r1.contains("  - legacyDbUrl : \"postgres://old\" [stdout:"),
+            "{r1}"
+        );
+        assert!(
+            r1.contains(
+                "Diagnostics:\n  aws:ec2:Instance (web-server): warning: ami-123 is deprecated [stdout:"
+            ),
+            "{r1}"
+        );
+        assert!(
+            r1.contains(
+                "Resources: + 1 to create, ~ 1 to update, - 1 to delete, +-1 to replace; 4 changes. 81 unchanged\n"
+            ),
+            "{r1}"
+        );
+        assert!(
+            r1.len() * 5 < tree.len(),
+            "expected >80% reduction: {} vs {}\n{r1}",
+            r1.len(),
+            tree.len()
+        );
+
+        // Rerun comparison: web-server replacement fixed & new cloudfront added.
+        let tree2 = tree
+            .replace(
+                " +-  ├─ aws:ec2:Instance          web-server         replace             [diff: ~ami]\n",
+                " +   ├─ aws:cloudfront:Distribution cdn              create\n",
+            );
+        let s2 = parse("pulumi preview", &tree2);
+        let delta = s2.render(Some(("run-1", &s1)), 0).unwrap();
+        assert!(delta.contains("Compared with run-1:\n"), "{delta}");
+        assert!(
+            delta.contains("+ + aws:cloudfront:Distribution cdn create [stdout:"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("- +- aws:ec2:Instance web-server replace [diff: ~ami] [prior stdout:"),
+            "{delta}"
+        );
+        assert!(!delta.contains("main-vpc"), "{delta}");
+
+        // 2. `pulumi preview --diff` detailed view extracts changed field names & collapses `(same)`.
+        let diff_out = concat!(
+            "Previewing update (staging):\n",
+            "  pulumi:pulumi:Stack: (same)\n",
+            "    [urn=urn:pulumi:staging::my-app::pulumi:pulumi:Stack::my-app-staging]\n",
+            "    + aws:ec2/vpc:Vpc: (create)\n",
+            "        [urn=urn:pulumi:staging::my-app::aws:ec2/vpc:Vpc::main-vpc]\n",
+            "        cidrBlock: \"10.0.0.0/16\"\n",
+            "    ~ aws:s3/bucket:Bucket: (update)\n",
+            "        [id=assets-bucket-123]\n",
+            "        [urn=urn:pulumi:staging::my-app::aws:s3/bucket:Bucket::assets-bucket]\n",
+            "      ~ tags: {\n",
+            "          + env: \"staging\"\n",
+            "        }\n",
+            "      + versioning: {\n",
+            "            enabled: true\n",
+            "        }\n",
+            "    +-aws:ec2/instance:Instance: (replace)\n",
+            "        [id=i-0123456]\n",
+            "        [urn=urn:pulumi:staging::my-app::aws:ec2/instance:Instance::web-server]\n",
+            "      ~ ami: \"ami-old\" => \"ami-new\"\n",
+            "      ~ instanceType: \"t3.micro\" => \"t3.small\"\n",
+            "    aws:iam/role:Role: (same)\n",
+            "        [id=app-role-111]\n",
+            "        [urn=urn:pulumi:staging::my-app::aws:iam/role:Role::app-role]\n",
+            "    --outputs:--\n",
+            "      + vpcId: output<string>\n",
+            "Resources:\n",
+            "    + 1 to create\n",
+            "    ~ 1 to update\n",
+            "    +-1 to replace\n",
+            "    3 changes. 2 unchanged\n",
+        );
+        let mut p = Parser::new("pulumi preview", None);
+        for (i, line) in diff_out.split_inclusive('\n').enumerate() {
+            p.observe(line, i + 1);
+        }
+        p.observe_stderr("warning: stack config key 'oldKey' is unused\n", 1);
+        let ds = p.finish();
+        let dr = ds.render(None, 0).unwrap();
+        assert!(dr.contains("Previewing update (staging)\n"), "{dr}");
+        assert!(
+            dr.contains("+ aws:ec2/vpc:Vpc main-vpc create [stdout:4-6]\n"),
+            "{dr}"
+        );
+        assert!(
+            dr.contains(
+                "~ aws:s3/bucket:Bucket assets-bucket update (tags, versioning) [stdout:7-15]\n"
+            ),
+            "{dr}"
+        );
+        assert!(
+            dr.contains(
+                "+- aws:ec2/instance:Instance web-server replace (ami, instanceType) [stdout:16-20]\n"
+            ),
+            "{dr}"
+        );
+        assert!(dr.contains("2 unchanged [stdout:2-23]\n"), "{dr}");
+        assert!(
+            dr.contains("Outputs:\n  + vpcId: output<string> [stdout:25]\n"),
+            "{dr}"
+        );
+        assert!(
+            dr.contains("warning: stack config key 'oldKey' is unused [stderr:1]\n"),
+            "{dr}"
+        );
+
+        // Failing preview with no resource changes returns None so error stays verbatim.
+        let crashed = parse("pulumi preview", "error: no stack selected\n");
+        assert!(crashed.render(None, 255).is_none());
     }
 }

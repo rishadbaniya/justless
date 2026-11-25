@@ -188,10 +188,9 @@ fn medium_diff_uses_compact_tier_preserving_every_changed_line_and_metadata() {
     has(&shown, "=== src/module_0.rs (+2 -2) [stdout:");
     has(&shown, "=== scripts/deploy.sh [stdout:");
     has(&shown, "old mode 100644\nnew mode 100755\n");
-    has(&shown, "=== src/new_name.rs [stdout:");
     has(
         &shown,
-        "rename from src/old_name.rs\nrename to src/new_name.rs\n",
+        "rename src/old_name.rs -> src/new_name.rs (100%) [stdout:",
     );
     lacks(&shown, "\nindex ");
     lacks(&shown, "--- a/");
