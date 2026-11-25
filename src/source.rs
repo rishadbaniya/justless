@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -39,7 +40,7 @@ fn fresh_arg() -> Arg<'static> {
 pub fn commands() -> Vec<Cli<'static>> {
     vec![
         Cli::new("read")
-            .about("Read a small file or page through one or more files' outlines")
+            .about("Read a small file, or outline files or directories")
             .arg(Arg::new("file").required(true).multiple_values(true))
             .arg(Arg::new("outline").long("outline"))
             .arg(
@@ -47,7 +48,7 @@ pub fn commands() -> Vec<Cli<'static>> {
                     .long("shell-range")
                     .value_name("A-B|+N")
                     .hidden(true)
-                    .conflicts_with_all(&["outline", "json", "match", "after"]),
+                    .conflicts_with_all(&["outline", "json", "match", "after", "depth"]),
             )
             .arg(
                 Arg::new("json")
@@ -88,10 +89,17 @@ pub fn commands() -> Vec<Cli<'static>> {
                     .value_name("REF")
                     .help("Continue after this revision-bound entry"),
             )
+            .arg(
+                Arg::new("depth")
+                    .long("depth")
+                    .takes_value(true)
+                    .value_name("N")
+                    .help("Maximum directory recursion depth"),
+            )
             .arg(session_arg())
             .arg(fresh_arg())
             .arg(crate::number("limit", "40", "Maximum entries per page"))
-            .arg(crate::budget()),
+            .arg(crate::budget().alias("max-bytes")),
         Cli::new("expand")
             .about("Print the exact source bytes for a symbol, outline reference or line range")
             .arg(
@@ -765,19 +773,7 @@ impl Snapshot {
         let mut size = page.display().len() + reserve;
         let mut last = None;
         let filter = filter.to_lowercase();
-        let terms: Vec<&str> =
-            if !filter.is_empty() && !filter.contains(' ') && filter.contains('|') {
-                let parts: Vec<&str> = filter.split('|').collect();
-                if parts.iter().all(|part| !part.is_empty()) {
-                    parts
-                } else {
-                    vec![filter.as_str()]
-                }
-            } else if filter.is_empty() {
-                Vec::new()
-            } else {
-                vec![filter.as_str()]
-            };
+        let terms = parse_match_terms(&filter);
         let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut index = start;
         while index < self.entries.len() {
@@ -864,6 +860,121 @@ impl Snapshot {
             }
         }
         Ok(page)
+    }
+
+    /// Slimmed, folded outline rows for a directory skeleton.
+    ///
+    /// Preserves every `#N` / `#A..#B` ID and `L<first>-<last>` range for direct
+    /// `justless expand FILE REV#N` follow-up, folds 3+ imports/modules and 5+
+    /// single-line constants, and (when unfiltered) collapses inline Rust test
+    /// modules into a single module row so production API signatures stay first.
+    fn skeleton_rows(&self, filter: &str) -> Vec<Row> {
+        let filter_lower = filter.to_lowercase();
+        let terms = parse_match_terms(&filter_lower);
+        let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut rows = Vec::new();
+        let mut index = 0usize;
+        while index < self.entries.len() {
+            let e = &self.entries[index];
+            let (row, end_index) = if terms.is_empty() {
+                if self.is_rust && self.is_test_module(e) {
+                    let mut run_end = index + 1;
+                    while run_end < self.entries.len()
+                        && self.entries[run_end].bytes.start >= e.bytes.start
+                        && self.entries[run_end].bytes.end <= e.bytes.end
+                    {
+                        run_end += 1;
+                    }
+                    let inner = run_end - (index + 1);
+                    if inner > 0 {
+                        let row = Row {
+                            id: index + 1,
+                            end_id: None,
+                            name: clipped(&e.name, 100),
+                            kind: e.kind.clone(),
+                            first: self.line(e.bytes.start),
+                            last: self.line(e.bytes.end.saturating_sub(1)),
+                            signature: format!("({inner} inner)"),
+                        };
+                        (row, run_end - 1)
+                    } else if let Some((group, min_run)) = self.fold_group(e) {
+                        self.folded_or_single_row(index, e, group, min_run, &words)
+                    } else {
+                        let row = self.row_for(
+                            index,
+                            e,
+                            words(&self.text[e.signature_start..e.header_end]),
+                        );
+                        (row, index)
+                    }
+                } else if let Some((group, min_run)) = self.fold_group(e) {
+                    self.folded_or_single_row(index, e, group, min_run, &words)
+                } else {
+                    let row =
+                        self.row_for(index, e, words(&self.text[e.signature_start..e.header_end]));
+                    (row, index)
+                }
+            } else {
+                let signature = words(&self.text[e.signature_start..e.header_end]);
+                let name = e.name.to_lowercase();
+                let header = words(&self.text[e.bytes.start..e.header_end]).to_lowercase();
+                if !terms
+                    .iter()
+                    .any(|term| name.contains(term) || header.contains(term))
+                {
+                    index += 1;
+                    continue;
+                }
+                (self.row_for(index, e, signature), index)
+            };
+            rows.push(row);
+            index = end_index + 1;
+        }
+        rows
+    }
+
+    fn is_test_module(&self, entry: &Entry) -> bool {
+        entry.kind == "module"
+            && (entry.name == "tests"
+                || entry.name.ends_with("::tests")
+                || self
+                    .text
+                    .get(entry.bytes.start..entry.signature_start)
+                    .is_some_and(|prefix| prefix.contains("cfg(test)")))
+    }
+
+    fn folded_or_single_row(
+        &self,
+        index: usize,
+        e: &Entry,
+        group: &'static str,
+        min_run: usize,
+        words: &impl Fn(&str) -> String,
+    ) -> (Row, usize) {
+        let mut run_end = index + 1;
+        while run_end < self.entries.len()
+            && self.fold_group(&self.entries[run_end]) == Some((group, min_run))
+            && (group != "constants"
+                || entry_scope_prefix(e) == entry_scope_prefix(&self.entries[run_end]))
+        {
+            run_end += 1;
+        }
+        let run_len = run_end - index;
+        if run_len >= min_run {
+            let row = Row {
+                id: index + 1,
+                end_id: Some(run_end),
+                name: format!("{run_len} items"),
+                kind: group.into(),
+                first: self.line(e.bytes.start),
+                last: self.line(self.entries[run_end - 1].bytes.end.saturating_sub(1)),
+                signature: String::new(),
+            };
+            (row, run_end - 1)
+        } else {
+            let row = self.row_for(index, e, words(&self.text[e.signature_start..e.header_end]));
+            (row, index)
+        }
     }
 
     /// The outline rows that overlap source lines `first..=last`, such as the
@@ -982,6 +1093,21 @@ impl Window {
             out.push_str(&row.display_with_signatures(signatures));
         }
         out
+    }
+}
+
+fn parse_match_terms(filter_lower: &str) -> Vec<&str> {
+    if !filter_lower.is_empty() && !filter_lower.contains(' ') && filter_lower.contains('|') {
+        let parts: Vec<&str> = filter_lower.split('|').collect();
+        if parts.iter().all(|part| !part.is_empty()) {
+            parts
+        } else {
+            vec![filter_lower]
+        }
+    } else if filter_lower.is_empty() {
+        Vec::new()
+    } else {
+        vec![filter_lower]
     }
 }
 
@@ -1368,7 +1494,7 @@ pub struct Page {
     #[serde(skip)]
     progress: Option<String>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Row {
     id: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1565,7 +1691,7 @@ fn hoistable_read_prefix(paths: &[String]) -> Option<String> {
     (base_line_bytes < repeated_bytes).then_some(common)
 }
 
-fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool) -> Result<()> {
+fn read_many_resolved(ws: &Workspace, resolved: &[String], args: &ArgMatches) -> Result<()> {
     ensure!(
         args.value_of("shell-range").is_none(),
         "--shell-range applies to a single file"
@@ -1588,14 +1714,10 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
         && args.occurrences_of("limit") == 0
         && args.occurrences_of("budget") == 0;
 
-    let resolved: Vec<String> = files
-        .iter()
-        .map(|raw| workspace_file(ws, raw, root_given))
-        .collect::<Result<_>>()?;
     let base_prefix = if json_mode {
         None
     } else {
-        hoistable_read_prefix(&resolved)
+        hoistable_read_prefix(resolved)
     };
 
     let mut remaining = total_budget;
@@ -1718,6 +1840,1471 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
     } else {
         print!("{text_out}");
     }
+    if let Some(mem) = memory {
+        mem.save(ws);
+    }
+    Ok(())
+}
+
+/// Target resolved for `justless read`: either a workspace file or a workspace
+/// directory to render as a budgeted code skeleton.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadTarget {
+    File(String),
+    Dir {
+        /// Workspace-relative directory using `/`; empty string for workspace root.
+        relative: String,
+        /// Canonical on-disk path strictly inside `ws.root`.
+        canonical: PathBuf,
+    },
+}
+
+/// Minimum per-file floor (header + ~2–3 declarations + truncation line) used when
+/// choosing how many files fit fairly into a directory skeleton budget.
+const SKELETON_MIN_PER_FILE: usize = 220;
+
+/// Cap on files parsed eagerly during an unfiltered directory walk of a very
+/// large tree; remaining files are still counted in totals and summarized.
+const SKELETON_MAX_EAGER_PARSE: usize = 512;
+
+fn lexical_path(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            part => clean.push(part),
+        }
+    }
+    clean
+}
+
+fn path_to_slash_string(path: &Path) -> Option<String> {
+    path.components()
+        .map(|part| part.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.join("/"))
+}
+
+/// Checks whether `raw`, resolved from `base`, names an existing directory
+/// strictly inside `ws.root` without crossing symlinks.
+///
+/// Returns:
+/// - `Ok(Some((relative, canonical)))` when it is a valid workspace directory
+/// - `Ok(None)` when it is a regular file or does not exist
+/// - `Err(_)` when it escapes the workspace or traverses a symlink
+fn workspace_dir_at(
+    ws: &Workspace,
+    base: &Path,
+    raw: &str,
+    bare: bool,
+) -> Result<Option<(String, PathBuf)>> {
+    ensure!(!raw.is_empty(), "expected a workspace file or directory");
+    let mut local = lexical_path(&base.join(raw));
+    if let (Some(parent), Some(name)) = (local.parent(), local.file_name())
+        && let Ok(parent) = parent.canonicalize()
+    {
+        local = parent.join(name);
+    }
+    let Ok(rel) = local.strip_prefix(&ws.root) else {
+        if !bare {
+            bail!("{raw} is outside the workspace");
+        }
+        return Ok(None);
+    };
+    let rel_buf = rel.to_path_buf();
+    if fs::symlink_metadata(&local).is_err() {
+        return Ok(None);
+    }
+    // Reject any symlink component below `ws.root`, preserving the same boundary
+    // contract as `Workspace::source_path`.
+    let mut cur = ws.root.clone();
+    for part in rel_buf.components() {
+        cur.push(part);
+        if fs::symlink_metadata(&cur).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            if cur.canonicalize().is_ok_and(|c| !c.starts_with(&ws.root)) {
+                bail!("{raw} is outside the workspace");
+            }
+            bail!("expected a workspace file or directory: {raw}");
+        }
+    }
+    let canonical = local
+        .canonicalize()
+        .with_context(|| format!("open {raw}"))?;
+    ensure!(
+        canonical.starts_with(&ws.root),
+        "{raw} is outside the workspace"
+    );
+    if canonical.is_dir() {
+        let rel_str =
+            path_to_slash_string(&rel_buf).with_context(|| format!("{raw} is not valid UTF-8"))?;
+        return Ok(Some((rel_str, canonical)));
+    }
+    Ok(None)
+}
+
+fn resolve_read_target(ws: &Workspace, raw: &str, root_given: bool) -> Result<ReadTarget> {
+    let path = Path::new(raw);
+    let bare = !raw.is_empty()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)));
+    if !bare {
+        if let Some((relative, canonical)) = workspace_dir_at(ws, &ws.cwd, raw, false)? {
+            return Ok(ReadTarget::Dir {
+                relative,
+                canonical,
+            });
+        }
+        return Ok(ReadTarget::File(workspace_file(ws, raw, root_given)?));
+    }
+    if ws.cwd == ws.root {
+        if let Some((relative, canonical)) = workspace_dir_at(ws, &ws.root, raw, true)? {
+            return Ok(ReadTarget::Dir {
+                relative,
+                canonical,
+            });
+        }
+        return Ok(ReadTarget::File(raw.to_owned()));
+    }
+    // Check cwd and root in the same precedence order as `workspace_file`.
+    let cwd_rel = ws
+        .cwd
+        .strip_prefix(&ws.root)
+        .ok()
+        .map(|sub| sub.join(path))
+        .and_then(|p| path_to_slash_string(&p));
+    let cwd_is_file = cwd_rel
+        .as_deref()
+        .is_some_and(|rel| ws.source_path(rel).is_ok());
+    let root_is_file = ws.source_path(raw).is_ok();
+    if cwd_is_file && root_is_file {
+        return Ok(ReadTarget::File(workspace_file(ws, raw, root_given)?));
+    }
+    let bases: [(&Path, bool); 2] = if root_given {
+        [(&ws.root, root_is_file), (&ws.cwd, cwd_is_file)]
+    } else {
+        [(&ws.cwd, cwd_is_file), (&ws.root, root_is_file)]
+    };
+    for (base, is_file) in bases {
+        if is_file {
+            return Ok(ReadTarget::File(workspace_file(ws, raw, root_given)?));
+        }
+        if let Some((relative, canonical)) = workspace_dir_at(ws, base, raw, true)? {
+            return Ok(ReadTarget::Dir {
+                relative,
+                canonical,
+            });
+        }
+    }
+    Ok(ReadTarget::File(workspace_file(ws, raw, root_given)?))
+}
+
+fn is_excluded_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".hg" | ".svn" | ".justless" | "target" | "node_modules" | ".venv" | "__pycache__"
+    )
+}
+
+fn is_lockfile(name: &str) -> bool {
+    matches!(
+        name,
+        "Cargo.lock"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lock"
+            | "bun.lockb"
+            | "poetry.lock"
+            | "Pipfile.lock"
+            | "uv.lock"
+            | "pdm.lock"
+            | "composer.lock"
+            | "Gemfile.lock"
+            | "go.sum"
+            | "flake.lock"
+            | "mix.lock"
+            | "pubspec.lock"
+            | "Podfile.lock"
+            | "Package.resolved"
+            | "gradle.lockfile"
+            | "packages.lock.json"
+            | "paket.lock"
+            | "deno.lock"
+            | "shrinkwrap.yaml"
+            | "terraform.lock.hcl"
+            | ".terraform.lock.hcl"
+    )
+}
+
+fn looks_binary_file(path: &Path) -> bool {
+    let mut head = [0u8; 8192];
+    File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .map_or(true, |n| head[..n].contains(&0))
+}
+
+/// Builds a `Gitignore` matcher covering ignore files from `ws.root` down to
+/// `dir_canonical.parent()` (strictly within `ws.root`, so ancestor ignore
+/// rules outside the workspace never leak in). `dir_canonical` itself and its
+/// subdirectories are handled natively by `ignore::WalkBuilder`.
+fn build_ancestor_ignores(
+    ws: &Workspace,
+    dir_canonical: &Path,
+) -> Result<ignore::gitignore::Gitignore> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(&ws.root);
+    let git_exclude = ws.root.join(".git").join("info").join("exclude");
+    if git_exclude.is_file() {
+        let _ = builder.add(&git_exclude);
+    }
+    let Ok(rel) = dir_canonical.strip_prefix(&ws.root) else {
+        return Ok(builder.build()?);
+    };
+    let components: Vec<_> = rel.components().collect();
+    if components.is_empty() {
+        // `dir_canonical == ws.root`; WalkBuilder handles `ws.root` itself.
+        return Ok(builder.build()?);
+    }
+    let mut current = ws.root.clone();
+    for (idx, part) in components.iter().enumerate() {
+        for name in [".gitignore", ".justlessignore"] {
+            let candidate = current.join(name);
+            if candidate.is_file()
+                && let Some(err) = builder.add(&candidate)
+            {
+                return Err(err).with_context(|| format!("read {}", candidate.display()));
+            }
+        }
+        if idx + 1 < components.len() {
+            current.push(part);
+        }
+    }
+    Ok(builder.build()?)
+}
+
+/// Discovers all eligible non-binary, non-lockfile, non-ignored workspace files
+/// under `dir_canonical`, sorted deterministically by `/`-normalized path.
+fn collect_dir_files(
+    ws: &Workspace,
+    dir_rel: &str,
+    dir_canonical: &Path,
+    max_depth: Option<usize>,
+) -> Result<Vec<String>> {
+    if !dir_rel.is_empty() && dir_rel.split('/').any(is_excluded_dir) {
+        return Ok(Vec::new());
+    }
+    let cap = ws.settings()?.max_file_bytes;
+    let ancestor_ignores = build_ancestor_ignores(ws, dir_canonical)?;
+    let mut walker = ignore::WalkBuilder::new(dir_canonical);
+    walker
+        .hidden(false)
+        .require_git(false)
+        .parents(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(".justlessignore")
+        .follow_links(false);
+    if let Some(depth) = max_depth {
+        walker.max_depth(Some(depth));
+    }
+    walker.filter_entry(move |entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        if is_dir && is_excluded_dir(&entry.file_name().to_string_lossy()) {
+            return false;
+        }
+        !ancestor_ignores
+            .matched_path_or_any_parents(entry.path(), is_dir)
+            .is_ignore()
+    });
+
+    let mut files = Vec::new();
+    for entry in walker.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_file() {
+            continue;
+        }
+        if is_lockfile(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(rel_path) = entry.path().strip_prefix(&ws.root) else {
+            continue;
+        };
+        let Some(rel) = path_to_slash_string(rel_path) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let Ok(real) = ws.source_path(&rel) else {
+            continue;
+        };
+        let Ok(meta) = real.metadata() else {
+            continue;
+        };
+        if meta.len() > cap || looks_binary_file(&real) {
+            continue;
+        }
+        files.push(rel);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn is_entrypoint_file(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        base,
+        "lib.rs"
+            | "mod.rs"
+            | "main.rs"
+            | "index.ts"
+            | "index.tsx"
+            | "index.js"
+            | "index.mjs"
+            | "__init__.py"
+            | "main.go"
+            | "README.md"
+    )
+}
+
+fn path_structural_hint(path: &str) -> u8 {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if is_entrypoint_file(path) {
+        return 4;
+    }
+    match ext.as_deref() {
+        Some(
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "kt"
+            | "kts" | "swift" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "cs" | "rb" | "php"
+            | "scala" | "ex" | "exs" | "dart" | "zig" | "lua" | "jl" | "groovy" | "sql" | "tf"
+            | "hcl" | "sh" | "bash" | "ps1",
+        ) => 3,
+        Some("md" | "markdown" | "mdx" | "toml" | "yaml" | "yml" | "json") => 2,
+        _ => 1,
+    }
+}
+
+fn structural_priority(rel_path: &str, snapshot: &Snapshot, rows: &[Row]) -> (u8, usize, usize) {
+    let real_decls = rows
+        .iter()
+        .filter(|row| {
+            !matches!(
+                row.kind.as_str(),
+                "import" | "imports" | "modules" | "constants" | "text"
+            ) && !(row.kind == "module" && row.signature.ends_with(" inner)"))
+        })
+        .count();
+    let non_text = rows.iter().filter(|row| row.kind != "text").count();
+    let tier = if (snapshot.is_rust || snapshot.grammar.is_some()) && real_decls > 0 {
+        3
+    } else if (snapshot.is_markdown || non_text > 0) && !rows.is_empty() {
+        2
+    } else if !rows.is_empty() {
+        1
+    } else {
+        0
+    };
+    let entry_boost = usize::from(is_entrypoint_file(rel_path)) * 100;
+    (tier, real_decls + entry_boost, snapshot.line_count())
+}
+
+struct SkeletonCandidate {
+    /// Workspace-relative file path (with `/`).
+    file: String,
+    /// Display path relative to hoisted directory/base prefix.
+    rel_path: String,
+    revision: String,
+    digest: String,
+    lines: usize,
+    raw_bytes: usize,
+    parse_error: Option<String>,
+    /// Slimmed, folded rows (up to `--limit`).
+    rows: Vec<Row>,
+    /// Total matching/folded rows before `--limit`.
+    total_rows: usize,
+    /// Structural priority `(tier, decl_score, lines)` for fair selection.
+    priority: (u8, usize, usize),
+}
+
+impl SkeletonCandidate {
+    fn header_line(&self) -> String {
+        format!(
+            "=== {} ({} lines) · rev {} ===\n",
+            self.rel_path, self.lines, self.revision
+        )
+    }
+
+    fn parse_error_line(&self) -> Option<String> {
+        self.parse_error
+            .as_deref()
+            .map(|err| format!("{}\n", clipped(err, 160)))
+    }
+
+    fn full_bytes(&self) -> usize {
+        let mut size = self.header_line().len();
+        if let Some(err) = self.parse_error_line() {
+            size += err.len();
+        }
+        for row in &self.rows {
+            size += row.display().len();
+        }
+        size += skeleton_trunc_line(self.rows.len(), self.total_rows).len();
+        size
+    }
+
+    fn min_useful_bytes(&self) -> usize {
+        let mut size = self.header_line().len();
+        if let Some(err) = self.parse_error_line() {
+            size += err.len();
+        }
+        if let Some(first) = self.rows.first() {
+            size += first.display().len();
+            size += skeleton_trunc_line(1, self.total_rows).len();
+        } else {
+            size += skeleton_trunc_line(0, self.total_rows).len();
+        }
+        size
+    }
+}
+
+struct OmittedSummaryEntry {
+    file: String,
+    rel_path: String,
+    lines: usize,
+    raw_bytes: usize,
+    total_entries: usize,
+    priority: (u8, usize, usize),
+}
+
+fn skeleton_row_priority(row: &Row) -> u8 {
+    let is_public = row.signature.starts_with("pub ")
+        || row.signature.starts_with("pub(")
+        || row.signature.starts_with("export ")
+        || row.signature == "export"
+        || row.signature.starts_with("public ");
+    match row.kind.as_str() {
+        "import" | "imports" | "modules" => 0,
+        "module" if row.signature.ends_with(" inner)") => 1,
+        "constants" | "text" => 1,
+        "struct" | "enum" | "trait" | "interface" | "class" | "union" | "type" | "table"
+        | "protocol" | "record" | "object" => {
+            if is_public {
+                6
+            } else {
+                5
+            }
+        }
+        "h1" | "h2" => 5,
+        "h3" | "section" => 4,
+        "function" | "method" => {
+            if is_public {
+                5
+            } else if !row.name.contains("::") {
+                4
+            } else {
+                3
+            }
+        }
+        "module" | "namespace" => 3,
+        "constant" | "const" | "static" | "variable" if is_public => 3,
+        _ => 2,
+    }
+}
+
+struct SelectedSkeletonFile {
+    candidate_idx: usize,
+    shown_rows: Vec<Row>,
+    rendered_rows: Vec<String>,
+    /// True when `shown_rows` is an unbroken prefix `0..shown_rows.len()` of `candidate.rows`.
+    contiguous_prefix: bool,
+}
+
+struct SkeletonAllocation {
+    header: String,
+    base_line: String,
+    shown: Vec<SelectedSkeletonFile>,
+    omitted: Vec<OmittedSummaryEntry>,
+    omitted_summary_line: Option<String>,
+    next_line: Option<String>,
+}
+
+fn skeleton_header_line(
+    target_label: &str,
+    shown: usize,
+    total_files: usize,
+    total_lines: usize,
+    total_bytes: u64,
+    filter: &str,
+) -> String {
+    let raw = crate::history::human_bytes(total_bytes);
+    if filter.is_empty() {
+        format!(
+            "skeleton {target_label} · {shown}/{total_files} files · {total_lines} lines ({raw} raw)\n"
+        )
+    } else {
+        format!(
+            "skeleton {target_label} · {shown}/{total_files} files · {total_lines} lines ({raw} raw) · match \"{filter}\"\n"
+        )
+    }
+}
+
+fn skeleton_trunc_line(shown: usize, total: usize) -> String {
+    if shown >= total {
+        String::new()
+    } else {
+        format!("… +{} more ({shown}/{total})\n", total - shown)
+    }
+}
+
+fn format_omitted_footer(
+    omitted: &[OmittedSummaryEntry],
+    filter: &str,
+    inv_files: &str,
+    max_bytes: usize,
+) -> (Option<String>, Option<String>) {
+    if omitted.is_empty() || max_bytes < 24 {
+        return (None, None);
+    }
+    let count = omitted.len();
+    let rem_lines: usize = omitted.iter().map(|e| e.lines).sum();
+    let rem_bytes: u64 = omitted.iter().map(|e| e.raw_bytes as u64).sum();
+    let noun = match (filter.is_empty(), count == 1) {
+        (true, true) => "file",
+        (true, false) => "files",
+        (false, true) => "matching file",
+        (false, false) => "matching files",
+    };
+    let mut ranked: Vec<usize> = (0..omitted.len()).collect();
+    ranked.sort_by(|&a, &b| {
+        omitted[b]
+            .priority
+            .cmp(&omitted[a].priority)
+            .then_with(|| omitted[a].file.cmp(&omitted[b].file))
+    });
+    let top_file = &omitted[ranked[0]].file;
+    let next_candidate = format!(
+        "Next: {inv_files} read {} --outline\n",
+        crate::workspace::shell_text(top_file)
+    );
+    let base_summary = if rem_lines > 0 {
+        format!(
+            "… +{count} more {noun} ({rem_lines} lines, {} raw)",
+            crate::history::human_bytes(rem_bytes)
+        )
+    } else {
+        format!(
+            "… +{count} more {noun} ({} raw)",
+            crate::history::human_bytes(rem_bytes)
+        )
+    };
+    let next_line =
+        (next_candidate.len() + base_summary.len() < max_bytes).then_some(next_candidate.clone());
+    let summary_cap = max_bytes.saturating_sub(next_line.as_ref().map_or(0, String::len));
+    if base_summary.len() >= summary_cap {
+        let minimal = format!("… +{count} more {noun}\n");
+        let summary = (minimal.len() <= summary_cap).then_some(minimal);
+        return (summary, next_line);
+    }
+    // Append highest-priority omitted filenames while staying within `summary_cap`.
+    let mut line = base_summary;
+    let mut listed = 0usize;
+    for (pos, &idx) in ranked.iter().enumerate() {
+        let entry = &omitted[idx];
+        let item = if entry.lines > 0 {
+            format!("{} ({}L)", entry.rel_path, entry.lines)
+        } else {
+            entry.rel_path.clone()
+        };
+        let sep = if pos == 0 { ": " } else { ", " };
+        let tail_count = omitted.len() - (pos + 1);
+        let tail = if tail_count > 0 {
+            format!(", +{tail_count} more")
+        } else {
+            String::new()
+        };
+        if line.len() + sep.len() + item.len() + tail.len() < summary_cap {
+            line.push_str(sep);
+            line.push_str(&item);
+            listed += 1;
+        } else {
+            break;
+        }
+    }
+    let unlisted = omitted.len().saturating_sub(listed);
+    if listed > 0 && unlisted > 0 {
+        let tail = format!(", +{unlisted} more");
+        if line.len() + tail.len() < summary_cap {
+            line.push_str(&tail);
+        }
+    }
+    line.push('\n');
+    (Some(line), next_line)
+}
+
+fn clip_row_to_fit(row: &Row, max_bytes: usize) -> Option<(Row, String)> {
+    let mut slim = row.clone();
+    slim.signature.clear();
+    let rendered = slim.display();
+    if rendered.len() <= max_bytes {
+        return Some((slim, rendered));
+    }
+    let overhead = rendered.len().saturating_sub(slim.name.len());
+    if overhead >= max_bytes {
+        return None;
+    }
+    let allowed_name = max_bytes - overhead;
+    slim.name = clipped(&slim.name, allowed_name);
+    let rendered = slim.display();
+    (rendered.len() <= max_bytes).then_some((slim, rendered))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_skeleton(
+    candidates: &[SkeletonCandidate],
+    unparsed_omitted: &[OmittedSummaryEntry],
+    target_label: &str,
+    base_line: String,
+    total_files: usize,
+    total_lines: usize,
+    total_bytes: u64,
+    filter: &str,
+    per_file_limit: Option<usize>,
+    budget: usize,
+    inv_files: &str,
+) -> SkeletonAllocation {
+    if candidates.is_empty() {
+        let header = skeleton_header_line(
+            target_label,
+            0,
+            total_files,
+            total_lines,
+            total_bytes,
+            filter,
+        );
+        let omitted: Vec<OmittedSummaryEntry> = unparsed_omitted
+            .iter()
+            .map(|e| OmittedSummaryEntry {
+                file: e.file.clone(),
+                rel_path: e.rel_path.clone(),
+                lines: e.lines,
+                raw_bytes: e.raw_bytes,
+                total_entries: e.total_entries,
+                priority: e.priority,
+            })
+            .collect();
+        let footer_cap = budget.saturating_sub(header.len() + base_line.len());
+        let (omitted_summary_line, next_line) =
+            format_omitted_footer(&omitted, filter, inv_files, footer_cap);
+        return SkeletonAllocation {
+            header,
+            base_line,
+            shown: Vec::new(),
+            omitted,
+            omitted_summary_line,
+            next_line,
+        };
+    }
+
+    // Fast path: every candidate fits with all its rows (respecting `--limit`) and no unparsed files remain.
+    if unparsed_omitted.is_empty()
+        && per_file_limit.is_none_or(|lim| candidates.iter().all(|c| c.rows.len() <= lim))
+    {
+        let header = skeleton_header_line(
+            target_label,
+            candidates.len(),
+            total_files,
+            total_lines,
+            total_bytes,
+            filter,
+        );
+        let full_total = header.len()
+            + base_line.len()
+            + candidates
+                .iter()
+                .map(SkeletonCandidate::full_bytes)
+                .sum::<usize>();
+        if full_total <= budget {
+            let shown = candidates
+                .iter()
+                .enumerate()
+                .map(|(idx, c)| SelectedSkeletonFile {
+                    candidate_idx: idx,
+                    rendered_rows: c.rows.iter().map(Row::display).collect(),
+                    shown_rows: c.rows.clone(),
+                    contiguous_prefix: true,
+                })
+                .collect();
+            return SkeletonAllocation {
+                header,
+                base_line,
+                shown,
+                omitted: Vec::new(),
+                omitted_summary_line: None,
+                next_line: None,
+            };
+        }
+    }
+
+    // Budgeted path: select the most structural files fairly, then fill rows round-robin.
+    let mut ranked: Vec<usize> = (0..candidates.len()).collect();
+    ranked.sort_by(|&a, &b| {
+        candidates[b]
+            .priority
+            .cmp(&candidates[a].priority)
+            .then_with(|| candidates[a].file.cmp(&candidates[b].file))
+    });
+
+    let max_header_len = skeleton_header_line(
+        target_label,
+        candidates.len(),
+        total_files,
+        total_lines,
+        total_bytes,
+        filter,
+    )
+    .len();
+    let overhead = max_header_len + base_line.len();
+    let avail_all = budget.saturating_sub(overhead);
+
+    // Reserve footer space if we already have unparsed files or won't fit every file's floor.
+    let all_floor: usize = candidates
+        .iter()
+        .map(|c| {
+            c.min_useful_bytes()
+                .max(SKELETON_MIN_PER_FILE.min(c.full_bytes()))
+        })
+        .sum();
+    let will_omit = !unparsed_omitted.is_empty() || all_floor > avail_all;
+    let footer_reserve = if will_omit {
+        (budget / 4).clamp(64, 300).min(avail_all / 2)
+    } else if budget >= 256 {
+        96.min(avail_all / 4)
+    } else {
+        0
+    };
+    let select_budget = avail_all.saturating_sub(footer_reserve);
+
+    // Scale the per-file admission floor down under very tight budgets so one
+    // large file cannot monopolize a 512 B skeleton while dozens of siblings exist.
+    let target_floor = SKELETON_MIN_PER_FILE.min(select_budget / 2).max(120);
+    let mut admitted_ranked: Vec<usize> = Vec::new();
+    let mut floor_used = 0usize;
+    for &idx in &ranked {
+        let c = &candidates[idx];
+        let floor = c.min_useful_bytes().max(target_floor.min(c.full_bytes()));
+        if floor_used + floor <= select_budget {
+            floor_used += floor;
+            admitted_ranked.push(idx);
+        } else {
+            break;
+        }
+    }
+    // Under very tight budgets, fall back to fitting at least header + 1 row (or header).
+    if admitted_ranked.is_empty() {
+        for &idx in &ranked {
+            let need = candidates[idx].min_useful_bytes();
+            if floor_used + need <= select_budget {
+                floor_used += need;
+                admitted_ranked.push(idx);
+            } else {
+                break;
+            }
+        }
+    }
+    if admitted_ranked.is_empty() {
+        let first = ranked[0];
+        let base_need = candidates[first].header_line().len()
+            + candidates[first]
+                .parse_error_line()
+                .as_deref()
+                .map_or(0, str::len)
+            + skeleton_trunc_line(0, candidates[first].total_rows).len();
+        if base_need <= avail_all {
+            admitted_ranked.push(first);
+        }
+    }
+
+    // Build omitted list and ensure headers + zero-row trunc lines + footer fit strictly.
+    let build_omitted = |admitted: &[usize]| -> Vec<OmittedSummaryEntry> {
+        let admitted_set: BTreeSet<usize> = admitted.iter().copied().collect();
+        let mut omitted: Vec<OmittedSummaryEntry> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !admitted_set.contains(idx))
+            .map(|(_, c)| OmittedSummaryEntry {
+                file: c.file.clone(),
+                rel_path: c.rel_path.clone(),
+                lines: c.lines,
+                raw_bytes: c.raw_bytes,
+                total_entries: c.total_rows,
+                priority: c.priority,
+            })
+            .collect();
+        for extra in unparsed_omitted {
+            omitted.push(OmittedSummaryEntry {
+                file: extra.file.clone(),
+                rel_path: extra.rel_path.clone(),
+                lines: extra.lines,
+                raw_bytes: extra.raw_bytes,
+                total_entries: extra.total_entries,
+                priority: extra.priority,
+            });
+        }
+        omitted.sort_by(|a, b| a.file.cmp(&b.file));
+        omitted
+    };
+
+    let mut omitted = build_omitted(&admitted_ranked);
+    let mut header = skeleton_header_line(
+        target_label,
+        admitted_ranked.len(),
+        total_files,
+        total_lines,
+        total_bytes,
+        filter,
+    );
+    let mut footer_cap = if !omitted.is_empty() {
+        (budget / 4)
+            .clamp(48, 300)
+            .min(budget.saturating_sub(header.len() + base_line.len()))
+    } else {
+        0
+    };
+    let (mut omitted_summary_line, mut next_line) =
+        format_omitted_footer(&omitted, filter, inv_files, footer_cap);
+
+    loop {
+        let footer_bytes = omitted_summary_line.as_deref().map_or(0, str::len)
+            + next_line.as_deref().map_or(0, str::len);
+        let headers_and_trunc: usize = admitted_ranked
+            .iter()
+            .map(|&idx| {
+                let c = &candidates[idx];
+                c.header_line().len()
+                    + c.parse_error_line().as_deref().map_or(0, str::len)
+                    + skeleton_trunc_line(0, c.total_rows).len()
+            })
+            .sum();
+        if header.len() + base_line.len() + headers_and_trunc + footer_bytes <= budget
+            || admitted_ranked.is_empty()
+        {
+            break;
+        }
+        // Drop the lowest-priority admitted file to omitted and recompute.
+        admitted_ranked.pop();
+        omitted = build_omitted(&admitted_ranked);
+        header = skeleton_header_line(
+            target_label,
+            admitted_ranked.len(),
+            total_files,
+            total_lines,
+            total_bytes,
+            filter,
+        );
+        footer_cap = (budget / 4)
+            .clamp(48, 300)
+            .min(budget.saturating_sub(header.len() + base_line.len()));
+        (omitted_summary_line, next_line) =
+            format_omitted_footer(&omitted, filter, inv_files, footer_cap);
+    }
+
+    // Re-sort admitted files into deterministic path order for readable tree output.
+    admitted_ranked.sort_unstable();
+
+    let fixed_footer = omitted_summary_line.as_deref().map_or(0, str::len)
+        + next_line.as_deref().map_or(0, str::len);
+    // When all files are shown, reserve space for a single `Next:` hint if any file truncates.
+    let trunc_next_reserve = if omitted.is_empty() && budget >= 256 {
+        let longest_next = admitted_ranked
+            .iter()
+            .map(|&idx| {
+                format!(
+                    "Next: {inv_files} read {} --outline\n",
+                    crate::workspace::shell_text(&candidates[idx].file)
+                )
+                .len()
+            })
+            .max()
+            .unwrap_or(0);
+        longest_next.min(budget.saturating_sub(header.len() + base_line.len()) / 4)
+    } else {
+        0
+    };
+    let body_budget =
+        budget.saturating_sub(header.len() + base_line.len() + fixed_footer + trunc_next_reserve);
+
+    // For each admitted file, order rows by structural priority (when unfiltered)
+    // so tight budgets surface public types, traits, classes and functions before
+    // imports and private constants; selected rows are re-sorted back into source
+    // line order after allocation.
+    struct FillSlot {
+        candidate_idx: usize,
+        row_order: Vec<usize>,
+        cursor: usize,
+        picked: Vec<(usize, Row, String)>,
+    }
+
+    let mut slots: Vec<FillSlot> = admitted_ranked
+        .iter()
+        .map(|&idx| {
+            let c = &candidates[idx];
+            let mut order: Vec<usize> = (0..c.rows.len()).collect();
+            if filter.is_empty() {
+                order.sort_by(|&a, &b| {
+                    skeleton_row_priority(&c.rows[b])
+                        .cmp(&skeleton_row_priority(&c.rows[a]))
+                        .then_with(|| a.cmp(&b))
+                });
+            }
+            FillSlot {
+                candidate_idx: idx,
+                row_order: order,
+                cursor: 0,
+                picked: Vec::new(),
+            }
+        })
+        .collect();
+    let mut total_used: usize = slots
+        .iter()
+        .map(|slot| {
+            let c = &candidates[slot.candidate_idx];
+            c.header_line().len()
+                + c.parse_error_line().as_deref().map_or(0, str::len)
+                + skeleton_trunc_line(0, c.total_rows).len()
+        })
+        .sum();
+
+    // Fair round-robin row filling: every file gets 1 row per pass until full, limit, or budget ends.
+    loop {
+        let mut progressed = false;
+        for slot in &mut slots {
+            if per_file_limit.is_some_and(|lim| slot.picked.len() >= lim) {
+                continue;
+            }
+            let c = &candidates[slot.candidate_idx];
+            let mut skipped_structural = false;
+            while slot.cursor < slot.row_order.len() {
+                let row_idx = slot.row_order[slot.cursor];
+                let row = &c.rows[row_idx];
+                if filter.is_empty() && skipped_structural && skeleton_row_priority(row) < 2 {
+                    slot.cursor = slot.row_order.len();
+                    break;
+                }
+                let rendered = row.display();
+                let k = slot.picked.len();
+                let old_trunc = skeleton_trunc_line(k, c.total_rows).len();
+                let new_trunc = skeleton_trunc_line(k + 1, c.total_rows).len();
+                let new_total = total_used + rendered.len() + new_trunc - old_trunc;
+                slot.cursor += 1;
+                if new_total <= body_budget {
+                    slot.picked.push((row_idx, row.clone(), rendered));
+                    total_used = new_total;
+                    progressed = true;
+                    break;
+                } else if k == 0 {
+                    let max_row_bytes =
+                        (body_budget + old_trunc).saturating_sub(total_used + new_trunc);
+                    if let Some((slim, slim_str)) = clip_row_to_fit(row, max_row_bytes) {
+                        let slim_total = total_used + slim_str.len() + new_trunc - old_trunc;
+                        if slim_total <= body_budget {
+                            slot.picked.push((row_idx, slim, slim_str));
+                            total_used = slim_total;
+                            progressed = true;
+                            break;
+                        }
+                    }
+                } else if skeleton_row_priority(row) >= 2 {
+                    skipped_structural = true;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let shown: Vec<SelectedSkeletonFile> = slots
+        .into_iter()
+        .map(|mut slot| {
+            slot.picked.sort_by_key(|(row_idx, _, _)| *row_idx);
+            let contiguous_prefix = slot
+                .picked
+                .iter()
+                .enumerate()
+                .all(|(pos, (row_idx, _, _))| pos == *row_idx);
+            let mut shown_rows = Vec::with_capacity(slot.picked.len());
+            let mut rendered_rows = Vec::with_capacity(slot.picked.len());
+            for (_, row, rendered) in slot.picked {
+                shown_rows.push(row);
+                rendered_rows.push(rendered);
+            }
+            SelectedSkeletonFile {
+                candidate_idx: slot.candidate_idx,
+                shown_rows,
+                rendered_rows,
+                contiguous_prefix,
+            }
+        })
+        .collect();
+
+    // If all files were shown but at least one was truncated, suggest expanding the most-truncated file.
+    if omitted.is_empty()
+        && let Some(most_truncated) = shown
+            .iter()
+            .filter_map(|slot| {
+                let c = &candidates[slot.candidate_idx];
+                let rem = c.total_rows.saturating_sub(slot.shown_rows.len());
+                (rem > 0).then_some((rem, &c.file))
+            })
+            .max_by(|(rem_a, file_a), (rem_b, file_b)| {
+                rem_a.cmp(rem_b).then_with(|| file_b.cmp(file_a))
+            })
+    {
+        let hint = format!(
+            "Next: {inv_files} read {} --outline\n",
+            crate::workspace::shell_text(most_truncated.1)
+        );
+        if header.len() + base_line.len() + total_used + hint.len() <= budget {
+            next_line = Some(hint);
+        }
+    }
+
+    SkeletonAllocation {
+        header,
+        base_line,
+        shown,
+        omitted,
+        omitted_summary_line,
+        next_line,
+    }
+}
+
+fn format_target_label(targets: &[ReadTarget]) -> String {
+    let label_one = |target: &ReadTarget| match target {
+        ReadTarget::Dir { relative, .. } => {
+            if relative.is_empty() {
+                "./".to_owned()
+            } else {
+                format!("{relative}/")
+            }
+        }
+        ReadTarget::File(file) => file.clone(),
+    };
+    if targets.len() <= 3 {
+        targets.iter().map(label_one).collect::<Vec<_>>().join(", ")
+    } else {
+        format!(
+            "{}, {}, +{} more",
+            label_one(&targets[0]),
+            label_one(&targets[1]),
+            targets.len() - 2
+        )
+    }
+}
+
+struct SkeletonOptions<'a> {
+    budget: usize,
+    filter: &'a str,
+    limit: Option<usize>,
+    max_depth: Option<usize>,
+    json_mode: bool,
+    fresh: bool,
+    can_dedup: bool,
+}
+
+struct SkeletonOutput {
+    bytes: Vec<u8>,
+}
+
+fn build_skeleton_output(
+    ws: &Workspace,
+    targets: &[ReadTarget],
+    opts: &SkeletonOptions<'_>,
+    mut memory: Option<&mut crate::seen::Memory>,
+) -> Result<SkeletonOutput> {
+    // Collect explicit files (which must open cleanly) and discovered dir files (skip unreadable/binary).
+    let mut explicit_files = BTreeSet::new();
+    let mut all_files = BTreeSet::new();
+    for target in targets {
+        match target {
+            ReadTarget::File(file) => {
+                explicit_files.insert(file.clone());
+                all_files.insert(file.clone());
+            }
+            ReadTarget::Dir {
+                relative,
+                canonical,
+            } => {
+                for file in collect_dir_files(ws, relative, canonical, opts.max_depth)? {
+                    all_files.insert(file);
+                }
+            }
+        }
+    }
+
+    let ordered_files: Vec<String> = all_files.into_iter().collect();
+    let target_label = format_target_label(targets);
+    let (strip_prefix, emit_base_line) = match targets {
+        [ReadTarget::Dir { relative, .. }] => {
+            let prefix = (!relative.is_empty()).then(|| format!("{relative}/"));
+            (prefix, false)
+        }
+        _ => {
+            let hoisted = hoistable_read_prefix(&ordered_files);
+            let emit = !opts.json_mode && hoisted.is_some();
+            (hoisted, emit)
+        }
+    };
+    let display_rel = |file: &str| -> String {
+        strip_prefix
+            .as_deref()
+            .and_then(|base| file.strip_prefix(base))
+            .unwrap_or(file)
+            .to_owned()
+    };
+
+    // For very large unfiltered trees, prioritize structural paths for eager parsing
+    // while still counting total files and raw bytes across the entire directory.
+    let parse_set: BTreeSet<usize> =
+        if ordered_files.len() <= SKELETON_MAX_EAGER_PARSE || !opts.filter.is_empty() {
+            (0..ordered_files.len()).collect()
+        } else {
+            let mut by_hint: Vec<usize> = (0..ordered_files.len()).collect();
+            by_hint.sort_by(|&a, &b| {
+                let exp_a = explicit_files.contains(&ordered_files[a]);
+                let exp_b = explicit_files.contains(&ordered_files[b]);
+                exp_b
+                    .cmp(&exp_a)
+                    .then_with(|| {
+                        path_structural_hint(&ordered_files[b])
+                            .cmp(&path_structural_hint(&ordered_files[a]))
+                    })
+                    .then_with(|| ordered_files[a].cmp(&ordered_files[b]))
+            });
+            by_hint.into_iter().take(SKELETON_MAX_EAGER_PARSE).collect()
+        };
+
+    let mut total_files = 0usize;
+    let mut total_lines = 0usize;
+    let mut total_bytes = 0u64;
+    let mut candidates = Vec::new();
+    let mut unparsed_omitted = Vec::new();
+
+    for (idx, file) in ordered_files.iter().enumerate() {
+        if !parse_set.contains(&idx) {
+            if let Ok(path) = ws.source_path(file)
+                && let Ok(meta) = path.metadata()
+            {
+                let raw_bytes = meta.len() as usize;
+                total_files += 1;
+                total_bytes += meta.len();
+                unparsed_omitted.push(OmittedSummaryEntry {
+                    file: file.clone(),
+                    rel_path: display_rel(file),
+                    lines: 0,
+                    raw_bytes,
+                    total_entries: 0,
+                    priority: (path_structural_hint(file), 0, 0),
+                });
+            }
+            continue;
+        }
+        let mut source = match Snapshot::open(ws, file) {
+            Ok(snap) => snap,
+            Err(err) if explicit_files.contains(file) => return Err(err),
+            Err(_) => continue,
+        };
+        let raw_bytes = source.text.len();
+        let lines = source.line_count();
+        let digest = crate::capture::source_digest(source.text.as_bytes());
+        total_files += 1;
+        total_lines += lines;
+        total_bytes += raw_bytes as u64;
+        source.index(file)?;
+        let rows = source.skeleton_rows(opts.filter);
+        let total_rows = rows.len();
+        if !opts.filter.is_empty() && rows.is_empty() {
+            continue;
+        }
+        let rel_path = display_rel(file);
+        let priority = structural_priority(&rel_path, &source, &rows);
+        candidates.push(SkeletonCandidate {
+            file: file.clone(),
+            rel_path,
+            revision: source.revision,
+            digest,
+            lines,
+            raw_bytes,
+            parse_error: source.parse_error,
+            rows,
+            total_rows,
+            priority,
+        });
+    }
+
+    let inv_files = ws.invocation().files;
+    let base_line = if emit_base_line {
+        strip_prefix
+            .as_deref()
+            .map_or_else(String::new, |base| format!("base: {base}\n"))
+    } else {
+        String::new()
+    };
+    let allocation = allocate_skeleton(
+        &candidates,
+        &unparsed_omitted,
+        &target_label,
+        base_line,
+        total_files,
+        total_lines,
+        total_bytes,
+        opts.filter,
+        opts.limit,
+        opts.budget,
+        &inv_files,
+    );
+
+    if opts.json_mode {
+        let mut json_files = Vec::with_capacity(allocation.shown.len());
+        for slot in &allocation.shown {
+            let c = &candidates[slot.candidate_idx];
+            let omitted_entries = c.total_rows.saturating_sub(slot.shown_rows.len());
+            let truncated = omitted_entries > 0;
+            let next = if truncated && slot.contiguous_prefix {
+                slot.shown_rows
+                    .last()
+                    .map(|row| format!("{}#{}", c.revision, row.end_id.unwrap_or(row.id)))
+            } else {
+                None
+            };
+            let mut obj = serde_json::Map::new();
+            obj.insert("file".into(), serde_json::Value::String(c.file.clone()));
+            obj.insert(
+                "rel_path".into(),
+                serde_json::Value::String(c.rel_path.clone()),
+            );
+            obj.insert(
+                "revision".into(),
+                serde_json::Value::String(c.revision.clone()),
+            );
+            obj.insert("lines".into(), serde_json::json!(c.lines));
+            obj.insert("bytes".into(), serde_json::json!(c.raw_bytes));
+            obj.insert("total_entries".into(), serde_json::json!(c.total_rows));
+            if let Some(err) = &c.parse_error {
+                obj.insert(
+                    "parse_error".into(),
+                    serde_json::Value::String(clipped(err, 240)),
+                );
+            }
+            obj.insert("entries".into(), serde_json::to_value(&slot.shown_rows)?);
+            obj.insert("truncated".into(), serde_json::json!(truncated));
+            obj.insert("omitted_entries".into(), serde_json::json!(omitted_entries));
+            obj.insert("next".into(), serde_json::to_value(next)?);
+            let value = serde_json::Value::Object(obj);
+            let shown_bytes = serde_json::to_vec(&value)?.len() as u64;
+            crate::history::saw_outline_measured(
+                ws,
+                &c.file,
+                c.digest.clone(),
+                c.raw_bytes as u64,
+                shown_bytes,
+            );
+            json_files.push(value);
+        }
+        let json_omitted: Vec<serde_json::Value> = allocation
+            .omitted
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "file": entry.file,
+                    "rel_path": entry.rel_path,
+                    "lines": entry.lines,
+                    "bytes": entry.raw_bytes,
+                    "total_entries": entry.total_entries,
+                })
+            })
+            .collect();
+        let target_names: Vec<String> = targets
+            .iter()
+            .map(|t| match t {
+                ReadTarget::Dir { relative, .. } => {
+                    if relative.is_empty() {
+                        "./".to_owned()
+                    } else {
+                        format!("{relative}/")
+                    }
+                }
+                ReadTarget::File(file) => file.clone(),
+            })
+            .collect();
+        let mut root = serde_json::Map::new();
+        root.insert("mode".into(), serde_json::json!("skeleton"));
+        root.insert("targets".into(), serde_json::json!(target_names));
+        if let Some(base) = &strip_prefix {
+            root.insert("base".into(), serde_json::json!(base));
+        }
+        root.insert("budget".into(), serde_json::json!(opts.budget));
+        root.insert("shown_files".into(), serde_json::json!(json_files.len()));
+        root.insert("total_files".into(), serde_json::json!(total_files));
+        root.insert("total_lines".into(), serde_json::json!(total_lines));
+        root.insert("total_bytes".into(), serde_json::json!(total_bytes));
+        if !opts.filter.is_empty() {
+            root.insert("match".into(), serde_json::json!(opts.filter));
+        }
+        if let Some(depth) = opts.max_depth {
+            root.insert("depth".into(), serde_json::json!(depth));
+        }
+        root.insert("files".into(), serde_json::Value::Array(json_files));
+        root.insert(
+            "omitted_files".into(),
+            serde_json::Value::Array(json_omitted),
+        );
+        let bytes = serde_json::to_vec(&serde_json::Value::Object(root))?;
+        return Ok(SkeletonOutput { bytes });
+    }
+
+    // Text rendering with strict `<= budget` enforcement and optional session dedup.
+    let mut out = String::new();
+    if allocation.header.len() <= opts.budget {
+        out.push_str(&allocation.header);
+    } else {
+        out.push_str(&clipped(
+            allocation.header.trim_end_matches('\n'),
+            opts.budget.saturating_sub(1),
+        ));
+        if out.len() < opts.budget {
+            out.push('\n');
+        }
+    }
+    if !allocation.base_line.is_empty() && out.len() + allocation.base_line.len() <= opts.budget {
+        out.push_str(&allocation.base_line);
+    }
+    if candidates.is_empty() && !opts.filter.is_empty() && total_files > 0 {
+        let none = "no matching entries\n";
+        if out.len() + none.len() <= opts.budget {
+            out.push_str(none);
+        }
+    }
+
+    for slot in &allocation.shown {
+        let c = &candidates[slot.candidate_idx];
+        let mut section = c.header_line();
+        if let Some(err) = c.parse_error_line() {
+            section.push_str(&err);
+        }
+        for row_str in &slot.rendered_rows {
+            section.push_str(row_str);
+        }
+        let complete = slot.shown_rows.len() == c.total_rows && c.parse_error.is_none();
+        if !complete {
+            section.push_str(&skeleton_trunc_line(slot.shown_rows.len(), c.total_rows));
+        }
+        let deduped = if opts.can_dedup
+            && complete
+            && let Some(mem) = memory.as_deref_mut()
+        {
+            let full_hint = format!(
+                "full outline: {inv_files} read {} --outline --fresh",
+                crate::workspace::shell_text(&c.file)
+            );
+            mem.saw_outline(&c.file, &c.revision, &section, opts.fresh, &full_hint)
+        } else {
+            None
+        };
+        let emitted = match deduped {
+            Some(notice) if notice.len() <= section.len() => notice,
+            _ => {
+                crate::history::saw_outline_measured(
+                    ws,
+                    &c.file,
+                    c.digest.clone(),
+                    c.raw_bytes as u64,
+                    section.len() as u64,
+                );
+                section
+            }
+        };
+        if out.len() + emitted.len() <= opts.budget {
+            out.push_str(&emitted);
+        }
+    }
+    if let Some(summary) = &allocation.omitted_summary_line
+        && out.len() + summary.len() <= opts.budget
+    {
+        out.push_str(summary);
+    }
+    if let Some(next) = &allocation.next_line
+        && out.len() + next.len() <= opts.budget
+    {
+        out.push_str(next);
+    }
+
+    Ok(SkeletonOutput {
+        bytes: out.into_bytes(),
+    })
+}
+
+fn read_skeleton(ws: &Workspace, targets: &[ReadTarget], args: &ArgMatches) -> Result<()> {
+    ensure!(
+        args.value_of("shell-range").is_none(),
+        "--shell-range applies to a single file"
+    );
+    ensure!(
+        args.value_of("after").is_none(),
+        "--after applies to a single file"
+    );
+    let budget = if args.is_present("budget") {
+        crate::context_budget(ws, args)?
+    } else {
+        let settings = ws.settings()?;
+        settings.max_output_bytes.max(settings.context_budget)
+    };
+    let filter = args.value_of("match").unwrap_or("");
+    let limit = if args.occurrences_of("limit") > 0 {
+        Some(crate::read_num(args, "limit", 1)?)
+    } else {
+        None
+    };
+    let max_depth = if args.is_present("depth") {
+        Some(crate::read_num(args, "depth", 1)?)
+    } else {
+        None
+    };
+    let json_mode = args.is_present("json");
+    let fresh = args.is_present("fresh");
+    let mut memory = crate::seen::Memory::open(ws, args.value_of("session"), fresh);
+    let can_dedup = !json_mode
+        && filter.is_empty()
+        && args.occurrences_of("limit") == 0
+        && args.occurrences_of("budget") == 0;
+    let opts = SkeletonOptions {
+        budget,
+        filter,
+        limit,
+        max_depth,
+        json_mode,
+        fresh,
+        can_dedup,
+    };
+    let output = build_skeleton_output(ws, targets, &opts, memory.as_mut())?;
+    io::stdout().lock().write_all(&output.bytes)?;
     if let Some(mem) = memory {
         mem.save(ws);
     }
@@ -2020,38 +3607,55 @@ fn run_expand(ws: &Workspace, raw: &[&str], args: &ArgMatches, root_given: bool)
 }
 
 pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> Result<()> {
-    if name == "read" {
-        let files: Vec<&str> = args.values_of("file").unwrap().collect();
-        if files.len() > 1 {
-            return read_many(ws, &files, args, root_given);
-        }
-    }
     if name == "expand" {
         let raw: Vec<&str> = args.values_of("file").unwrap().collect();
         return run_expand(ws, &raw, args, root_given);
     }
-    let argument = args.value_of("file").unwrap();
-    if name == "read"
-        && let Some(range) = args.value_of("shell-range")
-    {
-        // The hook passes the already resolved, workspace-relative file, or the
-        // `git show` object name with the blob it resolved to.
-        return crate::shellread::read(
-            ws,
-            argument,
-            args.value_of("shell-object"),
-            (
-                range,
-                args.value_of("shell-numbered")
-                    .map(|numbering| match numbering {
-                        "cat" => crate::shellread::Numbering::Cat,
-                        _ => crate::shellread::Numbering::Nl,
-                    }),
-            ),
-            args.value_of("shell-session").unwrap_or("terminal"),
-        );
-    }
-    let file = &workspace_file(ws, argument, root_given)?;
+    let resolved_single_file = if name == "read" {
+        if let Some(range) = args.value_of("shell-range") {
+            let files: Vec<&str> = args.values_of("file").unwrap().collect();
+            ensure!(files.len() == 1, "--shell-range applies to a single file");
+            // The hook passes the already resolved, workspace-relative file, or the
+            // `git show` object name with the blob it resolved to.
+            return crate::shellread::read(
+                ws,
+                files[0],
+                args.value_of("shell-object"),
+                (
+                    range,
+                    args.value_of("shell-numbered")
+                        .map(|numbering| match numbering {
+                            "cat" => crate::shellread::Numbering::Cat,
+                            _ => crate::shellread::Numbering::Nl,
+                        }),
+                ),
+                args.value_of("shell-session").unwrap_or("terminal"),
+            );
+        }
+        let raw_paths: Vec<&str> = args.values_of("file").unwrap().collect();
+        let targets: Vec<ReadTarget> = raw_paths
+            .iter()
+            .map(|raw| resolve_read_target(ws, raw, root_given))
+            .collect::<Result<_>>()?;
+        if targets.iter().any(|t| matches!(t, ReadTarget::Dir { .. })) {
+            return read_skeleton(ws, &targets, args);
+        }
+        let files: Vec<String> = targets
+            .into_iter()
+            .map(|t| match t {
+                ReadTarget::File(file) => file,
+                ReadTarget::Dir { .. } => unreachable!(),
+            })
+            .collect();
+        if files.len() > 1 {
+            return read_many_resolved(ws, &files, args);
+        }
+        files.into_iter().next().unwrap()
+    } else {
+        let argument = args.value_of("file").unwrap();
+        workspace_file(ws, argument, root_given)?
+    };
+    let file = resolved_single_file.as_str();
     let mut source = Snapshot::open(ws, file)?;
     if name == "read" {
         let budget = crate::context_budget(ws, args)?;
@@ -3195,5 +4799,808 @@ mod tests {
             None,
             "only 1 common directory segment (`packages/`)"
         );
+    }
+
+    fn test_workspace(root: &Path) -> Workspace {
+        Workspace::discover(Some(root)).expect("discover temp workspace")
+    }
+
+    fn default_skeleton_opts(budget: usize) -> SkeletonOptions<'static> {
+        SkeletonOptions {
+            budget,
+            filter: "",
+            limit: None,
+            max_depth: None,
+            json_mode: false,
+            fresh: false,
+            can_dedup: false,
+        }
+    }
+
+    fn extract_file_revision(skeleton: &str, rel_path: &str) -> String {
+        let marker = format!("=== {rel_path} (");
+        let line = skeleton
+            .lines()
+            .find(|line| line.starts_with(&marker))
+            .unwrap_or_else(|| panic!("missing header for {rel_path} in:\n{skeleton}"));
+        line.split(" · rev ")
+            .nth(1)
+            .and_then(|rest| rest.strip_suffix(" ==="))
+            .unwrap_or_else(|| panic!("missing rev in header: {line}"))
+            .to_owned()
+    }
+
+    fn extract_row_id(skeleton: &str, rel_path: &str, needle: &str) -> usize {
+        let marker = format!("=== {rel_path} (");
+        let mut in_section = false;
+        for line in skeleton.lines() {
+            if line.starts_with("=== ") {
+                in_section = line.starts_with(&marker);
+                continue;
+            }
+            if in_section && line.contains(needle) {
+                let rest = line.strip_prefix('#').expect("row starts with #");
+                let digits = rest
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .expect("row digits");
+                return digits.parse::<usize>().expect("numeric row id");
+            }
+        }
+        panic!("missing row `{needle}` under `{rel_path}` in:\n{skeleton}");
+    }
+
+    #[test]
+    fn directory_skeleton_multilang_compression_and_expand_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        fs::create_dir_all(pkg.join("rust")).unwrap();
+        fs::create_dir_all(pkg.join("web")).unwrap();
+        fs::create_dir_all(pkg.join("docs")).unwrap();
+
+        // Rich Rust module (~9 KB): imports, constants, public types/traits/fns, and inline test module.
+        let mut rust_src = String::from(concat!(
+            "use std::collections::BTreeMap;\n",
+            "use std::collections::HashSet;\n",
+            "use std::fmt;\n",
+            "use std::path::PathBuf;\n\n",
+            "const C1: usize = 1;\n",
+            "const C2: usize = 2;\n",
+            "const C3: usize = 3;\n",
+            "const C4: usize = 4;\n",
+            "const C5: usize = 5;\n\n",
+            "pub struct BillingLedger {\n",
+            "    entries: BTreeMap<String, i64>,\n",
+            "    seen: HashSet<String>,\n",
+            "    root: PathBuf,\n",
+            "}\n\n",
+            "pub trait Pricer {\n",
+            "    fn quote(&self, sku: &str, qty: u32) -> i64;\n",
+            "}\n\n",
+            "pub enum InvoiceStatus {\n",
+            "    Draft,\n",
+            "    Issued,\n",
+            "    Paid,\n",
+            "}\n\n",
+            "impl BillingLedger {\n",
+            "    pub fn record_charge(&mut self, account: &str, cents: i64) -> Result<i64, fmt::Error> {\n",
+        ));
+        for i in 0..40 {
+            rust_src.push_str(&format!(
+                "        let step_{i} = cents.saturating_add({i} * 17) ^ 0x55;\n"
+            ));
+        }
+        rust_src.push_str(concat!(
+            "        let total = self.entries.entry(account.to_owned()).or_insert(0);\n",
+            "        *total += cents + step_39 - step_39;\n",
+            "        self.seen.insert(account.to_owned());\n",
+            "        Ok(*total)\n",
+            "    }\n\n",
+            "    pub fn balance(&self, account: &str) -> i64 {\n",
+        ));
+        for i in 0..35 {
+            rust_src.push_str(&format!(
+                "        let _check_{i} = account.len().saturating_add({i});\n"
+            ));
+        }
+        rust_src.push_str(concat!(
+            "        self.entries.get(account).copied().unwrap_or_default()\n",
+            "    }\n",
+            "}\n\n",
+            "pub fn reconcile_batch(items: &[(&str, i64)], root: PathBuf) -> BillingLedger {\n",
+        ));
+        for i in 0..35 {
+            rust_src.push_str(&format!(
+                "    let _audit_{i} = items.len().wrapping_mul({i} + 1);\n"
+            ));
+        }
+        rust_src.push_str(concat!(
+            "    let mut ledger = BillingLedger { entries: BTreeMap::new(), seen: HashSet::new(), root };\n",
+            "    for &(acct, cents) in items {\n",
+            "        let _ = ledger.record_charge(acct, cents);\n",
+            "    }\n",
+            "    ledger\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n",
+            "    #[test]\n",
+            "    fn test_reconcile() {\n",
+            "        let _ = reconcile_batch(&[(\"a\", 100)], PathBuf::new());\n",
+            "    }\n",
+            "    #[test]\n",
+            "    fn test_balance() {\n",
+            "        let _ = reconcile_batch(&[], PathBuf::new()).balance(\"a\");\n",
+            "    }\n",
+            "}\n",
+        ));
+
+        // Rich TypeScript module (~7 KB): imports, exported interface/class/async function.
+        let mut ts_src = String::from(concat!(
+            "import { formatCurrency } from './currency';\n",
+            "import { fetchJson } from './http';\n",
+            "import { AuditLogger } from './audit';\n",
+            "import type { TenantId } from './tenant';\n\n",
+            "export interface CheckoutQuote {\n",
+            "  subtotalCents: number;\n",
+            "  taxCents: number;\n",
+            "  totalCents: number;\n",
+            "}\n\n",
+            "export class CheckoutClient {\n",
+            "  async submitOrder(tenant: TenantId, sku: string, qty: number): Promise<CheckoutQuote> {\n",
+        ));
+        for i in 0..45 {
+            ts_src.push_str(&format!(
+                "    const traceStep{i} = `${{tenant}}:${{sku}}:${{qty + {i}}}`;\n"
+            ));
+        }
+        ts_src.push_str(concat!(
+            "    return { subtotalCents: qty * 100, taxCents: qty * 8, totalCents: qty * 108 };\n",
+            "  }\n",
+            "}\n\n",
+            "export async function fetchInvoiceSummary(id: string): Promise<string> {\n",
+        ));
+        for i in 0..45 {
+            ts_src.push_str(&format!(
+                "  const payloadChunk{i} = `chunk-{i}-${{id}}`.trim().toLowerCase();\n"
+            ));
+        }
+        ts_src.push_str("  return `invoice:${id}`;\n}\n");
+
+        // Rich Markdown runbook (~4 KB): headings + long prose + fenced code blocks.
+        let mut md_src = String::from("# Billing Architecture\n\n");
+        for i in 0..20 {
+            md_src.push_str(&format!(
+                "Paragraph {i}: Every billing write flows through idempotent ledger batches with strict currency validation and replay safety.\n\n"
+            ));
+        }
+        md_src.push_str("## Reconciliation Pipeline\n\n");
+        for i in 0..18 {
+            md_src.push_str(&format!(
+                "Stage {i}: Verify settled charges against checkout quotes and emit structured audit records to cold storage.\n\n"
+            ));
+        }
+        md_src.push_str("## Failure Recovery\n\nReplay dead-letter batches via the CLI.\n");
+
+        fs::write(pkg.join("rust/ledger.rs"), &rust_src).unwrap();
+        fs::write(pkg.join("web/checkout.ts"), &ts_src).unwrap();
+        fs::write(pkg.join("docs/guide.md"), &md_src).unwrap();
+        let raw_total = rust_src.len() + ts_src.len() + md_src.len();
+
+        let ws = test_workspace(dir.path());
+        let target = resolve_read_target(&ws, "pkg", false).unwrap();
+        assert!(matches!(target, ReadTarget::Dir { ref relative, .. } if relative == "pkg"));
+
+        let output =
+            build_skeleton_output(&ws, &[target], &default_skeleton_opts(4096), None).unwrap();
+        let skeleton = String::from_utf8(output.bytes).unwrap();
+
+        // Header + 75-95% byte reduction.
+        assert!(
+            skeleton.starts_with("skeleton pkg/ · 3/3 files · "),
+            "{skeleton}"
+        );
+        let reduction = 1.0 - (skeleton.len() as f64 / raw_total as f64);
+        assert!(
+            reduction >= 0.75,
+            "expected >= 75% reduction, got {:.1}% ({} B vs {} B raw):\n{skeleton}",
+            reduction * 100.0,
+            skeleton.len(),
+            raw_total
+        );
+        assert!(skeleton.len() <= 4096);
+
+        // 100% of exported types, traits, classes, interfaces, function signatures & headings preserved.
+        for expected in [
+            "=== docs/guide.md (",
+            "h1 Billing Architecture",
+            "h2 Reconciliation Pipeline",
+            "h2 Failure Recovery",
+            "=== rust/ledger.rs (",
+            "imports (4 items)",
+            "constants (5 items)",
+            "struct BillingLedger  pub struct BillingLedger",
+            "trait Pricer  pub trait Pricer",
+            "enum InvoiceStatus  pub enum InvoiceStatus",
+            "method BillingLedger::record_charge  pub fn record_charge(&mut self, account: &str, cents: i64) -> Result<i64, fmt::Error>",
+            "method BillingLedger::balance  pub fn balance(&self, account: &str) -> i64",
+            "function reconcile_batch  pub fn reconcile_batch(items: &[(&str, i64)], root: PathBuf) -> BillingLedger",
+            "module tests  (3 inner)",
+            "=== web/checkout.ts (",
+            "interface CheckoutQuote  export",
+            "class CheckoutClient  export",
+            "method CheckoutClient::submitOrder  async submitOrder(tenant: TenantId, sku: string, qty: number): Promise<CheckoutQuote>",
+            "function fetchInvoiceSummary  export async (id: string): Promise<string>",
+        ] {
+            assert!(
+                skeleton.contains(expected),
+                "missing `{expected}` in:\n{skeleton}"
+            );
+        }
+        // Function bodies must NOT appear in the skeleton.
+        assert!(!skeleton.contains("step_39"), "{skeleton}");
+        assert!(!skeleton.contains("payloadChunk44"), "{skeleton}");
+
+        // Exact `REV#N` round-trip expandability on both Rust and TypeScript files.
+        let rust_rev = extract_file_revision(&skeleton, "rust/ledger.rs");
+        let rust_fn_id = extract_row_id(&skeleton, "rust/ledger.rs", "function reconcile_batch");
+        let mut rust_snap = Snapshot::open(&ws, "pkg/rust/ledger.rs").unwrap();
+        rust_snap.index("pkg/rust/ledger.rs").unwrap();
+        let rust_span = rust_snap
+            .resolve(&format!("{rust_rev}#{rust_fn_id}"), None, true)
+            .unwrap();
+        assert!(
+            rust_snap.text[rust_span.clone()].starts_with("pub fn reconcile_batch("),
+            "unexpected expanded Rust span: {}",
+            &rust_snap.text[rust_span]
+        );
+        assert!(rust_snap.text[rust_span].contains("_audit_34"));
+
+        let ts_rev = extract_file_revision(&skeleton, "web/checkout.ts");
+        let ts_fn_id = extract_row_id(&skeleton, "web/checkout.ts", "function fetchInvoiceSummary");
+        let mut ts_snap = Snapshot::open(&ws, "pkg/web/checkout.ts").unwrap();
+        ts_snap.index("pkg/web/checkout.ts").unwrap();
+        let ts_span = ts_snap
+            .resolve(&format!("{ts_rev}#{ts_fn_id}"), None, true)
+            .unwrap();
+        assert!(
+            ts_snap.text[ts_span.clone()].starts_with("export async function fetchInvoiceSummary("),
+            "unexpected expanded TS span: {}",
+            &ts_snap.text[ts_span]
+        );
+        assert!(ts_snap.text[ts_span].contains("payloadChunk44"));
+    }
+
+    #[test]
+    fn directory_skeleton_match_filters_across_files_and_supports_or_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("billing.rs"),
+            concat!(
+                "pub struct Invoice {\n    pub total: u64,\n}\n",
+                "pub fn issue_invoice() -> Invoice {\n    Invoice { total: 0 }\n}\n",
+                "#[cfg(test)]\nmod tests {\n    fn test_billing_edge() {}\n}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            app.join("schema.sql"),
+            "CREATE TABLE purchase_orders (\n  order_id INTEGER PRIMARY KEY\n);\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join("unrelated.ts"),
+            "export function greet(name: string): string {\n  return name;\n}\n",
+        )
+        .unwrap();
+
+        let ws = test_workspace(dir.path());
+        let target = resolve_read_target(&ws, "app", false).unwrap();
+
+        let opts = SkeletonOptions {
+            filter: "Invoice|purchase_orders",
+            ..default_skeleton_opts(4096)
+        };
+        let out = String::from_utf8(
+            build_skeleton_output(&ws, std::slice::from_ref(&target), &opts, None)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("skeleton app/ · 2/3 files · ")
+                && out.contains("match \"Invoice|purchase_orders\""),
+            "{out}"
+        );
+        assert!(out.contains("=== billing.rs ("), "{out}");
+        assert!(out.contains("struct Invoice"), "{out}");
+        assert!(out.contains("function issue_invoice"), "{out}");
+        assert!(out.contains("=== schema.sql ("), "{out}");
+        assert!(out.contains("table purchase_orders"), "{out}");
+        assert!(
+            !out.contains("unrelated.ts"),
+            "non-matching file should be omitted:\n{out}"
+        );
+
+        // `--match` does not fold `mod tests`, so matching test functions are still discoverable.
+        let test_opts = SkeletonOptions {
+            filter: "test_billing_edge",
+            ..default_skeleton_opts(4096)
+        };
+        let test_out = String::from_utf8(
+            build_skeleton_output(&ws, std::slice::from_ref(&target), &test_opts, None)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(
+            test_out.contains("function tests::test_billing_edge"),
+            "{test_out}"
+        );
+
+        // Zero matches yields a clean empty skeleton message.
+        let miss_opts = SkeletonOptions {
+            filter: "definitely_missing_xyz",
+            ..default_skeleton_opts(4096)
+        };
+        let miss_out = String::from_utf8(
+            build_skeleton_output(&ws, &[target], &miss_opts, None)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(
+            miss_out.starts_with("skeleton app/ · 0/3 files"),
+            "{miss_out}"
+        );
+        assert!(miss_out.contains("no matching entries"), "{miss_out}");
+    }
+
+    #[test]
+    fn directory_skeleton_strict_budget_fair_allocation_and_remaining_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("modules");
+        fs::create_dir_all(&repo).unwrap();
+
+        // 1 huge file with 45 public structs/functions.
+        let mut giant = String::from("use std::io;\nuse std::fs;\nuse std::path::Path;\n\n");
+        for i in 0..45 {
+            giant.push_str(&format!(
+                "pub struct GiantRecord{i} {{\n    pub id: u64,\n}}\npub fn process_giant_{i}(x: u64) -> u64 {{\n    x + {i}\n}}\n\n"
+            ));
+        }
+        fs::write(repo.join("00_giant.rs"), &giant).unwrap();
+
+        // 24 structured Rust/TS modules.
+        for i in 1..=14 {
+            fs::write(
+                repo.join(format!("mod_{i:02}.rs")),
+                format!(
+                    "pub struct Service{i} {{\n    pub port: u16,\n}}\npub fn start_service_{i}(port: u16) -> Service{i} {{\n    Service{i} {{ port }}\n}}\npub fn stop_service_{i}(svc: Service{i}) {{\n    let _ = svc.port;\n}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        for i in 15..=24 {
+            fs::write(
+                repo.join(format!("view_{i:02}.ts")),
+                format!(
+                    "export interface Panel{i} {{\n  title: string;\n}}\nexport function renderPanel{i}(p: Panel{i}): string {{\n  return p.title;\n}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        // 5 unstructured plain text files (lowest structural priority).
+        for i in 1..=5 {
+            fs::write(
+                repo.join(format!("notes_{i:02}.txt")),
+                format!("plain note line {i}\nanother line\n"),
+            )
+            .unwrap();
+        }
+
+        let ws = test_workspace(dir.path());
+        let target = resolve_read_target(&ws, "modules", false).unwrap();
+
+        // Strict budget enforcement across multiple ceilings.
+        for budget in [4096usize, 2048, 1024, 512] {
+            let out = String::from_utf8(
+                build_skeleton_output(
+                    &ws,
+                    std::slice::from_ref(&target),
+                    &default_skeleton_opts(budget),
+                    None,
+                )
+                .unwrap()
+                .bytes,
+            )
+            .unwrap();
+            assert!(
+                out.len() <= budget,
+                "budget {budget} exceeded: got {} bytes:\n{out}",
+                out.len()
+            );
+            let shown_headers = out.lines().filter(|l| l.starts_with("=== ")).count();
+            assert!(
+                shown_headers >= 2,
+                "budget {budget}: giant file must not starve other files (only {shown_headers} shown):\n{out}"
+            );
+            assert!(
+                out.contains("more file"),
+                "budget {budget}: expected remaining-files summary:\n{out}"
+            );
+            if budget >= 1024 {
+                assert!(
+                    out.contains("Next: "),
+                    "budget {budget}: expected Next hint:\n{out}"
+                );
+                assert!(
+                    out.contains("read ") && out.contains("--outline"),
+                    "budget {budget}: expected `read <file> --outline` hint:\n{out}"
+                );
+            }
+            // At 4 KB, plain text notes are ranked below all 25 code modules so they stay omitted.
+            if budget == 4096 {
+                assert!(
+                    !out.contains("=== notes_01.txt"),
+                    "code modules should take priority over plain .txt files:\n{out}"
+                );
+                assert!(
+                    shown_headers >= 10,
+                    "expected fair coverage of >= 10 files at 4 KB, got {shown_headers}:\n{out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_skeleton_rejects_outside_workspace_and_skips_ignored_binary_lockfiles() {
+        let outer = tempfile::tempdir().unwrap();
+        let outside_dir = outer.path().join("outside");
+        let ws_root = outer.path().join("repo");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("secret.rs"), "pub fn secret() {}\n").unwrap();
+
+        fs::create_dir_all(ws_root.join("src/nested/deep")).unwrap();
+        fs::create_dir_all(ws_root.join("src/.git")).unwrap();
+        fs::create_dir_all(ws_root.join("src/.justless")).unwrap();
+        fs::create_dir_all(ws_root.join("src/target")).unwrap();
+        fs::create_dir_all(ws_root.join("src/node_modules/pkg")).unwrap();
+
+        fs::write(
+            ws_root.join(".gitignore"),
+            "ignored_by_git.rs\ngenerated/\n",
+        )
+        .unwrap();
+        fs::write(ws_root.join(".justlessignore"), "ignored_by_jl.rs\n").unwrap();
+        fs::create_dir_all(ws_root.join("src/generated")).unwrap();
+
+        // Included files.
+        fs::write(
+            ws_root.join("src/top.rs"),
+            "pub fn top_entry() -> usize {\n    1\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            ws_root.join("src/nested/mid.rs"),
+            "pub fn mid_entry() -> usize {\n    2\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            ws_root.join("src/nested/deep/leaf.rs"),
+            "pub fn leaf_entry() -> usize {\n    3\n}\n",
+        )
+        .unwrap();
+
+        // Excluded / ignored / lockfile / binary files.
+        fs::write(ws_root.join("src/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(ws_root.join("src/.justless/index.json"), "{}\n").unwrap();
+        fs::write(ws_root.join("src/target/built.rs"), "pub fn built() {}\n").unwrap();
+        fs::write(
+            ws_root.join("src/node_modules/pkg/index.js"),
+            "export function dep() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            ws_root.join("src/ignored_by_git.rs"),
+            "pub fn git_ignored() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            ws_root.join("src/generated/gen.rs"),
+            "pub fn generated() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            ws_root.join("src/ignored_by_jl.rs"),
+            "pub fn jl_ignored() {}\n",
+        )
+        .unwrap();
+        fs::write(ws_root.join("src/Cargo.lock"), "# lockfile\nversion = 3\n").unwrap();
+        fs::write(
+            ws_root.join("src/package-lock.json"),
+            "{\"lockfileVersion\":3}\n",
+        )
+        .unwrap();
+        fs::write(ws_root.join("src/blob.bin"), b"\x00\x01\x02PNG\x00binary").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside_dir, ws_root.join("escape_link")).unwrap();
+        }
+
+        let ws = test_workspace(&ws_root);
+
+        // Reject directories outside the workspace.
+        assert!(
+            resolve_read_target(&ws, "../outside", false)
+                .unwrap_err()
+                .to_string()
+                .contains("outside the workspace")
+        );
+        assert!(
+            resolve_read_target(&ws, "..", false)
+                .unwrap_err()
+                .to_string()
+                .contains("outside the workspace")
+        );
+        assert!(
+            resolve_read_target(&ws, outside_dir.to_str().unwrap(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("outside the workspace")
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                resolve_read_target(&ws, "escape_link", false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("outside the workspace")
+            );
+        }
+
+        // Recursive walk includes only valid workspace source files.
+        let src_target = resolve_read_target(&ws, "src", false).unwrap();
+        let out = String::from_utf8(
+            build_skeleton_output(
+                &ws,
+                std::slice::from_ref(&src_target),
+                &default_skeleton_opts(4096),
+                None,
+            )
+            .unwrap()
+            .bytes,
+        )
+        .unwrap();
+        assert!(out.starts_with("skeleton src/ · 3/3 files"), "{out}");
+        assert!(out.contains("top_entry"), "{out}");
+        assert!(out.contains("mid_entry"), "{out}");
+        assert!(out.contains("leaf_entry"), "{out}");
+        for forbidden in [
+            "HEAD",
+            "index.json",
+            "built.rs",
+            "node_modules",
+            "ignored_by_git",
+            "generated",
+            "ignored_by_jl",
+            "Cargo.lock",
+            "package-lock.json",
+            "blob.bin",
+            "secret",
+        ] {
+            assert!(
+                !out.contains(forbidden),
+                "excluded item `{forbidden}` leaked into skeleton:\n{out}"
+            );
+        }
+
+        // `--depth 1` restricts walk to direct children only.
+        let depth1_opts = SkeletonOptions {
+            max_depth: Some(1),
+            ..default_skeleton_opts(4096)
+        };
+        let depth1_out = String::from_utf8(
+            build_skeleton_output(&ws, &[src_target], &depth1_opts, None)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(
+            depth1_out.starts_with("skeleton src/ · 1/1 files"),
+            "{depth1_out}"
+        );
+        assert!(depth1_out.contains("top_entry"), "{depth1_out}");
+        assert!(!depth1_out.contains("mid_entry"), "{depth1_out}");
+        assert!(!depth1_out.contains("leaf_entry"), "{depth1_out}");
+    }
+
+    #[test]
+    fn directory_skeleton_json_mixed_targets_base_hoisting_and_session_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("packages/core/api")).unwrap();
+        fs::create_dir_all(dir.path().join("packages/core/db")).unwrap();
+        fs::write(
+            dir.path().join("packages/core/api/routes.ts"),
+            "export function handleHealth(): string {\n  return 'ok';\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("packages/core/db/pool.rs"),
+            concat!(
+                "pub struct Pool {\n    pub size: usize,\n}\n",
+                "pub fn connect(size: usize) -> Pool {\n    Pool { size }\n}\n",
+                "pub fn acquire(pool: &Pool) -> usize {\n    pool.size\n}\n",
+                "pub fn release(pool: &Pool, slot: usize) -> usize {\n    pool.size + slot\n}\n",
+                "pub fn health_check(pool: &Pool) -> bool {\n    pool.size > 0\n}\n",
+                "pub fn drain(pool: &mut Pool) {\n    pool.size = 0;\n}\n",
+                "pub fn resize(pool: &mut Pool, next: usize) {\n    pool.size = next;\n}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("README.md"),
+            "# Core Package\n\nOverview text.\n",
+        )
+        .unwrap();
+
+        let ws = test_workspace(dir.path());
+
+        // 1. Multi-dir with common deep prefix hoists `base: packages/core/`.
+        let api_dir = resolve_read_target(&ws, "packages/core/api", false).unwrap();
+        let db_dir = resolve_read_target(&ws, "packages/core/db", false).unwrap();
+        let multi_out = String::from_utf8(
+            build_skeleton_output(
+                &ws,
+                &[api_dir.clone(), db_dir.clone()],
+                &default_skeleton_opts(4096),
+                None,
+            )
+            .unwrap()
+            .bytes,
+        )
+        .unwrap();
+        assert!(multi_out.contains("base: packages/core/\n"), "{multi_out}");
+        assert!(multi_out.contains("=== api/routes.ts ("), "{multi_out}");
+        assert!(multi_out.contains("=== db/pool.rs ("), "{multi_out}");
+
+        // 2. Mixed DIR + FILE deduplicates overlapping files and includes standalone file.
+        let dup_file = resolve_read_target(&ws, "packages/core/db/pool.rs", false).unwrap();
+        let readme_file = resolve_read_target(&ws, "README.md", false).unwrap();
+        let mixed_out = String::from_utf8(
+            build_skeleton_output(
+                &ws,
+                &[db_dir.clone(), dup_file, readme_file],
+                &default_skeleton_opts(4096),
+                None,
+            )
+            .unwrap()
+            .bytes,
+        )
+        .unwrap();
+        assert!(
+            mixed_out.contains("· 2/2 files · "),
+            "overlapping file should be deduplicated:\n{mixed_out}"
+        );
+        assert_eq!(
+            mixed_out.matches("=== packages/core/db/pool.rs (").count(),
+            1,
+            "pool.rs section should appear once:\n{mixed_out}"
+        );
+        assert!(mixed_out.contains("=== README.md ("), "{mixed_out}");
+
+        // 3. `--json` structured output with tight budget populates `files` and `omitted_files`.
+        let json_opts = SkeletonOptions {
+            json_mode: true,
+            ..default_skeleton_opts(4096)
+        };
+        let json_bytes = build_skeleton_output(&ws, &[api_dir, db_dir], &json_opts, None)
+            .unwrap()
+            .bytes;
+        let parsed: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(parsed["mode"], "skeleton");
+        assert_eq!(parsed["base"], "packages/core/");
+        assert_eq!(parsed["shown_files"], 2);
+        assert_eq!(parsed["total_files"], 2);
+        let files = parsed["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["file"], "packages/core/api/routes.ts");
+        assert_eq!(files[0]["rel_path"], "api/routes.ts");
+        assert_eq!(files[0]["revision"].as_str().unwrap().len(), 24);
+        assert_eq!(files[0]["truncated"], false);
+        assert!(!files[0]["entries"].as_array().unwrap().is_empty());
+        assert_eq!(files[1]["file"], "packages/core/db/pool.rs");
+        assert!(parsed["omitted_files"].as_array().unwrap().is_empty());
+
+        // 4. Session dedup collapses unchanged complete files on second read; `--fresh` restores full output.
+        let pkg_dir = resolve_read_target(&ws, "packages/core", false).unwrap();
+        let session_opts = SkeletonOptions {
+            can_dedup: true,
+            ..default_skeleton_opts(4096)
+        };
+        let mut mem1 = crate::seen::Memory::open(&ws, Some("skel-sess"), false);
+        let first = String::from_utf8(
+            build_skeleton_output(
+                &ws,
+                std::slice::from_ref(&pkg_dir),
+                &session_opts,
+                mem1.as_mut(),
+            )
+            .unwrap()
+            .bytes,
+        )
+        .unwrap();
+        if let Some(m) = mem1 {
+            m.save(&ws);
+        }
+        assert!(first.contains("struct Pool"), "{first}");
+
+        let mut mem2 = crate::seen::Memory::open(&ws, Some("skel-sess"), false);
+        let second = String::from_utf8(
+            build_skeleton_output(
+                &ws,
+                std::slice::from_ref(&pkg_dir),
+                &session_opts,
+                mem2.as_mut(),
+            )
+            .unwrap()
+            .bytes,
+        )
+        .unwrap();
+        if let Some(m) = mem2 {
+            m.save(&ws);
+        }
+        assert!(
+            second.contains("outline unchanged"),
+            "second session read should dedup unchanged files:\n{second}"
+        );
+        assert!(second.len() < first.len());
+
+        let fresh_opts = SkeletonOptions {
+            fresh: true,
+            ..session_opts
+        };
+        let mut mem3 = crate::seen::Memory::open(&ws, Some("skel-sess"), true);
+        let third = String::from_utf8(
+            build_skeleton_output(&ws, &[pkg_dir], &fresh_opts, mem3.as_mut())
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(third.contains("struct Pool"), "{third}");
+        assert!(!third.contains("outline unchanged"), "{third}");
+
+        // 5. CLI flag parsing supports `--max-bytes`, `--budget`, `--depth`, `--match`, `--json`, and default `read DIR`.
+        let read_cmd = commands()
+            .into_iter()
+            .find(|cmd| cmd.get_name() == "read")
+            .unwrap();
+        let m1 = read_cmd
+            .clone()
+            .try_get_matches_from([
+                "read",
+                "packages/core",
+                "--max-bytes",
+                "1024",
+                "--depth",
+                "2",
+                "--match",
+                "Pool",
+                "--json",
+            ])
+            .unwrap();
+        assert_eq!(m1.value_of("budget"), Some("1024"));
+        assert_eq!(m1.value_of("depth"), Some("2"));
+        assert_eq!(m1.value_of("match"), Some("Pool"));
+        assert!(m1.is_present("json"));
+
+        let m2 = read_cmd
+            .try_get_matches_from(["read", "packages/core", "README.md"])
+            .unwrap();
+        let vals: Vec<&str> = m2.values_of("file").unwrap().collect();
+        assert_eq!(vals, ["packages/core", "README.md"]);
     }
 }
