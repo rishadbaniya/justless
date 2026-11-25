@@ -389,6 +389,11 @@ struct Deltas {
     shown_bytes: u64,
 }
 
+/// Maximum distinct outlined files remembered in `Outlines::seen` so
+/// `activity.json` stays bounded while preventing double-counting past the
+/// 32-entry `Activity::reads` window.
+const MAX_OUTLINE_SEEN: usize = 512;
+
 /// Measured bytes for `justless read` outlines and follow-up `expand` calls on
 /// those outlined files.
 #[derive(Default, Serialize, Deserialize)]
@@ -397,6 +402,87 @@ struct Outlines {
     whole_bytes: u64,
     shown_bytes: u64,
     expanded_bytes: u64,
+    /// Last outlined digest per workspace-relative file path, used to avoid
+    /// double-counting `whole_bytes` and to attribute follow-up `expand` bytes
+    /// even after `Activity::reads` rotates past 32 entries.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    seen: BTreeMap<String, String>,
+}
+
+/// Measured source outline and follow-up `expand` totals for `stats` and
+/// `stats --all`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OutlinesSummary {
+    pub views: u64,
+    pub whole_bytes: u64,
+    pub shown_bytes: u64,
+    pub expanded_bytes: u64,
+}
+
+impl OutlinesSummary {
+    fn from_activity(outlines: &Outlines) -> Self {
+        Self {
+            views: outlines.views,
+            whole_bytes: outlines.whole_bytes,
+            shown_bytes: outlines.shown_bytes,
+            expanded_bytes: outlines.expanded_bytes,
+        }
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.views += other.views;
+        self.whole_bytes += other.whole_bytes;
+        self.shown_bytes += other.shown_bytes;
+        self.expanded_bytes += other.expanded_bytes;
+    }
+
+    pub fn saved_bytes(&self) -> i64 {
+        net_bytes(self.whole_bytes, self.shown_bytes, 0)
+    }
+
+    pub fn net_saved_bytes(&self) -> i64 {
+        net_bytes(self.whole_bytes, self.shown_bytes, self.expanded_bytes)
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        let saved = self.saved_bytes();
+        let net = self.net_saved_bytes();
+        serde_json::json!({
+            "views": self.views,
+            "whole_bytes": self.whole_bytes,
+            "shown_bytes": self.shown_bytes,
+            "expanded_bytes": self.expanded_bytes,
+            "saved_bytes": saved,
+            "net_saved_bytes": net,
+            "estimated_tokens_saved": crate::tokens::Content::Code.tokens_signed(saved),
+            "estimated_tokens_net_saved": crate::tokens::Content::Code.tokens_signed(net),
+        })
+    }
+
+    pub fn line(&self) -> String {
+        let net = self.net_saved_bytes();
+        let expanded = if self.expanded_bytes > 0 {
+            format!(" (+{} expanded)", human_bytes(self.expanded_bytes))
+        } else {
+            String::new()
+        };
+        format!(
+            "Source outlines: {} view(s) printed {} instead of {}{expanded}, net {} kept out (≈{} tokens, estimated at {:.2} bytes per token for code)",
+            self.views,
+            human_bytes(self.shown_bytes),
+            human_bytes(self.whole_bytes),
+            signed_bytes(net),
+            crate::tokens::Content::Code.tokens_signed(net),
+            crate::tokens::Content::Code.bytes_per_token()
+        )
+    }
+}
+
+/// Measured source outline totals from a project's `activity.json`, quietly
+/// returning zeros when unreadable or absent.
+pub(crate) fn outlines_summary(workspace: &Workspace) -> OutlinesSummary {
+    let activity: Activity = get(&workspace.state.join("activity.json")).unwrap_or_default();
+    OutlinesSummary::from_activity(&activity.outlines)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -545,14 +631,32 @@ pub fn saw_outline_measured(
         &workspace.state.join("activity.json"),
         |a: &mut Activity| {
             let already_outlined = a
-                .reads
-                .iter()
-                .any(|r| r.file == file && r.digest == digest && r.outline);
+                .outlines
+                .seen
+                .get(file)
+                .is_some_and(|seen| seen == &digest)
+                || a.reads
+                    .iter()
+                    .any(|r| r.file == file && r.digest == digest && r.outline);
             if !already_outlined {
                 a.outlines.whole_bytes += file_bytes;
             }
             a.outlines.views += 1;
             a.outlines.shown_bytes += shown_bytes;
+            if !a.outlines.seen.contains_key(file)
+                && a.outlines.seen.len() >= MAX_OUTLINE_SEEN
+                && let Some(victim) = a
+                    .outlines
+                    .seen
+                    .keys()
+                    .find(|path| !a.reads.iter().any(|r| &r.file == *path))
+                    .cloned()
+            {
+                a.outlines.seen.remove(&victim);
+            }
+            if a.outlines.seen.contains_key(file) || a.outlines.seen.len() < MAX_OUTLINE_SEEN {
+                a.outlines.seen.insert(file.to_owned(), digest.clone());
+            }
             record_read(a, file, 0, 0, digest, true);
         },
     );
@@ -575,10 +679,15 @@ pub fn saw_expand(
     let _ = update(
         &workspace.state.join("activity.json"),
         |a: &mut Activity| {
-            if a.reads
-                .iter()
-                .any(|r| r.file == file && r.digest == digest && r.outline)
-            {
+            let was_outlined = a
+                .outlines
+                .seen
+                .get(file)
+                .is_some_and(|seen| seen == &digest)
+                || a.reads
+                    .iter()
+                    .any(|r| r.file == file && r.digest == digest && r.outline);
+            if was_outlined {
                 a.outlines.expanded_bytes += shown_bytes;
             }
             record_read(a, file, from, to, digest, false);
@@ -936,13 +1045,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             .cmp(&a.totals.net_saved_bytes)
             .then(a.family.cmp(&b.family))
     });
-    let outlines = &activity.outlines;
-    let outline_saved = net_bytes(outlines.whole_bytes, outlines.shown_bytes, 0);
-    let outline_net = net_bytes(
-        outlines.whole_bytes,
-        outlines.shown_bytes,
-        outlines.expanded_bytes,
-    );
+    let outlines = OutlinesSummary::from_activity(&activity.outlines);
     if as_json {
         // The keys from before retrievals were measured keep their meaning:
         // `saved_*` and `estimated_tokens_saved` are savings at first preview.
@@ -972,16 +1075,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
                 "saved_bytes": activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes),
                 "estimated_tokens_saved": crate::tokens::Content::Code.tokens(activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes)),
             },
-            "source_outlines": {
-                "views": outlines.views,
-                "whole_bytes": outlines.whole_bytes,
-                "shown_bytes": outlines.shown_bytes,
-                "expanded_bytes": outlines.expanded_bytes,
-                "saved_bytes": outline_saved,
-                "net_saved_bytes": outline_net,
-                "estimated_tokens_saved": crate::tokens::Content::Code.tokens_signed(outline_saved),
-                "estimated_tokens_net_saved": crate::tokens::Content::Code.tokens_signed(outline_net),
-            },
+            "source_outlines": outlines.json(),
             "redacted_secrets": secrets,
             "unredacted_replays": unredacted,
             "hook_pass_through": activity.bypasses,
@@ -1158,20 +1252,7 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
         );
     }
     if outlines.views > 0 {
-        let expanded = if outlines.expanded_bytes > 0 {
-            format!(" (+{} expanded)", human_bytes(outlines.expanded_bytes))
-        } else {
-            String::new()
-        };
-        println!(
-            "Source outlines: {} view(s) printed {} instead of {}{expanded}, net {} kept out (≈{} tokens, estimated at {:.2} bytes per token for code)",
-            outlines.views,
-            human_bytes(outlines.shown_bytes),
-            human_bytes(outlines.whole_bytes),
-            signed_bytes(outline_net),
-            crate::tokens::Content::Code.tokens_signed(outline_net),
-            crate::tokens::Content::Code.bytes_per_token()
-        );
+        println!("{}", outlines.line());
     }
     if !activity.bypasses.is_empty() {
         let passed: Vec<_> = activity

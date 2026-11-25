@@ -608,20 +608,15 @@ const BUDGET: Param = option(
     // The default is the project's `context_budget`, so it is not named here.
     "Max bytes",
 );
-const FILE: Param = positional("file", Kind::File, "Workspace-relative path");
-const RUN_ID: Param = positional("run_id", Kind::RunId, "Run ID from `justless run`");
+const FILE: Param = positional("file", Kind::File, "Workspace path");
+const RUN_ID: Param = positional("run_id", Kind::RunId, "Captured run ID");
 const STREAM: Param = option(
     "stream",
     "stream",
     Kind::Choice(STREAMS),
     "Stream (default both)",
 );
-const BASE: Param = option(
-    "base",
-    "base",
-    Kind::Text,
-    "Diff from merge base of this ref and HEAD",
-);
+const BASE: Param = option("base", "base", Kind::Text, "Diff from merge base with ref");
 
 const TOOLS: &[Tool] = &[
     Tool {
@@ -705,12 +700,13 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "context",
-        title: "Source around a location or diff",
+        title: "Source around location, diff or run",
         command: "context",
-        description: "Source around a location (`at`) or the Git diff (`changes`), with enclosing symbols and related tests.",
+        description: "Source around `at`, Git `changes` or `run_id`, with enclosing symbols and tests.",
         params: &[
             option("at", "at", Kind::Location, "PATH:LINE or PATH:START-END"),
             option("changes", "changes", Kind::Flag, "Use Git changes"),
+            option("run_id", "run", Kind::RunId, "Captured run ID"),
             option("staged", "staged", Kind::Flag, "Staged changes only"),
             BASE,
             BUDGET,
@@ -755,7 +751,7 @@ const TOOLS: &[Tool] = &[
                 "match",
                 "match",
                 Kind::Text,
-                "Rows whose name or signature contains this (use a|b for multiple terms)",
+                "Filter rows by name/signature (a|b for OR)",
             ),
             option(
                 "limit",
@@ -775,16 +771,12 @@ const TOOLS: &[Tool] = &[
         description: "Exact source of one symbol, Markdown section, outline row (REV#ROW) or line range (L10-20).",
         params: &[
             FILE,
-            positional(
-                "selector",
-                Kind::Text,
-                "Symbol, REV#ROW or line range such as L20-35",
-            ),
+            positional("selector", Kind::Text, "Symbol, REV#ROW or L20-35"),
             option(
                 "revision",
                 "revision",
                 Kind::Text,
-                "Revision from a read; rejects a changed file",
+                "Revision from read; fails if changed",
             ),
         ],
         check: None,
@@ -912,8 +904,11 @@ fn context_input(arguments: &Map<String, Value>) -> Result<(), String> {
     let changes = base_input(arguments)?;
     let staged = arguments.get("staged") == Some(&Value::Bool(true));
     let at = arguments.get("at").is_some_and(|value| !value.is_null());
-    if changes == at {
-        return Err("pass exactly one of `at` or `changes: true`".into());
+    let run = arguments
+        .get("run_id")
+        .is_some_and(|value| !value.is_null());
+    if usize::from(changes) + usize::from(at) + usize::from(run) != 1 {
+        return Err("pass exactly one of `at`, `changes: true` or `run_id`".into());
     }
     if staged && !changes {
         return Err("`staged` requires `changes: true`".into());

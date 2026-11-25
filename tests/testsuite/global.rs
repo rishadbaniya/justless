@@ -342,6 +342,19 @@ fn the_registry_totals_projects_by_repository_and_finds_their_runs() {
     git(&main, &["worktree", "add", "-q", "../tree"]);
     let tree = lab.base.join("tree");
     let scratch = lab.project("tmp/scratch", "");
+    let main_src: String = (0..30)
+        .map(|i| format!("pub fn main_fn_{i}() -> usize {{ {i} }}\n"))
+        .collect();
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), &main_src).unwrap();
+    let scratch_src: String = (0..30)
+        .map(|i| format!("pub fn scratch_fn_{i}() -> usize {{ {i} }}\n"))
+        .collect();
+    fs::create_dir_all(scratch.join("src")).unwrap();
+    fs::write(scratch.join("src/lib.rs"), &scratch_src).unwrap();
+    lab.run(&main, &["read", "src/lib.rs", "--outline"]);
+    lab.run(&main, &["expand", "src/lib.rs", "main_fn_0"]);
+    lab.run(&scratch, &["read", "src/lib.rs", "--outline"]);
     run_id(&lab, &main, "seq 1 3000");
     run_id(&lab, &tree, "seq 1 3000");
     let elsewhere = run_id(&lab, &scratch, "seq 1 3000; echo needle");
@@ -378,13 +391,30 @@ fn the_registry_totals_projects_by_repository_and_finds_their_runs() {
     assert_eq!(all["temporary_projects_left_out"], 1);
     assert_eq!(all["repositories"][0]["repository"], json!(main));
     assert_eq!(all["repositories"][0]["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(all["source_outlines"]["views"], 1, "{all}");
+    assert_eq!(
+        all["source_outlines"]["whole_bytes"],
+        main_src.len() as u64,
+        "{all}"
+    );
+    assert!(
+        all["source_outlines"]["expanded_bytes"].as_u64().unwrap() > 0,
+        "{all}"
+    );
     let all = stats("stats --all --include-temp --json");
     assert_eq!(counts(&all), (json!(3), json!(3)), "{all}");
     assert_eq!(all["repositories"].as_array().unwrap().len(), 2);
+    assert_eq!(all["source_outlines"]["views"], 2, "{all}");
+    assert_eq!(
+        all["source_outlines"]["whole_bytes"],
+        (main_src.len() + scratch_src.len()) as u64,
+        "{all}"
+    );
     let output = lab.output(&main, &["stats", "--all"], None, &temp);
     let text = String::from_utf8_lossy(&output.stdout);
     has(&text, "main (2 checkouts)  2 run(s)");
     starts(&text, "In the last 7 day(s), kept ");
+    has(&text, "Source outlines: 1 view(s) printed ");
     has(&text, "Left out 1 project(s) in temporary folders");
     // `--days` counts the runs that finished in the window.
     let old = run_id(&lab, &main, "seq 1 3000");

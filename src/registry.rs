@@ -223,7 +223,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
     let mut skipped = 0;
     let mut entries = projects();
     // The current project counts even before the registry lists it.
-    if workspace.state.join("runs").is_dir()
+    if (workspace.state.join("runs").is_dir() || workspace.state.join("activity.json").is_file())
         && !entries.iter().any(|entry| entry.root == workspace.root)
     {
         entries.push(Entry {
@@ -232,8 +232,11 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             used_ms: now_ms(),
         });
     }
+    let mut outlines = crate::history::OutlinesSummary::default();
     for entry in entries {
-        if !entry.root.join(".justless/runs").is_dir() {
+        let has_runs = entry.root.join(".justless/runs").is_dir();
+        let has_activity = entry.root.join(".justless/activity.json").is_file();
+        if !has_runs && !has_activity {
             continue;
         }
         if !include_temp
@@ -241,12 +244,24 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
                 .iter()
                 .any(|folder| entry.root.starts_with(folder))
         {
-            skipped += 1;
+            if has_runs
+                || Workspace::discover(Some(&entry.root))
+                    .ok()
+                    .is_some_and(|project| crate::history::outlines_summary(&project).views > 0)
+            {
+                skipped += 1;
+            }
             continue;
         }
         let Ok(project) = Workspace::discover(Some(&entry.root)) else {
             continue;
         };
+        if has_activity {
+            outlines.add(&crate::history::outlines_summary(&project));
+        }
+        if !has_runs {
+            continue;
+        }
         let summary = crate::history::summary(&project, since);
         if summary.runs == 0 {
             continue;
@@ -313,6 +328,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             "estimated_tokens_net_saved": total.estimate.net_tokens(),
             "token_estimate": crate::tokens::method(),
             "estimate_by_content": total.estimate.json(),
+            "source_outlines": outlines.json(),
             "repositories": repositories,
             "temporary_projects_left_out": skipped,
         });
@@ -350,6 +366,12 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
                 crate::history::signed_bytes(summary.net_saved_bytes),
             );
         }
+    }
+    if outlines.views > 0 {
+        if !groups.is_empty() {
+            println!();
+        }
+        println!("{}", outlines.line());
     }
     if skipped > 0 {
         println!(

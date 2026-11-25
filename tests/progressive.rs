@@ -1140,4 +1140,29 @@ fn outline_folds_contiguous_imports_and_reports_remaining_entries() {
         "{stats_text}"
     );
     assert!(stats_text.contains("expanded), net "), "{stats_text}");
+
+    // Even after Activity::reads rotates past its 32-entry window, Outlines::seen
+    // still avoids double-counting `whole_bytes` and attributes follow-up `expand`.
+    let other_lines: String = (1..=40).map(|i| format!("// line {i}\n")).collect();
+    fs::write(root.join("other.rs"), &other_lines).unwrap();
+    for line in 1..=35 {
+        let range = format!("L{line}-{line}");
+        out(root, &["expand", "other.rs", &range]);
+    }
+    let again = out(root, &["read", "lib.rs", "--outline", "--match", "func_7"]);
+    let func1 = out(root, &["expand", "lib.rs", "func_1"]);
+    let after_rotation: Value = serde_json::from_slice(&out(root, &["stats", "--json"])).unwrap();
+    let outlines = &after_rotation["source_outlines"];
+    assert_eq!(outlines["views"], 6, "{outlines}");
+    assert_eq!(outlines["whole_bytes"], source.len() as u64, "{outlines}");
+    assert_eq!(
+        outlines["shown_bytes"],
+        shown + again.len() as u64,
+        "{outlines}"
+    );
+    assert_eq!(
+        outlines["expanded_bytes"],
+        expanded + func1.len() as u64,
+        "{outlines}"
+    );
 }

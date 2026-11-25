@@ -128,6 +128,9 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
         ["unknown-arg", "read", {"file": "db/schema.sql", "lines": 3}],
         ["range", "find", {"text": "x", "limit": 0}],
         ["both", "context", {"at": "db/schema.sql:1", "changes": true}],
+        ["context-at-run", "context", {"at": "db/schema.sql:1", "run_id": "run-1a2b3c"}],
+        ["context-bad-run", "context", {"run_id": "../../etc"}],
+        ["context-run-staged", "context", {"run_id": "run-1a2b3c", "staged": true}],
         ["base-alone", "context", {"base": "main"}],
         ["base-staged", "context", {"changes": true, "staged": true, "base": "main"}],
         ["base-target", "affected", {"target": "purchase_orders", "base": "main"}],
@@ -257,6 +260,9 @@ fn legacy_handshake_lists_and_calls_read_only_tools() {
         ("unknown-arg", "unknown argument `lines`"),
         ("range", "from 1 to 1000"),
         ("both", "exactly one"),
+        ("context-at-run", "exactly one"),
+        ("context-bad-run", "run ID"),
+        ("context-run-staged", "`staged` requires `changes: true`"),
         ("base-alone", "`base` requires `changes: true`"),
         ("base-target", "`base` requires `changes: true`"),
         ("base-staged", "`staged` or `base`, not both"),
@@ -832,4 +838,46 @@ fn mcp_install_agy_updates_global_mcp_config_and_doctor_checks_it() {
     let doctor = run(&["doctor"]);
     has(&text(&doctor.stdout), "Antigravity CLI:");
     has(&text(&doctor.stdout), "mcp_config.json");
+}
+
+#[test]
+fn context_tool_accepts_run_id_for_captured_diagnostics() {
+    let fixture = mixed_fixture();
+    let root = fixture.path();
+    let captured = Command::new(BIN)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo 'backend/orders.py:8: failed query' >&2; exit 1",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert_eq!(captured.status.code(), Some(1));
+    let id = crate::common::run_id(&captured);
+
+    let responses = exchange(
+        root,
+        &[
+            legacy_initialize(),
+            call("ctx", "context", json!({"run_id": id})),
+        ],
+    );
+    let shown = succeeded(by_id(&responses, "ctx"));
+    starts(&shown, &format!("Run {id}"));
+    has(&shown, "backend/orders.py:8");
+    has(&shown, "list_orders");
+
+    let stats = Command::new(BIN)
+        .args(["--root", root.to_str().unwrap(), "stats", "--json"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(stats.status.success(), "{}", text(&stats.stderr));
+    let report: Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(report["commands"][0]["targeted_lookups"], 1, "{report}");
 }
