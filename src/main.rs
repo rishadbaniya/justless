@@ -30,6 +30,7 @@ mod learn;
 mod lint;
 mod listing;
 mod lockdiff;
+mod logview;
 mod lookup;
 mod map;
 mod markdown;
