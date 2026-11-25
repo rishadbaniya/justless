@@ -698,14 +698,82 @@ fn passages(
 }
 
 /// The best-matching line heads the passage, and the others follow in file order.
-fn show_text(report: &mut Report, hit: &Passage) {
+/// In a session, an unchanged passage shown before becomes a single line with
+/// an exact `expand` pointer when that is shorter than reprinting the passage.
+#[allow(clippy::too_many_arguments)]
+fn show_text(
+    workspace: &Workspace,
+    index: &Index,
+    cache: &mut BTreeMap<String, String>,
+    hit: &Passage,
+    report: &mut Report,
+    memory: Option<&mut Memory>,
+) {
     let file = display_path(&hit.location.file);
     let primary = hit.location.start;
+    let mut lines = Vec::with_capacity(hit.lines.len());
     for (line, text) in hit.lines.iter().filter(|(line, _)| *line == primary) {
-        report.line(format!("Text {file}:{line} {text}"));
+        lines.push(format!("Text {file}:{line} {text}"));
     }
     for (line, text) in hit.lines.iter().filter(|(line, _)| *line != primary) {
-        report.line(format!("    {line} | {text}"));
+        lines.push(format!("    {line} | {text}"));
+    }
+    let Some(memory) = memory else {
+        for line in &lines {
+            report.line(line);
+        }
+        return;
+    };
+    let text = cache.entry(hit.location.file.clone()).or_insert_with(|| {
+        workspace
+            .source_path(&hit.location.file)
+            .ok()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .unwrap_or_default()
+    });
+    let revision = crate::source::revision_for(&hit.location.file, text.as_bytes());
+    let first = hit.lines.first().map_or(primary, |(line, _)| *line);
+    let last = hit.lines.last().map_or(primary, |(line, _)| *line);
+    let line_list = hit
+        .lines
+        .iter()
+        .map(|(line, _)| line.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let selector = hit
+        .lines
+        .iter()
+        .map(|(line, _)| format!("L{line}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let note = format!(
+        "Text {file}:{line_list} · unchanged since you read it · {} expand {} {selector}",
+        workspace.invocation().files,
+        crate::workspace::shell_path(&hit.location.file),
+    );
+    let bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
+    if !lines.is_empty()
+        && note.len() + 1 < bytes
+        && memory.saw_excerpt(&hit.location.file, &revision, &lines)
+    {
+        let room = report.left();
+        report.line(note);
+        memory.count_saved(bytes.min(room), room.saturating_sub(report.left()));
+        return;
+    }
+    let clipped = report.clipped;
+    for line in &lines {
+        report.line(line);
+    }
+    if !clipped && !lines.is_empty() {
+        memory.showed(
+            &hit.location.file,
+            &revision,
+            &crate::context::seen_names(index, &hit.location.file, first, last),
+        );
+    }
+    if !report.clipped && !lines.is_empty() {
+        memory.remember_excerpt(&hit.location.file, &revision, &lines);
     }
 }
 
@@ -714,8 +782,23 @@ pub fn pack(
     index: &Index,
     task: &str,
     cap: usize,
-    mut memory: Option<&mut Memory>,
+    memory: Option<&mut Memory>,
 ) -> Result<()> {
+    let (report, failure) = pack_report(workspace, index, task, cap, memory)?;
+    report.finish()?;
+    if let Some((id, bytes)) = failure.filter(|(_, bytes)| *bytes > 0) {
+        history::excerpts(workspace, &BTreeMap::from([(id, bytes)]));
+    }
+    Ok(())
+}
+
+fn pack_report(
+    workspace: &Workspace,
+    index: &Index,
+    task: &str,
+    cap: usize,
+    mut memory: Option<&mut Memory>,
+) -> Result<(Report, Option<(String, u64)>)> {
     ensure!(!task.trim().is_empty(), "provide a task or symbol");
     let words = terms(task);
     let question = task.to_lowercase();
@@ -957,7 +1040,14 @@ pub fn pack(
                     || (covered < usize::MAX
                         && (hit.rank() + hit.focus > score || hit.focus > covered)))
             {
-                show_text(&mut report, hit);
+                show_text(
+                    workspace,
+                    index,
+                    &mut sources,
+                    hit,
+                    &mut report,
+                    memory.as_deref_mut(),
+                );
                 shown_text.insert(at);
                 text_files.insert(hit.location.file.clone());
             }
@@ -1009,6 +1099,7 @@ pub fn pack(
                 *other,
             )
         });
+        let mut header_shown = false;
         for (other, edge, direction) in neighbors {
             if seen.len() >= 24 || report.clipped {
                 break;
@@ -1016,17 +1107,31 @@ pub fn pack(
             if shown_links.len() >= 32 || !shown_links.insert((edge.from, edge.to, edge.kind)) {
                 continue;
             }
+            if !header_shown {
+                report.line(format!("  {} links:", index.definitions[id].qualified));
+                header_shown = true;
+                if report.clipped {
+                    break;
+                }
+            }
             let discovered = seen.insert(other);
             let target = &index.definitions[other];
+            let link = if edge.location.file == target.location.file {
+                if edge.location.start == edge.location.end {
+                    format!(":{}", edge.location.start)
+                } else {
+                    format!(":{}-{}", edge.location.start, edge.location.end)
+                }
+            } else {
+                edge.location.to_string()
+            };
             report.line(format!(
-                "  {} {}{} {direction} {} [{}] {} (link {})",
-                index.definitions[id].qualified,
+                "    {}{} {direction} {} [{}] {} (link {link})",
                 if edge.inferred { "possible " } else { "" },
                 relationship(edge.kind),
                 target.qualified,
                 if target.test { "test" } else { &target.kind },
                 target.location,
-                edge.location
             ));
             if discovered {
                 excerpt(
@@ -1057,7 +1162,14 @@ pub fn pack(
         {
             continue;
         }
-        show_text(&mut report, hit);
+        show_text(
+            workspace,
+            index,
+            &mut sources,
+            hit,
+            &mut report,
+            memory.as_deref_mut(),
+        );
         shown_text.insert(at);
         text_files.insert(file.clone());
     }
@@ -1075,9 +1187,238 @@ pub fn pack(
         report.line("No matching source or recorded failure. Try a symbol, file name, or an error from the log.");
     }
     history::saw_pack(workspace, inspected);
-    report.finish()?;
-    if let Some((id, bytes)) = failure.filter(|(_, bytes)| *bytes > 0) {
-        history::excerpts(workspace, &BTreeMap::from([(id, bytes)]));
+    Ok((report, failure))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for (rel, body) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, body).unwrap();
+        }
+        let workspace = Workspace::discover(Some(root)).unwrap();
+        (dir, workspace)
     }
-    Ok(())
+
+    #[test]
+    fn pack_groups_bfs_links_and_shortens_same_file_locations() {
+        let manifest =
+            "[package]\nname = \"billing_service\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lib = "pub mod audit;\npub mod handlers;\n\n\
+            pub fn apply_tax(amount: u64) -> u64 {\n    amount + amount / 10\n}\n\n\
+            pub fn checkout_total(amount: u64) -> u64 {\n    audit::record_sale(amount);\n    apply_tax(amount)\n}\n\n\
+            pub fn bulk_checkout(a: u64, b: u64) -> u64 {\n    checkout_total(a) + checkout_total(b)\n}\n\n\
+            pub fn preview_checkout(a: u64) -> u64 {\n    checkout_total(a)\n}\n";
+        let handlers = "use crate::checkout_total;\n\n\
+            pub fn handle_web(a: u64) -> u64 {\n    checkout_total(a)\n}\n\n\
+            pub fn handle_cli(a: u64) -> u64 {\n    checkout_total(a)\n}\n\n\
+            pub fn handle_batch(a: u64) -> u64 {\n    checkout_total(a)\n}\n";
+        let audit = "pub fn record_sale(amount: u64) -> u64 {\n    amount\n}\n";
+        let (_dir, workspace) = temp_workspace(&[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", lib),
+            ("src/handlers.rs", handlers),
+            ("src/audit.rs", audit),
+        ]);
+        let index = Index::open(&workspace).unwrap();
+
+        let (report, _) = pack_report(&workspace, &index, "checkout_total", 8000, None).unwrap();
+        let out = report.into_string();
+
+        // Parent header appears once (indented so it never acts as a column-0 lead).
+        assert_eq!(
+            out.matches("  billing_service::checkout_total links:\n")
+                .count(),
+            1,
+            "{out}"
+        );
+        // Link lines omit the repeated parent qualified prefix.
+        let link_lines: Vec<&str> = out
+            .lines()
+            .filter(|line| line.starts_with("    ") && line.contains(" (link "))
+            .collect();
+        assert!(link_lines.len() >= 6, "{out}");
+        assert!(
+            link_lines
+                .iter()
+                .all(|line| !line.starts_with("    billing_service::checkout_total ")),
+            "{out}"
+        );
+        // Same-file links (both incoming and same-file outgoing) shorten `(link file:line)` to `(link :line)`.
+        assert!(
+            out.contains("handle_web [function] src/handlers.rs:3-5 (link :4)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("apply_tax [function] src/lib.rs:4-6 (link :10)\n"),
+            "{out}"
+        );
+        // Cross-file outgoing link retains its source file path so no location information is lost.
+        assert!(
+            out.contains("audit::record_sale [function] src/audit.rs:1-3 (link src/lib.rs:9)\n"),
+            "{out}"
+        );
+
+        // Measure byte savings vs repeating `parent.qualified` + full `(link file:line)` on every link.
+        let grouped_link_bytes: usize = out
+            .lines()
+            .filter(|line| {
+                line.ends_with(" links:") || (line.starts_with("    ") && line.contains(" (link "))
+            })
+            .map(|line| line.len() + 1)
+            .sum();
+        let mut ungrouped_link_bytes = 0usize;
+        let mut current_parent = "";
+        for line in out.lines() {
+            if let Some(parent) = line
+                .strip_prefix("  ")
+                .and_then(|s| s.strip_suffix(" links:"))
+            {
+                current_parent = parent;
+            } else if let Some(rest) = line.strip_prefix("    ")
+                && rest.contains(" (link ")
+            {
+                // Reconstruct old format length: `  {parent} {rest_with_full_file}`.
+                let extra_file = if rest.contains("(link :") {
+                    // Extract file preceding ` (link :` from `{target.location}`.
+                    let before = rest.split(" (link :").next().unwrap();
+                    let loc = before.rsplit(' ').next().unwrap();
+                    loc.rsplit_once(':').map_or(0, |(file, _)| file.len())
+                } else {
+                    0
+                };
+                ungrouped_link_bytes += 2 + current_parent.len() + 1 + rest.len() + extra_file + 1;
+            }
+        }
+        assert!(
+            grouped_link_bytes < ungrouped_link_bytes,
+            "expected byte reduction: grouped={grouped_link_bytes} vs ungrouped={ungrouped_link_bytes}\n{out}"
+        );
+        // Expect >= 25% savings on link headers/lines for this 6-edge hub.
+        assert!(
+            grouped_link_bytes * 100 <= ungrouped_link_bytes * 75,
+            "expected >=25% link byte savings: grouped={grouped_link_bytes} vs ungrouped={ungrouped_link_bytes}\n{out}"
+        );
+    }
+
+    #[test]
+    fn pack_deduplicates_unchanged_doc_passages_in_session_memory() {
+        let doc = "# Deployment Policy\n\
+            The canary_rollout_policy requires 5 percent traffic for 30 minutes before expanding to 50 percent.\n\
+            Operators verify canary_rollout_policy error budgets and latency histograms in Grafana before promoting.\n\
+            Automatic rollback triggers whenever canary_rollout_policy sees error rates above 0.5 percent.\n";
+        let short_cfg = "short_toggle = true\n";
+        let (_dir, workspace) =
+            temp_workspace(&[("docs/rollout.md", doc), ("tiny.toml", short_cfg)]);
+        let index = Index::open(&workspace).unwrap();
+        let question = "how does canary_rollout_policy work";
+
+        // Baseline without session.
+        let plain = pack_report(&workspace, &index, question, 8000, None)
+            .unwrap()
+            .0
+            .into_string();
+        assert!(plain.contains("Text docs/rollout.md:"), "{plain}");
+
+        // First call in session prints identically and remembers the passage.
+        let mut mem1 = Memory::open(&workspace, Some("sess-doc"), false);
+        let first = pack_report(&workspace, &index, question, 8000, mem1.as_mut())
+            .unwrap()
+            .0
+            .into_string();
+        mem1.unwrap().save(&workspace);
+        assert_eq!(first, plain);
+
+        // Second call in the same session replaces the unchanged passage with a compact pointer.
+        let mut mem2 = Memory::open(&workspace, Some("sess-doc"), false);
+        let second = pack_report(&workspace, &index, question, 8000, mem2.as_mut())
+            .unwrap()
+            .0
+            .into_string();
+        mem2.unwrap().save(&workspace);
+        assert!(
+            second.contains("Text docs/rollout.md:2,3,4 · unchanged since you read it · "),
+            "{second}"
+        );
+        assert!(
+            second.contains("expand docs/rollout.md L2,L3,L4"),
+            "{second}"
+        );
+        assert!(!second.contains("Grafana"), "{second}");
+        assert!(
+            second.len() * 2 < first.len(),
+            "expected >50% reduction on repeated doc pack: second={} vs first={}\n{second}",
+            second.len(),
+            first.len()
+        );
+
+        // `--fresh` reprints the full passage.
+        let mut mem_fresh = Memory::open(&workspace, Some("sess-doc"), true);
+        let fresh = pack_report(&workspace, &index, question, 8000, mem_fresh.as_mut())
+            .unwrap()
+            .0
+            .into_string();
+        mem_fresh.unwrap().save(&workspace);
+        assert_eq!(fresh, first);
+
+        // Editing the doc invalidates the seen passage and prints the updated lines.
+        let edited = doc.replace("0.5 percent", "0.2 percent");
+        fs::write(workspace.root.join("docs/rollout.md"), &edited).unwrap();
+        let index_edited = Index::open(&workspace).unwrap();
+        let mut mem3 = Memory::open(&workspace, Some("sess-doc"), false);
+        let after_edit = pack_report(&workspace, &index_edited, question, 8000, mem3.as_mut())
+            .unwrap()
+            .0
+            .into_string();
+        mem3.unwrap().save(&workspace);
+        assert!(after_edit.contains("0.2 percent"), "{after_edit}");
+        assert!(
+            !after_edit.contains("unchanged since you read it"),
+            "{after_edit}"
+        );
+
+        // Reverting back to the original content prints whole again (not falsely unchanged).
+        fs::write(workspace.root.join("docs/rollout.md"), doc).unwrap();
+        let index_reverted = Index::open(&workspace).unwrap();
+        let mut mem4 = Memory::open(&workspace, Some("sess-doc"), false);
+        let after_revert = pack_report(&workspace, &index_reverted, question, 8000, mem4.as_mut())
+            .unwrap()
+            .0
+            .into_string();
+        mem4.unwrap().save(&workspace);
+        assert!(after_revert.contains("0.5 percent"), "{after_revert}");
+        assert!(
+            !after_revert.contains("unchanged since you read it"),
+            "{after_revert}"
+        );
+
+        // A very short 1-line passage stays verbatim rather than inflating with a longer note.
+        let short_q = "short_toggle";
+        let mut mem_s1 = Memory::open(&workspace, Some("sess-short"), false);
+        let short1 = pack_report(&workspace, &index_reverted, short_q, 8000, mem_s1.as_mut())
+            .unwrap()
+            .0
+            .into_string();
+        mem_s1.unwrap().save(&workspace);
+        let mut mem_s2 = Memory::open(&workspace, Some("sess-short"), false);
+        let short2 = pack_report(&workspace, &index_reverted, short_q, 8000, mem_s2.as_mut())
+            .unwrap()
+            .0
+            .into_string();
+        mem_s2.unwrap().save(&workspace);
+        assert_eq!(short2, short1);
+        assert!(
+            short2.contains("Text tiny.toml:1 short_toggle = true"),
+            "{short2}"
+        );
+        assert!(!short2.contains("unchanged since you read it"), "{short2}");
+    }
 }

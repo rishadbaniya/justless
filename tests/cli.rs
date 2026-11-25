@@ -5001,16 +5001,18 @@ fn rust_references_follow_globs_variants_trait_uses_and_twins() {
     assert!(tests.contains("demo::b::tests::makes_widget"), "{tests}");
     // Variant uses and patterns count as references to their enum.
     let status = success(root, &argv("query Status --view references"));
-    for line in ["src/b.rs:9", "src/b.rs:10", "src/b.rs:15"] {
+    for line in [
+        "demo::b::is_open at src/b.rs:7,9,10",
+        "demo::b::closed at src/b.rs:15",
+    ] {
         assert!(status.contains(line), "{line}: {status}");
     }
-    assert!(
-        status.contains("demo::b::closed at src/b.rs:15"),
-        "{status}"
-    );
     // An associated call credits its type as well as the method.
     let widget = success(root, &["query", "Widget", "--view", "references"]);
-    assert!(widget.contains("demo::b::build at src/b.rs:4"), "{widget}");
+    assert!(
+        widget.contains("demo::b::build at src/b.rs:3,4"),
+        "{widget}"
+    );
     // Trait impls, bounds and trait objects reference the trait.
     let describe = success(root, &["query", "Describe", "--view", "references"]);
     for line in [
@@ -5088,12 +5090,10 @@ fn sql_writes_and_schema_qualified_tables_link_by_short_name() {
         ],
     );
     let events = success(root, &["query", "events", "--view", "references"]);
-    for line in 1..=6 {
-        assert!(
-            events.contains(&format!("from writes.sql at writes.sql:{line}\n")),
-            "{line}: {events}"
-        );
-    }
+    assert!(
+        events.contains("from writes.sql at writes.sql:1,2,3,4,5,6\n"),
+        "{events}"
+    );
     assert!(events.contains("from app.py::save at app.py:2"), "{events}");
     let log = success(root, &["query", "event_log", "--view", "references"]);
     assert!(

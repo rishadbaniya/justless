@@ -87,67 +87,275 @@ fn describe(definition: &Definition) -> String {
     )
 }
 
+fn format_line_spans(file: &str, spans: &BTreeSet<(usize, usize)>) -> String {
+    let list: Vec<String> = spans
+        .iter()
+        .map(|&(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect();
+    format!("{}:{}", display_path(file), list.join(","))
+}
+
+struct QuerySection {
+    lines: Vec<String>,
+    empty: Option<&'static str>,
+    singular: &'static str,
+    plural: &'static str,
+}
+
+impl QuerySection {
+    fn clip_note(&self, shown: usize) -> Option<String> {
+        let missing = self.lines.len().saturating_sub(shown);
+        (missing > 0).then(|| {
+            let label = if missing == 1 {
+                self.singular
+            } else {
+                self.plural
+            };
+            format!("  … +{missing} more {label}")
+        })
+    }
+
+    fn body_bytes(&self, shown: usize) -> usize {
+        self.lines[..shown].iter().map(|line| line.len() + 1).sum()
+    }
+
+    fn rendered_bytes(&self, shown: usize) -> usize {
+        if self.lines.is_empty() {
+            return self.empty.map_or(0, |line| line.len() + 1);
+        }
+        let note = self.clip_note(shown).map_or(0, |line| line.len() + 1);
+        self.body_bytes(shown) + note
+    }
+}
+
+fn total_query_bytes(header: &str, sections: &[QuerySection], shown: &[usize]) -> usize {
+    header.len()
+        + 1
+        + sections
+            .iter()
+            .zip(shown)
+            .map(|(section, &count)| section.rendered_bytes(count))
+            .sum::<usize>()
+}
+
+/// Allocates `cap` across non-empty query sections so no single hub section
+/// starves the others: Pass 1 gives each non-empty section up to an equal byte
+/// share, and Pass 2 water-fills any leftover bytes across incomplete sections.
+fn fit_query_sections(header: &str, sections: &[QuerySection], cap: usize) -> Vec<usize> {
+    let usable = cap.saturating_sub(Report::CLIPPED.len());
+    let all: Vec<usize> = sections.iter().map(|section| section.lines.len()).collect();
+    if total_query_bytes(header, sections, &all) <= usable {
+        return all;
+    }
+    let mut shown = vec![0usize; sections.len()];
+    let non_empty: Vec<usize> = sections
+        .iter()
+        .enumerate()
+        .filter_map(|(i, section)| (!section.lines.is_empty()).then_some(i))
+        .collect();
+    if non_empty.is_empty() {
+        return shown;
+    }
+    let fixed: usize = header.len()
+        + 1
+        + sections
+            .iter()
+            .filter(|section| section.lines.is_empty())
+            .map(|section| section.rendered_bytes(0))
+            .sum::<usize>();
+    let fair_share = usable.saturating_sub(fixed) / non_empty.len();
+    let can_grow = |i: usize, shown: &[usize], limit: Option<usize>| -> bool {
+        if shown[i] >= sections[i].lines.len() {
+            return false;
+        }
+        let before = sections[i].rendered_bytes(shown[i]);
+        let after = sections[i].rendered_bytes(shown[i] + 1);
+        if let Some(limit) = limit
+            && after > limit
+        {
+            return false;
+        }
+        let next_total = total_query_bytes(header, sections, shown) - before + after;
+        next_total <= usable
+    };
+    // Pass 1: fair byte share per non-empty section.
+    loop {
+        let mut progress = false;
+        for &i in &non_empty {
+            if can_grow(i, &shown, Some(fair_share)) {
+                shown[i] += 1;
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    // Pass 2: surplus water-fill, preferring whichever incomplete section has
+    // shown the fewest body bytes so far.
+    loop {
+        let next = non_empty
+            .iter()
+            .copied()
+            .filter(|&i| can_grow(i, &shown, None))
+            .min_by_key(|&i| (sections[i].body_bytes(shown[i]), shown[i], i));
+        let Some(i) = next else {
+            break;
+        };
+        shown[i] += 1;
+    }
+    shown
+}
+
 pub fn query(index: &Index, name: &str, view: &str, cap: usize) -> Result<()> {
+    query_report(index, name, view, cap)?.finish()
+}
+
+fn query_report(index: &Index, name: &str, view: &str, cap: usize) -> Result<Report> {
     let id = index.select(name)?;
     let mut report = Report::new(cap);
-    report.line(describe(&index.definitions[id]));
+    let header = describe(&index.definitions[id]);
     if view == "definition" {
-        return report.finish();
+        report.line(&header);
+        return Ok(report);
     }
+    let mut sections = Vec::new();
     if matches!(view, "references" | "callers" | "all") {
-        let mut count = 0;
+        type IncomingKey<'a> = (Option<usize>, &'static str, bool, &'a str);
+        let mut groups: Vec<(IncomingKey<'_>, BTreeSet<(usize, usize)>)> = Vec::new();
+        let mut by_key: BTreeMap<IncomingKey<'_>, usize> = BTreeMap::new();
         for edge in index
             .incoming(id)
             .filter(|edge| view != "callers" || is_call(edge.kind))
         {
-            count += 1;
-            let owner = edge
-                .from
-                .map(|id| index.definitions[id].qualified.as_str())
-                .unwrap_or("file scope");
-            let kind = relationship(edge.kind);
-            let confidence = if edge.inferred { "possible " } else { "" };
-            report.line(format!(
-                "  {confidence}{kind} from {owner} at {}",
-                edge.location
-            ));
-            if report.clipped {
-                break;
-            }
+            let key = (
+                edge.from,
+                relationship(edge.kind),
+                edge.inferred,
+                edge.location.file.as_str(),
+            );
+            let slot = *by_key.entry(key).or_insert_with(|| {
+                let pos = groups.len();
+                groups.push((key, BTreeSet::new()));
+                pos
+            });
+            groups[slot]
+                .1
+                .insert((edge.location.start, edge.location.end));
         }
-        if count == 0 {
-            report.line("  No matching references found.");
-        }
+        let lines = groups
+            .into_iter()
+            .map(|((from, kind, inferred, file), spans)| {
+                let owner = from
+                    .map(|owner_id| index.definitions[owner_id].qualified.as_str())
+                    .unwrap_or("file scope");
+                let confidence = if inferred { "possible " } else { "" };
+                format!(
+                    "  {confidence}{kind} from {owner} at {}",
+                    format_line_spans(file, &spans)
+                )
+            })
+            .collect();
+        let (singular, plural) = if view == "callers" {
+            ("caller", "callers")
+        } else {
+            ("reference", "references")
+        };
+        sections.push(QuerySection {
+            lines,
+            empty: Some("  No matching references found."),
+            singular,
+            plural,
+        });
     }
     if matches!(view, "dependencies" | "all") {
+        type OutgoingKey<'a> = (usize, &'static str, bool, &'a str);
+        let mut groups: Vec<(OutgoingKey<'_>, BTreeSet<(usize, usize)>)> = Vec::new();
+        let mut by_key: BTreeMap<OutgoingKey<'_>, usize> = BTreeMap::new();
         for edge in index.outgoing(id) {
-            let confidence = if edge.inferred { "possible " } else { "" };
-            report.line(format!(
-                "  {confidence}{} → {} (from {})",
+            let key = (
+                edge.to,
                 relationship(edge.kind),
-                describe(&index.definitions[edge.to]),
-                edge.location
-            ));
+                edge.inferred,
+                edge.location.file.as_str(),
+            );
+            let slot = *by_key.entry(key).or_insert_with(|| {
+                let pos = groups.len();
+                groups.push((key, BTreeSet::new()));
+                pos
+            });
+            groups[slot]
+                .1
+                .insert((edge.location.start, edge.location.end));
+        }
+        let lines = groups
+            .into_iter()
+            .map(|((to, kind, inferred, file), spans)| {
+                let confidence = if inferred { "possible " } else { "" };
+                format!(
+                    "  {confidence}{kind} → {} (from {})",
+                    describe(&index.definitions[to]),
+                    format_line_spans(file, &spans)
+                )
+            })
+            .collect();
+        sections.push(QuerySection {
+            lines,
+            empty: None,
+            singular: "dependency",
+            plural: "dependencies",
+        });
+    }
+    if matches!(view, "tests" | "all") {
+        let lines = index
+            .related_tests(id, 16)
+            .into_iter()
+            .map(|(test_id, hops, inferred)| {
+                let confidence = if inferred { "possible " } else { "" };
+                format!(
+                    "  {confidence}related test ({hops} call hops): {}",
+                    describe(&index.definitions[test_id])
+                )
+            })
+            .collect();
+        sections.push(QuerySection {
+            lines,
+            empty: Some("  No related tests found in indexed calls."),
+            singular: "related test",
+            plural: "related tests",
+        });
+    }
+    let shown = fit_query_sections(&header, &sections, cap);
+    report.line(&header);
+    for (section, &count) in sections.iter().zip(&shown) {
+        if report.clipped {
+            break;
+        }
+        if section.lines.is_empty() {
+            if let Some(empty) = section.empty {
+                report.line(empty);
+            }
+            continue;
+        }
+        for line in &section.lines[..count] {
+            report.line(line);
             if report.clipped {
                 break;
             }
         }
-    }
-    if matches!(view, "tests" | "all") {
-        let tests = index.related_tests(id, 16);
-        for (id, hops, inferred) in &tests {
-            let confidence = if *inferred { "possible " } else { "" };
-            report.line(format!(
-                "  {confidence}related test ({} call hops): {}",
-                hops,
-                describe(&index.definitions[*id])
-            ));
-        }
-        if tests.is_empty() {
-            report.line("  No related tests found in indexed calls.");
+        if !report.clipped
+            && let Some(note) = section.clip_note(count)
+        {
+            report.line(note);
         }
     }
-    report.finish()
+    Ok(report)
 }
 
 pub(crate) fn relationship(kind: Kind) -> &'static str {
@@ -225,26 +433,49 @@ fn snippet(
     to: usize,
     report: &mut Report,
 ) -> Result<()> {
+    snippets(workspace, file, &[(from, to)], report)
+}
+
+fn snippets(
+    workspace: &Workspace,
+    file: &str,
+    windows: &[(usize, usize)],
+    report: &mut Report,
+) -> Result<()> {
+    if windows.is_empty() {
+        return Ok(());
+    }
     let text = fs::read_to_string(workspace.source_path(file)?)?;
-    let before = report.left();
-    let mut last = None;
-    for (line, content) in text.lines().enumerate().skip(from - 1).take(to - from + 1) {
+    let lines: Vec<&str> = text.lines().collect();
+    let digest = capture::source_digest(text.as_bytes());
+    for (index, &(from, to)) in windows.iter().enumerate() {
         if report.clipped {
             break;
         }
-        report.line(format!("  {} | {content}", line + 1));
-        last = Some(line + 1);
-    }
-    if let Some(last) = last {
-        let printed = before.saturating_sub(report.left()) as u64;
-        crate::history::saw_expand(
-            workspace,
-            file,
-            from,
-            last,
-            capture::source_digest(text.as_bytes()),
-            printed,
-        );
+        if index > 0 {
+            report.line("  …");
+            if report.clipped {
+                break;
+            }
+        }
+        let before = report.left();
+        let mut last = None;
+        for (offset, content) in lines
+            .iter()
+            .enumerate()
+            .skip(from.saturating_sub(1))
+            .take(to.saturating_sub(from) + 1)
+        {
+            if report.clipped {
+                break;
+            }
+            report.line(format!("  {} | {content}", offset + 1));
+            last = Some(offset + 1);
+        }
+        if let Some(last) = last {
+            let printed = before.saturating_sub(report.left()) as u64;
+            crate::history::saw_expand(workspace, file, from, last, digest.clone(), printed);
+        }
     }
     Ok(())
 }
@@ -366,7 +597,132 @@ fn overlapping_names(index: &Index, id: usize) -> Vec<String> {
 /// Distinct log lines listed for one source location in `context --run`.
 const MAX_DIAGNOSTICS_PER_LOCATION: usize = 4;
 
+enum Resolution {
+    /// One enclosing symbol: the innermost non-file/non-module member containing
+    /// the location, or the first file/module definition when no members overlap.
+    Single {
+        best: usize,
+        overlapping: Vec<usize>,
+    },
+    /// A range spanning multiple non-file/non-module symbols.
+    Multiple { members: Vec<usize> },
+    /// No indexed symbol overlaps the location.
+    None,
+}
+
+fn resolve_location(index: &Index, location: &Location) -> Resolution {
+    let definitions = index.at(location);
+    let members: Vec<usize> = definitions
+        .iter()
+        .copied()
+        .filter(|&id| !matches!(index.definitions[id].kind.as_str(), "file" | "module"))
+        .collect();
+    if let Some(best) = members.iter().copied().find(|&id| {
+        let span = &index.definitions[id].location;
+        span.start <= location.start && location.end <= span.end
+    }) {
+        return Resolution::Single {
+            best,
+            overlapping: members,
+        };
+    }
+    if !members.is_empty() {
+        return Resolution::Multiple { members };
+    }
+    match definitions.first().copied() {
+        Some(best) => Resolution::Single {
+            best,
+            overlapping: definitions,
+        },
+        None => Resolution::None,
+    }
+}
+
+fn snippet_window(definition: &Definition, location: &Location) -> (usize, usize) {
+    let from = location
+        .start
+        .saturating_sub(3)
+        .max(definition.location.start);
+    let to = location
+        .end
+        .max(location.start.saturating_add(3))
+        .min(definition.location.end)
+        .min(from.saturating_add(14));
+    (from, to.max(from))
+}
+
+fn merge_windows(mut windows: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    windows.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (from, to) in windows {
+        match merged.last_mut() {
+            Some((_, last_to)) if from <= last_to.saturating_add(1) => {
+                *last_to = (*last_to).max(to);
+            }
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
+}
+
+fn emit_diagnostics(
+    directory: &std::path::Path,
+    justless: &str,
+    id: &str,
+    location: &Location,
+    diagnostics: &[&capture::Diagnostic],
+    report: &mut Report,
+) -> Result<()> {
+    let shown = diagnostics.len().min(MAX_DIAGNOSTICS_PER_LOCATION);
+    for diagnostic in &diagnostics[..shown] {
+        if report.clipped {
+            break;
+        }
+        report.line(format!(
+            "{} · log {}:{}",
+            location,
+            diagnostic.stream.name(),
+            diagnostic.log_line
+        ));
+        report.line(format!(
+            "  Replay: {justless} log {id} --stream {} --from {} --to {}",
+            diagnostic.stream.name(),
+            diagnostic.log_line.saturating_sub(2).max(1),
+            diagnostic.log_line.saturating_add(2)
+        ));
+        for line in capture::diagnostic_excerpt(directory, diagnostic)? {
+            report.line(line);
+        }
+    }
+    if diagnostics.len() > shown && !report.clipped {
+        report.line(format!(
+            "  +{} more log line(s) at this location. {justless} search {id} {}",
+            diagnostics.len() - shown,
+            crate::workspace::shell_text(&location.file)
+        ));
+    }
+    Ok(())
+}
+
 pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> Result<()> {
+    let (directory, text, source) = from_run_report(workspace, index, id, cap)?;
+    io::stdout().lock().write_all(text.as_bytes())?;
+    // The log lines and notes retrieve the run's output again. The source shown
+    // beside them does not.
+    crate::history::recall(
+        &directory,
+        crate::history::Retrieval::Context,
+        Some(text.len().saturating_sub(source) as u64),
+    );
+    Ok(())
+}
+
+fn from_run_report(
+    workspace: &Workspace,
+    index: &Index,
+    id: &str,
+    cap: usize,
+) -> Result<(std::path::PathBuf, String, usize)> {
     let (directory, run) = capture::load(workspace, id)?;
     let mut report = Report::new(cap);
     let justless = workspace.justless();
@@ -404,55 +760,134 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
         }
         groups.sort_by_key(|(_, list)| !list.iter().any(on_stderr));
     }
+    // Group non-stale locations sharing one enclosing symbol so the symbol's
+    // metadata prints once and overlapping ±3-line snippets merge cleanly.
+    enum RunEntry<'a> {
+        Symbol {
+            best: usize,
+            overlapping: Vec<usize>,
+            items: Vec<(&'a Location, Vec<&'a capture::Diagnostic>)>,
+        },
+        Standalone {
+            location: &'a Location,
+            diagnostics: Vec<&'a capture::Diagnostic>,
+            stale: bool,
+        },
+    }
+    let mut entries: Vec<RunEntry<'_>> = Vec::new();
+    let mut by_symbol: BTreeMap<usize, usize> = BTreeMap::new();
     for (location, diagnostics) in groups {
-        let shown = diagnostics.len().min(MAX_DIAGNOSTICS_PER_LOCATION);
-        for diagnostic in &diagnostics[..shown] {
-            report.line(format!(
-                "{} · log {}:{}",
-                location,
-                diagnostic.stream.name(),
-                diagnostic.log_line
-            ));
-            report.line(format!(
-                "  Replay: {justless} log {id} --stream {} --from {} --to {}",
-                diagnostic.stream.name(),
-                diagnostic.log_line.saturating_sub(2).max(1),
-                diagnostic.log_line.saturating_add(2)
-            ));
-            for line in capture::diagnostic_excerpt(&directory, diagnostic)? {
-                report.line(line);
-            }
-        }
-        if diagnostics.len() > shown {
-            report.line(format!(
-                "  +{} more log line(s) at this location. {justless} search {id} {}",
-                diagnostics.len() - shown,
-                crate::workspace::shell_text(&location.file)
-            ));
-        }
-        if let Some(digest) = run.source_digests.get(&location.file)
-            && index.files.get(&location.file) != Some(digest)
+        let stale = run
+            .source_digests
+            .get(&location.file)
+            .is_some_and(|digest| index.files.get(&location.file) != Some(digest));
+        if !stale
+            && let Resolution::Single { best, overlapping } = resolve_location(index, location)
         {
-            report.line("  Source changed or disappeared after this run. Re-run the command for current locations.");
+            if let Some(&slot) = by_symbol.get(&best) {
+                if let RunEntry::Symbol {
+                    overlapping: existing,
+                    items,
+                    ..
+                } = &mut entries[slot]
+                {
+                    if location.end > location.start {
+                        for id in overlapping {
+                            if !existing.contains(&id) {
+                                existing.push(id);
+                            }
+                        }
+                    }
+                    items.push((location, diagnostics));
+                }
+            } else {
+                let slot = entries.len();
+                let keep_overlap = if location.end > location.start {
+                    overlapping
+                } else {
+                    Vec::new()
+                };
+                entries.push(RunEntry::Symbol {
+                    best,
+                    overlapping: keep_overlap,
+                    items: vec![(location, diagnostics)],
+                });
+                by_symbol.insert(best, slot);
+            }
         } else {
-            let room = report.left();
-            at_location(workspace, index, location, &mut report, None)?;
-            source += room.saturating_sub(report.left());
+            entries.push(RunEntry::Standalone {
+                location,
+                diagnostics,
+                stale,
+            });
         }
+    }
+    for entry in entries {
         if report.clipped {
             break;
         }
+        match entry {
+            RunEntry::Symbol {
+                best,
+                overlapping,
+                items,
+            } => {
+                for (location, diagnostics) in &items {
+                    emit_diagnostics(
+                        &directory,
+                        &justless,
+                        id,
+                        location,
+                        diagnostics,
+                        &mut report,
+                    )?;
+                    if report.clipped {
+                        break;
+                    }
+                }
+                if !report.clipped {
+                    let locations: Vec<Location> =
+                        items.iter().map(|(loc, _)| (*loc).clone()).collect();
+                    let room = report.left();
+                    detail_multi(
+                        workspace,
+                        index,
+                        best,
+                        &locations,
+                        &overlapping,
+                        &mut report,
+                        None,
+                    )?;
+                    source += room.saturating_sub(report.left());
+                }
+            }
+            RunEntry::Standalone {
+                location,
+                diagnostics,
+                stale,
+            } => {
+                emit_diagnostics(
+                    &directory,
+                    &justless,
+                    id,
+                    location,
+                    &diagnostics,
+                    &mut report,
+                )?;
+                if report.clipped {
+                    break;
+                }
+                if stale {
+                    report.line("  Source changed or disappeared after this run. Re-run the command for current locations.");
+                } else {
+                    let room = report.left();
+                    at_location(workspace, index, location, &mut report, None)?;
+                    source += room.saturating_sub(report.left());
+                }
+            }
+        }
     }
-    let text = report.into_string();
-    io::stdout().lock().write_all(text.as_bytes())?;
-    // The log lines and notes retrieve the run's output again. The source shown
-    // beside them does not.
-    crate::history::recall(
-        &directory,
-        crate::history::Retrieval::Context,
-        Some(text.len().saturating_sub(source) as u64),
-    );
-    Ok(())
+    Ok((directory, report.into_string(), source))
 }
 
 fn at_location(
@@ -462,107 +897,93 @@ fn at_location(
     report: &mut Report,
     mut memory: Option<&mut Memory>,
 ) -> Result<()> {
-    let definitions = index.at(location);
-    // A file or module contains everything in it, so it only stands for a range
-    // when no symbol inside it overlaps. A range across several symbols, such as
-    // a new file, shows each of them in source order.
-    let members: Vec<usize> = definitions
-        .iter()
-        .copied()
-        .filter(|&id| !matches!(index.definitions[id].kind.as_str(), "file" | "module"))
-        .collect();
-    let containing = members.iter().copied().find(|&id| {
-        let span = &index.definitions[id].location;
-        span.start <= location.start && location.end <= span.end
-    });
-    if let Some(best) = containing {
-        return detail(workspace, index, best, location, &members, report, memory);
-    }
-    if !members.is_empty() {
-        let mut outermost: Vec<usize> = members
-            .iter()
-            .copied()
-            .filter(|&id| {
-                let span = &index.definitions[id].location;
-                !members.iter().any(|&other| {
-                    let outer = &index.definitions[other].location;
-                    outer != span && outer.start <= span.start && span.end <= outer.end
-                })
-            })
-            .collect();
-        outermost.sort_by_key(|&id| (index.definitions[id].location.start, id));
-        let mut names: Vec<_> = outermost
-            .iter()
-            .take(24)
-            .map(|&id| {
-                let qualified = &index.definitions[id].qualified;
-                qualified.rsplit("::").next().unwrap_or(qualified)
-            })
-            .collect();
-        let more = outermost.len().saturating_sub(names.len());
-        let rest = format!("+{more} more");
-        if more > 0 {
-            names.push(&rest);
-        }
-        report.line(format!(
-            "{location} · {} symbols: {}",
-            outermost.len(),
-            names.join(", ")
-        ));
-        for id in outermost {
-            if report.clipped {
-                break;
-            }
-            let span = &index.definitions[id].location;
-            let part = Location {
-                file: location.file.clone(),
-                start: span.start.max(location.start),
-                end: span.end.min(location.end),
-            };
-            // Members such as a class's methods are named under their owner.
-            let mut inner: Vec<usize> = members
+    match resolve_location(index, location) {
+        Resolution::Single { best, overlapping } => detail(
+            workspace,
+            index,
+            best,
+            location,
+            &overlapping,
+            report,
+            memory,
+        ),
+        Resolution::Multiple { members } => {
+            let mut outermost: Vec<usize> = members
                 .iter()
                 .copied()
-                .filter(|&other| {
-                    let member = &index.definitions[other].location;
-                    other != id && span.start <= member.start && member.end <= span.end
+                .filter(|&id| {
+                    let span = &index.definitions[id].location;
+                    !members.iter().any(|&other| {
+                        let outer = &index.definitions[other].location;
+                        outer != span && outer.start <= span.start && span.end <= outer.end
+                    })
                 })
                 .collect();
-            inner.sort_by_key(|&other| (index.definitions[other].location.start, other));
-            detail(
+            outermost.sort_by_key(|&id| (index.definitions[id].location.start, id));
+            let mut names: Vec<_> = outermost
+                .iter()
+                .take(24)
+                .map(|&id| {
+                    let qualified = &index.definitions[id].qualified;
+                    qualified.rsplit("::").next().unwrap_or(qualified)
+                })
+                .collect();
+            let more = outermost.len().saturating_sub(names.len());
+            let rest = format!("+{more} more");
+            if more > 0 {
+                names.push(&rest);
+            }
+            report.line(format!(
+                "{location} · {} symbols: {}",
+                outermost.len(),
+                names.join(", ")
+            ));
+            for id in outermost {
+                if report.clipped {
+                    break;
+                }
+                let span = &index.definitions[id].location;
+                let part = Location {
+                    file: location.file.clone(),
+                    start: span.start.max(location.start),
+                    end: span.end.min(location.end),
+                };
+                // Members such as a class's methods are named under their owner.
+                let mut inner: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|&other| {
+                        let member = &index.definitions[other].location;
+                        other != id && span.start <= member.start && member.end <= span.end
+                    })
+                    .collect();
+                inner.sort_by_key(|&other| (index.definitions[other].location.start, other));
+                detail(
+                    workspace,
+                    index,
+                    id,
+                    &part,
+                    &inner,
+                    report,
+                    memory.as_deref_mut(),
+                )?;
+            }
+            Ok(())
+        }
+        Resolution::None => {
+            report.line(format!("{} · no enclosing indexed symbol", location));
+            if let Some(error) = index.errors.get(&location.file) {
+                report.line(format!("  Parse error: {error}"));
+            }
+            snippet(
                 workspace,
-                index,
-                id,
-                &part,
-                &inner,
+                &location.file,
+                location.start.saturating_sub(2).max(1),
+                location.end.min(location.start.saturating_add(8)),
                 report,
-                memory.as_deref_mut(),
-            )?;
+            )
         }
-        return Ok(());
     }
-    let Some(best) = definitions.first().copied() else {
-        report.line(format!("{} · no enclosing indexed symbol", location));
-        if let Some(error) = index.errors.get(&location.file) {
-            report.line(format!("  Parse error: {error}"));
-        }
-        return snippet(
-            workspace,
-            &location.file,
-            location.start.saturating_sub(2).max(1),
-            location.end.min(location.start.saturating_add(8)),
-            report,
-        );
-    };
-    detail(
-        workspace,
-        index,
-        best,
-        location,
-        &definitions,
-        report,
-        memory,
-    )
 }
 
 /// One symbol around a location: its calls, related tests, the other symbols
@@ -572,6 +993,33 @@ fn detail(
     index: &Index,
     best: usize,
     location: &Location,
+    overlapping: &[usize],
+    report: &mut Report,
+    memory: Option<&mut Memory>,
+) -> Result<()> {
+    let keep = if location.end > location.start {
+        overlapping
+    } else {
+        &[]
+    };
+    detail_multi(
+        workspace,
+        index,
+        best,
+        std::slice::from_ref(location),
+        keep,
+        report,
+        memory,
+    )
+}
+
+/// One symbol around one or more locations: prints its metadata once and merges
+/// overlapping ±3-line source windows into disjoint sorted windows.
+fn detail_multi(
+    workspace: &Workspace,
+    index: &Index,
+    best: usize,
+    locations: &[Location],
     overlapping: &[usize],
     report: &mut Report,
     memory: Option<&mut Memory>,
@@ -586,11 +1034,12 @@ fn detail(
         })
         .collect();
     edges.sort_by_key(|edge| {
-        (
-            edge.inferred,
-            edge.location.start.abs_diff(location.start),
-            edge.location.start,
-        )
+        let distance = locations
+            .iter()
+            .map(|location| edge.location.start.abs_diff(location.start))
+            .min()
+            .unwrap_or(usize::MAX);
+        (edge.inferred, distance, edge.location.start)
     });
     for edge in edges {
         if referenced.insert(edge.to) {
@@ -629,7 +1078,7 @@ fn detail(
             ));
         }
     }
-    if location.end > location.start {
+    if !overlapping.is_empty() {
         let others: Vec<_> = overlapping
             .iter()
             .filter(|&&id| id != best && index.definitions[id].location != definition.location)
@@ -644,39 +1093,42 @@ fn detail(
             ));
         }
     }
-    let from = location
-        .start
-        .saturating_sub(3)
-        .max(definition.location.start);
-    let to = location
-        .end
-        .max(location.start.saturating_add(3))
-        .min(definition.location.end)
-        .min(from.saturating_add(14));
-    match memory {
-        Some(memory) => {
-            let text = fs::read_to_string(workspace.source_path(&location.file)?)?;
+    let windows = merge_windows(
+        locations
+            .iter()
+            .map(|location| snippet_window(definition, location))
+            .collect(),
+    );
+    let file = locations
+        .first()
+        .map_or(definition.location.file.as_str(), |loc| loc.file.as_str());
+    match (memory, windows.as_slice()) {
+        (Some(memory), &[(from, to)]) => {
+            let text = fs::read_to_string(workspace.source_path(file)?)?;
             memory.show(
                 workspace,
                 &text,
                 &Symbol {
-                    file: &location.file,
+                    file,
                     name: &seen_name(index, best),
                     start: definition.location.start,
                     end: definition.location.end,
                 },
                 &overlapping_names(index, best),
-                (from, to.max(from)),
+                (from, to),
                 false,
                 report,
             );
         }
-        None => snippet(workspace, &location.file, from, to.max(from), report)?,
+        _ => snippets(workspace, file, &windows, report)?,
     }
-    if definition.declaration < from && !report.clipped {
+    if let Some(&(first_from, _)) = windows.first()
+        && definition.declaration < first_from
+        && !report.clipped
+    {
         report.line(format!(
             "  Declaration starts at {}:{}",
-            display_path(&location.file),
+            display_path(file),
             definition.declaration
         ));
     }
@@ -928,9 +1380,19 @@ fn deleted_symbols(workspace: &Workspace, file: &str, rev: &str, deletions: &mut
 }
 
 pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) -> Result<()> {
+    changed_report(workspace, index, since, cap)?.finish()
+}
+
+fn changed_report(
+    workspace: &Workspace,
+    index: &Index,
+    since: &Since,
+    cap: usize,
+) -> Result<Report> {
     let mut report = Report::new(cap);
     let changes = changes(workspace, index, since)?;
-    for (file, change) in &changes {
+    let mut deferred: BTreeMap<(String, usize), Vec<Location>> = BTreeMap::new();
+    for (pos, (file, change)) in changes.iter().enumerate() {
         let name = display_path(file);
         match change {
             Change::Unindexed if fs::symlink_metadata(workspace.root.join(file)).is_err() => {
@@ -943,32 +1405,53 @@ pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) 
                 report.line(format!("{name} · {what}"))
             }
             Change::Deleted(deletions) => {
-                for deletion in deletions {
-                    deleted(workspace, index, file, deletion, &mut report)?;
-                    if report.clipped {
-                        break;
-                    }
-                }
-            }
-            Change::Ranges(locations) => {
-                report.line(format!("{name} · {} changed ranges", locations.len()));
-                for &(start, end) in locations {
-                    report.line(format!("Changed {name}:{start}-{end}"));
-                    at_location(
-                        workspace,
-                        index,
-                        &Location {
+                // If this file also has changed ranges right after, defer symbol
+                // detail for any surviving symbol touched by both so its metadata
+                // prints once and its snippets merge.
+                let next_range_symbols: BTreeSet<usize> = changes
+                    .get(pos + 1)
+                    .and_then(|(next_file, next_change)| {
+                        (next_file == file)
+                            .then_some(next_change)
+                            .and_then(|change| match change {
+                                Change::Ranges(locations) => Some(locations),
+                                _ => None,
+                            })
+                    })
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&(start, end)| {
+                        let location = Location {
                             file: file.clone(),
                             start,
                             end,
-                        },
-                        &mut report,
-                        None,
-                    )?;
-                    if report.clipped {
-                        break;
-                    }
-                }
+                        };
+                        match resolve_location(index, &location) {
+                            Resolution::Single { best, .. } => Some(best),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                emit_deletions(
+                    workspace,
+                    index,
+                    file,
+                    deletions,
+                    &next_range_symbols,
+                    &mut deferred,
+                    &mut report,
+                )?;
+            }
+            Change::Ranges(locations) => {
+                report.line(format!("{name} · {} changed ranges", locations.len()));
+                emit_changed_ranges(
+                    workspace,
+                    index,
+                    file,
+                    locations,
+                    &mut deferred,
+                    &mut report,
+                )?;
             }
         }
         if report.clipped {
@@ -978,19 +1461,37 @@ pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) 
     if changes.is_empty() {
         report.line(since.nothing_changed(workspace));
     }
-    report.finish()
+    Ok(report)
 }
 
-/// One deletion for `context --changes`: where the lines were, what they said,
-/// the symbols removed whole, and the surviving symbol that lost lines, if any.
-/// A deletion between symbols is not pinned on the line before it.
-fn deleted(
-    workspace: &Workspace,
-    index: &Index,
-    file: &str,
-    deletion: &Deletion,
-    report: &mut Report,
-) -> Result<()> {
+fn surviving_symbol(index: &Index, file: &str, deletion: &Deletion) -> Option<(usize, Location)> {
+    if deletion.after == 0 {
+        return None;
+    }
+    // The lines on both sides of the removal belong to one symbol: it changed.
+    let location = Location {
+        file: file.to_owned(),
+        start: deletion.after,
+        end: deletion.after + 1,
+    };
+    let id = index
+        .at(&location)
+        .into_iter()
+        .filter(|&id| {
+            let definition = &index.definitions[id];
+            let span = &definition.location;
+            !matches!(definition.kind.as_str(), "file" | "module")
+                && span.start <= deletion.after
+                && deletion.after < span.end
+        })
+        .min_by_key(|&id| {
+            let span = &index.definitions[id].location;
+            span.end - span.start
+        })?;
+    Some((id, location))
+}
+
+fn emit_deletion_header(file: &str, deletion: &Deletion, report: &mut Report) {
     const SHOWN: usize = 8;
     let name = display_path(file);
     let (first, last) = deletion.old;
@@ -1027,31 +1528,185 @@ fn deleted(
             deletion.lines.len() - SHOWN
         ));
     }
-    if deletion.after == 0 {
-        return Ok(());
+}
+
+/// Deletions in one file for `context --changes`, grouped by surviving enclosing
+/// symbol so its metadata prints once and overlapping snippets merge.
+fn emit_deletions(
+    workspace: &Workspace,
+    index: &Index,
+    file: &str,
+    deletions: &[Deletion],
+    deferred_symbols: &BTreeSet<usize>,
+    deferred: &mut BTreeMap<(String, usize), Vec<Location>>,
+    report: &mut Report,
+) -> Result<()> {
+    enum Entry<'a> {
+        HeaderOnly(&'a Deletion),
+        Symbol {
+            id: usize,
+            items: Vec<(&'a Deletion, Location)>,
+        },
     }
-    // The lines on both sides of the removal belong to one symbol: it changed.
-    let location = Location {
-        file: file.to_owned(),
-        start: deletion.after,
-        end: deletion.after + 1,
-    };
-    let around = index
-        .at(&location)
-        .into_iter()
-        .filter(|&id| {
-            let definition = &index.definitions[id];
-            let span = &definition.location;
-            !matches!(definition.kind.as_str(), "file" | "module")
-                && span.start <= deletion.after
-                && deletion.after < span.end
-        })
-        .min_by_key(|&id| {
-            let span = &index.definitions[id].location;
-            span.end - span.start
-        });
-    if let Some(id) = around {
-        detail(workspace, index, id, &location, &[], report, None)?;
+    let mut entries: Vec<Entry<'_>> = Vec::new();
+    let mut by_symbol: BTreeMap<usize, usize> = BTreeMap::new();
+    for deletion in deletions {
+        match surviving_symbol(index, file, deletion) {
+            Some((id, location)) if deferred_symbols.contains(&id) => {
+                deferred
+                    .entry((file.to_owned(), id))
+                    .or_default()
+                    .push(location);
+                entries.push(Entry::HeaderOnly(deletion));
+            }
+            Some((id, location)) => {
+                if let Some(&slot) = by_symbol.get(&id) {
+                    if let Entry::Symbol { items, .. } = &mut entries[slot] {
+                        items.push((deletion, location));
+                    }
+                } else {
+                    let slot = entries.len();
+                    entries.push(Entry::Symbol {
+                        id,
+                        items: vec![(deletion, location)],
+                    });
+                    by_symbol.insert(id, slot);
+                }
+            }
+            None => entries.push(Entry::HeaderOnly(deletion)),
+        }
+    }
+    for entry in entries {
+        if report.clipped {
+            break;
+        }
+        match entry {
+            Entry::HeaderOnly(deletion) => emit_deletion_header(file, deletion, report),
+            Entry::Symbol { id, items } => {
+                for (deletion, _) in &items {
+                    emit_deletion_header(file, deletion, report);
+                    if report.clipped {
+                        break;
+                    }
+                }
+                if !report.clipped {
+                    let locations: Vec<Location> =
+                        items.into_iter().map(|(_, location)| location).collect();
+                    detail_multi(workspace, index, id, &locations, &[], report, None)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Changed ranges in one file for `context --changes`, grouped by enclosing
+/// symbol so each symbol's metadata prints once and overlapping snippets merge.
+fn emit_changed_ranges(
+    workspace: &Workspace,
+    index: &Index,
+    file: &str,
+    locations: &[(usize, usize)],
+    deferred: &mut BTreeMap<(String, usize), Vec<Location>>,
+    report: &mut Report,
+) -> Result<()> {
+    enum RangeEntry {
+        Symbol {
+            best: usize,
+            ranges: Vec<(usize, usize)>,
+            locations: Vec<Location>,
+            overlapping: Vec<usize>,
+        },
+        Standalone(Location),
+    }
+    let name = display_path(file);
+    let mut entries: Vec<RangeEntry> = Vec::new();
+    let mut by_symbol: BTreeMap<usize, usize> = BTreeMap::new();
+    for &(start, end) in locations {
+        let location = Location {
+            file: file.to_owned(),
+            start,
+            end,
+        };
+        match resolve_location(index, &location) {
+            Resolution::Single { best, overlapping } => {
+                if let Some(&slot) = by_symbol.get(&best) {
+                    if let RangeEntry::Symbol {
+                        ranges,
+                        locations: group_locs,
+                        overlapping: existing,
+                        ..
+                    } = &mut entries[slot]
+                    {
+                        ranges.push((start, end));
+                        group_locs.push(location);
+                        if end > start {
+                            for id in overlapping {
+                                if !existing.contains(&id) {
+                                    existing.push(id);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let slot = entries.len();
+                    let mut group_locs = deferred
+                        .remove(&(file.to_owned(), best))
+                        .unwrap_or_default();
+                    group_locs.push(location);
+                    let keep_overlap = if end > start { overlapping } else { Vec::new() };
+                    entries.push(RangeEntry::Symbol {
+                        best,
+                        ranges: vec![(start, end)],
+                        locations: group_locs,
+                        overlapping: keep_overlap,
+                    });
+                    by_symbol.insert(best, slot);
+                }
+            }
+            Resolution::Multiple { .. } | Resolution::None => {
+                entries.push(RangeEntry::Standalone(location));
+            }
+        }
+    }
+    for entry in entries {
+        if report.clipped {
+            break;
+        }
+        match entry {
+            RangeEntry::Symbol {
+                best,
+                ranges,
+                locations,
+                overlapping,
+            } => {
+                let list: Vec<String> = ranges
+                    .iter()
+                    .map(|&(start, end)| format!("{start}-{end}"))
+                    .collect();
+                report.line(format!("Changed {name}:{}", list.join(", ")));
+                if !report.clipped {
+                    detail_multi(
+                        workspace,
+                        index,
+                        best,
+                        &locations,
+                        &overlapping,
+                        report,
+                        None,
+                    )?;
+                }
+            }
+            RangeEntry::Standalone(location) => {
+                report.line(format!(
+                    "Changed {name}:{}-{}",
+                    location.start, location.end
+                ));
+                if !report.clipped {
+                    at_location(workspace, index, &location, report, None)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1518,5 +2173,357 @@ mod tests {
         );
         assert!(body("diff --git a/x b/x\nold mode 100755\nnew mode 100644\n") == Body::Unchanged);
         assert!(body("") == Body::Unchanged);
+    }
+
+    fn temp_workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for (rel, body) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, body).unwrap();
+        }
+        let workspace = Workspace::discover(Some(root)).unwrap();
+        (dir, workspace)
+    }
+
+    fn init_git(workspace: &Workspace) {
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Test"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["add", "."][..],
+            &["commit", "-qm", "init"][..],
+        ] {
+            let out = workspace.git(args).unwrap();
+            assert!(out.status.success(), "{args:?}: {:?}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn query_groups_duplicate_edges_and_saves_bytes() {
+        let manifest = "[package]\nname = \"hubdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lib =
+            "pub mod callers;\npub mod single;\n\npub fn core_fn(x: u32) -> u32 {\n    x + 1\n}\n";
+        let mut callers = String::from(
+            "use crate::core_fn;\n\npub fn heavy_caller() -> u32 {\n    let mut total = 0;\n",
+        );
+        for i in 0..8 {
+            callers.push_str(&format!("    total += core_fn({i});\n"));
+        }
+        callers.push_str("    total\n}\n");
+        let single = "use crate::core_fn;\n\npub fn single_caller() -> u32 {\n    core_fn(42)\n}\n";
+        let (_dir, workspace) = temp_workspace(&[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", lib),
+            ("src/callers.rs", &callers),
+            ("src/single.rs", single),
+        ]);
+        let index = Index::open(&workspace).unwrap();
+
+        let refs = query_report(&index, "core_fn", "references", 8000)
+            .unwrap()
+            .into_string();
+        assert!(
+            refs.contains(
+                "  call from hubdemo::callers::heavy_caller at src/callers.rs:5,6,7,8,9,10,11,12\n"
+            ),
+            "{refs}"
+        );
+        assert_eq!(
+            refs.matches("hubdemo::callers::heavy_caller").count(),
+            1,
+            "{refs}"
+        );
+        // Single-hit caller preserves the natural `file:line` format.
+        assert!(
+            refs.contains("  call from hubdemo::single::single_caller at src/single.rs:4\n"),
+            "{refs}"
+        );
+
+        let deps = query_report(&index, "heavy_caller", "dependencies", 8000)
+            .unwrap()
+            .into_string();
+        assert!(
+            deps.contains("  call → hubdemo::core_fn [function] at src/lib.rs:4-6 (from src/callers.rs:5,6,7,8,9,10,11,12)\n"),
+            "{deps}"
+        );
+        assert_eq!(
+            deps.matches("hubdemo::core_fn [function]").count(),
+            1,
+            "{deps}"
+        );
+
+        // Measure byte reduction against ungrouped lines for the 8 repeated call sites.
+        let ungrouped_refs: usize = (5..=12)
+            .map(|line| {
+                format!("  call from hubdemo::callers::heavy_caller at src/callers.rs:{line}\n")
+                    .len()
+            })
+            .sum();
+        let grouped_ref_line = refs
+            .lines()
+            .find(|line| line.contains("heavy_caller"))
+            .unwrap()
+            .len()
+            + 1;
+        assert!(
+            grouped_ref_line * 4 < ungrouped_refs,
+            "expected >75% reduction on 8-site caller: grouped={grouped_ref_line} vs ungrouped={ungrouped_refs}"
+        );
+    }
+
+    #[test]
+    fn query_all_view_balances_hub_references_dependencies_and_tests() {
+        let manifest = "[package]\nname = \"balance\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let mut src = String::from(
+            "pub fn dep_alpha(x: u32) -> u32 { x + 1 }\n\
+             pub fn dep_beta(x: u32) -> u32 { x + 2 }\n\
+             pub fn dep_gamma(x: u32) -> u32 { x + 3 }\n\
+             pub fn hub_symbol(x: u32) -> u32 {\n\
+                 dep_alpha(x) + dep_beta(x) + dep_gamma(x)\n\
+             }\n",
+        );
+        for i in 0..30 {
+            src.push_str(&format!(
+                "pub fn consumer_{i:02}(x: u32) -> u32 {{ hub_symbol(x + {i}) }}\n"
+            ));
+        }
+        src.push_str(
+            "#[cfg(test)]\nmod tests {\n\
+                 use super::*;\n\
+                 #[test]\nfn test_hub_first() { assert_eq!(hub_symbol(1), 9); }\n\
+                 #[test]\nfn test_hub_second() { assert_eq!(hub_symbol(2), 12); }\n\
+             }\n",
+        );
+        let (_dir, workspace) = temp_workspace(&[("Cargo.toml", manifest), ("src/lib.rs", &src)]);
+        let index = Index::open(&workspace).unwrap();
+
+        let cap = 1200;
+        let out = query_report(&index, "hub_symbol", "all", cap)
+            .unwrap()
+            .into_string();
+        assert!(out.len() <= cap, "len={} > {cap}\n{out}", out.len());
+        assert!(out.contains("dep_alpha"), "dependencies starved:\n{out}");
+        assert!(out.contains("dep_beta"), "dependencies starved:\n{out}");
+        assert!(out.contains("dep_gamma"), "dependencies starved:\n{out}");
+        assert!(out.contains("test_hub_first"), "tests starved:\n{out}");
+        assert!(out.contains("test_hub_second"), "tests starved:\n{out}");
+
+        // Exact clipped count for references: shown + omitted == total incoming groups.
+        let shown_refs = out
+            .lines()
+            .filter(|line| line.starts_with("  call from "))
+            .count();
+        let clip_line = out
+            .lines()
+            .find(|line| line.contains("… +") && line.contains("more reference"))
+            .unwrap_or_else(|| panic!("expected clipped references note:\n{out}"));
+        let omitted: usize = clip_line
+            .split("… +")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // 30 consumers + 2 tests call hub_symbol directly.
+        assert_eq!(shown_refs + omitted, 32, "{out}");
+
+        // Single view `--view callers` also reports exact `… +N more callers`.
+        let callers = query_report(&index, "hub_symbol", "callers", 500)
+            .unwrap()
+            .into_string();
+        assert!(callers.len() <= 500, "{callers}");
+        assert!(callers.contains("more caller"), "{callers}");
+    }
+
+    #[test]
+    fn changed_deduplicates_enclosing_symbol_and_merges_snippets() {
+        let manifest = "[package]\nname = \"chdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let mut lines = vec![
+            "pub fn helper(v: u32) -> u32 { v * 2 }".to_owned(),
+            String::new(),
+            "pub fn process_order(seed: u32) -> u32 {".to_owned(),
+            "    let mut acc = helper(seed);".to_owned(),
+        ];
+        for i in 1..=36 {
+            lines.push(format!("    acc += {i}; // step_{i:02}"));
+        }
+        lines.push("    acc".to_owned());
+        lines.push("}".to_owned());
+        lines.push("#[cfg(test)]".to_owned());
+        lines.push("mod tests {".to_owned());
+        lines.push("    #[test]".to_owned());
+        lines.push(
+            "    fn test_process_order() { assert!(super::process_order(1) > 0); }".to_owned(),
+        );
+        lines.push("}".to_owned());
+        let original = format!("{}\n", lines.join("\n"));
+
+        let (_dir, workspace) = temp_workspace(&[
+            ("Cargo.toml", manifest),
+            (".gitignore", "/.justless/\n"),
+            ("src/lib.rs", &original),
+        ]);
+        init_git(&workspace);
+
+        // Make 3 edits inside `process_order`: two overlapping ±3 windows (step_10, step_13)
+        // and one distant window (step_34), plus a pure deletion at step_22.
+        let edited = original
+            .replace("acc += 10; // step_10", "acc += 100; // step_10")
+            .replace("acc += 13; // step_13", "acc += 130; // step_13")
+            .replace("    acc += 22; // step_22\n", "")
+            .replace("acc += 34; // step_34", "acc += 340; // step_34");
+        fs::write(workspace.root.join("src/lib.rs"), &edited).unwrap();
+
+        let index = Index::open(&workspace).unwrap();
+        let out = changed_report(&workspace, &index, &Since::Head, 12_000)
+            .unwrap()
+            .into_string();
+
+        // Symbol header, calls, related test, and Declaration line appear ONCE.
+        assert_eq!(
+            out.matches("chdemo::process_order [function]").count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(out.matches("  calls chdemo::helper").count(), 1, "{out}");
+        assert_eq!(
+            out.matches("  related test: chdemo::tests::test_process_order")
+                .count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("  Declaration starts at src/lib.rs:3").count(),
+            1,
+            "{out}"
+        );
+        // Overlapping hunks merge cleanly without repeating lines in the overlap.
+        assert_eq!(out.matches("step_11").count(), 1, "{out}");
+        assert_eq!(out.matches("step_12").count(), 1, "{out}");
+        assert!(out.contains("step_10"), "{out}");
+        assert!(out.contains("step_13"), "{out}");
+        assert!(out.contains("step_34"), "{out}");
+        assert!(out.contains("\n  …\n"), "expected window separator:\n{out}");
+        // Compare against ungrouped baseline (calling detail once per hunk + deletion).
+        let mut ungrouped = Report::new(12_000);
+        for line in [14usize, 17, 25, 37] {
+            let loc = Location {
+                file: "src/lib.rs".into(),
+                start: line,
+                end: line,
+            };
+            at_location(&workspace, &index, &loc, &mut ungrouped, None).unwrap();
+        }
+        let ungrouped_len = ungrouped.into_string().len();
+        assert!(
+            out.len() * 10 < ungrouped_len * 7,
+            "expected >30% byte reduction: grouped={} vs ungrouped={ungrouped_len}\n{out}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn from_run_deduplicates_enclosing_symbol_and_merges_snippets() {
+        let manifest = "[package]\nname = \"rundemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let mut lines = vec![
+            "pub fn helper(v: u32) -> u32 { v * 2 }".to_owned(),
+            String::new(),
+            "pub fn compute(seed: u32) -> u32 {".to_owned(),
+            "    let mut acc = helper(seed);".to_owned(),
+        ];
+        for i in 1..=36 {
+            lines.push(format!("    acc += {i}; // line_{i:02}"));
+        }
+        lines.push("    acc".to_owned());
+        lines.push("}".to_owned());
+        lines.push("#[cfg(test)]".to_owned());
+        lines.push("mod tests {".to_owned());
+        lines.push("    #[test]".to_owned());
+        lines.push("    fn test_compute() { assert!(super::compute(1) > 0); }".to_owned());
+        lines.push("}".to_owned());
+        let src = format!("{}\n", lines.join("\n"));
+
+        let (_dir, workspace) = temp_workspace(&[("Cargo.toml", manifest), ("src/lib.rs", &src)]);
+        let index = Index::open(&workspace).unwrap();
+
+        // Create a real archived run with 3 diagnostics inside `compute`:
+        // lines 14 & 17 (overlapping ±3 windows) and line 38 (disjoint window).
+        let run_dir = workspace.state.join("runs/run-multi01");
+        fs::create_dir_all(&run_dir).unwrap();
+        let stderr = "src/lib.rs:14:5: error[E0308]: mismatch A\n\
+                      src/lib.rs:17:5: error[E0308]: mismatch B\n\
+                      src/lib.rs:38:5: error[E0308]: mismatch C\n";
+        fs::write(run_dir.join("stdout"), "").unwrap();
+        fs::write(run_dir.join("stderr"), stderr).unwrap();
+        let digest = index.files["src/lib.rs"].clone();
+        let record = serde_json::json!({
+            "id": "run-multi01",
+            "status": 1,
+            "raw_bytes": stderr.len(),
+            "preview_bytes": stderr.len(),
+            "diagnostics": [
+                {"location": {"file": "src/lib.rs", "start": 14, "end": 14}, "stream": "stderr", "log_line": 1},
+                {"location": {"file": "src/lib.rs", "start": 17, "end": 17}, "stream": "stderr", "log_line": 2},
+                {"location": {"file": "src/lib.rs", "start": 38, "end": 38}, "stream": "stderr", "log_line": 3}
+            ],
+            "source_digests": {"src/lib.rs": digest}
+        });
+        fs::write(run_dir.join("record.json"), record.to_string()).unwrap();
+
+        let (_, out, source_bytes) =
+            from_run_report(&workspace, &index, "run-multi01", 12_000).unwrap();
+        // Every diagnostic header & Replay command is preserved.
+        assert!(out.contains("src/lib.rs:14 · log stderr:1"), "{out}");
+        assert!(out.contains("src/lib.rs:17 · log stderr:2"), "{out}");
+        assert!(out.contains("src/lib.rs:38 · log stderr:3"), "{out}");
+        // Symbol metadata prints ONCE.
+        assert_eq!(
+            out.matches("rundemo::compute [function]").count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(out.matches("  calls rundemo::helper").count(), 1, "{out}");
+        assert_eq!(
+            out.matches("  related test: rundemo::tests::test_compute")
+                .count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("  Declaration starts at src/lib.rs:3").count(),
+            1,
+            "{out}"
+        );
+        // Overlapping ±3 lines (14..=17) print ONCE; disjoint window is separated by `  …`.
+        assert_eq!(out.matches("line_11").count(), 1, "{out}");
+        assert_eq!(out.matches("line_12").count(), 1, "{out}");
+        assert!(out.contains("\n  …\n"), "{out}");
+        assert!(
+            source_bytes > 0 && source_bytes < out.len(),
+            "source={source_bytes}, len={}",
+            out.len()
+        );
+
+        // Compare source section size against 3 ungrouped `at_location` calls.
+        let mut ungrouped = Report::new(12_000);
+        for line in [14usize, 17, 38] {
+            let loc = Location {
+                file: "src/lib.rs".into(),
+                start: line,
+                end: line,
+            };
+            at_location(&workspace, &index, &loc, &mut ungrouped, None).unwrap();
+        }
+        let ungrouped_source = ungrouped.into_string().len();
+        assert!(
+            source_bytes * 10 < ungrouped_source * 6,
+            "expected >40% source byte reduction: grouped={source_bytes} vs ungrouped={ungrouped_source}\n{out}"
+        );
     }
 }
