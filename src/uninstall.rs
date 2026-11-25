@@ -464,7 +464,10 @@ fn name(agent: Agent) -> &'static str {
 }
 
 /// The MCP client whose project file belongs to an agent. VS Code's file goes with
-/// Copilot, the agent harness that reads it.
+/// Copilot, the agent harness that reads it. Antigravity CLI's MCP config lives at
+/// the machine-wide `~/.gemini/config/mcp_config.json` rather than in a project,
+/// so project-level `init --remove` leaves it alone (`global::remove` prints a
+/// non-destructive note when that user-level file still lists `justless`).
 fn mcp_client(agent: Agent) -> Option<Client> {
     match agent {
         Agent::Claude => Some(Client::Claude),
@@ -1221,6 +1224,44 @@ pub(crate) fn strip_global(
     }))
 }
 
+/// Whether a regular JSON config file at `path` configures a `justless` MCP
+/// server under `servers_key`. Read-only; returns `false` when missing, a
+/// symlink/directory, unreadable or invalid JSON.
+pub(crate) fn has_json_mcp_server(path: &Path, servers_key: &str) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    has_json_mcp_server_in_text(&text, servers_key)
+}
+
+fn has_json_mcp_server_in_text(text: &str, servers_key: &str) -> bool {
+    if !mentions(text) {
+        return false;
+    }
+    let Ok(config) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let Some(entry) = config
+        .get(servers_key)
+        .and_then(Value::as_object)
+        .and_then(|servers| servers.get("justless"))
+    else {
+        return false;
+    };
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    is_server(entry.get("command").and_then(Value::as_str), &args)
+}
+
 /// An MCP server entry that runs `justless mcp`. Clients start `command` directly,
 /// so a path with spaces needs no quotes there.
 fn is_server(command: Option<&str>, args: &[&str]) -> bool {
@@ -1744,5 +1785,40 @@ mod tests {
         let found = strip_toml("c", &installed).unwrap().found.unwrap();
         assert_eq!(found.outcome, Outcome::Write(original.into()));
         assert!(strip_toml("c", original).unwrap().found.is_none());
+    }
+
+    #[test]
+    fn agy_global_mcp_stays_out_of_project_catalog_and_detects_server_entries() {
+        assert!(mcp_client(Agent::Agy).is_none());
+        assert!(has_json_mcp_server_in_text(
+            r#"{"mcpServers":{"other":{"command":"other-mcp"},"justless":{"command":"justless","args":["mcp"]}}}"#,
+            "mcpServers",
+        ));
+        assert!(has_json_mcp_server_in_text(
+            r#"{"mcpServers":{"justless":{"command":"/opt/bin/justless","args":["--root","/work","mcp"]}}}"#,
+            "mcpServers",
+        ));
+        assert!(!has_json_mcp_server_in_text(
+            r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#,
+            "mcpServers",
+        ));
+        assert!(!has_json_mcp_server_in_text(
+            r#"{"mcpServers":{"justless":{"command":"justless","args":["run","--","mcp"]}}}"#,
+            "mcpServers",
+        ));
+        assert!(!has_json_mcp_server_in_text(
+            "{not json justless",
+            "mcpServers"
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mcp_config.json");
+        assert!(!has_json_mcp_server(&path, "mcpServers"));
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"justless":{"command":"justless","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+        assert!(has_json_mcp_server(&path, "mcpServers"));
     }
 }

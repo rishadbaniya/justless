@@ -37,7 +37,8 @@ use clap::Command;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::history::{estimated_tokens, net_bytes, now_ms};
+use crate::history::{net_bytes, now_ms};
+use crate::tokens::Content;
 use crate::workspace::{Workspace, lock_state, private_dir, write_text};
 
 /// The command `init --statusline` installs. Other setup code matches it to tell
@@ -104,9 +105,11 @@ struct Tally {
     /// printed from the counted runs, measured or estimated as in `stats`.
     run_replayed: u64,
     reads: u64,
+    read_raw: u64,
+    read_shown: u64,
     searches: u64,
-    tool_raw: u64,
-    tool_shown: u64,
+    search_raw: u64,
+    search_shown: u64,
     /// Bytes of archived tool results that `justless recall` printed during the
     /// session, such as the original of a grouped Grep result.
     recalled: u64,
@@ -377,12 +380,20 @@ impl Tally {
             };
             if entry.tool == "Read" {
                 self.reads += 1;
+                self.read_raw += entry.raw;
+                self.read_shown += entry.shown;
             } else {
                 self.searches += 1;
+                self.search_raw += entry.raw;
+                self.search_shown += entry.shown;
             }
-            self.tool_raw += entry.raw;
-            self.tool_shown += entry.shown;
         }
+    }
+
+    fn total_raw(&self) -> u64 {
+        self.run_raw
+            .saturating_add(self.read_raw)
+            .saturating_add(self.search_raw)
     }
 
     /// Savings net of what came back later, as in `stats`: everything the agent
@@ -390,8 +401,45 @@ impl Tally {
     /// replays cost more than the previews saved.
     fn net_bytes(&self) -> i64 {
         let runs = net_bytes(self.run_raw, self.run_shown, self.run_replayed);
-        let tools = net_bytes(self.tool_raw, self.tool_shown, self.recalled);
-        runs.saturating_add(tools)
+        let reads = net_bytes(self.read_raw, self.read_shown, 0);
+        let searches = net_bytes(self.search_raw, self.search_shown, self.recalled);
+        runs.saturating_add(reads).saturating_add(searches)
+    }
+
+    /// Estimated tokens saved at first preview, before replays and recalls:
+    /// `Read` source bytes use the calibrated code ratio (2.57 B/tok) and
+    /// command/search bytes use the logs ratio (2.21 B/tok), matching `stats`.
+    fn initial_tokens(&self) -> i64 {
+        let code = net_bytes(self.read_raw, self.read_shown, 0);
+        let logs = net_bytes(self.run_raw, self.run_shown, 0).saturating_add(net_bytes(
+            self.search_raw,
+            self.search_shown,
+            0,
+        ));
+        Content::Code
+            .tokens_signed(code)
+            .saturating_add(Content::Logs.tokens_signed(logs))
+    }
+
+    /// Estimated net tokens saved, after replays and recalls.
+    fn net_tokens(&self) -> i64 {
+        let code = net_bytes(self.read_raw, self.read_shown, 0);
+        let logs = net_bytes(self.run_raw, self.run_shown, self.run_replayed)
+            .saturating_add(net_bytes(self.search_raw, self.search_shown, self.recalled));
+        Content::Code
+            .tokens_signed(code)
+            .saturating_add(Content::Logs.tokens_signed(logs))
+    }
+
+    /// Rounded whole-percent net byte reduction when the session saved bytes.
+    fn net_saved_percent(&self) -> Option<u64> {
+        let raw = self.total_raw();
+        let net = self.net_bytes();
+        if raw == 0 || net <= 0 || self.net_tokens() < 0 {
+            return None;
+        }
+        let pct = (net as f64 * 100.0 / raw as f64).round();
+        Some((pct as u64).min(100))
     }
 }
 
@@ -418,14 +466,17 @@ fn render(tally: &Tally, width: Option<usize>) -> String {
     if tally.runs + tally.reads + tally.searches == 0 {
         return "justless · ready".into();
     }
-    // Tokens are estimated with the measured bytes-per-token ratio for logs.
-    let net = tally.net_bytes();
-    let tokens = short_number(estimated_tokens(net.unsigned_abs()));
-    let saved = if net < 0 {
+    let net = tally.net_tokens();
+    let tokens = short_number(net.unsigned_abs());
+    let saved_plain = if net < 0 {
         format!("net ≈{tokens} extra tokens")
     } else {
         format!("net ≈{tokens} tokens saved")
     };
+    let saved_pct = tally
+        .net_saved_percent()
+        .map(|pct| format!("{saved_plain} ({pct}%)"));
+    let saved = saved_pct.as_deref().unwrap_or(&saved_plain);
     let mut counts = Vec::new();
     if tally.runs > 0 {
         counts.push(count(tally.runs, "run", "runs"));
@@ -438,25 +489,28 @@ fn render(tally: &Tally, width: Option<usize>) -> String {
     }
     let mut variants = Vec::new();
     if tally.run_replayed > 0 || tally.recalled > 0 {
-        let initial = net_bytes(tally.run_raw, tally.run_shown, 0).saturating_add(net_bytes(
-            tally.tool_raw,
-            tally.tool_shown,
-            0,
-        ));
-        let tokens = short_number(estimated_tokens(initial.unsigned_abs()));
+        let initial = tally.initial_tokens();
+        let tokens = short_number(initial.unsigned_abs());
         let direction = if initial < 0 { "extra" } else { "saved" };
-        let both = format!("justless · initially ≈{tokens} tokens {direction} · {saved}");
+        let initial_part = format!("justless · initially ≈{tokens} tokens {direction}");
+        let both = format!("{initial_part} · {saved}");
         let mut full = vec![format!("{both} this session")];
         full.extend(counts.iter().cloned());
         variants.push(full.join(" · "));
         variants.push(both);
+        if saved_pct.is_some() {
+            variants.push(format!("{initial_part} · {saved_plain}"));
+        }
     }
     for kept in (0..=counts.len()).rev() {
         let mut parts = vec!["justless".to_owned(), format!("{saved} this session")];
         parts.extend(counts[..kept].iter().cloned());
         variants.push(parts.join(" · "));
     }
-    variants.push(format!("justless · {saved}"));
+    if let Some(with_pct) = &saved_pct {
+        variants.push(format!("justless · {with_pct}"));
+    }
+    variants.push(format!("justless · {saved_plain}"));
     let fits = |text: &String| width.is_none_or(|width| text.chars().count() <= width);
     let last = variants.pop().unwrap_or_default();
     variants.into_iter().find(fits).unwrap_or(last)
@@ -723,6 +777,79 @@ enum Plan {
         existing: Value,
         local: bool,
     },
+}
+
+/// Read-only audit of Claude Code's `statusLine` setting for `workspace`,
+/// checked in Claude Code's settings precedence order (local, project, user).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Audit {
+    /// A Justless status line applies, from `label`.
+    Installed { label: String },
+    /// Another status line in `label` takes precedence (optionally shadowing a
+    /// lower-precedence Justless status line in `shadowed`).
+    Shadowed {
+        label: String,
+        shadowed: Option<String>,
+    },
+    /// No local, project or user settings file configures `statusLine`.
+    Unconfigured,
+    /// A settings file ahead of any `statusLine` could not be read or decoded.
+    Unreadable { label: String, error: String },
+}
+
+/// Checks Claude Code's local, project and user settings for `statusLine`
+/// without writing anything.
+pub(crate) fn audit(workspace: &Workspace) -> Audit {
+    let directory = workspace.root.join(".claude");
+    let project = directory.join("settings.json");
+    let local = workspace.root.join(LOCAL);
+    let mut sources = vec![
+        (local, LOCAL.to_owned()),
+        (project.clone(), ".claude/settings.json".to_owned()),
+    ];
+    if let Some(user) = user_settings()
+        && resolved(&project) != resolved(&user)
+    {
+        let label = user.display().to_string();
+        sources.push((user, label));
+    }
+    let mut winner: Option<(String, bool)> = None;
+    let mut shadowed_justless: Option<String> = None;
+    for (path, label) in sources {
+        let settings = match read_settings(&path, true) {
+            Ok(Some(settings)) => settings,
+            Ok(None) => continue,
+            Err(error) if winner.is_none() => {
+                return Audit::Unreadable {
+                    label,
+                    error: format!("{error:#}"),
+                };
+            }
+            Err(_) => continue,
+        };
+        let existing = &settings["statusLine"];
+        if existing.is_null() {
+            continue;
+        }
+        let is_justless = existing["command"]
+            .as_str()
+            .is_some_and(|command| command.contains(COMMAND));
+        if winner.is_none() {
+            if is_justless {
+                return Audit::Installed { label };
+            }
+            winner = Some((label, false));
+        } else if is_justless && shadowed_justless.is_none() {
+            shadowed_justless = Some(label);
+        }
+    }
+    match winner {
+        Some((label, _)) => Audit::Shadowed {
+            label,
+            shadowed: shadowed_justless,
+        },
+        None => Audit::Unconfigured,
+    }
 }
 
 /// Checks every file `init --statusline` reads, so that setup can stop before it
@@ -1017,15 +1144,27 @@ mod tests {
         };
         assert_eq!(
             render(&tally, None),
-            "justless · net ≈74.7k tokens saved this session · 23 runs · 1 read · 2 searches"
+            "justless · net ≈74.7k tokens saved (82%) this session · 23 runs · 1 read · 2 searches"
         );
         assert_eq!(
-            render(&tally, Some(66)),
-            "justless · net ≈74.7k tokens saved this session · 23 runs · 1 read"
+            render(&tally, Some(72)),
+            "justless · net ≈74.7k tokens saved (82%) this session · 23 runs · 1 read"
         );
         assert_eq!(
-            render(&tally, Some(65)),
-            "justless · net ≈74.7k tokens saved this session · 23 runs"
+            render(&tally, Some(71)),
+            "justless · net ≈74.7k tokens saved (82%) this session · 23 runs"
+        );
+        assert_eq!(
+            render(&tally, Some(53)),
+            "justless · net ≈74.7k tokens saved (82%) this session"
+        );
+        assert_eq!(
+            render(&tally, Some(40)),
+            "justless · net ≈74.7k tokens saved (82%)"
+        );
+        assert_eq!(
+            render(&tally, Some(34)),
+            "justless · net ≈74.7k tokens saved"
         );
         assert_eq!(
             render(&tally, Some(30)),
@@ -1036,6 +1175,62 @@ mod tests {
         assert_eq!(short_number(3_000), "3k");
         assert_eq!(short_number(999_949), "999.9k");
         assert_eq!(short_number(1_260_000), "1.3M");
+    }
+
+    #[test]
+    fn reads_use_code_token_ratio_and_searches_use_logs_ratio() {
+        // 95,000 saved bytes of source code: 37,035 tokens at 2.57 B/tok (Code),
+        // rather than 43,052 tokens at 2.21 B/tok (Logs, +16%).
+        let read_only = Tally {
+            reads: 2,
+            read_raw: 100_000,
+            read_shown: 5_000,
+            ..Tally::default()
+        };
+        assert_eq!(read_only.net_tokens(), Content::Code.tokens_signed(95_000));
+        assert_eq!(read_only.net_saved_percent(), Some(95));
+        assert_eq!(
+            render(&read_only, None),
+            "justless · net ≈37k tokens saved (95%) this session · 2 reads"
+        );
+
+        // Mixed session splits Read bytes (Code) from run/search bytes (Logs).
+        let mixed = Tally {
+            runs: 3,
+            run_raw: 50_000,
+            run_shown: 10_000,
+            reads: 1,
+            read_raw: 40_000,
+            read_shown: 4_000,
+            searches: 2,
+            search_raw: 10_000,
+            search_shown: 2_000,
+            ..Tally::default()
+        };
+        let expected_tokens =
+            Content::Code.tokens_signed(36_000) + Content::Logs.tokens_signed(40_000 + 8_000);
+        assert_eq!(mixed.net_tokens(), expected_tokens);
+        assert_eq!(mixed.net_saved_percent(), Some(84));
+        assert_eq!(
+            render(&mixed, None),
+            format!(
+                "justless · net ≈{} tokens saved (84%) this session · 3 runs · 1 read · 2 searches",
+                short_number(expected_tokens.unsigned_abs())
+            )
+        );
+
+        // Zero net savings omits the percentage suffix cleanly.
+        let verbatim = Tally {
+            runs: 1,
+            run_raw: 500,
+            run_shown: 500,
+            ..Tally::default()
+        };
+        assert_eq!(verbatim.net_saved_percent(), None);
+        assert_eq!(
+            render(&verbatim, None),
+            "justless · net ≈0 tokens saved this session · 1 run"
+        );
     }
 
     #[test]
@@ -1050,6 +1245,7 @@ mod tests {
             ..Tally::default()
         };
         assert_eq!(replayed.net_bytes(), -364);
+        assert_eq!(replayed.net_saved_percent(), None);
         assert_eq!(
             render(&replayed, None),
             "justless · initially ≈8.4k tokens saved · net ≈165 extra tokens this session · 1 run"
@@ -1057,15 +1253,77 @@ mod tests {
         // A grouped Grep result recalled in part keeps the rest of its saving.
         let recalled = Tally {
             searches: 1,
-            tool_raw: 10_000,
-            tool_shown: 1_000,
+            search_raw: 10_000,
+            search_shown: 1_000,
             recalled: 4_000,
             ..Tally::default()
         };
         assert_eq!(recalled.net_bytes(), 5_000);
+        assert_eq!(recalled.net_saved_percent(), Some(50));
         assert_eq!(
             render(&recalled, None),
-            "justless · initially ≈4.1k tokens saved · net ≈2.3k tokens saved this session · 1 search"
+            "justless · initially ≈4.1k tokens saved · net ≈2.3k tokens saved (50%) this session · 1 search"
         );
+    }
+
+    #[test]
+    fn audit_checks_local_and_project_settings_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = Workspace::discover_from(&root).unwrap();
+        assert_eq!(audit(&workspace), Audit::Unconfigured);
+        assert!(!root.join(".justless").exists());
+
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let project = claude.join("settings.json");
+        let local = claude.join("settings.local.json");
+
+        fs::write(
+            &project,
+            r#"{"statusLine":{"type":"command","command":"justless statusline"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            audit(&workspace),
+            Audit::Installed {
+                label: ".claude/settings.json".into()
+            }
+        );
+
+        // Local settings take precedence over project settings.
+        fs::write(
+            &local,
+            r#"{"statusLine":{"type":"command","command":"echo custom"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            audit(&workspace),
+            Audit::Shadowed {
+                label: LOCAL.into(),
+                shadowed: Some(".claude/settings.json".into()),
+            }
+        );
+
+        // Combined command in local settings counts as installed.
+        fs::write(
+            &local,
+            r#"{"statusLine":{"type":"command","command":"input=$(cat); printf '%s' \"$input\" | justless statusline"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            audit(&workspace),
+            Audit::Installed {
+                label: LOCAL.into()
+            }
+        );
+
+        // Unreadable/malformed JSON ahead of project settings is flagged.
+        fs::write(&local, "{").unwrap();
+        assert!(matches!(
+            audit(&workspace),
+            Audit::Unreadable { label, .. } if label == LOCAL
+        ));
+        assert!(!root.join(".justless").exists());
     }
 }

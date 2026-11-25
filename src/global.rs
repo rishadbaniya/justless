@@ -235,12 +235,34 @@ pub fn init(matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
+/// The Antigravity CLI user-level MCP config path if it currently configures a
+/// `justless` MCP server. `init --remove --global` only edits the hook files
+/// setup manages, so it prints a non-destructive note pointing to this file.
+fn agy_mcp_notice(selected: &[Agent]) -> Option<PathBuf> {
+    if !selected.contains(&Agent::Agy) {
+        return None;
+    }
+    let path = config_dir(Agent::Agy)?.join("mcp_config.json");
+    crate::uninstall::has_json_mcp_server(&path, crate::mcp::Client::Agy.servers_key())
+        .then_some(path)
+}
+
 /// `justless init --remove --global`.
 pub fn remove(matches: &ArgMatches) -> Result<()> {
     let dry_run = matches.is_present("dry-run");
+    let selected = chosen(matches, false)?;
+    let agy_mcp = agy_mcp_notice(&selected);
+    let print_agy_mcp_note = || {
+        if let Some(path) = &agy_mcp {
+            println!(
+                "Note: {} still configures the user-level `justless` MCP server (`init --remove --global` removes only global hooks; edit that file to remove the MCP entry).",
+                path.display()
+            );
+        }
+    };
     let mut record = load();
     let mut changes: Vec<(PathBuf, String, Option<String>)> = Vec::new();
-    for agent in chosen(matches, false)? {
+    for agent in selected {
         let Some(path) = hook_file(agent) else {
             continue;
         };
@@ -292,6 +314,7 @@ pub fn remove(matches: &ArgMatches) -> Result<()> {
     };
     if changes.is_empty() {
         println!("No global Justless hooks to remove.");
+        print_agy_mcp_note();
         return Ok(());
     }
     if dry_run {
@@ -299,6 +322,7 @@ pub fn remove(matches: &ArgMatches) -> Result<()> {
         for (path, what, outcome) in &changes {
             println!("  {}", line(path, what, outcome));
         }
+        print_agy_mcp_note();
         return Ok(());
     }
     println!("Removed the global Justless hooks:");
@@ -324,6 +348,7 @@ pub fn remove(matches: &ArgMatches) -> Result<()> {
         }
     }
     let _ = save(&record);
+    print_agy_mcp_note();
     println!("Start a new agent session so the clients stop loading the global hooks.");
     Ok(())
 }
@@ -555,4 +580,25 @@ pub fn installed() -> Vec<Installed> {
         });
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agy_mcp_notice_checks_only_when_agy_is_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp_config.json");
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"justless":{"command":"justless","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+        assert!(crate::uninstall::has_json_mcp_server(
+            &config,
+            crate::mcp::Client::Agy.servers_key()
+        ));
+        assert_eq!(agy_mcp_notice(&[Agent::Claude, Agent::Codex]), None);
+    }
 }

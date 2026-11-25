@@ -7406,11 +7406,15 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     // Two hook-routed runs in the session: one compacted, one shown verbatim.
     synthetic_run(&root, "run-compact", start + 1_000, 40_000, 2_000, true);
     synthetic_run(&root, "run-verbatim", start + 2_000, 952, 952, true);
-    // (40,000 + 952) - (2,048 + 1,000) bytes kept out = 37,904 bytes ≈ 17.2k tokens at 2.21 bytes per token.
-    let two_runs = "justless · net ≈17.2k tokens saved this session · 2 runs";
+    // (40,000 + 952) - (2,048 + 1,000) bytes kept out = 37,904 bytes (93%) ≈ 17.2k tokens at 2.21 bytes per token.
+    let two_runs = "justless · net ≈17.2k tokens saved (93%) this session · 2 runs";
     assert_eq!(line("s1"), two_runs);
     assert_eq!(
         status_line(&root, &[], event("s1").as_bytes(), Some("40")),
+        "justless · net ≈17.2k tokens saved (93%)"
+    );
+    assert_eq!(
+        status_line(&root, &[], event("s1").as_bytes(), Some("35")),
         "justless · net ≈17.2k tokens saved"
     );
 
@@ -7446,15 +7450,20 @@ fn statusline_counts_this_sessions_hook_runs_and_replaced_tool_results() {
     };
     let read_shown = shown(replaced, &replaced["updatedToolOutput"]["file"]["content"]);
     let grep_shown = shown(group, &group["updatedToolOutput"]["content"]);
-    let tool_saved = (source.len() - 1 + content.len() - read_shown - grep_shown) as u64;
-    let tokens = format!(
-        "{:.1}",
-        ((37_904 + tool_saved) * 63_191).div_ceil(139_440) as f64 / 1000.0
-    );
+    let read_saved = (source.len() - 1 - read_shown) as u64;
+    let grep_saved = (content.len() - grep_shown) as u64;
+    let read_tokens = (read_saved * 584_751).div_ceil(1_499_977);
+    let log_tokens = ((37_904 + grep_saved) * 63_191).div_ceil(139_440);
+    let tokens = format!("{:.1}", (read_tokens + log_tokens) as f64 / 1000.0);
     let expected = format!("≈{}k", tokens.strip_suffix(".0").unwrap_or(&tokens));
+    let total_raw = 40_952 + (source.len() - 1) as u64 + content.len() as u64;
+    let total_net = 37_904 + read_saved + grep_saved;
+    let pct = (total_net as f64 * 100.0 / total_raw as f64).round() as u64;
     assert_eq!(
         line("s1"),
-        format!("justless · net {expected} tokens saved this session · 2 runs · 1 read · 1 search")
+        format!(
+            "justless · net {expected} tokens saved ({pct}%) this session · 2 runs · 1 read · 1 search"
+        )
     );
     // Another session sees the shared project runs, but not this session's reads.
     assert_eq!(line("s2"), two_runs);
@@ -13066,9 +13075,11 @@ fn statusline_counts_replaced_bash_results_as_hook_runs_of_the_session() {
         - record["footer_bytes"].as_u64().unwrap();
     assert_eq!(saved, (content.len() - text.len()) as u64);
     // Command output is estimated at the logs ratio: 139,440 bytes per 63,191 tokens.
+    let raw = record["raw_bytes"].as_u64().unwrap();
+    let pct = (saved as f64 * 100.0 / raw as f64).round() as u64;
     let tokens = format!("{:.1}", (saved * 63_191).div_ceil(139_440) as f64 / 1000.0);
     let expected = format!(
-        "justless · net ≈{}k tokens saved this session · 1 run",
+        "justless · net ≈{}k tokens saved ({pct}%) this session · 1 run",
         tokens.strip_suffix(".0").unwrap_or(&tokens)
     );
     // It counts while the session is inside the nested repository and after the
@@ -16005,7 +16016,7 @@ fn statusline_shows_savings_net_of_replays_and_recalls() {
     write_files(&root, &[(".justless/runs/run-replayed/stdout", &y)]);
     assert_eq!(
         line(),
-        "justless · net ≈8.4k tokens saved this session · 1 run"
+        "justless · net ≈8.4k tokens saved (98%) this session · 1 run"
     );
     // Replaying it whole leaves the session 364 bytes worse off than running
     // the command directly.

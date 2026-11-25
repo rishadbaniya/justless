@@ -38,7 +38,15 @@ const SCANNED_RUNS: usize = 500;
 /// Run directories measured for the archive size.
 const MEASURED_RUNS: usize = 20_000;
 /// Directories in `.justless/` that Justless creates files in.
-const STATE_DIRECTORIES: &[&str] = &["", "runs", "observations", "baselines"];
+const STATE_DIRECTORIES: &[&str] = &[
+    "",
+    "runs",
+    "observations",
+    "baselines",
+    "sessions",
+    "seen",
+    "lookup",
+];
 /// The lock files `lock_state` opens in `.justless/`.
 const LOCK_FILES: &[&str] = &[
     "activity.lock",
@@ -400,6 +408,9 @@ impl Doctor<'_> {
                 }
                 if let Some(rules) = &rules {
                     section.checks.extend(self.claude_permission_checks(rules));
+                }
+                if profile.agent == Agent::Claude {
+                    section.checks.push(self.claude_statusline_check());
                 }
                 status = section.worst();
                 sections.push(section);
@@ -1004,6 +1015,50 @@ impl Doctor<'_> {
         unusable.chain(broad).collect()
     }
 
+    /// Read-only check of Claude Code's `statusLine` setting across local,
+    /// project and user settings files.
+    fn claude_statusline_check(&self) -> Check {
+        use crate::statusline::{Audit, COMMAND};
+        match crate::statusline::audit(self.workspace) {
+            Audit::Installed { label } => {
+                Check::new(Status::Ok, format!("Status line: {label} runs `{COMMAND}`"))
+            }
+            Audit::Shadowed {
+                label,
+                shadowed: Some(lower),
+            } => Check::new(
+                Status::Info,
+                format!(
+                    "Status line: {label} sets another statusLine, shadowing `{COMMAND}` in {lower}; run `{} init --statusline` to see how to show both",
+                    self.justless()
+                ),
+            ),
+            Audit::Shadowed {
+                label,
+                shadowed: None,
+            } => Check::new(
+                Status::Info,
+                format!(
+                    "Status line: {label} sets another statusLine; run `{} init --statusline` to see how to show both",
+                    self.justless()
+                ),
+            ),
+            Audit::Unconfigured => Check::new(
+                Status::Info,
+                format!(
+                    "Status line: not configured (optional: run `{} init --statusline`)",
+                    self.justless()
+                ),
+            ),
+            Audit::Unreadable { label, error } => Check::new(
+                Status::Warn,
+                format!(
+                    "Status line: cannot read {label} ({error}), so doctor cannot tell whether a status line is configured"
+                ),
+            ),
+        }
+    }
+
     /// The agent's hook file: whether it holds Justless entries, and its checks.
     fn audit_hooks(&self, profile: &Profile) -> Hooks {
         let relative = profile.agent.hook_file();
@@ -1534,13 +1589,42 @@ impl Doctor<'_> {
             ),
             Ok(metadata) => {
                 let before = checks.len();
+                let broken_dir = STATE_DIRECTORIES
+                    .iter()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| state.join(name))
+                    .find_map(|path| match fs::symlink_metadata(&path) {
+                        Ok(meta) if !meta.is_dir() => Some((path, meta)),
+                        _ => None,
+                    });
+                if let Some((path, meta)) = broken_dir {
+                    let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+                    let target = self.shell_path(&shown);
+                    checks.push(
+                        Check::new(
+                            Status::Fail,
+                            format!(
+                                "{shown} is a {}, but Justless keeps state in a directory there",
+                                if meta.file_type().is_symlink() {
+                                    "link"
+                                } else {
+                                    "file"
+                                }
+                            ),
+                        )
+                        .fix(Fix::Command(format!("mv {target} {target}.bak"))),
+                    );
+                }
                 // State files are replaced by a rename, so only their directories
                 // need write access. Lock files are opened for reading and writing.
                 let locked = STATE_DIRECTORIES
                     .iter()
                     .map(|name| (state.join(name), true))
                     .chain(LOCK_FILES.iter().map(|name| (state.join(name), false)))
-                    .find(|(path, _)| fs::symlink_metadata(path).is_ok() && !writable(path));
+                    .find(|(path, is_dir)| {
+                        fs::symlink_metadata(path)
+                            .is_ok_and(|meta| (!*is_dir || meta.is_dir()) && !writable(path))
+                    });
                 if let Some((path, directory_entry)) = locked {
                     let shown = path.strip_prefix(root).unwrap_or(&path).display();
                     let fix = if cfg!(unix) && foreign(&path, root) {
@@ -3031,5 +3115,91 @@ mod tests {
                 assert_eq!(audit.paths, paths, "{case}");
             }
         }
+    }
+
+    #[test]
+    fn state_checks_flag_broken_sessions_seen_and_lookup_directories() {
+        for name in ["sessions", "seen", "lookup"] {
+            assert!(STATE_DIRECTORIES.contains(&name), "{name}");
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let state = root.join(".justless");
+            fs::create_dir_all(&state).unwrap();
+            fs::write(state.join(".gitignore"), "*\n").unwrap();
+            // A regular file where Justless expects a state subdirectory must fail.
+            fs::write(state.join(name), "not a directory").unwrap();
+            let workspace = Workspace::discover_from(&root).unwrap();
+            let doctor = Doctor {
+                workspace: &workspace,
+                explicit_root: false,
+                at_root: true,
+            };
+            let checks = doctor.state_checks(&Facts::default());
+            assert!(
+                checks.iter().any(|check| {
+                    check.status == Status::Fail
+                        && check.message.contains(&format!(".justless/{name}"))
+                        && check.message.contains("is a file")
+                }),
+                "{name}: {:?}",
+                checks.iter().map(|c| &c.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn claude_statusline_check_is_read_only_and_covers_all_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = Workspace::discover_from(&root).unwrap();
+        let doctor = Doctor {
+            workspace: &workspace,
+            explicit_root: false,
+            at_root: true,
+        };
+
+        let check = doctor.claude_statusline_check();
+        assert!(check.status == Status::Info, "{}", check.message);
+        assert!(
+            check.message.contains("not configured"),
+            "{}",
+            check.message
+        );
+        assert!(!root.join(".justless").exists());
+
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{"statusLine":{"type":"command","command":"justless statusline"}}"#,
+        )
+        .unwrap();
+        let check = doctor.claude_statusline_check();
+        assert!(check.status == Status::Ok, "{}", check.message);
+        assert!(
+            check.message.contains(".claude/settings.json"),
+            "{}",
+            check.message
+        );
+
+        fs::write(
+            claude.join("settings.local.json"),
+            r#"{"statusLine":{"type":"command","command":"echo other"}}"#,
+        )
+        .unwrap();
+        let check = doctor.claude_statusline_check();
+        assert!(check.status == Status::Info, "{}", check.message);
+        assert!(check.message.contains("shadowing"), "{}", check.message);
+        assert!(
+            check.message.contains(".claude/settings.local.json"),
+            "{}",
+            check.message
+        );
+
+        fs::write(claude.join("settings.local.json"), "{bad json").unwrap();
+        let check = doctor.claude_statusline_check();
+        assert!(check.status == Status::Warn, "{}", check.message);
+        assert!(check.message.contains("cannot read"), "{}", check.message);
+        assert!(!root.join(".justless").exists());
     }
 }

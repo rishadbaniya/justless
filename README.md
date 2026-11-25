@@ -173,7 +173,7 @@ justless init --statusline   # Claude Code: a running total in the status line
 
 | To | Run |
 | --- | --- |
-| Turn it on for every project at once (Claude Code and Codex) | `justless init --global` ([details](docs/reference.md#global-hooks)) |
+| Turn it on for every project at once (Claude Code, Codex and Antigravity CLI) | `justless init --global` ([details](docs/reference.md#global-hooks)) |
 | Turn it on for one more project | `justless init --hooks --agent claude` in that folder |
 | Use it from an editor without hooks, such as VS Code | `justless mcp --install vscode` |
 | Pause every hook without uninstalling | Start the agent with `JUSTLESS_DISABLE=1` set |
