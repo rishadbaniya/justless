@@ -176,6 +176,8 @@ pub struct Snapshot {
     is_rust: bool,
     /// Whether this snapshot was indexed as a Markdown source file.
     is_markdown: bool,
+    /// Whether this snapshot was indexed as a Jupyter notebook (`.ipynb`).
+    is_notebook: bool,
     /// Tree-sitter grammar used when indexed as a polyglot source file.
     grammar: Option<Grammar>,
 }
@@ -216,6 +218,7 @@ impl Snapshot {
             parse_error: None,
             is_rust: false,
             is_markdown: false,
+            is_notebook: false,
             grammar: None,
         })
     }
@@ -238,6 +241,7 @@ impl Snapshot {
             parse_error: None,
             is_rust: false,
             is_markdown: false,
+            is_notebook: false,
             grammar: None,
         }
     }
@@ -396,15 +400,11 @@ impl Snapshot {
     fn sections(&mut self, file: &str) {
         // Where a 0-based line starts, or the end of the text past the last line.
         let offset = |line: usize| self.lines.get(line).copied().unwrap_or(self.text.len());
-        let markdown = matches!(
-            std::path::Path::new(file)
-                .extension()
-                .and_then(|x| x.to_str())
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("md" | "markdown" | "mdx")
-        );
-        if markdown {
+        let ext = Path::new(file)
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(str::to_ascii_lowercase);
+        if matches!(ext.as_deref(), Some("md" | "markdown" | "mdx")) {
             self.is_markdown = true;
             let lines: Vec<&str> = (0..self.lines.len())
                 .map(|line| {
@@ -424,6 +424,14 @@ impl Snapshot {
                 .collect();
             self.entries.extend(entries);
             return;
+        }
+        if ext.as_deref() == Some("ipynb") {
+            let entries = notebook_entries(&self.text);
+            if !entries.is_empty() {
+                self.is_notebook = true;
+                self.entries.extend(entries);
+                return;
+            }
         }
         let entries: Vec<Entry> = crate::config_outline::sections(file, &self.text, &self.lines)
             .into_iter()
@@ -720,10 +728,11 @@ impl Snapshot {
 
     fn row_for(&self, index: usize, entry: &Entry, raw_signature: String) -> Row {
         let signature = self.slim_signature(entry, raw_signature);
+        let max_name = if self.is_notebook { 160 } else { 100 };
         let name = if entry.kind == "import" && entry.name == "import" {
             String::new()
         } else {
-            clipped(&entry.name, 100)
+            clipped(&entry.name, max_name)
         };
         Row {
             id: index + 1,
@@ -1094,6 +1103,357 @@ impl Window {
         }
         out
     }
+}
+
+/// Zero-dependency structural outline entries for Jupyter notebooks (`.ipynb`).
+/// Strips base64/HTML cell outputs from the outline while surfacing markdown headings,
+/// code signatures, execution errors, and stripped media notes with exact cell byte spans.
+fn notebook_entries(text: &str) -> Vec<Entry> {
+    use serde_json::Value;
+    let Ok(Value::Object(root)) =
+        serde_json::from_str::<Value>(text.strip_prefix('\u{feff}').unwrap_or(text))
+    else {
+        return Vec::new();
+    };
+    let Some(cells) = root
+        .get("cells")
+        .and_then(Value::as_array)
+        .filter(|c| !c.is_empty() && c.iter().all(Value::is_object))
+    else {
+        return Vec::new();
+    };
+    let Some(spans) = notebook_cell_spans(text).filter(|s| s.len() == cells.len()) else {
+        return Vec::new();
+    };
+    cells
+        .iter()
+        .zip(spans)
+        .map(|(cell, span)| {
+            let (kind, name) = notebook_cell_summary(cell);
+            Entry {
+                name,
+                kind: kind.into(),
+                signature_start: span.start,
+                header_end: span.start,
+                bytes: span,
+            }
+        })
+        .collect()
+}
+
+/// Exact `[start..end]` byte spans of each element in the top-level `"cells"` array.
+fn notebook_cell_spans(text: &str) -> Option<Vec<Range<usize>>> {
+    let b = text.as_bytes();
+    let mut pos = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let skip_ws = |p: &mut usize| {
+        while b.get(*p).is_some_and(u8::is_ascii_whitespace) {
+            *p += 1;
+        }
+    };
+    let skip_str = |p: &mut usize| -> Option<Range<usize>> {
+        (b.get(*p) == Some(&b'"')).then_some(())?;
+        let start = *p;
+        *p += 1;
+        while *p < b.len() {
+            match b[*p] {
+                b'\\' => *p = (*p + 2 <= b.len()).then_some(*p + 2)?,
+                b'"' => {
+                    *p += 1;
+                    return Some(start..*p);
+                }
+                _ => *p += 1,
+            }
+        }
+        None
+    };
+    let skip_val = |p: &mut usize| -> Option<()> {
+        skip_ws(p);
+        match *b.get(*p)? {
+            b'"' => skip_str(p).map(|_| ()),
+            b'{' | b'[' => {
+                let mut depth = 0usize;
+                while *p < b.len() {
+                    match b[*p] {
+                        b'"' => {
+                            skip_str(p)?;
+                        }
+                        b'{' | b'[' => {
+                            depth += 1;
+                            *p += 1;
+                        }
+                        b'}' | b']' => {
+                            depth = depth.checked_sub(1)?;
+                            *p += 1;
+                            if depth == 0 {
+                                return Some(());
+                            }
+                        }
+                        _ => *p += 1,
+                    }
+                }
+                None
+            }
+            _ => {
+                let start = *p;
+                while b
+                    .get(*p)
+                    .is_some_and(|c| !c.is_ascii_whitespace() && !matches!(c, b',' | b'}' | b']'))
+                {
+                    *p += 1;
+                }
+                (*p > start).then_some(())
+            }
+        }
+    };
+
+    skip_ws(&mut pos);
+    (b.get(pos) == Some(&b'{')).then_some(())?;
+    pos += 1;
+    let mut found = None;
+    loop {
+        skip_ws(&mut pos);
+        if b.get(pos) == Some(&b'}') {
+            return found;
+        }
+        let key: String = serde_json::from_str(&text[skip_str(&mut pos)?]).ok()?;
+        skip_ws(&mut pos);
+        (b.get(pos) == Some(&b':')).then_some(())?;
+        pos += 1;
+        skip_ws(&mut pos);
+        if key == "cells" {
+            (b.get(pos) == Some(&b'[')).then_some(())?;
+            pos += 1;
+            let mut spans = Vec::new();
+            loop {
+                skip_ws(&mut pos);
+                if b.get(pos) == Some(&b']') {
+                    pos += 1;
+                    break;
+                }
+                let start = pos;
+                skip_val(&mut pos)?;
+                spans.push(start..pos);
+                skip_ws(&mut pos);
+                match b.get(pos) {
+                    Some(b',') => pos += 1,
+                    Some(b']') => {
+                        pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            found = Some(spans);
+        } else {
+            skip_val(&mut pos)?;
+        }
+        skip_ws(&mut pos);
+        match b.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b'}') => return found,
+            _ => return None,
+        }
+    }
+}
+
+fn notebook_cell_summary(cell: &serde_json::Value) -> (&'static str, String) {
+    use serde_json::Value;
+    let source = match cell.get("source") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr.iter().filter_map(Value::as_str).collect(),
+        _ => String::new(),
+    };
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match cell.get("cell_type").and_then(Value::as_str) {
+        Some("markdown") => {
+            let (mut in_fence, mut first) = (false, None);
+            for line in source.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                first.get_or_insert_with(|| words(line));
+                if line.starts_with("```") || line.starts_with("~~~") {
+                    in_fence = !in_fence;
+                } else if !in_fence {
+                    let h = line.bytes().take_while(|&b| b == b'#').count();
+                    if (1..=6).contains(&h)
+                        && line[h..].starts_with([' ', '\t'])
+                        && !line[h..].trim().is_empty()
+                    {
+                        return ("md", clipped(&words(line), 80));
+                    }
+                }
+            }
+            (
+                "md",
+                clipped(&first.unwrap_or_else(|| "(empty)".into()), 80),
+            )
+        }
+        Some("code") => {
+            let exec = cell
+                .get("execution_count")
+                .and_then(Value::as_i64)
+                .map_or_else(|| "[ ]".into(), |n| format!("[{n}]"));
+            let (mut sig, mut first_code, mut first_any) = (None, None, None);
+            for line in source.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let c = words(line);
+                first_any.get_or_insert_with(|| c.clone());
+                if !line.starts_with('#') {
+                    if ["def ", "async def ", "class "]
+                        .iter()
+                        .any(|p| line.starts_with(p))
+                    {
+                        sig = Some(c);
+                        break;
+                    }
+                    first_code.get_or_insert(c);
+                }
+            }
+            let base = format!(
+                "{exec} {}",
+                sig.or(first_code)
+                    .or(first_any)
+                    .unwrap_or_else(|| "(empty)".into())
+            );
+            let suffix = notebook_outputs_suffix(cell.get("outputs"));
+            let cap = 160usize.saturating_sub(suffix.len()).min(80);
+            ("cell", format!("{}{suffix}", clipped(&base, cap)))
+        }
+        _ => {
+            let first = source
+                .lines()
+                .map(words)
+                .find(|l| !l.is_empty())
+                .unwrap_or_else(|| "(empty)".into());
+            ("raw", clipped(&first, 80))
+        }
+    }
+}
+
+fn notebook_outputs_suffix(outputs: Option<&serde_json::Value>) -> String {
+    use serde_json::Value;
+    let Some(items) = outputs.and_then(Value::as_array) else {
+        return String::new();
+    };
+    let (mut err_msg, mut media_bytes, mut text_bytes) = (None::<String>, 0usize, 0usize);
+    let (mut best_media, mut best_text) = (None::<(u8, usize, &str)>, None::<(usize, &str)>);
+
+    for out in items {
+        match out.get("output_type").and_then(Value::as_str).unwrap_or("") {
+            "error" if err_msg.is_none() => {
+                let field = |k| {
+                    out.get(k)
+                        .and_then(Value::as_str)
+                        .map(strip_ansi_ws)
+                        .unwrap_or_default()
+                };
+                let (en, ev) = (field("ename"), field("evalue"));
+                err_msg = Some(match (en.is_empty(), ev.is_empty()) {
+                    (false, false) => format!("{en}: {ev}"),
+                    (false, true) => en,
+                    (true, false) => ev,
+                    (true, true) => "error".into(),
+                });
+            }
+            "display_data" | "execute_result" => {
+                let Some(data) = out.get("data").and_then(Value::as_object) else {
+                    continue;
+                };
+                let (mut best, mut rich_sum, mut plain_sum) = (None, 0usize, 0usize);
+                for (mime, val) in data {
+                    let size = json_payload_bytes(val);
+                    if size == 0 {
+                        continue;
+                    }
+                    let prio = if mime.starts_with("image/") {
+                        3
+                    } else if mime == "text/html"
+                        || ["application/", "audio/", "video/"]
+                            .iter()
+                            .any(|p| mime.starts_with(p))
+                    {
+                        2
+                    } else {
+                        0
+                    };
+                    if prio > 0 {
+                        rich_sum += size;
+                        if best.is_none_or(|(p, s, _)| (prio, size) > (p, s)) {
+                            best = Some((prio, size, mime.as_str()));
+                        }
+                    } else {
+                        plain_sum += size;
+                    }
+                }
+                if let Some((p, s, m)) = best {
+                    media_bytes += rich_sum;
+                    if best_media.is_none_or(|(bp, bs, _)| (p, s) > (bp, bs)) {
+                        best_media = Some((p, s, m));
+                    }
+                } else if plain_sum > 0 {
+                    text_bytes += plain_sum;
+                    if best_text.is_none_or(|(bs, _)| plain_sum > bs) {
+                        best_text = Some((plain_sum, "text/plain"));
+                    }
+                }
+            }
+            "stream" => {
+                let size = out.get("text").map_or(0, json_payload_bytes);
+                if size > 0 {
+                    text_bytes += size;
+                    let name = out.get("name").and_then(Value::as_str).unwrap_or("stdout");
+                    if best_text.is_none_or(|(bs, _)| size > bs) {
+                        best_text = Some((size, name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut suffix = String::new();
+    if let Some(err) = err_msg {
+        suffix.push_str(&format!(" [error: {}]", clipped(&err, 56)));
+    }
+    if let Some((_, _, mime)) = best_media {
+        let total = crate::history::human_bytes((media_bytes + text_bytes) as u64);
+        suffix.push_str(&format!(" (+output: {total} {})", clipped(mime, 24)));
+    } else if text_bytes >= 512
+        && let Some((_, label)) = best_text
+    {
+        let total = crate::history::human_bytes(text_bytes as u64);
+        suffix.push_str(&format!(" (+output: {total} {})", clipped(label, 24)));
+    }
+    suffix
+}
+
+fn json_payload_bytes(val: &serde_json::Value) -> usize {
+    match val {
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(arr) => arr.iter().map(json_payload_bytes).sum(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| k.len() + json_payload_bytes(v))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn strip_ansi_ws(s: &str) -> String {
+    let (mut out, b, mut i) = (String::with_capacity(s.len()), s.as_bytes(), 0);
+    while i < b.len() {
+        if b[i] == 0x1b && b.get(i + 1) == Some(&b'[') {
+            i += 2;
+            while b.get(i).is_some_and(|c| (0x20..=0x3f).contains(c)) {
+                i += 1;
+            }
+            if b.get(i).is_some_and(|c| (0x40..=0x7e).contains(c)) {
+                i += 1;
+            }
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_match_terms(filter_lower: &str) -> Vec<&str> {
@@ -2196,7 +2556,7 @@ fn path_structural_hint(path: &str) -> u8 {
             | "scala" | "ex" | "exs" | "dart" | "zig" | "lua" | "jl" | "groovy" | "sql" | "tf"
             | "hcl" | "sh" | "bash" | "ps1",
         ) => 3,
-        Some("md" | "markdown" | "mdx" | "toml" | "yaml" | "yml" | "json") => 2,
+        Some("md" | "markdown" | "mdx" | "toml" | "yaml" | "yml" | "json" | "ipynb") => 2,
         _ => 1,
     }
 }
@@ -2313,6 +2673,8 @@ fn skeleton_row_priority(row: &Row) -> u8 {
         }
         "h1" | "h2" => 5,
         "h3" | "section" => 4,
+        "cell" if row.name.contains("[error:") => 6,
+        "md" | "cell" => 4,
         "function" | "method" => {
             if is_public {
                 5
@@ -5602,5 +5964,228 @@ mod tests {
             .unwrap();
         let vals: Vec<&str> = m2.values_of("file").unwrap().collect();
         assert_eq!(vals, ["packages/core", "README.md"]);
+    }
+
+    #[test]
+    fn ipynb_outline_strips_base64_surfaces_errors_and_expands_exact_cell() {
+        let png_b64 = format!("iVBORw0KGgo{}", "QkJC".repeat(13_000));
+        let notebook = serde_json::to_string_pretty(&serde_json::json!({
+            "cells": [
+                {
+                    "cell_type": "markdown",
+                    "metadata": {},
+                    "source": ["# Sales Pipeline\n", "Quarterly forecast notebook."]
+                },
+                {
+                    "cell_type": "code",
+                    "execution_count": 1,
+                    "metadata": {"tags": ["chart"]},
+                    "outputs": [
+                        {
+                            "output_type": "display_data",
+                            "data": {
+                                "image/png": png_b64,
+                                "text/plain": ["<Figure size 640x480 with 1 Axes>"]
+                            },
+                            "metadata": {}
+                        }
+                    ],
+                    "source": [
+                        "# Render revenue chart\n",
+                        "import matplotlib.pyplot as plt\n",
+                        "def build_chart(df):\n",
+                        "    return df.plot()\n"
+                    ]
+                },
+                {
+                    "cell_type": "code",
+                    "execution_count": 2,
+                    "metadata": {},
+                    "outputs": [
+                        {
+                            "output_type": "error",
+                            "ename": "ZeroDivisionError",
+                            "evalue": "\u{1b}[31mdivision by zero\u{1b}[0m",
+                            "traceback": ["Traceback (most recent call last):", "ZeroDivisionError: division by zero"]
+                        }
+                    ],
+                    "source": [
+                        "# Margin check\n",
+                        "ratio = total / 0\n"
+                    ]
+                },
+                {
+                    "cell_type": "raw",
+                    "metadata": {},
+                    "source": ["Raw appendix notes"]
+                }
+            ],
+            "metadata": {"kernelspec": {"language": "python"}},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        }))
+        .unwrap();
+
+        let mut snap = Snapshot::from_text("notebooks/analysis.ipynb", notebook.clone());
+        snap.index("notebooks/analysis.ipynb").unwrap();
+        assert!(snap.is_notebook);
+        let outline = snap.page("", None, 40, 4096).unwrap().display();
+
+        assert!(
+            outline.len() * 20 < notebook.len(),
+            "expected >95% reduction: outline={} raw={}\n{outline}",
+            outline.len(),
+            notebook.len()
+        );
+        assert!(
+            outline.contains("#1 ") && outline.contains(" md # Sales Pipeline"),
+            "{outline}"
+        );
+        assert!(
+            outline.contains("#2 ")
+                && outline.contains(" cell [1] def build_chart(df):")
+                && outline.contains("(+output:")
+                && outline.contains("image/png)"),
+            "{outline}"
+        );
+        assert!(
+            !outline.contains("iVBORw0KGgo") && !outline.contains("QkJCQkJC"),
+            "base64 payload must be absent from outline:\n{outline}"
+        );
+        assert!(
+            outline.contains("#3 ")
+                && outline.contains(" cell [2] ratio = total / 0")
+                && outline.contains("[error: ZeroDivisionError: division by zero]"),
+            "{outline}"
+        );
+        assert!(
+            outline.contains("#4 ") && outline.contains(" raw Raw appendix notes"),
+            "{outline}"
+        );
+
+        // Exact expand on cell #2 returns the exact JSON object bytes in the original file.
+        let cell2_span = snap
+            .resolve(&format!("{}#2", snap.revision), None, false)
+            .unwrap();
+        let expanded = &snap.text[cell2_span];
+        assert!(expanded.starts_with('{') && expanded.ends_with('}'));
+        let parsed_cell: serde_json::Value = serde_json::from_str(expanded).unwrap();
+        assert_eq!(parsed_cell["cell_type"], "code");
+        assert_eq!(parsed_cell["execution_count"], 1);
+        assert!(expanded.contains("def build_chart(df):"));
+        assert!(expanded.contains("iVBORw0KGgo"));
+    }
+
+    #[test]
+    fn ipynb_invalid_or_non_notebook_falls_back_cleanly() {
+        let mut corrupt = Snapshot::from_text(
+            "broken.ipynb",
+            "{ not valid json\nline 2\nline 3\n".to_owned(),
+        );
+        corrupt.index("broken.ipynb").unwrap();
+        assert!(!corrupt.is_notebook);
+        let corrupt_out = corrupt.page("", None, 40, 4096).unwrap().display();
+        assert!(corrupt_out.contains("lines-1"), "{corrupt_out}");
+
+        let mut non_nb = Snapshot::from_text(
+            "plain.ipynb",
+            "{\n  \"name\": \"not-a-notebook\",\n  \"version\": 1\n}\n".to_owned(),
+        );
+        non_nb.index("plain.ipynb").unwrap();
+        assert!(!non_nb.is_notebook);
+        let non_nb_out = non_nb.page("", None, 40, 4096).unwrap().display();
+        assert!(!non_nb_out.is_empty());
+
+        let mut empty_cells = Snapshot::from_text(
+            "empty.ipynb",
+            "{\n  \"cells\": [],\n  \"nbformat\": 4\n}\n".to_owned(),
+        );
+        empty_cells.index("empty.ipynb").unwrap();
+        assert!(!empty_cells.is_notebook);
+    }
+
+    #[test]
+    fn directory_skeleton_includes_ipynb_with_compact_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let nb_dir = dir.path().join("notebooks");
+        fs::create_dir_all(&nb_dir).unwrap();
+
+        let png_b64 = format!("iVBORw0KGgo{}", "QUFB".repeat(13_000));
+        let raw_nb = serde_json::to_string_pretty(&serde_json::json!({
+            "cells": [
+                {
+                    "cell_type": "markdown",
+                    "metadata": {},
+                    "source": ["# Exploration\n"]
+                },
+                {
+                    "cell_type": "code",
+                    "execution_count": 1,
+                    "metadata": {},
+                    "outputs": [{
+                        "output_type": "display_data",
+                        "data": {"image/png": png_b64},
+                        "metadata": {}
+                    }],
+                    "source": ["def compute_metrics(df):\n", "    return df.describe()\n"]
+                },
+                {
+                    "cell_type": "code",
+                    "execution_count": 2,
+                    "metadata": {},
+                    "outputs": [{
+                        "output_type": "error",
+                        "ename": "ValueError",
+                        "evalue": "empty frame",
+                        "traceback": []
+                    }],
+                    "source": ["assert not df.empty\n"]
+                }
+            ],
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        }))
+        .unwrap();
+        fs::write(nb_dir.join("explore.ipynb"), &raw_nb).unwrap();
+        fs::write(
+            nb_dir.join("helper.py"),
+            "def load_csv(path: str):\n    return open(path).read()\n",
+        )
+        .unwrap();
+
+        let ws = test_workspace(dir.path());
+        let target = resolve_read_target(&ws, "notebooks", false).unwrap();
+        let skeleton = String::from_utf8(
+            build_skeleton_output(&ws, &[target], &default_skeleton_opts(4096), None)
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+
+        assert!(skeleton.contains("=== explore.ipynb ("), "{skeleton}");
+        assert!(skeleton.contains("=== helper.py ("), "{skeleton}");
+        assert!(skeleton.contains("md # Exploration"), "{skeleton}");
+        assert!(
+            skeleton.contains("cell [1] def compute_metrics(df):")
+                && skeleton.contains("image/png)"),
+            "{skeleton}"
+        );
+        assert!(
+            skeleton.contains("[error: ValueError: empty frame]"),
+            "{skeleton}"
+        );
+        assert!(!skeleton.contains("iVBORw0KGgo"), "{skeleton}");
+        assert!(skeleton.len() * 10 < raw_nb.len(), "{skeleton}");
+
+        let rev = extract_file_revision(&skeleton, "explore.ipynb");
+        let cell_id = extract_row_id(&skeleton, "explore.ipynb", "compute_metrics");
+        let mut snap = Snapshot::open(&ws, "notebooks/explore.ipynb").unwrap();
+        snap.index("notebooks/explore.ipynb").unwrap();
+        let span = snap
+            .resolve(&format!("{rev}#{cell_id}"), None, false)
+            .unwrap();
+        let cell_json: serde_json::Value = serde_json::from_str(&snap.text[span]).unwrap();
+        assert_eq!(cell_json["execution_count"], 1);
     }
 }
