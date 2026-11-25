@@ -2424,3 +2424,136 @@ fn openai_chat_and_responses_pass_through_verbatim_without_compact_live() {
     );
     assert!(!dir.path().join(".justless/observations").exists());
 }
+
+#[test]
+fn live_zone_gemini_stream_generate_content_compact_recall_and_passthrough() {
+    let gemini_sse = |_: &Message| {
+        stream(vec![
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Found \"}]}}]}\n\n"
+                .into(),
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ECONNREFUSED.\"}]},\"finishReason\":\"STOP\"}]}\n\n"
+                .into(),
+        ])
+    };
+    let big_json = live_json_payload();
+    let big_log = live_structured_log_payload();
+    let req_body = json!({
+        "systemInstruction": {"parts": [{"text": "You are a coding agent."}]},
+        "cachedContent": "cachedContents/gemini-ctx-01",
+        "tools": [{"functionDeclarations": [{"name": "run_shell", "description": "Run shell"}]}],
+        "contents": [
+            {"role": "user", "parts": [{"text": "Investigate orders-api."}]},
+            {"role": "model", "parts": [
+                {"thoughtSignature": "sig_prev", "functionCall": {"name": "run_shell", "args": {"command": "cat prev.log"}}}
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"name": "run_shell", "response": {"output": big_log}}}
+            ]},
+            {"role": "model", "parts": [
+                {"thoughtSignature": "sig_curr", "functionCall": {"name": "get_orders", "args": {}}},
+                {"functionCall": {"name": "run_shell", "args": {"command": "tail -n 220 api.log"}}}
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"name": "get_orders", "response": {"output": big_json, "exitCode": 0}}},
+                {"functionResponse": {"name": "run_shell", "response": {"output": big_log}}}
+            ]}
+        ]
+    });
+    let req_raw = serde_json::to_string_pretty(&req_body)
+        .unwrap()
+        .replace("\"role\": ", "\"role\" :   ");
+    let headers = [
+        ("content-type", "application/json"),
+        ("x-goog-api-key", "AIza-test-key"),
+    ];
+    let target = "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse";
+
+    // 1. With `--compact-live`: compacts final functionResponse outputs, preserves prefix, recalls verbatim.
+    let (dir, mock, proxy) = session(gemini_sse, "--compact-live");
+    let root = dir.path();
+    let resp = proxy.send("POST", target, &headers, req_raw.as_bytes());
+    assert_eq!(resp.status(), 200);
+    contains(&text(&resp.body), "ECONNREFUSED.");
+    let forwarded = mock.seen().pop().unwrap();
+    assert_eq!(forwarded.target(), target);
+    assert!(forwarded.header("anthropic-beta").is_none());
+    let prefix_end = req_raw.rfind("\"get_orders\"").unwrap();
+    assert_eq!(
+        &forwarded.body[..prefix_end],
+        &req_raw.as_bytes()[..prefix_end],
+        "Gemini prefix (systemInstruction, cachedContent, earlier turns) must stay byte-for-byte identical"
+    );
+    let sent = forwarded.json();
+    assert!(sent.get("context_management").is_none());
+    assert_eq!(sent["systemInstruction"], req_body["systemInstruction"]);
+    assert_eq!(sent["cachedContent"], req_body["cachedContent"]);
+    for i in 0..4 {
+        assert_eq!(sent["contents"][i], req_body["contents"][i], "turn {i}");
+    }
+    for (part_idx, orig) in [(0usize, &big_json), (1usize, &big_log)] {
+        let compacted =
+            sent["contents"][4]["parts"][part_idx]["functionResponse"]["response"]["output"]
+                .as_str()
+                .unwrap();
+        let pct = (orig.len() - compacted.len()) * 100 / orig.len();
+        assert!(
+            pct > 85,
+            "gemini part {part_idx}: {pct}% ({} -> {})",
+            orig.len(),
+            compacted.len()
+        );
+        assert!(compacted.len() <= 4096);
+        let id = extract_recall_id(compacted);
+        let recalled = recall(root, &id);
+        assert!(recalled.status.success(), "{}", text(&recalled.stderr));
+        assert_eq!(recalled.stdout, orig.as_bytes());
+    }
+    contains(
+        sent["contents"][4]["parts"][1]["functionResponse"]["response"]["output"]
+            .as_str()
+            .unwrap(),
+        "ECONNREFUSED",
+    );
+    // Also exercise `/v1/models/<model>:generateContent` (non-streaming).
+    let non_stream_target = "/v1/models/gemini-2.5-flash:generateContent";
+    let resp_v1 = proxy.send("POST", non_stream_target, &headers, req_raw.as_bytes());
+    assert_eq!(resp_v1.status(), 200);
+    assert!(mock.seen().pop().unwrap().body.len() < req_raw.len());
+    proxy.stop();
+    let records = ledger(root);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["path"], "gemini");
+    assert_eq!(records[0]["model"], "gemini-2.5-pro");
+    assert_eq!(records[0]["mode"], "compact");
+    assert_eq!(records[0]["live_compacted"]["results"], 2);
+    assert_eq!(records[1]["path"], "gemini");
+    assert_eq!(records[1]["model"], "gemini-2.5-flash");
+    assert_eq!(records[1]["mode"], "compact");
+    assert_eq!(records[1]["live_compacted"]["results"], 2);
+    let report = stats(root);
+    assert_eq!(report["proxy"]["live_compacted"]["results"], 4);
+    assert!(
+        report["proxy"]["live_compacted"]["saved_bytes"]
+            .as_u64()
+            .unwrap()
+            > 80_000
+    );
+
+    // 2. Without `--compact-live`: 100% byte-for-byte verbatim passthrough, no observations archived.
+    let (dir_off, mock_off, proxy_off) = session(gemini_sse, "");
+    let resp_off = proxy_off.send("POST", target, &headers, req_raw.as_bytes());
+    assert_eq!(resp_off.status(), 200);
+    let forwarded_off = mock_off.seen().pop().unwrap();
+    assert_eq!(forwarded_off.target(), target);
+    assert_eq!(forwarded_off.body, req_raw.as_bytes());
+    assert!(forwarded_off.header("anthropic-beta").is_none());
+    proxy_off.stop();
+    let records_off = ledger(dir_off.path());
+    assert_eq!(records_off.len(), 1);
+    assert_eq!(records_off[0]["path"], "gemini");
+    assert_eq!(records_off[0]["model"], "gemini-2.5-pro");
+    assert_eq!(records_off[0]["mode"], "pass");
+    assert_eq!(records_off[0]["reason"], "compact-live-off");
+    assert!(records_off[0].get("live_compacted").is_none());
+    assert!(!dir_off.path().join(".justless/observations").exists());
+}

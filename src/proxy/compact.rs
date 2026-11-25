@@ -8,6 +8,8 @@
 //! - Anthropic `/v1/messages`: `tool_result` blocks in the final `user` message.
 //! - OpenAI `/chat/completions`: trailing contiguous run of `role: "tool"` messages.
 //! - OpenAI `/responses`: trailing contiguous run of `type: "function_call_output"` items.
+//! - Google Gemini `:generateContent` / `:streamGenerateContent`: `functionResponse`
+//!   parts in the final `user` or `function` entry of `contents[]`.
 //!
 //! Each eligible oversized text block is:
 //! 1. Checked against strict safety guards (tail-only live zone, prior turn present,
@@ -322,6 +324,104 @@ pub fn compact_openai_responses_live_zone(
     apply_replacements(body, replacements)
 }
 
+/// Attempts to compact eligible oversized `functionResponse` string fields in
+/// the final `user` or `function` entry of a Google Gemini `generateContent` /
+/// `streamGenerateContent` request `body` (`contents[]`).
+///
+/// Only the final `contents` entry strictly after at least one prior `model`
+/// turn is eligible. `systemInstruction`, `cachedContent`, `tools`, and all
+/// earlier `contents` entries stay byte-for-byte untouched.
+pub fn compact_gemini_live_zone(
+    ws: &Workspace,
+    body: &Body<'_>,
+    options: &Options,
+) -> Option<LiveResult> {
+    if !live_enabled(options) {
+        return None;
+    }
+    let raw_contents = body.raw("contents")?;
+    if !raw_contents.get().trim_start().starts_with('[') {
+        return None;
+    }
+    let contents: Vec<&RawValue> = serde_json::from_str(raw_contents.get()).ok()?;
+    if contents.len() < 2 || !has_role(&contents[..contents.len() - 1], "model") {
+        return None;
+    }
+
+    let last_entry = *contents.last()?;
+    let last_members = plan::parse_members(last_entry.get())?;
+    let is_tool_turn = member_str(&last_members, "role")
+        .is_some_and(|role| matches!(role.as_str(), "user" | "function"));
+    if !is_tool_turn || has_non_null_member(&last_members, "cache_control") {
+        return None;
+    }
+
+    let raw_parts = member(&last_members, "parts")?;
+    if !raw_parts.get().trim_start().starts_with('[') {
+        return None;
+    }
+    let parts: Vec<&RawValue> = serde_json::from_str(raw_parts.get()).ok()?;
+    let eligible = after_last_cache_control(&parts);
+    if eligible.is_empty() {
+        return None;
+    }
+
+    let guard = gemini_retrieval_guard(&contents[..contents.len() - 1]);
+    let mut redactor: Option<Option<&'static crate::redact::Redactor>> = None;
+    let mut replacements: Vec<Replacement> = Vec::new();
+
+    for raw_part in eligible {
+        let Some(part_members) = plan::parse_members(raw_part.get()) else {
+            continue;
+        };
+        if has_non_null_member(&part_members, "cache_control") {
+            continue;
+        }
+        let Some(fr_raw) = member(&part_members, "functionResponse")
+            .or_else(|| member(&part_members, "function_response"))
+        else {
+            continue;
+        };
+        let Some(fr_members) = plan::parse_members(fr_raw.get()) else {
+            continue;
+        };
+        if has_non_null_member(&fr_members, "cache_control") || guard.is_skipped(&fr_members) {
+            continue;
+        }
+        let Some(resp_raw) = member(&fr_members, "response") else {
+            continue;
+        };
+        let Some(resp_members) = plan::parse_members(resp_raw.get()) else {
+            continue;
+        };
+        if has_non_null_member(&resp_members, "cache_control") {
+            continue;
+        }
+        let has_binary_mime = member_str(&resp_members, "mimeType")
+            .or_else(|| member_str(&resp_members, "mime_type"))
+            .is_some_and(|m| {
+                let lower = m.to_ascii_lowercase();
+                !lower.starts_with("text/") && lower != "application/json"
+            });
+        for (key, val_raw) in &resp_members {
+            if key == "cache_control" || (has_binary_mime && key == "data") {
+                continue;
+            }
+            compact_field_raw(
+                ws,
+                body,
+                val_raw,
+                &["text"],
+                options,
+                &mut redactor,
+                &mut replacements,
+            );
+        }
+    }
+
+    apply_replacements(body, replacements)
+}
+
 fn member_str(members: &[(String, &RawValue)], key: &str) -> Option<String> {
     serde_json::from_str::<String>(member(members, key)?.get()).ok()
 }
@@ -429,6 +529,79 @@ fn openai_responses_retrieval_ids(items: &[&RawValue]) -> HashSet<String> {
         }
     }
     ids
+}
+
+struct GeminiRetrievalGuard {
+    ids: HashSet<String>,
+    last_model_names: HashSet<String>,
+    last_model_unkeyed_names: HashSet<String>,
+}
+
+impl GeminiRetrievalGuard {
+    fn is_skipped(&self, resp_members: &[(String, &RawValue)]) -> bool {
+        let name = member_str(resp_members, "name").unwrap_or_default();
+        if is_retrieval_tool_name(&name) {
+            return true;
+        }
+        match member_str(resp_members, "id") {
+            Some(id) => self.ids.contains(&id) || self.last_model_unkeyed_names.contains(&name),
+            None => self.last_model_names.contains(&name),
+        }
+    }
+}
+
+/// Collects Gemini `functionCall` retrieval identifiers from prior `model` turns
+/// (matching by `id` when present and by `name` on the latest prior `model` turn).
+fn gemini_retrieval_guard(contents: &[&RawValue]) -> GeminiRetrievalGuard {
+    let mut guard = GeminiRetrievalGuard {
+        ids: HashSet::new(),
+        last_model_names: HashSet::new(),
+        last_model_unkeyed_names: HashSet::new(),
+    };
+    let last_model_idx = contents.iter().rposition(|raw| {
+        plan::parse_members(raw.get()).is_some_and(|m| member_str_eq(&m, "role", "model"))
+    });
+    for (idx, raw_entry) in contents.iter().enumerate() {
+        let Some(entry_members) = plan::parse_members(raw_entry.get()) else {
+            continue;
+        };
+        if !member_str_eq(&entry_members, "role", "model") {
+            continue;
+        }
+        let Some(parts_raw) = member(&entry_members, "parts") else {
+            continue;
+        };
+        let Ok(parts) = serde_json::from_str::<Vec<&RawValue>>(parts_raw.get()) else {
+            continue;
+        };
+        let is_last_model = Some(idx) == last_model_idx;
+        for part in parts {
+            let Some(pm) = plan::parse_members(part.get()) else {
+                continue;
+            };
+            let Some(fc_raw) = member(&pm, "functionCall").or_else(|| member(&pm, "function_call"))
+            else {
+                continue;
+            };
+            let Some(fc_members) = plan::parse_members(fc_raw.get()) else {
+                continue;
+            };
+            let name = member_str(&fc_members, "name").unwrap_or_default();
+            if !is_retrieval_call(&name, member(&fc_members, "args")) {
+                continue;
+            }
+            if let Some(id) = member_str(&fc_members, "id") {
+                guard.ids.insert(id);
+                if is_last_model {
+                    guard.last_model_names.insert(name);
+                }
+            } else if is_last_model {
+                guard.last_model_unkeyed_names.insert(name.clone());
+                guard.last_model_names.insert(name);
+            }
+        }
+    }
+    guard
 }
 
 fn is_retrieval_call(name: &str, args_raw: Option<&RawValue>) -> bool {
@@ -1757,6 +1930,192 @@ mod tests {
         assert!(
             compact_openai_responses_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn gemini_generate_content_compacts_live_zone_preserves_prefix_and_recalls() {
+        let (_dir, ws) = workspace();
+        let big_json = large_json_array();
+        let big_log = large_structured_log();
+
+        let req = json!({
+            "systemInstruction": {"parts": [{"text": "You are a coding agent."}]},
+            "cachedContent": "cachedContents/gemini-prefix-01",
+            "tools": [{"functionDeclarations": [{"name": "run_shell", "description": "Run command"}]}],
+            "contents": [
+                {"role": "user", "parts": [{"text": "Diagnose billing-api errors."}]},
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "Inspect older output first."},
+                    {"thoughtSignature": "sig_gemini_01", "functionCall": {"name": "run_shell", "args": {"command": "cat older.log"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "run_shell", "response": {"output": big_log}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"thoughtSignature": "sig_gemini_02", "functionCall": {"name": "get_orders", "args": {}}},
+                    {"functionCall": {"name": "run_shell", "args": {"command": "tail -n 220 api.log"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "get_orders", "response": {"output": big_json, "exitCode": 0}}},
+                    {"functionResponse": {"name": "run_shell", "response": {"result": big_log}}},
+                    {"text": "Summarize the root cause."}
+                ]}
+            ]
+        });
+        let raw = serde_json::to_string_pretty(&req)
+            .unwrap()
+            .replace("\"role\": ", "\"role\" :   ");
+        let parsed = Body::parse(raw.as_bytes()).unwrap();
+        let res = compact_gemini_live_zone(&ws, &parsed, &live_options())
+            .expect("gemini final functionResponse turn should compact");
+
+        // Every byte before the final `contents` entry — systemInstruction,
+        // cachedContent, tools, thoughtSignature, and earlier oversized
+        // functionResponse — must remain 100% byte-for-byte identical.
+        let orig_contents: Vec<&RawValue> =
+            serde_json::from_str(parsed.raw("contents").unwrap().get()).unwrap();
+        let last_start =
+            orig_contents.last().unwrap().get().as_ptr() as usize - raw.as_ptr() as usize;
+        assert_eq!(&res.body[..last_start], &raw.as_bytes()[..last_start]);
+
+        assert_eq!(res.stats.results, 2);
+        let pct = res.stats.saved_bytes * 100 / res.stats.bytes_before;
+        assert!(pct > 85, "gemini saved only {pct}%");
+
+        let out: Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(out["systemInstruction"], req["systemInstruction"]);
+        assert_eq!(out["cachedContent"], req["cachedContent"]);
+        for i in 0..4 {
+            assert_eq!(out["contents"][i], req["contents"][i], "turn {i}");
+        }
+        assert_eq!(
+            out["contents"][4]["parts"][0]["functionResponse"]["response"]["exitCode"],
+            0
+        );
+        assert_eq!(
+            out["contents"][4]["parts"][2],
+            req["contents"][4]["parts"][2]
+        );
+
+        // Verify exact lossless recall round-trip for both archived observations.
+        for (part_idx, key, orig) in [(0usize, "output", &big_json), (1usize, "result", &big_log)] {
+            let compacted = out["contents"][4]["parts"][part_idx]["functionResponse"]["response"]
+                [key]
+                .as_str()
+                .unwrap();
+            assert!(compacted.len() <= 4096);
+            let footer = compacted.lines().last().unwrap();
+            let id = footer
+                .strip_prefix("[justless recall ")
+                .and_then(|rest| rest.split_once(" · compacted "))
+                .expect("recall footer")
+                .0;
+            let archived_bytes =
+                std::fs::read(ws.state.join(format!("observations/{id}.json"))).unwrap();
+            assert_eq!(crate::capture::source_digest(&archived_bytes), id);
+            let recovered: String = serde_json::from_slice(&archived_bytes).unwrap();
+            assert_eq!(recovered, *orig);
+        }
+        assert!(
+            out["contents"][4]["parts"][1]["functionResponse"]["response"]["result"]
+                .as_str()
+                .unwrap()
+                .contains("ECONNREFUSED")
+        );
+
+        // `role: "function"` final turns are also supported.
+        let fn_role_req = json!({
+            "contents": [
+                {"role": "model", "parts": [{"functionCall": {"name": "run_shell", "args": {"command": "tail api.log"}}}]},
+                {"role": "function", "parts": [{"functionResponse": {"name": "run_shell", "response": {"stdout": big_log}}}]}
+            ]
+        });
+        let fn_raw = serde_json::to_vec(&fn_role_req).unwrap();
+        let fn_res = compact_gemini_live_zone(&ws, &Body::parse(&fn_raw).unwrap(), &live_options())
+            .expect("role: function final turn should compact");
+        assert_eq!(fn_res.stats.results, 1);
+
+        // Safety guards: single entry, no prior model turn, trailing model turn, or
+        // plain user text without functionResponse must stay untouched.
+        for skipped in [
+            json!({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "run_shell", "response": {"output": big_json}}}]}]}),
+            json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}, {"role": "user", "parts": [{"functionResponse": {"name": "run_shell", "response": {"output": big_json}}}]}]}),
+            json!({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "run_shell", "response": {"output": big_json}}}]}, {"role": "model", "parts": [{"text": "prefill"}]}]}),
+            json!({"contents": [{"role": "model", "parts": [{"text": "ok"}]}, {"role": "user", "parts": [{"text": big_json}]}]}),
+        ] {
+            let bytes = serde_json::to_vec(&skipped).unwrap();
+            assert!(
+                compact_gemini_live_zone(&ws, &Body::parse(&bytes).unwrap(), &live_options())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_skips_justless_recall_and_retrieval_function_calls() {
+        let (_dir, ws) = workspace();
+        let big = large_json_array();
+
+        // 1. Classic Gemini `functionCall` without `id` invoking `justless recall` -> skipped.
+        let shell_recall = json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "run_shell", "args": {"command": "justless recall deadbeef"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "run_shell", "response": {"output": big}}}
+                ]}
+            ]
+        });
+        let raw = serde_json::to_vec(&shell_recall).unwrap();
+        assert!(
+            compact_gemini_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options()).is_none()
+        );
+
+        // 2. MCP retrieval tool name -> skipped.
+        let mcp_recall = json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "mcp__justless__recall", "args": {"id": "deadbeef"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "mcp__justless__recall", "response": {"content": big}}}
+                ]}
+            ]
+        });
+        let raw = serde_json::to_vec(&mcp_recall).unwrap();
+        assert!(
+            compact_gemini_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options()).is_none()
+        );
+
+        // 3. Parallel calls with `id`: retrieval call is skipped while sibling call compacts.
+        let parallel = json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"functionCall": {"id": "call_rec", "name": "run_shell", "args": {"command": "justless recall deadbeef"}}},
+                    {"functionCall": {"id": "call_cat", "name": "run_shell", "args": {"command": "curl /orders"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"id": "call_rec", "name": "run_shell", "response": {"output": big}}},
+                    {"functionResponse": {"id": "call_cat", "name": "run_shell", "response": {"output": big}}}
+                ]}
+            ]
+        });
+        let raw = serde_json::to_vec(&parallel).unwrap();
+        let res = compact_gemini_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options())
+            .expect("non-retrieval sibling should still compact");
+        assert_eq!(res.stats.results, 1);
+        let out: Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(
+            out["contents"][1]["parts"][0]["functionResponse"]["response"]["output"],
+            big
+        );
+        assert!(
+            out["contents"][1]["parts"][1]["functionResponse"]["response"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("[justless recall ")
         );
     }
 }

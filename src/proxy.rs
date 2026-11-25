@@ -78,7 +78,7 @@ fn clearing_args() -> Vec<Arg<'static>> {
             .help("Do not archive tool results"),
         Arg::new("compact-live")
             .long("compact-live")
-            .help("Compact oversized newest tool results in the uncached live zone (Anthropic /v1/messages, OpenAI /chat/completions & /responses; or set JUSTLESS_PROXY_COMPACT_LIVE=1)"),
+            .help("Compact oversized newest tool results in the uncached live zone (Anthropic /v1/messages, OpenAI /chat/completions & /responses, Gemini :generateContent; or set JUSTLESS_PROXY_COMPACT_LIVE=1)"),
         crate::number(
             "compact-live-min-bytes",
             "8192",
@@ -507,7 +507,16 @@ enum Endpoint {
     CountTokens,
     ChatCompletions,
     Responses,
+    GeminiGenerate,
     Other,
+}
+
+fn gemini_model_from_path(path: &str) -> Option<&str> {
+    let without_action = path
+        .strip_suffix(":generateContent")
+        .or_else(|| path.strip_suffix(":streamGenerateContent"))?;
+    let (_, model) = without_action.rsplit_once("/models/")?;
+    (!model.is_empty() && !model.contains('/') && !model.contains(':')).then_some(model)
 }
 
 impl Endpoint {
@@ -517,6 +526,7 @@ impl Endpoint {
             ("POST", "/v1/messages/count_tokens") => Self::CountTokens,
             ("POST", path) if path.ends_with("/chat/completions") => Self::ChatCompletions,
             ("POST", path) if path.ends_with("/responses") => Self::Responses,
+            ("POST", path) if gemini_model_from_path(path).is_some() => Self::GeminiGenerate,
             _ => Self::Other,
         }
     }
@@ -527,6 +537,7 @@ impl Endpoint {
             Self::CountTokens => "count_tokens",
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
+            Self::GeminiGenerate => "gemini",
             Self::Other => "other",
         }
     }
@@ -656,7 +667,7 @@ fn count_repeats(calls: &mut state::Calls, req: &Request, boundary: usize) -> u6
 impl Shared {
     fn plan(&self, head: &Head, body: &[u8], endpoint: Endpoint, now: u64) -> Planned {
         if !endpoint.is_anthropic() {
-            return self.plan_openai(body, endpoint);
+            return self.plan_live_only(head, body, endpoint);
         }
         let Some(parsed) = Body::parse(body) else {
             return Planned::pass("unparsed");
@@ -704,27 +715,45 @@ impl Shared {
         planned
     }
 
-    /// Live-zone-only compaction for OpenAI Chat Completions and Responses APIs.
+    /// Live-zone-only compaction for provider-neutral endpoints (OpenAI Chat
+    /// Completions, OpenAI Responses, Google Gemini `generateContent`).
     /// Never applies Anthropic clearing edits or `anthropic-beta` headers.
-    fn plan_openai(&self, body: &[u8], endpoint: Endpoint) -> Planned {
+    fn plan_live_only(&self, head: &Head, body: &[u8], endpoint: Endpoint) -> Planned {
+        let path_model = (endpoint == Endpoint::GeminiGenerate)
+            .then(|| gemini_model_from_path(head.path()).map(str::to_owned))
+            .flatten();
         if !self.options.compact_live {
-            return Planned::pass("compact-live-off");
+            return Planned {
+                model: path_model,
+                ..Planned::pass("compact-live-off")
+            };
         }
         if !self.archive {
-            return Planned::pass("no-archive");
+            return Planned {
+                model: path_model,
+                ..Planned::pass("no-archive")
+            };
         }
         let Some(parsed) = Body::parse(body) else {
-            return Planned::pass("unparsed");
+            return Planned {
+                model: path_model,
+                ..Planned::pass("unparsed")
+            };
         };
-        let model = parsed
-            .value("model")
-            .and_then(|v| v.as_str().map(str::to_owned));
+        let model = path_model.or_else(|| {
+            parsed
+                .value("model")
+                .and_then(|v| v.as_str().map(str::to_owned))
+        });
         let live = match endpoint {
             Endpoint::ChatCompletions => {
                 compact::compact_openai_chat_live_zone(&self.ws, &parsed, &self.options)
             }
             Endpoint::Responses => {
                 compact::compact_openai_responses_live_zone(&self.ws, &parsed, &self.options)
+            }
+            Endpoint::GeminiGenerate => {
+                compact::compact_gemini_live_zone(&self.ws, &parsed, &self.options)
             }
             _ => None,
         };
