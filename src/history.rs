@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
@@ -67,11 +67,45 @@ const SUBCOMMANDS: &[&str] = &[
     "zig",
 ];
 
+/// Known Kubernetes resource nouns kept as a third word of `kubectl get …`
+/// labels so distinct resource inventories (`kubectl get events`, `svc`, `pods`,
+/// …) stay separate without ever exposing arbitrary names, namespaces or secrets.
+const KUBECTL_RESOURCES: &[&str] = &[
+    "pods",
+    "po",
+    "deployments",
+    "deploy",
+    "statefulsets",
+    "sts",
+    "daemonsets",
+    "ds",
+    "replicasets",
+    "rs",
+    "jobs",
+    "nodes",
+    "no",
+    "events",
+    "ev",
+    "svc",
+    "services",
+    "ing",
+    "ingresses",
+    "pvc",
+    "pvcs",
+    "cj",
+    "cronjobs",
+];
+
 /// A command label without arguments, such as `cargo test`, `make` or `mysql`.
 /// Only programs known to take subcommands keep their second word, so host,
 /// database and file names never appear in a label.
 pub fn label(words: &[&str]) -> String {
-    let words = crate::filters::unwrap_tool(words);
+    let owned = crate::wrappers::hook_effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(unwrapped) => unwrapped.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let words = crate::filters::unwrap_tool(&refs);
     let Some((program, rest)) = words.split_first() else {
         return "other".into();
     };
@@ -87,11 +121,22 @@ pub fn label(words: &[&str]) -> String {
     {
         return "other".into();
     }
+    if matches!(program, "python" | "python3")
+        && let ["-m", module @ ("pytest" | "unittest"), ..] = rest
+    {
+        return format!("{program} -m {module}");
+    }
     let rest = if program == "git" {
         crate::filters::git_display_subcommand(rest)
     } else {
         rest
     };
+    if program == "kubectl"
+        && let ["get", resource, ..] = rest
+        && KUBECTL_RESOURCES.contains(resource)
+    {
+        return format!("kubectl get {resource}");
+    }
     match rest.first() {
         Some(sub)
             if SUBCOMMANDS.contains(&program)
@@ -485,6 +530,150 @@ pub(crate) fn outlines_summary(workspace: &Workspace) -> OutlinesSummary {
     OutlinesSummary::from_activity(&activity.outlines)
 }
 
+/// Measured repeat-read / delta totals recorded by `seen::Memory` (`context`,
+/// `pack`, and session `read`/`expand` dedup) for `stats` and `stats --all`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeltasSummary {
+    pub views: u64,
+    pub whole_bytes: u64,
+    pub shown_bytes: u64,
+}
+
+impl DeltasSummary {
+    fn from_activity(deltas: &Deltas) -> Self {
+        Self {
+            views: deltas.views,
+            whole_bytes: deltas.whole_bytes,
+            shown_bytes: deltas.shown_bytes,
+        }
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.views += other.views;
+        self.whole_bytes += other.whole_bytes;
+        self.shown_bytes += other.shown_bytes;
+    }
+
+    pub fn saved_bytes(&self) -> u64 {
+        self.whole_bytes.saturating_sub(self.shown_bytes)
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        let saved = self.saved_bytes();
+        serde_json::json!({
+            "views": self.views,
+            "whole_bytes": self.whole_bytes,
+            "shown_bytes": self.shown_bytes,
+            "saved_bytes": saved,
+            "estimated_tokens_saved": crate::tokens::Content::Code.tokens(saved),
+        })
+    }
+
+    pub fn line(&self) -> String {
+        let saved = self.saved_bytes();
+        format!(
+            "Changed since read: {} view(s) printed {} instead of {}, {} kept out (≈{} tokens, estimated at {:.2} bytes per token for code)",
+            self.views,
+            human_bytes(self.shown_bytes),
+            human_bytes(self.whole_bytes),
+            human_bytes(saved),
+            crate::tokens::Content::Code.tokens(saved),
+            crate::tokens::Content::Code.bytes_per_token()
+        )
+    }
+}
+
+/// Measured repeat-read delta totals from a project's `activity.json`, quietly
+/// returning zeros when unreadable or absent.
+pub(crate) fn deltas_summary(workspace: &Workspace) -> DeltasSummary {
+    let activity: Activity = get(&workspace.state.join("activity.json")).unwrap_or_default();
+    DeltasSummary::from_activity(&activity.deltas)
+}
+
+/// Measured on-disk archived tool results under `.justless/observations/`
+/// (created by `justless mask` or `justless proxy`) for `stats` and `stats --all`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ObservationsSummary {
+    pub archived_results: u64,
+    pub archived_bytes: u64,
+}
+
+impl ObservationsSummary {
+    pub fn add(&mut self, other: &Self) {
+        self.archived_results += other.archived_results;
+        self.archived_bytes += other.archived_bytes;
+    }
+
+    pub fn json(&self, recalls: &ArchiveRecalls) -> serde_json::Value {
+        let net = net_bytes(self.archived_bytes, 0, recalls.bytes);
+        serde_json::json!({
+            "archived_results": self.archived_results,
+            "archived_bytes": self.archived_bytes,
+            "recalled_count": recalls.count,
+            "recalled_bytes": recalls.bytes,
+            "net_archived_bytes": net,
+            "estimated_tokens_archived": crate::tokens::Content::Logs.tokens(self.archived_bytes),
+        })
+    }
+
+    pub fn line(&self, recalls: &ArchiveRecalls) -> String {
+        let ratio = crate::tokens::Content::Logs.bytes_per_token();
+        let tokens = crate::tokens::Content::Logs.tokens(self.archived_bytes);
+        if recalls.count > 0 {
+            let net = net_bytes(self.archived_bytes, 0, recalls.bytes);
+            format!(
+                "Archived tool results: {} result(s) ({}, ≈{} tokens estimated at {:.2} bytes per token for logs), {} recalled ({} net)",
+                self.archived_results,
+                human_bytes(self.archived_bytes),
+                tokens,
+                ratio,
+                human_bytes(recalls.bytes),
+                signed_bytes(net),
+            )
+        } else {
+            format!(
+                "Archived tool results: {} result(s) ({}, ≈{} tokens estimated at {:.2} bytes per token for logs)",
+                self.archived_results,
+                human_bytes(self.archived_bytes),
+                tokens,
+                ratio,
+            )
+        }
+    }
+}
+
+fn is_observation_file(name: &str) -> bool {
+    name.strip_suffix(".json").is_some_and(|id| {
+        id.len() == 64
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+/// Count unique archived tool-result files stored under `.justless/observations/`
+/// and their measured bytes on disk.
+pub(crate) fn observations_summary(workspace: &Workspace) -> ObservationsSummary {
+    let Ok(entries) = fs::read_dir(workspace.state.join("observations")) else {
+        return ObservationsSummary::default();
+    };
+    let mut summary = ObservationsSummary::default();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_observation_file(name) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            summary.archived_results += 1;
+            summary.archived_bytes += meta.len();
+        }
+    }
+    summary
+}
+
 #[derive(Serialize, Deserialize)]
 struct Read {
     file: String,
@@ -571,11 +760,26 @@ pub fn recalled_archive(workspace: &Workspace, bytes: u64, proxy: bool) {
     crate::statusline::append(&workspace.state.join(ARCHIVE_RECALLS), &line);
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ArchiveRecalls {
-    count: u64,
+    pub(crate) count: u64,
     pub(crate) bytes: u64,
     pub(crate) proxy_bytes: u64,
+}
+
+impl ArchiveRecalls {
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.count += other.count;
+        self.bytes += other.bytes;
+        self.proxy_bytes += other.proxy_bytes;
+    }
+
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "recalls": self.count,
+            "bytes": self.bytes,
+        })
+    }
 }
 
 /// How many archived tool results `justless recall` printed since `since_ms`,
@@ -1046,6 +1250,8 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             .then(a.family.cmp(&b.family))
     });
     let outlines = OutlinesSummary::from_activity(&activity.outlines);
+    let deltas = DeltasSummary::from_activity(&activity.deltas);
+    let observations = observations_summary(workspace);
     if as_json {
         // The keys from before retrievals were measured keep their meaning:
         // `saved_*` and `estimated_tokens_saved` are savings at first preview.
@@ -1068,19 +1274,14 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             "days": timeline.into_values().collect::<Vec<_>>(),
             "commands": commands,
             "repeated_source_reads": activity.repeat_reads,
-            "changed_since_read": {
-                "views": activity.deltas.views,
-                "whole_bytes": activity.deltas.whole_bytes,
-                "shown_bytes": activity.deltas.shown_bytes,
-                "saved_bytes": activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes),
-                "estimated_tokens_saved": crate::tokens::Content::Code.tokens(activity.deltas.whole_bytes.saturating_sub(activity.deltas.shown_bytes)),
-            },
+            "changed_since_read": deltas.json(),
             "source_outlines": outlines.json(),
+            "observations": observations.json(&recalls),
             "redacted_secrets": secrets,
             "unredacted_replays": unredacted,
             "hook_pass_through": activity.bypasses,
             "proxy": proxy.as_ref().map(|p| p.json()),
-            "archive_recalls": {"recalls": recalls.count, "bytes": recalls.bytes},
+            "archive_recalls": recalls.json(),
             "preview_budgets": crate::adaptive::stats_json(workspace),
             "codex": codex.as_ref().map(|codex| &codex.json),
             "agy": agy.as_ref().map(|agy| &agy.json),
@@ -1238,21 +1439,14 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             }
         );
     }
-    let deltas = &activity.deltas;
     if deltas.views > 0 {
-        let saved = deltas.whole_bytes.saturating_sub(deltas.shown_bytes);
-        println!(
-            "Changed since read: {} view(s) printed {} instead of {}, {} kept out (≈{} tokens, estimated at {:.2} bytes per token for code)",
-            deltas.views,
-            human_bytes(deltas.shown_bytes),
-            human_bytes(deltas.whole_bytes),
-            human_bytes(saved),
-            crate::tokens::Content::Code.tokens(saved),
-            crate::tokens::Content::Code.bytes_per_token()
-        );
+        println!("{}", deltas.line());
     }
     if outlines.views > 0 {
         println!("{}", outlines.line());
+    }
+    if observations.archived_results > 0 && proxy.is_none() {
+        println!("{}", observations.line(&recalls));
     }
     if !activity.bypasses.is_empty() {
         let passed: Vec<_> = activity
@@ -1645,27 +1839,63 @@ fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
     let reserve = pack_bytes.min(room / 2);
     let mut dropped = pack.len() < activity.last_pack.len();
     // Activity keeps the 32 most recent ranges and outlines, newest first.
-    for read in activity.reads.iter().take(32) {
-        if report.clipped {
-            break;
+    // Multiple non-outline `Read` ranges on the same file with the same
+    // staleness coalesce onto one compact line (`Read file:10-40, 120-160`),
+    // keeping each file's position at its most recent read and preserving
+    // `[source changed]` accurately per range.
+    if report.left() <= reserve {
+        dropped |= !activity.reads.is_empty();
+    } else {
+        let mut digests: HashMap<&str, Option<String>> = HashMap::new();
+        let items = coalesce_reads(workspace, &activity.reads, &mut digests);
+        for item in items {
+            if report.clipped {
+                break;
+            }
+            let avail = report.left().saturating_sub(reserve);
+            match item {
+                ResumeRead::Outline {
+                    file,
+                    from,
+                    to,
+                    stale,
+                } => {
+                    let suffix = if stale { " [source changed]" } else { "" };
+                    let line = if from > 0 {
+                        format!("Outline {file}:{from}-{to}{suffix}")
+                    } else {
+                        format!("Outline {file}{suffix}")
+                    };
+                    if line.len() + 1 > avail {
+                        dropped = true;
+                        break;
+                    }
+                    report.line(line);
+                }
+                ResumeRead::Ranges {
+                    file,
+                    stale,
+                    ranges,
+                } => {
+                    let full = format_read_ranges(file, &ranges, stale);
+                    if full.len() < avail {
+                        report.line(full);
+                        continue;
+                    }
+                    // When the budget is too tight for every range on this file,
+                    // keep as many newest ranges as fit and mark the rest clipped.
+                    let fit = (1..ranges.len()).rev().find_map(|keep| {
+                        let line = format_read_ranges(file, &ranges[..keep], stale);
+                        (line.len() < avail).then_some(line)
+                    });
+                    if let Some(line) = fit {
+                        report.line(line);
+                    }
+                    dropped = true;
+                    break;
+                }
+            }
         }
-        let stale = if current(workspace, &read.file, &read.digest) {
-            ""
-        } else {
-            " [source changed]"
-        };
-        let line = if read.outline && read.from > 0 {
-            format!("Outline {}:{}-{}{stale}", read.file, read.from, read.to)
-        } else if read.outline {
-            format!("Outline {}{stale}", read.file)
-        } else {
-            format!("Read {}:{}-{}{stale}", read.file, read.from, read.to)
-        };
-        if line.len() + 1 + reserve > report.left() {
-            dropped = true;
-            break;
-        }
-        report.line(line);
     }
     for line in pack {
         if line.len() + 1 > report.left() {
@@ -1679,6 +1909,89 @@ fn activity_text(workspace: &Workspace, cap: usize) -> Result<String> {
         report.line("No recorded project activity yet.");
     }
     Ok(report.into_string())
+}
+
+enum ResumeRead<'a> {
+    Outline {
+        file: &'a str,
+        from: usize,
+        to: usize,
+        stale: bool,
+    },
+    Ranges {
+        file: &'a str,
+        stale: bool,
+        /// Inspected `(from, to)` line spans in newest-first order.
+        ranges: Vec<(usize, usize)>,
+    },
+}
+
+fn coalesce_reads<'a>(
+    workspace: &Workspace,
+    reads: &'a [Read],
+    digests: &mut HashMap<&'a str, Option<String>>,
+) -> Vec<ResumeRead<'a>> {
+    let mut items: Vec<ResumeRead<'a>> = Vec::new();
+    let mut groups: HashMap<(&'a str, bool), usize> = HashMap::new();
+    for read in reads.iter().take(32) {
+        let stale = !current_cached(workspace, digests, &read.file, &read.digest);
+        if read.outline {
+            items.push(ResumeRead::Outline {
+                file: &read.file,
+                from: read.from,
+                to: read.to,
+                stale,
+            });
+            continue;
+        }
+        let key = (read.file.as_str(), stale);
+        if let Some(&index) = groups.get(&key) {
+            if let ResumeRead::Ranges { ranges, .. } = &mut items[index]
+                && !ranges.contains(&(read.from, read.to))
+            {
+                ranges.push((read.from, read.to));
+            }
+        } else {
+            groups.insert(key, items.len());
+            items.push(ResumeRead::Ranges {
+                file: &read.file,
+                stale,
+                ranges: vec![(read.from, read.to)],
+            });
+        }
+    }
+    items
+}
+
+fn format_read_ranges(file: &str, ranges: &[(usize, usize)], stale: bool) -> String {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let spans: Vec<String> = sorted
+        .into_iter()
+        .map(|(from, to)| format!("{from}-{to}"))
+        .collect();
+    let suffix = if stale { " [source changed]" } else { "" };
+    format!("Read {file}:{}{suffix}", spans.join(", "))
+}
+
+fn current_cached<'a>(
+    workspace: &Workspace,
+    cache: &mut HashMap<&'a str, Option<String>>,
+    file: &'a str,
+    old: &str,
+) -> bool {
+    cache
+        .entry(file)
+        .or_insert_with(|| {
+            workspace
+                .source_path(file)
+                .ok()
+                .and_then(|p| fs::read(p).ok())
+                .map(|b| capture::source_digest(&b))
+        })
+        .as_deref()
+        == Some(old)
 }
 
 /// `justless` starts the command that replays an unfinished run.
@@ -1836,5 +2149,168 @@ fn file_identity(meta: &fs::Metadata) -> (u64, u64, u64) {
     #[cfg(not(unix))]
     {
         (0, 0, meta.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn temp_workspace() -> (TempDir, Workspace) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = Workspace::discover(Some(&root)).unwrap();
+        (dir, ws)
+    }
+
+    #[test]
+    fn resume_coalesces_same_file_ranges_preserving_recency_and_staleness() {
+        let (_dir, ws) = temp_workspace();
+        let agents_body = "fn a() {}\n".repeat(500);
+        let history_body = "fn h() {}\n".repeat(100);
+        fs::create_dir_all(ws.root.join("src")).unwrap();
+        fs::write(ws.root.join("src/agents.rs"), &agents_body).unwrap();
+        fs::write(ws.root.join("src/history.rs"), &history_body).unwrap();
+        let agents_digest = capture::source_digest(agents_body.as_bytes());
+        let history_digest = capture::source_digest(history_body.as_bytes());
+
+        // Older stale ranges, an outline, another file, and three current ranges
+        // on `src/agents.rs` (interleaved with `src/history.rs`).
+        saw_source(&ws, "src/agents.rs", 60, 80, "old-digest".into());
+        saw_source(&ws, "src/agents.rs", 1, 5, "old-digest".into());
+        saw_outline(&ws, "src/agents.rs", agents_digest.clone());
+        saw_source(&ws, "src/agents.rs", 10, 40, agents_digest.clone());
+        saw_source(&ws, "src/history.rs", 5, 20, history_digest);
+        saw_source(&ws, "src/agents.rs", 120, 160, agents_digest.clone());
+        saw_source(&ws, "src/agents.rs", 400, 440, agents_digest);
+
+        let text = resume_text(&ws, 4000).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Read src/agents.rs:10-40, 120-160, 400-440",
+                "Read src/history.rs:5-20",
+                "Outline src/agents.rs",
+                "Read src/agents.rs:1-5, 60-80 [source changed]",
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn resume_coalescing_frees_budget_and_trims_oldest_ranges_when_tight() {
+        let (_dir, ws) = temp_workspace();
+        fs::create_dir_all(ws.root.join("src")).unwrap();
+        let body = "pub fn line() {}\n".repeat(1000);
+        for name in ["alpha_module.rs", "beta_module.rs", "gamma_module.rs"] {
+            let path = format!("src/{name}");
+            fs::write(ws.root.join(&path), &body).unwrap();
+            let digest = capture::source_digest(body.as_bytes());
+            for block in 0..8 {
+                let from = block * 50 + 1;
+                let to = from + 30;
+                saw_source(&ws, &path, from, to, digest.clone());
+            }
+        }
+
+        // 24 distinct ranges across 3 files collapse to 3 lines, well under 1800 bytes.
+        let text = resume_text(&ws, 1800).unwrap();
+        assert!(text.len() <= 1800, "len={}", text.len());
+        assert!(!text.contains("[context budget reached]"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].starts_with("Read src/gamma_module.rs:1-31, 51-81, "));
+        assert!(lines[2].starts_with("Read src/alpha_module.rs:1-31, 51-81, "));
+
+        // Under a tight cap smaller than a full 8-range line, keep newest ranges
+        // that fit and emit the budget marker instead of dropping the whole file.
+        let tight = resume_text(&ws, 85).unwrap();
+        assert!(tight.len() <= 85, "tight len={}: {tight}", tight.len());
+        assert!(tight.contains("Read src/gamma_module.rs:"), "{tight}");
+        assert!(tight.contains("351-381"), "newest range missing: {tight}");
+        assert!(tight.ends_with("[context budget reached]\n"), "{tight}");
+    }
+
+    #[test]
+    fn label_unwraps_wave2_wrappers_and_keeps_allowlisted_subcommands() {
+        for (words, expected) in [
+            (&["timeout", "60", "cargo", "test"][..], "cargo test"),
+            (&["nice", "-n", "5", "bazel", "test", "//..."], "bazel test"),
+            (&["stdbuf", "-oL", "zig", "build"], "zig build"),
+            (
+                &["env", "RUST_BACKTRACE=1", "podman", "images"],
+                "podman images",
+            ),
+            (
+                &["python3", "-m", "unittest", "discover"],
+                "python3 -m unittest",
+            ),
+            (&["python", "-m", "pytest", "tests/"], "python -m pytest"),
+            (
+                &["kubectl", "get", "events", "-n", "secret-ns"],
+                "kubectl get events",
+            ),
+            (
+                &["kubectl", "get", "svc", "my-secret-svc"],
+                "kubectl get svc",
+            ),
+            (&["kubectl", "get", "secrets", "my-secret"], "kubectl get"),
+            (&["sh", "-c", "echo secret-arg"], "sh"),
+        ] {
+            assert_eq!(label(words), expected, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn deltas_and_observations_summaries_measure_bytes_and_label_estimates() {
+        let (_dir, ws) = temp_workspace();
+        saw_delta(&ws, 3, 12_000, 1_500);
+        let deltas = deltas_summary(&ws);
+        assert_eq!(deltas.views, 3);
+        assert_eq!(deltas.saved_bytes(), 10_500);
+        let deltas_json = deltas.json();
+        assert_eq!(deltas_json["saved_bytes"], 10_500);
+        assert!(deltas_json["estimated_tokens_saved"].as_u64().unwrap() > 0);
+        let deltas_line = deltas.line();
+        assert!(deltas_line.contains("Changed since read: 3 view(s)"));
+        assert!(deltas_line.contains("estimated at"));
+        assert!(!deltas_line.contains("÷ 4"));
+
+        // Write two valid 64-hex observation archives plus decoy entries that must be ignored.
+        let obs_dir = ws.state.join("observations");
+        fs::create_dir_all(obs_dir.join("nested")).unwrap();
+        let id_a = format!("{}.json", "a".repeat(64));
+        let id_b = format!("{}.json", "1".repeat(64));
+        fs::write(obs_dir.join(id_a), "x".repeat(4_096)).unwrap();
+        fs::write(obs_dir.join(id_b), "y".repeat(2_048)).unwrap();
+        fs::write(obs_dir.join("not-a-hash.json"), "z".repeat(9_999)).unwrap();
+        fs::write(
+            obs_dir
+                .join("nested")
+                .join(format!("{}.json", "b".repeat(64))),
+            "w",
+        )
+        .unwrap();
+
+        recalled_archive(&ws, 1_024, false);
+        let recalls = archive_recalls(&ws.state, 0);
+        assert_eq!(recalls.count, 1);
+        assert_eq!(recalls.bytes, 1_024);
+
+        let obs = observations_summary(&ws);
+        assert_eq!(obs.archived_results, 2);
+        assert_eq!(obs.archived_bytes, 6_144);
+        let obs_json = obs.json(&recalls);
+        assert_eq!(obs_json["archived_results"], 2);
+        assert_eq!(obs_json["archived_bytes"], 6_144);
+        assert_eq!(obs_json["recalled_bytes"], 1_024);
+        assert_eq!(obs_json["net_archived_bytes"], 5_120);
+        let obs_line = obs.line(&recalls);
+        assert!(obs_line.contains("Archived tool results: 2 result(s) (6.0 KB"));
+        assert!(obs_line.contains("1.0 KB recalled (5.0 KB net)"));
+        assert!(obs_line.contains("estimated at"));
+        assert!(!obs_line.contains("÷ 4"));
     }
 }

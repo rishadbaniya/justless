@@ -73,7 +73,10 @@ impl Route {
             Self::SupportedNotRouted
         } else if routes(command, &none) {
             Self::Excluded
-        } else if !routes(label, &none) && !has_routable_segment(command, &routes) {
+        } else if !routes(label, &none)
+            && !has_routable_segment(command, &routes)
+            && !has_supported_tool_prefix(command, &routes)
+        {
             Self::NotSupported
         } else if post_run && excluded_stage(exclusions, command) {
             Self::Excluded
@@ -83,19 +86,142 @@ impl Route {
     }
 }
 
+/// Split `command` into trimmed top-level stages on `\n`, `;`, `&&`, `||`, `|&`,
+/// `|`, and `&` outside single/double quotes and backslash escapes, keeping fd
+/// duplications like `2>&1` attached to their stage so single-quoted regexes
+/// (`'foo|bar'`) and merged pipes (`cmd 2>&1 | head`) stay intact.
+fn split_shell_stages(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut stages = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(b'\'') => {
+                if b == b'\'' {
+                    quote = None;
+                }
+                i += 1;
+            }
+            Some(b'"') => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    if b == b'"' {
+                        quote = None;
+                    }
+                    i += 1;
+                }
+            }
+            Some(_) => i += 1,
+            None => match b {
+                b'\\' if i + 1 < bytes.len() => i += 2,
+                b'\'' | b'"' => {
+                    quote = Some(b);
+                    i += 1;
+                }
+                // Keep fd duplications (`2>&1`, `1>&2`) inside the current stage.
+                b'>' if bytes.get(i + 1) == Some(&b'&')
+                    && bytes.get(i + 2).is_some_and(u8::is_ascii_digit) =>
+                {
+                    i += 3;
+                }
+                b'\n' | b';' => {
+                    let part = command[start..i].trim();
+                    if !part.is_empty() {
+                        stages.push(part);
+                    }
+                    i += 1;
+                    start = i;
+                }
+                b'&' | b'|' => {
+                    let part = command[start..i].trim();
+                    if !part.is_empty() {
+                        stages.push(part);
+                    }
+                    if bytes.get(i + 1) == Some(&b)
+                        || (b == b'|' && bytes.get(i + 1) == Some(&b'&'))
+                    {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    start = i;
+                }
+                _ => i += 1,
+            },
+        }
+    }
+    let tail = command[start..].trim();
+    if !tail.is_empty() {
+        stages.push(tail);
+    }
+    stages
+}
+
 /// Whether any top-level segment of `command` would be routed on its own. This
-/// keeps chains such as `cargo fmt --all -- --check && python3 x.py` or
-/// `ls -la | grep foo` in `PassedThrough` when the bare command label alone
-/// (`cargo fmt`, `ls`) is not routed.
+/// keeps chains such as `cargo fmt --all -- --check && python3 x.py`,
+/// `ls -la | grep foo`, or `rg 'foo|bar' src | wc -l` in `PassedThrough` when
+/// the bare command label alone (`cargo fmt`, `ls`, `rg`) is not routed.
 fn has_routable_segment(command: &str, routes: &impl Fn(&str, &Exclusions) -> bool) -> bool {
     let none = Exclusions::default();
-    command
-        .split(['\n', ';', '|'])
-        .flat_map(|part| part.split("&&"))
-        .flat_map(|part| part.split("||"))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
+    split_shell_stages(command)
+        .into_iter()
         .any(|part| routes(part, &none))
+}
+
+/// Whether any top-level stage starts with a multi-word supported command prefix
+/// (such as `kubectl get events`, `kubectl get svc`, `python3 -m unittest`,
+/// `docker compose ps`, `podman image ls`, or `gh pr list`) behind optional
+/// assignments and wrappers (`timeout`, `nice`, `stdbuf`, `env`). Keeps watch
+/// modes and machine formats (`-w`, `-o yaml`, `--format json`) in
+/// `PassedThrough` instead of `NotSupported`, while leaving unsupported
+/// resources like `kubectl get secrets` in `NotSupported`.
+fn has_supported_tool_prefix(command: &str, routes: &impl Fn(&str, &Exclusions) -> bool) -> bool {
+    let none = Exclusions::default();
+    let is_subword = |word: &str| {
+        word.starts_with(|c: char| c.is_ascii_lowercase())
+            && word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    };
+    split_shell_stages(command).into_iter().any(|stage| {
+        let text = crate::shell_form::parse(stage)
+            .and_then(|form| stage.get(form.command))
+            .unwrap_or(stage);
+        let Some(words) = shlex::split(text) else {
+            return false;
+        };
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let unwrapped = crate::wrappers::effective(&refs);
+        let effective: Vec<&str> = match &unwrapped {
+            Some(inner) => inner.iter().map(String::as_str).collect(),
+            None => refs,
+        };
+        let tool = crate::filters::unwrap_tool(&effective);
+        let Some((&program, rest)) = tool.split_first() else {
+            return false;
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        if matches!(program, "python" | "python3")
+            && let ["-m", module, ..] = rest
+            && is_subword(module)
+        {
+            candidates.push(format!("{program} -m {module}"));
+        }
+        if let [a, b, ..] = rest
+            && is_subword(a)
+            && is_subword(b)
+        {
+            candidates.push(format!("{program} {a} {b}"));
+        }
+        if let [a, ..] = rest
+            && is_subword(a)
+        {
+            candidates.push(format!("{program} {a}"));
+        }
+        candidates.into_iter().any(|prefix| routes(&prefix, &none))
+    })
 }
 
 /// Whether an entry names the line, a command in it, or a command of a pipe
@@ -103,8 +229,11 @@ fn has_routable_segment(command: &str, routes: &impl Fn(&str, &Exclusions) -> bo
 /// hook checks it.
 fn excluded_stage(exclusions: &Exclusions, command: &str) -> bool {
     exclusions.any(command).is_some()
-        || command.split(['&', '|', ';', '\n']).any(|stage| {
-            let words = shlex::split(stage).unwrap_or_default();
+        || split_shell_stages(command).into_iter().any(|stage| {
+            let text = crate::shell_form::parse(stage)
+                .and_then(|form| stage.get(form.command))
+                .unwrap_or(stage);
+            let words = shlex::split(text).unwrap_or_default();
             let words: Vec<&str> = words.iter().map(String::as_str).collect();
             crate::wrappers::effective(&words)
                 .is_some_and(|words| exclusions.matching(&words.join(" ")).is_some())
@@ -191,9 +320,11 @@ static FOOTER: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-/// The first line of `justless read` output, which the hooks substitute for `cat FILE`.
-static OUTLINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\Arevision [0-9a-f]+ · [0-9]+ lines\n").unwrap());
+/// The first line of `justless read` output (whole or windowed), which the hooks
+/// substitute for `cat FILE` and shell range reads (`head`, `tail`, `sed -n`).
+static OUTLINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\Arevision [0-9a-f]+ · [0-9]+ lines(?: · window L[0-9]+-[0-9]+)?\n").unwrap()
+});
 
 #[derive(Default, Serialize)]
 pub(crate) struct Group {
@@ -271,8 +402,9 @@ fn text_matches(content: &Value, pattern: &Regex) -> bool {
 }
 
 /// Whether a command ran through Justless: its output has a run footer, its
-/// labelled command is a `justless` binary at any path, or it is a bare
-/// `cat FILE` whose result is the outline the hooks substitute.
+/// labelled command is a `justless` binary at any path, or it is a shell file
+/// read (`cat FILE`, `head`, `tail`, `sed -n`) whose result is the outline the
+/// hooks substitute.
 pub(crate) fn routed(command: &str, label: &str, content: &Value) -> bool {
     if text_matches(content, &FOOTER) {
         return true;
@@ -281,11 +413,38 @@ pub(crate) fn routed(command: &str, label: &str, content: &Value) -> bool {
     let words: Vec<_> = command.split_whitespace().collect();
     let bare_cat = matches!(words.as_slice(), ["cat", file]
         if !file.starts_with('-') && !file.contains(|c: char| "|;&<>$`*?(){}[]!#~\\\"'".contains(c)));
+    let shell_read = bare_cat || (!cfg!(windows) && crate::shellread::parse(command).is_some());
     let first = match content {
         Value::Array(parts) => parts.first().and_then(|p| p["text"].as_str()),
         other => other.as_str(),
     };
-    invokes_justless || bare_cat && first.is_some_and(|text| OUTLINE.is_match(text))
+    invokes_justless || shell_read && first.is_some_and(|text| OUTLINE.is_match(text))
+}
+
+/// Command label for `discover`: delegates to `agents::command_label` +
+/// `history::label`, and preserves allowlisted 3-word labels (`python3 -m
+/// unittest`, `python -m unittest`, `kubectl get events|svc|pods|…`) without
+/// ever exposing arguments, paths, namespaces or patterns.
+fn discover_label(command: &str) -> String {
+    let words = crate::agents::command_label(command);
+    let base = crate::history::label(&words.split(' ').collect::<Vec<_>>());
+    if !matches!(base.as_str(), "python" | "python3" | "kubectl get") {
+        return base;
+    }
+    for stage in split_shell_stages(command) {
+        let text = crate::shell_form::parse(stage)
+            .and_then(|form| stage.get(form.command))
+            .unwrap_or(stage);
+        let Some(stage_words) = shlex::split(text) else {
+            continue;
+        };
+        let refs: Vec<&str> = stage_words.iter().map(String::as_str).collect();
+        let refined = crate::history::label(&refs);
+        if refined != base && refined.starts_with(&base) {
+            return refined;
+        }
+    }
+    base
 }
 
 #[derive(Default)]
@@ -424,8 +583,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
                         }
                         let content = &part["content"];
                         // Keep only the program and a known subcommand.
-                        let words = crate::agents::command_label(&call.command);
-                        let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
+                        let label = discover_label(&call.command);
                         let route = if routed(&call.command, &label, content) {
                             Route::ThroughJustless
                         } else {
@@ -530,6 +688,7 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
             }),
             "groups": groups_json(&groups),
             "what_if": what_if_json(&groups),
+            "top_opportunities": opportunities_json(&groups, &codex.groups, &agy.groups),
             "codex": codex.json(),
             "agy": agy.json(),
         });
@@ -543,6 +702,9 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
         );
         print_codex(workspace, &codex, days, plan);
         print_agy(workspace, &agy, days, plan);
+        if plan {
+            print_top_opportunities(&groups, &codex.groups, &agy.groups);
+        }
         return Ok(());
     }
     println!(
@@ -608,6 +770,9 @@ pub fn discover(workspace: &Workspace, days: u64, as_json: bool, plan: bool) -> 
     }
     print_codex(workspace, &codex, days, plan);
     print_agy(workspace, &agy, days, plan);
+    if plan {
+        print_top_opportunities(&groups, &codex.groups, &agy.groups);
+    }
     Ok(())
 }
 
@@ -730,6 +895,7 @@ fn print_codex(workspace: &Workspace, codex: &crate::rollouts::Coverage, days: u
         );
     }
     print_groups(&codex.groups);
+    print_client_what_if("Codex", &codex.groups);
     if plan {
         print_unrouted_plan(
             &codex.groups,
@@ -756,6 +922,7 @@ fn print_agy(workspace: &Workspace, agy: &crate::agy_sessions::Coverage, days: u
         human_bytes(agy.bytes())
     );
     print_groups(&agy.groups);
+    print_client_what_if("Antigravity CLI", &agy.groups);
     if plan {
         print_unrouted_plan(
             &agy.groups,
@@ -768,6 +935,128 @@ fn print_agy(workspace: &Workspace, agy: &crate::agy_sessions::Coverage, days: u
             workspace.justless(),
             workspace.justless()
         );
+    }
+}
+
+/// What-if split for clients without a post-run Bash hook (Codex, Antigravity CLI).
+fn print_client_what_if(client: &str, groups: &BTreeMap<Route, Group>) {
+    let [routed, compacted, written] = what_if(groups);
+    let commands = routed.0 + compacted.0 + written.0;
+    if commands == 0 {
+        return;
+    }
+    let part = |(commands, bytes): (u64, u64)| format!("{commands} ({})", human_bytes(bytes));
+    println!(
+        "\nWith the current build, of the {commands} {client} command(s) that did not go through Justless ({} output): hooks would route {}, and {} would reach {client} as written. These are output sizes, not savings.",
+        human_bytes(routed.1 + compacted.1 + written.1),
+        part(routed),
+        part((written.0 + compacted.0, written.1 + compacted.1)),
+    );
+}
+
+#[derive(Default)]
+struct Opportunity {
+    commands: u64,
+    output_bytes: u64,
+    clients: BTreeSet<&'static str>,
+}
+
+fn collect_opportunities(
+    claude: &BTreeMap<Route, Group>,
+    codex: &BTreeMap<Route, Group>,
+    agy: &BTreeMap<Route, Group>,
+    predicate: impl Fn(Route) -> bool,
+) -> Vec<(String, Opportunity)> {
+    let mut map: BTreeMap<String, Opportunity> = BTreeMap::new();
+    for (client, groups) in [("claude", claude), ("codex", codex), ("agy", agy)] {
+        for (&route, group) in groups {
+            if !predicate(route) {
+                continue;
+            }
+            for (label, &(commands, bytes)) in &group.labels {
+                let entry = map.entry(label.clone()).or_default();
+                entry.commands += commands;
+                entry.output_bytes += bytes;
+                entry.clients.insert(client);
+            }
+        }
+    }
+    let mut ranked: Vec<_> = map.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.output_bytes
+            .cmp(&a.1.output_bytes)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked
+}
+
+fn opportunities_json(
+    claude: &BTreeMap<Route, Group>,
+    codex: &BTreeMap<Route, Group>,
+    agy: &BTreeMap<Route, Group>,
+) -> Vec<Value> {
+    collect_opportunities(claude, codex, agy, |route| {
+        matches!(
+            route,
+            Route::SupportedNotRouted | Route::CompactedAfterRunning
+        )
+    })
+    .into_iter()
+    .take(10)
+    .map(|(label, opp)| {
+        let clients: Vec<&str> = opp.clients.into_iter().collect();
+        serde_json::json!({
+            "label": label,
+            "commands": opp.commands,
+            "output_bytes": opp.output_bytes,
+            "estimated_tokens": estimated_tokens(opp.output_bytes),
+            "clients": clients,
+        })
+    })
+    .collect()
+}
+
+fn print_top_opportunities(
+    claude: &BTreeMap<Route, Group>,
+    codex: &BTreeMap<Route, Group>,
+    agy: &BTreeMap<Route, Group>,
+) {
+    let compactable = collect_opportunities(claude, codex, agy, |route| {
+        matches!(
+            route,
+            Route::SupportedNotRouted | Route::CompactedAfterRunning
+        )
+    });
+    if !compactable.is_empty() {
+        println!("\nTop opportunities (would compact now, labels only):");
+        for (label, opp) in compactable.into_iter().take(5) {
+            let clients: Vec<&str> = opp.clients.into_iter().collect();
+            println!(
+                "  {label} ×{} ({}, ≈{} tokens) [{}]",
+                opp.commands,
+                human_bytes(opp.output_bytes),
+                estimated_tokens(opp.output_bytes),
+                clients.join(", ")
+            );
+        }
+    }
+    let unsupported: Vec<_> =
+        collect_opportunities(claude, codex, agy, |route| route == Route::NotSupported)
+            .into_iter()
+            .filter(|(_, opp)| opp.output_bytes > 0)
+            .collect();
+    if !unsupported.is_empty() {
+        println!("\nLargest unsupported command families (labels only):");
+        for (label, opp) in unsupported.into_iter().take(3) {
+            let clients: Vec<&str> = opp.clients.into_iter().collect();
+            println!(
+                "  {label} ×{} ({}, ≈{} tokens) [{}]",
+                opp.commands,
+                human_bytes(opp.output_bytes),
+                estimated_tokens(opp.output_bytes),
+                clients.join(", ")
+            );
+        }
     }
 }
 
@@ -807,7 +1096,13 @@ fn print_unrouted_plan(groups: &BTreeMap<Route, Group>, heading: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOOTER, Route};
+    use std::collections::BTreeMap;
+
+    use serde_json::Value;
+
+    use super::{
+        FOOTER, Group, Route, discover_label, opportunities_json, routed, split_shell_stages,
+    };
 
     #[test]
     fn footers_with_secret_counts_and_split_streams_count_as_routed() {
@@ -831,6 +1126,30 @@ mod tests {
         ] {
             assert!(!FOOTER.is_match(&format!("output\n{line}")), "{line}");
         }
+    }
+
+    #[test]
+    fn split_shell_stages_preserves_quotes_escapes_and_fd_merges() {
+        assert_eq!(
+            split_shell_stages("rg 'foo|bar' src | wc -l"),
+            vec!["rg 'foo|bar' src", "wc -l"]
+        );
+        assert_eq!(
+            split_shell_stages("rg 'a;b' src && echo ok"),
+            vec!["rg 'a;b' src", "echo ok"]
+        );
+        assert_eq!(
+            split_shell_stages("cargo test 2>&1 | head -n 20"),
+            vec!["cargo test 2>&1", "head -n 20"]
+        );
+        assert_eq!(
+            split_shell_stages("RUST_LOG=1 timeout 60 cargo build 2>&1 | tail -n 30"),
+            vec!["RUST_LOG=1 timeout 60 cargo build 2>&1", "tail -n 30"]
+        );
+        assert_eq!(
+            split_shell_stages(r#"rg "a|b\"|c" src | sort"#),
+            vec![r#"rg "a|b\"|c" src"#, "sort"]
+        );
     }
 
     #[cfg(unix)]
@@ -867,5 +1186,229 @@ mod tests {
             ),
             Route::PassedThrough
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wave2_routing_rules_classify_accurately_across_claude_codex_and_agy() {
+        let none = crate::rewrite::Exclusions::default();
+        let claude = |cmd: &str| {
+            let label = discover_label(cmd);
+            Route::unrouted(cmd, &label, &none, true, crate::agents::would_route)
+        };
+        let codex = |cmd: &str| {
+            let label = discover_label(cmd);
+            Route::unrouted(cmd, &label, &none, false, crate::agents::codex_would_route)
+        };
+        let agy = |cmd: &str| {
+            let label = discover_label(cmd);
+            Route::unrouted(cmd, &label, &none, false, crate::agents::agy_would_route)
+        };
+
+        // Single-quoted regexes: direct invocations route across all 3 clients;
+        // `rg 'foo|bar' src` is left by Claude's command hook to `after-bash` as a
+        // read list (PassedThrough before `after_running`) while Codex & Agy route it;
+        // piped to an unsupported consumer stays PassedThrough (never NotSupported).
+        for cmd in [
+            r"rg '\bfoo\b' src",
+            "rg 'foo$' src",
+            r"git grep '\bTODO\b'",
+            "go test ./... -run '^TestFoo$'",
+        ] {
+            assert_eq!(claude(cmd), Route::SupportedNotRouted, "claude {cmd}");
+            assert_eq!(codex(cmd), Route::SupportedNotRouted, "codex {cmd}");
+            assert_eq!(agy(cmd), Route::SupportedNotRouted, "agy {cmd}");
+        }
+        assert_eq!(claude("rg 'foo|bar' src"), Route::PassedThrough);
+        assert_eq!(codex("rg 'foo|bar' src"), Route::SupportedNotRouted);
+        assert_eq!(agy("rg 'foo|bar' src"), Route::SupportedNotRouted);
+        assert_eq!(claude("rg 'foo|bar' src | wc -l"), Route::PassedThrough);
+        assert_eq!(codex("rg 'foo|bar' src | wc -l"), Route::PassedThrough);
+        assert_eq!(agy("rg 'foo|bar' src | wc -l"), Route::PassedThrough);
+        assert_eq!(
+            codex("rg 'foo|bar' src | head -n 20"),
+            Route::SupportedNotRouted
+        );
+        assert_eq!(
+            agy("rg 'foo|bar' src | head -n 20"),
+            Route::SupportedNotRouted
+        );
+
+        // `2>&1 | head` and scoped `| tail`: Codex & Agy route build/test/lint;
+        // search behind `| tail` stays PassedThrough.
+        for cmd in [
+            "cargo test 2>&1 | head -n 40",
+            "cargo test 2>&1 | tail -n 40",
+            "timeout 60 cargo test 2>&1 | tail -n 20",
+        ] {
+            assert_eq!(claude(cmd), Route::PassedThrough, "claude {cmd}");
+            assert_eq!(codex(cmd), Route::SupportedNotRouted, "codex {cmd}");
+            assert_eq!(agy(cmd), Route::SupportedNotRouted, "agy {cmd}");
+        }
+        assert_eq!(codex("rg foo src | tail -n 20"), Route::PassedThrough);
+        assert_eq!(agy("rg foo src | tail -n 20"), Route::PassedThrough);
+
+        // Safe Wave-2 wrappers (`timeout`, `nice`, `stdbuf`, `env`).
+        for cmd in [
+            "timeout 60 cargo test",
+            "nice -n 5 cargo test",
+            "stdbuf -oL cargo test",
+            "env RUST_BACKTRACE=1 cargo test",
+        ] {
+            assert_eq!(claude(cmd), Route::SupportedNotRouted, "claude {cmd}");
+            assert_eq!(codex(cmd), Route::SupportedNotRouted, "codex {cmd}");
+            assert_eq!(agy(cmd), Route::SupportedNotRouted, "agy {cmd}");
+        }
+        assert_eq!(claude("env FOO=bar cargo test"), Route::SupportedNotRouted);
+        assert_eq!(agy("env FOO=bar cargo test"), Route::SupportedNotRouted);
+        assert_eq!(codex("env FOO=bar cargo test"), Route::PassedThrough);
+
+        // Wave-2 tools (`kubectl get events|svc`, `podman`, `bazel`, `zig`, `unittest`).
+        for cmd in [
+            "kubectl get events",
+            "kubectl get svc",
+            "podman images",
+            "podman build .",
+            "bazel test //...",
+            "zig build",
+            "python3 -m unittest discover",
+        ] {
+            assert_eq!(claude(cmd), Route::SupportedNotRouted, "claude {cmd}");
+            assert_eq!(agy(cmd), Route::SupportedNotRouted, "agy {cmd}");
+        }
+
+        // Watch/machine-format/redirect pass-throughs of multi-word supported tools
+        // count as PassedThrough rather than NotSupported; unsupported secrets stay NotSupported.
+        for cmd in [
+            "kubectl get events -w",
+            "kubectl get svc -o yaml",
+            "timeout 30 kubectl get events -w",
+            "python3 -m unittest discover > out.log",
+            "podman build --push .",
+            "podman image ls > out.txt",
+        ] {
+            assert_eq!(claude(cmd), Route::PassedThrough, "claude {cmd}");
+            assert_eq!(agy(cmd), Route::PassedThrough, "agy {cmd}");
+        }
+        assert_eq!(claude("kubectl get secrets"), Route::NotSupported);
+        assert_eq!(codex("kubectl get secrets"), Route::NotSupported);
+        assert_eq!(agy("kubectl get secrets"), Route::NotSupported);
+
+        // Exclusion still matches wrapped single-quoted piped commands.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".justless.toml"),
+            "exclude_commands = [\"rg\"]\n",
+        )
+        .unwrap();
+        let ws = crate::workspace::Workspace::discover(Some(dir.path())).unwrap();
+        let excl = crate::rewrite::Exclusions::of(&ws).unwrap();
+        assert_eq!(
+            Route::unrouted(
+                "timeout 30 rg 'foo|bar' src | wc -l",
+                "rg",
+                &excl,
+                true,
+                crate::agents::would_route,
+            ),
+            Route::Excluded
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routed_detects_windowed_shell_read_outlines() {
+        let windowed = Value::String(
+            "revision a1b2c3d4e5f60718 · 500 lines · window L10-500\n#1 L10-40 function main\n"
+                .into(),
+        );
+        assert!(routed("sed -n '10,$p' src/big.rs", "sed", &windowed));
+        assert!(routed("head -n200 src/big.rs", "head", &windowed));
+        let plain = Value::String("fn main() {}\n".into());
+        assert!(!routed("sed -n '10,$p' src/big.rs", "sed", &plain));
+    }
+
+    #[test]
+    fn discover_label_refines_allowlisted_commands_without_leaking_arguments() {
+        assert_eq!(
+            discover_label("python3 -m unittest discover -s secret_dir"),
+            "python3 -m unittest"
+        );
+        assert_eq!(
+            discover_label("timeout 30 python3 -m unittest tests/test_secret.py"),
+            "python3 -m unittest"
+        );
+        assert_eq!(
+            discover_label("kubectl get events -n prod-secret"),
+            "kubectl get events"
+        );
+        assert_eq!(
+            discover_label("kubectl get svc my-secret-service"),
+            "kubectl get svc"
+        );
+        assert_eq!(
+            discover_label("kubectl get secrets my-secret"),
+            "kubectl get"
+        );
+        assert_eq!(discover_label("python3 secret_script.py"), "python3");
+    }
+
+    #[test]
+    fn opportunities_json_ranks_compactable_families_across_clients_with_labels_only() {
+        let mut claude = BTreeMap::new();
+        claude.insert(
+            Route::SupportedNotRouted,
+            Group {
+                commands: 2,
+                output_bytes: 8_000,
+                labels: BTreeMap::from([("cargo test".into(), (2, 8_000))]),
+            },
+        );
+        claude.insert(
+            Route::CompactedAfterRunning,
+            Group {
+                commands: 1,
+                output_bytes: 12_000,
+                labels: BTreeMap::from([("sed".into(), (1, 12_000))]),
+            },
+        );
+        claude.insert(
+            Route::NotSupported,
+            Group {
+                commands: 5,
+                output_bytes: 50_000,
+                labels: BTreeMap::from([("python3".into(), (5, 50_000))]),
+            },
+        );
+
+        let mut codex = BTreeMap::new();
+        codex.insert(
+            Route::SupportedNotRouted,
+            Group {
+                commands: 3,
+                output_bytes: 10_000,
+                labels: BTreeMap::from([("cargo test".into(), (3, 10_000))]),
+            },
+        );
+
+        let mut agy = BTreeMap::new();
+        agy.insert(
+            Route::SupportedNotRouted,
+            Group {
+                commands: 1,
+                output_bytes: 5_000,
+                labels: BTreeMap::from([("bazel test".into(), (1, 5_000))]),
+            },
+        );
+
+        let opps = opportunities_json(&claude, &codex, &agy);
+        assert_eq!(opps.len(), 3, "{opps:?}");
+        assert_eq!(opps[0]["label"], "cargo test");
+        assert_eq!(opps[0]["commands"], 5);
+        assert_eq!(opps[0]["output_bytes"], 18_000);
+        assert_eq!(opps[0]["clients"], serde_json::json!(["claude", "codex"]));
+        assert!(opps[0]["estimated_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(opps[1]["label"], "sed");
+        assert_eq!(opps[2]["label"], "bazel test");
     }
 }

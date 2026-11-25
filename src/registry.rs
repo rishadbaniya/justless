@@ -213,6 +213,87 @@ pub fn locate(workspace: &Workspace, id: &str) -> Result<(Option<Workspace>, Pat
     Err(local)
 }
 
+fn has_project_state(root: &Path) -> bool {
+    let state = root.join(".justless");
+    state.join("runs").is_dir()
+        || state.join("activity.json").is_file()
+        || state.join("observations").is_dir()
+        || state.join("proxy").is_dir()
+        || state.join("archive-recalls.jsonl").is_file()
+}
+
+/// Aggregated proxy request-boundary clearing totals across registered projects
+/// for `stats --all`.
+#[derive(Default)]
+struct ProxyAllSummary {
+    projects: u64,
+    requests: u64,
+    cleared_requests: u64,
+    newly_cleared_results: u64,
+    newly_cleared_bytes: u64,
+    newly_cleared_est_tokens: u64,
+    recalled_bytes: u64,
+    net_cleared_bytes: i64,
+    tokens_not_sent: u64,
+    archived_results: u64,
+    archived_bytes: u64,
+}
+
+impl ProxyAllSummary {
+    fn add_report(&mut self, report: &serde_json::Value) {
+        let requests = report["requests"].as_u64().unwrap_or(0);
+        if requests == 0 {
+            return;
+        }
+        self.projects += 1;
+        self.requests += requests;
+        self.cleared_requests += report["cleared_requests"].as_u64().unwrap_or(0);
+        self.newly_cleared_results += report["newly_cleared"]["results"].as_u64().unwrap_or(0);
+        self.newly_cleared_bytes += report["newly_cleared"]["bytes"].as_u64().unwrap_or(0);
+        self.newly_cleared_est_tokens +=
+            report["newly_cleared"]["est_tokens"].as_u64().unwrap_or(0);
+        self.recalled_bytes += report["recalled_bytes"].as_u64().unwrap_or(0);
+        self.net_cleared_bytes =
+            crate::history::net_bytes(self.newly_cleared_bytes, 0, self.recalled_bytes);
+        self.tokens_not_sent += report["tokens_not_sent"].as_u64().unwrap_or(0);
+        self.archived_results += report["archived_results"].as_u64().unwrap_or(0);
+        self.archived_bytes += report["archived_bytes"].as_u64().unwrap_or(0);
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "projects": self.projects,
+            "requests": self.requests,
+            "cleared_requests": self.cleared_requests,
+            "newly_cleared": {
+                "results": self.newly_cleared_results,
+                "bytes": self.newly_cleared_bytes,
+                "est_tokens": self.newly_cleared_est_tokens,
+            },
+            "recalled_bytes": self.recalled_bytes,
+            "net_cleared_bytes": self.net_cleared_bytes,
+            "tokens_not_sent": self.tokens_not_sent,
+            "archived_results": self.archived_results,
+            "archived_bytes": self.archived_bytes,
+            "token_estimate": "UTF-8 bytes / 4",
+            "token_source": "API usage",
+        })
+    }
+
+    fn line(&self, days: u64) -> String {
+        format!(
+            "Request boundary (justless proxy), last {days} day(s): {} request(s) across {} project(s) · {} cleared ({} net after {} recalled; ≈{} tokens estimated, {} API tokens not sent)",
+            self.requests,
+            self.projects,
+            human_bytes(self.newly_cleared_bytes),
+            crate::history::signed_bytes(self.net_cleared_bytes),
+            human_bytes(self.recalled_bytes),
+            self.newly_cleared_est_tokens,
+            self.tokens_not_sent,
+        )
+    }
+}
+
 /// `stats --all`: one total across the registered projects, by repository, of
 /// the runs that finished in the last `days` days.
 pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<()> {
@@ -223,7 +304,7 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
     let mut skipped = 0;
     let mut entries = projects();
     // The current project counts even before the registry lists it.
-    if (workspace.state.join("runs").is_dir() || workspace.state.join("activity.json").is_file())
+    if has_project_state(&workspace.root)
         && !entries.iter().any(|entry| entry.root == workspace.root)
     {
         entries.push(Entry {
@@ -233,11 +314,18 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
         });
     }
     let mut outlines = crate::history::OutlinesSummary::default();
+    let mut deltas = crate::history::DeltasSummary::default();
+    let mut observations = crate::history::ObservationsSummary::default();
+    let mut recalls = crate::history::ArchiveRecalls::default();
+    let mut proxy_all = ProxyAllSummary::default();
     let mut agy_roots = Vec::new();
     for entry in entries {
         let has_runs = entry.root.join(".justless/runs").is_dir();
         let has_activity = entry.root.join(".justless/activity.json").is_file();
-        if !has_runs && !has_activity {
+        let has_observations = entry.root.join(".justless/observations").is_dir();
+        let has_proxy = entry.root.join(".justless/proxy").is_dir();
+        let has_recalls = entry.root.join(".justless/archive-recalls.jsonl").is_file();
+        if !has_runs && !has_activity && !has_observations && !has_proxy && !has_recalls {
             continue;
         }
         if !include_temp
@@ -248,7 +336,15 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             if has_runs
                 || Workspace::discover(Some(&entry.root))
                     .ok()
-                    .is_some_and(|project| crate::history::outlines_summary(&project).views > 0)
+                    .is_some_and(|project| {
+                        crate::history::outlines_summary(&project).views > 0
+                            || crate::history::deltas_summary(&project).views > 0
+                            || crate::history::observations_summary(&project).archived_results > 0
+                            || crate::proxy::report(&project, since, 0)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|r| r.json()["requests"].as_u64().unwrap_or(0) > 0)
+                    })
             {
                 skipped += 1;
             }
@@ -260,6 +356,22 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
         };
         if has_activity {
             outlines.add(&crate::history::outlines_summary(&project));
+            deltas.add(&crate::history::deltas_summary(&project));
+        }
+        if has_observations {
+            observations.add(&crate::history::observations_summary(&project));
+        }
+        let project_recalls = if has_recalls {
+            crate::history::archive_recalls(&project.state, since)
+        } else {
+            crate::history::ArchiveRecalls::default()
+        };
+        recalls.add(&project_recalls);
+        if has_proxy
+            && let Ok(Some(report)) =
+                crate::proxy::report(&project, since, project_recalls.proxy_bytes)
+        {
+            proxy_all.add_report(&report.json());
         }
         if !has_runs {
             continue;
@@ -331,10 +443,16 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             "estimated_tokens_net_saved": total.estimate.net_tokens(),
             "token_estimate": crate::tokens::method(),
             "estimate_by_content": total.estimate.json(),
+            "changed_since_read": deltas.json(),
             "source_outlines": outlines.json(),
+            "observations": observations.json(&recalls),
+            "archive_recalls": recalls.json(),
             "repositories": repositories,
             "temporary_projects_left_out": skipped,
         });
+        if proxy_all.requests > 0 {
+            report["proxy"] = proxy_all.json();
+        }
         if let Some(agy) = &agy {
             report["agy"] = agy.json.clone();
         }
@@ -373,11 +491,34 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
             );
         }
     }
-    if outlines.views > 0 {
-        if !groups.is_empty() {
+    let mut separated = false;
+    let mut separate = |has_runs: bool| {
+        if has_runs && !separated {
             println!();
+            separated = true;
         }
+    };
+    if deltas.views > 0 {
+        separate(!groups.is_empty());
+        println!("{}", deltas.line());
+    }
+    if outlines.views > 0 {
+        separate(!groups.is_empty());
         println!("{}", outlines.line());
+    }
+    if proxy_all.requests > 0 {
+        separate(!groups.is_empty());
+        println!("{}", proxy_all.line(days));
+    } else if observations.archived_results > 0 {
+        separate(!groups.is_empty());
+        println!("{}", observations.line(&recalls));
+    } else if recalls.count > 0 {
+        separate(!groups.is_empty());
+        println!(
+            "Archived tool results printed by `justless recall`, last {days} day(s): {}, {} back in context.",
+            recalls.count,
+            human_bytes(recalls.bytes)
+        );
     }
     if let Some(agy) = &agy {
         println!("{}", agy.line);
@@ -418,4 +559,83 @@ pub fn hooked_projects() -> Vec<(PathBuf, Vec<String>)> {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn proxy_all_summary_aggregates_projects_and_computes_net_cleared() {
+        let mut summary = ProxyAllSummary::default();
+        summary.add_report(&json!({
+            "requests": 4,
+            "cleared_requests": 2,
+            "newly_cleared": {"results": 6, "bytes": 12_000, "est_tokens": 3_000},
+            "recalled_bytes": 2_000,
+            "net_cleared_bytes": 10_000,
+            "tokens_not_sent": 2_800,
+            "archived_results": 8,
+            "archived_bytes": 20_000,
+        }));
+        summary.add_report(&json!({
+            "requests": 0,
+            "cleared_requests": 0,
+            "newly_cleared": {"results": 0, "bytes": 0, "est_tokens": 0},
+        }));
+        summary.add_report(&json!({
+            "requests": 3,
+            "cleared_requests": 1,
+            "newly_cleared": {"results": 4, "bytes": 8_000, "est_tokens": 2_000},
+            "recalled_bytes": 1_000,
+            "net_cleared_bytes": 7_000,
+            "tokens_not_sent": 1_900,
+            "archived_results": 5,
+            "archived_bytes": 10_000,
+        }));
+
+        assert_eq!(summary.projects, 2);
+        assert_eq!(summary.requests, 7);
+        assert_eq!(summary.cleared_requests, 3);
+        assert_eq!(summary.newly_cleared_results, 10);
+        assert_eq!(summary.newly_cleared_bytes, 20_000);
+        assert_eq!(summary.recalled_bytes, 3_000);
+        assert_eq!(summary.net_cleared_bytes, 17_000);
+        assert_eq!(summary.tokens_not_sent, 4_700);
+        assert_eq!(summary.archived_results, 13);
+        assert_eq!(summary.archived_bytes, 30_000);
+
+        let report = summary.json();
+        assert_eq!(report["projects"], 2);
+        assert_eq!(report["net_cleared_bytes"], 17_000);
+        assert_eq!(report["newly_cleared"]["bytes"], 20_000);
+
+        let line = summary.line(7);
+        assert!(line.contains("7 request(s) across 2 project(s)"), "{line}");
+        assert!(line.contains("tokens estimated"), "{line}");
+        assert!(line.contains("4700 API tokens not sent"), "{line}");
+        assert!(!line.contains("÷ 4"), "{line}");
+    }
+
+    #[test]
+    fn has_project_state_detects_deltas_observations_and_proxy_only_projects() {
+        let dir = TempDir::new().unwrap();
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(empty.join(".justless")).unwrap();
+        assert!(!has_project_state(&empty));
+
+        let obs = dir.path().join("obs");
+        fs::create_dir_all(obs.join(".justless/observations")).unwrap();
+        assert!(has_project_state(&obs));
+
+        let proxy = dir.path().join("proxy");
+        fs::create_dir_all(proxy.join(".justless/proxy")).unwrap();
+        assert!(has_project_state(&proxy));
+
+        let act = dir.path().join("act");
+        fs::create_dir_all(act.join(".justless")).unwrap();
+        fs::write(act.join(".justless/activity.json"), "{}").unwrap();
+        assert!(has_project_state(&act));
+    }
 }
