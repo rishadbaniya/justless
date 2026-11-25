@@ -156,6 +156,18 @@ pub struct Settings {
     pub exclude_commands: Vec<String>,
     /// Whether the user-level hooks `init --global` installs work in this project.
     pub global_hooks: bool,
+    /// Restrict output replacement strictly to bijective/lossless views.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub lossless_only: bool,
+    /// Reuse warm index/state from the primary checkout when running in a linked
+    /// Git worktree.
+    #[serde(default = "default_true")]
+    pub share_worktree_index: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -179,8 +191,89 @@ impl Default for Settings {
             json_grouping: false,
             exclude_commands: Vec::new(),
             global_hooks: true,
+            lossless_only: false,
+            share_worktree_index: true,
         }
     }
+}
+
+/// Upper bound for `.git` pointer and `commondir` files read by
+/// [`git_common_dir`].
+const MAX_GIT_POINTER_BYTES: u64 = 64 * 1024;
+
+fn read_git_pointer(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_GIT_POINTER_BYTES {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let line = text.trim_end_matches(['\r', '\n']);
+    if line.contains(['\r', '\n', '\0']) {
+        return None;
+    }
+    Some(line.to_owned())
+}
+
+/// Parses a `<root>/.git` regular file (`gitdir: <path>`) and optional
+/// `<gitdir>/commondir` without spawning any subprocesses.
+fn parse_gitfile(root: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
+    let line = read_git_pointer(&root.join(".git"))?;
+    let raw_gitdir = line.strip_prefix("gitdir:")?.trim();
+    if raw_gitdir.is_empty() {
+        return None;
+    }
+    let gitdir = root.join(raw_gitdir).canonicalize().ok()?;
+    if !gitdir.is_dir() {
+        return None;
+    }
+    let commondir_file = gitdir.join("commondir");
+    match fs::symlink_metadata(&commondir_file) {
+        Ok(_) => {
+            let raw_common = read_git_pointer(&commondir_file)?;
+            let raw_common = raw_common.trim();
+            if raw_common.is_empty() {
+                return None;
+            }
+            let common = gitdir.join(raw_common).canonicalize().ok()?;
+            if !common.is_dir() {
+                return None;
+            }
+            Some((gitdir, Some(common)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some((gitdir, None)),
+        Err(_) => None,
+    }
+}
+
+/// Returns the shared common Git directory only when `root` is a linked Git
+/// worktree (`.git` regular file with a distinct `<gitdir>/commondir`).
+fn linked_worktree_common_dir(root: &Path) -> Option<PathBuf> {
+    let (gitdir, common) = parse_gitfile(root)?;
+    let common = common?;
+    (common != gitdir).then_some(common)
+}
+
+/// Resolves the common Git directory for `root` using only filesystem reads
+/// (zero subprocesses):
+/// - For a normal checkout (`<root>/.git` directory), returns the canonicalized
+///   `<root>/.git`.
+/// - For a linked Git worktree (`<root>/.git` file + `<gitdir>/commondir`),
+///   returns the canonicalized shared Git directory.
+/// - For a submodule or separate-git-dir `.git` file without `commondir`,
+///   returns the canonicalized `<gitdir>`.
+/// - Returns `None` when `.git` is missing, malformed, or points to a broken
+///   or non-directory path.
+pub fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return dot_git.canonicalize().ok().filter(|path| path.is_dir());
+    }
+    if metadata.is_file() {
+        let (gitdir, common) = parse_gitfile(root)?;
+        return Some(common.unwrap_or(gitdir));
+    }
+    None
 }
 
 /// The marked root of a workspace entered at `cwd` when no `--root` is given: the
@@ -309,6 +402,46 @@ impl Workspace {
             .current_dir(&self.root)
             .output()
             .context("run git")
+    }
+
+    /// Whether this workspace is a linked Git worktree (`.git` regular file
+    /// with a `<gitdir>/commondir` pointing to a shared repository directory).
+    #[allow(dead_code)]
+    pub fn is_linked_worktree(&self) -> bool {
+        linked_worktree_common_dir(&self.root).is_some()
+    }
+
+    /// Returns `<primary_root>/.justless` when this workspace is a linked Git
+    /// worktree, the primary checkout has an existing `.justless` directory
+    /// distinct from `self.state`, and `share_worktree_index` is enabled.
+    #[allow(dead_code)]
+    pub fn shared_worktree_state_dir(&self) -> Option<PathBuf> {
+        let common_dir = linked_worktree_common_dir(&self.root)?;
+        if common_dir.file_name() != Some(std::ffi::OsStr::new(".git")) {
+            return None;
+        }
+        let primary_root = common_dir.parent()?;
+        let self_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        if primary_root == self_root {
+            return None;
+        }
+        let shared_state = primary_root.join(".justless");
+        if shared_state == self.state
+            || !fs::symlink_metadata(&shared_state).is_ok_and(|meta| meta.is_dir())
+            || self
+                .state
+                .canonicalize()
+                .is_ok_and(|state| state == shared_state)
+        {
+            return None;
+        }
+        if !self.settings().ok()?.share_worktree_index {
+            return None;
+        }
+        Some(shared_state)
     }
 
     pub fn source_path(&self, file: &str) -> Result<PathBuf> {
@@ -601,5 +734,151 @@ mod tests {
             shlex::split(&command).unwrap(),
             ["justless", "--root", spaced.to_str().unwrap()]
         );
+    }
+
+    #[test]
+    fn linked_worktree_resolves_common_dir_and_shared_state_without_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let primary = base.join("primary");
+        let wt_gitdir = primary.join(".git/worktrees/agent-1");
+        let worktree = base.join("agent-1");
+        fs::create_dir_all(&wt_gitdir).unwrap();
+        fs::create_dir_all(primary.join(".justless")).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../primary/.git/worktrees/agent-1\r\n",
+        )
+        .unwrap();
+
+        let ws = workspace(&worktree, &worktree);
+        assert_eq!(git_common_dir(&worktree), Some(primary.join(".git")));
+        assert!(ws.is_linked_worktree());
+        assert_eq!(
+            ws.shared_worktree_state_dir(),
+            Some(primary.join(".justless"))
+        );
+
+        // Opting out in `.justless.toml` disables shared state while keeping
+        // linked-worktree detection accurate.
+        fs::write(
+            worktree.join(".justless.toml"),
+            "share_worktree_index = false\n",
+        )
+        .unwrap();
+        assert!(ws.is_linked_worktree());
+        assert_eq!(ws.shared_worktree_state_dir(), None);
+
+        // Re-enabling works, and missing primary `.justless` returns None.
+        fs::remove_file(worktree.join(".justless.toml")).unwrap();
+        fs::remove_dir_all(primary.join(".justless")).unwrap();
+        assert_eq!(ws.shared_worktree_state_dir(), None);
+    }
+
+    #[test]
+    fn non_worktree_and_malformed_git_files_return_none_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Normal repository with `.git/` directory.
+        let normal = base.join("normal");
+        fs::create_dir_all(normal.join(".git")).unwrap();
+        fs::create_dir_all(normal.join(".justless")).unwrap();
+        let normal_ws = workspace(&normal, &normal);
+        assert_eq!(git_common_dir(&normal), Some(normal.join(".git")));
+        assert!(!normal_ws.is_linked_worktree());
+        assert_eq!(normal_ws.shared_worktree_state_dir(), None);
+
+        // Submodule-like `.git` file without `commondir`.
+        let submodule = base.join("submodule");
+        let module_git = base.join("parent/.git/modules/sub");
+        fs::create_dir_all(&submodule).unwrap();
+        fs::create_dir_all(&module_git).unwrap();
+        fs::write(
+            submodule.join(".git"),
+            format!("gitdir: {}\n", module_git.display()),
+        )
+        .unwrap();
+        let sub_ws = workspace(&submodule, &submodule);
+        assert_eq!(git_common_dir(&submodule), Some(module_git));
+        assert!(!sub_ws.is_linked_worktree());
+        assert_eq!(sub_ws.shared_worktree_state_dir(), None);
+
+        // Malformed `.git` files and broken pointers never panic.
+        for (name, bytes) in [
+            ("garbage", b"not a gitdir pointer\n".as_slice()),
+            ("empty_target", b"gitdir:   \n".as_slice()),
+            ("missing_target", b"gitdir: ./does-not-exist\n".as_slice()),
+            ("multiline", b"gitdir: ./a\nextra\n".as_slice()),
+            ("invalid_utf8", &[0xff, 0xfe, 0x00, b'\n']),
+        ] {
+            let root = base.join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(".git"), bytes).unwrap();
+            let ws = workspace(&root, &root);
+            assert_eq!(git_common_dir(&root), None, "{name}");
+            assert!(!ws.is_linked_worktree(), "{name}");
+            assert_eq!(ws.shared_worktree_state_dir(), None, "{name}");
+        }
+
+        // Broken `commondir` target returns None cleanly.
+        let broken_common = base.join("broken-common");
+        let broken_gitdir = base.join("broken-gitdir");
+        fs::create_dir_all(&broken_common).unwrap();
+        fs::create_dir_all(&broken_gitdir).unwrap();
+        fs::write(broken_gitdir.join("commondir"), "../../nowhere\n").unwrap();
+        fs::write(
+            broken_common.join(".git"),
+            format!("gitdir: {}\n", broken_gitdir.display()),
+        )
+        .unwrap();
+        let broken_ws = workspace(&broken_common, &broken_common);
+        assert_eq!(git_common_dir(&broken_common), None);
+        assert!(!broken_ws.is_linked_worktree());
+        assert_eq!(broken_ws.shared_worktree_state_dir(), None);
+
+        // Plain directory without `.git`.
+        let plain = base.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        let plain_ws = workspace(&plain, &plain);
+        assert_eq!(git_common_dir(&plain), None);
+        assert!(!plain_ws.is_linked_worktree());
+        assert_eq!(plain_ws.shared_worktree_state_dir(), None);
+    }
+
+    #[test]
+    fn settings_parse_lossless_only_and_share_worktree_index_with_clean_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ws = workspace(&root, &root);
+
+        // Missing `.justless.toml` uses defaults.
+        let defaults = ws.settings().unwrap();
+        assert!(!defaults.lossless_only);
+        assert!(defaults.share_worktree_index);
+
+        // Older `.justless.toml` without the new keys deserializes cleanly.
+        fs::write(
+            root.join(".justless.toml"),
+            "context_budget = 3000\nredact = false\n",
+        )
+        .unwrap();
+        let legacy = ws.settings().unwrap();
+        assert_eq!(legacy.context_budget, 3000);
+        assert!(!legacy.redact);
+        assert!(!legacy.lossless_only);
+        assert!(legacy.share_worktree_index);
+
+        // Explicit flags override defaults.
+        fs::write(
+            root.join(".justless.toml"),
+            "lossless_only = true\nshare_worktree_index = false\n",
+        )
+        .unwrap();
+        let custom = ws.settings().unwrap();
+        assert!(custom.lossless_only);
+        assert!(!custom.share_worktree_index);
     }
 }

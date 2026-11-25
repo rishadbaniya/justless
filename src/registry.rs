@@ -3,8 +3,8 @@
 //!
 //! Each project keeps its own data in its `.justless/`, so deleting that directory
 //! still deletes its archived output. The registry only lists where those
-//! directories are: each project root, its repository (the resolved
-//! `git rev-parse --git-common-dir`, shared by a repository's worktrees) and when
+//! directories are: each project root, its repository (the resolved common Git
+//! directory, shared by a repository's worktrees) and when
 //! Justless last used it. It never holds output or command lines. A project is
 //! added or refreshed when its `.justless/` is used, at most once an hour, so the
 //! file is safe to delete and is rebuilt as projects are used. It lets `stats --all`
@@ -13,7 +13,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use clap::ArgMatches;
@@ -22,7 +21,7 @@ use serde_json::json;
 
 use crate::capture::Run;
 use crate::history::{Summary, human_bytes, now_ms};
-use crate::workspace::{Workspace, private_dir, write_json};
+use crate::workspace::{Workspace, git_common_dir, private_dir, write_json};
 
 const FILE: &str = "projects.json";
 /// How long a use counts as recent enough that the entry is not rewritten.
@@ -39,7 +38,7 @@ struct Registry {
     projects: Vec<Entry>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub root: PathBuf,
     /// The repository's common Git directory, the same for each of its worktrees.
@@ -71,10 +70,34 @@ fn load(directory: &Path) -> Registry {
         .unwrap_or_default()
 }
 
+/// Deduplicates entries by `root` in place (keeping the newest timestamp and
+/// preserving `repository` when set), ordered most recently used first.
+fn normalize_entries(projects: &mut Vec<Entry>) {
+    projects.sort_by(|a, b| a.root.cmp(&b.root).then_with(|| b.used_ms.cmp(&a.used_ms)));
+    projects.dedup_by(|later, kept| {
+        if later.root == kept.root {
+            if kept.repository.is_none() {
+                kept.repository = later.repository.take();
+            }
+            true
+        } else {
+            false
+        }
+    });
+    projects.sort_by(|a, b| b.used_ms.cmp(&a.used_ms).then_with(|| a.root.cmp(&b.root)));
+}
+
+fn entry_is_recent(registry: &Registry, root: &Path, now: u64) -> bool {
+    registry
+        .projects
+        .iter()
+        .any(|entry| entry.root == root && now.saturating_sub(entry.used_ms) < REFRESH_MS)
+}
+
 /// The registered projects, most recently used first.
 pub fn projects() -> Vec<Entry> {
     let mut projects = home().map(|home| load(&home).projects).unwrap_or_default();
-    projects.sort_by_key(|entry| std::cmp::Reverse(entry.used_ms));
+    normalize_entries(&mut projects);
     projects
 }
 
@@ -88,43 +111,52 @@ pub fn touch(workspace: &Workspace) {
     let Some(directory) = home() else {
         return;
     };
-    let now = now_ms();
-    let recent = |registry: &Registry| {
-        registry.projects.iter().any(|entry| {
-            entry.root == workspace.root && now.saturating_sub(entry.used_ms) < REFRESH_MS
-        })
-    };
-    if recent(&load(&directory)) {
-        return;
+    let _ = touch_at(&directory, &workspace.root, now_ms());
+}
+
+/// Updates the registry in `directory` for `root` at `now` (Unix milliseconds).
+/// Returns `true` when `projects.json` was written, and `false` when the write
+/// was skipped (no `.justless/` state dir, entry updated within `REFRESH_MS`,
+/// lock held by another process, or no effective change).
+fn touch_at(directory: &Path, root: &Path, now: u64) -> bool {
+    if !root.join(".justless").is_dir() {
+        return false;
     }
-    let _ = update(&directory, |registry| {
-        if recent(registry) {
+    if entry_is_recent(&load(directory), root, now) {
+        return false;
+    }
+    // Resolve the common Git directory before acquiring the non-blocking lock
+    // (pure filesystem reads, zero subprocesses) to minimize contention across
+    // parallel worktree agents.
+    let repo = repository(root);
+    update(directory, |registry| {
+        if entry_is_recent(registry, root, now) {
             return false;
         }
-        let repository = repository(&workspace.root);
-        registry
-            .projects
-            .retain(|entry| entry.root != workspace.root);
+        let before = registry.projects.clone();
+        registry.projects.retain(|entry| entry.root != root);
         registry.projects.push(Entry {
-            root: workspace.root.clone(),
-            repository,
+            root: root.to_path_buf(),
+            repository: repo,
             used_ms: now,
         });
-        // Drop projects whose state is gone, and the oldest past the limit.
+        // Drop projects whose state is gone, deduplicate roots, and keep the
+        // newest `MAX_PROJECTS` entries.
         registry
             .projects
-            .retain(|entry| entry.root.join(".justless").is_dir());
-        registry
-            .projects
-            .sort_by_key(|entry| std::cmp::Reverse(entry.used_ms));
+            .retain(|entry| entry.root == root || entry.root.join(".justless").is_dir());
+        normalize_entries(&mut registry.projects);
         registry.projects.truncate(MAX_PROJECTS);
-        true
-    });
+        registry.projects != before
+    })
+    .unwrap_or(false)
 }
 
 /// Drop `root` from the registry, as `init --remove --purge` does.
 pub fn forget(root: &Path) {
-    if let Some(directory) = home() {
+    if let Some(directory) = home()
+        && directory.join(FILE).is_file()
+    {
         let _ = update(&directory, |registry| {
             let before = registry.projects.len();
             registry.projects.retain(|entry| entry.root != root);
@@ -134,7 +166,8 @@ pub fn forget(root: &Path) {
 }
 
 /// Apply `change` under the registry's lock, skipping when another process holds it.
-fn update(directory: &Path, change: impl FnOnce(&mut Registry) -> bool) -> Result<()> {
+/// Returns `Ok(true)` only when `projects.json` was actually written.
+fn update(directory: &Path, change: impl FnOnce(&mut Registry) -> bool) -> Result<bool> {
     if let Some(parent) = directory.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -146,31 +179,20 @@ fn update(directory: &Path, change: impl FnOnce(&mut Registry) -> bool) -> Resul
         .truncate(false)
         .open(directory.join("projects.lock"))?;
     if lock.try_lock().is_err() {
-        return Ok(());
+        return Ok(false);
     }
     let mut registry = load(directory);
     if change(&mut registry) {
         // The temporary file `write_json` renames into place is private.
         write_json(&directory.join(FILE), &registry)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The resolved common Git directory of the repository at `root`, if it is one.
 fn repository(root: &Path) -> Option<PathBuf> {
-    fs::symlink_metadata(root.join(".git")).ok()?;
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8(output.stdout).ok()?;
-    let path = text.trim_end_matches(['\n', '\r']);
-    (output.status.success() && !path.is_empty())
-        .then(|| root.join(path).canonicalize().ok())
-        .flatten()
+    git_common_dir(root)
 }
 
 /// The folders whose projects `stats --all` leaves out unless asked.
@@ -215,11 +237,12 @@ pub fn locate(workspace: &Workspace, id: &str) -> Result<(Option<Workspace>, Pat
 
 fn has_project_state(root: &Path) -> bool {
     let state = root.join(".justless");
-    state.join("runs").is_dir()
-        || state.join("activity.json").is_file()
-        || state.join("observations").is_dir()
-        || state.join("proxy").is_dir()
-        || state.join("archive-recalls.jsonl").is_file()
+    state.is_dir()
+        && (state.join("runs").is_dir()
+            || state.join("activity.json").is_file()
+            || state.join("observations").is_dir()
+            || state.join("proxy").is_dir()
+            || state.join("archive-recalls.jsonl").is_file())
 }
 
 /// Aggregated proxy request-boundary clearing totals across registered projects
@@ -320,11 +343,15 @@ pub fn stats(matches: &ArgMatches, workspace: &Workspace, days: u64) -> Result<(
     let mut proxy_all = ProxyAllSummary::default();
     let mut agy_roots = Vec::new();
     for entry in entries {
-        let has_runs = entry.root.join(".justless/runs").is_dir();
-        let has_activity = entry.root.join(".justless/activity.json").is_file();
-        let has_observations = entry.root.join(".justless/observations").is_dir();
-        let has_proxy = entry.root.join(".justless/proxy").is_dir();
-        let has_recalls = entry.root.join(".justless/archive-recalls.jsonl").is_file();
+        let state = entry.root.join(".justless");
+        if !state.is_dir() {
+            continue;
+        }
+        let has_runs = state.join("runs").is_dir();
+        let has_activity = state.join("activity.json").is_file();
+        let has_observations = state.join("observations").is_dir();
+        let has_proxy = state.join("proxy").is_dir();
+        let has_recalls = state.join("archive-recalls.jsonl").is_file();
         if !has_runs && !has_activity && !has_observations && !has_proxy && !has_recalls {
             continue;
         }
@@ -637,5 +664,87 @@ mod tests {
         fs::create_dir_all(act.join(".justless")).unwrap();
         fs::write(act.join(".justless/activity.json"), "{}").unwrap();
         assert!(has_project_state(&act));
+    }
+
+    #[test]
+    fn touch_skips_redundant_disk_rewrite_within_throttle_window_and_deduplicates() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let reg_dir = base.join("state/justless");
+
+        // Primary repo + linked worktree, resolved purely via filesystem.
+        let primary = base.join("repo");
+        let wt_gitdir = primary.join(".git/worktrees/wt-1");
+        let worktree = base.join("wt-1");
+        fs::create_dir_all(&wt_gitdir).unwrap();
+        fs::create_dir_all(primary.join(".justless")).unwrap();
+        fs::create_dir_all(worktree.join(".justless")).unwrap();
+        fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../repo/.git/worktrees/wt-1\n",
+        )
+        .unwrap();
+
+        let t0 = 1_700_000_000_000;
+        assert!(touch_at(&reg_dir, &worktree, t0));
+
+        let file = reg_dir.join(FILE);
+        let bytes_before = fs::read(&file).unwrap();
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&file).unwrap().ino()
+        };
+
+        let first = load(&reg_dir);
+        assert_eq!(first.projects.len(), 1);
+        assert_eq!(first.projects[0].root, worktree);
+        assert_eq!(first.projects[0].repository, Some(primary.join(".git")));
+        assert_eq!(first.projects[0].used_ms, t0);
+
+        // Rapid back-to-back touches within the throttle window skip disk writes.
+        assert!(!touch_at(&reg_dir, &worktree, t0 + 50));
+        assert!(!touch_at(&reg_dir, &worktree, t0 + REFRESH_MS - 1));
+        assert_eq!(fs::read(&file).unwrap(), bytes_before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&file).unwrap().ino(), inode_before);
+        }
+
+        // Once the throttle window elapses, the entry updates cleanly with no duplicate.
+        let t1 = t0 + REFRESH_MS;
+        assert!(touch_at(&reg_dir, &worktree, t1));
+        let refreshed = load(&reg_dir);
+        assert_eq!(refreshed.projects.len(), 1);
+        assert_eq!(refreshed.projects[0].root, worktree);
+        assert_eq!(refreshed.projects[0].repository, Some(primary.join(".git")));
+        assert_eq!(refreshed.projects[0].used_ms, t1);
+
+        // Pre-existing duplicate paths collapse to one entry keeping the newest timestamp.
+        let mut dupes = vec![
+            Entry {
+                root: primary.clone(),
+                repository: Some(primary.join(".git")),
+                used_ms: t0,
+            },
+            Entry {
+                root: primary.clone(),
+                repository: None,
+                used_ms: t1,
+            },
+            Entry {
+                root: worktree.clone(),
+                repository: Some(primary.join(".git")),
+                used_ms: t0 + 100,
+            },
+        ];
+        normalize_entries(&mut dupes);
+        assert_eq!(dupes.len(), 2);
+        assert_eq!(dupes[0].root, primary);
+        assert_eq!(dupes[0].used_ms, t1);
+        assert_eq!(dupes[0].repository, Some(primary.join(".git")));
+        assert_eq!(dupes[1].root, worktree);
     }
 }
