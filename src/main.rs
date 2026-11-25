@@ -58,6 +58,7 @@ mod stacktrace;
 mod statusline;
 mod summary;
 mod syntax_check;
+mod tableview;
 mod testrun;
 mod tokens;
 mod uninstall;
