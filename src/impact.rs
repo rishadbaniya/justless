@@ -12,6 +12,7 @@ use serde_json::{Map, json};
 use crate::context::{Change, Deletion, Since, changes, relationship};
 use crate::index::{Definition, Edge, Index};
 use crate::map::{Fill, Section, emit, is_test_file, label, name, node, plural};
+use crate::polyglot::Grammar;
 use crate::rust_syntax::Kind;
 use crate::workspace::{Location, Workspace};
 
@@ -126,11 +127,12 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     )];
     let first_distance = sections.len();
     sections.extend(distance_sections(&index, &walk, seeds.len() > 1));
-    let (tests, files) = tests(&index, &seeds, &possible, &walk);
+    let (tests, files, extra_notes) = tests(workspace, &index, &seeds, &possible, &walk);
     let tests_at = sections.len();
     sections.push(test_section(&index, &tests, &files));
-    sections.extend(command_section(&index, &tests));
-    let footer = notes(&index, &walk, depth);
+    sections.extend(command_section(workspace, &index, &tests, &files));
+    let mut footer = notes(&index, &walk, depth);
+    footer.extend(extra_notes);
 
     // Commands and tests are the payoff, so they claim space first. Nearer
     // dependents come next, and the list of changed symbols fills last.
@@ -217,14 +219,30 @@ fn test_section(index: &Index, tests: &[(usize, usize, bool)], files: &TestFiles
             value,
         );
     }
-    for (file, &(hops, inferred, at)) in files {
+    for (file, info) in files {
+        let note = info
+            .note
+            .as_deref()
+            .map(|why| format!(" ({why})"))
+            .unwrap_or_default();
+        let mut value = json!({
+            "file": file,
+            "kind": "test file",
+            "at": info.at.to_string(),
+            "hops": info.hops,
+            "possible": info.possible,
+        });
+        if let Some(why) = &info.note {
+            value["note"] = json!(why);
+        }
         section.push(
             format!(
-                "  {file} · test file at {at} · {}{}",
-                possible(inferred),
-                distance(hops)
+                "  {file} · test file at {}{note} · {}{}",
+                info.at,
+                possible(info.possible),
+                distance(info.hops)
             ),
-            json!({"file": file, "kind": "test file", "at": at.to_string(), "hops": hops, "possible": inferred}),
+            value,
         );
     }
     if section.lines.is_empty() {
@@ -236,8 +254,13 @@ fn test_section(index: &Index, tests: &[(usize, usize, bool)], files: &TestFiles
     section
 }
 
-fn command_section(index: &Index, tests: &[(usize, usize, bool)]) -> Option<Section> {
-    let (commands, left) = commands(index, tests);
+fn command_section(
+    workspace: &Workspace,
+    index: &Index,
+    tests: &[(usize, usize, bool)],
+    files: &TestFiles,
+) -> Option<Section> {
+    let (commands, left) = commands(workspace, index, tests, files);
     if commands.is_empty() {
         return None;
     }
@@ -1210,18 +1233,33 @@ fn walk_from<'a>(
     }
 }
 
-type TestFiles<'a> = BTreeMap<&'a str, (usize, bool, &'a Location)>;
+#[derive(Debug)]
+struct TestFileHit {
+    hops: usize,
+    possible: bool,
+    at: Location,
+    note: Option<String>,
+}
+
+type TestFiles = BTreeMap<String, TestFileHit>;
+
+/// Whether a file belongs to the JavaScript/TypeScript/component family.
+fn is_js_file(file: &str) -> bool {
+    Grammar::for_file(file).is_some_and(|grammar| grammar.family() == Grammar::JavaScript)
+}
 
 /// Test definitions that reach a seed, from the walk and from call chains up to
-/// eight hops regardless of `--depth`, and test-convention files reached without
-/// a detected test definition, such as JavaScript suites. A test that only a
-/// `possible` seed leads to is possible.
-fn tests<'a>(
-    index: &'a Index,
+/// eight hops regardless of `--depth`, plus Wave 1 indexed JS/TS (`describe`/
+/// `it`/`test`) and Ruby RSpec (`describe`/`context`/`it`/`specify`) test
+/// blocks, and test-convention files reached at file scope or conservatively
+/// widened for barrel re-exports, dynamic imports, or shared configs.
+fn tests(
+    workspace: &Workspace,
+    index: &Index,
     seeds: &[usize],
     possible: &BTreeSet<usize>,
-    walk: &Walk<'a>,
-) -> (Vec<(usize, usize, bool)>, TestFiles<'a>) {
+    walk: &Walk<'_>,
+) -> (Vec<(usize, usize, bool)>, TestFiles, Vec<String>) {
     let definitions = &index.definitions;
     let mut found = BTreeMap::<usize, (bool, usize)>::new();
     let mut keep = |id: usize, hops: usize, possible: bool| {
@@ -1246,6 +1284,155 @@ fn tests<'a>(
             }
         }
     }
+
+    // Collect every reached symbol and file to drive JS/TS and Ruby augmentations.
+    let mut all_ids =
+        Vec::with_capacity(seeds.len() + walk.levels.iter().map(Vec::len).sum::<usize>());
+    let mut seen_ids = BTreeSet::new();
+    for &seed in seeds {
+        if seen_ids.insert(seed) {
+            all_ids.push(seed);
+        }
+    }
+    for level in &walk.levels {
+        for reach in level {
+            if let Dependent::Symbol(id) = reach.dependent
+                && seen_ids.insert(id)
+            {
+                all_ids.push(id);
+            }
+        }
+    }
+
+    let mut files = TestFiles::new();
+    let mut insert_file = |file: String, hit: TestFileHit| {
+        let entry = files.entry(file).or_insert_with(|| TestFileHit {
+            hops: hit.hops,
+            possible: hit.possible,
+            at: hit.at.clone(),
+            note: hit.note.clone(),
+        });
+        if (hit.possible, hit.hops) < (entry.possible, entry.hops)
+            || (entry.note.is_none() && hit.note.is_some())
+        {
+            *entry = hit;
+        }
+    };
+    let mut extra_notes = Vec::new();
+
+    // Ruby: match indexed RSpec `describe`/`context`/`it` blocks by subject
+    // class/module and follow `require_relative`/`require` links.
+    let ruby_files: Vec<String> = all_ids
+        .iter()
+        .map(|&id| definitions[id].location.file.clone())
+        .filter(|file| file.ends_with(".rb"))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !ruby_files.is_empty() {
+        for (test_id, hops, inferred) in rspec_subject_tests(index, &all_ids) {
+            keep(test_id, hops, inferred);
+        }
+        let ruby_graph = RubyGraph::build(workspace, index);
+        let reach = ruby_graph.reach_from(&ruby_files);
+        for (spec_file, (line, why)) in reach.test_files {
+            insert_file(
+                spec_file.clone(),
+                TestFileHit {
+                    hops: 1,
+                    possible: false,
+                    at: Location {
+                        file: spec_file,
+                        start: line,
+                        end: line,
+                    },
+                    note: Some(why),
+                },
+            );
+        }
+        let touches_shared_ruby = ruby_files.iter().any(|file| is_shared_ruby_helper(file));
+        if touches_shared_ruby {
+            extra_notes.push(
+                "Shared Ruby test helper or config touched; run the full RSpec suite.".into(),
+            );
+        } else if !ruby_graph.dynamic_loaders.is_empty()
+            && ruby_files.iter().any(|file| !file.ends_with("_spec.rb"))
+        {
+            let (loader_file, line, kind) = &ruby_graph.dynamic_loaders[0];
+            extra_notes.push(format!(
+                "Dynamic Ruby loading ({kind} at {loader_file}:{line}); additional specs may be affected."
+            ));
+        }
+    }
+
+    // JS/TS: follow barrel re-exports, static dynamic imports / require(), and
+    // widen conservatively to full test files when reached through a barrel or
+    // dynamic import (or note full-suite impact for shared configs / computed imports).
+    let js_files: Vec<String> = all_ids
+        .iter()
+        .map(|&id| definitions[id].location.file.clone())
+        .filter(|file| is_js_file(file))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut widened_files = BTreeSet::<String>::new();
+    if !js_files.is_empty() {
+        let js_graph = JsGraph::build(workspace, index);
+        let reach = js_graph.reach_from(index, &js_files);
+        for (test_file, (line, why, widen_whole_file)) in reach.test_files {
+            if widen_whole_file {
+                widened_files.insert(test_file.clone());
+            }
+            insert_file(
+                test_file.clone(),
+                TestFileHit {
+                    hops: 1,
+                    possible: false,
+                    at: Location {
+                        file: test_file,
+                        start: line,
+                        end: line,
+                    },
+                    note: Some(why),
+                },
+            );
+        }
+        if !reach.alias_barrels.is_empty() {
+            let (barrel, importer, line, spec) = &reach.alias_barrels[0];
+            extra_notes.push(format!(
+                "Barrel re-export {barrel} is imported via path alias '{spec}' at {importer}:{line}; run the full suite."
+            ));
+        }
+        if !reach.unresolved_barrels.is_empty() {
+            let (barrel, line, spec) = &reach.unresolved_barrels[0];
+            extra_notes.push(format!(
+                "Barrel {barrel}:{line} has unresolved re-export '{spec}'; run the full suite."
+            ));
+        }
+        if !reach.computed_hits.is_empty() {
+            let (importer, line, kind, target) = &reach.computed_hits[0];
+            extra_notes.push(format!(
+                "Computed {kind} at {importer}:{line} may load {target}; run the full suite."
+            ));
+        }
+        for file in &js_files {
+            if is_shared_js_config_or_setup(file) {
+                extra_notes.push(format!(
+                    "Shared JS/TS test config or setup file {file} touched; run the full suite."
+                ));
+            } else if let Some(config) = config_reference(workspace, index, "", file) {
+                extra_notes.push(format!(
+                    "{file} is referenced by runner config {config}; run the full suite."
+                ));
+            }
+        }
+    }
+
+    // When a JS/TS test file is conservatively widened (barrel re-export or
+    // dynamic import), report the whole test file instead of a partial subset
+    // of its `it`/`describe` blocks.
+    found.retain(|&id, _| !widened_files.contains(&definitions[id].location.file));
+
     let mut tests: Vec<_> = found
         .into_iter()
         .map(|(id, (possible, hops))| (id, hops, possible))
@@ -1255,7 +1442,6 @@ fn tests<'a>(
         .iter()
         .map(|&(id, _, _)| definitions[id].location.file.as_str())
         .collect();
-    let mut files = TestFiles::new();
     let seed_files = seeds
         .iter()
         .map(|&id| (&definitions[id].location, 0, possible.contains(&id)));
@@ -1267,38 +1453,70 @@ fn tests<'a>(
     for (location, hops, possible) in seed_files.chain(reached) {
         let file = location.file.as_str();
         if is_test_file(file) && !covered.contains(file) {
-            let entry = files.entry(file).or_insert((hops, possible, location));
-            if (possible, hops) < (entry.1, entry.0) {
-                *entry = (hops, possible, location);
-            }
+            insert_file(
+                file.to_owned(),
+                TestFileHit {
+                    hops,
+                    possible,
+                    at: location.clone(),
+                    note: None,
+                },
+            );
         }
     }
-    (tests, files)
+    extra_notes.sort();
+    extra_notes.dedup();
+    (tests, files, extra_notes)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Runner {
     Cargo,
     Pytest,
+    Js,
+    Rspec,
     Go,
 }
 
 /// Commands that run just the given tests, where the file layout makes the
 /// runner and test name unambiguous. Returns the commands and how many
 /// matching tests did not fit in them.
-fn commands(index: &Index, tests: &[(usize, usize, bool)]) -> (Vec<String>, usize) {
+fn commands(
+    workspace: &Workspace,
+    index: &Index,
+    tests: &[(usize, usize, bool)],
+    files: &TestFiles,
+) -> (Vec<String>, usize) {
     let mut groups = BTreeMap::<(Runner, String), Vec<String>>::new();
+    let mut push = |runner: Runner, prefix: String, filter: String| {
+        let filters = groups.entry((runner, prefix)).or_default();
+        if !filters.contains(&filter) {
+            filters.push(filter);
+        }
+    };
     for &(id, _, _) in tests {
         let definition = &index.definitions[id];
         let selected = cargo(index, definition)
             .map(|(prefix, filter)| (Runner::Cargo, prefix, filter))
             .or_else(|| pytest(definition).map(|filter| (Runner::Pytest, "pytest".into(), filter)))
-            .or_else(|| go(index, definition).map(|(prefix, filter)| (Runner::Go, prefix, filter)));
+            .or_else(|| go(index, definition).map(|(prefix, filter)| (Runner::Go, prefix, filter)))
+            .or_else(|| {
+                js_command(workspace, index, &definition.location.file)
+                    .map(|(prefix, filter)| (Runner::Js, prefix, filter))
+            })
+            .or_else(|| {
+                rspec_command(index, &definition.location.file)
+                    .map(|(prefix, filter)| (Runner::Rspec, prefix, filter))
+            });
         if let Some((runner, prefix, filter)) = selected {
-            let filters = groups.entry((runner, prefix)).or_default();
-            if !filters.contains(&filter) {
-                filters.push(filter);
-            }
+            push(runner, prefix, filter);
+        }
+    }
+    for file in files.keys() {
+        if let Some((prefix, filter)) = js_command(workspace, index, file) {
+            push(Runner::Js, prefix, filter);
+        } else if let Some((prefix, filter)) = rspec_command(index, file) {
+            push(Runner::Rspec, prefix, filter);
         }
     }
     let mut left = 0;
@@ -1310,13 +1528,107 @@ fn commands(index: &Index, tests: &[(usize, usize, bool)]) -> (Vec<String>, usiz
             match runner {
                 Runner::Cargo if filters.len() == 1 => format!("{prefix} {}", filters[0]),
                 Runner::Cargo => format!("{prefix} -- {}", filters.join(" ")),
-                Runner::Pytest => format!("{prefix} {}", filters.join(" ")),
+                Runner::Pytest | Runner::Js | Runner::Rspec => {
+                    format!("{prefix} {}", filters.join(" "))
+                }
                 Runner::Go if filters.len() == 1 => format!("{prefix} -run '^{}$'", filters[0]),
                 Runner::Go => format!("{prefix} -run '^({})$'", filters.join("|")),
             }
         })
         .collect();
     (commands, left)
+}
+
+/// Suggests the unambiguous JS/TS runner command for a test file by inspecting
+/// the nearest `package.json` or `bunfig.toml` above `file`.
+fn js_command(workspace: &Workspace, index: &Index, file: &str) -> Option<(String, String)> {
+    if !is_js_file(file) || !is_test_file(file) {
+        return None;
+    }
+    let path = Path::new(file);
+    for directory in path.ancestors().skip(1) {
+        let dir = directory.to_str()?;
+        let rel_path = |name: &str| {
+            if dir.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{dir}/{name}")
+            }
+        };
+        let pkg_rel = rel_path("package.json");
+        if index.files.contains_key(&pkg_rel)
+            && let Ok(text) = fs::read_to_string(workspace.root.join(&pkg_rel))
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            let listed = |tool: &str| {
+                ["dependencies", "devDependencies"]
+                    .iter()
+                    .any(|key| json[key].get(tool).is_some())
+            };
+            let configured = |prefix: &str| {
+                index.files.keys().any(|other| {
+                    let parent = other.rsplit_once('/').map_or("", |(p, _)| p);
+                    parent == dir
+                        && other
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|name| name.starts_with(prefix))
+                })
+            };
+            let jest = listed("jest") || json.get("jest").is_some() || configured("jest.config.");
+            let vitest = listed("vitest") || configured("vitest.config.");
+            let script = json["scripts"]["test"].as_str().unwrap_or_default();
+            let prefix = match (jest, vitest) {
+                (true, true) => return None,
+                (false, true) => "npx vitest run",
+                (true, false) => "npx jest",
+                (false, false) => {
+                    if script.starts_with("bun test") {
+                        "bun test"
+                    } else if script.starts_with("node ") && script.contains("--test") {
+                        "node --test"
+                    } else if script.starts_with("playwright test") {
+                        "npx playwright test"
+                    } else if index.files.contains_key(&rel_path("bunfig.toml")) {
+                        "bun test"
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            return Some((prefix.to_owned(), quote(file)));
+        }
+        let bunfig_rel = rel_path("bunfig.toml");
+        if index.files.contains_key(&bunfig_rel) {
+            return Some(("bun test".to_owned(), quote(file)));
+        }
+    }
+    None
+}
+
+/// Suggests `bundle exec rspec` or `rspec` for an RSpec file (`*_spec.rb`).
+fn rspec_command(index: &Index, file: &str) -> Option<(String, String)> {
+    if !file.ends_with("_spec.rb") {
+        return None;
+    }
+    let path = Path::new(file);
+    for directory in path.ancestors().skip(1) {
+        let dir = directory.to_str()?;
+        let rel = |name: &str| {
+            if dir.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{dir}/{name}")
+            }
+        };
+        if index.files.contains_key(&rel("Gemfile")) {
+            return Some(("bundle exec rspec".to_owned(), quote(file)));
+        }
+        if index.files.contains_key(&rel(".rspec")) {
+            return Some(("rspec".to_owned(), quote(file)));
+        }
+    }
+    Some(("rspec".to_owned(), quote(file)))
 }
 
 /// `cargo test` with the test's path within its crate as the filter. Tests in
@@ -1402,5 +1714,1210 @@ fn quote(word: &str) -> String {
         word.to_owned()
     } else {
         format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JS/TS barrel re-exports, dynamic imports, and Ruby RSpec / require graphs
+// ---------------------------------------------------------------------------
+
+/// Whether a JS/TS file is a shared test setup or runner configuration file.
+pub(crate) fn is_shared_js_config_or_setup(file: &str) -> bool {
+    let base = file.rsplit('/').next().unwrap_or(file);
+    let stem = [
+        ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json", ".toml",
+    ]
+    .iter()
+    .find_map(|ext| base.strip_suffix(ext))
+    .unwrap_or(base);
+    base.starts_with("jest.config.")
+        || base.starts_with("vitest.config.")
+        || base.starts_with("vite.config.")
+        || base.starts_with("playwright.config.")
+        || base.starts_with("jest.setup.")
+        || base.starts_with("vitest.setup.")
+        || base == "bunfig.toml"
+        || matches!(
+            stem,
+            "setupTests"
+                | "setup-tests"
+                | "test-setup"
+                | "testSetup"
+                | "global-setup"
+                | "globalSetup"
+                | "global-teardown"
+                | "globalTeardown"
+        )
+}
+
+/// Whether a Ruby file is a shared RSpec/test helper or configuration file.
+pub(crate) fn is_shared_ruby_helper(file: &str) -> bool {
+    let base = file.rsplit('/').next().unwrap_or(file);
+    matches!(
+        base,
+        "spec_helper.rb"
+            | "rails_helper.rb"
+            | "test_helper.rb"
+            | ".rspec"
+            | "Gemfile"
+            | "Gemfile.lock"
+    ) || file.starts_with("spec/support/")
+        || file.contains("/spec/support/")
+        || file.starts_with("test/support/")
+        || file.contains("/test/support/")
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModuleEdge {
+    pub from: String,
+    pub line: usize,
+    pub kind: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ComputedImport {
+    pub file: String,
+    pub line: usize,
+    pub prefix: Option<String>,
+    pub kind: &'static str,
+}
+
+impl ComputedImport {
+    pub(crate) fn matches(&self, changed_file: &str, runner_root: &str) -> bool {
+        if !crate::runners::under(&self.file, runner_root)
+            || !crate::runners::under(changed_file, runner_root)
+        {
+            return false;
+        }
+        match &self.prefix {
+            Some(prefix) => changed_file.starts_with(prefix.as_str()),
+            None => true,
+        }
+    }
+}
+
+/// Augments the index's static JS/TS `import` graph with barrel re-exports
+/// (`export ... from`), CommonJS `require(...)`, dynamic `import(...)`, test
+/// mocks (`vi.mock`/`jest.mock`), and non-relative alias imports.
+#[derive(Default)]
+pub(crate) struct JsGraph {
+    /// Files that re-export symbols from another file (barrel files).
+    pub barrels: BTreeSet<String>,
+    /// `target_file -> [re-exporting barrel edges]`.
+    pub reexports: BTreeMap<String, Vec<ModuleEdge>>,
+    /// `barrel_file -> [(line, non-relative specifier)]`.
+    pub unresolved_reexports: BTreeMap<String, Vec<(usize, String)>>,
+    /// `target_file -> [static dynamic import / require / mock edges]`.
+    pub dynamic_imports: BTreeMap<String, Vec<ModuleEdge>>,
+    /// Non-literal `import(expr)` / `require(expr)` sites that cannot be statically resolved.
+    pub computed_dynamic: Vec<ComputedImport>,
+    /// Non-relative path-alias imports (`@/...`, `~/...`, `#...`, `src/...`).
+    pub alias_imports: Vec<(String, usize, String)>,
+}
+
+#[derive(Default)]
+pub(crate) struct JsReach {
+    /// `test_file -> (line, why, widen_whole_file)`.
+    pub test_files: BTreeMap<String, (usize, String, bool)>,
+    /// All non-test files reached via barrels or dynamic imports.
+    pub reached_files: BTreeSet<String>,
+    /// Barrel files touched (either changed directly or traversed on the way).
+    pub touched_barrels: BTreeSet<String>,
+    /// `(barrel, importer_file, line, specifier)` where a touched barrel may be
+    /// imported via an unresolved path alias.
+    pub alias_barrels: Vec<(String, String, usize, String)>,
+    /// `(barrel, line, specifier)` for unresolved re-exports in a touched barrel.
+    pub unresolved_barrels: Vec<(String, usize, String)>,
+    /// `(importer_file, line, kind, target_file)` for computed dynamic imports
+    /// that may load a changed or reached file.
+    pub computed_hits: Vec<(String, usize, &'static str, String)>,
+}
+
+impl JsGraph {
+    pub(crate) fn build(workspace: &Workspace, index: &Index) -> Self {
+        let mut graph = Self::default();
+        for file in index.files.keys() {
+            if !is_js_file(file) {
+                continue;
+            }
+            let Ok(path) = workspace.source_path(file) else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            graph.scan_file(index, file, &text);
+        }
+        graph
+    }
+
+    fn scan_file(&mut self, index: &Index, file: &str, text: &str) {
+        let mut in_export_clause = false;
+        let mut in_block_comment = false;
+        for (offset, raw_line) in text.lines().enumerate() {
+            let line_no = offset + 1;
+            let trimmed = raw_line.trim();
+            if in_block_comment {
+                if let Some((_, rest)) = trimmed.split_once("*/") {
+                    in_block_comment = false;
+                    if rest.trim().is_empty() {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            if trimmed.starts_with("/*") {
+                if !trimmed.contains("*/") {
+                    in_block_comment = true;
+                }
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('*') {
+                continue;
+            }
+            let code = strip_js_line_comment(raw_line);
+            let code_trimmed = code.trim();
+
+            // 1. Barrel re-exports: `export ... from '...'` (single-line or multi-line).
+            if code_trimmed.starts_with("export ")
+                && !code_trimmed.starts_with("export default ")
+                && !code_trimmed.starts_with("export function ")
+                && !code_trimmed.starts_with("export async function ")
+                && !code_trimmed.starts_with("export class ")
+                && !code_trimmed.starts_with("export const ")
+                && !code_trimmed.starts_with("export let ")
+                && !code_trimmed.starts_with("export var ")
+                && !code_trimmed.starts_with("export interface ")
+                && !code_trimmed.starts_with("export enum ")
+            {
+                if let Some(spec) = extract_from_specifier(code_trimmed) {
+                    self.record_reexport(index, file, line_no, &spec);
+                    in_export_clause = false;
+                } else if code_trimmed.contains('{') && !code_trimmed.contains('}') {
+                    in_export_clause = true;
+                }
+            } else if in_export_clause {
+                if let Some(spec) = extract_from_specifier(code_trimmed) {
+                    self.record_reexport(index, file, line_no, &spec);
+                    in_export_clause = false;
+                } else if code_trimmed.contains('}') || code_trimmed.contains(';') {
+                    in_export_clause = false;
+                }
+            }
+
+            // 2. Static path-alias imports (`import ... from '@/...'`).
+            if (code_trimmed.starts_with("import ") || code_trimmed.starts_with("import{"))
+                && let Some(spec) = extract_from_specifier(code_trimmed)
+                && is_alias_specifier(&spec)
+            {
+                self.alias_imports.push((file.to_owned(), line_no, spec));
+            }
+
+            // 3. `import(...)`, `require(...)`, `require.resolve(...)`, `vi.mock(...)`,
+            //    `jest.mock(...)`, `mock.module(...)`.
+            self.scan_calls(index, file, line_no, code);
+        }
+    }
+
+    fn record_reexport(&mut self, index: &Index, file: &str, line: usize, spec: &str) {
+        self.barrels.insert(file.to_owned());
+        if spec.starts_with('.') {
+            if let Some(target) = resolve_js_specifier(index, file, spec) {
+                self.reexports.entry(target).or_default().push(ModuleEdge {
+                    from: file.to_owned(),
+                    line,
+                    kind: "barrel re-export",
+                });
+            }
+        } else {
+            if is_alias_specifier(spec) {
+                self.alias_imports
+                    .push((file.to_owned(), line, spec.to_owned()));
+            }
+            self.unresolved_reexports
+                .entry(file.to_owned())
+                .or_default()
+                .push((line, spec.to_owned()));
+        }
+    }
+
+    fn scan_calls(&mut self, index: &Index, file: &str, line: usize, code: &str) {
+        let cjs_reexport = code.contains("module.exports")
+            || code.contains("exports.")
+            || code.contains("Object.assign(exports");
+        for (needle, kind, check_computed) in [
+            ("import(", "dynamic import", true),
+            ("require(", "require", true),
+            ("require.resolve(", "require", false),
+            ("vi.mock(", "mock", false),
+            ("jest.mock(", "mock", false),
+            ("mock.module(", "mock", false),
+        ] {
+            for (at, _) in code.match_indices(needle) {
+                if at > 0 {
+                    let prev = code[..at].chars().next_back().unwrap_or(' ');
+                    if prev.is_alphanumeric() || prev == '_' || prev == '$' || prev == '.' {
+                        continue;
+                    }
+                }
+                let rest = code[at + needle.len()..].trim_start();
+                let arg = extract_first_call_arg(rest);
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    continue;
+                }
+                if let Some(spec) = unquote_static_js_string(arg) {
+                    if spec.starts_with('.') {
+                        if let Some(target) = resolve_js_specifier(index, file, spec) {
+                            if cjs_reexport && kind == "require" {
+                                self.barrels.insert(file.to_owned());
+                                self.reexports.entry(target).or_default().push(ModuleEdge {
+                                    from: file.to_owned(),
+                                    line,
+                                    kind: "barrel re-export",
+                                });
+                            } else {
+                                self.dynamic_imports
+                                    .entry(target)
+                                    .or_default()
+                                    .push(ModuleEdge {
+                                        from: file.to_owned(),
+                                        line,
+                                        kind,
+                                    });
+                            }
+                        }
+                    } else if is_alias_specifier(spec) {
+                        self.alias_imports
+                            .push((file.to_owned(), line, spec.to_owned()));
+                    }
+                } else if check_computed {
+                    // Computed expression or template string with `${...}`.
+                    let prefix = template_static_prefix(file, arg);
+                    // Ignore obviously non-relative template strings like `` `node:${mod}` ``.
+                    if let Some(body) = arg.strip_prefix('`')
+                        && !body.starts_with('.')
+                        && !body.starts_with("${")
+                    {
+                        continue;
+                    }
+                    self.computed_dynamic.push(ComputedImport {
+                        file: file.to_owned(),
+                        line,
+                        prefix,
+                        kind,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Checks whether any non-relative alias import (such as `@/billing`) could
+    /// target `barrel_file`.
+    pub(crate) fn barrel_alias_importer(
+        &self,
+        barrel_file: &str,
+    ) -> Option<(String, usize, String)> {
+        let dir = barrel_file.rsplit_once('/').map_or("", |(d, _)| d);
+        let base = barrel_file.rsplit('/').next().unwrap_or(barrel_file);
+        let stem = base.split('.').next().unwrap_or(base);
+        let mut keys = Vec::new();
+        if stem == "index" && !dir.is_empty() {
+            keys.push(dir.to_owned());
+            if let Some((_, tail)) = dir.split_once('/') {
+                keys.push(tail.to_owned());
+            }
+            if let Some(last) = dir.rsplit('/').next() {
+                keys.push(last.to_owned());
+            }
+        } else if !stem.is_empty() {
+            let no_ext = if dir.is_empty() {
+                stem.to_owned()
+            } else {
+                format!("{dir}/{stem}")
+            };
+            keys.push(no_ext.clone());
+            if let Some((_, tail)) = no_ext.split_once('/') {
+                keys.push(tail.to_owned());
+            }
+        }
+        for (importer, line, spec) in &self.alias_imports {
+            if importer == barrel_file {
+                continue;
+            }
+            let normalized = spec
+                .trim_start_matches("@/")
+                .trim_start_matches("~/")
+                .trim_start_matches('#')
+                .trim_end_matches('/');
+            if keys.iter().any(|key| {
+                normalized == key
+                    || normalized.ends_with(&format!("/{key}"))
+                    || key.ends_with(&format!("/{normalized}"))
+            }) {
+                return Some((importer.clone(), *line, spec.clone()));
+            }
+        }
+        None
+    }
+
+    /// Transitively follows barrel re-exports, static `require`/`import()`/mock
+    /// edges, and static `index` file imports starting from `starts`.
+    pub(crate) fn reach_from(&self, index: &Index, starts: &[String]) -> JsReach {
+        let mut reach = JsReach::default();
+        // Map file path -> file-node definition ID for fast static import traversal.
+        let file_nodes: BTreeMap<&str, usize> = index
+            .definitions
+            .iter()
+            .enumerate()
+            .filter(|(_, def)| def.kind == "file" && is_js_file(&def.location.file))
+            .map(|(id, def)| (def.location.file.as_str(), id))
+            .collect();
+
+        // Queue entries: (file, via_barrel_or_dynamic, first_line, why_chain).
+        let mut visited = BTreeSet::<String>::new();
+        let mut queue = std::collections::VecDeque::<(String, bool, usize, String)>::new();
+        for start in starts {
+            if visited.insert(start.clone()) {
+                let is_barrel = self.barrels.contains(start);
+                if is_barrel {
+                    reach.touched_barrels.insert(start.clone());
+                }
+                queue.push_back((start.clone(), is_barrel, 1, String::new()));
+            }
+        }
+
+        while let Some((current, widened, _, prefix_why)) = queue.pop_front() {
+            for computed in &self.computed_dynamic {
+                if computed.file != current && computed.matches(&current, "") {
+                    reach.computed_hits.push((
+                        computed.file.clone(),
+                        computed.line,
+                        computed.kind,
+                        current.clone(),
+                    ));
+                }
+            }
+            // 1. Barrel re-exports of `current`.
+            if let Some(edges) = self.reexports.get(&current) {
+                for edge in edges {
+                    reach.touched_barrels.insert(edge.from.clone());
+                    let step_why =
+                        format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
+                    let why = join_why(&prefix_why, &step_why);
+                    if is_test_file(&edge.from) {
+                        reach
+                            .test_files
+                            .entry(edge.from.clone())
+                            .or_insert((edge.line, why, true));
+                    } else if visited.insert(edge.from.clone()) {
+                        reach.reached_files.insert(edge.from.clone());
+                        queue.push_back((edge.from.clone(), true, edge.line, why));
+                    }
+                }
+            }
+            // 2. Static `import('./...')`, `require('./...')`, `vi.mock('./...')`.
+            if let Some(edges) = self.dynamic_imports.get(&current) {
+                for edge in edges {
+                    let step_why =
+                        format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
+                    let why = join_why(&prefix_why, &step_why);
+                    if is_test_file(&edge.from) {
+                        reach
+                            .test_files
+                            .entry(edge.from.clone())
+                            .or_insert((edge.line, why, true));
+                    } else if visited.insert(edge.from.clone()) {
+                        reach.reached_files.insert(edge.from.clone());
+                        queue.push_back((edge.from.clone(), true, edge.line, why));
+                    }
+                }
+            }
+            // 3. Static `import` edges already indexed in `index` (needed once
+            //    we have stepped through a barrel or dynamic import!).
+            if widened && let Some(&node_id) = file_nodes.get(current.as_str()) {
+                for edge in index.incoming(node_id) {
+                    if edge.kind != Kind::Import {
+                        continue;
+                    }
+                    let importer = &edge.location.file;
+                    if importer == &current || !is_js_file(importer) {
+                        continue;
+                    }
+                    let step_why =
+                        format!("import at {}:{} → {current}", importer, edge.location.start);
+                    let why = join_why(&prefix_why, &step_why);
+                    if is_test_file(importer) {
+                        reach.test_files.entry(importer.clone()).or_insert((
+                            edge.location.start,
+                            why,
+                            true,
+                        ));
+                    } else if visited.insert(importer.clone()) {
+                        reach.reached_files.insert(importer.clone());
+                        queue.push_back((importer.clone(), true, edge.location.start, why));
+                    }
+                }
+            }
+        }
+
+        for barrel in &reach.touched_barrels {
+            if let Some((importer, line, spec)) = self.barrel_alias_importer(barrel) {
+                reach
+                    .alias_barrels
+                    .push((barrel.clone(), importer, line, spec));
+            }
+            if let Some(list) = self.unresolved_reexports.get(barrel) {
+                for (line, spec) in list {
+                    reach
+                        .unresolved_barrels
+                        .push((barrel.clone(), *line, spec.clone()));
+                }
+            }
+        }
+        reach
+    }
+}
+
+fn join_why(prefix: &str, next: &str) -> String {
+    if prefix.is_empty() {
+        next.to_owned()
+    } else {
+        format!("{next} · {prefix}")
+    }
+}
+
+fn strip_js_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match (quote, bytes[i]) {
+            (Some(_), b'\\') => i += 1,
+            (Some(q), b) if b == q => quote = None,
+            (None, b'"' | b'\'' | b'`') => quote = Some(bytes[i]),
+            (None, b'/') if bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+fn extract_from_specifier(line: &str) -> Option<String> {
+    let idx = line.rfind("from")?;
+    let before = line[..idx].chars().next_back();
+    if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+        return None;
+    }
+    let after = &line[idx + 4..];
+    if !after.starts_with(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
+        return None;
+    }
+    let after = after.trim_start();
+    let quote = after.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let rest = &after[1..];
+    let end = rest.find(quote)?;
+    let spec = &rest[..end];
+    (!spec.is_empty()).then(|| spec.to_owned())
+}
+
+fn extract_first_call_arg(rest: &str) -> &str {
+    let bytes = rest.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match (quote, bytes[i]) {
+            (Some(_), b'\\') => i += 1,
+            (Some(q), b) if b == q => quote = None,
+            (None, b'"' | b'\'' | b'`') => quote = Some(bytes[i]),
+            (None, b'(' | b'[' | b'{') => depth += 1,
+            (None, b')' | b']' | b'}') => {
+                if depth == 0 {
+                    return &rest[..i];
+                }
+                depth -= 1;
+            }
+            (None, b',') if depth == 0 => return &rest[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    rest
+}
+
+fn unquote_static_js_string(arg: &str) -> Option<&str> {
+    for q in ['"', '\''] {
+        if let Some(body) = arg.strip_prefix(q).and_then(|s| s.strip_suffix(q))
+            && !body.contains(q)
+        {
+            return Some(body);
+        }
+    }
+    if let Some(body) = arg.strip_prefix('`').and_then(|s| s.strip_suffix('`'))
+        && !body.contains("${")
+        && !body.contains('`')
+    {
+        return Some(body);
+    }
+    None
+}
+
+fn is_alias_specifier(spec: &str) -> bool {
+    spec.starts_with("@/")
+        || spec.starts_with("~/")
+        || spec.starts_with('#')
+        || spec.starts_with("src/")
+}
+
+fn template_static_prefix(from_file: &str, arg: &str) -> Option<String> {
+    let body = arg.strip_prefix('`')?;
+    let before_expr = body.split("${").next()?;
+    if !before_expr.starts_with('.') {
+        return None;
+    }
+    let dir_part = before_expr.rsplit_once('/').map_or(before_expr, |(d, _)| d);
+    let resolved = resolve_relative_path(from_file, dir_part)?;
+    Some(if resolved.is_empty() {
+        String::new()
+    } else {
+        format!("{resolved}/")
+    })
+}
+
+fn resolve_relative_path(from: &str, literal: &str) -> Option<String> {
+    if literal.is_empty() || literal.starts_with('/') || literal.contains("://") {
+        return None;
+    }
+    let mut parts: Vec<&str> = match from.rsplit_once('/') {
+        Some((directory, _)) => directory.split('/').collect(),
+        None => Vec::new(),
+    };
+    for part in literal.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn resolve_js_specifier(index: &Index, from: &str, spec: &str) -> Option<String> {
+    let base = resolve_relative_path(from, spec)?;
+    if !base.is_empty() && index.files.contains_key(&base) {
+        return Some(base);
+    }
+    let extensions = ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
+    if base.is_empty() {
+        for ext in extensions {
+            let candidate = format!("index.{ext}");
+            if index.files.contains_key(&candidate) {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+    let path = Path::new(&base);
+    let ext = path.extension().and_then(|e| e.to_str());
+    for candidate_ext in extensions {
+        if ext.is_none() {
+            let file = format!("{base}.{candidate_ext}");
+            if index.files.contains_key(&file) {
+                return Some(file);
+            }
+            let barrel = format!("{base}/index.{candidate_ext}");
+            if index.files.contains_key(&barrel) {
+                return Some(barrel);
+            }
+        } else if matches!(ext, Some("js" | "jsx" | "mjs" | "cjs"))
+            && let Some(replaced) = path.with_extension(candidate_ext).to_str()
+            && index.files.contains_key(replaced)
+        {
+            return Some(replaced.to_owned());
+        }
+    }
+    None
+}
+
+/// Checks if a runner configuration file (`jest.config.*`, `vitest.config.*`,
+/// `vite.config.*`, `playwright.config.*`, `bunfig.toml`) under `runner_root`
+/// references `changed_file` (e.g. via `setupFiles`, `setupFilesAfterEnv`,
+/// `preload`, or `globalSetup`).
+pub(crate) fn config_reference(
+    workspace: &Workspace,
+    index: &Index,
+    runner_root: &str,
+    changed_file: &str,
+) -> Option<String> {
+    if is_shared_js_config_or_setup(changed_file) {
+        return None;
+    }
+    let changed_base = changed_file.rsplit('/').next().unwrap_or(changed_file);
+    let changed_stem = changed_base.split('.').next().unwrap_or(changed_base);
+    for config in index.files.keys() {
+        if !crate::runners::under(config, runner_root) {
+            continue;
+        }
+        let name = config.rsplit('/').next().unwrap_or(config);
+        let is_config = name.starts_with("jest.config.")
+            || name.starts_with("vitest.config.")
+            || name.starts_with("vite.config.")
+            || name.starts_with("playwright.config.")
+            || name == "bunfig.toml";
+        if !is_config || config == changed_file {
+            continue;
+        }
+        let Ok(path) = workspace.source_path(config) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            for quote in ['"', '\''] {
+                let mut parts = line.split(quote);
+                parts.next();
+                while let Some(lit) = parts.next() {
+                    if lit.contains(changed_stem)
+                        && (lit == changed_file
+                            || lit.trim_start_matches("./") == changed_file
+                            || resolve_js_specifier(index, config, lit).as_deref()
+                                == Some(changed_file)
+                            || resolve_relative_path(config, lit).as_deref() == Some(changed_file)
+                            || lit.ends_with(&format!("/{changed_base}")))
+                    {
+                        return Some(config.clone());
+                    }
+                    parts.next();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ruby `require_relative`/`require` graph and dynamic-loader detector.
+#[derive(Default)]
+pub(crate) struct RubyGraph {
+    /// `target_rb_file -> [requiring rb edges]`.
+    pub requires: BTreeMap<String, Vec<ModuleEdge>>,
+    /// Dynamic Ruby loaders (`Dir.glob` + `require`, `Zeitwerk`, `autoload`, `require(expr)`).
+    pub dynamic_loaders: Vec<(String, usize, &'static str)>,
+}
+
+#[derive(Default)]
+pub(crate) struct RubyReach {
+    /// `spec_file -> (line, why)`.
+    pub test_files: BTreeMap<String, (usize, String)>,
+    /// Non-spec Ruby files reached transitively via `require_relative`/`require`.
+    pub reached_files: BTreeSet<String>,
+}
+
+impl RubyGraph {
+    pub(crate) fn build(workspace: &Workspace, index: &Index) -> Self {
+        let mut graph = Self::default();
+        let rb_files: Vec<String> = index
+            .files
+            .keys()
+            .filter(|file| file.ends_with(".rb"))
+            .cloned()
+            .collect();
+        for file in &rb_files {
+            let Ok(path) = workspace.source_path(file) else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            for (offset, raw_line) in text.lines().enumerate() {
+                let line_no = offset + 1;
+                let trimmed = raw_line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if trimmed.contains("Zeitwerk") {
+                    graph
+                        .dynamic_loaders
+                        .push((file.clone(), line_no, "Zeitwerk autoloader"));
+                } else if trimmed.starts_with("autoload ") || trimmed.starts_with("autoload(") {
+                    graph
+                        .dynamic_loaders
+                        .push((file.clone(), line_no, "Ruby autoload"));
+                } else if (trimmed.contains("Dir.glob") || trimmed.contains("Dir["))
+                    && trimmed.contains("require")
+                {
+                    graph
+                        .dynamic_loaders
+                        .push((file.clone(), line_no, "dynamic Dir glob require"));
+                }
+                if let Some(rest) = strip_ruby_keyword(trimmed, "require_relative") {
+                    if let Some(lit) = extract_ruby_string(rest) {
+                        if let Some(target) = resolve_ruby_relative(index, file, lit) {
+                            graph.requires.entry(target).or_default().push(ModuleEdge {
+                                from: file.clone(),
+                                line: line_no,
+                                kind: "require_relative",
+                            });
+                        }
+                    } else if !rest.is_empty() {
+                        graph.dynamic_loaders.push((
+                            file.clone(),
+                            line_no,
+                            "dynamic require_relative",
+                        ));
+                    }
+                } else if let Some(rest) = strip_ruby_keyword(trimmed, "require") {
+                    if let Some(lit) = extract_ruby_string(rest) {
+                        if let Some(target) = resolve_ruby_require(index, &rb_files, lit) {
+                            graph.requires.entry(target).or_default().push(ModuleEdge {
+                                from: file.clone(),
+                                line: line_no,
+                                kind: "require",
+                            });
+                        }
+                    } else if !rest.is_empty() && !rest.starts_with('=') {
+                        graph
+                            .dynamic_loaders
+                            .push((file.clone(), line_no, "dynamic require"));
+                    }
+                }
+            }
+        }
+        graph
+    }
+
+    pub(crate) fn reach_from(&self, starts: &[String]) -> RubyReach {
+        let mut reach = RubyReach::default();
+        let mut visited = BTreeSet::<String>::new();
+        let mut queue = std::collections::VecDeque::<(String, String)>::new();
+        for start in starts {
+            if visited.insert(start.clone()) {
+                queue.push_back((start.clone(), String::new()));
+            }
+        }
+        while let Some((current, prefix_why)) = queue.pop_front() {
+            if let Some(edges) = self.requires.get(&current) {
+                for edge in edges {
+                    let step_why =
+                        format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
+                    let why = join_why(&prefix_why, &step_why);
+                    if edge.from.ends_with("_spec.rb") || is_test_file(&edge.from) {
+                        reach
+                            .test_files
+                            .entry(edge.from.clone())
+                            .or_insert((edge.line, why));
+                    } else if visited.insert(edge.from.clone()) {
+                        reach.reached_files.insert(edge.from.clone());
+                        queue.push_back((edge.from.clone(), why));
+                    }
+                }
+            }
+        }
+        reach
+    }
+}
+
+fn strip_ruby_keyword<'a>(trimmed: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = trimmed.strip_prefix(kw)?;
+    if rest.starts_with(char::is_whitespace) || rest.starts_with('(') {
+        Some(rest.trim_start().trim_start_matches('(').trim_start())
+    } else {
+        None
+    }
+}
+
+fn extract_ruby_string(rest: &str) -> Option<&str> {
+    for q in ['\'', '"'] {
+        if let Some(after) = rest.strip_prefix(q)
+            && let Some(end) = after.find(q)
+        {
+            let body = &after[..end];
+            if !body.is_empty() && !(q == '"' && body.contains("#{")) {
+                return Some(body);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_ruby_relative(index: &Index, from: &str, lit: &str) -> Option<String> {
+    let base = resolve_relative_path(from, lit)?;
+    if index.files.contains_key(&base) {
+        return Some(base);
+    }
+    let with_rb = format!("{base}.rb");
+    index.files.contains_key(&with_rb).then_some(with_rb)
+}
+
+fn resolve_ruby_require(index: &Index, rb_files: &[String], lit: &str) -> Option<String> {
+    let normalized = lit.strip_suffix(".rb").unwrap_or(lit);
+    let direct = format!("{normalized}.rb");
+    if index.files.contains_key(&direct) {
+        return Some(direct);
+    }
+    let in_lib = format!("lib/{normalized}.rb");
+    if index.files.contains_key(&in_lib) {
+        return Some(in_lib);
+    }
+    let suffix = format!("/{normalized}.rb");
+    let mut matches = rb_files.iter().filter(|file| file.ends_with(&suffix));
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.clone())
+}
+
+/// Leverages Wave 1's indexed Ruby RSpec `describe`/`context`/`it`/`specify`
+/// test blocks: matches changed/reached Ruby classes, modules, and methods
+/// against `RSpec.describe MyApp::OrderService` and nested `describe '#total'`
+/// blocks even when examples call `described_class` without repeating the class
+/// name.
+pub(crate) fn rspec_subject_tests(index: &Index, ids: &[usize]) -> Vec<(usize, usize, bool)> {
+    // Collect target (full_subject, short_subject, optional_method_name) from Ruby definitions.
+    let mut subjects = BTreeSet::<String>::new();
+    let mut short_subjects = BTreeSet::<String>::new();
+    let mut methods_by_subject = BTreeMap::<String, BTreeSet<String>>::new();
+    for &id in ids {
+        let def = &index.definitions[id];
+        if !def.location.file.ends_with(".rb")
+            || def.test
+            || matches!(def.kind.as_str(), "file" | "module" if def.kind == "file")
+        {
+            continue;
+        }
+        let rel_name = name(def);
+        if matches!(def.kind.as_str(), "class" | "module") {
+            subjects.insert(rel_name.to_owned());
+            short_subjects.insert(short_name(rel_name).to_owned());
+        } else if let Some((owner, method)) = rel_name.rsplit_once("::") {
+            subjects.insert(owner.to_owned());
+            short_subjects.insert(short_name(owner).to_owned());
+            methods_by_subject
+                .entry(owner.to_owned())
+                .or_default()
+                .insert(method.to_owned());
+            methods_by_subject
+                .entry(short_name(owner).to_owned())
+                .or_default()
+                .insert(method.to_owned());
+        }
+    }
+    if subjects.is_empty() {
+        return Vec::new();
+    }
+    // Check which short class names are unambiguous across indexed Ruby classes/modules.
+    let mut short_counts = BTreeMap::<&str, usize>::new();
+    for def in &index.definitions {
+        if def.location.file.ends_with(".rb") && matches!(def.kind.as_str(), "class" | "module") {
+            *short_counts.entry(short_name(name(def))).or_default() += 1;
+        }
+    }
+    let unique_shorts: BTreeSet<&str> = short_subjects
+        .iter()
+        .map(String::as_str)
+        .filter(|short| short_counts.get(short).copied().unwrap_or(0) == 1)
+        .collect();
+
+    // Group indexed RSpec test blocks by their top-level unquoted subject.
+    let mut top_matches = BTreeMap::<String, Vec<(usize, Vec<String>)>>::new();
+    for (id, def) in index.definitions.iter().enumerate() {
+        if !def.test || !def.location.file.ends_with(".rb") {
+            continue;
+        }
+        let segments: Vec<String> = split_rspec_segments(name(def));
+        let Some(first) = segments.first() else {
+            continue;
+        };
+        let matched = subjects.contains(first.as_str()) || unique_shorts.contains(first.as_str());
+        if matched {
+            top_matches
+                .entry(def.location.file.clone())
+                .or_default()
+                .push((id, segments));
+        }
+    }
+
+    let mut hits = Vec::new();
+    for (_file, blocks) in top_matches {
+        // Prefer nested `describe '#method'` / `describe '.method'` blocks when
+        // a specific method changed and has matching nested RSpec blocks;
+        // otherwise select the top-level `RSpec.describe` block.
+        let mut method_specific = Vec::new();
+        for &(id, ref segments) in &blocks {
+            if segments.len() >= 2
+                && let Some(first) = segments.first()
+                && let Some(methods) = methods_by_subject.get(first)
+                && segments[1..].iter().any(|seg| {
+                    let clean = seg.trim_start_matches(['#', '.']);
+                    methods.contains(clean)
+                })
+            {
+                method_specific.push(id);
+            }
+        }
+        if !method_specific.is_empty() {
+            for id in method_specific {
+                hits.push((id, 1, true));
+            }
+        } else if let Some((top_id, _)) = blocks.iter().min_by_key(|(_, segs)| segs.len()) {
+            hits.push((*top_id, 1, true));
+        }
+    }
+    hits
+}
+
+/// Splits an indexed RSpec test path like `"\"MyApp::OrderService\"::\"#total\""`
+/// into unquoted segments `["MyApp::OrderService", "#total"]`.
+fn split_rspec_segments(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut rest = path;
+    while !rest.is_empty() {
+        if let Some(after_open) = rest.strip_prefix('"')
+            && let Some(close) = after_open.find('"')
+        {
+            segments.push(after_open[..close].to_owned());
+            rest = &after_open[close + 1..];
+            rest = rest.strip_prefix("::").unwrap_or(rest);
+            continue;
+        }
+        match rest.split_once("::") {
+            Some((head, tail)) => {
+                segments.push(head.trim_matches('"').to_owned());
+                rest = tail;
+            }
+            None => {
+                segments.push(rest.trim_matches('"').to_owned());
+                break;
+            }
+        }
+    }
+    segments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_repo(files: &[(&str, &str)]) -> (TempDir, Workspace, Index) {
+        let dir = TempDir::new().unwrap();
+        for (rel, content) in files {
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
+        let workspace = Workspace::discover(Some(dir.path())).unwrap();
+        let index = Index::open(&workspace).unwrap();
+        (dir, workspace, index)
+    }
+
+    #[test]
+    fn js_ts_indexed_test_blocks_map_direct_calls_and_suggest_runner_command() {
+        let (_dir, workspace, index) = write_repo(&[
+            ("package.json", r#"{"devDependencies":{"vitest":"2.0.0"}}"#),
+            (
+                "src/calc.ts",
+                "export function calcTax(cents: number): number {\n  return cents * 0.2;\n}\nexport function other(): number { return 1; }\n",
+            ),
+            (
+                "src/calc.test.ts",
+                concat!(
+                    "import { describe, it, expect } from 'vitest';\n",
+                    "import { calcTax, other } from './calc';\n",
+                    "describe('calc', () => {\n",
+                    "  it('computes tax', () => {\n",
+                    "    expect(calcTax(100)).toBe(20);\n",
+                    "  });\n",
+                    "  it('does other', () => {\n",
+                    "    expect(other()).toBe(1);\n",
+                    "  });\n",
+                    "});\n",
+                ),
+            ),
+        ]);
+        let (_, seeds) = resolve(&index, "calcTax").unwrap();
+        let walk = walk(&index, &seeds, 3);
+        let (found_tests, found_files, notes) =
+            tests(&workspace, &index, &seeds, &BTreeSet::new(), &walk);
+        let test_names: Vec<&str> = found_tests
+            .iter()
+            .map(|&(id, _, _)| name(&index.definitions[id]))
+            .collect();
+        assert_eq!(test_names, ["\"calc\"::\"computes tax\""]);
+        assert!(found_files.is_empty());
+        assert!(notes.is_empty(), "{notes:?}");
+        let (cmds, left) = commands(&workspace, &index, &found_tests, &found_files);
+        assert_eq!(left, 0);
+        assert_eq!(cmds, ["npx vitest run src/calc.test.ts"]);
+    }
+
+    #[test]
+    fn js_barrel_reexport_and_dynamic_import_widen_to_full_test_file() {
+        let (_dir, workspace, index) = write_repo(&[
+            ("package.json", r#"{"scripts":{"test":"bun test"}}"#),
+            (
+                "src/tax.ts",
+                "export function vat(n: number) { return n / 5; }\n",
+            ),
+            (
+                "src/index.ts",
+                "export { vat as computeVat } from './tax';\n",
+            ),
+            (
+                "src/barrel.test.ts",
+                concat!(
+                    "import { computeVat } from './index';\n",
+                    "describe('barrel', () => {\n",
+                    "  it('uses alias', () => { computeVat(100); });\n",
+                    "  it('other case', () => { computeVat(200); });\n",
+                    "});\n",
+                ),
+            ),
+            (
+                "src/dynamic.test.ts",
+                concat!(
+                    "test('loads lazily', async () => {\n",
+                    "  const mod = await import('./tax');\n",
+                    "  mod.vat(10);\n",
+                    "});\n",
+                ),
+            ),
+        ]);
+        let (_, seeds) = resolve(&index, "vat").unwrap();
+        let walk = walk(&index, &seeds, 3);
+        let (found_tests, found_files, _notes) =
+            tests(&workspace, &index, &seeds, &BTreeSet::new(), &walk);
+        // Both files were reached through barrel re-export / dynamic import, so
+        // they widen conservatively to full test files.
+        assert!(found_tests.is_empty(), "{found_tests:?}");
+        assert!(
+            found_files.contains_key("src/barrel.test.ts"),
+            "{found_files:?}"
+        );
+        assert!(
+            found_files.contains_key("src/dynamic.test.ts"),
+            "{found_files:?}"
+        );
+        let (cmds, _) = commands(&workspace, &index, &found_tests, &found_files);
+        assert_eq!(cmds, ["bun test src/barrel.test.ts src/dynamic.test.ts"]);
+    }
+
+    #[test]
+    fn js_computed_dynamic_import_and_shared_setup_emit_conservative_notes() {
+        let (_dir, workspace, index) = write_repo(&[
+            (
+                "jest.config.js",
+                "module.exports = { setupFilesAfterEnv: ['./src/custom-setup.ts'] };\n",
+            ),
+            ("src/custom-setup.ts", "export function initTestEnv() {}\n"),
+            (
+                "src/plugins/billing.ts",
+                "export function run() { return 1; }\n",
+            ),
+            (
+                "src/loader.ts",
+                "export async function loadPlugin(name: string) {\n  return await import(`./plugins/${name}`);\n}\n",
+            ),
+        ]);
+        let (_, plugin_seeds) = resolve(&index, "src/plugins/billing.ts").unwrap();
+        let plugin_walk = walk(&index, &plugin_seeds, 3);
+        let (_, _, plugin_notes) = tests(
+            &workspace,
+            &index,
+            &plugin_seeds,
+            &BTreeSet::new(),
+            &plugin_walk,
+        );
+        assert!(
+            plugin_notes
+                .iter()
+                .any(|n| n.contains("Computed dynamic import at src/loader.ts:2")),
+            "{plugin_notes:?}"
+        );
+
+        let (_, setup_seeds) = resolve(&index, "src/custom-setup.ts").unwrap();
+        let setup_walk = walk(&index, &setup_seeds, 3);
+        let (_, _, setup_notes) = tests(
+            &workspace,
+            &index,
+            &setup_seeds,
+            &BTreeSet::new(),
+            &setup_walk,
+        );
+        assert!(
+            setup_notes
+                .iter()
+                .any(|n| n.contains("referenced by runner config jest.config.js")),
+            "{setup_notes:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_rspec_test_blocks_map_by_subject_method_and_require_relative() {
+        let (_dir, workspace, index) = write_repo(&[
+            ("Gemfile", "gem 'rspec'\n"),
+            (
+                "lib/billing/order.rb",
+                concat!(
+                    "module Billing\n",
+                    "  class Order\n",
+                    "    def total(cents)\n",
+                    "      cents + 10\n",
+                    "    end\n",
+                    "    def refund(cents)\n",
+                    "      cents\n",
+                    "    end\n",
+                    "  end\n",
+                    "end\n",
+                ),
+            ),
+            (
+                "spec/billing/order_spec.rb",
+                concat!(
+                    "require_relative '../../lib/billing/order'\n",
+                    "RSpec.describe Billing::Order do\n",
+                    "  describe '#total' do\n",
+                    "    it 'adds fee' do\n",
+                    "      expect(described_class.new.total(100)).to eq(110)\n",
+                    "    end\n",
+                    "  end\n",
+                    "  describe '#refund' do\n",
+                    "    it 'returns cents' do\n",
+                    "      expect(described_class.new.refund(50)).to eq(50)\n",
+                    "    end\n",
+                    "  end\n",
+                    "end\n",
+                ),
+            ),
+        ]);
+        let (_, seeds) = resolve(&index, "Billing::Order::total").unwrap();
+        let walk = walk(&index, &seeds, 3);
+        let (found_tests, found_files, _notes) =
+            tests(&workspace, &index, &seeds, &BTreeSet::new(), &walk);
+        let test_names: Vec<&str> = found_tests
+            .iter()
+            .map(|&(id, _, _)| name(&index.definitions[id]))
+            .collect();
+        assert!(
+            test_names
+                .iter()
+                .any(|n| *n == "\"Billing::Order\"::\"#total\"::\"adds fee\""
+                    || *n == "\"Billing::Order\"::\"#total\""),
+            "{test_names:?}"
+        );
+        assert!(
+            !test_names.iter().any(|n| n.contains("#refund")),
+            "{test_names:?}"
+        );
+        let (cmds, _) = commands(&workspace, &index, &found_tests, &found_files);
+        assert_eq!(cmds, ["bundle exec rspec spec/billing/order_spec.rb"]);
     }
 }

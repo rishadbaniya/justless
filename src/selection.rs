@@ -14,11 +14,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{Change, Since, changes, relationship};
 use crate::doctests::{Docs, Group, doc_like, markdown_examples, may_hold_examples, spans_lines};
-use crate::impact::{Dependent, Walk, walk};
+use crate::impact::{
+    Dependent, JsGraph, RubyGraph, Walk, config_reference, is_shared_js_config_or_setup,
+    is_shared_ruby_helper, rspec_subject_tests, walk,
+};
 use crate::index::{Definition, Fingerprint, Index};
 use crate::map::{is_test_file, name};
 use crate::polyglot::Grammar;
-use crate::runners::{Cargo, Kind, Package, Runner, Target, enabled_features, under};
+use crate::runners::{
+    Cargo, Kind, Package, Runner, Target, cargo_user_args, enabled_features, is_bun_test_file,
+    is_dot_test_or_spec_file, is_node_test_file, under,
+};
 use crate::workspace::{Location, Workspace};
 
 /// Hops followed from each changed symbol. Deep enough to be complete in
@@ -102,6 +108,7 @@ const LOCKFILES: &[&str] = &[
     "yarn.lock",
     "bun.lock",
     "bun.lockb",
+    "Gemfile.lock",
     "go.sum",
 ];
 
@@ -126,7 +133,7 @@ pub(crate) struct Note {
     pub detail: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Mode {
     /// Tests reachable from the changes, labeled as a subset.
@@ -143,7 +150,7 @@ pub(crate) enum Mode {
     Command,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum StepKind {
     /// Whole packages.
@@ -676,10 +683,14 @@ fn comment_only(line: &str) -> bool {
 }
 
 /// Whether a file is code in a language some runner tests: Rust, Python,
-/// JavaScript, TypeScript and their components, or Go. Anything else changes
-/// tests only as data.
+/// JavaScript, TypeScript and their components, Ruby, or Go. Anything else
+/// changes tests only as data.
 fn runner_language(file: &str) -> bool {
-    file.ends_with(".rs") || file.ends_with(".py") || file.ends_with(".go") || javascript(file)
+    file.ends_with(".rs")
+        || file.ends_with(".py")
+        || file.ends_with(".go")
+        || file.ends_with(".rb")
+        || javascript(file)
 }
 
 /// Whether a Rust line is documentation, whose examples run as doctests.
@@ -1010,24 +1021,56 @@ fn changed_docs(
 
 /// Which runners a dependency or configuration file belongs to.
 fn concerns(kind: Kind, name: &str, file: &str) -> bool {
-    let javascript = matches!(kind, Kind::Jest | Kind::Vitest);
+    let cargo = kind.is_cargo();
+    let javascript = kind.is_js();
+    let ruby = kind == Kind::Rspec;
     match name {
-        "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" => kind == Kind::Cargo,
+        "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" => cargo,
+        "nextest.toml" => kind == Kind::Nextest,
         "uv.lock" | "poetry.lock" | "Pipfile.lock" | "pyproject.toml" | "setup.py"
         | "setup.cfg" | "pytest.ini" | "tox.ini" | "conftest.py" => kind == Kind::Pytest,
-        "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lock" | "bun.lockb"
-        | "package.json" | ".swcrc" => javascript,
+        "package-lock.json"
+        | "pnpm-lock.yaml"
+        | "yarn.lock"
+        | "bun.lock"
+        | "bun.lockb"
+        | "package.json"
+        | ".swcrc"
+        | "pnpm-workspace.yaml"
+        | "turbo.json"
+        | "nx.json"
+        | "lerna.json" => javascript,
+        "bunfig.toml" => kind == Kind::Bun,
+        "Gemfile" | "Gemfile.lock" | ".rspec" | ".ruby-version" | "spec_helper.rb"
+        | "rails_helper.rb" | "test_helper.rb" => ruby,
         "go.sum" | "go.mod" | "go.work" => kind == Kind::Go,
         _ if name.starts_with("requirements") && name.ends_with(".txt") => kind == Kind::Pytest,
-        _ if file.starts_with(".cargo/config") || file.contains("/.cargo/config") => {
-            kind == Kind::Cargo
+        _ if file.starts_with(".cargo/config") || file.contains("/.cargo/config") => cargo,
+        _ if file == ".config/nextest.toml" || file.ends_with("/.config/nextest.toml") => {
+            kind == Kind::Nextest
         }
+        _ if name.ends_with(".gemspec")
+            || file.starts_with("spec/support/")
+            || file.contains("/spec/support/")
+            || file.starts_with("test/support/")
+            || file.contains("/test/support/") =>
+        {
+            ruby
+        }
+        _ if name.starts_with("jest.config.") || name.starts_with("jest.setup.") => {
+            kind == Kind::Jest
+        }
+        _ if name.starts_with("vitest.config.")
+            || name.starts_with("vitest.setup.")
+            || name.starts_with("vite.config.") =>
+        {
+            kind == Kind::Vitest
+        }
+        _ if name.starts_with("playwright.config.") => kind == Kind::Playwright,
         _ if (name.starts_with("tsconfig") && name.ends_with(".json"))
             || name.starts_with("babel.config.")
             || name.starts_with(".babelrc")
-            || name.starts_with("jest.config.")
-            || name.starts_with("vitest.config.")
-            || name.starts_with("vite.config.") =>
+            || is_shared_js_config_or_setup(file) =>
         {
             javascript
         }
@@ -1036,7 +1079,12 @@ fn concerns(kind: Kind, name: &str, file: &str) -> bool {
 }
 
 /// How a changed file can change what every test sees, before any symbol is looked at.
-fn file_trigger(workspace: &Workspace, runner: &Runner, file: &str) -> Option<Reason> {
+fn file_trigger(
+    workspace: &Workspace,
+    index: &Index,
+    runner: &Runner,
+    file: &str,
+) -> Option<Reason> {
     let name = file.rsplit('/').next().unwrap_or(file);
     let directory = file.rsplit_once('/').map_or("", |(directory, _)| directory);
     if !concerns(runner.kind, name, file) {
@@ -1050,12 +1098,23 @@ fn file_trigger(workspace: &Workspace, runner: &Runner, file: &str) -> Option<Re
     }
     let at_root = directory == runner.root;
     let workspace_config = match name {
-        "rust-toolchain" | "rust-toolchain.toml" => true,
-        "pyproject.toml" | "setup.py" | "setup.cfg" | ".swcrc" | "go.mod" | "go.work"
-        | "package.json" => at_root,
+        "rust-toolchain" | "rust-toolchain.toml" | ".ruby-version" => true,
+        "pyproject.toml"
+        | "setup.py"
+        | "setup.cfg"
+        | ".swcrc"
+        | "go.mod"
+        | "go.work"
+        | "package.json"
+        | "pnpm-workspace.yaml"
+        | "turbo.json"
+        | "nx.json"
+        | "lerna.json"
+        | "Gemfile" => at_root,
         _ => {
             file.starts_with(".cargo/config")
                 || file.contains("/.cargo/config")
+                || name.ends_with(".gemspec")
                 || (name.starts_with("tsconfig") && name.ends_with(".json"))
                 || name.starts_with("babel.config.")
                 || name.starts_with(".babelrc")
@@ -1068,11 +1127,17 @@ fn file_trigger(workspace: &Workspace, runner: &Runner, file: &str) -> Option<Re
         });
     }
     let root_conftest = name == "conftest.py" && at_root;
+    let nextest_config = runner.kind == Kind::Nextest
+        && (name == "nextest.toml"
+            || file == ".config/nextest.toml"
+            || file.ends_with("/.config/nextest.toml"));
+    let js_test_config = runner.kind.is_js() && is_shared_js_config_or_setup(file);
+    let ruby_test_config = runner.kind == Kind::Rspec && is_shared_ruby_helper(file);
     let test_config = matches!(name, "pytest.ini" | "tox.ini")
         || root_conftest
-        || name.starts_with("jest.config.")
-        || name.starts_with("vitest.config.")
-        || name.starts_with("vite.config.")
+        || nextest_config
+        || js_test_config
+        || ruby_test_config
         || name == ".env"
         || name.starts_with(".env.");
     if test_config {
@@ -1081,7 +1146,15 @@ fn file_trigger(workspace: &Workspace, runner: &Runner, file: &str) -> Option<Re
             message: format!("{file} changed: runner configuration"),
         });
     }
-    if name == "Cargo.toml" && runner.kind == Kind::Cargo {
+    if runner.kind.is_js()
+        && let Some(config) = config_reference(workspace, index, &runner.root, file)
+    {
+        return Some(Reason {
+            code: "test-config",
+            message: format!("{file} changed: referenced by runner configuration {config}"),
+        });
+    }
+    if name == "Cargo.toml" && runner.kind.is_cargo() {
         let root_manifest = runner
             .cargo
             .as_ref()
@@ -1130,6 +1203,10 @@ struct Analysis {
     run_ignored: bool,
     /// Changed code files that nothing names by path.
     unmentioned_code: BTreeSet<String>,
+    /// Lazily constructed JS/TS barrel & dynamic-import graph (when JS/TS files changed).
+    js_graph: Option<JsGraph>,
+    /// Lazily constructed Ruby require & dynamic-loader graph (when `.rb` files changed).
+    ruby_graph: Option<RubyGraph>,
 }
 
 impl Analysis {
@@ -1332,6 +1409,8 @@ fn analyze(
         docs: DocHits::default(),
         run_ignored,
         unmentioned_code: BTreeSet::new(),
+        js_graph: None,
+        ruby_graph: None,
     };
     let doc_includes = doc_includes(index, &mut texts);
     let ignore_globs = if settings.ignore.is_empty() {
@@ -1942,7 +2021,9 @@ fn analyze(
                             && !seed.dependents.contains_key(&user)
                             && texts.get(&path).is_some_and(|text| {
                                 text.lines().nth(line - 1).is_some_and(|text| {
-                                    !comment_only(text) && used_as(text, word, &definition.kind)
+                                    !comment_only(text)
+                                        && (family == Some("Ruby")
+                                            || used_as(text, word, &definition.kind))
                                 })
                             })
                         {
@@ -2001,6 +2082,91 @@ fn analyze(
         target.files = seed.files;
         target.dependents = seed.dependents;
         target.capped = seed.capped;
+    }
+
+    // JS/TS barrel re-exports & static dynamic imports / require() / vi.mock()
+    // augmentation: propagate from changed & reached JS/TS files to whole test files.
+    if analysis.files.iter().any(|(file, _)| javascript(file)) {
+        let js_graph = JsGraph::build(workspace, index);
+        for seed in &mut analysis.seeds {
+            let mut js_starts = Vec::new();
+            let seed_file = &definitions[seed.id].location.file;
+            if javascript(seed_file) {
+                js_starts.push(seed_file.clone());
+            }
+            for &dep in seed.dependents.keys() {
+                let dep_file = &definitions[dep].location.file;
+                if javascript(dep_file) && !js_starts.contains(dep_file) {
+                    js_starts.push(dep_file.clone());
+                }
+            }
+            if js_starts.is_empty() {
+                continue;
+            }
+            let reach = js_graph.reach_from(index, &js_starts);
+            for (test_file, (_line, why, _widened)) in reach.test_files {
+                seed.files.entry(test_file).or_insert(Hit {
+                    hops: 1,
+                    possible: false,
+                    why,
+                });
+            }
+        }
+        // Also propagate directly from changed JS/TS files that had no symbol seed
+        // (such as barrel files holding only `export * from '...'` statements).
+        let changed_js: Vec<String> = analysis
+            .files
+            .iter()
+            .map(|(f, _)| f.clone())
+            .filter(|f| javascript(f))
+            .collect();
+        let reach = js_graph.reach_from(index, &changed_js);
+        for (test_file, (_line, why, _widened)) in reach.test_files {
+            analysis.mentioned_files.entry(test_file).or_insert(Hit {
+                hops: 1,
+                possible: false,
+                why,
+            });
+        }
+        analysis.js_graph = Some(js_graph);
+    }
+
+    // Ruby RSpec subject matching & static `require_relative`/`require` augmentation.
+    if analysis.files.iter().any(|(file, _)| file.ends_with(".rb")) {
+        let ruby_graph = RubyGraph::build(workspace, index);
+        for seed in &mut analysis.seeds {
+            let seed_def = &definitions[seed.id];
+            if !seed_def.location.file.ends_with(".rb") || seed_def.test {
+                continue;
+            }
+            let mut rb_starts = vec![seed_def.location.file.clone()];
+            let mut rb_ids = vec![seed.id];
+            for &dep in seed.dependents.keys() {
+                let dep_file = &definitions[dep].location.file;
+                if dep_file.ends_with(".rb") {
+                    rb_ids.push(dep);
+                    if !rb_starts.contains(dep_file) {
+                        rb_starts.push(dep_file.clone());
+                    }
+                }
+            }
+            let reach = ruby_graph.reach_from(&rb_starts);
+            for (spec_file, (_line, why)) in reach.test_files {
+                seed.files.entry(spec_file).or_insert(Hit {
+                    hops: 1,
+                    possible: false,
+                    why,
+                });
+            }
+            for (test_id, hops, inferred) in rspec_subject_tests(index, &rb_ids) {
+                seed.tests.entry(test_id).or_insert(Hit {
+                    hops,
+                    possible: inferred,
+                    why: format!("RSpec.describe subject matches {}", name(seed_def)),
+                });
+            }
+        }
+        analysis.ruby_graph = Some(ruby_graph);
     }
 
     // An example exercises a change only through a name on the way to it, such
@@ -2347,7 +2513,7 @@ fn in_scope(runner: &Runner, file: &str) -> bool {
         return false;
     }
     match runner.kind {
-        Kind::Cargo => {
+        Kind::Cargo | Kind::Nextest => {
             file.ends_with(".rs")
                 && runner.cargo.as_ref().is_some_and(|cargo| {
                     cargo
@@ -2356,7 +2522,10 @@ fn in_scope(runner: &Runner, file: &str) -> bool {
                 })
         }
         Kind::Pytest => file.ends_with(".py"),
-        Kind::Jest | Kind::Vitest => javascript(file),
+        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright => {
+            javascript(file)
+        }
+        Kind::Rspec => file.ends_with(".rb"),
         Kind::Go => file.ends_with(".go"),
         Kind::Command => true,
     }
@@ -2366,7 +2535,7 @@ fn in_scope(runner: &Runner, file: &str) -> bool {
 /// builds or runs: for Cargo, code in a package it tests or one they depend on.
 fn affects(runner: &Runner, file: &str) -> bool {
     match (runner.kind, &runner.cargo) {
-        (Kind::Cargo, Some(cargo)) => {
+        (kind, Some(cargo)) if kind.is_cargo() => {
             file.ends_with(".rs")
                 && cargo.owner(file).is_some_and(|package| {
                     cargo
@@ -2424,6 +2593,7 @@ fn plan_runner(
     // A change with no line range can reach tests anywhere, whatever their root.
     let mut reasons: Vec<Reason> = analysis.file_level.values().cloned().collect();
     let mut package_scope = BTreeMap::<String, Reason>::new();
+    let mut triggered_files = BTreeSet::<&str>::new();
     // File-level triggers for files under this runner.
     for (file, _) in &analysis.files {
         let deleted = analysis.deleted.contains(file);
@@ -2431,12 +2601,13 @@ fn plan_runner(
         if !mine {
             continue;
         }
-        if let Some(reason) = file_trigger(workspace, runner, file) {
+        if let Some(reason) = file_trigger(workspace, index, runner, file) {
+            triggered_files.insert(file.as_str());
             reasons.push(reason);
             continue;
         }
         let name = file.rsplit('/').next().unwrap_or(file);
-        if runner.kind == Kind::Cargo
+        if runner.kind.is_cargo()
             && let Some(cargo) = &runner.cargo
             && let Some(package) = cargo.owner(file)
             && cargo.scope.contains(&package.name)
@@ -2527,7 +2698,7 @@ fn plan_runner(
                             ),
                         });
                     }
-                } else if runner.kind != Kind::Cargo {
+                } else if !runner.kind.is_cargo() {
                     reasons.push(Reason {
                         code: "deleted-module",
                         message: format!("{file} was deleted; its importers cannot be traced"),
@@ -2611,11 +2782,7 @@ fn plan_runner(
     // Only tests the runner's plan keeps count: a test file pytest would not
     // collect satisfies nothing, so its change falls back instead.
     let runnable = |file: &str| in_scope(runner, file) && collects(runner, file);
-    let user_args: Vec<String> = runner.base[2.min(runner.base.len())..]
-        .iter()
-        .take_while(|word| *word != "--")
-        .cloned()
-        .collect();
+    let user_args = cargo_user_args(&runner.base);
     // The same rules the runner's plan keeps a test by: a Cargo target the base
     // command runs (a test with no target runs with its package), a Go test,
     // example or fuzz target.
@@ -2623,7 +2790,7 @@ fn plan_runner(
         let definition = &definitions[id];
         runnable(&definition.location.file)
             && match (runner.kind, &runner.cargo) {
-                (Kind::Cargo, Some(cargo)) => target_of(cargo, definition)
+                (kind, Some(cargo)) if kind.is_cargo() => target_of(cargo, definition)
                     .is_none_or(|(package, target)| runs(package, target, &user_args).is_ok()),
                 (Kind::Go, _) => go_test_like(definition),
                 _ => true,
@@ -2631,7 +2798,10 @@ fn plan_runner(
     };
     for seed in &analysis.seeds {
         let definition = &definitions[seed.id];
-        if !seed.rules || definition.test {
+        if !seed.rules
+            || definition.test
+            || triggered_files.contains(definition.location.file.as_str())
+        {
             continue;
         }
         let tests: Vec<&Hit> = seed
@@ -2708,8 +2878,97 @@ fn plan_runner(
         }
     }
 
+    // Conservative JS/TS barrel re-export and computed dynamic import guards:
+    // widen to the full suite whenever a touched barrel has alias/unresolved
+    // importers or a computed `import(expr)`/`require(expr)` may load a changed file.
+    if runner.kind.is_js()
+        && let Some(js_graph) = &analysis.js_graph
+    {
+        let mut js_touched: Vec<String> = analysis
+            .files
+            .iter()
+            .map(|(f, _)| f.clone())
+            .filter(|f| javascript(f) && runner.contains(f) && !analysis.deleted.contains(f))
+            .collect();
+        for seed in &analysis.seeds {
+            for &dep in seed.dependents.keys() {
+                let dep_file = &definitions[dep].location.file;
+                if javascript(dep_file)
+                    && runner.contains(dep_file)
+                    && !js_touched.contains(dep_file)
+                {
+                    js_touched.push(dep_file.clone());
+                }
+            }
+        }
+        if !js_touched.is_empty() {
+            let reach = js_graph.reach_from(index, &js_touched);
+            for (barrel, importer, line, spec) in reach.alias_barrels {
+                if runner.contains(&barrel) {
+                    reasons.push(Reason {
+                        code: "barrel-reexport",
+                        message: format!(
+                            "barrel {barrel} is imported via path alias '{spec}' at {importer}:{line}"
+                        ),
+                    });
+                }
+            }
+            for (barrel, line, spec) in reach.unresolved_barrels {
+                if runner.contains(&barrel) {
+                    reasons.push(Reason {
+                        code: "barrel-reexport",
+                        message: format!(
+                            "barrel {barrel}:{line} has unresolved re-export '{spec}'"
+                        ),
+                    });
+                }
+            }
+            for (importer, line, kind, target) in reach.computed_hits {
+                if runner.contains(&importer) && runner.contains(&target) {
+                    reasons.push(Reason {
+                        code: "dynamic-import",
+                        message: format!("computed {kind} at {importer}:{line} may load {target}"),
+                    });
+                }
+            }
+            for (file, _) in &analysis.files {
+                if runner.contains(file)
+                    && js_graph.barrels.contains(file)
+                    && !reach.test_files.keys().any(|test| runnable(test))
+                {
+                    reasons.push(Reason {
+                        code: "barrel-reexport",
+                        message: format!(
+                            "{file} is a barrel re-export with no statically traceable test importers"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // Conservative Ruby dynamic-loader guard for RSpec: if non-spec `.rb` code
+    // changed and a dynamic loader (`Zeitwerk`, `autoload`, `Dir.glob` + `require`,
+    // or non-literal `require`) exists under the runner root, widen to full suite.
+    if runner.kind == Kind::Rspec
+        && let Some(ruby_graph) = &analysis.ruby_graph
+        && analysis.files.iter().any(|(file, _)| {
+            file.ends_with(".rb") && runner.contains(file) && !file.ends_with("_spec.rb")
+        })
+    {
+        for (loader, line, kind) in &ruby_graph.dynamic_loaders {
+            if runner.contains(loader) {
+                reasons.push(Reason {
+                    code: "dynamic-import",
+                    message: format!("{kind} at {loader}:{line} loads Ruby files dynamically"),
+                });
+                break;
+            }
+        }
+    }
+
     let mut plan = match runner.kind {
-        Kind::Cargo => cargo_plan(
+        Kind::Cargo | Kind::Nextest => cargo_plan(
             workspace,
             index,
             runner,
@@ -2718,7 +2977,9 @@ fn plan_runner(
             &whole_targets,
         ),
         Kind::Pytest => file_plan(workspace, index, runner, analysis, true),
-        Kind::Jest | Kind::Vitest => file_plan(workspace, index, runner, analysis, false),
+        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright | Kind::Rspec => {
+            file_plan(workspace, index, runner, analysis, false)
+        }
         Kind::Go => go_plan(workspace, index, runner, analysis),
         Kind::Command => full_plan(runner, Vec::new()),
     };
@@ -2746,9 +3007,12 @@ fn plan_runner(
 
 fn in_scope_language(runner: &Runner, file: &str) -> bool {
     match runner.kind {
-        Kind::Cargo => file.ends_with(".rs"),
+        Kind::Cargo | Kind::Nextest => file.ends_with(".rs"),
         Kind::Pytest => file.ends_with(".py"),
-        Kind::Jest | Kind::Vitest => javascript(file),
+        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright => {
+            javascript(file)
+        }
+        Kind::Rspec => file.ends_with(".rb"),
         Kind::Go => file.ends_with(".go"),
         Kind::Command => false,
     }
@@ -2904,12 +3168,7 @@ fn cargo_plan(
 ) -> RunnerPlan {
     let cargo = runner.cargo.as_ref().expect("cargo facts");
     let definitions = &index.definitions;
-    let user = &runner.base[2.min(runner.base.len())..];
-    let user_args: Vec<String> = user
-        .iter()
-        .take_while(|word| *word != "--")
-        .cloned()
-        .collect();
+    let user_args = cargo_user_args(&runner.base);
     let mut plan = full_plan(runner, Vec::new());
     plan.mode = Mode::Subset;
     plan.steps.clear();
@@ -3242,13 +3501,20 @@ fn cargo_plan(
         cargo
             .package(package)
             .and_then(|p| p.target_by_id(target))
-            .map(|t| t.name.replace('-', "_"))
+            .map(|t| {
+                if runner.kind == Kind::Nextest {
+                    t.nextest_id(package)
+                } else {
+                    t.name.replace('-', "_")
+                }
+            })
             .unwrap_or_else(|| {
-                target
-                    .rsplit(':')
-                    .next()
-                    .unwrap_or(target)
-                    .replace('-', "_")
+                let fallback = target.rsplit(':').next().unwrap_or(target);
+                if runner.kind == Kind::Nextest {
+                    format!("{package}::{fallback}")
+                } else {
+                    fallback.replace('-', "_")
+                }
             })
     };
 
@@ -3324,7 +3590,8 @@ fn cargo_plan(
     let mut doc_paths = BTreeMap::<String, (String, &'static str, String)>::new();
     let mut doc_crates = BTreeMap::<String, String>::new();
     let runs_doctests = |package: &Package, target: &Target| {
-        target.is_lib()
+        runner.kind == Kind::Cargo
+            && target.is_lib()
             && target.doctest
             && cargo.scope.contains(&package.name)
             && !packages.contains(&package.name)
@@ -3632,14 +3899,19 @@ fn collectable_js(file: &str) -> bool {
 }
 
 /// Whether the runner's full suite runs tests in `file`: pytest's
-/// `python_files` and `testpaths`, Jest and Vitest test files, Go test files.
+/// `python_files` and `testpaths`, Jest/Vitest/Bun/Node/Playwright test files,
+/// RSpec spec files, Go test files.
 fn collects(runner: &Runner, file: &str) -> bool {
     runner.contains(file)
         && match runner.kind {
             Kind::Pytest => runner.pytest_collects(file),
-            Kind::Jest | Kind::Vitest => collectable_js(file),
+            Kind::Jest => collectable_js(file),
+            Kind::Vitest | Kind::Playwright => is_dot_test_or_spec_file(file),
+            Kind::Bun => is_bun_test_file(file),
+            Kind::NodeTest => is_node_test_file(file),
+            Kind::Rspec => file.ends_with("_spec.rb"),
             Kind::Go => file.ends_with("_test.go"),
-            Kind::Cargo | Kind::Command => true,
+            Kind::Cargo | Kind::Nextest | Kind::Command => true,
         }
 }
 
@@ -4177,5 +4449,335 @@ mod tests {
         ] {
             assert!(aliases(line, word).is_empty(), "{line}");
         }
+    }
+
+    fn git_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (rel, content) in files {
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-qm", "init"]);
+        let workspace = Workspace::discover(Some(dir.path())).unwrap();
+        (dir, workspace)
+    }
+
+    fn plan_for(workspace: &Workspace, command: Option<&[&str]>, no_fallback: bool) -> Plan {
+        let index = Index::open(workspace).unwrap();
+        let owned: Option<Vec<String>> =
+            command.map(|words| words.iter().map(|w| (*w).to_owned()).collect());
+        let runners = crate::runners::detect(workspace, &index, owned.as_deref()).unwrap();
+        plan(
+            workspace,
+            &index,
+            runners,
+            &TestSettings::default(),
+            no_fallback,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cargo_nextest_selects_subset_skips_doctests_and_widens_on_nextest_config() {
+        let (dir, workspace) = git_repo(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo-pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "src/lib.rs",
+                concat!(
+                    "/// Adds tax.\n",
+                    "///\n",
+                    "/// ```\n",
+                    "/// assert_eq!(demo_pkg::vat(100), 20);\n",
+                    "/// ```\n",
+                    "pub fn vat(cents: u64) -> u64 { cents / 5 }\n",
+                    "pub fn fee(cents: u64) -> u64 { cents + 1 }\n",
+                    "#[cfg(test)]\nmod tests {\n",
+                    "    #[test] fn vat_works() { assert_eq!(super::vat(100), 20); }\n",
+                    "    #[test] fn fee_works() { assert_eq!(super::fee(10), 11); }\n",
+                    "    #[test] fn extra_one() { assert_eq!(1, 1); }\n",
+                    "    #[test] fn extra_two() { assert_eq!(2, 2); }\n",
+                    "}\n",
+                ),
+            ),
+            (".config/nextest.toml", "[profile.default]\nretries = 0\n"),
+        ]);
+
+        // Edit vat(): nextest selects ONLY vat_works with nextest binary ID `demo-pkg`,
+        // and NEVER emits a `--doc` step (since nextest does not run doctests).
+        let lib = dir.path().join("src/lib.rs");
+        let text = fs::read_to_string(&lib).unwrap();
+        fs::write(&lib, text.replace("cents / 5", "cents * 20 / 100")).unwrap();
+
+        let p = plan_for(
+            &workspace,
+            Some(&["cargo", "nextest", "run", "--offline"]),
+            false,
+        );
+        let r = &p.runners[0];
+        assert_eq!(r.runner, Kind::Nextest);
+        assert_eq!(r.mode, Mode::Subset);
+        assert_eq!(r.steps.len(), 1);
+        assert_eq!(r.steps[0].kind, StepKind::Filtered);
+        assert!(
+            !r.steps.iter().any(|s| s.kind == StepKind::Doctests),
+            "nextest must never select doctests"
+        );
+        assert_eq!(
+            r.steps[0].argv.join(" "),
+            "cargo nextest run --offline -p demo-pkg --lib -- tests::vat_works --exact"
+        );
+        assert_eq!(
+            r.steps[0].names.get("demo-pkg").map(Vec::as_slice),
+            Some(&["tests::vat_works".to_owned()][..])
+        );
+
+        // Editing `.config/nextest.toml` forces full suite for Nextest.
+        fs::write(&lib, text).unwrap();
+        fs::write(
+            dir.path().join(".config/nextest.toml"),
+            "[profile.default]\nretries = 1\n",
+        )
+        .unwrap();
+        let cfg = plan_for(
+            &workspace,
+            Some(&["cargo", "nextest", "run", "--offline"]),
+            false,
+        );
+        assert_eq!(cfg.runners[0].mode, Mode::Full);
+        assert_eq!(cfg.runners[0].reasons[0].code, "test-config");
+    }
+
+    #[test]
+    fn bun_node_playwright_subsets_and_js_conservative_fallbacks_hold() {
+        let (dir, workspace) = git_repo(&[
+            ("package.json", r#"{"scripts":{"test":"bun test"}}"#),
+            ("bunfig.toml", "[test]\npreload = [\"./src/preload.ts\"]\n"),
+            ("src/preload.ts", "export const loaded = true;\n"),
+            (
+                "src/tax.ts",
+                "export function vat(n: number) { return n / 5; }\n",
+            ),
+            (
+                "src/index.ts",
+                "export { vat as computeVat } from './tax';\n",
+            ),
+            ("src/other.ts", "export function noop() { return 1; }\n"),
+            ("src/a.ts", "export function alpha() { return 1; }\n"),
+            (
+                "src/tax.test.ts",
+                "import { computeVat } from './index';\ntest('vat', () => { computeVat(10); });\n",
+            ),
+            (
+                "src/other.test.ts",
+                "import { noop } from './other';\ntest('noop', () => { noop(); });\n",
+            ),
+            (
+                "src/a.test.ts",
+                "import { alpha } from './a';\ntest('a', () => { alpha(); });\n",
+            ),
+            (
+                "test/a.test.js",
+                "import { alpha } from '../src/a.ts';\ntest('a', () => alpha());\n",
+            ),
+            ("test/b.test.js", "test('b', () => {});\n"),
+            ("test/c.test.js", "test('c', () => {});\n"),
+            (
+                "src/e2e.spec.ts",
+                "import { alpha } from './a';\ntest('e2e', () => alpha());\n",
+            ),
+            ("src/e2e2.spec.ts", "test('e2e2', () => {});\n"),
+            ("src/e2e3.spec.ts", "test('e2e3', () => {});\n"),
+        ]);
+
+        // 1. Barrel re-export: editing `src/tax.ts` selects `src/tax.test.ts` via `src/index.ts` under Bun!
+        let tax = dir.path().join("src/tax.ts");
+        let orig_tax = fs::read_to_string(&tax).unwrap();
+        fs::write(&tax, orig_tax.replace("n / 5", "n * 0.2")).unwrap();
+        let p = plan_for(&workspace, Some(&["bun", "test"]), false);
+        assert_eq!(p.runners[0].runner, Kind::Bun);
+        assert_eq!(p.runners[0].mode, Mode::Subset);
+        assert_eq!(
+            p.runners[0].steps[0].argv,
+            ["bun", "test", "src/tax.test.ts"]
+        );
+        fs::write(&tax, orig_tax).unwrap();
+
+        // 2. Node --test and Playwright positive subsets!
+        let a_file = dir.path().join("src/a.ts");
+        let orig_a = fs::read_to_string(&a_file).unwrap();
+        fs::write(&a_file, orig_a.replace("return 1", "return 2")).unwrap();
+
+        let node_p = plan_for(&workspace, Some(&["node", "--test"]), false);
+        assert_eq!(node_p.runners[0].runner, Kind::NodeTest);
+        assert_eq!(node_p.runners[0].mode, Mode::Subset);
+        assert!(
+            node_p.runners[0].steps[0]
+                .argv
+                .contains(&"test/a.test.js".to_owned()),
+            "{:?}",
+            node_p.runners[0].steps[0].argv
+        );
+        assert!(
+            !node_p.runners[0].steps[0]
+                .argv
+                .contains(&"src/e2e.spec.ts".to_owned()),
+            "node --test must not collect .spec.ts files"
+        );
+
+        let pw_p = plan_for(&workspace, Some(&["playwright", "test"]), false);
+        assert_eq!(pw_p.runners[0].runner, Kind::Playwright);
+        assert_eq!(pw_p.runners[0].mode, Mode::Subset);
+        assert!(
+            pw_p.runners[0].steps[0]
+                .argv
+                .contains(&"src/e2e.spec.ts".to_owned()),
+            "{:?}",
+            pw_p.runners[0].steps[0].argv
+        );
+        fs::write(&a_file, orig_a).unwrap();
+
+        // 3. Config-referenced preload file triggers `test-config` full-suite fallback!
+        let preload = dir.path().join("src/preload.ts");
+        let orig_preload = fs::read_to_string(&preload).unwrap();
+        fs::write(&preload, "export const loaded = false;\n").unwrap();
+        let preload_p = plan_for(&workspace, Some(&["bun", "test"]), false);
+        assert_eq!(preload_p.runners[0].mode, Mode::Full);
+        assert_eq!(preload_p.runners[0].reasons[0].code, "test-config");
+        fs::write(&preload, orig_preload).unwrap();
+
+        // 4. Computed dynamic import triggers `dynamic-import` full-suite fallback!
+        fs::write(
+            dir.path().join("src/loader.ts"),
+            "export const load = (x: string) => import(`./${x}`);\n",
+        )
+        .unwrap();
+        fs::write(&a_file, "export function alpha() { return 3; }\n").unwrap();
+        let dyn_p = plan_for(&workspace, Some(&["bun", "test"]), false);
+        assert_eq!(dyn_p.runners[0].mode, Mode::Full);
+        assert!(
+            dyn_p.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "dynamic-import"),
+            "{:?}",
+            dyn_p.runners[0]
+                .reasons
+                .iter()
+                .map(|r| (r.code, &r.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rspec_selects_subset_and_falls_back_conservatively_on_helpers_and_dynamic_loaders() {
+        let (dir, workspace) = git_repo(&[
+            ("Gemfile", "gem 'rspec'\n"),
+            (".rspec", "--format documentation\n"),
+            ("spec/spec_helper.rb", "RSpec.configure { |_c| }\n"),
+            (
+                "lib/order.rb",
+                "class Order\n  def total(x)\n    x + 1\n  end\nend\n",
+            ),
+            (
+                "lib/other.rb",
+                "class Other\n  def run\n    1\n  end\nend\n",
+            ),
+            (
+                "spec/order_spec.rb",
+                "require_relative '../lib/order'\nRSpec.describe Order do\n  it 'adds' do\n    expect(Order.new.total(1)).to eq(2)\n  end\nend\n",
+            ),
+            (
+                "spec/other_spec.rb",
+                "require_relative '../lib/other'\nRSpec.describe Other do\n  it 'runs' do\n    expect(Other.new.run).to eq(1)\n  end\nend\n",
+            ),
+            (
+                "spec/third_spec.rb",
+                "RSpec.describe 'Third' do\n  it 'ok' do\n    expect(1).to eq(1)\n  end\nend\n",
+            ),
+        ]);
+
+        // Positive subset via require_relative + auto-detected `bundle exec rspec`.
+        let order = dir.path().join("lib/order.rb");
+        let orig = fs::read_to_string(&order).unwrap();
+        fs::write(&order, orig.replace("x + 1", "x + 2")).unwrap();
+        let p = plan_for(&workspace, None, false);
+        assert_eq!(p.runners[0].runner, Kind::Rspec);
+        assert_eq!(p.runners[0].mode, Mode::Subset);
+        assert_eq!(
+            p.runners[0].steps[0].argv,
+            ["bundle", "exec", "rspec", "spec/order_spec.rb"]
+        );
+
+        // Editing spec_helper.rb triggers `test-config` full-suite fallback.
+        fs::write(&order, &orig).unwrap();
+        let helper = dir.path().join("spec/spec_helper.rb");
+        let orig_helper = fs::read_to_string(&helper).unwrap();
+        fs::write(&helper, "RSpec.configure { |c| c.order = :random }\n").unwrap();
+        let helper_p = plan_for(&workspace, None, false);
+        assert_eq!(helper_p.runners[0].mode, Mode::Full);
+        assert_eq!(helper_p.runners[0].reasons[0].code, "test-config");
+
+        // Dynamic `Dir.glob` require forces full-suite fallback on non-spec `.rb` edits.
+        fs::write(
+            &helper,
+            "Dir.glob('spec/support/**/*.rb').each { |f| require f }\n",
+        )
+        .unwrap();
+        // Commit helper so only `lib/order.rb` is dirty.
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qam",
+                    "loader"
+                ])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(&order, orig.replace("x + 1", "x + 3")).unwrap();
+        let dyn_p = plan_for(&workspace, None, false);
+        assert_eq!(dyn_p.runners[0].mode, Mode::Full);
+        assert!(
+            dyn_p.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "dynamic-import"),
+            "{:?}",
+            dyn_p.runners[0]
+                .reasons
+                .iter()
+                .map(|r| r.code)
+                .collect::<Vec<_>>()
+        );
+        let _ = orig_helper;
     }
 }

@@ -18,9 +18,15 @@ use crate::workspace::Workspace;
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Kind {
     Cargo,
+    Nextest,
     Pytest,
     Jest,
     Vitest,
+    Bun,
+    #[serde(rename = "node-test")]
+    NodeTest,
+    Playwright,
+    Rspec,
     Go,
     Command,
 }
@@ -29,9 +35,14 @@ impl Kind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cargo => "cargo",
+            Self::Nextest => "cargo nextest",
             Self::Pytest => "pytest",
             Self::Jest => "jest",
             Self::Vitest => "vitest",
+            Self::Bun => "bun test",
+            Self::NodeTest => "node --test",
+            Self::Playwright => "playwright",
+            Self::Rspec => "rspec",
             Self::Go => "go",
             Self::Command => "command",
         }
@@ -41,9 +52,14 @@ impl Kind {
     pub fn family(self) -> &'static str {
         match self {
             Self::Cargo => "cargo test",
+            Self::Nextest => "cargo nextest",
             Self::Pytest => "pytest",
             Self::Jest => "jest",
             Self::Vitest => "vitest",
+            Self::Bun => "bun test",
+            Self::NodeTest => "node --test",
+            Self::Playwright => "playwright test",
+            Self::Rspec => "rspec",
             Self::Go => "go test",
             Self::Command => "",
         }
@@ -52,9 +68,23 @@ impl Kind {
     /// What one selected unit is for this runner.
     pub fn unit(self) -> &'static str {
         match self {
-            Self::Jest | Self::Vitest => "test file",
+            Self::Jest | Self::Vitest | Self::Bun | Self::NodeTest | Self::Playwright => {
+                "test file"
+            }
+            Self::Rspec => "spec file",
             _ => "test",
         }
+    }
+
+    pub fn is_cargo(self) -> bool {
+        matches!(self, Self::Cargo | Self::Nextest)
+    }
+
+    pub fn is_js(self) -> bool {
+        matches!(
+            self,
+            Self::Jest | Self::Vitest | Self::Bun | Self::NodeTest | Self::Playwright
+        )
     }
 }
 
@@ -337,6 +367,41 @@ impl Target {
             None => format!("{package} {} {}", self.kind, self.name),
         }
     }
+    /// The binary ID `cargo nextest` prints for this target within `package`.
+    pub fn nextest_id(&self, package: &str) -> String {
+        match self.kind.as_str() {
+            "lib" | "proc-macro" | "rlib" | "dylib" | "cdylib" | "staticlib" => package.to_owned(),
+            "bin" => format!("{package}::bin/{}", self.name),
+            "test" => format!("{package}::{}", self.name),
+            "example" => format!("{package}::example/{}", self.name),
+            "bench" => format!("{package}::bench/{}", self.name),
+            _ => format!("{package}::{}", self.name),
+        }
+    }
+}
+
+/// The Cargo option slice from a `cargo test` or `cargo nextest run` command,
+/// before any `--`.
+pub(crate) fn cargo_user_args(base: &[String]) -> Vec<String> {
+    let words: Vec<&str> = base.iter().map(String::as_str).collect();
+    let unwrapped = crate::filters::unwrap_tool(&words);
+    let tail = match unwrapped {
+        [prog, "nextest", "run" | "r", rest @ ..]
+            if Path::new(prog).file_name().and_then(|n| n.to_str()) == Some("cargo") =>
+        {
+            rest
+        }
+        [prog, "test", rest @ ..]
+            if Path::new(prog).file_name().and_then(|n| n.to_str()) == Some("cargo") =>
+        {
+            rest
+        }
+        _ => &words[2.min(words.len())..],
+    };
+    tail.iter()
+        .take_while(|word| **word != "--")
+        .map(|word| (*word).to_owned())
+        .collect()
 }
 
 impl Package {
@@ -821,7 +886,8 @@ pub(crate) fn detect(
         pytest_configure(workspace, &mut runner);
         runners.push(runner);
     }
-    // Jest and Vitest: package.json files that name them.
+    // JavaScript/TypeScript runners: Jest, Vitest, Bun test, Node --test, Playwright.
+    let mut js_roots = BTreeSet::new();
     for file in index.files.keys() {
         if !(file == "package.json" || file.ends_with("/package.json")) {
             continue;
@@ -847,39 +913,138 @@ pub(crate) fn detect(
                         .is_some_and(|name| name.starts_with(prefix))
             })
         };
+        let has_file = |name: &str| {
+            let path = if directory.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{directory}/{name}")
+            };
+            index.files.contains_key(&path)
+        };
         let jest = listed("jest") || json.get("jest").is_some() || configured("jest.config.");
         let vitest = listed("vitest") || configured("vitest.config.");
-        let kind = match (jest, vitest) {
+        match (jest, vitest) {
             (true, true) => bail!(
                 "{file} lists both jest and vitest; pass the runner after --, e.g. {} test --affected -- npx vitest run",
                 workspace.justless()
             ),
-            (true, false) => Kind::Jest,
-            (false, true) => Kind::Vitest,
-            (false, false) => continue,
-        };
-        let base = match kind {
-            Kind::Jest => words(&["node_modules/.bin/jest"]),
-            _ => words(&["node_modules/.bin/vitest", "run"]),
-        };
-        let mut runner = Runner::new(kind, directory.clone(), base);
-        if !workspace
-            .root
-            .join(&directory)
-            .join(&runner.base[0])
-            .is_file()
-        {
-            runner.error = Some(format!(
-                "{} is not installed in {}",
-                runner.base[0],
-                if directory.is_empty() {
-                    "."
-                } else {
-                    &directory
+            (true, false) | (false, true) => {
+                let kind = if jest { Kind::Jest } else { Kind::Vitest };
+                let base = match kind {
+                    Kind::Jest => words(&["node_modules/.bin/jest"]),
+                    _ => words(&["node_modules/.bin/vitest", "run"]),
+                };
+                let mut runner = Runner::new(kind, directory.clone(), base);
+                if !workspace
+                    .root
+                    .join(&directory)
+                    .join(&runner.base[0])
+                    .is_file()
+                {
+                    runner.error = Some(format!(
+                        "{} is not installed in {}",
+                        runner.base[0],
+                        if directory.is_empty() {
+                            "."
+                        } else {
+                            &directory
+                        }
+                    ));
                 }
-            ));
+                js_roots.insert(directory);
+                runners.push(runner);
+                continue;
+            }
+            (false, false) => {}
         }
-        runners.push(runner);
+        // Check scripts.test for explicit `bun test`, `node --test`, or `playwright test`.
+        if let Some(script) = json["scripts"]["test"].as_str()
+            && let Some(mut runner) = detect_script_runner(workspace, &directory, script)
+        {
+            if runner.kind == Kind::Playwright
+                && runner
+                    .base
+                    .first()
+                    .is_some_and(|b| b.starts_with("node_modules/"))
+                && !workspace
+                    .root
+                    .join(&directory)
+                    .join(&runner.base[0])
+                    .is_file()
+            {
+                runner.error = Some(format!(
+                    "{} is not installed in {}",
+                    runner.base[0],
+                    if directory.is_empty() {
+                        "."
+                    } else {
+                        &directory
+                    }
+                ));
+            }
+            js_roots.insert(directory);
+            runners.push(runner);
+            continue;
+        }
+        // Bun test via bunfig.toml `[test]` or Bun lockfile + Bun types with test files.
+        let bunfig_path = if directory.is_empty() {
+            "bunfig.toml".to_owned()
+        } else {
+            format!("{directory}/bunfig.toml")
+        };
+        let bunfig_tests =
+            index.files.contains_key(&bunfig_path) && contains(workspace, &bunfig_path, "[test]");
+        let bun_project =
+            (has_file("bun.lock") || has_file("bun.lockb") || has_file("bunfig.toml"))
+                && (listed("@types/bun") || listed("bun-types"))
+                && index
+                    .files
+                    .keys()
+                    .any(|other| under(other, &directory) && is_bun_test_file(other));
+        if bunfig_tests || bun_project {
+            js_roots.insert(directory.clone());
+            runners.push(Runner::new(Kind::Bun, directory, words(&["bun", "test"])));
+        }
+    }
+    // Standalone bunfig.toml with [test] and no package.json in the same directory.
+    for file in index.files.keys() {
+        if !(file == "bunfig.toml" || file.ends_with("/bunfig.toml")) {
+            continue;
+        }
+        let directory = parent(file).to_owned();
+        if !js_roots.contains(&directory) && contains(workspace, file, "[test]") {
+            js_roots.insert(directory.clone());
+            runners.push(Runner::new(Kind::Bun, directory, words(&["bun", "test"])));
+        }
+    }
+    // Ruby RSpec: `.rspec` or a Gemfile listing `rspec`, alongside at least one `*_spec.rb`.
+    let mut rspec_roots = BTreeSet::new();
+    for file in index.files.keys() {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        let marker = name == ".rspec" || (name == "Gemfile" && contains(workspace, file, "rspec"));
+        if marker {
+            let directory = parent(file).to_owned();
+            if index
+                .files
+                .keys()
+                .any(|other| under(other, &directory) && other.ends_with("_spec.rb"))
+            {
+                rspec_roots.insert(directory);
+            }
+        }
+    }
+    for root in rspec_roots {
+        let gemfile = if root.is_empty() {
+            "Gemfile".to_owned()
+        } else {
+            format!("{root}/Gemfile")
+        };
+        let base = if index.files.contains_key(&gemfile) {
+            words(&["bundle", "exec", "rspec"])
+        } else {
+            words(&["rspec"])
+        };
+        runners.push(Runner::new(Kind::Rspec, root, base));
     }
     // Go: each module.
     for file in index.files.keys() {
@@ -910,6 +1075,55 @@ fn contains(workspace: &Workspace, file: &str, needle: &str) -> bool {
     fs::read_to_string(workspace.root.join(file)).is_ok_and(|text| text.contains(needle))
 }
 
+/// Whether `file` matches Bun's default test file discovery conventions.
+pub(crate) fn is_bun_test_file(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let Some(stem) = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]
+        .iter()
+        .find_map(|ext| name.strip_suffix(ext))
+    else {
+        return false;
+    };
+    stem.ends_with(".test")
+        || stem.ends_with(".spec")
+        || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+}
+
+/// Whether `file` matches Node's `node --test` default discovery conventions.
+pub(crate) fn is_node_test_file(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let Some(stem) = [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx"]
+        .iter()
+        .find_map(|ext| name.strip_suffix(ext))
+    else {
+        return false;
+    };
+    let in_test_dir = Path::new(file)
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .any(|part| part.as_os_str().to_str() == Some("test"));
+    in_test_dir
+        || stem == "test"
+        || stem.starts_with("test-")
+        || stem.ends_with(".test")
+        || stem.ends_with("-test")
+        || stem.ends_with("_test")
+}
+
+/// Whether `file` matches Playwright's / Vitest's default `*.test.*` or `*.spec.*` pattern.
+pub(crate) fn is_dot_test_or_spec_file(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let Some(stem) = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]
+        .iter()
+        .find_map(|ext| name.strip_suffix(ext))
+    else {
+        return false;
+    };
+    stem.ends_with(".test") || stem.ends_with(".spec")
+}
+
 /// The runner behind a command the user gave after `--`.
 fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String]) -> Runner {
     let all: Vec<&str> = command.iter().map(String::as_str).collect();
@@ -937,6 +1151,21 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
             }
             runner
         }
+        ("cargo", ["nextest", "run" | "r", tail @ ..]) => {
+            if has_flag(tail, &["--list"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("cargo nextest --list".into());
+                return runner;
+            }
+            let mut runner = Runner::new(Kind::Nextest, cwd.to_owned(), base);
+            runner.selects = nextest_selects(tail);
+            let manifest_path = flag_value(tail, "--manifest-path");
+            match cargo_facts(workspace, index, &workspace.cwd, manifest_path.as_deref()) {
+                Ok(facts) => runner.cargo = Some(facts),
+                Err(error) => runner.error = Some(format!("{error:#}")),
+            }
+            runner
+        }
         ("cargo", ["nextest", ..]) => {
             let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
             runner.unknown = Some("cargo nextest".into());
@@ -953,6 +1182,16 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
             runner
         }
         ("jest", tail) => {
+            if has_flag(tail, &["--watch", "--watchAll"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("jest in watch mode".into());
+                return runner;
+            }
+            if has_flag(tail, &["--listTests", "--showConfig"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("jest listing/config mode".into());
+                return runner;
+            }
             let mut runner = Runner::new(Kind::Jest, cwd.to_owned(), base);
             runner.selects = js_selects(tail);
             runner
@@ -965,14 +1204,77 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
                     runner.unknown = Some("vitest in watch mode".into());
                     return runner;
                 }
+                ["bench" | "list" | "typecheck" | "init", ..] => {
+                    let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                    runner.unknown = Some(format!("vitest {}", tail[0]));
+                    return runner;
+                }
                 _ => tail,
             };
+            if has_flag(tail, &["--watch", "-w"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("vitest in watch mode".into());
+                return runner;
+            }
+            if has_flag(tail, &["--ui"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("vitest in --ui mode".into());
+                return runner;
+            }
             let mut runner = Runner::new(Kind::Vitest, cwd.to_owned(), base);
             runner.selects = js_selects(tail);
-            if !runner.base[offset..].iter().any(|word| word == "run") {
+            if !runner.base[offset..]
+                .iter()
+                .any(|word| word == "run" || word == "--run")
+            {
                 // Without `run` Vitest watches; insert it so the step ends.
                 runner.base.insert(offset + 1, "run".into());
             }
+            runner
+        }
+        ("bun", ["test", tail @ ..]) => {
+            if has_flag(tail, &["--watch"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("bun test in watch mode".into());
+                return runner;
+            }
+            let mut runner = Runner::new(Kind::Bun, cwd.to_owned(), base);
+            runner.selects = bun_selects(tail);
+            runner
+        }
+        ("node", tail) if is_node_test_command(tail) => {
+            if has_flag(tail, &["--watch"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("node --test in watch mode".into());
+                return runner;
+            }
+            let mut runner = Runner::new(Kind::NodeTest, cwd.to_owned(), base);
+            runner.selects = node_test_selects(tail);
+            runner
+        }
+        ("playwright", ["test", tail @ ..]) => {
+            if has_flag(tail, &["--ui", "--debug"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("playwright test interactive mode".into());
+                return runner;
+            }
+            if has_flag(tail, &["--list"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("playwright test --list".into());
+                return runner;
+            }
+            let mut runner = Runner::new(Kind::Playwright, cwd.to_owned(), base);
+            runner.selects = playwright_selects(tail);
+            runner
+        }
+        ("rspec", tail) => {
+            if has_flag(tail, &["--dry-run", "--init"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("rspec non-run mode".into());
+                return runner;
+            }
+            let mut runner = Runner::new(Kind::Rspec, cwd.to_owned(), base);
+            runner.selects = rspec_selects(tail);
             runner
         }
         ("go", ["test", tail @ ..]) => {
@@ -980,9 +1282,8 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
             runner.selects = go_selects(tail);
             runner
         }
-        ("npm" | "pnpm" | "yarn" | "bun", ["test"] | ["run", "test"] | ["t"]) => {
-            script_runner(workspace, cwd, program, base)
-        }
+        ("npm" | "pnpm" | "yarn", ["test"] | ["run", "test"] | ["t"])
+        | ("bun", ["run", "test"] | ["t"]) => script_runner(workspace, cwd, program, base),
         _ => {
             let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
             runner.unknown = Some(
@@ -995,7 +1296,7 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
             runner
         }
     };
-    if runner.kind == Kind::Cargo
+    if runner.kind.is_cargo()
         && let Some(facts) = &runner.cargo
     {
         runner.root = parent(&facts.root_manifest).to_owned();
@@ -1004,6 +1305,13 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
         pytest_configure(workspace, &mut runner);
     }
     runner
+}
+
+fn has_flag(tail: &[&str], flags: &[&str]) -> bool {
+    tail.iter().take_while(|word| **word != "--").any(|word| {
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        flags.contains(&flag)
+    })
 }
 
 /// Reads pytest's options from the nearest configuration at or above the root.
@@ -1022,8 +1330,46 @@ fn pytest_configure(workspace: &Workspace, runner: &mut Runner) {
     }
 }
 
-/// `npm test` and friends: a plain `jest` or `vitest` test script is run from
-/// node_modules/.bin with its flags; anything else is run unchanged.
+/// Parses a plain `package.json` `scripts.test` string into a known JS runner
+/// (for auto-detection when neither Jest nor Vitest is installed directly).
+fn detect_script_runner(_workspace: &Workspace, directory: &str, script: &str) -> Option<Runner> {
+    let plain = !script.contains(['&', '|', ';', '>', '<', '$', '`', '(', '"', '\''])
+        && !script.split_whitespace().any(|word| word.contains('='));
+    if !plain {
+        return None;
+    }
+    let parts = shlex::split(script)?;
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let unwrapped = crate::filters::unwrap_tool(&refs);
+    match unwrapped {
+        ["bun", "test", tail @ ..] if !has_flag(tail, &["--watch"]) => {
+            let mut command = words(&["bun", "test"]);
+            command.extend(tail.iter().map(|s| (*s).to_owned()));
+            let mut runner = Runner::new(Kind::Bun, directory.to_owned(), command);
+            runner.selects = bun_selects(tail);
+            Some(runner)
+        }
+        ["node", tail @ ..] if is_node_test_command(tail) && !has_flag(tail, &["--watch"]) => {
+            let mut command = vec!["node".to_owned()];
+            command.extend(tail.iter().map(|s| (*s).to_owned()));
+            let mut runner = Runner::new(Kind::NodeTest, directory.to_owned(), command);
+            runner.selects = node_test_selects(tail);
+            Some(runner)
+        }
+        ["playwright", "test", tail @ ..] if !has_flag(tail, &["--ui", "--debug", "--list"]) => {
+            let mut command = words(&["node_modules/.bin/playwright", "test"]);
+            command.extend(tail.iter().map(|s| (*s).to_owned()));
+            let mut runner = Runner::new(Kind::Playwright, directory.to_owned(), command);
+            runner.selects = playwright_selects(tail);
+            Some(runner)
+        }
+        _ => None,
+    }
+}
+
+/// `npm test` and friends: a plain `jest`, `vitest`, `bun test`, `node --test`,
+/// or `playwright test` script is resolved directly with its flags; anything
+/// else is run unchanged.
 fn script_runner(workspace: &Workspace, cwd: &str, program: &str, base: Vec<String>) -> Runner {
     let script = fs::read_to_string(workspace.root.join(cwd).join("package.json"))
         .ok()
@@ -1036,31 +1382,83 @@ fn script_runner(workspace: &Workspace, cwd: &str, program: &str, base: Vec<Stri
     if let Some(script) = plain
         && let Some(parts) = shlex::split(script)
     {
-        let tool = parts.first().map(String::as_str);
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let unwrapped = crate::filters::unwrap_tool(&refs);
         let binary = |name: &str| format!("node_modules/.bin/{name}");
-        match tool {
-            Some("jest") => {
+        match unwrapped {
+            ["jest", tail @ ..] => {
+                if has_flag(
+                    tail,
+                    &["--watch", "--watchAll", "--listTests", "--showConfig"],
+                ) {
+                    let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                    runner.unknown = Some(format!("{program} test (jest watch/list)"));
+                    return runner;
+                }
                 let mut command = vec![binary("jest")];
-                command.extend(parts[1..].iter().cloned());
+                command.extend(tail.iter().map(|s| (*s).to_owned()));
                 let mut runner = Runner::new(Kind::Jest, cwd.to_owned(), command);
-                let tail: Vec<&str> = parts[1..].iter().map(String::as_str).collect();
-                runner.selects = js_selects(&tail);
+                runner.selects = js_selects(tail);
                 return runner;
             }
-            Some("vitest") => {
-                let mut tail: Vec<String> = parts[1..].to_vec();
-                if tail.first().map(String::as_str) == Some("run") {
-                    tail.remove(0);
-                } else if matches!(tail.first().map(String::as_str), Some("watch" | "dev")) {
+            ["vitest", tail @ ..] => {
+                let mut owned_tail: Vec<String> = tail.iter().map(|s| (*s).to_owned()).collect();
+                if owned_tail.first().map(String::as_str) == Some("run") {
+                    owned_tail.remove(0);
+                } else if matches!(
+                    owned_tail.first().map(String::as_str),
+                    Some("watch" | "dev" | "bench" | "list" | "typecheck" | "init")
+                ) {
+                    let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                    runner.unknown = Some(format!("{program} test (vitest watch)"));
+                    return runner;
+                }
+                let tail_refs: Vec<&str> = owned_tail.iter().map(String::as_str).collect();
+                if has_flag(&tail_refs, &["--watch", "-w", "--ui"]) {
                     let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
                     runner.unknown = Some(format!("{program} test (vitest watch)"));
                     return runner;
                 }
                 let mut command = vec![binary("vitest"), "run".into()];
-                command.extend(tail.iter().cloned());
+                command.extend(owned_tail.iter().cloned());
                 let mut runner = Runner::new(Kind::Vitest, cwd.to_owned(), command);
-                let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
-                runner.selects = js_selects(&tail);
+                runner.selects = js_selects(&tail_refs);
+                return runner;
+            }
+            ["bun", "test", tail @ ..] => {
+                if has_flag(tail, &["--watch"]) {
+                    let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                    runner.unknown = Some(format!("{program} test (bun test watch)"));
+                    return runner;
+                }
+                let mut command = words(&["bun", "test"]);
+                command.extend(tail.iter().map(|s| (*s).to_owned()));
+                let mut runner = Runner::new(Kind::Bun, cwd.to_owned(), command);
+                runner.selects = bun_selects(tail);
+                return runner;
+            }
+            ["node", tail @ ..] if is_node_test_command(tail) => {
+                if has_flag(tail, &["--watch"]) {
+                    let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                    runner.unknown = Some(format!("{program} test (node --test watch)"));
+                    return runner;
+                }
+                let mut command = vec!["node".to_owned()];
+                command.extend(tail.iter().map(|s| (*s).to_owned()));
+                let mut runner = Runner::new(Kind::NodeTest, cwd.to_owned(), command);
+                runner.selects = node_test_selects(tail);
+                return runner;
+            }
+            ["playwright", "test", tail @ ..] => {
+                if has_flag(tail, &["--ui", "--debug", "--list"]) {
+                    let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                    runner.unknown = Some(format!("{program} test (playwright interactive)"));
+                    return runner;
+                }
+                let mut command = vec![binary("playwright"), "test".into()];
+                command.extend(tail.iter().map(|s| (*s).to_owned()));
+                let mut runner = Runner::new(Kind::Playwright, cwd.to_owned(), command);
+                runner.selects = playwright_selects(tail);
                 return runner;
             }
             _ => {}
@@ -1161,6 +1559,316 @@ fn cargo_selects(tail: &[&str]) -> Option<String> {
             return Some((*word).to_owned());
         }
         if LIBTEST_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    None
+}
+
+/// `cargo nextest run` options that take a separate value.
+const NEXTEST_VALUES: &[&str] = &[
+    "-P",
+    "--profile",
+    "--cargo-profile",
+    "--build-jobs",
+    "--config-file",
+    "--user-config-file",
+    "--tool-config-file",
+    "--override-version-check",
+    "--test-threads",
+    "--retries",
+    "--status-level",
+    "--final-status-level",
+    "--failure-output",
+    "--success-output",
+    "--no-tests",
+    "--hide-progress-bar",
+    "--show-progress",
+    "--max-fail",
+    "--workspace-remap",
+    "--target-dir-remap",
+    "--cargo-metadata",
+    "--binaries-metadata",
+    "--extract-to",
+    "--cargo-message-format",
+    "--message-format-version",
+    "--stress-count",
+    "--stress-duration",
+    "--target-runner",
+];
+
+const NEXTEST_SELECTS: &[&str] = &[
+    "-E",
+    "--filterset",
+    "--filter-expr",
+    "--default-filter",
+    "--run-ignored",
+    "--partition",
+    "--archive-file",
+    "--rerun",
+];
+
+fn nextest_selects(tail: &[&str]) -> Option<String> {
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if CARGO_SELECTS.contains(&flag)
+            || NEXTEST_SELECTS.contains(&flag)
+            || (word.starts_with("-p") && word.len() > 2)
+            || (word.starts_with("-E") && word.len() > 2)
+        {
+            return Some((*word).to_owned());
+        }
+        if CARGO_VALUES.contains(word) || NEXTEST_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    while let Some(word) = words.next() {
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if LIBTEST_SELECTS.contains(&flag) {
+            return Some((*word).to_owned());
+        }
+        if LIBTEST_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    None
+}
+
+const BUN_VALUES: &[&str] = &[
+    "-t",
+    "--test-name-pattern",
+    "--timeout",
+    "--concurrency",
+    "--max-concurrency",
+    "--rerun-each",
+    "--reporter",
+    "--reporter-outfile",
+    "--preload",
+    "-r",
+    "--cwd",
+    "--config",
+    "-c",
+    "--env-file",
+    "--seed",
+    "--coverage-reporter",
+    "--coverage-dir",
+    "--coverage-threshold",
+];
+
+fn bun_selects(tail: &[&str]) -> Option<String> {
+    let mut words = tail.iter().peekable();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            if let Some(next) = words.next() {
+                return Some((*next).to_owned());
+            }
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if matches!(flag, "--only" | "--todo") {
+            return Some((*word).to_owned());
+        }
+        if *word == "--bail" {
+            if words
+                .peek()
+                .is_some_and(|next| !next.is_empty() && next.bytes().all(|b| b.is_ascii_digit()))
+            {
+                words.next();
+            }
+            continue;
+        }
+        if BUN_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    None
+}
+
+const NODE_TEST_VALUES: &[&str] = &[
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-concurrency",
+    "--test-timeout",
+    "--test-coverage-branches",
+    "--test-coverage-functions",
+    "--test-coverage-lines",
+    "--test-coverage-include",
+    "--test-coverage-exclude",
+    "--test-global-setup",
+    "--test-rerun-failures",
+    "--import",
+    "-r",
+    "--require",
+    "--loader",
+    "--experimental-loader",
+    "--conditions",
+    "-C",
+    "--env-file",
+    "--env-file-if-exists",
+    "--max-old-space-size",
+    "--cpu-prof-dir",
+    "--diagnostic-dir",
+];
+
+fn is_node_test_command(tail: &[&str]) -> bool {
+    let mut saw_test = false;
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if matches!(flag, "-e" | "--eval" | "-p" | "--print" | "-c" | "--check") {
+            return false;
+        }
+        if *word == "--test" {
+            saw_test = true;
+            continue;
+        }
+        if NODE_TEST_VALUES.contains(word) {
+            words.next();
+        }
+    }
+    saw_test
+}
+
+fn node_test_selects(tail: &[&str]) -> Option<String> {
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            if let Some(next) = words.next() {
+                return Some((*next).to_owned());
+            }
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if matches!(
+            flag,
+            "--test-name-pattern" | "--test-skip-pattern" | "--test-only" | "--test-shard"
+        ) {
+            return Some((*word).to_owned());
+        }
+        if NODE_TEST_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    None
+}
+
+const PLAYWRIGHT_VALUES: &[&str] = &[
+    "-c",
+    "--config",
+    "--project",
+    "--reporter",
+    "-j",
+    "--workers",
+    "--retries",
+    "--timeout",
+    "--global-timeout",
+    "--max-failures",
+    "--output",
+    "--trace",
+    "--repeat-each",
+    "--tsconfig",
+    "--fail-on-flaky-tests",
+];
+
+fn playwright_selects(tail: &[&str]) -> Option<String> {
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            if let Some(next) = words.next() {
+                return Some((*next).to_owned());
+            }
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if matches!(
+            flag,
+            "-g" | "--grep" | "--grep-invert" | "--shard" | "--last-failed" | "--only-changed"
+        ) {
+            return Some((*word).to_owned());
+        }
+        if PLAYWRIGHT_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    None
+}
+
+const RSPEC_VALUES: &[&str] = &[
+    "-f",
+    "--format",
+    "-o",
+    "--out",
+    "-I",
+    "-r",
+    "--require",
+    "-O",
+    "--options",
+    "--order",
+    "--seed",
+    "--deprecation-out",
+    "-P",
+    "--pattern",
+    "--exclude-pattern",
+    "--default-path",
+    "--failure-exit-code",
+    "--error-exit-code",
+];
+
+fn rspec_selects(tail: &[&str]) -> Option<String> {
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            if let Some(next) = words.next() {
+                return Some((*next).to_owned());
+            }
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if matches!(
+            flag,
+            "-e" | "--example"
+                | "-E"
+                | "--example-matches"
+                | "-t"
+                | "--tag"
+                | "--only-failures"
+                | "--next-failure"
+                | "--examples"
+        ) {
+            return Some((*word).to_owned());
+        }
+        if RSPEC_VALUES.contains(word) {
             words.next();
             continue;
         }
@@ -1333,6 +2041,10 @@ pub(crate) struct Tally {
     /// Cargo and pytest: each failing test with its target key and what the
     /// runner said about it. pytest `ERROR` lines count here, not in `failed`.
     pub failures: Vec<Failure>,
+    /// Whether the runner explicitly reported that no tests matched the selection.
+    pub no_tests_matched: bool,
+    /// Non-test suite/load/compile errors reported by the runner (never widened as 0-ran).
+    pub errors: usize,
 }
 
 /// A failing test and the runner's message about it.
@@ -1371,16 +2083,37 @@ impl Tally {
 pub(crate) fn tally(kind: Kind, stdout: &str, stderr: &str) -> Tally {
     match kind {
         Kind::Cargo => cargo_tally(stdout, stderr),
+        Kind::Nextest => nextest_tally(stdout, stderr),
         Kind::Pytest => pytest_tally(&format!("{stdout}\n{stderr}")),
         Kind::Jest | Kind::Vitest => js_tally(&format!("{stdout}\n{stderr}")),
+        Kind::Bun => bun_tally(&format!("{stdout}\n{stderr}")),
+        Kind::NodeTest => node_test_tally(&format!("{stdout}\n{stderr}")),
+        Kind::Playwright => playwright_tally(&format!("{stdout}\n{stderr}")),
+        Kind::Rspec => rspec_tally(&format!("{stdout}\n{stderr}")),
         Kind::Go => go_tally(stdout),
         Kind::Command => {
+            let combined = format!("{stdout}\n{stderr}");
             let mut tally = cargo_tally(stdout, stderr);
+            if !tally.known {
+                tally = nextest_tally(stdout, stderr);
+            }
             if !tally.known {
                 tally = pytest_tally(stdout);
             }
             if !tally.known {
-                tally = js_tally(&format!("{stdout}\n{stderr}"));
+                tally = js_tally(&combined);
+            }
+            if !tally.known {
+                tally = bun_tally(&combined);
+            }
+            if !tally.known {
+                tally = node_test_tally(&combined);
+            }
+            if !tally.known {
+                tally = playwright_tally(&combined);
+            }
+            if !tally.known {
+                tally = rspec_tally(&combined);
             }
             if !tally.known {
                 tally = go_tally(stdout);
@@ -1388,6 +2121,168 @@ pub(crate) fn tally(kind: Kind, stdout: &str, stderr: &str) -> Tally {
             tally
         }
     }
+}
+
+/// Parses `PASS`/`FAIL`/`TIMEOUT`/`SKIP`/`FLAKY` and `Summary [...]` lines from
+/// `cargo nextest run`. Nextest writes its status stream to stderr (or stdout
+/// when merged), and repeats `FAIL` lines after `Summary`, so outcomes are
+/// deduplicated per `(binary_id, test_name)`.
+fn nextest_tally(stdout: &str, stderr: &str) -> Tally {
+    let mut tally = Tally::default();
+    let mut seen = BTreeSet::<(String, String)>::new();
+    let mut summary_run = 0usize;
+    let mut summary_skipped = 0usize;
+    let mut saw_summary = false;
+    let mut output: Option<(String, String, Vec<String>)> = None;
+
+    let finish_output = |tally: &mut Tally, output: &mut Option<(String, String, Vec<String>)>| {
+        if let Some((target, name, lines)) = output.take() {
+            let text = lines.join("\n").trim().to_owned();
+            if !text.is_empty() {
+                let failure = tally.failure(&target, &name);
+                if failure.message.is_empty() {
+                    failure.message = text;
+                } else {
+                    failure.message.push('\n');
+                    failure.message.push_str(&text);
+                }
+            }
+        }
+    };
+
+    for text in [stderr, stdout] {
+        finish_output(&mut tally, &mut output);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Summary [")
+                || trimmed.starts_with("--- STDOUT:")
+                || trimmed.starts_with("--- STDERR:")
+                || trimmed.starts_with("PASS [")
+                || trimmed.starts_with("FAIL [")
+                || trimmed.starts_with("TIMEOUT [")
+                || trimmed.starts_with("SKIP [")
+                || trimmed.starts_with("FLAKY ")
+                || (trimmed.len() >= 6 && trimmed.bytes().all(|b| b == b'-'))
+            {
+                finish_output(&mut tally, &mut output);
+            }
+            if let Some(rest) = trimmed
+                .strip_prefix("--- STDOUT:")
+                .or_else(|| trimmed.strip_prefix("--- STDERR:"))
+                .and_then(|s| s.strip_suffix(" ---"))
+                .map(str::trim)
+                && let Some((binary, name)) = split_nextest_target_name(rest)
+            {
+                output = Some((binary.to_owned(), name.to_owned(), Vec::new()));
+                continue;
+            }
+            if let Some((_, _, lines)) = &mut output {
+                lines.push(line.to_owned());
+                continue;
+            }
+            if trimmed.starts_with("Summary [")
+                && let Some((_, rest)) = trimmed.split_once("] ")
+                && (rest.contains(" tests run:") || rest.contains(" test run:"))
+            {
+                tally.known = true;
+                saw_summary = true;
+                let ran = count_before(rest, "tests")
+                    .or_else(|| count_before(rest, "test"))
+                    .unwrap_or(0);
+                let skipped = count_before(rest, "skipped").unwrap_or(0);
+                summary_run += ran;
+                summary_skipped += skipped;
+                *tally.counts.entry("*".into()).or_default() += ran + skipped;
+                if ran == 0 && skipped == 0 {
+                    tally.no_tests_matched = true;
+                }
+                continue;
+            }
+            if trimmed.contains("no tests to run")
+                && (trimmed.starts_with("error:") || trimmed.starts_with("WARN"))
+            {
+                tally.no_tests_matched = true;
+                continue;
+            }
+            if let Some((status, binary, name)) = parse_nextest_outcome(trimmed) {
+                tally.known = true;
+                match status {
+                    "PASS" | "FLAKY" => {
+                        if seen.insert((binary.to_owned(), name.to_owned())) {
+                            tally.ran += 1;
+                            tally
+                                .names
+                                .entry(binary.to_owned())
+                                .or_default()
+                                .insert(name.to_owned());
+                        }
+                    }
+                    "FAIL" | "TIMEOUT" => {
+                        if seen.insert((binary.to_owned(), name.to_owned())) {
+                            tally.ran += 1;
+                            tally.failed.push(name.to_owned());
+                            tally.failure(binary, name);
+                            tally
+                                .names
+                                .entry(binary.to_owned())
+                                .or_default()
+                                .insert(name.to_owned());
+                        }
+                    }
+                    "SKIP" if seen.insert((binary.to_owned(), name.to_owned())) => {
+                        tally.ignored += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        finish_output(&mut tally, &mut output);
+    }
+    if saw_summary {
+        tally.ran = tally.ran.max(summary_run);
+        tally.ignored = tally.ignored.max(summary_skipped);
+    }
+    tally
+}
+
+fn parse_nextest_outcome(trimmed: &str) -> Option<(&'static str, &str, &str)> {
+    let (status, after_bracket) = if let Some(rest) = trimmed.strip_prefix("PASS [") {
+        ("PASS", rest.split_once("] ")?.1)
+    } else if let Some(rest) = trimmed.strip_prefix("FAIL [") {
+        ("FAIL", rest.split_once("] ")?.1)
+    } else if let Some(rest) = trimmed.strip_prefix("TIMEOUT [") {
+        ("TIMEOUT", rest.split_once("] ")?.1)
+    } else if let Some(rest) = trimmed.strip_prefix("SKIP [") {
+        ("SKIP", rest.split_once("] ")?.1)
+    } else {
+        let rest = trimmed.strip_prefix("FLAKY ")?;
+        let (_, rest) = rest.split_once('[')?;
+        ("FLAKY", rest.split_once("] ")?.1)
+    };
+    let tail = strip_nextest_retry_prefix(after_bracket.trim_start());
+    let (binary, name) = split_nextest_target_name(tail)?;
+    Some((status, binary, name))
+}
+
+fn strip_nextest_retry_prefix(tail: &str) -> &str {
+    tail.strip_prefix('(')
+        .and_then(|s| s.split_once(") "))
+        .filter(|(tries, _)| {
+            tries.split_once('/').is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            })
+        })
+        .map_or(tail, |(_, rest)| rest.trim_start())
+}
+
+fn split_nextest_target_name(text: &str) -> Option<(&str, &str)> {
+    let mut parts = text.split_whitespace();
+    let binary = parts.next()?;
+    let name = parts.next()?;
+    (!binary.is_empty() && !name.is_empty()).then_some((binary, name))
 }
 
 /// Pairs each `running N tests` block on stdout with the k-th `Running` or
@@ -1572,8 +2467,19 @@ fn pytest_tally(stdout: &str) -> Tally {
 
 fn js_tally(text: &str) -> Tally {
     let mut tally = Tally::default();
+    let mut failed_suites = 0usize;
     for line in text.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("No tests found")
+            || trimmed.starts_with("No test files found")
+            || trimmed.contains("No test files found, exiting")
+        {
+            tally.no_tests_matched = true;
+        }
+        // Jest: `Test Suites: 1 failed, 1 total`
+        if let Some(rest) = trimmed.strip_prefix("Test Suites:") {
+            failed_suites = failed_suites.max(count_before(rest, "failed").unwrap_or(0));
+        }
         // Jest: `Tests:       1 failed, 6 passed, 7 total`
         if let Some(rest) = trimmed.strip_prefix("Tests:") {
             tally.known = true;
@@ -1581,24 +2487,447 @@ fn js_tally(text: &str) -> Tally {
             tally.ignored = count_before(rest, "skipped").unwrap_or(0);
             tally.ran = tally.ran.saturating_sub(tally.ignored);
         }
-        // Vitest: `Tests  2 failed | 5 passed (7)`
-        else if let Some(rest) = trimmed.strip_prefix("Tests ")
-            && let Some(total) = rest
+        // Vitest: `Tests  2 failed | 5 passed (7)` or `Tests  no tests`
+        else if let Some(rest) = trimmed.strip_prefix("Tests ") {
+            let rest = rest.trim();
+            if rest == "no tests" {
+                tally.known = true;
+                tally.no_tests_matched = true;
+            } else if let Some(total) = rest
                 .rsplit_once('(')
                 .and_then(|(_, total)| total.trim_end_matches(')').trim().parse::<usize>().ok())
+            {
+                tally.known = true;
+                tally.ignored = count_before(rest, "skipped").unwrap_or(0);
+                tally.ran = total.saturating_sub(tally.ignored);
+            }
+        }
+        // Vitest: `Errors  1 error`
+        else if let Some(rest) = trimmed.strip_prefix("Errors ")
+            && let Some(count) =
+                count_before(rest, "error").or_else(|| count_before(rest, "errors"))
         {
-            tally.known = true;
-            tally.ignored = count_before(rest, "skipped").unwrap_or(0);
-            tally.ran = total.saturating_sub(tally.ignored);
+            tally.errors += count;
         }
         if let Some(file) = trimmed.strip_prefix("FAIL ").or_else(|| {
             trimmed
                 .strip_prefix("❯ ")
                 .filter(|rest| rest.contains(".test.") || rest.contains(".spec."))
         }) {
+            let file = file.trim();
             let file = file.split_whitespace().next().unwrap_or(file);
-            if !tally.failed.iter().any(|known| known == file) {
+            if !file.is_empty() && !tally.failed.iter().any(|known| known == file) {
                 tally.failed.push(file.to_owned());
+            }
+        }
+    }
+    if failed_suites > 0 && tally.ran == 0 {
+        tally.errors += failed_suites;
+    }
+    if tally.known
+        && tally.ran == 0
+        && tally.ignored == 0
+        && tally.errors == 0
+        && tally.failed.is_empty()
+    {
+        tally.no_tests_matched = true;
+    }
+    tally
+}
+
+fn bun_tally(text: &str) -> Tally {
+    let mut tally = Tally::default();
+    let mut current_file = String::new();
+    let mut pass_lines = 0usize;
+    let mut fail_lines = 0usize;
+    let mut skip_lines = 0usize;
+    let mut summary_pass = 0usize;
+    let mut summary_fail = 0usize;
+    let mut summary_skip = 0usize;
+    let mut summary_ran = 0usize;
+    let mut saw_summary_counts = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "0 tests ran"
+            || trimmed.starts_with("error: No tests found")
+            || trimmed.starts_with("No tests found")
+        {
+            tally.known = true;
+            tally.no_tests_matched = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Ran ")
+            && rest.contains(" across ")
+            && let Some(count) = count_before(rest, "tests").or_else(|| count_before(rest, "test"))
+        {
+            tally.known = true;
+            summary_ran = count;
+            continue;
+        }
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.len() == 2
+            && let Ok(count) = words[0].parse::<usize>()
+        {
+            match words[1] {
+                "pass" => {
+                    tally.known = true;
+                    saw_summary_counts = true;
+                    summary_pass = count;
+                    continue;
+                }
+                "fail" => {
+                    tally.known = true;
+                    saw_summary_counts = true;
+                    summary_fail = count;
+                    continue;
+                }
+                "skip" | "todo" => {
+                    tally.known = true;
+                    summary_skip += count;
+                    continue;
+                }
+                "error" | "errors" => {
+                    tally.known = true;
+                    tally.errors += count;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("(pass) ") {
+            tally.known = true;
+            pass_lines += 1;
+            let name = strip_trailing_bracket_timing(rest.trim());
+            let key = if current_file.is_empty() {
+                "*".to_owned()
+            } else {
+                current_file.clone()
+            };
+            tally.names.entry(key).or_default().insert(name.to_owned());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("(fail) ") {
+            tally.known = true;
+            fail_lines += 1;
+            let raw = strip_trailing_bracket_timing(rest.trim());
+            let full = if !current_file.is_empty() && !raw.contains(&current_file) {
+                format!("{current_file} › {raw}")
+            } else {
+                raw.to_owned()
+            };
+            if !tally.failed.iter().any(|known| known == &full) {
+                tally.failed.push(full);
+            }
+            let key = if current_file.is_empty() {
+                "*".to_owned()
+            } else {
+                current_file.clone()
+            };
+            tally.names.entry(key).or_default().insert(raw.to_owned());
+            continue;
+        }
+        if trimmed.starts_with("(skip) ") || trimmed.starts_with("(todo) ") {
+            tally.known = true;
+            skip_lines += 1;
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace)
+            && let Some(path) = trimmed.strip_suffix(':')
+            && !path.contains(char::is_whitespace)
+            && is_bun_test_file(path)
+        {
+            current_file = path.to_owned();
+        }
+    }
+    let from_counts = if saw_summary_counts {
+        summary_pass + summary_fail
+    } else {
+        summary_ran
+    };
+    tally.ran = from_counts.max(pass_lines + fail_lines);
+    tally.ignored = summary_skip.max(skip_lines);
+    if tally.known
+        && tally.ran == 0
+        && tally.ignored == 0
+        && tally.errors == 0
+        && tally.failed.is_empty()
+    {
+        tally.no_tests_matched = true;
+    }
+    tally
+}
+
+fn strip_trailing_bracket_timing(text: &str) -> &str {
+    if let Some((head, tail)) = text.rsplit_once(" [")
+        && tail.ends_with(']')
+        && (tail.ends_with("ms]") || tail.ends_with("s]") || tail.ends_with("m]"))
+    {
+        head.trim_end()
+    } else {
+        text
+    }
+}
+
+fn strip_trailing_paren_timing(text: &str) -> &str {
+    if let Some((head, tail)) = text.rsplit_once(" (")
+        && tail.ends_with(')')
+        && (tail.ends_with("ms)") || tail.ends_with("s)") || tail.ends_with("m)"))
+    {
+        head.trim_end()
+    } else {
+        text
+    }
+}
+
+fn node_test_tally(text: &str) -> Tally {
+    let mut tally = Tally::default();
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cancelled = 0usize;
+    let mut skipped = 0usize;
+    let mut total_tests: Option<usize> = None;
+    let mut in_failing_section = false;
+    let mut pending_tap_fail: Option<String> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Could not find '") {
+            tally.no_tests_matched = true;
+            continue;
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("# ")
+            .or_else(|| trimmed.strip_prefix("ℹ "))
+        {
+            let mut parts = rest.split_whitespace();
+            if let (Some(key), Some(val)) = (parts.next(), parts.next())
+                && let Ok(num) = val.parse::<usize>()
+            {
+                match key {
+                    "tests" => {
+                        tally.known = true;
+                        total_tests = Some(num);
+                        continue;
+                    }
+                    "pass" => {
+                        tally.known = true;
+                        pass = num;
+                        continue;
+                    }
+                    "fail" => {
+                        tally.known = true;
+                        fail = num;
+                        continue;
+                    }
+                    "cancelled" => {
+                        tally.known = true;
+                        cancelled = num;
+                        continue;
+                    }
+                    "skipped" | "todo" => {
+                        tally.known = true;
+                        skipped += num;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if trimmed == "✖ failing tests:" {
+            in_failing_section = true;
+            continue;
+        }
+        if in_failing_section && let Some(rest) = trimmed.strip_prefix("✖ ") {
+            let name = strip_trailing_paren_timing(rest.trim());
+            if !name.is_empty() && !tally.failed.iter().any(|known| known == name) {
+                tally.failed.push(name.to_owned());
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("not ok ") {
+            if let Some(prev) = pending_tap_fail.take()
+                && !tally.failed.iter().any(|known| known == &prev)
+            {
+                tally.failed.push(prev);
+            }
+            if let Some((_, name)) = rest.split_once(" - ") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    pending_tap_fail = Some(name.to_owned());
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("failureType: 'subtestsFailed'")
+            || trimmed.starts_with("failureType: \"subtestsFailed\"")
+        {
+            pending_tap_fail = None;
+            continue;
+        }
+        if (trimmed.starts_with("ok ") || trimmed.starts_with("1.."))
+            && let Some(prev) = pending_tap_fail.take()
+            && !tally.failed.iter().any(|known| known == &prev)
+        {
+            tally.failed.push(prev);
+        }
+    }
+    if let Some(prev) = pending_tap_fail.take()
+        && !tally.failed.iter().any(|known| known == &prev)
+    {
+        tally.failed.push(prev);
+    }
+    tally.ran = pass + fail + cancelled;
+    tally.ignored = skipped;
+    if total_tests == Some(0) && tally.ran == 0 && tally.ignored == 0 && tally.failed.is_empty() {
+        tally.no_tests_matched = true;
+    }
+    tally
+}
+
+fn playwright_tally(text: &str) -> Tally {
+    let mut tally = Tally::default();
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut flaky = 0usize;
+    let mut interrupted = 0usize;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Error: No tests found"
+            || trimmed == "Error: No tests found."
+            || trimmed == "No tests found"
+            || trimmed == "No tests found."
+        {
+            tally.no_tests_matched = true;
+            continue;
+        }
+        if trimmed.contains("error was not a part of any test")
+            || trimmed.contains("errors were not a part of any test")
+        {
+            let count = trimmed
+                .split_whitespace()
+                .next()
+                .and_then(|word| word.parse::<usize>().ok())
+                .unwrap_or(1);
+            tally.errors += count;
+            continue;
+        }
+        // Failure section header: `1) [chromium] › tests/auth.spec.ts:24:5 › Auth › rejects bad password ───`
+        if let Some((num, rest)) = trimmed.split_once(") ")
+            && !num.is_empty()
+            && num.bytes().all(|b| b.is_ascii_digit())
+            && rest.contains(" › ")
+        {
+            let name = rest.trim_end_matches(['─', '-', ' ']).trim();
+            if !name.is_empty() && !tally.failed.iter().any(|known| known == name) {
+                tally.failed.push(name.to_owned());
+            }
+            continue;
+        }
+        // Totals lines: `37 passed (18.4s)`, `2 failed`, `1 flaky`, `3 skipped`, `1 interrupted`
+        let mut parts = trimmed.split_whitespace();
+        if let (Some(num), Some(word)) = (parts.next(), parts.next())
+            && let Ok(count) = num.parse::<usize>()
+        {
+            let rest: Vec<&str> = parts.collect();
+            let timing_only = rest.is_empty()
+                || (rest.len() == 1 && rest[0].starts_with('(') && rest[0].ends_with(')'));
+            if timing_only {
+                match word {
+                    "passed" => {
+                        tally.known = true;
+                        passed = count;
+                    }
+                    "failed" => {
+                        tally.known = true;
+                        failed = count;
+                    }
+                    "flaky" => {
+                        tally.known = true;
+                        flaky = count;
+                    }
+                    "skipped" => {
+                        tally.known = true;
+                        tally.ignored = count;
+                    }
+                    "interrupted" => {
+                        tally.known = true;
+                        interrupted = count;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tally.ran = passed + failed + flaky + interrupted;
+    if tally.known
+        && tally.ran == 0
+        && tally.ignored == 0
+        && tally.errors == 0
+        && tally.failed.is_empty()
+    {
+        tally.no_tests_matched = true;
+    }
+    tally
+}
+
+fn rspec_tally(text: &str) -> Tally {
+    let mut tally = Tally::default();
+    let mut in_failed = false;
+    let mut saw_failed_item = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "No examples found." {
+            tally.known = true;
+            tally.no_tests_matched = true;
+            continue;
+        }
+        if trimmed == "Failed examples:" {
+            in_failed = true;
+            saw_failed_item = false;
+            continue;
+        }
+        if in_failed {
+            if let Some(rest) = trimmed.strip_prefix("rspec ") {
+                saw_failed_item = true;
+                let target = rest.split_whitespace().next().unwrap_or(rest);
+                let target = target.strip_prefix("./").unwrap_or(target);
+                if !target.is_empty() && !tally.failed.iter().any(|known| known == target) {
+                    tally.failed.push(target.to_owned());
+                }
+                continue;
+            } else if trimmed.is_empty() {
+                if saw_failed_item {
+                    in_failed = false;
+                }
+                continue;
+            } else {
+                in_failed = false;
+            }
+        }
+        // `12 examples, 1 failure, 2 pending` or `0 examples, 0 failures, 1 error occurred outside of examples`
+        if (trimmed.contains(" example,") || trimmed.contains(" examples,"))
+            && (trimmed.contains(" failure") || trimmed.contains(" failures"))
+            && let Some(examples) =
+                count_before(trimmed, "examples").or_else(|| count_before(trimmed, "example"))
+        {
+            tally.known = true;
+            let pending = count_before(trimmed, "pending").unwrap_or(0);
+            tally.ignored = pending;
+            tally.ran = examples.saturating_sub(pending);
+            if trimmed.contains("outside of examples") {
+                let errors = count_before(trimmed, "errors")
+                    .or_else(|| count_before(trimmed, "error"))
+                    .unwrap_or(1);
+                tally.errors += errors;
+            }
+            if examples == 0 && tally.errors == 0 {
+                tally.no_tests_matched = true;
             }
         }
     }
@@ -1836,5 +3165,228 @@ mod tests {
         let enabled = enabled_features(&package, &["--features".into(), "b".into()]).unwrap();
         assert!(enabled.contains("c"));
         assert!(enabled_features(&package, &["--all-features".into()]).is_none());
+    }
+
+    #[test]
+    fn nextest_selection_flags_and_tally_handle_binaries_retries_and_zero_tests() {
+        assert_eq!(
+            nextest_selects(&["--offline", "--features", "x", "-P", "ci"]),
+            None
+        );
+        assert_eq!(nextest_selects(&["-E", "test(vat)"]).as_deref(), Some("-E"));
+        assert_eq!(
+            nextest_selects(&["--filterset=package(api)"]).as_deref(),
+            Some("--filterset=package(api)")
+        );
+        assert_eq!(nextest_selects(&["-p", "api"]).as_deref(), Some("-p"));
+        assert_eq!(
+            nextest_selects(&["--archive-file", "tests.tar.zst"]).as_deref(),
+            Some("--archive-file")
+        );
+        assert_eq!(
+            nextest_selects(&["--run-ignored", "all"]).as_deref(),
+            Some("--run-ignored")
+        );
+        assert_eq!(nextest_selects(&["--", "--nocapture"]), None);
+        assert_eq!(nextest_selects(&["--", "vat"]).as_deref(), Some("vat"));
+        assert_eq!(
+            cargo_user_args(&words(&[
+                "cargo",
+                "nextest",
+                "run",
+                "--features",
+                "extra",
+                "--",
+                "--nocapture"
+            ])),
+            ["--features", "extra"]
+        );
+
+        let stderr = concat!(
+            "    Starting 3 tests across 2 binaries\n",
+            "        PASS [   0.004s] ledger-core tax::tests::a\n",
+            "       FLAKY 2/2 [   0.008s] ledger-core::totals total_ok\n",
+            "        FAIL [   0.015s] (1/2) ledger-core tax::tests::b\n",
+            "--- STDERR:              ledger-core tax::tests::b ---\n",
+            "thread 'tax::tests::b' panicked at src/tax.rs:10:5:\n",
+            "assertion failed\n",
+            "------------\n",
+            "     Summary [   0.120s] 3 tests run: 2 passed (1 flaky), 1 failed, 1 skipped\n",
+            "        FAIL [   0.015s] ledger-core tax::tests::b\n",
+        );
+        let t = tally(Kind::Nextest, "", stderr);
+        assert!(t.known);
+        assert_eq!(t.ran, 3);
+        assert_eq!(t.ignored, 1);
+        assert_eq!(t.failed, ["tax::tests::b"]);
+        assert!(t.names["ledger-core"].contains("tax::tests::a"));
+        assert!(t.names["ledger-core::totals"].contains("total_ok"));
+        assert_eq!(t.failures.len(), 1);
+        assert_eq!(t.failures[0].target, "ledger-core");
+        assert!(t.failures[0].message.contains("assertion failed"));
+        assert!(!t.no_tests_matched);
+
+        let empty = "     Summary [   0.010s] 0 tests run: 0 passed, 0 skipped\n";
+        let empty_t = tally(Kind::Nextest, "", empty);
+        assert!(empty_t.known);
+        assert_eq!(empty_t.ran, 0);
+        assert!(empty_t.no_tests_matched);
+    }
+
+    #[test]
+    fn polyglot_js_and_rspec_selection_flags_and_discovery_patterns_are_accurate() {
+        // Bun
+        assert_eq!(bun_selects(&["--bail", "1", "--timeout", "5000"]), None);
+        assert_eq!(
+            bun_selects(&["--bail", "src/a.test.ts"]).as_deref(),
+            Some("src/a.test.ts")
+        );
+        assert_eq!(bun_selects(&["--only"]).as_deref(), Some("--only"));
+        assert!(is_bun_test_file("src/cart.test.ts"));
+        assert!(is_bun_test_file("src/cart_spec.jsx"));
+        assert!(!is_bun_test_file("tests/helpers.ts"));
+
+        // Node --test
+        assert!(is_node_test_command(&[
+            "--experimental-strip-types",
+            "--test"
+        ]));
+        assert!(!is_node_test_command(&["-e", "console.log(1)", "--test"]));
+        assert_eq!(
+            node_test_selects(&["--test", "--test-concurrency", "2"]),
+            None
+        );
+        assert_eq!(
+            node_test_selects(&["--test", "--test-name-pattern=vat"]).as_deref(),
+            Some("--test-name-pattern=vat")
+        );
+        assert_eq!(
+            node_test_selects(&["--test", "test/math.test.js"]).as_deref(),
+            Some("test/math.test.js")
+        );
+        assert!(is_node_test_file("test/math.js"));
+        assert!(is_node_test_file("src/math.test.mjs"));
+        assert!(is_node_test_file("src/math-test.js"));
+        assert!(!is_node_test_file("src/math.spec.js"));
+        assert!(!is_node_test_file("tests/helper.js"));
+
+        // Playwright
+        assert_eq!(
+            playwright_selects(&["--project", "chromium", "--workers", "2"]),
+            None
+        );
+        assert_eq!(
+            playwright_selects(&["--grep", "login"]).as_deref(),
+            Some("--grep")
+        );
+        assert_eq!(
+            playwright_selects(&["tests/auth.spec.ts"]).as_deref(),
+            Some("tests/auth.spec.ts")
+        );
+        assert!(is_dot_test_or_spec_file("e2e/auth.spec.ts"));
+        assert!(!is_dot_test_or_spec_file("e2e/helpers.ts"));
+
+        // RSpec
+        assert_eq!(rspec_selects(&["--format", "documentation"]), None);
+        assert_eq!(rspec_selects(&["-e", "adds tax"]).as_deref(), Some("-e"));
+        assert_eq!(
+            rspec_selects(&["spec/order_spec.rb:12"]).as_deref(),
+            Some("spec/order_spec.rb:12")
+        );
+    }
+
+    #[test]
+    fn polyglot_tallies_distinguish_zero_ran_from_failures_and_suite_errors() {
+        // Bun passing + failing + 0 ran
+        let bun = tally(
+            Kind::Bun,
+            "",
+            "bun test v1.1.38\n\nsrc/billing.test.ts:\n(pass) Billing > ok [0.10ms]\n(fail) Billing > bad [1.20ms]\n 1 pass\n 1 fail\nRan 2 tests across 1 file. [4.00ms]\n",
+        );
+        assert!(bun.known);
+        assert_eq!(bun.ran, 2);
+        assert_eq!(bun.failed, ["src/billing.test.ts › Billing > bad"]);
+        assert!(!bun.no_tests_matched);
+        let bun_zero = tally(Kind::Bun, "", "bun test v1.1.38\n\n0 tests ran\n");
+        assert!(bun_zero.no_tests_matched);
+
+        // Node --test TAP & spec & 0 tests
+        let node_tap = tally(
+            Kind::NodeTest,
+            "TAP version 13\n    not ok 1 - divides safely\n      ---\n      failureType: 'testCodeFailure'\n      ...\nnot ok 1 - Math\n  ---\n  failureType: 'subtestsFailed'\n  ...\n# tests 2\n# pass 1\n# fail 1\n# skipped 0\n",
+            "",
+        );
+        assert!(node_tap.known);
+        assert_eq!(node_tap.ran, 2);
+        assert_eq!(node_tap.failed, ["divides safely"]);
+        let node_zero = tally(
+            Kind::NodeTest,
+            "ℹ tests 0\nℹ pass 0\nℹ fail 0\nℹ skipped 0\n",
+            "",
+        );
+        assert!(node_zero.known);
+        assert_eq!(node_zero.ran, 0);
+        assert!(node_zero.no_tests_matched);
+
+        // Playwright
+        let pw = tally(
+            Kind::Playwright,
+            "Running 2 tests using 1 worker\n  1) [chromium] › tests/auth.spec.ts:5:3 › login ───\n  1 failed\n  1 passed (2.1s)\n",
+            "",
+        );
+        assert!(pw.known);
+        assert_eq!(pw.ran, 2);
+        assert_eq!(pw.failed, ["[chromium] › tests/auth.spec.ts:5:3 › login"]);
+        let pw_zero = tally(Kind::Playwright, "", "Error: No tests found.\n");
+        assert!(pw_zero.no_tests_matched);
+
+        // RSpec
+        let rspec = tally(
+            Kind::Rspec,
+            "Failed examples:\n\nrspec ./spec/order_spec.rb:6 # Order adds tax\n\n3 examples, 1 failure, 1 pending\n",
+            "",
+        );
+        assert!(rspec.known);
+        assert_eq!((rspec.ran, rspec.ignored), (2, 1));
+        assert_eq!(rspec.failed, ["spec/order_spec.rb:6"]);
+        let rspec_zero = tally(
+            Kind::Rspec,
+            "No examples found.\n\n0 examples, 0 failures\n",
+            "",
+        );
+        assert!(rspec_zero.no_tests_matched);
+        let rspec_err = tally(
+            Kind::Rspec,
+            "0 examples, 0 failures, 1 error occurred outside of examples\n",
+            "",
+        );
+        assert_eq!(rspec_err.errors, 1);
+        assert!(!rspec_err.no_tests_matched);
+
+        // Jest suite-load crash vs No tests found
+        let jest_crash = tally(
+            Kind::Jest,
+            "",
+            "FAIL src/broken.test.ts\nTest Suites: 1 failed, 1 total\nTests:       0 total\n",
+        );
+        assert_eq!(jest_crash.errors, 1);
+        assert!(!jest_crash.no_tests_matched);
+        let jest_zero = tally(Kind::Jest, "", "No tests found, exiting with code 1\n");
+        assert!(jest_zero.no_tests_matched);
+
+        // Vitest `no tests` vs unhandled error
+        let vitest_zero = tally(
+            Kind::Vitest,
+            " Test Files  no tests\n      Tests  no tests\n",
+            "",
+        );
+        assert!(vitest_zero.no_tests_matched);
+        let vitest_err = tally(
+            Kind::Vitest,
+            " Test Files  0 passed (0)\n      Tests  0 passed (0)\n     Errors  1 error\n",
+            "",
+        );
+        assert_eq!(vitest_err.errors, 1);
+        assert!(!vitest_err.no_tests_matched);
     }
 }

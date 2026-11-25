@@ -715,10 +715,20 @@ impl RunnerResult {
 /// the names it selected that did not report.
 fn widening(runner: &RunnerPlan, step: &Step, outcome: &Outcome) -> Option<(usize, Vec<String>)> {
     if step.kind != StepKind::Filtered
-        || outcome.status != 0
-        || !outcome.tally.known
-        || !matches!(runner.runner, Kind::Cargo | Kind::Go)
+        || !matches!(runner.runner, Kind::Cargo | Kind::Nextest | Kind::Go)
     {
+        return None;
+    }
+    // `cargo nextest run` exits with code 4 (`NO_TESTS_RUN`) when filters match
+    // zero tests; treat that as all selected names missing so their targets run
+    // unfiltered instead of failing the subset.
+    let nextest_no_tests = runner.runner == Kind::Nextest
+        && outcome.status == 4
+        && outcome.tally.ran == 0
+        && outcome.tally.failed.is_empty()
+        && outcome.tally.errors == 0
+        && (outcome.tally.no_tests_matched || outcome.tally.known);
+    if !nextest_no_tests && (outcome.status != 0 || !outcome.tally.known) {
         return None;
     }
     let missing = missing_names(step, &outcome.tally);
@@ -766,6 +776,26 @@ fn widening(runner: &RunnerPlan, step: &Step, outcome: &Outcome) -> Option<(usiz
     }
     flags.extend(target_flags.into_iter().flatten());
     Some((count, selection::cargo_argv(&runner.base, &flags, &[])))
+}
+
+/// Whether a filtered JS/TS or RSpec step matched zero tests (and had no
+/// failures or suite load errors), requiring a conservative fallback to the
+/// full suite.
+fn file_runner_ran_zero(runner: &RunnerPlan, step: &Step, outcome: &Outcome) -> bool {
+    if step.kind != StepKind::Filtered || outcome.unavailable.is_some() {
+        return false;
+    }
+    if !matches!(
+        runner.runner,
+        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright | Kind::Rspec
+    ) {
+        return false;
+    }
+    let tally = &outcome.tally;
+    if tally.ran > 0 || tally.ignored > 0 || !tally.failed.is_empty() || tally.errors > 0 {
+        return false;
+    }
+    (outcome.status == 0 && tally.known) || tally.no_tests_matched
 }
 
 /// Filters of a passing doctest step that matched no doctest it reported.
@@ -851,9 +881,11 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
                 .unwrap_or_default()
                 .to_owned();
             // Selected names that never reported rerun with their whole target or
-            // package. Only a passing step is checked: after a failure cargo stops
-            // at the failing binary, and the step has already failed the subset.
+            // package. Only a passing step is checked (except nextest exit 4,
+            // where nextest reports `no tests to run` for an unmatched filter).
             let widen = widening(runner, step, &outcome);
+            let nextest_rejected =
+                runner.runner == Kind::Nextest && outcome.status == 4 && widen.is_some();
             let missed = doc_misses(step, &outcome);
             // pytest: unknown node IDs (exit 4) widen to their files, and an empty
             // collection (exit 5) means the selection did not match what pytest
@@ -864,8 +896,14 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
             let rejected =
                 pytest && outcome.status == 4 && selected.iter().any(|id| id.contains("::"));
             let mut collected_none = pytest && outcome.status == 5;
+            let file_zero_ran = file_runner_ran_zero(runner, step, &outcome);
             let not_found = outcome.tally.not_found.len();
-            result.record(outcome, &kind, &step.argv, !(rejected || collected_none));
+            result.record(
+                outcome,
+                &kind,
+                &step.argv,
+                !(rejected || collected_none || nextest_rejected || file_zero_ran),
+            );
             if let Some((count, argv)) = widen {
                 result.note(format!(
                     "widened: {} reported no result under their test names; running their {} in full",
@@ -885,6 +923,27 @@ fn execute(workspace: &Workspace, plan: &Plan, options: &Options) -> Result<i32>
                     options,
                 )?;
                 result.record(outcome, "widened", &argv, true);
+            }
+            if file_zero_ran {
+                let label = runner.runner.label();
+                result.note(format!(
+                    "runner-mismatch: {label} ran no tests for the selected files; running the full suite"
+                ));
+                result.mode = Mode::Full;
+                result.reasons.push(Reason {
+                    code: "runner-mismatch",
+                    message: format!("{label} ran no tests for the selected files"),
+                });
+                let argv = runner.base.clone();
+                let outcome = run_step(
+                    workspace,
+                    runner,
+                    Mode::Full,
+                    &argv,
+                    &echoed(&argv),
+                    options,
+                )?;
+                result.record(outcome, "full", &argv, true);
             }
             if !missed.is_empty()
                 && let Some(flags) = step.widen.get("--doc")
@@ -1462,5 +1521,163 @@ mod tests {
         assert!(doc_misses(&step, &outcome(quiet)).is_empty());
         let none = "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out\n";
         assert_eq!(doc_misses(&step, &outcome(none)).len(), 2);
+    }
+
+    fn runner_plan(kind: Kind, base: &[&str]) -> RunnerPlan {
+        RunnerPlan {
+            runner: kind,
+            root: String::new(),
+            cwd: String::new(),
+            base: base.iter().map(|w| (*w).to_owned()).collect(),
+            mode: Mode::Subset,
+            reasons: Vec::new(),
+            unit: kind.unit(),
+            indexed: 4,
+            selected: 1,
+            targets: None,
+            steps: Vec::new(),
+            tests: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nextest_exit_4_and_missing_names_widen_to_the_target() {
+        let mut step = filtered(
+            &[("demo-pkg", &["tests::vat_works", "tests::gone"])],
+            &[
+                "cargo",
+                "nextest",
+                "run",
+                "-p",
+                "demo-pkg",
+                "--lib",
+                "--",
+                "tests::vat_works",
+                "tests::gone",
+                "--exact",
+            ],
+        );
+        step.widen.insert(
+            "demo-pkg".into(),
+            vec!["-p".into(), "demo-pkg".into(), "--lib".into()],
+        );
+        let plan = runner_plan(Kind::Nextest, &["cargo", "nextest", "run", "--offline"]);
+
+        // Exit 4 (`NO_TESTS_RUN`) with 0 tests run widens to the whole target.
+        let exit4 = Outcome {
+            status: 4,
+            run: None,
+            tally: runners::tally(
+                Kind::Nextest,
+                "",
+                "     Summary [   0.010s] 0 tests run: 0 passed, 0 skipped\n",
+            ),
+            elapsed_ms: 0,
+            shown: 0,
+            raw: 0,
+            unavailable: None,
+        };
+        let (count, argv) = widening(&plan, &step, &exit4).expect("exit 4 should widen");
+        assert_eq!(count, 2);
+        assert_eq!(
+            argv.join(" "),
+            "cargo nextest run --offline -p demo-pkg --lib"
+        );
+
+        // Passing step where one test didn't report widens to its target.
+        let partial = Outcome {
+            status: 0,
+            run: None,
+            tally: runners::tally(
+                Kind::Nextest,
+                "",
+                "        PASS [   0.004s] demo-pkg tests::vat_works\n     Summary [   0.020s] 1 test run: 1 passed, 0 skipped\n",
+            ),
+            elapsed_ms: 0,
+            shown: 0,
+            raw: 0,
+            unavailable: None,
+        };
+        let (count, argv) = widening(&plan, &step, &partial).expect("missing name should widen");
+        assert_eq!(count, 1);
+        assert_eq!(
+            argv.join(" "),
+            "cargo nextest run --offline -p demo-pkg --lib"
+        );
+    }
+
+    #[test]
+    fn js_and_rspec_zero_ran_widens_unless_tests_failed_errored_or_skipped() {
+        let step = filtered(&[], &["bun", "test", "src/a.test.ts"]);
+        let make = |kind: Kind, status: i32, out: &str, err: &str| {
+            let plan = runner_plan(kind, &[kind.label()]);
+            let outcome = Outcome {
+                status,
+                run: None,
+                tally: runners::tally(kind, out, err),
+                elapsed_ms: 0,
+                shown: 0,
+                raw: 0,
+                unavailable: None,
+            };
+            file_runner_ran_zero(&plan, &step, &outcome)
+        };
+
+        // Zero tests matched -> MUST widen!
+        assert!(make(Kind::Bun, 1, "", "bun test v1.1.38\n\n0 tests ran\n"));
+        assert!(make(
+            Kind::Vitest,
+            0,
+            " Test Files  no tests\n      Tests  no tests\n",
+            ""
+        ));
+        assert!(make(
+            Kind::Jest,
+            1,
+            "",
+            "No tests found, exiting with code 1\n"
+        ));
+        assert!(make(
+            Kind::NodeTest,
+            0,
+            "ℹ tests 0\nℹ pass 0\nℹ fail 0\nℹ skipped 0\n",
+            ""
+        ));
+        assert!(make(Kind::Playwright, 1, "", "Error: No tests found.\n"));
+        assert!(make(
+            Kind::Rspec,
+            0,
+            "No examples found.\n\n0 examples, 0 failures\n",
+            ""
+        ));
+
+        // Suite load error (Jest crash) or RSpec error outside examples -> MUST NOT widen!
+        assert!(!make(
+            Kind::Jest,
+            1,
+            "",
+            "FAIL src/broken.test.ts\nTest Suites: 1 failed, 1 total\nTests:       0 total\n"
+        ));
+        assert!(!make(
+            Kind::Rspec,
+            1,
+            "0 examples, 0 failures, 1 error occurred outside of examples\n",
+            ""
+        ));
+        // Skipped tests -> tests WERE collected, MUST NOT widen!
+        assert!(!make(
+            Kind::Jest,
+            0,
+            "",
+            "Tests:       2 skipped, 2 total\n"
+        ));
+        // Normal passing run -> MUST NOT widen!
+        assert!(!make(
+            Kind::Bun,
+            0,
+            "",
+            "bun test v1.1.38\n 1 pass\nRan 1 test across 1 file. [1ms]\n"
+        ));
     }
 }
