@@ -409,7 +409,16 @@ pub(crate) fn routed(command: &str, label: &str, content: &Value) -> bool {
     if text_matches(content, &FOOTER) {
         return true;
     }
-    let invokes_justless = label == "justless" || label.starts_with("justless ");
+    let invokes_justless = label == "justless"
+        || label.starts_with("justless ")
+        || split_shell_stages(command).into_iter().any(|stage| {
+            let text = crate::shell_form::parse(stage)
+                .and_then(|form| stage.get(form.command))
+                .unwrap_or(stage);
+            text.split_whitespace()
+                .next()
+                .is_some_and(|prog| Path::new(prog).file_name().is_some_and(|n| n == "justless"))
+        });
     let words: Vec<_> = command.split_whitespace().collect();
     let bare_cat = matches!(words.as_slice(), ["cat", file]
         if !file.starts_with('-') && !file.contains(|c: char| "|;&<>$`*?(){}[]!#~\\\"'".contains(c)));
@@ -1410,5 +1419,53 @@ mod tests {
         assert!(opps[0]["estimated_tokens"].as_u64().unwrap() > 0);
         assert_eq!(opps[1]["label"], "sed");
         assert_eq!(opps[2]["label"], "bazel test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_var_chains_classify_as_supported_not_routed_for_claude_and_agy() {
+        let none = crate::rewrite::Exclusions::default();
+        let claude = |cmd: &str| {
+            let label = discover_label(cmd);
+            Route::unrouted(cmd, &label, &none, true, crate::agents::would_route)
+        };
+        let codex = |cmd: &str| {
+            let label = discover_label(cmd);
+            Route::unrouted(cmd, &label, &none, false, crate::agents::codex_would_route)
+        };
+        let agy = |cmd: &str| {
+            let label = discover_label(cmd);
+            Route::unrouted(cmd, &label, &none, false, crate::agents::agy_would_route)
+        };
+
+        for cmd in [
+            "cargo fmt --all && cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && tmp=/var/tmp/justless-test-tmp && mkdir -p \"$tmp\" && trap 'rm -rf \"$tmp\"' EXIT && TMPDIR=\"$tmp\" cargo test --locked",
+            r#"cargo build && ./target/debug/app "$ARG""#,
+            r#"git status && echo "branch=$BRANCH""#,
+            "cargo test && git diff > /tmp/out.patch",
+        ] {
+            assert_eq!(claude(cmd), Route::SupportedNotRouted, "claude: {cmd}");
+            assert_eq!(agy(cmd), Route::SupportedNotRouted, "agy: {cmd}");
+            assert_eq!(codex(cmd), Route::PassedThrough, "codex: {cmd}");
+        }
+
+        // Unsafe chains remain PassedThrough everywhere.
+        for rejected in [
+            r#"cd "$dir" && cargo test"#,
+            r#"PATH="$x" cargo test"#,
+            r#"export PATH="$x" && cargo test"#,
+            "FOO=$(id) cargo test",
+            r#"cargo test && eval "$x""#,
+        ] {
+            assert_eq!(claude(rejected), Route::PassedThrough, "claude: {rejected}");
+            assert_eq!(agy(rejected), Route::PassedThrough, "agy: {rejected}");
+            assert_eq!(codex(rejected), Route::PassedThrough, "codex: {rejected}");
+        }
+
+        // A rewritten mixed chain whose first segment is not `justless` still
+        // counts as routed even without a footer.
+        let rewritten = r#"tmp=/var/tmp/x && mkdir -p "$tmp" && TMPDIR="$tmp" justless run --hook -- cargo test --locked"#;
+        let label = discover_label(rewritten);
+        assert!(routed(rewritten, &label, &Value::String("ok\n".into())));
     }
 }

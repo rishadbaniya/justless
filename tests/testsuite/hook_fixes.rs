@@ -1361,3 +1361,254 @@ fn merged_pipe_and_timeout_preserve_streams_footer_and_exit_status() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn mixed_chains_with_vars_route_safely_execute_and_respect_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = project();
+    let bin_dir = project.base.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let justless_dir = PathBuf::from(env!("CARGO_BIN_EXE_justless"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // Fake `cargo` that echoes its subcommand and TMPDIR (asserting TMPDIR exists
+    // on disk during `cargo test`), so we can execute the rewritten chain in `sh`.
+    let cargo_stub = bin_dir.join("cargo");
+    fs::write(
+        &cargo_stub,
+        "#!/bin/sh\necho \"cargo:$1:TMPDIR=$TMPDIR\"\nif [ \"$1\" = test ]; then\n  [ -d \"$TMPDIR\" ] || exit 42\nfi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo_stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_env = format!(
+        "{}:{}:{}",
+        justless_dir.display(),
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // 1. Exact mixed verification chain with `tmp=...`, `mkdir -p "$tmp"`,
+    // `trap 'rm -rf "$tmp"' EXIT`, and `TMPDIR="$tmp" cargo test --locked`.
+    let scratch = project.base.join("chain-tmp-dir");
+    let chain = format!(
+        "cargo fmt --all && cargo clippy --locked --all-targets -- -D warnings && tmp={} && mkdir -p \"$tmp\" && trap 'rm -rf \"$tmp\"' EXIT && TMPDIR=\"$tmp\" cargo test --locked",
+        scratch.display()
+    );
+    let expected = format!(
+        "justless run --hook -- cargo fmt --all && justless run --hook -- cargo clippy --locked --all-targets -- -D warnings && tmp={} && mkdir -p \"$tmp\" && trap 'rm -rf \"$tmp\"' EXIT && TMPDIR=\"$tmp\" justless run --hook -- cargo test --locked",
+        scratch.display()
+    );
+
+    // Antigravity CLI Tier 2 rewrites all 3 cargo commands with `decision: "ask"`
+    // (never auto-allowing) while preserving tmp/mkdir/trap/TMPDIR verbatim.
+    let (agy_rewritten, agy_out) = project.client("hook-agy", &chain);
+    assert_eq!(
+        agy_rewritten.as_deref(),
+        Some(expected.as_str()),
+        "{agy_out}"
+    );
+    assert_eq!(
+        agy_out["decision"], "ask",
+        "mixed var chain must use Tier 2 ask, never allow: {agy_out}"
+    );
+
+    // Gemini CLI and Claude Code (without a restrictive mode) route the same chain.
+    let (gemini_rewritten, gemini_out) = project.client("hook-gemini", &chain);
+    assert_eq!(
+        gemini_rewritten.as_deref(),
+        Some(expected.as_str()),
+        "{gemini_out}"
+    );
+    let (claude_rewritten, claude_out) = project.client("hook-claude", &chain);
+    assert!(
+        claude_rewritten.as_deref().is_some_and(|s| s
+            .contains("TMPDIR=\"$tmp\" justless run --hook --session ")
+            && s.ends_with(" -- cargo test --locked")),
+        "claude: {claude_out}"
+    );
+
+    // Approving / non-mixed clients (`codex`, `cursor`, `copilot`) stay 100% unchanged!
+    for strict_client in ["hook-codex", "hook-cursor", "hook-copilot"] {
+        let (rewritten, out) = project.client(strict_client, &chain);
+        assert_eq!(
+            rewritten, None,
+            "{strict_client} must stay unchanged on mixed var chain: {out}"
+        );
+    }
+
+    // Executing the rewritten chain in `/bin/sh` runs all 3 cargo commands, passes
+    // the dynamic `$tmp` into `TMPDIR`, and the `EXIT` trap cleans up `$tmp`.
+    let exec = Command::new("sh")
+        .args(["-c", agy_rewritten.as_deref().unwrap()])
+        .current_dir(&project.root)
+        .env("PATH", &path_env)
+        .env("HOME", project.home())
+        .env("XDG_STATE_HOME", project.home().join(".local/state"))
+        .env_remove("JUSTLESS_DISABLE")
+        .output()
+        .unwrap();
+    assert!(
+        exec.status.success(),
+        "rewritten chain failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&exec.stdout),
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    let out_text = String::from_utf8_lossy(&exec.stdout);
+    assert!(out_text.contains("cargo:fmt:"), "{out_text}");
+    assert!(out_text.contains("cargo:clippy:"), "{out_text}");
+    assert!(
+        out_text.contains(&format!("cargo:test:TMPDIR={}", scratch.display())),
+        "{out_text}"
+    );
+    assert!(
+        !scratch.exists(),
+        "EXIT trap must have removed scratch dir {}",
+        scratch.display()
+    );
+
+    // 2. Other real-world mixed chains with `$var` and redirections route for mixed
+    // clients only (`agy` Tier 2 `ask`, `gemini`, `claude`), never `codex`/`cursor`/`copilot`.
+    for (cmd, expected_agy) in [
+        (
+            r#"cargo build && ./target/debug/app "$ARG""#,
+            r#"justless run --hook -- cargo build && ./target/debug/app "$ARG""#,
+        ),
+        (
+            r#"git status && echo "branch=$BRANCH""#,
+            r#"justless run --hook -- git status && echo "branch=$BRANCH""#,
+        ),
+        (
+            "cargo test && git diff > /tmp/out.patch",
+            "justless run --hook -- cargo test && git diff > /tmp/out.patch",
+        ),
+    ] {
+        let (rewritten, out) = project.client("hook-agy", cmd);
+        assert_eq!(rewritten.as_deref(), Some(expected_agy), "{cmd}: {out}");
+        assert_eq!(out["decision"], "ask", "{cmd}: {out}");
+        assert_eq!(
+            project.client("hook-gemini", cmd).0.as_deref(),
+            Some(expected_agy),
+            "gemini: {cmd}"
+        );
+        assert!(
+            project.client("hook-claude", cmd).0.is_some(),
+            "claude: {cmd}"
+        );
+        for strict_client in ["hook-codex", "hook-cursor", "hook-copilot"] {
+            assert_eq!(
+                project.client(strict_client, cmd).0,
+                None,
+                "{strict_client} must not route {cmd}"
+            );
+        }
+    }
+
+    // 3. Safety rejections: dynamic `cd`, steering env assignments, command
+    // substitution in env assignments, and `eval` stay 100% unwrapped across ALL clients.
+    for unsafe_cmd in [
+        r#"cd "$dir" && cargo test"#,
+        r#"PATH="$x" cargo test"#,
+        r#"PATH="$x" && cargo test"#,
+        r#"export PATH="$x" && cargo test"#,
+        r#"export LD_PRELOAD="$x" && cargo test"#,
+        r#"export "$VAR" && cargo test"#,
+        "FOO=$(id) cargo test",
+        r#"FOO="$(id)" cargo test"#,
+        "FOO=`id` cargo test",
+        r#"FOO="${PATH:=/evil}" cargo test"#,
+        r#"cargo test && eval "$x""#,
+        "cargo test && source ./env.sh",
+        "cargo test && $(touch x)",
+        "cargo test && { cd /tmp; }",
+        "cargo test &",
+        "(cd src && cargo test)",
+    ] {
+        for &client in ALL_CLIENTS {
+            let (rewritten, out) = project.client(client, unsafe_cmd);
+            assert_eq!(
+                rewritten, None,
+                "{client} must reject unsafe command {unsafe_cmd:?}: {out}"
+            );
+        }
+    }
+
+    // 4. Claude Code `deny` and `ask` rules on any segment (including `$var` segments,
+    // piped stages, and nested subshells/substitutions) STILL block rewriting!
+    let settings = project.root.join(".claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "permissions": {
+                "allow": ["Bash(cargo test *)"],
+                "ask": ["Bash(git push *)"],
+                "deny": ["Bash(rm *)"]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for mode in ["default", "bypassPermissions", "auto"] {
+        // Denied segment with `$tmp` must NEVER be rewritten.
+        for blocked in [
+            r#"cargo test && rm -rf "$tmp""#,
+            r#"tmp=/var/tmp/x && cargo test && rm -rf "$tmp""#,
+            r#"cargo test && echo hi | rm -rf "$tmp""#,
+            r#"cargo test && echo "$(rm -rf "$tmp")""#,
+            r#"cargo test && (rm -rf "$tmp")"#,
+            r#"cargo test && git push origin "$BRANCH""#,
+        ] {
+            let ans = project.claude(mode, blocked);
+            assert_eq!(
+                routed(&ans),
+                None,
+                "claude {mode} must block {blocked:?} under deny/ask rules: {ans}"
+            );
+        }
+    }
+    // Safe mixed `$var` chain with NO denied/asked segment routes in `bypassPermissions`
+    // and `auto` (without `permissionDecision: "allow"`), and stays left in `default`.
+    let safe_var_chain =
+        r#"tmp=/var/tmp/x && mkdir -p "$tmp" && TMPDIR="$tmp" cargo test --locked"#;
+    for mode in ["bypassPermissions", "auto"] {
+        let ans = project.claude(mode, safe_var_chain);
+        let cmd = routed(&ans).unwrap_or_else(|| panic!("claude {mode}: {ans}"));
+        assert!(
+            cmd.contains(r#"TMPDIR="$tmp" justless run --hook --session "#),
+            "claude {mode}: {cmd}"
+        );
+        assert!(
+            ans["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none(),
+            "claude {mode} must not auto-allow dynamic var chain: {ans}"
+        );
+    }
+    assert_eq!(
+        routed(&project.claude("default", safe_var_chain)),
+        None,
+        "claude default mode must leave uncovered mixed var chain to prompt user"
+    );
+
+    // 5. Antigravity Tier 1 (`decision: "allow"`) still works unchanged for plain
+    // approvable commands while dynamic env assignments never get Tier 1 `allow`.
+    let (plain_rewritten, plain_out) = project.client("hook-agy", "cargo test --locked");
+    assert_eq!(
+        plain_rewritten.as_deref(),
+        Some("justless run --hook -- cargo test --locked")
+    );
+    assert_eq!(plain_out["decision"], "allow");
+    let (dyn_rewritten, dyn_out) =
+        project.client("hook-agy", r#"TMPDIR="$tmp" cargo test --locked"#);
+    assert_eq!(
+        dyn_rewritten.as_deref(),
+        Some(r#"TMPDIR="$tmp" justless run --hook -- cargo test --locked"#)
+    );
+    assert_eq!(dyn_out["decision"], "ask");
+}

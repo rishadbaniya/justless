@@ -11788,6 +11788,11 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         // Setting other variables for later commands changes nothing Justless needs.
         "FOO=1; cargo test => *FOO=1; justless run --hook -- cargo test",
         "export FOO=1 && cargo test => *export FOO=1 && justless run --hook -- cargo test",
+        // Non-approving mixed clients also accept pure `$var`/`${var}` env values
+        // while keeping them outside `justless run` and keeping command words literal.
+        "RUST_BACKTRACE=$LEVEL cargo test => *RUST_BACKTRACE=$LEVEL justless run --hook -- cargo test",
+        "TMPDIR=\"$tmp\" cargo test --locked => *TMPDIR=\"$tmp\" justless run --hook -- cargo test --locked",
+        "TMPDIR=\"${tmp}/sub\" cargo test => *TMPDIR=\"${tmp}/sub\" justless run --hook -- cargo test",
     ] {
         let (command, expected) = case.split_once(" => ").unwrap();
         let (mixed, expected) = match expected.strip_prefix('*') {
@@ -11857,7 +11862,13 @@ fn hooks_keep_assignments_and_a_final_stderr_merge_around_the_wrapped_command() 
         "env -u PATH cargo test",
         "env -S 'cargo test'",
         "bash -c 'cargo test; rm -rf /'",
-        "RUST_BACKTRACE=$LEVEL cargo test",
+        "PATH=\"$x\" cargo test",
+        "export PATH=\"$x\" && cargo test",
+        "cd \"$dir\" && cargo test",
+        "cargo test && eval \"$x\"",
+        "FOO=$(id) cargo test",
+        "FOO=\"$(id)\" cargo test",
+        "FOO=\"${PATH:=/evil}\" cargo test",
         "FOO=`id` cargo test",
         "FOO=~/x cargo test",
         "FOO=a:~/x cargo test",

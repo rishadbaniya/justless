@@ -60,64 +60,752 @@ pub fn merges(rest: &str) -> bool {
         })
 }
 
+/// The blanks that separate shell words.
+const BLANKS: [char; 2] = [' ', '\t'];
+
+/// Nesting frame tracked while splitting a shell stage into pipe stages or words.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    SingleQuote,
+    DoubleQuote,
+    CmdSubst,
+    Param,
+    Paren,
+    Brace,
+    DoubleBracket,
+}
+
+/// Whether `name` is a valid POSIX shell variable identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+fn is_ident(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Split a shell command segment on top-level unquoted `|` and `|&` (never `||`),
+/// tracking single/double quotes, backslash escapes outside single quotes, and
+/// `$(...)`, `${...}`, `(...)`, `{...}`, `[[...]]` nesting. Returns `None` on
+/// unbalanced quotes/brackets or empty pipe stages.
+pub(crate) fn pipe_stages(segment: &str) -> Option<Vec<Range<usize>>> {
+    let bytes = segment.as_bytes();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut stages = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut push = |from: usize, to: usize| -> Option<()> {
+        let text = &segment[from..to];
+        let lead = text.len() - text.trim_start_matches(BLANKS).len();
+        let trimmed = text.trim_matches(BLANKS);
+        (!trimmed.is_empty()).then(|| stages.push(from + lead..from + lead + trimmed.len()))
+    };
+    while i < bytes.len() {
+        let c = bytes[i];
+        match stack.last().copied() {
+            Some(Frame::SingleQuote) => {
+                if c == b'\'' {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            Some(Frame::DoubleQuote) => {
+                if c == b'\\' {
+                    let next = segment[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else {
+                    if c == b'"' {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+            }
+            Some(Frame::DoubleBracket) => {
+                if c == b'\\' {
+                    let next = segment[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b']'
+                    && bytes.get(i + 1) == Some(&b']')
+                    && bytes
+                        .get(i + 2)
+                        .is_none_or(|b| matches!(b, b' ' | b'\t' | b';' | b'&' | b'|' | b')'))
+                {
+                    stack.pop();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            top => {
+                let at_top = top.is_none();
+                if c == b'\\' {
+                    let next = segment[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b'(' {
+                    stack.push(Frame::Paren);
+                    i += 1;
+                } else if c == b')' {
+                    if !matches!(stack.pop(), Some(Frame::CmdSubst | Frame::Paren)) {
+                        return None;
+                    }
+                    i += 1;
+                } else if c == b'{' {
+                    stack.push(Frame::Brace);
+                    i += 1;
+                } else if c == b'}' {
+                    if !matches!(stack.pop(), Some(Frame::Param | Frame::Brace)) {
+                        return None;
+                    }
+                    i += 1;
+                } else if c == b'['
+                    && bytes.get(i + 1) == Some(&b'[')
+                    && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'('))
+                    && bytes.get(i + 2).is_some_and(|b| matches!(b, b' ' | b'\t'))
+                {
+                    stack.push(Frame::DoubleBracket);
+                    i += 2;
+                } else if at_top && c == b'|' {
+                    if bytes.get(i + 1) == Some(&b'|') {
+                        i += 2;
+                    } else {
+                        push(start, i)?;
+                        i += if bytes.get(i + 1) == Some(&b'&') {
+                            2
+                        } else {
+                            1
+                        };
+                        start = i;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    if !stack.is_empty() {
+        return None;
+    }
+    push(start, segment.len())?;
+    Some(stages)
+}
+
+/// Whether `stage` is a parenthesized subshell `(...)` (never `((...))` arithmetic)
+/// followed only by optional whitespace and non-mutating redirections. A subshell
+/// runs in a child process and cannot change the outer shell's directory or variables.
+pub(crate) fn is_subshell(stage: &str) -> bool {
+    let trimmed = stage.trim_matches(BLANKS);
+    let bytes = trimmed.as_bytes();
+    if bytes.first() != Some(&b'(') || bytes.get(1) == Some(&b'(') {
+        return false;
+    }
+    let mut stack: Vec<Frame> = vec![Frame::Paren];
+    let mut i = 1usize;
+    let mut close = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match stack.last().copied() {
+            Some(Frame::SingleQuote) => {
+                if c == b'\'' {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            Some(Frame::DoubleQuote) => {
+                if c == b'\\' {
+                    let Some(next) = trimmed[i + 1..].chars().next() else {
+                        return false;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else {
+                    if c == b'"' {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if c == b'\\' {
+                    let Some(next) = trimmed[i + 1..].chars().next() else {
+                        return false;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b'(' {
+                    stack.push(Frame::Paren);
+                    i += 1;
+                } else if c == b')' {
+                    if !matches!(stack.pop(), Some(Frame::CmdSubst | Frame::Paren)) {
+                        return false;
+                    }
+                    if stack.is_empty() {
+                        close = Some(i);
+                        break;
+                    }
+                    i += 1;
+                } else if c == b'{' {
+                    stack.push(Frame::Brace);
+                    i += 1;
+                } else if c == b'}' {
+                    if !matches!(stack.pop(), Some(Frame::Param | Frame::Brace)) {
+                        return false;
+                    }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    let Some(close) = close else {
+        return false;
+    };
+    let after = trimmed[close + 1..].trim_matches(BLANKS);
+    if after.is_empty() {
+        return true;
+    }
+    if mutates_via_expansion(after) {
+        return false;
+    }
+    words(after).is_some_and(|w| strip_stage_redirections(after, &w).is_empty())
+}
+
+/// Whether `stage` contains shell expansion syntax that can mutate shell variables
+/// as a side effect: arithmetic evaluation/expansion (`$((...))` or `((...))`) or
+/// an assignment-capable `${...=...}` parameter expansion outside single quotes.
+pub(crate) fn mutates_via_expansion(stage: &str) -> bool {
+    let bytes = stage.as_bytes();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match stack.last().copied() {
+            Some(Frame::SingleQuote) => {
+                if c == b'\'' {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            Some(Frame::DoubleQuote) => {
+                if c == b'\\' {
+                    let Some(next) = stage[i + 1..].chars().next() else {
+                        return true;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if c == b'$' && bytes.get(i + 1..i + 3) == Some(b"((") {
+                    return true;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else {
+                    if c == b'"' {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+            }
+            Some(Frame::Param) => {
+                if c == b'=' {
+                    return true;
+                } else if c == b'\\' {
+                    let Some(next) = stage[i + 1..].chars().next() else {
+                        return true;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1..i + 3) == Some(b"((") {
+                    return true;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b'}' {
+                    stack.pop();
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                if c == b'\\' {
+                    let Some(next) = stage[i + 1..].chars().next() else {
+                        return true;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if (c == b'$' && bytes.get(i + 1..i + 3) == Some(b"(("))
+                    || (c == b'(' && bytes.get(i + 1) == Some(&b'('))
+                {
+                    return true;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b'(' {
+                    stack.push(Frame::Paren);
+                    i += 1;
+                } else if c == b')' {
+                    let _ = stack.pop();
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// First unquoted `<` or `>` offset in a raw word (outside quotes and nested
+/// expansions/subshells), if any.
+fn first_unquoted_redirect(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match stack.last().copied() {
+            Some(Frame::SingleQuote) => {
+                if c == b'\'' {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            Some(Frame::DoubleQuote) => {
+                if c == b'\\' {
+                    let next = raw[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else {
+                    if c == b'"' {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+            }
+            None => {
+                if c == b'\\' {
+                    let next = raw[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b'(' {
+                    stack.push(Frame::Paren);
+                    i += 1;
+                } else if c == b'{' {
+                    stack.push(Frame::Brace);
+                    i += 1;
+                } else if matches!(c, b'<' | b'>') {
+                    return Some(i);
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                if c == b'\\' {
+                    let next = raw[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b'(' {
+                    stack.push(Frame::Paren);
+                    i += 1;
+                } else if c == b')' {
+                    let _ = stack.pop();
+                    i += 1;
+                } else if c == b'{' {
+                    stack.push(Frame::Brace);
+                    i += 1;
+                } else if c == b'}' {
+                    let _ = stack.pop();
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether the redirection operator starting at `redir` (`>` or `<`) has no
+/// attached operand and therefore consumes the next shell word as its target.
+fn redirect_takes_next(redir: &str) -> bool {
+    let rest = if redir.starts_with(">>")
+        || redir.starts_with("<<")
+        || redir.starts_with("<>")
+        || redir.starts_with(">&")
+        || redir.starts_with("<&")
+        || redir.starts_with(">|")
+    {
+        &redir[2..]
+    } else {
+        &redir[1..]
+    };
+    rest.is_empty()
+}
+
+/// Drop redirection tokens (and separate filename targets) from a stage's raw
+/// words, splitting any glued suffix redirection (such as `PATH=/x>out`) so the
+/// leading word stays visible to safety checks.
+pub(crate) fn strip_stage_redirections(
+    stage: &str,
+    raw_words: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    let mut kept = Vec::with_capacity(raw_words.len());
+    let mut skip_next = false;
+    for range in raw_words {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let raw = &stage[range.clone()];
+        let Some(pos) = first_unquoted_redirect(raw) else {
+            kept.push(range.clone());
+            continue;
+        };
+        let prefix = &raw[..pos];
+        let redir = &raw[pos..];
+        let pure_redir = prefix.is_empty()
+            || prefix.bytes().all(|b| b.is_ascii_digit())
+            || (prefix == "&" && redir.starts_with('>'));
+        if !pure_redir {
+            kept.push(range.start..range.start + pos);
+        }
+        skip_next = redirect_takes_next(redir);
+    }
+    kept
+}
+
+/// Whether a raw shell word may dynamically expand (variable/command substitution,
+/// grouping, brace/glob/tilde expansion) when interpreted as a program or variable
+/// name. Exact `[` and `[[` are the literal test builtins and are not dynamic.
+pub(crate) fn raw_word_is_dynamic(raw: &str) -> bool {
+    if raw.is_empty() {
+        return true;
+    }
+    let literal_test = matches!(raw, "[" | "[[");
+    let bytes = raw.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(b'\'') => {
+                if c == b'\'' {
+                    quote = None;
+                }
+                i += 1;
+            }
+            Some(b'"') => {
+                if c == b'\\' {
+                    let Some(next) = raw[i + 1..].chars().next() else {
+                        return true;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if matches!(c, b'$' | b'`') {
+                    return true;
+                } else {
+                    if c == b'"' {
+                        quote = None;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if c == b'\\' {
+                    let Some(next) = raw[i + 1..].chars().next() else {
+                        return true;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if matches!(c, b'\'' | b'"') {
+                    quote = Some(c);
+                    i += 1;
+                } else if matches!(c, b'$' | b'`' | b'(' | b'{' | b'*' | b'?')
+                    || (c == b'[' && !literal_test)
+                    || (c == b'~' && i == 0)
+                {
+                    return true;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    quote.is_some()
+}
+
+/// Extract the unquoted identifier name of a leading `NAME=value` or `NAME+=value`
+/// assignment from a raw shell word.
+fn raw_assignment_name(raw: &str) -> Option<&str> {
+    let (head, _) = raw.split_once('=')?;
+    let name = head.strip_suffix('+').unwrap_or(head);
+    is_ident(name).then_some(name)
+}
+
+/// First unquoted `=` offset inside `raw`, if any.
+fn first_unquoted_eq(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(b'\'') => {
+                if c == b'\'' {
+                    quote = None;
+                }
+                i += 1;
+            }
+            Some(b'"') => {
+                if c == b'\\' {
+                    let next = raw[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else {
+                    if c == b'"' {
+                        quote = None;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if c == b'\\' {
+                    let next = raw[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if matches!(c, b'\'' | b'"') {
+                    quote = Some(c);
+                    i += 1;
+                } else if c == b'=' {
+                    return Some(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Unquote a single raw shell word via `shlex::split`, returning `None` if it
+/// does not parse into exactly one word.
+fn unquote_word(raw: &str) -> Option<String> {
+    match shlex::split(raw).as_deref() {
+        Some([word]) => Some(word.clone()),
+        _ => None,
+    }
+}
+
+/// Whether an argument to `export`, `declare`, `typeset`, `readonly`, `local` or
+/// `unset` names (or may dynamically expand to) a variable that steers Justless.
+fn declares_steering_var(raw: &str) -> bool {
+    let raw_name = match first_unquoted_eq(raw) {
+        Some(eq) => {
+            let head = &raw[..eq];
+            head.strip_suffix('+').unwrap_or(head)
+        }
+        None => raw,
+    };
+    if raw_word_is_dynamic(raw_name) {
+        return true;
+    }
+    let Some(unquoted) = unquote_word(raw_name) else {
+        return true;
+    };
+    let name = unquoted
+        .split_once('=')
+        .map_or(unquoted.as_str(), |(n, _)| n);
+    let name = name.strip_suffix('+').unwrap_or(name);
+    steers(name)
+}
+
 /// Whether a command of a list may change, for the commands after it, a variable
 /// that decides which Justless runs or how. That is a command made only of
 /// assignments, such as `PATH=/x` or `PATH=/x 2>&1`, an assignment before a POSIX
-/// special builtin such as `:`, which the shell keeps, or `export`, `declare`,
-/// `typeset`, `readonly`, `local` or `unset` naming such a variable, also behind
-/// `builtin` or `command`. A hook then passes the whole list through, as for a
-/// change of directory.
+/// special builtin such as `:`, which the shell keeps, `export`, `declare`,
+/// `typeset`, `readonly`, `local` or `unset` naming (or dynamically naming) such
+/// a variable, also behind `builtin`, `command` or control keywords, or a dynamic
+/// command word, brace group, `eval`/`source`/`.`/`exec`/`alias`/`function` or
+/// variable-mutating expansion (`${...=...}`, `$((...))`, `((...))`). A hook then
+/// passes the whole list through, as for a change of directory.
 pub fn steers_justless(segment: &str) -> bool {
-    let Some(words) = words(segment) else {
+    let Some(stages) = pipe_stages(segment) else {
         return true;
     };
-    // Each word with its quotes removed.
-    let words: Vec<String> = words
+    stages
+        .into_iter()
+        .any(|range| steers_justless_stage(&segment[range]))
+}
+
+fn steers_justless_stage(stage: &str) -> bool {
+    if is_subshell(stage) {
+        return false;
+    }
+    if mutates_via_expansion(stage) {
+        return true;
+    }
+    let Some(raw_words) = words(stage) else {
+        return true;
+    };
+    let raw_words = strip_stage_redirections(stage, &raw_words);
+    // Skip leading shell control-flow keywords before assignments/program.
+    let start = raw_words
         .iter()
-        .map(|word| {
-            shlex::split(&segment[word.clone()])
-                .and_then(|word| word.into_iter().next())
-                .unwrap_or_default()
+        .position(|range| {
+            let raw = &stage[range.clone()];
+            !matches!(
+                raw,
+                "!" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" | "time"
+            )
         })
-        .collect();
-    let words = match words.as_slice() {
-        [rest @ .., last] if last == MERGE => rest,
-        all => all,
-    };
-    // The variable a word names, as in `NAME=value`, or `NAME+=value`, which appends
-    // in bash and zsh.
-    let name = |word: &str| {
-        let name = word.split_once('=')?.0;
-        let name = name.strip_suffix('+').unwrap_or(name);
-        (name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .then(|| name.to_owned())
-    };
-    let program = words.iter().position(|word| name(word).is_none());
-    let assigned = words[..program.unwrap_or(words.len())]
+        .unwrap_or(raw_words.len());
+    let raw_words = &raw_words[start..];
+    let program_idx = raw_words
         .iter()
-        .filter_map(|word| name(word))
-        .any(|name| steers(&name));
-    let Some(program) = program else {
+        .position(|range| raw_assignment_name(&stage[range.clone()]).is_none());
+    let assigned = raw_words[..program_idx.unwrap_or(raw_words.len())]
+        .iter()
+        .filter_map(|range| raw_assignment_name(&stage[range.clone()]))
+        .any(steers);
+    let Some(program_idx) = program_idx else {
         return assigned;
     };
-    let mut rest = words[program..]
-        .iter()
-        .map(String::as_str)
-        .skip_while(|word| matches!(*word, "builtin" | "command"));
-    let Some(program) = rest.next() else {
-        return assigned;
+    let mut rest = raw_words[program_idx..].iter().map(|r| &stage[r.clone()]);
+    let raw_program = loop {
+        let Some(word) = rest.next() else {
+            return assigned;
+        };
+        if !matches!(word, "builtin" | "command" | "noglob" | "nocorrect") {
+            break word;
+        }
     };
-    let declares = matches!(
-        program,
-        "export" | "declare" | "typeset" | "readonly" | "local" | "unset"
-    );
-    (assigned && SPECIAL.contains(&program))
-        || (declares
-            && rest.any(|word| {
-                let name = word.split_once('=').map_or(word, |(name, _)| name);
-                steers(name.strip_suffix('+').unwrap_or(name))
-            }))
+    if raw_word_is_dynamic(raw_program) {
+        return true;
+    }
+    let Some(program) = unquote_word(raw_program) else {
+        return true;
+    };
+    let rest: Vec<&str> = rest.collect();
+    if program.ends_with("()") || rest.first().copied() == Some("()") {
+        return true;
+    }
+    if matches!(
+        program.as_str(),
+        "alias" | "unalias" | "function" | "exec" | "eval" | "source" | "."
+    ) {
+        return true;
+    }
+    if assigned && SPECIAL.contains(&program.as_str()) {
+        return true;
+    }
+    match program.as_str() {
+        "export" | "declare" | "typeset" | "readonly" | "local" | "unset" => {
+            rest.into_iter().any(declares_steering_var)
+        }
+        "for" => rest.first().is_none_or(|var| declares_steering_var(var)),
+        "read" | "mapfile" | "readarray" | "getopts" | "vared" => rest
+            .into_iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .any(declares_steering_var),
+        "printf" => {
+            let mut iter = rest.into_iter();
+            while let Some(arg) = iter.next() {
+                if arg == "-v" {
+                    if iter.next().is_none_or(declares_steering_var) {
+                        return true;
+                    }
+                } else if let Some(var) = arg.strip_prefix("-v")
+                    && !var.is_empty()
+                    && declares_steering_var(var)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// POSIX special builtins, after which a shell keeps the assignments that precede
@@ -207,6 +895,19 @@ impl Form {
                 .all(|(name, value)| display_assignment(&name, &value))
     }
 
+    /// Whether leading assignments are safe for a mixed, non-approving client
+    /// (Claude Code, Gemini CLI, Antigravity Tier 2 `ask`): every assignment is
+    /// a non-steering `NAME=value` whose value consists only of literal text,
+    /// single/double quotes and pure shell variable references (`$var` or `${var}`),
+    /// with no command substitution (`$(...)` or backticks), arithmetic expansion,
+    /// side-effect parameter expansion (`${var:=...}`), backslash escapes outside
+    /// single quotes, tilde expansion or shell metacharacters.
+    pub fn safe_dynamic_assignments(&self, segment: &str) -> bool {
+        self.assignments
+            .iter()
+            .all(|range| safe_dynamic_assignment(&segment[range.clone()]))
+    }
+
     /// Each assignment's name and its value after quote removal. An assignment the
     /// shell would not take literally yields an empty name, which no rule accepts.
     fn variables<'a>(&'a self, segment: &'a str) -> impl Iterator<Item = (String, String)> + 'a {
@@ -219,6 +920,83 @@ impl Form {
                 _ => Default::default(),
             }
         })
+    }
+}
+
+/// Whether one `NAME=value` assignment has a non-steering identifier and a value
+/// built only from literal text, quotes, and pure `$var` / `${var}` expansions.
+fn safe_dynamic_assignment(raw: &str) -> bool {
+    let Some((name, value)) = raw.split_once('=') else {
+        return false;
+    };
+    if !is_ident(name) || steers(name) {
+        return false;
+    }
+    let mut quote: Option<char> = None;
+    let mut previous: Option<char> = None;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character.is_control() && character != '\t' {
+            return false;
+        }
+        match quote {
+            Some('\'') => {
+                if character == '\\' && chars.peek() == Some(&'\'') {
+                    return false;
+                }
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match character {
+                '\\' | '`' => return false,
+                '"' => quote = None,
+                '$' if !consume_simple_var(&mut chars) => return false,
+                '$' => {}
+                _ => {}
+            },
+            None => match character {
+                '\\' | '`' => return false,
+                '\'' | '"' => quote = Some(character),
+                '$' if !consume_simple_var(&mut chars) => return false,
+                '$' => {}
+                '~' if previous.is_none_or(|p| p == ':') => return false,
+                c if "|;&<>*?[]{}#!()".contains(c) => return false,
+                _ => {}
+            },
+            Some(_) => unreachable!(),
+        }
+        previous = Some(character);
+    }
+    quote.is_none()
+}
+
+/// Consume a pure shell variable reference immediately after `$`: either `IDENT`
+/// or `{IDENT}`, where `IDENT` is `[A-Za-z_][A-Za-z0-9_]*`. Rejects command
+/// substitution `$(...)`, arithmetic `$((...))`, parameter operators (`${a:=b}`),
+/// positional/special parameters (`$1`, `$?`), and bare `$`.
+fn consume_simple_var(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let braced = chars.peek() == Some(&'{');
+    if braced {
+        chars.next();
+    }
+    let Some(&first) = chars.peek() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.next();
+    while chars
+        .peek()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+    {
+        chars.next();
+    }
+    if braced {
+        chars.next() == Some('}')
+    } else {
+        true
     }
 }
 
@@ -265,31 +1043,207 @@ fn assignment(word: &str) -> bool {
     })
 }
 
-/// The byte range of each word, split at blanks outside quotes.
-fn words(text: &str) -> Option<Vec<Range<usize>>> {
+/// The byte range of each word, split at blanks outside quotes and nested
+/// `$(...)`, `${...}`, `(...)`, `{...}` groups, keeping backslash escapes intact.
+pub(crate) fn words(text: &str) -> Option<Vec<Range<usize>>> {
+    let bytes = text.as_bytes();
     let mut words = Vec::new();
-    let mut start = None;
-    let mut quote = None;
-    for (index, character) in text.char_indices() {
-        match quote {
-            Some(active) if character == active => quote = None,
-            Some(_) => {}
-            None if matches!(character, ' ' | '\t') => {
-                if let Some(start) = start.take() {
-                    words.push(start..index);
+    let mut start: Option<usize> = None;
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match stack.last().copied() {
+            Some(Frame::SingleQuote) => {
+                start.get_or_insert(i);
+                if c == b'\'' {
+                    stack.pop();
                 }
-                continue;
+                i += 1;
             }
-            None if matches!(character, '\'' | '"') => quote = Some(character),
-            None => {}
+            Some(Frame::DoubleQuote) => {
+                start.get_or_insert(i);
+                if c == b'\\' {
+                    let next = text[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else {
+                    if c == b'"' {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+            }
+            top => {
+                let at_top = top.is_none();
+                if at_top && matches!(c, b' ' | b'\t') {
+                    if let Some(s) = start.take() {
+                        words.push(s..i);
+                    }
+                    i += 1;
+                    continue;
+                }
+                start.get_or_insert(i);
+                if c == b'\\' {
+                    let next = text[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if c == b'\'' {
+                    stack.push(Frame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(Frame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(Frame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(Frame::Param);
+                    i += 2;
+                } else if c == b'(' {
+                    stack.push(Frame::Paren);
+                    i += 1;
+                } else if c == b')' {
+                    if !matches!(stack.pop(), Some(Frame::CmdSubst | Frame::Paren)) {
+                        return None;
+                    }
+                    i += 1;
+                } else if c == b'{' {
+                    stack.push(Frame::Brace);
+                    i += 1;
+                } else if c == b'}' {
+                    if !matches!(stack.pop(), Some(Frame::Param | Frame::Brace)) {
+                        return None;
+                    }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
         }
-        start.get_or_insert(index);
     }
-    if quote.is_some() {
+    if !stack.is_empty() {
         return None;
     }
-    if let Some(start) = start {
-        words.push(start..text.len());
+    if let Some(s) = start {
+        words.push(s..text.len());
     }
     Some(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_subshell, parse, pipe_stages, steers_justless};
+
+    #[test]
+    fn safe_dynamic_assignments_accept_pure_vars_and_reject_substitutions() {
+        for ok in [
+            r#"TMPDIR="$tmp" cargo test --locked"#,
+            "TMPDIR=$tmp cargo test",
+            r#"TMPDIR="${tmp}/sub" cargo test"#,
+            "TMPDIR=${tmp}/sub cargo test",
+            "RUST_BACKTRACE=$LEVEL cargo test",
+            r#"FOO="$A:$B" BAR='literal $x' cargo test"#,
+            "FOO= cargo test",
+        ] {
+            let form = parse(ok).unwrap_or_else(|| panic!("parse {ok}"));
+            assert!(form.keeps_justless(ok), "keeps_justless {ok}");
+            assert!(form.safe_dynamic_assignments(ok), "safe_dynamic {ok}");
+            assert!(!form.approvable(ok), "must not be approvable: {ok}");
+        }
+
+        for rejected in [
+            "FOO=$(id) cargo test",
+            r#"FOO="$(id)" cargo test"#,
+            "FOO=`id` cargo test",
+            r#"FOO="`id`" cargo test"#,
+            "FOO=$((1+1)) cargo test",
+            r#"FOO="${PATH:=/evil}" cargo test"#,
+            r#"FOO="${tmp:-/tmp}" cargo test"#,
+            "FOO=~/x cargo test",
+            "FOO=a:~/x cargo test",
+            "FOO=$1 cargo test",
+            r#"FOO="$" cargo test"#,
+            r#"PATH="$x" cargo test"#,
+            r#"LD_PRELOAD="$x" cargo test"#,
+            r#"JUSTLESS_DISABLE="$x" cargo test"#,
+        ] {
+            if let Some(form) = parse(rejected) {
+                assert!(
+                    !(form.keeps_justless(rejected) && form.safe_dynamic_assignments(rejected)),
+                    "must reject {rejected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn steers_justless_catches_dynamic_and_redirected_mutations() {
+        for steering in [
+            r#"PATH="$x""#,
+            r#"export PATH="$x""#,
+            r#"export "$VAR""#,
+            r#"unset "$VAR""#,
+            "PATH=$(echo /a /b)",
+            "2>&1 PATH=/x",
+            ">out.txt export PATH=/x",
+            "PATH=/x>out.txt",
+            "then PATH=/x",
+            "! PATH=/x",
+            r#"FOO="${PATH:=/evil}""#,
+            "echo $((PATH=1))",
+            "(( PATH = 1 ))",
+            "$(touch x)",
+            r#""$CMD" arg"#,
+            r#"eval "$x""#,
+            "source ./env.sh",
+            ". ./env.sh",
+            "exec >out.txt",
+            "alias justless=true",
+            "justless() { true; }",
+            "{ PATH=/evil; }",
+            "echo x | PATH=/evil",
+            "echo x | read PATH",
+            "for PATH in /a /b",
+            "printf -v PATH %s /evil",
+        ] {
+            assert!(steers_justless(steering), "must steer: {steering}");
+        }
+
+        for safe in [
+            "tmp=/var/tmp/justless-test-tmp",
+            "tmp=$(mktemp -d)",
+            r#"mkdir -p "$tmp""#,
+            r#"trap 'rm -rf "$tmp"' EXIT"#,
+            r#"TMPDIR="$tmp" cargo test --locked"#,
+            r#"echo "branch=$BRANCH""#,
+            "git diff > /tmp/out.patch",
+            "rg 'foo|bar' src | wc -l",
+            r#"export FOO="$BAR""#,
+            "PATH=/tmp/bin cargo test",
+            r#"[ -f "$tmp" ]"#,
+            r#"[[ -f "$a" && -f "$b" ]]"#,
+            "(cd /tmp && ls)",
+            "(cd /tmp && ls) > /dev/null",
+        ] {
+            assert!(!steers_justless(safe), "must not steer: {safe}");
+        }
+    }
+
+    #[test]
+    fn pipe_stages_and_subshell_handle_quotes_and_nesting() {
+        let s = r#"rg 'a|b' src | wc -l"#;
+        let ranges = pipe_stages(s).unwrap();
+        let parts: Vec<&str> = ranges.into_iter().map(|r| &s[r]).collect();
+        assert_eq!(parts, vec!["rg 'a|b' src", "wc -l"]);
+
+        assert!(is_subshell("(cd /tmp && ls)"));
+        assert!(is_subshell("(cd /tmp && ls) 2>&1"));
+        assert!(!is_subshell("(( x = 1 ))"));
+        assert!(!is_subshell("(cd /tmp) extra"));
+    }
 }

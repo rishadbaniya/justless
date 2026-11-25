@@ -2630,15 +2630,14 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -
     });
     // Claude Code checks its permission rules against the rewritten command, so
     // when it reports a mode, the rules are judged on the original first. See
-    // `claude_permissions`. A routed line always splits into its commands.
+    // `claude_permissions`. A routed line always splits into its commands via the
+    // same resilient splitter used by `plan`, expanding pipeline stages and
+    // leaving commands with nested subshells or command substitutions to Claude Code.
     let mut approve = agent == Agent::Codex;
     if agent == Agent::Claude
         && let Some(mode) = crate::claude_permissions::mode(input)
     {
-        let segments: Vec<&str> = split_compound(command)?
-            .into_iter()
-            .map(|range| &command[range])
-            .collect();
+        let segments = claude_permission_segments(command)?;
         match crate::claude_permissions::decide(&workspace.root, mode, &segments) {
             crate::claude_permissions::Answer::Leave => {
                 if record {
@@ -2911,6 +2910,7 @@ fn wrap_event(
         replace,
         entered,
         step,
+        ..
     } in plan.wrap
     {
         rewritten.push_str(&command[copied..replace.start]);
@@ -3356,11 +3356,12 @@ enum Step {
     Read,
 }
 
-/// One command a hook rewrites: the words it passes after `-- `, the full byte
-/// span it replaces in the line, the number of `cd` commands accepted before it,
-/// and how.
+/// One command a hook rewrites: the full segment range it came from, the words
+/// it passes after `-- `, the full byte span it replaces in the line, the number
+/// of `cd` commands accepted before it, and how.
 #[derive(Clone, Debug)]
 struct Wrap {
+    segment: Range<usize>,
     words: Range<usize>,
     replace: Range<usize>,
     entered: usize,
@@ -3382,7 +3383,12 @@ impl Plan {
     /// mix commands keeps the others; one that runs a rewritten list without asking
     /// gets the list as written, as for any unsupported command.
     fn exclude(&mut self, command: &str, rules: Rules, exclusions: &crate::rewrite::Exclusions) {
-        let excluded = |wrap: &Wrap| exclusions.within(command, &wrap.words).is_some();
+        let excluded = |wrap: &Wrap| {
+            exclusions
+                .matching(&command[wrap.segment.clone()])
+                .is_some()
+                || exclusions.within(command, &wrap.words).is_some()
+        };
         if rules.mixed {
             self.wrap.retain(|wrap| !excluded(wrap));
         } else if self.wrap.iter().any(excluded) {
@@ -3536,19 +3542,54 @@ fn allows_tail(command: &str) -> bool {
 }
 
 /// The command before and the filter after the one `|` outside quotes in `segment`,
-/// as trimmed ranges.
+/// as trimmed ranges. Rejects `|&` and multiple pipes.
 fn pipe_parts(segment: &str) -> Option<(Range<usize>, Range<usize>)> {
+    let bytes = segment.as_bytes();
     let mut quote = None;
     let mut pipe = None;
-    for (at, byte) in segment.bytes().enumerate() {
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
         match quote {
-            Some(open) if byte == open => quote = None,
-            Some(_) => {}
-            None if matches!(byte, b'\'' | b'"') => quote = Some(byte),
-            None if byte == b'|' && pipe.is_some() => return None,
-            None if byte == b'|' => pipe = Some(at),
-            None => {}
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    quote = None;
+                }
+                i += 1;
+            }
+            Some(b'"') => {
+                if byte == b'\\' {
+                    let next = segment[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else {
+                    if byte == b'"' {
+                        quote = None;
+                    }
+                    i += 1;
+                }
+            }
+            Some(_) => i += 1,
+            None => {
+                if byte == b'\\' {
+                    let next = segment[i + 1..].chars().next()?;
+                    i += 1 + next.len_utf8();
+                } else if matches!(byte, b'\'' | b'"') {
+                    quote = Some(byte);
+                    i += 1;
+                } else if byte == b'|' {
+                    if bytes.get(i + 1) == Some(&b'&') || pipe.is_some() {
+                        return None;
+                    }
+                    pipe = Some(i);
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
         }
+    }
+    if quote.is_some() {
+        return None;
     }
     let pipe = pipe?;
     let trimmed = |range: Range<usize>| {
@@ -3570,10 +3611,17 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         let form = crate::shell_form::parse(segment)?;
         let words = &segment[form.command.clone()];
         // A client that approves a rewrite, or may not check it again, takes only
-        // display settings.
+        // display settings with literal values. Mixed non-approving clients
+        // (Claude Code, Gemini CLI, Antigravity Tier 2 `ask`) also accept safe
+        // variable-expansion assignments (`TMPDIR="$tmp"`) when non-steering and
+        // free of command substitution, while the command words stay strictly literal.
         let env = form.keeps_justless(segment)
-            && (rules.mixed && !rules.approves || form.approvable(segment));
-        (env && literal_command(&segment[..form.command.end]).is_some()
+            && if rules.mixed && !rules.approves {
+                form.safe_dynamic_assignments(segment)
+            } else {
+                form.approvable(segment) && literal_command(&segment[..form.command.end]).is_some()
+            };
+        (env && literal_command(words).is_some()
             && supported_command(words, json)
             && !(rules.claude && runs_grep(words))
             && (!rules.approves && !rules.ask_safe
@@ -3631,7 +3679,9 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         None
     };
     let mut plan = Plan::default();
-    let segments = if rules.script || rules.pipes {
+    let segments = if rules.mixed {
+        split_mixed_list(command, rules.script)
+    } else if rules.script || rules.pipes {
         split_list(command, rules.script, rules.pipes)
     } else {
         split_compound(command).filter(|s| s.len() > 1)
@@ -3640,10 +3690,15 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
         let start = command.len() - command.trim_start_matches(SHELL_BLANKS).len();
         let range = start..command.trim_end_matches(SHELL_BLANKS).len().max(start);
         plan.last = Some(range.clone());
+        if rules.mixed {
+            plan.other.push(range);
+            return plan;
+        }
         match supported(&command[range.clone()], !rules.claude) {
             Some(words) => {
                 let words = within(&range, words);
                 plan.wrap.push(Wrap {
+                    segment: range,
                     replace: words.clone(),
                     words,
                     entered: 0,
@@ -3687,6 +3742,7 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
             None if safe_shell_set(segment) => {}
             None => match step {
                 Some((words, replace, step)) => plan.wrap.push(Wrap {
+                    segment: range.clone(),
                     words,
                     replace,
                     entered,
@@ -3715,50 +3771,79 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
 const SHELL_BLANKS: [char; 2] = [' ', '\t'];
 
 /// A command that can change the shell's directory: `Some(Some(DIR))` for a plain
-/// `cd DIR`, and `Some(None)` for any other form, such as a bare `cd`, `cd -P DIR`,
-/// `builtin cd`, `pushd`, `popd`, `source` or `eval`.
+/// literal `cd DIR`, and `Some(None)` for any other form, such as a bare `cd`,
+/// `cd "$dir"`, `cd -P DIR`, `2>&1 cd DIR`, `builtin cd`, `pushd`, `popd`,
+/// `source`, `.`, `eval`, or a dynamic program word.
 fn directory_change(segment: &str) -> Option<Option<String>> {
-    let Some(words) = shlex::split(segment) else {
+    let Some(stages) = crate::shell_form::pipe_stages(segment) else {
         return Some(None);
     };
-    // Look past assignments and the words that run the next one in this shell, such
-    // as `builtin cd`, `time cd` or the `then cd` of an `if` split at its `;`.
-    let program = words.iter().map(String::as_str).find(|word| {
-        !word.contains('=')
-            && !word.starts_with('-')
-            && !matches!(
-                *word,
-                "builtin"
-                    | "command"
-                    | "time"
-                    | "if"
-                    | "then"
-                    | "else"
-                    | "elif"
-                    | "while"
-                    | "until"
-                    | "do"
-            )
-    })?;
-    match words.as_slice() {
-        // `cd 2>&1` is a bare `cd`, not a directory named `2>&1`.
-        [cd, directory]
-            if cd == "cd"
-                && !directory.is_empty()
-                && !directory.starts_with('-')
-                && !segment.ends_with("2>&1") =>
-        {
-            Some(Some(directory.clone()))
-        }
-        _ if matches!(
-            program,
-            "cd" | "pushd" | "popd" | "chdir" | "source" | "." | "eval"
-        ) =>
-        {
-            Some(None)
-        }
-        _ => None,
+    if stages.len() > 1 {
+        return stages
+            .into_iter()
+            .any(|range| directory_change_stage(&segment[range]).is_some())
+            .then_some(None);
     }
+    directory_change_stage(&segment[stages[0].clone()])
+}
+
+fn directory_change_stage(stage: &str) -> Option<Option<String>> {
+    if crate::shell_form::is_subshell(stage) {
+        return None;
+    }
+    let Some(raw_words) = crate::shell_form::words(stage) else {
+        return Some(None);
+    };
+    let raw_words = crate::shell_form::strip_stage_redirections(stage, &raw_words);
+    // Look past leading assignments, redirections, and words that run the next
+    // command in this shell, such as `builtin cd`, `time cd` or `then cd`.
+    let raw_program = raw_words
+        .iter()
+        .map(|range| &stage[range.clone()])
+        .find(|word| {
+            !word.contains('=')
+                && !word.starts_with('-')
+                && !matches!(
+                    *word,
+                    "!" | "builtin"
+                        | "command"
+                        | "noglob"
+                        | "nocorrect"
+                        | "time"
+                        | "if"
+                        | "then"
+                        | "else"
+                        | "elif"
+                        | "while"
+                        | "until"
+                        | "do"
+                )
+        })?;
+    if crate::shell_form::raw_word_is_dynamic(raw_program) {
+        return Some(None);
+    }
+    let program = match shlex::split(raw_program).as_deref() {
+        Some([word]) => word.clone(),
+        _ => return Some(None),
+    };
+    if program == "cd" {
+        // Only a strictly literal `cd DIR` with no expansions, options, assignments
+        // or redirections can be verified to descend inside the workspace.
+        if let Some(words) = literal_command(stage)
+            && let [cd, directory] = words.as_slice()
+            && cd == "cd"
+            && !directory.is_empty()
+            && !directory.starts_with('-')
+        {
+            return Some(Some(directory.clone()));
+        }
+        return Some(None);
+    }
+    matches!(
+        program.as_str(),
+        "pushd" | "popd" | "chdir" | "source" | "." | "eval"
+    )
+    .then_some(None)
 }
 
 /// Whether a `cd` operand names a directory below the current one, without `..`,
@@ -3793,10 +3878,378 @@ pub(crate) fn split_script(command: &str) -> Option<Vec<Range<usize>>> {
 /// The commands of `command` as `agent`'s command hook splits them.
 pub(crate) fn split_for_agent(agent: Agent, command: &str) -> Option<Vec<Range<usize>>> {
     match agent {
-        Agent::Codex | Agent::Agy => split_list(command, true, true),
-        Agent::Cursor | Agent::Gemini | Agent::Copilot => split_list(command, false, true),
+        Agent::Codex => split_list(command, true, true),
+        Agent::Agy => split_mixed_list(command, true),
+        Agent::Claude | Agent::Gemini => split_mixed_list(command, false),
+        Agent::Cursor | Agent::Copilot => split_list(command, false, true),
         _ => split_compound(command),
     }
+}
+
+/// Nesting frame for `split_mixed_list`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixedFrame {
+    SingleQuote,
+    DoubleQuote,
+    CmdSubst,
+    Param,
+    Paren,
+    Brace,
+    DoubleBracket,
+}
+
+/// Resilient top-level command list splitter used ONLY when `rules.mixed == true`
+/// (Claude Code, Gemini CLI, Antigravity Tier 2 `decision: "ask"`).
+///
+/// Splits on unquoted top-level `&&`, `||`, `;` (plus `\n` when `script` is true),
+/// tracking single/double quotes, backslash escapes outside single quotes, and
+/// `$(...)`, `${...}`, `(...)`, `{...}`, `[[...]]` nesting depth. Unsupported
+/// segments (variable expansions, redirections, arbitrary pipes) stay verbatim as
+/// segments for `plan` to keep in `plan.other`, while dangerous whole-line forms
+/// (here-docs `<<`, process substitutions `<(`/ `>(`, backticks outside single
+/// quotes, background `&`, case `;;`/ `;&`, subshell/brace-group-only whole lines,
+/// comments `#`, control chars, line continuations, or unclosed quotes/brackets)
+/// return `None`.
+fn split_mixed_list(command: &str, script: bool) -> Option<Vec<Range<usize>>> {
+    let bytes = command.as_bytes();
+    let mut stack: Vec<MixedFrame> = Vec::new();
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut push = |from: usize, to: usize| -> Option<()> {
+        let text = &command[from..to];
+        let lead = text.len() - text.trim_start_matches(SHELL_BLANKS).len();
+        let trimmed = text.trim_matches(SHELL_BLANKS);
+        (!trimmed.is_empty()).then(|| segments.push(from + lead..from + lead + trimmed.len()))
+    };
+    while i < bytes.len() {
+        let c = bytes[i];
+        match stack.last().copied() {
+            Some(MixedFrame::SingleQuote) => {
+                if c.is_ascii_control() && c != b'\t' {
+                    return None;
+                }
+                if c == b'\\' && bytes.get(i + 1) == Some(&b'\'') {
+                    return None;
+                }
+                if c == b'\'' {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            Some(MixedFrame::DoubleQuote) => {
+                if c.is_ascii_control() && c != b'\t' {
+                    return None;
+                }
+                if c == b'\\' {
+                    let next = command[i + 1..].chars().next()?;
+                    if next.is_ascii_control() && next != '\t' {
+                        return None;
+                    }
+                    i += 1 + next.len_utf8();
+                } else if c == b'`' {
+                    return None;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(MixedFrame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(MixedFrame::Param);
+                    i += 2;
+                } else {
+                    if c == b'"' {
+                        stack.pop();
+                    }
+                    i += 1;
+                }
+            }
+            Some(MixedFrame::DoubleBracket) => {
+                if c.is_ascii_control() && c != b'\t' {
+                    return None;
+                }
+                if c == b'\\' {
+                    let next = command[i + 1..].chars().next()?;
+                    if next.is_ascii_control() && next != '\t' {
+                        return None;
+                    }
+                    i += 1 + next.len_utf8();
+                } else if c == b'`' || c == b'#' {
+                    return None;
+                } else if c == b'\'' {
+                    stack.push(MixedFrame::SingleQuote);
+                    i += 1;
+                } else if c == b'"' {
+                    stack.push(MixedFrame::DoubleQuote);
+                    i += 1;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'(') {
+                    stack.push(MixedFrame::CmdSubst);
+                    i += 2;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    stack.push(MixedFrame::Param);
+                    i += 2;
+                } else if c == b']'
+                    && bytes.get(i + 1) == Some(&b']')
+                    && bytes.get(i + 2).is_none_or(|b| {
+                        matches!(b, b' ' | b'\t' | b';' | b'&' | b'|' | b')' | b'\n')
+                    })
+                {
+                    stack.pop();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            top => {
+                let at_top = top.is_none();
+                if c == b'\n' {
+                    if !(script && at_top) {
+                        return None;
+                    }
+                    let before = command[..i].trim_end_matches(SHELL_BLANKS);
+                    if before.ends_with('|') || before.ends_with("&&") || before.ends_with('\\') {
+                        return None;
+                    }
+                    if !command[start..i].trim_matches(SHELL_BLANKS).is_empty() {
+                        push(start, i)?;
+                    }
+                    i += 1;
+                    start = i;
+                    continue;
+                }
+                if c.is_ascii_control() && c != b'\t' {
+                    return None;
+                }
+                if c == b'\\' {
+                    let next = command[i + 1..].chars().next()?;
+                    if next.is_ascii_control() && next != '\t' {
+                        return None;
+                    }
+                    i += 1 + next.len_utf8();
+                    continue;
+                }
+                if c == b'`' {
+                    return None;
+                }
+                if c == b'#' && top != Some(MixedFrame::Param) {
+                    return None;
+                }
+                match c {
+                    b'\'' => {
+                        stack.push(MixedFrame::SingleQuote);
+                        i += 1;
+                    }
+                    b'"' => {
+                        stack.push(MixedFrame::DoubleQuote);
+                        i += 1;
+                    }
+                    b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                        stack.push(MixedFrame::CmdSubst);
+                        i += 2;
+                    }
+                    b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                        stack.push(MixedFrame::Param);
+                        i += 2;
+                    }
+                    b'(' => {
+                        stack.push(MixedFrame::Paren);
+                        i += 1;
+                    }
+                    b')' => {
+                        if !matches!(stack.pop(), Some(MixedFrame::CmdSubst | MixedFrame::Paren)) {
+                            return None;
+                        }
+                        i += 1;
+                    }
+                    b'{' => {
+                        stack.push(MixedFrame::Brace);
+                        i += 1;
+                    }
+                    b'}' => {
+                        if !matches!(stack.pop(), Some(MixedFrame::Param | MixedFrame::Brace)) {
+                            return None;
+                        }
+                        i += 1;
+                    }
+                    b'[' if bytes.get(i + 1) == Some(&b'[')
+                        && (i == 0
+                            || matches!(
+                                bytes[i - 1],
+                                b' ' | b'\t' | b';' | b'&' | b'|' | b'(' | b'\n'
+                            ))
+                        && bytes.get(i + 2).is_some_and(|b| matches!(b, b' ' | b'\t')) =>
+                    {
+                        stack.push(MixedFrame::DoubleBracket);
+                        i += 2;
+                    }
+                    b'<' => {
+                        if matches!(bytes.get(i + 1), Some(b'<' | b'(')) {
+                            return None;
+                        }
+                        i += if bytes.get(i + 1) == Some(&b'&') {
+                            2
+                        } else {
+                            1
+                        };
+                    }
+                    b'>' => {
+                        if bytes.get(i + 1) == Some(&b'(') {
+                            return None;
+                        }
+                        if bytes.get(i + 1) == Some(&b'&') {
+                            // Keep `2>&1` followed directly by `&&`/`||` (without a
+                            // separating blank) rejected so `shell_form::merges`
+                            // always agrees with `shell_form::parse`.
+                            if at_top
+                                && bytes.get(i + 2).is_some_and(u8::is_ascii_digit)
+                                && matches!(bytes.get(i + 3..i + 5), Some(b"&&" | b"||"))
+                            {
+                                return None;
+                            }
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    b'&' if bytes.get(i + 1) == Some(&b'&') => {
+                        if at_top {
+                            push(start, i)?;
+                            i += 2;
+                            start = i;
+                        } else {
+                            i += 2;
+                        }
+                    }
+                    b'&' if bytes.get(i + 1) == Some(&b'>') => {
+                        i += 2;
+                    }
+                    b'&' => return None,
+                    b'|' if bytes.get(i + 1) == Some(&b'|') => {
+                        if at_top {
+                            push(start, i)?;
+                            i += 2;
+                            start = i;
+                        } else {
+                            i += 2;
+                        }
+                    }
+                    b'|' if bytes.get(i + 1) == Some(&b'&') => {
+                        i += 2;
+                    }
+                    b';' if matches!(bytes.get(i + 1), Some(b';' | b'&')) => return None,
+                    b';' if at_top => {
+                        push(start, i)?;
+                        i += 1;
+                        start = i;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+    }
+    if !stack.is_empty() {
+        return None;
+    }
+    let end = command.trim_end_matches(SHELL_BLANKS);
+    if !command[start..].trim_matches(SHELL_BLANKS).is_empty() {
+        if end.ends_with('|') && !end.ends_with("||") {
+            return None;
+        }
+        push(start, command.len())?;
+    } else if segments.is_empty() || end.ends_with("&&") || end.ends_with("||") {
+        return None;
+    }
+    // Reject subshell-only and brace-group-only whole lines such as `(cd web && npm test)`.
+    if segments.len() == 1 && command[segments[0].clone()].starts_with(['(', '{']) {
+        return None;
+    }
+    Some(segments)
+}
+
+/// Whether `command` contains nested shell execution (`$(...)`, backticks, or
+/// unquoted `(...)`/`{...}` outside `${...}`) whose inner commands
+/// `claude_permissions::verdict` cannot inspect directly.
+fn has_nested_shell_execution(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut param_depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(b'\'') => {
+                if c == b'\'' {
+                    quote = None;
+                }
+                i += 1;
+            }
+            Some(b'"') => {
+                if c == b'\\' {
+                    let Some(next) = command[i + 1..].chars().next() else {
+                        return true;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if c == b'`' || (c == b'$' && bytes.get(i + 1) == Some(&b'(')) {
+                    return true;
+                } else {
+                    if c == b'"' {
+                        quote = None;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if c == b'\\' {
+                    let Some(next) = command[i + 1..].chars().next() else {
+                        return true;
+                    };
+                    i += 1 + next.len_utf8();
+                } else if matches!(c, b'\'' | b'"') {
+                    quote = Some(c);
+                    i += 1;
+                } else if c == b'`' || (c == b'$' && bytes.get(i + 1) == Some(&b'(')) {
+                    return true;
+                } else if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    param_depth += 1;
+                    i += 2;
+                } else if c == b'}' && param_depth > 0 {
+                    param_depth -= 1;
+                    i += 1;
+                } else if matches!(c, b'(' | b'{') && param_depth == 0 {
+                    return true;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    quote.is_some() || param_depth > 0
+}
+
+/// The command segments passed to `claude_permissions::decide` / `Rules::answer`.
+/// Uses `split_compound` on plain lists (identical to before), and for mixed lists
+/// with `$var`, redirections, or pipes uses `split_mixed_list` while expanding
+/// every pipeline stage so `deny`/`ask` rules see every command (including
+/// `rm -rf "$tmp"`). Lines with nested subshells or command substitutions return
+/// `None`, leaving them for Claude Code's own permission engine.
+fn claude_permission_segments(command: &str) -> Option<Vec<&str>> {
+    if let Some(ranges) = split_compound(command) {
+        return Some(ranges.into_iter().map(|range| &command[range]).collect());
+    }
+    if has_nested_shell_execution(command) {
+        return None;
+    }
+    let ranges = split_mixed_list(command, false)?;
+    let mut segments = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let seg = &command[range];
+        segments.push(seg);
+        let stages = crate::shell_form::pipe_stages(seg)?;
+        if stages.len() > 1 {
+            for stage in stages {
+                segments.push(&seg[stage]);
+            }
+        }
+    }
+    Some(segments)
 }
 
 /// `split_compound`, and with `script`, as Codex and Antigravity write a script's
@@ -3914,10 +4367,10 @@ pub fn left_by_permissions(
     mode: &str,
     rules: &crate::claude_permissions::Rules,
 ) -> bool {
-    // The hook skips plan mode before it judges anything.
+    // The hook skips plan mode before it judges anything, and leaves any line
+    // whose segments cannot be safely flattened for permission matching.
     mode == "plan"
-        || split_compound(command).is_some_and(|ranges| {
-            let segments: Vec<&str> = ranges.into_iter().map(|range| &command[range]).collect();
+        || claude_permission_segments(command).is_none_or(|segments| {
             rules.answer(mode, &segments) == crate::claude_permissions::Answer::Leave
         })
 }
@@ -3976,6 +4429,20 @@ pub fn command_label(command: &str) -> String {
     // A label never runs, so a loose split also works for pipes and expansions.
     let segments: Vec<&str> = split_compound(command)
         .map(|ranges| ranges.into_iter().map(|r| &command[r]).collect())
+        .or_else(|| {
+            split_mixed_list(command, true).map(|ranges| {
+                let mut parts = Vec::with_capacity(ranges.len());
+                for r in ranges {
+                    let seg = &command[r];
+                    if let Some(stages) = crate::shell_form::pipe_stages(seg) {
+                        parts.extend(stages.into_iter().map(|s| &seg[s]));
+                    } else {
+                        parts.push(seg);
+                    }
+                }
+                parts
+            })
+        })
         .unwrap_or_else(|| {
             command
                 .split(['&', '|', ';', '\n'])
@@ -4279,7 +4746,10 @@ pub(crate) fn setup_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_would_route, command_label, exit1_valid, split_script};
+    use super::{
+        agy_would_route, codex_would_route, command_label, exit1_valid, split_mixed_list,
+        split_script, would_route,
+    };
 
     /// What `discover` counts as routed for Codex, judged from the command alone,
     /// on the shapes Codex scripts write.
@@ -4430,5 +4900,106 @@ mod tests {
         ] {
             assert!(!exit1_valid(statement), "{statement}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_chains_with_vars_and_redirects_route_for_mixed_clients_only() {
+        let none = crate::rewrite::Exclusions::default();
+        let verify_chain = "cargo fmt --all && cargo fmt --all -- --check && cargo clippy --locked --all-targets -- -D warnings && tmp=/var/tmp/justless-test-tmp && mkdir -p \"$tmp\" && trap 'rm -rf \"$tmp\"' EXIT && TMPDIR=\"$tmp\" cargo test --locked";
+        for cmd in [
+            verify_chain,
+            r#"cargo build && ./target/debug/app "$ARG""#,
+            r#"git status && echo "branch=$BRANCH""#,
+            "cargo test && git diff > /tmp/out.patch",
+            r#"TMPDIR="$tmp" cargo test --locked"#,
+            r#"TMPDIR="${tmp}/sub" cargo test"#,
+            "RUST_BACKTRACE=$LEVEL cargo test",
+        ] {
+            assert!(would_route(cmd, &none), "claude would_route: {cmd}");
+            assert!(agy_would_route(cmd, &none), "agy_would_route: {cmd}");
+            assert!(
+                !codex_would_route(cmd, &none),
+                "codex_would_route must stay false: {cmd}"
+            );
+        }
+
+        // Unsafe directory changes, steering env assignments, command substitutions
+        // in assignments, dynamic command words, here-docs, background jobs, comments,
+        // and subshell-only lines must remain unrouted everywhere.
+        for rejected in [
+            r#"cd "$dir" && cargo test"#,
+            "cd .. && cargo test",
+            "cd && cargo test",
+            r#"PATH="$x" cargo test"#,
+            r#"PATH="$x" && cargo test"#,
+            r#"export PATH="$x" && cargo test"#,
+            r#"export LD_PRELOAD="$x" && cargo test"#,
+            r#"export "$VAR" && cargo test"#,
+            "FOO=$(id) cargo test",
+            r#"FOO="$(id)" cargo test"#,
+            "FOO=`id` cargo test",
+            r#"FOO="${PATH:=/evil}" cargo test"#,
+            r#"cargo test && eval "$x""#,
+            "cargo test && source ./env.sh",
+            "cargo test && $(touch x)",
+            r#"cargo test && "$CMD" arg"#,
+            "cargo test && { cd /tmp; }",
+            "(cd sub && cargo test)",
+            "cargo test &",
+            "cargo test && cat <<EOF\nx\nEOF",
+            "cargo test # && rm -rf /",
+        ] {
+            assert!(
+                !would_route(rejected, &none),
+                "claude must reject: {rejected}"
+            );
+            assert!(
+                !agy_would_route(rejected, &none),
+                "agy must reject: {rejected}"
+            );
+            assert!(
+                !codex_would_route(rejected, &none),
+                "codex must reject: {rejected}"
+            );
+        }
+
+        // `split_mixed_list` preserves quoted operators, escapes, and `$(...)`/`(...)`
+        // nesting while rejecting unbalanced quotes/brackets and here-docs.
+        fn split(s: &str, script: bool) -> Option<Vec<&str>> {
+            split_mixed_list(s, script).map(|r| r.into_iter().map(|r| &s[r]).collect())
+        }
+        assert_eq!(
+            split(
+                r#"cargo test && echo "a && b" && git diff > /tmp/out.patch"#,
+                false
+            ),
+            Some(vec![
+                "cargo test",
+                r#"echo "a && b""#,
+                "git diff > /tmp/out.patch"
+            ])
+        );
+        assert_eq!(
+            split(
+                r#"cargo test && [[ -f "$a" && -f "$b" ]] && git status"#,
+                false
+            ),
+            Some(vec![
+                "cargo test",
+                r#"[[ -f "$a" && -f "$b" ]]"#,
+                "git status"
+            ])
+        );
+        assert_eq!(split("(cd web && npm test)", false), None);
+        assert_eq!(split("{ git status; }", false), None);
+        assert_eq!(split("cargo test && echo \"unclosed", false), None);
+        assert_eq!(split("cargo test && echo (unclosed", false), None);
+        assert_eq!(split("cargo test && cat <<EOF\nhi\nEOF", true), None);
+        assert_eq!(split("cargo test\ngit status", false), None);
+        assert_eq!(
+            split("cargo test\ngit status", true),
+            Some(vec!["cargo test", "git status"])
+        );
     }
 }
