@@ -22,6 +22,7 @@ mod history;
 mod impact;
 mod index;
 mod inventory;
+mod js_tests;
 mod json_edit;
 mod jsonview;
 mod known;

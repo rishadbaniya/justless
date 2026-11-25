@@ -1608,6 +1608,7 @@ impl Capture<'_> {
         // leave out what came after it.
         if !run.produced_bytes.is_empty() {
             run.summary.cargo = None;
+            run.summary.js = None;
         }
         let mut key = Sha256::new();
         for field in std::iter::once(workspace.cwd.as_os_str().as_encoded_bytes())
@@ -1682,20 +1683,32 @@ impl Capture<'_> {
             run.summary = summary.clone();
         }
         let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
-        // `cargo test` totals account for every line of stdout, and of stderr when
-        // they show all its other lines, so they replace what they cover.
-        let whole = run.summary.cargo.is_some();
+        // `cargo test` totals and structured JS/TS test reports account for every
+        // line of stdout, and of stderr when they cover it, so they replace what
+        // they cover.
+        let whole = run.summary.cargo.is_some() || run.summary.js.is_some();
         let covers_stderr = run
             .summary
             .cargo
             .as_ref()
-            .is_some_and(|totals| totals.stderr);
-        let covered = previews[0].1.len()
-            + if covers_stderr {
-                previews[1].1.len()
+            .is_some_and(|totals| totals.stderr)
+            || run.summary.js.as_ref().is_some_and(|report| report.stderr);
+        let covered = if run.summary.js.is_some() {
+            let stdout_raw = usize::try_from(lengths[0]).unwrap_or(usize::MAX);
+            let stderr_raw = if covers_stderr {
+                usize::try_from(lengths[1]).unwrap_or(usize::MAX)
             } else {
                 0
             };
+            stdout_raw.saturating_add(stderr_raw)
+        } else {
+            previews[0].1.len()
+                + if covers_stderr {
+                    previews[1].1.len()
+                } else {
+                    0
+                }
+        };
         // The Cargo.lock sections of a patch, described by their dependency changes.
         let locks = (!merged && run.produced_bytes.is_empty() && crate::lockdiff::applies(words))
             .then(|| read_text(&archive.readers[0], lengths[0], crate::lockdiff::LIMIT))

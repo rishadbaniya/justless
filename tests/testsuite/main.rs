@@ -13,6 +13,7 @@ mod git_views;
 mod global;
 mod grep_lists;
 mod hook_fixes;
+mod js_reports;
 mod known_commands;
 mod lookup;
 mod mcp;

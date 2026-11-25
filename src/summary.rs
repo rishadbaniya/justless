@@ -19,6 +19,14 @@ pub struct Summary {
     /// both streams. The report then stands in for both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cargo: Option<crate::cargo_tests::Totals>,
+    /// Structured JS/TS or Playwright test report, when recognized output
+    /// accounts for both streams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js: Option<crate::js_tests::Report>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,6 +36,8 @@ pub struct Item {
     pub digest: String,
     pub first: usize,
     pub last: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stderr: bool,
 }
 
 pub fn family(args: &[OsString]) -> String {
@@ -53,6 +63,27 @@ pub fn family(args: &[OsString]) -> String {
                 || w.starts_with("--unified=")
         })
     };
+    let playwright_display = || {
+        let mut iter = tool.iter().skip(2);
+        while let Some(&arg) = iter.next() {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg, None), |(f, v)| (f, Some(v)));
+            match flag {
+                "--list" | "--ui" | "--debug" | "--headed" | "--help" | "--version" => {
+                    return false;
+                }
+                "--reporter" => {
+                    let val = inline.or_else(|| iter.next().copied()).unwrap_or("");
+                    if !matches!(val, "list" | "line" | "dot") {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    };
     match words.as_slice() {
         ["git", "diff", ..] => "git diff",
         ["git", "show", ..] => "git show",
@@ -61,6 +92,7 @@ pub fn family(args: &[OsString]) -> String {
         ["cargo", "nextest", "run", ..] => "cargo nextest",
         ["go", "test", ..] => "go test",
         ["npm", "test", ..] => "npm test",
+        ["playwright", "test", ..] if playwright_display() => "playwright test",
         ["pytest", ..] | ["python" | "python3", "-m", "pytest"] => "pytest",
         ["terraform" | "tofu", "plan", ..] => "terraform plan",
         [cmd @ ("cargo" | "git" | "go" | "npm" | "rg"), ..] => cmd,
@@ -74,6 +106,7 @@ const LIMIT: usize = 2048;
 pub struct Parser {
     inventory: Option<crate::inventory::Inventory>,
     cargo: Option<crate::cargo_tests::Scan>,
+    js_tests: Option<crate::js_tests::Scan>,
     summary: Summary,
     hash: Sha256,
     file: String,
@@ -123,8 +156,11 @@ enum Place {
 
 impl Parser {
     pub fn new(family: &str, profile: Option<crate::filters::Profile>) -> Self {
+        let is_js_tests = profile == Some(crate::filters::Profile::JsTests)
+            || (profile.is_none() && family == "playwright test");
         let commits = profile.is_none() && matches!(family, "git show" | "git log");
         let kind = match family {
+            _ if is_js_tests => "tests",
             _ if profile.is_some() => "",
             "git diff" => "diff",
             _ if commits => "diff",
@@ -141,6 +177,7 @@ impl Parser {
                 "cargo nextest" if profile.is_none() => Some(crate::cargo_tests::Scan::nextest()),
                 _ => None,
             },
+            js_tests: is_js_tests.then(crate::js_tests::Scan::default),
             summary: Summary {
                 kind: kind.into(),
                 ..Default::default()
@@ -227,6 +264,8 @@ impl Parser {
             self.diff(line, number);
         } else if self.summary.kind == "plan" {
             self.plan(line, number);
+        } else if let Some(js) = &mut self.js_tests {
+            js.observe(line, number, crate::capture::Stream::Stdout);
         } else {
             if let Some(cargo) = &mut self.cargo {
                 cargo.observe(line, number, crate::capture::Stream::Stdout);
@@ -235,10 +274,24 @@ impl Parser {
         }
     }
 
-    /// Read a line of stderr, where `cargo test` names each test binary it runs.
+    /// Read a line of stderr, where `cargo test` and JS runners such as Jest,
+    /// Vitest and Bun print test output.
     pub fn observe_stderr(&mut self, text: &str, number: usize) {
         if let Some(cargo) = &mut self.cargo {
             cargo.observe(text, number, crate::capture::Stream::Stderr);
+        }
+        if let Some(js) = &mut self.js_tests
+            && !self.discarded
+        {
+            if text.len() >= 256 * 1024 || text.contains('\0') {
+                self.discarded = true;
+                return;
+            }
+            js.observe(
+                text.trim_end_matches('\n'),
+                number,
+                crate::capture::Stream::Stderr,
+            );
         }
     }
 
@@ -646,6 +699,16 @@ impl Parser {
         if let Some(inventory) = self.inventory {
             return inventory.finish();
         }
+        if let Some(js) = self.js_tests {
+            let Some(report) = js.finish() else {
+                return Summary::default();
+            };
+            self.summary.kind = "tests".into();
+            self.summary.items = report.summary_items();
+            self.summary.outcomes = report.totals.clone();
+            self.summary.js = Some(report);
+            return self.summary;
+        }
         // A hunk that a filter such as `grep` thinned out tells nothing about where
         // the output stopped.
         if self.ends_early
@@ -748,13 +811,27 @@ impl Item {
     }
 
     pub(crate) fn new(name: &str, detail: &str, n: usize) -> Self {
+        Self::new_in_stream(name, detail, n, crate::capture::Stream::Stdout)
+    }
+
+    pub(crate) fn new_in_stream(
+        name: &str,
+        detail: &str,
+        n: usize,
+        stream: crate::capture::Stream,
+    ) -> Self {
         Self {
             name: short(name, 320),
             detail: short(detail, 360),
             digest: String::new(),
             first: n,
             last: n,
+            stderr: matches!(stream, crate::capture::Stream::Stderr),
         }
+    }
+
+    pub(crate) fn stream_name(&self) -> &'static str {
+        if self.stderr { "stderr" } else { "stdout" }
     }
     /// The identity used to compare runs. A patch hunk drops its line ranges,
     /// which shift whenever an earlier hunk grows or shrinks.
@@ -777,8 +854,12 @@ impl Item {
 
     pub(crate) fn display(&self) -> String {
         format!(
-            "{} {} [stdout:{}-{}]",
-            self.name, self.detail, self.first, self.last
+            "{} {} [{}:{}-{}]",
+            self.name,
+            self.detail,
+            self.stream_name(),
+            self.first,
+            self.last
         )
     }
 }
@@ -884,6 +965,7 @@ impl Summary {
             || (self.items.is_empty()
                 && self.outcomes.is_empty()
                 && self.cargo.is_none()
+                && self.js.is_none()
                 && !(self.kind == "diff" && previous.is_some_and(|(_, s)| !s.items.is_empty())))
         {
             return None;
@@ -900,6 +982,17 @@ impl Summary {
             return None;
         }
         if self.kind == "tests" {
+            if let Some(js) = self.js.as_ref() {
+                let has_diff = previous.is_some_and(|(_, old)| {
+                    old.kind == self.kind && (!self.items.is_empty() || !old.items.is_empty())
+                });
+                if !has_diff {
+                    if status != 0 && self.items.is_empty() {
+                        return None;
+                    }
+                    return Some(js.render());
+                }
+            }
             if let Some(totals) = self
                 .cargo
                 .as_ref()
@@ -919,7 +1012,7 @@ impl Summary {
                 return None;
             }
             // With no failing test, cargo's totals line comes first.
-            if !self.items.is_empty() || self.cargo.is_none() {
+            if !self.items.is_empty() || (self.cargo.is_none() && self.js.is_none()) {
                 if self.items.is_empty() && self.failing_outcome().is_some() {
                     report.push_str("failing test names not in the captured output\n");
                 } else {
@@ -928,6 +1021,7 @@ impl Summary {
             }
         }
         let previous = previous.filter(|(_, s)| s.kind == self.kind);
+        let mut remaining = Vec::new();
         if let Some((id, old)) = previous {
             // Compare as multisets so identical hunks are matched one for one.
             let known = Item::counts(&old.items);
@@ -936,7 +1030,10 @@ impl Summary {
             let mut unmatched = known.clone();
             for item in &self.items {
                 match unmatched.get_mut(&item.key()) {
-                    Some(left) if *left > 0 => *left -= 1,
+                    Some(left) if *left > 0 => {
+                        *left -= 1;
+                        remaining.push(item);
+                    }
                     _ => report.push_str(&format!("+ {}\n", item.display())),
                 }
             }
@@ -945,8 +1042,12 @@ impl Summary {
                 match unmatched.get_mut(&item.key()) {
                     Some(left) if *left > 0 => *left -= 1,
                     _ => report.push_str(&format!(
-                        "- {} {} [prior stdout:{}-{}]\n",
-                        item.name, item.detail, item.first, item.last
+                        "- {} {} [prior {}:{}-{}]\n",
+                        item.name,
+                        item.detail,
+                        item.stream_name(),
+                        item.first,
+                        item.last
                     )),
                 }
             }
@@ -977,7 +1078,12 @@ impl Summary {
                         items[0].display()
                     ));
                     for item in &items[1..] {
-                        report.push_str(&format!("  {} [stdout:{}]\n", item.name, item.first));
+                        report.push_str(&format!(
+                            "  {} [{}:{}]\n",
+                            item.name,
+                            item.stream_name(),
+                            item.first
+                        ));
                     }
                 }
             }
@@ -991,6 +1097,10 @@ impl Summary {
             for item in &self.items {
                 report.push_str(&format!("{}\n", item.display()));
             }
+        }
+        if let Some(js) = self.js.as_ref().filter(|_| self.kind == "tests") {
+            report.push_str(&js.render_after_diff(&remaining));
+            return Some(report);
         }
         if let Some(totals) = self.cargo.as_ref().filter(|_| self.kind == "tests") {
             if totals.nextest_summary.is_some() {
