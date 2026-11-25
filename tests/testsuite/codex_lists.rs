@@ -287,6 +287,7 @@ fn codex_rewrites_lists_of_reads_and_supported_commands_only() {
     // because Codex cannot ask, while Antigravity CLI Tier 2 rewrites them with
     // `decision: "ask"` (never auto-allowing).
     let agy_ask_cases = [
+        "git -C src diff",
         "cargo fmt && git status",
         "git status && git branch new-branch",
         "set -o pipefail\ngit status",

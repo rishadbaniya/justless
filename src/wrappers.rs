@@ -40,13 +40,19 @@ fn env_rest(words: &[&str]) -> Option<Vec<String>> {
 }
 
 /// Information about safe wrappers unwrapped by [`hook_effective_detail`] so
-/// approval checks can enforce stricter rules on `env` flags and assignments.
+/// approval checks can enforce stricter rules on `env` flags and assignments,
+/// and prevent auto-approval behind toolchain runners that may sync packages
+/// or run environment hooks.
 pub(crate) struct HookEffective {
     pub words: Vec<String>,
     /// Whether an `env` wrapper passed `-i`/`--ignore-environment` or `-u`/`--unset`.
     pub env_clears: bool,
     /// `NAME=VALUE` assignments carried by any unwrapped `env` wrapper.
     pub env_assignments: Vec<(String, String)>,
+    /// Whether an unwrapped toolchain runner (`uv run`, `mise exec`/`x`,
+    /// `direnv exec`, `pixi run`) may sync tools, evaluate `.envrc`/hooks, or
+    /// run project tasks, so auto-approving clients must ask first.
+    pub runner_unapprovable: bool,
 }
 
 fn program_name(first: &str) -> &str {
@@ -124,20 +130,111 @@ fn is_stdbuf_mode(text: &str) -> bool {
     )
 }
 
-/// Strictly unwrap ONLY `timeout`, `nice`, `stdbuf`, and `env` with validated,
-/// safe options for command-hook routing and profile selection. Never unwraps
-/// `bash -c`, `sh -c`, `time`, `nohup`, `command`, or relative scripts.
+fn is_safe_runner_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// Remaining command words after `uv run` and any validated read-only/project-local
+/// flags. Rejects package-fetching/execution flags such as `--with`,
+/// `--with-requirements`, `--from`, `--python-fetch`, `--script`, and non-local
+/// `--directory`/`--project` paths.
+pub(crate) fn uv_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    while let Some((&word, rest)) = args.split_first() {
+        match word {
+            "--" => {
+                args = rest;
+                break;
+            }
+            "--frozen" | "--offline" | "--no-sync" | "--locked" | "--no-dev" | "--dev"
+            | "--all-extras" | "-q" | "--quiet" => args = rest,
+            "--group" | "--extra" => {
+                let (&value, tail) = rest.split_first()?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = tail;
+            }
+            "--directory" | "--project" => {
+                let (&value, tail) = rest.split_first()?;
+                if !crate::filters::is_local_dir(value) {
+                    return None;
+                }
+                args = tail;
+            }
+            _ if word.starts_with("--group=") || word.starts_with("--extra=") => {
+                let (_, value) = word.split_once('=')?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if word.starts_with("--directory=") || word.starts_with("--project=") => {
+                let (_, value) = word.split_once('=')?;
+                if !crate::filters::is_local_dir(value) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if word.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
+}
+
+/// Remaining command words after `pixi run` and safe read-only/env-selection flags.
+fn pixi_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    while let Some((&word, rest)) = args.split_first() {
+        match word {
+            "--" => {
+                args = rest;
+                break;
+            }
+            "--frozen" | "--locked" | "--no-install" | "--clean-env" | "-q" | "--quiet" => {
+                args = rest;
+            }
+            "-e" | "--environment" => {
+                let (&value, tail) = rest.split_first()?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = tail;
+            }
+            _ if word.starts_with("--environment=") => {
+                let (_, value) = word.split_once('=')?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if word.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
+}
+
+/// Strictly unwrap ONLY `timeout`, `nice`, `stdbuf`, `env`, and validated
+/// toolchain runner wrappers (`uv run`, `mise exec`/`x`, `asdf exec`,
+/// `direnv exec`, `pixi run`) for command-hook routing and profile selection.
+/// Never unwraps `bash -c`, `sh -c`, `time`, `nohup`, `command`, or relative scripts.
 pub(crate) fn hook_effective(words: &[&str]) -> Option<Vec<String>> {
     hook_effective_detail(words).map(|detail| detail.words)
 }
 
-/// Like [`hook_effective`], also reporting `env` options and assignments so
-/// `filters::approvable` can require display-only plain assignments for
-/// auto-approved clients.
+/// Like [`hook_effective`], also reporting `env` options/assignments and
+/// whether an unwrapped toolchain runner requires client approval so
+/// `filters::approvable` can keep auto-approved clients strictly safe.
 pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
     let mut words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
     let mut env_clears = false;
     let mut env_assignments = Vec::new();
+    let mut runner_unapprovable = false;
     loop {
         let first = words.first()?.clone();
         let program = program_name(&first);
@@ -336,6 +433,45 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
                 }
                 tail(&refs, i)?
             }
+            "uv" if refs.get(1) == Some(&"run") => {
+                let inner = uv_run_rest(&refs[2..])?;
+                runner_unapprovable = true;
+                inner.iter().map(|w| (*w).to_owned()).collect()
+            }
+            "mise" if matches!(refs.get(1), Some(&"exec" | &"x")) => {
+                // Only `mise exec -- <cmd>` / `mise x -- <cmd>` without tool@version
+                // installs or directory-changing flags before `--`.
+                if refs.get(2) != Some(&"--") || !refs.get(3).is_some_and(|w| !w.starts_with('-')) {
+                    return None;
+                }
+                runner_unapprovable = true;
+                tail(&refs, 3)?
+            }
+            "asdf" if refs.get(1) == Some(&"exec") => {
+                if !refs
+                    .get(2)
+                    .is_some_and(|cmd| !cmd.starts_with('-') && !cmd.contains('/'))
+                {
+                    return None;
+                }
+                tail(&refs, 2)?
+            }
+            "direnv" if refs.get(1) == Some(&"exec") => {
+                if !refs
+                    .get(2)
+                    .is_some_and(|dir| crate::filters::is_local_dir(dir))
+                    || !refs.get(3).is_some_and(|cmd| !cmd.starts_with('-'))
+                {
+                    return None;
+                }
+                runner_unapprovable = true;
+                tail(&refs, 3)?
+            }
+            "pixi" if refs.get(1) == Some(&"run") => {
+                let inner = pixi_run_rest(&refs[2..])?;
+                runner_unapprovable = true;
+                inner.iter().map(|w| (*w).to_owned()).collect()
+            }
             _ => break,
         };
         words = rest;
@@ -344,6 +480,7 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
         words,
         env_clears,
         env_assignments,
+        runner_unapprovable,
     })
 }
 
@@ -491,6 +628,39 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                 out.extend(refs[i..].iter().map(|w| (*w).to_owned()));
                 return Some(out);
             }
+            "uv" if refs.get(1) == Some(&"run") => uv_run_rest(&refs[2..])?
+                .iter()
+                .map(|w| (*w).to_owned())
+                .collect(),
+            "mise" if matches!(refs.get(1), Some(&"exec" | &"x")) => {
+                if refs.get(2) != Some(&"--") || !refs.get(3).is_some_and(|w| !w.starts_with('-')) {
+                    return None;
+                }
+                tail(&refs, 3)?
+            }
+            "asdf" if refs.get(1) == Some(&"exec") => {
+                if !refs
+                    .get(2)
+                    .is_some_and(|cmd| !cmd.starts_with('-') && !cmd.contains('/'))
+                {
+                    return None;
+                }
+                tail(&refs, 2)?
+            }
+            "direnv" if refs.get(1) == Some(&"exec") => {
+                if !refs
+                    .get(2)
+                    .is_some_and(|dir| crate::filters::is_local_dir(dir))
+                    || !refs.get(3).is_some_and(|cmd| !cmd.starts_with('-'))
+                {
+                    return None;
+                }
+                tail(&refs, 3)?
+            }
+            "pixi" if refs.get(1) == Some(&"run") => pixi_run_rest(&refs[2..])?
+                .iter()
+                .map(|w| (*w).to_owned())
+                .collect(),
             _ => break,
         };
         words = rest;
@@ -700,8 +870,93 @@ mod tests {
             "stdbuf cargo test",
             "stdbuf -oX cargo test",
             "stdbuf -z cargo test",
+            "uv run",
+            "uv run --frozen",
+            "uv run --with evil pytest",
+            "uv run --with=evil pytest",
+            "uv run -w evil pytest",
+            "uv run --with-requirements req.txt pytest",
+            "uv run --from evil pytest",
+            "uv run --python-fetch automatic pytest",
+            "uv run --directory /tmp pytest",
+            "uv run --directory ../outside pytest",
+            "uv run --project ~/app pytest",
+            "uv run --group ../bad pytest",
+            "mise exec python@3.12 -- pytest",
+            "mise x -C /tmp -- pytest",
+            "mise exec cargo test",
+            "mise exec --",
+            "asdf exec",
+            "asdf exec --bad cargo",
+            "asdf exec ./evil.sh",
+            "direnv exec /tmp pytest",
+            "direnv exec ../outside pytest",
+            "direnv exec ~/app pytest",
+            "direnv exec .",
+            "pixi run",
+            "pixi run --manifest-path /tmp/pixi.toml pytest",
         ] {
             assert_eq!(hook_effective_words(rejected), None, "{rejected}");
+        }
+
+        // Validated toolchain runner wrappers unwrap with expected approval flags.
+        for (command, expected, unapprovable) in [
+            ("uv run pytest -q", &["pytest", "-q"][..], true),
+            (
+                "uv run --frozen --offline --no-sync pytest",
+                &["pytest"][..],
+                true,
+            ),
+            (
+                "uv run --locked --no-dev --group lint --extra test --directory packages/api ruff check .",
+                &["ruff", "check", "."][..],
+                true,
+            ),
+            (
+                "uv run --dev --all-extras --project=apps/web -- mypy src",
+                &["mypy", "src"][..],
+                true,
+            ),
+            ("mise exec -- cargo test", &["cargo", "test"][..], true),
+            ("mise x -- pytest -q", &["pytest", "-q"][..], true),
+            ("asdf exec cargo test", &["cargo", "test"][..], false),
+            ("direnv exec . pytest", &["pytest"][..], true),
+            (
+                "direnv exec packages/api cargo test",
+                &["cargo", "test"][..],
+                true,
+            ),
+            ("pixi run pytest", &["pytest"][..], true),
+            (
+                "pixi run --frozen -e test ruff check .",
+                &["ruff", "check", "."][..],
+                true,
+            ),
+            ("timeout 60 uv run --frozen pytest", &["pytest"][..], true),
+        ] {
+            let words = shlex::split(command).unwrap();
+            let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+            let detail = super::hook_effective_detail(&refs).expect(command);
+            assert_eq!(detail.words, expected, "{command}");
+            assert_eq!(detail.runner_unapprovable, unapprovable, "{command}");
+            assert_eq!(effective_words(command).unwrap(), expected, "{command}");
+        }
+
+        // Non-runner subcommands and relative scripts stay untouched.
+        for untouched in [
+            "uv sync",
+            "mise ls",
+            "asdf list",
+            "direnv status",
+            "pixi install",
+            "./uv run pytest",
+            "./mise exec -- cargo test",
+            "./asdf exec cargo test",
+            "./direnv exec . pytest",
+            "./pixi run pytest",
+        ] {
+            let words = shlex::split(untouched).unwrap();
+            assert_eq!(hook_effective_words(untouched), Some(words), "{untouched}");
         }
     }
 }

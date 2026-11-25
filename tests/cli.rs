@@ -2243,7 +2243,7 @@ fn hooks_without_a_post_run_hook_route_json_reads_left_to_their_reader() {
         "cargo metadata --manifest-path /elsewhere/Cargo.toml",
         "cargo build --message-format json",
         "cargo test --message-format=json",
-        "npm ls",
+        "npm ls --parseable",
         "npm ls --json --parseable",
         "gh api repos/acme/ledger | jq .name",
         "gh api repos/acme/ledger > repo.json",

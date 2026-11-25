@@ -713,7 +713,16 @@ fn client_command(workspace: &Workspace, agent: Agent, input: &Value) -> Option<
         script: false,
         pipes: true,
     };
-    let rewritten = wrap_event(workspace, &cwd, &command, session, rules)?;
+    let rewritten = match wrap_event(workspace, &cwd, &command, session, rules) {
+        Some(rewritten) => rewritten,
+        None if !cfg!(windows)
+            && crate::rewrite::Exclusions::of(workspace)
+                .is_ok_and(|exclusions| exclusions.line(&command).is_none()) =>
+        {
+            with_seen_session_for(&command, session, input["agent_id"].as_str())?
+        }
+        None => return None,
+    };
     args["command"] = Value::String(rewritten);
     Some(match agent {
         Agent::Cursor => json!({"permission":"allow", "updated_input":args}),
@@ -2666,18 +2675,30 @@ fn bash_hook(workspace: &Workspace, agent: Agent, input: &Value, record: bool) -
     Some(json!({"hookSpecificOutput":hook}))
 }
 
-/// A `justless context` or `justless pack` command with `--session` added, so a
-/// symbol the agent reads again prints only what changed since (see
-/// `crate::seen`). The session digests Claude Code's `session_id` with the
-/// `agent_id` that its hooks add inside a subagent, which has a context of its
-/// own, so a subagent's reads never stand for its parent's, nor the parent's
-/// for a subagent's. Only a single literal command that names no session is
-/// changed, and only at its end, so the flag cannot change what it runs. The
-/// caller rewrites only when the input reports a permission mode, and judges
-/// the original command against the permission rules first. Command hooks
+/// A `justless context`, `pack`, `read`, or `expand` command with `--session`
+/// added, so a symbol or file view the agent reads again prints only what
+/// changed since (see `crate::seen` and `crate::source`). The session digests
+/// the client's session/conversation ID with the `agent_id` that hooks add
+/// inside a subagent, which has a context of its own, so a subagent's reads
+/// never stand for its parent's, nor the parent's for a subagent's. Only a
+/// single literal command that names no `--session` or `--fresh` is changed,
+/// and only at its end, so the flag cannot change what it runs. Command hooks
 /// pass everything through on Windows, and so does this.
 fn with_seen_session(command: &str, input: &Value) -> Option<String> {
     let digest = seen_session(input)?;
+    append_seen_session(command, &digest)
+}
+
+fn with_seen_session_for(
+    command: &str,
+    session: Option<&str>,
+    agent_id: Option<&str>,
+) -> Option<String> {
+    let digest = seen_session_digest(session?, agent_id)?;
+    append_seen_session(command, &digest)
+}
+
+fn append_seen_session(command: &str, digest: &str) -> Option<String> {
     let line = command.trim_end();
     let (line, tail) = match line.strip_suffix(" 2>&1") {
         Some(line) => (line.trim_end(), " 2>&1"),
@@ -2699,29 +2720,52 @@ fn with_seen_session(command: &str, input: &Value) -> Option<String> {
             break;
         }
     }
-    if !matches!(words.next(), Some("context" | "pack")) {
+    if !matches!(words.next(), Some("context" | "pack" | "read" | "expand")) {
         return None;
     }
-    // `--` would make the flag an argument.
-    if words.any(|word| word == "--" || word == "--session" || word.starts_with("--session=")) {
+    let rest: Vec<&str> = words.collect();
+    if rest.is_empty() {
+        return None;
+    }
+    // `--` would make the flag an argument; explicit `--session`, `--fresh`,
+    // internal shell-read flags, or help/version leave the command untouched.
+    if rest.iter().any(|&word| {
+        word == "--"
+            || word == "--session"
+            || word.starts_with("--session=")
+            || word == "--fresh"
+            || word == "--shell-range"
+            || word.starts_with("--shell-range=")
+            || word == "--shell-session"
+            || word.starts_with("--shell-session=")
+            || matches!(word, "-h" | "--help" | "-V" | "--version")
+    }) {
         return None;
     }
     Some(format!("{line} --session {digest}{tail}"))
 }
 
-/// The `--session` value for the agent whose hook sent `input`: a digest of
-/// Claude Code / Codex `session_id` (or Antigravity CLI `conversationId`) with,
-/// inside a subagent, its `agent_id`.
-fn seen_session(input: &Value) -> Option<String> {
-    let session = input["session_id"]
-        .as_str()
-        .or_else(|| input["conversationId"].as_str())
-        .filter(|id| !id.is_empty())?;
-    let key = match input["agent_id"].as_str().filter(|id| !id.is_empty()) {
+fn seen_session_digest(session: &str, agent_id: Option<&str>) -> Option<String> {
+    if session.is_empty() {
+        return None;
+    }
+    let key = match agent_id.filter(|id| !id.is_empty()) {
         Some(agent) => format!("{session}\0{agent}"),
         None => session.to_owned(),
     };
     Some(crate::capture::source_digest(key.as_bytes())[..24].to_owned())
+}
+
+/// The `--session` value for the agent whose hook sent `input`: a digest of
+/// Claude Code / Codex / Gemini `session_id`, Antigravity CLI `conversationId`,
+/// Cursor `conversation_id`, or Copilot `sessionId`, with any subagent `agent_id`.
+fn seen_session(input: &Value) -> Option<String> {
+    let session = input["session_id"]
+        .as_str()
+        .or_else(|| input["conversationId"].as_str())
+        .or_else(|| input["conversation_id"].as_str())
+        .or_else(|| input["sessionId"].as_str())?;
+    seen_session_digest(session, input["agent_id"].as_str())
 }
 
 /// What a client's command hook may rewrite.
@@ -3632,6 +3676,7 @@ fn plan(command: &str, rules: Rules, mut enter: impl FnMut(&str) -> bool) -> Pla
                             && crate::wrappers::hook_effective(&words).is_some_and(|inner| {
                                 let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
                                 crate::filters::approvable(crate::filters::unwrap_tool(&inner))
+                                    || crate::filters::git_local_routed(&inner)
                                     || crate::known::routes(&words)
                             }))
                 })))
@@ -5001,5 +5046,176 @@ mod tests {
             split("cargo test\ngit status", true),
             Some(vec!["cargo test", "git status"])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seen_session_injects_for_read_expand_and_all_clients_respecting_fresh() {
+        use super::{Agent, Value, Workspace, agy_hook, client_command, json, with_seen_session};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        // `with_seen_session` covers context, pack, read, and expand, skipping
+        // commands with explicit `--session`, `--fresh`, `--`, or `--help`.
+        let claude_input = json!({"session_id": "sess-1", "agent_id": "sub-1"});
+        for cmd in [
+            "justless read src/main.rs --outline",
+            "justless expand src/main.rs 'rev#1'",
+            "justless context --symbol main",
+            "justless pack 'fix bug'",
+            "justless --root /repo read src/lib.rs",
+        ] {
+            let out = with_seen_session(cmd, &claude_input).expect(cmd);
+            assert!(out.starts_with(&format!("{cmd} --session ")), "{out}");
+        }
+        for skipped in [
+            "justless read src/main.rs --session abc",
+            "justless read src/main.rs --session=abc",
+            "justless read src/main.rs --fresh",
+            "justless expand src/main.rs 'rev#1' --fresh",
+            "justless context --symbol main --fresh",
+            "justless pack 'fix bug' --fresh",
+            "justless read -- src/main.rs",
+            "justless read --help",
+            "justless read",
+            "justless edit src/main.rs 'rev#1'",
+        ] {
+            assert_eq!(with_seen_session(skipped, &claude_input), None, "{skipped}");
+        }
+
+        // Cursor, Gemini CLI, and Copilot CLI all inject `--session` consistently
+        // when a session/conversation ID is present, and skip when absent or `--fresh`.
+        for (name, agent, input, extract) in [
+            (
+                "cursor",
+                Agent::Cursor,
+                json!({
+                    "tool_name": "Shell",
+                    "conversation_id": "cursor-conv-1",
+                    "cwd": root,
+                    "tool_input": {"command": "justless read src/main.rs --outline"}
+                }),
+                Box::new(|v: &Value| v["updated_input"]["command"].as_str().map(str::to_owned))
+                    as Box<dyn Fn(&Value) -> Option<String>>,
+            ),
+            (
+                "gemini",
+                Agent::Gemini,
+                json!({
+                    "hook_event_name": "BeforeTool",
+                    "tool_name": "run_shell_command",
+                    "session_id": "gemini-sess-1",
+                    "cwd": root,
+                    "tool_input": {"command": "justless expand src/main.rs 'rev#1'"}
+                }),
+                Box::new(|v: &Value| {
+                    v["hookSpecificOutput"]["tool_input"]["command"]
+                        .as_str()
+                        .map(str::to_owned)
+                }),
+            ),
+            (
+                "copilot",
+                Agent::Copilot,
+                json!({
+                    "toolName": "bash",
+                    "sessionId": "copilot-sess-1",
+                    "cwd": root,
+                    "toolArgs": {"command": "justless read src/lib.rs"}
+                }),
+                Box::new(|v: &Value| v["modifiedArgs"]["command"].as_str().map(str::to_owned)),
+            ),
+        ] {
+            let answer = client_command(&ws, agent, &input).expect("client_command rewrite");
+            let rewritten = extract(&answer).expect("rewritten command");
+            assert!(rewritten.contains(" --session "), "{name}: {rewritten}");
+            let token = rewritten.rsplit_once(" --session ").unwrap().1;
+            assert_eq!(token.len(), 24, "{name}: {token}");
+            assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        // Fresh flag or missing session ID leaves client_command untouched.
+        let cursor_fresh = json!({
+            "tool_name": "Shell",
+            "conversation_id": "cursor-conv-1",
+            "cwd": root,
+            "tool_input": {"command": "justless read src/main.rs --fresh"}
+        });
+        assert_eq!(client_command(&ws, Agent::Cursor, &cursor_fresh), None);
+        let gemini_no_session = json!({
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "cwd": root,
+            "tool_input": {"command": "justless read src/main.rs"}
+        });
+        assert_eq!(client_command(&ws, Agent::Gemini, &gemini_no_session), None);
+
+        // Antigravity Tier 2 (`ask`) routes safe `git -C <LOCAL_DIR>` and safe toolchain
+        // wrappers while rejecting unsafe flags, and Tier 1 (`allow`) never auto-approves them.
+        let agy_call = |cmd: &str| {
+            agy_hook(
+                &ws,
+                "before-command",
+                &json!({
+                    "cwd": root,
+                    "workspacePaths": [root],
+                    "conversationId": "agy-conv-am",
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}
+                }),
+            )
+        };
+        for tier1 in [
+            "cargo +nightly clippy -- -D warnings",
+            "cargo +stable test",
+            "pnpm -F web test",
+            "npm -w web test",
+            "yarn --cwd packages/web test",
+            "git -c color.ui=always diff",
+            "asdf exec cargo test",
+            "docker compose -f compose.yml -p app ps",
+        ] {
+            let out = agy_call(tier1).unwrap_or_else(|| panic!("tier1 missing: {tier1}"));
+            assert_eq!(out["decision"], "allow", "tier1: {tier1}: {out}");
+        }
+        for tier2 in [
+            "git -C subdir status",
+            "git -C packages/web diff",
+            "uv run --frozen pytest",
+            "uv run --group dev --directory packages/api ruff check .",
+            "mise exec -- cargo test",
+            "mise x -- pytest -q",
+            "direnv exec . pytest",
+            "pixi run pytest",
+            "docker compose -f compose.yml build",
+            "docker buildx build .",
+            "npm ls",
+            "clang-tidy src/main.cpp",
+            "kubectl diff -f k8s.yaml",
+        ] {
+            let out = agy_call(tier2).unwrap_or_else(|| panic!("tier2 missing: {tier2}"));
+            assert_eq!(out["decision"], "ask", "tier2: {tier2}: {out}");
+        }
+        for rejected in [
+            "cargo +nightly test -Z unstable-options",
+            "git -C /tmp diff",
+            "git -C ../outside status",
+            "git -c core.fsmonitor=evil status",
+            "pnpm -C /tmp test",
+            "npm --prefix ../outside test",
+            "yarn --cwd /tmp test",
+            "uv run --with evil pytest",
+            "uv run --directory /tmp pytest",
+            "mise exec node@20 -- npm test",
+            "direnv exec /tmp pytest",
+            "pixi run deploy",
+            "docker compose -f /tmp/compose.yml ps",
+            "docker compose --env-file ../.env logs",
+            "docker buildx build --push .",
+            "clang-tidy --fix src/main.cpp",
+        ] {
+            assert_eq!(agy_call(rejected), None, "must reject: {rejected}");
+        }
     }
 }

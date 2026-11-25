@@ -29,6 +29,8 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["npm", "install"], &[]),
     (&["npm", "i"], &[]),
     (&["npm", "ci"], &[]),
+    (&["npm", "ls"], &["--json", "-p", "--parseable"]),
+    (&["npm", "list"], &["--json", "-p", "--parseable"]),
     (&["npm", "outdated"], &[]),
     (&["npm", "run", "build"], &[]),
     (&["npm", "run", "lint"], &[]),
@@ -43,11 +45,15 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["pnpm", "build"], &[]),
     (&["pnpm", "lint"], &[]),
     (&["pnpm", "typecheck"], &[]),
+    (&["pnpm", "check"], &[]),
     (&["pnpm", "run", "build"], &[]),
     (&["pnpm", "run", "lint"], &[]),
     (&["pnpm", "run", "typecheck"], &[]),
+    (&["pnpm", "run", "check"], &[]),
     (&["yarn", "audit"], &[]),
     (&["yarn", "install"], &[]),
+    (&["yarn", "list"], &["--json"]),
+    (&["yarn", "outdated"], &["--json"]),
     (&["yarn", "build"], &[]),
     (&["yarn", "lint"], &[]),
     (&["yarn", "typecheck"], &[]),
@@ -98,6 +104,10 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["pip3", "list"], &[]),
     (&["pip3", "show"], &[]),
     (&["pip3", "freeze"], &[]),
+    (
+        &["pipdeptree"],
+        &["--json", "--json-tree", "--graph-output"],
+    ),
     (&["uv", "sync"], &[]),
     (&["uv", "lock"], &[]),
     (&["uv", "add"], &[]),
@@ -125,7 +135,10 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["composer", "install"], &[]),
     (&["composer", "update"], &[]),
     (&["composer", "require"], &[]),
-    // JVM, Elixir and other builds
+    // JVM, Go, Elixir and other builds
+    (&["go", "mod", "graph"], &[]),
+    (&["mvn", "dependency:tree"], &["-DoutputFile"]),
+    (&["gradle", "dependencies"], &["--write-locks"]),
     (&["mvnd", "compile"], &[]),
     (&["mvnd", "test"], &[]),
     (&["mvnd", "package"], &[]),
@@ -136,6 +149,7 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["sbt", "package"], &[]),
     (&["sbt", "assembly"], &[]),
     (&["mix", "compile"], &[]),
+    (&["mix", "credo"], &["--format"]),
     (&["mix", "format"], &[]),
     (&["mix", "test"], &[]),
     (&["mix", "deps.get"], &[]),
@@ -151,6 +165,17 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     // Linters, formatters and checks
     (&["gofmt"], &[]),
     (&["shfmt"], &[]),
+    (
+        &["clang-tidy"],
+        &["--fix", "--fix-errors", "--fix-notes", "--export-fixes"],
+    ),
+    (&["cppcheck"], &["--xml", "--output-file"]),
+    (&["ktlint"], &["-F", "--format", "--reporter"]),
+    (
+        &["stylelint"],
+        &["--fix", "-f", "--formatter", "-o", "--output-file"],
+    ),
+    (&["actionlint"], &["-format"]),
     (&["markdownlint"], &[]),
     (&["markdownlint-cli2"], &[]),
     (&["yamllint"], &[]),
@@ -164,11 +189,16 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["docker", "images"], &[]),
     (&["docker", "image", "ls"], &[]),
     (&["docker", "build"], &["--push"]),
+    (
+        &["docker", "buildx", "build"],
+        &["--push", "--output", "-o"],
+    ),
     (&["docker", "compose", "build"], &["--push"]),
     (&["podman", "images"], &[]),
     (&["podman", "image", "ls"], &[]),
     (&["podman", "build"], &["--push"]),
     (&["kubectl", "describe"], &[]),
+    (&["kubectl", "diff"], &[]),
     (
         &["kubectl", "get", "events"],
         &["-w", "--watch", "-o", "--output"],
@@ -207,6 +237,7 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     ),
     (&["oc", "get"], &["-w", "--watch"]),
     (&["oc", "describe"], &[]),
+    (&["oc", "diff"], &[]),
     (&["oc", "status"], &[]),
     (&["helm", "list"], &[]),
     (&["helm", "status"], &[]),
@@ -355,6 +386,10 @@ const PROGRESS: &[(&[&str], &str)] = &[
         r"^(?:#\d+ (?:CACHED|DONE \d|\[internal\] |transferring |load (?:build|metadata|transfer)|sha256:[0-9a-f]|exporting (?:layers|manifest|config))|---> (?:Using cache|[0-9a-f]{12})$)",
     ),
     (
+        &["docker", "buildx", "build"],
+        r"^(?:#\d+ (?:CACHED|DONE \d|\[internal\] |transferring |load (?:build|metadata|transfer)|sha256:[0-9a-f]|exporting (?:layers|manifest|config))|---> (?:Using cache|[0-9a-f]{12})$)",
+    ),
+    (
         &["docker", "compose", "build"],
         r"^(?:#\d+ (?:CACHED|DONE \d|\[internal\] |transferring |load (?:build|metadata|transfer)|sha256:[0-9a-f]|exporting (?:layers|manifest|config))|---> (?:Using cache|[0-9a-f]{12})$)",
     ),
@@ -413,14 +448,49 @@ const PROGRESS: &[(&[&str], &str)] = &[
 ];
 
 /// The entry with the longest command that `words` start with, reading the
-/// program by its file name and skipping package runners such as `npx`.
+/// program by its file name and skipping package runners, Rust toolchain
+/// selectors, JS workspace flags, safe Docker Compose global flags, and
+/// kubectl/oc namespace/context flags.
 fn longest<'a, T>(table: &'a [(&'static [&'static str], T)], words: &[&str]) -> Option<&'a T> {
     let words = crate::filters::unwrap_tool(words);
     let (program, args) = words.split_first()?;
     let program = Path::new(program).file_name()?.to_str()?;
+    let program = match program {
+        "gradlew" => "gradle",
+        "mvnw" => "mvn",
+        other => other,
+    };
+    let (prefix, args): (&[&str], &[&str]) = match program {
+        "cargo" => (&[], crate::filters::cargo_args(args)),
+        "pnpm" | "npm" | "yarn" => (&[], crate::filters::js_workspace_args(program, args)?),
+        "docker" | "podman" if args.first() == Some(&"compose") => (
+            &["compose"],
+            crate::filters::compose_subcommand(&args[1..])?,
+        ),
+        "kubectl" | "oc" => {
+            let mut rest = args;
+            while let Some((&arg, tail)) = rest.split_first() {
+                if ["--namespace", "-n", "--context"].contains(&arg)
+                    && tail.first().is_some_and(|v| !v.starts_with('-'))
+                {
+                    rest = &tail[1..];
+                } else if arg.starts_with("--namespace=") || arg.starts_with("--context=") {
+                    rest = tail;
+                } else {
+                    break;
+                }
+            }
+            (&[], rest)
+        }
+        _ => (&[], args),
+    };
     table
         .iter()
-        .filter(|(command, _)| command[0] == program && args.starts_with(&command[1..]))
+        .filter(|(command, _)| {
+            command[0] == program
+                && command[1..].starts_with(prefix)
+                && args.starts_with(&command[1 + prefix.len()..])
+        })
         .max_by_key(|(command, _)| command.len())
         .map(|(_, value)| value)
 }
@@ -437,8 +507,9 @@ pub fn routes(words: &[&str]) -> bool {
         return false;
     };
     let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
-    longest(ROUTED, &refs).is_some_and(|except| {
-        !refs
+    let tool = crate::filters::unwrap_tool(&refs);
+    longest(ROUTED, tool).is_some_and(|except| {
+        !tool
             .iter()
             .any(|word| except.contains(&word.split_once('=').map_or(*word, |(flag, _)| flag)))
     })
@@ -555,9 +626,103 @@ mod tests {
             "gofmt -l .",
             "shfmt -d scripts/",
             "rustfmt --check src/main.rs",
+            // Rust toolchain selector + known commands.
+            "cargo +nightly audit",
+            "cargo +nightly fmt",
+            "cargo +1.91 outdated",
+            // JS/TS monorepo workspace flags + known commands.
+            "pnpm -F web build",
+            "pnpm --filter @acme/web lint",
+            "pnpm -r typecheck",
+            "pnpm -r check",
+            "pnpm -C packages/web audit",
+            "pnpm --dir apps/api outdated",
+            "pnpm -F web list",
+            "pnpm -F web ls",
+            "npm -w web run build",
+            "npm --workspace @acme/web run lint",
+            "npm --workspaces run typecheck",
+            "npm --prefix packages/api audit",
+            "npm -w web outdated",
+            "npm -w web ls",
+            "npm --prefix packages/api list",
+            "yarn --cwd packages/web build",
+            "yarn workspace web lint",
+            "yarn workspace web audit",
+            "yarn --cwd apps/web outdated",
+            "yarn workspace web list",
+            // Docker compose global flags + build.
+            "docker compose -f docker-compose.yml -p myproj build",
+            "docker compose --file compose.prod.yml --profile web build",
+            "docker compose --project-directory deploy --env-file .env.local build",
+            // Wave-6 read-only build/deptree/linter/diff commands.
+            "docker buildx build .",
+            "npm ls",
+            "npm list --depth=0",
+            "yarn list",
+            "pipdeptree",
+            "go mod graph",
+            "mvn dependency:tree",
+            "./mvnw dependency:tree",
+            "gradle dependencies",
+            "./gradlew dependencies",
+            "clang-tidy src/main.cpp",
+            "cppcheck src/",
+            "ktlint src/",
+            "stylelint src/",
+            "pnpm -F web exec stylelint src/",
+            "pnpm -F web exec ktlint src/",
+            "actionlint",
+            "mix credo --strict",
+            "kubectl diff -f k8s.yaml",
+            "kubectl -n prod diff -f k8s.yaml",
+            "oc diff -f k8s.yaml",
+            "oc --context staging diff -f k8s.yaml",
         ] {
             let words: Vec<&str> = line.split(' ').collect();
             assert!(routes(&words), "{line}");
+        }
+        // Unsafe flags, mutating options, machine formats, and escaping paths stay unrouted.
+        for rejected in [
+            "cargo +nightly audit fix",
+            "cargo +../bad audit",
+            "pnpm -C /tmp build",
+            "pnpm --dir ../outside lint",
+            "pnpm -F web audit --fix",
+            "npm --prefix /etc run build",
+            "npm -w web audit fix",
+            "npm -w web run dev",
+            "npm ls --json",
+            "npm ls --parseable",
+            "npm list -p",
+            "yarn --cwd /tmp build",
+            "yarn --cwd ../outside list",
+            "yarn list --json",
+            "docker compose -f /tmp/compose.yml build",
+            "docker compose --file ../outside.yml build",
+            "docker compose --env-file /etc/secrets build",
+            "docker compose --env-file ../.env build",
+            "docker compose -f compose.yml build --push",
+            "docker compose -f compose.yml up",
+            "docker buildx build --push .",
+            "docker buildx build --output type=local,dest=out .",
+            "docker buildx build -o out .",
+            "pipdeptree --json",
+            "pipdeptree --json-tree",
+            "mvn dependency:tree -DoutputFile=deps.txt",
+            "gradle dependencies --write-locks",
+            "clang-tidy --fix src/main.cpp",
+            "clang-tidy --fix-errors src/main.cpp",
+            "cppcheck --xml src/",
+            "ktlint -F src/",
+            "ktlint --format src/",
+            "stylelint --fix src/",
+            "stylelint --formatter json src/",
+            "actionlint -format json",
+            "mix credo --format json",
+        ] {
+            let words: Vec<&str> = rejected.split(' ').collect();
+            assert!(!routes(&words), "must stay unrouted: {rejected}");
         }
     }
 

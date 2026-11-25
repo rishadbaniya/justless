@@ -78,6 +78,288 @@ fn display_options(mut args: &[&str], flags: &[&str], valued: &[&str], names: bo
     true
 }
 
+/// Whether `arg` is a safe workspace-relative directory or file path:
+/// non-empty, not a flag, not absolute, not under `~`, no `$`, no `..`, and
+/// no Windows drive prefix or backslash.
+pub(crate) fn is_local_dir(arg: &str) -> bool {
+    !arg.is_empty()
+        && !arg.starts_with('-')
+        && !arg.starts_with(['/', '\\', '~'])
+        && !arg.contains(['$', '\\'])
+        && arg.as_bytes().get(1) != Some(&b':')
+        && local_argument(arg)
+}
+
+/// Whether `arg` is a safe workspace/package selector for `pnpm -F/--filter`,
+/// `npm -w/--workspace`, or `yarn workspace`: non-empty, not a flag, no `$`,
+/// and no escaping path (`..`, absolute, or `~`), including inside pnpm `{dir}`
+/// braces or `...` graph selectors.
+fn is_workspace_filter(arg: &str) -> bool {
+    if arg.is_empty() || arg.starts_with('-') || arg.contains(['$', '\\']) {
+        return false;
+    }
+    let trimmed = arg
+        .trim_start_matches("...")
+        .trim_end_matches("...")
+        .trim_start_matches('^')
+        .trim_start_matches('!');
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    !inner.is_empty()
+        && !inner.starts_with(['/', '~'])
+        && inner.as_bytes().get(1) != Some(&b':')
+        && local_argument(inner)
+        && local_argument(arg)
+}
+
+/// Whether `word` is a safe rustup toolchain selector such as `+nightly`,
+/// `+stable`, `+1.91`, or `+nightly-2026-01-01`.
+pub(crate) fn is_cargo_toolchain(word: &str) -> bool {
+    let Some(name) = word.strip_prefix('+') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Cargo arguments after an optional leading rustup `+TOOLCHAIN` selector.
+pub(crate) fn cargo_args<'a, 'b>(args: &'a [&'b str]) -> &'a [&'b str] {
+    match args {
+        [toolchain, rest @ ..] if is_cargo_toolchain(toolchain) => rest,
+        _ => args,
+    }
+}
+
+/// Skip safe workspace/filter flags before a `pnpm`, `npm`, or `yarn`
+/// subcommand. Returns `None` when a workspace flag has a missing or unsafe
+/// value (such as `-C /tmp`, `--dir ../outside`, `--prefix ~/x`, `--cwd /etc`).
+pub(crate) fn js_workspace_args<'a, 'b>(
+    program: &str,
+    mut args: &'a [&'b str],
+) -> Option<&'a [&'b str]> {
+    match program {
+        "pnpm" => {
+            while let Some((&arg, rest)) = args.split_first() {
+                match arg {
+                    "-r" | "--recursive" => args = rest,
+                    "-F" | "--filter" => {
+                        let (&pkg, tail) = rest.split_first()?;
+                        if !is_workspace_filter(pkg) {
+                            return None;
+                        }
+                        args = tail;
+                    }
+                    "-C" | "--dir" => {
+                        let (&dir, tail) = rest.split_first()?;
+                        if !is_local_dir(dir) {
+                            return None;
+                        }
+                        args = tail;
+                    }
+                    _ if arg.starts_with("--filter=") => {
+                        let (_, pkg) = arg.split_once('=')?;
+                        if !is_workspace_filter(pkg) {
+                            return None;
+                        }
+                        args = rest;
+                    }
+                    _ if arg.starts_with("-F") && arg.len() > 2 => {
+                        if !is_workspace_filter(&arg[2..]) {
+                            return None;
+                        }
+                        args = rest;
+                    }
+                    _ if arg.starts_with("--dir=") => {
+                        let (_, dir) = arg.split_once('=')?;
+                        if !is_local_dir(dir) {
+                            return None;
+                        }
+                        args = rest;
+                    }
+                    _ if arg.starts_with("-C") && arg.len() > 2 => {
+                        if !is_local_dir(&arg[2..]) {
+                            return None;
+                        }
+                        args = rest;
+                    }
+                    _ => break,
+                }
+            }
+            Some(args)
+        }
+        "npm" => {
+            while let Some((&arg, rest)) = args.split_first() {
+                match arg {
+                    "--workspaces" => args = rest,
+                    "-w" | "--workspace" => {
+                        let (&pkg, tail) = rest.split_first()?;
+                        if !is_workspace_filter(pkg) {
+                            return None;
+                        }
+                        args = tail;
+                    }
+                    "--prefix" => {
+                        let (&dir, tail) = rest.split_first()?;
+                        if !is_local_dir(dir) {
+                            return None;
+                        }
+                        args = tail;
+                    }
+                    _ if arg.starts_with("--workspace=") => {
+                        let (_, pkg) = arg.split_once('=')?;
+                        if !is_workspace_filter(pkg) {
+                            return None;
+                        }
+                        args = rest;
+                    }
+                    _ if arg.starts_with("--prefix=") => {
+                        let (_, dir) = arg.split_once('=')?;
+                        if !is_local_dir(dir) {
+                            return None;
+                        }
+                        args = rest;
+                    }
+                    _ => break,
+                }
+            }
+            Some(args)
+        }
+        "yarn" => {
+            let mut saw_workspace = false;
+            while let Some((&arg, rest)) = args.split_first() {
+                match arg {
+                    "--cwd" => {
+                        let (&dir, tail) = rest.split_first()?;
+                        if !is_local_dir(dir) {
+                            return None;
+                        }
+                        args = tail;
+                    }
+                    _ if arg.starts_with("--cwd=") => {
+                        let (_, dir) = arg.split_once('=')?;
+                        if !is_local_dir(dir) {
+                            return None;
+                        }
+                        args = rest;
+                    }
+                    "workspace" if !saw_workspace => {
+                        let (&pkg, tail) = rest.split_first()?;
+                        if !is_workspace_filter(pkg) {
+                            return None;
+                        }
+                        saw_workspace = true;
+                        args = tail;
+                    }
+                    _ => break,
+                }
+            }
+            Some(args)
+        }
+        _ => Some(args),
+    }
+}
+
+fn is_compose_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// Skip safe `docker compose` / `podman compose` global options before the
+/// subcommand (`ps`, `logs`, `build`). Enforces `is_local_dir` on `-f`/`--file`,
+/// `--project-directory`, and `--env-file` so files outside the workspace stay
+/// rejected. Returns `None` on invalid, unsafe, or unknown global options.
+pub(crate) fn compose_subcommand<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    while let Some((&arg, rest)) = args.split_first() {
+        match arg {
+            "-f" | "--file" | "--project-directory" | "--env-file" => {
+                let (&path, tail) = rest.split_first()?;
+                if !is_local_dir(path) {
+                    return None;
+                }
+                args = tail;
+            }
+            "-p" | "--project-name" | "--profile" => {
+                let (&name, tail) = rest.split_first()?;
+                if !is_compose_name(name) {
+                    return None;
+                }
+                args = tail;
+            }
+            "--ansi" => {
+                let (&mode, tail) = rest.split_first()?;
+                if !matches!(mode, "never" | "always" | "auto") {
+                    return None;
+                }
+                args = tail;
+            }
+            "--progress" => {
+                let (&mode, tail) = rest.split_first()?;
+                if !matches!(mode, "auto" | "tty" | "plain" | "quiet") {
+                    return None;
+                }
+                args = tail;
+            }
+            "--compatibility" => args = rest,
+            _ if arg.starts_with("--file=")
+                || arg.starts_with("--project-directory=")
+                || arg.starts_with("--env-file=") =>
+            {
+                let (_, path) = arg.split_once('=')?;
+                if !is_local_dir(path) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if arg.starts_with("-f") && arg.len() > 2 => {
+                if !is_local_dir(&arg[2..]) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if arg.starts_with("--project-name=") || arg.starts_with("--profile=") => {
+                let (_, name) = arg.split_once('=')?;
+                if !is_compose_name(name) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if arg.starts_with("-p") && arg.len() > 2 => {
+                if !is_compose_name(&arg[2..]) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if arg.starts_with("--ansi=") => {
+                let (_, mode) = arg.split_once('=')?;
+                if !matches!(mode, "never" | "always" | "auto") {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if arg.starts_with("--progress=") => {
+                let (_, mode) = arg.split_once('=')?;
+                if !matches!(mode, "auto" | "tty" | "plain" | "quiet") {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if arg.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    Some(args)
+}
+
 /// Skip package-runner prefixes such as `npx`, `uv run` and `bundle exec` so the
 /// tool they launch selects the profile.
 pub fn unwrap_tool<'a, 'b>(words: &'a [&'b str]) -> &'a [&'b str] {
@@ -92,13 +374,31 @@ fn runners<'a, 'b>(mut words: &'a [&'b str]) -> (&'a [&'b str], bool) {
         let (rest, downloads) = match words {
             ["npx" | "bunx" | "uvx" | "pnpx", rest @ ..] => (rest, true),
             ["pnpm" | "yarn" | "bun", "dlx", rest @ ..] => (rest, true),
-            // `uv run` and `hatch run` sync the environment first, and the others
-            // can be configured to.
-            ["uv" | "pdm" | "hatch" | "rye", "run", rest @ ..] => (rest, true),
+            ["uv", "run", rest @ ..] => match crate::wrappers::uv_run_rest(rest) {
+                Some(inner) => {
+                    fetches = true;
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            // `hatch run` and friends sync the environment first or can be
+            // configured to.
+            ["pdm" | "hatch" | "rye", "run", rest @ ..] => (rest, true),
+            ["mise", "exec" | "x", "--", rest @ ..] => (rest, true),
+            ["direnv", "exec", dir, rest @ ..] if is_local_dir(dir) => (rest, true),
+            ["pixi", "run", rest @ ..] => (rest, true),
             // These run a tool the project already installed.
             ["pnpm" | "yarn" | "bun", "exec", rest @ ..]
             | ["poetry" | "pipenv", "run", rest @ ..]
             | ["bundle", "exec", rest @ ..] => (rest, false),
+            ["asdf", "exec", cmd, ..] if !cmd.starts_with('-') && !cmd.contains('/') => {
+                (&words[2..], false)
+            }
+            ["pnpm" | "yarn", rest @ ..] => match js_workspace_args(words[0], rest) {
+                Some(["exec", tail @ ..]) => (tail, false),
+                _ => return (words, fetches),
+            },
             ["python" | "python3", "-m", tool, ..] if !matches!(*tool, "pytest" | "unittest") => {
                 (&words[2..], false)
             }
@@ -154,6 +454,11 @@ pub fn tool_label_words(words: &[&str]) -> String {
     ) {
         return program.to_owned();
     }
+    let rest = match program {
+        "cargo" => cargo_args(rest),
+        "pnpm" | "npm" | "yarn" => js_workspace_args(program, rest).unwrap_or(rest),
+        _ => rest,
+    };
     match rest.first() {
         Some(sub)
             if sub.starts_with(|c: char| c.is_ascii_lowercase())
@@ -189,8 +494,11 @@ fn lint_display(args: &[&str]) -> bool {
 
 fn lint_tool(program: &str, args: &[&str]) -> bool {
     match (program, args) {
-        ("cargo", ["clippy" | "check" | "build", ..]) => true,
-        ("cargo", ["doc", rest @ ..]) => !rest.contains(&"--open"),
+        ("cargo", args) => match cargo_args(args) {
+            ["clippy" | "check" | "build", ..] => true,
+            ["doc", rest @ ..] => !rest.contains(&"--open"),
+            _ => false,
+        },
         ("ruff", ["check", ..])
         | ("biome", ["check" | "lint" | "ci", ..])
         | ("ty", ["check", ..])
@@ -625,16 +933,54 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
         {
             Some(Profile::Containers)
         }
-        ("docker", ["compose", "ps", tail @ ..])
-            if display_options(
-                tail,
-                &["-a", "--all", "--no-trunc", "--orphans"],
-                &["--status", "--filter"],
-                true,
-            ) =>
-        {
-            Some(Profile::ComposeContainers)
-        }
+        ("docker", ["compose", rest @ ..]) => match compose_subcommand(rest)? {
+            ["ps", tail @ ..]
+                if display_options(
+                    tail,
+                    &["-a", "--all", "--no-trunc", "--orphans"],
+                    &["--status", "--filter"],
+                    true,
+                ) =>
+            {
+                Some(Profile::ComposeContainers)
+            }
+            ["logs", tail @ ..]
+                if display_options(
+                    tail,
+                    &[
+                        "-t",
+                        "--timestamps",
+                        "--details",
+                        "--no-color",
+                        "--no-log-prefix",
+                    ],
+                    &["--since", "--until", "--tail", "-n"],
+                    true,
+                ) =>
+            {
+                Some(Profile::Logs)
+            }
+            _ => None,
+        },
+        ("podman", ["compose", rest @ ..]) => match compose_subcommand(rest)? {
+            ["logs", tail @ ..]
+                if display_options(
+                    tail,
+                    &[
+                        "-t",
+                        "--timestamps",
+                        "--details",
+                        "--no-color",
+                        "--no-log-prefix",
+                    ],
+                    &["--since", "--until", "--tail", "-n"],
+                    true,
+                ) =>
+            {
+                Some(Profile::Logs)
+            }
+            _ => None,
+        },
         ("kubectl", ["get", resource, tail @ ..])
             if display_options(
                 tail,
@@ -668,21 +1014,19 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
                 _ => None,
             }
         }
-        (
-            "docker" | "podman",
-            ["logs", tail @ ..] | ["container", "logs", tail @ ..] | ["compose", "logs", tail @ ..],
-        ) if display_options(
-            tail,
-            &[
-                "-t",
-                "--timestamps",
-                "--details",
-                "--no-color",
-                "--no-log-prefix",
-            ],
-            &["--since", "--until", "--tail", "-n"],
-            true,
-        ) =>
+        ("docker" | "podman", ["logs", tail @ ..] | ["container", "logs", tail @ ..])
+            if display_options(
+                tail,
+                &[
+                    "-t",
+                    "--timestamps",
+                    "--details",
+                    "--no-color",
+                    "--no-log-prefix",
+                ],
+                &["--since", "--until", "--tail", "-n"],
+                true,
+            ) =>
         {
             Some(Profile::Logs)
         }
@@ -713,7 +1057,11 @@ pub fn profile(words: &[&str]) -> Option<Profile> {
         {
             Some(Profile::Logs)
         }
-        ("pnpm" | "npm" | "yarn" | "bun", ["test", ..] | ["run", "test", ..])
+        ("pnpm" | "npm" | "yarn", rest) => match js_workspace_args(program, rest)? {
+            sub @ (["test", ..] | ["run", "test", ..]) if js_display(sub) => Some(Profile::JsTests),
+            _ => None,
+        },
+        ("bun", ["test", ..] | ["run", "test", ..])
         | ("jest", _)
         | ("vitest", ["run", ..])
         | ("node", ["--test", ..])
@@ -799,51 +1147,57 @@ pub fn json_output(words: &[&str]) -> bool {
         ) => gh_json(rest),
         ("kubectl", _) => kubectl_json(args),
         ("docker", _) => docker_json(args),
-        ("cargo", ["metadata", rest @ ..]) => {
-            display_options(
-                rest,
-                &[
-                    "--no-deps",
-                    "--offline",
-                    "--frozen",
-                    "--locked",
-                    "--all-features",
-                    "--no-default-features",
-                    "-q",
-                    "--quiet",
-                ],
-                &[
-                    "--format-version",
-                    "--features",
-                    "-F",
-                    "--filter-platform",
-                    "--manifest-path",
-                ],
-                false,
-            ) && option_values(rest, &["--format-version"]).all(|version| version == "1")
-                && option_values(rest, &["--manifest-path"]).all(local_argument)
-        }
-        ("npm", ["ls" | "list" | "la" | "ll", rest @ ..]) => {
-            rest.contains(&"--json")
-                && display_options(
+        ("cargo", args) => match cargo_args(args) {
+            ["metadata", rest @ ..] => {
+                display_options(
                     rest,
                     &[
-                        "--json",
-                        "--all",
-                        "-a",
-                        "--long",
-                        "-l",
-                        "--global",
-                        "-g",
-                        "--link",
-                        "--package-lock-only",
-                        "--workspaces",
-                        "--include-workspace-root",
+                        "--no-deps",
+                        "--offline",
+                        "--frozen",
+                        "--locked",
+                        "--all-features",
+                        "--no-default-features",
+                        "-q",
+                        "--quiet",
                     ],
-                    &["--depth", "--omit", "--include", "--workspace", "-w"],
-                    true,
-                )
-        }
+                    &[
+                        "--format-version",
+                        "--features",
+                        "-F",
+                        "--filter-platform",
+                        "--manifest-path",
+                    ],
+                    false,
+                ) && option_values(rest, &["--format-version"]).all(|version| version == "1")
+                    && option_values(rest, &["--manifest-path"]).all(local_argument)
+            }
+            _ => false,
+        },
+        ("npm", args) => match js_workspace_args("npm", args) {
+            Some(["ls" | "list" | "la" | "ll", rest @ ..]) => {
+                rest.contains(&"--json")
+                    && display_options(
+                        rest,
+                        &[
+                            "--json",
+                            "--all",
+                            "-a",
+                            "--long",
+                            "-l",
+                            "--global",
+                            "-g",
+                            "--link",
+                            "--package-lock-only",
+                            "--workspaces",
+                            "--include-workspace-root",
+                        ],
+                        &["--depth", "--omit", "--include", "--workspace", "-w"],
+                        true,
+                    )
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1025,8 +1379,75 @@ fn docker_json(args: &[&str]) -> bool {
     }
 }
 
-/// Skip Git global options that only disable pagers/locks or control pathspec
-/// matching without changing directory, repository or configuration.
+/// Strict allowlist of harmless display-only `git -c KEY=VALUE` pairs.
+/// Never allows `core.fsmonitor`, `core.sshCommand`, `credential.helper`,
+/// `diff.external`, `alias.*`, `filter.*`, non-`cat` pagers, or arbitrary keys.
+fn is_safe_git_config(spec: &str) -> bool {
+    let Some((key, value)) = spec.split_once('=') else {
+        return false;
+    };
+    let key = key.to_ascii_lowercase();
+    let value_lower = value.to_ascii_lowercase();
+    match key.as_str() {
+        "color.ui" | "color.status" | "color.diff" | "color.branch" => {
+            matches!(
+                value_lower.as_str(),
+                "always" | "auto" | "never" | "true" | "false"
+            )
+        }
+        "core.pager" => value == "cat",
+        "diff.algorithm" => matches!(
+            value_lower.as_str(),
+            "myers" | "default" | "minimal" | "patience" | "histogram"
+        ),
+        "diff.colormoved" => matches!(
+            value_lower.as_str(),
+            "no" | "default"
+                | "plain"
+                | "blocks"
+                | "zebra"
+                | "dimmed-zebra"
+                | "dimmed_zebra"
+                | "true"
+                | "false"
+        ),
+        "log.date" => matches!(
+            value_lower.as_str(),
+            "relative"
+                | "local"
+                | "iso"
+                | "iso8601"
+                | "iso-local"
+                | "iso-strict"
+                | "iso8601-strict"
+                | "iso-strict-local"
+                | "rfc"
+                | "rfc2822"
+                | "rfc-local"
+                | "short"
+                | "short-local"
+                | "raw"
+                | "raw-local"
+                | "human"
+                | "human-local"
+                | "unix"
+                | "default"
+                | "default-local"
+                | "auto:human"
+        ),
+        "status.short" | "status.branch" => {
+            matches!(
+                value_lower.as_str(),
+                "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Skip Git global options that only disable pagers/locks, control pathspec
+/// matching, or set allowlisted display-only `-c` keys without changing
+/// directory or repository.
 pub(crate) fn git_display_subcommand<'a, 'b>(mut args: &'a [&'b str]) -> &'a [&'b str] {
     while let Some((first, tail)) = args.split_first() {
         if matches!(
@@ -1041,11 +1462,94 @@ pub(crate) fn git_display_subcommand<'a, 'b>(mut args: &'a [&'b str]) -> &'a [&'
                 | "--icase-pathspecs"
         ) {
             args = tail;
+        } else if *first == "-c"
+            && let Some((spec, rest)) = tail.split_first()
+            && is_safe_git_config(spec)
+        {
+            args = rest;
+        } else if let Some(spec) = first.strip_prefix("-c")
+            && !spec.is_empty()
+            && is_safe_git_config(spec)
+        {
+            args = tail;
         } else {
             break;
         }
     }
     args
+}
+
+/// Like [`git_display_subcommand`], also skipping `-C <LOCAL_DIR>` (strictly
+/// workspace-relative via [`is_local_dir`]) for non-auto-approved routing.
+/// Returns `None` if a `-C` or `-c` flag has a missing or unsafe value.
+fn git_routed_subcommand<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    while let Some((first, tail)) = args.split_first() {
+        if matches!(
+            *first,
+            "--no-pager"
+                | "-P"
+                | "--no-optional-locks"
+                | "--no-replace-objects"
+                | "--literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+        ) {
+            args = tail;
+        } else if *first == "-C" {
+            let (dir, rest) = tail.split_first()?;
+            if !is_local_dir(dir) {
+                return None;
+            }
+            args = rest;
+        } else if let Some(dir) = first.strip_prefix("-C")
+            && !dir.is_empty()
+        {
+            if !is_local_dir(dir) {
+                return None;
+            }
+            args = tail;
+        } else if *first == "-c" {
+            let (spec, rest) = tail.split_first()?;
+            if !is_safe_git_config(spec) {
+                return None;
+            }
+            args = rest;
+        } else if let Some(spec) = first.strip_prefix("-c")
+            && !spec.is_empty()
+        {
+            if !is_safe_git_config(spec) {
+                return None;
+            }
+            args = tail;
+        } else {
+            break;
+        }
+    }
+    Some(args)
+}
+
+fn git_display_match(sub: &[&str]) -> bool {
+    match sub {
+        ["diff" | "show" | "status" | "log", ..] => true,
+        ["branch", branch_args @ ..] => git_branch_display(branch_args),
+        ["tag", tag_args @ ..] => git_tag_display(tag_args),
+        ["stash", "list", stash_args @ ..] => git_stash_list_display(stash_args),
+        ["reflog", reflog_args @ ..] => git_reflog_display(reflog_args),
+        ["blame", blame_args @ ..] => git_blame_display(blame_args),
+        _ => false,
+    }
+}
+
+/// Whether `words` is a read-only Git display command that uses only validated
+/// local `-C <LOCAL_DIR>` and/or allowlisted display `-c` options, suitable for
+/// ask-mode routing (such as Antigravity CLI Tier 2) without auto-approval.
+pub(crate) fn git_local_routed(words: &[&str]) -> bool {
+    let Some((&program, rest)) = words.split_first() else {
+        return false;
+    };
+    Path::new(program).file_name().and_then(|n| n.to_str()) == Some("git")
+        && git_routed_subcommand(rest).is_some_and(git_display_match)
 }
 
 pub fn legacy_hook(words: &[&str]) -> bool {
@@ -1054,27 +1558,25 @@ pub fn legacy_hook(words: &[&str]) -> bool {
     };
     let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
     match unwrap_tool(&refs) {
-        ["cargo", "build" | "check" | "clippy" | "test" | "tree", ..]
-        | ["cargo", "nextest", "run", ..]
-        | ["make" | "gmake" | "ninja", ..]
+        ["cargo", rest @ ..] => match cargo_args(rest) {
+            ["build" | "check" | "clippy" | "test" | "tree", ..] | ["nextest", "run", ..] => true,
+            ["doc", doc_rest @ ..] => !doc_rest.contains(&"--open"),
+            _ => false,
+        },
+        ["make" | "gmake" | "ninja", ..]
         | ["cmake", "--build", ..]
-        | ["gradle" | "gradlew" | "./gradlew", ..]
-        | ["mvn" | "mvnw" | "./mvnw", ..]
         | ["dotnet", "build" | "test" | "restore", ..]
         | ["swift", "build" | "test", ..]
         | ["go", "test" | "build", ..]
         | ["python" | "python3", "-m", "pytest", ..]
         | ["pytest" | "rg", ..] => true,
-        ["cargo", "doc", rest @ ..] => !rest.contains(&"--open"),
-        ["git", rest @ ..] => match git_display_subcommand(rest) {
-            ["diff" | "show" | "status" | "log", ..] => true,
-            ["branch", branch_args @ ..] => git_branch_display(branch_args),
-            ["tag", tag_args @ ..] => git_tag_display(tag_args),
-            ["stash", "list", stash_args @ ..] => git_stash_list_display(stash_args),
-            ["reflog", reflog_args @ ..] => git_reflog_display(reflog_args),
-            ["blame", blame_args @ ..] => git_blame_display(blame_args),
-            _ => false,
-        },
+        ["gradle" | "gradlew" | "./gradlew", rest @ ..]
+            if rest.first() != Some(&"dependencies") =>
+        {
+            true
+        }
+        ["mvn" | "mvnw" | "./mvnw", rest @ ..] if rest.first() != Some(&"dependency:tree") => true,
+        ["git", rest @ ..] => git_routed_subcommand(rest).is_some_and(git_display_match),
         _ => false,
     }
 }
@@ -1774,7 +2276,10 @@ fn deno_fmt_check(words: &[&str]) -> bool {
 /// and display/selection options only. Bare `cargo fmt` writes files and stays
 /// unapproved.
 fn cargo_fmt_check(words: &[&str]) -> bool {
-    let ["cargo", "fmt", args @ ..] = words else {
+    let ["cargo", rest @ ..] = words else {
+        return false;
+    };
+    let ["fmt", args @ ..] = cargo_args(rest) else {
         return false;
     };
     if !args.iter().all(|arg| local_argument(arg)) {
@@ -1847,7 +2352,7 @@ pub fn approvable(words: &[&str]) -> bool {
     let Some(effective) = crate::wrappers::hook_effective_detail(words) else {
         return false;
     };
-    if effective.env_clears {
+    if effective.env_clears || effective.runner_unapprovable {
         return false;
     }
     let eff_refs: Vec<&str> = effective.words.iter().map(String::as_str).collect();
@@ -1883,7 +2388,7 @@ pub fn approvable(words: &[&str]) -> bool {
         return true;
     }
     if program == "git" {
-        return legacy_hook(tool);
+        return git_display_match(git_display_subcommand(args));
     }
     // A command routed for its preview alone installs, builds or reaches a
     // service, so it runs only when the client asks — except read-only
@@ -2039,12 +2544,19 @@ pub fn approvable(words: &[&str]) -> bool {
             },
         ),
         "cargo" => {
-            !args.iter().any(|arg| {
+            if args
+                .first()
+                .is_some_and(|arg| arg.starts_with('+') && !is_cargo_toolchain(arg))
+            {
+                return false;
+            }
+            let cargo_rest = cargo_args(args);
+            !cargo_rest.iter().any(|arg| {
                 let flag = arg.split_once('=').map_or(*arg, |(flag, _)| flag);
                 arg.starts_with("-Z")
                     || flag == "--config"
-                    || (args.first() == Some(&"doc") && *arg == "--open")
-                    || (args.first() == Some(&"nextest")
+                    || (cargo_rest.first() == Some(&"doc") && *arg == "--open")
+                    || (cargo_rest.first() == Some(&"nextest")
                         && matches!(
                             flag,
                             "--config-file"
@@ -2057,8 +2569,8 @@ pub fn approvable(words: &[&str]) -> bool {
                                 | "--remap-path-prefix"
                                 | "--target-runner"
                         ))
-            }) && (args.first() != Some(&"nextest") || args.get(1) == Some(&"run"))
-                && clippy_lint_levels(args)
+            }) && (cargo_rest.first() != Some(&"nextest") || cargo_rest.get(1) == Some(&"run"))
+                && clippy_lint_levels(cargo_rest)
         }
         // `-vettool` and `-toolexec` run the program they name, `-gccgoflags` and
         // an `-extld` or `-extldflags` in `-ldflags` choose the compiler's or
@@ -2110,6 +2622,10 @@ pub fn approvable(words: &[&str]) -> bool {
                 .next()
                 .is_some_and(|f| f.starts_with("--fix"))
         }),
+        "pnpm" | "npm" | "yarn" => js_workspace_args(program, args).is_some(),
+        "docker" | "podman" => {
+            args.first() != Some(&"compose") || compose_subcommand(&args[1..]).is_some()
+        }
         _ => true,
     }
 }
@@ -3198,5 +3714,222 @@ mod tests {
         assert!(text.contains("2 filtered"), "{text}");
         assert!(text.contains("(fail) billing > charges card"), "{text}");
         assert!(!text.contains("verifies token"), "{text}");
+    }
+
+    #[test]
+    fn cargo_toolchain_monorepo_compose_git_and_safe_runners_enforce_security_contracts() {
+        // 1. Rust toolchain selector (`cargo +TOOLCHAIN`).
+        for (cmd, expected_profile, expected_legacy, expected_approvable) in [
+            ("cargo +nightly clippy", Some(Profile::Lint), true, true),
+            (
+                "cargo +nightly clippy -- -D warnings",
+                Some(Profile::Lint),
+                true,
+                true,
+            ),
+            ("cargo +stable test", None, true, true),
+            ("cargo +1.91 check", Some(Profile::Lint), true, true),
+            ("cargo +1.91.0 build", Some(Profile::Lint), true, true),
+            (
+                "cargo +nightly-2026-01-01 doc --no-deps",
+                Some(Profile::Lint),
+                true,
+                true,
+            ),
+            ("cargo +nightly doc --open", None, false, false),
+            ("cargo +nightly fmt --check", None, false, true),
+            ("cargo +nightly fmt", None, false, false),
+            ("cargo +nightly audit", None, false, false),
+            ("cargo +nightly test -Z unstable-options", None, true, false),
+            (
+                "cargo +nightly clippy -- -Clinker=evil",
+                Some(Profile::Lint),
+                true,
+                false,
+            ),
+            ("cargo +../evil clippy", None, false, false),
+            ("cargo +nightly/foo test", None, false, false),
+            ("cargo +nightly;rm test", None, false, false),
+            ("cargo + test", None, false, false),
+        ] {
+            let words: Vec<&str> = cmd.split(' ').collect();
+            assert_eq!(profile(&words), expected_profile, "profile: {cmd}");
+            assert_eq!(legacy_hook(&words), expected_legacy, "legacy: {cmd}");
+            assert_eq!(approvable(&words), expected_approvable, "approvable: {cmd}");
+        }
+
+        // 2. JS/TS monorepo workspace flags (with strict local_argument on dirs).
+        for (cmd, expected_profile, expected_approvable) in [
+            ("pnpm -F web test", Some(Profile::JsTests), true),
+            ("pnpm --filter @acme/web test", Some(Profile::JsTests), true),
+            ("pnpm -r test", Some(Profile::JsTests), true),
+            ("pnpm --recursive run test", Some(Profile::JsTests), true),
+            ("pnpm -C packages/web test", Some(Profile::JsTests), true),
+            ("pnpm --dir apps/api test", Some(Profile::JsTests), true),
+            ("pnpm -F web exec eslint src", Some(Profile::Lint), true),
+            (
+                "pnpm -C packages/web exec tsc --noEmit",
+                Some(Profile::Lint),
+                true,
+            ),
+            ("npm -w web test", Some(Profile::JsTests), true),
+            (
+                "npm --workspace @acme/web test",
+                Some(Profile::JsTests),
+                true,
+            ),
+            ("npm --workspaces run test", Some(Profile::JsTests), true),
+            (
+                "npm --prefix packages/api test",
+                Some(Profile::JsTests),
+                true,
+            ),
+            ("yarn --cwd packages/web test", Some(Profile::JsTests), true),
+            ("yarn workspace web test", Some(Profile::JsTests), true),
+            ("yarn workspace web exec jest", Some(Profile::JsTests), true),
+            // Reject unsafe or escaping dirs and watch/code-loading options.
+            ("pnpm -C /tmp test", None, false),
+            ("pnpm --dir ../outside test", None, false),
+            ("pnpm --dir ~/app test", None, false),
+            ("pnpm -C $DIR test", None, false),
+            ("pnpm -F {../outside} test", None, false),
+            ("pnpm -C /tmp exec eslint src", None, false),
+            (
+                "pnpm -F web exec eslint --plugin evil src",
+                Some(Profile::Lint),
+                false,
+            ),
+            ("npm --prefix /etc test", None, false),
+            ("npm --prefix ../outside test", None, false),
+            ("npm -w web test --watch", None, true),
+            (
+                "npm -w web test --script-shell=/bin/sh",
+                Some(Profile::JsTests),
+                false,
+            ),
+            ("yarn --cwd /tmp test", None, false),
+            ("yarn --cwd ../outside test", None, false),
+            ("yarn --cwd ~/app test", None, false),
+            ("yarn workspace ../outside test", None, false),
+        ] {
+            let words: Vec<&str> = cmd.split(' ').collect();
+            assert_eq!(profile(&words), expected_profile, "profile: {cmd}");
+            assert_eq!(approvable(&words), expected_approvable, "approvable: {cmd}");
+        }
+        assert!(json_output(&["npm", "-w", "web", "ls", "--json"]));
+        assert!(json_output(&[
+            "npm",
+            "--prefix",
+            "packages/api",
+            "ls",
+            "--json"
+        ]));
+        assert!(!json_output(&["npm", "--prefix", "/tmp", "ls", "--json"]));
+
+        // 3. `git -C <LOCAL_DIR>` (routed, non-approvable) and safe `-c` display keys.
+        for (cmd, expected_legacy, expected_approvable, expected_local) in [
+            ("git -C subdir status", true, false, true),
+            ("git -C packages/web diff", true, false, true),
+            ("git -C subdir log -n 10", true, false, true),
+            ("git -C subdir blame src/lib.rs", true, false, true),
+            ("git -C subdir -c color.ui=always diff", true, false, true),
+            ("git -c color.ui=always diff", true, true, true),
+            ("git -c color.status=always status", true, true, true),
+            ("git -c color.diff=never diff", true, true, true),
+            ("git -c color.branch=auto branch -a", true, true, true),
+            ("git -c core.pager=cat log -n 5", true, true, true),
+            ("git -c diff.algorithm=histogram diff", true, true, true),
+            ("git -c diff.colorMoved=zebra diff", true, true, true),
+            ("git -c log.date=iso log", true, true, true),
+            ("git -c status.short=true status", true, true, true),
+            ("git -c status.branch=true status", true, true, true),
+            // Unsafe `-C` paths and unsafe `-c` keys stay rejected everywhere.
+            ("git -C /tmp status", false, false, false),
+            ("git -C ../outside diff", false, false, false),
+            ("git -C ~/repo log", false, false, false),
+            ("git -C $DIR status", false, false, false),
+            ("git -C subdir push", false, false, false),
+            ("git -c core.pager=sh diff", false, false, false),
+            ("git -c core.fsmonitor=evil status", false, false, false),
+            ("git -c core.sshCommand=evil diff", false, false, false),
+            ("git -c credential.helper=evil status", false, false, false),
+            ("git -c diff.external=evil diff", false, false, false),
+            ("git -c alias.st=!evil st", false, false, false),
+            ("git -c filter.lfs.smudge=evil diff", false, false, false),
+            ("git -c http.extraHeader=x log", false, false, false),
+        ] {
+            let words: Vec<&str> = cmd.split(' ').collect();
+            assert_eq!(legacy_hook(&words), expected_legacy, "legacy: {cmd}");
+            assert_eq!(approvable(&words), expected_approvable, "approvable: {cmd}");
+            assert_eq!(git_local_routed(&words), expected_local, "local: {cmd}");
+        }
+
+        // 4. `docker compose` global flags before `ps` / `logs`.
+        for (cmd, expected_profile, expected_approvable) in [
+            (
+                "docker compose -f docker-compose.yml -p myproj ps",
+                Some(Profile::ComposeContainers),
+                true,
+            ),
+            (
+                "docker compose --file compose.prod.yml --profile web logs --tail 50 api",
+                Some(Profile::Logs),
+                true,
+            ),
+            (
+                "docker compose --project-directory deploy --env-file .env.local ps -a",
+                Some(Profile::ComposeContainers),
+                true,
+            ),
+            (
+                "podman compose -f compose.yml -p shop logs api",
+                Some(Profile::Logs),
+                true,
+            ),
+            // Reject paths escaping workspace and streaming `-f` after `logs`.
+            ("docker compose -f /tmp/compose.yml ps", None, false),
+            ("docker compose --file ../outside.yml logs", None, false),
+            ("docker compose --project-directory /etc ps", None, false),
+            ("docker compose --env-file /etc/secrets logs", None, false),
+            ("docker compose --env-file ../.env ps", None, false),
+            ("docker compose --env-file ~/.env ps", None, false),
+            ("docker compose -f compose.yml logs -f", None, true),
+        ] {
+            let words: Vec<&str> = cmd.split(' ').collect();
+            assert_eq!(profile(&words), expected_profile, "profile: {cmd}");
+            assert_eq!(approvable(&words), expected_approvable, "approvable: {cmd}");
+        }
+
+        // 5. Toolchain runner wrappers respect `approvable` safety boundaries.
+        for (cmd, expected_legacy, expected_approvable) in [
+            ("uv run --frozen pytest", true, false),
+            ("uv run --offline --no-sync pytest", true, false),
+            (
+                "uv run --group dev --directory packages/api pytest",
+                true,
+                false,
+            ),
+            ("uv run --with evil pytest", false, false),
+            ("uv run --with-requirements req.txt pytest", false, false),
+            ("uv run --from pkg pytest", false, false),
+            ("uv run --python-fetch automatic pytest", false, false),
+            ("uv run --directory /tmp pytest", false, false),
+            ("mise exec -- cargo test", true, false),
+            ("mise x -- pytest -q", true, false),
+            ("mise exec python@3.12 -- pytest", false, false),
+            ("asdf exec cargo test", true, true),
+            ("asdf exec pytest -p evil", true, false),
+            ("direnv exec . pytest", true, false),
+            ("direnv exec packages/api cargo test", true, false),
+            ("direnv exec /tmp pytest", false, false),
+            ("direnv exec ../other pytest", false, false),
+            ("pixi run pytest", true, false),
+            ("pixi run --frozen cargo test", true, false),
+            ("pixi run deploy", false, false),
+        ] {
+            let words: Vec<&str> = cmd.split(' ').collect();
+            assert_eq!(legacy_hook(&words), expected_legacy, "legacy: {cmd}");
+            assert_eq!(approvable(&words), expected_approvable, "approvable: {cmd}");
+        }
     }
 }
