@@ -1861,6 +1861,23 @@ impl Capture<'_> {
             report = true;
             run.replaced = Some("stdout".to_owned());
         } else if !merged
+            && run.produced_bytes.is_empty()
+            && selection.profile.is_none()
+            && run.summary.kind.is_empty()
+            && let Some(view) = cli_view(
+                words,
+                &archive.readers[0],
+                lengths[0],
+                redactor,
+                secrets[0] > 0,
+                max_bytes,
+            )
+            && (!stdout_fits || view.len() + 64 < previews[0].1.len())
+        {
+            previews[0].1 = view.into_bytes();
+            report = true;
+            run.replaced = Some("stdout".to_owned());
+        } else if !merged
             && selection.profile.is_none()
             && run.summary.kind.is_empty()
             && run.produced_bytes.is_empty()
@@ -2317,6 +2334,30 @@ fn extra_inventory_view(
         Kind::Images => crate::inventory::images(&text, max_bytes),
         Kind::Resource(resource) => crate::inventory::resources(resource, &text, max_bytes),
     }
+}
+
+/// Format high-volume CLI views handled by `cli_views::format` (`kubectl describe`,
+/// `gh pr checks`/`run view`/lists, security audits, `terraform state list`,
+/// outdated/package lists), redacting before formatting.
+fn cli_view(
+    words: &[&str],
+    reader: &File,
+    length: u64,
+    redactor: Option<&crate::redact::Redactor>,
+    has_secrets: bool,
+    max_bytes: usize,
+) -> Option<String> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    if length == 0 || length > LIMIT {
+        return None;
+    }
+    crate::cli_views::kind_tag(words)?;
+    let text = read_text(reader, length, LIMIT)?;
+    let text = match redactor.filter(|_| has_secrets) {
+        Some(redactor) => redactor.text(&text).into_owned(),
+        None => text,
+    };
+    crate::cli_views::format(words, &text, max_bytes)
 }
 
 /// Stdout shown as JSON tables or compact JSON, clipped at whole lines to

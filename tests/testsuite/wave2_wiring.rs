@@ -1030,3 +1030,105 @@ fn opencode_plugin_retires_in_window_duplicates_and_forwards_session_id() {
     assert_eq!(payload["session_id"], "oc-sess-42", "{payload}");
     assert_eq!(payload["hook_event_name"], "PostToolUse", "{payload}");
 }
+
+#[cfg(unix)]
+#[test]
+fn wave4_cli_views_and_merged_logview_work_end_to_end() {
+    use std::fmt::Write as _;
+
+    let sb = Sandbox::new();
+
+    // 1) `gh pr checks 42` via `justless run --hook` collapses 60 passing checks
+    //    and preserves failures + exact `[stdout:A-B]` replay.
+    let mut checks = String::new();
+    for i in 1..=60 {
+        let _ = writeln!(
+            checks,
+            "ci / build-shard-{i:02}\tpass\t1m12s\thttps://github.com/org/repo/actions/runs/{i}"
+        );
+    }
+    checks
+        .push_str("ci / integration\tfail\t3m05s\thttps://github.com/org/repo/actions/runs/999\n");
+    sb.write_fixture_stub("gh", "gh_checks.txt", &checks);
+
+    let out = sb.run_hook(&["gh", "pr", "checks", "42"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let rendered = text(&out.stdout);
+    has(&rendered, "60 passed");
+    has(&rendered, "ci / integration");
+    has(&rendered, "[stdout:1-60]");
+    assert!(
+        rendered.len() < checks.len() / 5,
+        "expected strong gh pr checks compaction: {} vs {}\n{rendered}",
+        rendered.len(),
+        checks.len()
+    );
+    let id = run_id(&out);
+    let replay = sb.log(&id, &["--stream", "stdout", "--from", "61", "--to", "61"]);
+    assert_eq!(
+        text(&replay.stdout).trim(),
+        "ci / integration\tfail\t3m05s\thttps://github.com/org/repo/actions/runs/999"
+    );
+
+    // 2) `terraform state list` via `justless run --hook` groups 150 resources by type.
+    let mut tf_state = String::new();
+    for i in 0..110 {
+        let _ = writeln!(tf_state, "module.network.aws_subnet.private[{i}]");
+    }
+    for i in 0..40 {
+        let _ = writeln!(tf_state, "aws_instance.worker[{i}]");
+    }
+    sb.write_fixture_stub("terraform", "tf_state.txt", &tf_state);
+
+    let out = sb.run_hook(&["terraform", "state", "list"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let rendered = text(&out.stdout);
+    has(&rendered, "module.network.aws_subnet");
+    has(&rendered, "aws_instance");
+    has(&rendered, "[stdout:1-110]");
+    assert!(
+        rendered.len() < tf_state.len() / 8,
+        "expected strong terraform state list compaction: {} vs {}\n{rendered}",
+        rendered.len(),
+        tf_state.len()
+    );
+
+    // 3) `kubectl logs` with `--merge` (like `2>&1`) folds via `logview` instead
+    //    of falling back to raw head/tail clipping.
+    let mut merged_logs = String::new();
+    for i in 1..=120 {
+        let _ = writeln!(
+            merged_logs,
+            "2026-11-25T10:00:{:02}Z INFO api-1 GET /healthz status=200 latency={}ms",
+            i % 60,
+            10 + (i % 5)
+        );
+    }
+    merged_logs.push_str("2026-11-25T10:02:01Z ERROR api-1 database pool exhausted code=53300\n");
+    sb.write_fixture_stub("kubectl", "klogs.txt", &merged_logs);
+
+    let out = sb
+        .cmd(&[
+            "--root",
+            sb.root.to_str().unwrap(),
+            "run",
+            "--hook",
+            "--merge",
+            "--",
+            "kubectl",
+            "logs",
+            "deploy/api",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let rendered = text(&out.stdout);
+    has(&rendered, "database pool exhausted");
+    has(&rendered, "×120");
+    assert!(
+        rendered.len() < merged_logs.len() / 6,
+        "expected merged logview compaction: {} vs {}\n{rendered}",
+        rendered.len(),
+        merged_logs.len()
+    );
+}
