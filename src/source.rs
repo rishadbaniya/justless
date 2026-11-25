@@ -23,6 +23,18 @@ fn revision() -> Arg<'static> {
         .value_name("REV")
         .help("Revision from the outline")
 }
+fn session_arg() -> Arg<'static> {
+    Arg::new("session")
+        .long("session")
+        .takes_value(true)
+        .value_name("NAME")
+        .help("Print only what changed since this session read the file")
+}
+fn fresh_arg() -> Arg<'static> {
+    Arg::new("fresh")
+        .long("fresh")
+        .help("Print full output even when this session already saw it")
+}
 
 pub fn commands() -> Vec<Cli<'static>> {
     vec![
@@ -76,18 +88,26 @@ pub fn commands() -> Vec<Cli<'static>> {
                     .value_name("REF")
                     .help("Continue after this revision-bound entry"),
             )
+            .arg(session_arg())
+            .arg(fresh_arg())
             .arg(crate::number("limit", "40", "Maximum entries per page"))
             .arg(crate::budget()),
         Cli::new("expand")
             .about("Print the exact source bytes for a symbol, outline reference or line range")
-            .arg(file())
-            .arg(Arg::new("selector").required(true))
+            .arg(
+                Arg::new("file")
+                    .value_name("FILE [SELECTOR] | FILE:SELECTOR...")
+                    .required(true)
+                    .multiple_values(true),
+            )
             .arg(
                 Arg::new("json")
                     .long("json")
                     .help("Include the edit reference, source lines and revision"),
             )
-            .arg(revision()),
+            .arg(revision())
+            .arg(session_arg())
+            .arg(fresh_arg()),
         Cli::new("edit")
             .about("Replace or insert at verified source locations")
             .arg(file())
@@ -144,6 +164,8 @@ pub struct Snapshot {
     entries: Vec<Entry>,
     /// Why the language parser produced no entries, such as a Rust syntax error.
     parse_error: Option<String>,
+    /// Whether this snapshot was indexed as a Rust source file.
+    is_rust: bool,
 }
 
 pub(crate) fn revision_for(file: &str, bytes: &[u8]) -> String {
@@ -180,6 +202,7 @@ impl Snapshot {
             lines,
             entries: Vec::new(),
             parse_error: None,
+            is_rust: false,
         })
     }
 
@@ -199,6 +222,7 @@ impl Snapshot {
             lines,
             entries: Vec::new(),
             parse_error: None,
+            is_rust: false,
         }
     }
 
@@ -234,6 +258,21 @@ impl Snapshot {
         self.lines.partition_point(|&start| start <= offset)
     }
 
+    /// Whether `span` covers every non-whitespace byte on its first and last
+    /// lines, so recording it by line range never hides a sibling declaration
+    /// sharing the same line.
+    fn is_full_lines(&self, span: &Range<usize>) -> bool {
+        if span.is_empty() {
+            return false;
+        }
+        let first = self.line(span.start);
+        let last = self.line(span.end.saturating_sub(1).max(span.start));
+        let line_start = self.lines[first - 1];
+        let line_end = self.lines.get(last).copied().unwrap_or(self.text.len());
+        self.text[line_start..span.start].trim().is_empty()
+            && self.text[span.end..line_end].trim().is_empty()
+    }
+
     /// The start of `offset`'s line when only indentation precedes it, so a
     /// symbol insertion goes before the whole line.
     fn line_aligned_start(&self, offset: usize) -> usize {
@@ -262,7 +301,8 @@ impl Snapshot {
 
     pub fn index(&mut self, file: &str) -> Result<()> {
         let mut imports = Vec::new();
-        if file.ends_with(".rs") {
+        self.is_rust = file.ends_with(".rs");
+        if self.is_rust {
             // syn parses whole files, so one syntax error leaves no symbols.
             match crate::rust_syntax::parse(&self.text) {
                 Err(error) => {
@@ -384,6 +424,21 @@ impl Snapshot {
         format!("{}#{}", self.revision, index + 1)
     }
 
+    fn resolve_entry_range(&self, first: usize, last: usize) -> Result<Range<usize>> {
+        ensure!(first >= 1, "entry IDs start at 1");
+        ensure!(
+            first <= last && last <= self.entries.len(),
+            "outline entry range outside file"
+        );
+        let start = self.entries[first - 1].bytes.start;
+        let end = self.entries[first - 1..last]
+            .iter()
+            .map(|entry| entry.bytes.end)
+            .max()
+            .unwrap_or(start);
+        Ok(start..end)
+    }
+
     fn resolve(
         &self,
         selector: &str,
@@ -401,14 +456,17 @@ impl Snapshot {
             !guarded || embedded.is_some() || revision.is_some(),
             "editing requires a revision-bound reference or --revision"
         );
-        if selector.contains('#')
-            && let Ok(id) = target.parse::<usize>()
-        {
-            return self
-                .entries
-                .get(id.checked_sub(1).context("entry IDs start at 1")?)
-                .map(|entry| entry.bytes.clone())
-                .context("unknown outline entry");
+        if selector.contains('#') {
+            if let Ok(id) = target.parse::<usize>() {
+                return self
+                    .entries
+                    .get(id.checked_sub(1).context("entry IDs start at 1")?)
+                    .map(|entry| entry.bytes.clone())
+                    .context("unknown outline entry");
+            }
+            if let Some((first, last)) = entry_range(target) {
+                return self.resolve_entry_range(first, last);
+            }
         }
         if let Some(range) = line_range(target) {
             let (first, last) = range.split_once('-').unwrap_or((range, range));
@@ -439,6 +497,156 @@ impl Snapshot {
             );
         }
         Ok(entry.bytes.clone())
+    }
+
+    fn resolve_span(
+        &self,
+        selector: &str,
+        revision: Option<&str>,
+        order: usize,
+    ) -> Result<ResolvedSpan> {
+        let span = self.resolve(selector, revision, false)?;
+        let first = self.line(span.start);
+        let last = self.line(span.end.saturating_sub(1).max(span.start));
+        let (_, target) = split_selector(selector);
+        let (id_label, anchor) = if selector.contains('#')
+            && let Some((a, b)) = entry_range(target)
+        {
+            if a == b {
+                (Some(format!("#{a}")), self.reference(a - 1))
+            } else {
+                (
+                    Some(format!("#{a}..#{b}")),
+                    format!("{}#{a}..#{b}", self.revision),
+                )
+            }
+        } else if let Some(index) = self.entries.iter().position(|entry| entry.bytes == span) {
+            (Some(format!("#{}", index + 1)), self.reference(index))
+        } else {
+            (None, format!("{}#L{first}-{last}", self.revision))
+        };
+        Ok(ResolvedSpan {
+            order,
+            span,
+            first,
+            last,
+            id_label,
+            anchor,
+        })
+    }
+
+    fn coalesce_spans(&self, mut resolved: Vec<ResolvedSpan>) -> Vec<CoalescedSpan> {
+        resolved.sort_by_key(|item| {
+            (
+                item.span.start,
+                std::cmp::Reverse(item.span.end),
+                item.order,
+            )
+        });
+        let mut clusters: Vec<(Range<usize>, Vec<ResolvedSpan>)> = Vec::new();
+        for item in resolved {
+            if let Some((cluster_span, members)) = clusters.last_mut()
+                && (item.span.start < cluster_span.end || item.span == *cluster_span)
+            {
+                cluster_span.end = cluster_span.end.max(item.span.end);
+                members.push(item);
+            } else {
+                clusters.push((item.span.clone(), vec![item]));
+            }
+        }
+        clusters.sort_by_key(|(_, members)| {
+            members.iter().map(|m| m.order).min().unwrap_or(usize::MAX)
+        });
+        clusters
+            .into_iter()
+            .map(|(span, mut members)| {
+                members.sort_by_key(|m| m.order);
+                let first = self.line(span.start);
+                let last = self.line(span.end.saturating_sub(1).max(span.start));
+                if members.len() == 1 {
+                    let item = &members[0];
+                    let label = match &item.id_label {
+                        Some(id) => format!("{id} L{first}-{last}"),
+                        None => format!("L{first}-{last}"),
+                    };
+                    return CoalescedSpan {
+                        span,
+                        first,
+                        last,
+                        anchor: item.anchor.clone(),
+                        label,
+                    };
+                }
+                if let Some(primary_idx) = members
+                    .iter()
+                    .position(|m| m.span == span && m.id_label.is_some())
+                {
+                    let primary = &members[primary_idx];
+                    let primary_id = primary.id_label.as_deref().unwrap();
+                    let mut included = Vec::new();
+                    for (idx, other) in members.iter().enumerate() {
+                        if idx == primary_idx {
+                            continue;
+                        }
+                        let tag = other
+                            .id_label
+                            .clone()
+                            .unwrap_or_else(|| format!("L{}-{}", other.first, other.last));
+                        if tag != primary_id && !included.contains(&tag) {
+                            included.push(tag);
+                        }
+                    }
+                    let label = if included.is_empty() {
+                        format!("{primary_id} L{first}-{last}")
+                    } else {
+                        format!(
+                            "{primary_id} L{first}-{last} (includes {})",
+                            included.join(", ")
+                        )
+                    };
+                    CoalescedSpan {
+                        span,
+                        first,
+                        last,
+                        anchor: primary.anchor.clone(),
+                        label,
+                    }
+                } else {
+                    let mut ids = Vec::new();
+                    for member in &members {
+                        if let Some(id) = &member.id_label
+                            && !ids.contains(id)
+                        {
+                            ids.push(id.clone());
+                        }
+                    }
+                    let label = if ids.is_empty() {
+                        format!("L{first}-{last}")
+                    } else {
+                        format!("L{first}-{last} (includes {})", ids.join(", "))
+                    };
+                    CoalescedSpan {
+                        span,
+                        first,
+                        last,
+                        anchor: format!("{}#L{first}-{last}", self.revision),
+                        label,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Trims strictly redundant Rust signatures where the header repeats only
+    /// `{kind} {name}` with no visibility, generics, bounds or tuple fields.
+    fn slim_signature(&self, entry: &Entry, signature: String) -> String {
+        if self.is_rust && matches!(entry.kind.as_str(), "struct" | "enum" | "trait" | "union") {
+            let short = entry.name.rsplit("::").next().unwrap_or(&entry.name);
+            if signature == format!("{} {short}", entry.kind) {
+                return String::new();
+            }
+        }
+        signature
     }
 
     pub fn page(
@@ -492,13 +700,23 @@ impl Snapshot {
                 vec![filter.as_str()]
             };
         let words = |raw: &str| raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        let fold_group = |entry: &Entry| -> Option<&'static str> {
+        fn scope_prefix(entry: &Entry) -> Option<&str> {
+            entry.name.rsplit_once("::").map(|(prefix, _)| prefix)
+        }
+        let fold_group = |entry: &Entry| -> Option<(&'static str, usize)> {
             if entry.kind == "import" {
-                Some("imports")
+                Some(("imports", 3))
             } else if entry.kind == "module"
                 && self.text[entry.bytes.clone()].trim_end().ends_with(';')
             {
-                Some("modules")
+                Some(("modules", 3))
+            } else if matches!(
+                entry.kind.as_str(),
+                "constant" | "const" | "static" | "variable"
+            ) && self.line(entry.bytes.start)
+                == self.line(entry.bytes.end.saturating_sub(1).max(entry.bytes.start))
+            {
+                Some(("constants", 5))
             } else {
                 None
             }
@@ -506,21 +724,24 @@ impl Snapshot {
         let mut index = start;
         while index < self.entries.len() {
             let e = &self.entries[index];
-            // Fold runs of 3+ contiguous imports or external `mod name;` declarations
-            // in unfiltered outlines so large preamble blocks don't crowd real
-            // declarations off page 1. Individual `#N` entry IDs stay unchanged for
-            // `expand` and `edit`.
+            // Fold runs of 3+ contiguous imports or external `mod name;` declarations,
+            // or 5+ contiguous single-line constants/statics/variables, in unfiltered
+            // outlines so large preamble blocks don't crowd real declarations off page 1.
+            // Individual `#N` entry IDs stay unchanged for `expand` and `edit`, and
+            // folded blocks expand directly with `#A..#B`.
             let (row, end_index) = if filter.is_empty()
-                && let Some(group) = fold_group(e)
+                && let Some((group, min_run)) = fold_group(e)
             {
                 let mut run_end = index + 1;
                 while run_end < self.entries.len()
-                    && fold_group(&self.entries[run_end]) == Some(group)
+                    && fold_group(&self.entries[run_end]) == Some((group, min_run))
+                    && (group != "constants"
+                        || scope_prefix(e) == scope_prefix(&self.entries[run_end]))
                 {
                     run_end += 1;
                 }
                 let run_len = run_end - index;
-                if run_len >= 3 {
+                if run_len >= min_run {
                     let row = Row {
                         id: index + 1,
                         end_id: Some(run_end),
@@ -532,7 +753,8 @@ impl Snapshot {
                     };
                     (row, run_end - 1)
                 } else {
-                    let signature = words(&self.text[e.signature_start..e.header_end]);
+                    let signature =
+                        self.slim_signature(e, words(&self.text[e.signature_start..e.header_end]));
                     let row = Row {
                         id: index + 1,
                         end_id: None,
@@ -558,6 +780,7 @@ impl Snapshot {
                         continue;
                     }
                 }
+                let signature = self.slim_signature(e, signature);
                 let row = Row {
                     id: index + 1,
                     end_id: None,
@@ -759,15 +982,136 @@ fn is_const_or_static(tokens: &[proc_macro2::TokenTree]) -> bool {
     }
 }
 
+struct ResolvedSpan {
+    order: usize,
+    span: Range<usize>,
+    first: usize,
+    last: usize,
+    id_label: Option<String>,
+    anchor: String,
+}
+
+struct CoalescedSpan {
+    span: Range<usize>,
+    first: usize,
+    last: usize,
+    anchor: String,
+    label: String,
+}
+
+/// The inclusive 1-based `(first, last)` outline-entry IDs of an `A..#B` or
+/// `A..B` target (after the leading `#` has been stripped by `split_selector`).
+fn entry_range(target: &str) -> Option<(usize, usize)> {
+    let (start, end) = target.split_once("..")?;
+    let end = end.strip_prefix('#').unwrap_or(end);
+    let first = start.parse::<usize>().ok()?;
+    let last = end.parse::<usize>().ok()?;
+    Some((first, last))
+}
+
 /// A selector's embedded revision, if any, and its target.
 fn split_selector(selector: &str) -> (Option<&str>, &str) {
     selector
         .split_once('#')
         .filter(|(r, t)| {
-            (r.is_empty() && t.parse::<usize>().is_ok())
+            (r.is_empty() && (t.parse::<usize>().is_ok() || entry_range(t).is_some()))
                 || (r.len() == 24 && r.bytes().all(|b| b.is_ascii_hexdigit()))
         })
         .map_or((None, selector), |(r, t)| ((!r.is_empty()).then_some(r), t))
+}
+
+fn has_windows_drive_prefix(spec: &str) -> bool {
+    let bytes = spec.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+/// Splits a `FILE:SELECTOR` batch argument while preserving Windows drive
+/// prefixes (`C:\path\file.rs:L1-10`), `::` symbol paths (`file.rs:Foo::bar`),
+/// and Unix filenames that contain colons.
+fn split_file_selector<'a>(
+    ws: &Workspace,
+    spec: &'a str,
+    root_given: bool,
+) -> Option<(&'a str, &'a str)> {
+    let start = if has_windows_drive_prefix(spec) { 3 } else { 0 };
+    let bytes = spec.as_bytes();
+    let mut fallback = None;
+    for i in start..bytes.len() {
+        if bytes[i] != b':' {
+            continue;
+        }
+        let left = &spec[..i];
+        let right = &spec[i + 1..];
+        if left.is_empty() || right.is_empty() {
+            continue;
+        }
+        if workspace_file(ws, left, root_given)
+            .and_then(|file| ws.source_path(&file))
+            .is_ok()
+        {
+            return Some((left, right));
+        }
+        let prev_colon = i > 0 && bytes[i - 1] == b':';
+        let next_colon = bytes.get(i + 1) == Some(&b':');
+        if fallback.is_none() && !prev_colon && !next_colon {
+            fallback = Some((left, right));
+        }
+    }
+    fallback
+}
+
+/// Parses positional arguments to `expand` into `(file, selector)` pairs and
+/// whether cross-file batch formatting (`=== FILE ===`) applies.
+fn parse_expand_targets<'a>(
+    ws: &Workspace,
+    raw: &[&'a str],
+    root_given: bool,
+) -> Result<(Vec<(&'a str, &'a str)>, bool)> {
+    match raw {
+        [] => bail!("missing file and selector"),
+        [only] => {
+            if workspace_file(ws, only, root_given)
+                .and_then(|file| ws.source_path(&file))
+                .is_err()
+                && let Some(pair) = split_file_selector(ws, only, root_given)
+            {
+                return Ok((vec![pair], false));
+            }
+            bail!(
+                "missing selector; use `expand FILE SELECTOR` or `expand FILE1:SEL1 FILE2:SEL2 ...`"
+            );
+        }
+        [first, second] => {
+            // Preserve standard 2-arg `expand FILE SEL` whenever `first` is an
+            // existing workspace file or cannot be split cleanly with `second`.
+            if workspace_file(ws, first, root_given)
+                .and_then(|file| ws.source_path(&file))
+                .is_ok()
+            {
+                return Ok((vec![(first, second)], false));
+            }
+            if let (Some(a), Some(b)) = (
+                split_file_selector(ws, first, root_given),
+                split_file_selector(ws, second, root_given),
+            ) {
+                return Ok((vec![a, b], true));
+            }
+            Ok((vec![(first, second)], false))
+        }
+        many => {
+            let mut pairs = Vec::with_capacity(many.len());
+            for &spec in many {
+                let pair = split_file_selector(ws, spec, root_given).with_context(|| {
+                    format!("expected FILE:SELECTOR in batch expand, got `{spec}`")
+                })?;
+                pairs.push(pair);
+            }
+            Ok((pairs, true))
+        }
+    }
 }
 
 /// The `A-B` of an `LA-B` or `LA-LB` target.
@@ -994,6 +1338,12 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
     let filter = args.value_of("match").unwrap_or("");
     let limit = crate::read_num(args, "limit", 1)?;
     let json_mode = args.is_present("json");
+    let fresh = args.is_present("fresh");
+    let mut memory = crate::seen::Memory::open(ws, args.value_of("session"), fresh);
+    let can_dedup_outline = !json_mode
+        && filter.is_empty()
+        && args.occurrences_of("limit") == 0
+        && args.occurrences_of("budget") == 0;
 
     let mut remaining = total_budget;
     let mut json_files = Vec::new();
@@ -1007,16 +1357,49 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
         let digest = crate::capture::source_digest(source.text.as_bytes());
         if !json_mode && !outline_forced && source.text.len() <= share {
             let header = format!("=== {file} ===\n");
+            let full_hint = format!(
+                "full: {} read {} --fresh",
+                ws.invocation().files,
+                crate::workspace::shell_text(&file)
+            );
+            let deduped = if let Some(mem) = memory.as_mut()
+                && !source.text.is_empty()
+            {
+                mem.show_range(
+                    &file,
+                    &source.revision,
+                    &source.text,
+                    1,
+                    source.line_count(),
+                    &source.text,
+                    fresh,
+                    &full_hint,
+                )
+            } else {
+                None
+            };
             text_out.push_str(&header);
-            text_out.push_str(&source.text);
-            if !source.text.ends_with('\n') {
-                text_out.push('\n');
+            if let Some(short) = deduped {
+                text_out.push_str(&short);
+                remaining = remaining.saturating_sub(header.len() + short.len());
+            } else {
+                text_out.push_str(&source.text);
+                if !source.text.ends_with('\n') {
+                    text_out.push('\n');
+                }
+                let lines = source.text.lines().count();
+                if lines > 0 {
+                    crate::history::saw_expand(
+                        ws,
+                        &file,
+                        1,
+                        lines,
+                        digest,
+                        source.text.len() as u64,
+                    );
+                }
+                remaining = remaining.saturating_sub(header.len() + source.text.len());
             }
-            let lines = source.text.lines().count();
-            if lines > 0 {
-                crate::history::saw_expand(ws, &file, 1, lines, digest, source.text.len() as u64);
-            }
-            remaining = remaining.saturating_sub(header.len() + source.text.len());
             continue;
         }
         source.index(&file)?;
@@ -1039,17 +1422,32 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
         } else {
             let header = format!("=== {file} ===\n");
             let rendered = page.display();
-            let used = header.len() + rendered.len();
-            text_out.push_str(&header);
-            text_out.push_str(&rendered);
-            crate::history::saw_outline_measured(
-                ws,
-                &file,
-                digest,
-                source.text.len() as u64,
-                rendered.len() as u64,
+            let full_hint = format!(
+                "full outline: {} read {} --outline --fresh",
+                ws.invocation().files,
+                crate::workspace::shell_text(&file)
             );
-            remaining = remaining.saturating_sub(used);
+            let deduped = if can_dedup_outline && let Some(mem) = memory.as_mut() {
+                mem.saw_outline(&file, &source.revision, &rendered, fresh, &full_hint)
+            } else {
+                None
+            };
+            text_out.push_str(&header);
+            if let Some(notice) = deduped {
+                text_out.push_str(&notice);
+                remaining = remaining.saturating_sub(header.len() + notice.len());
+            } else {
+                let used = header.len() + rendered.len();
+                text_out.push_str(&rendered);
+                crate::history::saw_outline_measured(
+                    ws,
+                    &file,
+                    digest,
+                    source.text.len() as u64,
+                    rendered.len() as u64,
+                );
+                remaining = remaining.saturating_sub(used);
+            }
         }
     }
 
@@ -1058,6 +1456,304 @@ fn read_many(ws: &Workspace, files: &[&str], args: &ArgMatches, root_given: bool
         io::stdout().lock().write_all(&encoded)?;
     } else {
         print!("{text_out}");
+    }
+    if let Some(mem) = memory {
+        mem.save(ws);
+    }
+    Ok(())
+}
+
+struct PreparedExpand {
+    file: String,
+    source: Snapshot,
+    digest: String,
+    selector: String,
+    multi: bool,
+    spans: Vec<CoalescedSpan>,
+}
+
+fn prepare_expand(
+    ws: &Workspace,
+    raw_file: &str,
+    selector: &str,
+    explicit_revision: Option<&str>,
+    root_given: bool,
+) -> Result<PreparedExpand> {
+    let file = workspace_file(ws, raw_file, root_given)?;
+    let mut source = Snapshot::open(ws, &file)?;
+    if needs_outline(selector) {
+        source.index(&file)?;
+    }
+    let parts = split_expand_selectors(&source, selector);
+    let digest = crate::capture::source_digest(source.text.as_bytes());
+    let multi = parts.len() > 1;
+    let spans = if !multi {
+        let resolved = source.resolve_span(parts[0], explicit_revision, 0)?;
+        let label = match &resolved.id_label {
+            Some(id) => format!("{id} L{}-{}", resolved.first, resolved.last),
+            None => format!("L{}-{}", resolved.first, resolved.last),
+        };
+        vec![CoalescedSpan {
+            span: resolved.span,
+            first: resolved.first,
+            last: resolved.last,
+            anchor: resolved.anchor,
+            label,
+        }]
+    } else {
+        // Inherit an embedded revision from the first selector so callers can
+        // write `REV#10,#11,#20` without repeating the 24-hex revision.
+        let inherited = split_selector(parts[0]).0;
+        let mut resolved = Vec::with_capacity(parts.len());
+        for (order, part) in parts.into_iter().enumerate() {
+            let rev = explicit_revision.or_else(|| split_selector(part).0.or(inherited));
+            resolved.push(source.resolve_span(part, rev, order)?);
+        }
+        source.coalesce_spans(resolved)
+    };
+    Ok(PreparedExpand {
+        file,
+        source,
+        digest,
+        selector: selector.to_owned(),
+        multi,
+        spans,
+    })
+}
+
+fn expand_json_value(prepared: &PreparedExpand) -> serde_json::Value {
+    if !prepared.multi {
+        let span = &prepared.spans[0];
+        serde_json::json!({
+            "file": prepared.file,
+            "revision": prepared.source.revision,
+            "selector": span.anchor,
+            "first": span.first,
+            "last": span.last,
+            "content": &prepared.source.text[span.span.clone()],
+        })
+    } else {
+        let spans: Vec<_> = prepared
+            .spans
+            .iter()
+            .map(|span| {
+                serde_json::json!({
+                    "selector": span.anchor,
+                    "first": span.first,
+                    "last": span.last,
+                    "content": &prepared.source.text[span.span.clone()],
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "file": prepared.file,
+            "revision": prepared.source.revision,
+            "spans": spans,
+        })
+    }
+}
+
+fn run_expand(ws: &Workspace, raw: &[&str], args: &ArgMatches, root_given: bool) -> Result<()> {
+    let (targets, is_batch) = parse_expand_targets(ws, raw, root_given)?;
+    let explicit_revision = args.value_of("revision");
+    if is_batch {
+        ensure!(
+            explicit_revision.is_none(),
+            "--revision applies to a single file; embed REV#... in each FILE:SELECTOR"
+        );
+    }
+    // Resolve and verify every file and revision strictly before printing anything.
+    let mut prepared = Vec::with_capacity(targets.len());
+    for (raw_file, selector) in targets {
+        prepared.push(prepare_expand(
+            ws,
+            raw_file,
+            selector,
+            explicit_revision,
+            root_given,
+        )?);
+    }
+    let json_mode = args.is_present("json");
+    let fresh = args.is_present("fresh");
+    let mut memory = crate::seen::Memory::open(ws, args.value_of("session"), fresh);
+
+    if json_mode {
+        if is_batch {
+            let files: Vec<_> = prepared.iter().map(expand_json_value).collect();
+            let encoded = serde_json::to_vec(&serde_json::json!({ "files": files }))?;
+            io::stdout().lock().write_all(&encoded)?;
+            for item in &prepared {
+                let item_bytes = serde_json::to_vec(&expand_json_value(item))?.len() as u64;
+                for (index, span) in item.spans.iter().enumerate() {
+                    if let Some(mem) = memory.as_mut()
+                        && item.source.is_full_lines(&span.span)
+                    {
+                        mem.record_range(
+                            &item.file,
+                            &item.source.revision,
+                            &item.source.text,
+                            span.first,
+                            span.last,
+                        );
+                    }
+                    let charged = if index == 0 { item_bytes } else { 0 };
+                    crate::history::saw_expand(
+                        ws,
+                        &item.file,
+                        span.first,
+                        span.last,
+                        item.digest.clone(),
+                        charged,
+                    );
+                }
+            }
+        } else {
+            let item = &prepared[0];
+            let encoded = serde_json::to_vec(&expand_json_value(item))?;
+            io::stdout().lock().write_all(&encoded)?;
+            let shown_bytes = encoded.len() as u64;
+            for (index, span) in item.spans.iter().enumerate() {
+                if let Some(mem) = memory.as_mut()
+                    && item.source.is_full_lines(&span.span)
+                {
+                    mem.record_range(
+                        &item.file,
+                        &item.source.revision,
+                        &item.source.text,
+                        span.first,
+                        span.last,
+                    );
+                }
+                let charged = if index == 0 { shown_bytes } else { 0 };
+                crate::history::saw_expand(
+                    ws,
+                    &item.file,
+                    span.first,
+                    span.last,
+                    item.digest.clone(),
+                    charged,
+                );
+            }
+        }
+        if let Some(mem) = memory {
+            mem.save(ws);
+        }
+        return Ok(());
+    }
+
+    if !is_batch && !prepared[0].multi {
+        // Single-selector `expand FILE SEL`: 100% raw exact source bytes (zero headers)
+        // unless `--session` returns an unchanged notice or line-level delta.
+        let item = &prepared[0];
+        let span = &item.spans[0];
+        let content = &item.source.text[span.span.clone()];
+        if let Some(mem) = memory.as_mut()
+            && item.source.is_full_lines(&span.span)
+        {
+            let full_hint = format!(
+                "full: {} expand {} {} --fresh",
+                ws.invocation().files,
+                crate::workspace::shell_text(&item.file),
+                crate::workspace::shell_text(&item.selector)
+            );
+            if let Some(short) = mem.show_range(
+                &item.file,
+                &item.source.revision,
+                &item.source.text,
+                span.first,
+                span.last,
+                content,
+                fresh,
+                &full_hint,
+            ) {
+                io::stdout().lock().write_all(short.as_bytes())?;
+                if let Some(mem) = memory {
+                    mem.save(ws);
+                }
+                return Ok(());
+            }
+        }
+        io::stdout().lock().write_all(content.as_bytes())?;
+        crate::history::saw_expand(
+            ws,
+            &item.file,
+            span.first,
+            span.last,
+            item.digest.clone(),
+            content.len() as u64,
+        );
+        if let Some(mem) = memory {
+            mem.save(ws);
+        }
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    let mut history_records: Vec<(String, usize, usize, String, u64)> = Vec::new();
+    for item in &prepared {
+        if is_batch {
+            out.push_str("=== ");
+            out.push_str(&item.file);
+            out.push_str(" ===\n");
+        }
+        let item_start = out.len();
+        let mut printed_whole = Vec::new();
+        for span in &item.spans {
+            let content = &item.source.text[span.span.clone()];
+            let deduped = if let Some(mem) = memory.as_mut()
+                && item.source.is_full_lines(&span.span)
+            {
+                let hint_sel = if item.multi {
+                    span.anchor.as_str()
+                } else {
+                    item.selector.as_str()
+                };
+                let full_hint = format!(
+                    "full: {} expand {} {} --fresh",
+                    ws.invocation().files,
+                    crate::workspace::shell_text(&item.file),
+                    crate::workspace::shell_text(hint_sel)
+                );
+                mem.show_range(
+                    &item.file,
+                    &item.source.revision,
+                    &item.source.text,
+                    span.first,
+                    span.last,
+                    content,
+                    fresh,
+                    &full_hint,
+                )
+            } else {
+                None
+            };
+            if let Some(short) = deduped {
+                out.push_str(&short);
+                continue;
+            }
+            if item.multi {
+                out.push_str("--- ");
+                out.push_str(&span.label);
+                out.push_str(" ---\n");
+            }
+            out.push_str(content);
+            if !content.ends_with('\n') {
+                out.push('\n');
+            }
+            printed_whole.push((span.first, span.last));
+        }
+        let item_bytes = (out.len() - item_start) as u64;
+        for (index, (first, last)) in printed_whole.into_iter().enumerate() {
+            let charged = if index == 0 { item_bytes } else { 0 };
+            history_records.push((item.file.clone(), first, last, item.digest.clone(), charged));
+        }
+    }
+    io::stdout().lock().write_all(out.as_bytes())?;
+    for (file, first, last, digest, charged) in history_records {
+        crate::history::saw_expand(ws, &file, first, last, digest, charged);
+    }
+    if let Some(mem) = memory {
+        mem.save(ws);
     }
     Ok(())
 }
@@ -1068,6 +1764,10 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
         if files.len() > 1 {
             return read_many(ws, &files, args, root_given);
         }
+    }
+    if name == "expand" {
+        let raw: Vec<&str> = args.values_of("file").unwrap().collect();
+        return run_expand(ws, &raw, args, root_given);
     }
     let argument = args.value_of("file").unwrap();
     if name == "read"
@@ -1098,12 +1798,42 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
             .iter()
             .any(|id| args.occurrences_of(id) > 0);
         let digest = crate::capture::source_digest(source.text.as_bytes());
+        let fresh = args.is_present("fresh");
+        let mut memory = crate::seen::Memory::open(ws, args.value_of("session"), fresh);
         if !outline && source.text.len() <= budget {
+            if let Some(mem) = memory.as_mut()
+                && !source.text.is_empty()
+            {
+                let full_hint = format!(
+                    "full: {} read {} --fresh",
+                    ws.invocation().files,
+                    crate::workspace::shell_text(file)
+                );
+                if let Some(short) = mem.show_range(
+                    file,
+                    &source.revision,
+                    &source.text,
+                    1,
+                    source.line_count(),
+                    &source.text,
+                    fresh,
+                    &full_hint,
+                ) {
+                    io::stdout().lock().write_all(short.as_bytes())?;
+                    if let Some(mem) = memory {
+                        mem.save(ws);
+                    }
+                    return Ok(());
+                }
+            }
             io::stdout().lock().write_all(source.text.as_bytes())?;
             // The whole file, recorded as `expand FILE L1-N` would record it.
             let lines = source.text.lines().count();
             if lines > 0 {
                 crate::history::saw_expand(ws, file, 1, lines, digest, source.text.len() as u64);
+            }
+            if let Some(mem) = memory {
+                mem.save(ws);
             }
             return Ok(());
         }
@@ -1114,114 +1844,53 @@ pub fn run(ws: &Workspace, name: &str, args: &ArgMatches, root_given: bool) -> R
             crate::read_num(args, "limit", 1)?,
             budget,
         )?;
-        let shown_bytes = if args.is_present("json") {
+        let can_dedup_outline = !args.is_present("json")
+            && args.value_of("match").is_none()
+            && args.value_of("after").is_none()
+            && args.occurrences_of("limit") == 0
+            && args.occurrences_of("budget") == 0;
+        if args.is_present("json") {
             let encoded = serde_json::to_vec(&page)?;
             io::stdout().lock().write_all(&encoded)?;
-            encoded.len() as u64
+            crate::history::saw_outline_measured(
+                ws,
+                file,
+                digest,
+                source.text.len() as u64,
+                encoded.len() as u64,
+            );
         } else {
             let rendered = page.display();
-            print!("{rendered}");
-            rendered.len() as u64
-        };
-        crate::history::saw_outline_measured(
-            ws,
-            file,
-            digest,
-            source.text.len() as u64,
-            shown_bytes,
-        );
-    } else {
-        if name == "edit" {
-            return edit(ws, file, source, args);
-        }
-        let selector = args.value_of("selector").unwrap();
-        if needs_outline(selector) {
-            source.index(file)?;
-        }
-        let parts = split_expand_selectors(&source, selector);
-        let digest = crate::capture::source_digest(source.text.as_bytes());
-        if parts.len() == 1 {
-            let span = source.resolve(parts[0], args.value_of("revision"), false)?;
-            let first = source.line(span.start);
-            let last = source.line(span.end.saturating_sub(1));
-            let content = &source.text[span.clone()];
-            let shown_bytes = if args.is_present("json") {
-                let anchor = source
-                    .entries
-                    .iter()
-                    .position(|entry| entry.bytes == span)
-                    .map(|index| source.reference(index))
-                    .unwrap_or_else(|| format!("{}#L{first}-{last}", source.revision));
-                let encoded = serde_json::to_vec(&serde_json::json!({
-                    "file": file, "revision": source.revision, "selector": anchor, "first": first, "last": last, "content": content,
-                }))?;
-                io::stdout().lock().write_all(&encoded)?;
-                encoded.len() as u64
-            } else {
-                io::stdout().lock().write_all(content.as_bytes())?;
-                content.len() as u64
-            };
-            crate::history::saw_expand(ws, file, first, last, digest, shown_bytes);
-        } else {
-            // Inherit an embedded revision from the first selector so callers can
-            // write `REV#10,#11,#20` without repeating the 24-hex revision.
-            let inherited = split_selector(parts[0]).0;
-            let explicit = args.value_of("revision");
-            let mut resolved = Vec::with_capacity(parts.len());
-            for part in parts {
-                let rev = explicit.or_else(|| split_selector(part).0.or(inherited));
-                let span = source.resolve(part, rev, false)?;
-                let first = source.line(span.start);
-                let last = source.line(span.end.saturating_sub(1));
-                let entry_id = source.entries.iter().position(|entry| entry.bytes == span);
-                let anchor = entry_id
-                    .map(|index| source.reference(index))
-                    .unwrap_or_else(|| format!("{}#L{first}-{last}", source.revision));
-                let label = match entry_id {
-                    Some(index) => format!("#{} L{first}-{last}", index + 1),
-                    None => format!("L{first}-{last}"),
-                };
-                resolved.push((span, first, last, anchor, label));
-            }
-            let shown_bytes = if args.is_present("json") {
-                let spans: Vec<_> = resolved
-                    .iter()
-                    .map(|(span, first, last, anchor, _)| {
-                        serde_json::json!({
-                            "selector": anchor,
-                            "first": first,
-                            "last": last,
-                            "content": &source.text[span.clone()],
-                        })
-                    })
-                    .collect();
-                let encoded = serde_json::to_vec(&serde_json::json!({
-                    "file": file,
-                    "revision": source.revision,
-                    "spans": spans,
-                }))?;
-                io::stdout().lock().write_all(&encoded)?;
-                encoded.len() as u64
-            } else {
-                let mut out = String::new();
-                for (span, _, _, _, label) in &resolved {
-                    out.push_str("--- ");
-                    out.push_str(label);
-                    out.push_str(" ---\n");
-                    let content = &source.text[span.clone()];
-                    out.push_str(content);
-                    if !content.ends_with('\n') {
-                        out.push('\n');
+            if can_dedup_outline && let Some(mem) = memory.as_mut() {
+                let full_hint = format!(
+                    "full outline: {} read {} --outline --fresh",
+                    ws.invocation().files,
+                    crate::workspace::shell_text(file)
+                );
+                if let Some(notice) =
+                    mem.saw_outline(file, &source.revision, &rendered, fresh, &full_hint)
+                {
+                    print!("{notice}");
+                    if let Some(mem) = memory {
+                        mem.save(ws);
                     }
+                    return Ok(());
                 }
-                io::stdout().lock().write_all(out.as_bytes())?;
-                out.len() as u64
-            };
-            for (index, (_, first, last, _, _)) in resolved.iter().enumerate() {
-                let charged = if index == 0 { shown_bytes } else { 0 };
-                crate::history::saw_expand(ws, file, *first, *last, digest.clone(), charged);
             }
+            print!("{rendered}");
+            crate::history::saw_outline_measured(
+                ws,
+                file,
+                digest,
+                source.text.len() as u64,
+                rendered.len() as u64,
+            );
         }
+        if let Some(mem) = memory {
+            mem.save(ws);
+        }
+    } else {
+        return edit(ws, file, source, args);
     }
     Ok(())
 }
@@ -1610,4 +2279,132 @@ fn preview(file: &str, path: &Path, before: &str, after: &str) -> Result<()> {
         String::from_utf8_lossy(&result.stderr)
     );
     Ok(io::stdout().lock().write_all(&result.stdout)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_selector_and_entry_range_parse_inclusive_ranges() {
+        assert_eq!(entry_range("1..#12"), Some((1, 12)));
+        assert_eq!(entry_range("3..7"), Some((3, 7)));
+        assert_eq!(entry_range("12"), None);
+        assert_eq!(entry_range("a..#b"), None);
+
+        assert_eq!(split_selector("#1..#12"), (None, "1..#12"));
+        assert_eq!(split_selector("#1..12"), (None, "1..12"));
+        let rev = "0123456789abcdef01234567";
+        let full = format!("{rev}#1..#12");
+        assert_eq!(split_selector(&full), (Some(rev), "1..#12"));
+        assert_eq!(split_selector("#5"), (None, "5"));
+    }
+
+    #[test]
+    fn entry_range_resolution_and_validation() {
+        let text = concat!(
+            "use std::fs;\n",
+            "use std::io;\n",
+            "use std::path::Path;\n",
+            "use std::fmt;\n\n",
+            "pub fn alpha() -> usize { 1 }\n",
+            "pub fn beta() -> usize { 2 }\n",
+        );
+        let mut snap = Snapshot::from_text("src/lib.rs", text.to_owned());
+        snap.index("src/lib.rs").unwrap();
+        let rev = snap.revision.clone();
+
+        let imports = snap.resolve(&format!("{rev}#1..#4"), None, false).unwrap();
+        assert_eq!(
+            &snap.text[imports],
+            "use std::fs;\nuse std::io;\nuse std::path::Path;\nuse std::fmt;"
+        );
+
+        let single = snap.resolve("#5..#5", None, false).unwrap();
+        assert_eq!(&snap.text[single], "pub fn alpha() -> usize { 1 }");
+
+        assert!(snap.resolve("#0..#2", None, false).is_err());
+        assert!(snap.resolve("#4..#2", None, false).is_err());
+        assert!(snap.resolve("#1..#99", None, false).is_err());
+        assert!(
+            snap.resolve("000000000000000000000000#1..#4", None, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn coalesce_spans_merges_containment_and_overlaps() {
+        let text = concat!(
+            "mod outer {\n",
+            "    pub fn inside() -> usize {\n",
+            "        1\n",
+            "    }\n",
+            "}\n",
+            "pub fn after() -> usize {\n",
+            "    2\n",
+            "}\n",
+        );
+        let mut snap = Snapshot::from_text("src/lib.rs", text.to_owned());
+        snap.index("src/lib.rs").unwrap();
+        let rev = snap.revision.clone();
+
+        // Parent `#1` (mod outer) contains `#2` (outer::inside).
+        let r1 = snap.resolve_span(&format!("{rev}#1"), None, 0).unwrap();
+        let r2 = snap.resolve_span("#2", Some(&rev), 1).unwrap();
+        let merged = snap.coalesce_spans(vec![r1, r2]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].label, "#1 L1-5 (includes #2)");
+        assert_eq!(
+            &snap.text[merged[0].span.clone()],
+            "mod outer {\n    pub fn inside() -> usize {\n        1\n    }\n}"
+        );
+
+        // Overlapping line ranges `L1-4,L3-7` merge into `L1-7`.
+        let l1 = snap.resolve_span("L1-4", None, 0).unwrap();
+        let l2 = snap.resolve_span("L3-7", None, 1).unwrap();
+        let merged_lines = snap.coalesce_spans(vec![l1, l2]);
+        assert_eq!(merged_lines.len(), 1);
+        assert_eq!(merged_lines[0].label, "L1-7");
+        assert_eq!(merged_lines[0].first, 1);
+        assert_eq!(merged_lines[0].last, 7);
+    }
+
+    #[test]
+    fn windows_drive_prefix_detection_avoids_splitting_drive_colon() {
+        assert!(has_windows_drive_prefix(r"C:\repo\src\lib.rs:L1-10"));
+        assert!(has_windows_drive_prefix("D:/repo/src/lib.rs:Foo::bar"));
+        assert!(!has_windows_drive_prefix("a:L1-10"));
+        assert!(!has_windows_drive_prefix("src/lib.rs:L1-10"));
+    }
+
+    #[test]
+    fn outline_folds_five_plus_single_line_constants_and_slims_plain_rust_types() {
+        let mut text = String::new();
+        for i in 1..=6 {
+            text.push_str(&format!("const K_{i}: usize = {i};\n"));
+        }
+        text.push_str("struct Local {\n    x: usize,\n}\n");
+        text.push_str("pub struct Exported {\n    pub x: usize,\n}\n");
+        let mut snap = Snapshot::from_text("src/cfg.rs", text);
+        snap.index("src/cfg.rs").unwrap();
+
+        let page = snap.page("", None, 40, 4096).unwrap().display();
+        assert!(page.contains("#1..#6 L1-6 constants (6 items)\n"), "{page}");
+        assert!(page.contains("#7 L7-9 struct Local\n"), "{page}");
+        assert!(
+            page.contains("#8 L10-12 struct Exported  pub struct Exported\n"),
+            "{page}"
+        );
+
+        // `--match` bypasses folding and still finds individual constants and slimmed structs.
+        let matched = snap.page("K_4", None, 40, 4096).unwrap().display();
+        assert!(matched.contains("#4 L4-4 constant K_4"), "{matched}");
+        assert!(!matched.contains("constants ("), "{matched}");
+
+        let matched_struct = snap.page("struct Local", None, 40, 4096).unwrap().display();
+        assert!(
+            matched_struct.contains("#7 L7-9 struct Local\n"),
+            "{matched_struct}"
+        );
+    }
 }

@@ -28,3 +28,4 @@ mod read_shapes;
 mod redact;
 mod report_fixes;
 mod retirement;
+mod source_upgrades;

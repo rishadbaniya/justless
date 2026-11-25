@@ -35,6 +35,13 @@ const VIEW_BYTES: usize = 64 * 1024;
 /// Files whose `pack` excerpts a session remembers, and excerpts per file.
 const PACK_FILES: usize = 64;
 const PACK_EXCERPTS: usize = 64;
+/// Files remembered per session for `read`/`expand` range and outline dedup.
+const FILES: usize = 64;
+/// Total cached file text remembered per session for range deltas.
+const FILE_TOTAL_BYTES: usize = 1024 * 1024;
+/// A larger file keeps its revision and seen ranges without caching full text
+/// for line diffs, so unchanged re-reads still compact while edits print whole.
+const FILE_TEXT_BYTES: usize = 128 * 1024;
 /// Unchanged lines printed around each change.
 const AROUND: usize = 2;
 /// The largest line table the diff fills after trimming the common start and
@@ -57,6 +64,35 @@ struct Store {
     /// The `pack` excerpts printed from each file, newest first.
     #[serde(default)]
     pack: Vec<PackFile>,
+    /// File ranges and outlines shown by `read` / `expand`, newest first.
+    #[serde(default)]
+    files: Vec<FileView>,
+}
+
+/// What a session was shown of `file`: its text and seen 1-based line ranges
+/// at `revision`, plus the revision of its full outline if shown.
+#[derive(Clone, Serialize, Deserialize)]
+struct FileView {
+    file: String,
+    revision: String,
+    text: String,
+    #[serde(default)]
+    seen_ranges: Vec<(usize, usize)>,
+    #[serde(default)]
+    outlined_revision: Option<String>,
+    ms: u64,
+}
+
+impl FileView {
+    fn saw_line(&self, line: usize) -> bool {
+        self.seen_ranges
+            .iter()
+            .any(|&(from, to)| from <= line && line <= to)
+    }
+
+    fn covers(&self, first: usize, last: usize) -> bool {
+        first > 0 && first <= last && (first..=last).all(|line| self.saw_line(line))
+    }
 }
 
 /// Digests of the excerpts `pack` printed from `file` while it had
@@ -103,6 +139,8 @@ pub(crate) struct Memory {
     changes: Vec<(String, String, Option<View>)>,
     /// Excerpts to add, or a file's list to start again at a new revision.
     pack: Vec<PackFile>,
+    /// File range/outline records to replace, by workspace-relative file.
+    file_changes: Vec<(String, Option<FileView>)>,
     /// Views printed as changes, with the bytes their whole views would have
     /// printed and the bytes they did, for `stats`.
     saved: (u64, u64, u64),
@@ -144,6 +182,7 @@ impl Memory {
             fresh,
             changes: Vec::new(),
             pack: Vec::new(),
+            file_changes: Vec::new(),
             saved: (0, 0, 0),
         })
     }
@@ -455,6 +494,317 @@ impl Memory {
         });
     }
 
+    fn current_file(&self, file: &str) -> Option<&FileView> {
+        if let Some((_, updated)) = self
+            .file_changes
+            .iter()
+            .rev()
+            .find(|(other, _)| other == file)
+        {
+            updated.as_ref()
+        } else {
+            self.store.files.iter().find(|entry| entry.file == file)
+        }
+    }
+
+    /// Records that this session was shown inclusive 1-based lines `first..=last`
+    /// of `file` at `revision`.
+    pub(crate) fn record_range(
+        &mut self,
+        file: &str,
+        revision: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) {
+        if first == 0 || last < first {
+            return;
+        }
+        let stored_text = if text.len() <= FILE_TEXT_BYTES {
+            text.to_owned()
+        } else {
+            String::new()
+        };
+        let ms = crate::history::now_ms();
+        let updated = match self.current_file(file).cloned() {
+            Some(mut view) if view.revision == revision => {
+                view.seen_ranges.push((first, last));
+                view.seen_ranges = merge_line_ranges(view.seen_ranges);
+                if view.text.is_empty() && !stored_text.is_empty() {
+                    view.text = stored_text;
+                }
+                view.ms = ms;
+                view
+            }
+            Some(view) => FileView {
+                file: file.to_owned(),
+                revision: revision.to_owned(),
+                text: stored_text,
+                seen_ranges: vec![(first, last)],
+                outlined_revision: view.outlined_revision.filter(|rev| rev == revision),
+                ms,
+            },
+            None => FileView {
+                file: file.to_owned(),
+                revision: revision.to_owned(),
+                text: stored_text,
+                seen_ranges: vec![(first, last)],
+                outlined_revision: None,
+                ms,
+            },
+        };
+        self.file_changes.push((file.to_owned(), Some(updated)));
+    }
+
+    /// Compares inclusive 1-based lines `first..=last` of `file` (whose full
+    /// bytes are `text` at `revision`, and whose caller-rendered slice is `whole`)
+    /// with what this session already saw. Returns a 1-line unchanged notice or a
+    /// line-level exact delta when strictly smaller than `whole`, or `None` when
+    /// `whole` should be printed as-is.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn show_range(
+        &mut self,
+        file: &str,
+        revision: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+        whole: &str,
+        fresh: bool,
+        full_hint: &str,
+    ) -> Option<String> {
+        let new_lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let last = last.min(new_lines.len());
+        if first == 0 || first > last {
+            return None;
+        }
+        let effective_fresh = self.fresh || fresh;
+        let old = self.current_file(file).cloned();
+        let path = display_path(file);
+        let location = format!("{path}:{first}-{last}");
+
+        // Fast path: unchanged file at the same revision.
+        if let Some(ref old_view) = old
+            && old_view.revision == revision
+        {
+            if old_view.covers(first, last) {
+                if !effective_fresh {
+                    let rev_short = &revision[..revision.len().min(12)];
+                    let notice = format!(
+                        "{location} · unchanged since you read it at {rev_short} · {full_hint}\n"
+                    );
+                    if notice.len() < whole.len() {
+                        self.count_saved(whole.len(), notice.len());
+                        let mut touched = old_view.clone();
+                        touched.ms = crate::history::now_ms();
+                        self.file_changes.push((file.to_owned(), Some(touched)));
+                        return Some(notice);
+                    }
+                }
+                self.record_range(file, revision, text, first, last);
+                return None;
+            }
+            // Partial overlap at the same revision: print only the unseen lines
+            // with surrounding context when smaller than `whole`.
+            if !effective_fresh {
+                let wa = first - 1;
+                let wb = last - 1;
+                let status: Vec<Line> = (0..new_lines.len())
+                    .map(|i| {
+                        if old_view.saw_line(i + 1) {
+                            Line::Seen
+                        } else {
+                            Line::Unseen
+                        }
+                    })
+                    .collect();
+                let count = wb - wa + 1;
+                let seen = (wa..=wb).filter(|&i| status[i] == Line::Seen).count();
+                if seen > 0 {
+                    let rev_short = &revision[..revision.len().min(12)];
+                    let summary = format!(
+                        "{location} · {seen} of {count} lines unchanged since you read them at {rev_short} · {full_hint}"
+                    );
+                    let rows = hunks(summary, &status, &[], wa, wb);
+                    let rendered = render_range_rows(&rows, &status, &new_lines, &[], last);
+                    if rendered.len() < whole.len() {
+                        self.count_saved(whole.len(), rendered.len());
+                        self.record_range(file, revision, text, first, last);
+                        return Some(rendered);
+                    }
+                }
+            }
+            self.record_range(file, revision, text, first, last);
+            return None;
+        }
+
+        // Different revision (or first read of this file).
+        let Some(old_view) =
+            old.filter(|view| !view.text.is_empty() && !view.seen_ranges.is_empty())
+        else {
+            self.record_range(file, revision, text, first, last);
+            return None;
+        };
+
+        let wa = first - 1;
+        let wb = last - 1;
+        let old_lines: Vec<&str> = old_view.text.split_inclusive('\n').collect();
+        let alignment = align(&old_lines, &new_lines);
+        let status: Vec<Line> = alignment
+            .from
+            .iter()
+            .map(|from| match from {
+                Some(j) if old_view.saw_line(*j + 1) => Line::Seen,
+                None => Line::Changed,
+                Some(_) => Line::Unseen,
+            })
+            .collect();
+        let removed: Vec<(usize, usize)> = alignment
+            .removed
+            .iter()
+            .copied()
+            .filter(|&(j, _)| old_view.saw_line(j + 1))
+            .collect();
+        let window_removed: Vec<(usize, usize)> = removed
+            .iter()
+            .copied()
+            .filter(|&(_, anchor)| (wa..=wb + 1).contains(&anchor))
+            .collect();
+        let count = wb - wa + 1;
+        let seen = (wa..=wb).filter(|&i| status[i] == Line::Seen).count();
+        let changed = !window_removed.is_empty() || seen < count;
+        let rev_short = &old_view.revision[..old_view.revision.len().min(12)];
+
+        let candidate = if effective_fresh {
+            None
+        } else if !changed {
+            Some(format!(
+                "{location} · unchanged since you read it at {rev_short} · {full_hint}\n"
+            ))
+        } else if seen > 0 || !window_removed.is_empty() {
+            let summary = format!(
+                "{location} · {seen} of {count} lines unchanged since you read them at {rev_short} · {full_hint}"
+            );
+            let rows = hunks(summary, &status, &window_removed, wa, wb);
+            Some(render_range_rows(
+                &rows, &status, &new_lines, &old_lines, last,
+            ))
+        } else {
+            None
+        };
+
+        let delta = candidate.filter(|rendered| rendered.len() < whole.len());
+        let whole_file = wa == 0 && wb + 1 == new_lines.len();
+        let shown_removed: BTreeSet<usize> = if delta.is_some() {
+            window_removed.iter().map(|&(j, _)| j).collect()
+        } else {
+            BTreeSet::new()
+        };
+        let all_removed_covered = removed.iter().all(|&(j, anchor)| {
+            shown_removed.contains(&j)
+                || (delta.is_none() && (whole_file || (wa < anchor && anchor <= wb)))
+        });
+        let showed_anything_new =
+            !window_removed.is_empty() || (wa..=wb).any(|i| status[i] != Line::Seen);
+        let stored_text = if text.len() <= FILE_TEXT_BYTES {
+            text.to_owned()
+        } else {
+            String::new()
+        };
+        let ms = crate::history::now_ms();
+        let kept_outline = old_view
+            .outlined_revision
+            .clone()
+            .filter(|rev| rev == revision);
+
+        if all_removed_covered {
+            let known: BTreeSet<usize> = (0..new_lines.len())
+                .filter(|&i| status[i] == Line::Seen || (wa..=wb).contains(&i))
+                .map(|i| i + 1)
+                .collect();
+            let updated = FileView {
+                file: file.to_owned(),
+                revision: revision.to_owned(),
+                text: stored_text,
+                seen_ranges: ranges(&known),
+                outlined_revision: kept_outline,
+                ms,
+            };
+            self.file_changes.push((file.to_owned(), Some(updated)));
+        } else if showed_anything_new {
+            // Unshown removals exist outside this window, while this view
+            // revealed new lines at `revision`. Reset to only `first..=last`
+            // so a revert or a later read of the other lines is never hidden.
+            let updated = FileView {
+                file: file.to_owned(),
+                revision: revision.to_owned(),
+                text: stored_text,
+                seen_ranges: vec![(first, last)],
+                outlined_revision: kept_outline,
+                ms,
+            };
+            self.file_changes.push((file.to_owned(), Some(updated)));
+        }
+        // Otherwise: unchanged notice with unshown edits outside this window —
+        // keep `old_view` intact so those edits are still shown when read.
+
+        if let Some(ref rendered) = delta {
+            self.count_saved(whole.len(), rendered.len());
+        }
+        delta
+    }
+
+    /// Checks whether this session already saw the full outline of `file` at
+    /// `revision`. Returns a 1-line unchanged notice when smaller than `whole`
+    /// and `--fresh` was not given; otherwise records `outlined_revision` while
+    /// preserving any seen source ranges for future line diffs.
+    pub(crate) fn saw_outline(
+        &mut self,
+        file: &str,
+        revision: &str,
+        whole: &str,
+        fresh: bool,
+        full_hint: &str,
+    ) -> Option<String> {
+        let effective_fresh = self.fresh || fresh;
+        let old = self.current_file(file).cloned();
+        let ms = crate::history::now_ms();
+        if let Some(ref old_view) = old
+            && old_view.outlined_revision.as_deref() == Some(revision)
+        {
+            if !effective_fresh {
+                let path = display_path(file);
+                let rev_short = &revision[..revision.len().min(12)];
+                let notice = format!("{path} · outline unchanged at {rev_short} · {full_hint}\n");
+                if notice.len() < whole.len() {
+                    self.count_saved(whole.len(), notice.len());
+                    let mut touched = old_view.clone();
+                    touched.ms = ms;
+                    self.file_changes.push((file.to_owned(), Some(touched)));
+                    return Some(notice);
+                }
+            }
+            return None;
+        }
+        let updated = match old {
+            Some(mut view) => {
+                view.outlined_revision = Some(revision.to_owned());
+                view.ms = ms;
+                view
+            }
+            None => FileView {
+                file: file.to_owned(),
+                revision: revision.to_owned(),
+                text: String::new(),
+                seen_ranges: Vec::new(),
+                outlined_revision: Some(revision.to_owned()),
+                ms,
+            },
+        };
+        self.file_changes.push((file.to_owned(), Some(updated)));
+        None
+    }
+
     /// Writes the records this command changed back to the session's file,
     /// over what other commands wrote meanwhile, within the store's bounds.
     /// Counts a view that printed `shown` bytes where the whole view would
@@ -470,7 +820,7 @@ impl Memory {
         if views > 0 {
             crate::history::saw_delta(workspace, views, whole, shown);
         }
-        if self.changes.is_empty() && self.pack.is_empty() {
+        if self.changes.is_empty() && self.pack.is_empty() && self.file_changes.is_empty() {
             return;
         }
         let Some(directory) = self.path.parent() else {
@@ -516,6 +866,22 @@ impl Memory {
         }
         store.pack.sort_by_key(|entry| Reverse(entry.ms));
         store.pack.truncate(PACK_FILES);
+        for (file, updated) in self.file_changes {
+            store.files.retain(|other| other.file != file);
+            if let Some(view) = updated {
+                store.files.push(view);
+            }
+        }
+        store.files.sort_by_key(|entry| Reverse(entry.ms));
+        store.files.truncate(FILES);
+        let mut file_text_total = 0;
+        for entry in &mut store.files {
+            if file_text_total + entry.text.len() > FILE_TOTAL_BYTES {
+                entry.text.clear();
+            } else {
+                file_text_total += entry.text.len();
+            }
+        }
         if write_json(&self.path, &store).is_err() {
             return;
         }
@@ -617,6 +983,56 @@ fn ranges(lines: &BTreeSet<usize>) -> Vec<(usize, usize)> {
         }
     }
     ranges
+}
+
+fn merge_line_ranges(mut input: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    input.retain(|&(from, to)| from > 0 && from <= to);
+    input.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (from, to) in input {
+        match merged.last_mut() {
+            Some((_, prev_to)) if from <= prev_to.saturating_add(1) => {
+                *prev_to = (*prev_to).max(to);
+            }
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
+}
+
+fn render_range_rows(
+    rows: &[Row],
+    status: &[Line],
+    new_lines: &[&str],
+    old_lines: &[&str],
+    last_line: usize,
+) -> String {
+    let width = last_line.to_string().len();
+    let mut out = String::new();
+    for row in rows {
+        match row {
+            Row::Text(text) => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            Row::Line(i) => {
+                let mark = if status[*i] == Line::Changed {
+                    '+'
+                } else {
+                    ' '
+                };
+                out.push_str(&format!(
+                    "{mark} {:>width$} | {}\n",
+                    i + 1,
+                    shown(new_lines[*i])
+                ));
+            }
+            Row::Removed(j) => {
+                out.push_str(&format!("- {:width$} | {}\n", "", shown(old_lines[*j])));
+            }
+        }
+    }
+    out
 }
 
 /// The summary, then each changed or unseen line in `wa..=wb` and each removed
@@ -823,5 +1239,167 @@ mod tests {
             })
             .collect();
         assert_eq!(shape, ["2", "3", "-4", "4", "5", "6", "…", "9", "10", "11"]);
+    }
+
+    fn make_lines(count: usize) -> String {
+        (1..=count)
+            .map(|i| format!("    let item_{i:02} = compute_value({i});\n"))
+            .collect()
+    }
+
+    fn test_memory(dir: &tempfile::TempDir, session: &str, fresh: bool) -> (Workspace, Memory) {
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+        let mem = Memory::open(&ws, Some(session), fresh).unwrap();
+        (ws, mem)
+    }
+
+    #[test]
+    fn legacy_seen_store_without_files_deserializes_cleanly() {
+        let legacy = r#"{"views":[],"pack":[]}"#;
+        let store: Store = serde_json::from_str(legacy).unwrap();
+        assert!(store.files.is_empty());
+        assert!(store.views.is_empty());
+        assert!(store.pack.is_empty());
+    }
+
+    #[test]
+    fn show_range_emits_unchanged_delta_fresh_and_handles_reverts() {
+        let dir = tempfile::tempdir().unwrap();
+        let text1 = make_lines(40);
+        let rev1 = crate::source::revision_for("src/lib.rs", text1.as_bytes());
+        let hint = "full: justless expand src/lib.rs L1-40 --fresh";
+
+        // First read prints whole and records the seen range.
+        let (ws, mut mem) = test_memory(&dir, "s-range", false);
+        assert!(
+            mem.show_range("src/lib.rs", &rev1, &text1, 1, 40, &text1, false, hint)
+                .is_none()
+        );
+        mem.save(&ws);
+
+        // Second unchanged read returns a 1-line notice.
+        let (ws, mut mem) = test_memory(&dir, "s-range", false);
+        let unchanged = mem
+            .show_range("src/lib.rs", &rev1, &text1, 1, 40, &text1, false, hint)
+            .expect("unchanged notice");
+        assert_eq!(unchanged.lines().count(), 1, "{unchanged}");
+        assert!(
+            unchanged.contains("src/lib.rs:1-40 · unchanged since you read it at "),
+            "{unchanged}"
+        );
+        assert!(unchanged.contains(hint), "{unchanged}");
+        // `--fresh` bypasses dedup.
+        assert!(
+            mem.show_range("src/lib.rs", &rev1, &text1, 1, 40, &text1, true, hint)
+                .is_none()
+        );
+        mem.save(&ws);
+
+        // Small edit produces a line-level delta with AROUND = 2 context.
+        let text2 = text1.replace("compute_value(20)", "compute_value(200)");
+        let rev2 = crate::source::revision_for("src/lib.rs", text2.as_bytes());
+        let (ws, mut mem) = test_memory(&dir, "s-range", false);
+        let delta = mem
+            .show_range("src/lib.rs", &rev2, &text2, 1, 40, &text2, false, hint)
+            .expect("edit delta");
+        assert!(delta.len() < text2.len());
+        assert!(delta.contains("39 of 40 lines unchanged"), "{delta}");
+        assert!(
+            delta.contains("+ 20 |     let item_20 = compute_value(200);\n"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("-    |     let item_20 = compute_value(20);\n"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("  18 |     let item_18 = compute_value(18);\n"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("  22 |     let item_22 = compute_value(22);\n"),
+            "{delta}"
+        );
+        assert!(!delta.contains("item_05"), "{delta}");
+        mem.save(&ws);
+
+        // Edit two lines, view only the top window, then revert the top line:
+        // reading the whole file must still show BOTH the reverted top line and
+        // the unshown bottom edit.
+        let text3 = text2
+            .replace("compute_value(5)", "compute_value(55)")
+            .replace("compute_value(35)", "compute_value(355)");
+        let rev3 = crate::source::revision_for("src/lib.rs", text3.as_bytes());
+        let top_slice: String = text3.split_inclusive('\n').take(15).collect();
+        let (ws, mut mem) = test_memory(&dir, "s-range", false);
+        let partial = mem
+            .show_range("src/lib.rs", &rev3, &text3, 1, 15, &top_slice, false, hint)
+            .expect("partial delta");
+        assert!(partial.contains("compute_value(55)"), "{partial}");
+        assert!(!partial.contains("compute_value(355)"), "{partial}");
+        mem.save(&ws);
+
+        let text4 = text3.replace("compute_value(55)", "compute_value(5)");
+        let rev4 = crate::source::revision_for("src/lib.rs", text4.as_bytes());
+        let (ws, mut mem) = test_memory(&dir, "s-range", false);
+        let after_revert = mem.show_range("src/lib.rs", &rev4, &text4, 1, 40, &text4, false, hint);
+        // Either printed whole (None) or a delta that includes both lines 5 and 35.
+        if let Some(view) = after_revert {
+            assert!(view.contains("compute_value(5)"), "{view}");
+            assert!(view.contains("compute_value(355)"), "{view}");
+            assert!(!view.contains("· unchanged since you read it"), "{view}");
+        }
+        mem.save(&ws);
+    }
+
+    #[test]
+    fn record_range_merges_and_saw_outline_preserves_range_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let text1 = make_lines(30);
+        let rev1 = crate::source::revision_for("src/a.rs", text1.as_bytes());
+        let outline_text = "revision abc · 30 lines\n".to_owned()
+            + &"#1 L1-30 function demo  pub fn demo()\n".repeat(6);
+        let outline_hint = "full outline: justless read src/a.rs --outline --fresh";
+        let range_hint = "full: justless expand src/a.rs L1-30 --fresh";
+
+        let (ws, mut mem) = test_memory(&dir, "s-outline", false);
+        mem.record_range("src/a.rs", &rev1, &text1, 1, 15);
+        mem.record_range("src/a.rs", &rev1, &text1, 16, 30);
+        // Merged range covers 1..=30 so show_range emits unchanged.
+        let hit = mem
+            .show_range("src/a.rs", &rev1, &text1, 1, 30, &text1, false, range_hint)
+            .expect("merged range unchanged");
+        assert!(hit.contains("unchanged since you read it"), "{hit}");
+        // First outline returns None, second returns 1-line notice.
+        assert!(
+            mem.saw_outline("src/a.rs", &rev1, &outline_text, false, outline_hint)
+                .is_none()
+        );
+        let notice = mem
+            .saw_outline("src/a.rs", &rev1, &outline_text, false, outline_hint)
+            .expect("outline unchanged");
+        assert_eq!(notice.lines().count(), 1, "{notice}");
+        assert!(notice.contains("outline unchanged at"), "{notice}");
+        assert!(
+            mem.saw_outline("src/a.rs", &rev1, &outline_text, true, outline_hint)
+                .is_none()
+        );
+        mem.save(&ws);
+
+        // Editing the file invalidates the outline, and re-outlining at rev2
+        // still preserves rev1's seen text so a follow-up range read diffs cleanly.
+        let text2 = text1.replace("compute_value(12)", "compute_value(120)");
+        let rev2 = crate::source::revision_for("src/a.rs", text2.as_bytes());
+        let (ws, mut mem) = test_memory(&dir, "s-outline", false);
+        assert!(
+            mem.saw_outline("src/a.rs", &rev2, &outline_text, false, outline_hint)
+                .is_none()
+        );
+        let delta = mem
+            .show_range("src/a.rs", &rev2, &text2, 1, 30, &text2, false, range_hint)
+            .expect("delta survives outline refresh");
+        assert!(delta.contains("compute_value(120)"), "{delta}");
+        assert!(delta.contains("29 of 30 lines unchanged"), "{delta}");
+        mem.save(&ws);
     }
 }
