@@ -148,14 +148,18 @@ fn extension(file: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn ends_with_ignore_ascii_case(text: &str, suffix: &[u8]) -> bool {
+    text.len() >= suffix.len()
+        && text.as_bytes()[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
 /// How a file is chunked and how its results rank.
 pub(crate) fn classify(file: &str, text: &str, lines: usize) -> Class {
     let name = file_name(file);
     let extension = extension(file);
-    let lower = name.to_ascii_lowercase();
     if DATA_EXTENSIONS.contains(&extension.as_str())
-        || lower.ends_with(".min.js")
-        || lower.ends_with("-lock.json")
+        || ends_with_ignore_ascii_case(name, b".min.js")
+        || ends_with_ignore_ascii_case(name, b"-lock.json")
         || LOCKFILES.contains(&name)
         || text.len() > 300 * lines.max(1)
         || (extension == "json" && lines > 400)
@@ -172,11 +176,11 @@ pub(crate) fn classify(file: &str, text: &str, lines: usize) -> Class {
 
 /// Whether a path names test code.
 pub(crate) fn test_path(file: &str) -> bool {
-    let mut parts = file.split('/').collect::<Vec<_>>();
-    let name = parts.pop().unwrap_or_default();
-    parts
-        .iter()
-        .any(|part| matches!(*part, "test" | "tests" | "__tests__" | "spec" | "e2e"))
+    let (dir, name) = file.rsplit_once('/').map_or(("", file), |(d, n)| (d, n));
+    (!dir.is_empty()
+        && dir
+            .split('/')
+            .any(|part| matches!(part, "test" | "tests" | "__tests__" | "spec" | "e2e")))
         || file.contains("_test.")
         || file.contains(".test.")
         || file.contains(".spec.")

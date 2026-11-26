@@ -28,7 +28,12 @@ struct Line<'a> {
     terms: u64,
 }
 
-fn mentions(line: &str, question: &Question, tokenizer: &mut Tokenizer) -> Vec<Mention> {
+fn mentions(
+    line: &str,
+    question: &Question,
+    has_qualified: bool,
+    tokenizer: &mut Tokenizer,
+) -> Vec<Mention> {
     let mut found = Vec::new();
     words(line, |start, word| {
         tokenizer.word(word, |token| {
@@ -44,14 +49,16 @@ fn mentions(line: &str, question: &Question, tokenizer: &mut Tokenizer) -> Vec<M
             }
         });
     });
-    qualified(line, |start, end, token| {
-        if let Ok(term) = question
-            .terms
-            .binary_search_by(|term| term.as_str().cmp(token))
-        {
-            found.push(Mention { term, start, end });
-        }
-    });
+    if has_qualified {
+        qualified(line, |start, end, token| {
+            if let Ok(term) = question
+                .terms
+                .binary_search_by(|term| term.as_str().cmp(token))
+            {
+                found.push(Mention { term, start, end });
+            }
+        });
+    }
     found
 }
 
@@ -149,14 +156,14 @@ pub(crate) fn trim_excerpt_lines(lines: &[(usize, &str)]) -> Vec<(usize, String)
         .collect()
 }
 
-/// A line trimmed from `strip` and, when longer than [`MAX_LINE`], clipped to
-/// the window that shows the rarest terms not in `shown`, then the rarest
-/// overall. Also returns the terms the shown text contains.
-fn clip(line: &str, strip: usize, mentions: &[Mention], idf: &[f64], shown: u64) -> (String, u64) {
-    let trimmed = line[strip..].trim_end();
-    if trimmed.len() <= MAX_LINE {
-        return (trimmed.to_owned(), terms(mentions));
-    }
+/// Selects the best clipping window and visible term bitset without allocating.
+fn best_window(
+    trimmed: &str,
+    strip: usize,
+    mentions: &[Mention],
+    idf: &[f64],
+    shown: u64,
+) -> ((usize, usize, bool, bool), u64) {
     let indent = strip;
     let visible = |(from, to, _, _): (usize, usize, bool, bool)| {
         mentions
@@ -164,7 +171,8 @@ fn clip(line: &str, strip: usize, mentions: &[Mention], idf: &[f64], shown: u64)
             .filter(|mention| mention.start >= indent + from && mention.end <= indent + to)
             .fold(0, |terms, mention| terms | 1 << mention.term)
     };
-    let mut best = (window(trimmed, 0), visible(window(trimmed, 0)));
+    let initial = window(trimmed, 0);
+    let mut best = (initial, visible(initial));
     for mention in mentions {
         let candidate = window(
             trimmed,
@@ -177,7 +185,26 @@ fn clip(line: &str, strip: usize, mentions: &[Mention], idf: &[f64], shown: u64)
             best = (candidate, terms);
         }
     }
-    let ((from, to, before, after), terms) = best;
+    best
+}
+
+fn visible_terms(line: &str, strip: usize, mentions: &[Mention], idf: &[f64], shown: u64) -> u64 {
+    let trimmed = line[strip..].trim_end();
+    if trimmed.len() <= MAX_LINE {
+        return terms(mentions);
+    }
+    best_window(trimmed, strip, mentions, idf, shown).1
+}
+
+/// A line trimmed from `strip` and, when longer than [`MAX_LINE`], clipped to
+/// the window that shows the rarest terms not in `shown`, then the rarest
+/// overall. Also returns the terms the shown text contains.
+fn clip(line: &str, strip: usize, mentions: &[Mention], idf: &[f64], shown: u64) -> (String, u64) {
+    let trimmed = line[strip..].trim_end();
+    if trimmed.len() <= MAX_LINE {
+        return (trimmed.to_owned(), terms(mentions));
+    }
+    let ((from, to, before, after), terms) = best_window(trimmed, strip, mentions, idf, shown);
     let mut text = String::with_capacity(MAX_LINE);
     if before {
         text.push_str(CUT);
@@ -235,12 +262,13 @@ pub(crate) fn lines_excluding(
     excluded_texts: &HashSet<String>,
 ) -> Vec<(usize, String)> {
     let mut tokenizer = Tokenizer::default();
-    let seen = terms(&mentions(header, question, &mut tokenizer));
+    let has_qualified = question.terms.iter().any(|term| term.contains("::"));
+    let seen = terms(&mentions(header, question, has_qualified, &mut tokenizer));
     let lines = candidates
         .iter()
         .filter(|&&(number, text)| !text.trim().is_empty() && !excluded_numbers.contains(&number))
         .map(|&(number, text)| {
-            let mentions = mentions(text, question, &mut tokenizer);
+            let mentions = mentions(text, question, has_qualified, &mut tokenizer);
             Line {
                 number,
                 text,
@@ -260,7 +288,7 @@ pub(crate) fn lines_excluding(
     }) else {
         return Vec::new();
     };
-    let (_, first_visible) = clip(
+    let first_visible = visible_terms(
         first.text,
         leading_indent(first.text).len(),
         &first.mentions,

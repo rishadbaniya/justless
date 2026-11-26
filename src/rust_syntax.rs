@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use proc_macro2::Span;
 use serde::{Deserialize, Serialize};
@@ -81,7 +81,8 @@ pub(crate) fn parse_file(text: &str) -> syn::Result<syn::File> {
         content = &content[end..];
     }
     let tokens: proc_macro2::TokenStream = content.parse()?;
-    let mut levels = vec![tokens.clone().into_iter()];
+    let mut levels = Vec::with_capacity(16);
+    levels.push(tokens.clone().into_iter());
     // Prefix operators such as `!!!x` nest without delimiters.
     let mut operators = 0;
     while let Some(level) = levels.last_mut() {
@@ -171,7 +172,18 @@ pub fn parse_macros(text: &str) -> syn::Result<Syntax> {
 
 fn extract(text: &str, every_macro: bool) -> syn::Result<Syntax> {
     let file = parse_file(text)?;
+    let item_count = file.items.len();
     let mut visitor = Extractor {
+        syntax: Syntax {
+            use_ranges: Vec::new(),
+            symbols: Vec::with_capacity(item_count),
+            references: Vec::with_capacity(item_count.saturating_mul(4)),
+            imports: Vec::new(),
+            modules: Vec::new(),
+        },
+        locals: Vec::with_capacity(32),
+        scope_starts: Vec::with_capacity(16),
+        scratch: String::with_capacity(64),
         every_macro,
         ..Extractor::default()
     };
@@ -231,7 +243,11 @@ struct Extractor {
     module: Vec<String>,
     symbol: Option<usize>,
     owner: Option<Vec<String>>,
-    locals: Vec<BTreeMap<String, Option<Vec<String>>>>,
+    /// Flat stack of local bindings across nested lexical scopes.
+    locals: Vec<(String, Option<Vec<String>>)>,
+    scope_starts: Vec<usize>,
+    /// Reusable buffer for allocation-free `Ident` formatting during lookups.
+    scratch: String,
     /// Whether to read the body of any macro call, not only the standard ones.
     every_macro: bool,
 }
@@ -246,18 +262,27 @@ impl Extractor {
         walk: impl FnOnce(&mut Self),
     ) {
         let name = identifier(ident);
-        let mut path = self.module.clone();
-        if matches!(kind, "method" | "associated type" | "associated constant")
+        let mut path = if matches!(kind, "method" | "associated type" | "associated constant")
             && let Some(owner) = &self.owner
-            && let Some(name) = owner.last()
+            && let Some(owner_name) = owner.last()
         {
-            path.push(name.clone());
+            let mut path = Vec::with_capacity(self.module.len() + 2);
+            path.extend(self.module.iter().cloned());
+            path.push(owner_name.clone());
+            path
         } else if matches!(kind, "function" | "macro")
             && let Some(parent) = self.symbol
             && self.syntax.symbols[parent].kind != "module"
         {
-            path = self.syntax.symbols[parent].path.clone();
-        }
+            let parent_path = &self.syntax.symbols[parent].path;
+            let mut path = Vec::with_capacity(parent_path.len() + 1);
+            path.extend(parent_path.iter().cloned());
+            path
+        } else {
+            let mut path = Vec::with_capacity(self.module.len() + 1);
+            path.extend(self.module.iter().cloned());
+            path
+        };
         path.push(name.clone());
         let start = span.start().line;
         let end = span.end();
@@ -293,7 +318,10 @@ impl Extractor {
         }
         if path[0] == "Self" {
             let Some(owner) = &self.owner else { return };
-            path.splice(..1, owner.clone());
+            let mut resolved = Vec::with_capacity(owner.len() + path.len() - 1);
+            resolved.extend(owner.iter().cloned());
+            resolved.extend(path.into_iter().skip(1));
+            path = resolved;
         } else if path.len() == 1
             && matches!(kind, Kind::Call | Kind::Reference)
             && self.local(&path[0]).is_some()
@@ -310,18 +338,73 @@ impl Extractor {
         });
     }
 
+    /// Records a reference from a `syn::Path` without allocating when a single
+    /// segment names a local binding or `Self` without an enclosing owner.
+    fn reference_path(
+        &mut self,
+        path: &syn::Path,
+        kind: Kind,
+        span: Span,
+        inferred_receiver: bool,
+    ) {
+        let Some(first) = path.segments.first() else {
+            return;
+        };
+        let resolved = if first.ident == "Self" {
+            let Some(owner) = &self.owner else { return };
+            let mut resolved = Vec::with_capacity(owner.len() + path.segments.len() - 1);
+            resolved.extend(owner.iter().cloned());
+            resolved.extend(path.segments.iter().skip(1).map(|s| identifier(&s.ident)));
+            resolved
+        } else if path.segments.len() == 1 && matches!(kind, Kind::Call | Kind::Reference) {
+            let name = ident_str(&first.ident, &mut self.scratch);
+            if self.locals.iter().rev().any(|(local, _)| local == name) {
+                return;
+            }
+            vec![name.to_owned()]
+        } else {
+            path_parts(path)
+        };
+        self.syntax.references.push(Reference {
+            path: resolved,
+            module: self.module.clone(),
+            from: self.symbol,
+            kind,
+            line: span.start().line,
+            inferred_receiver,
+        });
+    }
+
     fn local(&self, name: &str) -> Option<&Option<Vec<String>>> {
-        self.locals.iter().rev().find_map(|scope| scope.get(name))
+        self.locals
+            .iter()
+            .rev()
+            .find(|(local, _)| local == name)
+            .map(|(_, ty)| ty)
+    }
+
+    fn push_scope(&mut self) {
+        self.scope_starts.push(self.locals.len());
+    }
+
+    fn pop_scope(&mut self) {
+        let start = self.scope_starts.pop().unwrap_or(0);
+        self.locals.truncate(start);
     }
 
     fn bind(&mut self, pattern: &Pat, ty: Option<Vec<String>>) {
         match pattern {
             Pat::Ident(binding) => {
-                if let Some(scope) = self.locals.last_mut() {
-                    scope.insert(identifier(&binding.ident), ty.clone());
-                }
-                if let Some((_, pattern)) = &binding.subpat {
-                    self.bind(pattern, ty);
+                if !self.scope_starts.is_empty() {
+                    let name = identifier(&binding.ident);
+                    if let Some((_, subpat)) = &binding.subpat {
+                        self.locals.push((name, ty.clone()));
+                        self.bind(subpat, ty);
+                    } else {
+                        self.locals.push((name, ty));
+                    }
+                } else if let Some((_, subpat)) = &binding.subpat {
+                    self.bind(subpat, ty);
                 }
             }
             Pat::Type(annotated) => self.bind(&annotated.pat, type_path(&annotated.ty)),
@@ -343,44 +426,53 @@ impl Extractor {
     }
 
     fn signature(&mut self, signature: &syn::Signature, walk: impl FnOnce(&mut Self)) {
-        self.locals.push(BTreeMap::new());
+        self.push_scope();
         for parameter in &signature.inputs {
             if let syn::FnArg::Typed(parameter) = parameter {
                 self.bind(&parameter.pat, type_path(&parameter.ty));
             }
         }
         walk(self);
-        self.locals.pop();
+        self.pop_scope();
     }
 
-    fn imports(&mut self, tree: &UseTree, mut prefix: Vec<String>, span: Span) {
+    fn imports(&mut self, tree: &UseTree, prefix: &mut Vec<String>, span: Span) {
         let (alias, path) = match tree {
             UseTree::Path(part) => {
+                let saved = prefix.len();
                 prefix.push(identifier(&part.ident));
-                return self.imports(&part.tree, prefix, span);
+                self.imports(&part.tree, prefix, span);
+                prefix.truncate(saved);
+                return;
             }
             UseTree::Group(group) => {
                 for item in &group.items {
-                    self.imports(item, prefix.clone(), item.span());
+                    self.imports(item, prefix, item.span());
                 }
                 return;
             }
-            UseTree::Glob(_) => (None, prefix),
+            UseTree::Glob(_) => (None, prefix.clone()),
             UseTree::Name(name) => {
                 let name = identifier(&name.ident);
-                let alias = if name == "self" {
-                    prefix.last().cloned()
+                if name == "self" {
+                    (prefix.last().cloned(), prefix.clone())
                 } else {
-                    prefix.push(name.clone());
-                    Some(name)
-                };
-                (alias, prefix)
+                    let mut path = Vec::with_capacity(prefix.len() + 1);
+                    path.extend(prefix.iter().cloned());
+                    path.push(name.clone());
+                    (Some(name), path)
+                }
             }
             UseTree::Rename(rename) => {
-                if rename.ident != "self" {
-                    prefix.push(identifier(&rename.ident));
-                }
-                (Some(identifier(&rename.rename)), prefix)
+                let path = if rename.ident == "self" {
+                    prefix.clone()
+                } else {
+                    let mut path = Vec::with_capacity(prefix.len() + 1);
+                    path.extend(prefix.iter().cloned());
+                    path.push(identifier(&rename.ident));
+                    path
+                };
+                (Some(identifier(&rename.rename)), path)
             }
         };
         if alias.is_some() {
@@ -407,7 +499,8 @@ impl<'ast> Visit<'ast> for Extractor {
             ),
             Item::Mod(module) => {
                 self.with_symbol(&module.ident, "module", item.span(), false, |this| {
-                    this.module.push(identifier(&module.ident));
+                    let mod_name = this.syntax.symbols[this.symbol.unwrap()].name.clone();
+                    this.module.push(mod_name);
                     if module.content.is_none() {
                         let override_path = module.attrs.iter().find_map(|attribute| {
                             if attribute.path().is_ident("path")
@@ -430,7 +523,7 @@ impl<'ast> Visit<'ast> for Extractor {
             }
             Item::Impl(implementation) => {
                 if let Some((_, path, _)) = &implementation.trait_ {
-                    self.reference(path_parts(path), Kind::Reference, path.span(), false);
+                    self.reference_path(path, Kind::Reference, path.span(), false);
                 }
                 let previous =
                     std::mem::replace(&mut self.owner, type_path(&implementation.self_ty));
@@ -454,7 +547,8 @@ impl<'ast> Visit<'ast> for Extractor {
             }
             Item::Trait(value) => {
                 self.with_symbol(&value.ident, "trait", item.span(), false, |this| {
-                    let previous = this.owner.replace(vec![identifier(&value.ident)]);
+                    let trait_name = this.syntax.symbols[this.symbol.unwrap()].name.clone();
+                    let previous = this.owner.replace(vec![trait_name]);
                     visit::visit_item_trait(this, value);
                     this.owner = previous;
                 })
@@ -490,7 +584,8 @@ impl<'ast> Visit<'ast> for Extractor {
             }
             Item::Use(value) => {
                 self.syntax.use_ranges.push(value.span().byte_range());
-                self.imports(&value.tree, Vec::new(), value.tree.span());
+                let mut prefix = Vec::with_capacity(4);
+                self.imports(&value.tree, &mut prefix, value.tree.span());
             }
             _ => visit::visit_item(self, item),
         }
@@ -547,13 +642,16 @@ impl<'ast> Visit<'ast> for Extractor {
     }
 
     fn visit_block(&mut self, block: &'ast syn::Block) {
-        self.locals.push(BTreeMap::new());
+        self.push_scope();
         visit::visit_block(self, block);
-        self.locals.pop();
+        self.pop_scope();
     }
 
     fn visit_local(&mut self, local: &'ast syn::Local) {
         visit::visit_local(self, local);
+        if matches!(local.pat, Pat::Wild(_)) {
+            return;
+        }
         let inferred = local.init.as_ref().and_then(|init| {
             if let Expr::Struct(value) = init.expr.as_ref() {
                 Some(path_parts(&value.path))
@@ -568,7 +666,7 @@ impl<'ast> Visit<'ast> for Extractor {
         if let Expr::Path(path) = call.func.as_ref()
             && path.qself.is_none()
         {
-            self.reference(path_parts(&path.path), Kind::Call, path.span(), false);
+            self.reference_path(&path.path, Kind::Call, path.span(), false);
         } else {
             self.visit_expr(&call.func);
         }
@@ -578,46 +676,64 @@ impl<'ast> Visit<'ast> for Extractor {
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        let receiver = match call.receiver.as_ref() {
-            Expr::Path(path) if path.path.is_ident("self") => self.owner.clone(),
-            Expr::Path(path) => path
-                .path
-                .get_ident()
-                .and_then(|ident| self.local(&identifier(ident)))
-                .cloned()
-                .flatten(),
-            Expr::Struct(value) => Some(path_parts(&value.path)),
-            _ => None,
+        let (path, inferred) = match call.receiver.as_ref() {
+            Expr::Path(path) if path.path.is_ident("self") => match &self.owner {
+                Some(owner) => {
+                    let mut full = Vec::with_capacity(owner.len() + 1);
+                    full.extend(owner.iter().cloned());
+                    full.push(identifier(&call.method));
+                    (full, false)
+                }
+                None => (vec![identifier(&call.method)], true),
+            },
+            Expr::Path(path) => {
+                let resolved = path.path.get_ident().and_then(|ident| {
+                    let name = ident_str(ident, &mut self.scratch);
+                    self.locals
+                        .iter()
+                        .rev()
+                        .find(|(local, _)| local == name)
+                        .and_then(|(_, ty)| ty.as_deref())
+                });
+                match resolved {
+                    Some(owner) => {
+                        let mut full = Vec::with_capacity(owner.len() + 1);
+                        full.extend(owner.iter().cloned());
+                        full.push(identifier(&call.method));
+                        (full, false)
+                    }
+                    None => (vec![identifier(&call.method)], true),
+                }
+            }
+            Expr::Struct(value) => {
+                let mut full = Vec::with_capacity(value.path.segments.len() + 1);
+                full.extend(value.path.segments.iter().map(|s| identifier(&s.ident)));
+                full.push(identifier(&call.method));
+                (full, false)
+            }
+            _ => (vec![identifier(&call.method)], true),
         };
-        let inferred = receiver.is_none();
-        let mut path = receiver.unwrap_or_default();
-        path.push(identifier(&call.method));
         self.reference(path, Kind::Method, call.method.span(), inferred);
         visit::visit_expr_method_call(self, call);
     }
 
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
         if path.qself.is_none() {
-            self.reference(path_parts(&path.path), Kind::Reference, path.span(), false);
+            self.reference_path(&path.path, Kind::Reference, path.span(), false);
         }
         visit::visit_expr_path(self, path);
     }
 
     fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
         if path.qself.is_none() {
-            self.reference(path_parts(&path.path), Kind::Reference, path.span(), false);
+            self.reference_path(&path.path, Kind::Reference, path.span(), false);
         }
         visit::visit_type_path(self, path);
     }
 
     // Bounds in generics and where clauses, supertraits, `dyn Trait` and `impl Trait`.
     fn visit_trait_bound(&mut self, bound: &'ast syn::TraitBound) {
-        self.reference(
-            path_parts(&bound.path),
-            Kind::Reference,
-            bound.path.span(),
-            false,
-        );
+        self.reference_path(&bound.path, Kind::Reference, bound.path.span(), false);
         visit::visit_trait_bound(self, bound);
     }
 
@@ -625,47 +741,29 @@ impl<'ast> Visit<'ast> for Extractor {
     // Plain path patterns already arrive through visit_expr_path.
     fn visit_pat_tuple_struct(&mut self, pattern: &'ast syn::PatTupleStruct) {
         if pattern.qself.is_none() {
-            self.reference(
-                path_parts(&pattern.path),
-                Kind::Reference,
-                pattern.path.span(),
-                false,
-            );
+            self.reference_path(&pattern.path, Kind::Reference, pattern.path.span(), false);
         }
         visit::visit_pat_tuple_struct(self, pattern);
     }
 
     fn visit_pat_struct(&mut self, pattern: &'ast syn::PatStruct) {
         if pattern.qself.is_none() {
-            self.reference(
-                path_parts(&pattern.path),
-                Kind::Reference,
-                pattern.path.span(),
-                false,
-            );
+            self.reference_path(&pattern.path, Kind::Reference, pattern.path.span(), false);
         }
         visit::visit_pat_struct(self, pattern);
     }
 
     fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
-        self.reference(
-            path_parts(&value.path),
-            Kind::Reference,
-            value.path.span(),
-            false,
-        );
+        self.reference_path(&value.path, Kind::Reference, value.path.span(), false);
         visit::visit_expr_struct(self, value);
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        let name = mac
-            .path
-            .segments
-            .last()
-            .map(|segment| segment.ident.to_string())
-            .unwrap_or_default();
+        let name = mac.path.segments.last().map_or("", |segment| {
+            raw_ident_str(&segment.ident, &mut self.scratch)
+        });
         let standard = matches!(
-            name.as_str(),
+            name,
             "assert"
                 | "assert_eq"
                 | "assert_ne"
@@ -689,7 +787,7 @@ impl<'ast> Visit<'ast> for Extractor {
                 | "matches"
         );
         // `stringify!` turns its tokens into text, and a `macro_rules!` body is patterns.
-        let other = self.every_macro && !matches!(name.as_str(), "stringify" | "macro_rules");
+        let other = self.every_macro && !matches!(name, "stringify" | "macro_rules");
         if (standard || other)
             && let Ok(expressions) =
                 mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
@@ -705,9 +803,23 @@ impl<'ast> Visit<'ast> for Extractor {
     }
 }
 
+fn raw_ident_str<'a>(ident: &syn::Ident, scratch: &'a mut String) -> &'a str {
+    scratch.clear();
+    let _ = write!(scratch, "{ident}");
+    scratch.as_str()
+}
+
+fn ident_str<'a>(ident: &syn::Ident, scratch: &'a mut String) -> &'a str {
+    let raw = raw_ident_str(ident, scratch);
+    raw.strip_prefix("r#").unwrap_or(raw)
+}
+
 fn identifier(ident: &syn::Ident) -> String {
-    let name = ident.to_string();
-    name.strip_prefix("r#").unwrap_or(&name).to_owned()
+    let mut name = ident.to_string();
+    if name.starts_with("r#") {
+        name.drain(..2);
+    }
+    name
 }
 
 fn path_parts(path: &syn::Path) -> Vec<String> {
@@ -729,10 +841,7 @@ fn type_path(ty: &Type) -> Option<Vec<String>> {
 fn is_test(attributes: &[syn::Attribute]) -> bool {
     attributes.iter().any(|attribute| {
         attribute.path().segments.last().is_some_and(|segment| {
-            matches!(
-                segment.ident.to_string().as_str(),
-                "test" | "rstest" | "test_case"
-            )
+            segment.ident == "test" || segment.ident == "rstest" || segment.ident == "test_case"
         })
     })
 }
@@ -806,5 +915,95 @@ mod tests {
             &src[syntax.symbols[11].bytes.clone()],
             "pub const LIMIT: usize = 64;"
         );
+    }
+
+    #[test]
+    fn extracts_async_const_impl_trait_self_resolution_and_cfg_test_items() {
+        let src = concat!(
+            "use std::collections::{BTreeMap, HashMap as Map};\n\n",
+            "macro_rules! make_const {\n",
+            "    ($name:ident, $val:expr) => { pub const $name: usize = $val; };\n",
+            "}\n\n",
+            "pub trait Runner {\n",
+            "    fn start(&self);\n",
+            "}\n\n",
+            "pub struct Job;\n\n",
+            "impl Job {\n",
+            "    pub const fn max_attempts() -> usize { 3 }\n",
+            "    pub async fn run_once(&self) -> usize {\n",
+            "        let r#type = Self::max_attempts();\n",
+            "        let local_copy = r#type;\n",
+            "        local_copy\n",
+            "    }\n",
+            "}\n\n",
+            "impl Runner for Job {\n",
+            "    fn start(&self) {\n",
+            "        let _ = Self::max_attempts();\n",
+            "    }\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn helper() -> usize { 1 }\n",
+            "    #[test]\n",
+            "    fn sync_test() { assert_eq!(helper(), 1); }\n",
+            "    #[tokio::test]\n",
+            "    async fn async_test() { assert_eq!(super::Job::max_attempts(), 3); }\n",
+            "    #[rstest]\n",
+            "    fn param_test() {}\n",
+            "}\n",
+        );
+        let syntax = parse(src).unwrap();
+        let found: Vec<_> = syntax
+            .symbols
+            .iter()
+            .map(|s| (s.kind.as_str(), s.path.join("::"), s.test))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("macro", "make_const".into(), false),
+                ("trait", "Runner".into(), false),
+                ("method", "Runner::start".into(), false),
+                ("struct", "Job".into(), false),
+                ("method", "Job::max_attempts".into(), false),
+                ("method", "Job::run_once".into(), false),
+                ("method", "Job::start".into(), false),
+                ("module", "tests".into(), false),
+                ("function", "tests::helper".into(), false),
+                ("function", "tests::sync_test".into(), true),
+                ("function", "tests::async_test".into(), true),
+                ("function", "tests::param_test".into(), true),
+            ]
+        );
+        // `impl Runner for Job` records a reference to `Runner`, and `Self::max_attempts()`
+        // resolves to `Job::max_attempts` while local variables (`r#type`, `local_copy`) are skipped.
+        assert!(
+            syntax
+                .references
+                .iter()
+                .any(|r| r.kind == Kind::Reference && r.path == ["Runner"])
+        );
+        assert_eq!(
+            syntax
+                .references
+                .iter()
+                .filter(|r| r.kind == Kind::Call && r.path == ["Job", "max_attempts"])
+                .count(),
+            2
+        );
+        assert!(
+            !syntax
+                .references
+                .iter()
+                .any(|r| r.path == ["type"] || r.path == ["local_copy"])
+        );
+        // Grouped `use` expands cleanly with alias preserved.
+        assert_eq!(syntax.imports.len(), 2);
+        assert_eq!(syntax.imports[0].path, ["std", "collections", "BTreeMap"]);
+        assert_eq!(syntax.imports[1].alias.as_deref(), Some("Map"));
+        assert_eq!(syntax.imports[1].path, ["std", "collections", "HashMap"]);
+        // `#[cfg(test)] mod tests` byte span begins at the attribute for outline test-module folding.
+        let tests_mod = &syntax.symbols[7];
+        assert!(src[tests_mod.bytes.clone()].starts_with("#[cfg(test)]\nmod tests"));
     }
 }

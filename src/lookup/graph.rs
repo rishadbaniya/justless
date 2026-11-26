@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -172,12 +173,47 @@ pub(crate) struct GraphPath {
     pair_score: f64,
 }
 
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some(&first) = needle.first() else {
+        return true;
+    };
+    let len = needle.len();
+    if haystack.len() < len {
+        return false;
+    }
+    let first_upper = first.to_ascii_uppercase();
+    let limit = haystack.len() - len;
+    let mut i = 0;
+    while i <= limit {
+        let byte = haystack[i];
+        if (byte == first || byte == first_upper)
+            && haystack[i..i + len].eq_ignore_ascii_case(needle)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Every pattern in `RELATIONAL_PATTERNS` requires at least one of these ASCII
+/// substrings, so ordinary queries reject in nanoseconds without compiling any regex.
+const RELATIONAL_TRIGGERS: &[&[u8]] =
+    &[b"connect", b"between", b"from", b"how", b"trace", b"links"];
+
 /// Whether a natural-language question asks how two concepts connect in the
 /// code graph. Carefully scoped so ordinary factual questions like "where are
 /// retries configured?" or "connection reset" do not trigger graph loading.
 pub(crate) fn is_relational_question(question: &str) -> bool {
     let trimmed = question.trim();
     if trimmed.is_empty() {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    if !RELATIONAL_TRIGGERS
+        .iter()
+        .any(|trigger| contains_ascii_case_insensitive(bytes, trigger))
+    {
         return false;
     }
     RELATIONAL_PATTERNS
@@ -197,8 +233,12 @@ fn clean_clause(raw: &str) -> String {
         if trimmed.is_empty() {
             continue;
         }
-        let lower = trimmed.to_ascii_lowercase();
-        if tokens::STOPWORDS.contains(&lower.as_str()) || RELATIONAL_NOISE.contains(&lower.as_str())
+        if tokens::STOPWORDS
+            .iter()
+            .any(|word| trimmed.eq_ignore_ascii_case(word))
+            || RELATIONAL_NOISE
+                .iter()
+                .any(|word| trimmed.eq_ignore_ascii_case(word))
         {
             continue;
         }
@@ -254,6 +294,7 @@ fn hit_definition(index: &Index, hit: &Hit) -> Option<usize> {
         return None;
     }
     let hit_compact = tokens::compact_ident(&hit.name);
+    let mut scratch = String::new();
     candidates.into_iter().min_by_key(|&id| {
         let def = &index.definitions[id];
         let exact_span =
@@ -262,33 +303,46 @@ fn hit_definition(index: &Index, hit: &Hit) -> Option<usize> {
         let tail = short_name.rsplit("::").next().unwrap_or(short_name);
         let name_match = short_name == hit.name
             || tail == hit.name
-            || (!hit_compact.is_empty() && tokens::compact_ident(tail) == hit_compact);
+            || (!hit_compact.is_empty() && {
+                tokens::compact_ident_into(tail, &mut scratch);
+                scratch == hit_compact
+            });
         let is_container = matches!(def.kind.as_str(), "file" | "module");
         let span_len = def.location.end.saturating_sub(def.location.start);
         (!exact_span, !name_match, is_container, span_len, id)
     })
 }
 
-fn text_terms(text: &str) -> BTreeSet<String> {
-    let mut set = BTreeSet::new();
-    let mut tokenizer = tokens::Tokenizer::default();
+fn fill_text_terms(text: &str, tokenizer: &mut tokens::Tokenizer, set: &mut BTreeSet<String>) {
+    set.clear();
     tokens::words(text, |_, word| {
         tokenizer.word(word, |token| {
-            set.insert(token.to_owned());
+            if !set.contains(token) {
+                set.insert(token.to_owned());
+            }
         });
     });
     tokens::qualified(text, |_, _, token| {
-        set.insert(token.to_owned());
+        if !set.contains(token) {
+            set.insert(token.to_owned());
+        }
     });
+}
+
+fn text_terms(text: &str) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    let mut tokenizer = tokens::Tokenizer::default();
+    fill_text_terms(text, &mut tokenizer, &mut set);
     set
 }
 
 fn clause_words(clause: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut scratch = String::new();
     tokens::words(clause, |_, word| {
-        let compact = tokens::compact_ident(word);
-        if !compact.is_empty() && !out.contains(&compact) {
-            out.push(compact);
+        tokens::compact_ident_into(word, &mut scratch);
+        if !scratch.is_empty() && !out.iter().any(|seen: &String| seen == &scratch) {
+            out.push(scratch.clone());
         }
     });
     out
@@ -296,6 +350,8 @@ fn clause_words(clause: &str) -> Vec<String> {
 
 fn direct_symbol_matches(index: &Index, clause: &str) -> Vec<usize> {
     let mut found = Vec::new();
+    let mut target = String::new();
+    let mut scratch = String::new();
     for piece in clause.split_whitespace() {
         let clean = piece.trim_matches(|ch: char| {
             matches!(
@@ -312,7 +368,7 @@ fn direct_symbol_matches(index: &Index, clause: &str) -> Vec<usize> {
             }
             continue;
         }
-        let target = tokens::compact_ident(clean);
+        tokens::compact_ident_into(clean, &mut target);
         if target.len() < 3 {
             continue;
         }
@@ -323,7 +379,13 @@ fn direct_symbol_matches(index: &Index, clause: &str) -> Vec<usize> {
             }
             let short = map::name(def);
             let tail = short.rsplit("::").next().unwrap_or(short);
-            if tokens::compact_ident(tail) == target || tokens::compact_ident(short) == target {
+            tokens::compact_ident_into(tail, &mut scratch);
+            let matched = scratch == target
+                || (tail.len() != short.len() && {
+                    tokens::compact_ident_into(short, &mut scratch);
+                    scratch == target
+                });
+            if matched {
                 exact.push(id);
             }
         }
@@ -338,55 +400,77 @@ fn direct_symbol_matches(index: &Index, clause: &str) -> Vec<usize> {
     found
 }
 
-fn clause_score(
-    def: &Definition,
-    clause_terms: &BTreeSet<String>,
-    exclusive_terms: &BTreeSet<String>,
-    raw_words: &[String],
-    hit_rank: Option<usize>,
-) -> f64 {
-    let short_name = map::name(def);
-    let tail = short_name.rsplit("::").next().unwrap_or(short_name);
-    let tail_compact = tokens::compact_ident(tail);
-    let short_compact = tokens::compact_ident(short_name);
-    let file_stem = std::path::Path::new(&def.location.file)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(tokens::compact_ident)
-        .unwrap_or_default();
+/// Reusable scratch buffers for scoring a definition against both relational
+/// clauses without re-tokenizing its name or path.
+#[derive(Default)]
+struct DefSignals {
+    tokenizer: tokens::Tokenizer,
+    tail_compact: String,
+    short_compact: String,
+    file_stem: String,
+    name_terms: BTreeSet<String>,
+    file_terms: BTreeSet<String>,
+}
 
-    let name_terms = text_terms(short_name);
-    let file_terms = text_terms(&def.location.file);
+impl DefSignals {
+    fn prepare(&mut self, def: &Definition) {
+        let short_name = map::name(def);
+        let tail = short_name.rsplit("::").next().unwrap_or(short_name);
+        tokens::compact_ident_into(tail, &mut self.tail_compact);
+        tokens::compact_ident_into(short_name, &mut self.short_compact);
+        self.file_stem.clear();
+        if let Some(stem) = std::path::Path::new(&def.location.file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            tokens::compact_ident_into(stem, &mut self.file_stem);
+        }
+        fill_text_terms(short_name, &mut self.tokenizer, &mut self.name_terms);
+        fill_text_terms(
+            &def.location.file,
+            &mut self.tokenizer,
+            &mut self.file_terms,
+        );
+    }
 
-    let mut score = 0.0;
-    for word in raw_words {
-        if *word == tail_compact || *word == short_compact {
-            score += 12.0;
-        } else if !file_stem.is_empty() && *word == file_stem {
-            score += 6.0;
+    fn score(
+        &self,
+        def: &Definition,
+        clause_terms: &BTreeSet<String>,
+        exclusive_terms: &BTreeSet<&str>,
+        raw_words: &[String],
+        hit_rank: Option<usize>,
+    ) -> f64 {
+        let mut score = 0.0;
+        for word in raw_words {
+            if *word == self.tail_compact || *word == self.short_compact {
+                score += 12.0;
+            } else if !self.file_stem.is_empty() && *word == self.file_stem {
+                score += 6.0;
+            }
         }
+        for term in clause_terms {
+            let exclusive = exclusive_terms.contains(term.as_str());
+            if self.name_terms.contains(term) {
+                score += if exclusive { 5.0 } else { 1.5 };
+            }
+            if self.file_terms.contains(term) {
+                score += if exclusive { 3.0 } else { 1.0 };
+            }
+        }
+        if score > 0.0 {
+            if def.test {
+                score *= 0.6;
+            }
+            if def.kind == "file" {
+                score *= 0.5;
+            }
+            if let Some(rank) = hit_rank {
+                score += 0.5 / (1.0 + rank as f64);
+            }
+        }
+        score
     }
-    for term in clause_terms {
-        let exclusive = exclusive_terms.contains(term);
-        if name_terms.contains(term) {
-            score += if exclusive { 5.0 } else { 1.5 };
-        }
-        if file_terms.contains(term) {
-            score += if exclusive { 3.0 } else { 1.0 };
-        }
-    }
-    if score > 0.0 {
-        if def.test {
-            score *= 0.6;
-        }
-        if def.kind == "file" {
-            score *= 0.5;
-        }
-        if let Some(rank) = hit_rank {
-            score += 0.5 / (1.0 + rank as f64);
-        }
-    }
-    score
 }
 
 /// Picks up to `limit` top-scoring candidate definitions, preferring distinct
@@ -430,136 +514,184 @@ fn pick_diverse(index: &Index, mut scored: Vec<(usize, f64)>, limit: usize) -> V
     picked
 }
 
-/// Bounded directed shortest path from `start` to `end` (up to `MAX_HOPS`),
-/// minimizing `(inferred_count, file_hops, hops)` so exact symbol-level calls
-/// beat guessed links and generic file-import detours.
-fn directed_path(index: &Index, start: usize, end: usize) -> Option<Vec<(&Edge, bool)>> {
-    if start == end {
-        return None;
-    }
-    let mut best = BTreeMap::from([(start, (0usize, 0usize, 0usize))]);
-    let mut previous = BTreeMap::<usize, Option<(usize, &Edge)>>::from([(start, None)]);
-    let mut heap = BinaryHeap::from([Reverse((0usize, 0usize, 0usize, start))]);
+type PathCost = (u8, u8, u8, u8);
+type HeapItem = Reverse<(PathCost, usize)>;
 
-    while let Some(Reverse((inferred, file_hops, hops, node))) = heap.pop() {
-        if best
-            .get(&node)
-            .is_some_and(|&cost| cost < (inferred, file_hops, hops))
-        {
-            continue;
-        }
-        if node == end {
-            let mut steps = Vec::new();
-            let mut curr = node;
-            while let Some((parent, edge)) = previous[&curr] {
-                steps.push((edge, false));
-                curr = parent;
-            }
-            steps.reverse();
-            return Some(steps);
-        }
-        if hops >= MAX_HOPS {
-            continue;
-        }
-        let mut edges: Vec<&Edge> = index.outgoing(node).filter(|e| e.to != node).collect();
-        edges.sort_by_key(|e| {
-            (
-                e.inferred,
-                index.definitions[e.to].kind == "file",
-                kind_rank(e.kind),
-                &e.location,
-                e.to,
-            )
-        });
-        for edge in edges {
-            let is_file_hop = edge.to != end && index.definitions[edge.to].kind == "file";
-            let next_cost = (
-                inferred + usize::from(edge.inferred),
-                file_hops + usize::from(is_file_hop),
-                hops + 1,
-            );
-            if best.get(&edge.to).is_none_or(|&cost| next_cost < cost) {
-                best.insert(edge.to, next_cost);
-                previous.insert(edge.to, Some((node, edge)));
-                heap.push(Reverse((next_cost.0, next_cost.1, next_cost.2, edge.to)));
-            }
-        }
-    }
-    None
+/// Dense generation-stamped Dijkstra scratch buffers reused across all endpoint
+/// pair searches in [`trace_in`], avoiding per-search `BTreeMap` and per-node
+/// adjacency `Vec` allocations.
+struct SearchScratch<'a> {
+    seen_epoch: Vec<u32>,
+    epoch: u32,
+    best_cost: Vec<PathCost>,
+    prev: Vec<Option<(usize, &'a Edge, bool)>>,
+    heap: BinaryHeap<HeapItem>,
+    edges_buf: Vec<&'a Edge>,
+    neighbors_buf: Vec<(usize, &'a Edge, bool)>,
 }
 
-/// Bounded undirected fallback shortest path (up to `MAX_HOPS`), minimizing
-/// `(inferred_count, file_hops, reverse_count, hops)` and labeling reversed
-/// edges.
-fn undirected_path(index: &Index, start: usize, end: usize) -> Option<Vec<(&Edge, bool)>> {
-    if start == end {
-        return None;
+impl<'a> SearchScratch<'a> {
+    fn new(node_count: usize) -> Self {
+        Self {
+            seen_epoch: vec![0; node_count],
+            epoch: 0,
+            best_cost: vec![(0, 0, 0, 0); node_count],
+            prev: vec![None; node_count],
+            heap: BinaryHeap::with_capacity(64),
+            edges_buf: Vec::with_capacity(32),
+            neighbors_buf: Vec::with_capacity(32),
+        }
     }
-    let mut best = BTreeMap::from([(start, (0usize, 0usize, 0usize, 0usize))]);
-    let mut previous = BTreeMap::<usize, Option<(usize, &Edge, bool)>>::from([(start, None)]);
-    let mut heap = BinaryHeap::from([Reverse((0usize, 0usize, 0usize, 0usize, start))]);
 
-    while let Some(Reverse((inferred, file_hops, reverses, hops, node))) = heap.pop() {
-        if best
-            .get(&node)
-            .is_some_and(|&cost| cost < (inferred, file_hops, reverses, hops))
-        {
-            continue;
+    fn next_epoch(&mut self) -> u32 {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen_epoch.fill(0);
+            self.epoch = 1;
         }
-        if node == end {
-            let mut steps = Vec::new();
-            let mut curr = node;
-            while let Some((parent, edge, reverse)) = previous[&curr] {
-                steps.push((edge, reverse));
-                curr = parent;
-            }
-            steps.reverse();
-            return Some(steps);
-        }
-        if hops >= MAX_HOPS {
-            continue;
-        }
-        let mut neighbors: Vec<(usize, &Edge, bool)> = index
-            .outgoing(node)
-            .filter(|e| e.to != node)
-            .map(|e| (e.to, e, false))
-            .chain(index.incoming(node).filter_map(|e| {
-                let from = e.from?;
-                (from != node).then_some((from, e, true))
-            }))
-            .collect();
-        neighbors.sort_by_key(|&(target, e, rev)| {
-            (
-                e.inferred,
-                index.definitions[target].kind == "file",
-                rev,
-                kind_rank(e.kind),
-                &e.location,
-                target,
-            )
-        });
-        for (target, edge, reverse) in neighbors {
-            let is_file_hop = target != end && index.definitions[target].kind == "file";
-            let next_cost = (
-                inferred + usize::from(edge.inferred),
-                file_hops + usize::from(is_file_hop),
-                reverses + usize::from(reverse),
-                hops + 1,
-            );
-            if best.get(&target).is_none_or(|&cost| next_cost < cost) {
-                best.insert(target, next_cost);
-                previous.insert(target, Some((node, edge, reverse)));
-                heap.push(Reverse((
-                    next_cost.0,
-                    next_cost.1,
-                    next_cost.2,
-                    next_cost.3,
-                    target,
-                )));
-            }
-        }
+        self.heap.clear();
+        self.epoch
     }
-    None
+
+    fn reconstruct(&self, end: usize) -> Vec<(&'a Edge, bool)> {
+        let mut steps = Vec::with_capacity(MAX_HOPS);
+        let mut curr = end;
+        while let Some((parent, edge, reverse)) = self.prev[curr] {
+            steps.push((edge, reverse));
+            curr = parent;
+        }
+        steps.reverse();
+        steps
+    }
+
+    /// Bounded directed shortest path from `start` to `end` (up to `MAX_HOPS`),
+    /// minimizing `(inferred_count, file_hops, hops)` so exact symbol-level calls
+    /// beat guessed links and generic file-import detours.
+    fn directed_path(
+        &mut self,
+        index: &'a Index,
+        start: usize,
+        end: usize,
+    ) -> Option<Vec<(&'a Edge, bool)>> {
+        if start == end {
+            return None;
+        }
+        let epoch = self.next_epoch();
+        self.seen_epoch[start] = epoch;
+        self.best_cost[start] = (0, 0, 0, 0);
+        self.prev[start] = None;
+        self.heap.push(Reverse(((0, 0, 0, 0), start)));
+
+        while let Some(Reverse((cost @ (inferred, file_hops, hops, _), node))) = self.heap.pop() {
+            if self.seen_epoch[node] == epoch && self.best_cost[node] < cost {
+                continue;
+            }
+            if node == end {
+                return Some(self.reconstruct(node));
+            }
+            if usize::from(hops) >= MAX_HOPS {
+                continue;
+            }
+            self.edges_buf.clear();
+            self.edges_buf
+                .extend(index.outgoing(node).filter(|e| e.to != node));
+            self.edges_buf.sort_by_key(|e| {
+                (
+                    e.inferred,
+                    index.definitions[e.to].kind == "file",
+                    kind_rank(e.kind),
+                    &e.location,
+                    e.to,
+                )
+            });
+            for &edge in &self.edges_buf {
+                let is_file_hop = edge.to != end && index.definitions[edge.to].kind == "file";
+                let next_cost = (
+                    inferred + u8::from(edge.inferred),
+                    file_hops + u8::from(is_file_hop),
+                    hops + 1,
+                    0,
+                );
+                if self.seen_epoch[edge.to] != epoch || next_cost < self.best_cost[edge.to] {
+                    self.seen_epoch[edge.to] = epoch;
+                    self.best_cost[edge.to] = next_cost;
+                    self.prev[edge.to] = Some((node, edge, false));
+                    self.heap.push(Reverse((next_cost, edge.to)));
+                }
+            }
+        }
+        None
+    }
+
+    /// Bounded undirected fallback shortest path (up to `MAX_HOPS`), minimizing
+    /// `(inferred_count, file_hops, reverse_count, hops)` and labeling reversed
+    /// edges.
+    fn undirected_path(
+        &mut self,
+        index: &'a Index,
+        start: usize,
+        end: usize,
+    ) -> Option<Vec<(&'a Edge, bool)>> {
+        if start == end {
+            return None;
+        }
+        let epoch = self.next_epoch();
+        self.seen_epoch[start] = epoch;
+        self.best_cost[start] = (0, 0, 0, 0);
+        self.prev[start] = None;
+        self.heap.push(Reverse(((0, 0, 0, 0), start)));
+
+        while let Some(Reverse((cost @ (inferred, file_hops, reverses, hops), node))) =
+            self.heap.pop()
+        {
+            if self.seen_epoch[node] == epoch && self.best_cost[node] < cost {
+                continue;
+            }
+            if node == end {
+                return Some(self.reconstruct(node));
+            }
+            if usize::from(hops) >= MAX_HOPS {
+                continue;
+            }
+            self.neighbors_buf.clear();
+            self.neighbors_buf.extend(
+                index
+                    .outgoing(node)
+                    .filter(|e| e.to != node)
+                    .map(|e| (e.to, e, false))
+                    .chain(index.incoming(node).filter_map(|e| {
+                        let from = e.from?;
+                        (from != node).then_some((from, e, true))
+                    })),
+            );
+            self.neighbors_buf.sort_by_key(|&(target, e, rev)| {
+                (
+                    e.inferred,
+                    index.definitions[target].kind == "file",
+                    rev,
+                    kind_rank(e.kind),
+                    &e.location,
+                    target,
+                )
+            });
+            for &(target, edge, reverse) in &self.neighbors_buf {
+                let is_file_hop = target != end && index.definitions[target].kind == "file";
+                let next_cost = (
+                    inferred + u8::from(edge.inferred),
+                    file_hops + u8::from(is_file_hop),
+                    reverses + u8::from(reverse),
+                    hops + 1,
+                );
+                if self.seen_epoch[target] != epoch || next_cost < self.best_cost[target] {
+                    self.seen_epoch[target] = epoch;
+                    self.best_cost[target] = next_cost;
+                    self.prev[target] = Some((node, edge, reverse));
+                    self.heap.push(Reverse((next_cost, target)));
+                }
+            }
+        }
+        None
+    }
 }
 
 fn build_graph_path(
@@ -568,9 +700,9 @@ fn build_graph_path(
     raw_steps: Vec<(&Edge, bool)>,
     pair_score: f64,
 ) -> GraphPath {
-    let mut nodes = vec![start_id];
+    let mut nodes = Vec::with_capacity(raw_steps.len() + 1);
+    nodes.push(start_id);
     let mut steps = Vec::with_capacity(raw_steps.len());
-    let mut curr = start_id;
     let mut directed = true;
     let mut possible = false;
     let mut languages = BTreeSet::new();
@@ -579,6 +711,7 @@ fn build_graph_path(
     if let Some(lang) = start.language {
         languages.insert(lang);
     }
+    let mut curr_node = start.clone();
 
     for (edge, reverse) in raw_steps {
         let next_id = if reverse {
@@ -588,11 +721,11 @@ fn build_graph_path(
             edge.to
         };
         possible |= edge.inferred;
-        let from_node = NodeInfo::from_def(index, curr);
         let to_node = NodeInfo::from_def(index, next_id);
         if let Some(lang) = to_node.language {
             languages.insert(lang);
         }
+        let from_node = std::mem::replace(&mut curr_node, to_node.clone());
         steps.push(StepInfo {
             reverse,
             kind: relationship(edge.kind),
@@ -602,10 +735,9 @@ fn build_graph_path(
             to: to_node,
         });
         nodes.push(next_id);
-        curr = next_id;
     }
 
-    let end = NodeInfo::from_def(index, curr);
+    let end = curr_node;
     GraphPath {
         start,
         end,
@@ -634,101 +766,99 @@ pub(crate) fn trace_in(index: &Index, question: &str, hits: &[Hit]) -> Vec<Graph
         }
     }
 
-    let pairs: Vec<(usize, usize, f64)> = if let Some((left_clause, right_clause)) =
-        split_relational_clauses(question)
-    {
-        let left_terms = text_terms(&left_clause);
-        let right_terms = text_terms(&right_clause);
-        let left_only: BTreeSet<String> = left_terms.difference(&right_terms).cloned().collect();
-        let right_only: BTreeSet<String> = right_terms.difference(&left_terms).cloned().collect();
-        let left_words = clause_words(&left_clause);
-        let right_words = clause_words(&right_clause);
+    let pairs: Vec<(usize, usize, f64)> =
+        if let Some((left_clause, right_clause)) = split_relational_clauses(question) {
+            let left_terms = text_terms(&left_clause);
+            let right_terms = text_terms(&right_clause);
+            let left_only: BTreeSet<&str> = left_terms
+                .difference(&right_terms)
+                .map(String::as_str)
+                .collect();
+            let right_only: BTreeSet<&str> = right_terms
+                .difference(&left_terms)
+                .map(String::as_str)
+                .collect();
+            let left_words = clause_words(&left_clause);
+            let right_words = clause_words(&right_clause);
 
-        let mut pool: BTreeSet<usize> = hit_ranks.keys().copied().collect();
-        pool.extend(direct_symbol_matches(index, &left_clause));
-        pool.extend(direct_symbol_matches(index, &right_clause));
+            let mut pool: BTreeSet<usize> = hit_ranks.keys().copied().collect();
+            pool.extend(direct_symbol_matches(index, &left_clause));
+            pool.extend(direct_symbol_matches(index, &right_clause));
 
-        let mut left_scored = Vec::new();
-        let mut right_scored = Vec::new();
-        for id in pool {
-            let def = &index.definitions[id];
-            let rank = hit_ranks.get(&id).map(|&(r, _)| r);
-            let l_score = clause_score(def, &left_terms, &left_only, &left_words, rank);
-            let r_score = clause_score(def, &right_terms, &right_only, &right_words, rank);
-            if l_score > 0.0 && l_score >= r_score {
-                left_scored.push((id, l_score));
-            }
-            if r_score > 0.0 && r_score >= l_score {
-                right_scored.push((id, r_score));
-            }
-        }
-        // If one side got no exclusive owner (e.g. shared terms), allow its
-        // positive-scoring matches as secondary candidates.
-        if left_scored.is_empty() {
-            for &id in hit_ranks.keys() {
-                let s = clause_score(
-                    &index.definitions[id],
-                    &left_terms,
-                    &left_only,
-                    &left_words,
-                    hit_ranks.get(&id).map(|&(r, _)| r),
-                );
-                if s > 0.0 {
-                    left_scored.push((id, s));
+            let mut signals = DefSignals::default();
+            let mut left_scored = Vec::new();
+            let mut right_scored = Vec::new();
+            let mut left_fallback = Vec::new();
+            let mut right_fallback = Vec::new();
+            for id in pool {
+                let def = &index.definitions[id];
+                let rank = hit_ranks.get(&id).map(|&(r, _)| r);
+                signals.prepare(def);
+                let l_score = signals.score(def, &left_terms, &left_only, &left_words, rank);
+                let r_score = signals.score(def, &right_terms, &right_only, &right_words, rank);
+                if l_score > 0.0 {
+                    if l_score >= r_score {
+                        left_scored.push((id, l_score));
+                    }
+                    if rank.is_some() {
+                        left_fallback.push((id, l_score));
+                    }
+                }
+                if r_score > 0.0 {
+                    if r_score >= l_score {
+                        right_scored.push((id, r_score));
+                    }
+                    if rank.is_some() {
+                        right_fallback.push((id, r_score));
+                    }
                 }
             }
-        }
-        if right_scored.is_empty() {
-            for &id in hit_ranks.keys() {
-                let s = clause_score(
-                    &index.definitions[id],
-                    &right_terms,
-                    &right_only,
-                    &right_words,
-                    hit_ranks.get(&id).map(|&(r, _)| r),
-                );
-                if s > 0.0 {
-                    right_scored.push((id, s));
-                }
+            // If one side got no exclusive owner (e.g. shared terms), allow its
+            // positive-scoring matches as secondary candidates.
+            if left_scored.is_empty() {
+                left_scored = left_fallback;
             }
-        }
+            if right_scored.is_empty() {
+                right_scored = right_fallback;
+            }
 
-        let left_top = pick_diverse(index, left_scored, MAX_SIDE_CANDIDATES);
-        let right_top = pick_diverse(index, right_scored, MAX_SIDE_CANDIDATES);
-        let mut pairs = Vec::new();
-        for &(l_id, l_score) in &left_top {
-            for &(r_id, r_score) in &right_top {
-                if l_id != r_id {
-                    pairs.push((l_id, r_id, l_score + r_score));
+            let left_top = pick_diverse(index, left_scored, MAX_SIDE_CANDIDATES);
+            let right_top = pick_diverse(index, right_scored, MAX_SIDE_CANDIDATES);
+            let mut pairs = Vec::with_capacity(left_top.len() * right_top.len());
+            for &(l_id, l_score) in &left_top {
+                for &(r_id, r_score) in &right_top {
+                    if l_id != r_id {
+                        pairs.push((l_id, r_id, l_score + r_score));
+                    }
                 }
             }
-        }
-        pairs
-    } else {
-        let mut pool: BTreeSet<usize> = hit_ranks.keys().copied().collect();
-        pool.extend(direct_symbol_matches(index, question));
-        let scored: Vec<(usize, f64)> = pool
-            .into_iter()
-            .map(|id| {
-                let s = hit_ranks
-                    .get(&id)
-                    .map_or(1.0, |&(rank, score)| score + 1.0 / (1.0 + rank as f64));
-                (id, s)
-            })
-            .collect();
-        let top = pick_diverse(index, scored, MAX_SIDE_CANDIDATES + 2);
-        let mut pairs = Vec::new();
-        for i in 0..top.len() {
-            for j in (i + 1)..top.len() {
-                pairs.push((top[i].0, top[j].0, top[i].1 + top[j].1));
+            pairs
+        } else {
+            let mut pool: BTreeSet<usize> = hit_ranks.keys().copied().collect();
+            pool.extend(direct_symbol_matches(index, question));
+            let scored: Vec<(usize, f64)> = pool
+                .into_iter()
+                .map(|id| {
+                    let s = hit_ranks
+                        .get(&id)
+                        .map_or(1.0, |&(rank, score)| score + 1.0 / (1.0 + rank as f64));
+                    (id, s)
+                })
+                .collect();
+            let top = pick_diverse(index, scored, MAX_SIDE_CANDIDATES + 2);
+            let mut pairs = Vec::with_capacity(top.len() * top.len().saturating_sub(1) / 2);
+            for i in 0..top.len() {
+                for j in (i + 1)..top.len() {
+                    pairs.push((top[i].0, top[j].0, top[i].1 + top[j].1));
+                }
             }
-        }
-        pairs
-    };
+            pairs
+        };
 
     // Prefer cross-file pairs first, falling back to same-file pairs if none connect.
     let mut found = Vec::<GraphPath>::new();
     let mut seen_routes = BTreeSet::<Vec<usize>>::new();
+    let mut scratch = SearchScratch::new(index.definitions.len());
 
     for allow_same_file in [false, true] {
         if allow_same_file && !found.is_empty() {
@@ -740,12 +870,13 @@ pub(crate) fn trace_in(index: &Index, question: &str, hits: &[Hit]) -> Vec<Graph
             if same_file != allow_same_file {
                 continue;
             }
-            let path = if let Some(steps) = directed_path(index, src, dst) {
+            let path = if let Some(steps) = scratch.directed_path(index, src, dst) {
                 Some(build_graph_path(index, src, steps, pair_score))
-            } else if let Some(steps) = directed_path(index, dst, src) {
+            } else if let Some(steps) = scratch.directed_path(index, dst, src) {
                 Some(build_graph_path(index, dst, steps, pair_score))
             } else {
-                undirected_path(index, src, dst)
+                scratch
+                    .undirected_path(index, src, dst)
                     .map(|steps| build_graph_path(index, src, steps, pair_score))
             };
             if let Some(graph_path) = path
@@ -792,23 +923,25 @@ pub(crate) fn trace_in(index: &Index, question: &str, hits: &[Hit]) -> Vec<Graph
 }
 
 pub(crate) fn render_path(path: &GraphPath) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(64 + path.steps.len() * 96);
     let show_lang = path.cross_language;
     let mode = if path.directed { "" } else { " · via reverse" };
-    out.push_str(&format!(
-        "  {} ({}{mode})\n",
+    let _ = writeln!(
+        out,
+        "  {} ({}{mode})",
         path.start.label(show_lang),
         map::plural(path.hops, "hop"),
-    ));
+    );
     for step in &path.steps {
         let arrow = if step.reverse { "←" } else { "→" };
         let conf = if step.possible { "possible " } else { "" };
-        out.push_str(&format!(
-            "    {arrow} {conf}{} at {} → {}\n",
+        let _ = writeln!(
+            out,
+            "    {arrow} {conf}{} at {} → {}",
             step.kind,
             step.at,
             step.to.label(show_lang),
-        ));
+        );
     }
     out
 }
@@ -963,5 +1096,86 @@ mod tests {
             split_relational_clauses("how does fetchOrders reach purchase_orders?"),
             Some(("fetchOrders".into(), "purchase_orders".into()))
         );
+    }
+
+    #[test]
+    fn graph_trace_and_ranking_preserve_directed_reverse_and_subpath_parity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let write = |rel: &str, body: &str| {
+            let full = root.join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        };
+        // Three-file directed chain `ingress -> dispatcher -> sink`, plus a sibling
+        // leaf `audit_log` called by `dispatcher` so `sink` and `audit_log` connect
+        // only via a reverse edge (`←`) through `dispatcher`.
+        write(
+            "src/ingress.py",
+            "from src.dispatcher import dispatch_order\ndef handle_ingress(order):\n    return dispatch_order(order)\n",
+        );
+        write(
+            "src/dispatcher.py",
+            "from src.sink import persist_sink\nfrom src.audit import record_audit\ndef dispatch_order(order):\n    record_audit(order)\n    return persist_sink(order)\n",
+        );
+        write(
+            "src/sink.py",
+            "def persist_sink(order):\n    return order\n",
+        );
+        write(
+            "src/audit.py",
+            "def record_audit(order):\n    return order\n",
+        );
+
+        let workspace = Workspace {
+            root: root.clone(),
+            cwd: root.clone(),
+            state: root.join(".justless"),
+            origin: root.clone(),
+        };
+        let ranking = crate::lookup::rank(
+            &workspace,
+            "how does handle_ingress connect to persist_sink?",
+            &crate::lookup::Options {
+                limit: 8,
+                logs: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(ranking.hits[0].name, "handle_ingress");
+        let index = Index::open(&workspace).unwrap();
+        let directed = trace_in(
+            &index,
+            "how does handle_ingress connect to persist_sink?",
+            &ranking.hits,
+        );
+        assert_eq!(directed.len(), 1, "{directed:?}");
+        assert!(directed[0].directed);
+        assert_eq!(directed[0].hops, 2);
+        assert_eq!(directed[0].start.name, "handle_ingress");
+        assert_eq!(directed[0].steps[0].to.name, "dispatch_order");
+        assert_eq!(directed[0].end.name, "persist_sink");
+
+        // Reusing dense epoch-stamped Dijkstra finds reverse-edge connections cleanly.
+        let reverse_ranking = crate::lookup::rank(
+            &workspace,
+            "how does persist_sink connect to record_audit?",
+            &crate::lookup::Options {
+                limit: 8,
+                logs: false,
+            },
+        )
+        .unwrap();
+        let reverse = trace_in(
+            &index,
+            "how does persist_sink connect to record_audit?",
+            &reverse_ranking.hits,
+        );
+        assert_eq!(reverse.len(), 1, "{reverse:?}");
+        assert!(!reverse[0].directed);
+        assert_eq!(reverse[0].hops, 2);
+        assert!(reverse[0].steps[0].reverse);
+        assert_eq!(reverse[0].steps[0].to.name, "dispatch_order");
+        assert!(!reverse[0].steps[1].reverse);
     }
 }

@@ -32,6 +32,21 @@ pub(crate) fn tokens(text: &str, mut emit: impl FnMut(&str, usize)) {
 
 /// Calls `visit` with the byte offset and text of each word.
 pub(crate) fn words(text: &str, mut visit: impl FnMut(usize, &str)) {
+    if text.is_ascii() {
+        let bytes = text.as_bytes();
+        let mut start = None;
+        for (index, &byte) in bytes.iter().enumerate() {
+            if byte.is_ascii_alphanumeric() || byte == b'_' {
+                start.get_or_insert(index);
+            } else if let Some(begin) = start.take() {
+                visit(begin, &text[begin..index]);
+            }
+        }
+        if let Some(begin) = start {
+            visit(begin, &text[begin..]);
+        }
+        return;
+    }
     let mut start = None;
     for (index, character) in text.char_indices() {
         if character.is_alphanumeric() || character == '_' {
@@ -49,33 +64,47 @@ pub(crate) fn words(text: &str, mut visit: impl FnMut(usize, &str)) {
 /// compact lowercased `a::b` token, together with its `[start, end)` byte
 /// span in `text`.
 pub(crate) fn qualified(text: &str, mut emit: impl FnMut(usize, usize, &str)) {
-    let mut previous: Option<(usize, usize, String)> = None;
+    if !text.contains("::") {
+        return;
+    }
+    let mut previous: Option<(usize, usize)> = None;
+    let mut prev_norm = String::new();
+    let mut norm = String::new();
     let mut buffer = String::new();
     words(text, |start, word| {
         let end = start + word.len();
-        let norm = compact_ident(word);
-        if let Some((prev_start, prev_end, prev_norm)) = previous.as_ref()
-            && text.get(*prev_end..start) == Some("::")
-            && prev_norm.chars().nth(1).is_some()
-            && norm.chars().nth(1).is_some()
-            && !(prev_norm.bytes().all(|byte| byte.is_ascii_digit())
-                && norm.bytes().all(|byte| byte.is_ascii_digit()))
-            && prev_norm.len() + 2 + norm.len() <= MAX_WHOLE
+        if let Some((prev_start, prev_end)) = previous
+            && text.get(prev_end..start) == Some("::")
         {
-            buffer.clear();
-            buffer.push_str(prev_norm);
-            buffer.push_str("::");
-            buffer.push_str(&norm);
-            emit(*prev_start, end, &buffer);
+            compact_ident_into(&text[prev_start..prev_end], &mut prev_norm);
+            compact_ident_into(word, &mut norm);
+            if prev_norm.chars().nth(1).is_some()
+                && norm.chars().nth(1).is_some()
+                && !(prev_norm.bytes().all(|byte| byte.is_ascii_digit())
+                    && norm.bytes().all(|byte| byte.is_ascii_digit()))
+                && prev_norm.len() + 2 + norm.len() <= MAX_WHOLE
+            {
+                buffer.clear();
+                buffer.push_str(&prev_norm);
+                buffer.push_str("::");
+                buffer.push_str(&norm);
+                emit(prev_start, end, &buffer);
+            }
         }
-        previous = Some((start, end, norm));
+        previous = Some((start, end));
     });
 }
 
-/// Lowercased alphanumeric form of an identifier, ignoring `_` and `-`, so
-/// `parseHttpHeader`, `parse_http_header`, and `parse-http-header` match.
-pub(crate) fn compact_ident(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+fn push_compact_ident(text: &str, out: &mut String) {
+    if text.is_ascii() {
+        out.reserve(text.len());
+        for byte in text.bytes() {
+            if byte.is_ascii_alphanumeric() {
+                out.push(char::from(byte.to_ascii_lowercase()));
+            }
+        }
+        return;
+    }
     for character in text.chars() {
         if character.is_alphanumeric() {
             if character.is_ascii() {
@@ -85,23 +114,45 @@ pub(crate) fn compact_ident(text: &str) -> String {
             }
         }
     }
+}
+
+/// Writes the lowercased alphanumeric form of `text` (ignoring `_` and `-`)
+/// into `out`, reusing its allocation.
+pub(crate) fn compact_ident_into(text: &str, out: &mut String) {
+    out.clear();
+    push_compact_ident(text, out);
+}
+
+/// Lowercased alphanumeric form of an identifier, ignoring `_` and `-`, so
+/// `parseHttpHeader`, `parse_http_header`, and `parse-http-header` match.
+pub(crate) fn compact_ident(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    push_compact_ident(text, &mut out);
     out
+}
+
+/// Writes the normalized qualified symbol path (`Foo::bar_baz` or `Foo.barBaz`
+/// -> `foo::barbaz`) into `out`, reusing its allocation.
+pub(crate) fn normalize_qualified_into(text: &str, out: &mut String) {
+    out.clear();
+    for segment in text.split("::").flat_map(|part| part.split('.')) {
+        let before = out.len();
+        if !out.is_empty() {
+            out.push_str("::");
+        }
+        let content_start = out.len();
+        push_compact_ident(segment, out);
+        if out.len() == content_start {
+            out.truncate(before);
+        }
+    }
 }
 
 /// Normalizes a qualified symbol path (`Foo::bar_baz` or `Foo.barBaz`) to
 /// `foo::barbaz` for exact/normalized symbol matching.
 pub(crate) fn normalize_qualified(text: &str) -> String {
-    let mut out = String::new();
-    for segment in text.split("::").flat_map(|part| part.split('.')) {
-        let compact = compact_ident(segment);
-        if compact.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push_str("::");
-        }
-        out.push_str(&compact);
-    }
+    let mut out = String::with_capacity(text.len());
+    normalize_qualified_into(text, &mut out);
     out
 }
 
@@ -110,6 +161,16 @@ enum Class {
     Digit,
     Upper,
     Lower,
+}
+
+fn class_byte(byte: u8) -> Class {
+    if byte.is_ascii_digit() {
+        Class::Digit
+    } else if byte.is_ascii_uppercase() {
+        Class::Upper
+    } else {
+        Class::Lower
+    }
 }
 
 fn class(character: char) -> Class {
@@ -182,50 +243,53 @@ impl Tokenizer {
         // Emit letter+digit compounds (e.g. `v2`, `s3`, `utf8`, `http2`) and
         // short numeronyms (e.g. `k8s`, `i18n`, `e2e`) inside multi-part
         // camelCase pieces so `v2Api` and `s3Bucket` meet `v2_api` and `s3_bucket`.
-        let mut first = 0;
-        while first < self.parts.len() {
-            let piece = self.parts[first].0;
-            let last = first
-                + self.parts[first..]
-                    .iter()
-                    .take_while(|(owner, _)| *owner == piece)
-                    .count();
-            if last - first >= 3 {
-                let mut index = first;
-                while index + 1 < last {
-                    let left = &word[self.parts[index].1.clone()];
-                    let mid = &word[self.parts[index + 1].1.clone()];
-                    let left_alpha = !left.is_empty() && left.chars().all(char::is_alphabetic);
-                    let mid_digits = (1..=4).contains(&mid.len())
-                        && mid.bytes().all(|byte| byte.is_ascii_digit());
-                    if left_alpha && mid_digits {
-                        let right = (index + 2 < last)
-                            .then(|| &word[self.parts[index + 2].1.clone()])
-                            .filter(|part| {
-                                left.len() == 1
-                                    && part.len() == 1
-                                    && part.bytes().all(|byte| byte.is_ascii_lowercase())
-                            });
-                        let span_len = if right.is_some() { 3 } else { 2 };
-                        if span_len < last - first {
-                            self.joined.clear();
-                            push_lower(&mut self.joined, left);
-                            self.joined.push_str(mid);
-                            if let Some(right) = right {
-                                push_lower(&mut self.joined, right);
+        if self.parts.len() >= 3 {
+            let mut first = 0;
+            while first < self.parts.len() {
+                let piece = self.parts[first].0;
+                let last = first
+                    + self.parts[first..]
+                        .iter()
+                        .take_while(|(owner, _)| *owner == piece)
+                        .count();
+                if last - first >= 3 {
+                    let mut index = first;
+                    while index + 1 < last {
+                        let left = &word[self.parts[index].1.clone()];
+                        let mid = &word[self.parts[index + 1].1.clone()];
+                        let left_alpha = !left.is_empty() && left.chars().all(char::is_alphabetic);
+                        let mid_digits = (1..=4).contains(&mid.len())
+                            && mid.bytes().all(|byte| byte.is_ascii_digit());
+                        if left_alpha && mid_digits {
+                            let right = (index + 2 < last)
+                                .then(|| &word[self.parts[index + 2].1.clone()])
+                                .filter(|part| {
+                                    left.len() == 1
+                                        && part.len() == 1
+                                        && part.bytes().all(|byte| byte.is_ascii_lowercase())
+                                });
+                            let span_len = if right.is_some() { 3 } else { 2 };
+                            if span_len < last - first {
+                                self.joined.clear();
+                                push_lower(&mut self.joined, left);
+                                self.joined.push_str(mid);
+                                if let Some(right) = right {
+                                    push_lower(&mut self.joined, right);
+                                }
+                                if (2..=MAX_WHOLE).contains(&self.joined.len()) {
+                                    emit(&self.joined);
+                                }
                             }
-                            if (2..=MAX_WHOLE).contains(&self.joined.len()) {
-                                emit(&self.joined);
-                            }
+                            index += span_len;
+                            continue;
                         }
-                        index += span_len;
-                        continue;
+                        index += 1;
                     }
-                    index += 1;
                 }
+                first = last;
             }
-            first = last;
         }
+        let mut stem_buf = [0u8; MAX_WORD];
         for (_, range) in &self.parts {
             let part = &word[range.clone()];
             if part.chars().nth(1).is_none()
@@ -235,13 +299,51 @@ impl Tokenizer {
             }
             self.lower.clear();
             push_lower(&mut self.lower, part);
-            emit(&stem(&self.lower));
+            let bytes = self.lower.as_bytes();
+            if bytes.len() > 3
+                && bytes.len() <= MAX_WORD
+                && bytes.iter().all(u8::is_ascii_lowercase)
+            {
+                stem_buf[..bytes.len()].copy_from_slice(bytes);
+                let new_len = stem_ascii_slice(&mut stem_buf[..bytes.len()]);
+                emit(std::str::from_utf8(&stem_buf[..new_len]).expect("ASCII stem"));
+            } else {
+                emit(&stem(&self.lower));
+            }
         }
     }
 
     /// Splits one piece at lower-to-upper humps, before the last capital of an
     /// acronym that runs into a lowercase word, and around digit runs.
     fn camel(&mut self, piece: &str, offset: usize, owner: usize) {
+        if piece.is_ascii() {
+            let bytes = piece.as_bytes();
+            if bytes.is_empty() {
+                return;
+            }
+            if bytes.iter().all(u8::is_ascii_lowercase) {
+                self.parts.push((owner, offset..offset + bytes.len()));
+                return;
+            }
+            let mut start = 0;
+            for index in 1..bytes.len() {
+                let previous = class_byte(bytes[index - 1]);
+                let current = class_byte(bytes[index]);
+                let next = bytes.get(index + 1).map(|&b| class_byte(b));
+                let boundary = (previous == Class::Digit) != (current == Class::Digit)
+                    || (previous == Class::Lower && current == Class::Upper)
+                    || (previous == Class::Upper
+                        && current == Class::Upper
+                        && next == Some(Class::Lower));
+                if boundary {
+                    self.parts.push((owner, offset + start..offset + index));
+                    start = index;
+                }
+            }
+            self.parts
+                .push((owner, offset + start..offset + bytes.len()));
+            return;
+        }
         self.characters.clear();
         self.characters.extend(piece.char_indices());
         let mut start = 0;
@@ -297,6 +399,58 @@ fn undouble(text: &[u8]) -> &[u8] {
     }
 }
 
+/// Stems an ASCII-lowercase byte slice in place and returns its new length
+/// (always `<= stem.len()`).
+fn stem_ascii_slice(stem: &mut [u8]) -> usize {
+    let mut len = stem.len();
+    let mut stripped = false;
+    if (stem[..len].ends_with(b"ies") || stem[..len].ends_with(b"ied")) && len > 4 {
+        len -= 2;
+        stem[len - 1] = b'y';
+    } else if stem[..len].ends_with(b"ying") && len > 5 {
+        len -= 3;
+    } else if stem[..len].ends_with(b"ing") && len - 3 >= 3 && has_vowel(&stem[..len - 3]) {
+        len = undouble(&stem[..len - 3]).len();
+        stripped = true;
+    } else if stem[..len].ends_with(b"eed") {
+    } else if stem[..len].ends_with(b"ed") && len - 2 >= 3 && has_vowel(&stem[..len - 2]) {
+        len = undouble(&stem[..len - 2]).len();
+        stripped = true;
+    } else if len > 4
+        && [&b"ses"[..], b"xes", b"zes", b"ches", b"shes"]
+            .iter()
+            .any(|suffix| stem[..len].ends_with(suffix))
+    {
+        len -= 2;
+    } else if stem[..len].ends_with(b"s")
+        && !(stem[..len].ends_with(b"ss")
+            || stem[..len].ends_with(b"us")
+            || stem[..len].ends_with(b"is"))
+    {
+        len -= 1;
+    }
+    if stem[..len].ends_with(b"ation") && len - 5 >= 4 {
+        len -= 5;
+    } else if stem[..len].ends_with(b"ion") && len - 3 >= 4 && matches!(stem[len - 4], b't' | b's')
+    {
+        len -= 3;
+    } else if stem[..len].ends_with(b"or") && len - 2 >= 4 && stem[len - 3] == b't' {
+        len -= 2;
+    } else if stem[..len].ends_with(b"ery") && len > 5 {
+        len -= 1;
+    } else if stem[..len].ends_with(b"ate") && len - 3 >= 4 {
+        len -= 3;
+    } else if stripped && stem[..len].ends_with(b"at") && len - 2 >= 4 {
+        len -= 2;
+    }
+    if stem[..len].ends_with(b"y") && len > 3 {
+        stem[len - 1] = b'i';
+    } else if stem[..len].ends_with(b"e") && len >= 5 {
+        len -= 1;
+    }
+    len
+}
+
 /// A light, deterministic suffix stemmer for ASCII words of four or more
 /// letters, so that "retries", "retrying" and "retried" all become "retri".
 pub(crate) fn stem(word: &str) -> std::borrow::Cow<'_, str> {
@@ -305,55 +459,23 @@ pub(crate) fn stem(word: &str) -> std::borrow::Cow<'_, str> {
     if bytes.len() <= 3 || !bytes.iter().all(u8::is_ascii_lowercase) {
         return Cow::Borrowed(word);
     }
-    let mut stem = bytes.to_vec();
-    let mut stripped = false;
-    let length = stem.len();
-    if (stem.ends_with(b"ies") || stem.ends_with(b"ied")) && length > 4 {
-        stem.truncate(length - 3);
-        stem.push(b'y');
-    } else if stem.ends_with(b"ying") && length > 5 {
-        stem.truncate(length - 3);
-    } else if stem.ends_with(b"ing") && length - 3 >= 3 && has_vowel(&stem[..length - 3]) {
-        let kept = undouble(&stem[..length - 3]).len();
-        stem.truncate(kept);
-        stripped = true;
-    } else if stem.ends_with(b"eed") {
-    } else if stem.ends_with(b"ed") && length - 2 >= 3 && has_vowel(&stem[..length - 2]) {
-        let kept = undouble(&stem[..length - 2]).len();
-        stem.truncate(kept);
-        stripped = true;
-    } else if length > 4
-        && [&b"ses"[..], b"xes", b"zes", b"ches", b"shes"]
-            .iter()
-            .any(|suffix| stem.ends_with(suffix))
-    {
-        stem.truncate(length - 2);
-    } else if stem.ends_with(b"s")
-        && !(stem.ends_with(b"ss") || stem.ends_with(b"us") || stem.ends_with(b"is"))
-    {
-        stem.truncate(length - 1);
+    if bytes.len() <= MAX_WORD {
+        let mut buf = [0u8; MAX_WORD];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        let new_len = stem_ascii_slice(&mut buf[..bytes.len()]);
+        if buf[..new_len] == bytes[..new_len] {
+            return Cow::Borrowed(&word[..new_len]);
+        }
+        return Cow::Owned(
+            std::str::from_utf8(&buf[..new_len])
+                .expect("ASCII stem")
+                .to_owned(),
+        );
     }
-    let length = stem.len();
-    if stem.ends_with(b"ation") && length - 5 >= 4 {
-        stem.truncate(length - 5);
-    } else if stem.ends_with(b"ion") && length - 3 >= 4 && matches!(stem[length - 4], b't' | b's') {
-        stem.truncate(length - 3);
-    } else if stem.ends_with(b"or") && length - 2 >= 4 && stem[length - 3] == b't' {
-        stem.truncate(length - 2);
-    } else if stem.ends_with(b"ery") && length > 5 {
-        stem.truncate(length - 1);
-    } else if stem.ends_with(b"ate") && length - 3 >= 4 {
-        stem.truncate(length - 3);
-    } else if stripped && stem.ends_with(b"at") && length - 2 >= 4 {
-        stem.truncate(length - 2);
-    }
-    let length = stem.len();
-    if stem.ends_with(b"y") && length > 3 {
-        stem[length - 1] = b'i';
-    } else if stem.ends_with(b"e") && length >= 5 {
-        stem.truncate(length - 1);
-    }
-    Cow::Owned(String::from_utf8(stem).expect("ASCII stem"))
+    let mut buf = bytes.to_vec();
+    let new_len = stem_ascii_slice(&mut buf);
+    buf.truncate(new_len);
+    Cow::Owned(String::from_utf8(buf).expect("ASCII stem"))
 }
 
 /// Known source/config/doc file extensions used to recognize explicit file hints
@@ -376,8 +498,9 @@ fn is_path_hint(token: &str) -> bool {
         && stem.chars().any(char::is_alphanumeric)
         && !ext.is_empty()
     {
-        let lower = ext.to_ascii_lowercase();
-        return FILE_EXTENSIONS.contains(&lower.as_str());
+        return FILE_EXTENSIONS
+            .iter()
+            .any(|candidate| ext.eq_ignore_ascii_case(candidate));
     }
     false
 }
@@ -387,12 +510,12 @@ fn is_identifier_hint(token: &str) -> bool {
         return token.split("::").filter(|part| !part.is_empty()).count() >= 2;
     }
     if token.contains('.') {
-        let parts = token.split('.').collect::<Vec<_>>();
-        return parts.len() >= 2
-            && parts.iter().all(|part| {
-                !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
-            })
-            && !is_path_hint(token);
+        let mut count = 0usize;
+        let valid = token.split('.').all(|part| {
+            count += 1;
+            !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+        return count >= 2 && valid && !is_path_hint(token);
     }
     if token.contains('_') && token.chars().any(char::is_alphanumeric) {
         return true;
@@ -538,9 +661,9 @@ impl Question {
             }
             let path_candidate = strip_line_suffix(token);
             if is_path_hint(path_candidate) {
-                let normalized = path_candidate.trim_start_matches("./").to_owned();
-                if !path_hints.contains(&normalized) {
-                    path_hints.push(normalized);
+                let normalized = path_candidate.trim_start_matches("./");
+                if !path_hints.iter().any(|seen| seen == normalized) {
+                    path_hints.push(normalized.to_owned());
                 }
             } else if is_identifier_hint(token) && !identifiers.iter().any(|seen| seen == token) {
                 identifiers.push(token.to_owned());

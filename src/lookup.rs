@@ -16,6 +16,7 @@ mod store;
 mod tokens;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 
@@ -269,25 +270,29 @@ fn rank_in(
         }
         let stream = |candidate: &Candidate| logs::parse_key(file(candidate).0).map(|key| key.1);
         let mut found = capture::Tally::default();
+        let mut best_stderr: Option<Candidate> = None;
+        let mut best_stdout: Option<Candidate> = None;
         for candidate in &candidates {
-            found.found(stream(candidate).unwrap_or(Stream::Stdout), 1);
+            let candidate_stream = stream(candidate);
+            found.found(candidate_stream.unwrap_or(Stream::Stdout), 1);
+            let slot = match candidate_stream {
+                Some(Stream::Stderr) => &mut best_stderr,
+                Some(Stream::Stdout) => &mut best_stdout,
+                None => continue,
+            };
+            if slot.is_none_or(|current| compare(candidate, &current).is_lt()) {
+                *slot = Some(*candidate);
+            }
         }
         logs = Some(found);
         let limit = LOG_RESULTS.min(options.limit);
-        let mut picked = score::select(
-            candidates.clone(),
-            limit,
-            compare,
-            contents,
-            copy,
-            |_, _| false,
-        );
+        let mut picked = score::select(candidates, limit, compare, contents, copy, |_, _| false);
         // A stream whose windows all rank below the other stream's still keeps
         // a place, such as the one stderr line that explains a failure under
         // pages of progress. It takes the place of the other stream's last and
         // is listed second, so a budget that leaves out the last windows still
         // shows both streams.
-        for missing in [Stream::Stderr, Stream::Stdout] {
+        for (missing, best) in [(Stream::Stderr, best_stderr), (Stream::Stdout, best_stdout)] {
             if picked.len() < 2
                 || picked
                     .iter()
@@ -295,18 +300,14 @@ fn rank_in(
             {
                 continue;
             }
-            let Some(best) = candidates
-                .iter()
-                .filter(|candidate| stream(candidate) == Some(missing))
-                .min_by(|left, right| compare(left, right))
-            else {
+            let Some(best) = best else {
                 continue;
             };
             picked.pop();
             picked.insert(
                 1,
                 Picked {
-                    item: *best,
+                    item: best,
                     copies: Vec::new(),
                     merged: Vec::new(),
                 },
@@ -315,6 +316,9 @@ fn rank_in(
         chosen.extend(picked);
     }
     let mut seen_snippets = HashMap::<String, (HashSet<usize>, HashSet<String>)>::new();
+    let mut file_cache = HashMap::<&str, Option<String>>::new();
+    let empty_nums = HashSet::new();
+    let empty_texts = HashSet::new();
     let hits = chosen
         .iter()
         .map(|picked| {
@@ -332,8 +336,6 @@ fn rank_in(
                 .copied()
                 .collect::<Vec<_>>();
             let idf = &scores[candidate.group].idf;
-            let empty_nums = HashSet::new();
-            let empty_texts = HashSet::new();
             let (excluded_numbers, excluded_texts) = seen_snippets
                 .get(primary_file)
                 .map_or((&empty_nums, &empty_texts), |(nums, texts)| (nums, texts));
@@ -346,6 +348,7 @@ fn rank_in(
                 idf,
                 excluded_numbers,
                 excluded_texts,
+                &mut file_cache,
             );
             if hit.run.is_none() {
                 let entry = seen_snippets.entry(hit.location.file.clone()).or_default();
@@ -388,15 +391,16 @@ fn rank_in(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn hit(
+fn hit<'s>(
     workspace: &Workspace,
-    segment: &segment::Segment,
+    segment: &'s segment::Segment,
     candidate: &Candidate,
     merged: &[Candidate],
     question: &Question,
     idf: &[f64],
     excluded_numbers: &HashSet<usize>,
     excluded_texts: &HashSet<String>,
+    file_cache: &mut HashMap<&'s str, Option<String>>,
 ) -> Hit {
     let row = segment.row(candidate.chunk);
     let class = row.class();
@@ -423,7 +427,8 @@ fn hit(
         bytes: None,
         same: Vec::new(),
     };
-    let (text, candidates): (Vec<String>, Vec<usize>) = if class == Class::Log {
+    let owned_log_lines: Vec<String>;
+    let (all_lines, candidates): (Vec<&str>, Vec<usize>) = if class == Class::Log {
         let Some((run, stream)) = logs::parse_key(file) else {
             return hit;
         };
@@ -433,20 +438,28 @@ fn hit(
             return hit;
         };
         hit.status = Some(record.status);
-        let lines = logs::read_lines(&directory.join(stream.name()), end);
+        owned_log_lines = logs::read_lines(&directory.join(stream.name()), end);
         hit.bytes = Some(
-            lines
+            owned_log_lines
                 .iter()
                 .skip(start - 1)
                 .map(|line| line.len() + 1)
                 .sum(),
         );
-        (lines, (start..=end).collect())
+        (
+            owned_log_lines.iter().map(String::as_str).collect(),
+            (start..=end).collect(),
+        )
     } else {
-        let Some(text) = workspace
-            .source_path(file)
-            .ok()
-            .and_then(|path| fs::read_to_string(path).ok())
+        let Some(text) = file_cache
+            .entry(file.as_str())
+            .or_insert_with(|| {
+                workspace
+                    .source_path(file)
+                    .ok()
+                    .and_then(|path| fs::read_to_string(path).ok())
+            })
+            .as_deref()
         else {
             return hit;
         };
@@ -487,24 +500,26 @@ fn hit(
         // Merge candidate lines from absorbed overlapping/adjacent chunks that
         // fall inside this hit's displayed span so one hit carries the best
         // evidence without duplicating lines.
-        for other in merged {
-            let other_row = segment.row(other.chunk);
-            let (os, oe) = (other_row.start as usize, other_row.end as usize);
-            let other_others = segment.ranges()[other_row.file as usize]
-                .clone()
-                .filter(|&id| id != other.chunk)
-                .map(|id| {
-                    let sibling = segment.row(id);
-                    (sibling.start as usize, sibling.end as usize)
-                });
-            for line in chunks::indexed_lines(other_row.class(), (os, oe), other_others) {
-                if (start..=end).contains(&line) {
-                    indexed.push(line);
+        if !merged.is_empty() {
+            for other in merged {
+                let other_row = segment.row(other.chunk);
+                let (os, oe) = (other_row.start as usize, other_row.end as usize);
+                let other_others = segment.ranges()[other_row.file as usize]
+                    .clone()
+                    .filter(|&id| id != other.chunk)
+                    .map(|id| {
+                        let sibling = segment.row(id);
+                        (sibling.start as usize, sibling.end as usize)
+                    });
+                for line in chunks::indexed_lines(other_row.class(), (os, oe), other_others) {
+                    if (start..=end).contains(&line) {
+                        indexed.push(line);
+                    }
                 }
             }
+            indexed.sort_unstable();
+            indexed.dedup();
         }
-        indexed.sort_unstable();
-        indexed.dedup();
         hit.bytes = Some(
             text.split_inclusive('\n')
                 .skip(start - 1)
@@ -512,11 +527,11 @@ fn hit(
                 .map(str::len)
                 .sum(),
         );
-        (text.lines().map(str::to_owned).collect(), indexed)
+        (text.lines().collect(), indexed)
     };
     let lines = candidates
         .iter()
-        .filter_map(|&number| Some((number, text.get(number.checked_sub(1)?)?.as_str())))
+        .filter_map(|&number| Some((number, *all_lines.get(number.checked_sub(1)?)?)))
         .collect::<Vec<_>>();
     // Words the header already shows count as shown.
     let header = format!("{} {} {}", hit.location.file, hit.kind, hit.name);
@@ -531,7 +546,8 @@ fn hit(
     if hit.lines.is_empty() {
         let declaration = row.declaration as usize;
         let non_blank = |number: usize| {
-            text.get(number.saturating_sub(1))
+            all_lines
+                .get(number.saturating_sub(1))
                 .is_some_and(|line| !line.trim().is_empty())
         };
         let fallback = if class == Class::Code
@@ -550,7 +566,7 @@ fn hit(
                 .map(|(number, _)| *number)
         };
         hit.lines.extend(
-            fallback.and_then(|number| Some((number, snippet::plain(text.get(number - 1)?)))),
+            fallback.and_then(|number| Some((number, snippet::plain(all_lines.get(number - 1)?)))),
         );
     }
     hit
@@ -674,7 +690,7 @@ fn render_blocks(hits: &[Hit]) -> Vec<String> {
                 }
             };
             for (line, text) in &hit.lines {
-                block.push_str(&format!("  {line} | {text}\n"));
+                let _ = writeln!(block, "  {line} | {text}");
             }
             block
         })
@@ -698,15 +714,16 @@ fn log_windows(ranking: &Ranking, shown: usize) -> Option<capture::Tally> {
 }
 
 fn counts(ranking: &Ranking, shown: usize, limit: Option<usize>) -> String {
-    let mut line = format!("{shown} of {} ranked", ranking.total);
+    let mut line = String::with_capacity(96);
+    let _ = write!(line, "{shown} of {} ranked", ranking.total);
     if let Some(limit) = limit {
-        line.push_str(&format!(" · matched {}", words(&ranking.matched, limit)));
+        let _ = write!(line, " · matched {}", words(&ranking.matched, limit));
         if !ranking.unmatched.is_empty() {
-            line.push_str(&format!(" · no match {}", words(&ranking.unmatched, limit)));
+            let _ = write!(line, " · no match {}", words(&ranking.unmatched, limit));
         }
     }
     if ranking.truncated {
-        line.push_str(&format!(" · first {} terms used", tokens::MAX_TERMS));
+        let _ = write!(line, " · first {} terms used", tokens::MAX_TERMS);
     }
     // Log windows the three places left out are counted per stream. The clause
     // is there whatever the budget shows, so the footer it reserves fits. More
@@ -714,7 +731,7 @@ fn counts(ranking: &Ranking, shown: usize, limit: Option<usize>) -> String {
     // lists every matching line.
     let ranked = ranking.hits.iter().filter(|hit| hit.run.is_some()).count();
     if let Some(windows) = log_windows(ranking, shown).filter(|tally| tally.total() > ranked) {
-        line.push_str(&format!(" · log windows {windows}"));
+        let _ = write!(line, " · log windows {windows}");
         if limit.is_some() {
             line.push_str(" (justless history TEXT lists every matching line)");
         }
@@ -917,14 +934,8 @@ fn render_json_with_graph(
         .iter()
         .map(|hit| serde_json::to_string(&result_json(hit)))
         .collect::<serde_json::Result<Vec<_>>>()?;
-    let encoded_paths = graph_paths
-        .map(|paths| {
-            paths
-                .iter()
-                .map(|path| serde_json::to_string(&graph::path_json(path)))
-                .collect::<serde_json::Result<Vec<_>>>()
-        })
-        .transpose()?;
+    let path_values: Option<Vec<Value>> =
+        graph_paths.map(|paths| paths.iter().map(graph::path_json).collect());
     // `limit` bounds the echoed question and each word list, in bytes.
     let envelope = |kept: usize, kept_paths: usize, limit: usize| {
         let (matched, more) = cut(&ranking.matched, limit);
@@ -956,12 +967,8 @@ fn render_json_with_graph(
             budget,
             &ranking.justless
         )));
-        if let Some(paths) = &encoded_paths {
-            let parsed: Vec<Value> = paths[..kept_paths]
-                .iter()
-                .map(|item| serde_json::from_str(item).expect("valid path JSON"))
-                .collect();
-            value["graph_paths"] = Value::Array(parsed);
+        if let Some(paths) = &path_values {
+            value["graph_paths"] = Value::Array(paths[..kept_paths].to_vec());
         }
         value["results"] = json!([]);
         value.to_string()
@@ -978,7 +985,7 @@ fn render_json_with_graph(
     };
     // Shorter lists, down to none, for the budgets too small for them.
     let limits = || std::iter::successors(Some(MAX_WORDS), |limit| limit.checked_sub(8));
-    let total_paths = encoded_paths.as_ref().map_or(0, Vec::len);
+    let total_paths = path_values.as_ref().map_or(0, Vec::len);
     // Prefer fitting results alongside graph paths when graph tracing is active,
     // gracefully shedding trailing paths or results under tight budgets.
     let (kept, base) = if total_paths == 0 {

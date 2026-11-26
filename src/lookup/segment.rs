@@ -212,18 +212,34 @@ fn walk_postings(
 
 fn decode_postings(bytes: &[u8], chunks: u32, out: &mut Vec<Posting>) -> Result<()> {
     out.clear();
-    walk_postings(bytes, chunks, |chunk, range| {
-        let mask = bytes[range.start];
-        let mut position = range.start + 1;
+    let mut position = 0;
+    let mut previous: Option<u32> = None;
+    while position < bytes.len() {
+        let delta = get_varint(bytes, &mut position)?;
+        check(previous.is_none() || delta > 0, "unordered postings")?;
+        let chunk = u64::from(previous.unwrap_or(0)) + delta;
+        check(chunk < u64::from(chunks), "posting outside the segment")?;
+        let chunk = chunk as u32;
+        previous = Some(chunk);
+        let mask = *bytes
+            .get(position)
+            .ok_or_else(|| corrupt("truncated posting"))?;
+        position += 1;
+        check(mask != 0 && mask < 1 << FIELDS, "bad field mask")?;
         let mut frequency = [0; FIELDS];
         for (field, slot) in frequency.iter_mut().enumerate() {
-            if mask & 1 << field != 0 {
-                // Validated by the walk.
-                *slot = get_varint(bytes, &mut position).unwrap_or(1) as u32;
+            if mask & (1 << field) != 0 {
+                let value = get_varint(bytes, &mut position)?;
+                check(
+                    (1..=u64::from(u32::MAX)).contains(&value),
+                    "bad term frequency",
+                )?;
+                *slot = value as u32;
             }
         }
         out.push(Posting { chunk, frequency });
-    })
+    }
+    Ok(())
 }
 
 /// A dictionary row.
@@ -437,6 +453,11 @@ impl Segment {
         Row::decode(&self.data[at..at + ROW])
     }
 
+    /// Reads only the file index of chunk `id` without decoding the full row.
+    pub(crate) fn row_file(&self, id: u32) -> u32 {
+        u32_at(&self.data, self.chunks_at + id as usize * ROW)
+    }
+
     pub(crate) fn name(&self, row: &Row) -> &str {
         self.string((row.name.0, row.name.1.into()))
             .unwrap_or_default()
@@ -478,24 +499,48 @@ impl Segment {
         None
     }
 
-    /// Reads and decodes one term's postings.
-    pub(crate) fn postings(&self, entry: &Entry, out: &mut Vec<Posting>) -> Result<()> {
-        let mut bytes = vec![0; entry.length as usize];
-        match &self.postings {
+    /// Reads and decodes one term's postings, reusing `raw` for file-backed
+    /// segments and borrowing zero-copy for in-memory segments.
+    pub(crate) fn postings_into(
+        &self,
+        entry: &Entry,
+        raw: &mut Vec<u8>,
+        out: &mut Vec<Posting>,
+    ) -> Result<()> {
+        let len = entry.length as usize;
+        let bytes: &[u8] = match &self.postings {
             Postings::Memory(start) => {
                 let at = start + index(entry.offset)?;
-                bytes.copy_from_slice(&self.data[at..at + entry.length as usize]);
+                &self.data[at..at + len]
             }
             Postings::File(file, start) => {
+                raw.resize(len, 0);
                 let mut file = file;
                 file.seek(SeekFrom::Start(start + entry.offset))?;
-                file.read_exact(&mut bytes)
+                file.read_exact(raw)
                     .map_err(|_| corrupt("truncated postings"))?;
+                raw.as_slice()
             }
+        };
+        out.clear();
+        // Bound reservation by the actual posting bytes and chunk count so a
+        // corrupted `entry.df` cannot request a giant allocation before check().
+        let reserve = (entry.df as usize)
+            .min(bytes.len() / 3)
+            .min(self.chunks as usize);
+        if out.capacity() < reserve {
+            out.reserve(reserve);
         }
-        decode_postings(&bytes, self.chunks, out)?;
+        decode_postings(bytes, self.chunks, out)?;
         check(out.len() == entry.df as usize, "document count mismatch")?;
         Ok(())
+    }
+
+    /// Reads and decodes one term's postings.
+    #[cfg(test)]
+    pub(crate) fn postings(&self, entry: &Entry, out: &mut Vec<Posting>) -> Result<()> {
+        let mut raw = Vec::new();
+        self.postings_into(entry, &mut raw, out)
     }
 
     /// Reads every term's postings in dictionary order.

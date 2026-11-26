@@ -193,7 +193,9 @@ struct Scanner<'a> {
     /// Open block quotes and list items, outermost first.
     containers: Vec<Container>,
     /// The open leaf block, inside the innermost container.
-    leaf: Leaf<'a>,
+    leaf: Leaf,
+    /// Reusable line buffer for the currently open `Leaf::Paragraph`.
+    paragraph_lines: Vec<(usize, &'a str)>,
     headings: Vec<Heading>,
     /// Whether to also collect large top-level fenced code blocks and GFM tables.
     collect_blocks: bool,
@@ -212,13 +214,12 @@ enum Container {
 }
 
 #[derive(Default)]
-enum Leaf<'a> {
+enum Leaf {
     #[default]
     None,
-    /// Paragraph lines as (line, text), and how many of them at the start are
-    /// link reference definitions.
+    /// Open paragraph whose `(line, text)` entries live in `Scanner::paragraph_lines`,
+    /// tracking how many leading lines are link reference definitions.
     Paragraph {
-        lines: Vec<(usize, &'a str)>,
         definitions: usize,
     },
     /// A fenced code block opened by `width` backticks or tildes.
@@ -312,9 +313,74 @@ fn indentation(text: &str, at: usize) -> (usize, usize) {
     (spaces, at + spaces)
 }
 
+/// Fast check for closing a top-level fenced code block directly on raw bytes
+/// (before tab expansion): at most 3 leading spaces (a leading tab expands to
+/// column 4 and cannot close), at least `width` marker bytes, then only spaces
+/// or tabs.
+fn closes_fence_raw(raw: &str, marker: u8, width: usize) -> bool {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+        if i > 3 {
+            return false;
+        }
+    }
+    if bytes.get(i) != Some(&marker) {
+        return false;
+    }
+    let start = i;
+    while i < bytes.len() && bytes[i] == marker {
+        i += 1;
+    }
+    i - start >= width && bytes[i..].iter().all(|&b| b == b' ' || b == b'\t')
+}
+
 impl<'a> Scanner<'a> {
     fn line(&mut self, number: usize, line: &'a str) {
-        let line = Expanded::new(line.strip_suffix('\r').unwrap_or(line));
+        let raw = line.strip_suffix('\r').unwrap_or(line);
+        // Top-level fences and HTML blocks can often be decided on raw bytes
+        // without expanding tabs (important for Go/Makefile/TSV code fences).
+        if self.containers.is_empty() {
+            match &self.leaf {
+                Leaf::Fence { marker, width, .. } => {
+                    if closes_fence_raw(raw, *marker, *width)
+                        && let Leaf::Fence {
+                            first,
+                            label,
+                            top_level,
+                            ..
+                        } = std::mem::take(&mut self.leaf)
+                    {
+                        let end = number + 1;
+                        if self.collect_blocks && top_level && end - first >= MIN_CODE_LINES {
+                            self.blocks.push(OutlineBlock {
+                                kind: BlockKind::Code,
+                                name: label,
+                                first,
+                                header_last: first,
+                                end,
+                            });
+                        }
+                    }
+                    return;
+                }
+                Leaf::Html(HtmlEnd::Blank) => {
+                    if raw.bytes().all(|b| b == b' ' || b == b'\t') {
+                        self.leaf = Leaf::None;
+                    }
+                    return;
+                }
+                Leaf::Html(HtmlEnd::Contains(ends)) => {
+                    if contains(raw, ends) {
+                        self.leaf = Leaf::None;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let line = Expanded::new(raw);
         let text = &*line.text;
         let mut at = 0;
         // Each open container must continue on this line, outermost first.
@@ -340,27 +406,27 @@ impl<'a> Scanner<'a> {
         // The open code, table or HTML block takes the line when its containers do.
         if continued {
             match self.leaf {
-                Leaf::Fence {
-                    marker,
-                    width,
-                    first,
-                    ref label,
-                    top_level,
-                } => {
+                Leaf::Fence { marker, width, .. } => {
                     let (indent, next) = indentation(text, at);
-                    if indent <= 3 && closes_fence(&text[next..], marker, width) {
+                    if indent <= 3
+                        && closes_fence(&text[next..], marker, width)
+                        && let Leaf::Fence {
+                            first,
+                            label,
+                            top_level,
+                            ..
+                        } = std::mem::take(&mut self.leaf)
+                    {
                         let end = number + 1;
                         if self.collect_blocks && top_level && end - first >= MIN_CODE_LINES {
-                            let name = label.clone();
                             self.blocks.push(OutlineBlock {
                                 kind: BlockKind::Code,
-                                name,
+                                name: label,
                                 first,
                                 header_last: first,
                                 end,
                             });
                         }
-                        self.leaf = Leaf::None;
                     }
                     return;
                 }
@@ -372,12 +438,18 @@ impl<'a> Scanner<'a> {
                     let (indent, next) = indentation(text, at);
                     let rest = &text[next..];
                     let interrupts = indent <= 3
-                        && (rest.starts_with('>')
-                            || atx(rest).is_some()
-                            || fence(rest).is_some()
-                            || html(rest, true).is_some()
-                            || thematic_break(rest)
-                            || list_marker(rest, true).is_some());
+                        && match rest.as_bytes().first().copied() {
+                            Some(b'>') => true,
+                            Some(b'#') => atx(rest).is_some(),
+                            Some(b'`' | b'~') => fence(rest).is_some(),
+                            Some(b'<') => html(rest, true).is_some(),
+                            Some(b'-' | b'*') => {
+                                thematic_break(rest) || list_marker(rest, true).is_some()
+                            }
+                            Some(b'_') => thematic_break(rest),
+                            Some(b'+' | b'0'..=b'9') => list_marker(rest, true).is_some(),
+                            _ => false,
+                        };
                     if !interrupts && has_unescaped_pipe(rest) {
                         if let Leaf::Table {
                             data_rows,
@@ -436,82 +508,148 @@ impl<'a> Scanner<'a> {
                 self.start(&mut matched, Leaf::Code);
                 return;
             }
-            if rest.starts_with('>') {
-                self.start(&mut matched, Leaf::None);
-                at = next + 1;
-                if text[at..].starts_with(' ') {
-                    at += 1;
+            // Fast first-byte dispatch: normal prose lines skip all block checks in one branch.
+            match rest.as_bytes()[0] {
+                b'>' => {
+                    self.start(&mut matched, Leaf::None);
+                    at = next + 1;
+                    if text[at..].starts_with(' ') {
+                        at += 1;
+                    }
+                    self.containers.push(Container::Quote);
+                    matched += 1;
+                    (paragraph, lazy) = (false, false);
+                    continue;
                 }
-                self.containers.push(Container::Quote);
-                matched += 1;
-                (paragraph, lazy) = (false, false);
-                continue;
-            }
-            if let Some((level, title)) = atx(rest) {
-                self.start(&mut matched, Leaf::None);
-                if self.containers.is_empty() {
-                    self.headings.push(Heading {
-                        first: number,
-                        last: number,
-                        level,
-                        title: line.slice(next + title.start..next + title.end).to_owned(),
-                    });
+                b'#' => {
+                    if let Some((level, title)) = atx(rest) {
+                        self.start(&mut matched, Leaf::None);
+                        if self.containers.is_empty() {
+                            self.headings.push(Heading {
+                                first: number,
+                                last: number,
+                                level,
+                                title: line.slice(next + title.start..next + title.end).to_owned(),
+                            });
+                        }
+                        return;
+                    }
                 }
-                return;
-            }
-            if let Some((marker, width)) = fence(rest) {
-                self.start(&mut matched, Leaf::None);
-                let top_level = self.containers.is_empty();
-                let label = if self.collect_blocks && top_level {
-                    fence_label(line.slice(next + width..text.len()))
-                } else {
-                    String::new()
-                };
-                self.leaf = Leaf::Fence {
-                    marker,
-                    width,
-                    first: number,
-                    label,
-                    top_level,
-                };
-                return;
-            }
-            if let Some(end) = html(rest, paragraph || lazy) {
-                let leaf = match end {
-                    HtmlEnd::Contains(ends) if contains(rest, ends) => Leaf::None,
-                    end => Leaf::Html(end),
-                };
-                self.start(&mut matched, leaf);
-                return;
-            }
-            if paragraph
-                && let Some(level) = setext(rest)
-                && self.underline(number, level)
-            {
-                return;
-            }
-            if thematic_break(rest) {
-                self.start(&mut matched, Leaf::None);
-                return;
-            }
-            if self.collect_blocks
-                && paragraph
-                && self.containers.is_empty()
-                && let Some(cols) = table_delimiter_columns(rest)
-                && self.start_table(number, cols)
-            {
-                return;
-            }
-            if let Some((padding, empty)) = list_marker(rest, paragraph) {
-                self.start(&mut matched, Leaf::None);
-                self.containers.push(Container::Item {
-                    width: indent + padding,
-                    filled: !empty,
-                });
-                matched += 1;
-                at = if empty { text.len() } else { next + padding };
-                (paragraph, lazy) = (false, false);
-                continue;
+                b'`' | b'~' => {
+                    if let Some((marker, width)) = fence(rest) {
+                        self.start(&mut matched, Leaf::None);
+                        let top_level = self.containers.is_empty();
+                        let label = if self.collect_blocks && top_level {
+                            fence_label(line.slice(next + width..text.len()))
+                        } else {
+                            String::new()
+                        };
+                        self.leaf = Leaf::Fence {
+                            marker,
+                            width,
+                            first: number,
+                            label,
+                            top_level,
+                        };
+                        return;
+                    }
+                }
+                b'<' => {
+                    if let Some(end) = html(rest, paragraph || lazy) {
+                        let leaf = match end {
+                            HtmlEnd::Contains(ends) if contains(rest, ends) => Leaf::None,
+                            end => Leaf::Html(end),
+                        };
+                        self.start(&mut matched, leaf);
+                        return;
+                    }
+                }
+                b'=' => {
+                    if paragraph
+                        && let Some(level) = setext(rest)
+                        && self.underline(number, level)
+                    {
+                        return;
+                    }
+                }
+                b'-' => {
+                    if paragraph
+                        && let Some(level) = setext(rest)
+                        && self.underline(number, level)
+                    {
+                        return;
+                    }
+                    if thematic_break(rest) {
+                        self.start(&mut matched, Leaf::None);
+                        return;
+                    }
+                    if self.collect_blocks
+                        && paragraph
+                        && self.containers.is_empty()
+                        && let Some(cols) = table_delimiter_columns(rest)
+                        && self.start_table(number, cols)
+                    {
+                        return;
+                    }
+                    if let Some((padding, empty)) = list_marker(rest, paragraph) {
+                        self.start(&mut matched, Leaf::None);
+                        self.containers.push(Container::Item {
+                            width: indent + padding,
+                            filled: !empty,
+                        });
+                        matched += 1;
+                        at = if empty { text.len() } else { next + padding };
+                        (paragraph, lazy) = (false, false);
+                        continue;
+                    }
+                }
+                b'*' => {
+                    if thematic_break(rest) {
+                        self.start(&mut matched, Leaf::None);
+                        return;
+                    }
+                    if let Some((padding, empty)) = list_marker(rest, paragraph) {
+                        self.start(&mut matched, Leaf::None);
+                        self.containers.push(Container::Item {
+                            width: indent + padding,
+                            filled: !empty,
+                        });
+                        matched += 1;
+                        at = if empty { text.len() } else { next + padding };
+                        (paragraph, lazy) = (false, false);
+                        continue;
+                    }
+                }
+                b'_' => {
+                    if thematic_break(rest) {
+                        self.start(&mut matched, Leaf::None);
+                        return;
+                    }
+                }
+                b'|' | b':' => {
+                    if self.collect_blocks
+                        && paragraph
+                        && self.containers.is_empty()
+                        && let Some(cols) = table_delimiter_columns(rest)
+                        && self.start_table(number, cols)
+                    {
+                        return;
+                    }
+                }
+                b'+' | b'0'..=b'9' => {
+                    if let Some((padding, empty)) = list_marker(rest, paragraph) {
+                        self.start(&mut matched, Leaf::None);
+                        self.containers.push(Container::Item {
+                            width: indent + padding,
+                            filled: !empty,
+                        });
+                        matched += 1;
+                        at = if empty { text.len() } else { next + padding };
+                        (paragraph, lazy) = (false, false);
+                        continue;
+                    }
+                }
+                _ => {}
             }
             break;
         }
@@ -525,13 +663,8 @@ impl<'a> Scanner<'a> {
         if paragraph {
             self.add(number, content);
         } else {
-            self.start(
-                &mut matched,
-                Leaf::Paragraph {
-                    lines: Vec::new(),
-                    definitions: 0,
-                },
-            );
+            self.paragraph_lines.clear();
+            self.start(&mut matched, Leaf::Paragraph { definitions: 0 });
             self.add(number, content);
         }
     }
@@ -547,7 +680,7 @@ impl<'a> Scanner<'a> {
 
     /// Starts a block in the innermost container that continued, closing the
     /// open leaf.
-    fn start(&mut self, matched: &mut usize, leaf: Leaf<'a>) {
+    fn start(&mut self, matched: &mut usize, leaf: Leaf) {
         self.close(matched);
         if let Some(Container::Item { filled, .. }) = self.containers.last_mut() {
             *filled = true;
@@ -557,29 +690,39 @@ impl<'a> Scanner<'a> {
 
     /// Adds a line of text to the open paragraph.
     fn add(&mut self, number: usize, content: &'a str) {
-        if let Leaf::Paragraph { lines, definitions } = &mut self.leaf {
-            if *definitions == lines.len() && definition(content) {
+        if let Leaf::Paragraph { definitions } = &mut self.leaf {
+            if *definitions == self.paragraph_lines.len() && definition(content) {
                 *definitions += 1;
             }
-            lines.push((number, content));
+            self.paragraph_lines.push((number, content));
         }
     }
 
     /// Turns the open paragraph into a setext heading, unless it holds only
     /// link reference definitions.
     fn underline(&mut self, number: usize, level: usize) -> bool {
-        let Leaf::Paragraph { lines, definitions } = &self.leaf else {
+        let Leaf::Paragraph { definitions } = self.leaf else {
             return false;
         };
-        let Some(&(first, _)) = lines.get(*definitions) else {
+        let Some(&(first, _)) = self.paragraph_lines.get(definitions) else {
             return false;
         };
         if self.containers.is_empty() {
-            let title = lines[*definitions..]
-                .iter()
-                .map(|(_, text)| *text)
-                .collect::<Vec<_>>()
-                .join(" ");
+            let slice = &self.paragraph_lines[definitions..];
+            let title = if slice.len() == 1 {
+                slice[0].1.to_owned()
+            } else {
+                let cap: usize =
+                    slice.iter().map(|(_, text)| text.len()).sum::<usize>() + slice.len() - 1;
+                let mut title = String::with_capacity(cap);
+                for (index, &(_, text)) in slice.iter().enumerate() {
+                    if index > 0 {
+                        title.push(' ');
+                    }
+                    title.push_str(text);
+                }
+                title
+            };
             self.headings.push(Heading {
                 first,
                 last: number,
@@ -594,13 +737,13 @@ impl<'a> Scanner<'a> {
     /// Promotes the open paragraph's last line into a top-level GFM pipe table
     /// when its cell count matches the delimiter row's `cols`.
     fn start_table(&mut self, number: usize, cols: usize) -> bool {
-        let Leaf::Paragraph { lines, definitions } = &self.leaf else {
+        let Leaf::Paragraph { definitions } = self.leaf else {
             return false;
         };
-        if lines.len() <= *definitions {
+        if self.paragraph_lines.len() <= definitions {
             return false;
         }
-        let Some(&(header_line, header_text)) = lines.last() else {
+        let Some(&(header_line, header_text)) = self.paragraph_lines.last() else {
             return false;
         };
         let Some(headers) = split_table_cells(header_text) else {
@@ -793,6 +936,12 @@ fn fence_label(info: &str) -> String {
 }
 
 fn has_unescaped_pipe(line: &str) -> bool {
+    if !line.contains('|') {
+        return false;
+    }
+    if !line.contains('\\') {
+        return true;
+    }
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -857,15 +1006,37 @@ fn split_table_cells(line: &str) -> Option<Vec<String>> {
 
 /// Column count of a GFM table delimiter row (e.g. `| --- | ---: |`), or `None`.
 fn table_delimiter_columns(line: &str) -> Option<usize> {
-    let cells = split_table_cells(line)?;
-    let valid = !cells.is_empty()
-        && cells.iter().all(|cell| {
-            let inner = cell.trim_matches([' ', '\t']);
-            let inner = inner.strip_prefix(':').unwrap_or(inner);
-            let inner = inner.strip_suffix(':').unwrap_or(inner);
-            !inner.is_empty() && inner.bytes().all(|byte| byte == b'-')
-        });
-    valid.then_some(cells.len())
+    let trimmed = line.trim_matches([' ', '\t', '\r']);
+    let bytes = trimmed.as_bytes();
+    let &first = bytes.first()?;
+    if !matches!(first, b'|' | b'-' | b':') || trimmed == "|" {
+        return None;
+    }
+    let mut has_pipe = false;
+    for &byte in bytes {
+        match byte {
+            b'|' => has_pipe = true,
+            b'-' | b':' | b' ' | b'\t' => {}
+            _ => return None,
+        }
+    }
+    if !has_pipe {
+        return None;
+    }
+    let leading_pipe = bytes[0] == b'|';
+    let trailing_pipe = bytes[bytes.len() - 1] == b'|' && bytes.len() > 1;
+    let inner = &trimmed[usize::from(leading_pipe)..bytes.len() - usize::from(trailing_pipe)];
+    let mut cols = 0usize;
+    for cell in inner.split('|') {
+        let cell = cell.trim_matches([' ', '\t']);
+        let cell = cell.strip_prefix(':').unwrap_or(cell);
+        let cell = cell.strip_suffix(':').unwrap_or(cell);
+        if cell.is_empty() || !cell.bytes().all(|byte| byte == b'-') {
+            return None;
+        }
+        cols += 1;
+    }
+    (cols > 0).then_some(cols)
 }
 
 fn table_label(headers: &[String], data_rows: usize) -> String {
@@ -937,15 +1108,15 @@ fn closes_fence(rest: &str, marker: u8, width: usize) -> bool {
 
 /// A setext underline's level: a run of `=` for 1 or `-` for 2.
 fn setext(rest: &str) -> Option<usize> {
-    let underline = rest.trim_end_matches(' ');
-    let level = match underline.as_bytes().first()? {
-        b'=' => 1,
-        b'-' => 2,
+    let (marker, level) = match rest.as_bytes().first()? {
+        b'=' => (b'=', 1),
+        b'-' => (b'-', 2),
         _ => return None,
     };
+    let underline = rest.trim_end_matches(' ');
     underline
         .bytes()
-        .all(|byte| byte == underline.as_bytes()[0])
+        .all(|byte| byte == marker)
         .then_some(level)
 }
 
@@ -954,8 +1125,15 @@ fn thematic_break(rest: &str) -> bool {
     let Some(&marker @ (b'*' | b'-' | b'_')) = rest.as_bytes().first() else {
         return false;
     };
-    rest.bytes().all(|byte| byte == marker || byte == b' ')
-        && rest.bytes().filter(|&byte| byte == marker).count() >= 3
+    let mut count = 0usize;
+    for byte in rest.bytes() {
+        if byte == marker {
+            count += 1;
+        } else if byte != b' ' {
+            return false;
+        }
+    }
+    count >= 3
 }
 
 /// A list item marker: the columns from the marker to the item's content, and
@@ -1079,9 +1257,22 @@ static DEFINITION: LazyLock<Regex> = LazyLock::new(|| {
 
 fn definition(content: &str) -> bool {
     content.starts_with('[')
+        && content.contains("]:")
         && DEFINITION
             .captures(content)
             .is_some_and(|definition| !definition[1].trim().is_empty())
+}
+
+fn is_block_tag(name: &str) -> bool {
+    if name.is_empty() || name.len() > 16 {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    for (slot, byte) in buf.iter_mut().zip(name.bytes()) {
+        *slot = byte.to_ascii_lowercase();
+    }
+    let lower = std::str::from_utf8(&buf[..name.len()]).unwrap_or("");
+    BLOCK_TAGS.binary_search(&lower).is_ok()
 }
 
 /// The end condition of an HTML block that starts `rest`. A lone tag of
@@ -1090,13 +1281,14 @@ fn html(rest: &str, interrupts: bool) -> Option<HtmlEnd> {
     if !rest.starts_with('<') {
         return None;
     }
-    let lower = rest.to_ascii_lowercase();
+    let after_lt = &rest[1..];
     let ends_name = |name: &str| {
-        lower[1..].starts_with(name)
-            && lower[1 + name.len()..]
-                .chars()
-                .next()
-                .is_none_or(|next| next == ' ' || next == '>')
+        after_lt.len() >= name.len()
+            && after_lt.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+            && after_lt
+                .as_bytes()
+                .get(name.len())
+                .is_none_or(|&next| next == b' ' || next == b'>')
     };
     if ["pre", "script", "style", "textarea"]
         .iter()
@@ -1109,41 +1301,71 @@ fn html(rest: &str, interrupts: bool) -> Option<HtmlEnd> {
             "</textarea>",
         ]));
     }
-    if lower.starts_with("<!--") {
+    if rest.starts_with("<!--") {
         return Some(HtmlEnd::Contains(&["-->"]));
     }
-    if lower.starts_with("<?") {
+    if rest.starts_with("<?") {
         return Some(HtmlEnd::Contains(&["?>"]));
     }
-    if lower
-        .strip_prefix("<!")
-        .is_some_and(|after| after.starts_with(|c: char| c.is_ascii_alphabetic()))
+    if rest.as_bytes().get(1) == Some(&b'!')
+        && rest.as_bytes().get(2).is_some_and(u8::is_ascii_alphabetic)
     {
         return Some(HtmlEnd::Contains(&[">"]));
     }
-    if lower.starts_with("<![cdata[") {
+    if rest.len() >= 9 && rest.as_bytes()[..9].eq_ignore_ascii_case(b"<![cdata[") {
         return Some(HtmlEnd::Contains(&["]]>"]));
     }
-    let tag = lower[1..].strip_prefix('/').unwrap_or(&lower[1..]);
-    let name = &tag[..tag
+    let tag = after_lt.strip_prefix('/').unwrap_or(after_lt);
+    let name_len = tag
         .bytes()
         .take_while(|byte| byte.is_ascii_alphanumeric())
-        .count()];
-    let after = &tag[name.len()..];
-    if BLOCK_TAGS.contains(&name)
+        .count();
+    let name = &tag[..name_len];
+    let after = &tag[name_len..];
+    if is_block_tag(name)
         && (after.is_empty() || after.starts_with([' ', '>']) || after.starts_with("/>"))
     {
         return Some(HtmlEnd::Blank);
     }
+    if interrupts || !rest.trim_end().ends_with('>') {
+        return None;
+    }
     let lone = LONE_TAG.captures(rest)?;
-    let name = lone.get(1).or(lone.get(2))?.as_str().to_ascii_lowercase();
-    (!interrupts && !matches!(name.as_str(), "pre" | "script" | "style" | "textarea"))
-        .then_some(HtmlEnd::Blank)
+    let name = lone.get(1).or(lone.get(2))?.as_str();
+    let excluded = name.eq_ignore_ascii_case("pre")
+        || name.eq_ignore_ascii_case("script")
+        || name.eq_ignore_ascii_case("style")
+        || name.eq_ignore_ascii_case("textarea");
+    (!excluded).then_some(HtmlEnd::Blank)
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some(&first) = needle.first() else {
+        return true;
+    };
+    let len = needle.len();
+    if haystack.len() < len {
+        return false;
+    }
+    let first_upper = first.to_ascii_uppercase();
+    let limit = haystack.len() - len;
+    let mut i = 0;
+    while i <= limit {
+        let byte = haystack[i];
+        if (byte == first || byte == first_upper)
+            && haystack[i..i + len].eq_ignore_ascii_case(needle)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn contains(text: &str, ends: &[&str]) -> bool {
-    let lower = text.to_ascii_lowercase();
-    ends.iter().any(|end| lower.contains(end))
+    let haystack = text.as_bytes();
+    ends.iter()
+        .any(|end| contains_ascii_case_insensitive(haystack, end.as_bytes()))
 }
 
 #[cfg(test)]
@@ -1587,5 +1809,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("One".to_owned(), 4, 33), ("Two".to_owned(), 16, 33)]
         );
+    }
+
+    #[test]
+    fn outline_blocks_preserve_exact_byte_spans_for_frontmatter_fences_and_tables() {
+        let mut doc = String::from(concat!(
+            "\u{feff}---\n",
+            "title: Fast Path\n",
+            "\"schema:v1\": true\n",
+            "---\n",
+            "# Spec\n",
+            "```go\n",
+        ));
+        for i in 1..=13 {
+            // Tabs inside a top-level fence must not close it or corrupt its byte span.
+            doc.push_str(&format!("\tfmt.Println({i})\n"));
+        }
+        doc.push_str("```\t\n");
+        doc.push_str("| Key\\|Alias | Value |\n| :--- | ---: |\n");
+        for i in 1..=8 {
+            doc.push_str(&format!("| k{i} | v{i} |\n"));
+        }
+        doc.push_str("## After\nTrailing text.\n");
+
+        // Reconstruct exact line start byte offsets (matching `source::Snapshot`).
+        let mut starts = vec![0usize];
+        for (idx, byte) in doc.bytes().enumerate() {
+            if byte == b'\n' && idx + 1 < doc.len() {
+                starts.push(idx + 1);
+            }
+        }
+        let offset = |line: usize| starts.get(line).copied().unwrap_or(doc.len());
+        let lines: Vec<&str> = (0..starts.len())
+            .map(|line| {
+                let raw = &doc[offset(line)..offset(line + 1)];
+                raw.strip_suffix('\n').unwrap_or(raw)
+            })
+            .collect();
+
+        let blocks = outline_blocks(&lines);
+        assert_eq!(blocks.len(), 5, "{blocks:?}");
+
+        let slice_of = |b: &OutlineBlock| &doc[offset(b.first)..offset(b.end)];
+
+        assert_eq!(blocks[0].kind, BlockKind::FrontMatter);
+        assert_eq!(blocks[0].name, "keys: title, schema:v1");
+        assert_eq!(
+            slice_of(&blocks[0]),
+            "\u{feff}---\ntitle: Fast Path\n\"schema:v1\": true\n---\n"
+        );
+
+        assert_eq!(blocks[1].kind, BlockKind::Heading(1));
+        assert_eq!(blocks[1].name, "Spec");
+        assert!(slice_of(&blocks[1]).starts_with("# Spec\n```go\n"));
+        assert!(slice_of(&blocks[1]).ends_with("Trailing text.\n"));
+
+        assert_eq!(blocks[2].kind, BlockKind::Code);
+        assert_eq!(blocks[2].name, "go");
+        assert!(slice_of(&blocks[2]).starts_with("```go\n\tfmt.Println(1)\n"));
+        assert!(slice_of(&blocks[2]).ends_with("```\t\n"));
+
+        assert_eq!(blocks[3].kind, BlockKind::Table);
+        assert_eq!(blocks[3].name, "Key|Alias | Value (8 rows)");
+        assert!(slice_of(&blocks[3]).starts_with("| Key\\|Alias | Value |\n| :--- | ---: |\n"));
+        assert!(slice_of(&blocks[3]).ends_with("| k8 | v8 |\n"));
+
+        assert_eq!(blocks[4].kind, BlockKind::Heading(2));
+        assert_eq!(blocks[4].name, "After");
+        assert_eq!(slice_of(&blocks[4]), "## After\nTrailing text.\n");
     }
 }

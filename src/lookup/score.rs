@@ -9,7 +9,9 @@ use anyhow::Result;
 
 use super::chunks::{Class, FIELDS};
 use super::segment::{Posting, Row, Segment};
-use super::tokens::{Question, compact_ident, normalize_qualified};
+use super::tokens::{
+    Question, compact_ident, compact_ident_into, normalize_qualified, normalize_qualified_into,
+};
 
 /// Field weights: name, signature, doc comments or parent headings, body, path.
 pub(crate) const WEIGHTS: [f64; FIELDS] = [4.0, 3.5, 3.0, 1.0, 0.5];
@@ -48,8 +50,8 @@ pub(crate) struct Scores {
     pub(crate) idf: Vec<f64>,
 }
 
-fn live(part: &Part, row: &Row) -> bool {
-    part.live.get(row.file as usize).copied().unwrap_or(false)
+fn live_file(part: &Part, file: u32) -> bool {
+    part.live.get(file as usize).copied().unwrap_or(false)
 }
 
 /// Live chunk count and average field lengths across `parts`.
@@ -141,66 +143,147 @@ fn matches_path_suffix(path: &str, suffix: &str) -> bool {
         && path[path.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-/// Multiplies a chunk's score when its symbol/heading name or file path
-/// directly matches the query or an identifier/path token in the query.
-pub(crate) fn exact_boost(name: &str, kind: &str, file: &str, question: &Question) -> f64 {
-    let symbol_or_heading = !matches!(kind, "file" | "data" | "log");
-    let simple = name.rsplit("::").next().unwrap_or(name);
-    let mut boost = 1.0f64;
+/// Precomputed query forms for [`exact_boost`] so scoring thousands of chunks
+/// allocates zero temporary strings.
+struct BoostQuery<'a> {
+    raw: &'a str,
+    raw_single: bool,
+    norm_raw: String,
+    compact_raw: String,
+    identifiers: Vec<IdentHint<'a>>,
+    path_hints: &'a [String],
+}
 
-    if symbol_or_heading && !question.raw.is_empty() {
+enum IdentHint<'a> {
+    Qualified { raw: &'a str, normalized: String },
+    Simple { raw: &'a str, compact: String },
+}
+
+#[derive(Default)]
+struct BoostScratch {
+    norm_name: String,
+    compact_simple: String,
+}
+
+impl<'a> BoostQuery<'a> {
+    fn new(question: &'a Question) -> Self {
         let raw = question.raw.as_str();
-        let single = !raw.contains(char::is_whitespace);
-        if name == raw {
-            boost = boost.max(1.50);
-        } else if name.eq_ignore_ascii_case(raw) || (single && simple == raw) {
-            boost = boost.max(1.35);
-        } else if single && simple.eq_ignore_ascii_case(raw) {
-            boost = boost.max(1.25);
-        } else if single {
-            let norm_raw = normalize_qualified(raw);
-            if norm_raw.len() >= 2 && normalize_qualified(name) == norm_raw {
-                boost = boost.max(1.20);
-            } else {
-                let compact_raw = compact_ident(raw);
-                if compact_raw.len() >= 4 && compact_ident(simple) == compact_raw {
-                    boost = boost.max(1.15);
+        let raw_single = !raw.is_empty() && !raw.contains(char::is_whitespace);
+        let (norm_raw, compact_raw) = if raw_single {
+            (normalize_qualified(raw), compact_ident(raw))
+        } else {
+            (String::new(), String::new())
+        };
+        let identifiers = question
+            .identifiers
+            .iter()
+            .map(|ident| {
+                if ident.contains("::") || ident.contains('.') {
+                    IdentHint::Qualified {
+                        raw: ident.as_str(),
+                        normalized: normalize_qualified(ident),
+                    }
+                } else {
+                    IdentHint::Simple {
+                        raw: ident.as_str(),
+                        compact: compact_ident(ident),
+                    }
                 }
-            }
+            })
+            .collect();
+        Self {
+            raw,
+            raw_single,
+            norm_raw,
+            compact_raw,
+            identifiers,
+            path_hints: &question.path_hints,
         }
     }
 
-    if symbol_or_heading {
-        for ident in &question.identifiers {
-            if name == ident {
-                boost = boost.max(1.45);
-            } else if ident.contains("::") || ident.contains('.') {
-                if normalize_qualified(name) == normalize_qualified(ident) {
-                    boost = boost.max(1.35);
-                }
-            } else if simple == ident {
+    fn boost(&self, name: &str, kind: &str, file: &str, scratch: &mut BoostScratch) -> f64 {
+        let symbol_or_heading = !matches!(kind, "file" | "data" | "log");
+        let simple = name.rsplit("::").next().unwrap_or(name);
+        let mut boost = 1.0f64;
+        let mut norm_name_ready = false;
+        let mut compact_simple_ready = false;
+
+        if symbol_or_heading && !self.raw.is_empty() {
+            if name == self.raw {
+                boost = boost.max(1.50);
+            } else if name.eq_ignore_ascii_case(self.raw) || (self.raw_single && simple == self.raw)
+            {
                 boost = boost.max(1.35);
-            } else {
-                let compact = compact_ident(ident);
-                if compact.len() >= 4 && compact_ident(simple) == compact {
-                    boost = boost.max(1.15);
+            } else if self.raw_single && simple.eq_ignore_ascii_case(self.raw) {
+                boost = boost.max(1.25);
+            } else if self.raw_single {
+                let matched_norm = if self.norm_raw.len() >= 2 {
+                    normalize_qualified_into(name, &mut scratch.norm_name);
+                    norm_name_ready = true;
+                    scratch.norm_name == self.norm_raw
+                } else {
+                    false
+                };
+                if matched_norm {
+                    boost = boost.max(1.20);
+                } else if self.compact_raw.len() >= 4 {
+                    compact_ident_into(simple, &mut scratch.compact_simple);
+                    compact_simple_ready = true;
+                    if scratch.compact_simple == self.compact_raw {
+                        boost = boost.max(1.15);
+                    }
                 }
             }
         }
-    }
 
-    for hint in &question.path_hints {
-        if matches_path_suffix(file, hint) {
-            boost *= 1.30;
-            break;
+        if symbol_or_heading {
+            for hint in &self.identifiers {
+                match hint {
+                    IdentHint::Qualified { raw, normalized } => {
+                        if name == *raw {
+                            boost = boost.max(1.45);
+                        } else {
+                            if !norm_name_ready {
+                                normalize_qualified_into(name, &mut scratch.norm_name);
+                                norm_name_ready = true;
+                            }
+                            if scratch.norm_name == *normalized {
+                                boost = boost.max(1.35);
+                            }
+                        }
+                    }
+                    IdentHint::Simple { raw, compact } => {
+                        if name == *raw {
+                            boost = boost.max(1.45);
+                        } else if simple == *raw {
+                            boost = boost.max(1.35);
+                        } else if compact.len() >= 4 {
+                            if !compact_simple_ready {
+                                compact_ident_into(simple, &mut scratch.compact_simple);
+                                compact_simple_ready = true;
+                            }
+                            if scratch.compact_simple == *compact {
+                                boost = boost.max(1.15);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        if hint.contains('/') && matches_path_suffix(strip_extension(file), hint) {
-            boost *= 1.20;
-            break;
-        }
-    }
 
-    boost
+        for hint in self.path_hints {
+            if matches_path_suffix(file, hint) {
+                boost *= 1.30;
+                break;
+            }
+            if hint.contains('/') && matches_path_suffix(strip_extension(file), hint) {
+                boost *= 1.20;
+                break;
+            }
+        }
+
+        boost
+    }
 }
 
 /// Scores every live chunk that matches at least one query term.
@@ -208,10 +291,23 @@ pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
     let stats = stats(parts);
     let terms = question.terms.len();
     let tests_wanted = question.mentions_tests();
+    let all_live: Vec<bool> = parts
+        .iter()
+        .map(|part| {
+            part.live.len() >= part.segment.files().len()
+                && part
+                    .live
+                    .iter()
+                    .take(part.segment.files().len())
+                    .all(|&l| l)
+        })
+        .collect();
     let mut sums = parts.iter().map(|_| Vec::new()).collect::<Vec<Vec<f64>>>();
     let mut matched = parts.iter().map(|_| Vec::new()).collect::<Vec<Vec<u8>>>();
+    let mut touched = parts.iter().map(|_| Vec::new()).collect::<Vec<Vec<u32>>>();
     let mut df = vec![0u64; terms];
     let mut idf = vec![0f64; terms];
+    let mut raw = Vec::new();
     let mut postings = Vec::new();
     let mut hits = Vec::<(usize, Posting)>::new();
     for (term, text) in question.terms.iter().enumerate() {
@@ -220,19 +316,25 @@ pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
             let Some(entry) = part.segment.find(text) else {
                 continue;
             };
-            part.segment.postings(&entry, &mut postings)?;
-            hits.extend(
-                postings
-                    .iter()
-                    .filter(|posting| live(part, &part.segment.row(posting.chunk)))
-                    .map(|posting| (index, *posting)),
-            );
+            part.segment
+                .postings_into(&entry, &mut raw, &mut postings)?;
+            if all_live[index] {
+                hits.extend(postings.iter().map(|posting| (index, *posting)));
+            } else {
+                hits.extend(
+                    postings
+                        .iter()
+                        .filter(|posting| live_file(part, part.segment.row_file(posting.chunk)))
+                        .map(|posting| (index, *posting)),
+                );
+            }
         }
         if hits.is_empty() {
             continue;
         }
         df[term] = hits.len() as u64;
         idf[term] = self::idf(stats.chunks, df[term]);
+        let term_idf = idf[term];
         for &(index, posting) in &hits {
             let part = &parts[index];
             if sums[index].is_empty() {
@@ -240,19 +342,30 @@ pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
                 sums[index] = vec![0.0; count];
                 matched[index] = vec![0; count];
             }
+            let chunk_idx = posting.chunk as usize;
+            if matched[index][chunk_idx] == 0 {
+                touched[index].push(posting.chunk);
+            }
             let row = part.segment.row(posting.chunk);
             let frequency = weighted_frequency(&posting, &row, &stats);
-            sums[index][posting.chunk as usize] += idf[term] * frequency / (SATURATION + frequency);
-            matched[index][posting.chunk as usize] += 1;
+            sums[index][chunk_idx] += term_idf * frequency / (SATURATION + frequency);
+            matched[index][chunk_idx] += 1;
         }
     }
-    let mut scored = Vec::new();
+    let total_touched: usize = touched.iter().map(Vec::len).sum();
+    let mut scored = Vec::with_capacity(total_touched);
+    let boost_query = BoostQuery::new(question);
+    let mut boost_scratch = BoostScratch::default();
     for (index, part) in parts.iter().enumerate() {
-        for (chunk, &count) in matched[index].iter().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            let row = part.segment.row(chunk as u32);
+        let touched_part = &mut touched[index];
+        if touched_part.is_empty() {
+            continue;
+        }
+        let score_chunk = |chunk_id: u32,
+                           count: u8,
+                           boost_scratch: &mut BoostScratch,
+                           scored: &mut Vec<Scored>| {
+            let row = part.segment.row(chunk_id);
             let class = row.class();
             let boost = if matches!(class, Class::Log | Class::Data) {
                 1.0
@@ -260,22 +373,57 @@ pub(crate) fn score(parts: &[Part], question: &Question) -> Result<Scores> {
                 let name = part.segment.name(&row);
                 let kind = part.segment.kind(&row);
                 let file = &part.segment.files()[row.file as usize];
-                exact_boost(name, kind, file, question)
+                boost_query.boost(name, kind, file, boost_scratch)
             };
-            let score = sums[index][chunk]
+            let score = sums[index][chunk_id as usize]
                 * coordination(usize::from(count), terms)
                 * prior(class, row.test(), tests_wanted)
                 * boost;
             if score > 0.0 {
                 scored.push(Scored {
                     part: index,
-                    chunk: chunk as u32,
+                    chunk: chunk_id,
                     score,
                 });
+            }
+        };
+        if touched_part.len().saturating_mul(4) < matched[index].len() {
+            touched_part.sort_unstable();
+            for &chunk_id in touched_part.iter() {
+                let count = matched[index][chunk_id as usize];
+                score_chunk(chunk_id, count, &mut boost_scratch, &mut scored);
+            }
+        } else {
+            for (chunk, &count) in matched[index].iter().enumerate() {
+                if count != 0 {
+                    score_chunk(chunk as u32, count, &mut boost_scratch, &mut scored);
+                }
             }
         }
     }
     Ok(Scores { scored, df, idf })
+}
+
+/// Up to two chosen slot indices per file, stored inline without heap allocation.
+#[derive(Clone, Copy, Default)]
+struct Slots {
+    items: [usize; 2],
+    len: u8,
+}
+
+impl Slots {
+    fn as_slice(&self) -> &[usize] {
+        &self.items[..usize::from(self.len)]
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    fn push(&mut self, index: usize) {
+        self.items[usize::from(self.len)] = index;
+        self.len += 1;
+    }
 }
 
 /// The best `limit` items in `compare` order, at most two non-overlapping
@@ -302,9 +450,9 @@ pub(crate) fn select<T: Copy, K: Eq + Hash, C: Eq + Hash>(
             items.select_nth_unstable_by(take - 1, &compare);
         }
         items[..take].sort_by(&compare);
-        let mut per_file = HashMap::<K, Vec<usize>>::new();
-        let mut copies = HashMap::<C, usize>::new();
-        let mut chosen = Vec::<Picked<T>>::new();
+        let mut per_file = HashMap::<K, Slots>::with_capacity(limit);
+        let mut copies = HashMap::<C, usize>::with_capacity(limit);
+        let mut chosen = Vec::<Picked<T>>::with_capacity(limit);
         for item in &items[..take] {
             let key = copy(item);
             if let Some(&index) = key.as_ref().and_then(|key| copies.get(key)) {
@@ -313,7 +461,7 @@ pub(crate) fn select<T: Copy, K: Eq + Hash, C: Eq + Hash>(
             }
             let file_key = file(item);
             if let Some(existing) = per_file.get(&file_key)
-                && let Some(&index) = existing.iter().find(|&&index| {
+                && let Some(&index) = existing.as_slice().iter().find(|&&index| {
                     overlaps(&chosen[index].item, item)
                         || chosen[index]
                             .merged
