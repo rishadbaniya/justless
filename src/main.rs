@@ -430,6 +430,40 @@ fn cli() -> Command<'static> {
         .subcommand(mcp::command())
         .subcommand(doctor::command())
         .subcommand(rewrite::command())
+        .subcommand(
+            Command::new("rename")
+                .about("Rename a symbol across the workspace using AST-verified spans")
+                .arg(
+                    Arg::new("symbol")
+                        .required(true)
+                        .value_name("SYMBOL")
+                        .help("Target symbol short name or qualified name (e.g. foo or src/a.rs::foo)"),
+                )
+                .arg(
+                    Arg::new("new-name")
+                        .required(true)
+                        .value_name("NEW_NAME")
+                        .help("New identifier name"),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Preview planned replacements without modifying any files"),
+                )
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .value_name("PATH")
+                        .takes_value(true)
+                        .multiple_occurrences(true)
+                        .help("Limit rename to matching workspace files or directories (repeatable)"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .help("Print a machine-readable JSON plan or report"),
+                ),
+        )
         .subcommands(source::commands())
         .subcommands(observations::commands())
         .subcommands(proxy::commands())
@@ -611,6 +645,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         (name @ ("read" | "expand" | "edit"), sub) => {
             source::run(&workspace, name, sub, matches.is_present("root"))?
         }
+        ("rename", sub) => run_rename(&workspace, sub)?,
         (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
         ("mcp", sub) => mcp::run(&workspace, sub)?,
         ("doctor", sub) => return doctor::run(&workspace, sub, matches.is_present("root")),
@@ -872,6 +907,142 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         _ => unreachable!("known subcommand"),
     }
     Ok(0)
+}
+
+fn run_rename(workspace: &Workspace, sub: &ArgMatches) -> Result<()> {
+    let symbol = sub.value_of("symbol").unwrap();
+    let new_name = sub.value_of("new-name").unwrap();
+    let dry_run = sub.is_present("dry-run");
+    let json = sub.is_present("json");
+    let include_files: Option<Vec<String>> = sub
+        .values_of("file")
+        .map(|vals| vals.map(str::to_owned).collect());
+
+    let index = Index::open(workspace)?;
+    let plan = source::plan_symbol_rename(
+        workspace,
+        &index,
+        symbol,
+        new_name,
+        include_files.as_deref(),
+    )?;
+
+    if dry_run {
+        if json {
+            let files: Vec<serde_json::Value> = plan
+                .files
+                .iter()
+                .map(|file| {
+                    let mut lines: Vec<usize> =
+                        file.replacements.iter().map(|span| span.line).collect();
+                    lines.sort_unstable();
+                    lines.dedup();
+                    let occurrences: Vec<serde_json::Value> = file
+                        .replacements
+                        .iter()
+                        .map(|span| {
+                            serde_json::json!({
+                                "line": span.line,
+                                "column": span.column,
+                                "start": span.bytes.start,
+                                "end": span.bytes.end,
+                                "snippet": span.snippet,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "path": file.path,
+                        "revision": file.revision,
+                        "replacements": file.replacements.len(),
+                        "lines": lines,
+                        "occurrences": occurrences,
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "dry_run": true,
+                "symbol": plan.qualified,
+                "kind": plan.kind,
+                "definition_file": plan.definition_file,
+                "definition_line": plan.definition_line,
+                "old_name": plan.old_name,
+                "new_name": plan.new_name,
+                "files": files,
+                "total_replacements": plan.total_replacements(),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            print!("{}", source::render_rename_plan(&plan, true));
+        }
+        return Ok(());
+    }
+
+    let report = source::apply_symbol_rename(workspace, &plan)?;
+    let _ = Index::open(workspace);
+
+    if json {
+        let files: Vec<serde_json::Value> = report
+            .files
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.path,
+                    "revision": file.revision,
+                    "replacements": file.replacements,
+                    "lines": file.lines,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "dry_run": false,
+            "symbol": report.qualified,
+            "kind": plan.kind,
+            "definition_file": plan.definition_file,
+            "definition_line": plan.definition_line,
+            "old_name": report.old_name,
+            "new_name": report.new_name,
+            "files": files,
+            "total_replacements": report.total_replacements,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let file_word = if report.files.len() == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        let occ_word = if report.total_replacements == 1 {
+            "occurrence"
+        } else {
+            "occurrences"
+        };
+        println!(
+            "[rename] {} -> {} ({} · {} {file_word}, {} {occ_word})",
+            report.qualified,
+            report.new_name,
+            plan.kind,
+            report.files.len(),
+            report.total_replacements
+        );
+        for file in &report.files {
+            let word = if file.replacements == 1 {
+                "occurrence"
+            } else {
+                "occurrences"
+            };
+            let lines = file
+                .lines
+                .iter()
+                .map(|line| format!("L{line}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{} · rev {} · {} {word} · {lines}",
+                file.path, file.revision, file.replacements
+            );
+        }
+    }
+    Ok(())
 }
 
 fn merge_plan_action(

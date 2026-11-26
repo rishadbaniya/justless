@@ -1640,3 +1640,240 @@ fn expanded_structural_outlines_round_trip_exact_bytes_via_expand() {
         );
     }
 }
+
+#[test]
+fn rename_cli_dry_run_and_apply_multifile_rust_and_typescript() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("web")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub mod math;\npub mod caller;\n").unwrap();
+    let math_orig = concat!(
+        "/// old_fn doc comment stays untouched\n",
+        "pub fn old_fn(x: i32) -> i32 {\n",
+        "    // old_fn inline comment\n",
+        "    let label = \"old_fn\";\n",
+        "    let old_fn_helper = x + 1;\n",
+        "    label.len() as i32 + old_fn_helper\n",
+        "}\n",
+    );
+    let caller_orig = concat!(
+        "use crate::math::old_fn;\n\n",
+        "// old_fn comment\n",
+        "pub fn run(n: i32) -> (&'static str, i32) {\n",
+        "    let my_old_fn_2 = old_fn(n);\n",
+        "    (\"old_fn\", my_old_fn_2)\n",
+        "}\n",
+    );
+    fs::write(root.join("src/math.rs"), math_orig).unwrap();
+    fs::write(root.join("src/caller.rs"), caller_orig).unwrap();
+
+    let ts_calc_orig = concat!(
+        "// calcTotal comment\n",
+        "export function calcTotal(a: number, b: number): number {\n",
+        "  const tag = \"calcTotal\";\n",
+        "  const calcTotal_v2 = a + b;\n",
+        "  return tag.length + calcTotal_v2;\n",
+        "}\n",
+    );
+    let ts_app_orig = concat!(
+        "import { calcTotal } from \"./calc\";\n\n",
+        "export function main(): string {\n",
+        "  /* calcTotal block comment */\n",
+        "  const my_calcTotal_2 = calcTotal(2, 3);\n",
+        "  return `calcTotal=${my_calcTotal_2}`;\n",
+        "}\n",
+    );
+    fs::write(root.join("web/calc.ts"), ts_calc_orig).unwrap();
+    fs::write(root.join("web/app.ts"), ts_app_orig).unwrap();
+
+    // Dry-run human preview leaves all Rust files untouched on disk.
+    let preview = String::from_utf8(out(
+        root,
+        &["rename", "old_fn", "compute_score", "--dry-run"],
+    ))
+    .unwrap();
+    contains(&preview, "[rename dry-run]");
+    contains(&preview, "src/math.rs · rev ");
+    contains(&preview, "src/caller.rs · rev ");
+    assert_eq!(read(root, "src/math.rs"), math_orig);
+    assert_eq!(read(root, "src/caller.rs"), caller_orig);
+
+    // Dry-run JSON preview reports full structured plan without touching disk.
+    let dry_json = json(
+        root,
+        &["rename", "old_fn", "compute_score", "--dry-run", "--json"],
+    );
+    assert_eq!(dry_json["dry_run"], true);
+    assert_eq!(dry_json["symbol"], "demo::math::old_fn");
+    assert_eq!(dry_json["old_name"], "old_fn");
+    assert_eq!(dry_json["new_name"], "compute_score");
+    assert_eq!(dry_json["total_replacements"], 3);
+    assert_eq!(dry_json["files"].as_array().unwrap().len(), 2);
+    assert_eq!(read(root, "src/math.rs"), math_orig);
+    assert_eq!(read(root, "src/caller.rs"), caller_orig);
+
+    // Apply Rust rename across all files while preserving comments, strings, and substrings.
+    let applied = String::from_utf8(out(root, &["rename", "old_fn", "compute_score"])).unwrap();
+    contains(&applied, "[rename] demo::math::old_fn -> compute_score");
+    contains(&applied, "src/math.rs · rev ");
+    contains(&applied, "src/caller.rs · rev ");
+
+    let math_after = read(root, "src/math.rs");
+    let caller_after = read(root, "src/caller.rs");
+    contains(&math_after, "pub fn compute_score(x: i32) -> i32");
+    contains(&math_after, "/// old_fn doc comment stays untouched");
+    contains(&math_after, "// old_fn inline comment");
+    contains(&math_after, "let label = \"old_fn\";");
+    contains(&math_after, "let old_fn_helper = x + 1;");
+    contains(&caller_after, "use crate::math::compute_score;");
+    contains(&caller_after, "let my_old_fn_2 = compute_score(n);");
+    contains(&caller_after, "// old_fn comment");
+    contains(&caller_after, "(\"old_fn\", my_old_fn_2)");
+
+    // Refreshed index & outline reflect the renamed Rust symbol cleanly.
+    let math_outline = String::from_utf8(out(root, &["read", "src/math.rs", "--outline"])).unwrap();
+    contains(&math_outline, "fn compute_score");
+    let callers =
+        String::from_utf8(out(root, &["query", "compute_score", "--view", "callers"])).unwrap();
+    contains(&callers, "demo::caller::run");
+
+    // Apply TypeScript rename with --json and verify post-rename revisions and AST safety.
+    let ts_report = json(root, &["rename", "calcTotal", "sumValues", "--json"]);
+    assert_eq!(ts_report["dry_run"], false);
+    assert_eq!(ts_report["old_name"], "calcTotal");
+    assert_eq!(ts_report["new_name"], "sumValues");
+    assert_eq!(ts_report["total_replacements"], 3);
+    let ts_files = ts_report["files"].as_array().unwrap();
+    assert_eq!(ts_files.len(), 2);
+    for entry in ts_files {
+        let path = entry["path"].as_str().unwrap();
+        assert_eq!(entry["revision"].as_str().unwrap(), revision(root, path));
+    }
+
+    let ts_calc_after = read(root, "web/calc.ts");
+    let ts_app_after = read(root, "web/app.ts");
+    contains(&ts_calc_after, "export function sumValues(");
+    contains(&ts_calc_after, "// calcTotal comment");
+    contains(&ts_calc_after, "const tag = \"calcTotal\";");
+    contains(&ts_calc_after, "const calcTotal_v2 = a + b;");
+    contains(&ts_app_after, "import { sumValues } from \"./calc\";");
+    contains(&ts_app_after, "const my_calcTotal_2 = sumValues(2, 3);");
+    contains(&ts_app_after, "/* calcTotal block comment */");
+    contains(&ts_app_after, "`calcTotal=${my_calcTotal_2}`");
+}
+
+#[test]
+fn rename_cli_file_scope_restricts_updates_and_preserves_unselected_files() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod math;\npub mod alpha;\npub mod beta;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/math.rs"),
+        "pub fn old_fn(x: i32) -> i32 {\n    x + 1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/alpha.rs"),
+        "use crate::math::old_fn;\npub fn a() -> i32 { old_fn(1) }\n",
+    )
+    .unwrap();
+    let beta_orig = "use crate::math::old_fn;\npub fn b() -> i32 { old_fn(2) }\n";
+    fs::write(root.join("src/beta.rs"), beta_orig).unwrap();
+
+    let report = json(
+        root,
+        &[
+            "rename",
+            "old_fn",
+            "scoped_fn",
+            "--file",
+            "src/math.rs",
+            "--file",
+            "src/alpha.rs",
+            "--json",
+        ],
+    );
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["total_replacements"], 3);
+    let paths: Vec<&str> = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["src/alpha.rs", "src/math.rs"]);
+    contains(&read(root, "src/math.rs"), "pub fn scoped_fn(");
+    contains(&read(root, "src/alpha.rs"), "scoped_fn(1)");
+    assert_eq!(read(root, "src/beta.rs"), beta_orig);
+}
+
+#[test]
+fn rename_cli_fails_closed_on_ambiguous_invalid_keyword_and_collision() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    let lib_src = "pub mod a;\npub mod b;\n";
+    let a_src = "pub fn dup() -> i32 { 1 }\npub fn taken_name() -> i32 { 2 }\n";
+    let b_src = "pub fn dup() -> i32 { 3 }\n";
+    let py_src = "def py_worker():\n    return 1\n";
+    fs::write(root.join("src/lib.rs"), lib_src).unwrap();
+    fs::write(root.join("src/a.rs"), a_src).unwrap();
+    fs::write(root.join("src/b.rs"), b_src).unwrap();
+    fs::write(root.join("worker.py"), py_src).unwrap();
+
+    // Ambiguous short name
+    let ambiguous = run(root, &["rename", "dup", "unique_fn"], b"");
+    assert!(!ambiguous.status.success());
+    let ambiguous_err = stderr(&ambiguous);
+    contains(&ambiguous_err, "ambiguous");
+    contains(&ambiguous_err, "demo::a::dup");
+    contains(&ambiguous_err, "demo::b::dup");
+
+    // Invalid identifiers and reserved keywords
+    for bad in ["", "123bad", "bad name", "bad-name", "fn", "struct"] {
+        let out = run(root, &["rename", "a::dup", bad], b"");
+        assert!(!out.status.success(), "expected failure for `{bad}`");
+        let err = stderr(&out);
+        assert!(
+            err.contains("invalid") || err.contains("empty") || err.contains("keyword"),
+            "unexpected stderr for `{bad}`: {err}"
+        );
+    }
+
+    let py_kw = run(root, &["rename", "py_worker", "def"], b"");
+    assert!(!py_kw.status.success());
+    contains(&stderr(&py_kw), "keyword");
+
+    // Scope name collision
+    let collision = run(root, &["rename", "a::dup", "taken_name"], b"");
+    assert!(!collision.status.success());
+    contains(&stderr(&collision), "collision");
+
+    // Zero files modified across every rejected invocation.
+    assert_eq!(read(root, "src/lib.rs"), lib_src);
+    assert_eq!(read(root, "src/a.rs"), a_src);
+    assert_eq!(read(root, "src/b.rs"), b_src);
+    assert_eq!(read(root, "worker.py"), py_src);
+}

@@ -4532,7 +4532,6 @@ fn preview(file: &str, path: &Path, before: &str, after: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// One exact identifier token occurrence slated for replacement inside a file.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameSpan {
     pub bytes: Range<usize>,
@@ -4543,7 +4542,6 @@ pub struct RenameSpan {
 
 /// All AST-verified identifier replacements planned for a single workspace file,
 /// bound to that file's path-bound content revision.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRename {
     pub path: String,
@@ -4552,7 +4550,6 @@ pub struct FileRename {
 }
 
 /// A deterministic, dry-runnable multi-file symbol rename plan.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenamePlan {
     pub qualified: String,
@@ -4564,7 +4561,6 @@ pub struct RenamePlan {
     pub files: Vec<FileRename>,
 }
 
-#[allow(dead_code)]
 impl RenamePlan {
     pub fn total_replacements(&self) -> usize {
         self.files.iter().map(|file| file.replacements.len()).sum()
@@ -4572,7 +4568,6 @@ impl RenamePlan {
 }
 
 /// Per-file summary returned by [`apply_symbol_rename`].
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenamedFile {
     pub path: String,
@@ -4582,7 +4577,6 @@ pub struct RenamedFile {
 }
 
 /// Outcome of atomically applying a [`RenamePlan`].
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameReport {
     pub qualified: String,
@@ -4597,7 +4591,6 @@ pub struct RenameReport {
 /// Validates identifier syntax, reserved keywords, symbol uniqueness (never
 /// guesses on ambiguous short names), and scope collisions before reading
 /// candidate files discovered across the entire workspace index.
-#[allow(dead_code)]
 pub fn plan_symbol_rename(
     workspace: &Workspace,
     index: &Index,
@@ -4745,7 +4738,6 @@ pub fn plan_symbol_rename(
 /// `syntax_check` on every modified file BEFORE writing a single byte. If an
 /// I/O error occurs mid-batch, any already-written files are rolled back to
 /// their original contents.
-#[allow(dead_code)]
 pub fn apply_symbol_rename(workspace: &Workspace, plan: &RenamePlan) -> Result<RenameReport> {
     ensure!(!plan.files.is_empty(), "rename plan has no files to update");
     ensure!(!plan.old_name.is_empty(), "rename plan has empty old_name");
@@ -4963,7 +4955,6 @@ pub fn apply_symbol_rename(workspace: &Workspace, plan: &RenamePlan) -> Result<R
 
 /// Renders a compact, high-signal preview of `plan` with per-file revisions,
 /// occurrence counts, and `L<line>` snippets.
-#[allow(dead_code)]
 pub fn render_rename_plan(plan: &RenamePlan, dry_run: bool) -> String {
     let total = plan.total_replacements();
     let tag = if dry_run { "rename dry-run" } else { "rename" };
